@@ -831,7 +831,11 @@ impl EngineCore {
                 .keys()
                 .any(|plan_id| rolled_back_plans.contains(plan_id))
         });
-        for scheduled in &exact_schedule {
+        self.rollback_schedule_state(&exact_schedule);
+    }
+
+    fn rollback_schedule_state(&mut self, exact_schedule: &[super::scheduler::ScheduledRequest]) {
+        for scheduled in exact_schedule {
             let session = scheduled.session_key();
             if let Some(reservation) = self.active_managed_cache.remove(&scheduled.plan_id) {
                 if let Err(error) = self.managed_kv_cache.finalize(&reservation, None, false) {
@@ -875,14 +879,30 @@ impl EngineCore {
     /// this hook when a prepared dispatch can no longer produce a completion
     /// (for example, a cancelled/join-failed runner task).
     pub(super) fn rollback_all_in_flight_dispatches(&mut self) -> usize {
-        let scheduled = self
+        let batch_ids = self
             .in_flight_dispatches
-            .values()
-            .flat_map(|dispatch| dispatch.scheduled.iter().cloned())
+            .keys()
+            .copied()
             .collect::<Vec<_>>();
-        let count = self.in_flight_dispatches.len();
-        self.rollback_unexecuted_schedule(&scheduled);
-        count
+        self.rollback_in_flight_dispatches(&batch_ids)
+    }
+
+    /// Roll back only the exact physical tickets owned by one abandoned
+    /// prepared step. Later tickets may already be present by the time recovery
+    /// acquires the core lock and must remain untouched.
+    pub(super) fn rollback_in_flight_dispatches(&mut self, batch_ids: &[BatchId]) -> usize {
+        let mut scheduled = Vec::new();
+        let mut removed = 0;
+        for batch_id in batch_ids.iter().copied().collect::<HashSet<_>>() {
+            let Some(dispatch) = self.in_flight_dispatches.remove(&batch_id) else {
+                continue;
+            };
+            removed += 1;
+            self.active_stream_batches.remove(&batch_id);
+            scheduled.extend(dispatch.scheduled);
+        }
+        self.rollback_schedule_state(&scheduled);
+        removed
     }
 
     fn defer_unexecuted_schedule_for_capacity(
@@ -2368,11 +2388,17 @@ impl EngineCore {
     ) -> Result<ExecutedEngineStep> {
         let (progress_tx, mut progress_rx) = mpsc::channel(STREAM_PROGRESS_QUEUE_CAPACITY);
         let progress_budget = StreamProgressBudget::new(STREAM_PROGRESS_MAX_BUFFERED_BYTES);
-        let mut runner = tokio::spawn(ExecutionGroupRunner::execute(
-            prepared,
-            progress_tx,
-            progress_budget,
-        ));
+        let recovery = prepared.recovery();
+        let runner_registration = recovery.register_runner();
+        let mut runner = tokio::spawn(async move {
+            ExecutionGroupRunner::execute(
+                prepared,
+                runner_registration,
+                progress_tx,
+                progress_budget,
+            )
+            .await
+        });
         let (mut deliveries, mut delivery_failures) = IncrementalStreamDeliveryWorkers::new();
         let mut failures = HashMap::new();
         let mut progress_closed = false;
@@ -2384,11 +2410,13 @@ impl EngineCore {
                     break match result {
                         Ok(executed) => executed,
                         Err(error) if error.is_panic() => {
-                            self.rollback_all_in_flight_dispatches();
+                            recovery.wait_for_task_drain().await;
+                            self.rollback_in_flight_dispatches(recovery.batch_ids());
                             std::panic::resume_unwind(error.into_panic())
                         }
                         Err(error) => {
-                            self.rollback_all_in_flight_dispatches();
+                            recovery.wait_for_task_drain().await;
+                            self.rollback_in_flight_dispatches(recovery.batch_ids());
                             return Err(Error::InferenceError(format!(
                                 "execution group task was cancelled: {error}"
                             )));
@@ -7218,6 +7246,100 @@ mod tests {
         assert!(core.active_managed_cache.is_empty());
         assert!(core.active_stream_batches.is_empty());
         drop(decode);
+    }
+
+    #[tokio::test]
+    async fn exact_prepared_recovery_rolls_back_only_its_cache_plan_and_ticket() {
+        let model_instance = ModelInstanceId::new(992);
+        let executor = UnifiedExecutor::new_for_test(Box::new(ManagedReceiptExecutor));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                max_batch_size: 1,
+                max_tokens_per_step: 1,
+                min_tokens_per_step: 1,
+                enable_chunked_prefill: false,
+                enable_adaptive_batching: false,
+                block_size: 16,
+                max_blocks: 8,
+                backend: BackendKind::Cpu,
+                ..Default::default()
+            },
+            executor,
+        )
+        .expect("core");
+        for (id, token) in [("recovery-first", 11), ("recovery-later", 22)] {
+            let request = managed_test_request(&mut core, model_instance, id, vec![token]);
+            core.add_request(request).expect("add managed request");
+        }
+
+        let first = core
+            .prepare_step()
+            .await
+            .expect("prepare first")
+            .expect("first ticket");
+        let first_recovery = first.recovery();
+        assert_eq!(first_recovery.batch_ids().len(), 1);
+        let first_batch_id = first_recovery.batch_ids()[0];
+        let first_ticket = core
+            .in_flight_dispatches
+            .remove(&first_batch_id)
+            .expect("first ticket registration");
+        let first_plan_id = first_ticket.scheduled[0].plan_id;
+
+        // Simulate recovery reacquiring the core after another prepared step
+        // has registered a newer ticket.
+        let later = core
+            .prepare_step()
+            .await
+            .expect("prepare later")
+            .expect("later ticket");
+        let later_recovery = later.recovery();
+        assert_eq!(later_recovery.batch_ids().len(), 1);
+        let later_batch_id = later_recovery.batch_ids()[0];
+        let later_plan_id = core.in_flight_dispatches[&later_batch_id].scheduled[0].plan_id;
+        core.in_flight_dispatches
+            .insert(first_batch_id, first_ticket);
+
+        assert_eq!(core.in_flight_dispatches.len(), 2);
+        assert_eq!(core.active_plans.len(), 2);
+        assert_eq!(core.active_managed_cache.len(), 2);
+        assert_eq!(
+            core.managed_kv_cache
+                .runtime_snapshot()
+                .totals
+                .coordinator
+                .active_transactions,
+            2
+        );
+
+        assert_eq!(
+            core.rollback_in_flight_dispatches(first_recovery.batch_ids()),
+            1
+        );
+        assert!(!core.in_flight_dispatches.contains_key(&first_batch_id));
+        assert!(!core.active_plans.contains_key(&first_plan_id));
+        assert!(!core.active_managed_cache.contains_key(&first_plan_id));
+        assert!(core.in_flight_dispatches.contains_key(&later_batch_id));
+        assert!(core.active_plans.contains_key(&later_plan_id));
+        assert!(core.active_managed_cache.contains_key(&later_plan_id));
+        assert_eq!(
+            core.managed_kv_cache
+                .runtime_snapshot()
+                .totals
+                .coordinator
+                .active_transactions,
+            1,
+            "exact recovery must leave the later managed transaction active"
+        );
+
+        assert_eq!(
+            core.rollback_in_flight_dispatches(later_recovery.batch_ids()),
+            1
+        );
+        assert!(core.in_flight_dispatches.is_empty());
+        assert!(core.active_plans.is_empty());
+        assert!(core.active_managed_cache.is_empty());
+        drop((first, later));
     }
 
     #[tokio::test]

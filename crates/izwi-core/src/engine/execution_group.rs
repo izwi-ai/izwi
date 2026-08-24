@@ -9,11 +9,11 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::stream::{FuturesUnordered, StreamExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tracing::{debug, warn};
 
 use crate::config::{PhysicalExecutionMode, PhysicalInFlightLimit};
@@ -197,6 +197,111 @@ pub(super) struct PreparedEngineStep {
     dispatches: Vec<PreparedPhysicalDispatch>,
     physical_execution_mode: PhysicalExecutionMode,
     max_physical_in_flight: PhysicalInFlightLimit,
+    recovery: PreparedStepRecovery,
+}
+
+/// Exact recovery fence retained outside the runner task. The caller registers
+/// the runner before spawning it, and every nested physical launch registers
+/// before its own spawn, so cancellation cannot make recovery race native work.
+#[derive(Clone)]
+pub(super) struct PreparedStepRecovery {
+    batch_ids: Arc<[super::BatchId]>,
+    task_drain: PhysicalTaskDrainTracker,
+}
+
+impl PreparedStepRecovery {
+    pub(super) fn batch_ids(&self) -> &[super::BatchId] {
+        &self.batch_ids
+    }
+
+    pub(super) fn register_runner(&self) -> PhysicalTaskDrainRegistration {
+        self.task_drain.register(&self.batch_ids)
+    }
+
+    pub(super) async fn wait_for_task_drain(&self) {
+        self.task_drain.wait_for(&self.batch_ids).await;
+    }
+}
+
+#[derive(Clone, Default)]
+struct PhysicalTaskDrainTracker {
+    inner: Arc<PhysicalTaskDrainState>,
+}
+
+#[derive(Default)]
+struct PhysicalTaskDrainState {
+    active: Mutex<HashMap<super::BatchId, usize>>,
+    changed: Notify,
+}
+
+pub(super) struct PhysicalTaskDrainRegistration {
+    tracker: PhysicalTaskDrainTracker,
+    batch_ids: Arc<[super::BatchId]>,
+}
+
+impl PhysicalTaskDrainTracker {
+    fn register(&self, batch_ids: &[super::BatchId]) -> PhysicalTaskDrainRegistration {
+        let batch_ids = batch_ids.iter().copied().collect::<HashSet<_>>();
+        {
+            let mut active = self
+                .inner
+                .active
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            for batch_id in &batch_ids {
+                *active.entry(*batch_id).or_default() += 1;
+            }
+        }
+        PhysicalTaskDrainRegistration {
+            tracker: self.clone(),
+            batch_ids: batch_ids.into_iter().collect::<Vec<_>>().into(),
+        }
+    }
+
+    async fn wait_for(&self, batch_ids: &[super::BatchId]) {
+        loop {
+            let changed = self.inner.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let drained = {
+                let active = self
+                    .inner
+                    .active
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                batch_ids
+                    .iter()
+                    .all(|batch_id| !active.contains_key(batch_id))
+            };
+            if drained {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
+impl Drop for PhysicalTaskDrainRegistration {
+    fn drop(&mut self) {
+        {
+            let mut active = self
+                .tracker
+                .inner
+                .active
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            for batch_id in self.batch_ids.iter() {
+                let remove = active.get_mut(batch_id).is_some_and(|count| {
+                    *count = count.saturating_sub(1);
+                    *count == 0
+                });
+                if remove {
+                    active.remove(batch_id);
+                }
+            }
+        }
+        self.tracker.inner.changed.notify_waiters();
+    }
 }
 
 impl PreparedEngineStep {
@@ -218,12 +323,29 @@ impl PreparedEngineStep {
         physical_execution_mode: PhysicalExecutionMode,
         max_physical_in_flight: PhysicalInFlightLimit,
     ) -> Self {
+        let batch_ids = dispatches
+            .iter()
+            .map(|dispatch| dispatch.physical_batch.batch_id)
+            .collect::<Vec<_>>();
+        debug_assert_eq!(
+            batch_ids.iter().copied().collect::<HashSet<_>>().len(),
+            batch_ids.len(),
+            "prepared engine step contains duplicate physical batch IDs"
+        );
         Self {
             executor,
             dispatches,
             physical_execution_mode,
             max_physical_in_flight,
+            recovery: PreparedStepRecovery {
+                batch_ids: batch_ids.into(),
+                task_drain: PhysicalTaskDrainTracker::default(),
+            },
         }
+    }
+
+    pub(super) fn recovery(&self) -> PreparedStepRecovery {
+        self.recovery.clone()
     }
 }
 
@@ -343,9 +465,12 @@ pub(super) struct ExecutionGroupRunner;
 impl ExecutionGroupRunner {
     pub(super) async fn execute(
         prepared: PreparedEngineStep,
+        runner_registration: PhysicalTaskDrainRegistration,
         progress_tx: mpsc::Sender<FencedStreamProgress>,
         progress_budget: Arc<StreamProgressBudget>,
     ) -> ExecutedEngineStep {
+        let _runner_registration = runner_registration;
+        let task_drain = prepared.recovery.task_drain.clone();
         let batches = execute_dispatches(
             &prepared.executor,
             prepared.dispatches,
@@ -353,6 +478,7 @@ impl ExecutionGroupRunner {
             prepared.max_physical_in_flight,
             &progress_tx,
             &progress_budget,
+            &task_drain,
         )
         .await;
 
@@ -367,6 +493,7 @@ async fn execute_dispatches(
     max_physical_in_flight: PhysicalInFlightLimit,
     progress_tx: &mpsc::Sender<FencedStreamProgress>,
     progress_budget: &Arc<StreamProgressBudget>,
+    task_drain: &PhysicalTaskDrainTracker,
 ) -> Vec<ExecutedPhysicalBatch> {
     if mode == PhysicalExecutionMode::Shadow {
         observe_shadow_launch_plan(&dispatches, max_physical_in_flight);
@@ -385,6 +512,7 @@ async fn execute_dispatches(
         max_physical_in_flight,
         progress_tx,
         progress_budget,
+        task_drain,
     )
     .await
 }
@@ -572,6 +700,7 @@ async fn execute_dispatches_concurrent(
     engine_limit: PhysicalInFlightLimit,
     progress_tx: &mpsc::Sender<FencedStreamProgress>,
     progress_budget: &Arc<StreamProgressBudget>,
+    task_drain: &PhysicalTaskDrainTracker,
 ) -> Vec<ExecutedPhysicalBatch> {
     let result_count = dispatches.len();
     let mut pending = dispatches
@@ -611,10 +740,12 @@ async fn execute_dispatches_concurrent(
             };
             active.push(launch);
             let recovery = dispatch.clone();
+            let task_registration = task_drain.register(&[dispatch.physical_batch.batch_id]);
             let task_executor = executor.clone();
             let task_progress_tx = progress_tx.clone();
             let task_progress_budget = progress_budget.clone();
             let task = tokio::spawn(async move {
+                let _task_registration = task_registration;
                 let mut executed = execute_dispatches_serial(
                     &task_executor,
                     vec![dispatch],
@@ -1277,6 +1408,109 @@ mod tests {
     struct ReverseCompletionExecutor {
         completion_order: Arc<std::sync::Mutex<Vec<BatchId>>>,
         slow_batch: BatchId,
+    }
+
+    struct BlockingDrainExecutor {
+        entered: Arc<AtomicUsize>,
+        exited: Arc<AtomicUsize>,
+        release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    struct PanickingPhysicalExecutor;
+
+    impl ModelExecutor for BlockingDrainExecutor {
+        fn execute_physical_batch(
+            &self,
+            execution: PhysicalBatchExecution<'_>,
+        ) -> PhysicalDispatchResult {
+            execution.validate().expect("test physical batch");
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            let (released, wake) = self.release.as_ref();
+            let mut released = released.lock().unwrap_or_else(|poison| poison.into_inner());
+            while !*released {
+                released = wake
+                    .wait(released)
+                    .unwrap_or_else(|poison| poison.into_inner());
+            }
+            self.exited.fetch_add(1, Ordering::SeqCst);
+            let dispatch = execution.expected_dispatch();
+            Ok(execution
+                .scheduled
+                .iter()
+                .map(|scheduled| {
+                    ExecutorStepResult::new(
+                        scheduled,
+                        ExecutorOutput::terminal(scheduled.request_id.clone()),
+                    )
+                    .with_dispatch(dispatch)
+                })
+                .collect())
+        }
+
+        fn execute_prefill(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            unreachable!("physical boundary must own dispatch")
+        }
+
+        fn execute_decode(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            unreachable!("physical boundary must own dispatch")
+        }
+
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        fn initialize(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ModelExecutor for PanickingPhysicalExecutor {
+        fn execute_physical_batch(
+            &self,
+            _execution: PhysicalBatchExecution<'_>,
+        ) -> PhysicalDispatchResult {
+            panic!("intentional physical task panic")
+        }
+
+        fn execute_prefill(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            unreachable!("physical boundary must own dispatch")
+        }
+
+        fn execute_decode(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            unreachable!("physical boundary must own dispatch")
+        }
+
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        fn initialize(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&mut self) -> Result<()> {
+            Ok(())
+        }
     }
 
     impl ModelExecutor for ReverseCompletionExecutor {
@@ -2011,6 +2245,166 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn outer_runner_abort_drains_detached_launches_before_workspace_and_permit_release() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 2, 4));
+        let authority = coordinator.resource_authority();
+        let admission = coordinator.physical_execution_admission();
+        let execution_group = coordinator.execution_group_id();
+        let model_instance = ModelInstanceId::new(991);
+        let policy = PhysicalLaunchPolicy::concurrent(2).unwrap();
+        let entered = Arc::new(AtomicUsize::new(0));
+        let exited = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let executor = UnifiedExecutor::new_for_test_with_physical_context(
+            Box::new(BlockingDrainExecutor {
+                entered: entered.clone(),
+                exited: exited.clone(),
+                release: release.clone(),
+            }),
+            BackendKind::Cpu,
+            authority.clone(),
+            admission.clone(),
+        );
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let mut dispatches = [301, 302]
+            .into_iter()
+            .map(|batch_id| {
+                prepared_bound_rows_with_policy(
+                    batch_id,
+                    execution_group,
+                    model_instance,
+                    1,
+                    policy,
+                    cancellation.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for dispatch in &mut dispatches {
+            dispatch.physical_batch.workspace.host_bytes = ResourceAmount::Known(8);
+            dispatch.physical_batch.budget.max_workspace_bytes = 8;
+            dispatch.physical_batch.rows[0].cost = WorkCost::new(1, 1, 8);
+        }
+        let prepared = PreparedEngineStep::with_execution_policy(
+            executor,
+            dispatches,
+            PhysicalExecutionMode::Concurrent,
+            PhysicalInFlightLimit::new(2).unwrap(),
+        );
+        let recovery = prepared.recovery();
+        let runner_registration = recovery.register_runner();
+        let (progress_tx, _progress_rx) = mpsc::channel(8);
+        let runner = tokio::spawn(async move {
+            ExecutionGroupRunner::execute(
+                prepared,
+                runner_registration,
+                progress_tx,
+                StreamProgressBudget::new(1024),
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while entered.load(Ordering::SeqCst) != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both physical launches did not enter native execution");
+        assert_eq!(authority.snapshot().reservations, 2);
+
+        runner.abort();
+        let runner_error = match runner.await {
+            Ok(_) => panic!("aborted runner unexpectedly completed"),
+            Err(error) => error,
+        };
+        assert!(runner_error.is_cancelled());
+        let drain_recovery = recovery.clone();
+        let drain = tokio::spawn(async move { drain_recovery.wait_for_task_drain().await });
+        tokio::task::yield_now().await;
+        assert!(
+            !drain.is_finished(),
+            "drain completed while native calls ran"
+        );
+        assert_eq!(exited.load(Ordering::SeqCst), 0);
+        assert_eq!(authority.snapshot().reservations, 2);
+
+        let waiter = tokio::spawn(async move {
+            admission
+                .acquire_dispatch(
+                    execution_group,
+                    model_instance,
+                    policy,
+                    NativeBatchMode::None,
+                    1,
+                    None,
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "physical permits were released early"
+        );
+
+        let (released, wake) = release.as_ref();
+        *released.lock().unwrap_or_else(|poison| poison.into_inner()) = true;
+        wake.notify_all();
+        tokio::time::timeout(Duration::from_secs(1), drain)
+            .await
+            .expect("physical task drain did not finish")
+            .expect("drain task panicked");
+        assert_eq!(exited.load(Ordering::SeqCst), 2);
+        assert_eq!(authority.snapshot().reservations, 0);
+        drop(
+            tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("permit did not become available after drain")
+                .expect("permit waiter panicked")
+                .expect("permit waiter failed"),
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn panicking_physical_tasks_leave_the_prepared_recovery_fence_drained() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(PanickingPhysicalExecutor));
+        let policy = PhysicalLaunchPolicy::concurrent(2).unwrap();
+        let prepared = PreparedEngineStep::with_execution_policy(
+            executor,
+            vec![
+                prepared_rows_with_policy(303, "panic-a", 1, policy),
+                prepared_rows_with_policy(304, "panic-b", 1, policy),
+            ],
+            PhysicalExecutionMode::Concurrent,
+            PhysicalInFlightLimit::new(2).unwrap(),
+        );
+        let recovery = prepared.recovery();
+        let runner_registration = recovery.register_runner();
+        let (progress_tx, _progress_rx) = mpsc::channel(8);
+        let executed = tokio::spawn(async move {
+            ExecutionGroupRunner::execute(
+                prepared,
+                runner_registration,
+                progress_tx,
+                StreamProgressBudget::new(1024),
+            )
+            .await
+        })
+        .await
+        .expect("child physical panics must be reconciled by the runner");
+
+        tokio::time::timeout(Duration::from_millis(100), recovery.wait_for_task_drain())
+            .await
+            .expect("panic recovery left a physical task registered");
+        assert_eq!(executed.batches.len(), 2);
+        assert!(executed.batches.iter().all(|batch| {
+            batch.results.iter().all(|result| {
+                result.provenance.failure_origin == Some(FailureOrigin::Panic)
+                    && result.provenance.dispatch_state == DispatchState::Started
+            })
+        }));
+    }
+
     #[test]
     fn prepared_physical_dispatch_rejects_duplicate_session_or_plan_quantum() {
         let build = |batch_id: u64, scheduled: Vec<ScheduledRequest>| {
@@ -2084,8 +2478,10 @@ mod tests {
 
     async fn execute_prepared(prepared: PreparedEngineStep) -> ExecutedEngineStep {
         let (progress_tx, _progress_rx) = mpsc::channel(64);
+        let runner_registration = prepared.recovery().register_runner();
         ExecutionGroupRunner::execute(
             prepared,
+            runner_registration,
             progress_tx,
             StreamProgressBudget::new(1024 * 1024),
         )

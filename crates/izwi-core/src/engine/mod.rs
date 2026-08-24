@@ -323,9 +323,13 @@ struct OwnedStepContext {
 }
 
 impl OwnedStepContext {
-    async fn rollback_abandoned_dispatches(&self) {
+    async fn rollback_abandoned_dispatches(
+        &self,
+        recovery: &execution_group::PreparedStepRecovery,
+    ) {
+        recovery.wait_for_task_drain().await;
         let mut core = self.core.write().await;
-        core.rollback_all_in_flight_dispatches();
+        core.rollback_in_flight_dispatches(recovery.batch_ids());
     }
 
     fn take_completion_sender(
@@ -422,11 +426,17 @@ impl OwnedStepContext {
         let (progress_tx, mut progress_rx) = mpsc::channel(request::STREAM_PROGRESS_QUEUE_CAPACITY);
         let progress_budget =
             request::StreamProgressBudget::new(request::STREAM_PROGRESS_MAX_BUFFERED_BYTES);
-        let mut runner = tokio::spawn(execution_group::ExecutionGroupRunner::execute(
-            prepared,
-            progress_tx,
-            progress_budget,
-        ));
+        let recovery = prepared.recovery();
+        let runner_registration = recovery.register_runner();
+        let mut runner = tokio::spawn(async move {
+            execution_group::ExecutionGroupRunner::execute(
+                prepared,
+                runner_registration,
+                progress_tx,
+                progress_budget,
+            )
+            .await
+        });
         let (mut deliveries, mut delivery_failures) =
             executor::IncrementalStreamDeliveryWorkers::new();
         let mut failures = HashMap::new();
@@ -439,11 +449,11 @@ impl OwnedStepContext {
                     break match result {
                         Ok(executed) => executed,
                         Err(error) if error.is_panic() => {
-                            self.rollback_abandoned_dispatches().await;
+                            self.rollback_abandoned_dispatches(&recovery).await;
                             std::panic::resume_unwind(error.into_panic())
                         }
                         Err(error) => {
-                            self.rollback_abandoned_dispatches().await;
+                            self.rollback_abandoned_dispatches(&recovery).await;
                             return Err(Error::InferenceError(format!(
                                 "execution group task was cancelled: {error}"
                             )));
