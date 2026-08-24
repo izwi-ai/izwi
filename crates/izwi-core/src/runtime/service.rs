@@ -80,6 +80,20 @@ use crate::runtime::types::RuntimeRequestContext;
 use crate::runtime_models::{LoadedModelDiagnostics, ModelRegistry};
 use crate::tokenizer::Tokenizer;
 
+fn effective_physical_execution_parallelism(
+    mode: crate::config::PhysicalExecutionMode,
+    request_parallelism: usize,
+    configured_launch_limit: usize,
+) -> usize {
+    if mode == crate::config::PhysicalExecutionMode::Concurrent {
+        request_parallelism.max(configured_launch_limit).max(1)
+    } else {
+        // Serial is the emergency rollback path and Shadow must observe
+        // decisions without allowing direct-capability calls to overlap.
+        1
+    }
+}
+
 fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(msg) = payload.downcast_ref::<&str>() {
         return (*msg).to_string();
@@ -1197,7 +1211,9 @@ impl RuntimeService {
         )?);
         worker_config.static_tensor_batch_variants =
             Arc::new(adapter_registry.static_tensor_batch_variants(selected_backend_kind));
-        let execution_parallelism = worker_config.request_parallelism.max(
+        let execution_parallelism = effective_physical_execution_parallelism(
+            core_config.physical_execution_mode,
+            worker_config.request_parallelism,
             core_config
                 .resolved_physical_execution_capacity()
                 .physical_launch_limit
@@ -3125,6 +3141,34 @@ mod tests {
         OutputProcessor,
     };
     use crate::runtime::broker::{InferenceBroker, InferenceBrokerMode};
+
+    #[test]
+    fn direct_execution_capacity_obeys_rollout_mode() {
+        assert_eq!(
+            effective_physical_execution_parallelism(
+                crate::config::PhysicalExecutionMode::Serial,
+                4,
+                8,
+            ),
+            1
+        );
+        assert_eq!(
+            effective_physical_execution_parallelism(
+                crate::config::PhysicalExecutionMode::Shadow,
+                4,
+                8,
+            ),
+            1
+        );
+        assert_eq!(
+            effective_physical_execution_parallelism(
+                crate::config::PhysicalExecutionMode::Concurrent,
+                4,
+                8,
+            ),
+            8
+        );
+    }
 
     fn terminal_output(reason: ExecutionFinishReason) -> EngineOutput {
         OutputProcessor::new(24_000).process_execution(

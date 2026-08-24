@@ -15,9 +15,9 @@ use serde::Serialize;
 use crate::backends::{BackendKind, DeviceKind, DeviceProfile};
 use crate::engine::{
     BatchId, BatchWorkspaceLease, CapacitySource, ExecutionDomain, ExecutionGroupId,
-    NativeBatchMode, PhysicalCapacityProvider, PhysicalCapacitySnapshot, PhysicalLaunchPolicy,
-    Priority, ReservationClass, ReservationOwner, ResourceAmount, ResourceAuthority,
-    ResourceEstimate, ResourceLease, ResourceVector, WorkUnit, WorkloadClass,
+    ModelInstanceId, NativeBatchMode, PhysicalCapacityProvider, PhysicalCapacitySnapshot,
+    PhysicalLaunchPolicy, Priority, ReservationClass, ReservationOwner, ResourceAmount,
+    ResourceAuthority, ResourceEstimate, ResourceLease, ResourceVector, WorkUnit, WorkloadClass,
 };
 use crate::error::{Error, Result};
 use crate::runtime::adapters::{LoadedCapabilityBinding, LoadedExecutionContract};
@@ -90,23 +90,50 @@ pub(crate) struct PhysicalExecutionAdmission {
 
 #[derive(Debug)]
 struct PhysicalExecutionAdmissionInner {
+    execution_group: Option<ExecutionGroupId>,
     capacity: usize,
     permits: Arc<Semaphore>,
+    groups: Mutex<HashMap<ExecutionGroupId, Weak<GroupPhysicalAdmission>>>,
+    models: Mutex<HashMap<(ExecutionGroupId, ModelInstanceId), Weak<ModelPhysicalAdmission>>>,
     active: AtomicUsize,
     idle: Arc<Notify>,
 }
 
+#[derive(Debug)]
+struct GroupPhysicalAdmission {
+    permits: Arc<Semaphore>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelAdmissionPolicy {
+    Exclusive,
+    Concurrent { max_in_flight: usize },
+}
+
+#[derive(Debug)]
+struct ModelPhysicalAdmission {
+    policy: ModelAdmissionPolicy,
+    permits: Arc<Semaphore>,
+}
+
 impl PhysicalExecutionAdmission {
     pub(crate) fn standalone(capacity: usize) -> Self {
-        Self::with_idle(capacity, Arc::new(Notify::new()))
+        Self::with_idle(None, capacity, Arc::new(Notify::new()))
     }
 
-    fn with_idle(capacity: usize, idle: Arc<Notify>) -> Self {
+    fn with_idle(
+        execution_group: Option<ExecutionGroupId>,
+        capacity: usize,
+        idle: Arc<Notify>,
+    ) -> Self {
         let capacity = capacity.max(1);
         Self {
             inner: Arc::new(PhysicalExecutionAdmissionInner {
+                execution_group,
                 capacity,
                 permits: Arc::new(Semaphore::new(capacity)),
+                groups: Mutex::new(HashMap::new()),
+                models: Mutex::new(HashMap::new()),
                 active: AtomicUsize::new(0),
                 idle,
             }),
@@ -143,7 +170,7 @@ impl PhysicalExecutionAdmission {
         }
         Ok(match launch_policy {
             PhysicalLaunchPolicy::ExecutionGroupExclusive
-            | PhysicalLaunchPolicy::ModelExclusive => self.inner.capacity,
+            | PhysicalLaunchPolicy::ModelExclusive => 1,
             PhysicalLaunchPolicy::Concurrent { .. } if batch_mode == NativeBatchMode::None => {
                 row_width
             }
@@ -153,19 +180,69 @@ impl PhysicalExecutionAdmission {
 
     pub(crate) async fn acquire_dispatch(
         &self,
+        execution_group: ExecutionGroupId,
+        model_instance: ModelInstanceId,
         launch_policy: PhysicalLaunchPolicy,
         batch_mode: NativeBatchMode,
         row_width: usize,
         deadline: Option<Instant>,
     ) -> Result<PhysicalExecutionLease> {
+        if self
+            .inner
+            .execution_group
+            .is_some_and(|expected| expected != execution_group)
+        {
+            return Err(Error::InvalidInput(
+                "physical dispatch belongs to a different execution group".to_string(),
+            ));
+        }
         let units = self.required_units(launch_policy, batch_mode, row_width)?;
-        self.acquire_units(units, deadline).await
+        let model = self.model_admission(execution_group, model_instance, launch_policy)?;
+        let model_permit = match model.as_ref() {
+            Some(model) => {
+                let model_units = match model.policy {
+                    ModelAdmissionPolicy::Exclusive => 1,
+                    ModelAdmissionPolicy::Concurrent { .. } => units,
+                };
+                Some(
+                    Self::acquire_from(model.permits.clone(), model_units, deadline, "model")
+                        .await?,
+                )
+            }
+            None => None,
+        };
+        let group = self.group_admission(execution_group);
+        let group_units = if launch_policy == PhysicalLaunchPolicy::ExecutionGroupExclusive {
+            self.inner.capacity
+        } else {
+            units
+        };
+        let group_permit = Self::acquire_from(
+            group.permits.clone(),
+            group_units,
+            deadline,
+            "execution-group",
+        )
+        .await?;
+        self.acquire_units(
+            units,
+            deadline,
+            Some(group),
+            Some(group_permit),
+            model,
+            model_permit,
+        )
+        .await
     }
 
     async fn acquire_units(
         &self,
         units: usize,
         deadline: Option<Instant>,
+        group: Option<Arc<GroupPhysicalAdmission>>,
+        group_permit: Option<OwnedSemaphorePermit>,
+        model: Option<Arc<ModelPhysicalAdmission>>,
+        model_permit: Option<OwnedSemaphorePermit>,
     ) -> Result<PhysicalExecutionLease> {
         if units == 0 {
             return Err(Error::InvalidInput(
@@ -178,30 +255,107 @@ impl PhysicalExecutionAdmission {
                 self.inner.capacity
             )));
         }
-        let units = u32::try_from(units).map_err(|_| {
-            Error::InvalidInput("execution unit request exceeds supported range".to_string())
-        })?;
-        let acquire = self.inner.permits.clone().acquire_many_owned(units);
-        let permit = match deadline {
-            Some(deadline) => tokio::time::timeout_at(deadline.into(), acquire)
-                .await
-                .map_err(|_| Error::Timeout("device execution capacity".to_string()))?
-                .map_err(|_| Error::Overloaded("coordinator closed".to_string()))?,
-            None => acquire
-                .await
-                .map_err(|_| Error::Overloaded("coordinator closed".to_string()))?,
-        };
+        let permit =
+            Self::acquire_from(self.inner.permits.clone(), units, deadline, "device").await?;
         self.inner.active.fetch_add(1, Ordering::AcqRel);
         Ok(PhysicalExecutionLease {
             admission: self.clone(),
+            _group: group,
+            _group_permit: group_permit,
+            _model: model,
+            _model_permit: model_permit,
             _permit: permit,
         })
+    }
+
+    fn group_admission(&self, execution_group: ExecutionGroupId) -> Arc<GroupPhysicalAdmission> {
+        let mut groups = self
+            .inner
+            .groups
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(active) = groups.get(&execution_group).and_then(Weak::upgrade) {
+            return active;
+        }
+        groups.retain(|_, admission| admission.strong_count() > 0);
+        let admission = Arc::new(GroupPhysicalAdmission {
+            permits: Arc::new(Semaphore::new(self.inner.capacity)),
+        });
+        groups.insert(execution_group, Arc::downgrade(&admission));
+        admission
+    }
+
+    async fn acquire_from(
+        permits: Arc<Semaphore>,
+        units: usize,
+        deadline: Option<Instant>,
+        scope: &'static str,
+    ) -> Result<OwnedSemaphorePermit> {
+        let units = u32::try_from(units).map_err(|_| {
+            Error::InvalidInput("execution unit request exceeds supported range".to_string())
+        })?;
+        let acquire = permits.acquire_many_owned(units);
+        match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline.into(), acquire)
+                .await
+                .map_err(|_| Error::Timeout(format!("{scope} execution capacity")))?
+                .map_err(|_| Error::Overloaded("coordinator closed".to_string())),
+            None => acquire
+                .await
+                .map_err(|_| Error::Overloaded("coordinator closed".to_string())),
+        }
+    }
+
+    fn model_admission(
+        &self,
+        execution_group: ExecutionGroupId,
+        model_instance: ModelInstanceId,
+        launch_policy: PhysicalLaunchPolicy,
+    ) -> Result<Option<Arc<ModelPhysicalAdmission>>> {
+        let policy = match launch_policy {
+            PhysicalLaunchPolicy::ExecutionGroupExclusive => return Ok(None),
+            PhysicalLaunchPolicy::ModelExclusive => ModelAdmissionPolicy::Exclusive,
+            PhysicalLaunchPolicy::Concurrent {
+                max_in_flight_per_model,
+            } => ModelAdmissionPolicy::Concurrent {
+                max_in_flight: max_in_flight_per_model.get().min(self.inner.capacity),
+            },
+        };
+        let key = (execution_group, model_instance);
+        let mut models = self
+            .inner
+            .models
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(active) = models.get(&key).and_then(Weak::upgrade) {
+            if active.policy != policy {
+                return Err(Error::InvalidInput(
+                    "physical launch policy changed for an active model instance".to_string(),
+                ));
+            }
+            return Ok(Some(active));
+        }
+        models.retain(|_, admission| admission.strong_count() > 0);
+        let capacity = match policy {
+            ModelAdmissionPolicy::Exclusive => 1,
+            ModelAdmissionPolicy::Concurrent { max_in_flight } => max_in_flight,
+        };
+        let admission = Arc::new(ModelPhysicalAdmission {
+            policy,
+            permits: Arc::new(Semaphore::new(capacity)),
+        });
+        models.insert(key, Arc::downgrade(&admission));
+        Ok(Some(admission))
     }
 }
 
 #[derive(Debug)]
 pub(crate) struct PhysicalExecutionLease {
     admission: PhysicalExecutionAdmission,
+    _group_permit: Option<OwnedSemaphorePermit>,
+    _group: Option<Arc<GroupPhysicalAdmission>>,
+    _model_permit: Option<OwnedSemaphorePermit>,
+    _model: Option<Arc<ModelPhysicalAdmission>>,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -275,16 +429,20 @@ impl InferenceCoordinator {
             BackendKind::Metal => 1,
             BackendKind::Cpu | BackendKind::Cuda => execution_parallelism.max(1),
         };
+        let execution_group_id =
+            ExecutionGroupId::new(NEXT_EXECUTION_GROUP_ID.fetch_add(1, Ordering::Relaxed));
         let idle = Arc::new(Notify::new());
         Self {
-            execution_group_id: ExecutionGroupId::new(
-                NEXT_EXECUTION_GROUP_ID.fetch_add(1, Ordering::Relaxed),
-            ),
+            execution_group_id,
             capacity,
             backend,
             jobs: Arc::new(Semaphore::new(max_queued_jobs.max(capacity).max(1))),
             host_work: Arc::new(Semaphore::new(capacity)),
-            execution: PhysicalExecutionAdmission::with_idle(capacity, idle.clone()),
+            execution: PhysicalExecutionAdmission::with_idle(
+                Some(execution_group_id),
+                capacity,
+                idle.clone(),
+            ),
             resources,
             admission_gate: Mutex::new(()),
             idle,
@@ -490,11 +648,17 @@ impl InferenceCoordinator {
         units: usize,
         deadline: Option<Instant>,
     ) -> Result<PhysicalExecutionLease> {
-        self.count_execution_timeout(self.execution.acquire_units(units, deadline).await)
+        self.count_execution_timeout(
+            self.execution
+                .acquire_units(units, deadline, None, None, None, None)
+                .await,
+        )
     }
 
     async fn acquire_physical_dispatch(
         self: &Arc<Self>,
+        execution_group: ExecutionGroupId,
+        model_instance: ModelInstanceId,
         launch_policy: PhysicalLaunchPolicy,
         batch_mode: NativeBatchMode,
         row_width: usize,
@@ -502,7 +666,14 @@ impl InferenceCoordinator {
     ) -> Result<PhysicalExecutionLease> {
         self.count_execution_timeout(
             self.execution
-                .acquire_dispatch(launch_policy, batch_mode, row_width, deadline)
+                .acquire_dispatch(
+                    execution_group,
+                    model_instance,
+                    launch_policy,
+                    batch_mode,
+                    row_width,
+                    deadline,
+                )
                 .await,
         )
     }
@@ -584,6 +755,8 @@ impl InferenceCoordinator {
         let deadline = job.spec.deadline;
         let _execution = self
             .acquire_physical_dispatch(
+                self.execution_group_id,
+                ModelInstanceId::new(0),
                 PhysicalLaunchPolicy::ExecutionGroupExclusive,
                 NativeBatchMode::None,
                 1,
@@ -679,6 +852,38 @@ impl InferenceCoordinator {
         T: Send + 'static,
         F: FnOnce() -> Result<T> + Send + 'static,
     {
+        let binding = self.validate_loaded_execution_contract(&contract)?;
+        let stage = binding.stage_for_work(&work)?;
+        if stage.domain != ExecutionDomain::ExecutionGroup {
+            return Err(Error::InvalidInput(
+                "host-only adapter stage cannot enter device execution".to_string(),
+            ));
+        }
+        if stage.batch_mode != NativeBatchMode::None {
+            return Err(Error::InvalidInput(
+                "runtime scalar runner cannot execute a native tensor stage".to_string(),
+            ));
+        }
+        let launch_policy = stage.physical_launch_policy;
+
+        self.run_blocking_stage_inner_with_policy(
+            job,
+            binding.execution_group_id,
+            binding.model_instance_id,
+            launch_policy,
+            move || {
+                let _contract = contract;
+                let _work = work;
+                operation()
+            },
+        )
+        .await
+    }
+
+    fn validate_loaded_execution_contract(
+        &self,
+        contract: &LoadedExecutionContract,
+    ) -> Result<crate::engine::ExecutionAdapterBinding> {
         if !contract.execution_profile.resolved_from_loaded_model {
             return Err(Error::InferenceError(
                 "runtime execution contract was not resolved from a loaded model".to_string(),
@@ -694,26 +899,7 @@ impl InferenceCoordinator {
                 "runtime execution contract belongs to a different backend".to_string(),
             ));
         }
-        let binding = contract.adapter_binding()?;
-        let stage = binding.stage_for_work(&work)?;
-        if stage.domain != ExecutionDomain::ExecutionGroup {
-            return Err(Error::InvalidInput(
-                "host-only adapter stage cannot enter device execution".to_string(),
-            ));
-        }
-        if stage.batch_mode != NativeBatchMode::None {
-            return Err(Error::InvalidInput(
-                "runtime scalar runner cannot execute a native tensor stage".to_string(),
-            ));
-        }
-        let launch_policy = stage.physical_launch_policy;
-
-        self.run_blocking_stage_inner_with_policy(job, launch_policy, move || {
-            let _contract = contract;
-            let _work = work;
-            operation()
-        })
-        .await
+        contract.adapter_binding()
     }
 
     /// Execute a scalar stage with the complete typed invocation workspace
@@ -731,7 +917,7 @@ impl InferenceCoordinator {
         T: Send + 'static,
         F: FnOnce(&mut crate::kv::v2::InvocationWorkspaceLeaseSetV2) -> Result<T> + Send + 'static,
     {
-        let binding = contract.adapter_binding()?;
+        let binding = self.validate_loaded_execution_contract(&contract)?;
         if capability.execution != binding {
             return Err(Error::InferenceError(
                 "direct invocation state belongs to a different loaded execution adapter"
@@ -751,16 +937,22 @@ impl InferenceCoordinator {
         }
         let stage_id = stage.id;
         let launch_policy = stage.physical_launch_policy;
-        self.run_blocking_stage_inner_with_policy(job, launch_policy, move || {
-            let _contract = contract;
-            let _work = work;
-            let mut leases = capability
-                .state
-                .lease_complete_invocation_workspace_set(stage_id)?;
-            let output = operation(&mut leases)?;
-            let _completions = leases.release()?;
-            Ok(output)
-        })
+        self.run_blocking_stage_inner_with_policy(
+            job,
+            binding.execution_group_id,
+            binding.model_instance_id,
+            launch_policy,
+            move || {
+                let _contract = contract;
+                let _work = work;
+                let mut leases = capability
+                    .state
+                    .lease_complete_invocation_workspace_set(stage_id)?;
+                let output = operation(&mut leases)?;
+                let _completions = leases.release()?;
+                Ok(output)
+            },
+        )
         .await
     }
 
@@ -778,7 +970,7 @@ impl InferenceCoordinator {
         T: Send + 'static,
         F: FnOnce(&mut crate::kv::v2::InvocationPagedLeaseSetV2) -> Result<T> + Send + 'static,
     {
-        let binding = contract.adapter_binding()?;
+        let binding = self.validate_loaded_execution_contract(&contract)?;
         if capability.execution != binding {
             return Err(Error::InferenceError(
                 "direct invocation state belongs to a different loaded execution adapter"
@@ -798,16 +990,22 @@ impl InferenceCoordinator {
         }
         let stage_id = stage.id;
         let launch_policy = stage.physical_launch_policy;
-        self.run_blocking_stage_inner_with_policy(job, launch_policy, move || {
-            let _contract = contract;
-            let _work = work;
-            let mut leases = capability
-                .state
-                .lease_complete_invocation_paged_set(stage_id)?;
-            let output = operation(&mut leases)?;
-            let _completions = leases.release()?;
-            Ok(output)
-        })
+        self.run_blocking_stage_inner_with_policy(
+            job,
+            binding.execution_group_id,
+            binding.model_instance_id,
+            launch_policy,
+            move || {
+                let _contract = contract;
+                let _work = work;
+                let mut leases = capability
+                    .state
+                    .lease_complete_invocation_paged_set(stage_id)?;
+                let output = operation(&mut leases)?;
+                let _completions = leases.release()?;
+                Ok(output)
+            },
+        )
         .await
     }
 
@@ -822,6 +1020,8 @@ impl InferenceCoordinator {
     {
         self.run_blocking_stage_inner_with_policy(
             job,
+            self.execution_group_id,
+            ModelInstanceId::new(0),
             PhysicalLaunchPolicy::ExecutionGroupExclusive,
             operation,
         )
@@ -831,6 +1031,8 @@ impl InferenceCoordinator {
     async fn run_blocking_stage_inner_with_policy<T, F>(
         self: &Arc<Self>,
         job: &JobLease,
+        execution_group: ExecutionGroupId,
+        model_instance: ModelInstanceId,
         launch_policy: PhysicalLaunchPolicy,
         operation: F,
     ) -> Result<T>
@@ -840,7 +1042,14 @@ impl InferenceCoordinator {
     {
         let deadline = job.spec.deadline;
         let execution = self
-            .acquire_physical_dispatch(launch_policy, NativeBatchMode::None, 1, deadline)
+            .acquire_physical_dispatch(
+                execution_group,
+                model_instance,
+                launch_policy,
+                NativeBatchMode::None,
+                1,
+                deadline,
+            )
             .await?;
         self.run_blocking_task(job, execution, "inference", operation)
             .await
@@ -2844,6 +3053,8 @@ Pages free: 10.\n";
     async fn physical_dispatch_admission_is_weighted_and_fifo_fair() {
         let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cuda, 4, 8));
         let admission = coordinator.physical_execution_admission();
+        let execution_group = coordinator.execution_group_id();
+        let model_instance = ModelInstanceId::new(7);
         let concurrent = PhysicalLaunchPolicy::concurrent(4).unwrap();
         assert_eq!(
             admission
@@ -2869,17 +3080,26 @@ Pages free: 10.\n";
                     1,
                 )
                 .unwrap(),
-            4
+            1
         );
 
         let held = admission
-            .acquire_dispatch(concurrent, NativeBatchMode::None, 3, None)
+            .acquire_dispatch(
+                execution_group,
+                model_instance,
+                concurrent,
+                NativeBatchMode::None,
+                3,
+                None,
+            )
             .await
             .unwrap();
         let exclusive_admission = admission.clone();
         let exclusive = tokio::spawn(async move {
             exclusive_admission
                 .acquire_dispatch(
+                    execution_group,
+                    ModelInstanceId::new(8),
                     PhysicalLaunchPolicy::ExecutionGroupExclusive,
                     NativeBatchMode::None,
                     1,
@@ -2891,7 +3111,14 @@ Pages free: 10.\n";
         let scalar_admission = admission.clone();
         let scalar = tokio::spawn(async move {
             scalar_admission
-                .acquire_dispatch(concurrent, NativeBatchMode::None, 1, None)
+                .acquire_dispatch(
+                    execution_group,
+                    model_instance,
+                    concurrent,
+                    NativeBatchMode::None,
+                    1,
+                    None,
+                )
                 .await
         });
         tokio::task::yield_now().await;
@@ -2915,7 +3142,202 @@ Pages free: 10.\n";
     }
 
     #[tokio::test]
-    async fn loaded_scalar_stage_accepts_parallel_row_capacity_and_rejects_cross_group_work() {
+    async fn physical_dispatch_admission_enforces_exact_same_model_limit() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 4, 8));
+        let admission = coordinator.physical_execution_admission();
+        let group = coordinator.execution_group_id();
+        let model = ModelInstanceId::new(31);
+        let concurrent = PhysicalLaunchPolicy::concurrent(2).unwrap();
+
+        let first = admission
+            .acquire_dispatch(group, model, concurrent, NativeBatchMode::Static, 1, None)
+            .await
+            .unwrap();
+        let second = admission
+            .acquire_dispatch(group, model, concurrent, NativeBatchMode::Static, 1, None)
+            .await
+            .unwrap();
+        let blocked = admission
+            .acquire_dispatch(
+                group,
+                model,
+                concurrent,
+                NativeBatchMode::Static,
+                1,
+                Some(Instant::now() + Duration::from_millis(5)),
+            )
+            .await;
+        assert!(matches!(blocked, Err(Error::Timeout(_))));
+
+        let other_model = admission
+            .acquire_dispatch(
+                group,
+                ModelInstanceId::new(32),
+                concurrent,
+                NativeBatchMode::Static,
+                1,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(coordinator.snapshot().active_executions, 3);
+        drop((first, second, other_model));
+    }
+
+    #[tokio::test]
+    async fn model_exclusive_is_model_scoped_and_group_exclusive_blocks_every_model() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 2, 8));
+        let admission = coordinator.physical_execution_admission();
+        let group = coordinator.execution_group_id();
+        let first_model = ModelInstanceId::new(41);
+        let second_model = ModelInstanceId::new(42);
+
+        let first = admission
+            .acquire_dispatch(
+                group,
+                first_model,
+                PhysicalLaunchPolicy::ModelExclusive,
+                NativeBatchMode::None,
+                1,
+                None,
+            )
+            .await
+            .unwrap();
+        let same_model = admission
+            .acquire_dispatch(
+                group,
+                first_model,
+                PhysicalLaunchPolicy::ModelExclusive,
+                NativeBatchMode::None,
+                1,
+                Some(Instant::now() + Duration::from_millis(5)),
+            )
+            .await;
+        assert!(matches!(same_model, Err(Error::Timeout(_))));
+        let second = admission
+            .acquire_dispatch(
+                group,
+                second_model,
+                PhysicalLaunchPolicy::ModelExclusive,
+                NativeBatchMode::None,
+                1,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(coordinator.snapshot().active_executions, 2);
+
+        drop((first, second));
+        let group_exclusive = admission
+            .acquire_dispatch(
+                group,
+                first_model,
+                PhysicalLaunchPolicy::ExecutionGroupExclusive,
+                NativeBatchMode::None,
+                1,
+                None,
+            )
+            .await
+            .unwrap();
+        let blocked_other = admission
+            .acquire_dispatch(
+                group,
+                second_model,
+                PhysicalLaunchPolicy::ModelExclusive,
+                NativeBatchMode::None,
+                1,
+                Some(Instant::now() + Duration::from_millis(5)),
+            )
+            .await;
+        assert!(matches!(blocked_other, Err(Error::Timeout(_))));
+        drop(group_exclusive);
+    }
+
+    #[tokio::test]
+    async fn group_exclusive_allows_a_distinct_execution_group_to_overlap() {
+        let admission = PhysicalExecutionAdmission::standalone(2);
+        let first_group = ExecutionGroupId::new(71);
+        let second_group = ExecutionGroupId::new(72);
+        let first = admission
+            .acquire_dispatch(
+                first_group,
+                ModelInstanceId::new(1),
+                PhysicalLaunchPolicy::ExecutionGroupExclusive,
+                NativeBatchMode::None,
+                1,
+                None,
+            )
+            .await
+            .unwrap();
+        let second = admission
+            .acquire_dispatch(
+                second_group,
+                ModelInstanceId::new(1),
+                PhysicalLaunchPolicy::ExecutionGroupExclusive,
+                NativeBatchMode::None,
+                1,
+                Some(Instant::now() + Duration::from_millis(50)),
+            )
+            .await
+            .expect("distinct execution groups retain independent exclusive scopes");
+        drop((first, second));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn direct_and_engine_admission_share_the_exact_model_limit() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 4, 8));
+        let job = coordinator.admit(job("mixed-model-limit")).await.unwrap();
+        let group = coordinator.execution_group_id();
+        let model = ModelInstanceId::new(51);
+        let policy = PhysicalLaunchPolicy::concurrent(2).unwrap();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let task_release = release.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task_coordinator = coordinator.clone();
+        let direct = tokio::spawn(async move {
+            task_coordinator
+                .run_blocking_stage_inner_with_policy(&job, group, model, policy, move || {
+                    let _ = started_tx.send(());
+                    let (lock, wake) = &*task_release;
+                    let mut released = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+                    while !*released {
+                        released = wake
+                            .wait(released)
+                            .unwrap_or_else(|poison| poison.into_inner());
+                    }
+                    Ok(())
+                })
+                .await
+        });
+        started_rx.await.unwrap();
+
+        let engine = coordinator
+            .physical_execution_admission()
+            .acquire_dispatch(group, model, policy, NativeBatchMode::None, 1, None)
+            .await
+            .unwrap();
+        let third = coordinator
+            .physical_execution_admission()
+            .acquire_dispatch(
+                group,
+                model,
+                policy,
+                NativeBatchMode::None,
+                1,
+                Some(Instant::now() + Duration::from_millis(5)),
+            )
+            .await;
+        assert!(matches!(third, Err(Error::Timeout(_))));
+
+        drop(engine);
+        let (lock, wake) = &*release;
+        *lock.lock().unwrap_or_else(|poison| poison.into_inner()) = true;
+        wake.notify_all();
+        direct.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn loaded_scalar_stage_uses_certified_width_and_rejects_cross_group_work() {
         let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 4));
         let job = coordinator.admit(job("loaded-scalar")).await.unwrap();
         let adapters = RuntimeAdapterRegistry::built_in_with_execution_limits(1, 4).unwrap();
@@ -2929,7 +3351,7 @@ Pages free: 10.\n";
         .unwrap();
         let contract = bundle.contract(CapabilityKind::Tts, false).unwrap();
         assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::None);
-        assert_eq!(contract.stages[0].max_batch_size, 4);
+        assert_eq!(contract.stages[0].max_batch_size, 1);
         let calls = Arc::new(AtomicUsize::new(0));
         let task_calls = calls.clone();
 
@@ -2977,6 +3399,50 @@ Pages free: 10.\n";
 
         assert!(error.to_string().contains("different execution group"));
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(coordinator.snapshot().active_executions, 0);
+    }
+
+    #[tokio::test]
+    async fn invocation_runners_reject_a_foreign_execution_group_before_dispatch() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 2, 4));
+        let job = coordinator.admit(job("foreign-invocation")).await.unwrap();
+        let adapters = RuntimeAdapterRegistry::built_in_with_execution_limits(1, 2).unwrap();
+        let foreign_group = ExecutionGroupId::new(coordinator.execution_group_id().get() + 1);
+        let bundle = LoadedModelBundle::bind(
+            &adapters,
+            foreign_group,
+            ModelInstanceId::new(61),
+            ModelVariant::Kokoro82M,
+            BackendKind::Cpu,
+        )
+        .unwrap();
+        let contract = bundle.contract(CapabilityKind::Tts, false).unwrap();
+        let capability = bundle
+            .capability_binding_for_streaming(
+                CapabilityKind::Tts,
+                crate::runtime::adapters::StreamingRequirements::NONE,
+            )
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let task_calls = calls.clone();
+        let error = coordinator
+            .run_loaded_blocking_stage_with_invocation_workspace(
+                &job,
+                contract,
+                capability,
+                WorkUnit::AtomicJob {
+                    kind: "tts".to_string(),
+                },
+                move |_workspace| {
+                    task_calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                },
+            )
+            .await
+            .expect_err("foreign invocation contract must fail closed");
+
+        assert!(error.to_string().contains("different execution group"));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
         assert_eq!(coordinator.snapshot().active_executions, 0);
     }
 
@@ -3033,6 +3499,8 @@ Pages free: 10.\n";
 
         let engine_concurrent = coordinator
             .acquire_physical_dispatch(
+                coordinator.execution_group_id(),
+                ModelInstanceId::new(12),
                 PhysicalLaunchPolicy::concurrent(2).unwrap(),
                 NativeBatchMode::Static,
                 2,
@@ -3050,6 +3518,8 @@ Pages free: 10.\n";
         let engine_concurrent = coordinator
             .physical_execution_admission()
             .acquire_dispatch(
+                coordinator.execution_group_id(),
+                ModelInstanceId::new(12),
                 PhysicalLaunchPolicy::concurrent(2).unwrap(),
                 NativeBatchMode::Static,
                 2,

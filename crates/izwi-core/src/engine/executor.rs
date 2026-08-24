@@ -705,6 +705,17 @@ impl From<&EngineCoreConfig> for WorkerConfig {
             .min(Self::tensor_batch_cap(backend_kind))
             .max(1);
         let request_parallelism = Self::request_parallelism_for(backend_kind, num_threads);
+        let physical_execution_capacity =
+            if config.physical_execution_mode == crate::config::PhysicalExecutionMode::Concurrent {
+                request_parallelism.max(
+                    config
+                        .resolved_physical_execution_capacity()
+                        .physical_launch_limit
+                        .get(),
+                )
+            } else {
+                1
+            };
         Self {
             models_dir: config.models_dir.clone(),
             backend: backend_kind,
@@ -717,10 +728,7 @@ impl From<&EngineCoreConfig> for WorkerConfig {
             model_registry: None,
             resource_authority: None,
             physical_execution_admission: Some(PhysicalExecutionAdmission::standalone(
-                config
-                    .resolved_physical_execution_capacity()
-                    .physical_launch_limit
-                    .get(),
+                physical_execution_capacity,
             )),
             max_tensor_batch_size,
             static_tensor_batch_variants: Arc::new(HashSet::new()),
@@ -2159,7 +2167,14 @@ impl UnifiedExecutor {
             let deadline = requests.iter().filter_map(|request| request.deadline).min();
             let permit_wait_started = std::time::Instant::now();
             let acquired = admission
-                .acquire_dispatch(launch_policy, batch.mode, width, deadline)
+                .acquire_dispatch(
+                    batch.lane.execution_group,
+                    batch.lane.model_instance,
+                    launch_policy,
+                    batch.mode,
+                    width,
+                    deadline,
+                )
                 .await;
             record_engine_physical_permit_wait(permit_wait_started.elapsed());
             match acquired {
@@ -2655,6 +2670,42 @@ mod tests {
         assert_eq!(
             config.backend_context.source,
             BackendSelectionSource::Config
+        );
+    }
+
+    #[test]
+    fn standalone_execution_capacity_obeys_physical_rollout_mode() {
+        let mut engine = EngineCoreConfig {
+            backend: BackendKind::Cpu,
+            max_physical_in_flight: crate::config::PhysicalInFlightLimit::new(4).unwrap(),
+            ..Default::default()
+        };
+
+        for mode in [
+            crate::config::PhysicalExecutionMode::Serial,
+            crate::config::PhysicalExecutionMode::Shadow,
+        ] {
+            engine.physical_execution_mode = mode;
+            let worker = WorkerConfig::from(&engine);
+            assert_eq!(
+                worker
+                    .physical_execution_admission
+                    .as_ref()
+                    .unwrap()
+                    .capacity(),
+                1
+            );
+        }
+
+        engine.physical_execution_mode = crate::config::PhysicalExecutionMode::Concurrent;
+        let worker = WorkerConfig::from(&engine);
+        assert_eq!(
+            worker
+                .physical_execution_admission
+                .as_ref()
+                .unwrap()
+                .capacity(),
+            worker.request_parallelism.max(4)
         );
     }
 
