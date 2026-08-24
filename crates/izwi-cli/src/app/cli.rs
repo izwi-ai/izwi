@@ -103,6 +103,14 @@ pub enum Commands {
         #[arg(long, value_name = "AUTO_OR_ROWS")]
         max_batch_size: Option<izwi_core::BatchSizePreference>,
 
+        /// Physical launch rollout mode (`serial`, `shadow`, `concurrent`)
+        #[arg(long, value_name = "MODE")]
+        physical_execution_mode: Option<izwi_core::PhysicalExecutionMode>,
+
+        /// Maximum candidate physical launches in flight
+        #[arg(long, value_name = "COUNT")]
+        max_physical_in_flight: Option<izwi_core::PhysicalInFlightLimit>,
+
         /// Maximum logical rows selected by one scheduler step
         #[arg(long)]
         max_scheduler_batch_size: Option<usize>,
@@ -774,6 +782,7 @@ impl Backend {
 mod tests {
     use super::{Cli, Commands};
     use clap::Parser;
+    use izwi_core::PhysicalExecutionMode;
 
     #[test]
     fn chat_model_accepts_qwen38_catalog_id_as_free_form_input() {
@@ -783,6 +792,31 @@ mod tests {
         match cli.command {
             Commands::Chat { model, .. } => assert_eq!(model, "Qwen3.8-27B-FP8"),
             _ => panic!("expected chat command"),
+        }
+    }
+
+    #[test]
+    fn serve_parses_typed_physical_execution_controls() {
+        let cli = Cli::try_parse_from([
+            "izwi",
+            "serve",
+            "--physical-execution-mode",
+            "shadow",
+            "--max-physical-in-flight",
+            "3",
+        ])
+        .expect("physical execution controls should parse");
+
+        match cli.command {
+            Commands::Serve {
+                physical_execution_mode,
+                max_physical_in_flight,
+                ..
+            } => {
+                assert_eq!(physical_execution_mode, Some(PhysicalExecutionMode::Shadow));
+                assert_eq!(max_physical_in_flight.map(|limit| limit.get()), Some(3));
+            }
+            _ => panic!("expected serve command"),
         }
     }
 }

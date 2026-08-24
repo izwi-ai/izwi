@@ -1,7 +1,8 @@
 use anyhow::{anyhow, Result};
 use izwi_core::backends::BackendPreference;
 use izwi_core::{
-    BatchSizePreference, ContextLengthPreference, ServeRuntimeConfig, ServeRuntimeConfigOverrides,
+    BatchSizePreference, ContextLengthPreference, PhysicalExecutionMode, PhysicalInFlightLimit,
+    ServeRuntimeConfig, ServeRuntimeConfigOverrides,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -60,6 +61,10 @@ pub struct RuntimeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_batch_size: Option<BatchSizePreference>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_execution_mode: Option<PhysicalExecutionMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_physical_in_flight: Option<PhysicalInFlightLimit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_scheduler_batch_size: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enable_prefix_caching: Option<bool>,
@@ -91,6 +96,8 @@ impl RuntimeConfig {
     fn is_empty(&self) -> bool {
         self.backend.is_none()
             && self.max_batch_size.is_none()
+            && self.physical_execution_mode.is_none()
+            && self.max_physical_in_flight.is_none()
             && self.max_scheduler_batch_size.is_none()
             && self.enable_prefix_caching.is_none()
             && self.managed_prefix_cache_salt.is_none()
@@ -177,6 +184,8 @@ impl Config {
             runtime: RuntimeConfig {
                 backend: Some(defaults.backend),
                 max_batch_size: Some(defaults.max_batch_size),
+                physical_execution_mode: Some(defaults.physical_execution_mode),
+                max_physical_in_flight: Some(defaults.max_physical_in_flight),
                 max_scheduler_batch_size: Some(defaults.max_scheduler_batch_size),
                 enable_prefix_caching: Some(defaults.enable_prefix_caching),
                 managed_prefix_cache_salt: defaults.managed_prefix_cache_salt.clone(),
@@ -213,6 +222,8 @@ impl Config {
             models_dir: self.models.dir.clone(),
             backend: self.runtime.backend,
             max_batch_size: self.runtime.max_batch_size,
+            physical_execution_mode: self.runtime.physical_execution_mode,
+            max_physical_in_flight: self.runtime.max_physical_in_flight,
             max_scheduler_batch_size: self.runtime.max_scheduler_batch_size,
             enable_prefix_caching: self.runtime.enable_prefix_caching,
             managed_prefix_cache_salt: self.runtime.managed_prefix_cache_salt.clone(),
@@ -245,6 +256,20 @@ impl Config {
                 self.runtime.max_batch_size = Some(
                     value
                         .parse::<BatchSizePreference>()
+                        .map_err(|error| anyhow!(error.to_string()))?,
+                )
+            }
+            "runtime.physical_execution_mode" => {
+                self.runtime.physical_execution_mode = Some(
+                    value
+                        .parse::<PhysicalExecutionMode>()
+                        .map_err(|error| anyhow!(error.to_string()))?,
+                )
+            }
+            "runtime.max_physical_in_flight" => {
+                self.runtime.max_physical_in_flight = Some(
+                    value
+                        .parse::<PhysicalInFlightLimit>()
                         .map_err(|error| anyhow!(error.to_string()))?,
                 )
             }
@@ -324,6 +349,14 @@ impl Config {
                     |rows| toml::Value::Integer(rows as i64),
                 )
             }),
+            "runtime.physical_execution_mode" => self
+                .runtime
+                .physical_execution_mode
+                .map(|value| toml::Value::String(value.to_string())),
+            "runtime.max_physical_in_flight" => self
+                .runtime
+                .max_physical_in_flight
+                .map(|value| toml::Value::Integer(value.get() as i64)),
             "runtime.max_scheduler_batch_size" => self
                 .runtime
                 .max_scheduler_batch_size
@@ -509,6 +542,8 @@ mod tests {
             runtime: RuntimeConfig {
                 backend: Some(BackendPreference::Cpu),
                 max_batch_size: Some(BatchSizePreference::fixed(12).unwrap()),
+                physical_execution_mode: Some(PhysicalExecutionMode::Shadow),
+                max_physical_in_flight: Some(PhysicalInFlightLimit::new(4).unwrap()),
                 max_scheduler_batch_size: Some(9),
                 enable_prefix_caching: Some(true),
                 managed_prefix_cache_salt: Some("tenant-a".to_string()),
@@ -541,6 +576,14 @@ mod tests {
                 .max_batch_size
                 .and_then(BatchSizePreference::fixed_rows),
             Some(12)
+        );
+        assert_eq!(
+            overrides.physical_execution_mode,
+            Some(PhysicalExecutionMode::Shadow)
+        );
+        assert_eq!(
+            overrides.max_physical_in_flight.map(|limit| limit.get()),
+            Some(4)
         );
         assert_eq!(overrides.max_scheduler_batch_size, Some(9));
         assert_eq!(overrides.enable_prefix_caching, Some(true));
@@ -580,6 +623,12 @@ mod tests {
             .set_value("runtime.max_batch_size", "auto")
             .expect("automatic physical batch size should parse");
         config
+            .set_value("runtime.physical_execution_mode", "concurrent")
+            .expect("physical execution mode should parse");
+        config
+            .set_value("runtime.max_physical_in_flight", "3")
+            .expect("physical execution limit should parse");
+        config
             .set_value("runtime.max_scheduler_batch_size", "13")
             .expect("scheduler capacity should parse");
         config
@@ -597,6 +646,25 @@ mod tests {
         assert_eq!(
             config.runtime.max_batch_size,
             Some(BatchSizePreference::Auto)
+        );
+        assert_eq!(
+            config.runtime.physical_execution_mode,
+            Some(PhysicalExecutionMode::Concurrent)
+        );
+        assert_eq!(
+            config
+                .runtime
+                .max_physical_in_flight
+                .map(|limit| limit.get()),
+            Some(3)
+        );
+        assert_eq!(
+            config.get_value("runtime.physical_execution_mode"),
+            Some(toml::Value::String("concurrent".to_string()))
+        );
+        assert_eq!(
+            config.get_value("runtime.max_physical_in_flight"),
+            Some(toml::Value::Integer(3))
         );
         assert_eq!(config.runtime.max_scheduler_batch_size, Some(13));
         assert_eq!(
@@ -620,6 +688,14 @@ mod tests {
 
         assert_eq!(loaded.server.host, config.server.host);
         assert_eq!(loaded.runtime.max_batch_size, config.runtime.max_batch_size);
+        assert_eq!(
+            loaded.runtime.physical_execution_mode,
+            config.runtime.physical_execution_mode
+        );
+        assert_eq!(
+            loaded.runtime.max_physical_in_flight,
+            config.runtime.max_physical_in_flight
+        );
         assert_eq!(loaded.ui.enabled, config.ui.enabled);
     }
 }

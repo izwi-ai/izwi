@@ -82,6 +82,14 @@ struct ServerArgs {
     #[arg(long, value_enum, env = "IZWI_BACKEND")]
     backend: Option<BackendArg>,
 
+    /// Physical launch rollout mode (`serial`, `shadow`, `concurrent`)
+    #[arg(long, value_name = "MODE")]
+    physical_execution_mode: Option<izwi_core::PhysicalExecutionMode>,
+
+    /// Maximum candidate physical launches in flight
+    #[arg(long, value_name = "COUNT")]
+    max_physical_in_flight: Option<izwi_core::PhysicalInFlightLimit>,
+
     /// Portable context length (`auto` or a positive token count)
     #[arg(long, value_name = "AUTO_OR_TOKENS")]
     max_sequence_length: Option<izwi_core::ContextLengthPreference>,
@@ -450,6 +458,8 @@ fn resolve_serve_runtime_config(args: &ServerArgs) -> ServeRuntimeConfig {
         host: args.host.clone(),
         port: args.port,
         backend: args.backend.as_ref().map(BackendArg::as_preference),
+        physical_execution_mode: args.physical_execution_mode,
+        max_physical_in_flight: args.max_physical_in_flight,
         max_sequence_length: args.max_sequence_length,
         ..ServeRuntimeConfigOverrides::default()
     };
@@ -833,6 +843,8 @@ mod tests {
         std::env::remove_var("IZWI_MAX_RETAINED_SEQUENCES");
         std::env::remove_var("IZWI_MAX_STAGED_TRANSACTIONS");
         std::env::remove_var("IZWI_MAX_QUEUED_REQUESTS");
+        std::env::remove_var("IZWI_PHYSICAL_EXECUTION_MODE");
+        std::env::remove_var("IZWI_MAX_PHYSICAL_IN_FLIGHT");
         std::env::remove_var("IZWI_NUM_THREADS");
         std::env::remove_var("IZWI_MAX_CONCURRENT");
         std::env::remove_var("IZWI_TIMEOUT");
@@ -928,6 +940,30 @@ mod tests {
             result.is_err(),
             "invalid backend should fail argument parsing"
         );
+    }
+
+    #[test]
+    fn physical_execution_flags_override_environment() {
+        let _guard = env_lock();
+        clear_bind_env();
+        std::env::set_var("IZWI_PHYSICAL_EXECUTION_MODE", "concurrent");
+        std::env::set_var("IZWI_MAX_PHYSICAL_IN_FLIGHT", "4");
+
+        let args = parse(&[
+            "izwi-server",
+            "--physical-execution-mode",
+            "shadow",
+            "--max-physical-in-flight",
+            "3",
+        ]);
+        let resolved = resolve_serve_runtime_config(&args);
+
+        assert_eq!(
+            resolved.physical_execution_mode,
+            izwi_core::PhysicalExecutionMode::Shadow
+        );
+        assert_eq!(resolved.max_physical_in_flight.get(), 3);
+        clear_bind_env();
     }
 
     #[test]
@@ -1036,6 +1072,11 @@ mod tests {
             resolved.max_batch_size,
             izwi_core::BatchSizePreference::Auto
         );
+        assert_eq!(
+            resolved.physical_execution_mode,
+            izwi_core::PhysicalExecutionMode::Serial
+        );
+        assert_eq!(resolved.max_physical_in_flight.get(), 1);
         assert!(resolved.num_threads >= 1);
         clear_bind_env();
     }

@@ -35,6 +35,16 @@ pub async fn execute(args: ServeArgs) -> Result<()> {
     );
     println!("  Models dir:     {}", args.runtime.models_dir.display());
     println!("  Tensor batch:   {}", args.runtime.max_batch_size);
+    let physical_capacity = args
+        .runtime
+        .engine_config()
+        .resolved_physical_execution_capacity();
+    println!(
+        "  Physical exec:  {} (configured {}, effective {})",
+        args.runtime.physical_execution_mode,
+        args.runtime.max_physical_in_flight,
+        physical_capacity.physical_launch_limit
+    );
     println!(
         "  Scheduler rows: {}",
         args.runtime.max_scheduler_batch_size
@@ -177,6 +187,14 @@ fn set_server_env(args: &ServeArgs) {
     std::env::set_var(
         "IZWI_MAX_BATCH_SIZE",
         args.runtime.max_batch_size.to_string(),
+    );
+    std::env::set_var(
+        "IZWI_PHYSICAL_EXECUTION_MODE",
+        args.runtime.physical_execution_mode.to_string(),
+    );
+    std::env::set_var(
+        "IZWI_MAX_PHYSICAL_IN_FLIGHT",
+        args.runtime.max_physical_in_flight.to_string(),
     );
     std::env::set_var(
         "IZWI_MAX_SCHEDULER_BATCH_SIZE",
@@ -585,6 +603,8 @@ mod tests {
         std::env::remove_var("IZWI_HOST");
         std::env::remove_var("IZWI_PORT");
         std::env::remove_var("IZWI_MAX_BATCH_SIZE");
+        std::env::remove_var("IZWI_PHYSICAL_EXECUTION_MODE");
+        std::env::remove_var("IZWI_MAX_PHYSICAL_IN_FLIGHT");
         std::env::remove_var("IZWI_MAX_SCHEDULER_BATCH_SIZE");
         std::env::remove_var("IZWI_MAX_RETAINED_SEQUENCES");
         std::env::remove_var("IZWI_MAX_STAGED_TRANSACTIONS");
@@ -609,6 +629,8 @@ mod tests {
                 port: 8080,
                 models_dir: PathBuf::from("/tmp/models"),
                 max_batch_size: izwi_core::BatchSizePreference::Auto,
+                physical_execution_mode: izwi_core::PhysicalExecutionMode::Shadow,
+                max_physical_in_flight: izwi_core::PhysicalInFlightLimit::new(3).unwrap(),
                 max_scheduler_batch_size: 8,
                 enable_prefix_caching: false,
                 managed_prefix_cache_salt: None,
@@ -644,6 +666,14 @@ mod tests {
         assert_eq!(std::env::var("IZWI_CORS").as_deref(), Ok("1"));
         assert_eq!(std::env::var("IZWI_NO_UI").as_deref(), Ok("1"));
         assert_eq!(std::env::var("IZWI_LOG_FORMAT").as_deref(), Ok("text"));
+        assert_eq!(
+            std::env::var("IZWI_PHYSICAL_EXECUTION_MODE").as_deref(),
+            Ok("shadow")
+        );
+        assert_eq!(
+            std::env::var("IZWI_MAX_PHYSICAL_IN_FLIGHT").as_deref(),
+            Ok("3")
+        );
         assert_eq!(
             std::env::var("IZWI_MODELS_DIR").as_deref(),
             Ok("/tmp/models")
