@@ -117,6 +117,27 @@ fn certified_physical_launch_policy(
     }
 }
 
+fn certified_scalar_row_width(
+    metadata: AdapterMetadata,
+    backend_kind: BackendKind,
+    adapter_abi_revision: AdapterAbiRevision,
+    requested_width: usize,
+) -> Result<(usize, PhysicalLaunchPolicy)> {
+    let requested_width = requested_width.max(1);
+    let policy = certified_physical_launch_policy(
+        metadata,
+        backend_kind,
+        adapter_abi_revision,
+        requested_width,
+    )?;
+    let width = if matches!(policy, PhysicalLaunchPolicy::Concurrent { .. }) {
+        requested_width
+    } else {
+        1
+    };
+    Ok((width, policy))
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct LoadedExecutionContract {
     pub(crate) execution_group_id: ExecutionGroupId,
@@ -960,18 +981,19 @@ fn scalar_contract(
     execution_profile.resolved_from_loaded_model = true;
     execution_profile.prefill_batch = NativeBatchMode::None;
     execution_profile.decode_batch = NativeBatchMode::None;
-    execution_profile.max_batch_size = request_parallelism.max(1);
+    let (certified_row_width, physical_launch_policy) = certified_scalar_row_width(
+        metadata,
+        backend_kind,
+        adapter_abi_revision,
+        request_parallelism,
+    )?;
+    execution_profile.max_batch_size = certified_row_width;
     execution_profile.concurrency = if execution_profile.max_batch_size > 1 {
         ConcurrencyClass::Batchable
     } else {
         ConcurrencyClass::Exclusive
     };
-    execution_profile.physical_launch_policy = certified_physical_launch_policy(
-        metadata,
-        backend_kind,
-        adapter_abi_revision,
-        execution_profile.max_batch_size,
-    )?;
+    execution_profile.physical_launch_policy = physical_launch_policy;
 
     let mut stage = StageDescriptor::from_execution_profile(
         StageId::new(0),
@@ -1291,17 +1313,11 @@ impl LoadedExecutionAdapter for StaticTtsExecutionAdapter {
             NativeBatchMode::None,
         );
         scalar.selector = StageWorkSelector::Any;
-        scalar.max_batch_size = self.request_parallelism;
-        scalar.concurrency = if self.request_parallelism > 1 {
-            ConcurrencyClass::Batchable
-        } else {
-            ConcurrencyClass::Exclusive
-        };
-        scalar.shape_policy = if self.request_parallelism > 1 {
-            crate::engine::StageShapePolicy::Independent
-        } else {
-            crate::engine::StageShapePolicy::Exact
-        };
+        // The static tensor certificate applies to the single native B>1 call,
+        // not to overlapping scalar fallbacks into the same loaded model.
+        scalar.max_batch_size = 1;
+        scalar.concurrency = ConcurrencyClass::Exclusive;
+        scalar.shape_policy = crate::engine::StageShapePolicy::Exact;
         scalar.output_visibility = output_visibility_for(
             streaming.transport_output,
             execution_profile.mode,
@@ -1330,7 +1346,6 @@ struct ContinuousChatExecutionAdapter {
     metadata: AdapterMetadata,
     backend_kind: BackendKind,
     max_batch_size: usize,
-    request_parallelism: usize,
 }
 
 impl ContinuousChatExecutionAdapter {
@@ -1340,7 +1355,7 @@ impl ContinuousChatExecutionAdapter {
         metadata: AdapterMetadata,
         backend_kind: BackendKind,
         max_batch_size: usize,
-        request_parallelism: usize,
+        _request_parallelism: usize,
     ) -> Self {
         Self {
             execution_group_id,
@@ -1351,7 +1366,6 @@ impl ContinuousChatExecutionAdapter {
             metadata,
             backend_kind,
             max_batch_size: max_batch_size.max(1),
-            request_parallelism: scalar_request_parallelism(backend_kind, request_parallelism),
         }
     }
 }
@@ -1399,17 +1413,11 @@ impl LoadedExecutionAdapter for ContinuousChatExecutionAdapter {
             NativeBatchMode::None,
         );
         prefill.selector = StageWorkSelector::SequencePrefill;
-        prefill.max_batch_size = self.request_parallelism;
-        prefill.concurrency = if self.request_parallelism > 1 {
-            ConcurrencyClass::Batchable
-        } else {
-            ConcurrencyClass::Exclusive
-        };
-        prefill.shape_policy = if self.request_parallelism > 1 {
-            crate::engine::StageShapePolicy::Independent
-        } else {
-            crate::engine::StageShapePolicy::Exact
-        };
+        // Continuous decode is one model-owned tensor call. Prefill remains a
+        // scalar model entry and has no independent-row reentrancy certificate.
+        prefill.max_batch_size = 1;
+        prefill.concurrency = ConcurrencyClass::Exclusive;
+        prefill.shape_policy = crate::engine::StageShapePolicy::Exact;
         prefill.output_visibility = output_visibility_for(
             streaming.transport_output,
             execution_profile.mode,
@@ -2521,6 +2529,11 @@ mod tests {
                     contract.execution_profile.physical_launch_policy,
                     PhysicalLaunchPolicy::ExecutionGroupExclusive
                 );
+                assert_eq!(contract.execution_profile.max_batch_size, 1);
+                assert_eq!(
+                    contract.execution_profile.concurrency,
+                    ConcurrencyClass::Exclusive
+                );
                 assert!(!contract.execution_profile.capabilities().native_batch);
                 assert!(contract
                     .stages
@@ -2547,7 +2560,7 @@ mod tests {
             .remove(0);
         assert_eq!(
             base.execution_profile.concurrency,
-            ConcurrencyClass::Batchable
+            ConcurrencyClass::Exclusive
         );
         assert_eq!(
             base.execution_profile.physical_launch_policy,
@@ -2609,7 +2622,7 @@ mod tests {
     }
 
     #[test]
-    fn every_scalar_adapter_uses_the_configured_independent_row_width() {
+    fn only_certified_scalar_adapter_uses_independent_row_width() {
         let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(1, 3).unwrap();
 
         for (index, variant) in ModelVariant::all().iter().copied().enumerate() {
@@ -2635,15 +2648,26 @@ mod tests {
                     .unwrap_or_else(|error| panic!("failed to contract {variant}: {error}"));
                 for contract in contract {
                     assert_eq!(contract.adapter_abi_revision, SCALAR_ADAPTER_ABI);
-                    assert_eq!(contract.execution_profile.max_batch_size, 3);
+                    let certified = variant == ModelVariant::WhisperLargeV3Turbo
+                        && metadata.capability == CapabilityKind::Asr;
+                    let expected_width = if certified { 3 } else { 1 };
+                    assert_eq!(contract.execution_profile.max_batch_size, expected_width);
                     assert_eq!(
                         contract.execution_profile.concurrency,
-                        ConcurrencyClass::Batchable
+                        if certified {
+                            ConcurrencyClass::Batchable
+                        } else {
+                            ConcurrencyClass::Exclusive
+                        }
                     );
-                    assert_eq!(contract.stages[0].max_batch_size, 3);
+                    assert_eq!(contract.stages[0].max_batch_size, expected_width);
                     assert_eq!(
                         contract.stages[0].shape_policy,
-                        crate::engine::StageShapePolicy::Independent
+                        if certified {
+                            crate::engine::StageShapePolicy::Independent
+                        } else {
+                            crate::engine::StageShapePolicy::Exact
+                        }
                     );
                 }
             }

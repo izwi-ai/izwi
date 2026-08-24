@@ -1547,17 +1547,24 @@ impl EngineCore {
                 .as_ref()
                 .map(|stage| stage.physical_launch_policy)
                 .unwrap_or(PhysicalLaunchPolicy::ExecutionGroupExclusive);
-            if self.config.physical_execution_mode
-                == crate::config::PhysicalExecutionMode::Concurrent
-                && matches!(launch_policy, PhysicalLaunchPolicy::Concurrent { .. })
-            {
-                let launch_limit = self
-                    .config
-                    .resolved_physical_execution_capacity()
-                    .physical_launch_limit;
-                budget.max_rows = budget
-                    .max_rows
-                    .min(launch_policy.effective_max_in_flight_per_model(launch_limit));
+            if plan.batch_mode == NativeBatchMode::None {
+                if self.config.physical_execution_mode
+                    == crate::config::PhysicalExecutionMode::Concurrent
+                    && matches!(launch_policy, PhysicalLaunchPolicy::Concurrent { .. })
+                {
+                    let launch_limit = self
+                        .config
+                        .resolved_physical_execution_capacity()
+                        .physical_launch_limit;
+                    budget.max_rows = budget
+                        .max_rows
+                        .min(launch_policy.effective_max_in_flight_per_model(launch_limit));
+                } else {
+                    // Physical serial/shadow modes are authoritative for
+                    // scalar calls. Native B>1 tensor stages remain one model
+                    // entry and are governed by their independent rollout.
+                    budget.max_rows = 1;
+                }
             }
             let planned_work = plan.work.clone();
             let managed_cache = match request.managed_cache_runtime().map(|runtime| {
