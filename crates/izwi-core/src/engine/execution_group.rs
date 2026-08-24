@@ -30,8 +30,9 @@ use super::executor::{
     UnifiedExecutor,
 };
 use super::metrics::{
-    begin_engine_physical_workspace, record_engine_physical_defer, record_engine_physical_fallback,
-    EnginePhysicalDeferReason, EnginePhysicalFallbackReason,
+    begin_engine_physical_workspace, record_engine_physical_cohort_wait,
+    record_engine_physical_defer, record_engine_physical_fallback, EnginePhysicalDeferReason,
+    EnginePhysicalFallbackReason,
 };
 use super::request::{
     EngineCoreRequest, FencedStreamProgress, StreamBindingGuard, StreamProgressBudget,
@@ -468,6 +469,7 @@ impl ExecutionGroupRunner {
         runner_registration: PhysicalTaskDrainRegistration,
         progress_tx: mpsc::Sender<FencedStreamProgress>,
         progress_budget: Arc<StreamProgressBudget>,
+        completion_tx: Option<mpsc::UnboundedSender<ExecutedPhysicalBatch>>,
     ) -> ExecutedEngineStep {
         let _runner_registration = runner_registration;
         let task_drain = prepared.recovery.task_drain.clone();
@@ -479,6 +481,7 @@ impl ExecutionGroupRunner {
             &progress_tx,
             &progress_budget,
             &task_drain,
+            completion_tx.as_ref(),
         )
         .await;
 
@@ -494,16 +497,34 @@ async fn execute_dispatches(
     progress_tx: &mpsc::Sender<FencedStreamProgress>,
     progress_budget: &Arc<StreamProgressBudget>,
     task_drain: &PhysicalTaskDrainTracker,
+    completion_tx: Option<&mpsc::UnboundedSender<ExecutedPhysicalBatch>>,
 ) -> Vec<ExecutedPhysicalBatch> {
+    let cohort_ready_at = Instant::now();
     if mode == PhysicalExecutionMode::Shadow {
         observe_shadow_launch_plan(&dispatches, max_physical_in_flight);
-        return execute_dispatches_serial(executor, dispatches, progress_tx, progress_budget).await;
+        return execute_dispatches_serial(
+            executor,
+            dispatches,
+            progress_tx,
+            progress_budget,
+            completion_tx,
+            Some(cohort_ready_at),
+        )
+        .await;
     }
     if mode != PhysicalExecutionMode::Concurrent
         || max_physical_in_flight.get() == 1
         || dispatches.len() < 2
     {
-        return execute_dispatches_serial(executor, dispatches, progress_tx, progress_budget).await;
+        return execute_dispatches_serial(
+            executor,
+            dispatches,
+            progress_tx,
+            progress_budget,
+            completion_tx,
+            Some(cohort_ready_at),
+        )
+        .await;
     }
 
     execute_dispatches_concurrent(
@@ -513,6 +534,8 @@ async fn execute_dispatches(
         progress_tx,
         progress_budget,
         task_drain,
+        completion_tx,
+        cohort_ready_at,
     )
     .await
 }
@@ -648,6 +671,7 @@ fn failed_physical_task_completion(
     dispatch: PreparedPhysicalDispatch,
     message: String,
 ) -> ExecutedPhysicalBatch {
+    record_engine_physical_fallback(EnginePhysicalFallbackReason::DispatchFailure);
     let expected_dispatch = dispatch.physical_batch.expected_dispatch();
     let results = dispatch
         .scheduled
@@ -701,36 +725,44 @@ async fn execute_dispatches_concurrent(
     progress_tx: &mpsc::Sender<FencedStreamProgress>,
     progress_budget: &Arc<StreamProgressBudget>,
     task_drain: &PhysicalTaskDrainTracker,
+    completion_tx: Option<&mpsc::UnboundedSender<ExecutedPhysicalBatch>>,
+    cohort_ready_at: Instant,
 ) -> Vec<ExecutedPhysicalBatch> {
     let result_count = dispatches.len();
     let mut pending = dispatches
         .into_iter()
         .enumerate()
+        .map(|(index, dispatch)| (index, cohort_ready_at, dispatch))
         .collect::<std::collections::VecDeque<_>>();
     let mut launches = FuturesUnordered::<PhysicalLaunchFuture>::new();
     let mut active = Vec::<ActivePhysicalLaunch>::new();
     let mut completed = vec![None; result_count];
 
     while !pending.is_empty() || !launches.is_empty() {
-        while let Some((index, dispatch)) = pending.front() {
+        while let Some((index, _, dispatch)) = pending.front() {
             if physical_launch_units(dispatch) > engine_limit.get() {
                 let index = *index;
-                let (_, dispatch) = pending
+                let (_, cohort_ready_at, dispatch) = pending
                     .pop_front()
                     .expect("front dispatch disappeared before rejection");
-                completed[index] = Some(rejected_physical_dispatch_completion(
+                record_engine_physical_cohort_wait(cohort_ready_at.elapsed());
+                record_engine_physical_defer(EnginePhysicalDeferReason::ExecutionCapacity);
+                let batch = rejected_physical_dispatch_completion(
                     dispatch,
                     "physical dispatch width exceeds the configured launch capacity".to_string(),
-                ));
+                );
+                publish_completed_batch(index, batch, &mut completed, completion_tx);
                 continue;
             }
             if !launch_is_compatible(dispatch, &active, engine_limit) {
+                record_engine_physical_defer(EnginePhysicalDeferReason::ExecutionCapacity);
                 break;
             }
             let index = *index;
-            let (_, dispatch) = pending
+            let (_, cohort_ready_at, dispatch) = pending
                 .pop_front()
                 .expect("front dispatch disappeared before launch");
+            record_engine_physical_cohort_wait(cohort_ready_at.elapsed());
             let launch = ActivePhysicalLaunch {
                 index,
                 execution_group: dispatch.physical_batch.lane.execution_group,
@@ -751,6 +783,8 @@ async fn execute_dispatches_concurrent(
                     vec![dispatch],
                     &task_progress_tx,
                     &task_progress_budget,
+                    None,
+                    None,
                 )
                 .await;
                 executed
@@ -773,16 +807,41 @@ async fn execute_dispatches_concurrent(
             break;
         };
         active.retain(|candidate| candidate.index != launch.index);
-        completed[launch.index] = Some(batch);
+        publish_completed_batch(launch.index, batch, &mut completed, completion_tx);
     }
 
-    completed
-        .into_iter()
-        .enumerate()
-        .map(|(index, batch)| {
-            batch.unwrap_or_else(|| panic!("physical dispatch {index} produced no completion"))
-        })
-        .collect()
+    completed.into_iter().flatten().collect()
+}
+
+fn publish_completed_batch(
+    index: usize,
+    batch: ExecutedPhysicalBatch,
+    completed: &mut [Option<ExecutedPhysicalBatch>],
+    completion_tx: Option<&mpsc::UnboundedSender<ExecutedPhysicalBatch>>,
+) {
+    match completion_tx {
+        Some(completion_tx) => {
+            if let Err(error) = completion_tx.send(batch) {
+                completed[index] = Some(error.0);
+            }
+        }
+        None => completed[index] = Some(batch),
+    }
+}
+
+fn publish_serial_completion(
+    batch: ExecutedPhysicalBatch,
+    executed: &mut Vec<ExecutedPhysicalBatch>,
+    completion_tx: Option<&mpsc::UnboundedSender<ExecutedPhysicalBatch>>,
+) {
+    match completion_tx {
+        Some(completion_tx) => {
+            if let Err(error) = completion_tx.send(batch) {
+                executed.push(error.0);
+            }
+        }
+        None => executed.push(batch),
+    }
 }
 
 async fn execute_dispatches_serial(
@@ -790,6 +849,8 @@ async fn execute_dispatches_serial(
     dispatches: Vec<PreparedPhysicalDispatch>,
     progress_tx: &mpsc::Sender<FencedStreamProgress>,
     progress_budget: &Arc<StreamProgressBudget>,
+    completion_tx: Option<&mpsc::UnboundedSender<ExecutedPhysicalBatch>>,
+    cohort_ready_at: Option<Instant>,
 ) -> Vec<ExecutedPhysicalBatch> {
     if dispatches.is_empty() {
         return Vec::new();
@@ -797,14 +858,21 @@ async fn execute_dispatches_serial(
 
     let mut executed = Vec::new();
     for dispatch in dispatches {
+        if let Some(cohort_ready_at) = cohort_ready_at {
+            record_engine_physical_cohort_wait(cohort_ready_at.elapsed());
+        }
         let batch_started = Instant::now();
         if let Some(results) = pre_device_entry_results(&dispatch, Instant::now()) {
-            executed.push(executed_batch(
-                dispatch,
-                results,
-                batch_started.elapsed(),
-                super::ResourceVector::zero(),
-            ));
+            publish_serial_completion(
+                executed_batch(
+                    dispatch,
+                    results,
+                    batch_started.elapsed(),
+                    super::ResourceVector::zero(),
+                ),
+                &mut executed,
+                completion_tx,
+            );
             continue;
         }
         let expected_dispatch = dispatch.physical_batch.expected_dispatch();
@@ -821,12 +889,16 @@ async fn execute_dispatches_serial(
             Ok(PhysicalExecutionAdmissionOutcome::Cancelled) => {
                 let results = pre_dispatch_all_cancelled_results(&dispatch)
                     .unwrap_or_else(|| cancelled_before_dispatch_results(&dispatch.scheduled));
-                executed.push(executed_batch(
-                    dispatch,
-                    results,
-                    batch_started.elapsed(),
-                    super::ResourceVector::zero(),
-                ));
+                publish_serial_completion(
+                    executed_batch(
+                        dispatch,
+                        results,
+                        batch_started.elapsed(),
+                        super::ResourceVector::zero(),
+                    ),
+                    &mut executed,
+                    completion_tx,
+                );
                 continue;
             }
             Err(error) => {
@@ -837,23 +909,31 @@ async fn execute_dispatches_serial(
                     Err(error),
                 );
                 apply_post_dispatch_deadlines(&dispatch, Instant::now(), &mut results);
-                executed.push(executed_batch(
-                    dispatch,
-                    results,
-                    batch_started.elapsed(),
-                    super::ResourceVector::zero(),
-                ));
+                publish_serial_completion(
+                    executed_batch(
+                        dispatch,
+                        results,
+                        batch_started.elapsed(),
+                        super::ResourceVector::zero(),
+                    ),
+                    &mut executed,
+                    completion_tx,
+                );
                 continue;
             }
         };
         if let Some(results) = pre_device_entry_results(&dispatch, Instant::now()) {
             drop(admitted);
-            executed.push(executed_batch(
-                dispatch,
-                results,
-                batch_started.elapsed(),
-                super::ResourceVector::zero(),
-            ));
+            publish_serial_completion(
+                executed_batch(
+                    dispatch,
+                    results,
+                    batch_started.elapsed(),
+                    super::ResourceVector::zero(),
+                ),
+                &mut executed,
+                completion_tx,
+            );
             continue;
         }
         let workspace = match executor.reserve_batch_workspace(&dispatch.physical_batch) {
@@ -876,12 +956,16 @@ async fn execute_dispatches_serial(
                         result
                     })
                     .collect();
-                executed.push(executed_batch(
-                    dispatch,
-                    results,
-                    batch_started.elapsed(),
-                    super::ResourceVector::zero(),
-                ));
+                publish_serial_completion(
+                    executed_batch(
+                        dispatch,
+                        results,
+                        batch_started.elapsed(),
+                        super::ResourceVector::zero(),
+                    ),
+                    &mut executed,
+                    completion_tx,
+                );
                 continue;
             }
         };
@@ -891,12 +975,16 @@ async fn execute_dispatches_serial(
         if let Some(results) = pre_device_entry_results(&dispatch, Instant::now()) {
             drop(admitted);
             drop(workspace);
-            executed.push(executed_batch(
-                dispatch,
-                results,
-                batch_started.elapsed(),
-                super::ResourceVector::zero(),
-            ));
+            publish_serial_completion(
+                executed_batch(
+                    dispatch,
+                    results,
+                    batch_started.elapsed(),
+                    super::ResourceVector::zero(),
+                ),
+                &mut executed,
+                completion_tx,
+            );
             continue;
         }
         let stream_bindings = match bind_stream_quantum(&dispatch, progress_tx, progress_budget) {
@@ -920,12 +1008,16 @@ async fn execute_dispatches_serial(
                         ))
                     })
                     .collect();
-                executed.push(executed_batch(
-                    dispatch,
-                    results,
-                    batch_started.elapsed(),
-                    super::ResourceVector::zero(),
-                ));
+                publish_serial_completion(
+                    executed_batch(
+                        dispatch,
+                        results,
+                        batch_started.elapsed(),
+                        super::ResourceVector::zero(),
+                    ),
+                    &mut executed,
+                    completion_tx,
+                );
                 continue;
             }
         };
@@ -933,12 +1025,16 @@ async fn execute_dispatches_serial(
             drop(stream_bindings);
             drop(workspace);
             drop(admitted);
-            executed.push(executed_batch(
-                dispatch,
-                results,
-                batch_started.elapsed(),
-                super::ResourceVector::zero(),
-            ));
+            publish_serial_completion(
+                executed_batch(
+                    dispatch,
+                    results,
+                    batch_started.elapsed(),
+                    super::ResourceVector::zero(),
+                ),
+                &mut executed,
+                completion_tx,
+            );
             continue;
         }
         let observed_workspace = dispatch.physical_batch.workspace;
@@ -958,13 +1054,14 @@ async fn execute_dispatches_serial(
         );
         apply_post_dispatch_deadlines(&dispatch, Instant::now(), &mut results);
         drop(stream_bindings);
-        executed.push(executed_batch(
+        let batch = executed_batch(
             dispatch,
             results,
             batch_started.elapsed(),
             observed_workspace,
-        ));
+        );
         drop(workspace);
+        publish_serial_completion(batch, &mut executed, completion_tx);
     }
     executed
 }
@@ -1417,6 +1514,94 @@ mod tests {
     }
 
     struct PanickingPhysicalExecutor;
+
+    struct ReverseProgressExecutor {
+        slow_batch: BatchId,
+        slow_entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl ModelExecutor for ReverseProgressExecutor {
+        fn execute_physical_batch(
+            &self,
+            execution: PhysicalBatchExecution<'_>,
+        ) -> PhysicalDispatchResult {
+            execution.validate().expect("test physical batch");
+            if execution.batch.batch_id == self.slow_batch {
+                if let Some(entered) = self
+                    .slow_entered
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .take()
+                {
+                    let _ = entered.send(());
+                }
+                let (released, wake) = self.release.as_ref();
+                let mut released = released.lock().unwrap_or_else(|poison| poison.into_inner());
+                while !*released {
+                    released = wake
+                        .wait(released)
+                        .unwrap_or_else(|poison| poison.into_inner());
+                }
+            } else {
+                let request = execution.requests[0];
+                request
+                    .stream_staging_buffer()
+                    .push_with_policy(
+                        super::super::StreamingOutput {
+                            request_id: request.id.clone(),
+                            sequence: 0,
+                            samples: Vec::new(),
+                            sample_rate: 0,
+                            is_final: false,
+                            text: Some("fast-progress".to_string()),
+                            stats: None,
+                            asr_progress: None,
+                        },
+                        request.stream_policy,
+                    )
+                    .expect("publish fast progress");
+            }
+            let dispatch = execution.expected_dispatch();
+            Ok(execution
+                .scheduled
+                .iter()
+                .map(|scheduled| {
+                    ExecutorStepResult::new(
+                        scheduled,
+                        ExecutorOutput::terminal(scheduled.request_id.clone()),
+                    )
+                    .with_dispatch(dispatch)
+                })
+                .collect())
+        }
+
+        fn execute_prefill(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            unreachable!("physical boundary must own dispatch")
+        }
+
+        fn execute_decode(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            unreachable!("physical boundary must own dispatch")
+        }
+
+        fn is_ready(&self) -> bool {
+            true
+        }
+        fn initialize(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn shutdown(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
 
     impl ModelExecutor for BlockingDrainExecutor {
         fn execute_physical_batch(
@@ -2015,6 +2200,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_mode_keeps_same_group_exclusive_tickets_serial() {
+        let before = super::super::metrics::engine_physical_execution_metrics_snapshot();
         let active = Arc::new(AtomicUsize::new(0));
         let max_active = Arc::new(AtomicUsize::new(0));
         let executor = UnifiedExecutor::new_for_test(Box::new(ObservedPhysicalExecutor {
@@ -2037,9 +2223,18 @@ mod tests {
         );
 
         let executed = execute_prepared(prepared).await;
+        let after = super::super::metrics::engine_physical_execution_metrics_snapshot();
 
         assert_eq!(executed.batches.len(), 2);
         assert_eq!(max_active.load(Ordering::SeqCst), 1);
+        assert!(
+            after.cohort_wait.observations_total
+                >= before.cohort_wait.observations_total.saturating_add(2)
+        );
+        assert!(after.cohort_wait.total_seconds >= before.cohort_wait.total_seconds + 0.02);
+        assert!(
+            after.defers.execution_capacity >= before.defers.execution_capacity.saturating_add(1)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2246,6 +2441,76 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fast_completion_is_published_while_slow_peer_runs_and_after_its_progress_enqueue() {
+        let (slow_entered_tx, slow_entered_rx) = tokio::sync::oneshot::channel();
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let executor = UnifiedExecutor::new_for_test(Box::new(ReverseProgressExecutor {
+            slow_batch: BatchId::new(305),
+            slow_entered: std::sync::Mutex::new(Some(slow_entered_tx)),
+            release: release.clone(),
+        }));
+        let policy = PhysicalLaunchPolicy::concurrent(2).unwrap();
+        let mut slow_request = EngineCoreRequest::tts("slow completion");
+        slow_request.id = "slow-completion".to_string();
+        let slow = prepared_batch_with_policy(
+            305,
+            slow_request,
+            scheduled("slow-completion", 305, 1),
+            policy,
+        );
+        let mut fast_request = EngineCoreRequest::tts("fast completion");
+        fast_request.id = "fast-completion".to_string();
+        fast_request.streaming = true;
+        let (stream_tx, _stream_rx) = mpsc::channel(4);
+        fast_request.streaming_tx = Some(stream_tx);
+        let mut fast = prepared_batch_with_policy(
+            306,
+            fast_request,
+            scheduled("fast-completion", 306, 2),
+            policy,
+        );
+        fast.output_visibility = OutputVisibility::IncrementalCommitted;
+        let prepared = PreparedEngineStep::with_execution_policy(
+            executor,
+            vec![slow, fast],
+            PhysicalExecutionMode::Concurrent,
+            PhysicalInFlightLimit::new(2).unwrap(),
+        );
+        let recovery = prepared.recovery();
+        let runner_registration = recovery.register_runner();
+        let (progress_tx, mut progress_rx) = mpsc::channel(8);
+        let (completion_tx, mut completion_rx) = mpsc::unbounded_channel();
+        let runner = tokio::spawn(ExecutionGroupRunner::execute(
+            prepared,
+            runner_registration,
+            progress_tx,
+            StreamProgressBudget::new(1024),
+            Some(completion_tx),
+        ));
+
+        slow_entered_rx.await.expect("slow dispatch did not enter");
+        let fast_completion = tokio::time::timeout(Duration::from_secs(1), completion_rx.recv())
+            .await
+            .expect("fast completion waited for its slow peer")
+            .expect("completion channel closed");
+        assert_eq!(fast_completion.physical_batch.batch_id, BatchId::new(306));
+        assert!(!runner.is_finished(), "slow peer unexpectedly completed");
+        let progress = progress_rx
+            .try_recv()
+            .expect("completion overtook its already-published progress");
+        assert_eq!(progress.batch_id, BatchId::new(306));
+        assert_eq!(progress.output.text.as_deref(), Some("fast-progress"));
+
+        let (released, wake) = release.as_ref();
+        *released.lock().unwrap_or_else(|poison| poison.into_inner()) = true;
+        wake.notify_all();
+        let slow_completion = completion_rx.recv().await.expect("slow completion");
+        assert_eq!(slow_completion.physical_batch.batch_id, BatchId::new(305));
+        let aggregate = runner.await.expect("runner panicked");
+        assert!(aggregate.batches.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn outer_runner_abort_drains_detached_launches_before_workspace_and_permit_release() {
         let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 2, 4));
         let authority = coordinator.resource_authority();
@@ -2300,6 +2565,7 @@ mod tests {
                 runner_registration,
                 progress_tx,
                 StreamProgressBudget::new(1024),
+                None,
             )
             .await
         });
@@ -2367,6 +2633,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn panicking_physical_tasks_leave_the_prepared_recovery_fence_drained() {
+        let before = super::super::metrics::engine_physical_execution_metrics_snapshot();
         let executor = UnifiedExecutor::new_for_test(Box::new(PanickingPhysicalExecutor));
         let policy = PhysicalLaunchPolicy::concurrent(2).unwrap();
         let prepared = PreparedEngineStep::with_execution_policy(
@@ -2387,6 +2654,7 @@ mod tests {
                 runner_registration,
                 progress_tx,
                 StreamProgressBudget::new(1024),
+                None,
             )
             .await
         })
@@ -2403,6 +2671,13 @@ mod tests {
                     && result.provenance.dispatch_state == DispatchState::Started
             })
         }));
+        let after = super::super::metrics::engine_physical_execution_metrics_snapshot();
+        assert!(
+            after.fallbacks.dispatch_failure >= before.fallbacks.dispatch_failure.saturating_add(2),
+            "dispatch failure fallback count did not include both task panics: before={}, after={}",
+            before.fallbacks.dispatch_failure,
+            after.fallbacks.dispatch_failure,
+        );
     }
 
     #[test]
@@ -2484,6 +2759,7 @@ mod tests {
             runner_registration,
             progress_tx,
             StreamProgressBudget::new(1024 * 1024),
+            None,
         )
         .await
     }
@@ -2622,6 +2898,7 @@ mod tests {
 
     #[tokio::test]
     async fn workspace_rejection_never_enters_the_model_executor() {
+        let before = super::super::metrics::engine_physical_execution_metrics_snapshot();
         let calls = Arc::new(AtomicUsize::new(0));
         let executor = UnifiedExecutor::new_for_test(Box::new(CountingExecutor {
             calls: calls.clone(),
@@ -2691,6 +2968,10 @@ mod tests {
                 FailureOrigin::WorkspaceAdmission,
                 DispatchState::NotStarted,
             )
+        );
+        let after = super::super::metrics::engine_physical_execution_metrics_snapshot();
+        assert!(
+            after.defers.workspace_capacity >= before.defers.workspace_capacity.saturating_add(1)
         );
     }
 

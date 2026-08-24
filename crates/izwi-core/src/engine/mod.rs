@@ -322,16 +322,49 @@ struct OwnedStepContext {
     completion_mailboxes: Arc<std::sync::Mutex<HashMap<RequestId, CompletionMailbox>>>,
 }
 
-impl OwnedStepContext {
-    async fn rollback_abandoned_dispatches(
-        &self,
-        recovery: &execution_group::PreparedStepRecovery,
-    ) {
+struct OwnedRunnerRecoveryGuard {
+    core: Arc<RwLock<EngineCore>>,
+    recovery: Option<execution_group::PreparedStepRecovery>,
+    abort: tokio::task::AbortHandle,
+}
+
+impl OwnedRunnerRecoveryGuard {
+    async fn recover_now(&mut self) {
+        self.abort.abort();
+        let Some(recovery) = self.recovery.take() else {
+            return;
+        };
         recovery.wait_for_task_drain().await;
-        let mut core = self.core.write().await;
-        core.rollback_in_flight_dispatches(recovery.batch_ids());
+        self.core
+            .write()
+            .await
+            .rollback_in_flight_dispatches(recovery.batch_ids());
     }
 
+    fn disarm(&mut self) {
+        self.recovery = None;
+    }
+}
+
+impl Drop for OwnedRunnerRecoveryGuard {
+    fn drop(&mut self) {
+        let Some(recovery) = self.recovery.take() else {
+            return;
+        };
+        self.abort.abort();
+        let core = self.core.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                recovery.wait_for_task_drain().await;
+                core.write()
+                    .await
+                    .rollback_in_flight_dispatches(recovery.batch_ids());
+            });
+        }
+    }
+}
+
+impl OwnedStepContext {
     fn take_completion_sender(
         &self,
         session: &SessionKey,
@@ -422,8 +455,10 @@ impl OwnedStepContext {
     async fn execute_prepared(
         &self,
         prepared: execution_group::PreparedEngineStep,
-    ) -> Result<execution_group::ExecutedEngineStep> {
+        defer_unregistered_terminal_ack: bool,
+    ) -> Result<Vec<EngineOutput>> {
         let (progress_tx, mut progress_rx) = mpsc::channel(request::STREAM_PROGRESS_QUEUE_CAPACITY);
+        let (completion_tx, mut completion_rx) = mpsc::unbounded_channel();
         let progress_budget =
             request::StreamProgressBudget::new(request::STREAM_PROGRESS_MAX_BUFFERED_BYTES);
         let recovery = prepared.recovery();
@@ -434,31 +469,42 @@ impl OwnedStepContext {
                 runner_registration,
                 progress_tx,
                 progress_budget,
+                Some(completion_tx),
             )
             .await
         });
+        let mut recovery_guard = OwnedRunnerRecoveryGuard {
+            core: self.core.clone(),
+            recovery: Some(recovery.clone()),
+            abort: runner.abort_handle(),
+        };
         let (mut deliveries, mut delivery_failures) =
             executor::IncrementalStreamDeliveryWorkers::new();
         let mut failures = HashMap::new();
         let mut progress_closed = false;
+        let mut completion_closed = false;
         let mut delivery_failures_closed = false;
+        let mut runner_finished = false;
+        let mut fallback_batches = Vec::new();
+        let mut completed_outputs = HashMap::<BatchId, Vec<EngineOutput>>::new();
 
-        let mut executed = loop {
+        while !runner_finished || !completion_closed {
             tokio::select! {
-                result = &mut runner => {
-                    break match result {
-                        Ok(executed) => executed,
+                result = &mut runner, if !runner_finished => {
+                    match result {
+                        Ok(executed) => fallback_batches.extend(executed.batches),
                         Err(error) if error.is_panic() => {
-                            self.rollback_abandoned_dispatches(&recovery).await;
+                            recovery_guard.recover_now().await;
                             std::panic::resume_unwind(error.into_panic())
                         }
                         Err(error) => {
-                            self.rollback_abandoned_dispatches(&recovery).await;
+                            recovery_guard.recover_now().await;
                             return Err(Error::InferenceError(format!(
                                 "execution group task was cancelled: {error}"
                             )));
                         }
-                    };
+                    }
+                    runner_finished = true;
                 }
                 progress = progress_rx.recv(), if !progress_closed => {
                     match progress {
@@ -472,6 +518,23 @@ impl OwnedStepContext {
                         None => progress_closed = true,
                     }
                 }
+                completion = completion_rx.recv(), if !completion_closed => {
+                    match completion {
+                        Some(batch) => {
+                            let batch_id = batch.physical_batch.batch_id;
+                            let outputs = self.commit_completed_dispatch(
+                                batch,
+                                &mut progress_rx,
+                                &mut delivery_failures,
+                                &mut failures,
+                                &mut deliveries,
+                                defer_unregistered_terminal_ack,
+                            ).await?;
+                            completed_outputs.insert(batch_id, outputs);
+                        }
+                        None => completion_closed = true,
+                    }
+                }
                 failure = delivery_failures.recv(), if !delivery_failures_closed => {
                     match failure {
                         Some(failure) => self.record_stream_failure(
@@ -483,7 +546,22 @@ impl OwnedStepContext {
                     }
                 }
             }
-        };
+        }
+
+        for batch in fallback_batches {
+            let batch_id = batch.physical_batch.batch_id;
+            let outputs = self
+                .commit_completed_dispatch(
+                    batch,
+                    &mut progress_rx,
+                    &mut delivery_failures,
+                    &mut failures,
+                    &mut deliveries,
+                    defer_unregistered_terminal_ack,
+                )
+                .await?;
+            completed_outputs.insert(batch_id, outputs);
+        }
 
         while let Some(progress) = progress_rx.recv().await {
             self.enqueue_incremental_progress(progress, &mut failures, &mut deliveries)
@@ -498,45 +576,85 @@ impl OwnedStepContext {
             self.cancel_failed_stream(&failure);
             failures.entry(failure.session.clone()).or_insert(failure);
         }
-        let failures = failures.into_values().collect::<Vec<_>>();
-        executed.apply_stream_delivery_failures(&failures);
-        Ok(executed)
+
+        // An empty prepared step can still own durable terminal outbox rows.
+        let tail = {
+            let mut core = self.core.write().await;
+            core.commit_step(execution_group::ExecutedEngineStep {
+                batches: Vec::new(),
+            })
+            .await?
+        };
+        let mut tail_outputs = self
+            .deliver_and_route_committed(tail, defer_unregistered_terminal_ack)
+            .await?;
+
+        let mut outputs = Vec::new();
+        for batch_id in recovery.batch_ids() {
+            if let Some(mut batch_outputs) = completed_outputs.remove(batch_id) {
+                outputs.append(&mut batch_outputs);
+            }
+        }
+        for mut unordered in completed_outputs.into_values() {
+            outputs.append(&mut unordered);
+        }
+        outputs.append(&mut tail_outputs);
+        recovery_guard.disarm();
+        Ok(outputs)
     }
 
-    async fn run(self, defer_unregistered_terminal_ack: bool) -> Result<Vec<EngineOutput>> {
-        let _step = self.step_gate.lock().await;
-        let prepared = {
+    async fn commit_completed_dispatch(
+        &self,
+        batch: execution_group::ExecutedPhysicalBatch,
+        progress_rx: &mut mpsc::Receiver<request::FencedStreamProgress>,
+        delivery_failures: &mut mpsc::UnboundedReceiver<executor::StreamDeliveryFailure>,
+        failures: &mut HashMap<SessionKey, executor::StreamDeliveryFailure>,
+        deliveries: &mut executor::IncrementalStreamDeliveryWorkers,
+        defer_unregistered_terminal_ack: bool,
+    ) -> Result<Vec<EngineOutput>> {
+        while let Ok(progress) = progress_rx.try_recv() {
+            self.enqueue_incremental_progress(progress, failures, deliveries)
+                .await;
+        }
+        let sessions = batch
+            .results
+            .iter()
+            .map(|result| result.session.clone())
+            .collect::<HashSet<_>>();
+        for failure in deliveries.finish_sessions(&sessions).await {
+            self.record_stream_failure(failure, failures, deliveries);
+        }
+        while let Ok(failure) = delivery_failures.try_recv() {
+            self.record_stream_failure(failure, failures, deliveries);
+        }
+        let dispatch_failures = failures
+            .values()
+            .filter(|failure| sessions.contains(&failure.session))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut executed = execution_group::ExecutedEngineStep {
+            batches: vec![batch],
+        };
+        executed.apply_stream_delivery_failures(&dispatch_failures);
+        let committed = {
             let mut core = self.core.write().await;
-            core.prepare_step().await?
+            core.commit_step(executed).await?
         };
-        let executed = match prepared {
-            Some(prepared) => Some(self.execute_prepared(prepared).await?),
-            None => None,
-        };
-        let (mut outputs, stream_deliveries) = {
-            let mut core = self.core.write().await;
-            match executed {
-                Some(executed) => {
-                    let committed = core.commit_step(executed).await?;
-                    (committed.outputs, committed.stream_deliveries)
-                }
-                None => (Vec::new(), Vec::new()),
-            }
-        };
-        let failed_streams = executor::deliver_committed_streams(stream_deliveries).await;
+        self.deliver_and_route_committed(committed, defer_unregistered_terminal_ack)
+            .await
+    }
+
+    async fn deliver_and_route_committed(
+        &self,
+        committed: core::CommittedEngineStep,
+        defer_unregistered_terminal_ack: bool,
+    ) -> Result<Vec<EngineOutput>> {
+        let mut outputs = committed.outputs;
+        let failed_streams = executor::deliver_committed_streams(committed.stream_deliveries).await;
         if !failed_streams.is_empty() {
             let mut core = self.core.write().await;
             core.reconcile_stream_delivery_failures(&mut outputs, failed_streams)
                 .await;
-        }
-
-        // Keep every await before terminal dispatch. Once a completion sender
-        // is notified, routing and exact-session acknowledgement finish
-        // synchronously inside this owned transaction.
-        {
-            let mut metrics = self.metrics.write().await;
-            metrics.total_steps += 1;
-            metrics.requests_processed += outputs.len() as u64;
         }
 
         let mut core = self.core.write().await;
@@ -548,7 +666,6 @@ impl OwnedStepContext {
             } else {
                 false
             };
-
             if (routed_to_mailbox || !defer_unregistered_terminal_ack)
                 && !core.acknowledge_terminal_output(&session)
             {
@@ -558,7 +675,6 @@ impl OwnedStepContext {
                     "Terminal output had no matching delivery fence"
                 );
             }
-
             let mut controls = self
                 .request_controls
                 .lock()
@@ -569,6 +685,31 @@ impl OwnedStepContext {
             {
                 controls.remove(&output.request_id);
             }
+        }
+        Ok(outputs)
+    }
+
+    async fn run(self, defer_unregistered_terminal_ack: bool) -> Result<Vec<EngineOutput>> {
+        let _step = self.step_gate.lock().await;
+        let prepared = {
+            let mut core = self.core.write().await;
+            core.prepare_step().await?
+        };
+        let outputs = match prepared {
+            Some(prepared) => {
+                self.execute_prepared(prepared, defer_unregistered_terminal_ack)
+                    .await?
+            }
+            None => Vec::new(),
+        };
+
+        // Keep every await before terminal dispatch. Once a completion sender
+        // is notified, routing and exact-session acknowledgement finish
+        // synchronously inside this owned transaction.
+        {
+            let mut metrics = self.metrics.write().await;
+            metrics.total_steps += 1;
+            metrics.requests_processed += outputs.len() as u64;
         }
 
         Ok(outputs)
@@ -1913,6 +2054,117 @@ mod tests {
         variant: ModelVariant,
     }
 
+    struct ReverseTerminalExecutor {
+        slow_request: RequestId,
+        slow_entered: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+        release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        cleanup: Arc<std::sync::Mutex<Vec<RequestId>>>,
+        variant: ModelVariant,
+    }
+
+    impl ModelExecutor for ReverseTerminalExecutor {
+        fn execution_profile(&self, _request: &EngineCoreRequest) -> Option<ExecutionProfile> {
+            let mut profile = ExecutionProfile::fail_closed(
+                BackendKind::Cpu,
+                Some(self.variant),
+                ExecutionMode::Atomic,
+            );
+            profile.concurrency = ConcurrencyClass::Batchable;
+            profile.physical_launch_policy = PhysicalLaunchPolicy::concurrent(2).unwrap();
+            profile.max_batch_size = 2;
+            profile.resolved_from_loaded_model = true;
+            Some(profile)
+        }
+
+        fn execute_physical_batch(
+            &self,
+            execution: PhysicalBatchExecution<'_>,
+        ) -> PhysicalDispatchResult {
+            execution.validate().expect("test physical batch");
+            let request = execution.requests[0];
+            if request.id == self.slow_request {
+                if let Some(entered) = self
+                    .slow_entered
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .take()
+                {
+                    let _ = entered.send(());
+                }
+                let (released, wake) = self.release.as_ref();
+                let mut released = released.lock().unwrap_or_else(|poison| poison.into_inner());
+                while !*released {
+                    released = wake
+                        .wait(released)
+                        .unwrap_or_else(|poison| poison.into_inner());
+                }
+            } else {
+                request
+                    .stream_staging_buffer()
+                    .push_with_policy(
+                        StreamingOutput {
+                            request_id: request.id.clone(),
+                            sequence: 0,
+                            samples: Vec::new(),
+                            sample_rate: 0,
+                            is_final: false,
+                            text: Some("fast-progress".to_string()),
+                            stats: None,
+                            asr_progress: None,
+                        },
+                        request.stream_policy,
+                    )
+                    .expect("publish fast progress");
+            }
+            let dispatch = execution.expected_dispatch();
+            Ok(execution
+                .scheduled
+                .iter()
+                .map(|scheduled| {
+                    ExecutorStepResult::new(
+                        scheduled,
+                        ExecutorOutput::terminal(scheduled.request_id.clone()),
+                    )
+                    .with_dispatch(dispatch)
+                })
+                .collect())
+        }
+
+        fn execute_prefill(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            unreachable!("physical boundary must own dispatch")
+        }
+
+        fn execute_decode(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            unreachable!("physical boundary must own dispatch")
+        }
+
+        fn is_ready(&self) -> bool {
+            true
+        }
+        fn initialize(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn shutdown(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn cleanup_session(&self, session: &SessionKey) -> CacheReleaseReport {
+            self.cleanup
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push(session.request_id.clone());
+            CacheReleaseReport::confirmed(1)
+        }
+    }
+
     impl IncrementalBlockingExecutor {
         fn execute(
             &self,
@@ -2653,6 +2905,142 @@ mod tests {
                 .is_empty(),
             "terminal routing must consume both exact-session mailboxes"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fast_terminal_mailbox_and_cache_cleanup_do_not_wait_for_slow_peer() {
+        let variant = ModelVariant::Kokoro82M;
+        let (slow_entered_tx, slow_entered_rx) = oneshot::channel();
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let cleanup = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let config = EngineCoreConfig {
+            max_batch_size: 2,
+            max_tokens_per_step: 2,
+            min_tokens_per_step: 1,
+            enable_adaptive_batching: false,
+            physical_execution_mode: crate::config::PhysicalExecutionMode::Concurrent,
+            max_physical_in_flight: crate::config::PhysicalInFlightLimit::new(2).unwrap(),
+            ..Default::default()
+        };
+        let core = EngineCore::new_with_unified_executor(
+            config.clone(),
+            executor::UnifiedExecutor::new_for_test(Box::new(ReverseTerminalExecutor {
+                slow_request: "slow-mailbox".to_string(),
+                slow_entered: std::sync::Mutex::new(Some(slow_entered_tx)),
+                release: release.clone(),
+                cleanup: cleanup.clone(),
+                variant,
+            })),
+        )
+        .unwrap();
+        let engine = Arc::new(Engine {
+            core: Arc::new(RwLock::new(core)),
+            step_gate: Arc::new(Mutex::new(())),
+            request_processor: RequestProcessor::new(config.clone()),
+            output_processor: OutputProcessor::new(config.sample_rate),
+            direct_request_preparation_permits: Arc::new(Semaphore::new(2)),
+            config,
+            model_registry: None,
+            running: std::sync::atomic::AtomicBool::new(false),
+            metrics: Arc::new(RwLock::new(EngineMetrics::default())),
+            wake_notify: Arc::new(Notify::new()),
+            request_controls: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            completion_mailboxes: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            next_completion_registration: std::sync::atomic::AtomicU64::new(1),
+        });
+
+        let policy = PhysicalLaunchPolicy::concurrent(2).unwrap();
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, Some(variant), ExecutionMode::Atomic);
+        profile.concurrency = ConcurrencyClass::Batchable;
+        profile.physical_launch_policy = policy;
+        profile.max_batch_size = 2;
+        profile.resolved_from_loaded_model = true;
+        let mut stage = StageDescriptor::from_execution_profile(
+            StageId::new(88),
+            "test.reverse.terminal",
+            &profile,
+            NativeBatchMode::None,
+        );
+        stage.selector = StageWorkSelector::Atomic;
+        stage.output_visibility = OutputVisibility::IncrementalCommitted;
+        let slow_binding = ExecutionAdapterBinding {
+            execution_group_id: ExecutionGroupId::new(88),
+            model_instance_id: ModelInstanceId::new(88),
+            adapter_instance_id: AdapterInstanceId::new(88),
+            adapter_abi_revision: AdapterAbiRevision::new(1),
+            model_variant: variant,
+            capability_id: "tts".to_string(),
+            stages: Arc::from([stage]),
+        };
+        let mut fast_binding = slow_binding.clone();
+        fast_binding.execution_group_id = ExecutionGroupId::new(89);
+        fast_binding.model_instance_id = ModelInstanceId::new(89);
+        fast_binding.adapter_instance_id = AdapterInstanceId::new(89);
+        let mut slow = EngineCoreRequest::tts("slow").with_model_variant(variant);
+        slow.id = "slow-mailbox".to_string();
+        slow.prompt_tokens = vec![1];
+        slow.bind_execution_adapter(slow_binding).unwrap();
+        let mut fast = EngineCoreRequest::tts("fast").with_model_variant(variant);
+        fast.id = "fast-mailbox".to_string();
+        fast.prompt_tokens = vec![1];
+        fast.bind_execution_adapter(fast_binding).unwrap();
+        fast.streaming = true;
+        let (fast_stream_tx, mut fast_stream_rx) = mpsc::channel(4);
+        fast.streaming_tx = Some(fast_stream_tx);
+
+        let (slow_registration, slow_rx) =
+            engine.register_completion_mailbox(slow.id.clone()).unwrap();
+        let (fast_registration, fast_rx) =
+            engine.register_completion_mailbox(fast.id.clone()).unwrap();
+        {
+            let mut core = engine.core.write().await;
+            core.add_request(slow).unwrap();
+            core.add_request(fast).unwrap();
+            let slow_session = core.get_session_key(&"slow-mailbox".to_string()).unwrap();
+            let fast_session = core.get_session_key(&"fast-mailbox".to_string()).unwrap();
+            engine.bind_completion_mailbox(
+                &slow_session.request_id,
+                slow_registration.registration_id,
+                slow_session.epoch,
+            );
+            engine.bind_completion_mailbox(
+                &fast_session.request_id,
+                fast_registration.registration_id,
+                fast_session.epoch,
+            );
+        }
+
+        let stepping = engine.clone();
+        let step = tokio::spawn(async move { stepping.step().await });
+        slow_entered_rx.await.expect("slow dispatch did not enter");
+        let fast_output = tokio::time::timeout(Duration::from_secs(1), fast_rx).await;
+        let progress = fast_stream_rx.try_recv();
+        let step_finished_early = step.is_finished();
+        let fast_still_active = engine.has_request(&"fast-mailbox".to_string()).await;
+        let slow_still_active = engine.has_request(&"slow-mailbox".to_string()).await;
+        let fast_cleaned = cleanup
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .contains(&"fast-mailbox".to_string());
+
+        let (released, wake) = release.as_ref();
+        *released.lock().unwrap_or_else(|poison| poison.into_inner()) = true;
+        wake.notify_all();
+        let slow_output = slow_rx.await.expect("slow mailbox closed");
+        assert_eq!(slow_output.request_id, "slow-mailbox");
+        step.await.unwrap().unwrap();
+        let fast_output = fast_output
+            .expect("fast mailbox waited for slow peer")
+            .expect("fast mailbox closed");
+        assert_eq!(fast_output.request_id, "fast-mailbox");
+        assert!(!step_finished_early, "slow peer unexpectedly completed");
+        let progress = progress.expect("terminal mailbox overtook committed progress delivery");
+        assert_eq!(progress.text.as_deref(), Some("fast-progress"));
+        assert!(!fast_still_active);
+        assert!(slow_still_active);
+        assert!(fast_cleaned);
+        drop((slow_registration, fast_registration));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

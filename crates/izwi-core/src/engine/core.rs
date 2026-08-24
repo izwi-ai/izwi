@@ -29,7 +29,7 @@ use super::execution::{
 };
 use super::execution_group::{
     ExecutedEngineStep, ExecutionGroupRunner, ExecutionPhase, PreparedEngineStep,
-    PreparedPhysicalDispatch,
+    PreparedPhysicalDispatch, PreparedStepRecovery,
 };
 use super::executor::REQUEST_DEADLINE_EXCEEDED;
 use super::executor::{
@@ -420,6 +420,8 @@ pub struct EngineCore {
     active_plans: HashMap<u64, ExecutionPlan>,
     /// Exact physical tickets currently owned outside the core lock.
     in_flight_dispatches: HashMap<BatchId, InFlightPhysicalDispatch>,
+    /// Recovery left armed if a borrowed low-level step future is cancelled.
+    pending_runner_recovery: Option<PreparedStepRecovery>,
     /// Prepared physical KV transactions keyed by their exact execution plan.
     active_managed_cache: HashMap<u64, super::ManagedCacheReservation>,
     /// Terminal sessions whose table release waits for an in-flight row.
@@ -1964,6 +1966,7 @@ impl EngineCore {
             execution_trackers: HashMap::new(),
             active_plans: HashMap::new(),
             in_flight_dispatches: HashMap::new(),
+            pending_runner_recovery: None,
             active_managed_cache: HashMap::new(),
             pending_managed_releases: HashSet::new(),
             active_stream_batches: HashMap::new(),
@@ -2373,7 +2376,181 @@ impl EngineCore {
         let Some(prepared) = self.prepare_step().await? else {
             return Ok(Vec::new());
         };
-        let executed = self.execute_prepared_with_progress(prepared).await?;
+        self.execute_and_commit_prepared_with_progress(prepared)
+            .await
+    }
+
+    async fn execute_and_commit_prepared_with_progress(
+        &mut self,
+        prepared: PreparedEngineStep,
+    ) -> Result<Vec<EngineOutput>> {
+        let (progress_tx, mut progress_rx) = mpsc::channel(STREAM_PROGRESS_QUEUE_CAPACITY);
+        let (completion_tx, mut completion_rx) = mpsc::unbounded_channel();
+        let progress_budget = StreamProgressBudget::new(STREAM_PROGRESS_MAX_BUFFERED_BYTES);
+        let recovery = prepared.recovery();
+        debug_assert!(self.pending_runner_recovery.is_none());
+        self.pending_runner_recovery = Some(recovery.clone());
+        let runner_registration = recovery.register_runner();
+        let mut runner = tokio::spawn(async move {
+            ExecutionGroupRunner::execute(
+                prepared,
+                runner_registration,
+                progress_tx,
+                progress_budget,
+                Some(completion_tx),
+            )
+            .await
+        });
+        let (mut deliveries, mut delivery_failures) = IncrementalStreamDeliveryWorkers::new();
+        let mut failures = HashMap::new();
+        let mut progress_closed = false;
+        let mut completion_closed = false;
+        let mut delivery_failures_closed = false;
+        let mut runner_finished = false;
+        let mut fallback_batches = Vec::new();
+        let mut completed_outputs = HashMap::<BatchId, Vec<EngineOutput>>::new();
+
+        while !runner_finished || !completion_closed {
+            tokio::select! {
+                result = &mut runner, if !runner_finished => {
+                    match result {
+                        Ok(executed) => fallback_batches.extend(executed.batches),
+                        Err(error) if error.is_panic() => {
+                            recovery.wait_for_task_drain().await;
+                            self.rollback_in_flight_dispatches(recovery.batch_ids());
+                            self.pending_runner_recovery = None;
+                            std::panic::resume_unwind(error.into_panic())
+                        }
+                        Err(error) => {
+                            recovery.wait_for_task_drain().await;
+                            self.rollback_in_flight_dispatches(recovery.batch_ids());
+                            self.pending_runner_recovery = None;
+                            return Err(Error::InferenceError(format!(
+                                "execution group task was cancelled: {error}"
+                            )));
+                        }
+                    }
+                    runner_finished = true;
+                }
+                progress = progress_rx.recv(), if !progress_closed => {
+                    match progress {
+                        Some(progress) => self.enqueue_incremental_progress(
+                            progress,
+                            &mut failures,
+                            &mut deliveries,
+                        ),
+                        None => progress_closed = true,
+                    }
+                }
+                completion = completion_rx.recv(), if !completion_closed => {
+                    match completion {
+                        Some(batch) => {
+                            let batch_id = batch.physical_batch.batch_id;
+                            let outputs = self.commit_completed_dispatch_with_progress(
+                                batch,
+                                &mut progress_rx,
+                                &mut delivery_failures,
+                                &mut failures,
+                                &mut deliveries,
+                            ).await?;
+                            completed_outputs.insert(batch_id, outputs);
+                        }
+                        None => completion_closed = true,
+                    }
+                }
+                failure = delivery_failures.recv(), if !delivery_failures_closed => {
+                    match failure {
+                        Some(failure) => self.record_stream_failure(
+                            failure,
+                            &mut failures,
+                            &mut deliveries,
+                        ),
+                        None => delivery_failures_closed = true,
+                    }
+                }
+            }
+        }
+
+        for batch in fallback_batches {
+            let batch_id = batch.physical_batch.batch_id;
+            let outputs = self
+                .commit_completed_dispatch_with_progress(
+                    batch,
+                    &mut progress_rx,
+                    &mut delivery_failures,
+                    &mut failures,
+                    &mut deliveries,
+                )
+                .await?;
+            completed_outputs.insert(batch_id, outputs);
+        }
+        while let Some(progress) = progress_rx.recv().await {
+            self.enqueue_incremental_progress(progress, &mut failures, &mut deliveries);
+        }
+        for failure in deliveries.finish().await {
+            self.cancel_failed_stream(&failure);
+            failures.entry(failure.session.clone()).or_insert(failure);
+        }
+        while let Ok(failure) = delivery_failures.try_recv() {
+            self.cancel_failed_stream(&failure);
+            failures.entry(failure.session.clone()).or_insert(failure);
+        }
+
+        let tail = self
+            .commit_step(ExecutedEngineStep {
+                batches: Vec::new(),
+            })
+            .await?;
+        let mut tail_outputs = tail.outputs;
+        let failed_streams = deliver_committed_streams(tail.stream_deliveries).await;
+        self.reconcile_stream_delivery_failures(&mut tail_outputs, failed_streams)
+            .await;
+
+        let mut outputs = Vec::new();
+        for batch_id in recovery.batch_ids() {
+            if let Some(mut batch_outputs) = completed_outputs.remove(batch_id) {
+                outputs.append(&mut batch_outputs);
+            }
+        }
+        for mut unordered in completed_outputs.into_values() {
+            outputs.append(&mut unordered);
+        }
+        outputs.append(&mut tail_outputs);
+        self.pending_runner_recovery = None;
+        Ok(outputs)
+    }
+
+    async fn commit_completed_dispatch_with_progress(
+        &mut self,
+        batch: super::execution_group::ExecutedPhysicalBatch,
+        progress_rx: &mut mpsc::Receiver<FencedStreamProgress>,
+        delivery_failures: &mut mpsc::UnboundedReceiver<StreamDeliveryFailure>,
+        failures: &mut HashMap<super::SessionKey, StreamDeliveryFailure>,
+        deliveries: &mut IncrementalStreamDeliveryWorkers,
+    ) -> Result<Vec<EngineOutput>> {
+        while let Ok(progress) = progress_rx.try_recv() {
+            self.enqueue_incremental_progress(progress, failures, deliveries);
+        }
+        let sessions = batch
+            .results
+            .iter()
+            .map(|result| result.session.clone())
+            .collect::<HashSet<_>>();
+        for failure in deliveries.finish_sessions(&sessions).await {
+            self.record_stream_failure(failure, failures, deliveries);
+        }
+        while let Ok(failure) = delivery_failures.try_recv() {
+            self.record_stream_failure(failure, failures, deliveries);
+        }
+        let dispatch_failures = failures
+            .values()
+            .filter(|failure| sessions.contains(&failure.session))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut executed = ExecutedEngineStep {
+            batches: vec![batch],
+        };
+        executed.apply_stream_delivery_failures(&dispatch_failures);
         let committed = self.commit_step(executed).await?;
         let mut outputs = committed.outputs;
         let failed_streams = deliver_committed_streams(committed.stream_deliveries).await;
@@ -2382,6 +2559,7 @@ impl EngineCore {
         Ok(outputs)
     }
 
+    #[cfg(test)]
     async fn execute_prepared_with_progress(
         &mut self,
         prepared: PreparedEngineStep,
@@ -2396,6 +2574,7 @@ impl EngineCore {
                 runner_registration,
                 progress_tx,
                 progress_budget,
+                None,
             )
             .await
         });
@@ -2530,6 +2709,10 @@ impl EngineCore {
 
     /// Prepare an immutable execution transaction under the engine state lock.
     pub(super) async fn prepare_step(&mut self) -> Result<Option<PreparedEngineStep>> {
+        if let Some(recovery) = self.pending_runner_recovery.take() {
+            recovery.wait_for_task_drain().await;
+            self.rollback_in_flight_dispatches(recovery.batch_ids());
+        }
         // Ensure initialized
         if !self.initialized {
             self.initialize().await?;
