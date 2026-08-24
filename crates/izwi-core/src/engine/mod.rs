@@ -1613,23 +1613,28 @@ impl Engine {
 
     /// Abort only the request incarnation named by `session`.
     pub async fn abort_request_session(&self, session: &SessionKey) -> Result<bool> {
-        if let Some(control) = self
-            .request_controls
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .get(&session.request_id)
-        {
-            if control.session_epoch == session.epoch {
-                control
-                    .cancellation
-                    .store(true, std::sync::atomic::Ordering::Release);
-            }
-        }
+        let signaled = {
+            let controls = self
+                .request_controls
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            controls
+                .get(&session.request_id)
+                .filter(|control| control.session_epoch == session.epoch)
+                .map(|control| {
+                    control
+                        .cancellation
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    true
+                })
+                .unwrap_or(false)
+        };
         let _step = self.step_gate.lock().await;
         let mut core = self.core.write().await;
         let aborted = core.abort_request_session(session).await;
         drop(core);
-        if aborted {
+        let accepted = signaled || aborted;
+        if accepted {
             let mut controls = self
                 .request_controls
                 .lock()
@@ -1643,7 +1648,7 @@ impl Engine {
             drop(controls);
             self.wake_notify.notify_one();
         }
-        Ok(aborted)
+        Ok(accepted)
     }
 
     /// Abort all requests currently routed to a specific model variant.
