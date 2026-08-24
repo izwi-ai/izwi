@@ -580,11 +580,14 @@ impl Engine {
 
     fn physical_execution_telemetry_policy(
         config: &EngineCoreConfig,
+        admitted_capacity: Option<usize>,
     ) -> (EnginePhysicalExecutionMode, usize) {
         let capacity = config.resolved_physical_execution_capacity();
         (
             Self::physical_execution_telemetry_mode(config.physical_execution_mode),
-            capacity.physical_launch_limit.get(),
+            admitted_capacity
+                .unwrap_or_else(|| capacity.physical_launch_limit.get())
+                .max(1),
         )
     }
 
@@ -632,12 +635,16 @@ impl Engine {
         info!("Initializing inference engine");
 
         let model_registry = worker_config.model_registry.clone();
+        let admitted_capacity = worker_config
+            .physical_execution_admission
+            .as_ref()
+            .map(|admission| admission.capacity());
         let core = EngineCore::new_with_worker(config.clone(), worker_config)?;
-        let (physical_execution_mode, physical_execution_cap) =
-            Self::physical_execution_telemetry_policy(&config);
+        let (physical_execution_mode, effective_physical_execution_cap) =
+            Self::physical_execution_telemetry_policy(&config, admitted_capacity);
         metrics::set_engine_effective_physical_execution(
             physical_execution_mode,
-            physical_execution_cap,
+            effective_physical_execution_cap,
         );
         let request_processor = RequestProcessor::new(config.clone());
         let output_processor = OutputProcessor::new(config.sample_rate);
@@ -2163,14 +2170,19 @@ mod tests {
         shadow.physical_execution_mode = crate::config::PhysicalExecutionMode::Shadow;
         shadow.max_physical_in_flight = crate::config::PhysicalInFlightLimit::new(4).unwrap();
         assert_eq!(
-            Engine::physical_execution_telemetry_policy(&shadow),
+            Engine::physical_execution_telemetry_policy(&shadow, None),
             (EnginePhysicalExecutionMode::Shadow, 1)
         );
 
         shadow.physical_execution_mode = crate::config::PhysicalExecutionMode::Concurrent;
         assert_eq!(
-            Engine::physical_execution_telemetry_policy(&shadow),
+            Engine::physical_execution_telemetry_policy(&shadow, None),
             (EnginePhysicalExecutionMode::Concurrent, 4)
+        );
+        assert_eq!(
+            Engine::physical_execution_telemetry_policy(&shadow, Some(1)),
+            (EnginePhysicalExecutionMode::Concurrent, 1),
+            "effective telemetry must report the actual shared admission cap"
         );
     }
 
