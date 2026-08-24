@@ -93,49 +93,16 @@ fn scalar_request_parallelism(backend_kind: BackendKind, configured: usize) -> u
     }
 }
 
-/// Closed certification table for overlapping physical model calls.
-///
-/// Whisper's CPU graph is reentrant: loaded weights and preprocessing plans are
-/// immutable, while decoder self-attention and cross-attention state are exact
-/// per-row invocation leases. Metal/CUDA kernels and every other loaded model
-/// remain execution-group serialized until separately certified.
-fn certified_physical_launch_policy(
-    metadata: AdapterMetadata,
-    backend_kind: BackendKind,
-    adapter_abi_revision: AdapterAbiRevision,
-    max_in_flight_per_model: usize,
-) -> Result<PhysicalLaunchPolicy> {
-    if backend_kind == BackendKind::Cpu
-        && metadata.capability == CapabilityKind::Asr
-        && metadata.model_variant == ModelVariant::WhisperLargeV3Turbo
-        && adapter_abi_revision == SCALAR_ADAPTER_ABI
-        && max_in_flight_per_model > 1
-    {
-        PhysicalLaunchPolicy::concurrent(max_in_flight_per_model)
-    } else {
-        Ok(PhysicalLaunchPolicy::ExecutionGroupExclusive)
-    }
+/// Catalog metadata, backend selection, and adapter ABI are structural identity,
+/// not evidence that distinct physical model calls may overlap. No production
+/// concurrency evidence is loaded at this boundary today, so every contract must
+/// remain execution-group serialized.
+const fn launch_policy_without_concurrency_evidence() -> PhysicalLaunchPolicy {
+    PhysicalLaunchPolicy::ExecutionGroupExclusive
 }
 
-fn certified_scalar_row_width(
-    metadata: AdapterMetadata,
-    backend_kind: BackendKind,
-    adapter_abi_revision: AdapterAbiRevision,
-    requested_width: usize,
-) -> Result<(usize, PhysicalLaunchPolicy)> {
-    let requested_width = requested_width.max(1);
-    let policy = certified_physical_launch_policy(
-        metadata,
-        backend_kind,
-        adapter_abi_revision,
-        requested_width,
-    )?;
-    let width = if matches!(policy, PhysicalLaunchPolicy::Concurrent { .. }) {
-        requested_width
-    } else {
-        1
-    };
-    Ok((width, policy))
+const fn scalar_row_policy_without_concurrency_evidence() -> (usize, PhysicalLaunchPolicy) {
+    (1, launch_policy_without_concurrency_evidence())
 }
 
 #[derive(Debug, Clone)]
@@ -163,15 +130,10 @@ impl LoadedExecutionContract {
         }
 
         let declared = self.execution_profile.effective_physical_launch_policy();
-        let certified = certified_physical_launch_policy(
-            self.metadata,
-            self.execution_profile.backend,
-            self.adapter_abi_revision,
-            self.execution_profile.max_batch_size,
-        )?;
-        if declared != certified {
+        let supported = launch_policy_without_concurrency_evidence();
+        if declared != supported {
             return Err(Error::ModelLoadError(format!(
-                "loaded model {} capability {:?} declared uncertified physical launch policy {declared:?}; certified policy is {certified:?}",
+                "loaded model {} capability {:?} declared unsupported physical launch policy {declared:?}; no production concurrency evidence is available, so the supported policy is {supported:?}",
                 self.metadata.model_variant, self.metadata.capability,
             )));
         }
@@ -954,7 +916,7 @@ fn scalar_contract(
     adapter_abi_revision: AdapterAbiRevision,
     metadata: AdapterMetadata,
     backend_kind: BackendKind,
-    request_parallelism: usize,
+    _request_parallelism: usize,
     streaming: StreamingRequirements,
 ) -> Result<LoadedExecutionContract> {
     if streaming.model_native && metadata.streaming_mode == StreamingMode::None {
@@ -981,13 +943,8 @@ fn scalar_contract(
     execution_profile.resolved_from_loaded_model = true;
     execution_profile.prefill_batch = NativeBatchMode::None;
     execution_profile.decode_batch = NativeBatchMode::None;
-    let (certified_row_width, physical_launch_policy) = certified_scalar_row_width(
-        metadata,
-        backend_kind,
-        adapter_abi_revision,
-        request_parallelism,
-    )?;
-    execution_profile.max_batch_size = certified_row_width;
+    let (row_width, physical_launch_policy) = scalar_row_policy_without_concurrency_evidence();
+    execution_profile.max_batch_size = row_width;
     execution_profile.concurrency = if execution_profile.max_batch_size > 1 {
         ConcurrencyClass::Batchable
     } else {
@@ -2431,7 +2388,7 @@ mod tests {
     }
 
     #[test]
-    fn loaded_launch_policy_matrix_only_certifies_cpu_whisper_asr() {
+    fn loaded_launch_policy_matrix_is_group_exclusive_without_concurrency_evidence() {
         let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(1, 3).unwrap();
 
         for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
@@ -2456,14 +2413,7 @@ mod tests {
                             )
                         })
                     {
-                        let expected = if backend == BackendKind::Cpu
-                            && variant == ModelVariant::WhisperLargeV3Turbo
-                            && metadata.capability == CapabilityKind::Asr
-                        {
-                            PhysicalLaunchPolicy::concurrent(3).unwrap()
-                        } else {
-                            PhysicalLaunchPolicy::ExecutionGroupExclusive
-                        };
+                        let expected = PhysicalLaunchPolicy::ExecutionGroupExclusive;
                         assert_eq!(
                             contract.execution_profile.physical_launch_policy, expected,
                             "{variant} {:?} on {backend:?}",
@@ -2480,7 +2430,7 @@ mod tests {
     }
 
     #[test]
-    fn cpu_row_parallelism_keeps_whisper_scalar_and_tts_non_native() {
+    fn missing_concurrency_evidence_keeps_cpu_whisper_and_tts_scalar_width_one() {
         let request_parallelism = 4;
         let registry =
             RuntimeAdapterRegistry::built_in_with_execution_limits(2, request_parallelism).unwrap();
@@ -2496,17 +2446,21 @@ mod tests {
             .execution_contracts(CapabilityKind::Asr)
             .unwrap()
             .remove(0);
+        assert_eq!(whisper.execution_profile.max_batch_size, 1);
         assert_eq!(
-            whisper.execution_profile.max_batch_size,
-            request_parallelism
+            whisper.execution_profile.concurrency,
+            ConcurrencyClass::Exclusive
         );
         assert_eq!(
             whisper.execution_profile.physical_launch_policy,
-            PhysicalLaunchPolicy::concurrent(request_parallelism).unwrap()
+            PhysicalLaunchPolicy::ExecutionGroupExclusive
         );
         assert!(whisper.stages.iter().all(|stage| {
             stage.batch_mode == NativeBatchMode::None
-                && stage.shape_policy == StageShapePolicy::Independent
+                && stage.max_batch_size == 1
+                && stage.concurrency == ConcurrencyClass::Exclusive
+                && stage.shape_policy == StageShapePolicy::Exact
+                && stage.physical_launch_policy == PhysicalLaunchPolicy::ExecutionGroupExclusive
         }));
 
         for (index, variant) in [
@@ -2544,7 +2498,7 @@ mod tests {
     }
 
     #[test]
-    fn loaded_contracts_reject_unknown_policy_and_stage_profile_mismatch() {
+    fn loaded_contracts_reject_policy_without_evidence_and_stage_profile_mismatch() {
         let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(1, 3).unwrap();
         let unknown = LoadedModelBundleDraft::build(
             &registry,
@@ -2585,35 +2539,15 @@ mod tests {
                 .into();
             let error = contract
                 .validate_physical_launch_policy()
-                .expect_err("uncertified model policy must fail closed");
+                .expect_err("unsupported model policy must fail closed");
             assert!(error
                 .to_string()
-                .contains("uncertified physical launch policy"));
+                .contains("no production concurrency evidence is available"));
         }
 
-        let whisper = LoadedModelBundleDraft::build(
-            &registry,
-            ExecutionGroupId::new(43),
-            ModelInstanceId::new(2),
-            ModelVariant::WhisperLargeV3Turbo,
-            BackendKind::Cpu,
-        )
-        .unwrap();
-        let mut mismatch = whisper
-            .execution_contracts(CapabilityKind::Asr)
-            .unwrap()
-            .remove(0);
-        let mut stale_abi = mismatch.clone();
-        stale_abi.adapter_abi_revision = AdapterAbiRevision::new(7);
-        let error = stale_abi
-            .validate_physical_launch_policy()
-            .expect_err("an uncertified adapter ABI must not inherit concurrency");
-        assert!(error
-            .to_string()
-            .contains("uncertified physical launch policy"));
-
+        let mut mismatch = base;
         let mut stages = mismatch.stages.to_vec();
-        stages[0].physical_launch_policy = PhysicalLaunchPolicy::ExecutionGroupExclusive;
+        stages[0].physical_launch_policy = PhysicalLaunchPolicy::ModelExclusive;
         mismatch.stages = stages.into();
         let error = mismatch
             .validate_physical_launch_policy()
@@ -2622,7 +2556,56 @@ mod tests {
     }
 
     #[test]
-    fn only_certified_scalar_adapter_uses_independent_row_width() {
+    fn whisper_metadata_and_scalar_abi_cannot_manufacture_concurrent_policy() {
+        let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(1, 3).unwrap();
+        let whisper = LoadedModelBundleDraft::build(
+            &registry,
+            ExecutionGroupId::new(43),
+            ModelInstanceId::new(2),
+            ModelVariant::WhisperLargeV3Turbo,
+            BackendKind::Cpu,
+        )
+        .unwrap();
+        let mut manufactured = whisper
+            .execution_contracts(CapabilityKind::Asr)
+            .unwrap()
+            .remove(0);
+        assert_eq!(manufactured.adapter_abi_revision, SCALAR_ADAPTER_ABI);
+        assert_eq!(
+            manufactured.metadata.model_variant,
+            ModelVariant::WhisperLargeV3Turbo
+        );
+        assert_eq!(manufactured.metadata.capability, CapabilityKind::Asr);
+
+        let concurrent = PhysicalLaunchPolicy::concurrent(3).unwrap();
+        manufactured.execution_profile.max_batch_size = 3;
+        manufactured.execution_profile.concurrency = ConcurrencyClass::Batchable;
+        manufactured.execution_profile.physical_launch_policy = concurrent;
+        manufactured.stages = manufactured
+            .stages
+            .iter()
+            .cloned()
+            .map(|mut stage| {
+                stage.max_batch_size = 3;
+                stage.max_work_units = 3;
+                stage.concurrency = ConcurrencyClass::Batchable;
+                stage.shape_policy = StageShapePolicy::Independent;
+                stage.physical_launch_policy = concurrent;
+                stage
+            })
+            .collect::<Vec<_>>()
+            .into();
+
+        let error = manufactured
+            .validate_physical_launch_policy()
+            .expect_err("metadata and adapter ABI are not concurrency evidence");
+        assert!(error
+            .to_string()
+            .contains("no production concurrency evidence is available"));
+    }
+
+    #[test]
+    fn scalar_adapters_remain_exact_width_one_without_concurrency_evidence() {
         let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(1, 3).unwrap();
 
         for (index, variant) in ModelVariant::all().iter().copied().enumerate() {
@@ -2648,26 +2631,23 @@ mod tests {
                     .unwrap_or_else(|error| panic!("failed to contract {variant}: {error}"));
                 for contract in contract {
                     assert_eq!(contract.adapter_abi_revision, SCALAR_ADAPTER_ABI);
-                    let certified = variant == ModelVariant::WhisperLargeV3Turbo
-                        && metadata.capability == CapabilityKind::Asr;
-                    let expected_width = if certified { 3 } else { 1 };
-                    assert_eq!(contract.execution_profile.max_batch_size, expected_width);
+                    assert_eq!(contract.execution_profile.max_batch_size, 1);
                     assert_eq!(
                         contract.execution_profile.concurrency,
-                        if certified {
-                            ConcurrencyClass::Batchable
-                        } else {
-                            ConcurrencyClass::Exclusive
-                        }
+                        ConcurrencyClass::Exclusive
                     );
-                    assert_eq!(contract.stages[0].max_batch_size, expected_width);
+                    assert_eq!(
+                        contract.execution_profile.physical_launch_policy,
+                        PhysicalLaunchPolicy::ExecutionGroupExclusive
+                    );
+                    assert_eq!(contract.stages[0].max_batch_size, 1);
                     assert_eq!(
                         contract.stages[0].shape_policy,
-                        if certified {
-                            crate::engine::StageShapePolicy::Independent
-                        } else {
-                            crate::engine::StageShapePolicy::Exact
-                        }
+                        crate::engine::StageShapePolicy::Exact
+                    );
+                    assert_eq!(
+                        contract.stages[0].physical_launch_policy,
+                        PhysicalLaunchPolicy::ExecutionGroupExclusive
                     );
                 }
             }
