@@ -1,6 +1,6 @@
 //! Configuration types for the Izwi TTS engine
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -299,19 +299,42 @@ impl FromStr for PhysicalExecutionMode {
 ///
 /// A distinct type prevents this capacity from being confused with the width
 /// of one tensor invocation or with any logical scheduler/session capacity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct PhysicalInFlightLimit(NonZeroUsize);
 
 impl PhysicalInFlightLimit {
+    /// Operational ceiling well below Tokio's semaphore panic boundary. A
+    /// physical launch count above this value is a configuration error rather
+    /// than a meaningful inference setting.
+    pub const MAX: usize = 1024;
+
     pub fn new(limit: usize) -> Result<Self> {
-        NonZeroUsize::new(limit).map(Self).ok_or_else(|| {
+        let limit = NonZeroUsize::new(limit).ok_or_else(|| {
             Error::ConfigError("max physical in-flight must be greater than zero".into())
-        })
+        })?;
+        if limit.get() > Self::MAX {
+            return Err(Error::ConfigError(format!(
+                "max physical in-flight {} exceeds the supported limit {}",
+                limit,
+                Self::MAX
+            )));
+        }
+        Ok(Self(limit))
     }
 
     pub const fn get(self) -> usize {
         self.0.get()
+    }
+}
+
+impl<'de> Deserialize<'de> for PhysicalInFlightLimit {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let limit = usize::deserialize(deserializer)?;
+        Self::new(limit).map_err(serde::de::Error::custom)
     }
 }
 
@@ -1028,6 +1051,7 @@ mod managed_kv_default_tests {
             r#"{"physical_execution_mode":"off"}"#,
             r#"{"physical_execution_mode":"parallel"}"#,
             r#"{"max_physical_in_flight":0}"#,
+            r#"{"max_physical_in_flight":1025}"#,
         ] {
             assert!(
                 serde_json::from_str::<EngineConfig>(invalid).is_err(),
@@ -1036,6 +1060,7 @@ mod managed_kv_default_tests {
         }
 
         assert!(PhysicalInFlightLimit::new(0).is_err());
+        assert!(PhysicalInFlightLimit::new(PhysicalInFlightLimit::MAX + 1).is_err());
     }
 
     #[test]
