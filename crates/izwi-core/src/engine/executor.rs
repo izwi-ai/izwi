@@ -43,7 +43,10 @@ use super::execution::{
     NativeBatchMode, OutcomeProvenance, PhysicalBatch, PhysicalLaunchPolicy, PlanId, PrefillMode,
     RetryDisposition, SessionKey, StageProgressKind, WorkUnit, YieldReason,
 };
-use super::metrics::begin_engine_physical_dispatch;
+use super::metrics::{
+    begin_engine_physical_dispatch, record_engine_physical_defer, record_engine_physical_fallback,
+    EnginePhysicalDeferReason, EnginePhysicalFallbackReason,
+};
 use super::output::StreamingOutput;
 use super::request::EngineCoreRequest;
 use super::resources::{BatchWorkspaceLease, ResourceAuthority, ResourceVector};
@@ -1644,9 +1647,7 @@ impl NativeExecutor {
                 Err(payload) => {
                     let message = panic_payload_to_string(payload.as_ref());
                     error!("Model execution panicked: {message}");
-                    Err(Error::InferenceError(format!(
-                        "Model execution panicked: {message}"
-                    )))
+                    std::panic::resume_unwind(payload)
                 }
             }
         };
@@ -2144,11 +2145,13 @@ impl UnifiedExecutor {
         requests: &[&EngineCoreRequest],
     ) -> PhysicalLaunchPolicy {
         if requests.len() != batch.rows.len() {
+            record_engine_physical_fallback(EnginePhysicalFallbackReason::BatchIncompatible);
             return PhysicalLaunchPolicy::ExecutionGroupExclusive;
         }
         let mut policy = None;
         for (request, row) in requests.iter().zip(&batch.rows) {
             let Some(binding) = request.execution_adapter_binding() else {
+                record_engine_physical_fallback(EnginePhysicalFallbackReason::UncertifiedProfile);
                 return PhysicalLaunchPolicy::ExecutionGroupExclusive;
             };
             if binding.execution_group_id != batch.lane.execution_group
@@ -2157,45 +2160,89 @@ impl UnifiedExecutor {
                 || binding.adapter_abi_revision != batch.lane.adapter_abi
                 || binding.capability_id != batch.lane.capability_id
             {
+                record_engine_physical_fallback(EnginePhysicalFallbackReason::AdapterUnsupported);
                 return PhysicalLaunchPolicy::ExecutionGroupExclusive;
             }
             let Ok(stage) = binding.stage_for_work(&row.work) else {
+                record_engine_physical_fallback(EnginePhysicalFallbackReason::AdapterUnsupported);
                 return PhysicalLaunchPolicy::ExecutionGroupExclusive;
             };
             if stage.id != batch.lane.stage_id || stage.batch_mode != batch.mode {
+                record_engine_physical_fallback(EnginePhysicalFallbackReason::BatchIncompatible);
                 return PhysicalLaunchPolicy::ExecutionGroupExclusive;
             }
             match policy {
                 None => policy = Some(stage.physical_launch_policy),
                 Some(active) if active == stage.physical_launch_policy => {}
-                Some(_) => return PhysicalLaunchPolicy::ExecutionGroupExclusive,
+                Some(_) => {
+                    record_engine_physical_fallback(
+                        EnginePhysicalFallbackReason::BatchIncompatible,
+                    );
+                    return PhysicalLaunchPolicy::ExecutionGroupExclusive;
+                }
             }
         }
-        policy.unwrap_or(PhysicalLaunchPolicy::ExecutionGroupExclusive)
+        policy.unwrap_or_else(|| {
+            record_engine_physical_fallback(EnginePhysicalFallbackReason::UncertifiedProfile);
+            PhysicalLaunchPolicy::ExecutionGroupExclusive
+        })
     }
 
     pub(super) fn reserve_batch_workspace(
         &self,
         batch: &PhysicalBatch,
     ) -> Result<Option<BatchWorkspaceLease>> {
-        if batch.workspace.workspace_bytes()? == 0 {
+        let workspace_bytes = match batch.workspace.workspace_bytes() {
+            Ok(workspace_bytes) => workspace_bytes,
+            Err(error) => {
+                record_engine_physical_fallback(EnginePhysicalFallbackReason::BatchIncompatible);
+                return Err(error);
+            }
+        };
+        if workspace_bytes == 0 {
             return Ok(None);
         }
-        let context = self.batch_workspace.as_ref().ok_or_else(|| {
-            Error::Overloaded(
+        let Some(context) = self.batch_workspace.as_ref() else {
+            record_engine_physical_defer(EnginePhysicalDeferReason::WorkspaceCapacity);
+            return Err(Error::Overloaded(
                 "physical batch requires workspace but no resource authority is installed"
                     .to_string(),
-            )
-        })?;
+            ));
+        };
         if batch.lane.backend != context.backend {
+            record_engine_physical_fallback(EnginePhysicalFallbackReason::BatchIncompatible);
             return Err(Error::InvalidInput(
                 "physical batch workspace backend does not match its executor".to_string(),
             ));
         }
-        context
+        let reservation = context
             .authority
             .reserve_batch_workspace(batch.lane.execution_group, batch.batch_id, batch.workspace)
-            .map(Some)
+            .map(Some);
+        if let Err(error) = &reservation {
+            match error {
+                Error::Overloaded(_) => {
+                    record_engine_physical_defer(EnginePhysicalDeferReason::WorkspaceCapacity)
+                }
+                _ => {
+                    record_engine_physical_fallback(EnginePhysicalFallbackReason::BatchIncompatible)
+                }
+            }
+        }
+        reservation
+    }
+
+    /// Permanently fail physical admission after a panic crossed native/model
+    /// entry. Per-model recovery is not available, so both execution capacity
+    /// and the shared resource authority fail closed until runtime recreation.
+    pub(super) fn poison_physical_runtime(&self, reason: impl Into<String>) {
+        let reason = reason.into();
+        if let Some(admission) = &self.physical_execution_admission {
+            admission.poison(reason.clone());
+        }
+        if let Some(context) = &self.batch_workspace {
+            context.authority.poison(reason);
+        }
     }
 
     /// Acquire physical execution capacity for one validated batch envelope.
@@ -2214,6 +2261,7 @@ impl UnifiedExecutor {
         }
         .validate()
         .map_err(|error| {
+            record_engine_physical_fallback(EnginePhysicalFallbackReason::BatchIncompatible);
             PhysicalDispatchError::not_started(error, width, FailureOrigin::ExecutorValidation)
         })?;
         if !requests.is_empty() && requests.iter().all(|request| request.is_cancelled()) {
@@ -2314,16 +2362,49 @@ impl UnifiedExecutor {
                 })
                 .collect());
         }
+        if let Some(admission) = &self.physical_execution_admission {
+            if let Err(error) = admission.ensure_healthy() {
+                return Err(PhysicalDispatchError::not_started(
+                    error,
+                    admitted.width,
+                    FailureOrigin::DispatchCoordination,
+                ));
+            }
+        }
         let _physical_dispatch = begin_engine_physical_dispatch();
         let executor = self.inner.read().await;
-        let result = executor.execute_physical_batch(PhysicalBatchExecution {
-            batch,
-            requests,
-            scheduled,
-        });
-        drop(executor);
-        drop(admitted);
-        result
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            executor.execute_physical_batch(PhysicalBatchExecution {
+                batch,
+                requests,
+                scheduled,
+            })
+        }));
+        match result {
+            Ok(result) => {
+                drop(executor);
+                drop(admitted);
+                result
+            }
+            Err(payload) => {
+                let message = panic_payload_to_string(payload.as_ref());
+                error!(
+                    batch_id = batch.batch_id.get(),
+                    "Physical model execution panicked after entry: {message}"
+                );
+                record_engine_physical_fallback(EnginePhysicalFallbackReason::DispatchFailure);
+                self.poison_physical_runtime("physical model execution panicked after entry");
+                drop(executor);
+                drop(admitted);
+                Err(PhysicalDispatchError::started(
+                    Error::InferenceError(
+                        "physical model execution panicked; runtime must be recreated".to_string(),
+                    ),
+                    batch.expected_dispatch(),
+                    FailureOrigin::Panic,
+                ))
+            }
+        }
     }
 
     /// Compatibility boundary for callers that do not need to interpose
@@ -2367,6 +2448,13 @@ impl UnifiedExecutor {
 
     /// Check if ready.
     pub async fn is_ready(&self) -> bool {
+        if self
+            .physical_execution_admission
+            .as_ref()
+            .is_some_and(|admission| admission.ensure_healthy().is_err())
+        {
+            return false;
+        }
         let executor = self.inner.read().await;
         executor.is_ready()
     }
@@ -2499,6 +2587,38 @@ mod tests {
                 available: self.capacity,
                 source: CapacitySource::Test,
             }
+        }
+    }
+
+    struct PanickingPhysicalExecutor;
+
+    impl ModelExecutor for PanickingPhysicalExecutor {
+        fn execute_prefill(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            panic!("physical executor panic sentinel");
+        }
+
+        fn execute_decode(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            panic!("physical executor panic sentinel");
+        }
+
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        fn initialize(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&mut self) -> Result<()> {
+            Ok(())
         }
     }
 
@@ -3056,15 +3176,165 @@ mod tests {
     }
 
     #[test]
-    fn test_run_blocking_converts_panic_to_error() {
-        let result = NativeExecutor::run_blocking(|| -> Result<()> {
-            panic!("executor panic sentinel");
-        });
-
-        let Err(Error::InferenceError(message)) = result else {
-            panic!("expected inference error from panic");
+    fn uncertified_physical_policy_fallback_is_observed_in_production_derivation() {
+        let before = super::super::metrics::engine_physical_execution_metrics_snapshot();
+        let request = EngineCoreRequest::tts("uncertified physical policy");
+        let lane = super::super::BatchLaneKey {
+            execution_group: super::super::ExecutionGroupId::new(17),
+            model_instance: super::super::ModelInstanceId::new(18),
+            adapter_instance: super::super::AdapterInstanceId::new(19),
+            adapter_abi: super::super::AdapterAbiRevision::new(1),
+            capability_id: "test".to_string(),
+            stage_id: super::super::StageId::new(1),
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            compute_dtype: "f32".to_string(),
+            state_dtype: "f32".to_string(),
+            tensor_layout: "exact".to_string(),
+            quantization: "none".to_string(),
+            state_schema: "none".to_string(),
+            kernel_mode: "test".to_string(),
+            semantic_mode: "test".to_string(),
+            shape_bucket: "exact.1".to_string(),
         };
-        assert!(message.contains("executor panic sentinel"));
+        let batch = PhysicalBatch {
+            batch_id: super::super::BatchId::new(20),
+            lane: lane.clone(),
+            mode: NativeBatchMode::None,
+            budget: super::super::BatchBudget::width_one(),
+            rows: vec![super::super::ReadyQuantum {
+                plan_id: 1,
+                session: SessionKey::new(request.id.clone(), 1),
+                lane,
+                work: super::super::WorkUnit::AtomicJob {
+                    kind: "test".to_string(),
+                },
+                cost: super::super::WorkCost::new(1, 1, 0),
+                managed_cache: None,
+            }],
+            materialized_tensor_elements: 1,
+            workspace: ResourceVector::zero(),
+        };
+
+        assert_eq!(
+            UnifiedExecutor::explicit_physical_launch_policy(&batch, &[&request]),
+            PhysicalLaunchPolicy::ExecutionGroupExclusive
+        );
+        let after = super::super::metrics::engine_physical_execution_metrics_snapshot();
+        assert!(
+            after.fallbacks.uncertified_profile
+                >= before.fallbacks.uncertified_profile.saturating_add(1)
+        );
+    }
+
+    #[test]
+    fn test_run_blocking_propagates_panic_to_physical_boundary() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            NativeExecutor::run_blocking(|| -> Result<()> {
+                panic!("executor panic sentinel");
+            })
+        }));
+
+        let payload = result.expect_err("model panic must cross the native boundary");
+        assert!(panic_payload_to_string(payload.as_ref()).contains("executor panic sentinel"));
+    }
+
+    #[tokio::test]
+    async fn post_entry_panic_poisons_physical_runtime_and_releases_admission() {
+        let authority = Arc::new(ResourceAuthority::new(Arc::new(FixedCapacityProvider {
+            capacity: ResourceVector {
+                host_bytes: ResourceAmount::Known(64),
+                ..ResourceVector::zero()
+            },
+        })));
+        let admission = PhysicalExecutionAdmission::standalone(1);
+        let executor = UnifiedExecutor::new_for_test_with_physical_context(
+            Box::new(PanickingPhysicalExecutor),
+            BackendKind::Cpu,
+            authority.clone(),
+            admission.clone(),
+        );
+        let mut request = EngineCoreRequest::tts("panic containment");
+        request.id = "panic-containment".to_string();
+        let lane = super::super::BatchLaneKey {
+            execution_group: super::super::ExecutionGroupId::new(27),
+            model_instance: super::super::ModelInstanceId::new(28),
+            adapter_instance: super::super::AdapterInstanceId::new(29),
+            adapter_abi: super::super::AdapterAbiRevision::new(1),
+            capability_id: "panic-test".to_string(),
+            stage_id: super::super::StageId::new(1),
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            compute_dtype: "f32".to_string(),
+            state_dtype: "f32".to_string(),
+            tensor_layout: "exact".to_string(),
+            quantization: "none".to_string(),
+            state_schema: "none".to_string(),
+            kernel_mode: "test".to_string(),
+            semantic_mode: "test".to_string(),
+            shape_bucket: "exact.1".to_string(),
+        };
+        let work = super::super::WorkUnit::AtomicJob {
+            kind: "panic-test".to_string(),
+        };
+        let batch = PhysicalBatch {
+            batch_id: super::super::BatchId::new(30),
+            lane: lane.clone(),
+            mode: NativeBatchMode::None,
+            budget: super::super::BatchBudget::width_one(),
+            rows: vec![super::super::ReadyQuantum {
+                plan_id: 1,
+                session: SessionKey::new(request.id.clone(), 1),
+                lane: lane.clone(),
+                work: work.clone(),
+                cost: super::super::WorkCost::new(1, 1, 0),
+                managed_cache: None,
+            }],
+            materialized_tensor_elements: 1,
+            workspace: ResourceVector::zero(),
+        };
+        let scheduled = ScheduledRequest {
+            plan_id: 1,
+            request_id: request.id.clone(),
+            sequence_id: 1,
+            num_tokens: 1,
+            is_prefill: true,
+            num_computed_tokens: 0,
+            work,
+        };
+
+        let failure = executor
+            .execute_physical_batch(&batch, &[&request], &[scheduled])
+            .await
+            .expect_err("physical panic must become a typed dispatch failure");
+        assert_eq!(failure.provenance.dispatch_state, DispatchState::Started);
+        assert_eq!(
+            failure.provenance.failure_origin,
+            Some(FailureOrigin::Panic)
+        );
+        assert_eq!(admission.active(), 0);
+        assert_eq!(
+            admission.poison_reason().as_deref(),
+            Some("physical model execution panicked after entry")
+        );
+        assert_eq!(
+            authority.poison_reason().as_deref(),
+            Some("physical model execution panicked after entry")
+        );
+        assert!(!executor.is_ready().await);
+        assert!(matches!(
+            admission
+                .acquire_dispatch(
+                    lane.execution_group,
+                    lane.model_instance,
+                    PhysicalLaunchPolicy::ExecutionGroupExclusive,
+                    NativeBatchMode::None,
+                    1,
+                    None,
+                )
+                .await,
+            Err(Error::Overloaded(message)) if message.contains("poisoned")
+        ));
     }
 
     #[test]

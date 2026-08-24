@@ -79,6 +79,7 @@ pub struct CoordinatorSnapshot {
     pub rejected_total: u64,
     pub expired_total: u64,
     pub draining: bool,
+    pub poisoned: bool,
 }
 
 /// Cloneable handle to the one fair physical-launch semaphore shared by the
@@ -97,6 +98,7 @@ struct PhysicalExecutionAdmissionInner {
     models: Mutex<HashMap<(ExecutionGroupId, ModelInstanceId), Weak<ModelPhysicalAdmission>>>,
     active: AtomicUsize,
     idle: Arc<Notify>,
+    poison_reason: Mutex<Option<String>>,
 }
 
 #[derive(Debug)]
@@ -146,6 +148,7 @@ impl PhysicalExecutionAdmission {
                 models: Mutex::new(HashMap::new()),
                 active: AtomicUsize::new(0),
                 idle,
+                poison_reason: Mutex::new(None),
             }),
         }
     }
@@ -154,8 +157,67 @@ impl PhysicalExecutionAdmission {
         self.inner.capacity
     }
 
-    fn active(&self) -> usize {
+    pub(crate) fn active(&self) -> usize {
         self.inner.active.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn poison_reason(&self) -> Option<String> {
+        self.inner
+            .poison_reason
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn ensure_healthy(&self) -> Result<()> {
+        if let Some(reason) = self.poison_reason() {
+            return Err(Error::Overloaded(format!(
+                "physical inference runtime is poisoned and must be recreated: {reason}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn poison(&self, reason: impl Into<String>) {
+        let inserted = {
+            let mut poison_reason = self
+                .inner
+                .poison_reason
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if poison_reason.is_some() {
+                false
+            } else {
+                *poison_reason = Some(reason.into());
+                true
+            }
+        };
+        if !inserted {
+            return;
+        }
+
+        self.inner.permits.close();
+        for admission in self
+            .inner
+            .groups
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .values()
+            .filter_map(Weak::upgrade)
+        {
+            admission.permits.close();
+        }
+        for admission in self
+            .inner
+            .models
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .values()
+            .filter_map(Weak::upgrade)
+        {
+            admission.permits.close();
+        }
+        self.inner.idle.notify_waiters();
     }
 
     fn required_units(
@@ -197,6 +259,7 @@ impl PhysicalExecutionAdmission {
         row_width: usize,
         deadline: Option<Instant>,
     ) -> Result<PhysicalExecutionLease> {
+        self.ensure_healthy()?;
         if self
             .inner
             .execution_group
@@ -257,6 +320,7 @@ impl PhysicalExecutionAdmission {
         model: Option<Arc<ModelPhysicalAdmission>>,
         model_permit: Option<OwnedSemaphorePermit>,
     ) -> Result<PhysicalExecutionLease> {
+        self.ensure_healthy()?;
         if units == 0 {
             return Err(Error::InvalidInput(
                 "execution units must be greater than zero".to_string(),
@@ -270,6 +334,7 @@ impl PhysicalExecutionAdmission {
         }
         let permit =
             Self::acquire_from(self.inner.permits.clone(), units, deadline, "device").await?;
+        self.ensure_healthy()?;
         self.inner.active.fetch_add(1, Ordering::AcqRel);
         Ok(PhysicalExecutionLease {
             admission: self.clone(),
@@ -305,6 +370,9 @@ impl PhysicalExecutionAdmission {
         scope: &'static str,
     ) -> Result<OwnedSemaphorePermit> {
         if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+            crate::engine::metrics::record_engine_physical_defer(
+                crate::engine::metrics::EnginePhysicalDeferReason::ExecutionCapacity,
+            );
             return Err(Error::Timeout(format!("{scope} execution capacity")));
         }
         let units = u32::try_from(units).map_err(|_| {
@@ -312,16 +380,30 @@ impl PhysicalExecutionAdmission {
         })?;
         let acquire = permits.acquire_many_owned(units);
         let permit = match deadline {
-            Some(deadline) => tokio::time::timeout_at(deadline.into(), acquire)
-                .await
-                .map_err(|_| Error::Timeout(format!("{scope} execution capacity")))?
-                .map_err(|_| Error::Overloaded("coordinator closed".to_string()))?,
+            Some(deadline) => match tokio::time::timeout_at(deadline.into(), acquire).await {
+                Ok(acquired) => {
+                    acquired.map_err(|_| Error::Overloaded("coordinator closed".to_string()))
+                }
+                Err(_) => Err(Error::Timeout(format!("{scope} execution capacity"))),
+            },
             None => acquire
                 .await
-                .map_err(|_| Error::Overloaded("coordinator closed".to_string()))?,
+                .map_err(|_| Error::Overloaded("coordinator closed".to_string())),
+        };
+        let permit = match permit {
+            Ok(permit) => permit,
+            Err(error) => {
+                crate::engine::metrics::record_engine_physical_defer(
+                    crate::engine::metrics::EnginePhysicalDeferReason::ExecutionCapacity,
+                );
+                return Err(error);
+            }
         };
         if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
             drop(permit);
+            crate::engine::metrics::record_engine_physical_defer(
+                crate::engine::metrics::EnginePhysicalDeferReason::ExecutionCapacity,
+            );
             return Err(Error::Timeout(format!("{scope} execution capacity")));
         }
         Ok(permit)
@@ -521,6 +603,7 @@ impl InferenceCoordinator {
             rejected_total: self.rejected_total.load(Ordering::Relaxed),
             expired_total: self.expired_total.load(Ordering::Relaxed),
             draining: self.draining.load(Ordering::Acquire),
+            poisoned: self.execution.poison_reason().is_some(),
         }
     }
 
@@ -579,6 +662,10 @@ impl InferenceCoordinator {
             self.rejected_total.fetch_add(1, Ordering::Relaxed);
             return Err(Error::Overloaded("runtime is draining".to_string()));
         }
+        if let Err(error) = self.execution.ensure_healthy() {
+            self.rejected_total.fetch_add(1, Ordering::Relaxed);
+            return Err(error);
+        }
         if spec
             .deadline
             .is_some_and(|deadline| deadline <= Instant::now())
@@ -632,6 +719,10 @@ impl InferenceCoordinator {
         if self.draining.load(Ordering::Acquire) {
             self.rejected_total.fetch_add(1, Ordering::Relaxed);
             return Err(Error::Overloaded("runtime is draining".to_string()));
+        }
+        if let Err(error) = self.execution.ensure_healthy() {
+            self.rejected_total.fetch_add(1, Ordering::Relaxed);
+            return Err(error);
         }
         self.active_model_loads.fetch_add(1, Ordering::AcqRel);
         Ok(ModelLoadLease {
@@ -1074,6 +1165,7 @@ impl InferenceCoordinator {
                 deadline,
             )
             .await?;
+        self.execution.ensure_healthy()?;
         self.run_blocking_task(job, execution, "inference", operation)
             .await
     }
@@ -1094,6 +1186,8 @@ impl InferenceCoordinator {
         let request_id = job.spec.request_id.clone();
         let retained_job = job.clone();
         let blocking_request_id = request_id.clone();
+        let poison_admission = self.execution.clone();
+        let poison_resources = self.resources.clone();
         let handle = tokio::task::spawn_blocking(move || {
             let _guard = guard;
             let _job = retained_job;
@@ -1102,6 +1196,17 @@ impl InferenceCoordinator {
             }
             let _physical_dispatch = (task_kind == "inference")
                 .then(crate::engine::metrics::begin_engine_physical_dispatch);
+            if task_kind == "inference" {
+                return match std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)) {
+                    Ok(result) => result,
+                    Err(payload) => {
+                        let reason = "blocking inference task panicked after entry";
+                        poison_admission.poison(reason);
+                        poison_resources.poison(reason);
+                        std::panic::resume_unwind(payload)
+                    }
+                };
+            }
             operation()
         });
         let joined = match deadline {
@@ -1113,9 +1218,14 @@ impl InferenceCoordinator {
                 })?,
             None => handle.await,
         };
-        let result = joined.map_err(|err| {
-            Error::InferenceError(format!("blocking {task_kind} task failed: {err}"))
-        })?;
+        let result = match joined {
+            Ok(result) => result,
+            Err(err) => {
+                return Err(Error::InferenceError(format!(
+                    "blocking {task_kind} task failed: {err}"
+                )));
+            }
+        };
         if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
             self.expired_total.fetch_add(1, Ordering::Relaxed);
             return Err(Error::Timeout(request_id));
@@ -3208,6 +3318,47 @@ Pages free: 10.\n";
     }
 
     #[tokio::test]
+    async fn physical_broker_records_wait_observations_and_capacity_defers() {
+        let before = crate::engine::engine_physical_execution_metrics_snapshot();
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 8));
+        let admission = coordinator.physical_execution_admission();
+        let group = coordinator.execution_group_id();
+        let model = ModelInstanceId::new(35);
+        let held = admission
+            .acquire_dispatch(
+                group,
+                model,
+                PhysicalLaunchPolicy::ModelExclusive,
+                NativeBatchMode::None,
+                1,
+                None,
+            )
+            .await
+            .unwrap();
+        let rejected = admission
+            .acquire_dispatch(
+                group,
+                model,
+                PhysicalLaunchPolicy::ModelExclusive,
+                NativeBatchMode::None,
+                1,
+                Some(Instant::now() + Duration::from_millis(5)),
+            )
+            .await;
+        assert!(matches!(rejected, Err(Error::Timeout(_))));
+        drop(held);
+
+        let after = crate::engine::engine_physical_execution_metrics_snapshot();
+        assert!(
+            after.permit_wait.observations_total
+                >= before.permit_wait.observations_total.saturating_add(2)
+        );
+        assert!(
+            after.defers.execution_capacity >= before.defers.execution_capacity.saturating_add(1)
+        );
+    }
+
+    #[tokio::test]
     async fn model_exclusive_is_model_scoped_and_group_exclusive_blocks_every_model() {
         let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 2, 8));
         let admission = coordinator.physical_execution_admission();
@@ -3937,10 +4088,10 @@ Pages free: 10.\n";
     #[tokio::test]
     async fn blocking_stage_maps_worker_panics_and_releases_execution() {
         let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 4));
-        let job = coordinator.admit(job("blocking-panic")).await.unwrap();
+        let admitted = coordinator.admit(job("blocking-panic")).await.unwrap();
 
         let result = coordinator
-            .run_blocking_stage::<(), _>(&job, || panic!("test blocking panic"))
+            .run_blocking_stage::<(), _>(&admitted, || panic!("test blocking panic"))
             .await;
 
         assert!(matches!(
@@ -3949,8 +4100,41 @@ Pages free: 10.\n";
                 if message.contains("blocking inference task failed")
         ));
         assert_eq!(coordinator.snapshot().active_executions, 0);
-        drop(job);
+        assert!(coordinator.snapshot().poisoned);
+        drop(admitted);
         assert_eq!(coordinator.snapshot().active_jobs, 0);
+        assert!(matches!(
+            coordinator.admit(job("after-blocking-panic")).await,
+            Err(Error::Overloaded(message)) if message.contains("poisoned")
+        ));
+    }
+
+    #[tokio::test]
+    async fn timed_out_blocking_panic_still_poisons_the_detached_runtime() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 4));
+        let mut spec = job("detached-blocking-panic");
+        spec.deadline = Some(Instant::now() + Duration::from_millis(5));
+        let admitted = coordinator.admit(spec).await.unwrap();
+
+        let result = coordinator
+            .run_blocking_stage::<(), _>(&admitted, || {
+                std::thread::sleep(Duration::from_millis(25));
+                panic!("detached blocking panic")
+            })
+            .await;
+        assert!(matches!(result, Err(Error::Timeout(_))));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !coordinator.snapshot().poisoned {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached post-entry panic did not poison the runtime");
+        assert!(matches!(
+            coordinator.admit(job("after-detached-panic")).await,
+            Err(Error::Overloaded(message)) if message.contains("poisoned")
+        ));
     }
 
     #[tokio::test]

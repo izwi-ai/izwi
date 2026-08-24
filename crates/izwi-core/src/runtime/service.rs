@@ -2977,7 +2977,9 @@ izwi_inference_coordinator_rejected_total {}\n\
 # TYPE izwi_inference_coordinator_expired_total counter\n\
 izwi_inference_coordinator_expired_total {}\n\
 # TYPE izwi_inference_coordinator_draining gauge\n\
-izwi_inference_coordinator_draining {}\n",
+izwi_inference_coordinator_draining {}\n\
+# TYPE izwi_inference_coordinator_poisoned gauge\n\
+izwi_inference_coordinator_poisoned {}\n",
             snapshot.capacity,
             snapshot.active_jobs,
             snapshot.active_executions,
@@ -2989,6 +2991,7 @@ izwi_inference_coordinator_draining {}\n",
             snapshot.rejected_total,
             snapshot.expired_total,
             u8::from(snapshot.draining),
+            u8::from(snapshot.poisoned),
         ));
     }
 
@@ -4606,6 +4609,7 @@ mod tests {
         assert!(payload.contains("izwi_inference_coordinator_reserved_device_memory_bytes"));
         assert!(payload.contains("izwi_inference_coordinator_reserved_unified_memory_bytes"));
         assert!(payload.contains("izwi_inference_coordinator_draining 0"));
+        assert!(payload.contains("izwi_inference_coordinator_poisoned 0"));
 
         let snapshot = runtime.telemetry_snapshot().await;
         assert_eq!(snapshot.coordinator, runtime.coordinator_snapshot());

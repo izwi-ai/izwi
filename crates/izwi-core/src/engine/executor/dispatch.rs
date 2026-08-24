@@ -193,9 +193,7 @@ impl NativeExecutor {
                     route = route.name,
                     "Executor request handling panicked: {message}"
                 );
-                Err(Error::InferenceError(format!(
-                    "Executor request handling panicked: {message}"
-                )))
+                std::panic::resume_unwind(payload)
             }
         };
 
