@@ -5543,12 +5543,19 @@ mod tests {
     }
 
     #[test]
-    fn independent_compatibility_rows_form_bounded_parallel_batches() {
+    fn certified_independent_rows_form_bounded_scalar_candidates() {
         let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
             Mutex::new(Vec::new()),
         ))));
-        let mut core = EngineCore::new_with_unified_executor(EngineCoreConfig::default(), executor)
-            .expect("core");
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                physical_execution_mode: crate::config::PhysicalExecutionMode::Concurrent,
+                max_physical_in_flight: crate::config::PhysicalInFlightLimit::new(2).unwrap(),
+                ..EngineCoreConfig::default()
+            },
+            executor,
+        )
+        .expect("core");
         let ids = [
             "parallel-a",
             "parallel-b",
@@ -5571,6 +5578,7 @@ mod tests {
         let mut profile =
             ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
         profile.concurrency = ConcurrencyClass::Batchable;
+        profile.physical_launch_policy = PhysicalLaunchPolicy::concurrent(2).unwrap();
         profile.max_batch_size = 2;
         let stage = super::super::StageDescriptor::from_execution_profile(
             super::super::StageId::new(6),
@@ -5630,7 +5638,7 @@ mod tests {
             .iter()
             .map(|batch| batch.physical_batch().rows.len())
             .collect::<Vec<_>>();
-        assert_eq!(widths, vec![2]);
+        assert_eq!(widths, vec![1, 1]);
         assert_eq!(deferred.len(), 3);
         assert!(batches
             .iter()

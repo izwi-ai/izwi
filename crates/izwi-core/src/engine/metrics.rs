@@ -1847,6 +1847,8 @@ mod tests {
     #[test]
     fn physical_execution_metrics_have_bounded_dimensions_and_drop_scoped_lifecycle() {
         let before = engine_physical_execution_metrics_snapshot();
+        let before_cohort_wait_nanos = ENGINE_PHYSICAL_COHORT_WAIT_NANOS.load(Ordering::Relaxed);
+        let before_permit_wait_nanos = ENGINE_PHYSICAL_PERMIT_WAIT_NANOS.load(Ordering::Relaxed);
         set_engine_effective_physical_execution(EnginePhysicalExecutionMode::Concurrent, 4);
         record_engine_physical_cohort_wait(Duration::from_millis(3));
         record_engine_physical_permit_wait(Duration::from_millis(5));
@@ -1877,9 +1879,17 @@ mod tests {
         assert!(active.dispatches_max_in_flight >= active.dispatches_in_flight);
         assert!(active.dispatches_started_total >= before.dispatches_started_total + 2);
         assert!(active.cohort_wait.observations_total > before.cohort_wait.observations_total);
-        assert!(active.cohort_wait.total_seconds >= before.cohort_wait.total_seconds + 0.003);
+        assert!(
+            ENGINE_PHYSICAL_COHORT_WAIT_NANOS.load(Ordering::Relaxed)
+                >= before_cohort_wait_nanos
+                    .saturating_add(duration_nanos(Duration::from_millis(3)))
+        );
         assert!(active.permit_wait.observations_total > before.permit_wait.observations_total);
-        assert!(active.permit_wait.total_seconds >= before.permit_wait.total_seconds + 0.005);
+        assert!(
+            ENGINE_PHYSICAL_PERMIT_WAIT_NANOS.load(Ordering::Relaxed)
+                >= before_permit_wait_nanos
+                    .saturating_add(duration_nanos(Duration::from_millis(5)))
+        );
         assert_eq!(
             active.dispatch_duration.observations_total,
             before.dispatch_duration.observations_total
