@@ -2870,7 +2870,7 @@ impl EngineCore {
                     return Err(error);
                 }
             };
-        } else if !decode_scheduled.is_empty() && !(candidate_capacity == 1 && both_phases) {
+        } else if !(decode_scheduled.is_empty() || candidate_capacity == 1 && both_phases) {
             transaction_deferred.extend(decode_scheduled.iter().cloned());
         }
 
