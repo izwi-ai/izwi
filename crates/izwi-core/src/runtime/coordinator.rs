@@ -1100,6 +1100,8 @@ impl InferenceCoordinator {
             if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
                 return Err(Error::Timeout(blocking_request_id));
             }
+            let _physical_dispatch = (task_kind == "inference")
+                .then(crate::engine::metrics::begin_engine_physical_dispatch);
             operation()
         });
         let joined = match deadline {
@@ -3355,6 +3357,29 @@ Pages free: 10.\n";
         *lock.lock().unwrap_or_else(|poison| poison.into_inner()) = true;
         wake.notify_all();
         direct.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_inference_records_physical_dispatch_lifetime() {
+        let before = crate::engine::engine_physical_execution_metrics_snapshot();
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 4));
+        let job = coordinator
+            .admit(job("direct-physical-metrics"))
+            .await
+            .unwrap();
+
+        coordinator
+            .run_blocking_stage_inner(&job, || Ok(()))
+            .await
+            .unwrap();
+
+        let after = crate::engine::engine_physical_execution_metrics_snapshot();
+        assert!(
+            after.dispatches_started_total >= before.dispatches_started_total.saturating_add(1)
+        );
+        assert!(
+            after.dispatches_completed_total >= before.dispatches_completed_total.saturating_add(1)
+        );
     }
 
     #[tokio::test]
