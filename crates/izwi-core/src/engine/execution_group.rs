@@ -25,8 +25,9 @@ use super::execution::{
     PhysicalLaunchPolicy, RetryDisposition, StateDisposition,
 };
 use super::executor::{
-    ExecutorOutput, ExecutorStepResult, PhysicalDispatchResult, StreamDeliveryFailure,
-    StreamDeliveryFailureKind, UnifiedExecutor,
+    ExecutorOutput, ExecutorStepResult, ModelSessionResult, PhysicalDispatchResult,
+    PhysicalExecutionAdmissionOutcome, StreamDeliveryFailure, StreamDeliveryFailureKind,
+    UnifiedExecutor,
 };
 use super::metrics::{
     begin_engine_physical_workspace, record_engine_physical_defer, record_engine_physical_fallback,
@@ -666,7 +667,56 @@ async fn execute_dispatches_serial(
     let mut executed = Vec::new();
     for dispatch in dispatches {
         let batch_started = Instant::now();
-        if let Some(results) = pre_dispatch_deadline_results(&dispatch, Instant::now()) {
+        if let Some(results) = pre_device_entry_results(&dispatch, Instant::now()) {
+            executed.push(executed_batch(
+                dispatch,
+                results,
+                batch_started.elapsed(),
+                super::ResourceVector::zero(),
+            ));
+            continue;
+        }
+        let expected_dispatch = dispatch.physical_batch.expected_dispatch();
+        let request_refs: Vec<_> = dispatch.requests.iter().map(Arc::as_ref).collect();
+        let admitted = match executor
+            .acquire_physical_execution(
+                &dispatch.physical_batch,
+                &request_refs,
+                &dispatch.scheduled,
+            )
+            .await
+        {
+            Ok(PhysicalExecutionAdmissionOutcome::Admitted(admitted)) => admitted,
+            Ok(PhysicalExecutionAdmissionOutcome::Cancelled) => {
+                let results = pre_dispatch_all_cancelled_results(&dispatch)
+                    .unwrap_or_else(|| cancelled_before_dispatch_results(&dispatch.scheduled));
+                executed.push(executed_batch(
+                    dispatch,
+                    results,
+                    batch_started.elapsed(),
+                    super::ResourceVector::zero(),
+                ));
+                continue;
+            }
+            Err(error) => {
+                let mut results = reconcile_executor_outputs(
+                    dispatch.phase.label(),
+                    &dispatch.scheduled,
+                    expected_dispatch,
+                    Err(error),
+                );
+                apply_post_dispatch_deadlines(&dispatch, Instant::now(), &mut results);
+                executed.push(executed_batch(
+                    dispatch,
+                    results,
+                    batch_started.elapsed(),
+                    super::ResourceVector::zero(),
+                ));
+                continue;
+            }
+        };
+        if let Some(results) = pre_device_entry_results(&dispatch, Instant::now()) {
+            drop(admitted);
             executed.push(executed_batch(
                 dispatch,
                 results,
@@ -707,7 +757,8 @@ async fn execute_dispatches_serial(
         let _workspace_metrics = workspace
             .as_ref()
             .map(|_| begin_engine_physical_workspace(dispatch.physical_batch.workspace));
-        if let Some(results) = pre_dispatch_deadline_results(&dispatch, Instant::now()) {
+        if let Some(results) = pre_device_entry_results(&dispatch, Instant::now()) {
+            drop(admitted);
             drop(workspace);
             executed.push(executed_batch(
                 dispatch,
@@ -747,11 +798,26 @@ async fn execute_dispatches_serial(
                 continue;
             }
         };
+        if let Some(results) = pre_device_entry_results(&dispatch, Instant::now()) {
+            drop(stream_bindings);
+            drop(workspace);
+            drop(admitted);
+            executed.push(executed_batch(
+                dispatch,
+                results,
+                batch_started.elapsed(),
+                super::ResourceVector::zero(),
+            ));
+            continue;
+        }
         let observed_workspace = dispatch.physical_batch.workspace;
-        let expected_dispatch = dispatch.physical_batch.expected_dispatch();
-        let request_refs: Vec<_> = dispatch.requests.iter().map(Arc::as_ref).collect();
         let result = executor
-            .execute_physical_batch(&dispatch.physical_batch, &request_refs, &dispatch.scheduled)
+            .execute_admitted_physical_batch(
+                admitted,
+                &dispatch.physical_batch,
+                &request_refs,
+                &dispatch.scheduled,
+            )
             .await;
         let mut results = reconcile_executor_outputs(
             dispatch.phase.label(),
@@ -874,6 +940,41 @@ fn pre_dispatch_deadline_results(
             })
             .collect(),
     )
+}
+
+fn pre_dispatch_all_cancelled_results(
+    batch: &PreparedPhysicalDispatch,
+) -> Option<Vec<ExecutorStepResult>> {
+    if batch.requests.is_empty()
+        || batch.requests.len() != batch.scheduled.len()
+        || !batch.requests.iter().all(|request| request.is_cancelled())
+    {
+        return None;
+    }
+    Some(cancelled_before_dispatch_results(&batch.scheduled))
+}
+
+fn cancelled_before_dispatch_results(scheduled: &[ScheduledRequest]) -> Vec<ExecutorStepResult> {
+    let dispatch = super::BatchDispatch::not_dispatched(scheduled.len().max(1));
+    scheduled
+        .iter()
+        .map(|scheduled| {
+            ExecutorStepResult::from_session(
+                scheduled,
+                ModelSessionResult::cancelled_before_dispatch(ExecutorOutput::cancelled(
+                    scheduled.request_id.clone(),
+                )),
+            )
+            .with_dispatch(dispatch)
+        })
+        .collect()
+}
+
+fn pre_device_entry_results(
+    batch: &PreparedPhysicalDispatch,
+    now: Instant,
+) -> Option<Vec<ExecutorStepResult>> {
+    pre_dispatch_deadline_results(batch, now).or_else(|| pre_dispatch_all_cancelled_results(batch))
 }
 
 fn apply_post_dispatch_deadlines(
@@ -1106,16 +1207,20 @@ fn dispatch_state_for(dispatch: super::BatchDispatch) -> DispatchState {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::*;
     use crate::backends::BackendKind;
     use crate::engine::{
         AdapterAbiRevision, AdapterInstanceId, BatchBudget, BatchDispatch, BatchDispatchKind,
-        BatchId, BatchLaneKey, ExecutionGroupId, InputRange, ModelExecutor, ModelInstanceId,
-        NativeBatchMode, PhysicalBatchExecution, PhysicalDispatchError, PhysicalDispatchResult,
-        ReadyQuantum, ResourceVector, SequencePhase, SessionKey, StageId, WorkCost, WorkUnit,
+        BatchId, BatchLaneKey, ExecutionAdapterBinding, ExecutionGroupId, ExecutionMode,
+        ExecutionProfile, InputRange, ModelExecutor, ModelInstanceId, NativeBatchMode,
+        PhysicalBatchExecution, PhysicalDispatchError, PhysicalDispatchResult, ReadyQuantum,
+        ResourceAmount, ResourceVector, SequencePhase, SessionKey, StageDescriptor, StageId,
+        WorkCost, WorkUnit,
     };
+    use crate::model::ModelVariant;
+    use crate::runtime::InferenceCoordinator;
 
     struct CountingExecutor {
         calls: Arc<AtomicUsize>,
@@ -1500,6 +1605,99 @@ mod tests {
             .map(|scheduled| {
                 let mut request = EngineCoreRequest::tts("parallel rows");
                 request.id = scheduled.request_id.clone();
+                Arc::new(request)
+            })
+            .collect::<Vec<_>>();
+        let rows = scheduled
+            .iter()
+            .map(|scheduled| ReadyQuantum {
+                plan_id: scheduled.plan_id,
+                session: scheduled.session_key(),
+                lane: lane.clone(),
+                work: scheduled.work.clone(),
+                cost: WorkCost::new(1, 1, 0),
+                managed_cache: None,
+            })
+            .collect::<Vec<_>>();
+        PreparedPhysicalDispatch::new(
+            ExecutionPhase::Prefill,
+            PhysicalBatch {
+                batch_id: BatchId::new(batch_id),
+                lane,
+                mode: NativeBatchMode::None,
+                budget: BatchBudget {
+                    max_rows: width,
+                    max_logical_units: width as u64,
+                    max_tensor_elements: width as u64,
+                    max_workspace_bytes: 0,
+                    max_padding_basis_points: 0,
+                    max_formation_delay: Duration::ZERO,
+                },
+                rows,
+                materialized_tensor_elements: width as u64,
+                workspace: ResourceVector::zero(),
+            },
+            requests,
+            scheduled,
+            OutputVisibility::AfterQuantumCommit,
+            Vec::new(),
+            policy,
+        )
+        .unwrap()
+    }
+
+    fn prepared_bound_rows_with_policy(
+        batch_id: u64,
+        execution_group: ExecutionGroupId,
+        model_instance: ModelInstanceId,
+        width: usize,
+        policy: PhysicalLaunchPolicy,
+        cancellation: Arc<AtomicBool>,
+    ) -> PreparedPhysicalDispatch {
+        let mut lane = lane();
+        lane.execution_group = execution_group;
+        lane.model_instance = model_instance;
+        let variant = ModelVariant::Kokoro82M;
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, Some(variant), ExecutionMode::Atomic);
+        profile.concurrency = super::super::ConcurrencyClass::Batchable;
+        profile.physical_launch_policy = policy;
+        profile.max_batch_size = width;
+        profile.resolved_from_loaded_model = true;
+        let stage = StageDescriptor::from_execution_profile(
+            lane.stage_id,
+            "test.concurrent.scalar",
+            &profile,
+            NativeBatchMode::None,
+        );
+        let binding = ExecutionAdapterBinding {
+            execution_group_id: lane.execution_group,
+            model_instance_id: lane.model_instance,
+            adapter_instance_id: lane.adapter_instance,
+            adapter_abi_revision: lane.adapter_abi,
+            model_variant: variant,
+            capability_id: lane.capability_id.clone(),
+            stages: Arc::from([stage]),
+        };
+        let scheduled = (0..width)
+            .map(|row| {
+                scheduled(
+                    &format!("cancelled-wide-{row}"),
+                    batch_id * 10 + row as u64,
+                    row as u64 + 1,
+                )
+            })
+            .collect::<Vec<_>>();
+        let requests = scheduled
+            .iter()
+            .map(|scheduled| {
+                let mut request = EngineCoreRequest::tts("cancelled wide FIFO waiter")
+                    .with_model_variant(variant);
+                request.id = scheduled.request_id.clone();
+                request.set_cancellation_signal(cancellation.clone());
+                request
+                    .bind_execution_adapter(binding.clone())
+                    .expect("test execution binding");
                 Arc::new(request)
             })
             .collect::<Vec<_>>();
@@ -2098,6 +2296,301 @@ mod tests {
                 DispatchState::NotStarted,
             )
         );
+    }
+
+    #[tokio::test]
+    async fn queued_engine_dispatch_does_not_reserve_workspace_before_physical_admission() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 4));
+        let authority = coordinator.resource_authority();
+        let admission = coordinator.physical_execution_admission();
+        let group = coordinator.execution_group_id();
+        let blocker = admission
+            .acquire_dispatch(
+                group,
+                ModelInstanceId::new(700),
+                PhysicalLaunchPolicy::ExecutionGroupExclusive,
+                NativeBatchMode::None,
+                1,
+                None,
+            )
+            .await
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let executor = UnifiedExecutor::new_for_test_with_physical_context(
+            Box::new(SleepingPhysicalExecutor {
+                physical_calls: calls.clone(),
+                delay: Duration::ZERO,
+            }),
+            BackendKind::Cpu,
+            authority.clone(),
+            admission,
+        );
+        let request = EngineCoreRequest::tts("workspace after permit");
+        let request_id = request.id.clone();
+        let scheduled = scheduled(&request_id, 700, 1);
+        let mut dispatch =
+            rebind_execution_group(prepared_batch(700, request, scheduled), group.get());
+        dispatch.physical_batch.workspace.host_bytes = ResourceAmount::Known(8);
+        dispatch.physical_batch.rows[0].cost = WorkCost::new(1, 1, 8);
+        let task = tokio::spawn(execute_prepared(PreparedEngineStep::new(
+            executor,
+            vec![dispatch],
+        )));
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!task.is_finished());
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert_eq!(authority.snapshot().reservations, 0);
+
+        drop(blocker);
+        let executed = task.await.unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(authority.snapshot().reservations, 0);
+        assert_eq!(executed.batches.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn deadline_expiring_while_queued_for_a_permit_never_enters_the_executor() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 4));
+        let admission = coordinator.physical_execution_admission();
+        let group = coordinator.execution_group_id();
+        let blocker = admission
+            .acquire_dispatch(
+                group,
+                ModelInstanceId::new(710),
+                PhysicalLaunchPolicy::ExecutionGroupExclusive,
+                NativeBatchMode::None,
+                1,
+                None,
+            )
+            .await
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let executor = UnifiedExecutor::new_for_test_with_physical_context(
+            Box::new(SleepingPhysicalExecutor {
+                physical_calls: calls.clone(),
+                delay: Duration::ZERO,
+            }),
+            BackendKind::Cpu,
+            coordinator.resource_authority(),
+            admission,
+        );
+        let mut request = EngineCoreRequest::tts("permit deadline");
+        request.deadline = Some(Instant::now() + Duration::from_millis(20));
+        let request_id = request.id.clone();
+        let scheduled = scheduled(&request_id, 710, 1);
+        let dispatch = rebind_execution_group(prepared_batch(710, request, scheduled), group.get());
+        let executed = execute_prepared(PreparedEngineStep::new(executor, vec![dispatch])).await;
+
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            executed.batches[0].results[0].disposition,
+            ExecutionDisposition::Finished(FinishReason::TimedOut)
+        );
+        assert_eq!(
+            executed.batches[0].results[0].provenance,
+            OutcomeProvenance::deadline(DeadlinePhase::DispatchWait, DispatchState::NotStarted)
+        );
+        drop(blocker);
+    }
+
+    #[tokio::test]
+    async fn fully_cancelled_batch_queued_for_a_permit_never_enters_the_executor() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 4));
+        let admission = coordinator.physical_execution_admission();
+        let group = coordinator.execution_group_id();
+        let blocker = admission
+            .acquire_dispatch(
+                group,
+                ModelInstanceId::new(720),
+                PhysicalLaunchPolicy::ExecutionGroupExclusive,
+                NativeBatchMode::None,
+                1,
+                None,
+            )
+            .await
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let executor = UnifiedExecutor::new_for_test_with_physical_context(
+            Box::new(SleepingPhysicalExecutor {
+                physical_calls: calls.clone(),
+                delay: Duration::ZERO,
+            }),
+            BackendKind::Cpu,
+            coordinator.resource_authority(),
+            admission,
+        );
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut request = EngineCoreRequest::tts("permit cancellation");
+        request.set_cancellation_signal(cancelled.clone());
+        let request_id = request.id.clone();
+        let scheduled = scheduled(&request_id, 720, 1);
+        let dispatch = rebind_execution_group(prepared_batch(720, request, scheduled), group.get());
+        let task = tokio::spawn(execute_prepared(PreparedEngineStep::new(
+            executor,
+            vec![dispatch],
+        )));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        cancelled.store(true, Ordering::Release);
+        drop(blocker);
+        let executed = task.await.unwrap();
+
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            executed.batches[0].results[0].disposition,
+            ExecutionDisposition::Finished(FinishReason::Cancelled)
+        );
+        assert_eq!(
+            executed.batches[0].results[0].dispatch.kind,
+            BatchDispatchKind::NotDispatched
+        );
+    }
+
+    #[tokio::test]
+    async fn fully_cancelled_wide_waiter_leaves_fifo_before_capacity_releases() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 3, 8));
+        let admission = coordinator.physical_execution_admission();
+        let group = coordinator.execution_group_id();
+        let policy = PhysicalLaunchPolicy::concurrent(3).unwrap();
+        let blocker = admission
+            .acquire_dispatch(
+                group,
+                ModelInstanceId::new(740),
+                policy,
+                NativeBatchMode::None,
+                1,
+                None,
+            )
+            .await
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let executor = UnifiedExecutor::new_for_test_with_physical_context(
+            Box::new(SleepingPhysicalExecutor {
+                physical_calls: calls.clone(),
+                delay: Duration::ZERO,
+            }),
+            BackendKind::Cpu,
+            coordinator.resource_authority(),
+            admission.clone(),
+        );
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let wide_dispatch = prepared_bound_rows_with_policy(
+            741,
+            group,
+            ModelInstanceId::new(741),
+            3,
+            policy,
+            cancelled.clone(),
+        );
+        let wide = tokio::spawn(execute_prepared(PreparedEngineStep::new(
+            executor,
+            vec![wide_dispatch],
+        )));
+        tokio::task::yield_now().await;
+
+        let follower_admission = admission.clone();
+        let follower = tokio::spawn(async move {
+            follower_admission
+                .acquire_dispatch(
+                    group,
+                    ModelInstanceId::new(742),
+                    policy,
+                    NativeBatchMode::None,
+                    1,
+                    None,
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !follower.is_finished(),
+            "the live narrow follower must initially remain behind the wide FIFO waiter"
+        );
+
+        cancelled.store(true, Ordering::Release);
+        let follower = tokio::time::timeout(Duration::from_millis(250), follower)
+            .await
+            .expect("cancelled wide waiter should leave FIFO within the polling bound")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            coordinator.snapshot().active_executions,
+            2,
+            "the follower acquires alongside the still-held original blocker"
+        );
+        let executed = tokio::time::timeout(Duration::from_millis(250), wide)
+            .await
+            .expect("cancelled engine waiter")
+            .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert!(executed.batches[0].results.iter().all(|result| {
+            result.disposition == ExecutionDisposition::Finished(FinishReason::Cancelled)
+                && result.dispatch.kind == BatchDispatchKind::NotDispatched
+        }));
+
+        drop((follower, blocker));
+        assert_eq!(coordinator.snapshot().active_executions, 0);
+    }
+
+    #[tokio::test]
+    async fn one_cancelled_peer_does_not_cancel_a_live_physical_batch() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let executor = UnifiedExecutor::new_for_test(Box::new(SleepingPhysicalExecutor {
+            physical_calls: calls.clone(),
+            delay: Duration::ZERO,
+        }));
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let mut cancelled_request = EngineCoreRequest::tts("cancelled peer");
+        cancelled_request.id = "cancelled-peer".to_string();
+        cancelled_request.set_cancellation_signal(cancelled);
+        let mut live_request = EngineCoreRequest::tts("live peer");
+        live_request.id = "live-peer-cancel".to_string();
+        let cancelled_scheduled = scheduled("cancelled-peer", 730, 1);
+        let live_scheduled = scheduled("live-peer-cancel", 731, 1);
+        let lane = lane();
+        let physical_batch = PhysicalBatch {
+            batch_id: BatchId::new(730),
+            lane: lane.clone(),
+            mode: NativeBatchMode::Static,
+            budget: BatchBudget {
+                max_rows: 2,
+                max_logical_units: 2,
+                max_tensor_elements: 2,
+                max_workspace_bytes: 0,
+                max_padding_basis_points: 0,
+                max_formation_delay: Duration::ZERO,
+            },
+            rows: [&cancelled_scheduled, &live_scheduled]
+                .into_iter()
+                .map(|scheduled| ReadyQuantum {
+                    plan_id: scheduled.plan_id,
+                    session: scheduled.session_key(),
+                    lane: lane.clone(),
+                    work: scheduled.work.clone(),
+                    cost: WorkCost::new(1, 1, 0),
+                    managed_cache: None,
+                })
+                .collect(),
+            materialized_tensor_elements: 2,
+            workspace: ResourceVector::zero(),
+        };
+        let dispatch = PreparedPhysicalDispatch::new(
+            ExecutionPhase::Prefill,
+            physical_batch,
+            vec![Arc::new(cancelled_request), Arc::new(live_request)],
+            vec![cancelled_scheduled, live_scheduled],
+            OutputVisibility::AfterQuantumCommit,
+            Vec::new(),
+            PhysicalLaunchPolicy::ExecutionGroupExclusive,
+        )
+        .unwrap();
+        let executed = execute_prepared(PreparedEngineStep::new(executor, vec![dispatch])).await;
+
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(executed.batches[0]
+            .results
+            .iter()
+            .all(|result| result.dispatch.kind != BatchDispatchKind::NotDispatched));
     }
 
     #[tokio::test]

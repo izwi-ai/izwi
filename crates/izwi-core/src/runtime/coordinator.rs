@@ -116,6 +116,16 @@ struct ModelPhysicalAdmission {
     permits: Arc<Semaphore>,
 }
 
+struct PhysicalPermitWaitMetric {
+    started: Instant,
+}
+
+impl Drop for PhysicalPermitWaitMetric {
+    fn drop(&mut self) {
+        crate::engine::metrics::record_engine_physical_permit_wait(self.started.elapsed());
+    }
+}
+
 impl PhysicalExecutionAdmission {
     pub(crate) fn standalone(capacity: usize) -> Self {
         Self::with_idle(None, capacity, Arc::new(Notify::new()))
@@ -197,6 +207,9 @@ impl PhysicalExecutionAdmission {
             ));
         }
         let units = self.required_units(launch_policy, batch_mode, row_width)?;
+        let _permit_wait_metric = PhysicalPermitWaitMetric {
+            started: Instant::now(),
+        };
         let model = self.model_admission(execution_group, model_instance, launch_policy)?;
         let model_permit = match model.as_ref() {
             Some(model) => {
@@ -291,19 +304,27 @@ impl PhysicalExecutionAdmission {
         deadline: Option<Instant>,
         scope: &'static str,
     ) -> Result<OwnedSemaphorePermit> {
+        if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+            return Err(Error::Timeout(format!("{scope} execution capacity")));
+        }
         let units = u32::try_from(units).map_err(|_| {
             Error::InvalidInput("execution unit request exceeds supported range".to_string())
         })?;
         let acquire = permits.acquire_many_owned(units);
-        match deadline {
+        let permit = match deadline {
             Some(deadline) => tokio::time::timeout_at(deadline.into(), acquire)
                 .await
                 .map_err(|_| Error::Timeout(format!("{scope} execution capacity")))?
-                .map_err(|_| Error::Overloaded("coordinator closed".to_string())),
+                .map_err(|_| Error::Overloaded("coordinator closed".to_string()))?,
             None => acquire
                 .await
-                .map_err(|_| Error::Overloaded("coordinator closed".to_string())),
+                .map_err(|_| Error::Overloaded("coordinator closed".to_string()))?,
+        };
+        if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+            drop(permit);
+            return Err(Error::Timeout(format!("{scope} execution capacity")));
         }
+        Ok(permit)
     }
 
     fn model_admission(
@@ -426,8 +447,10 @@ impl InferenceCoordinator {
         resources: Arc<ResourceAuthority>,
     ) -> Self {
         let capacity = match backend {
-            BackendKind::Metal => 1,
-            BackendKind::Cpu | BackendKind::Cuda => execution_parallelism.max(1),
+            // Accelerator overlap needs backend/device-stream certification;
+            // current certificates cover CPU scalar execution only.
+            BackendKind::Metal | BackendKind::Cuda => 1,
+            BackendKind::Cpu => execution_parallelism.max(1),
         };
         let execution_group_id =
             ExecutionGroupId::new(NEXT_EXECUTION_GROUP_ID.fetch_add(1, Ordering::Relaxed));
@@ -2918,7 +2941,7 @@ Pages free: 10.\n";
     }
 
     #[tokio::test]
-    async fn cpu_and_cuda_use_configured_capacity_while_metal_serializes() {
+    async fn cpu_uses_configured_capacity_while_accelerators_serialize() {
         assert_eq!(
             InferenceCoordinator::new(BackendKind::Cpu, 8, 8).capacity,
             8
@@ -2929,7 +2952,7 @@ Pages free: 10.\n";
         );
         assert_eq!(
             InferenceCoordinator::new(BackendKind::Cuda, 4, 8).capacity,
-            4
+            1
         );
     }
 
@@ -3005,19 +3028,17 @@ Pages free: 10.\n";
     }
 
     #[tokio::test]
-    async fn cuda_execution_uses_configured_concurrency() {
+    async fn cuda_execution_remains_serial_without_a_backend_certificate() {
         let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cuda, 3, 4));
         let first = coordinator.acquire_execution(None).await.unwrap();
-        let second = coordinator.acquire_execution(None).await.unwrap();
-        let third = coordinator.acquire_execution(None).await.unwrap();
 
-        assert_eq!(coordinator.snapshot().active_executions, 3);
+        assert_eq!(coordinator.snapshot().active_executions, 1);
         let blocked = coordinator
             .acquire_execution(Some(Instant::now() + std::time::Duration::from_millis(5)))
             .await;
         assert!(matches!(blocked, Err(Error::Timeout(_))));
 
-        drop((first, second, third));
+        drop(first);
         assert_eq!(coordinator.snapshot().active_executions, 0);
     }
 
@@ -3043,15 +3064,15 @@ Pages free: 10.\n";
         ));
 
         let cuda = Arc::new(InferenceCoordinator::new(BackendKind::Cuda, 4, 8));
-        let lease = cuda.acquire_execution_units(4, None).await.unwrap();
-        assert_eq!(cuda.snapshot().active_executions, 1);
-        drop(lease);
-        assert_eq!(cuda.snapshot().active_executions, 0);
+        assert!(matches!(
+            cuda.acquire_execution_units(2, None).await,
+            Err(Error::InvalidInput(_))
+        ));
     }
 
     #[tokio::test]
     async fn physical_dispatch_admission_is_weighted_and_fifo_fair() {
-        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cuda, 4, 8));
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 4, 8));
         let admission = coordinator.physical_execution_admission();
         let execution_group = coordinator.execution_group_id();
         let model_instance = ModelInstanceId::new(7);

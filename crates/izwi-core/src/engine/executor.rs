@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
@@ -36,13 +37,13 @@ pub(super) fn decode_request_audio_with_rate(
 
 use super::config::EngineCoreConfig;
 use super::execution::{
-    BatchDispatch, CacheMode, CancellationGranularity, ConcurrencyClass, DispatchState,
-    ExecutionCapabilities, ExecutionDisposition, ExecutionFailure, ExecutionMode, ExecutionProfile,
-    FailureKind, FailureOrigin, FailureScope, FinishReason, HealthImpact, NativeBatchMode,
-    OutcomeProvenance, PhysicalBatch, PhysicalLaunchPolicy, PlanId, PrefillMode, RetryDisposition,
-    SessionKey, StageProgressKind, WorkUnit, YieldReason,
+    BatchDispatch, BatchId, BatchLaneKey, CacheMode, CancellationGranularity, ConcurrencyClass,
+    DispatchState, ExecutionCapabilities, ExecutionDisposition, ExecutionFailure, ExecutionMode,
+    ExecutionProfile, FailureKind, FailureOrigin, FailureScope, FinishReason, HealthImpact,
+    NativeBatchMode, OutcomeProvenance, PhysicalBatch, PhysicalLaunchPolicy, PlanId, PrefillMode,
+    RetryDisposition, SessionKey, StageProgressKind, WorkUnit, YieldReason,
 };
-use super::metrics::{begin_engine_physical_dispatch, record_engine_physical_permit_wait};
+use super::metrics::begin_engine_physical_dispatch;
 use super::output::StreamingOutput;
 use super::request::EngineCoreRequest;
 use super::resources::{BatchWorkspaceLease, ResourceAuthority, ResourceVector};
@@ -59,11 +60,15 @@ use crate::models::architectures::qwen3::tts::Qwen3TtsModel;
 use crate::models::registry::{AsrModelLease, NativeAsrModel, NativeChatModel, QwenTtsModelLease};
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::ModelRegistry;
-use crate::runtime::PhysicalExecutionAdmission;
+use crate::runtime::{PhysicalExecutionAdmission, PhysicalExecutionLease};
 use state::{ActiveAsrDecode, ActiveChatDecode, ActiveQwenTtsDecode};
 
 const QWEN38_TARGET_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(1);
 const QWEN38_MTP_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(4);
+// Cancellation signals are AtomicBools without a notification edge. Polling
+// at 40 Hz bounds cancelled FIFO residency without turning admission into a
+// hot loop.
+const PHYSICAL_ADMISSION_CANCELLATION_POLL: Duration = Duration::from_millis(25);
 
 struct Qwen38ManagedCaches {
     target: PhysicalPagedKvCache,
@@ -705,17 +710,15 @@ impl From<&EngineCoreConfig> for WorkerConfig {
             .min(Self::tensor_batch_cap(backend_kind))
             .max(1);
         let request_parallelism = Self::request_parallelism_for(backend_kind, num_threads);
-        let physical_execution_capacity =
-            if config.physical_execution_mode == crate::config::PhysicalExecutionMode::Concurrent {
-                request_parallelism.max(
-                    config
-                        .resolved_physical_execution_capacity()
-                        .physical_launch_limit
-                        .get(),
-                )
-            } else {
-                1
-            };
+        let physical_execution_capacity = Self::physical_execution_capacity(
+            config.physical_execution_mode,
+            backend_kind,
+            request_parallelism,
+            config
+                .resolved_physical_execution_capacity()
+                .physical_launch_limit
+                .get(),
+        );
         Self {
             models_dir: config.models_dir.clone(),
             backend: backend_kind,
@@ -738,6 +741,19 @@ impl From<&EngineCoreConfig> for WorkerConfig {
 }
 
 impl WorkerConfig {
+    fn physical_execution_capacity(
+        mode: crate::config::PhysicalExecutionMode,
+        backend: BackendKind,
+        request_parallelism: usize,
+        configured_launch_limit: usize,
+    ) -> usize {
+        if mode == crate::config::PhysicalExecutionMode::Concurrent && backend == BackendKind::Cpu {
+            request_parallelism.max(configured_launch_limit).max(1)
+        } else {
+            1
+        }
+    }
+
     fn tensor_batch_cap(backend: BackendKind) -> usize {
         match backend {
             BackendKind::Cpu | BackendKind::Metal => 2,
@@ -2067,6 +2083,20 @@ pub struct UnifiedExecutor {
     physical_execution_admission: Option<PhysicalExecutionAdmission>,
 }
 
+/// Opaque proof that one exact physical envelope owns execution capacity.
+/// Consuming this token is the only runner path into the native executor.
+pub(super) struct AdmittedPhysicalExecution {
+    batch_id: BatchId,
+    lane: BatchLaneKey,
+    width: usize,
+    _lease: Option<PhysicalExecutionLease>,
+}
+
+pub(super) enum PhysicalExecutionAdmissionOutcome {
+    Admitted(AdmittedPhysicalExecution),
+    Cancelled,
+}
+
 impl UnifiedExecutor {
     /// Create a new unified executor with native backend.
     pub fn new_native(config: WorkerConfig) -> Self {
@@ -2092,6 +2122,20 @@ impl UnifiedExecutor {
             inner: Arc::new(RwLock::new(executor)),
             batch_workspace: None,
             physical_execution_admission: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test_with_physical_context(
+        executor: Box<dyn ModelExecutor>,
+        backend: BackendKind,
+        authority: Arc<ResourceAuthority>,
+        admission: PhysicalExecutionAdmission,
+    ) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(executor)),
+            batch_workspace: Some(BatchWorkspaceContext { backend, authority }),
+            physical_execution_admission: Some(admission),
         }
     }
 
@@ -2154,29 +2198,55 @@ impl UnifiedExecutor {
             .map(Some)
     }
 
-    /// Execute one exact physical batch envelope.
-    pub async fn execute_physical_batch(
+    /// Acquire physical execution capacity for one validated batch envelope.
+    /// Workspace and stream state must not be acquired until this returns.
+    pub(super) async fn acquire_physical_execution(
         &self,
         batch: &PhysicalBatch,
         requests: &[&EngineCoreRequest],
         scheduled: &[ScheduledRequest],
-    ) -> PhysicalDispatchResult {
+    ) -> std::result::Result<PhysicalExecutionAdmissionOutcome, PhysicalDispatchError> {
         let width = batch.rows.len().max(1);
-        let _execution = if let Some(admission) = &self.physical_execution_admission {
+        PhysicalBatchExecution {
+            batch,
+            requests,
+            scheduled,
+        }
+        .validate()
+        .map_err(|error| {
+            PhysicalDispatchError::not_started(error, width, FailureOrigin::ExecutorValidation)
+        })?;
+        if !requests.is_empty() && requests.iter().all(|request| request.is_cancelled()) {
+            return Ok(PhysicalExecutionAdmissionOutcome::Cancelled);
+        }
+        let lease = if let Some(admission) = &self.physical_execution_admission {
             let launch_policy = Self::explicit_physical_launch_policy(batch, requests);
             let deadline = requests.iter().filter_map(|request| request.deadline).min();
-            let permit_wait_started = std::time::Instant::now();
-            let acquired = admission
-                .acquire_dispatch(
-                    batch.lane.execution_group,
-                    batch.lane.model_instance,
-                    launch_policy,
-                    batch.mode,
-                    width,
-                    deadline,
-                )
-                .await;
-            record_engine_physical_permit_wait(permit_wait_started.elapsed());
+            let acquire = admission.acquire_dispatch(
+                batch.lane.execution_group,
+                batch.lane.model_instance,
+                launch_policy,
+                batch.mode,
+                width,
+                deadline,
+            );
+            tokio::pin!(acquire);
+            let acquired = loop {
+                tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep(PHYSICAL_ADMISSION_CANCELLATION_POLL) => {
+                        if !requests.is_empty()
+                            && requests.iter().all(|request| request.is_cancelled())
+                        {
+                            break None;
+                        }
+                    }
+                    acquired = &mut acquire => break Some(acquired),
+                }
+            };
+            let Some(acquired) = acquired else {
+                return Ok(PhysicalExecutionAdmissionOutcome::Cancelled);
+            };
             match acquired {
                 Ok(lease) => Some(lease),
                 Err(error) => {
@@ -2190,13 +2260,104 @@ impl UnifiedExecutor {
         } else {
             None
         };
+        Ok(PhysicalExecutionAdmissionOutcome::Admitted(
+            AdmittedPhysicalExecution {
+                batch_id: batch.batch_id,
+                lane: batch.lane.clone(),
+                width,
+                _lease: lease,
+            },
+        ))
+    }
+
+    /// Execute a batch whose exact physical capacity has already been admitted.
+    pub(super) async fn execute_admitted_physical_batch(
+        &self,
+        admitted: AdmittedPhysicalExecution,
+        batch: &PhysicalBatch,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+    ) -> PhysicalDispatchResult {
+        if admitted.batch_id != batch.batch_id
+            || admitted.lane != batch.lane
+            || admitted.width != batch.rows.len().max(1)
+        {
+            return Err(PhysicalDispatchError::not_started(
+                Error::InvalidInput(
+                    "physical execution admission does not match its batch envelope".to_string(),
+                ),
+                batch.rows.len().max(1),
+                FailureOrigin::ExecutorValidation,
+            ));
+        }
+        if let Some(deadline) = requests.iter().filter_map(|request| request.deadline).min() {
+            if deadline <= std::time::Instant::now() {
+                return Err(PhysicalDispatchError::not_started(
+                    Error::Timeout("physical batch device entry".to_string()),
+                    admitted.width,
+                    FailureOrigin::DispatchCoordination,
+                ));
+            }
+        }
+        if !requests.is_empty() && requests.iter().all(|request| request.is_cancelled()) {
+            let dispatch = BatchDispatch::not_dispatched(admitted.width);
+            return Ok(scheduled
+                .iter()
+                .map(|scheduled| {
+                    ExecutorStepResult::from_session(
+                        scheduled,
+                        ModelSessionResult::cancelled_before_dispatch(ExecutorOutput::cancelled(
+                            scheduled.request_id.clone(),
+                        )),
+                    )
+                    .with_dispatch(dispatch)
+                })
+                .collect());
+        }
         let _physical_dispatch = begin_engine_physical_dispatch();
         let executor = self.inner.read().await;
-        executor.execute_physical_batch(PhysicalBatchExecution {
+        let result = executor.execute_physical_batch(PhysicalBatchExecution {
             batch,
             requests,
             scheduled,
-        })
+        });
+        drop(executor);
+        drop(admitted);
+        result
+    }
+
+    /// Compatibility boundary for callers that do not need to interpose
+    /// workspace admission between physical admission and device entry.
+    pub async fn execute_physical_batch(
+        &self,
+        batch: &PhysicalBatch,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+    ) -> PhysicalDispatchResult {
+        let admitted = self
+            .acquire_physical_execution(batch, requests, scheduled)
+            .await?;
+        match admitted {
+            PhysicalExecutionAdmissionOutcome::Admitted(admitted) => {
+                self.execute_admitted_physical_batch(admitted, batch, requests, scheduled)
+                    .await
+            }
+            PhysicalExecutionAdmissionOutcome::Cancelled => {
+                let dispatch = BatchDispatch::not_dispatched(batch.rows.len().max(1));
+                Ok(scheduled
+                    .iter()
+                    .map(|scheduled| {
+                        ExecutorStepResult::from_session(
+                            scheduled,
+                            ModelSessionResult::cancelled_before_dispatch(
+                                ExecutorOutput::cancelled(scheduled.request_id.clone()),
+                            ),
+                        )
+                        .with_dispatch(dispatch)
+                    })
+                    .collect())
+            }
+        }
     }
 
     pub async fn execution_profile(&self, request: &EngineCoreRequest) -> Option<ExecutionProfile> {
@@ -2706,6 +2867,17 @@ mod tests {
                 .unwrap()
                 .capacity(),
             worker.request_parallelism.max(4)
+        );
+
+        assert_eq!(
+            WorkerConfig::physical_execution_capacity(
+                crate::config::PhysicalExecutionMode::Concurrent,
+                BackendKind::Cuda,
+                4,
+                4,
+            ),
+            1,
+            "CUDA remains device-serialized until a backend certificate exists"
         );
     }
 
