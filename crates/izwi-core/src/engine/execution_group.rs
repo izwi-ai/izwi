@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::config::{PhysicalExecutionMode, PhysicalInFlightLimit};
 
@@ -28,7 +28,10 @@ use super::executor::{
     ExecutorOutput, ExecutorStepResult, PhysicalDispatchResult, StreamDeliveryFailure,
     StreamDeliveryFailureKind, UnifiedExecutor,
 };
-use super::metrics::begin_engine_physical_workspace;
+use super::metrics::{
+    begin_engine_physical_workspace, record_engine_physical_defer, record_engine_physical_fallback,
+    EnginePhysicalDeferReason, EnginePhysicalFallbackReason,
+};
 use super::request::{
     EngineCoreRequest, FencedStreamProgress, StreamBindingGuard, StreamProgressBudget,
 };
@@ -364,6 +367,10 @@ async fn execute_dispatches(
     progress_tx: &mpsc::Sender<FencedStreamProgress>,
     progress_budget: &Arc<StreamProgressBudget>,
 ) -> Vec<ExecutedPhysicalBatch> {
+    if mode == PhysicalExecutionMode::Shadow {
+        observe_shadow_launch_plan(&dispatches, max_physical_in_flight);
+        return execute_dispatches_serial(executor, dispatches, progress_tx, progress_budget).await;
+    }
     if mode != PhysicalExecutionMode::Concurrent
         || max_physical_in_flight.get() == 1
         || dispatches.len() < 2
@@ -384,6 +391,7 @@ async fn execute_dispatches(
 #[derive(Clone, Copy)]
 struct ActivePhysicalLaunch {
     index: usize,
+    execution_group: super::ExecutionGroupId,
     model_instance: super::ModelInstanceId,
     policy: PhysicalLaunchPolicy,
     units: usize,
@@ -413,16 +421,19 @@ fn launch_is_compatible(
     {
         return false;
     }
-    if active
-        .iter()
-        .any(|launch| launch.policy == PhysicalLaunchPolicy::ExecutionGroupExclusive)
-    {
+    let execution_group = candidate.physical_batch.lane.execution_group;
+    if active.iter().any(|launch| {
+        launch.execution_group == execution_group
+            && launch.policy == PhysicalLaunchPolicy::ExecutionGroupExclusive
+    }) {
         return false;
     }
 
     let model_instance = candidate.physical_batch.lane.model_instance;
     match candidate.launch_policy {
-        PhysicalLaunchPolicy::ExecutionGroupExclusive => active.is_empty(),
+        PhysicalLaunchPolicy::ExecutionGroupExclusive => active
+            .iter()
+            .all(|launch| launch.execution_group != execution_group),
         PhysicalLaunchPolicy::ModelExclusive => !active
             .iter()
             .any(|launch| launch.model_instance == model_instance),
@@ -446,6 +457,57 @@ fn launch_is_compatible(
                 .any(|launch| launch.policy == PhysicalLaunchPolicy::ModelExclusive)
                 && same_model.iter().map(|launch| launch.units).sum::<usize>() + candidate_units
                     <= same_model_limit
+        }
+    }
+}
+
+/// Evaluate the same bounded compatibility rules used by concurrent mode while
+/// retaining serial execution. Existing bounded fallback/defer counters expose
+/// the dry-run result without adding request or model identities as labels.
+fn observe_shadow_launch_plan(
+    dispatches: &[PreparedPhysicalDispatch],
+    engine_limit: PhysicalInFlightLimit,
+) {
+    let mut active = Vec::new();
+    for (index, dispatch) in dispatches.iter().enumerate() {
+        let units = physical_launch_units(dispatch);
+        if units > engine_limit.get() {
+            record_engine_physical_fallback(EnginePhysicalFallbackReason::ResourcePressure);
+            debug!(
+                batch_id = dispatch.physical_batch.batch_id.get(),
+                required_units = units,
+                available_units = engine_limit.get(),
+                decision = "fallback",
+                reason = "resource_pressure",
+                "Shadow physical launch decision"
+            );
+            continue;
+        }
+
+        if launch_is_compatible(dispatch, &active, engine_limit) {
+            active.push(ActivePhysicalLaunch {
+                index,
+                execution_group: dispatch.physical_batch.lane.execution_group,
+                model_instance: dispatch.physical_batch.lane.model_instance,
+                policy: dispatch.launch_policy,
+                units,
+            });
+            // Shadow deliberately falls back to serial after proving that this
+            // candidate would have been launchable under the effective policy.
+            record_engine_physical_fallback(EnginePhysicalFallbackReason::PolicyDisabled);
+            debug!(
+                batch_id = dispatch.physical_batch.batch_id.get(),
+                decision = "would_launch",
+                "Shadow physical launch decision"
+            );
+        } else {
+            record_engine_physical_defer(EnginePhysicalDeferReason::ExecutionCapacity);
+            debug!(
+                batch_id = dispatch.physical_batch.batch_id.get(),
+                decision = "defer",
+                reason = "execution_capacity_or_policy_conflict",
+                "Shadow physical launch decision"
+            );
         }
     }
 }
@@ -541,6 +603,7 @@ async fn execute_dispatches_concurrent(
                 .expect("front dispatch disappeared before launch");
             let launch = ActivePhysicalLaunch {
                 index,
+                execution_group: dispatch.physical_batch.lane.execution_group,
                 model_instance: dispatch.physical_batch.lane.model_instance,
                 policy: dispatch.launch_policy,
                 units: physical_launch_units(&dispatch),
@@ -1401,6 +1464,21 @@ mod tests {
         dispatch
     }
 
+    fn rebind_execution_group(
+        mut dispatch: PreparedPhysicalDispatch,
+        execution_group: u64,
+    ) -> PreparedPhysicalDispatch {
+        let execution_group = ExecutionGroupId::new(execution_group);
+        let model_instance = ModelInstanceId::new(execution_group.get());
+        dispatch.physical_batch.lane.execution_group = execution_group;
+        dispatch.physical_batch.lane.model_instance = model_instance;
+        for row in &mut dispatch.physical_batch.rows {
+            row.lane.execution_group = execution_group;
+            row.lane.model_instance = model_instance;
+        }
+        dispatch
+    }
+
     fn prepared_rows_with_policy(
         batch_id: u64,
         request_prefix: &str,
@@ -1504,7 +1582,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_mode_keeps_group_exclusive_tickets_serial() {
+    async fn concurrent_mode_keeps_same_group_exclusive_tickets_serial() {
         let active = Arc::new(AtomicUsize::new(0));
         let max_active = Arc::new(AtomicUsize::new(0));
         let executor = UnifiedExecutor::new_for_test(Box::new(ObservedPhysicalExecutor {
@@ -1530,6 +1608,107 @@ mod tests {
 
         assert_eq!(executed.batches.len(), 2);
         assert_eq!(max_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_mode_overlaps_exclusive_tickets_from_distinct_groups() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let executor = UnifiedExecutor::new_for_test(Box::new(ObservedPhysicalExecutor {
+            active,
+            max_active: max_active.clone(),
+            delay: Duration::from_millis(25),
+        }));
+        let mut first = EngineCoreRequest::tts("first group");
+        first.id = "first-group".to_string();
+        let mut second = EngineCoreRequest::tts("second group");
+        second.id = "second-group".to_string();
+        let prepared = PreparedEngineStep::with_execution_policy(
+            executor,
+            vec![
+                rebind_execution_group(
+                    prepared_batch(112, first, scheduled("first-group", 112, 1)),
+                    11,
+                ),
+                rebind_execution_group(
+                    prepared_batch(113, second, scheduled("second-group", 113, 1)),
+                    12,
+                ),
+            ],
+            PhysicalExecutionMode::Concurrent,
+            PhysicalInFlightLimit::new(2).unwrap(),
+        );
+
+        let executed = execute_prepared(prepared).await;
+
+        assert_eq!(executed.batches.len(), 2);
+        assert_eq!(max_active.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shadow_mode_observes_compatibility_but_executes_serially() {
+        let before = super::super::metrics::engine_physical_execution_metrics_snapshot();
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let executor = UnifiedExecutor::new_for_test(Box::new(ObservedPhysicalExecutor {
+            active,
+            max_active: max_active.clone(),
+            delay: Duration::from_millis(10),
+        }));
+        let policy = PhysicalLaunchPolicy::concurrent(2).unwrap();
+        let mut first = EngineCoreRequest::tts("first shadow");
+        first.id = "first-shadow".to_string();
+        let mut second = EngineCoreRequest::tts("second shadow");
+        second.id = "second-shadow".to_string();
+        let prepared = PreparedEngineStep::with_execution_policy(
+            executor,
+            vec![
+                prepared_batch_with_policy(114, first, scheduled("first-shadow", 114, 1), policy),
+                prepared_batch_with_policy(115, second, scheduled("second-shadow", 115, 1), policy),
+            ],
+            PhysicalExecutionMode::Shadow,
+            PhysicalInFlightLimit::new(2).unwrap(),
+        );
+
+        let executed = execute_prepared(prepared).await;
+        let after = super::super::metrics::engine_physical_execution_metrics_snapshot();
+
+        assert_eq!(executed.batches.len(), 2);
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
+        assert!(
+            after.fallbacks.policy_disabled >= before.fallbacks.policy_disabled.saturating_add(2)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shadow_mode_records_same_group_policy_deferral() {
+        let before = super::super::metrics::engine_physical_execution_metrics_snapshot();
+        let executor = UnifiedExecutor::new_for_test(Box::new(ObservedPhysicalExecutor {
+            active: Arc::new(AtomicUsize::new(0)),
+            max_active: Arc::new(AtomicUsize::new(0)),
+            delay: Duration::ZERO,
+        }));
+        let mut first = EngineCoreRequest::tts("first shadow exclusive");
+        first.id = "first-shadow-exclusive".to_string();
+        let mut second = EngineCoreRequest::tts("second shadow exclusive");
+        second.id = "second-shadow-exclusive".to_string();
+        let prepared = PreparedEngineStep::with_execution_policy(
+            executor,
+            vec![
+                prepared_batch(116, first, scheduled("first-shadow-exclusive", 116, 1)),
+                prepared_batch(117, second, scheduled("second-shadow-exclusive", 117, 1)),
+            ],
+            PhysicalExecutionMode::Shadow,
+            PhysicalInFlightLimit::new(2).unwrap(),
+        );
+
+        let executed = execute_prepared(prepared).await;
+        let after = super::super::metrics::engine_physical_execution_metrics_snapshot();
+
+        assert_eq!(executed.batches.len(), 2);
+        assert!(
+            after.defers.execution_capacity >= before.defers.execution_capacity.saturating_add(1)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
