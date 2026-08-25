@@ -4,10 +4,17 @@
 //! It uses a Qwen3 architecture with MRoPE (Multi-modal Rotary Position Embeddings)
 //! to handle both text and audio modalities.
 
+use std::sync::Arc;
+
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{ops, Embedding, Linear, Module, RmsNorm, VarBuilder};
 
+use crate::backends::kv::{
+    submit_ordered_after_write, KvSlotMap, KvWriteArgs, KvWriteCompletionCollector,
+    PagedKvDecodeArgs,
+};
 use crate::error::{Error, Result};
+use crate::kv::KvDecodeBatchMetadata;
 use crate::models::architectures::qwen3::tts::config::TalkerConfig;
 use crate::models::architectures::qwen3::tts::rope::{
     build_rope_inv_freq, build_rope_window, duplicate_rope_window, qwen_rotate_half,
@@ -210,6 +217,104 @@ impl Attention {
         let out = out.reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
         self.o_proj.forward(&out).map_err(Error::from)
     }
+
+    /// Execute one native ragged decode step for rows sharing one physical
+    /// arena. Dense projections keep the real batch dimension while the paged
+    /// backend consumes each row's independent block table.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_physical_decode_batch(
+        &self,
+        x: &Tensor,
+        start_positions: &[usize],
+        caches: &[&TalkerPhysicalCache],
+        slots: &dyn KvSlotMap,
+        metadata: &KvDecodeBatchMetadata,
+        completions: &mut KvWriteCompletionCollector,
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let (batch_size, sequence_len, _) = x.dims3()?;
+        if batch_size == 0
+            || sequence_len != 1
+            || start_positions.len() != batch_size
+            || caches.len() != batch_size
+        {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3-TTS physical talker batch expects matching [batch,1,hidden] rows, got {:?}",
+                x.dims()
+            )));
+        }
+        let first = caches[0];
+        if caches.iter().any(|cache| {
+            !Arc::ptr_eq(cache.arena(), first.arena())
+                || cache.layer_binding(layer_idx).ok() != first.layer_binding(layer_idx).ok()
+        }) {
+            return Err(Error::InvalidInput(
+                "Qwen3-TTS physical talker batch rows must share one arena and layer binding"
+                    .into(),
+            ));
+        }
+
+        let mut q =
+            self.q_proj
+                .forward(x)?
+                .reshape((batch_size, 1, self.num_heads, self.head_dim))?;
+        let mut k =
+            self.k_proj
+                .forward(x)?
+                .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?;
+        let v =
+            self.v_proj
+                .forward(x)?
+                .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?;
+        q = self.apply_qk_norm(q, &self.q_norm, self.num_heads, 1)?;
+        k = self.apply_qk_norm(k, &self.k_norm, self.num_kv_heads, 1)?;
+
+        let mut query_rows = Vec::with_capacity(batch_size);
+        let mut key_rows = Vec::with_capacity(batch_size);
+        let mut value_rows = Vec::with_capacity(batch_size);
+        for row in 0..batch_size {
+            let q_row = self.apply_rope(q.i(row)?.unsqueeze(0)?, start_positions[row], None)?;
+            let k_row = self.apply_rope(k.i(row)?.unsqueeze(0)?, start_positions[row], None)?;
+            query_rows.push(q_row.reshape((self.num_heads, self.head_dim))?);
+            key_rows.push(k_row.reshape((self.num_kv_heads, self.head_dim))?);
+            value_rows.push(v.i(row)?.reshape((self.num_kv_heads, self.head_dim))?);
+        }
+        let query_refs = query_rows.iter().collect::<Vec<_>>();
+        let key_refs = key_rows.iter().collect::<Vec<_>>();
+        let value_refs = value_rows.iter().collect::<Vec<_>>();
+        let queries = Tensor::stack(&query_refs, 0)?.contiguous()?;
+        let keys = Tensor::stack(&key_refs, 0)?.contiguous()?;
+        let values = Tensor::stack(&value_refs, 0)?.contiguous()?;
+        if slots.arena_id() != first.arena().id() || slots.len() != batch_size {
+            return Err(Error::InvalidInput(
+                "Qwen3-TTS physical talker batch received an incompatible slot map".into(),
+            ));
+        }
+        let binding = first.layer_binding(layer_idx)?;
+        let completion = first.arena().write_slots(
+            binding,
+            KvWriteArgs {
+                keys: &keys,
+                values: &values,
+                slots,
+            },
+        )?;
+        let (out, completion) = submit_ordered_after_write(completion, || {
+            first.arena().paged_decode(
+                binding,
+                PagedKvDecodeArgs {
+                    queries: &queries,
+                    batch: metadata,
+                    softmax_scale: 1.0 / (self.head_dim as f32).sqrt(),
+                    softcap: None,
+                },
+            )
+        })?;
+        completions.collect(completion)?;
+        self.o_proj
+            .forward(&out.reshape((batch_size, 1, self.num_heads * self.head_dim))?)
+            .map_err(Error::from)
+    }
 }
 
 /// SwiGLU MLP
@@ -296,6 +401,33 @@ impl Layer {
         let mlp_out = self.mlp.forward(&normed)?;
         x.broadcast_add(&mlp_out).map_err(Error::from)
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_physical_decode_batch(
+        &self,
+        x: &Tensor,
+        start_positions: &[usize],
+        caches: &[&TalkerPhysicalCache],
+        slots: &dyn KvSlotMap,
+        metadata: &KvDecodeBatchMetadata,
+        completions: &mut KvWriteCompletionCollector,
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let normed = self.input_layernorm.forward(x)?;
+        let attn_out = self.self_attn.forward_physical_decode_batch(
+            &normed,
+            start_positions,
+            caches,
+            slots,
+            metadata,
+            completions,
+            layer_idx,
+        )?;
+        let x = x.broadcast_add(&attn_out)?;
+        let normed = self.post_attention_layernorm.forward(&x)?;
+        let mlp_out = self.mlp.forward(&normed)?;
+        x.broadcast_add(&mlp_out).map_err(Error::from)
+    }
 }
 
 /// Text projection MLP to project text embeddings to model hidden size
@@ -332,6 +464,13 @@ pub struct TalkerModel {
     device: Device,
     cfg: TalkerConfig,
     use_mrope: bool,
+}
+
+/// Normalized hidden states and semantic logits produced by one native talker
+/// batch. Both tensors retain `[batch, 1, width]` row order.
+pub struct TalkerPhysicalBatchOutput {
+    pub hidden_states: Tensor,
+    pub logits: Tensor,
 }
 
 impl TalkerModel {
@@ -399,35 +538,32 @@ impl TalkerModel {
         cache: &mut TalkerPhysicalCache,
         position_ids: Option<&Tensor>,
     ) -> Result<(Tensor, Tensor)> {
-        let (batch_size, sequence_len, hidden_size) = embeds.dims3()?;
-        if batch_size != 1 || sequence_len == 0 || hidden_size != self.cfg.hidden_size {
-            return Err(Error::InvalidInput(format!(
-                "Qwen3-TTS physical talker expects [1,sequence,{}], got {:?}",
-                self.cfg.hidden_size,
-                embeds.dims()
-            )));
-        }
-        if start_pos != cache.context_len() {
-            return Err(Error::InvalidInput(format!(
-                "Qwen3-TTS physical talker starts at {start_pos}, expected retained cursor {}",
-                cache.context_len()
-            )));
-        }
-        cache.validate_model(
-            self.cfg.num_hidden_layers,
-            self.cfg.num_key_value_heads,
-            self.cfg.head_dim(),
-        )?;
+        let sequence_len = self.validate_physical_append(embeds, start_pos, cache)?;
         let mut prepared = cache.prepare_append(start_pos, sequence_len)?;
-
-        let mut x = embeds.clone();
-        for (idx, layer) in self.layers.iter().enumerate() {
-            x = layer.forward_physical(&x, start_pos, position_ids, cache, &mut prepared, idx)?;
+        let execution = (|| {
+            let hidden = self.forward_physical_layers_with_prepared(
+                embeds,
+                start_pos,
+                cache,
+                position_ids,
+                &mut prepared,
+            )?;
+            let hidden = self.norm.forward(&hidden)?;
+            let logits = self.lm_head.forward(&hidden)?;
+            Ok((hidden, logits))
+        })();
+        match execution {
+            Ok(output) => {
+                cache.commit_prepared(prepared)?;
+                Ok(output)
+            }
+            Err(error) => match cache.abort_prepared(prepared) {
+                Ok(()) => Err(error),
+                Err(drain) => Err(Error::InferenceError(format!(
+                    "Qwen3-TTS physical talker failed: {error}; write-fence drain also failed: {drain}"
+                ))),
+            },
         }
-        let hidden = self.norm.forward(&x)?;
-        let logits = self.lm_head.forward(&hidden)?;
-        cache.commit_prepared(prepared)?;
-        Ok((hidden, logits))
     }
 
     /// Prefill a fresh retained physical talker cache.
@@ -451,6 +587,105 @@ impl TalkerModel {
         Ok((last_hidden, last_logits))
     }
 
+    /// Append one exact span of already prepared prompt embeddings.
+    ///
+    /// Intermediate spans avoid retaining decoder outputs. The final span
+    /// returns only its last normalized hidden state and semantic logits, which
+    /// are the continuation tensors required by TTS decode.
+    pub fn prefill_physical_span_with_embeds(
+        &self,
+        embeds: &Tensor,
+        start_pos: usize,
+        cache: &mut TalkerPhysicalCache,
+        position_ids: Option<&Tensor>,
+        final_span: bool,
+    ) -> Result<Option<(Tensor, Tensor)>> {
+        let sequence_len = self.validate_physical_append(embeds, start_pos, cache)?;
+        let mut prepared = cache.prepare_append(start_pos, sequence_len)?;
+        let execution = (|| {
+            let hidden = self.forward_physical_layers_with_prepared(
+                embeds,
+                start_pos,
+                cache,
+                position_ids,
+                &mut prepared,
+            )?;
+            if !final_span {
+                return Ok(None);
+            }
+            // RMS normalization and the codec head are token-local, so the
+            // final continuation is exactly preserved by projecting only the
+            // last token instead of the full final span.
+            let last_hidden = hidden.i((.., sequence_len - 1..sequence_len, ..))?;
+            let last_hidden = self.norm.forward(&last_hidden)?;
+            let last_logits = self.lm_head.forward(&last_hidden)?;
+            Ok(Some((last_hidden, last_logits)))
+        })();
+        match execution {
+            Ok(output) => {
+                cache.commit_prepared(prepared)?;
+                Ok(output)
+            }
+            Err(error) => match cache.abort_prepared(prepared) {
+                Ok(()) => Err(error),
+                Err(drain) => Err(Error::InferenceError(format!(
+                    "Qwen3-TTS physical prefill span failed: {error}; write-fence drain also failed: {drain}"
+                ))),
+            },
+        }
+    }
+
+    fn validate_physical_append(
+        &self,
+        embeds: &Tensor,
+        start_pos: usize,
+        cache: &TalkerPhysicalCache,
+    ) -> Result<usize> {
+        let (batch_size, sequence_len, hidden_size) = embeds.dims3()?;
+        if batch_size != 1 || sequence_len == 0 || hidden_size != self.cfg.hidden_size {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3-TTS physical talker expects [1,sequence,{}], got {:?}",
+                self.cfg.hidden_size,
+                embeds.dims()
+            )));
+        }
+        if start_pos != cache.context_len() {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3-TTS physical talker starts at {start_pos}, expected retained cursor {}",
+                cache.context_len()
+            )));
+        }
+        cache.validate_model(
+            self.cfg.num_hidden_layers,
+            self.cfg.num_key_value_heads,
+            self.cfg.head_dim(),
+        )?;
+        cache.slots_for_append(start_pos, sequence_len)?;
+        Ok(sequence_len)
+    }
+
+    fn forward_physical_layers_with_prepared(
+        &self,
+        embeds: &Tensor,
+        start_pos: usize,
+        cache: &TalkerPhysicalCache,
+        position_ids: Option<&Tensor>,
+        prepared: &mut PreparedPhysicalPagedStep,
+    ) -> Result<Tensor> {
+        let mut hidden = embeds.clone();
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            hidden = layer.forward_physical(
+                &hidden,
+                start_pos,
+                position_ids,
+                cache,
+                prepared,
+                layer_idx,
+            )?;
+        }
+        Ok(hidden)
+    }
+
     /// Append one generation token at the retained physical cursor.
     pub fn generate_physical_step_with_embed(
         &self,
@@ -467,6 +702,143 @@ impl TalkerModel {
         }
         let start_pos = cache.context_len();
         self.forward_physical_with_embeds_and_hidden(input_embed, start_pos, cache, None)
+    }
+
+    /// Append one generation embedding for a ragged set of retained sessions.
+    ///
+    /// A single row intentionally uses the scalar implementation. Wider calls
+    /// batch projections/MLPs and issue one paged decode operation per layer.
+    /// Every row must share the same arena and layer geometry, but may have a
+    /// different retained context length. Logical cursor commits are all-or-none.
+    pub fn generate_physical_step_batch_with_embeds(
+        &self,
+        input_embeds: &Tensor,
+        caches: &mut [&mut TalkerPhysicalCache],
+    ) -> Result<TalkerPhysicalBatchOutput> {
+        let (batch_size, sequence_len, hidden_size) = input_embeds.dims3()?;
+        if batch_size == 0
+            || sequence_len != 1
+            || hidden_size != self.cfg.hidden_size
+            || caches.len() != batch_size
+        {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3-TTS physical talker batch expects [batch,1,{}] and one cache per row, got {:?} and {} caches",
+                self.cfg.hidden_size,
+                input_embeds.dims(),
+                caches.len()
+            )));
+        }
+        if batch_size == 1 {
+            let (hidden_states, logits) =
+                self.generate_physical_step_with_embed(input_embeds, caches[0])?;
+            return Ok(TalkerPhysicalBatchOutput {
+                hidden_states,
+                logits,
+            });
+        }
+
+        let start_positions = caches
+            .iter()
+            .map(|cache| cache.context_len())
+            .collect::<Vec<_>>();
+        for (row, cache) in caches.iter().enumerate() {
+            cache.validate_model(
+                self.cfg.num_hidden_layers,
+                self.cfg.num_key_value_heads,
+                self.cfg.head_dim(),
+            )?;
+            cache.slots_for_append(start_positions[row], 1)?;
+        }
+        let first = &*caches[0];
+        if caches
+            .iter()
+            .any(|cache| !Arc::ptr_eq(cache.arena(), first.arena()))
+        {
+            return Err(Error::InvalidInput(
+                "Qwen3-TTS physical talker batch rows must share one arena".into(),
+            ));
+        }
+        let combined_slots = caches
+            .iter()
+            .enumerate()
+            .map(|(row, cache)| {
+                cache
+                    .slots_for_append(start_positions[row], 1)
+                    .map(|slots| slots[0])
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let lowered = first.arena().lower_slots(&combined_slots)?;
+        let metadata = KvDecodeBatchMetadata {
+            sequences: caches
+                .iter()
+                .enumerate()
+                .map(|(row, cache)| cache.sequence_table(start_positions[row] + 1))
+                .collect::<Result<Vec<_>>>()?,
+        };
+        let checkpoints = caches
+            .iter()
+            .map(|cache| cache.logical_checkpoint())
+            .collect::<Vec<_>>();
+        let mut completions =
+            KvWriteCompletionCollector::new(first.arena().config(), lowered.logical_slots())?;
+        let execution = (|| -> Result<(Tensor, Tensor)> {
+            let mut hidden = input_embeds.clone();
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                let cache_refs = caches
+                    .iter()
+                    .map(|cache| &**cache)
+                    .collect::<Vec<&TalkerPhysicalCache>>();
+                hidden = layer.forward_physical_decode_batch(
+                    &hidden,
+                    &start_positions,
+                    &cache_refs,
+                    lowered.as_ref(),
+                    &metadata,
+                    &mut completions,
+                    layer_idx,
+                )?;
+            }
+            let hidden = self.norm.forward(&hidden)?;
+            let logits = self.lm_head.forward(&hidden)?;
+            Ok((hidden, logits))
+        })();
+        let (hidden_states, logits) = match execution {
+            Ok(output) => output,
+            Err(error) => {
+                return match completions.drain() {
+                    Ok(()) => Err(error),
+                    Err(drain) => Err(Error::InferenceError(format!(
+                        "Qwen3-TTS talker batch failed: {error}; write-fence drain also failed: {drain}"
+                    ))),
+                };
+            }
+        };
+        let completion = Arc::new(completions.seal()?);
+        for (committed, row) in (0..batch_size).enumerate() {
+            if let Err(error) =
+                caches[row].commit_shared_completion(start_positions[row], 1, completion.clone())
+            {
+                let mut rollback_error = None;
+                for rollback_row in 0..committed {
+                    if let Err(rollback) = caches[rollback_row]
+                        .restore_logical_checkpoint(checkpoints[rollback_row].clone())
+                    {
+                        rollback_error.get_or_insert(rollback);
+                    }
+                }
+                return if let Some(rollback) = rollback_error {
+                    Err(Error::InferenceError(format!(
+                        "Qwen3-TTS talker batch commit failed: {error}; rollback also failed: {rollback}"
+                    )))
+                } else {
+                    Err(error)
+                };
+            }
+        }
+        Ok(TalkerPhysicalBatchOutput {
+            hidden_states,
+            logits,
+        })
     }
 
     /// Get projected text embeddings for a sequence of token IDs.
@@ -585,8 +957,194 @@ fn repeated_mrope_position_ids(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    use crate::backends::kv::{CpuKvArena, KvArena, KvArenaConfig, KvLayerConfig};
+    use crate::backends::BackendKind;
+    use crate::engine::ModelInstanceId;
+    use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
+    use crate::models::architectures::qwen3::tts::config::CodePredictorConfig;
+
+    fn test_linear(output: usize, input: usize, offset: usize, device: &Device) -> Linear {
+        let values = (0..output * input)
+            .map(|index| {
+                let value = (index.saturating_mul(7).saturating_add(offset)) % 29;
+                (value as f32 - 14.0) / 32.0
+            })
+            .collect::<Vec<_>>();
+        Linear::new(
+            Tensor::from_vec(values, (output, input), device).unwrap(),
+            None,
+        )
+    }
+
+    pub(crate) fn tiny_talker(device: &Device) -> TalkerModel {
+        let predictor = CodePredictorConfig {
+            model_type: "test-predictor".into(),
+            hidden_size: 4,
+            intermediate_size: 8,
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 2,
+            max_position_embeddings: 32,
+            vocab_size: 8,
+            num_code_groups: 4,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10_000.0,
+            hidden_act: "silu".into(),
+            use_cache: true,
+            layer_types: Vec::new(),
+            text_hidden_size: None,
+        };
+        let cfg = TalkerConfig {
+            model_type: "test-talker".into(),
+            hidden_size: 4,
+            intermediate_size: 8,
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 2,
+            max_position_embeddings: 32,
+            vocab_size: 8,
+            text_vocab_size: 8,
+            text_hidden_size: 4,
+            num_code_groups: 4,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10_000.0,
+            hidden_act: "silu".into(),
+            use_cache: true,
+            position_id_per_seconds: 13,
+            rope_scaling: None,
+            sliding_window: None,
+            code_predictor_config: predictor,
+            spk_id: HashMap::new(),
+            spk_is_dialect: HashMap::new(),
+            codec_bos_id: 1,
+            codec_eos_token_id: 2,
+            codec_think_id: 3,
+            codec_nothink_id: 4,
+            codec_pad_id: 5,
+            codec_think_bos_id: 6,
+            codec_think_eos_id: 7,
+            codec_language_id: HashMap::new(),
+        };
+        let attention = Attention {
+            q_proj: test_linear(4, 4, 1, device),
+            k_proj: test_linear(2, 4, 2, device),
+            v_proj: test_linear(2, 4, 3, device),
+            o_proj: test_linear(4, 4, 4, device),
+            q_norm: None,
+            k_norm: None,
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 2,
+            rope_inv_freq: build_rope_inv_freq(2, cfg.rope_theta),
+            use_mrope: false,
+            mrope_section: Vec::new(),
+        };
+        let layer = Layer {
+            input_layernorm: RmsNorm::new(Tensor::ones(4, DType::F32, device).unwrap(), 1e-5),
+            self_attn: attention,
+            post_attention_layernorm: RmsNorm::new(
+                Tensor::ones(4, DType::F32, device).unwrap(),
+                1e-5,
+            ),
+            mlp: Mlp {
+                gate_proj: test_linear(8, 4, 5, device),
+                up_proj: test_linear(8, 4, 6, device),
+                down_proj: test_linear(4, 8, 7, device),
+            },
+        };
+        let embedding_values = (0..32)
+            .map(|index| ((index * 5 % 17) as f32 - 8.0) / 16.0)
+            .collect::<Vec<_>>();
+        TalkerModel {
+            text_embedding: Embedding::new(
+                Tensor::from_vec(embedding_values.clone(), (8, 4), device).unwrap(),
+                4,
+            ),
+            text_projection: TextProjection {
+                linear_fc1: test_linear(4, 4, 8, device),
+                linear_fc2: test_linear(4, 4, 9, device),
+            },
+            codec_embedding: Embedding::new(
+                Tensor::from_vec(embedding_values, (8, 4), device).unwrap(),
+                4,
+            ),
+            layers: vec![layer],
+            norm: RmsNorm::new(Tensor::ones(4, DType::F32, device).unwrap(), 1e-5),
+            lm_head: test_linear(8, 4, 10, device),
+            device: device.clone(),
+            cfg,
+            use_mrope: false,
+        }
+    }
+
+    pub(crate) fn test_arena(instance: u64) -> (Arc<dyn KvArena>, Vec<KvLayerBinding>) {
+        let binding = KvLayerBinding {
+            model_layer: 0,
+            physical_layer: 0,
+        };
+        let arena = CpuKvArena::new(KvArenaConfig {
+            id: KvArenaId {
+                model_instance: ModelInstanceId::new(instance),
+                backend: BackendKind::Cpu,
+                device_ordinal: None,
+                generation: 1,
+            },
+            group: KvGroupId::new(0),
+            page_tokens: 2,
+            capacity_pages: 24,
+            growth: None,
+            dtype: DType::F32,
+            layers: vec![KvLayerConfig {
+                binding,
+                num_kv_heads: 1,
+                key_head_dim: 2,
+                value_head_dim: 2,
+            }],
+        })
+        .unwrap();
+        (Arc::new(arena), vec![binding])
+    }
+
+    pub(crate) fn test_cache(
+        arena: Arc<dyn KvArena>,
+        bindings: &[KvLayerBinding],
+        first_page: u32,
+    ) -> TalkerPhysicalCache {
+        let blocks = (first_page..first_page + 6)
+            .map(|index| CacheBlockRef {
+                arena: arena.id(),
+                group: arena.config().group,
+                index,
+                slot_generation: 1,
+            })
+            .collect();
+        TalkerPhysicalCache::new(arena, bindings.to_vec(), blocks, 0).unwrap()
+    }
+
+    pub(crate) fn embeddings(tokens: usize, seed: usize, device: &Device) -> Tensor {
+        let values = (0..tokens * 4)
+            .map(|index| {
+                let value = (index.saturating_mul(11).saturating_add(seed)) % 31;
+                (value as f32 - 15.0) / 20.0
+            })
+            .collect::<Vec<_>>();
+        Tensor::from_vec(values, (1, tokens, 4), device).unwrap()
+    }
+
+    fn assert_close(left: &Tensor, right: &Tensor) {
+        assert_eq!(left.dims(), right.dims());
+        let left = left.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let right = right.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for (left, right) in left.iter().zip(right) {
+            assert!((left - right).abs() < 1e-4, "{left} != {right}");
+        }
+    }
 
     #[test]
     fn repeated_mrope_positions_match_standard_rope_when_axes_equal() {
@@ -616,5 +1174,129 @@ mod tests {
             mrope_sin.to_vec2::<f32>().unwrap(),
             standard_sin.to_vec2::<f32>().unwrap()
         );
+    }
+
+    #[test]
+    fn resumable_embedding_prefill_matches_one_shot_last_continuation() {
+        let device = Device::Cpu;
+        let model = tiny_talker(&device);
+        let prompt = embeddings(4, 3, &device);
+        let (full_arena, full_bindings) = test_arena(701);
+        let (chunk_arena, chunk_bindings) = test_arena(702);
+        let mut full_cache = test_cache(full_arena, &full_bindings, 0);
+        let mut chunk_cache = test_cache(chunk_arena, &chunk_bindings, 0);
+
+        let (full_hidden, full_logits) = model
+            .prefill_physical_with_embeds(&prompt, &mut full_cache, None)
+            .unwrap();
+        let first = prompt.narrow(1, 0, 2).unwrap();
+        let second = prompt.narrow(1, 2, 2).unwrap();
+        assert!(model
+            .prefill_physical_span_with_embeds(&first, 0, &mut chunk_cache, None, false)
+            .unwrap()
+            .is_none());
+        let (chunk_hidden, chunk_logits) = model
+            .prefill_physical_span_with_embeds(&second, 2, &mut chunk_cache, None, true)
+            .unwrap()
+            .unwrap();
+
+        assert_close(&full_hidden, &chunk_hidden);
+        assert_close(&full_logits, &chunk_logits);
+        assert_eq!(full_cache.context_len(), 4);
+        assert_eq!(chunk_cache.context_len(), 4);
+    }
+
+    #[test]
+    fn ragged_talker_batch_matches_scalar_rows_and_shares_completion() {
+        let device = Device::Cpu;
+        let model = tiny_talker(&device);
+        let (scalar_arena, scalar_bindings) = test_arena(703);
+        let (batch_arena, batch_bindings) = test_arena(704);
+        let mut scalar_a = test_cache(scalar_arena.clone(), &scalar_bindings, 0);
+        let mut scalar_b = test_cache(scalar_arena, &scalar_bindings, 6);
+        let mut batch_a = test_cache(batch_arena.clone(), &batch_bindings, 0);
+        let mut batch_b = test_cache(batch_arena, &batch_bindings, 6);
+        let prefix_a = embeddings(2, 5, &device);
+        let prefix_b = embeddings(3, 7, &device);
+        for cache in [&mut scalar_a, &mut batch_a] {
+            model
+                .prefill_physical_with_embeds(&prefix_a, cache, None)
+                .unwrap();
+            cache.take_completed_writes();
+        }
+        for cache in [&mut scalar_b, &mut batch_b] {
+            model
+                .prefill_physical_with_embeds(&prefix_b, cache, None)
+                .unwrap();
+            cache.take_completed_writes();
+        }
+        let step_a = embeddings(1, 11, &device);
+        let step_b = embeddings(1, 13, &device);
+        let (scalar_hidden_a, scalar_logits_a) = model
+            .generate_physical_step_with_embed(&step_a, &mut scalar_a)
+            .unwrap();
+        let (scalar_hidden_b, scalar_logits_b) = model
+            .generate_physical_step_with_embed(&step_b, &mut scalar_b)
+            .unwrap();
+        let inputs = Tensor::cat(&[&step_a, &step_b], 0).unwrap();
+        let mut caches = [&mut batch_a, &mut batch_b];
+        let batch = model
+            .generate_physical_step_batch_with_embeds(&inputs, &mut caches)
+            .unwrap();
+
+        assert_close(
+            &scalar_hidden_a,
+            &batch.hidden_states.i(0).unwrap().unsqueeze(0).unwrap(),
+        );
+        assert_close(
+            &scalar_hidden_b,
+            &batch.hidden_states.i(1).unwrap().unsqueeze(0).unwrap(),
+        );
+        assert_close(
+            &scalar_logits_a,
+            &batch.logits.i(0).unwrap().unsqueeze(0).unwrap(),
+        );
+        assert_close(
+            &scalar_logits_b,
+            &batch.logits.i(1).unwrap().unsqueeze(0).unwrap(),
+        );
+        assert_eq!((batch_a.context_len(), batch_b.context_len()), (3, 4));
+        let completion_a = batch_a.take_completed_writes();
+        let completion_b = batch_b.take_completed_writes();
+        assert_eq!(completion_a.len(), 1);
+        assert_eq!(completion_b.len(), 1);
+        assert!(Arc::ptr_eq(&completion_a[0], &completion_b[0]));
+    }
+
+    #[test]
+    fn incompatible_talker_batch_leaves_every_row_cursor_unchanged() {
+        let device = Device::Cpu;
+        let model = tiny_talker(&device);
+        let (arena_a, bindings_a) = test_arena(705);
+        let (arena_b, bindings_b) = test_arena(706);
+        let mut cache_a = test_cache(arena_a, &bindings_a, 0);
+        let mut cache_b = test_cache(arena_b, &bindings_b, 0);
+        let prefix = embeddings(2, 17, &device);
+        model
+            .prefill_physical_with_embeds(&prefix, &mut cache_a, None)
+            .unwrap();
+        model
+            .prefill_physical_with_embeds(&prefix, &mut cache_b, None)
+            .unwrap();
+        cache_a.take_completed_writes();
+        cache_b.take_completed_writes();
+        let inputs = Tensor::cat(
+            &[&embeddings(1, 19, &device), &embeddings(1, 23, &device)],
+            0,
+        )
+        .unwrap();
+        let mut caches = [&mut cache_a, &mut cache_b];
+
+        assert!(model
+            .generate_physical_step_batch_with_embeds(&inputs, &mut caches)
+            .is_err());
+        assert_eq!((cache_a.context_len(), cache_b.context_len()), (2, 2));
+        assert!(cache_a.take_completed_writes().is_empty());
+        assert!(cache_b.take_completed_writes().is_empty());
     }
 }

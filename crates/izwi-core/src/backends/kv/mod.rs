@@ -354,6 +354,21 @@ pub(crate) struct KvWriteBatchCompletion {
 }
 
 impl KvWriteBatchCompletion {
+    #[cfg(test)]
+    pub(crate) fn from_test_parts(
+        arena: KvArenaId,
+        layers: Vec<KvLayerBinding>,
+        slots: Vec<KvSlotRef>,
+        page_tokens: u32,
+    ) -> Self {
+        Self {
+            arena,
+            layers,
+            slots: slots.into(),
+            page_tokens,
+        }
+    }
+
     pub(crate) fn arena(&self) -> KvArenaId {
         self.arena
     }
@@ -398,6 +413,32 @@ impl KvWriteBatchCompletion {
             self.slots = self.slots[..slots_per_layer].to_vec().into();
         }
         Ok(self)
+    }
+
+    /// Project one sealed physical-batch proof onto an exact contiguous row
+    /// range. The original collector has already fenced every layer, while the
+    /// projection prevents a row-local lease from retaining authentication for
+    /// another row's invocation slots.
+    pub(crate) fn project_slot_range(
+        &self,
+        start_slot: usize,
+        slots_per_layer: usize,
+    ) -> Result<Self> {
+        let end_slot = start_slot.checked_add(slots_per_layer).ok_or_else(|| {
+            Error::InvalidInput("KV write completion projection overflowed".into())
+        })?;
+        if slots_per_layer == 0 || end_slot > self.slots.len() {
+            return Err(Error::InvalidInput(format!(
+                "KV write completion projection {start_slot}..{end_slot} is outside 0..{}",
+                self.slots.len()
+            )));
+        }
+        Ok(Self {
+            arena: self.arena,
+            layers: self.layers.clone(),
+            slots: self.slots[start_slot..end_slot].to_vec().into(),
+            page_tokens: self.page_tokens,
+        })
     }
 }
 

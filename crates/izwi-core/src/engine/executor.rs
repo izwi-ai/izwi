@@ -1945,7 +1945,10 @@ fn loaded_native_batch_support(request: &EngineCoreRequest) -> NativeBatchSuppor
         TaskType::ASR => request
             .prepared_asr_model_for_executor()
             .is_ok_and(|model| model.is_some_and(|model| model.supports_continuous_decode_batch())),
-        TaskType::TTS | TaskType::SpeechToSpeech => false,
+        TaskType::TTS => request
+            .prepared_qwen_tts_model_for_executor()
+            .is_ok_and(|model| model.is_some_and(|model| model.supports_continuous_decode_batch())),
+        TaskType::SpeechToSpeech => false,
     };
     if !supported {
         return NativeBatchSupport::NONE;
@@ -2085,7 +2088,12 @@ impl ModelExecutor for NativeExecutor {
                 .ok()
                 .flatten()
                 .map(|model| model.supports_resumable_prefill()),
-            super::types::TaskType::TTS | super::types::TaskType::SpeechToSpeech => None,
+            super::types::TaskType::TTS => request
+                .prepared_qwen_tts_model_for_executor()
+                .ok()
+                .flatten()
+                .map(|model| model.supports_resumable_prefill()),
+            super::types::TaskType::SpeechToSpeech => None,
         };
 
         if implementation_incremental {
@@ -2240,6 +2248,16 @@ impl ModelExecutor for NativeExecutor {
                     mode: NativeBatchMode::Continuous,
                     ..
                 } => self.execute_continuous_asr_requests_with_rows(
+                    execution.requests,
+                    execution.scheduled,
+                    Some(&execution.batch.rows),
+                ),
+                NativeBatchRoute::Audio {
+                    task: TaskType::TTS,
+                    stage: NativeAudioStage::SequenceDecode,
+                    mode: NativeBatchMode::Continuous,
+                    ..
+                } => self.execute_continuous_tts_requests_with_rows(
                     execution.requests,
                     execution.scheduled,
                     Some(&execution.batch.rows),

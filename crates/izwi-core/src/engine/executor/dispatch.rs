@@ -392,6 +392,40 @@ impl NativeExecutor {
         )
     }
 
+    pub(super) fn execute_continuous_tts_requests_with_rows(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+        rows: Option<&[ReadyQuantum]>,
+    ) -> Result<Vec<ExecutorStepResult>> {
+        let managed_caches = scheduled
+            .iter()
+            .map(|scheduled| {
+                let reservation = rows
+                    .and_then(|rows| rows.iter().find(|row| row.plan_id == scheduled.plan_id))
+                    .and_then(|row| row.managed_cache.as_ref());
+                let request = Self::find_request(requests, scheduled).ok_or_else(|| {
+                    Error::InferenceError(
+                        "continuous TTS managed-cache row has no request snapshot".to_string(),
+                    )
+                })?;
+                reservation
+                    .map(|reservation| {
+                        super::retained_row_managed_state_for_row(request, scheduled, reservation)
+                    })
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let outputs = self.tts_decode_batch_with_managed(requests, scheduled, managed_caches)?;
+        self.finish_scheduled_execution(
+            requests,
+            scheduled,
+            outputs,
+            BatchDispatch::new(BatchDispatchKind::TensorContinuous, scheduled.len()),
+            rows,
+        )
+    }
+
     fn finish_scheduled_execution(
         &self,
         requests: &[&EngineCoreRequest],

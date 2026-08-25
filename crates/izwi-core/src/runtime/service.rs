@@ -2010,6 +2010,28 @@ impl RuntimeService {
                 self.backend_router.context().backend_kind,
             ))?;
         }
+        if request.task_type == TaskType::TTS
+            && request
+                .model_variant
+                .is_some_and(|variant| variant.family() == ModelFamily::Qwen3Tts)
+        {
+            let frames =
+                u64::try_from(request.qwen_tts_generation_params().max_frames).map_err(|_| {
+                    Error::Overloaded("Qwen3-TTS output frame bound exceeds u64".into())
+                })?;
+            let output_bytes = frames
+                .checked_mul(1_920)
+                .and_then(|samples| samples.checked_mul(std::mem::size_of::<f32>() as u64))
+                .ok_or_else(|| Error::Overloaded("Qwen3-TTS output reservation overflow".into()))?;
+            let mut output = ResourceVector::zero();
+            match self.backend_router.context().backend_kind {
+                BackendKind::Metal => output.unified_bytes = ResourceAmount::Known(output_bytes),
+                BackendKind::Cpu | BackendKind::Cuda => {
+                    output.host_bytes = ResourceAmount::Known(output_bytes)
+                }
+            }
+            spec.resources = spec.resources.checked_add(output)?;
+        }
         if request.task_type == TaskType::Chat && !request.chat_config.media_inputs.is_empty() {
             if !request
                 .model_variant
@@ -5189,5 +5211,29 @@ mod tests {
             coordinator_lane_for_request(&offline_asr),
             CoordinatorLane::Realtime
         );
+    }
+
+    #[test]
+    fn qwen_tts_coordinator_reserves_request_max_output_exactly() {
+        let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+        let backend = runtime.backend_context().backend_kind;
+        let mut request = EngineCoreRequest::tts("hello");
+        request.model_variant = Some(ModelVariant::Qwen3Tts12Hz06BBase);
+        let output_bytes = (request.qwen_tts_generation_params().max_frames as u64)
+            * 1_920
+            * std::mem::size_of::<f32>() as u64;
+        let mut output = ResourceVector::zero();
+        match backend {
+            BackendKind::Metal => output.unified_bytes = ResourceAmount::Known(output_bytes),
+            BackendKind::Cpu | BackendKind::Cuda => {
+                output.host_bytes = ResourceAmount::Known(output_bytes)
+            }
+        }
+        let mut plain = request.clone();
+        plain.model_variant = None;
+        let (plain_spec, _) = runtime.coordinator_job_for_request(&plain).unwrap();
+        let expected = plain_spec.resources.checked_add(output).unwrap();
+        let (spec, _) = runtime.coordinator_job_for_request(&request).unwrap();
+        assert_eq!(spec.resources, expected);
     }
 }

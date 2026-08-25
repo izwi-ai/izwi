@@ -1,15 +1,18 @@
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::tts::{
-    SpeakerReference, TalkerPhysicalCache, TtsGenerationParams, TtsStreamingConfig,
+    PhysicalTtsManagedQuantumCheckpoint, PhysicalTtsPrefillManagedCheckpoint, SpeakerReference,
+    TalkerPhysicalCache, TtsGenerationParams, TtsStreamingConfig,
 };
 use crate::runtime::audio_io::decode_reference_audio_base64;
 
 use super::super::request::EngineCoreRequest;
 use super::super::scheduler::ScheduledRequest;
 use super::super::types::AudioOutput;
-use super::state::ActiveQwenTtsDecode;
+use super::super::SessionKey;
+use super::state::{ActiveQwenTtsDecode, QwenTtsPhysicalState};
 use super::{
     ExecutorOutput, ExecutorPhaseTiming, ExecutorStateLease, ModelSessionResult, NativeExecutor,
 };
@@ -43,6 +46,249 @@ fn qwen_tts_decode_iterations(scheduled: &ScheduledRequest) -> usize {
         0
     } else {
         scheduled.num_tokens.max(1)
+    }
+}
+
+fn resumable_tts_prefill_span(
+    scheduled: &ScheduledRequest,
+    prompt_tokens: usize,
+) -> Result<(usize, usize)> {
+    let start = scheduled.num_computed_tokens;
+    let end = start.checked_add(scheduled.num_tokens).ok_or_else(|| {
+        Error::InvalidInput("resumable TTS prefill span overflowed prompt accounting".into())
+    })?;
+    let crate::engine::WorkUnit::SequenceStep { phase, input, .. } = &scheduled.work else {
+        return Err(Error::InvalidInput(
+            "resumable TTS prefill requires sequence-prefill work".into(),
+        ));
+    };
+    if *phase != crate::engine::SequencePhase::Prefill
+        || input.start != start
+        || input.end != end
+        || start >= end
+        || end > prompt_tokens
+    {
+        return Err(Error::InvalidInput(format!(
+            "resumable TTS work [{}, {}) disagrees with scheduler span [{start}, {end}) for {prompt_tokens} prompt tokens",
+            input.start, input.end
+        )));
+    }
+    Ok((start, end))
+}
+
+fn validate_continuous_tts_batch_shape(scheduled: &[ScheduledRequest]) -> Result<()> {
+    if scheduled.is_empty()
+        || scheduled
+            .iter()
+            .any(|scheduled| scheduled.is_prefill || scheduled.num_tokens != 1)
+    {
+        return Err(Error::InvalidInput(
+            "continuous TTS execution requires one decode frame per row".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn late_cancelled_tts_rows(cancelled: &[bool], checkpoint_armed: &[bool]) -> Vec<usize> {
+    cancelled
+        .iter()
+        .zip(checkpoint_armed)
+        .enumerate()
+        .filter_map(|(row, (cancelled, armed))| (*cancelled && *armed).then_some(row))
+        .collect()
+}
+
+fn continuous_tts_model_call(
+    live_kernel_rows: usize,
+    tensor_batched: bool,
+) -> Option<crate::engine::metrics::EngineModelCall> {
+    match live_kernel_rows {
+        0 => None,
+        1 => Some(crate::engine::metrics::EngineModelCall::ScalarRows {
+            envelope: crate::engine::NativeBatchMode::Continuous,
+            rows: 1,
+        }),
+        rows if tensor_batched => Some(crate::engine::metrics::EngineModelCall::NativeTensor {
+            mode: crate::engine::NativeBatchMode::Continuous,
+            rows,
+        }),
+        rows => Some(crate::engine::metrics::EngineModelCall::ScalarRows {
+            envelope: crate::engine::NativeBatchMode::Continuous,
+            rows,
+        }),
+    }
+}
+
+fn accepted_tts_talker_tokens(
+    start_cursor: usize,
+    end_cursor: usize,
+    scheduled_tokens: usize,
+) -> Result<usize> {
+    let accepted = end_cursor
+        .checked_sub(start_cursor)
+        .ok_or_else(|| Error::InferenceError("Qwen3-TTS talker cursor moved backwards".into()))?;
+    if accepted > scheduled_tokens {
+        return Err(Error::InferenceError(
+            "Qwen3-TTS accepted more frames than were scheduled".into(),
+        ));
+    }
+    Ok(accepted)
+}
+
+#[derive(Clone)]
+struct ActiveTtsOuterCheckpoint {
+    last_frames_generated: usize,
+    stream_sequence: usize,
+    audio_samples_len: usize,
+    sampling_ms: f64,
+    prefill_ms: f64,
+    decode_ms: f64,
+    codec_ms: f64,
+    postprocess_ms: f64,
+    first_output_ms_since_start: Option<f64>,
+    prefill_steps: u32,
+    decode_steps: u32,
+}
+
+impl ActiveTtsOuterCheckpoint {
+    fn capture(state: &ActiveQwenTtsDecode) -> Self {
+        Self {
+            last_frames_generated: state.last_frames_generated,
+            stream_sequence: state.stream_sequence,
+            audio_samples_len: state.audio_samples_accum.len(),
+            sampling_ms: state.sampling_ms,
+            prefill_ms: state.prefill_ms,
+            decode_ms: state.decode_ms,
+            codec_ms: state.codec_ms,
+            postprocess_ms: state.postprocess_ms,
+            first_output_ms_since_start: state.first_output_ms_since_start,
+            prefill_steps: state.prefill_steps,
+            decode_steps: state.decode_steps,
+        }
+    }
+
+    fn restore(self, state: &mut ActiveQwenTtsDecode) {
+        state.last_frames_generated = self.last_frames_generated;
+        state.stream_sequence = self.stream_sequence;
+        state.audio_samples_accum.truncate(self.audio_samples_len);
+        state.sampling_ms = self.sampling_ms;
+        state.prefill_ms = self.prefill_ms;
+        state.decode_ms = self.decode_ms;
+        state.codec_ms = self.codec_ms;
+        state.postprocess_ms = self.postprocess_ms;
+        state.first_output_ms_since_start = self.first_output_ms_since_start;
+        state.prefill_steps = self.prefill_steps;
+        state.decode_steps = self.decode_steps;
+    }
+}
+
+enum TtsManagedCheckpoint {
+    Prefill(PhysicalTtsPrefillManagedCheckpoint),
+    Decode(PhysicalTtsManagedQuantumCheckpoint),
+}
+
+fn rollback_tts_quantum(
+    active: &mut ActiveQwenTtsDecode,
+    checkpoint: TtsManagedCheckpoint,
+    outer: ActiveTtsOuterCheckpoint,
+) -> Result<()> {
+    match (&mut active.state, checkpoint) {
+        (QwenTtsPhysicalState::Prefill(state), TtsManagedCheckpoint::Prefill(checkpoint)) => {
+            state.rollback_managed_quantum(checkpoint);
+        }
+        (QwenTtsPhysicalState::Decode(state), TtsManagedCheckpoint::Decode(checkpoint)) => {
+            state.rollback_managed_quantum(checkpoint);
+        }
+        (state, TtsManagedCheckpoint::Prefill(checkpoint)) => {
+            *state = QwenTtsPhysicalState::Prefill(checkpoint.into_state());
+        }
+        _ => {
+            return Err(Error::InferenceError(
+                "Qwen3-TTS rollback checkpoint no longer matches active phase".into(),
+            ));
+        }
+    }
+    outer.restore(active);
+    Ok(())
+}
+
+struct ContinuousTtsStateBatch<'a> {
+    rows: Vec<(
+        usize,
+        SessionKey,
+        ExecutorStateLease<'a, ActiveQwenTtsDecode>,
+        Option<(TtsManagedCheckpoint, ActiveTtsOuterCheckpoint)>,
+    )>,
+    armed: bool,
+}
+
+impl<'a> ContinuousTtsStateBatch<'a> {
+    fn new(
+        rows: Vec<(
+            usize,
+            SessionKey,
+            ExecutorStateLease<'a, ActiveQwenTtsDecode>,
+        )>,
+    ) -> Self {
+        Self {
+            rows: rows
+                .into_iter()
+                .map(|(index, session, lease)| (index, session, lease, None))
+                .collect(),
+            armed: true,
+        }
+    }
+
+    fn rollback_row(&mut self, row: usize) -> Result<usize> {
+        let (index, _, lease, checkpoint) = self.rows.get_mut(row).ok_or_else(|| {
+            Error::InferenceError("continuous TTS rollback row is out of range".into())
+        })?;
+        let (checkpoint, outer) = checkpoint.take().ok_or_else(|| {
+            Error::InferenceError("continuous TTS row has no armed checkpoint".into())
+        })?;
+        rollback_tts_quantum(lease.require_state_mut()?, checkpoint, outer)?;
+        lease.mark_clean();
+        Ok(*index)
+    }
+
+    fn commit(
+        mut self,
+    ) -> Vec<(
+        usize,
+        SessionKey,
+        ExecutorStateLease<'a, ActiveQwenTtsDecode>,
+    )> {
+        self.armed = false;
+        std::mem::take(&mut self.rows)
+            .into_iter()
+            .map(|(index, session, lease, _)| (index, session, lease))
+            .collect()
+    }
+}
+
+impl Drop for ContinuousTtsStateBatch<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        for (_, session, lease, checkpoint) in &mut self.rows {
+            let Some((checkpoint, outer)) = checkpoint.take() else {
+                continue;
+            };
+            match lease
+                .require_state_mut()
+                .and_then(|state| rollback_tts_quantum(state, checkpoint, outer))
+            {
+                Ok(()) => lease.mark_clean(),
+                Err(error) => tracing::error!(
+                    request_id = %session.request_id,
+                    epoch = session.epoch,
+                    %error,
+                    "continuous TTS rollback failed; state fenced until cleanup"
+                ),
+            }
+        }
+        self.rows.clear();
     }
 }
 
@@ -111,13 +357,8 @@ impl NativeExecutor {
             tensor_arena.is_some(),
             tensor_reservation.is_some(),
         )?;
-        if scheduled.is_prefill
-            && (scheduled.num_computed_tokens != 0
-                || scheduled.num_tokens != request.num_prompt_tokens())
-        {
-            return Err(Error::InvalidInput(
-                "physical Qwen TTS requires one exact full-prompt prefill quantum".to_string(),
-            ));
+        if scheduled.is_prefill {
+            resumable_tts_prefill_span(scheduled, request.num_prompt_tokens())?;
         }
         let execution_started = Instant::now();
         let stream_tx = Self::stream_sender(request);
@@ -140,31 +381,7 @@ impl NativeExecutor {
             {
                 state_lease.discard_state();
             }
-            if state_lease.state().is_some() {
-                state_lease.mark_dirty();
-                state_lease
-                    .require_state_mut()?
-                    .state
-                    .install_retained_talker_reservation(talker_cache.take().ok_or_else(
-                        || {
-                            Error::InferenceError(
-                                "active Qwen TTS state lost its talker reservation".to_string(),
-                            )
-                        },
-                    )?)?;
-                if let (Some(arena), Some(reservation)) =
-                    (tensor_arena.as_ref(), tensor_reservation)
-                {
-                    state_lease
-                        .require_state_mut()?
-                        .state
-                        .bind_tensor_sequence(reservation.sequence)?;
-                    state_lease
-                        .require_state_mut()?
-                        .state
-                        .restore_tensor_state(arena)?;
-                }
-            }
+            let fresh_state = state_lease.state().is_none();
             let (model, new_model_lease) = if let Some(state) = state_lease.state() {
                 (state.model.clone(), None)
             } else {
@@ -193,16 +410,15 @@ impl NativeExecutor {
                     TtsStreamingConfig::final_only()
                 };
                 let normalization_ms = normalization_started.elapsed().as_secs_f64() * 1000.0;
-                let prefill_started = Instant::now();
                 let cache = talker_cache.take().ok_or_else(|| {
                     Error::InferenceError(
                         "Qwen TTS prefill lost its retained talker reservation".to_string(),
                     )
                 })?;
 
-                let decode_state = if let Some(reference) = prepared.reference.as_deref() {
+                let prefill_state = if let Some(reference) = prepared.reference.as_deref() {
                     Self::run_blocking(|| {
-                        model.start_physical_decode_with_voice_clone_params(
+                        model.begin_physical_prefill_with_voice_clone_params(
                             text,
                             reference,
                             language,
@@ -213,7 +429,7 @@ impl NativeExecutor {
                     })?
                 } else if let Some(speaker) = prepared.speaker.as_deref() {
                     Self::run_blocking(|| {
-                        model.start_physical_decode_with_speaker_params(
+                        model.begin_physical_prefill_with_speaker_params(
                             text,
                             speaker,
                             language,
@@ -225,7 +441,7 @@ impl NativeExecutor {
                     })?
                 } else {
                     Self::run_blocking(|| {
-                        model.start_physical_decode_with_text_params(
+                        model.begin_physical_prefill_with_text_params(
                             text,
                             language,
                             request.voice_description.as_deref(),
@@ -235,10 +451,10 @@ impl NativeExecutor {
                         )
                     })?
                 };
-                if decode_state.talker_context_len() != prepared.prefill_tokens {
+                if prefill_state.prefill_tokens() != prepared.prefill_tokens {
                     return Err(Error::InferenceError(format!(
-                        "Qwen TTS runtime prefill produced {} tokens, but admission authorized {}",
-                        decode_state.talker_context_len(),
+                        "Qwen TTS runtime prepared {} tokens, but admission authorized {}",
+                        prefill_state.prefill_tokens(),
                         prepared.prefill_tokens
                     )));
                 }
@@ -247,79 +463,222 @@ impl NativeExecutor {
                     variant,
                     model: model_arc.clone(),
                     _model_lease: new_model_lease,
-                    state: decode_state,
+                    state: QwenTtsPhysicalState::Prefill(prefill_state),
                     last_frames_generated: 0,
                     stream_sequence: 0,
                     audio_samples_accum: Vec::new(),
                     execution_started,
                     normalization_ms,
-                    prefill_ms: prefill_started.elapsed().as_secs_f64() * 1000.0,
+                    prefill_ms: 0.0,
                     sampling_ms: 0.0,
                     decode_ms: 0.0,
                     codec_ms: 0.0,
                     postprocess_ms: 0.0,
                     first_output_ms_since_start: None,
+                    prefill_steps: 0,
                     decode_steps: 0,
                 };
                 if let Some(reservation) = tensor_reservation {
-                    active.state.bind_tensor_sequence(reservation.sequence)?;
+                    let QwenTtsPhysicalState::Prefill(state) = &mut active.state else {
+                        unreachable!("fresh Qwen3-TTS state is prefill")
+                    };
+                    state.bind_tensor_sequence(reservation.sequence)?;
                 }
                 state_lease.install_state(active)?;
             }
 
+            let outer_checkpoint =
+                ActiveTtsOuterCheckpoint::capture(state_lease.require_state_mut()?);
+            let mut managed_checkpoint = if fresh_state {
+                None
+            } else {
+                let cache = talker_cache.take().ok_or_else(|| {
+                    Error::InferenceError(
+                        "active Qwen TTS state lost its talker reservation".into(),
+                    )
+                })?;
+                let active = state_lease.require_state_mut()?;
+                Some(match &mut active.state {
+                    QwenTtsPhysicalState::Prefill(state) => {
+                        TtsManagedCheckpoint::Prefill(state.begin_managed_quantum(cache)?)
+                    }
+                    QwenTtsPhysicalState::Decode(state) => {
+                        TtsManagedCheckpoint::Decode(state.begin_managed_quantum(cache)?)
+                    }
+                    QwenTtsPhysicalState::Transitioning => {
+                        return Err(Error::InferenceError(
+                            "Qwen3-TTS state was left in a transition".into(),
+                        ));
+                    }
+                })
+            };
+            if let Some(reservation) = tensor_reservation {
+                let hydration = (|| -> Result<()> {
+                    let active = state_lease.require_state_mut()?;
+                    match &mut active.state {
+                        QwenTtsPhysicalState::Prefill(state) => {
+                            state.bind_tensor_sequence(reservation.sequence)?;
+                        }
+                        QwenTtsPhysicalState::Decode(state) => {
+                            state.bind_tensor_sequence(reservation.sequence)?;
+                            state.restore_tensor_state(tensor_arena.as_ref().ok_or_else(
+                                || {
+                                    Error::InferenceError(
+                                        "Qwen3-TTS tensor arena disappeared".into(),
+                                    )
+                                },
+                            )?)?;
+                        }
+                        QwenTtsPhysicalState::Transitioning => {
+                            return Err(Error::InferenceError(
+                                "Qwen3-TTS state was left in a transition".into(),
+                            ));
+                        }
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = hydration {
+                    if let Some(checkpoint) = managed_checkpoint.take() {
+                        rollback_tts_quantum(
+                            state_lease.require_state_mut()?,
+                            checkpoint,
+                            outer_checkpoint,
+                        )?;
+                        state_lease.mark_clean();
+                    } else {
+                        state_lease.discard_state();
+                    }
+                    return Err(error);
+                }
+            }
+
             if request.is_cancelled() {
+                if let Some(checkpoint) = managed_checkpoint.take() {
+                    rollback_tts_quantum(
+                        state_lease.require_state_mut()?,
+                        checkpoint,
+                        outer_checkpoint,
+                    )?;
+                    state_lease.mark_clean();
+                } else {
+                    state_lease.discard_state();
+                }
                 state_lease.release()?;
                 return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
                     request.id.clone(),
                 )));
             }
 
-            let decode_iterations = qwen_tts_decode_iterations(scheduled);
             state_lease.mark_dirty();
-            let (
-                tokens_processed,
-                total_tokens_generated,
-                finished,
-                finished_samples,
-                phase_timing_override,
-                managed_cache_completions,
-            ) = {
+            let execution = (|| -> Result<(
+                usize,
+                usize,
+                bool,
+                Vec<f32>,
+                Option<ExecutorPhaseTiming>,
+                Vec<Arc<crate::backends::kv::KvWriteBatchCompletion>>,
+            )> {
                 let active_state = state_lease.require_state_mut()?;
-                let mut total_tokens_generated = 0usize;
-                let mut decode_steps_ran = 0usize;
-                let mut finished = false;
+                if scheduled.is_prefill {
+                    let (span_start, span_end) =
+                        resumable_tts_prefill_span(scheduled, request.num_prompt_tokens())?;
+                    let prefill_started = Instant::now();
+                    let complete = {
+                        let QwenTtsPhysicalState::Prefill(state) = &mut active_state.state else {
+                            return Err(Error::InferenceError(
+                                "Qwen3-TTS prefill work reached a decode state".into(),
+                            ));
+                        };
+                        Self::run_blocking(|| {
+                            active_state.model.continue_physical_prefill(
+                                state,
+                                span_start,
+                                span_end,
+                            )
+                        })?
+                    };
+                    active_state.prefill_ms +=
+                        prefill_started.elapsed().as_secs_f64() * 1000.0;
+                    active_state.prefill_steps = active_state.prefill_steps.saturating_add(1);
+                    if request.is_cancelled() {
+                        return Err(Error::Cancelled("Qwen3-TTS prefill cancelled".into()));
+                    }
+                    if let Some(arena) = tensor_arena.as_ref() {
+                        let QwenTtsPhysicalState::Prefill(state) = &active_state.state else {
+                            unreachable!("prefill state remains prefill before transition")
+                        };
+                        state.stage_tensor_state(arena, scheduled.plan_id)?;
+                    }
+                    if request.is_cancelled() {
+                        return Err(Error::Cancelled("Qwen3-TTS prefill cancelled".into()));
+                    }
+                    let completions = match &mut active_state.state {
+                        QwenTtsPhysicalState::Prefill(state) => {
+                            state.take_managed_write_completions()
+                        }
+                        _ => unreachable!("prefill state remains prefill before transition"),
+                    };
+                    if complete {
+                        let prefill = match std::mem::replace(
+                            &mut active_state.state,
+                            QwenTtsPhysicalState::Transitioning,
+                        ) {
+                            QwenTtsPhysicalState::Prefill(state) => state,
+                            _ => unreachable!("validated prefill transition"),
+                        };
+                        active_state.state = QwenTtsPhysicalState::Decode(
+                            active_state.model.finish_physical_prefill(prefill)?,
+                        );
+                    }
+                    let timing = Some(ExecutorPhaseTiming {
+                        normalization_ms: Some(active_state.normalization_ms),
+                        prefill_ms: Some(active_state.prefill_ms),
+                        prefill_steps: Some(active_state.prefill_steps),
+                        ..ExecutorPhaseTiming::default()
+                    });
+                    return Ok((
+                        scheduled.num_tokens,
+                        0,
+                        false,
+                        Vec::new(),
+                        timing,
+                        completions,
+                    ));
+                }
 
+                let decode_iterations = qwen_tts_decode_iterations(scheduled);
+                let start_cursor = match &active_state.state {
+                    QwenTtsPhysicalState::Decode(state) => state.talker_context_len(),
+                    _ => {
+                        return Err(Error::InferenceError(
+                            "Qwen3-TTS decode work reached an unfinished prefill".into(),
+                        ));
+                    }
+                };
+                let mut finished = false;
+                let mut stream_events = Vec::new();
                 for _ in 0..decode_iterations {
                     if request.is_cancelled() {
-                        return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
-                            request.id.clone(),
-                        )));
+                        return Err(Error::Cancelled("Qwen3-TTS decode cancelled".into()));
                     }
                     let mut predictor = super::invocation_paged_lease_for_row(request, scheduled)?;
                     let step = Self::run_blocking(|| {
-                        active_state.model.tts_decode_step_physical(
-                            &mut active_state.state,
-                            predictor.cache_mut(),
-                        )
+                        let QwenTtsPhysicalState::Decode(state) = &mut active_state.state else {
+                            unreachable!("validated Qwen3-TTS decode state")
+                        };
+                        active_state
+                            .model
+                            .tts_decode_step_physical(state, predictor.cache_mut())
                     })?;
-                    let _predictor_completion = predictor.release()?;
+                    let _ = predictor.release()?;
                     if request.is_cancelled() {
-                        return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
-                            request.id.clone(),
-                        )));
+                        return Err(Error::Cancelled("Qwen3-TTS decode cancelled".into()));
                     }
                     active_state.sampling_ms += step.sampling_ms;
                     active_state.decode_ms += step.decode_ms;
                     active_state.codec_ms += step.codec_ms;
                     active_state.decode_steps = active_state.decode_steps.saturating_add(1);
-                    decode_steps_ran = decode_steps_ran.saturating_add(1);
-                    let step_tokens_generated = step
-                        .frames_generated
-                        .saturating_sub(active_state.last_frames_generated);
                     active_state.last_frames_generated = step.frames_generated;
-                    total_tokens_generated =
-                        total_tokens_generated.saturating_add(step_tokens_generated);
-
                     if !step.samples.is_empty() {
                         if active_state.first_output_ms_since_start.is_none() {
                             active_state.first_output_ms_since_start = Some(
@@ -329,47 +688,51 @@ impl NativeExecutor {
                         active_state
                             .audio_samples_accum
                             .extend_from_slice(&step.samples);
-                        if let Some(tx) = stream_tx.as_ref() {
-                            Self::stream_audio_with_policy(
-                                tx,
-                                stream_policy,
-                                &request.id,
-                                &mut active_state.stream_sequence,
-                                step.samples.clone(),
-                                24_000,
-                                false,
-                            )?;
-                        }
+                        stream_events.push((step.samples, false));
                     }
-
                     if step.finished {
-                        if let Some(tx) = stream_tx.as_ref() {
-                            Self::stream_final_marker_with_policy(
-                                tx,
-                                stream_policy,
-                                &request.id,
-                                &mut active_state.stream_sequence,
-                            )?;
-                        }
+                        stream_events.push((Vec::new(), true));
                         finished = true;
                         break;
                     }
                 }
-
-                let tokens_processed = if scheduled.is_prefill {
-                    request.num_prompt_tokens()
-                } else {
-                    decode_steps_ran.max(1)
+                let (end_cursor, completions) = match &mut active_state.state {
+                    QwenTtsPhysicalState::Decode(state) => {
+                        let cursor = state.talker_context_len();
+                        if let Some(arena) = tensor_arena.as_ref() {
+                            state.stage_tensor_state(arena, scheduled.plan_id)?;
+                        }
+                        (cursor, state.take_managed_write_completions())
+                    }
+                    _ => unreachable!("validated Qwen3-TTS decode state"),
                 };
+                let accepted =
+                    accepted_tts_talker_tokens(start_cursor, end_cursor, scheduled.num_tokens)?;
+                if let Some(tx) = stream_tx.as_ref() {
+                    for (samples, is_final) in stream_events {
+                        Self::stream_audio_with_policy(
+                            tx,
+                            stream_policy,
+                            &request.id,
+                            &mut active_state.stream_sequence,
+                            samples,
+                            if is_final { 0 } else { 24_000 },
+                            is_final,
+                        )?;
+                    }
+                }
+                if request.is_cancelled() {
+                    return Err(Error::Cancelled("Qwen3-TTS decode cancelled".into()));
+                }
                 let postprocess_started = Instant::now();
                 let finished_samples = if finished {
                     active_state.audio_samples_accum.clone()
                 } else {
                     Vec::new()
                 };
-                active_state.postprocess_ms += postprocess_started.elapsed().as_secs_f64() * 1000.0;
-
-                let phase_timing_override = Some(ExecutorPhaseTiming {
+                active_state.postprocess_ms +=
+                    postprocess_started.elapsed().as_secs_f64() * 1000.0;
+                let timing = Some(ExecutorPhaseTiming {
                     normalization_ms: Some(active_state.normalization_ms),
                     prefill_ms: Some(active_state.prefill_ms),
                     decode_ms: Some(active_state.decode_ms),
@@ -377,31 +740,82 @@ impl NativeExecutor {
                     codec_ms: Some(active_state.codec_ms),
                     postprocess_ms: Some(active_state.postprocess_ms),
                     first_output_ms_since_start: active_state.first_output_ms_since_start,
-                    prefill_steps: Some(1),
+                    prefill_steps: Some(active_state.prefill_steps),
                     decode_steps: Some(active_state.decode_steps),
                     ..ExecutorPhaseTiming::default()
                 });
-
-                if let Some(arena) = tensor_arena.as_ref() {
-                    active_state
-                        .state
-                        .stage_tensor_state(arena, scheduled.plan_id)?;
-                }
-                let managed_cache_completions = active_state.state.take_managed_write_completions();
-                (
-                    tokens_processed,
-                    total_tokens_generated,
+                Ok((
+                    accepted,
+                    accepted,
                     finished,
                     finished_samples,
-                    phase_timing_override,
-                    managed_cache_completions,
-                )
-            };
+                    timing,
+                    completions,
+                ))
+            })();
 
-            if finished {
+            let (
+                tokens_processed,
+                total_tokens_generated,
+                finished,
+                finished_samples,
+                phase_timing_override,
+                managed_cache_completions,
+            ) = match execution {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = request.take_staged_stream_outputs();
+                    if let Some(checkpoint) = managed_checkpoint.take() {
+                        rollback_tts_quantum(
+                            state_lease.require_state_mut()?,
+                            checkpoint,
+                            outer_checkpoint,
+                        )?;
+                        state_lease.mark_clean();
+                    } else {
+                        state_lease.discard_state();
+                    }
+                    return if matches!(error, Error::Cancelled(_)) {
+                        state_lease.release()?;
+                        Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                            request.id.clone(),
+                        )))
+                    } else {
+                        Err(error)
+                    };
+                }
+            };
+            // This is the commit fence for both final prefill and decode. A
+            // cancellation may arrive after model/tensor/stream staging, so do
+            // not disarm the managed checkpoint or publish cache completions
+            // until the request has passed this last gate.
+            if request.is_cancelled() {
+                let _ = request.take_staged_stream_outputs()?;
+                if let Some(checkpoint) = managed_checkpoint.take() {
+                    rollback_tts_quantum(
+                        state_lease.require_state_mut()?,
+                        checkpoint,
+                        outer_checkpoint,
+                    )?;
+                    state_lease.mark_clean();
+                } else {
+                    state_lease.discard_state();
+                }
                 state_lease.release()?;
+                return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                    request.id.clone(),
+                )));
+            }
+            drop(managed_checkpoint);
+
+            let transition = if finished {
+                state_lease.release()
             } else {
-                state_lease.restore()?;
+                state_lease.restore()
+            };
+            if let Err(error) = transition {
+                let _ = request.take_staged_stream_outputs();
+                return Err(error);
             }
 
             Ok(ModelSessionResult::sequence(ExecutorOutput {
@@ -418,6 +832,349 @@ impl NativeExecutor {
             })
             .with_managed_cache_completions(managed_cache_completions))
         }
+    }
+
+    pub(super) fn tts_decode_batch_with_managed(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+        managed_caches: Vec<Option<super::RetainedRowManagedState>>,
+    ) -> Result<Vec<ModelSessionResult>> {
+        validate_continuous_tts_batch_shape(scheduled)?;
+        if managed_caches.len() != scheduled.len() {
+            return Err(Error::InvalidInput(
+                "continuous TTS managed-cache rows do not match batch width".into(),
+            ));
+        }
+        let ordered_requests = scheduled
+            .iter()
+            .map(|scheduled| {
+                requests
+                    .iter()
+                    .copied()
+                    .find(|request| request.id == scheduled.request_id)
+                    .ok_or_else(|| {
+                        Error::InferenceError(format!(
+                            "continuous TTS request {} is missing its snapshot",
+                            scheduled.request_id
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let live_indices = ordered_requests
+            .iter()
+            .enumerate()
+            .filter_map(|(index, request)| (!request.is_cancelled()).then_some(index))
+            .collect::<Vec<_>>();
+        let mut outputs = (0..scheduled.len())
+            .map(|_| None)
+            .collect::<Vec<Option<ModelSessionResult>>>();
+        for (index, request) in ordered_requests.iter().enumerate() {
+            if request.is_cancelled() {
+                outputs[index] = Some(ModelSessionResult::cancelled_before_dispatch(
+                    ExecutorOutput::cancelled(request.id.clone()),
+                ));
+            }
+        }
+        if live_indices.is_empty() {
+            return outputs
+                .into_iter()
+                .map(|output| {
+                    output.ok_or_else(|| {
+                        Error::InferenceError("cancelled TTS row produced no result".into())
+                    })
+                })
+                .collect();
+        }
+
+        let model = ordered_requests[live_indices[0]]
+            .prepared_qwen_tts_model_for_executor()?
+            .ok_or_else(|| {
+                Error::InferenceError(
+                    "continuous TTS request has no exact loaded model identity".into(),
+                )
+            })?;
+        if !model.supports_continuous_decode_batch() {
+            return Err(Error::InvalidInput(
+                "loaded TTS model has no continuous tensor decode adapter".into(),
+            ));
+        }
+        for index in live_indices.iter().copied().skip(1) {
+            let row_model = ordered_requests[index]
+                .prepared_qwen_tts_model_for_executor()?
+                .ok_or_else(|| {
+                    Error::InferenceError(
+                        "continuous TTS row has no exact loaded model identity".into(),
+                    )
+                })?;
+            if !Arc::ptr_eq(&model, &row_model) {
+                return Err(Error::InferenceError(
+                    "continuous TTS batch spans different loaded model instances".into(),
+                ));
+            }
+        }
+
+        let mut checked_out = Vec::with_capacity(live_indices.len());
+        for index in live_indices.iter().copied() {
+            let request = ordered_requests[index];
+            let session = scheduled[index].session_key();
+            let lease = ExecutorStateLease::checkout(
+                &self.qwen_tts_decode_states,
+                session.clone(),
+                "continuous Qwen TTS decode",
+            )?;
+            let state = lease.state().ok_or_else(|| {
+                Error::InferenceError(format!(
+                    "continuous TTS session {}:{} has no active decode state",
+                    session.request_id, session.epoch
+                ))
+            })?;
+            if state.variant != request.model_variant || !Arc::ptr_eq(&state.model, &model) {
+                return Err(Error::InferenceError(
+                    "continuous TTS state identity does not match its request".into(),
+                ));
+            }
+            if !matches!(state.state, QwenTtsPhysicalState::Decode(_)) {
+                return Err(Error::InferenceError(
+                    "continuous TTS batch contains an unfinished prefill".into(),
+                ));
+            }
+            checked_out.push((index, session, lease));
+        }
+
+        let mut active = ContinuousTtsStateBatch::new(checked_out);
+        let mut managed_caches = managed_caches;
+        for (index, _, lease, checkpoint) in &mut active.rows {
+            let request = ordered_requests[*index];
+            let mut views = managed_caches[*index].take().ok_or_else(|| {
+                Error::InferenceError(
+                    "continuous Qwen3-TTS decode requires retained physical state".into(),
+                )
+            })?;
+            let tensor_reservation = views.tensor_state;
+            let tensor_arena = request
+                .managed_cache_runtime()
+                .and_then(|runtime| runtime.tensor_state());
+            if tensor_arena.is_some() != tensor_reservation.is_some() {
+                return Err(Error::InferenceError(
+                    "continuous Qwen3-TTS row lost its tensor reservation".into(),
+                ));
+            }
+            let cache = views.take_only_paged()?;
+            let state = lease.require_state_mut()?;
+            let outer = ActiveTtsOuterCheckpoint::capture(state);
+            let QwenTtsPhysicalState::Decode(decode) = &mut state.state else {
+                unreachable!("validated continuous Qwen3-TTS decode state")
+            };
+            let native = decode.begin_managed_quantum(cache)?;
+            *checkpoint = Some((TtsManagedCheckpoint::Decode(native), outer));
+            if let (Some(arena), Some(reservation)) = (tensor_arena, tensor_reservation) {
+                decode.bind_tensor_sequence(reservation.sequence)?;
+                decode.restore_tensor_state(arena)?;
+            }
+            lease.mark_dirty();
+        }
+
+        let before_cursors = active
+            .rows
+            .iter_mut()
+            .map(|(_, _, lease, _)| {
+                let state = lease.require_state_mut()?;
+                let QwenTtsPhysicalState::Decode(state) = &state.state else {
+                    unreachable!("validated continuous Qwen3-TTS decode state")
+                };
+                Ok(state.talker_context_len())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut predictor_leases = active
+            .rows
+            .iter()
+            .map(|(index, _, _, _)| {
+                super::invocation_paged_lease_for_row(ordered_requests[*index], &scheduled[*index])
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let steps = {
+            let mut state_refs = active
+                .rows
+                .iter_mut()
+                .map(|(_, _, lease, _)| {
+                    let active = lease.require_state_mut()?;
+                    let QwenTtsPhysicalState::Decode(state) = &mut active.state else {
+                        unreachable!("validated continuous Qwen3-TTS decode state")
+                    };
+                    Ok(state)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut predictor_refs = predictor_leases
+                .iter_mut()
+                .map(|lease| lease.cache_mut())
+                .collect::<Vec<_>>();
+            Self::run_blocking(|| {
+                model.tts_decode_step_batch_physical(&mut state_refs, &mut predictor_refs)
+            })?
+        };
+        for predictor in predictor_leases {
+            let _ = predictor.release()?;
+        }
+        if steps.len() != active.rows.len() {
+            return Err(Error::InferenceError(
+                "continuous TTS model returned the wrong number of rows".into(),
+            ));
+        }
+        let live_kernel_rows = steps.iter().filter(|step| step.executed_model_row).count();
+        if let Some(call) = continuous_tts_model_call(
+            live_kernel_rows,
+            model.continuous_decode_is_tensor_batched(),
+        ) {
+            crate::engine::metrics::record_engine_model_call(call);
+        }
+
+        let mut continuing = vec![false; scheduled.len()];
+        for (row, step) in steps.into_iter().enumerate() {
+            let index = active.rows[row].0;
+            let request = ordered_requests[index];
+            if request.is_cancelled() {
+                let _ = request.take_staged_stream_outputs()?;
+                let index = active.rollback_row(row)?;
+                outputs[index] = Some(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                    request.id.clone(),
+                )));
+                continue;
+            }
+            let row_result = (|| -> Result<ModelSessionResult> {
+                let active_state = active.rows[row].2.require_state_mut()?;
+                let QwenTtsPhysicalState::Decode(state) = &mut active_state.state else {
+                    unreachable!("validated continuous Qwen3-TTS decode state")
+                };
+                if let Some(arena) = request
+                    .managed_cache_runtime()
+                    .and_then(|runtime| runtime.tensor_state())
+                {
+                    state.stage_tensor_state(arena, scheduled[index].plan_id)?;
+                }
+                let accepted =
+                    accepted_tts_talker_tokens(before_cursors[row], state.talker_context_len(), 1)?;
+                active_state.sampling_ms += step.sampling_ms;
+                active_state.decode_ms += step.decode_ms;
+                active_state.codec_ms += step.codec_ms;
+                active_state.decode_steps = active_state.decode_steps.saturating_add(1);
+                active_state.last_frames_generated = step.frames_generated;
+                if !step.samples.is_empty() {
+                    if active_state.first_output_ms_since_start.is_none() {
+                        active_state.first_output_ms_since_start =
+                            Some(active_state.execution_started.elapsed().as_secs_f64() * 1000.0);
+                    }
+                    active_state
+                        .audio_samples_accum
+                        .extend_from_slice(&step.samples);
+                    if let Some(tx) = Self::stream_sender(request) {
+                        Self::stream_audio_with_policy(
+                            &tx,
+                            request.stream_policy,
+                            &request.id,
+                            &mut active_state.stream_sequence,
+                            step.samples.clone(),
+                            24_000,
+                            false,
+                        )?;
+                    }
+                }
+                if step.finished {
+                    if let Some(tx) = Self::stream_sender(request) {
+                        Self::stream_final_marker_with_policy(
+                            &tx,
+                            request.stream_policy,
+                            &request.id,
+                            &mut active_state.stream_sequence,
+                        )?;
+                    }
+                }
+                if request.is_cancelled() {
+                    return Err(Error::Cancelled(request.id.clone()));
+                }
+                let completions = state.take_managed_write_completions();
+                let audio = if step.finished {
+                    active_state.audio_samples_accum.clone()
+                } else {
+                    Vec::new()
+                };
+                Ok(ModelSessionResult::sequence(ExecutorOutput {
+                    request_id: request.id.clone(),
+                    audio: Some(AudioOutput::new(audio, 24_000)),
+                    text: None,
+                    input_transcription: None,
+                    tokens_processed: accepted,
+                    tokens_generated: accepted,
+                    finished: step.finished,
+                    phase_timing_override: None,
+                    asr_diagnostics: None,
+                    error: None,
+                })
+                .with_managed_cache_completions(completions))
+            })();
+            match row_result {
+                Ok(result) => {
+                    continuing[index] = !step.finished;
+                    outputs[index] = Some(result);
+                }
+                Err(error) => {
+                    let _ = request.take_staged_stream_outputs();
+                    let index = active.rollback_row(row)?;
+                    outputs[index] = Some(if matches!(error, Error::Cancelled(_)) {
+                        ModelSessionResult::cancelled(ExecutorOutput::cancelled(request.id.clone()))
+                    } else {
+                        ModelSessionResult::sequence(ExecutorOutput::error(
+                            request.id.clone(),
+                            format!("continuous TTS row failed: {error}"),
+                        ))
+                    });
+                }
+            }
+        }
+
+        let cancelled = active
+            .rows
+            .iter()
+            .map(|(index, _, _, _)| ordered_requests[*index].is_cancelled())
+            .collect::<Vec<_>>();
+        let checkpoint_armed = active
+            .rows
+            .iter()
+            .map(|(_, _, _, checkpoint)| checkpoint.is_some())
+            .collect::<Vec<_>>();
+        for row in late_cancelled_tts_rows(&cancelled, &checkpoint_armed) {
+            let index = active.rows[row].0;
+            let request = ordered_requests[index];
+            let _ = request.take_staged_stream_outputs()?;
+            let index = active.rollback_row(row)?;
+            continuing[index] = false;
+            outputs[index] = Some(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                request.id.clone(),
+            )));
+        }
+
+        for (index, _, lease) in active.commit() {
+            let transition = if continuing[index] {
+                lease.restore()
+            } else {
+                lease.release()
+            };
+            if let Err(error) = transition {
+                let _ = ordered_requests[index].take_staged_stream_outputs();
+                outputs[index] = Some(ModelSessionResult::sequence(ExecutorOutput::error(
+                    ordered_requests[index].id.clone(),
+                    format!("continuous TTS state transition failed: {error}"),
+                )));
+            }
+        }
+        outputs
+            .into_iter()
+            .map(|output| {
+                output.ok_or_else(|| {
+                    Error::InferenceError("continuous TTS row produced no result".into())
+                })
+            })
+            .collect()
     }
 }
 
@@ -462,6 +1219,38 @@ mod tests {
         assert_eq!(qwen_tts_decode_iterations(&scheduled(true, 17)), 0);
         assert_eq!(qwen_tts_decode_iterations(&scheduled(false, 0)), 1);
         assert_eq!(qwen_tts_decode_iterations(&scheduled(false, 4)), 4);
+    }
+
+    #[test]
+    fn continuous_tts_final_sweep_selects_only_newly_cancelled_armed_rows() {
+        assert_eq!(
+            late_cancelled_tts_rows(
+                &[true, false, true, true, false],
+                &[true, true, false, true, false]
+            ),
+            vec![0, 3]
+        );
+    }
+
+    #[test]
+    fn terminal_tts_rows_report_zero_accepted_talker_tokens() {
+        assert_eq!(accepted_tts_talker_tokens(17, 17, 1).unwrap(), 0);
+        assert_eq!(accepted_tts_talker_tokens(17, 18, 1).unwrap(), 1);
+        assert!(accepted_tts_talker_tokens(18, 17, 1).is_err());
+        assert!(accepted_tts_talker_tokens(17, 19, 1).is_err());
+    }
+
+    #[test]
+    fn continuous_tts_telemetry_uses_live_kernel_width() {
+        assert!(continuous_tts_model_call(0, true).is_none());
+        assert!(matches!(
+            continuous_tts_model_call(1, true),
+            Some(crate::engine::metrics::EngineModelCall::ScalarRows { rows: 1, .. })
+        ));
+        assert!(matches!(
+            continuous_tts_model_call(2, true),
+            Some(crate::engine::metrics::EngineModelCall::NativeTensor { rows: 2, .. })
+        ));
     }
 
     #[test]

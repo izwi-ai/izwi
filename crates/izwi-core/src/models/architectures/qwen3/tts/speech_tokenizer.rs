@@ -1730,6 +1730,157 @@ impl SpeechTokenizerDecoder {
         Ok(ceil_div(resampled_samples, self.encode_downsample_rate).max(1))
     }
 
+    pub(crate) fn decoded_sample_upper_bound(&self, codec_frames: usize) -> Result<usize> {
+        if self.decode_upsample_rate == 0 {
+            return Err(Error::ModelError(
+                "speech-tokenizer decode upsample rate must be non-zero".into(),
+            ));
+        }
+        codec_frames
+            .checked_mul(self.decode_upsample_rate)
+            .ok_or_else(|| Error::Overloaded("speech-tokenizer sample bound overflow".into()))
+    }
+
+    pub(crate) fn reference_encode_temporary_upper_bound_bytes(
+        &self,
+        max_seconds: usize,
+        element_bytes: usize,
+    ) -> Result<u64> {
+        let encoder = self.encoder.as_ref().ok_or_else(|| {
+            Error::ModelError("speech-tokenizer reference encoder is unavailable".into())
+        })?;
+        let cfg = &encoder.config;
+        let samples = self
+            .input_sample_rate
+            .checked_mul(max_seconds)
+            .ok_or_else(|| {
+                Error::Overloaded("speech-tokenizer reference sample overflow".into())
+            })?;
+        let frames = ceil_div(samples, self.encode_downsample_rate.max(1));
+        let u64_value = |value: usize, label: &str| {
+            u64::try_from(value).map_err(|_| {
+                Error::Overloaded(format!("speech-tokenizer reference {label} exceeds u64"))
+            })
+        };
+        let mul = |left: u64, right: u64| {
+            left.checked_mul(right).ok_or_else(|| {
+                Error::Overloaded("speech-tokenizer reference workspace overflow".into())
+            })
+        };
+        let add = |left: u64, right: u64| {
+            left.checked_add(right).ok_or_else(|| {
+                Error::Overloaded("speech-tokenizer reference workspace overflow".into())
+            })
+        };
+        let samples = u64_value(samples, "samples")?;
+        let frames = u64_value(frames, "frames")?;
+        let conv_width = [cfg.num_filters, cfg.hidden_size, cfg.intermediate_size]
+            .into_iter()
+            .max()
+            .unwrap_or(1);
+        let convolution = mul(mul(samples, u64_value(conv_width, "conv width")?)?, 8)?;
+        let attention = mul(
+            mul(u64_value(cfg.num_attention_heads, "head count")?, frames)?,
+            frames,
+        )?;
+        let transformer_width = cfg
+            .hidden_size
+            .checked_mul(8)
+            .and_then(|value| {
+                cfg.intermediate_size
+                    .checked_mul(3)
+                    .and_then(|ffn| value.checked_add(ffn))
+            })
+            .ok_or_else(|| {
+                Error::Overloaded("speech-tokenizer reference transformer overflow".into())
+            })?;
+        let transformer = mul(frames, u64_value(transformer_width, "transformer width")?)?;
+        let quantizer_width = cfg
+            .codebook_size
+            .checked_add(
+                cfg.vector_quantization_hidden_dimension
+                    .checked_mul(4)
+                    .ok_or_else(|| {
+                        Error::Overloaded("speech-tokenizer reference quantizer overflow".into())
+                    })?,
+            )
+            .ok_or_else(|| {
+                Error::Overloaded("speech-tokenizer reference quantizer overflow".into())
+            })?;
+        let quantizer = mul(frames, u64_value(quantizer_width, "quantizer width")?)?;
+        let elements = add(add(convolution, attention)?, add(transformer, quantizer)?)?;
+        mul(elements, u64_value(element_bytes, "dtype width")?)
+    }
+
+    /// Conservative backend-temporary peak for a terminal codec/vocoder pass.
+    /// It follows the actual decoder geometry: transformer attention runs at
+    /// codec-frame width, then each configured upsample stage increases time
+    /// while decoder blocks reduce channels.
+    pub(crate) fn decode_temporary_upper_bound_bytes(
+        &self,
+        codec_frames: usize,
+        element_bytes: usize,
+    ) -> Result<u64> {
+        let frames = u64::try_from(codec_frames)
+            .map_err(|_| Error::Overloaded("speech-tokenizer frame bound exceeds u64".into()))?;
+        let checked_mul = |left: u64, right: u64| {
+            left.checked_mul(right)
+                .ok_or_else(|| Error::Overloaded("speech-tokenizer workspace overflow".into()))
+        };
+        let hidden = u64::try_from(self.config.hidden_size)
+            .map_err(|_| Error::Overloaded("speech-tokenizer hidden width exceeds u64".into()))?;
+        let heads = u64::try_from(self.config.num_attention_heads)
+            .map_err(|_| Error::Overloaded("speech-tokenizer head count exceeds u64".into()))?;
+        let attention = checked_mul(checked_mul(heads, frames)?, frames)?;
+        let transformer_linear = checked_mul(hidden, frames)?
+            .checked_mul(12)
+            .ok_or_else(|| Error::Overloaded("speech-tokenizer workspace overflow".into()))?;
+
+        let mut time = frames;
+        let latent = u64::try_from(self.config.latent_dim)
+            .map_err(|_| Error::Overloaded("speech-tokenizer latent width exceeds u64".into()))?;
+        let mut peak_activation = checked_mul(latent, time)?;
+        for ratio in &self.config.upsampling_ratios {
+            time = checked_mul(
+                time,
+                u64::try_from(*ratio).map_err(|_| {
+                    Error::Overloaded("speech-tokenizer upsample ratio exceeds u64".into())
+                })?,
+            )?;
+            peak_activation = peak_activation.max(checked_mul(latent, time)?);
+        }
+        let mut channels = u64::try_from(self.config.decoder_dim)
+            .map_err(|_| Error::Overloaded("speech-tokenizer decoder width exceeds u64".into()))?;
+        peak_activation = peak_activation.max(checked_mul(channels, time)?);
+        for rate in &self.config.upsample_rates {
+            time = checked_mul(
+                time,
+                u64::try_from(*rate).map_err(|_| {
+                    Error::Overloaded("speech-tokenizer decoder rate exceeds u64".into())
+                })?,
+            )?;
+            channels = (channels / 2).max(1);
+            peak_activation = peak_activation.max(checked_mul(channels, time)?);
+        }
+        // Convolution/residual blocks may retain inputs, outputs, and gated
+        // intermediates simultaneously; eight activation widths is a closed
+        // upper envelope for these inference-only stages.
+        let codec_elements = attention
+            .checked_add(transformer_linear)
+            .and_then(|value| {
+                peak_activation
+                    .checked_mul(8)
+                    .and_then(|peak| value.checked_add(peak))
+            })
+            .ok_or_else(|| Error::Overloaded("speech-tokenizer workspace overflow".into()))?;
+        checked_mul(
+            codec_elements,
+            u64::try_from(element_bytes).map_err(|_| {
+                Error::Overloaded("speech-tokenizer dtype width exceeds u64".into())
+            })?,
+        )
+    }
+
     /// Encode reference waveform into speech-tokenizer codec groups.
     pub fn encode_reference_audio(
         &self,

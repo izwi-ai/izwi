@@ -955,6 +955,51 @@ mod tests {
     }
 
     #[test]
+    fn projected_batch_completions_release_two_distinct_leases() {
+        let (plan, workspace_domain) = plan();
+        let arena = arena(&plan, 2);
+        let pool =
+            InvocationPagedKvPoolOwner::new(&plan, &workspace_domain, arena.clone(), 0, 1, 2, 6)
+                .unwrap();
+        let mut first = pool.lease().unwrap();
+        let mut second = pool.lease().unwrap();
+        let first_slots = first.cache().slots_for_append(0, 2).unwrap();
+        let second_slots = second.cache().slots_for_append(0, 2).unwrap();
+        let combined = first_slots
+            .iter()
+            .chain(&second_slots)
+            .copied()
+            .collect::<Vec<_>>();
+        let layers = plan.paged_attention[0]
+            .layers
+            .iter()
+            .map(|binding| KvLayerBinding {
+                model_layer: binding.model_layer,
+                physical_layer: binding.physical_layer,
+            })
+            .collect();
+        let completion = KvWriteBatchCompletion::from_test_parts(
+            arena.id(),
+            layers,
+            combined,
+            arena.config().page_tokens,
+        );
+        first
+            .cache_mut()
+            .commit_shared_completion(0, 2, Arc::new(completion.project_slot_range(0, 2).unwrap()))
+            .unwrap();
+        second
+            .cache_mut()
+            .commit_shared_completion(0, 2, Arc::new(completion.project_slot_range(2, 2).unwrap()))
+            .unwrap();
+
+        let first_completion = first.release().unwrap();
+        let second_completion = second.release().unwrap();
+        assert_eq!(first_completion.writes[0].slots(), first_slots);
+        assert_eq!(second_completion.writes[0].slots(), second_slots);
+    }
+
+    #[test]
     fn pool_rejects_nonmatching_domain_or_overlapping_capacity() {
         let (plan, workspace_domain) = plan();
         let base_arena = arena(&plan, 1);

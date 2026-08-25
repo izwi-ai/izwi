@@ -2021,6 +2021,86 @@ impl EngineCoreRequest {
         Ok(Some((stage.id, cost)))
     }
 
+    fn continuous_tts_stage_cost(
+        binding: Option<&super::ExecutionAdapterBinding>,
+        model: &Qwen3TtsModel,
+        prefill_tokens: usize,
+        max_frames: usize,
+    ) -> Result<Option<(StageId, WorkCost)>> {
+        let Some(stage) = binding.and_then(|binding| {
+            binding
+                .stages
+                .iter()
+                .find(|stage| stage.batch_mode == super::NativeBatchMode::Continuous)
+        }) else {
+            return Ok(None);
+        };
+        if !model.supports_continuous_decode_batch() {
+            return Err(Error::InvalidInput(
+                "loaded adapter selected continuous decode for an incompatible TTS model".into(),
+            ));
+        }
+        let (host_bytes, accelerator_bytes) =
+            model.continuous_decode_bounded_workspace_per_row_bytes(prefill_tokens, max_frames)?;
+        let cost = WorkCost::with_workspace(
+            1,
+            1,
+            ResourceVector {
+                host_bytes: ResourceAmount::Known(host_bytes),
+                temporary_bytes: ResourceAmount::Known(accelerator_bytes),
+                ..ResourceVector::zero()
+            },
+        );
+        if !cost
+            .workspace
+            .workspace_bytes()
+            .is_ok_and(|bytes| bytes <= stage.max_workspace_bytes)
+        {
+            return Err(Error::Overloaded(
+                "continuous TTS decode workspace exceeds its loaded adapter budget".into(),
+            ));
+        }
+        Ok(Some((stage.id, cost)))
+    }
+
+    fn resumable_tts_prefill_stage_cost(
+        binding: Option<&super::ExecutionAdapterBinding>,
+        model: &Qwen3TtsModel,
+        prefill_tokens: usize,
+        max_frames: usize,
+        has_reference: bool,
+    ) -> Result<Option<(StageId, WorkCost)>> {
+        let Some(stage) = binding.and_then(|binding| {
+            binding
+                .stages
+                .iter()
+                .find(|stage| stage.selector == super::StageWorkSelector::SequencePrefill)
+        }) else {
+            return Ok(None);
+        };
+        let (host_bytes, accelerator_bytes) =
+            model.resumable_prefill_workspace_bytes(prefill_tokens, max_frames, has_reference)?;
+        let cost = WorkCost::with_workspace(
+            1,
+            1,
+            ResourceVector {
+                host_bytes: ResourceAmount::Known(host_bytes),
+                temporary_bytes: ResourceAmount::Known(accelerator_bytes),
+                ..ResourceVector::zero()
+            },
+        );
+        if !cost
+            .workspace
+            .workspace_bytes()
+            .is_ok_and(|bytes| bytes <= stage.max_workspace_bytes)
+        {
+            return Err(Error::Overloaded(
+                "resumable TTS prefill workspace exceeds its loaded adapter budget".into(),
+            ));
+        }
+        Ok(Some((stage.id, cost)))
+    }
+
     pub(crate) fn install_prepared_asr_audio(
         &mut self,
         model_variant: ModelVariant,
@@ -2186,8 +2266,8 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
-        self.prepared_stage_costs.clear();
         let model_arc = model.model_arc();
+        self.prepared_stage_costs.clear();
         let text = self
             .text
             .as_deref()
@@ -2228,6 +2308,19 @@ impl EngineCoreRequest {
             uses_preset_speaker: speaker.is_some(),
             max_frames: params.max_frames,
         })?;
+        let prepared_continuous_cost = Self::continuous_tts_stage_cost(
+            self.execution_adapter_binding.as_ref(),
+            &model_arc,
+            layout.prefill_tokens,
+            layout.max_frames,
+        )?;
+        let prepared_prefill_cost = Self::resumable_tts_prefill_stage_cost(
+            self.execution_adapter_binding.as_ref(),
+            &model_arc,
+            layout.prefill_tokens,
+            layout.max_frames,
+            reference.is_some(),
+        )?;
         if layout.prefill_tokens == 0 || layout.prefill_tokens >= max_sequence_tokens {
             return Err(Error::InvalidInput(format!(
                 "Qwen TTS request {} exact prefill has {} tokens and leaves no output capacity in the configured {max_sequence_tokens}-token context",
@@ -2246,6 +2339,12 @@ impl EngineCoreRequest {
                 max_frames: layout.max_frames,
             }),
         });
+        if let Some((stage_id, cost)) = prepared_continuous_cost {
+            self.install_prepared_stage_cost(stage_id, cost)?;
+        }
+        if let Some((stage_id, cost)) = prepared_prefill_cost {
+            self.install_prepared_stage_cost(stage_id, cost)?;
+        }
         Ok(())
     }
 
@@ -2801,11 +2900,57 @@ impl EngineCoreRequest {
             .map(|model| Self::continuous_asr_stage_cost(Some(&binding), model))
             .transpose()?
             .flatten();
+        let prepared_tts_continuous_cost = self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| match (&ready.model, ready.qwen_tts.as_ref()) {
+                (PreparedIncrementalModel::QwenTts(model), Some(prepared)) => Some((
+                    model.model_arc(),
+                    prepared.prefill_tokens,
+                    prepared.max_frames,
+                )),
+                (PreparedIncrementalModel::Asr(_), _) => None,
+                _ => None,
+            })
+            .map(|(model, prefill_tokens, max_frames)| {
+                Self::continuous_tts_stage_cost(Some(&binding), &model, prefill_tokens, max_frames)
+            })
+            .transpose()?
+            .flatten();
+        let prepared_tts_prefill_cost = self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| match (&ready.model, ready.qwen_tts.as_ref()) {
+                (PreparedIncrementalModel::QwenTts(model), Some(prepared)) => Some((
+                    model.model_arc(),
+                    prepared.prefill_tokens,
+                    prepared.max_frames,
+                    prepared.reference.is_some(),
+                )),
+                _ => None,
+            })
+            .map(|(model, prefill_tokens, max_frames, has_reference)| {
+                Self::resumable_tts_prefill_stage_cost(
+                    Some(&binding),
+                    &model,
+                    prefill_tokens,
+                    max_frames,
+                    has_reference,
+                )
+            })
+            .transpose()?
+            .flatten();
         self.execution_adapter_binding = Some(binding);
         if let Some((stage_id, cost)) = prepared_continuous_cost {
             self.install_prepared_stage_cost(stage_id, cost)?;
         }
         if let Some((stage_id, cost)) = prepared_asr_continuous_cost {
+            self.install_prepared_stage_cost(stage_id, cost)?;
+        }
+        if let Some((stage_id, cost)) = prepared_tts_continuous_cost {
+            self.install_prepared_stage_cost(stage_id, cost)?;
+        }
+        if let Some((stage_id, cost)) = prepared_tts_prefill_cost {
             self.install_prepared_stage_cost(stage_id, cost)?;
         }
         Ok(())

@@ -49,10 +49,10 @@ pub(crate) use contract::{
 };
 #[allow(unused_imports)]
 pub(crate) use descriptor::{
-    stage_graph_fingerprint, CapabilityStateDescriptorV2, InvocationLeaseScope,
-    InvocationStageWorkspace, InvocationStateCapacity, InvocationWorkspaceDomain,
-    InvocationWorkspaceProfile, InvocationWorkspaceSet, RetainedStateCapability,
-    StateCapacityAxis, StateCapacityBinding, WorkspaceFormula,
+    minimum_physical_bytes_for_capacity, stage_graph_fingerprint, CapabilityStateDescriptorV2,
+    InvocationLeaseScope, InvocationStageWorkspace, InvocationStateCapacity,
+    InvocationWorkspaceDomain, InvocationWorkspaceProfile, InvocationWorkspaceSet,
+    RetainedStateCapability, StateCapacityAxis, StateCapacityBinding, WorkspaceFormula,
 };
 #[allow(unused_imports)]
 pub(crate) use intent::{

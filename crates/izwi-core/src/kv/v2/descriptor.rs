@@ -705,7 +705,7 @@ impl InvocationWorkspaceDomain {
     }
 }
 
-fn minimum_physical_bytes_for_capacity(
+pub(crate) fn minimum_physical_bytes_for_capacity(
     state: &StateDomainSpec,
     capacity: InvocationStateCapacity,
 ) -> Result<u64> {

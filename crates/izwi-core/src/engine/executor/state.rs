@@ -2,7 +2,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::model::ModelVariant;
-use crate::models::architectures::qwen3::tts::{PhysicalTtsDecodeState, Qwen3TtsModel};
+use crate::models::architectures::qwen3::tts::{
+    PhysicalTtsDecodeState, PhysicalTtsPrefillState, Qwen3TtsModel,
+};
 use crate::models::registry::{
     AsrModelLease, NativeAsrDecodeState, NativeAsrModel, NativeChatDecodeState, QwenTtsModelLease,
 };
@@ -29,11 +31,17 @@ pub(super) struct ActiveAsrDecode {
     pub(super) input_sample_count: usize,
 }
 
+pub(super) enum QwenTtsPhysicalState {
+    Prefill(PhysicalTtsPrefillState),
+    Decode(PhysicalTtsDecodeState),
+    Transitioning,
+}
+
 pub(super) struct ActiveQwenTtsDecode {
     pub(super) variant: Option<ModelVariant>,
     pub(super) model: Arc<Qwen3TtsModel>,
     pub(super) _model_lease: Option<QwenTtsModelLease>,
-    pub(super) state: PhysicalTtsDecodeState,
+    pub(super) state: QwenTtsPhysicalState,
     pub(super) last_frames_generated: usize,
     pub(super) stream_sequence: usize,
     pub(super) audio_samples_accum: Vec<f32>,
@@ -45,5 +53,6 @@ pub(super) struct ActiveQwenTtsDecode {
     pub(super) codec_ms: f64,
     pub(super) postprocess_ms: f64,
     pub(super) first_output_ms_since_start: Option<f64>,
+    pub(super) prefill_steps: u32,
     pub(super) decode_steps: u32,
 }

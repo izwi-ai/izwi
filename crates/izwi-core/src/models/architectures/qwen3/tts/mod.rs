@@ -37,14 +37,14 @@ use crate::catalog::ModelFamily;
 use crate::engine::{StageDescriptor, StageWorkSelector};
 use crate::error::{Error, Result};
 use crate::kv::v2::{
-    stage_graph_fingerprint, BoundedShape, CapabilityStateDescriptorV2, CheckpointPolicy,
-    InferenceStateContract, InvocationLeaseScope, InvocationStageWorkspace,
-    InvocationStateCapacity, InvocationWorkspaceDomain, InvocationWorkspaceProfile,
-    InvocationWorkspaceSet, PlacementPolicy, PositionSemantics, PrefixPolicy,
-    RetainedStateCapability, ShapeAxis, ShapeDimension, ShapeExtent, StateClock, StateComponentId,
-    StateDType, StateDomainHeader, StateDomainId, StateDomainSpec, StateGroupId, StateGroupSpec,
-    StateScope, TensorComponentSpec, TensorRole, TensorStateDomainSpec, WorkspaceFormula,
-    CURRENT_INFERENCE_STATE_ABI,
+    minimum_physical_bytes_for_capacity, stage_graph_fingerprint, BoundedShape,
+    CapabilityStateDescriptorV2, CheckpointPolicy, InferenceStateContract, InvocationLeaseScope,
+    InvocationStageWorkspace, InvocationStateCapacity, InvocationWorkspaceDomain,
+    InvocationWorkspaceProfile, InvocationWorkspaceSet, PlacementPolicy, PositionSemantics,
+    PrefixPolicy, RetainedStateCapability, ShapeAxis, ShapeDimension, ShapeExtent, StateClock,
+    StateComponentId, StateDType, StateDomainHeader, StateDomainId, StateDomainSpec, StateGroupId,
+    StateGroupSpec, StateScope, TensorComponentSpec, TensorRole, TensorStateDomainSpec,
+    WorkspaceFormula, CURRENT_INFERENCE_STATE_ABI,
 };
 use crate::models::architectures::qwen3::core::{
     qwen3_decoder_cache_domain, Qwen3DecoderCacheGeometry,
@@ -55,8 +55,96 @@ const NEWLINE_TOKEN_ID: u32 = 198;
 const ENV_QWEN_TTS_CUDA_CHUNKED_CODEC_STREAM: &str = "IZWI_QWEN_TTS_CUDA_CHUNKED_CODEC_STREAM";
 const MIN_QWEN_TTS_TOKENS_BEFORE_EOS: usize = 8;
 const MAX_VOICE_CLONE_REFERENCE_FRAMES: usize = 320;
-pub(crate) const QWEN3_TTS_PREDICTOR_STAGE_WORKSPACE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const QWEN3_TTS_MODEL_STATE_DOMAIN: StateDomainId = StateDomainId::new(2);
+
+fn validate_qwen3_tts_tensor_state_shapes(
+    memory: &Tensor,
+    pad: &Tensor,
+    hidden: Option<&Tensor>,
+    logits: Option<&Tensor>,
+) -> Result<()> {
+    let (memory_batch, memory_sequence, memory_width) = memory.dims3()?;
+    let (pad_batch, pad_sequence, pad_width) = pad.dims3()?;
+    if memory_batch != 1
+        || memory_sequence == 0
+        || pad_batch != 1
+        || pad_sequence != 1
+        || pad_width != memory_width
+    {
+        return Err(Error::InferenceError(
+            "Qwen3-TTS retained tensor state has a non-canonical memory/pad shape".into(),
+        ));
+    }
+    if let Some(hidden) = hidden {
+        let (batch, sequence, width) = hidden.dims3()?;
+        if batch != 1 || sequence != 1 || width != memory_width {
+            return Err(Error::InferenceError(
+                "Qwen3-TTS retained hidden state has a non-canonical shape".into(),
+            ));
+        }
+    }
+    if let Some(logits) = logits {
+        let (batch, sequence, vocabulary) = logits.dims3()?;
+        if batch != 1 || sequence != 1 || vocabulary == 0 {
+            return Err(Error::InferenceError(
+                "Qwen3-TTS retained logits have a non-canonical shape".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn transformer_workspace_upper_bound_bytes(
+    query_tokens: usize,
+    attention_span: usize,
+    hidden: usize,
+    intermediate: usize,
+    query_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    vocabulary: usize,
+    element_bytes: usize,
+) -> Result<u64> {
+    let value = |input: usize, label: &str| {
+        u64::try_from(input)
+            .map_err(|_| Error::Overloaded(format!("Qwen3-TTS {label} exceeds u64")))
+    };
+    let query_tokens = value(query_tokens.max(1), "query span")?;
+    let attention_span = value(attention_span.max(1), "attention span")?;
+    let hidden = value(hidden, "hidden width")?;
+    let intermediate = value(intermediate, "intermediate width")?;
+    let query_heads = value(query_heads, "query head count")?;
+    let kv_heads = value(kv_heads, "KV head count")?;
+    let head_dim = value(head_dim, "head width")?;
+    let vocabulary = value(vocabulary, "vocabulary width")?;
+    let multiply = |left: u64, right: u64| {
+        left.checked_mul(right)
+            .ok_or_else(|| Error::Overloaded("Qwen3-TTS transformer workspace overflow".into()))
+    };
+    let hidden_buffers = multiply(multiply(query_tokens, hidden)?, 6)?;
+    let ffn_buffers = multiply(multiply(query_tokens, intermediate)?, 3)?;
+    let qkv_heads = query_heads
+        .checked_add(kv_heads.checked_mul(2).ok_or_else(|| {
+            Error::Overloaded("Qwen3-TTS transformer head geometry overflow".into())
+        })?)
+        .ok_or_else(|| Error::Overloaded("Qwen3-TTS transformer head geometry overflow".into()))?;
+    let qkv = multiply(multiply(multiply(query_tokens, qkv_heads)?, head_dim)?, 2)?;
+    let attention = multiply(
+        multiply(multiply(query_heads, query_tokens)?, attention_span)?,
+        2,
+    )?;
+    let elements = hidden_buffers
+        .checked_add(ffn_buffers)
+        .and_then(|total| total.checked_add(qkv))
+        .and_then(|total| total.checked_add(attention))
+        .and_then(|total| total.checked_add(vocabulary))
+        .ok_or_else(|| Error::Overloaded("Qwen3-TTS transformer workspace overflow".into()))?;
+    multiply(
+        elements,
+        value(element_bytes.max(std::mem::size_of::<f32>()), "dtype width")?,
+    )
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct Qwen3TtsPhysicalStateSpec {
@@ -129,11 +217,207 @@ impl TtsStreamingConfig {
     }
 }
 
-struct PreparedTtsDecodePrefill {
+/// Device-side TTS prompt material prepared once before scheduler chunking.
+///
+/// The embedding tensor is immutable across resumptions; only its exact
+/// `[span_start, span_end)` view is executed by each prefill quantum.
+#[derive(Clone)]
+pub struct PreparedTtsDecodePrefill {
     prefill_embeds: Tensor,
     trailing_text_hidden: Tensor,
+    retained_sequence_memory: Tensor,
     tts_pad_embed: Tensor,
     params: TtsGenerationParams,
+}
+
+impl PreparedTtsDecodePrefill {
+    pub fn prefill_tokens(&self) -> Result<usize> {
+        self.prefill_embeds.dim(1).map_err(Error::from)
+    }
+
+    pub fn max_frames(&self) -> usize {
+        self.params.max_frames.max(1)
+    }
+}
+
+/// In-progress prepared-embedding prefill over scheduler-owned talker pages.
+pub struct PhysicalTtsPrefillState {
+    prepared: PreparedTtsDecodePrefill,
+    talker_cache: TalkerPhysicalCache,
+    stream_config: TtsStreamingConfig,
+    progress: usize,
+    total_tokens: usize,
+    last_hidden: Option<Tensor>,
+    last_logits: Option<Tensor>,
+    tensor_sequence: Option<PhysicalStateSequenceId>,
+}
+
+pub(crate) struct PhysicalTtsPrefillManagedCheckpoint {
+    talker_cache: TalkerPhysicalCache,
+    prepared: PreparedTtsDecodePrefill,
+    stream_config: TtsStreamingConfig,
+    progress: usize,
+    total_tokens: usize,
+    last_hidden: Option<Tensor>,
+    last_logits: Option<Tensor>,
+    tensor_sequence: Option<PhysicalStateSequenceId>,
+}
+
+impl PhysicalTtsPrefillState {
+    pub fn prefill_progress(&self) -> usize {
+        self.progress
+    }
+
+    pub fn prefill_tokens(&self) -> usize {
+        self.total_tokens
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.progress == self.total_tokens
+            && self.last_hidden.is_some()
+            && self.last_logits.is_some()
+    }
+
+    pub(crate) fn take_managed_write_completions(
+        &mut self,
+    ) -> Vec<Arc<crate::backends::kv::KvWriteBatchCompletion>> {
+        self.talker_cache.take_completed_writes()
+    }
+
+    pub(crate) fn install_retained_talker_reservation(
+        &mut self,
+        cache: TalkerPhysicalCache,
+    ) -> Result<()> {
+        if self.talker_cache.arena().id() != cache.arena().id()
+            || self.talker_cache.arena().config().group != cache.arena().config().group
+        {
+            return Err(Error::InferenceError(
+                "a Qwen3-TTS prefill cannot switch retained talker authority".into(),
+            ));
+        }
+        if cache.context_len() != self.progress {
+            return Err(Error::InferenceError(format!(
+                "Qwen3-TTS prefill reservation starts at {}, but prepared progress is {}",
+                cache.context_len(),
+                self.progress
+            )));
+        }
+        self.talker_cache = cache;
+        Ok(())
+    }
+
+    pub(crate) fn begin_managed_quantum(
+        &mut self,
+        cache: TalkerPhysicalCache,
+    ) -> Result<PhysicalTtsPrefillManagedCheckpoint> {
+        if self.talker_cache.arena().id() != cache.arena().id()
+            || self.talker_cache.arena().config().group != cache.arena().config().group
+        {
+            return Err(Error::InferenceError(
+                "a Qwen3-TTS prefill cannot switch retained talker authority".into(),
+            ));
+        }
+        if cache.context_len() != self.progress {
+            return Err(Error::InferenceError(format!(
+                "Qwen3-TTS prefill reservation starts at {}, but prepared progress is {}",
+                cache.context_len(),
+                self.progress
+            )));
+        }
+        let checkpoint = PhysicalTtsPrefillManagedCheckpoint {
+            talker_cache: std::mem::replace(&mut self.talker_cache, cache),
+            prepared: self.prepared.clone(),
+            stream_config: self.stream_config,
+            progress: self.progress,
+            total_tokens: self.total_tokens,
+            last_hidden: self.last_hidden.clone(),
+            last_logits: self.last_logits.clone(),
+            tensor_sequence: self.tensor_sequence,
+        };
+        Ok(checkpoint)
+    }
+
+    pub(crate) fn rollback_managed_quantum(
+        &mut self,
+        checkpoint: PhysicalTtsPrefillManagedCheckpoint,
+    ) {
+        *self = checkpoint.into_state();
+    }
+
+    pub(crate) fn bind_tensor_sequence(&mut self, sequence: u64) -> Result<()> {
+        let sequence = PhysicalStateSequenceId::new(sequence)?;
+        if self
+            .tensor_sequence
+            .is_some_and(|current| current != sequence)
+        {
+            return Err(Error::InferenceError(
+                "Qwen3-TTS prefill tensor-state sequence identity changed".into(),
+            ));
+        }
+        self.tensor_sequence = Some(sequence);
+        Ok(())
+    }
+
+    pub(crate) fn stage_tensor_state(
+        &self,
+        arena: &TensorStateArena,
+        transaction: u64,
+    ) -> Result<()> {
+        self.tensor_sequence.ok_or_else(|| {
+            Error::InferenceError("Qwen3-TTS prefill has no tensor sequence".into())
+        })?;
+        validate_qwen3_tts_tensor_state_shapes(
+            &self.prepared.retained_sequence_memory,
+            &self.prepared.tts_pad_embed,
+            self.last_hidden.as_ref(),
+            self.last_logits.as_ref(),
+        )?;
+        let transaction = PhysicalStateTransactionId::new(transaction)?;
+        let expected_cursor = arena
+            .read_transaction_base(transaction, QWEN3_TTS_MODEL_STATE_DOMAIN)?
+            .map_or(0, |snapshot| snapshot.cursor);
+        let target_cursor = self.talker_cache.context_len() as u64;
+        let components = [
+            Some(self.prepared.retained_sequence_memory.clone()),
+            Some(self.prepared.tts_pad_embed.clone()),
+            self.last_hidden.clone(),
+            self.last_logits.clone(),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, tensor)| StateComponentValue {
+            component: StateComponentId::new((index + 1) as u32),
+            tensor,
+        })
+        .collect();
+        arena.stage_replace(
+            transaction,
+            QWEN3_TTS_MODEL_STATE_DOMAIN,
+            expected_cursor,
+            target_cursor,
+            components,
+        )?;
+        Ok(())
+    }
+
+    pub fn into_retained_talker_cache(self) -> TalkerPhysicalCache {
+        self.talker_cache
+    }
+}
+
+impl PhysicalTtsPrefillManagedCheckpoint {
+    pub(crate) fn into_state(self) -> PhysicalTtsPrefillState {
+        PhysicalTtsPrefillState {
+            prepared: self.prepared,
+            talker_cache: self.talker_cache,
+            stream_config: self.stream_config,
+            progress: self.progress,
+            total_tokens: self.total_tokens,
+            last_hidden: self.last_hidden,
+            last_logits: self.last_logits,
+            tensor_sequence: self.tensor_sequence,
+        }
+    }
 }
 
 /// Incremental Qwen3-TTS state backed by scheduler-owned physical talker pages.
@@ -146,6 +430,8 @@ pub struct PhysicalTtsDecodeState {
     acoustic_vocab_size: u32,
     semantic_vocab_size: u32,
     trailing_text_hidden: Option<Tensor>,
+    retained_sequence_memory: Option<Tensor>,
+    prefill_tokens: usize,
     trailing_text_len: usize,
     tts_pad_embed: Option<Tensor>,
     max_frames: usize,
@@ -165,6 +451,33 @@ pub struct PhysicalTtsDecodeState {
     finished: bool,
 }
 
+/// Row-local continuation snapshot used to make the multi-row convenience API
+/// atomic at its `Result<Vec<_>>` boundary. Physical KV has its own logical
+/// checkpoint; this value covers every mutable non-KV field touched by talker
+/// commit or codec finalization.
+struct PhysicalTtsDecodeBatchCheckpoint {
+    frame_idx: usize,
+    offset: usize,
+    all_code_group_lengths: Vec<usize>,
+    semantic_history: Vec<u32>,
+    last_hidden: Option<Tensor>,
+    last_logits: Option<Tensor>,
+    retained_sequence_memory: Option<Tensor>,
+    trailing_text_hidden: Option<Tensor>,
+    tts_pad_embed: Option<Tensor>,
+    tensor_sequence: Option<PhysicalStateSequenceId>,
+    rng: SimpleRng,
+    emitted_frames: usize,
+    emitted_samples: usize,
+    decode_raw_token_scratch: Vec<Vec<u32>>,
+    finished: bool,
+}
+
+pub(crate) struct PhysicalTtsManagedQuantumCheckpoint {
+    talker_cache: TalkerPhysicalCache,
+    continuation: PhysicalTtsDecodeBatchCheckpoint,
+}
+
 /// Consuming terminal handoff for a physical TTS session.
 ///
 /// Taking this value drains the model state exactly once and returns ownership
@@ -177,6 +490,50 @@ pub struct PhysicalTtsDecodeCompletion {
 }
 
 impl PhysicalTtsDecodeState {
+    fn batch_checkpoint(&self) -> PhysicalTtsDecodeBatchCheckpoint {
+        PhysicalTtsDecodeBatchCheckpoint {
+            frame_idx: self.frame_idx,
+            offset: self.offset,
+            all_code_group_lengths: self.all_code_groups.iter().map(Vec::len).collect(),
+            semantic_history: self.semantic_history.clone(),
+            last_hidden: self.last_hidden.clone(),
+            last_logits: self.last_logits.clone(),
+            retained_sequence_memory: self.retained_sequence_memory.clone(),
+            trailing_text_hidden: self.trailing_text_hidden.clone(),
+            tts_pad_embed: self.tts_pad_embed.clone(),
+            tensor_sequence: self.tensor_sequence,
+            rng: self.rng,
+            emitted_frames: self.emitted_frames,
+            emitted_samples: self.emitted_samples,
+            decode_raw_token_scratch: self.decode_raw_token_scratch.clone(),
+            finished: self.finished,
+        }
+    }
+
+    fn restore_batch_checkpoint(&mut self, checkpoint: PhysicalTtsDecodeBatchCheckpoint) {
+        self.frame_idx = checkpoint.frame_idx;
+        self.offset = checkpoint.offset;
+        for (group, length) in self
+            .all_code_groups
+            .iter_mut()
+            .zip(checkpoint.all_code_group_lengths)
+        {
+            group.truncate(length);
+        }
+        self.semantic_history = checkpoint.semantic_history;
+        self.last_hidden = checkpoint.last_hidden;
+        self.last_logits = checkpoint.last_logits;
+        self.retained_sequence_memory = checkpoint.retained_sequence_memory;
+        self.trailing_text_hidden = checkpoint.trailing_text_hidden;
+        self.tts_pad_embed = checkpoint.tts_pad_embed;
+        self.tensor_sequence = checkpoint.tensor_sequence;
+        self.rng = checkpoint.rng;
+        self.emitted_frames = checkpoint.emitted_frames;
+        self.emitted_samples = checkpoint.emitted_samples;
+        self.decode_raw_token_scratch = checkpoint.decode_raw_token_scratch;
+        self.finished = checkpoint.finished;
+    }
+
     pub fn talker_context_len(&self) -> usize {
         self.talker_cache.context_len()
     }
@@ -215,6 +572,38 @@ impl PhysicalTtsDecodeState {
         }
         self.talker_cache = cache;
         Ok(())
+    }
+
+    pub(crate) fn begin_managed_quantum(
+        &mut self,
+        cache: TalkerPhysicalCache,
+    ) -> Result<PhysicalTtsManagedQuantumCheckpoint> {
+        if self.talker_cache.arena().id() != cache.arena().id()
+            || self.talker_cache.arena().config().group != cache.arena().config().group
+        {
+            return Err(Error::InferenceError(
+                "a Qwen3-TTS session cannot switch retained talker authority".into(),
+            ));
+        }
+        if cache.context_len() != self.offset {
+            return Err(Error::InferenceError(format!(
+                "Qwen3-TTS talker reservation starts at {}, but decode state is at {}",
+                cache.context_len(),
+                self.offset
+            )));
+        }
+        Ok(PhysicalTtsManagedQuantumCheckpoint {
+            talker_cache: std::mem::replace(&mut self.talker_cache, cache),
+            continuation: self.batch_checkpoint(),
+        })
+    }
+
+    pub(crate) fn rollback_managed_quantum(
+        &mut self,
+        checkpoint: PhysicalTtsManagedQuantumCheckpoint,
+    ) {
+        self.talker_cache = checkpoint.talker_cache;
+        self.restore_batch_checkpoint(checkpoint.continuation);
     }
 
     pub(crate) fn bind_tensor_sequence(&mut self, sequence: u64) -> Result<()> {
@@ -259,10 +648,25 @@ impl PhysicalTtsDecodeState {
                     Error::InferenceError("Qwen3-TTS required tensor component is absent".into())
                 })
             });
-        self.trailing_text_hidden = Some(tensors.next().expect("four components")?);
-        self.tts_pad_embed = Some(tensors.next().expect("four components")?);
-        self.last_hidden = Some(tensors.next().expect("four components")?);
-        self.last_logits = Some(tensors.next().expect("four components")?);
+        let retained_sequence_memory = tensors.next().expect("four components")?;
+        let tts_pad_embed = tensors.next().expect("four components")?;
+        let last_hidden = tensors.next().expect("four components")?;
+        let last_logits = tensors.next().expect("four components")?;
+        validate_qwen3_tts_tensor_state_shapes(
+            &retained_sequence_memory,
+            &tts_pad_embed,
+            Some(&last_hidden),
+            Some(&last_logits),
+        )?;
+        self.trailing_text_hidden = Some(retained_sequence_memory.narrow(
+            1,
+            self.prefill_tokens,
+            self.trailing_text_len,
+        )?);
+        self.retained_sequence_memory = Some(retained_sequence_memory);
+        self.tts_pad_embed = Some(tts_pad_embed);
+        self.last_hidden = Some(last_hidden);
+        self.last_logits = Some(last_logits);
         Ok(())
     }
 
@@ -271,13 +675,23 @@ impl PhysicalTtsDecodeState {
         arena: &TensorStateArena,
         transaction: u64,
     ) -> Result<()> {
+        validate_qwen3_tts_tensor_state_shapes(
+            self.retained_sequence_memory.as_ref().ok_or_else(|| {
+                Error::InferenceError("Qwen3-TTS tensor memory was not hydrated".into())
+            })?,
+            self.tts_pad_embed.as_ref().ok_or_else(|| {
+                Error::InferenceError("Qwen3-TTS tensor pad was not hydrated".into())
+            })?,
+            self.last_hidden.as_ref(),
+            self.last_logits.as_ref(),
+        )?;
         let transaction = PhysicalStateTransactionId::new(transaction)?;
         let expected_cursor = arena
             .read_transaction_base(transaction, QWEN3_TTS_MODEL_STATE_DOMAIN)?
             .map_or(0, |snapshot| snapshot.cursor);
         let target_cursor = self.talker_cache.context_len() as u64;
         let components = [
-            self.trailing_text_hidden.clone(),
+            self.retained_sequence_memory.clone(),
             self.tts_pad_embed.clone(),
             self.last_hidden.clone(),
             self.last_logits.clone(),
@@ -309,6 +723,7 @@ impl PhysicalTtsDecodeState {
 
     pub(crate) fn clear_tensor_handles(&mut self) {
         self.trailing_text_hidden = None;
+        self.retained_sequence_memory = None;
         self.tts_pad_embed = None;
         self.last_hidden = None;
         self.last_logits = None;
@@ -337,6 +752,77 @@ impl PhysicalTtsDecodeState {
     }
 }
 
+fn run_tts_decode_batch_transaction<T>(
+    states: &mut [&mut PhysicalTtsDecodeState],
+    predictor_caches: &mut [&mut CodePredictorPhysicalCache],
+    operation: impl FnOnce(
+        &mut [&mut PhysicalTtsDecodeState],
+        &mut [&mut CodePredictorPhysicalCache],
+    ) -> Result<T>,
+) -> Result<T> {
+    let row_checkpoints = states
+        .iter()
+        .map(|state| state.batch_checkpoint())
+        .collect::<Vec<_>>();
+    let talker_checkpoints = states
+        .iter()
+        .map(|state| state.talker_cache.logical_checkpoint())
+        .collect::<Vec<_>>();
+    let talker_cursors = states
+        .iter()
+        .map(|state| state.talker_cache.context_len())
+        .collect::<Vec<_>>();
+    let predictor_checkpoints = predictor_caches
+        .iter()
+        .map(|cache| cache.logical_checkpoint())
+        .collect::<Vec<_>>();
+    let predictor_cursors = predictor_caches
+        .iter()
+        .map(|cache| cache.context_len())
+        .collect::<Vec<_>>();
+
+    let error = match operation(states, predictor_caches) {
+        Ok(value) => return Ok(value),
+        Err(error) => error,
+    };
+
+    let mut rollback_error = None;
+    for (((state, row_checkpoint), talker_checkpoint), initial_cursor) in states
+        .iter_mut()
+        .zip(row_checkpoints)
+        .zip(talker_checkpoints)
+        .zip(talker_cursors)
+    {
+        if state.talker_cache.context_len() != initial_cursor {
+            if let Err(rollback) = state
+                .talker_cache
+                .restore_logical_checkpoint(talker_checkpoint)
+            {
+                rollback_error.get_or_insert(rollback);
+            }
+        }
+        state.restore_batch_checkpoint(row_checkpoint);
+    }
+    for ((cache, predictor_checkpoint), initial_cursor) in predictor_caches
+        .iter_mut()
+        .zip(predictor_checkpoints)
+        .zip(predictor_cursors)
+    {
+        if cache.context_len() != initial_cursor {
+            if let Err(rollback) = cache.restore_logical_checkpoint(predictor_checkpoint) {
+                rollback_error.get_or_insert(rollback);
+            }
+        }
+    }
+    if let Some(rollback) = rollback_error {
+        Err(Error::InferenceError(format!(
+            "Qwen3-TTS decode batch failed: {error}; rollback also failed: {rollback}"
+        )))
+    } else {
+        Err(error)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TtsDecodeStep {
     pub samples: Vec<f32>,
@@ -345,6 +831,77 @@ pub struct TtsDecodeStep {
     pub sampling_ms: f64,
     pub decode_ms: f64,
     pub codec_ms: f64,
+    /// True only when this row executed predictor and talker kernels.
+    pub executed_model_row: bool,
+}
+
+/// Row-local semantic decision and immutable inputs for the independently
+/// schedulable predictor stage. Construction never mutates decode state.
+pub struct PreparedTtsPredictorStage {
+    semantic_token: u32,
+    semantic_embed: Tensor,
+    talker_hidden: Tensor,
+    source_logits: Tensor,
+    text_addition: Tensor,
+    expected_talker_context: usize,
+    expected_frame_idx: usize,
+    expected_rng: SimpleRng,
+    expected_semantic_history: Vec<u32>,
+    expected_tensor_sequence: Option<PhysicalStateSequenceId>,
+    next_rng: SimpleRng,
+    next_semantic_history: Vec<u32>,
+    sampling_ms: f64,
+}
+
+/// Result of row-local frame preparation. Terminal rows bypass predictor and
+/// talker work but retain enough information to reproduce scalar RNG/EOS and
+/// codec-finalization semantics.
+pub enum PreparedTtsFrameStage {
+    Predictor(PreparedTtsPredictorStage),
+    Terminal(PreparedTtsTerminalStage),
+}
+
+enum TtsTerminalReason {
+    AlreadyFinished,
+    FrameLimit,
+    SemanticEos,
+}
+
+pub struct PreparedTtsTerminalStage {
+    reason: TtsTerminalReason,
+    expected_talker_context: usize,
+    expected_frame_idx: usize,
+    expected_rng: SimpleRng,
+    expected_semantic_history: Vec<u32>,
+    next_rng: SimpleRng,
+    sampling_ms: f64,
+}
+
+impl PreparedTtsPredictorStage {
+    pub fn semantic_token(&self) -> u32 {
+        self.semantic_token
+    }
+
+    pub fn talker_context(&self) -> usize {
+        self.expected_talker_context
+    }
+}
+
+/// Completed predictor output waiting for one native talker batch.
+pub struct PreparedTtsTalkerStage {
+    predictor: PreparedTtsPredictorStage,
+    acoustic_codes: Vec<u32>,
+    step_input: Tensor,
+    predictor_ms: f64,
+}
+
+/// Timing handoff from the transactional talker stage to codec emission.
+/// Codec/vocoder work intentionally happens only after this state commit.
+#[derive(Debug, Clone, Copy)]
+pub struct TtsTalkerStageCompletion {
+    sampling_ms: f64,
+    predictor_ms: f64,
+    talker_ms: f64,
 }
 
 /// Inputs required to authorize one scheduler-owned Qwen3-TTS decode session.
@@ -474,6 +1031,15 @@ impl Qwen3TtsModel {
         predictor_contract.validate()?;
         let predictor_domain = predictor_contract.domains[0].clone();
         let predictor_group = predictor_contract.groups[0].clone();
+        let predictor_workspace_tokens = u64::try_from(self.physical_predictor_workspace_tokens())
+            .map_err(|_| {
+                Error::ModelLoadError("Qwen3-TTS predictor workspace exceeds u64".into())
+            })?;
+        let predictor_capacity = InvocationStateCapacity::PagedTokens {
+            max_tokens: predictor_workspace_tokens,
+        };
+        let predictor_physical_bytes =
+            minimum_physical_bytes_for_capacity(&predictor_domain, predictor_capacity)?;
 
         let mut profiles = Vec::with_capacity(stage_graphs.len());
         for stages in stage_graphs {
@@ -491,10 +1057,10 @@ impl Qwen3TtsModel {
                         domains: decode
                             .then(|| InvocationWorkspaceDomain::State {
                                 state: predictor_domain.clone(),
-                                capacity: InvocationStateCapacity::PagedTokens { max_tokens: 16 },
+                                capacity: predictor_capacity,
                                 placement: predictor_domain.header().placement,
                                 formula: WorkspaceFormula {
-                                    fixed_bytes: QWEN3_TTS_PREDICTOR_STAGE_WORKSPACE_BYTES,
+                                    fixed_bytes: predictor_physical_bytes,
                                     dimensions: vec![],
                                     terms: vec![],
                                 },
@@ -566,25 +1132,25 @@ fn qwen3_tts_retained_state_contract(
                 qwen3_tts_state_component(
                     1,
                     TensorRole::EncoderMemory,
-                    &[("sequence", max_sequence), ("hidden", hidden)],
+                    &[("batch", 1), ("sequence", max_sequence), ("hidden", hidden)],
                     state_dtype,
                 )?,
                 qwen3_tts_state_component(
                     2,
                     TensorRole::RetainedEmbedding,
-                    &[("sequence", 1), ("hidden", hidden)],
+                    &[("batch", 1), ("sequence", 1), ("hidden", hidden)],
                     state_dtype,
                 )?,
                 qwen3_tts_state_component(
                     3,
                     TensorRole::RecurrentHidden,
-                    &[("sequence", 1), ("hidden", hidden)],
+                    &[("batch", 1), ("sequence", 1), ("hidden", hidden)],
                     state_dtype,
                 )?,
                 qwen3_tts_state_component(
                     4,
                     TensorRole::RetainedLogits,
-                    &[("sequence", 1), ("vocabulary", vocab)],
+                    &[("batch", 1), ("sequence", 1), ("vocabulary", vocab)],
                     state_dtype,
                 )?,
             ],
@@ -607,6 +1173,7 @@ fn qwen3_tts_state_component(
         .iter()
         .map(|(axis, extent)| {
             let axis = match *axis {
+                "batch" => ShapeAxis::Batch,
                 "sequence" => ShapeAxis::Sequence,
                 "hidden" => ShapeAxis::Hidden,
                 other => ShapeAxis::Custom(other.into()),
@@ -1067,6 +1634,186 @@ impl Qwen3TtsModel {
         self.code_predictor.physical_context_tokens_per_frame()
     }
 
+    pub fn supports_resumable_prefill(&self) -> bool {
+        true
+    }
+
+    pub fn supports_continuous_decode_batch(&self) -> bool {
+        true
+    }
+
+    pub fn continuous_decode_is_tensor_batched(&self) -> bool {
+        true
+    }
+
+    pub fn continuous_decode_batch_workspace_per_row_bytes(&self) -> Result<u64> {
+        let predictor = &self.config.talker_config.code_predictor_config;
+        let predictor_span = self.physical_predictor_workspace_tokens();
+        let transformer = transformer_workspace_upper_bound_bytes(
+            predictor_span,
+            predictor_span,
+            predictor.hidden_size,
+            predictor.intermediate_size,
+            predictor.num_attention_heads,
+            predictor.num_key_value_heads,
+            predictor.head_dim,
+            predictor.vocab_size,
+            self.code_predictor_dtype.size_in_bytes(),
+        )?;
+        let row_staging = self
+            .config
+            .talker_config
+            .hidden_size
+            .checked_mul(8)
+            .and_then(|elements| elements.checked_mul(self.dtype.size_in_bytes()))
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| Error::Overloaded("Qwen3-TTS batch row staging overflow".into()))?;
+        transformer
+            .checked_add(row_staging)
+            .ok_or_else(|| Error::Overloaded("Qwen3-TTS batch workspace overflow".into()))
+    }
+
+    pub fn resumable_prefill_workspace_bytes(
+        &self,
+        prefill_tokens: usize,
+        max_frames: usize,
+        has_reference: bool,
+    ) -> Result<(u64, u64)> {
+        let sequence = prefill_tokens
+            .checked_add(max_frames)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| Error::Overloaded("Qwen3-TTS prefill sequence overflow".into()))?;
+        let host_elements = sequence
+            .checked_mul(8)
+            .ok_or_else(|| Error::Overloaded("Qwen3-TTS prefill host overflow".into()))?;
+        let host = u64::try_from(host_elements)
+            .ok()
+            .and_then(|value| value.checked_mul(std::mem::size_of::<u32>() as u64))
+            .ok_or_else(|| Error::Overloaded("Qwen3-TTS prefill host overflow".into()))?;
+        let talker = &self.config.talker_config;
+        let transformer = transformer_workspace_upper_bound_bytes(
+            prefill_tokens,
+            prefill_tokens,
+            talker.hidden_size,
+            talker.intermediate_size,
+            talker.num_attention_heads,
+            talker.num_key_value_heads,
+            talker.head_dim,
+            talker.vocab_size,
+            self.dtype.size_in_bytes(),
+        )?;
+        let embedding_elements = sequence
+            .checked_mul(talker.hidden_size)
+            .and_then(|value| value.checked_mul(4))
+            .and_then(|value| {
+                prefill_tokens
+                    .checked_mul(talker.text_hidden_size)
+                    .and_then(|text| value.checked_add(text))
+            })
+            .ok_or_else(|| Error::Overloaded("Qwen3-TTS prefill embedding overflow".into()))?;
+        let embedding_bytes = u64::try_from(embedding_elements)
+            .ok()
+            .and_then(|value| value.checked_mul(self.dtype.size_in_bytes() as u64))
+            .ok_or_else(|| Error::Overloaded("Qwen3-TTS prefill embedding overflow".into()))?;
+        let mut accelerator = transformer
+            .checked_add(embedding_bytes)
+            .ok_or_else(|| Error::Overloaded("Qwen3-TTS prefill tensor overflow".into()))?;
+        if has_reference {
+            accelerator = accelerator
+                .checked_add(
+                    self.speech_tokenizer
+                        .reference_encode_temporary_upper_bound_bytes(
+                            30,
+                            self.speech_tokenizer_dtype.size_in_bytes(),
+                        )?,
+                )
+                .ok_or_else(|| {
+                    Error::Overloaded("Qwen3-TTS reference workspace overflow".into())
+                })?;
+        }
+        Ok((host.max(1), accelerator.max(1)))
+    }
+
+    /// Frame-bounded scheduler accounting for one continuously decoded row.
+    /// Host memory includes retained codec history, the rollback-safe codec
+    /// scratch clone, bounded semantic history, and commit-fenced waveform
+    /// copies. Backend memory includes both talker/predictor batching and the
+    /// terminal speech-tokenizer/vocoder peak.
+    pub fn continuous_decode_bounded_workspace_per_row_bytes(
+        &self,
+        prefill_tokens: usize,
+        max_frames: usize,
+    ) -> Result<(u64, u64)> {
+        let frames = max_frames.max(1);
+        let groups = self.config.talker_config.num_code_groups.max(1);
+        let samples = self.speech_tokenizer.decoded_sample_upper_bound(frames)?;
+        let checked_bytes = |elements: usize, element_bytes: usize, label: &str| {
+            elements
+                .checked_mul(element_bytes)
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .ok_or_else(|| Error::Overloaded(format!("Qwen3-TTS {label} workspace overflow")))
+        };
+        let codec_elements = groups
+            .checked_mul(frames)
+            .and_then(|elements| elements.checked_mul(2))
+            .ok_or_else(|| Error::Overloaded("Qwen3-TTS codec history overflow".into()))?;
+        let codec_host = checked_bytes(codec_elements, std::mem::size_of::<u32>(), "codec host")?;
+        let semantic_host = checked_bytes(
+            frames.min(256),
+            std::mem::size_of::<u32>(),
+            "semantic history",
+        )?;
+        let sampling_host =
+            checked_bytes(self.config.talker_config.vocab_size, 32, "sampling vectors")?;
+        // Decoder output, row result, and commit-fenced stream staging can
+        // coexist. The accumulated final output is reserved by RuntimeService,
+        // not duplicated in this per-quantum workspace.
+        let waveform_host = checked_bytes(
+            samples
+                .checked_mul(3)
+                .ok_or_else(|| Error::Overloaded("Qwen3-TTS waveform bound overflow".into()))?,
+            std::mem::size_of::<f32>(),
+            "waveform host",
+        )?;
+        let vector_headers = groups
+            .checked_mul(3)
+            .and_then(|count| count.checked_mul(std::mem::size_of::<Vec<u32>>()))
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| Error::Overloaded("Qwen3-TTS vector metadata overflow".into()))?;
+        let host_bytes = codec_host
+            .checked_add(semantic_host)
+            .and_then(|bytes| bytes.checked_add(waveform_host))
+            .and_then(|bytes| bytes.checked_add(sampling_host))
+            .and_then(|bytes| bytes.checked_add(vector_headers))
+            .ok_or_else(|| Error::Overloaded("Qwen3-TTS host workspace overflow".into()))?;
+
+        let batch = self.continuous_decode_batch_workspace_per_row_bytes()?;
+        let codec = self.speech_tokenizer.decode_temporary_upper_bound_bytes(
+            frames,
+            self.speech_tokenizer_dtype.size_in_bytes(),
+        )?;
+        let context = prefill_tokens
+            .checked_add(frames)
+            .ok_or_else(|| Error::Overloaded("Qwen3-TTS context workspace overflow".into()))?;
+        let talker = &self.config.talker_config;
+        let talker_workspace = transformer_workspace_upper_bound_bytes(
+            1,
+            context,
+            talker.hidden_size,
+            talker.intermediate_size,
+            talker.num_attention_heads,
+            talker.num_key_value_heads,
+            talker.head_dim,
+            talker.vocab_size,
+            self.dtype.size_in_bytes(),
+        )?;
+        let accelerator_bytes = batch
+            .checked_add(codec)
+            .and_then(|bytes| bytes.checked_add(talker_workspace))
+            .ok_or_else(|| Error::Overloaded("Qwen3-TTS accelerator workspace overflow".into()))?;
+        Ok((host_bytes, accelerator_bytes))
+    }
+
     pub fn diagnostics(&self) -> Qwen3TtsDiagnostics {
         Qwen3TtsDiagnostics {
             model_family: "qwen3_tts",
@@ -1095,15 +1842,30 @@ impl Qwen3TtsModel {
         stream_config: TtsStreamingConfig,
         talker_cache: TalkerPhysicalCache,
     ) -> Result<PhysicalTtsDecodeState> {
-        let prepared = self.prepare_voice_clone_decode(text, reference, language, params)?;
-        self.start_physical_decode_from_prefill(
-            prepared.prefill_embeds,
-            prepared.trailing_text_hidden,
-            prepared.tts_pad_embed,
-            &prepared.params,
+        let mut prefill = self.begin_physical_prefill_with_voice_clone_params(
+            text,
+            reference,
+            language,
+            params,
             stream_config,
             talker_cache,
-        )
+        )?;
+        let total = prefill.prefill_tokens();
+        self.continue_physical_prefill(&mut prefill, 0, total)?;
+        self.finish_physical_prefill(prefill)
+    }
+
+    pub fn begin_physical_prefill_with_voice_clone_params(
+        &self,
+        text: &str,
+        reference: &SpeakerReference,
+        language: Option<&str>,
+        params: &TtsGenerationParams,
+        stream_config: TtsStreamingConfig,
+        talker_cache: TalkerPhysicalCache,
+    ) -> Result<PhysicalTtsPrefillState> {
+        let prepared = self.prepare_voice_clone_decode(text, reference, language, params)?;
+        self.begin_physical_prefill(prepared, stream_config, talker_cache)
     }
 
     pub fn start_physical_decode_with_speaker_params(
@@ -1116,15 +1878,33 @@ impl Qwen3TtsModel {
         stream_config: TtsStreamingConfig,
         talker_cache: TalkerPhysicalCache,
     ) -> Result<PhysicalTtsDecodeState> {
-        let prepared = self.prepare_speaker_decode(text, speaker, language, instruct, params)?;
-        self.start_physical_decode_from_prefill(
-            prepared.prefill_embeds,
-            prepared.trailing_text_hidden,
-            prepared.tts_pad_embed,
-            &prepared.params,
+        let mut prefill = self.begin_physical_prefill_with_speaker_params(
+            text,
+            speaker,
+            language,
+            instruct,
+            params,
             stream_config,
             talker_cache,
-        )
+        )?;
+        let total = prefill.prefill_tokens();
+        self.continue_physical_prefill(&mut prefill, 0, total)?;
+        self.finish_physical_prefill(prefill)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_physical_prefill_with_speaker_params(
+        &self,
+        text: &str,
+        speaker: &str,
+        language: Option<&str>,
+        instruct: Option<&str>,
+        params: &TtsGenerationParams,
+        stream_config: TtsStreamingConfig,
+        talker_cache: TalkerPhysicalCache,
+    ) -> Result<PhysicalTtsPrefillState> {
+        let prepared = self.prepare_speaker_decode(text, speaker, language, instruct, params)?;
+        self.begin_physical_prefill(prepared, stream_config, talker_cache)
     }
 
     pub fn start_physical_decode_with_text_params(
@@ -1136,15 +1916,62 @@ impl Qwen3TtsModel {
         stream_config: TtsStreamingConfig,
         talker_cache: TalkerPhysicalCache,
     ) -> Result<PhysicalTtsDecodeState> {
-        let prepared = self.prepare_text_decode(text, language, instruct, params)?;
-        self.start_physical_decode_from_prefill(
-            prepared.prefill_embeds,
-            prepared.trailing_text_hidden,
-            prepared.tts_pad_embed,
-            &prepared.params,
+        let mut prefill = self.begin_physical_prefill_with_text_params(
+            text,
+            language,
+            instruct,
+            params,
             stream_config,
             talker_cache,
-        )
+        )?;
+        let total = prefill.prefill_tokens();
+        self.continue_physical_prefill(&mut prefill, 0, total)?;
+        self.finish_physical_prefill(prefill)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_physical_prefill_with_text_params(
+        &self,
+        text: &str,
+        language: Option<&str>,
+        instruct: Option<&str>,
+        params: &TtsGenerationParams,
+        stream_config: TtsStreamingConfig,
+        talker_cache: TalkerPhysicalCache,
+    ) -> Result<PhysicalTtsPrefillState> {
+        let prepared = self.prepare_text_decode(text, language, instruct, params)?;
+        self.begin_physical_prefill(prepared, stream_config, talker_cache)
+    }
+
+    fn prepared_decode_prefill(
+        &self,
+        prefill_embeds: Tensor,
+        trailing_text_hidden: Tensor,
+        tts_pad_embed: Tensor,
+        params: TtsGenerationParams,
+    ) -> Result<PreparedTtsDecodePrefill> {
+        let prefill_tokens = prefill_embeds.dim(1)?;
+        let trailing_tokens = trailing_text_hidden.dim(1)?;
+        let retained_tokens = prefill_tokens
+            .checked_add(trailing_tokens)
+            .ok_or_else(|| Error::InferenceError("Qwen3-TTS retained sequence overflow".into()))?;
+        if retained_tokens > self.config.talker_config.max_position_embeddings {
+            return Err(Error::InferenceError(format!(
+                "Qwen3-TTS prepared and trailing memory require {retained_tokens} tokens, exceeding context {}",
+                self.config.talker_config.max_position_embeddings
+            )));
+        }
+        let retained_sequence_memory = Tensor::cat(&[&prefill_embeds, &trailing_text_hidden], 1)?;
+        let prefill_embeds = retained_sequence_memory.narrow(1, 0, prefill_tokens)?;
+        let trailing_text_hidden =
+            retained_sequence_memory.narrow(1, prefill_tokens, trailing_tokens)?;
+        Ok(PreparedTtsDecodePrefill {
+            prefill_embeds,
+            trailing_text_hidden,
+            retained_sequence_memory,
+            tts_pad_embed,
+            params,
+        })
     }
 
     fn prepare_voice_clone_decode(
@@ -1213,15 +2040,15 @@ impl Qwen3TtsModel {
         } else {
             params.max_frames.max(1).min(context_budget)
         };
-        Ok(PreparedTtsDecodePrefill {
+        self.prepared_decode_prefill(
             prefill_embeds,
             trailing_text_hidden,
             tts_pad_embed,
-            params: TtsGenerationParams {
+            TtsGenerationParams {
                 max_frames: resolved_max_frames,
                 ..params.clone()
             },
-        })
+        )
     }
 
     fn prepare_speaker_decode(
@@ -1271,15 +2098,15 @@ impl Qwen3TtsModel {
         };
         let (trailing_text_hidden, _, tts_pad_embed) =
             self.build_trailing_text_embeddings_from_prompt(&prompt_ids, resolved_max_frames)?;
-        Ok(PreparedTtsDecodePrefill {
+        self.prepared_decode_prefill(
             prefill_embeds,
             trailing_text_hidden,
             tts_pad_embed,
-            params: TtsGenerationParams {
+            TtsGenerationParams {
                 max_frames: resolved_max_frames,
                 ..params.clone()
             },
-        })
+        )
     }
 
     fn prepare_text_decode(
@@ -1317,14 +2144,515 @@ impl Qwen3TtsModel {
         };
         let (trailing_text_hidden, _, tts_pad_embed) =
             self.build_trailing_text_embeddings_from_prompt(&prompt_ids, resolved_max_frames)?;
-        Ok(PreparedTtsDecodePrefill {
+        self.prepared_decode_prefill(
             prefill_embeds,
             trailing_text_hidden,
             tts_pad_embed,
-            params: TtsGenerationParams {
+            TtsGenerationParams {
                 max_frames: resolved_max_frames,
                 ..params.clone()
             },
+        )
+    }
+
+    /// Prepare one row-local semantic decision without mutating retained state.
+    ///
+    /// Terminal rows carry their row-local RNG transition and bypass
+    /// predictor/talker work; codec finalization remains outside that transaction.
+    pub fn prepare_tts_predictor_stage(
+        &self,
+        state: &PhysicalTtsDecodeState,
+    ) -> Result<PreparedTtsFrameStage> {
+        if state.finished {
+            return Ok(PreparedTtsFrameStage::Terminal(PreparedTtsTerminalStage {
+                reason: TtsTerminalReason::AlreadyFinished,
+                expected_talker_context: state.talker_cache.context_len(),
+                expected_frame_idx: state.frame_idx,
+                expected_rng: state.rng,
+                expected_semantic_history: state.semantic_history.clone(),
+                next_rng: state.rng,
+                sampling_ms: 0.0,
+            }));
+        }
+        if state.frame_idx >= state.max_frames {
+            return Ok(PreparedTtsFrameStage::Terminal(PreparedTtsTerminalStage {
+                reason: TtsTerminalReason::FrameLimit,
+                expected_talker_context: state.talker_cache.context_len(),
+                expected_frame_idx: state.frame_idx,
+                expected_rng: state.rng,
+                expected_semantic_history: state.semantic_history.clone(),
+                next_rng: state.rng,
+                sampling_ms: 0.0,
+            }));
+        }
+        if state.offset != state.talker_cache.context_len() {
+            return Err(Error::InferenceError(format!(
+                "Qwen3-TTS physical state offset {} diverged from retained talker cursor {}",
+                state.offset,
+                state.talker_cache.context_len()
+            )));
+        }
+        let sampling_started = Instant::now();
+        let allow_eos = qwen_tts_allows_eos(state.frames_generated());
+        let mut next_rng = state.rng;
+        let last_logits = state.last_logits.as_ref().ok_or_else(|| {
+            Error::InferenceError("Qwen3-TTS last logits are not hydrated".into())
+        })?;
+        let semantic_token = sample_semantic(
+            &last_logits.i((0, 0))?,
+            state.semantic_vocab_size,
+            self.specials.codec_eos_token_id,
+            allow_eos,
+            &state.params,
+            &state.semantic_history,
+            &mut next_rng,
+            qwen_tts_uses_cuda_sampling(&self.device),
+        )?;
+        if allow_eos && semantic_token == self.specials.codec_eos_token_id {
+            return Ok(PreparedTtsFrameStage::Terminal(PreparedTtsTerminalStage {
+                reason: TtsTerminalReason::SemanticEos,
+                expected_talker_context: state.talker_cache.context_len(),
+                expected_frame_idx: state.frame_idx,
+                expected_rng: state.rng,
+                expected_semantic_history: state.semantic_history.clone(),
+                next_rng,
+                sampling_ms: sampling_started.elapsed().as_secs_f64() * 1000.0,
+            }));
+        }
+        let mut next_semantic_history = state.semantic_history.clone();
+        next_semantic_history.push(semantic_token);
+        if next_semantic_history.len() > 256 {
+            let drain = next_semantic_history.len() - 256;
+            next_semantic_history.drain(0..drain);
+        }
+        let semantic_embed = self.talker.get_codec_embedding(semantic_token)?;
+        let talker_hidden = state.last_hidden.as_ref().ok_or_else(|| {
+            Error::InferenceError("Qwen3-TTS last hidden state is not hydrated".into())
+        })?;
+        let text_addition = if state.frame_idx < state.trailing_text_len {
+            state
+                .trailing_text_hidden
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::InferenceError("Qwen3-TTS trailing text state is not hydrated".into())
+                })?
+                .i((.., state.frame_idx..state.frame_idx + 1, ..))?
+        } else {
+            state.tts_pad_embed.clone().ok_or_else(|| {
+                Error::InferenceError("Qwen3-TTS pad embedding is not hydrated".into())
+            })?
+        };
+        Ok(PreparedTtsFrameStage::Predictor(
+            PreparedTtsPredictorStage {
+                semantic_token,
+                semantic_embed,
+                talker_hidden: talker_hidden.clone(),
+                source_logits: last_logits.clone(),
+                text_addition,
+                expected_talker_context: state.talker_cache.context_len(),
+                expected_frame_idx: state.frame_idx,
+                expected_rng: state.rng,
+                expected_semantic_history: state.semantic_history.clone(),
+                expected_tensor_sequence: state.tensor_sequence,
+                next_rng,
+                next_semantic_history,
+                sampling_ms: sampling_started.elapsed().as_secs_f64() * 1000.0,
+            },
+        ))
+    }
+
+    /// Run the independently batchable predictor/codebook stage.
+    ///
+    /// All rows must be at fresh invocation cursor zero and share exact model
+    /// geometry. Predictor writes roll back to their entry cursors if any later
+    /// acoustic embedding or step-input construction fails.
+    pub fn tts_predictor_stage_batch_physical(
+        &self,
+        rows: Vec<PreparedTtsPredictorStage>,
+        caches: &mut [&mut CodePredictorPhysicalCache],
+    ) -> Result<Vec<PreparedTtsTalkerStage>> {
+        if rows.is_empty() || rows.len() != caches.len() {
+            return Err(Error::InvalidInput(
+                "Qwen3-TTS predictor stage requires one non-empty cache row per prepared row"
+                    .into(),
+            ));
+        }
+        let talker_refs = rows
+            .iter()
+            .map(|row| &row.talker_hidden)
+            .collect::<Vec<_>>();
+        let semantic_refs = rows
+            .iter()
+            .map(|row| &row.semantic_embed)
+            .collect::<Vec<_>>();
+        let talker_hidden = Tensor::cat(&talker_refs, 0)?;
+        let semantic_embeds = Tensor::cat(&semantic_refs, 0)?;
+        let checkpoints = caches
+            .iter()
+            .map(|cache| cache.logical_checkpoint())
+            .collect::<Vec<_>>();
+        let initial_cursors = caches
+            .iter()
+            .map(|cache| cache.context_len())
+            .collect::<Vec<_>>();
+        let predictor_started = Instant::now();
+        let acoustic = self.code_predictor.generate_acoustic_codes_physical_batch(
+            &talker_hidden,
+            &semantic_embeds,
+            caches,
+        )?;
+        let predictor_ms = predictor_started.elapsed().as_secs_f64() * 1000.0;
+        let result = rows
+            .into_iter()
+            .zip(acoustic)
+            .map(|(predictor, acoustic_codes)| {
+                if acoustic_codes.len() != self.code_predictor.num_acoustic_groups() {
+                    return Err(Error::InferenceError(format!(
+                        "Qwen3-TTS predictor row returned {} acoustic groups, expected {}",
+                        acoustic_codes.len(),
+                        self.code_predictor.num_acoustic_groups()
+                    )));
+                }
+                let acoustic_embed_sum = self
+                    .code_predictor
+                    .get_acoustic_embeddings_sum(&acoustic_codes)?;
+                let step_input = predictor
+                    .semantic_embed
+                    .broadcast_add(&acoustic_embed_sum)?
+                    .broadcast_add(&predictor.text_addition)?;
+                Ok(PreparedTtsTalkerStage {
+                    predictor,
+                    acoustic_codes,
+                    step_input,
+                    predictor_ms,
+                })
+            })
+            .collect::<Result<Vec<_>>>();
+        if let Err(error) = result {
+            let mut rollback_error = None;
+            for (row, cache) in caches.iter_mut().enumerate() {
+                if cache.context_len() != initial_cursors[row] {
+                    if let Err(rollback) =
+                        cache.restore_logical_checkpoint(checkpoints[row].clone())
+                    {
+                        rollback_error.get_or_insert(rollback);
+                    }
+                }
+            }
+            return if let Some(rollback) = rollback_error {
+                Err(Error::InferenceError(format!(
+                    "Qwen3-TTS predictor stage failed: {error}; rollback also failed: {rollback}"
+                )))
+            } else {
+                Err(error)
+            };
+        }
+        result
+    }
+
+    /// Commit one native ragged talker batch and then update row continuation
+    /// tensors/history. Every fallible tensor operation completes before either
+    /// the talker cursors or continuation fields become visible.
+    pub fn tts_talker_stage_batch_physical(
+        &self,
+        states: &mut [&mut PhysicalTtsDecodeState],
+        rows: Vec<PreparedTtsTalkerStage>,
+    ) -> Result<Vec<TtsTalkerStageCompletion>> {
+        Self::tts_talker_stage_batch_with_model(&self.talker, states, rows)
+    }
+
+    fn tts_talker_stage_batch_with_model(
+        talker: &TalkerModel,
+        states: &mut [&mut PhysicalTtsDecodeState],
+        rows: Vec<PreparedTtsTalkerStage>,
+    ) -> Result<Vec<TtsTalkerStageCompletion>> {
+        if states.is_empty() || states.len() != rows.len() {
+            return Err(Error::InvalidInput(
+                "Qwen3-TTS talker stage requires matching non-empty state and predictor rows"
+                    .into(),
+            ));
+        }
+        let mut combined_tokens = Vec::with_capacity(rows.len());
+        for (state, row) in states.iter().zip(&rows) {
+            if state.finished
+                || state.frame_idx != row.predictor.expected_frame_idx
+                || state.offset != row.predictor.expected_talker_context
+                || state.talker_cache.context_len() != row.predictor.expected_talker_context
+                || state.rng.state != row.predictor.expected_rng.state
+                || state.semantic_history != row.predictor.expected_semantic_history
+                || state.tensor_sequence != row.predictor.expected_tensor_sequence
+                || state
+                    .last_hidden
+                    .as_ref()
+                    .is_none_or(|hidden| hidden.id() != row.predictor.talker_hidden.id())
+                || state
+                    .last_logits
+                    .as_ref()
+                    .is_none_or(|logits| logits.id() != row.predictor.source_logits.id())
+                || state.all_code_groups.len() != row.acoustic_codes.len() + 1
+            {
+                return Err(Error::InvalidInput(
+                    "Qwen3-TTS talker stage row no longer matches its prepared continuation".into(),
+                ));
+            }
+            let mut tokens = Vec::with_capacity(row.acoustic_codes.len() + 1);
+            tokens.push(
+                state
+                    .text_vocab_size
+                    .checked_add(row.predictor.semantic_token)
+                    .ok_or_else(|| {
+                        Error::InvalidInput("Qwen3-TTS semantic token offset overflow".into())
+                    })?,
+            );
+            for (acoustic_idx, group_token) in row.acoustic_codes.iter().enumerate() {
+                let group_idx = u32::try_from(acoustic_idx + 1).map_err(|_| {
+                    Error::InvalidInput("Qwen3-TTS acoustic group index overflow".into())
+                })?;
+                let offset = group_idx
+                    .checked_mul(state.acoustic_vocab_size)
+                    .and_then(|offset| offset.checked_add(state.text_vocab_size))
+                    .and_then(|offset| offset.checked_add(*group_token))
+                    .ok_or_else(|| {
+                        Error::InvalidInput("Qwen3-TTS acoustic token offset overflow".into())
+                    })?;
+                tokens.push(offset);
+            }
+            combined_tokens.push(tokens);
+        }
+        let input_refs = rows.iter().map(|row| &row.step_input).collect::<Vec<_>>();
+        let inputs = Tensor::cat(&input_refs, 0)?;
+        let checkpoints = states
+            .iter()
+            .map(|state| state.talker_cache.logical_checkpoint())
+            .collect::<Vec<_>>();
+        let initial_cursors = states
+            .iter()
+            .map(|state| state.talker_cache.context_len())
+            .collect::<Vec<_>>();
+        let talker_started = Instant::now();
+        let output = {
+            let mut caches = states
+                .iter_mut()
+                .map(|state| &mut state.talker_cache)
+                .collect::<Vec<_>>();
+            talker.generate_physical_step_batch_with_embeds(&inputs, &mut caches)?
+        };
+        let talker_ms = talker_started.elapsed().as_secs_f64() * 1000.0;
+        let continuation_tensors = (0..states.len())
+            .map(|row| {
+                Ok((
+                    output.hidden_states.i(row)?.unsqueeze(0)?,
+                    output.logits.i(row)?.unsqueeze(0)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>();
+        let continuation_tensors = match continuation_tensors {
+            Ok(tensors) => tensors,
+            Err(error) => {
+                let mut rollback_error = None;
+                for (row, state) in states.iter_mut().enumerate() {
+                    if state.talker_cache.context_len() != initial_cursors[row] {
+                        if let Err(rollback) = state
+                            .talker_cache
+                            .restore_logical_checkpoint(checkpoints[row].clone())
+                        {
+                            rollback_error.get_or_insert(rollback);
+                        }
+                    }
+                }
+                return if let Some(rollback) = rollback_error {
+                    Err(Error::InferenceError(format!(
+                        "Qwen3-TTS talker continuation failed: {error}; rollback also failed: {rollback}"
+                    )))
+                } else {
+                    Err(error)
+                };
+            }
+        };
+
+        let mut completions = Vec::with_capacity(states.len());
+        for (((state, row), tokens), (new_hidden, new_logits)) in states
+            .iter_mut()
+            .zip(rows)
+            .zip(combined_tokens)
+            .zip(continuation_tensors)
+        {
+            state.rng = row.predictor.next_rng;
+            state.semantic_history = row.predictor.next_semantic_history;
+            for (group, token) in state.all_code_groups.iter_mut().zip(tokens) {
+                group.push(token);
+            }
+            state.last_hidden = Some(new_hidden);
+            state.last_logits = Some(new_logits);
+            state.frame_idx += 1;
+            state.offset = state.talker_cache.context_len();
+            completions.push(TtsTalkerStageCompletion {
+                sampling_ms: row.predictor.sampling_ms,
+                predictor_ms: row.predictor_ms,
+                talker_ms,
+            });
+        }
+        Ok(completions)
+    }
+
+    /// Perform codec emission after a successful talker transaction.
+    pub fn finish_tts_talker_stage_physical(
+        &self,
+        state: &mut PhysicalTtsDecodeState,
+        completion: TtsTalkerStageCompletion,
+    ) -> Result<TtsDecodeStep> {
+        let codec_started = Instant::now();
+        let mut samples = self.collect_incremental_audio_physical(state, false)?;
+        if state.frame_idx >= state.max_frames {
+            let final_samples = self.collect_incremental_audio_physical(state, true)?;
+            state.finished = true;
+            samples.extend(final_samples);
+        }
+        let codec_ms = codec_started.elapsed().as_secs_f64() * 1000.0;
+        Ok(TtsDecodeStep {
+            samples,
+            frames_generated: state.frames_generated(),
+            finished: state.finished,
+            sampling_ms: completion.sampling_ms,
+            decode_ms: completion.predictor_ms + completion.talker_ms,
+            codec_ms,
+            executed_model_row: true,
+        })
+    }
+
+    /// Finalize a terminal row without touching predictor or talker KV.
+    pub fn finish_tts_terminal_stage_physical(
+        &self,
+        state: &mut PhysicalTtsDecodeState,
+        terminal: PreparedTtsTerminalStage,
+    ) -> Result<TtsDecodeStep> {
+        if state.frame_idx != terminal.expected_frame_idx
+            || state.talker_cache.context_len() != terminal.expected_talker_context
+            || state.offset != terminal.expected_talker_context
+            || state.rng.state != terminal.expected_rng.state
+            || state.semantic_history != terminal.expected_semantic_history
+        {
+            return Err(Error::InvalidInput(
+                "Qwen3-TTS terminal row no longer matches its prepared continuation".into(),
+            ));
+        }
+        if matches!(terminal.reason, TtsTerminalReason::AlreadyFinished) {
+            return Ok(TtsDecodeStep {
+                samples: Vec::new(),
+                frames_generated: state.frames_generated(),
+                finished: true,
+                sampling_ms: 0.0,
+                decode_ms: 0.0,
+                codec_ms: 0.0,
+                executed_model_row: false,
+            });
+        }
+        let codec_started = Instant::now();
+        let samples = self.collect_incremental_audio_physical(state, true)?;
+        if matches!(terminal.reason, TtsTerminalReason::SemanticEos) {
+            state.rng = terminal.next_rng;
+        }
+        state.finished = true;
+        Ok(TtsDecodeStep {
+            samples,
+            frames_generated: state.frames_generated(),
+            finished: true,
+            sampling_ms: terminal.sampling_ms,
+            decode_ms: 0.0,
+            codec_ms: codec_started.elapsed().as_secs_f64() * 1000.0,
+            executed_model_row: false,
+        })
+    }
+
+    /// Execute a changing set of TTS rows while preserving input/output order.
+    /// Terminal/EOS rows are finalized independently, live rows form one native
+    /// predictor/talker batch, and a single live row uses scalar model kernels.
+    pub fn tts_decode_step_batch_physical(
+        &self,
+        states: &mut [&mut PhysicalTtsDecodeState],
+        predictor_caches: &mut [&mut CodePredictorPhysicalCache],
+    ) -> Result<Vec<TtsDecodeStep>> {
+        if states.is_empty() || states.len() != predictor_caches.len() {
+            return Err(Error::InvalidInput(
+                "Qwen3-TTS decode batch requires matching non-empty state and predictor rows"
+                    .into(),
+            ));
+        }
+        if states.len() == 1 {
+            return self
+                .tts_decode_step_physical(states[0], predictor_caches[0])
+                .map(|step| vec![step]);
+        }
+        run_tts_decode_batch_transaction(states, predictor_caches, |states, predictor_caches| {
+            let prepared = states
+                .iter()
+                .map(|state| self.prepare_tts_predictor_stage(state))
+                .collect::<Result<Vec<_>>>()?;
+            let row_count = states.len();
+            let mut live_mask = vec![false; row_count];
+            let mut live_indices = Vec::new();
+            let mut predictor_rows = Vec::new();
+            let mut terminal_rows = (0..row_count).map(|_| None).collect::<Vec<_>>();
+            for (row, stage) in prepared.into_iter().enumerate() {
+                match stage {
+                    PreparedTtsFrameStage::Predictor(stage) => {
+                        live_mask[row] = true;
+                        live_indices.push(row);
+                        predictor_rows.push(stage);
+                    }
+                    PreparedTtsFrameStage::Terminal(stage) => {
+                        // Scalar EOS sampling validates its fresh invocation
+                        // workspace before deciding not to use it. Preserve that
+                        // contract, while frame-limit/already-finished rows remain
+                        // workspace-free exactly like the scalar path.
+                        if matches!(stage.reason, TtsTerminalReason::SemanticEos) {
+                            self.code_predictor
+                                .validate_physical_workspace(predictor_caches[row])?;
+                        }
+                        terminal_rows[row] = Some(stage);
+                    }
+                }
+            }
+            let mut results = vec![None; row_count];
+            if !predictor_rows.is_empty() {
+                let mut live_caches = predictor_caches
+                    .iter_mut()
+                    .enumerate()
+                    .filter_map(|(row, cache)| live_mask[row].then_some(&mut **cache))
+                    .collect::<Vec<_>>();
+                let talker_rows =
+                    self.tts_predictor_stage_batch_physical(predictor_rows, &mut live_caches)?;
+                let mut live_states = states
+                    .iter_mut()
+                    .enumerate()
+                    .filter_map(|(row, state)| live_mask[row].then_some(&mut **state))
+                    .collect::<Vec<_>>();
+                let completions =
+                    self.tts_talker_stage_batch_physical(&mut live_states, talker_rows)?;
+                for ((row, state), completion) in live_indices
+                    .iter()
+                    .copied()
+                    .zip(live_states.iter_mut())
+                    .zip(completions)
+                {
+                    results[row] = Some(self.finish_tts_talker_stage_physical(state, completion)?);
+                }
+                drop(live_states);
+                drop(live_caches);
+            }
+            for (row, (state, terminal)) in states.iter_mut().zip(terminal_rows).enumerate() {
+                if let Some(terminal) = terminal {
+                    results[row] = Some(self.finish_tts_terminal_stage_physical(state, terminal)?);
+                }
+            }
+            results
+                .into_iter()
+                .map(|step| {
+                    step.ok_or_else(|| {
+                        Error::InferenceError("Qwen3-TTS batch omitted an output row".into())
+                    })
+                })
+                .collect()
         })
     }
 
@@ -1347,6 +2675,7 @@ impl Qwen3TtsModel {
                 sampling_ms: 0.0,
                 decode_ms: 0.0,
                 codec_ms: 0.0,
+                executed_model_row: false,
             });
         }
 
@@ -1361,6 +2690,7 @@ impl Qwen3TtsModel {
                 sampling_ms: 0.0,
                 decode_ms: 0.0,
                 codec_ms: codec_started.elapsed().as_secs_f64() * 1000.0,
+                executed_model_row: false,
             });
         }
         if state.offset != state.talker_cache.context_len() {
@@ -1409,6 +2739,7 @@ impl Qwen3TtsModel {
                 sampling_ms: semantic_ms,
                 decode_ms: 0.0,
                 codec_ms: codec_started.elapsed().as_secs_f64() * 1000.0,
+                executed_model_row: false,
             });
         }
 
@@ -1504,6 +2835,7 @@ impl Qwen3TtsModel {
             sampling_ms: semantic_ms,
             decode_ms: (total_ms - semantic_ms - audio_ms).max(0.0),
             codec_ms: audio_ms,
+            executed_model_row: true,
         })
     }
 
@@ -1654,64 +2986,119 @@ impl Qwen3TtsModel {
         Tensor::cat(&[&codec_bos, &codec_embed], 1).map_err(Error::from)
     }
 
-    fn start_physical_decode_from_prefill(
+    /// Bind immutable prepared embeddings to a fresh retained talker cache.
+    /// No transformer work occurs until [`Self::continue_physical_prefill`].
+    pub fn begin_physical_prefill(
         &self,
-        prefill_embeds: Tensor,
-        trailing_text_hidden: Tensor,
-        tts_pad_embed: Tensor,
-        params: &TtsGenerationParams,
+        prepared: PreparedTtsDecodePrefill,
         stream_config: TtsStreamingConfig,
-        mut talker_cache: TalkerPhysicalCache,
-    ) -> Result<PhysicalTtsDecodeState> {
+        talker_cache: TalkerPhysicalCache,
+    ) -> Result<PhysicalTtsPrefillState> {
         if talker_cache.context_len() != 0 {
             return Err(Error::InvalidInput(format!(
-                "Qwen3-TTS physical start requires a fresh talker cursor, got {}",
+                "Qwen3-TTS physical prefill requires a fresh talker cursor, got {}",
                 talker_cache.context_len()
             )));
         }
         let acoustic_groups = self.code_predictor.num_acoustic_groups();
         if acoustic_groups == 0 {
             return Err(Error::InvalidInput(
-                "Qwen3-TTS physical start requires at least one acoustic group".to_string(),
+                "Qwen3-TTS physical prefill requires at least one acoustic group".to_string(),
             ));
         }
         let expected_code_groups = acoustic_groups.saturating_add(1);
         if self.config.talker_config.num_code_groups != expected_code_groups {
             return Err(Error::InvalidInput(format!(
-                "Qwen3-TTS physical start has {} codec groups, expected {expected_code_groups}",
+                "Qwen3-TTS physical prefill has {} codec groups, expected {expected_code_groups}",
                 self.config.talker_config.num_code_groups
             )));
         }
+        let total_tokens = prepared.prefill_tokens()?;
+        if total_tokens == 0 {
+            return Err(Error::InvalidInput(
+                "Qwen3-TTS prepared prefill cannot be empty".into(),
+            ));
+        }
+        Ok(PhysicalTtsPrefillState {
+            prepared,
+            talker_cache,
+            stream_config,
+            progress: 0,
+            total_tokens,
+            last_hidden: None,
+            last_logits: None,
+            tensor_sequence: None,
+        })
+    }
 
-        let prefill_len = prefill_embeds.dim(1)?;
-        let max_frames = params.max_frames.max(1);
-        let required_tokens = prefill_len;
-        if talker_cache.capacity_tokens() < required_tokens {
+    /// Execute one exact prepared-embedding span. The logical span cursor and
+    /// physical talker cursor must agree; a failed span changes neither.
+    pub fn continue_physical_prefill(
+        &self,
+        state: &mut PhysicalTtsPrefillState,
+        span_start: usize,
+        span_end: usize,
+    ) -> Result<bool> {
+        if state.progress != span_start
+            || span_start >= span_end
+            || span_end > state.total_tokens
+            || state.last_hidden.is_some()
+            || state.last_logits.is_some()
+            || state.talker_cache.context_len() != span_start
+        {
             return Err(Error::InvalidInput(format!(
-                "Qwen3-TTS physical talker cache holds {} tokens, requires {required_tokens}",
-                talker_cache.capacity_tokens()
+                "Qwen3-TTS resumable prefill span [{span_start},{span_end}) is incompatible with cursor {} and total {}",
+                state.progress, state.total_tokens
             )));
         }
-
-        let text_vocab_size = self.tokenizer.text_vocab_size() as u32;
-        let acoustic_vocab_size = self.tokenizer.codec_vocab_size() as u32;
-        let talker_codec_vocab_size = self.config.talker_config.vocab_size as u32;
-        let semantic_vocab_size = talker_codec_vocab_size.saturating_sub(1024);
-        let trailing_text_len = trailing_text_hidden.dim(1)?;
+        let span = state
+            .prepared
+            .prefill_embeds
+            .narrow(1, span_start, span_end - span_start)?;
+        let complete = span_end == state.total_tokens;
         let prefill_start = Instant::now();
-        let (last_hidden, last_logits) =
-            self.talker
-                .prefill_physical_with_embeds(&prefill_embeds, &mut talker_cache, None)?;
-        if talker_cache.context_len() != prefill_len {
-            return Err(Error::InferenceError(format!(
-                "Qwen3-TTS physical prefill ended at cursor {}, expected {prefill_len}",
-                talker_cache.context_len()
-            )));
+        let checkpoint = state.talker_cache.logical_checkpoint();
+        let transition = (|| {
+            let output = self.talker.prefill_physical_span_with_embeds(
+                &span,
+                span_start,
+                &mut state.talker_cache,
+                None,
+                complete,
+            )?;
+            if state.talker_cache.context_len() != span_end {
+                return Err(Error::InferenceError(format!(
+                    "Qwen3-TTS physical prefill ended at cursor {}, expected {span_end}",
+                    state.talker_cache.context_len()
+                )));
+            }
+            match (complete, output) {
+                (true, Some(continuation)) => Ok(Some(continuation)),
+                (false, None) => Ok(None),
+                _ => Err(Error::InferenceError(
+                    "Qwen3-TTS prefill span returned inconsistent continuation tensors".into(),
+                )),
+            }
+        })();
+        let continuation = match transition {
+            Ok(continuation) => continuation,
+            Err(error) => {
+                if state.talker_cache.context_len() != span_start {
+                    state.talker_cache.restore_logical_checkpoint(checkpoint)?;
+                }
+                return Err(error);
+            }
+        };
+        if let Some((last_hidden, last_logits)) = continuation {
+            state.last_hidden = Some(last_hidden);
+            state.last_logits = Some(last_logits);
         }
+        state.progress = span_end;
         if self.device.kind.is_cuda() {
             debug!(
-                prefill_len,
-                trailing_text_len,
+                span_start,
+                span_end,
+                complete,
                 talker_dtype = ?self.dtype,
                 predictor_dtype = ?self.code_predictor_dtype,
                 speech_tokenizer_dtype = ?self.speech_tokenizer_dtype,
@@ -1719,25 +3106,53 @@ impl Qwen3TtsModel {
                 "Qwen3-TTS physical CUDA prefill timings"
             );
         }
+        Ok(complete)
+    }
 
+    /// Consume a completed resumable prefill and materialize decode-only
+    /// continuation state. No codec/vocoder work occurs at this boundary.
+    pub fn finish_physical_prefill(
+        &self,
+        state: PhysicalTtsPrefillState,
+    ) -> Result<PhysicalTtsDecodeState> {
+        if !state.is_complete() || state.talker_cache.context_len() != state.total_tokens {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3-TTS cannot finish prefill at logical/physical cursors {}/{} of {}",
+                state.progress,
+                state.talker_cache.context_len(),
+                state.total_tokens
+            )));
+        }
+        let PhysicalTtsPrefillState {
+            prepared,
+            talker_cache,
+            stream_config,
+            total_tokens,
+            last_hidden,
+            last_logits,
+            ..
+        } = state;
+        let trailing_text_len = prepared.trailing_text_hidden.dim(1)?;
         Ok(PhysicalTtsDecodeState {
             talker_cache,
-            text_vocab_size,
-            acoustic_vocab_size,
-            semantic_vocab_size,
-            trailing_text_hidden: Some(trailing_text_hidden),
+            text_vocab_size: self.tokenizer.text_vocab_size() as u32,
+            acoustic_vocab_size: self.tokenizer.codec_vocab_size() as u32,
+            semantic_vocab_size: (self.config.talker_config.vocab_size as u32).saturating_sub(1024),
+            trailing_text_hidden: Some(prepared.trailing_text_hidden),
+            retained_sequence_memory: Some(prepared.retained_sequence_memory),
+            prefill_tokens: total_tokens,
             trailing_text_len,
-            tts_pad_embed: Some(tts_pad_embed),
-            max_frames,
+            tts_pad_embed: Some(prepared.tts_pad_embed),
+            max_frames: prepared.params.max_frames.max(1),
             frame_idx: 0,
-            offset: prefill_len,
+            offset: total_tokens,
             all_code_groups: vec![Vec::new(); self.config.talker_config.num_code_groups],
             semantic_history: Vec::new(),
-            last_hidden: Some(last_hidden),
-            last_logits: Some(last_logits),
+            last_hidden,
+            last_logits,
             tensor_sequence: None,
             rng: SimpleRng::new(),
-            params: params.clone(),
+            params: prepared.params,
             stream_config,
             emitted_frames: 0,
             emitted_samples: 0,
@@ -2827,6 +4242,62 @@ mod tests {
         assert_eq!(predictor.accepted_dtypes, vec![StateDType::F32]);
     }
 
+    #[test]
+    fn predictor_width_two_plan_uses_exact_physical_kv_bytes() {
+        let full =
+            qwen3_tts_inference_state_contract(&cache_test_config(), DType::F16, DType::F32, 32)
+                .unwrap();
+        let mut predictor = full.domains[1].clone();
+        let StateDomainSpec::PagedAttention(spec) = &mut predictor else {
+            panic!("predictor must use paged attention")
+        };
+        spec.header.scope = StateScope::Invocation;
+        spec.header.prefix = PrefixPolicy::Disabled;
+        spec.header.checkpoint = CheckpointPolicy::None;
+        let placement = spec.header.placement;
+        let capacity = InvocationStateCapacity::PagedTokens { max_tokens: 16 };
+        let per_row = minimum_physical_bytes_for_capacity(&predictor, capacity).unwrap();
+        assert_eq!(per_row, 1_310_720);
+        assert_eq!(per_row.checked_mul(2).unwrap(), 2_621_440);
+
+        let workspace = InvocationWorkspaceDomain::State {
+            state: predictor,
+            capacity,
+            placement,
+            formula: WorkspaceFormula {
+                fixed_bytes: per_row,
+                dimensions: vec![],
+                terms: vec![],
+            },
+        };
+        assert_eq!(workspace.maximum_bytes().unwrap(), per_row);
+    }
+
+    #[test]
+    fn transformer_workspace_bound_tracks_span_and_geometry_and_fails_closed() {
+        let short = transformer_workspace_upper_bound_bytes(1, 32, 1024, 3072, 16, 8, 128, 3072, 2)
+            .unwrap();
+        let long = transformer_workspace_upper_bound_bytes(64, 64, 1024, 3072, 16, 8, 128, 3072, 2)
+            .unwrap();
+        let wider =
+            transformer_workspace_upper_bound_bytes(64, 64, 1024, 6144, 16, 8, 128, 3072, 2)
+                .unwrap();
+        assert!(long > short);
+        assert!(wider > long);
+        assert!(transformer_workspace_upper_bound_bytes(
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+        )
+        .is_err());
+    }
+
     fn retained_state_test_contract() -> InferenceStateContract {
         let full =
             qwen3_tts_inference_state_contract(&cache_test_config(), DType::F32, DType::F32, 32)
@@ -2867,6 +4338,12 @@ mod tests {
         assert_eq!(tensor.header.checkpoint, CheckpointPolicy::Transactional);
         assert_eq!(tensor.header.prefix, PrefixPolicy::Disabled);
         assert_eq!(tensor.components.len(), 4);
+        assert!(tensor.components.iter().all(|component| {
+            component.shape.dimensions.first().is_some_and(|dimension| {
+                dimension.axis == ShapeAxis::Batch
+                    && dimension.extent == ShapeExtent::RuntimeBounded { min: 1, max: 1 }
+            })
+        }));
         assert_eq!(
             tensor
                 .components
@@ -2884,6 +4361,19 @@ mod tests {
             .components
             .iter()
             .all(|component| component.accepted_dtypes == vec![StateDType::F32]));
+    }
+
+    #[test]
+    fn retained_tensor_shape_guard_requires_fixed_batch_axis() {
+        let memory = Tensor::zeros((2, 4, 8), DType::F32, &candle_core::Device::Cpu).unwrap();
+        let pad = Tensor::zeros((1, 1, 8), DType::F32, &candle_core::Device::Cpu).unwrap();
+        assert!(validate_qwen3_tts_tensor_state_shapes(&memory, &pad, None, None).is_err());
+
+        let memory = Tensor::zeros((1, 4, 8), DType::F32, &candle_core::Device::Cpu).unwrap();
+        let hidden = Tensor::zeros((1, 1, 7), DType::F32, &candle_core::Device::Cpu).unwrap();
+        assert!(
+            validate_qwen3_tts_tensor_state_shapes(&memory, &pad, Some(&hidden), None).is_err()
+        );
     }
 
     #[test]
@@ -3023,6 +4513,392 @@ mod tests {
 
         arena.release(sequence).unwrap();
         assert!(arena.read(sequence, QWEN3_TTS_MODEL_STATE_DOMAIN).is_err());
+    }
+
+    #[test]
+    fn non_final_prefill_stages_canonical_tensor_state_without_head_outputs() {
+        let mut contract = retained_state_test_contract();
+        let StateDomainSpec::Tensor(domain) = &mut contract.domains[1] else {
+            panic!("second retained domain must be tensor state")
+        };
+        for component in &mut domain.components {
+            for dimension in &mut component.shape.dimensions {
+                let max = match dimension.axis {
+                    ShapeAxis::Sequence => {
+                        if component.id == StateComponentId::new(1) {
+                            8
+                        } else {
+                            1
+                        }
+                    }
+                    ShapeAxis::Hidden => 4,
+                    _ => 8,
+                };
+                dimension.extent = ShapeExtent::RuntimeBounded { min: 1, max };
+            }
+        }
+        contract.validate().unwrap();
+        let plan = negotiate_state_plan(
+            &contract,
+            &StateBackendPlanRequest {
+                backend: BackendKind::Cpu,
+                device_ordinal: None,
+                page_tokens_hint: Some(2),
+                storage_dtype_hint: Some(StateDType::F32),
+            },
+        )
+        .unwrap();
+        let capacity = crate::backends::state::TensorStateCapacity::for_plan(&plan, 1, 1).unwrap();
+        let arena =
+            TensorStateArena::new(Arc::new(plan), capacity, candle_core::Device::Cpu).unwrap();
+        let sequence = PhysicalStateSequenceId::new(71).unwrap();
+        let transaction = PhysicalStateTransactionId::new(72).unwrap();
+        arena.register(sequence).unwrap();
+        arena.begin(transaction, sequence).unwrap();
+
+        let device = candle_core::Device::Cpu;
+        let retained_sequence_memory = Tensor::zeros((1, 4, 4), DType::F32, &device).unwrap();
+        let prepared = PreparedTtsDecodePrefill {
+            prefill_embeds: retained_sequence_memory.narrow(1, 0, 2).unwrap(),
+            trailing_text_hidden: retained_sequence_memory.narrow(1, 2, 2).unwrap(),
+            retained_sequence_memory,
+            tts_pad_embed: Tensor::zeros((1, 1, 4), DType::F32, &device).unwrap(),
+            params: TtsGenerationParams::default(),
+        };
+        let (cache_arena, bindings) = talker::tests::test_arena(770);
+        let mut state = PhysicalTtsPrefillState {
+            prepared,
+            talker_cache: talker::tests::test_cache(cache_arena, &bindings, 0),
+            stream_config: TtsStreamingConfig::final_only(),
+            progress: 0,
+            total_tokens: 2,
+            last_hidden: None,
+            last_logits: None,
+            tensor_sequence: None,
+        };
+        state.bind_tensor_sequence(sequence.get()).unwrap();
+        state.stage_tensor_state(&arena, transaction.get()).unwrap();
+        arena.commit(transaction, 0).unwrap();
+        let snapshot = arena
+            .read(sequence, QWEN3_TTS_MODEL_STATE_DOMAIN)
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.cursor, 0);
+        assert!(snapshot.components[0].tensor.is_some());
+        assert!(snapshot.components[1].tensor.is_some());
+        assert!(snapshot.components[2].tensor.is_none());
+        assert!(snapshot.components[3].tensor.is_none());
+    }
+
+    fn transactional_decode_state(cache: TalkerPhysicalCache, seed: u64) -> PhysicalTtsDecodeState {
+        let device = candle_core::Device::Cpu;
+        PhysicalTtsDecodeState {
+            talker_cache: cache,
+            text_vocab_size: 32,
+            acoustic_vocab_size: 8,
+            semantic_vocab_size: 8,
+            trailing_text_hidden: Some(Tensor::full(seed as f32, (1, 1, 4), &device).unwrap()),
+            retained_sequence_memory: Some(Tensor::full(seed as f32, (1, 1, 4), &device).unwrap()),
+            prefill_tokens: 0,
+            trailing_text_len: 1,
+            tts_pad_embed: Some(Tensor::full(seed as f32 + 1.0, (1, 1, 4), &device).unwrap()),
+            max_frames: 8,
+            frame_idx: 0,
+            offset: 0,
+            all_code_groups: vec![Vec::new(); 4],
+            semantic_history: vec![seed as u32],
+            last_hidden: Some(Tensor::full(seed as f32 + 2.0, (1, 1, 4), &device).unwrap()),
+            last_logits: Some(Tensor::full(seed as f32 + 3.0, (1, 1, 8), &device).unwrap()),
+            tensor_sequence: None,
+            rng: SimpleRng { state: seed },
+            params: TtsGenerationParams {
+                max_frames: 8,
+                ..Default::default()
+            },
+            stream_config: TtsStreamingConfig::final_only(),
+            emitted_frames: 0,
+            emitted_samples: 0,
+            decode_raw_token_scratch: Vec::new(),
+            finished: false,
+        }
+    }
+
+    #[test]
+    fn managed_quantum_rollback_restores_all_tensor_continuation_handles() {
+        let (arena, bindings) = talker::tests::test_arena(771);
+        let mut state =
+            transactional_decode_state(talker::tests::test_cache(arena.clone(), &bindings, 0), 61);
+        let tensor_ids = [
+            state.retained_sequence_memory.as_ref().unwrap().id(),
+            state.trailing_text_hidden.as_ref().unwrap().id(),
+            state.tts_pad_embed.as_ref().unwrap().id(),
+            state.last_hidden.as_ref().unwrap().id(),
+            state.last_logits.as_ref().unwrap().id(),
+        ];
+        let checkpoint = state
+            .begin_managed_quantum(talker::tests::test_cache(arena, &bindings, 0))
+            .unwrap();
+        state.clear_tensor_handles();
+        state.frame_idx = 3;
+        state.rng.state = 999;
+        state.rollback_managed_quantum(checkpoint);
+        assert_eq!(state.frame_idx, 0);
+        assert_eq!(state.rng.state, 61);
+        assert_eq!(
+            [
+                state.retained_sequence_memory.as_ref().unwrap().id(),
+                state.trailing_text_hidden.as_ref().unwrap().id(),
+                state.tts_pad_embed.as_ref().unwrap().id(),
+                state.last_hidden.as_ref().unwrap().id(),
+                state.last_logits.as_ref().unwrap().id(),
+            ],
+            tensor_ids
+        );
+    }
+
+    fn prepared_talker_stage(
+        state: &PhysicalTtsDecodeState,
+        semantic_token: u32,
+    ) -> PreparedTtsTalkerStage {
+        let device = candle_core::Device::Cpu;
+        let mut next_history = state.semantic_history.clone();
+        next_history.push(semantic_token);
+        PreparedTtsTalkerStage {
+            predictor: PreparedTtsPredictorStage {
+                semantic_token,
+                semantic_embed: Tensor::zeros((1, 1, 4), DType::F32, &device).unwrap(),
+                talker_hidden: state.last_hidden.as_ref().unwrap().clone(),
+                source_logits: state.last_logits.as_ref().unwrap().clone(),
+                text_addition: Tensor::zeros((1, 1, 4), DType::F32, &device).unwrap(),
+                expected_talker_context: state.talker_cache.context_len(),
+                expected_frame_idx: state.frame_idx,
+                expected_rng: state.rng,
+                expected_semantic_history: state.semantic_history.clone(),
+                expected_tensor_sequence: state.tensor_sequence,
+                next_rng: SimpleRng {
+                    state: state.rng.state.wrapping_add(1),
+                },
+                next_semantic_history: next_history,
+                sampling_ms: 1.0,
+            },
+            acoustic_codes: vec![1, 2, 3],
+            step_input: Tensor::full(0.25f32, (1, 1, 4), &device).unwrap(),
+            predictor_ms: 2.0,
+        }
+    }
+
+    #[test]
+    fn failed_talker_batch_preserves_every_cursor_and_continuation_tensor() {
+        let device = candle_core::Device::Cpu;
+        let talker = talker::tests::tiny_talker(&device);
+        let (arena_a, bindings_a) = talker::tests::test_arena(721);
+        let (arena_b, bindings_b) = talker::tests::test_arena(722);
+        let mut state_a =
+            transactional_decode_state(talker::tests::test_cache(arena_a, &bindings_a, 0), 41);
+        let mut state_b =
+            transactional_decode_state(talker::tests::test_cache(arena_b, &bindings_b, 0), 43);
+        let rows = vec![
+            prepared_talker_stage(&state_a, 2),
+            prepared_talker_stage(&state_b, 3),
+        ];
+        let snapshot = [&state_a, &state_b].map(|state| {
+            (
+                state.talker_cache.context_len(),
+                state.frame_idx,
+                state.offset,
+                state.rng.state,
+                state.semantic_history.clone(),
+                state.all_code_groups.clone(),
+                state
+                    .last_hidden
+                    .as_ref()
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap(),
+                state
+                    .last_logits
+                    .as_ref()
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap(),
+            )
+        });
+        let mut states = [&mut state_a, &mut state_b];
+
+        assert!(
+            Qwen3TtsModel::tts_talker_stage_batch_with_model(&talker, &mut states, rows,).is_err()
+        );
+        for (state, expected) in [&state_a, &state_b].into_iter().zip(snapshot) {
+            assert_eq!(state.talker_cache.context_len(), expected.0);
+            assert_eq!(state.frame_idx, expected.1);
+            assert_eq!(state.offset, expected.2);
+            assert_eq!(state.rng.state, expected.3);
+            assert_eq!(state.semantic_history, expected.4);
+            assert_eq!(state.all_code_groups, expected.5);
+            assert_eq!(
+                state
+                    .last_hidden
+                    .as_ref()
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap(),
+                expected.6
+            );
+            assert_eq!(
+                state
+                    .last_logits
+                    .as_ref()
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap(),
+                expected.7
+            );
+        }
+    }
+
+    fn simulate_batch_model_progress(
+        talker: &TalkerModel,
+        state: &mut PhysicalTtsDecodeState,
+        predictor_cache: &mut CodePredictorPhysicalCache,
+        token: u32,
+    ) -> Result<()> {
+        let input = Tensor::full(token as f32 / 8.0, (1, 1, 4), &candle_core::Device::Cpu)?;
+        let (last_hidden, last_logits) =
+            talker.generate_physical_step_with_embed(&input, &mut state.talker_cache)?;
+        let _ = talker.generate_physical_step_with_embed(&input, predictor_cache)?;
+
+        state.frame_idx += 1;
+        state.offset = state.talker_cache.context_len();
+        state.rng.state = state.rng.state.wrapping_add(1);
+        state.semantic_history.push(token);
+        for group in &mut state.all_code_groups {
+            group.push(token);
+        }
+        state.last_hidden = Some(last_hidden);
+        state.last_logits = Some(last_logits);
+        Ok(())
+    }
+
+    fn simulate_batch_codec_finalization(state: &mut PhysicalTtsDecodeState, token: u32) {
+        state.emitted_frames += 1;
+        state.emitted_samples += 80;
+        state.decode_raw_token_scratch.push(vec![token]);
+    }
+
+    #[test]
+    fn late_codec_failure_rolls_back_every_row_before_ordered_retry() {
+        let talker = talker::tests::tiny_talker(&candle_core::Device::Cpu);
+        let (arena, bindings) = talker::tests::test_arena(723);
+        let mut state_a =
+            transactional_decode_state(talker::tests::test_cache(arena.clone(), &bindings, 0), 47);
+        let mut state_b =
+            transactional_decode_state(talker::tests::test_cache(arena.clone(), &bindings, 6), 53);
+        let mut predictor_a = talker::tests::test_cache(arena.clone(), &bindings, 12);
+        let mut predictor_b = talker::tests::test_cache(arena, &bindings, 18);
+        let initial_hidden_ids = [
+            state_a.last_hidden.as_ref().unwrap().id(),
+            state_b.last_hidden.as_ref().unwrap().id(),
+        ];
+        let initial_logits_ids = [
+            state_a.last_logits.as_ref().unwrap().id(),
+            state_b.last_logits.as_ref().unwrap().id(),
+        ];
+        let initial_rng = [state_a.rng.state, state_b.rng.state];
+
+        let mut states = [&mut state_a, &mut state_b];
+        let mut predictors = [&mut predictor_a, &mut predictor_b];
+        let failed: Result<Vec<u32>> =
+            run_tts_decode_batch_transaction(&mut states, &mut predictors, |states, predictors| {
+                for row in 0..states.len() {
+                    simulate_batch_model_progress(
+                        &talker,
+                        states[row],
+                        predictors[row],
+                        u32::try_from(row + 1).unwrap(),
+                    )?;
+                }
+                // Row zero has already produced audio when row one's codec
+                // fails. The public Vec-returning call cannot expose row zero,
+                // so the complete physical batch must become retryable.
+                simulate_batch_codec_finalization(states[0], 1);
+                Err(Error::InferenceError(
+                    "injected second-row codec failure".into(),
+                ))
+            });
+        let failure = failed.unwrap_err().to_string();
+        assert!(
+            failure.contains("injected second-row codec failure"),
+            "unexpected failure: {failure}"
+        );
+        drop(states);
+        drop(predictors);
+
+        for (row, state) in [&mut state_a, &mut state_b].into_iter().enumerate() {
+            assert_eq!(state.talker_cache.context_len(), 0);
+            assert_eq!(state.frame_idx, 0);
+            assert_eq!(state.offset, 0);
+            assert_eq!(state.rng.state, initial_rng[row]);
+            assert_eq!(state.semantic_history.len(), 1);
+            assert!(state.all_code_groups.iter().all(Vec::is_empty));
+            assert_eq!(
+                state.last_hidden.as_ref().unwrap().id(),
+                initial_hidden_ids[row]
+            );
+            assert_eq!(
+                state.last_logits.as_ref().unwrap().id(),
+                initial_logits_ids[row]
+            );
+            assert_eq!(state.emitted_frames, 0);
+            assert_eq!(state.emitted_samples, 0);
+            assert!(state.decode_raw_token_scratch.is_empty());
+            assert!(!state.finished);
+            assert!(state.take_managed_write_completions().is_empty());
+        }
+        assert_eq!(
+            (predictor_a.context_len(), predictor_b.context_len()),
+            (0, 0)
+        );
+        assert!(predictor_a.take_completed_writes().is_empty());
+        assert!(predictor_b.take_completed_writes().is_empty());
+
+        let mut states = [&mut state_a, &mut state_b];
+        let mut predictors = [&mut predictor_a, &mut predictor_b];
+        let outputs =
+            run_tts_decode_batch_transaction(&mut states, &mut predictors, |states, predictors| {
+                for row in 0..states.len() {
+                    let token = u32::try_from(row + 1).unwrap();
+                    simulate_batch_model_progress(&talker, states[row], predictors[row], token)?;
+                    simulate_batch_codec_finalization(states[row], token);
+                }
+                Ok(vec![10, 20])
+            })
+            .unwrap();
+        assert_eq!(outputs, vec![10, 20]);
+        drop(states);
+        drop(predictors);
+
+        for state in [&state_a, &state_b] {
+            assert_eq!(state.talker_cache.context_len(), 1);
+            assert_eq!(state.frame_idx, 1);
+            assert_eq!(state.offset, 1);
+            assert_eq!(state.semantic_history.len(), 2);
+            assert!(state.all_code_groups.iter().all(|group| group.len() == 1));
+            assert_eq!(state.emitted_frames, 1);
+            assert_eq!(state.emitted_samples, 80);
+            assert_eq!(state.decode_raw_token_scratch.len(), 1);
+        }
+        assert_eq!(
+            (predictor_a.context_len(), predictor_b.context_len()),
+            (1, 1)
+        );
     }
 
     #[test]
