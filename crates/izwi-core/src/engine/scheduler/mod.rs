@@ -14,7 +14,10 @@ use std::time::{Duration, Instant};
 use tracing::debug;
 
 use super::config::EngineCoreConfig;
-use super::execution::{CacheMode, ExecutionProfile, NativeBatchMode, PrefillMode};
+use super::execution::{
+    CacheMode, ExecutionProfile, NativeBatchMode, PrefillMode, RealtimePreparationMode,
+    RealtimeStageOutcome, RealtimeSubphase,
+};
 use super::request::{EngineCoreRequest, RequestStatus, WorkloadClass};
 use super::types::{Priority, RequestId, SequenceId, TaskType};
 use super::{InputRange, PlanId, RealtimeOperationId, SequencePhase, SessionKey, WorkUnit};
@@ -367,6 +370,8 @@ pub struct Scheduler {
     next_sequence_id: SequenceId,
     /// Next execution plan identity.
     next_plan_id: PlanId,
+    /// Monotonic fair-service clock for realtime session rotation.
+    next_realtime_service_clock: u64,
     /// Monotonic scheduling cycle used for one-cycle preemption resume fences.
     /// Adaptive scheduling telemetry.
     telemetry: SchedulerTelemetry,
@@ -385,7 +390,71 @@ pub struct Scheduler {
 #[derive(Debug, Clone)]
 struct RealtimePendingOperation {
     id: RealtimeOperationId,
-    work: WorkUnit,
+    external: RealtimeExternalOperation,
+    phase: RealtimeSubphase,
+    remaining_output_steps: usize,
+    committed_cache_append: usize,
+}
+
+#[derive(Debug, Clone)]
+enum RealtimeExternalOperation {
+    Push {
+        input: InputRange,
+        max_cache_append: usize,
+    },
+    Finish {
+        max_cache_append: usize,
+    },
+}
+
+impl RealtimePendingOperation {
+    fn max_cache_append(&self) -> usize {
+        match self.external {
+            RealtimeExternalOperation::Push {
+                max_cache_append, ..
+            }
+            | RealtimeExternalOperation::Finish { max_cache_append } => max_cache_append,
+        }
+    }
+
+    fn work(&self, committed_input_samples: usize) -> WorkUnit {
+        match self.phase {
+            RealtimeSubphase::Preparation => {
+                let (mode, input) = match self.external {
+                    RealtimeExternalOperation::Push { input, .. } => {
+                        (RealtimePreparationMode::Push, input)
+                    }
+                    RealtimeExternalOperation::Finish { .. } => (
+                        RealtimePreparationMode::Finish,
+                        InputRange {
+                            start: committed_input_samples,
+                            end: committed_input_samples,
+                        },
+                    ),
+                };
+                WorkUnit::RealtimePreparation {
+                    operation_id: self.id,
+                    mode,
+                    input,
+                    max_output_steps: self.remaining_output_steps,
+                    max_cache_append: self.max_cache_append(),
+                }
+            }
+            RealtimeSubphase::PromptPrefill { cache_append } => WorkUnit::RealtimePromptPrefill {
+                operation_id: self.id,
+                max_output_steps: self.remaining_output_steps,
+                cache_append,
+            },
+            RealtimeSubphase::DecodeContinuation => WorkUnit::RealtimeDecodeContinuation {
+                operation_id: self.id,
+                max_output_steps: self.remaining_output_steps,
+                max_cache_append: 1,
+            },
+            RealtimeSubphase::Completion => WorkUnit::RealtimeCompletion {
+                operation_id: self.id,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -395,8 +464,16 @@ struct RealtimeSchedulerState {
     enqueued_input_samples: usize,
     next_operation_id: u64,
     pending: VecDeque<RealtimePendingOperation>,
-    in_flight: Option<RealtimeOperationId>,
+    in_flight: Option<RealtimeInFlight>,
+    last_service_clock: u64,
     finish_enqueued: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RealtimeInFlight {
+    plan_id: PlanId,
+    operation_id: RealtimeOperationId,
+    subphase: RealtimeSubphase,
 }
 
 /// Metadata for a request in the scheduler.
@@ -485,11 +562,43 @@ impl Scheduler {
             pending_releases: HashMap::new(),
             next_sequence_id: 0,
             next_plan_id: 1,
+            next_realtime_service_clock: 1,
             telemetry,
             class_service: HashMap::new(),
             decode_only_steps_with_waiting_full_prefill: 0,
             decode_only_steps_with_waiting_incremental_prefill: 0,
         }
+    }
+
+    fn ensure_realtime_service_clock_capacity(&mut self, quanta: usize) {
+        let required = u64::try_from(quanta).unwrap_or(u64::MAX);
+        if self
+            .next_realtime_service_clock
+            .checked_add(required)
+            .is_some()
+        {
+            return;
+        }
+        let mut order = self
+            .realtime_sessions
+            .iter()
+            .map(|(request_id, state)| {
+                (
+                    state.last_service_clock,
+                    state.sequence_id,
+                    request_id.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        order.sort_unstable();
+        for (rank, (_, _, request_id)) in order.into_iter().enumerate() {
+            if let Some(state) = self.realtime_sessions.get_mut(&request_id) {
+                state.last_service_clock = u64::try_from(rank).unwrap_or(u64::MAX - 1);
+            }
+        }
+        self.next_realtime_service_clock = u64::try_from(self.realtime_sessions.len())
+            .unwrap_or(u64::MAX - 1)
+            .saturating_add(1);
     }
 
     /// Add a request to the waiting queue.
@@ -593,6 +702,7 @@ impl Scheduler {
                 paused: false,
             },
         );
+        let initial_service_clock = self.next_realtime_service_clock.saturating_sub(1);
         self.realtime_sessions.insert(
             request.id.clone(),
             RealtimeSchedulerState {
@@ -602,6 +712,7 @@ impl Scheduler {
                 next_operation_id: 1,
                 pending: VecDeque::new(),
                 in_flight: None,
+                last_service_clock: initial_service_clock,
                 finish_enqueued: false,
             },
         );
@@ -645,12 +756,13 @@ impl Scheduler {
         state.enqueued_input_samples = end;
         state.pending.push_back(RealtimePendingOperation {
             id,
-            work: WorkUnit::RealtimePush {
-                operation_id: id,
+            external: RealtimeExternalOperation::Push {
                 input,
-                max_output_steps,
                 max_cache_append,
             },
+            phase: RealtimeSubphase::Preparation,
+            remaining_output_steps: max_output_steps,
+            committed_cache_append: 0,
         });
         Ok((id, input))
     }
@@ -684,11 +796,10 @@ impl Scheduler {
         state.finish_enqueued = true;
         state.pending.push_back(RealtimePendingOperation {
             id,
-            work: WorkUnit::RealtimeFinish {
-                operation_id: id,
-                max_output_steps,
-                max_cache_append,
-            },
+            external: RealtimeExternalOperation::Finish { max_cache_append },
+            phase: RealtimeSubphase::Preparation,
+            remaining_output_steps: max_output_steps,
+            committed_cache_append: 0,
         });
         Ok(id)
     }
@@ -802,16 +913,20 @@ impl Scheduler {
         // Realtime operations are already admitted, session-fenced quanta.
         // Schedule at most one FIFO head per session and keep their source
         // sample clock independent from token-prefill/decode accounting.
+        self.ensure_realtime_service_clock_capacity(self.realtime_sessions.len());
         let mut realtime_candidates = self
             .realtime_sessions
             .iter()
             .filter_map(|(request_id, state)| {
-                (state.in_flight.is_none() && !state.pending.is_empty())
-                    .then_some((state.sequence_id, request_id.clone()))
+                (state.in_flight.is_none() && !state.pending.is_empty()).then_some((
+                    state.last_service_clock,
+                    state.sequence_id,
+                    request_id.clone(),
+                ))
             })
             .collect::<Vec<_>>();
-        realtime_candidates.sort_unstable_by_key(|(sequence_id, _)| *sequence_id);
-        for (_, request_id) in realtime_candidates {
+        realtime_candidates.sort_unstable();
+        for (_, _, request_id) in realtime_candidates {
             if remaining_batch == 0 || remaining_decode_budget == 0 {
                 break;
             }
@@ -821,10 +936,20 @@ impl Scheduler {
             let Some(operation) = state.pending.front().cloned() else {
                 continue;
             };
-            state.in_flight = Some(operation.id);
             let plan_id = self.next_plan_id;
             self.next_plan_id = self.next_plan_id.saturating_add(1);
+            state.in_flight = Some(RealtimeInFlight {
+                plan_id,
+                operation_id: operation.id,
+                subphase: operation.phase,
+            });
+            state.last_service_clock = self.next_realtime_service_clock;
+            self.next_realtime_service_clock = self
+                .next_realtime_service_clock
+                .checked_add(1)
+                .expect("realtime service clock capacity was reserved");
             let num_computed_tokens = state.committed_input_samples;
+            let work = operation.work(state.committed_input_samples);
             result.decode_requests.push(ScheduledRequest {
                 plan_id,
                 request_id,
@@ -832,7 +957,7 @@ impl Scheduler {
                 num_tokens: 1,
                 is_prefill: false,
                 num_computed_tokens,
-                work: operation.work,
+                work,
             });
             remaining_decode_budget = remaining_decode_budget.saturating_sub(1);
             remaining_batch -= 1;
@@ -1326,11 +1451,10 @@ impl Scheduler {
         self.update_dynamic_budget();
     }
 
-    pub(crate) fn commit_realtime_operation(
+    pub(crate) fn commit_realtime_stage_outcome(
         &mut self,
         session: &SessionKey,
-        operation_id: RealtimeOperationId,
-        input_consumed: usize,
+        outcome: RealtimeStageOutcome,
     ) -> crate::error::Result<()> {
         let state = self
             .realtime_sessions
@@ -1338,32 +1462,154 @@ impl Scheduler {
             .ok_or_else(|| {
                 crate::error::Error::InferenceError("committed realtime session is missing".into())
             })?;
-        let head = state.pending.front().ok_or_else(|| {
+        let head = state.pending.front_mut().ok_or_else(|| {
             crate::error::Error::InferenceError(
                 "committed realtime operation queue is empty".into(),
             )
         })?;
         if state.sequence_id != session.epoch
-            || state.in_flight != Some(operation_id)
-            || head.id != operation_id
+            || state.in_flight
+                != Some(RealtimeInFlight {
+                    plan_id: outcome.plan_id,
+                    operation_id: outcome.operation_id,
+                    subphase: outcome.completed,
+                })
+            || head.id != outcome.operation_id
+            || head.phase != outcome.completed
         {
             return Err(crate::error::Error::InferenceError(
                 "realtime operation commit crossed its FIFO session fence".into(),
             ));
         }
-        if let WorkUnit::RealtimePush { input, .. } = &head.work {
-            if input.start != state.committed_input_samples || input_consumed != input.len() {
-                return Err(crate::error::Error::InferenceError(
-                    "realtime push commit did not consume its exact sample interval".into(),
-                ));
-            }
-            state.committed_input_samples = input.end;
-        } else if input_consumed != 0 {
+        let transition_valid = matches!(
+            (head.phase, outcome.next),
+            (
+                RealtimeSubphase::Preparation,
+                Some(
+                    RealtimeSubphase::PromptPrefill { .. }
+                        | RealtimeSubphase::DecodeContinuation
+                        | RealtimeSubphase::Completion
+                )
+            ) | (
+                RealtimeSubphase::PromptPrefill { .. },
+                Some(RealtimeSubphase::DecodeContinuation | RealtimeSubphase::Completion)
+            ) | (
+                RealtimeSubphase::DecodeContinuation,
+                Some(RealtimeSubphase::DecodeContinuation | RealtimeSubphase::Completion)
+            ) | (RealtimeSubphase::Completion, None)
+        ) || (outcome.next.is_none()
+            && !matches!(head.phase, RealtimeSubphase::Completion)
+            && matches!(head.external, RealtimeExternalOperation::Push { .. }));
+        if !transition_valid {
             return Err(crate::error::Error::InferenceError(
-                "realtime finish cannot consume source samples".into(),
+                "realtime stage outcome requested an invalid subphase transition".into(),
             ));
         }
-        state.pending.pop_front();
+        if matches!(
+            head.phase,
+            RealtimeSubphase::Preparation | RealtimeSubphase::Completion
+        ) && (outcome.output_steps != 0 || outcome.cache_append != 0)
+        {
+            return Err(crate::error::Error::InferenceError(
+                "realtime preparation/completion cannot report decoder progress".into(),
+            ));
+        }
+        match head.phase {
+            RealtimeSubphase::PromptPrefill { cache_append }
+                if cache_append == 0
+                    || outcome.cache_append != cache_append
+                    || outcome.output_steps != 1 =>
+            {
+                return Err(crate::error::Error::InferenceError(
+                    "realtime prompt prefill did not append its exact KV span".into(),
+                ));
+            }
+            RealtimeSubphase::DecodeContinuation
+                if outcome.cache_append != 1 || outcome.output_steps != 1 =>
+            {
+                return Err(crate::error::Error::InferenceError(
+                    "realtime decode continuation must append exactly one KV token".into(),
+                ));
+            }
+            _ => {}
+        }
+        if outcome.output_steps > head.remaining_output_steps
+            || outcome.output_steps
+                > usize::from(matches!(
+                    head.phase,
+                    RealtimeSubphase::PromptPrefill { .. } | RealtimeSubphase::DecodeContinuation
+                ))
+        {
+            return Err(crate::error::Error::InferenceError(
+                "realtime stage exceeded its remaining output-step bound".into(),
+            ));
+        }
+        let committed_cache_append = head
+            .committed_cache_append
+            .checked_add(outcome.cache_append)
+            .ok_or_else(|| {
+                crate::error::Error::InferenceError("realtime KV append clock overflow".into())
+            })?;
+        if committed_cache_append > head.max_cache_append() {
+            return Err(crate::error::Error::InferenceError(
+                "realtime stage exceeded its operation KV append ceiling".into(),
+            ));
+        }
+        if let Some(RealtimeSubphase::PromptPrefill { cache_append }) = outcome.next {
+            if cache_append == 0
+                || committed_cache_append
+                    .checked_add(cache_append)
+                    .is_none_or(|total| total > head.max_cache_append())
+            {
+                return Err(crate::error::Error::InferenceError(
+                    "realtime prompt prefill exceeds its operation KV append ceiling".into(),
+                ));
+            }
+        }
+        let remaining_output_steps = head.remaining_output_steps - outcome.output_steps;
+        if outcome.next.is_some()
+            && remaining_output_steps == 0
+            && !matches!(outcome.next, Some(RealtimeSubphase::Completion))
+        {
+            return Err(crate::error::Error::InferenceError(
+                "realtime stage cannot continue after exhausting its output-step bound".into(),
+            ));
+        }
+
+        let final_stage = outcome.next.is_none();
+        if !final_stage && outcome.input_consumed != 0 {
+            return Err(crate::error::Error::InferenceError(
+                "intermediate realtime stages cannot commit source input".into(),
+            ));
+        }
+        if final_stage {
+            match head.external {
+                RealtimeExternalOperation::Push { input, .. } => {
+                    if input.start != state.committed_input_samples
+                        || outcome.input_consumed != input.len()
+                    {
+                        return Err(crate::error::Error::InferenceError(
+                            "realtime push completion did not consume its exact sample interval"
+                                .into(),
+                        ));
+                    }
+                    state.committed_input_samples = input.end;
+                }
+                RealtimeExternalOperation::Finish { .. } if outcome.input_consumed != 0 => {
+                    return Err(crate::error::Error::InferenceError(
+                        "realtime finish cannot consume source samples".into(),
+                    ));
+                }
+                RealtimeExternalOperation::Finish { .. } => {}
+            }
+            head.remaining_output_steps = remaining_output_steps;
+            head.committed_cache_append = committed_cache_append;
+            state.pending.pop_front();
+        } else {
+            head.remaining_output_steps = remaining_output_steps;
+            head.committed_cache_append = committed_cache_append;
+            head.phase = outcome.next.expect("non-final outcome has a next phase");
+        }
         state.in_flight = None;
         Ok(())
     }
@@ -1371,14 +1617,22 @@ impl Scheduler {
     pub(crate) fn release_realtime_operation_for_retry(
         &mut self,
         session: &SessionKey,
+        plan_id: PlanId,
         operation_id: RealtimeOperationId,
+        subphase: RealtimeSubphase,
     ) -> bool {
         let Some(state) = self.realtime_sessions.get_mut(&session.request_id) else {
             return false;
         };
         if state.sequence_id != session.epoch
-            || state.in_flight != Some(operation_id)
+            || state.in_flight
+                != Some(RealtimeInFlight {
+                    plan_id,
+                    operation_id,
+                    subphase,
+                })
             || state.pending.front().map(|operation| operation.id) != Some(operation_id)
+            || state.pending.front().map(|operation| operation.phase) != Some(subphase)
         {
             return false;
         }
@@ -2491,39 +2745,243 @@ mod tests {
         assert_eq!(first.decode_requests.len(), 1);
         assert!(matches!(
             &first.decode_requests[0].work,
-            WorkUnit::RealtimePush { operation_id, .. } if *operation_id == first_id
+            WorkUnit::RealtimePreparation {
+                operation_id,
+                mode: RealtimePreparationMode::Push,
+                input,
+                ..
+            } if *operation_id == first_id && *input == first_input
         ));
-        assert!(scheduler.release_realtime_operation_for_retry(&session, first_id));
+        assert!(scheduler.release_realtime_operation_for_retry(
+            &session,
+            first.decode_requests[0].plan_id,
+            first_id,
+            RealtimeSubphase::Preparation,
+        ));
         let retried = scheduler.schedule();
         assert!(matches!(
             &retried.decode_requests[0].work,
-            WorkUnit::RealtimePush { operation_id, .. } if *operation_id == first_id
+            WorkUnit::RealtimePreparation { operation_id, .. } if *operation_id == first_id
+        ));
+        assert!(!scheduler.release_realtime_operation_for_retry(
+            &session,
+            first.decode_requests[0].plan_id,
+            first_id,
+            RealtimeSubphase::Preparation,
+        ));
+        assert!(scheduler
+            .commit_realtime_stage_outcome(
+                &session,
+                RealtimeStageOutcome {
+                    plan_id: first.decode_requests[0].plan_id,
+                    operation_id: first_id,
+                    completed: RealtimeSubphase::Preparation,
+                    next: Some(RealtimeSubphase::PromptPrefill { cache_append: 2 }),
+                    input_consumed: 0,
+                    output_steps: 0,
+                    cache_append: 0,
+                },
+            )
+            .is_err());
+        assert!(scheduler.schedule().decode_requests.is_empty());
+        scheduler
+            .commit_realtime_stage_outcome(
+                &session,
+                RealtimeStageOutcome {
+                    plan_id: retried.decode_requests[0].plan_id,
+                    operation_id: first_id,
+                    completed: RealtimeSubphase::Preparation,
+                    next: Some(RealtimeSubphase::PromptPrefill { cache_append: 2 }),
+                    input_consumed: 0,
+                    output_steps: 0,
+                    cache_append: 0,
+                },
+            )
+            .expect("preparation transition");
+        let prompt = scheduler.schedule();
+        assert!(matches!(
+            &prompt.decode_requests[0].work,
+            WorkUnit::RealtimePromptPrefill {
+                operation_id,
+                cache_append: 2,
+                ..
+            } if *operation_id == first_id
         ));
         scheduler
-            .commit_realtime_operation(&session, first_id, 160)
-            .expect("exact first commit");
+            .commit_realtime_stage_outcome(
+                &session,
+                RealtimeStageOutcome {
+                    plan_id: prompt.decode_requests[0].plan_id,
+                    operation_id: first_id,
+                    completed: RealtimeSubphase::PromptPrefill { cache_append: 2 },
+                    next: Some(RealtimeSubphase::DecodeContinuation),
+                    input_consumed: 0,
+                    output_steps: 1,
+                    cache_append: 2,
+                },
+            )
+            .expect("prompt transition");
+        let decode = scheduler.schedule();
+        assert!(matches!(
+            &decode.decode_requests[0].work,
+            WorkUnit::RealtimeDecodeContinuation { operation_id, .. }
+                if *operation_id == first_id
+        ));
+        scheduler
+            .commit_realtime_stage_outcome(
+                &session,
+                RealtimeStageOutcome {
+                    plan_id: decode.decode_requests[0].plan_id,
+                    operation_id: first_id,
+                    completed: RealtimeSubphase::DecodeContinuation,
+                    next: None,
+                    input_consumed: first_input.len(),
+                    output_steps: 1,
+                    cache_append: 1,
+                },
+            )
+            .expect("exact first completion");
 
         let second = scheduler.schedule();
         assert!(matches!(
             &second.decode_requests[0].work,
-            WorkUnit::RealtimePush { operation_id, .. } if *operation_id == second_id
+            WorkUnit::RealtimePreparation { operation_id, .. } if *operation_id == second_id
         ));
         assert!(scheduler
-            .commit_realtime_operation(&session, second_id, 79)
+            .commit_realtime_stage_outcome(
+                &session,
+                RealtimeStageOutcome {
+                    plan_id: second.decode_requests[0].plan_id,
+                    operation_id: second_id,
+                    completed: RealtimeSubphase::Preparation,
+                    next: None,
+                    input_consumed: 79,
+                    output_steps: 0,
+                    cache_append: 0,
+                },
+            )
             .is_err());
         scheduler
-            .commit_realtime_operation(&session, second_id, 80)
+            .commit_realtime_stage_outcome(
+                &session,
+                RealtimeStageOutcome {
+                    plan_id: second.decode_requests[0].plan_id,
+                    operation_id: second_id,
+                    completed: RealtimeSubphase::Preparation,
+                    next: None,
+                    input_consumed: second_input.len(),
+                    output_steps: 0,
+                    cache_append: 0,
+                },
+            )
             .expect("exact second commit");
 
         let finish = scheduler.schedule();
         assert!(matches!(
             &finish.decode_requests[0].work,
-            WorkUnit::RealtimeFinish { operation_id, .. } if *operation_id == finish_id
+            WorkUnit::RealtimePreparation {
+                operation_id,
+                mode: RealtimePreparationMode::Finish,
+                input,
+                ..
+            } if *operation_id == finish_id && input.is_empty()
         ));
         scheduler
-            .commit_realtime_operation(&session, finish_id, 0)
+            .commit_realtime_stage_outcome(
+                &session,
+                RealtimeStageOutcome {
+                    plan_id: finish.decode_requests[0].plan_id,
+                    operation_id: finish_id,
+                    completed: RealtimeSubphase::Preparation,
+                    next: Some(RealtimeSubphase::Completion),
+                    input_consumed: 0,
+                    output_steps: 0,
+                    cache_append: 0,
+                },
+            )
+            .expect("finish preparation");
+        let completion = scheduler.schedule();
+        assert!(matches!(
+            &completion.decode_requests[0].work,
+            WorkUnit::RealtimeCompletion { operation_id } if *operation_id == finish_id
+        ));
+        scheduler
+            .commit_realtime_stage_outcome(
+                &session,
+                RealtimeStageOutcome {
+                    plan_id: completion.decode_requests[0].plan_id,
+                    operation_id: finish_id,
+                    completed: RealtimeSubphase::Completion,
+                    next: None,
+                    input_consumed: 0,
+                    output_steps: 0,
+                    cache_append: 0,
+                },
+            )
             .expect("finish commit");
         assert!(!scheduler.has_pending_work());
+    }
+
+    #[test]
+    fn realtime_width_one_rotates_before_serving_an_older_session_continuation() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 1,
+            max_tokens_per_step: 1,
+            min_tokens_per_step: 1,
+            policy: SchedulingPolicy::Priority,
+            enable_adaptive_batching: false,
+            ..Default::default()
+        });
+        let mut older = build_request(TaskType::ASR, "realtime-older", Priority::High);
+        let mut newer = build_request(TaskType::ASR, "realtime-newer", Priority::High);
+        older
+            .enable_realtime_asr_ingress()
+            .expect("older realtime ingress");
+        newer
+            .enable_realtime_asr_ingress()
+            .expect("newer realtime ingress");
+        assert!(scheduler.add_realtime_session(&older));
+        assert!(scheduler.add_realtime_session(&newer));
+        let older_session = SessionKey::new(
+            older.id.clone(),
+            scheduler.get_sequence_id(&older.id).expect("older epoch"),
+        );
+        let newer_session = SessionKey::new(
+            newer.id.clone(),
+            scheduler.get_sequence_id(&newer.id).expect("newer epoch"),
+        );
+        let (older_operation, _) = scheduler
+            .enqueue_realtime_push(&older_session, 80, 1, 2)
+            .expect("older push");
+        let (newer_operation, _) = scheduler
+            .enqueue_realtime_push(&newer_session, 80, 1, 2)
+            .expect("newer push");
+
+        let first = scheduler.schedule();
+        assert_eq!(first.decode_requests[0].request_id, older.id);
+        scheduler
+            .commit_realtime_stage_outcome(
+                &older_session,
+                RealtimeStageOutcome {
+                    plan_id: first.decode_requests[0].plan_id,
+                    operation_id: older_operation,
+                    completed: RealtimeSubphase::Preparation,
+                    next: Some(RealtimeSubphase::Completion),
+                    input_consumed: 0,
+                    output_steps: 0,
+                    cache_append: 0,
+                },
+            )
+            .expect("older preparation continuation");
+
+        let second = scheduler.schedule();
+        assert_eq!(second.decode_requests.len(), 1);
+        assert_eq!(second.decode_requests[0].request_id, newer.id);
+        assert!(matches!(
+            &second.decode_requests[0].work,
+            WorkUnit::RealtimePreparation { operation_id, .. }
+                if *operation_id == newer_operation
+        ));
     }
 
     fn allow_incremental_prefill(scheduler: &mut Scheduler, request_id: &str) {

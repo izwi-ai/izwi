@@ -73,7 +73,10 @@ use crate::models::registry::{AsrModelLease, NativeAsrModel, NativeChatModel, Qw
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::ModelRegistry;
 use crate::runtime::{PhysicalExecutionAdmission, PhysicalExecutionLease};
-use state::{ActiveAsrDecode, ActiveChatDecode, ActiveQwenTtsDecode, ActiveVoxtralRealtime};
+use state::{
+    ActiveAsrDecode, ActiveChatDecode, ActiveQwenTtsDecode, ActiveVoxtralRealtime,
+    PendingVoxtralRealtimeQuantum, PreparedVoxtralRealtimeQuantum,
+};
 
 const QWEN38_TARGET_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(1);
 const QWEN38_MTP_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(4);
@@ -111,6 +114,10 @@ pub(super) enum NativeAudioStage {
     SequenceDecode,
     RealtimePush,
     RealtimeFinish,
+    RealtimePreparation,
+    RealtimePromptPrefill,
+    RealtimeDecodeContinuation,
+    RealtimeCompletion,
     Atomic,
     Pipeline { ordinal: usize },
 }
@@ -143,6 +150,12 @@ impl NativeBatchRoute {
             } => NativeAudioStage::SequenceDecode,
             WorkUnit::RealtimePush { .. } => NativeAudioStage::RealtimePush,
             WorkUnit::RealtimeFinish { .. } => NativeAudioStage::RealtimeFinish,
+            WorkUnit::RealtimePreparation { .. } => NativeAudioStage::RealtimePreparation,
+            WorkUnit::RealtimePromptPrefill { .. } => NativeAudioStage::RealtimePromptPrefill,
+            WorkUnit::RealtimeDecodeContinuation { .. } => {
+                NativeAudioStage::RealtimeDecodeContinuation
+            }
+            WorkUnit::RealtimeCompletion { .. } => NativeAudioStage::RealtimeCompletion,
             WorkUnit::AtomicJob { .. } => NativeAudioStage::Atomic,
             WorkUnit::PipelineStage { ordinal, .. } => {
                 NativeAudioStage::Pipeline { ordinal: *ordinal }
@@ -1194,6 +1207,9 @@ pub struct ModelSessionResult {
     /// Exact decoder-KV cursor advance, distinct from source samples consumed
     /// and user-visible output events for realtime audio work.
     pub(crate) managed_cache_append: Option<usize>,
+    /// The result is not authoritative unless Core resolves the exact
+    /// executor-owned post-model transaction registered for its plan/session.
+    pub(crate) pending_quantum_required: bool,
     pub(crate) clocked_state_completion: Option<crate::backends::state::TensorStateBatchCompletion>,
 }
 
@@ -1229,6 +1245,7 @@ impl ModelSessionResult {
             staged_stream_outputs: Vec::new(),
             managed_cache_completions: Vec::new(),
             managed_cache_append: None,
+            pending_quantum_required: false,
             clocked_state_completion: None,
         }
     }
@@ -1242,6 +1259,7 @@ impl ModelSessionResult {
             staged_stream_outputs: Vec::new(),
             managed_cache_completions: Vec::new(),
             managed_cache_append: None,
+            pending_quantum_required: false,
             clocked_state_completion: None,
         }
     }
@@ -1270,6 +1288,7 @@ impl ModelSessionResult {
             staged_stream_outputs: Vec::new(),
             managed_cache_completions: Vec::new(),
             managed_cache_append: None,
+            pending_quantum_required: false,
             clocked_state_completion: None,
         }
     }
@@ -1284,6 +1303,7 @@ impl ModelSessionResult {
             staged_stream_outputs: Vec::new(),
             managed_cache_completions: Vec::new(),
             managed_cache_append: None,
+            pending_quantum_required: false,
             clocked_state_completion: None,
         }
     }
@@ -1298,6 +1318,7 @@ impl ModelSessionResult {
             staged_stream_outputs: Vec::new(),
             managed_cache_completions: Vec::new(),
             managed_cache_append: None,
+            pending_quantum_required: false,
             clocked_state_completion: None,
         }
     }
@@ -1326,6 +1347,7 @@ impl ModelSessionResult {
             staged_stream_outputs: Vec::new(),
             managed_cache_completions: Vec::new(),
             managed_cache_append: None,
+            pending_quantum_required: false,
             clocked_state_completion: None,
         }
     }
@@ -1345,6 +1367,11 @@ impl ModelSessionResult {
 
     pub(crate) fn with_managed_cache_append(mut self, appended: usize) -> Self {
         self.managed_cache_append = Some(appended);
+        self
+    }
+
+    pub(crate) fn requiring_pending_quantum(mut self) -> Self {
+        self.pending_quantum_required = true;
         self
     }
 
@@ -1375,6 +1402,7 @@ pub struct ExecutorStepResult {
     pub managed_cache: Option<super::ManagedCacheReceipt>,
     pub(crate) managed_cache_completions: Vec<Arc<crate::backends::kv::KvWriteBatchCompletion>>,
     pub(crate) managed_cache_append: Option<usize>,
+    pub(crate) pending_quantum_required: bool,
     pub(crate) clocked_state_completion: Option<crate::backends::state::TensorStateBatchCompletion>,
 }
 
@@ -1404,6 +1432,7 @@ impl ExecutorStepResult {
             managed_cache: None,
             managed_cache_completions: session_result.managed_cache_completions,
             managed_cache_append: session_result.managed_cache_append,
+            pending_quantum_required: session_result.pending_quantum_required,
             clocked_state_completion: session_result.clocked_state_completion,
         }
     }
@@ -1649,6 +1678,37 @@ pub enum CacheReleaseOutcome {
     Unconfirmed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingQuantumDecision {
+    Commit,
+    Abort,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingQuantumFinalizeStatus {
+    NotFound,
+    Finalized,
+}
+
+pub(crate) trait PendingQuantumFinalizer: Send + Sync {
+    fn contains(&self, plan_id: PlanId, session: &SessionKey) -> bool;
+
+    fn prepare(
+        &self,
+        plan_id: PlanId,
+        session: &SessionKey,
+        decision: PendingQuantumDecision,
+    ) -> Result<PendingQuantumFinalizeStatus>;
+
+    fn publish(
+        &self,
+        plan_id: PlanId,
+        session: &SessionKey,
+    ) -> Result<PendingQuantumFinalizeStatus>;
+
+    fn discard(&self, plan_id: PlanId, session: &SessionKey);
+}
+
 impl CacheReleaseReport {
     pub const fn confirmed(released_sessions: usize) -> Self {
         Self {
@@ -1824,6 +1884,27 @@ impl<'a, T> ExecutorStateLease<'a, T> {
         }
     }
 
+    /// Transfer the checked-out value to a post-execution transaction while
+    /// deliberately retaining the visible `InFlight` ownership marker.
+    fn defer(mut self) -> Result<T> {
+        {
+            let states = self.store.lock().map_err(|_| {
+                Error::InferenceError(format!("{} state mutex poisoned", self.label))
+            })?;
+            if !matches!(states.get(&self.session), Some(ExecutorStateSlot::InFlight)) {
+                return Err(self.transition_collision());
+            }
+        }
+        let state = self.state.take().ok_or_else(|| {
+            Error::InferenceError(format!(
+                "{} session {}:{} cannot defer an empty state",
+                self.label, self.session.request_id, self.session.epoch
+            ))
+        })?;
+        self.armed = false;
+        Ok(state)
+    }
+
     fn replace_in_flight(&mut self, replacement: ExecutorStateSlot<T>) -> Result<()> {
         let mut states = self
             .store
@@ -1843,6 +1924,253 @@ impl<'a, T> ExecutorStateLease<'a, T> {
             "{} session {}:{} lost its in-flight ownership marker",
             self.label, self.session.request_id, self.session.epoch
         ))
+    }
+}
+
+struct VoxtralRealtimeStateCoordinator {
+    states: ExecutorStateStore<ActiveVoxtralRealtime>,
+    pending: Mutex<HashMap<PlanId, PendingVoxtralRealtimeQuantum>>,
+    prepared: Mutex<HashMap<PlanId, PreparedVoxtralRealtimeQuantum>>,
+}
+
+impl VoxtralRealtimeStateCoordinator {
+    fn new() -> Self {
+        Self {
+            states: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
+            prepared: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn register(
+        &self,
+        plan_id: PlanId,
+        pending: PendingVoxtralRealtimeQuantum,
+    ) -> std::result::Result<(), (Error, PendingVoxtralRealtimeQuantum)> {
+        let mut quanta = match self.pending.lock() {
+            Ok(quanta) => quanta,
+            Err(_) => {
+                return Err((
+                    Error::InferenceError("Voxtral pending-quantum mutex poisoned".to_string()),
+                    pending,
+                ));
+            }
+        };
+        if quanta.contains_key(&plan_id) {
+            return Err((
+                Error::InferenceError(format!(
+                    "Voxtral pending quantum already exists for plan {plan_id}"
+                )),
+                pending,
+            ));
+        }
+        quanta.insert(plan_id, pending);
+        Ok(())
+    }
+
+    fn replace_in_flight(
+        &self,
+        session: &SessionKey,
+        replacement: Option<ActiveVoxtralRealtime>,
+    ) -> Result<()> {
+        // Publication follows a successful model prepare and managed-KV
+        // finalize. Recover the guard so mutex poisoning cannot strand a
+        // successfully committed authoritative transaction.
+        let mut states = self
+            .states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !matches!(states.get(session), Some(ExecutorStateSlot::InFlight)) {
+            states.insert(session.clone(), ExecutorStateSlot::Poisoned);
+            return Err(Error::InferenceError(format!(
+                "Voxtral realtime session {}:{} lost its pending ownership marker",
+                session.request_id, session.epoch
+            )));
+        }
+        match replacement {
+            Some(active) => {
+                states.insert(session.clone(), ExecutorStateSlot::Ready(active));
+            }
+            None => {
+                states.remove(session);
+            }
+        }
+        Ok(())
+    }
+
+    fn poison_in_flight(&self, session: &SessionKey) {
+        let mut states = self
+            .states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        states.insert(session.clone(), ExecutorStateSlot::Poisoned);
+    }
+
+    fn resolve_pending(
+        &self,
+        mut pending: PendingVoxtralRealtimeQuantum,
+        decision: PendingQuantumDecision,
+    ) -> Result<PreparedVoxtralRealtimeQuantum> {
+        let operation = match decision {
+            PendingQuantumDecision::Commit => pending.active.model.commit_realtime_quantum(
+                &mut pending.active.state,
+                &pending.cache,
+                &mut pending.checkpoint,
+            ),
+            PendingQuantumDecision::Abort => {
+                pending.active.last_tokens_generated = pending.prior_last_tokens_generated;
+                pending.active.stream_sequence = pending.prior_stream_sequence;
+                pending.active.input_sample_rate = pending.prior_input_sample_rate;
+                pending.active.model.rollback_realtime_quantum(
+                    &mut pending.active.state,
+                    &mut pending.cache,
+                    &mut pending.checkpoint,
+                )
+            }
+        };
+        if let Err(error) = operation {
+            self.poison_in_flight(&pending.session);
+            return Err(error);
+        }
+        if decision == PendingQuantumDecision::Commit {
+            pending.active.last_tokens_generated = pending.active.state.tokens_generated();
+        }
+        let replacement = if decision == PendingQuantumDecision::Commit && pending.finished {
+            None
+        } else {
+            Some(pending.active)
+        };
+        Ok(PreparedVoxtralRealtimeQuantum {
+            session: pending.session,
+            replacement,
+        })
+    }
+
+    fn abort_matching(
+        &self,
+        predicate: impl Fn(&PendingVoxtralRealtimeQuantum) -> bool,
+    ) -> Result<usize> {
+        let pending = {
+            let mut quanta = self
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let ids = quanta
+                .iter()
+                .filter_map(|(id, pending)| predicate(pending).then_some(*id))
+                .collect::<Vec<_>>();
+            ids.into_iter()
+                .filter_map(|id| quanta.remove(&id))
+                .collect::<Vec<_>>()
+        };
+        let count = pending.len();
+        let mut failure = None;
+        for quantum in pending {
+            let session = quantum.session.clone();
+            let result = self
+                .resolve_pending(quantum, PendingQuantumDecision::Abort)
+                .and_then(|prepared| self.replace_in_flight(&session, prepared.replacement));
+            if let Err(error) = result {
+                error!(error = %error, "Failed to abort a pending Voxtral realtime quantum");
+                failure.get_or_insert(error);
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(count),
+        }
+    }
+
+    fn has_prepared(&self) -> bool {
+        !self
+            .prepared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
+    }
+}
+
+impl PendingQuantumFinalizer for VoxtralRealtimeStateCoordinator {
+    fn contains(&self, plan_id: PlanId, session: &SessionKey) -> bool {
+        self.pending
+            .lock()
+            .ok()
+            .and_then(|pending| pending.get(&plan_id).map(|row| &row.session == session))
+            .unwrap_or(false)
+    }
+
+    fn prepare(
+        &self,
+        plan_id: PlanId,
+        session: &SessionKey,
+        decision: PendingQuantumDecision,
+    ) -> Result<PendingQuantumFinalizeStatus> {
+        let pending = {
+            let mut quanta = self.pending.lock().map_err(|_| {
+                Error::InferenceError("Voxtral pending-quantum mutex poisoned".to_string())
+            })?;
+            let Some(pending) = quanta.get(&plan_id) else {
+                return Ok(PendingQuantumFinalizeStatus::NotFound);
+            };
+            if &pending.session != session {
+                return Err(Error::InferenceError(format!(
+                    "pending quantum plan {plan_id} belongs to a different session"
+                )));
+            }
+            quanta
+                .remove(&plan_id)
+                .expect("pending quantum was present")
+        };
+        let prepared = self.resolve_pending(pending, decision)?;
+        let mut rows = self.prepared.lock().map_err(|_| {
+            self.poison_in_flight(session);
+            Error::InferenceError("Voxtral prepared-quantum mutex poisoned".to_string())
+        })?;
+        if rows.insert(plan_id, prepared).is_some() {
+            self.poison_in_flight(session);
+            return Err(Error::InferenceError(format!(
+                "Voxtral prepared quantum already exists for plan {plan_id}"
+            )));
+        }
+        Ok(PendingQuantumFinalizeStatus::Finalized)
+    }
+
+    fn publish(
+        &self,
+        plan_id: PlanId,
+        session: &SessionKey,
+    ) -> Result<PendingQuantumFinalizeStatus> {
+        let prepared = {
+            let mut rows = self
+                .prepared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(prepared) = rows.remove(&plan_id) else {
+                return Ok(PendingQuantumFinalizeStatus::NotFound);
+            };
+            prepared
+        };
+        if &prepared.session != session {
+            self.poison_in_flight(&prepared.session);
+            return Err(Error::InferenceError(format!(
+                "prepared quantum plan {plan_id} belongs to a different session"
+            )));
+        }
+        self.replace_in_flight(session, prepared.replacement)?;
+        Ok(PendingQuantumFinalizeStatus::Finalized)
+    }
+
+    fn discard(&self, plan_id: PlanId, session: &SessionKey) {
+        let prepared = self
+            .prepared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&plan_id);
+        if let Some(prepared) = prepared {
+            self.poison_in_flight(&prepared.session);
+        } else {
+            self.poison_in_flight(session);
+        }
     }
 }
 
@@ -1897,20 +2225,27 @@ pub struct NativeExecutor {
     loaded_tts_model: Option<Arc<Qwen3TtsModel>>,
     chat_decode_states: ExecutorStateStore<ActiveChatDecode>,
     asr_decode_states: ExecutorStateStore<ActiveAsrDecode>,
-    voxtral_realtime_states: ExecutorStateStore<ActiveVoxtralRealtime>,
+    voxtral_realtime: Arc<VoxtralRealtimeStateCoordinator>,
     qwen_tts_decode_states: ExecutorStateStore<ActiveQwenTtsDecode>,
 }
 
 impl NativeExecutor {
     /// Create a new native executor.
     pub fn new(config: WorkerConfig) -> Self {
+        Self::with_voxtral_realtime(config, Arc::new(VoxtralRealtimeStateCoordinator::new()))
+    }
+
+    fn with_voxtral_realtime(
+        config: WorkerConfig,
+        voxtral_realtime: Arc<VoxtralRealtimeStateCoordinator>,
+    ) -> Self {
         Self {
             config,
             initialized: false,
             loaded_tts_model: None,
             chat_decode_states: Mutex::new(HashMap::new()),
             asr_decode_states: Mutex::new(HashMap::new()),
-            voxtral_realtime_states: Mutex::new(HashMap::new()),
+            voxtral_realtime,
             qwen_tts_decode_states: Mutex::new(HashMap::new()),
         }
     }
@@ -2517,7 +2852,17 @@ impl ModelExecutor for NativeExecutor {
             .asr_decode_states
             .lock()
             .map_err(|_| Error::InferenceError("ASR decode state mutex poisoned".to_string()))?;
-        let mut voxtral = self.voxtral_realtime_states.lock().map_err(|_| {
+        if self.voxtral_realtime.abort_matching(|_| true).is_err() {
+            return Err(Error::InferenceError(
+                "failed to abort pending Voxtral realtime state during shutdown".to_string(),
+            ));
+        }
+        if self.voxtral_realtime.has_prepared() {
+            return Err(Error::InferenceError(
+                "cannot shut down with a prepared Voxtral realtime quantum".to_string(),
+            ));
+        }
+        let mut voxtral = self.voxtral_realtime.states.lock().map_err(|_| {
             Error::InferenceError("Voxtral realtime state mutex poisoned".to_string())
         })?;
         let mut tts = self.qwen_tts_decode_states.lock().map_err(|_| {
@@ -2534,10 +2879,17 @@ impl ModelExecutor for NativeExecutor {
     }
 
     fn cleanup_request(&self, request_id: &str) -> CacheReleaseReport {
+        if self
+            .voxtral_realtime
+            .abort_matching(|pending| pending.session.request_id == request_id)
+            .is_err()
+        {
+            return CacheReleaseReport::unconfirmed();
+        }
         let (Ok(mut chat), Ok(mut asr), Ok(mut voxtral), Ok(mut tts)) = (
             self.chat_decode_states.lock(),
             self.asr_decode_states.lock(),
-            self.voxtral_realtime_states.lock(),
+            self.voxtral_realtime.states.lock(),
             self.qwen_tts_decode_states.lock(),
         ) else {
             return CacheReleaseReport::unconfirmed();
@@ -2551,10 +2903,17 @@ impl ModelExecutor for NativeExecutor {
     }
 
     fn cleanup_session(&self, session: &SessionKey) -> CacheReleaseReport {
+        if self
+            .voxtral_realtime
+            .abort_matching(|pending| &pending.session == session)
+            .is_err()
+        {
+            return CacheReleaseReport::unconfirmed();
+        }
         let (Ok(mut chat), Ok(mut asr), Ok(mut voxtral), Ok(mut tts)) = (
             self.chat_decode_states.lock(),
             self.asr_decode_states.lock(),
-            self.voxtral_realtime_states.lock(),
+            self.voxtral_realtime.states.lock(),
             self.qwen_tts_decode_states.lock(),
         ) else {
             return CacheReleaseReport::unconfirmed();
@@ -2567,8 +2926,22 @@ impl ModelExecutor for NativeExecutor {
         cleanup_report(chat.combine(asr).combine(voxtral).combine(tts))
     }
 
-    fn purge_model_cache(&self, _variant: ModelVariant) -> CacheReleaseReport {
-        CacheReleaseReport::confirmed(0)
+    fn purge_model_cache(&self, variant: ModelVariant) -> CacheReleaseReport {
+        if self
+            .voxtral_realtime
+            .abort_matching(|pending| pending.active.variant == variant)
+            .is_err()
+        {
+            return CacheReleaseReport::unconfirmed();
+        }
+        let Ok(mut states) = self.voxtral_realtime.states.lock() else {
+            return CacheReleaseReport::unconfirmed();
+        };
+        cleanup_report(cleanup_model_states_locked(
+            &mut states,
+            variant,
+            |active| active.variant,
+        ))
     }
 }
 
@@ -2584,6 +2957,7 @@ pub struct UnifiedExecutor {
     inner: Arc<RwLock<Box<dyn ModelExecutor>>>,
     batch_workspace: Option<BatchWorkspaceContext>,
     physical_execution_admission: Option<PhysicalExecutionAdmission>,
+    pending_quantum_finalizer: Option<Arc<dyn PendingQuantumFinalizer>>,
 }
 
 /// Opaque proof that one exact physical envelope owns execution capacity.
@@ -2612,10 +2986,14 @@ impl UnifiedExecutor {
                     backend: config.backend,
                     authority: authority.clone(),
                 });
+        let voxtral_realtime = Arc::new(VoxtralRealtimeStateCoordinator::new());
         Self {
-            inner: Arc::new(RwLock::new(Box::new(NativeExecutor::new(config)))),
+            inner: Arc::new(RwLock::new(Box::new(
+                NativeExecutor::with_voxtral_realtime(config, voxtral_realtime.clone()),
+            ))),
             batch_workspace,
             physical_execution_admission,
+            pending_quantum_finalizer: Some(voxtral_realtime),
         }
     }
 
@@ -2625,7 +3003,17 @@ impl UnifiedExecutor {
             inner: Arc::new(RwLock::new(executor)),
             batch_workspace: None,
             physical_execution_admission: None,
+            pending_quantum_finalizer: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_pending_quantum_finalizer_for_test(
+        mut self,
+        finalizer: Arc<dyn PendingQuantumFinalizer>,
+    ) -> Self {
+        self.pending_quantum_finalizer = Some(finalizer);
+        self
     }
 
     #[cfg(test)]
@@ -2639,6 +3027,7 @@ impl UnifiedExecutor {
             inner: Arc::new(RwLock::new(executor)),
             batch_workspace: Some(BatchWorkspaceContext { backend, authority }),
             physical_execution_admission: Some(admission),
+            pending_quantum_finalizer: None,
         }
     }
 
@@ -2948,6 +3337,57 @@ impl UnifiedExecutor {
         executor.execution_profile(request)
     }
 
+    pub(crate) fn has_pending_quantum(&self, plan_id: PlanId, session: &SessionKey) -> bool {
+        self.pending_quantum_finalizer
+            .as_ref()
+            .is_some_and(|finalizer| finalizer.contains(plan_id, session))
+    }
+
+    pub(crate) fn finalize_pending_quantum(
+        &self,
+        plan_id: PlanId,
+        session: &SessionKey,
+        decision: PendingQuantumDecision,
+    ) -> Result<PendingQuantumFinalizeStatus> {
+        let Some(finalizer) = self.pending_quantum_finalizer.as_ref() else {
+            return Ok(PendingQuantumFinalizeStatus::NotFound);
+        };
+        let prepared = finalizer.prepare(plan_id, session, decision)?;
+        if prepared == PendingQuantumFinalizeStatus::NotFound {
+            return Ok(prepared);
+        }
+        finalizer.publish(plan_id, session)
+    }
+
+    pub(crate) fn prepare_pending_quantum(
+        &self,
+        plan_id: PlanId,
+        session: &SessionKey,
+        decision: PendingQuantumDecision,
+    ) -> Result<PendingQuantumFinalizeStatus> {
+        let Some(finalizer) = self.pending_quantum_finalizer.as_ref() else {
+            return Ok(PendingQuantumFinalizeStatus::NotFound);
+        };
+        finalizer.prepare(plan_id, session, decision)
+    }
+
+    pub(crate) fn publish_pending_quantum(
+        &self,
+        plan_id: PlanId,
+        session: &SessionKey,
+    ) -> Result<PendingQuantumFinalizeStatus> {
+        let Some(finalizer) = self.pending_quantum_finalizer.as_ref() else {
+            return Ok(PendingQuantumFinalizeStatus::NotFound);
+        };
+        finalizer.publish(plan_id, session)
+    }
+
+    pub(crate) fn discard_prepared_quantum(&self, plan_id: PlanId, session: &SessionKey) {
+        if let Some(finalizer) = self.pending_quantum_finalizer.as_ref() {
+            finalizer.discard(plan_id, session);
+        }
+    }
+
     /// Check if ready.
     pub async fn is_ready(&self) -> bool {
         if self
@@ -2994,6 +3434,7 @@ impl UnifiedExecutor {
 struct StateCleanupSummary {
     released: usize,
     busy: usize,
+    unknown: usize,
 }
 
 impl StateCleanupSummary {
@@ -3001,15 +3442,51 @@ impl StateCleanupSummary {
         Self {
             released: self.released.saturating_add(other.released),
             busy: self.busy.saturating_add(other.busy),
+            unknown: self.unknown.saturating_add(other.unknown),
         }
     }
 }
 
 fn cleanup_report(summary: StateCleanupSummary) -> CacheReleaseReport {
-    if summary.busy > 0 {
+    if summary.unknown > 0 {
+        CacheReleaseReport::unconfirmed()
+    } else if summary.busy > 0 {
         CacheReleaseReport::busy_in_flight(summary.released, summary.busy)
     } else {
         CacheReleaseReport::confirmed(summary.released)
+    }
+}
+
+fn cleanup_model_states_locked<T>(
+    states: &mut HashMap<SessionKey, ExecutorStateSlot<T>>,
+    variant: ModelVariant,
+    model_variant: impl Fn(&T) -> ModelVariant,
+) -> StateCleanupSummary {
+    let busy = states
+        .values()
+        .filter(|state| matches!(state, ExecutorStateSlot::InFlight))
+        .count();
+    let unknown = states
+        .values()
+        .filter(|state| matches!(state, ExecutorStateSlot::Poisoned))
+        .count();
+    let sessions = states
+        .iter()
+        .filter_map(|(session, state)| match state {
+            ExecutorStateSlot::Ready(active) if model_variant(active) == variant => {
+                Some(session.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let released = sessions.len();
+    for session in sessions {
+        states.remove(&session);
+    }
+    StateCleanupSummary {
+        released,
+        busy,
+        unknown,
     }
 }
 
@@ -3044,12 +3521,14 @@ fn cleanup_session_state_locked<T>(
         Some(ExecutorStateSlot::InFlight) => StateCleanupSummary {
             released: 0,
             busy: 1,
+            unknown: 0,
         },
         Some(ExecutorStateSlot::Ready(_) | ExecutorStateSlot::Poisoned) => {
             states.remove(session);
             StateCleanupSummary {
                 released: 1,
                 busy: 0,
+                unknown: 0,
             }
         }
         None => StateCleanupSummary::default(),
@@ -3077,6 +3556,48 @@ mod tests {
     use crate::kv::v2::{StateClock, StateGroupId};
     use crate::model::ModelVariant;
     use base64::Engine;
+
+    struct RecordingPendingFinalizer {
+        session: SessionKey,
+        calls: Mutex<Vec<(PlanId, PendingQuantumDecision)>>,
+        prepared: Mutex<bool>,
+    }
+
+    impl PendingQuantumFinalizer for RecordingPendingFinalizer {
+        fn contains(&self, plan_id: PlanId, session: &SessionKey) -> bool {
+            plan_id == 41 && session == &self.session
+        }
+
+        fn prepare(
+            &self,
+            plan_id: PlanId,
+            session: &SessionKey,
+            decision: PendingQuantumDecision,
+        ) -> Result<PendingQuantumFinalizeStatus> {
+            if !self.contains(plan_id, session) {
+                return Ok(PendingQuantumFinalizeStatus::NotFound);
+            }
+            self.calls.lock().unwrap().push((plan_id, decision));
+            *self.prepared.lock().unwrap() = true;
+            Ok(PendingQuantumFinalizeStatus::Finalized)
+        }
+
+        fn publish(
+            &self,
+            plan_id: PlanId,
+            session: &SessionKey,
+        ) -> Result<PendingQuantumFinalizeStatus> {
+            if plan_id != 41 || session != &self.session || !*self.prepared.lock().unwrap() {
+                return Ok(PendingQuantumFinalizeStatus::NotFound);
+            }
+            *self.prepared.lock().unwrap() = false;
+            Ok(PendingQuantumFinalizeStatus::Finalized)
+        }
+
+        fn discard(&self, _plan_id: PlanId, _session: &SessionKey) {
+            *self.prepared.lock().unwrap() = false;
+        }
+    }
 
     #[derive(Debug)]
     struct FixedCapacityProvider {
@@ -3126,6 +3647,31 @@ mod tests {
     }
 
     #[test]
+    fn unified_pending_quantum_finalizer_is_exact_and_model_neutral() {
+        let session = SessionKey::new("pending-finalizer".to_string(), 9);
+        let finalizer = Arc::new(RecordingPendingFinalizer {
+            session: session.clone(),
+            calls: Mutex::new(Vec::new()),
+            prepared: Mutex::new(false),
+        });
+        let executor = UnifiedExecutor::new_for_test(Box::new(PanickingPhysicalExecutor))
+            .with_pending_quantum_finalizer_for_test(finalizer.clone());
+
+        assert!(executor.has_pending_quantum(41, &session));
+        assert!(!executor.has_pending_quantum(41, &SessionKey::new(session.request_id.clone(), 10)));
+        assert_eq!(
+            executor
+                .finalize_pending_quantum(41, &session, PendingQuantumDecision::Abort)
+                .unwrap(),
+            PendingQuantumFinalizeStatus::Finalized
+        );
+        assert_eq!(
+            finalizer.calls.lock().unwrap().as_slice(),
+            &[(41, PendingQuantumDecision::Abort)]
+        );
+    }
+
+    #[test]
     fn executor_state_lease_keeps_in_flight_ownership_visible_to_cleanup() {
         let session = SessionKey::new("visible-in-flight".to_string(), 7);
         let store = Mutex::new(HashMap::from([(
@@ -3144,7 +3690,8 @@ mod tests {
             summary,
             StateCleanupSummary {
                 released: 0,
-                busy: 1
+                busy: 1,
+                unknown: 0,
             }
         );
         drop(lease);
@@ -3184,10 +3731,31 @@ mod tests {
             summary,
             StateCleanupSummary {
                 released: 1,
-                busy: 0
+                busy: 0,
+                unknown: 0,
             }
         );
         assert!(!store.lock().unwrap().contains_key(&session));
+    }
+
+    #[test]
+    fn model_purge_never_confirms_unknown_poisoned_ownership() {
+        let session = SessionKey::new("poisoned-model-purge".to_string(), 1);
+        let mut states = HashMap::<SessionKey, ExecutorStateSlot<ModelVariant>>::from([(
+            session,
+            ExecutorStateSlot::Poisoned,
+        )]);
+
+        let summary = cleanup_model_states_locked(
+            &mut states,
+            ModelVariant::VoxtralMini4BRealtime2602,
+            |variant| *variant,
+        );
+        assert_eq!(summary.unknown, 1);
+        assert_eq!(
+            cleanup_report(summary).outcome,
+            CacheReleaseOutcome::Unconfirmed
+        );
     }
 
     #[test]

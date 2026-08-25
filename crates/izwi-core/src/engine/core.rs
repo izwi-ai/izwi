@@ -38,8 +38,9 @@ use super::execution_group::{
 use super::executor::REQUEST_DEADLINE_EXCEEDED;
 use super::executor::{
     deliver_committed_streams, CacheReleaseReport, CommittedStreamDelivery, ExecutorOutput,
-    ExecutorStepResult, IncrementalStreamDeliveryWorkers, StreamDeliveryFailure,
-    StreamDeliveryFailureKind, UnifiedExecutor, WorkerConfig,
+    ExecutorStepResult, IncrementalStreamDeliveryWorkers, PendingQuantumDecision,
+    PendingQuantumFinalizeStatus, StreamDeliveryFailure, StreamDeliveryFailureKind,
+    UnifiedExecutor, WorkerConfig,
 };
 use super::metrics::{
     record_engine_execution_outcome, record_engine_physical_batch,
@@ -772,6 +773,17 @@ impl EngineCore {
             WorkUnit::SequenceStep { phase, .. } => format!("{phase:?}").to_ascii_lowercase(),
             WorkUnit::RealtimePush { .. } => "realtime_push".to_string(),
             WorkUnit::RealtimeFinish { .. } => "realtime_finish".to_string(),
+            WorkUnit::RealtimePreparation { mode, .. } => {
+                format!(
+                    "realtime_{}_preparation",
+                    format!("{mode:?}").to_ascii_lowercase()
+                )
+            }
+            WorkUnit::RealtimePromptPrefill { .. } => "realtime_prompt_prefill".to_string(),
+            WorkUnit::RealtimeDecodeContinuation { .. } => {
+                "realtime_decode_continuation".to_string()
+            }
+            WorkUnit::RealtimeCompletion { .. } => "realtime_completion".to_string(),
             WorkUnit::AtomicJob { kind } => kind.clone(),
             WorkUnit::PipelineStage { name, ordinal } => format!("{name}:{ordinal}"),
         };
@@ -841,6 +853,23 @@ impl EngineCore {
             } => ExecutionState::Decoding,
             WorkUnit::RealtimePush { .. } => ExecutionState::RealtimeRunning,
             WorkUnit::RealtimeFinish { .. } => ExecutionState::RealtimeFinishing,
+            WorkUnit::RealtimePreparation {
+                mode: super::execution::RealtimePreparationMode::Push,
+                ..
+            } => ExecutionState::RealtimeRunning,
+            WorkUnit::RealtimePreparation {
+                mode: super::execution::RealtimePreparationMode::Finish,
+                ..
+            } => ExecutionState::RealtimeFinishing,
+            WorkUnit::RealtimePromptPrefill { .. }
+            | WorkUnit::RealtimeDecodeContinuation { .. }
+            | WorkUnit::RealtimeCompletion { .. } => {
+                if tracker.state() == ExecutionState::RealtimeFinishing {
+                    ExecutionState::RealtimeFinishing
+                } else {
+                    ExecutionState::RealtimeRunning
+                }
+            }
             WorkUnit::AtomicJob { .. } => ExecutionState::AtomicRunning,
             WorkUnit::PipelineStage { .. } => ExecutionState::PipelineRunning,
         };
@@ -900,6 +929,18 @@ impl EngineCore {
     fn rollback_schedule_state(&mut self, exact_schedule: &[super::scheduler::ScheduledRequest]) {
         for scheduled in exact_schedule {
             let session = scheduled.session_key();
+            if let Err(error) = self.executor.finalize_pending_quantum(
+                scheduled.plan_id,
+                &session,
+                PendingQuantumDecision::Abort,
+            ) {
+                warn!(
+                    plan_id = scheduled.plan_id,
+                    request_id = %scheduled.request_id,
+                    error = %error,
+                    "Failed to abort executor pending quantum during schedule rollback"
+                );
+            }
             if let Some(reservation) = self.active_managed_cache.remove(&scheduled.plan_id) {
                 if let Err(error) = self.managed_kv_cache.finalize(&reservation, None, false) {
                     warn!(
@@ -1136,6 +1177,18 @@ impl EngineCore {
         step_time_ms: f64,
     ) -> Option<CommittedExecutorOutput> {
         let Some(plan) = self.active_plans.remove(&result.plan_id) else {
+            if let Err(error) = self.executor.finalize_pending_quantum(
+                result.plan_id,
+                &result.session,
+                PendingQuantumDecision::Abort,
+            ) {
+                warn!(
+                    plan_id = result.plan_id,
+                    request_id = %result.session.request_id,
+                    error = %error,
+                    "Failed to abort executor state for an inactive result"
+                );
+            }
             if let Some(reservation) = self.active_managed_cache.remove(&result.plan_id) {
                 let _ = self.managed_kv_cache.finalize(&reservation, None, false);
                 self.release_managed_session_if_ready(&reservation.session);
@@ -1148,6 +1201,22 @@ impl EngineCore {
             );
             return None;
         };
+
+        if self
+            .executor
+            .has_pending_quantum(plan.plan_id, &plan.session)
+            && self
+                .requests
+                .get(&plan.session.request_id)
+                .is_some_and(|request| request.is_cancelled())
+        {
+            result.output = ExecutorOutput::cancelled(plan.session.request_id.clone());
+            result.disposition = ExecutionDisposition::Finished(ExecutionFinishReason::Cancelled);
+            result.safe_point = true;
+            result.staged_stream_outputs.clear();
+            result.managed_cache = None;
+            result.managed_cache_completions.clear();
+        }
 
         if self.incremental_stream_sessions.contains(&plan.session) {
             match &mut result.disposition {
@@ -1274,6 +1343,18 @@ impl EngineCore {
         let prospective_tracker = match prospective_tracker {
             Ok(tracker) => tracker,
             Err(err) => {
+                if let Err(abort_error) = self.executor.finalize_pending_quantum(
+                    plan.plan_id,
+                    &plan.session,
+                    PendingQuantumDecision::Abort,
+                ) {
+                    warn!(
+                        plan_id = plan.plan_id,
+                        request_id = %plan.session.request_id,
+                        error = %abort_error,
+                        "Failed to abort executor state after result validation rejection"
+                    );
+                }
                 if let Some(reservation) = managed_reservation.as_ref() {
                     let _ = self.managed_kv_cache.finalize(reservation, None, false);
                 }
@@ -1318,23 +1399,86 @@ impl EngineCore {
             }
         };
 
-        let managed_commit = matches!(
+        // Completed terminal quanta commit their final append before normal
+        // terminal cleanup releases the managed sequence. The executor's host
+        // transaction and the managed table must use this exact same decision.
+        let authoritative_commit = matches!(
             result.disposition,
-            ExecutionDisposition::Progress | ExecutionDisposition::Yielded(_)
+            ExecutionDisposition::Progress
+                | ExecutionDisposition::Yielded(_)
+                | ExecutionDisposition::Finished(ExecutionFinishReason::Completed)
         );
-        let managed_result = match managed_reservation.as_ref() {
-            Some(reservation) => self.managed_kv_cache.finalize(
-                reservation,
-                result.managed_cache.as_ref(),
-                managed_commit,
-            ),
+        let pending_decision = if authoritative_commit {
+            PendingQuantumDecision::Commit
+        } else {
+            PendingQuantumDecision::Abort
+        };
+        let prepared =
+            self.executor
+                .prepare_pending_quantum(plan.plan_id, &plan.session, pending_decision);
+        let pending_was_prepared = matches!(&prepared, Ok(PendingQuantumFinalizeStatus::Finalized));
+        let pending_auth = match prepared {
+            Ok(PendingQuantumFinalizeStatus::Finalized) if result.pending_quantum_required => {
+                Ok(())
+            }
+            Ok(PendingQuantumFinalizeStatus::NotFound) if !result.pending_quantum_required => {
+                Ok(())
+            }
+            Ok(PendingQuantumFinalizeStatus::NotFound) => Err(Error::InferenceError(
+                "executor result requires a pending quantum, but none was registered".to_string(),
+            )),
+            Ok(PendingQuantumFinalizeStatus::Finalized) => Err(Error::InferenceError(
+                "executor registered a pending quantum without authenticating it in the result"
+                    .to_string(),
+            )),
+            Err(error) => Err(error),
+        };
+        let mut finalize_managed = |commit| match managed_reservation.as_ref() {
+            Some(reservation) => {
+                self.managed_kv_cache
+                    .finalize(reservation, result.managed_cache.as_ref(), commit)
+            }
             None if result.managed_cache.is_some() => Err(Error::InferenceError(
                 "executor returned an unplanned managed KV receipt".to_string(),
             )),
             None => Ok(()),
         };
+        let managed_result = match pending_auth {
+            Ok(()) => finalize_managed(authoritative_commit),
+            Err(error) => match finalize_managed(false) {
+                Ok(()) => Err(error),
+                Err(abort_error) => Err(Error::InferenceError(format!(
+                    "{error}; managed KV abort also failed: {abort_error}"
+                ))),
+            },
+        };
+        let pending_result = if pending_was_prepared {
+            if managed_result.is_ok() {
+                match self
+                    .executor
+                    .publish_pending_quantum(plan.plan_id, &plan.session)
+                {
+                    Ok(PendingQuantumFinalizeStatus::Finalized) => Ok(()),
+                    Ok(PendingQuantumFinalizeStatus::NotFound) => Err(Error::InferenceError(
+                        "prepared executor quantum disappeared before publication".to_string(),
+                    )),
+                    Err(error) => Err(error),
+                }
+            } else {
+                self.executor
+                    .discard_prepared_quantum(plan.plan_id, &plan.session);
+                Ok(())
+            }
+        } else {
+            Ok(())
+        };
         if let Err(error) = managed_result {
-            let message = format!("managed KV commit failed: {error}");
+            let message = match pending_result.as_ref() {
+                Ok(_) => format!("managed KV commit failed: {error}"),
+                Err(abort_error) => format!(
+                    "managed KV commit failed: {error}; executor pending-quantum abort also failed: {abort_error}"
+                ),
+            };
             result.output = ExecutorOutput::error(plan.session.request_id.clone(), message.clone());
             result.disposition =
                 ExecutionDisposition::Failed(ExecutionFailure::invalid_output(message));
@@ -1344,6 +1488,22 @@ impl EngineCore {
                 result.provenance.dispatch_state,
             );
             result.staged_stream_outputs.clear();
+            let failure_report = Self::report_from_result(&result);
+            if let Some(tracker) = self.execution_trackers.get_mut(&plan.session.request_id) {
+                let _ = tracker.commit(&plan, &failure_report);
+            }
+        } else if let Err(error) = pending_result {
+            let message = format!("executor pending-quantum finalization failed: {error}");
+            result.output = ExecutorOutput::error(plan.session.request_id.clone(), message.clone());
+            result.disposition =
+                ExecutionDisposition::Failed(ExecutionFailure::invalid_output(message));
+            result.safe_point = true;
+            result.provenance = OutcomeProvenance::failure(
+                FailureOrigin::StateCommit,
+                result.provenance.dispatch_state,
+            );
+            result.staged_stream_outputs.clear();
+            result.managed_cache_completions.clear();
             let failure_report = Self::report_from_result(&result);
             if let Some(tracker) = self.execution_trackers.get_mut(&plan.session.request_id) {
                 let _ = tracker.commit(&plan, &failure_report);
@@ -1673,6 +1833,23 @@ impl EngineCore {
                 })?;
                 output.max(cache_append).max(1)
             }
+            WorkUnit::RealtimePreparation { input, .. } => u64::try_from(input.len())
+                .map_err(|_| {
+                    Error::Overloaded(
+                        "realtime preparation input exceeds work accounting".to_string(),
+                    )
+                })?
+                .max(1),
+            WorkUnit::RealtimePromptPrefill {
+                max_output_steps,
+                cache_append,
+                ..
+            } => u64::try_from((*max_output_steps).max(*cache_append))
+                .map_err(|_| {
+                    Error::Overloaded("realtime prompt prefill exceeds work accounting".to_string())
+                })?
+                .max(1),
+            WorkUnit::RealtimeDecodeContinuation { .. } | WorkUnit::RealtimeCompletion { .. } => 1,
             WorkUnit::AtomicJob { .. } | WorkUnit::PipelineStage { .. } => 1,
         };
         let workspace_bytes = stage.map_or(Ok(0), |stage| {
@@ -3277,6 +3454,20 @@ impl EngineCore {
         for mut batch in batches {
             let batch_id = batch.physical_batch.batch_id;
             let Some(in_flight) = self.in_flight_dispatches.remove(&batch_id) else {
+                for result in &batch.results {
+                    if let Err(error) = self.executor.finalize_pending_quantum(
+                        result.plan_id,
+                        &result.session,
+                        PendingQuantumDecision::Abort,
+                    ) {
+                        warn!(
+                            plan_id = result.plan_id,
+                            request_id = %result.session.request_id,
+                            error = %error,
+                            "Failed to abort executor state for a stale physical completion"
+                        );
+                    }
+                }
                 warn!(
                     batch_id = batch_id.get(),
                     "Ignoring a stale or duplicate physical completion"
@@ -6609,6 +6800,7 @@ mod tests {
                 staged_stream_outputs: Vec::new(),
                 managed_cache_completions: Vec::new(),
                 managed_cache_append: None,
+                pending_quantum_required: false,
                 clocked_state_completion: None,
             },
         )

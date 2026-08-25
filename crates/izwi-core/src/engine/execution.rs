@@ -271,6 +271,33 @@ impl RealtimeOperationId {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RealtimePreparationMode {
+    Push,
+    Finish,
+}
+
+/// Scheduler-visible phase of one externally submitted realtime operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RealtimeSubphase {
+    Preparation,
+    PromptPrefill { cache_append: usize },
+    DecodeContinuation,
+    Completion,
+}
+
+/// Executor-authored, core-committed transition for one exact realtime phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RealtimeStageOutcome {
+    pub plan_id: PlanId,
+    pub operation_id: RealtimeOperationId,
+    pub completed: RealtimeSubphase,
+    pub next: Option<RealtimeSubphase>,
+    pub input_consumed: usize,
+    pub output_steps: usize,
+    pub cache_append: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum WorkUnit {
     /// A model stage that must complete before the request's execution shape
@@ -306,6 +333,34 @@ pub enum WorkUnit {
         operation_id: RealtimeOperationId,
         max_output_steps: usize,
         max_cache_append: usize,
+    },
+    /// Pure audio preparation for one queued realtime push or finish. This
+    /// stage owns no decoder KV mutation and may use padded static batching.
+    RealtimePreparation {
+        operation_id: RealtimeOperationId,
+        mode: RealtimePreparationMode,
+        input: InputRange,
+        max_output_steps: usize,
+        max_cache_append: usize,
+    },
+    /// One scalar prompt-prefill transaction whose exact KV append was learned
+    /// from the committed preparation outcome.
+    RealtimePromptPrefill {
+        operation_id: RealtimeOperationId,
+        max_output_steps: usize,
+        cache_append: usize,
+    },
+    /// One ready retained decode token. Continuous batches contain only rows
+    /// that can perform this exact tensor/KV mutation.
+    RealtimeDecodeContinuation {
+        operation_id: RealtimeOperationId,
+        max_output_steps: usize,
+        max_cache_append: usize,
+    },
+    /// Zero-tensor control phase used to seal a closed/exhausted stream and its
+    /// final marker without claiming a decode dispatch.
+    RealtimeCompletion {
+        operation_id: RealtimeOperationId,
     },
     AtomicJob {
         kind: String,
@@ -390,6 +445,10 @@ pub enum StageWorkSelector {
     SequenceDecode,
     RealtimePush,
     RealtimeFinish,
+    RealtimePreparation,
+    RealtimePromptPrefill,
+    RealtimeDecodeContinuation,
+    RealtimeCompletion,
     Atomic,
     Pipeline { ordinal: Option<usize> },
 }
@@ -415,6 +474,10 @@ impl StageWorkSelector {
             )
             | (Self::RealtimePush, WorkUnit::RealtimePush { .. })
             | (Self::RealtimeFinish, WorkUnit::RealtimeFinish { .. })
+            | (Self::RealtimePreparation, WorkUnit::RealtimePreparation { .. })
+            | (Self::RealtimePromptPrefill, WorkUnit::RealtimePromptPrefill { .. })
+            | (Self::RealtimeDecodeContinuation, WorkUnit::RealtimeDecodeContinuation { .. })
+            | (Self::RealtimeCompletion, WorkUnit::RealtimeCompletion { .. })
             | (Self::Atomic, WorkUnit::AtomicJob { .. }) => true,
             (
                 Self::Pipeline { ordinal },
@@ -656,13 +719,24 @@ impl StageDescriptor {
         }
         if matches!(
             self.selector,
-            StageWorkSelector::RealtimePush | StageWorkSelector::RealtimeFinish
+            StageWorkSelector::RealtimePush
+                | StageWorkSelector::RealtimeFinish
+                | StageWorkSelector::RealtimePreparation
+                | StageWorkSelector::RealtimePromptPrefill
         ) && (self.progress != StageProgressKind::InputDriven
             || self.membership_safe_point != MembershipSafePoint::InputBoundary)
         {
             return Err(Error::InvalidInput(
                 "realtime work stages require input-driven progress at an input boundary"
                     .to_string(),
+            ));
+        }
+        if self.selector == StageWorkSelector::RealtimeDecodeContinuation
+            && (self.progress != StageProgressKind::Iterative
+                || self.membership_safe_point != MembershipSafePoint::QuantumBoundary)
+        {
+            return Err(Error::InvalidInput(
+                "realtime decode continuation requires iterative quantum-boundary progress".into(),
             ));
         }
         Ok(())
@@ -2711,6 +2785,34 @@ impl ExecutionReport {
                     ));
                 }
             }
+            WorkUnit::RealtimePreparation { input, .. } => {
+                if self.input_consumed != 0 || self.output_produced != 0 {
+                    return Err(Error::InferenceError(format!(
+                        "realtime preparation for {} source samples reported decoder progress",
+                        input.len()
+                    )));
+                }
+            }
+            WorkUnit::RealtimePromptPrefill {
+                max_output_steps, ..
+            }
+            | WorkUnit::RealtimeDecodeContinuation {
+                max_output_steps, ..
+            } => {
+                if self.input_consumed != 0 || self.output_produced > max_output_steps.min(1) {
+                    return Err(Error::InferenceError(
+                        "realtime decoder subphase reported progress beyond its exact quantum"
+                            .into(),
+                    ));
+                }
+            }
+            WorkUnit::RealtimeCompletion { .. } => {
+                if self.input_consumed != 0 || self.output_produced != 0 {
+                    return Err(Error::InferenceError(
+                        "realtime completion cannot report tensor progress".into(),
+                    ));
+                }
+            }
             WorkUnit::AtomicJob { .. } => {
                 if !matches!(
                     self.disposition,
@@ -3338,6 +3440,42 @@ mod tests {
                 .id,
             StageId::new(11)
         );
+    }
+
+    #[test]
+    fn realtime_subphase_selectors_are_exact_and_disjoint() {
+        let operation_id = RealtimeOperationId::new(9);
+        let works = [
+            WorkUnit::RealtimePreparation {
+                operation_id,
+                mode: RealtimePreparationMode::Push,
+                input: InputRange::new(0, 160).unwrap(),
+                max_output_steps: 2,
+                max_cache_append: 4,
+            },
+            WorkUnit::RealtimePromptPrefill {
+                operation_id,
+                max_output_steps: 2,
+                cache_append: 2,
+            },
+            WorkUnit::RealtimeDecodeContinuation {
+                operation_id,
+                max_output_steps: 1,
+                max_cache_append: 1,
+            },
+            WorkUnit::RealtimeCompletion { operation_id },
+        ];
+        let selectors = [
+            StageWorkSelector::RealtimePreparation,
+            StageWorkSelector::RealtimePromptPrefill,
+            StageWorkSelector::RealtimeDecodeContinuation,
+            StageWorkSelector::RealtimeCompletion,
+        ];
+        for (work_index, work) in works.iter().enumerate() {
+            for (selector_index, selector) in selectors.iter().copied().enumerate() {
+                assert_eq!(selector.matches(work), work_index == selector_index);
+            }
+        }
     }
 
     #[test]

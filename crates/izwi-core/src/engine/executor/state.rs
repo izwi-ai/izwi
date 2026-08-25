@@ -5,11 +5,14 @@ use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::tts::{
     PhysicalTtsDecodeState, PhysicalTtsPrefillState, Qwen3TtsModel,
 };
-use crate::models::architectures::voxtral::realtime::VoxtralRealtimeState;
+use crate::models::architectures::voxtral::realtime::{
+    VoxtralRealtimeCheckpoint, VoxtralRealtimeState,
+};
 use crate::models::registry::{
     AsrModelLease, NativeAsrDecodeState, NativeAsrModel, NativeChatDecodeState, QwenTtsModelLease,
     VoxtralModelLease,
 };
+use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 
 pub(super) struct ActiveChatDecode {
     pub(super) variant: ModelVariant,
@@ -40,6 +43,27 @@ pub(super) struct ActiveVoxtralRealtime {
     pub(super) last_tokens_generated: usize,
     pub(super) stream_sequence: usize,
     pub(super) input_sample_rate: u32,
+}
+
+/// A Voxtral host/cache transaction that has completed model execution but is
+/// not authoritative until EngineCore accepts the matching physical result.
+pub(super) struct PendingVoxtralRealtimeQuantum {
+    pub(super) session: crate::engine::SessionKey,
+    pub(super) active: ActiveVoxtralRealtime,
+    pub(super) cache: PhysicalPagedKvCache,
+    pub(super) checkpoint: VoxtralRealtimeCheckpoint,
+    pub(super) prior_last_tokens_generated: usize,
+    pub(super) prior_stream_sequence: usize,
+    pub(super) prior_input_sample_rate: u32,
+    pub(super) finished: bool,
+}
+
+/// A pending quantum whose model checkpoint has been resolved, but whose
+/// retained state cannot be published until Core resolves the matching managed
+/// KV transaction.
+pub(super) struct PreparedVoxtralRealtimeQuantum {
+    pub(super) session: crate::engine::SessionKey,
+    pub(super) replacement: Option<ActiveVoxtralRealtime>,
 }
 
 pub(super) enum QwenTtsPhysicalState {

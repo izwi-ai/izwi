@@ -7,7 +7,7 @@ use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use super::config::EngineCoreConfig;
@@ -172,9 +172,80 @@ pub(crate) enum RealtimeAsrOperationPayload {
     Finish,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RealtimeAsrOperationKind {
+    Push,
+    Finish,
+}
+
+impl RealtimeAsrOperationPayload {
+    const fn kind(&self) -> RealtimeAsrOperationKind {
+        match self {
+            Self::Push { .. } => RealtimeAsrOperationKind::Push,
+            Self::Finish => RealtimeAsrOperationKind::Finish,
+        }
+    }
+
+    fn accepted_samples(&self) -> usize {
+        match self {
+            Self::Push { samples, .. } => samples.len(),
+            Self::Finish => 0,
+        }
+    }
+}
+
+/// Durable acknowledgement for one exact externally allocated operation ID.
+/// The acknowledgement intentionally carries no payload owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RealtimeAsrOperationAck {
+    pub operation_id: RealtimeOperationId,
+    pub kind: RealtimeAsrOperationKind,
+    pub accepted_samples: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RealtimeAsrTerminalOutcome {
+    Cancelled,
+    Unloaded,
+    Failed(Arc<str>),
+}
+
+pub(crate) type RealtimeAsrOperationOutcome =
+    std::result::Result<RealtimeAsrOperationAck, RealtimeAsrTerminalOutcome>;
+pub(crate) type RealtimeAsrOperationWaiter = oneshot::Receiver<RealtimeAsrOperationOutcome>;
+
+#[derive(Debug)]
+struct RealtimeAsrIngressOperation {
+    payload: RealtimeAsrOperationPayload,
+    completion: oneshot::Sender<RealtimeAsrOperationOutcome>,
+}
+
+#[derive(Debug, Default)]
+struct RealtimeAsrIngressState {
+    operations: std::collections::HashMap<RealtimeOperationId, RealtimeAsrIngressOperation>,
+    highest_operation_id: Option<RealtimeOperationId>,
+    terminal: Option<RealtimeAsrTerminalOutcome>,
+}
+
 #[derive(Debug, Default)]
 pub(super) struct RealtimeAsrIngress {
-    operations: Mutex<std::collections::HashMap<RealtimeOperationId, RealtimeAsrOperationPayload>>,
+    state: Mutex<RealtimeAsrIngressState>,
+}
+
+impl Drop for RealtimeAsrIngress {
+    fn drop(&mut self) {
+        let state = self
+            .state
+            .get_mut()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let terminal = state
+            .terminal
+            .clone()
+            .unwrap_or(RealtimeAsrTerminalOutcome::Cancelled);
+        for (_, operation) in state.operations.drain() {
+            let _ = operation.completion.send(Err(terminal.clone()));
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -989,17 +1060,35 @@ impl EngineCoreRequest {
         &self,
         operation_id: RealtimeOperationId,
         payload: RealtimeAsrOperationPayload,
-    ) -> Result<()> {
+    ) -> Result<RealtimeAsrOperationWaiter> {
         let ingress = self.realtime_asr_ingress.as_ref().ok_or_else(|| {
             Error::InvalidInput("request is not an engine-owned realtime ASR session".into())
         })?;
-        let mut operations = ingress
-            .operations
+        let mut state = ingress
+            .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        match operations.entry(operation_id) {
+        if state.terminal.is_some() {
+            return Err(Error::InferenceError(
+                "realtime ASR session is already terminal".into(),
+            ));
+        }
+        if state
+            .highest_operation_id
+            .is_some_and(|highest| operation_id <= highest)
+        {
+            return Err(Error::InferenceError(format!(
+                "realtime ASR operation identity {} is duplicate or stale",
+                operation_id.get()
+            )));
+        }
+        let (completion, waiter) = oneshot::channel();
+        match state.operations.entry(operation_id) {
             std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(payload);
+                entry.insert(RealtimeAsrIngressOperation {
+                    payload,
+                    completion,
+                });
             }
             std::collections::hash_map::Entry::Occupied(_) => {
                 return Err(Error::InferenceError(
@@ -1007,7 +1096,8 @@ impl EngineCoreRequest {
                 ));
             }
         }
-        Ok(())
+        state.highest_operation_id = Some(operation_id);
+        Ok(waiter)
     }
 
     pub(crate) fn realtime_asr_operation(
@@ -1018,11 +1108,12 @@ impl EngineCoreRequest {
             Error::InvalidInput("request is not an engine-owned realtime ASR session".into())
         })?;
         ingress
-            .operations
+            .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
+            .operations
             .get(&operation_id)
-            .cloned()
+            .map(|operation| operation.payload.clone())
             .ok_or_else(|| {
                 Error::InferenceError(format!(
                     "realtime ASR operation {} has no retained payload",
@@ -1031,17 +1122,64 @@ impl EngineCoreRequest {
             })
     }
 
-    pub(super) fn remove_realtime_asr_operation(&self, operation_id: RealtimeOperationId) -> bool {
-        self.realtime_asr_ingress
-            .as_ref()
-            .and_then(|ingress| {
-                ingress
-                    .operations
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .remove(&operation_id)
-            })
-            .is_some()
+    /// Atomically retires one payload before publishing its acknowledgement.
+    /// A repeated or unknown identity is rejected and cannot acknowledge a
+    /// later operation that happens to have the same payload shape.
+    pub(super) fn complete_realtime_asr_operation(
+        &self,
+        operation_id: RealtimeOperationId,
+    ) -> Result<()> {
+        let ingress = self.realtime_asr_ingress.as_ref().ok_or_else(|| {
+            Error::InvalidInput("request is not an engine-owned realtime ASR session".into())
+        })?;
+        let operation = ingress
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .operations
+            .remove(&operation_id)
+            .ok_or_else(|| {
+                Error::InferenceError(format!(
+                    "realtime ASR operation {} is unknown, stale, or already completed",
+                    operation_id.get()
+                ))
+            })?;
+        let acknowledgement = RealtimeAsrOperationAck {
+            operation_id,
+            kind: operation.payload.kind(),
+            accepted_samples: operation.payload.accepted_samples(),
+        };
+        // Sending may fail when an external waiter was cancelled. The payload
+        // is still authoritatively retired and must not be resurrected.
+        let _ = operation.completion.send(Ok(acknowledgement));
+        Ok(())
+    }
+
+    /// Fences future installation, retires every retained payload, and wakes
+    /// all operation waiters with the same authoritative terminal outcome.
+    pub(super) fn terminate_realtime_asr_ingress(
+        &self,
+        terminal: RealtimeAsrTerminalOutcome,
+    ) -> Result<usize> {
+        let ingress = self.realtime_asr_ingress.as_ref().ok_or_else(|| {
+            Error::InvalidInput("request is not an engine-owned realtime ASR session".into())
+        })?;
+        let operations = {
+            let mut state = ingress
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if state.terminal.is_some() {
+                return Ok(0);
+            }
+            state.terminal = Some(terminal.clone());
+            std::mem::take(&mut state.operations)
+        };
+        let retired = operations.len();
+        for (_, operation) in operations {
+            let _ = operation.completion.send(Err(terminal.clone()));
+        }
+        Ok(retired)
     }
 
     fn sync_task_from_fields(&mut self) {
@@ -5168,7 +5306,7 @@ mod tests {
             .enable_realtime_asr_ingress()
             .expect("ASR session ingress");
         let operation_id = RealtimeOperationId::new(7);
-        request
+        let _waiter = request
             .install_realtime_asr_operation(
                 operation_id,
                 RealtimeAsrOperationPayload::Push {
@@ -5194,5 +5332,129 @@ mod tests {
             }
             RealtimeAsrOperationPayload::Finish => panic!("duplicate replaced original payload"),
         }
+    }
+
+    #[test]
+    fn realtime_operation_completion_is_exactly_once_and_releases_payload() {
+        let mut request = EngineCoreRequest::asr_bytes(Vec::new());
+        request
+            .enable_realtime_asr_ingress()
+            .expect("ASR session ingress");
+        let operation_id = RealtimeOperationId::new(11);
+        let samples: Arc<[f32]> = Arc::from([3.0_f32, 4.0, 5.0]);
+        let samples_weak = Arc::downgrade(&samples);
+        let mut waiter = request
+            .install_realtime_asr_operation(
+                operation_id,
+                RealtimeAsrOperationPayload::Push {
+                    samples: Arc::clone(&samples),
+                    sample_rate: 16_000,
+                },
+            )
+            .expect("payload installation");
+        drop(samples);
+
+        request
+            .complete_realtime_asr_operation(operation_id)
+            .expect("first completion");
+        assert_eq!(
+            waiter.try_recv().expect("completion acknowledgement"),
+            Ok(RealtimeAsrOperationAck {
+                operation_id,
+                kind: RealtimeAsrOperationKind::Push,
+                accepted_samples: 3,
+            })
+        );
+        assert!(samples_weak.upgrade().is_none());
+        assert!(request
+            .complete_realtime_asr_operation(operation_id)
+            .is_err());
+        assert!(request.realtime_asr_operation(operation_id).is_err());
+    }
+
+    #[test]
+    fn realtime_operation_ids_cannot_be_reinstalled_or_move_backwards() {
+        let mut request = EngineCoreRequest::asr_bytes(Vec::new());
+        request
+            .enable_realtime_asr_ingress()
+            .expect("ASR session ingress");
+        let operation_id = RealtimeOperationId::new(13);
+        let _waiter = request
+            .install_realtime_asr_operation(operation_id, RealtimeAsrOperationPayload::Finish)
+            .expect("payload installation");
+        request
+            .complete_realtime_asr_operation(operation_id)
+            .expect("completion");
+
+        assert!(request
+            .install_realtime_asr_operation(
+                RealtimeOperationId::new(12),
+                RealtimeAsrOperationPayload::Finish,
+            )
+            .is_err());
+        assert!(request
+            .install_realtime_asr_operation(operation_id, RealtimeAsrOperationPayload::Finish)
+            .is_err());
+        let _next_waiter = request
+            .install_realtime_asr_operation(
+                RealtimeOperationId::new(14),
+                RealtimeAsrOperationPayload::Finish,
+            )
+            .expect("strictly newer identity remains valid");
+    }
+
+    #[test]
+    fn realtime_session_terminal_drains_waiters_payloads_and_fences_ingress() {
+        let mut request = EngineCoreRequest::asr_bytes(Vec::new());
+        request
+            .enable_realtime_asr_ingress()
+            .expect("ASR session ingress");
+        let samples: Arc<[f32]> = Arc::from([8.0_f32, 9.0]);
+        let samples_weak = Arc::downgrade(&samples);
+        let mut push_waiter = request
+            .install_realtime_asr_operation(
+                RealtimeOperationId::new(20),
+                RealtimeAsrOperationPayload::Push {
+                    samples: Arc::clone(&samples),
+                    sample_rate: 48_000,
+                },
+            )
+            .expect("push installation");
+        let mut finish_waiter = request
+            .install_realtime_asr_operation(
+                RealtimeOperationId::new(21),
+                RealtimeAsrOperationPayload::Finish,
+            )
+            .expect("finish installation");
+        drop(samples);
+
+        let terminal = RealtimeAsrTerminalOutcome::Failed(Arc::from("model unloaded"));
+        assert_eq!(
+            request
+                .terminate_realtime_asr_ingress(terminal.clone())
+                .expect("terminal drain"),
+            2
+        );
+        assert_eq!(
+            push_waiter.try_recv().expect("push terminal"),
+            Err(terminal.clone())
+        );
+        assert_eq!(
+            finish_waiter.try_recv().expect("finish terminal"),
+            Err(terminal)
+        );
+        assert!(samples_weak.upgrade().is_none());
+        assert_eq!(
+            request
+                .terminate_realtime_asr_ingress(RealtimeAsrTerminalOutcome::Cancelled)
+                .expect("idempotent terminal drain"),
+            0
+        );
+        assert!(request
+            .install_realtime_asr_operation(
+                RealtimeOperationId::new(22),
+                RealtimeAsrOperationPayload::Finish,
+            )
+            .is_err());
     }
 }

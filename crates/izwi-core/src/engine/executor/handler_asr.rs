@@ -519,8 +519,8 @@ impl NativeExecutor {
         let payload = request.realtime_asr_operation(operation_id)?;
         let session = scheduled.session_key();
         let mut state_lease = ExecutorStateLease::checkout(
-            &self.voxtral_realtime_states,
-            session,
+            &self.voxtral_realtime.states,
+            session.clone(),
             "Voxtral realtime ASR",
         )?;
         if state_lease
@@ -722,11 +722,7 @@ impl NativeExecutor {
 
         let (tokens_generated, text, finished, sample_rate, sample_count) = {
             let active = state_lease.require_state_mut()?;
-            active
-                .model
-                .commit_realtime_quantum(&mut active.state, &cache, &mut checkpoint)?;
             let tokens_generated = active.state.tokens_generated().saturating_sub(prior_tokens);
-            active.last_tokens_generated = active.state.tokens_generated();
             (
                 tokens_generated,
                 active.state.text().to_string(),
@@ -736,10 +732,35 @@ impl NativeExecutor {
             )
         };
         let completions = cache.take_completed_writes();
-        if finished {
-            state_lease.release()?;
-        } else {
-            state_lease.restore()?;
+        let cache_append = cache.context_len().saturating_sub(prior_cache_len);
+        let active = state_lease.defer()?;
+        let pending = super::PendingVoxtralRealtimeQuantum {
+            session: session.clone(),
+            active,
+            cache,
+            checkpoint,
+            prior_last_tokens_generated: prior_tokens,
+            prior_stream_sequence,
+            prior_input_sample_rate,
+            finished,
+        };
+        if let Err((register_error, pending)) =
+            self.voxtral_realtime.register(scheduled.plan_id, pending)
+        {
+            let pending_session = pending.session.clone();
+            let rollback = self
+                .voxtral_realtime
+                .resolve_pending(pending, super::PendingQuantumDecision::Abort)
+                .and_then(|prepared| {
+                    self.voxtral_realtime
+                        .replace_in_flight(&pending_session, prepared.replacement)
+                });
+            return Err(match rollback {
+                Ok(()) => register_error,
+                Err(rollback_error) => Error::InferenceError(format!(
+                    "{register_error}; Voxtral pending-quantum rollback also failed: {rollback_error}"
+                )),
+            });
         }
         Ok(ModelSessionResult::sequence(ExecutorOutput {
             request_id: request.id.clone(),
@@ -767,7 +788,8 @@ impl NativeExecutor {
         })
         .with_staged_stream_outputs(staged)
         .with_managed_cache_completions(completions)
-        .with_managed_cache_append(cache.context_len().saturating_sub(prior_cache_len)))
+        .with_managed_cache_append(cache_append)
+        .requiring_pending_quantum())
     }
 
     fn granite_speech_asr_sequence_request(
