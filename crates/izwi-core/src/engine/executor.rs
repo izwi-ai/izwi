@@ -1228,6 +1228,32 @@ impl ModelSessionResult {
         }
     }
 
+    /// Request a model-neutral restart of this exact retained sequence. The
+    /// model commits its semantic restart checkpoint (including pending retry
+    /// intent) but publishes no physical write completion; Core aborts the
+    /// scheduler reservation and advances the managed subgeneration.
+    pub fn restart_sequence(request_id: String, reason: super::SequenceRestartReason) -> Self {
+        Self {
+            output: ExecutorOutput {
+                request_id,
+                audio: None,
+                text: None,
+                input_transcription: None,
+                tokens_processed: 0,
+                tokens_generated: 0,
+                finished: false,
+                phase_timing_override: None,
+                asr_diagnostics: None,
+                error: None,
+            },
+            disposition: ExecutionDisposition::RestartSequence(reason),
+            safe_point: true,
+            provenance: OutcomeProvenance::started(),
+            staged_stream_outputs: Vec::new(),
+            managed_cache_completions: Vec::new(),
+        }
+    }
+
     pub fn cancelled(mut output: ExecutorOutput) -> Self {
         output.finished = true;
         Self {

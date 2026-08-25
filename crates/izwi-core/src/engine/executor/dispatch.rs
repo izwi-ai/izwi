@@ -489,6 +489,27 @@ impl NativeExecutor {
                         .with_observed_resources(crate::engine::ResourceVector::zero())
                     }
                 };
+                if matches!(
+                    result.disposition,
+                    super::ExecutionDisposition::RestartSequence(_)
+                ) && (!result.staged_stream_outputs.is_empty()
+                    || !result.managed_cache_completions.is_empty()
+                    || result.output.audio.is_some()
+                    || result.output.text.is_some()
+                    || result.output.input_transcription.is_some()
+                    || result.output.phase_timing_override.is_some()
+                    || result.output.asr_diagnostics.is_some())
+                {
+                    result = ExecutorStepResult::from_session(
+                        scheduled,
+                        ModelSessionResult::atomic(ExecutorOutput::error(
+                            scheduled.request_id.clone(),
+                            "sequence restart cannot publish stream output or managed-cache completions",
+                        )),
+                    )
+                    .with_dispatch(dispatch)
+                    .with_observed_resources(result.observed_resources);
+                }
                 if result.output.error.is_none()
                     && result.provenance.dispatch_state == super::DispatchState::ProducedOutput
                     && matches!(
@@ -832,6 +853,48 @@ mod tests {
             )
             .unwrap();
         assert!(terminal[0].managed_cache.is_none());
+
+        let restart = executor
+            .finish_scheduled_execution(
+                &[&request],
+                std::slice::from_ref(&scheduled),
+                vec![ModelSessionResult::restart_sequence(
+                    request.id.clone(),
+                    crate::engine::SequenceRestartReason::ModelFallback,
+                )],
+                BatchDispatch::serial(),
+                Some(&rows),
+            )
+            .unwrap();
+        assert!(matches!(
+            restart[0].disposition,
+            crate::engine::ExecutionDisposition::RestartSequence(_)
+        ));
+        assert!(restart[0].managed_cache.is_none());
+        assert!(restart[0].managed_cache_completions.is_empty());
+        assert!(restart[0].staged_stream_outputs.is_empty());
+        assert_eq!(restart[0].output.tokens_processed, 0);
+        assert_eq!(restart[0].output.tokens_generated, 0);
+
+        let mut invalid_restart = ModelSessionResult::restart_sequence(
+            request.id.clone(),
+            crate::engine::SequenceRestartReason::ModelFallback,
+        );
+        invalid_restart.output.text = Some("must not escape".to_string());
+        let invalid_restart = executor
+            .finish_scheduled_execution(
+                &[&request],
+                std::slice::from_ref(&scheduled),
+                vec![invalid_restart],
+                BatchDispatch::serial(),
+                Some(&rows),
+            )
+            .unwrap();
+        assert!(matches!(
+            invalid_restart[0].disposition,
+            crate::engine::ExecutionDisposition::Failed(_)
+        ));
+        assert!(invalid_restart[0].managed_cache.is_none());
     }
 
     #[test]

@@ -87,9 +87,9 @@ pub use execution::{
     ManagedCacheReservation, ManagedSessionGeneration, ManagedTensorStateReservation,
     MembershipSafePoint, ModelInstanceId, NativeBatchMode, OutcomeProvenance, OutputVisibility,
     PhysicalBatch, PhysicalBatchReport, PhysicalBatchRowReport, PhysicalLaunchPolicy, PlanId,
-    PrefillMode, ReadyQuantum, RetryDisposition, SequencePhase, SessionEpoch, SessionKey,
-    StageDescriptor, StageId, StageProgressKind, StageShapePolicy, StageWorkSelector,
-    StateDisposition, TerminalOutcome, WorkCost, WorkUnit, YieldReason,
+    PrefillMode, ReadyQuantum, RetryDisposition, SequencePhase, SequenceRestartReason,
+    SessionEpoch, SessionKey, StageDescriptor, StageId, StageProgressKind, StageShapePolicy,
+    StageWorkSelector, StateDisposition, TerminalOutcome, WorkCost, WorkUnit, YieldReason,
 };
 pub use executor::{
     CacheReleaseOutcome, CacheReleaseReport, ExecutorOutput, ExecutorStepResult, ModelExecutor,

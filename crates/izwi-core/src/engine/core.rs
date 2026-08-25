@@ -445,6 +445,8 @@ pub struct EngineCore {
     /// Consecutive retryable executor failures for each exact session.
     execution_retry_attempts: HashMap<super::SessionKey, u32>,
     retry_policy: LifecycleRetryPolicy,
+    #[cfg(test)]
+    restart_after_reset_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Phase preferred when decode and prefill compete for a single physical
     /// candidate slot. It advances only after the preferred phase actually
     /// owns a ticket, so blocked work does not waste the device opportunity.
@@ -1027,6 +1029,30 @@ impl EngineCore {
         }
     }
 
+    fn replace_active_result_with_terminal(
+        &mut self,
+        plan: &ExecutionPlan,
+        result: &mut ExecutorStepResult,
+        output: ExecutorOutput,
+        disposition: ExecutionDisposition,
+        provenance: OutcomeProvenance,
+    ) -> Result<()> {
+        result.output = output;
+        result.disposition = disposition;
+        result.safe_point = true;
+        result.provenance = provenance;
+        result.staged_stream_outputs.clear();
+        result.managed_cache = None;
+        result.managed_cache_completions.clear();
+        let report = Self::report_from_result(result);
+        self.execution_trackers
+            .get_mut(&plan.session.request_id)
+            .ok_or_else(|| {
+                Error::InferenceError("execution tracker is missing for active plan".into())
+            })?
+            .commit(plan, &report)
+    }
+
     fn canonical_failure_dispatch(
         plan: &ExecutionPlan,
         result: &ExecutorStepResult,
@@ -1077,8 +1103,10 @@ impl EngineCore {
         };
 
         if self.incremental_stream_sessions.contains(&plan.session) {
-            if let ExecutionDisposition::Failed(failure) = &mut result.disposition {
-                if failure.retry != RetryDisposition::Never {
+            match &mut result.disposition {
+                ExecutionDisposition::Failed(failure)
+                    if failure.retry != RetryDisposition::Never =>
+                {
                     let message = format!(
                         "executor failed after committed stream progress; retry is unsafe: {}",
                         failure.message
@@ -1089,7 +1117,47 @@ impl EngineCore {
                     result.output.error = Some(message);
                     result.staged_stream_outputs.clear();
                 }
+                ExecutionDisposition::RestartSequence(_) => {
+                    let message =
+                        "sequence restart is unsafe after committed incremental stream output";
+                    result.output = ExecutorOutput::error(plan.session.request_id.clone(), message);
+                    result.disposition =
+                        ExecutionDisposition::Failed(ExecutionFailure::invalid_output(message));
+                    result.safe_point = true;
+                    result.provenance = OutcomeProvenance::failure(
+                        FailureOrigin::ExecutorValidation,
+                        result.provenance.dispatch_state,
+                    );
+                    result.staged_stream_outputs.clear();
+                    result.managed_cache_completions.clear();
+                }
+                _ => {}
             }
+        }
+
+        if matches!(result.disposition, ExecutionDisposition::RestartSequence(_))
+            && (!result.staged_stream_outputs.is_empty()
+                || result.managed_cache.is_some()
+                || !result.managed_cache_completions.is_empty()
+                || result.output.audio.is_some()
+                || result.output.text.is_some()
+                || result.output.input_transcription.is_some()
+                || result.output.phase_timing_override.is_some()
+                || result.output.asr_diagnostics.is_some())
+        {
+            let message =
+                "sequence restart cannot publish output or managed-cache completion state";
+            result.output = ExecutorOutput::error(plan.session.request_id.clone(), message);
+            result.disposition =
+                ExecutionDisposition::Failed(ExecutionFailure::invalid_output(message));
+            result.safe_point = true;
+            result.provenance = OutcomeProvenance::failure(
+                FailureOrigin::ExecutorValidation,
+                result.provenance.dispatch_state,
+            );
+            result.staged_stream_outputs.clear();
+            result.managed_cache_completions.clear();
+            result.managed_cache = None;
         }
 
         let staged_next_sequence = match self
@@ -1233,9 +1301,123 @@ impl EngineCore {
             if let Some(tracker) = self.execution_trackers.get_mut(&plan.session.request_id) {
                 let _ = tracker.commit(&plan, &failure_report);
             }
-        } else {
+        } else if !matches!(result.disposition, ExecutionDisposition::RestartSequence(_)) {
             self.execution_trackers
                 .insert(plan.session.request_id.clone(), prospective_tracker);
+        }
+        if matches!(result.disposition, ExecutionDisposition::RestartSequence(_)) {
+            let restart_failure = if let Some(reservation) = managed_reservation.as_ref() {
+                let request = self.requests.get(&plan.session.request_id).cloned();
+                if request
+                    .as_ref()
+                    .is_some_and(|request| request.is_cancelled())
+                {
+                    if let Err(error) = self.replace_active_result_with_terminal(
+                        &plan,
+                        &mut result,
+                        ExecutorOutput::cancelled(plan.session.request_id.clone()),
+                        ExecutionDisposition::Finished(ExecutionFinishReason::Cancelled),
+                        OutcomeProvenance::started(),
+                    ) {
+                        Some(format!(
+                            "sequence restart cancellation commit failed: {error}"
+                        ))
+                    } else {
+                        self.release_managed_session_if_ready(&plan.session);
+                        result.output.request_id = plan.session.request_id.clone();
+                        return Some(CommittedExecutorOutput {
+                            session: plan.session,
+                            output: result.output,
+                            disposition: result.disposition,
+                            provenance: result.provenance,
+                            staged_stream_outputs: Vec::new(),
+                        });
+                    }
+                } else if let Some(request) = request {
+                    if let Some(runtime) = request.managed_cache_runtime().cloned() {
+                        match self.managed_kv_cache.reset_session_generation(
+                            &runtime,
+                            &plan.session,
+                            reservation.session_generation,
+                        ) {
+                            Ok(_) => {
+                                #[cfg(test)]
+                                if let Some(hook) = self.restart_after_reset_hook.as_ref() {
+                                    hook();
+                                }
+                                if request.is_cancelled() {
+                                    if let Err(error) = self.replace_active_result_with_terminal(
+                                        &plan,
+                                        &mut result,
+                                        ExecutorOutput::cancelled(plan.session.request_id.clone()),
+                                        ExecutionDisposition::Finished(
+                                            ExecutionFinishReason::Cancelled,
+                                        ),
+                                        OutcomeProvenance::started(),
+                                    ) {
+                                        Some(format!(
+                                            "post-reset cancellation commit failed: {error}"
+                                        ))
+                                    } else {
+                                        self.release_managed_session_if_ready(&plan.session);
+                                        result.output.request_id = plan.session.request_id.clone();
+                                        return Some(CommittedExecutorOutput {
+                                            session: plan.session,
+                                            output: result.output,
+                                            disposition: result.disposition,
+                                            provenance: result.provenance,
+                                            staged_stream_outputs: Vec::new(),
+                                        });
+                                    }
+                                } else if self
+                                    .scheduler
+                                    .restart_request_for_recompute(&plan.session)
+                                {
+                                    self.execution_trackers.insert(
+                                        plan.session.request_id.clone(),
+                                        ExecutionTracker::new(plan.session.clone()),
+                                    );
+                                    self.execution_retry_attempts.remove(&plan.session);
+                                    return None;
+                                } else {
+                                    Some(
+                                        "scheduler rejected a managed sequence restart".to_string(),
+                                    )
+                                }
+                            }
+                            Err(error) => Some(format!("managed sequence reset failed: {error}")),
+                        }
+                    } else {
+                        Some("sequence restart request lost its managed-cache runtime".to_string())
+                    }
+                } else {
+                    Some("sequence restart request is no longer active".to_string())
+                }
+            } else {
+                Some("sequence restart requires a managed-cache reservation".to_string())
+            };
+
+            let message =
+                restart_failure.unwrap_or_else(|| "managed sequence restart failed".to_string());
+            let dispatch_state = result.provenance.dispatch_state;
+            if let Err(error) = self.replace_active_result_with_terminal(
+                &plan,
+                &mut result,
+                ExecutorOutput::error(plan.session.request_id.clone(), message.clone()),
+                ExecutionDisposition::Failed(ExecutionFailure::invalid_output(message)),
+                OutcomeProvenance::failure(FailureOrigin::StateCommit, dispatch_state),
+            ) {
+                result.output = ExecutorOutput::error(
+                    plan.session.request_id.clone(),
+                    format!("sequence restart failure commit failed: {error}"),
+                );
+                result.disposition =
+                    ExecutionDisposition::Failed(ExecutionFailure::invalid_output(
+                        "sequence restart failure could not be committed",
+                    ));
+                result.provenance =
+                    OutcomeProvenance::failure(FailureOrigin::StateCommit, dispatch_state);
+            }
         }
         self.release_managed_session_if_ready(&plan.session);
 
@@ -1329,6 +1511,7 @@ impl EngineCore {
             }
             ExecutionDisposition::Progress
             | ExecutionDisposition::Yielded(_)
+            | ExecutionDisposition::RestartSequence(_)
             | ExecutionDisposition::Finished(_) => {
                 self.scheduler.update_after_step(
                     &plan.session.request_id,
@@ -1989,6 +2172,8 @@ impl EngineCore {
             pending_terminal_outputs: VecDeque::new(),
             execution_retry_attempts: HashMap::new(),
             retry_policy: LifecycleRetryPolicy::default(),
+            #[cfg(test)]
+            restart_after_reset_hook: None,
             next_single_candidate_phase: ExecutionPhase::Decode,
             initialized: false,
             next_batch_id: 1,
@@ -3976,14 +4161,14 @@ impl Drop for EngineCore {
 #[cfg(test)]
 mod tests {
     use super::super::executor::{
-        ExecutorOutput, ExecutorPhaseTiming, ExecutorStepResult, ModelExecutor,
+        ExecutorOutput, ExecutorPhaseTiming, ExecutorStepResult, ModelExecutor, ModelSessionResult,
     };
     use super::super::scheduler::ScheduledRequest;
     use super::super::types::{AudioOutput, TaskType};
     use super::*;
     use crate::model::ModelVariant;
     use crate::models::shared::chat::{ChatMessage, ChatRole};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -4306,6 +4491,90 @@ mod tests {
 
         fn cleanup_request(&self, _request_id: &str) -> CacheReleaseReport {
             CacheReleaseReport::confirmed(0)
+        }
+    }
+
+    struct RestartSequenceExecutor {
+        cancel_during_dispatch: bool,
+        cleanup_calls: Arc<AtomicUsize>,
+    }
+
+    impl ModelExecutor for RestartSequenceExecutor {
+        fn execution_profile(&self, request: &EngineCoreRequest) -> Option<ExecutionProfile> {
+            let mut profile = ExecutionProfile::fail_closed(
+                BackendKind::Cpu,
+                request.model_variant,
+                ExecutionMode::Sequence,
+            );
+            profile.prefill = PrefillMode::Full;
+            profile.cache_mode = CacheMode::ExternalPaged;
+            profile.cache_release_safe = true;
+            profile.recompute_safe = true;
+            Some(profile)
+        }
+
+        fn cleanup_session(
+            &self,
+            _session: &super::super::SessionKey,
+        ) -> super::super::executor::CacheReleaseReport {
+            self.cleanup_calls.fetch_add(1, Ordering::AcqRel);
+            super::super::executor::CacheReleaseReport::confirmed(1)
+        }
+
+        fn execute_physical_batch(
+            &self,
+            execution: super::super::executor::PhysicalBatchExecution<'_>,
+        ) -> super::super::executor::PhysicalDispatchResult {
+            if self.cancel_during_dispatch {
+                for request in execution.requests {
+                    if let Some(cancellation) = request.cancellation.as_ref() {
+                        cancellation.store(true, Ordering::Release);
+                    }
+                }
+            }
+            let dispatch = execution.expected_dispatch();
+            Ok(execution
+                .scheduled
+                .iter()
+                .map(|scheduled| {
+                    ExecutorStepResult::from_session(
+                        scheduled,
+                        ModelSessionResult::restart_sequence(
+                            scheduled.request_id.clone(),
+                            super::super::SequenceRestartReason::ModelFallback,
+                        ),
+                    )
+                    .with_dispatch(dispatch)
+                })
+                .collect())
+        }
+
+        fn execute_prefill(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            unreachable!("physical dispatch is overridden")
+        }
+
+        fn execute_decode(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            unreachable!("physical dispatch is overridden")
+        }
+
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        fn initialize(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&mut self) -> Result<()> {
+            Ok(())
         }
     }
 
@@ -6890,6 +7159,207 @@ mod tests {
         assert_eq!(released.totals.registered_sessions, 0);
         assert_eq!(released.totals.coordinator.admission_claimed_pages, 0);
         assert_eq!(released.totals.coordinator.active_transactions, 0);
+    }
+
+    fn restart_test_core(cancel_during_dispatch: bool) -> (EngineCore, Arc<AtomicUsize>) {
+        let cleanup_calls = Arc::new(AtomicUsize::new(0));
+        let executor = UnifiedExecutor::new_for_test(Box::new(RestartSequenceExecutor {
+            cancel_during_dispatch,
+            cleanup_calls: cleanup_calls.clone(),
+        }));
+        let core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                enable_chunked_prefill: false,
+                block_size: 16,
+                max_blocks: 4,
+                max_batch_size: 1,
+                backend: BackendKind::Cpu,
+                ..Default::default()
+            },
+            executor,
+        )
+        .expect("restart test core");
+        (core, cleanup_calls)
+    }
+
+    #[tokio::test]
+    async fn managed_sequence_restart_preserves_epoch_and_requeues_context_zero() {
+        let model = ModelInstanceId::new(915);
+        let (mut core, cleanup_calls) = restart_test_core(false);
+        let request = managed_test_request(&mut core, model, "managed-restart", vec![1, 2, 3, 4]);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let request = request.with_deadline(Some(deadline));
+        core.add_request(request).unwrap();
+        let session = core
+            .get_session_key(&"managed-restart".to_string())
+            .unwrap();
+        core.execution_retry_attempts.insert(session.clone(), 3);
+        let first = core.prepare_step().await.unwrap().expect("initial prefill");
+        let claim_before = core
+            .managed_kv_cache
+            .runtime_snapshot()
+            .totals
+            .coordinator
+            .admission_claimed_pages;
+        assert!(claim_before > 0);
+        let executed = core.execute_prepared_with_progress(first).await.unwrap();
+        let committed = core.commit_step(executed).await.unwrap();
+        assert!(committed.outputs.is_empty());
+        assert_eq!(cleanup_calls.load(Ordering::Acquire), 0);
+        assert!(!core.execution_retry_attempts.contains_key(&session));
+        assert_eq!(
+            core.get_session_key(&"managed-restart".to_string()),
+            Some(session.clone())
+        );
+        assert_eq!(core.requests["managed-restart"].deadline, Some(deadline));
+        assert_eq!(
+            core.execution_trackers["managed-restart"].state(),
+            ExecutionState::Queued
+        );
+        assert_eq!(
+            core.scheduler.get_running_info(&session.request_id),
+            Some((0, 0))
+        );
+        let reset = core
+            .managed_kv_cache
+            .snapshot(model, &session, crate::kv::CacheDomainId::new(1))
+            .unwrap();
+        assert_eq!(reset.committed_tokens, 0);
+        assert!(reset.groups.is_empty());
+        assert_eq!(
+            core.managed_kv_cache
+                .runtime_snapshot()
+                .totals
+                .coordinator
+                .admission_claimed_pages,
+            claim_before
+        );
+
+        let prepared = core
+            .prepare_step()
+            .await
+            .unwrap()
+            .expect("restarted prefill");
+        assert_eq!(
+            core.get_session_key(&session.request_id),
+            Some(session.clone()),
+            "semantic restart must preserve the scheduler epoch"
+        );
+        let plan = core.active_plans.values().next().unwrap();
+        let WorkUnit::SequenceStep { input, .. } = &plan.work else {
+            panic!("restart must schedule sequence prefill")
+        };
+        assert_eq!(input.start, 0);
+        let reservation = core.active_managed_cache.values().next().unwrap();
+        assert_eq!(reservation.session_generation.get(), 2);
+        assert!(reservation
+            .domains
+            .iter()
+            .all(|domain| domain.execution_start_tokens == 0));
+        assert_eq!(core.rollback_all_in_flight_dispatches(), 1);
+        drop(prepared);
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_restart_wins_and_releases_managed_session() {
+        let model = ModelInstanceId::new(916);
+        let (mut core, cleanup_calls) = restart_test_core(false);
+        let mut request =
+            managed_test_request(&mut core, model, "managed-restart-cancel", vec![1, 2]);
+        let cancellation = Arc::new(AtomicBool::new(false));
+        request.cancellation = Some(cancellation.clone());
+        core.restart_after_reset_hook = Some(Arc::new(move || {
+            cancellation.store(true, Ordering::Release);
+        }));
+        core.add_request(request).unwrap();
+        let session = core
+            .get_session_key(&"managed-restart-cancel".to_string())
+            .unwrap();
+
+        let outputs = core.step().await.unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(
+            outputs[0].finish_reason,
+            Some(super::super::types::FinishReason::Aborted)
+        );
+        assert_eq!(cleanup_calls.load(Ordering::Acquire), 1);
+        assert!(core
+            .managed_kv_cache
+            .snapshot(model, &session, crate::kv::CacheDomainId::new(1))
+            .is_none());
+        assert_eq!(
+            core.managed_kv_cache
+                .runtime_snapshot()
+                .totals
+                .coordinator
+                .admission_claimed_pages,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_restart_generation_fails_terminally_without_requeue() {
+        let model = ModelInstanceId::new(917);
+        let (mut core, _cleanup_calls) = restart_test_core(false);
+        let request = managed_test_request(&mut core, model, "managed-restart-stale", vec![1, 2]);
+        core.add_request(request).unwrap();
+        let session = core
+            .get_session_key(&"managed-restart-stale".to_string())
+            .unwrap();
+        let prepared = core
+            .prepare_step()
+            .await
+            .unwrap()
+            .expect("prepared restart");
+        core.active_managed_cache
+            .values_mut()
+            .next()
+            .unwrap()
+            .session_generation = super::super::ManagedSessionGeneration::for_test(2);
+
+        let executed = core.execute_prepared_with_progress(prepared).await.unwrap();
+        let committed = core.commit_step(executed).await.unwrap();
+        assert_eq!(committed.outputs.len(), 1);
+        assert!(committed.outputs[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("managed sequence reset failed")));
+        assert!(core
+            .managed_kv_cache
+            .snapshot(model, &session, crate::kv::CacheDomainId::new(1))
+            .is_none());
+        assert!(!core.has_request(&session.request_id));
+    }
+
+    #[tokio::test]
+    async fn scheduler_restart_rejection_fails_terminally_after_cache_reset() {
+        let model = ModelInstanceId::new(918);
+        let (mut core, _cleanup_calls) = restart_test_core(false);
+        let request =
+            managed_test_request(&mut core, model, "managed-restart-rejected", vec![1, 2]);
+        core.add_request(request).unwrap();
+        let session = core
+            .get_session_key(&"managed-restart-rejected".to_string())
+            .unwrap();
+        let prepared = core
+            .prepare_step()
+            .await
+            .unwrap()
+            .expect("prepared restart");
+        let executed = core.execute_prepared_with_progress(prepared).await.unwrap();
+        core.scheduler.finish_request(&session.request_id);
+
+        let committed = core.commit_step(executed).await.unwrap();
+        assert_eq!(committed.outputs.len(), 1);
+        assert!(committed.outputs[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("scheduler rejected a managed sequence restart")));
+        assert!(core
+            .managed_kv_cache
+            .snapshot(model, &session, crate::kv::CacheDomainId::new(1))
+            .is_none());
+        assert!(!core.has_request(&session.request_id));
     }
 
     #[tokio::test]

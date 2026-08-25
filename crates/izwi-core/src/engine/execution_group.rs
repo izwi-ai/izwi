@@ -1296,6 +1296,7 @@ fn state_disposition(disposition: &ExecutionDisposition) -> StateDisposition {
         ExecutionDisposition::Progress | ExecutionDisposition::Yielded(_) => {
             StateDisposition::ValidNext
         }
+        ExecutionDisposition::RestartSequence(_) => StateDisposition::RestartPending,
         ExecutionDisposition::Failed(ExecutionFailure {
             retry: RetryDisposition::RetrySameSession,
             ..

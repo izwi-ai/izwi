@@ -1030,6 +1030,11 @@ impl ManagedSessionGeneration {
         self.0
     }
 
+    #[cfg(test)]
+    pub(crate) const fn for_test(value: u64) -> Self {
+        Self(value)
+    }
+
     pub(crate) fn next(self) -> Result<Self> {
         self.0
             .checked_add(1)
@@ -1585,6 +1590,7 @@ pub enum StateDisposition {
     Unchanged,
     ValidNext,
     RolledBack,
+    RestartPending,
     Poisoned,
 }
 
@@ -1622,6 +1628,23 @@ impl PhysicalBatchRowReport {
             {
                 return Err(Error::InferenceError(
                     "recompute retry cannot publish advanced model state".to_string(),
+                ));
+            }
+            ExecutionDisposition::RestartSequence(_)
+                if self.state != StateDisposition::RestartPending =>
+            {
+                return Err(Error::InferenceError(
+                    "sequence restart requires rolled-back restart-pending model state".to_string(),
+                ));
+            }
+            _ if self.state == StateDisposition::RestartPending
+                && !matches!(
+                    self.execution.disposition,
+                    ExecutionDisposition::RestartSequence(_)
+                ) =>
+            {
+                return Err(Error::InferenceError(
+                    "restart-pending model state requires a sequence restart outcome".to_string(),
                 ));
             }
             _ => {}
@@ -1740,6 +1763,21 @@ impl PhysicalBatchReport {
             let expected_row = expected
                 .get(&key)
                 .expect("reported row was validated above");
+            if matches!(
+                row.execution.disposition,
+                ExecutionDisposition::RestartSequence(_)
+            ) {
+                if expected_row.managed_cache.is_none() {
+                    return Err(Error::InferenceError(
+                        "sequence restart requires an exact managed-cache reservation".to_string(),
+                    ));
+                }
+                if row.managed_cache.is_some() {
+                    return Err(Error::InferenceError(
+                        "sequence restart cannot publish a managed-cache receipt".to_string(),
+                    ));
+                }
+            }
             match (&expected_row.managed_cache, &row.managed_cache) {
                 (None, None) => {}
                 (None, Some(_)) => {
@@ -1801,6 +1839,13 @@ pub enum FinishReason {
     Cancelled,
     TimedOut,
     Rejected,
+}
+
+/// Model-authored reason for discarding one committed generation attempt and
+/// rebuilding the same logical sequence from context zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SequenceRestartReason {
+    ModelFallback,
 }
 
 impl FinishReason {
@@ -1869,6 +1914,7 @@ impl ExecutionFailure {
 pub enum ExecutionDisposition {
     Progress,
     Yielded(YieldReason),
+    RestartSequence(SequenceRestartReason),
     Finished(FinishReason),
     Failed(ExecutionFailure),
 }
@@ -1883,6 +1929,7 @@ pub enum ExecutionState {
     PipelineRunning,
     Cancelling,
     PreemptedRecompute,
+    RestartPending,
     Terminal(TerminalOutcome),
 }
 
@@ -1903,12 +1950,16 @@ impl ExecutionState {
                 )
                 | (
                     Prefilling,
-                    Prefilling | Decoding | Cancelling | PreemptedRecompute
+                    Prefilling | Decoding | Cancelling | PreemptedRecompute | RestartPending
                 )
-                | (Decoding, Decoding | Cancelling | PreemptedRecompute)
+                | (
+                    Decoding,
+                    Decoding | Cancelling | PreemptedRecompute | RestartPending
+                )
                 | (AtomicRunning, Cancelling)
                 | (PipelineRunning, PipelineRunning | Cancelling)
                 | (PreemptedRecompute, Admitted | Prefilling | Cancelling)
+                | (RestartPending, Cancelling)
                 | (
                     Cancelling,
                     Terminal(TerminalOutcome::Cancelled | TerminalOutcome::TimedOut)
@@ -2102,11 +2153,30 @@ impl ExecutionReport {
             ));
         }
         match &self.disposition {
-            ExecutionDisposition::Progress | ExecutionDisposition::Yielded(_) => {
+            ExecutionDisposition::Progress
+            | ExecutionDisposition::Yielded(_)
+            | ExecutionDisposition::RestartSequence(_) => {
                 if self.output_finished || self.output_has_error {
                     return Err(Error::InferenceError(
                         "non-terminal execution returned a terminal or errored payload".to_string(),
                     ));
+                }
+                if matches!(self.disposition, ExecutionDisposition::RestartSequence(_)) {
+                    if !self.safe_point {
+                        return Err(Error::InferenceError(
+                            "sequence restart requires a declared safe point".to_string(),
+                        ));
+                    }
+                    if self.input_consumed != 0 || self.output_produced != 0 {
+                        return Err(Error::InferenceError(
+                            "sequence restart cannot report committed progress".to_string(),
+                        ));
+                    }
+                    if !matches!(plan.work, WorkUnit::SequenceStep { .. }) {
+                        return Err(Error::InferenceError(
+                            "sequence restart is only valid for sequence execution".to_string(),
+                        ));
+                    }
                 }
             }
             ExecutionDisposition::Finished(_) => {
@@ -2234,6 +2304,7 @@ impl ExecutionTracker {
             {
                 Some(ExecutionState::PreemptedRecompute)
             }
+            ExecutionDisposition::RestartSequence(_) => Some(ExecutionState::RestartPending),
             ExecutionDisposition::Progress
             | ExecutionDisposition::Yielded(_)
             | ExecutionDisposition::Failed(_) => None,
@@ -3011,6 +3082,22 @@ mod tests {
         assert!(report.validate_against(&batch, &active).is_err());
         report.rows[0].managed_cache = None;
         assert!(report.validate_against(&batch, &active).is_err());
+        let mut restart = report_for(
+            active.get(&7).unwrap(),
+            ExecutionDisposition::RestartSequence(SequenceRestartReason::ModelFallback),
+        );
+        restart.dispatch = BatchDispatch::serial();
+        report.rows[0] = PhysicalBatchRowReport {
+            execution: restart,
+            state: StateDisposition::RestartPending,
+            managed_cache: None,
+        };
+        assert!(report.validate_against(&batch, &active).is_ok());
+        report.rows[0].state = StateDisposition::RolledBack;
+        assert!(report.validate_against(&batch, &active).is_err());
+        report.rows[0].state = StateDisposition::RestartPending;
+        report.rows[0].managed_cache = Some(reservation.completed_write_receipt_for_test());
+        assert!(report.validate_against(&batch, &active).is_err());
         let mut foreign = reservation;
         foreign.domains[0].expected_version += 1;
         report.rows[0].managed_cache = Some(ManagedCacheReceipt {
@@ -3151,7 +3238,9 @@ mod tests {
 
     fn report_for(plan: &ExecutionPlan, disposition: ExecutionDisposition) -> ExecutionReport {
         let (output_finished, output_has_error) = match &disposition {
-            ExecutionDisposition::Progress | ExecutionDisposition::Yielded(_) => (false, false),
+            ExecutionDisposition::Progress
+            | ExecutionDisposition::Yielded(_)
+            | ExecutionDisposition::RestartSequence(_) => (false, false),
             ExecutionDisposition::Finished(_) => (true, false),
             ExecutionDisposition::Failed(failure) => {
                 (failure.retry == RetryDisposition::Never, true)
@@ -3247,6 +3336,38 @@ mod tests {
         assert!(yielded.validate_against(&plan).is_ok());
         yielded.safe_point = false;
         assert!(yielded.validate_against(&plan).is_err());
+    }
+
+    #[test]
+    fn sequence_restart_requires_zero_progress_safe_point_and_enters_restart_pending() {
+        let session = SessionKey::new("restart".to_string(), 9);
+        let plan = plan_for(
+            session.clone(),
+            WorkUnit::SequenceStep {
+                phase: SequencePhase::Decode,
+                input: InputRange { start: 4, end: 5 },
+                max_output_steps: 1,
+            },
+        );
+        let disposition =
+            ExecutionDisposition::RestartSequence(SequenceRestartReason::ModelFallback);
+        let report = report_for(&plan, disposition.clone());
+        assert!(report.validate_against(&plan).is_ok());
+
+        let mut unsafe_report = report.clone();
+        unsafe_report.safe_point = false;
+        assert!(unsafe_report.validate_against(&plan).is_err());
+        let mut progressed = report.clone();
+        progressed.output_produced = 1;
+        assert!(progressed.validate_against(&plan).is_err());
+
+        let mut tracker = ExecutionTracker::new(session);
+        tracker.transition(ExecutionState::Admitted).unwrap();
+        tracker.transition(ExecutionState::Decoding).unwrap();
+        tracker.begin_plan(&plan).unwrap();
+        tracker.commit(&plan, &report).unwrap();
+        assert_eq!(tracker.state(), ExecutionState::RestartPending);
+        assert_eq!(tracker.active_plan_id(), None);
     }
 
     #[test]
