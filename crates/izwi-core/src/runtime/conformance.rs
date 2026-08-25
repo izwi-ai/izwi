@@ -9,7 +9,7 @@ use crate::catalog::{CudaSupportLevel, ModelFamily, ModelVariant};
 use super::adapters::{CapabilityKind, RuntimeAdapterRegistry};
 
 pub(crate) const EXPECTED_CATALOG_VARIANT_COUNT: usize = 51;
-pub(crate) const EXPECTED_CATALOG_CAPABILITY_BINDING_COUNT: usize = 73;
+pub(crate) const EXPECTED_CATALOG_CAPABILITY_BINDING_COUNT: usize = 74;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ConformanceCapability {
@@ -291,7 +291,8 @@ fn workspace_expectation(
         // addition to its retained streaming state. These entries keep the
         // retained-state and invocation-workspace axes independent.
         (ModelFamily::Qwen3Tts, Capability::Tts | Capability::StreamingTts)
-        | (ModelFamily::NemotronAsr, Capability::RealtimeAsr) => InvocationStateRequired,
+        | (ModelFamily::NemotronAsr, Capability::RealtimeAsr)
+        | (ModelFamily::Voxtral, Capability::RealtimeAsr) => InvocationStateRequired,
 
         // Current atomic model implementations keep their cache-like numeric
         // state within one invocation. Their final stateless declaration is
@@ -388,7 +389,7 @@ fn retained_state_expectation(
             }
         }
         ModelFamily::Voxtral => match capability {
-            Capability::Asr => Managed,
+            Capability::Asr | Capability::RealtimeAsr => Managed,
             _ => unexpected_capability(variant, capability),
         },
         ModelFamily::GraniteSpeechAsr => match capability {
@@ -601,7 +602,7 @@ mod tests {
                 .iter()
                 .filter(|case| case.retained_state == Managed)
                 .count(),
-            55
+            56
         );
         assert_eq!(
             manifest
@@ -664,6 +665,22 @@ mod tests {
             )
             .retained_state,
             Stateless
+        );
+        let voxtral_realtime = manifest_case(
+            &manifest,
+            ModelVariant::VoxtralMini4BRealtime2602,
+            ConformanceCapability::RealtimeAsr,
+        );
+        assert_eq!(voxtral_realtime.retained_state, Managed);
+        assert_eq!(voxtral_realtime.workspace, InvocationStateRequired);
+        assert_eq!(voxtral_realtime.backends.cpu, Backend::RequiredWhenCompiled);
+        assert_eq!(
+            voxtral_realtime.backends.metal,
+            Backend::RequiredWhenCompiled
+        );
+        assert_eq!(
+            voxtral_realtime.backends.cuda,
+            Backend::RequiredWhenCompiled
         );
         assert_eq!(
             manifest_case(

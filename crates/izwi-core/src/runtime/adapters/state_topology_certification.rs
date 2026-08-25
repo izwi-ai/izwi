@@ -11,6 +11,7 @@ enum CertifiedTopology {
     Stateless,
     RetainedPaged,
     RetainedPagedRing,
+    RetainedPagedRotatingAndInvocationScratch,
     RetainedPagedTensorAndInvocationPaged,
     RetainedPagedAndInvocationPagedTensor,
     RetainedPagedAndInvocationPaged,
@@ -37,6 +38,7 @@ impl CertifiedTopology {
             | Self::RetainedPagedAndInvocationPaged
             | Self::RetainedPagedAndInvocationPagedTensor
             | Self::RetainedPagedStaticAndInvocationPagedStatic
+            | Self::RetainedPagedRotatingAndInvocationScratch
             | Self::RetainedAppendRingTensor => InferenceStateRequirement::RetainedAndInvocation,
             Self::InvocationPaged
             | Self::InvocationPagedPaged
@@ -85,6 +87,9 @@ fn certified_topology(
         // one retained transaction; long-form leases invocation pages only.
         (Qwen3Asr, Asr) => RetainedPagedTensorAndInvocationPaged,
         (Voxtral, Asr) => InvocationPaged,
+        // Realtime Voxtral retains transactional external pages while its
+        // absolute-position sliding window rotates the visible cache view.
+        (Voxtral, RealtimeAsr) => RetainedPagedRotatingAndInvocationScratch,
         // Normal VibeVoice ASR retains decoder pages after freezing its
         // stochastic tokenizer output; the long/chunk compatibility graph
         // still leases decoder pages plus acoustic/semantic tensor state.
@@ -156,6 +161,17 @@ fn every_enabled_catalog_backend_route_has_an_explicit_state_topology() {
     }
 
     assert!(certified_cells > 0, "certification matrix was empty");
+}
+
+#[test]
+fn voxtral_realtime_certifies_transactional_rotating_pages_and_invocation_scratch() {
+    assert_eq!(
+        certified_topology(
+            ModelVariant::VoxtralMini4BRealtime2602,
+            CapabilityKind::RealtimeAsr,
+        ),
+        Some(CertifiedTopology::RetainedPagedRotatingAndInvocationScratch)
+    );
 }
 
 #[test]

@@ -168,6 +168,17 @@ impl VoxtralTokenizer {
         self.inner.vocab_size()
     }
 
+    pub(crate) fn max_decoded_token_bytes(&self) -> Result<usize> {
+        self.inner
+            .vocab()
+            .iter()
+            .map(String::len)
+            .max()
+            .ok_or_else(|| {
+                Error::TokenizationError("Voxtral tokenizer has an empty vocabulary".into())
+            })
+    }
+
     /// Build the Mistral streaming transcription prefix:
     /// BOS followed by left-padding and delay STREAMING_PAD tokens.
     pub fn build_transcription_prompt(&self) -> Result<Vec<u32>> {

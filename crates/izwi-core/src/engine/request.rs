@@ -173,7 +173,7 @@ pub(crate) enum RealtimeAsrOperationPayload {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RealtimeAsrOperationKind {
+pub enum RealtimeAsrOperationKind {
     Push,
     Finish,
 }
@@ -197,15 +197,44 @@ impl RealtimeAsrOperationPayload {
 /// Durable acknowledgement for one exact externally allocated operation ID.
 /// The acknowledgement intentionally carries no payload owner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RealtimeAsrOperationAck {
-    pub operation_id: RealtimeOperationId,
-    pub kind: RealtimeAsrOperationKind,
-    pub accepted_samples: usize,
+pub struct RealtimeAsrOperationAck {
+    operation_id: RealtimeOperationId,
+    kind: RealtimeAsrOperationKind,
+    accepted_samples: usize,
+}
+
+impl RealtimeAsrOperationAck {
+    #[cfg(test)]
+    pub(crate) const fn for_test(
+        operation_id: RealtimeOperationId,
+        kind: RealtimeAsrOperationKind,
+        accepted_samples: usize,
+    ) -> Self {
+        Self {
+            operation_id,
+            kind,
+            accepted_samples,
+        }
+    }
+
+    pub const fn operation_id(&self) -> RealtimeOperationId {
+        self.operation_id
+    }
+
+    pub const fn kind(&self) -> RealtimeAsrOperationKind {
+        self.kind
+    }
+
+    pub const fn accepted_samples(&self) -> usize {
+        self.accepted_samples
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RealtimeAsrTerminalOutcome {
+    Completed,
     Cancelled,
+    TimedOut,
     Unloaded,
     Failed(Arc<str>),
 }
@@ -217,6 +246,7 @@ pub(crate) type RealtimeAsrOperationWaiter = oneshot::Receiver<RealtimeAsrOperat
 #[derive(Debug)]
 struct RealtimeAsrIngressOperation {
     payload: RealtimeAsrOperationPayload,
+    preparation_cost: WorkCost,
     completion: oneshot::Sender<RealtimeAsrOperationOutcome>,
 }
 
@@ -1061,6 +1091,25 @@ impl EngineCoreRequest {
         operation_id: RealtimeOperationId,
         payload: RealtimeAsrOperationPayload,
     ) -> Result<RealtimeAsrOperationWaiter> {
+        let logical_units = match &payload {
+            RealtimeAsrOperationPayload::Push { samples, .. } => {
+                u64::try_from(samples.len()).unwrap_or(u64::MAX).max(1)
+            }
+            RealtimeAsrOperationPayload::Finish => 1,
+        };
+        self.install_realtime_asr_operation_with_cost(
+            operation_id,
+            payload,
+            WorkCost::new(logical_units, logical_units, 0),
+        )
+    }
+
+    pub(crate) fn install_realtime_asr_operation_with_cost(
+        &self,
+        operation_id: RealtimeOperationId,
+        payload: RealtimeAsrOperationPayload,
+        preparation_cost: WorkCost,
+    ) -> Result<RealtimeAsrOperationWaiter> {
         let ingress = self.realtime_asr_ingress.as_ref().ok_or_else(|| {
             Error::InvalidInput("request is not an engine-owned realtime ASR session".into())
         })?;
@@ -1087,6 +1136,7 @@ impl EngineCoreRequest {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(RealtimeAsrIngressOperation {
                     payload,
+                    preparation_cost,
                     completion,
                 });
             }
@@ -1098,6 +1148,28 @@ impl EngineCoreRequest {
         }
         state.highest_operation_id = Some(operation_id);
         Ok(waiter)
+    }
+
+    pub(crate) fn realtime_asr_preparation_cost(
+        &self,
+        operation_id: RealtimeOperationId,
+    ) -> Result<WorkCost> {
+        let ingress = self.realtime_asr_ingress.as_ref().ok_or_else(|| {
+            Error::InvalidInput("request is not an engine-owned realtime ASR session".into())
+        })?;
+        ingress
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .operations
+            .get(&operation_id)
+            .map(|operation| operation.preparation_cost)
+            .ok_or_else(|| {
+                Error::InferenceError(format!(
+                    "realtime ASR operation {} has no retained preparation cost",
+                    operation_id.get()
+                ))
+            })
     }
 
     pub(crate) fn realtime_asr_operation(

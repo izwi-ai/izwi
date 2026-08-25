@@ -1114,6 +1114,22 @@ impl ModelLifecycleController {
                     )));
                 };
                 bundle_draft.seal_granite_speech_asr_preparation(model)?;
+            } else if variant.family() == crate::catalog::ModelFamily::Voxtral
+                && self
+                    .adapter_registry
+                    .require(CapabilityKind::RealtimeAsr, variant)
+                    .is_ok()
+            {
+                let model = self
+                    .model_registry
+                    .get_loading_voxtral(variant)
+                    .await
+                    .ok_or_else(|| {
+                        Error::ModelLoadError(format!(
+                            "instantiated Voxtral realtime model {variant} is missing before adapter sealing"
+                        ))
+                    })?;
+                bundle_draft.seal_voxtral_realtime_preparation(model.as_ref())?;
             }
             // Metal records many tensor uploads asynchronously. Flush them
             // before publishing the model so an allocation failure is owned by

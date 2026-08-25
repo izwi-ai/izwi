@@ -1462,11 +1462,14 @@ impl ManagedCacheReservation {
                 "managed-cache reservation has no paged or clocked state".to_string(),
             ));
         }
-        let realtime_work = matches!(
+        let unchanged_prefix_work = matches!(
             &row.work,
-            WorkUnit::RealtimePush { .. } | WorkUnit::RealtimeFinish { .. }
+            WorkUnit::RealtimePush { .. }
+                | WorkUnit::RealtimeFinish { .. }
+                | WorkUnit::RealtimePreparation { .. }
+                | WorkUnit::RealtimeCompletion { .. }
         );
-        if self.allow_unchanged_prefix != realtime_work {
+        if self.allow_unchanged_prefix != unchanged_prefix_work {
             return Err(Error::InvalidInput(
                 "managed-cache zero-append authority does not match the exact row work".into(),
             ));

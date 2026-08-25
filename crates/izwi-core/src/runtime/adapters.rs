@@ -530,7 +530,11 @@ struct RealtimeAsrCapabilityAdapter;
 
 impl ModelCapabilityAdapter for RealtimeAsrCapabilityAdapter {
     fn metadata_for(&self, model_variant: ModelVariant) -> Option<AdapterMetadata> {
-        (model_variant == ModelVariant::Nemotron35AsrStreaming06B).then_some(AdapterMetadata {
+        matches!(
+            model_variant,
+            ModelVariant::Nemotron35AsrStreaming06B | ModelVariant::VoxtralMini4BRealtime2602
+        )
+        .then_some(AdapterMetadata {
             id: "builtin.realtime_asr",
             capability: CapabilityKind::RealtimeAsr,
             model_variant,
@@ -671,7 +675,10 @@ mod tests {
         if model_variant.supports_speaker_attributed_asr() {
             expected.insert(CapabilityKind::SpeakerAttributedAsr);
         }
-        if model_variant == ModelVariant::Nemotron35AsrStreaming06B {
+        if matches!(
+            model_variant,
+            ModelVariant::Nemotron35AsrStreaming06B | ModelVariant::VoxtralMini4BRealtime2602
+        ) {
             expected.insert(CapabilityKind::RealtimeAsr);
         }
         if model_variant.is_chat() {
@@ -971,9 +978,22 @@ mod tests {
                 .state_requirement,
             InferenceStateRequirement::Invocation
         );
-        assert!(registry
+        let realtime = registry
             .require(CapabilityKind::RealtimeAsr, variant)
-            .is_err());
+            .expect("Voxtral retained realtime adapter");
+        assert_eq!(
+            realtime.execution_target,
+            ExecutionTargetKind::RealtimeRunner
+        );
+        assert_eq!(realtime.streaming_mode, StreamingMode::Realtime);
+        assert_eq!(
+            realtime.state_requirement,
+            InferenceStateRequirement::RetainedAndInvocation
+        );
+        assert_eq!(
+            registry_capabilities(&registry, variant),
+            BTreeSet::from([CapabilityKind::Asr, CapabilityKind::RealtimeAsr])
+        );
         assert!(registry
             .require(CapabilityKind::AudioChat, variant)
             .is_err());

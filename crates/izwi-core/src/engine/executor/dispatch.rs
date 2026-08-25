@@ -467,7 +467,7 @@ impl NativeExecutor {
         )
     }
 
-    fn finish_scheduled_execution(
+    pub(super) fn finish_scheduled_execution(
         &self,
         requests: &[&EngineCoreRequest],
         scheduled: &[ScheduledRequest],
@@ -558,6 +558,9 @@ impl NativeExecutor {
                         result.disposition,
                         super::ExecutionDisposition::Progress
                             | super::ExecutionDisposition::Yielded(_)
+                            | super::ExecutionDisposition::Finished(
+                                super::FinishReason::Completed,
+                            )
                     )
                 {
                     if let Some(reservation) = rows
@@ -948,7 +951,7 @@ mod tests {
             audio: None,
             text: Some("done".to_string()),
             input_transcription: None,
-            tokens_processed: 0,
+            tokens_processed: 1,
             tokens_generated: 0,
             finished: true,
             phase_timing_override: None,
@@ -965,7 +968,12 @@ mod tests {
                 Some(&rows),
             )
             .unwrap();
-        assert!(terminal[0].managed_cache.is_none());
+        let terminal_receipt = terminal[0]
+            .managed_cache
+            .as_ref()
+            .expect("completed terminal row must acknowledge its appended KV writes");
+        assert_eq!(terminal_receipt.reservation, reservation);
+        assert_eq!(terminal_receipt.domains[0].written_blocks, vec![block]);
 
         let restart = executor
             .finish_scheduled_execution(

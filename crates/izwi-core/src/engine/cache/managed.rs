@@ -337,6 +337,8 @@ struct ManagedKvModelState {
     coordinators: HashMap<KvArenaId, KvCacheCoordinator>,
     prefix_indexes: HashMap<KvArenaId, CoordinatedPrefixIndex>,
     pending_prefixes: HashMap<PlanId, Vec<PendingPrefixCommit>>,
+    /// Transactions whose accepted prefix must equal their reserved target.
+    exact_target_transactions: HashSet<PlanId>,
     registered_sessions: HashSet<SessionKey>,
     session_generations: HashMap<SessionKey, ManagedSessionGeneration>,
     capacity_claims: HashMap<SessionKey, Vec<(KvArenaId, u32)>>,
@@ -1154,6 +1156,7 @@ impl ManagedKvCacheManager {
                 coordinators,
                 prefix_indexes,
                 pending_prefixes: HashMap::new(),
+                exact_target_transactions: HashSet::new(),
                 registered_sessions: HashSet::new(),
                 session_generations: HashMap::new(),
                 capacity_claims: HashMap::new(),
@@ -1212,18 +1215,45 @@ impl ManagedKvCacheManager {
         work: &WorkUnit,
         request: Option<&EngineCoreRequest>,
     ) -> Result<Option<ManagedCacheReservation>> {
-        let (sequence_input, auxiliary_state, realtime_cache_append) = match work {
+        let (
+            sequence_input,
+            auxiliary_state,
+            realtime_cache_append,
+            allow_unchanged_prefix,
+            exact_target_prefix,
+        ) = match work {
             WorkUnit::SequenceStep {
                 input,
                 auxiliary_state,
                 ..
-            } => (Some(*input), auxiliary_state.as_ref(), None),
+            } => (Some(*input), auxiliary_state.as_ref(), None, false, false),
             WorkUnit::RealtimePush {
                 max_cache_append, ..
             }
             | WorkUnit::RealtimeFinish {
                 max_cache_append, ..
-            } => (None, None, Some(*max_cache_append)),
+            } => (None, None, Some(*max_cache_append), true, false),
+            WorkUnit::RealtimePreparation { .. } | WorkUnit::RealtimeCompletion { .. } => {
+                (None, None, Some(0), true, false)
+            }
+            WorkUnit::RealtimePromptPrefill { cache_append, .. } => {
+                if *cache_append == 0 {
+                    return Err(Error::InvalidInput(
+                        "realtime prompt prefill requires a positive exact cache append".into(),
+                    ));
+                }
+                (None, None, Some(*cache_append), false, true)
+            }
+            WorkUnit::RealtimeDecodeContinuation {
+                max_cache_append, ..
+            } => {
+                if *max_cache_append != 1 {
+                    return Err(Error::InvalidInput(
+                        "realtime decode continuation requires exactly one cache append".into(),
+                    ));
+                }
+                (None, None, Some(1), false, true)
+            }
             _ => return Ok(None),
         };
         if self
@@ -1724,13 +1754,29 @@ impl ManagedKvCacheManager {
         if domains.is_empty() && clocked_state.is_none() {
             return Ok(None);
         }
+        if exact_target_prefix && !state.exact_target_transactions.insert(txn_id) {
+            abort_reservation(
+                state,
+                &ManagedCacheReservation {
+                    txn_id,
+                    session: session.clone(),
+                    session_generation,
+                    domains: domains.clone(),
+                    clocked_state: clocked_state.clone(),
+                    allow_unchanged_prefix,
+                },
+            );
+            return Err(Error::InferenceError(
+                "managed exact-target transaction identity was reused".into(),
+            ));
+        }
         Ok(Some(ManagedCacheReservation {
             txn_id,
             session: session.clone(),
             session_generation,
             domains,
             clocked_state,
-            allow_unchanged_prefix: realtime_cache_append.is_some(),
+            allow_unchanged_prefix,
         }))
     }
 
@@ -1794,6 +1840,19 @@ impl ManagedKvCacheManager {
         }
 
         let accepted_prefix = receipt.accepted_prefix();
+        if state
+            .exact_target_transactions
+            .contains(&reservation.txn_id)
+            && reservation.domains.iter().any(|domain| {
+                accepted_prefix.unwrap_or(domain.target_committed_tokens)
+                    != domain.target_committed_tokens
+            })
+        {
+            abort_reservation(state, reservation);
+            return Err(Error::InferenceError(
+                "managed KV exact-target reservation rejected a partial prefix".into(),
+            ));
+        }
         let mut resolved_domains = Vec::with_capacity(reservation.domains.len());
         for domain in &reservation.domains {
             let Some(written) = receipt
@@ -2008,6 +2067,7 @@ impl ManagedKvCacheManager {
             }
         }
         state.pending_prefixes.remove(&reservation.txn_id);
+        state.exact_target_transactions.remove(&reservation.txn_id);
         self.telemetry.record_commit();
         Ok(())
     }
@@ -3206,6 +3266,7 @@ fn abort_domains(
 
 fn abort_reservation(state: &mut ManagedKvModelState, reservation: &ManagedCacheReservation) {
     state.pending_prefixes.remove(&reservation.txn_id);
+    state.exact_target_transactions.remove(&reservation.txn_id);
     abort_domains(state, reservation.txn_id, &reservation.domains);
     if reservation.clocked_state.is_some() {
         if let (Some(arena), Ok(transaction)) = (
@@ -4959,6 +5020,43 @@ mod tests {
     }
 
     #[test]
+    fn realtime_physical_token_demand_claims_the_full_rotating_window() {
+        let model = ModelInstanceId::new(421);
+        let session = SessionKey::new("realtime-full-window-claim".into(), 1);
+        let mut manager = ManagedKvCacheManager::default();
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                4,
+                16,
+                &CacheCapability::Managed(sliding_contract(64)),
+            )
+            .unwrap()
+            .unwrap();
+        let logical_reach = usize::try_from(runtime.logical_token_reach()).unwrap();
+        let mut request = EngineCoreRequest::asr_bytes(Vec::new())
+            .with_model_variant(ModelVariant::VoxtralMini4BRealtime2602);
+        request.params.max_tokens = logical_reach;
+
+        let state = manager.models.get_mut(&model).unwrap();
+        assert!(ensure_capacity_claim(state, &session, &request).unwrap());
+        let claims = &state.capacity_claims[&session];
+        assert!(!claims.is_empty());
+        for (arena, claimed_pages) in claims {
+            let capacity_pages = state
+                .runtime
+                .plan
+                .groups
+                .iter()
+                .find(|group| group.arena == *arena)
+                .map(|group| group.capacity_pages)
+                .unwrap();
+            assert_eq!(*claimed_pages, capacity_pages);
+        }
+    }
+
+    #[test]
     fn one_request_larger_than_the_arena_fails_before_page_dispatch() {
         let model = ModelInstanceId::new(43);
         let session = SessionKey::new("oversized-capacity".into(), 1);
@@ -5990,6 +6088,138 @@ mod tests {
             .coordinators
             .values()
             .all(|coordinator| coordinator.stats().active_transactions == 0));
+    }
+
+    #[test]
+    fn realtime_subphase_reservations_are_exact_and_stage_scoped() {
+        let model = ModelInstanceId::new(778);
+        let session = SessionKey::new("managed-realtime-subphases".into(), 1);
+        let mut manager = ManagedKvCacheManager::default();
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                8,
+                8,
+                &CacheCapability::Managed(test_contract()),
+            )
+            .unwrap()
+            .unwrap();
+        let operation_id = crate::engine::RealtimeOperationId::new(1);
+
+        for (txn_id, work) in [
+            (
+                7781,
+                WorkUnit::RealtimePreparation {
+                    operation_id,
+                    mode: crate::engine::RealtimePreparationMode::Push,
+                    input: crate::engine::InputRange::new(0, 160).unwrap(),
+                    max_output_steps: 2,
+                    max_cache_append: 4,
+                },
+            ),
+            (7782, WorkUnit::RealtimeCompletion { operation_id }),
+        ] {
+            let reservation = manager
+                .prepare(&runtime, txn_id, &session, &work, None)
+                .unwrap()
+                .expect("unchanged-prefix reservation");
+            assert!(reservation.allow_unchanged_prefix);
+            assert!(reservation
+                .domains
+                .iter()
+                .all(|domain| { domain.target_committed_tokens == domain.execution_start_tokens }));
+            let receipt = reservation
+                .completed_write_receipt_for_prefix(
+                    &[],
+                    reservation.domains[0].execution_start_tokens,
+                )
+                .expect("unchanged-prefix receipt");
+            manager
+                .finalize(&reservation, Some(&receipt), true)
+                .expect("unchanged-prefix commit");
+        }
+
+        let prompt = manager
+            .prepare(
+                &runtime,
+                7783,
+                &session,
+                &WorkUnit::RealtimePromptPrefill {
+                    operation_id,
+                    max_output_steps: 2,
+                    cache_append: 3,
+                },
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(!prompt.allow_unchanged_prefix);
+        assert!(prompt
+            .domains
+            .iter()
+            .all(|domain| { domain.target_committed_tokens - domain.execution_start_tokens == 3 }));
+        let partial = prompt
+            .completed_write_receipt_for_prefix_for_test(1, 8)
+            .expect("partial prompt receipt");
+        assert!(manager.finalize(&prompt, Some(&partial), true).is_err());
+
+        let prompt = manager
+            .prepare(
+                &runtime,
+                7784,
+                &session,
+                &WorkUnit::RealtimePromptPrefill {
+                    operation_id,
+                    max_output_steps: 2,
+                    cache_append: 3,
+                },
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        let prompt_receipt = prompt.completed_write_receipt_for_test();
+        manager
+            .finalize(&prompt, Some(&prompt_receipt), true)
+            .expect("exact prompt commit");
+
+        let decode = manager
+            .prepare(
+                &runtime,
+                7785,
+                &session,
+                &WorkUnit::RealtimeDecodeContinuation {
+                    operation_id,
+                    max_output_steps: 1,
+                    max_cache_append: 1,
+                },
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(!decode.allow_unchanged_prefix);
+        assert!(decode
+            .domains
+            .iter()
+            .all(|domain| { domain.target_committed_tokens - domain.execution_start_tokens == 1 }));
+        let decode_receipt = decode.completed_write_receipt_for_test();
+        manager
+            .finalize(&decode, Some(&decode_receipt), true)
+            .expect("exact decode commit");
+
+        assert!(manager
+            .prepare(
+                &runtime,
+                7786,
+                &session,
+                &WorkUnit::RealtimeDecodeContinuation {
+                    operation_id,
+                    max_output_steps: 1,
+                    max_cache_append: 2,
+                },
+                None,
+            )
+            .is_err());
     }
 
     #[test]

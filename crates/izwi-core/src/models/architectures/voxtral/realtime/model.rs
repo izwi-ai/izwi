@@ -76,6 +76,24 @@ pub(crate) struct VoxtralRealtimePreparationStageSeal {
     pub(crate) max_workspace_bytes: u64,
 }
 
+/// Finite per-session authorization covering the worst preparation
+/// transaction: retained old source, the owned ingress packet, replacement
+/// cumulative source, old/new embedding overlap, and encoder scratch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VoxtralRealtimeStreamPeakReservation {
+    pub(crate) max_source_samples: usize,
+    pub(crate) max_host_bytes: u64,
+    pub(crate) max_tensor_bytes: u64,
+    pub(crate) max_preparation_scratch_bytes: u64,
+    pub(crate) max_committed_host_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VoxtralRealtimePreparedResourceUsage {
+    pub(crate) host_bytes: u64,
+    pub(crate) tensor_bytes: u64,
+}
+
 pub(crate) struct VoxtralRealtimePreparationBatchRow<'a> {
     pub(crate) state: &'a VoxtralRealtimeState,
     pub(crate) appended_samples: &'a [f32],
@@ -118,6 +136,7 @@ pub struct VoxtralRealtimeModel {
     block_pool_size: usize,
     audio_length_per_tok: usize,
     realtime_max_source_samples: Option<usize>,
+    max_decoded_token_bytes: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -249,6 +268,7 @@ impl VoxtralRealtimeModel {
             ..AudioConfig::default()
         };
         let tokenizer = VoxtralTokenizer::load(model_dir, audio_config)?;
+        let max_decoded_token_bytes = tokenizer.max_decoded_token_bytes()?;
         let streaming_left_pad_tokens = tokenizer.audio_config().streaming_left_pad_tokens;
         let offline_left_pad_tokens =
             offline_left_pad_tokens_for_generation(streaming_left_pad_tokens, num_delay_tokens);
@@ -311,6 +331,7 @@ impl VoxtralRealtimeModel {
             block_pool_size,
             audio_length_per_tok,
             realtime_max_source_samples,
+            max_decoded_token_bytes,
         })
     }
 
@@ -719,6 +740,54 @@ impl VoxtralRealtimeModel {
         state.next_audio_frame = prompt_len;
         self.accept_realtime_prediction(state, argmax(&next_logits)?)
             .map(Some)
+    }
+
+    pub(crate) fn realtime_prompt_cache_append(
+        &self,
+        state: &VoxtralRealtimeState,
+    ) -> Result<Option<usize>> {
+        if state.prompt_initialized || state.finished {
+            return Ok(None);
+        }
+        let prompt_len =
+            voxtral_generation_prefix_len(self.tokenizer.build_transcription_prompt()?.len());
+        Ok((state.prepared_audio_frames >= prompt_len).then_some(prompt_len))
+    }
+
+    pub(crate) fn realtime_decode_ready(&self, state: &VoxtralRealtimeState) -> bool {
+        state.prompt_initialized
+            && !state.finished
+            && state.pending_input_token.is_some()
+            && state.next_audio_frame < state.prepared_audio_frames
+    }
+
+    /// Prompt prefill inside an executor-owned outer checkpoint.
+    pub(crate) fn prefill_realtime_in_quantum(
+        &self,
+        state: &mut VoxtralRealtimeState,
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<VoxtralRealtimeStep> {
+        self.ensure_active_realtime_quantum(state, cache)?;
+        self.prefill_realtime_unchecked(state, cache)?
+            .ok_or_else(|| {
+                Error::InvalidInput("Voxtral realtime prompt prefill is not ready".into())
+            })
+    }
+
+    /// Tensor-free terminal transition after all prepared audio was consumed.
+    pub(crate) fn complete_realtime_in_quantum(
+        &self,
+        state: &mut VoxtralRealtimeState,
+        cache: &PhysicalPagedKvCache,
+    ) -> Result<VoxtralRealtimeStep> {
+        self.ensure_active_realtime_quantum(state, cache)?;
+        if !state.input_closed || state.next_audio_frame < state.prepared_audio_frames {
+            return Err(Error::InvalidInput(
+                "Voxtral realtime completion requires closed, exhausted input".into(),
+            ));
+        }
+        state.finished = true;
+        Ok(self.realtime_step(state, String::new()))
     }
 
     /// Advance one retained decoder token against one prepared audio frame.
@@ -1322,6 +1391,118 @@ impl VoxtralRealtimeModel {
             max_materialized_tensor_elements_per_row: self
                 .realtime_materialized_elements(max.mel_frames, max.conv2_frames)?,
             max_workspace_bytes: self.realtime_workspace_bytes(max.mel_frames, max.conv2_frames)?,
+        })
+    }
+
+    pub(crate) fn realtime_stream_peak_reservation(
+        &self,
+    ) -> Result<VoxtralRealtimeStreamPeakReservation> {
+        let seal = self.realtime_preparation_stage_seal()?;
+        let source_bytes = u64::try_from(seal.max_source_samples)
+            .ok()
+            .and_then(|samples| samples.checked_mul(std::mem::size_of::<f32>() as u64))
+            .ok_or_else(|| {
+                Error::ModelLoadError("Voxtral source-byte ceiling overflowed".into())
+            })?;
+        let geometry = realtime_preparation_geometry_for(
+            seal.max_source_samples,
+            self.mel.config().sample_rate as u32,
+            self.mel.config().sample_rate as u32,
+            self.mel.config().hop_length,
+            self.mel.config().n_mels,
+            self.raw_audio_length_per_tok,
+            self.offline_left_pad_tokens,
+            self.streaming_right_pad_tokens,
+            self.block_pool_size,
+            self.config.text_dim,
+            self.whisper_encoder.conv1_spec,
+            self.whisper_encoder.conv2_spec,
+            VoxtralRealtimePreparationMode::Finish,
+        )?;
+        let embedding_bytes = geometry
+            .embedding_elements
+            .checked_mul(self.dtype.size_in_bytes() as u64)
+            .ok_or_else(|| Error::ModelLoadError("Voxtral embedding ceiling overflowed".into()))?;
+        let frontend_host_bytes = checked_realtime_frontend_host_peak_bytes(
+            source_bytes,
+            geometry.resampled_samples,
+            geometry.padded_samples,
+            geometry.mel_frames,
+            self.mel.config().n_mels,
+            self.mel.config().n_fft,
+        )?;
+        let (committed_text_host_bytes, transactional_text_host_bytes) =
+            checked_realtime_text_host_bytes(geometry.pooled_frames, self.max_decoded_token_bytes)?;
+        let max_committed_host_bytes = source_bytes
+            .checked_add(committed_text_host_bytes)
+            .ok_or_else(|| {
+                Error::ModelLoadError("Voxtral committed host peak overflowed".into())
+            })?;
+        let (max_host_bytes, max_tensor_bytes) = checked_realtime_stream_peak_bytes(
+            frontend_host_bytes,
+            transactional_text_host_bytes,
+            embedding_bytes,
+            seal.max_workspace_bytes,
+        )?;
+        Ok(VoxtralRealtimeStreamPeakReservation {
+            max_source_samples: seal.max_source_samples,
+            max_host_bytes,
+            max_tensor_bytes,
+            max_preparation_scratch_bytes: seal.max_workspace_bytes,
+            max_committed_host_bytes,
+        })
+    }
+
+    pub(crate) fn realtime_preparation_geometry_for_source_samples(
+        &self,
+        source_samples: usize,
+        sample_rate: u32,
+        mode: VoxtralRealtimePreparationMode,
+    ) -> Result<VoxtralRealtimePreparationGeometry> {
+        if source_samples == 0
+            || source_samples > self.realtime_preparation_stage_seal()?.max_source_samples
+        {
+            return Err(Error::InvalidInput(
+                "Voxtral cumulative source samples are outside the sealed realtime range".into(),
+            ));
+        }
+        realtime_preparation_geometry_for(
+            source_samples,
+            sample_rate,
+            self.mel.config().sample_rate as u32,
+            self.mel.config().hop_length,
+            self.mel.config().n_mels,
+            self.raw_audio_length_per_tok,
+            self.offline_left_pad_tokens,
+            self.streaming_right_pad_tokens,
+            self.block_pool_size,
+            self.config.text_dim,
+            self.whisper_encoder.conv1_spec,
+            self.whisper_encoder.conv2_spec,
+            mode,
+        )
+    }
+
+    pub(crate) fn realtime_prepared_resource_usage(
+        &self,
+        geometry: VoxtralRealtimePreparationGeometry,
+    ) -> Result<VoxtralRealtimePreparedResourceUsage> {
+        let source_bytes = u64::try_from(geometry.source_samples)
+            .ok()
+            .and_then(|samples| samples.checked_mul(std::mem::size_of::<f32>() as u64))
+            .ok_or_else(|| Error::Overloaded("Voxtral prepared host usage overflowed".into()))?;
+        let (text_bytes, _) =
+            checked_realtime_text_host_bytes(geometry.pooled_frames, self.max_decoded_token_bytes)?;
+        let host_bytes = source_bytes
+            .checked_add(text_bytes)
+            .ok_or_else(|| Error::Overloaded("Voxtral prepared host usage overflowed".into()))?;
+        let tensor_bytes = geometry
+            .embedding_elements
+            .checked_mul(self.dtype.size_in_bytes() as u64)
+            .ok_or_else(|| Error::Overloaded("Voxtral prepared tensor usage overflowed".into()))?;
+        Ok(VoxtralRealtimePreparedResourceUsage {
+            host_bytes,
+            tensor_bytes,
         })
     }
 
@@ -2923,6 +3104,118 @@ fn checked_materialized_elements(
         .ok_or_else(|| Error::ModelLoadError("Voxtral materialization ceiling overflow".into()))
 }
 
+fn checked_realtime_stream_peak_bytes(
+    frontend_host_bytes: u64,
+    transactional_text_host_bytes: u64,
+    embedding_bytes: u64,
+    preparation_scratch_bytes: u64,
+) -> Result<(u64, u64)> {
+    let host = frontend_host_bytes
+        .checked_add(transactional_text_host_bytes)
+        .ok_or_else(|| {
+            Error::ModelLoadError("Voxtral transactional host peak overflowed".into())
+        })?;
+    // Tensor checkpoints are shallow handles, but their old allocation stays
+    // live until commit while the replacement embedding and scratch coexist.
+    let tensor = embedding_bytes
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(preparation_scratch_bytes))
+        .ok_or_else(|| {
+            Error::ModelLoadError("Voxtral transactional tensor peak overflowed".into())
+        })?;
+    Ok((host, tensor))
+}
+
+fn checked_realtime_frontend_host_peak_bytes(
+    source_bytes: u64,
+    resampled_samples: usize,
+    padded_samples: usize,
+    mel_frames: usize,
+    n_mels: usize,
+    n_fft: usize,
+) -> Result<u64> {
+    let f32_bytes = std::mem::size_of::<f32>() as u64;
+    let bytes = |elements: usize, element_bytes: u64| {
+        u64::try_from(elements)
+            .ok()
+            .and_then(|elements| elements.checked_mul(element_bytes))
+    };
+    // Old source + owned append equals one complete stream, and the newly
+    // assembled source is a second. The remaining terms mirror the actual
+    // host frontend: optional resample, padded PCM, reflect padding, FFT frame,
+    // power spectrum, flat log-mel, and its frame-vector conversion.
+    let source_overlap = source_bytes.checked_mul(2);
+    let resampled = bytes(resampled_samples, f32_bytes);
+    let padded = bytes(padded_samples, f32_bytes);
+    let reflected = padded_samples
+        .checked_add(n_fft)
+        .and_then(|elements| bytes(elements, f32_bytes));
+    let fft_frame = bytes(
+        n_fft,
+        std::mem::size_of::<rustfft::num_complex::Complex<f32>>() as u64,
+    );
+    let power = bytes(n_fft / 2 + 1, f32_bytes);
+    let mel_elements = mel_frames.checked_mul(n_mels);
+    let flat_mel = mel_elements.and_then(|elements| bytes(elements, f32_bytes));
+    let nested_mel = flat_mel.and_then(|data| {
+        bytes(mel_frames, std::mem::size_of::<Vec<f32>>() as u64)
+            .and_then(|headers| data.checked_add(headers))
+    });
+    [
+        source_overlap,
+        resampled,
+        padded,
+        reflected,
+        fft_frame,
+        power,
+        flat_mel,
+        nested_mel,
+    ]
+    .into_iter()
+    .try_fold(0u64, |total, value| total.checked_add(value?))
+    .ok_or_else(|| Error::ModelLoadError("Voxtral frontend host peak overflowed".into()))
+}
+
+fn checked_realtime_text_host_bytes(
+    max_generated_tokens: usize,
+    max_decoded_token_bytes: usize,
+) -> Result<(u64, u64)> {
+    // Realtime prefill/decode produces at most one prediction per prepared
+    // pooled audio frame across the entire stream.
+    let token_capacity = max_generated_tokens
+        .checked_next_power_of_two()
+        .ok_or_else(|| {
+            Error::ModelLoadError("Voxtral generated-token capacity overflowed".into())
+        })?;
+    let generated = u64::try_from(token_capacity)
+        .ok()
+        .and_then(|tokens| tokens.checked_mul(std::mem::size_of::<u32>() as u64))
+        .ok_or_else(|| Error::ModelLoadError("Voxtral generated-token bytes overflowed".into()))?;
+    let assembled_len = max_generated_tokens
+        .checked_mul(max_decoded_token_bytes)
+        .ok_or_else(|| Error::ModelLoadError("Voxtral assembled-text length overflowed".into()))?;
+    let assembled_capacity = assembled_len
+        .checked_next_power_of_two()
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| {
+            Error::ModelLoadError("Voxtral assembled-text capacity overflowed".into())
+        })?;
+    let committed = generated
+        .checked_add(assembled_capacity)
+        .ok_or_else(|| Error::ModelLoadError("Voxtral committed text bytes overflowed".into()))?;
+    let transactional = generated
+        .checked_mul(2)
+        .and_then(|bytes| {
+            assembled_capacity
+                .checked_mul(3)
+                .and_then(|text| bytes.checked_add(text))
+        })
+        .ok_or_else(|| {
+            Error::ModelLoadError("Voxtral transactional text bytes overflowed".into())
+        })?;
+    Ok((committed, transactional))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn checked_workspace_bytes(
     materialized: u64,
@@ -3090,19 +3383,46 @@ fn gelu(x: &Tensor) -> Result<Tensor> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_interleaved_rotary_emb, argmax, attention_scale_tensor, checked_workspace_bytes,
-        conv_output_length, create_valid_attention_mask, drop_last_mel_frame_for_voxtral,
-        load_voxtral_runtime_config, mel_frames_to_tensor, normalize_log_mel_with_max,
-        offline_left_pad_tokens_for_generation, offline_streaming_padding_samples,
-        pool_audio_embeddings_by_block, prepare_realtime_conv_input,
-        realtime_preparation_geometry_for, resample_audio, select_voxtral_dtype, text_delta,
-        validate_realtime_sample_ceiling, voxtral_generation_prefix_len,
-        voxtral_realtime_cuda_sliding_flash_options, voxtral_realtime_offline_frame_limit,
-        Conv1dGeometry, VoxtralRealtimePreparationMode,
+        apply_interleaved_rotary_emb, argmax, attention_scale_tensor,
+        checked_realtime_frontend_host_peak_bytes, checked_realtime_stream_peak_bytes,
+        checked_realtime_text_host_bytes, checked_workspace_bytes, conv_output_length,
+        create_valid_attention_mask, drop_last_mel_frame_for_voxtral, load_voxtral_runtime_config,
+        mel_frames_to_tensor, normalize_log_mel_with_max, offline_left_pad_tokens_for_generation,
+        offline_streaming_padding_samples, pool_audio_embeddings_by_block,
+        prepare_realtime_conv_input, realtime_preparation_geometry_for, resample_audio,
+        select_voxtral_dtype, text_delta, validate_realtime_sample_ceiling,
+        voxtral_generation_prefix_len, voxtral_realtime_cuda_sliding_flash_options,
+        voxtral_realtime_offline_frame_limit, Conv1dGeometry, VoxtralRealtimePreparationMode,
     };
     use crate::backends::{BackendKind, DeviceCapabilities, DeviceKind, DeviceProfile};
     use candle_core::{DType, Device, Tensor};
     use uuid::Uuid;
+
+    #[test]
+    fn realtime_stream_peak_covers_transactional_overlap() {
+        assert_eq!(
+            checked_realtime_stream_peak_bytes(80, 12, 24, 16).unwrap(),
+            (92, 64)
+        );
+        assert!(checked_realtime_stream_peak_bytes(u64::MAX, 1, 1, 1).is_err());
+        assert!(checked_realtime_stream_peak_bytes(1, 1, u64::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn realtime_frontend_peak_accounts_for_host_stft_and_mel_buffers() {
+        let peak = checked_realtime_frontend_host_peak_bytes(40, 10, 20, 4, 3, 8).unwrap();
+        let expected = 80 // source/checkpoint/ingress/replacement relation
+            + 40 // resampled
+            + 80 // padded PCM
+            + 112 // reflection-padded PCM
+            + 64 // complex FFT frame
+            + 20 // power spectrum
+            + 48 // flat mel
+            + 48 + 4 * std::mem::size_of::<Vec<f32>>() as u64; // nested mel
+        assert_eq!(peak, expected);
+
+        assert_eq!(checked_realtime_text_host_bytes(8, 3).unwrap(), (64, 160));
+    }
 
     #[test]
     fn voxtral_dense_cuda_uses_checkpoint_dtype() {

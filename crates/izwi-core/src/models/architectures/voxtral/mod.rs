@@ -22,6 +22,76 @@ pub mod tts;
 
 use lm::VoxtralLM;
 
+pub(crate) const VOXTRAL_REALTIME_EXECUTION_ABI: u32 = 24;
+pub(crate) const VOXTRAL_REALTIME_PREPARATION_STAGE: &str = "asr.realtime.voxtral.preparation";
+pub(crate) const VOXTRAL_REALTIME_PROMPT_PREFILL_STAGE: &str =
+    "asr.realtime.voxtral.prompt_prefill";
+pub(crate) const VOXTRAL_REALTIME_DECODE_STAGE: &str = "asr.realtime.voxtral.decode";
+pub(crate) const VOXTRAL_REALTIME_COMPLETION_STAGE: &str = "asr.realtime.voxtral.completion";
+
+pub(crate) fn authenticate_voxtral_realtime_execution_binding(
+    binding: &crate::engine::ExecutionAdapterBinding,
+) -> Result<()> {
+    if binding.model_variant != crate::model::ModelVariant::VoxtralMini4BRealtime2602
+        || binding.capability_id != "realtime_asr"
+        || binding.adapter_abi_revision
+            != crate::engine::AdapterAbiRevision::new(VOXTRAL_REALTIME_EXECUTION_ABI)
+        || binding.stages.len() != 4
+    {
+        return Err(Error::InvalidInput(
+            "realtime ASR request is not bound to the exact Voxtral execution ABI".into(),
+        ));
+    }
+    let expected = [
+        (
+            0,
+            VOXTRAL_REALTIME_PREPARATION_STAGE,
+            StageWorkSelector::RealtimePreparation,
+            NativeBatchMode::Static,
+            StageShapePolicy::Padded,
+        ),
+        (
+            1,
+            VOXTRAL_REALTIME_PROMPT_PREFILL_STAGE,
+            StageWorkSelector::RealtimePromptPrefill,
+            NativeBatchMode::None,
+            StageShapePolicy::Exact,
+        ),
+        (
+            2,
+            VOXTRAL_REALTIME_DECODE_STAGE,
+            StageWorkSelector::RealtimeDecodeContinuation,
+            NativeBatchMode::Continuous,
+            StageShapePolicy::Ragged,
+        ),
+        (
+            3,
+            VOXTRAL_REALTIME_COMPLETION_STAGE,
+            StageWorkSelector::RealtimeCompletion,
+            NativeBatchMode::None,
+            StageShapePolicy::Exact,
+        ),
+    ];
+    if !binding
+        .stages
+        .iter()
+        .zip(expected)
+        .all(|(stage, expected)| {
+            stage.id == crate::engine::StageId::new(expected.0)
+                && stage.name == expected.1
+                && stage.selector == expected.2
+                && stage.batch_mode == expected.3
+                && stage.shape_policy == expected.4
+                && stage.output_visibility == OutputVisibility::AfterQuantumCommit
+        })
+    {
+        return Err(Error::InvalidInput(
+            "realtime ASR request crossed the sealed Voxtral stage graph".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct VoxtralPhysicalStateSpec {
     pub(crate) descriptor: CapabilityStateDescriptorV2,
@@ -107,28 +177,85 @@ pub(crate) fn voxtral_realtime_physical_state_spec(
         ));
     }
     for stages in stage_graphs {
-        let valid_stage = |stage: &StageDescriptor, selector| {
-            stage.selector == selector
-                && stage.progress == StageProgressKind::InputDriven
-                && stage.membership_safe_point == MembershipSafePoint::InputBoundary
-                && stage.output_visibility == OutputVisibility::AfterQuantumCommit
-                && stage.batch_mode == NativeBatchMode::None
-                && stage.max_batch_size == 1
-                && stage.max_work_units < u64::MAX
-                && stage.max_workspace_bytes > 0
-                && stage.shape_policy == StageShapePolicy::Exact
-                && stage.concurrency == ConcurrencyClass::Exclusive
-        };
-        let valid = stages.len() == 2
-            && stages
-                .iter()
-                .any(|stage| valid_stage(stage, StageWorkSelector::RealtimePush))
-            && stages
-                .iter()
-                .any(|stage| valid_stage(stage, StageWorkSelector::RealtimeFinish));
+        let preparation = stages.iter().find(|stage| {
+            stage.name == VOXTRAL_REALTIME_PREPARATION_STAGE
+                && stage.selector == StageWorkSelector::RealtimePreparation
+        });
+        let prompt = stages.iter().find(|stage| {
+            stage.name == VOXTRAL_REALTIME_PROMPT_PREFILL_STAGE
+                && stage.selector == StageWorkSelector::RealtimePromptPrefill
+        });
+        let decode = stages.iter().find(|stage| {
+            stage.name == VOXTRAL_REALTIME_DECODE_STAGE
+                && stage.selector == StageWorkSelector::RealtimeDecodeContinuation
+        });
+        let completion = stages.iter().find(|stage| {
+            stage.name == VOXTRAL_REALTIME_COMPLETION_STAGE
+                && stage.selector == StageWorkSelector::RealtimeCompletion
+        });
+        let native_width = preparation.map(|stage| stage.max_batch_size).unwrap_or(0);
+        let valid = stages.len() == 4
+            && preparation.is_some_and(|stage| {
+                stage.id.get() == 0
+                    && stage.progress == StageProgressKind::InputDriven
+                    && stage.membership_safe_point == MembershipSafePoint::InputBoundary
+                    && stage.output_visibility == OutputVisibility::AfterQuantumCommit
+                    && stage.batch_mode == NativeBatchMode::Static
+                    && stage.max_batch_size > 0
+                    && stage.max_work_units < u64::MAX
+                    && stage.workspace_per_row_bytes > 0
+                    && stage.max_workspace_bytes >= stage.workspace_per_row_bytes
+                    && u64::try_from(stage.max_batch_size)
+                        .ok()
+                        .and_then(|width| stage.workspace_per_row_bytes.checked_mul(width))
+                        == Some(stage.max_workspace_bytes)
+                    && stage.shape_policy == StageShapePolicy::Padded
+                    && stage.concurrency == ConcurrencyClass::Batchable
+            })
+            && prompt.is_some_and(|stage| {
+                stage.id.get() == 1
+                    && stage.progress == StageProgressKind::InputDriven
+                    && stage.membership_safe_point == MembershipSafePoint::InputBoundary
+                    && stage.output_visibility == OutputVisibility::AfterQuantumCommit
+                    && stage.batch_mode == NativeBatchMode::None
+                    && stage.max_batch_size == 1
+                    && stage.max_work_units < u64::MAX
+                    && stage.max_workspace_bytes > 0
+                    && stage.shape_policy == StageShapePolicy::Exact
+                    && stage.concurrency == ConcurrencyClass::Exclusive
+            })
+            && decode.is_some_and(|stage| {
+                stage.id.get() == 2
+                    && stage.progress == StageProgressKind::Iterative
+                    && stage.membership_safe_point == MembershipSafePoint::QuantumBoundary
+                    && stage.output_visibility == OutputVisibility::AfterQuantumCommit
+                    && stage.batch_mode == NativeBatchMode::Continuous
+                    && stage.max_batch_size > 0
+                    && stage.max_batch_size == native_width
+                    && stage.max_work_units == u64::try_from(native_width).unwrap_or(0)
+                    && stage.max_work_units < u64::MAX
+                    && stage.workspace_per_row_bytes > 0
+                    && stage.max_workspace_bytes >= stage.workspace_per_row_bytes
+                    && u64::try_from(stage.max_batch_size)
+                        .ok()
+                        .and_then(|width| stage.workspace_per_row_bytes.checked_mul(width))
+                        == Some(stage.max_workspace_bytes)
+                    && stage.shape_policy == StageShapePolicy::Ragged
+                    && stage.concurrency == ConcurrencyClass::Batchable
+            })
+            && completion.is_some_and(|stage| {
+                stage.id.get() == 3
+                    && stage.output_visibility == OutputVisibility::AfterQuantumCommit
+                    && stage.batch_mode == NativeBatchMode::None
+                    && stage.max_batch_size == 1
+                    && stage.max_work_units == 1
+                    && stage.max_workspace_bytes == 0
+                    && stage.shape_policy == StageShapePolicy::Exact
+                    && stage.concurrency == ConcurrencyClass::Exclusive
+            });
         if !valid {
             return Err(Error::ModelLoadError(
-                "Voxtral realtime requires bounded-workspace exact exclusive push and finish stages"
+                "Voxtral realtime requires its exact sealed preparation, prompt, decode, and completion graph"
                     .into(),
             ));
         }
@@ -145,7 +272,12 @@ pub(crate) fn voxtral_realtime_physical_state_spec(
         ordered.sort_unstable_by_key(|stage| stage.id);
         let mut invocation_stages = Vec::with_capacity(ordered.len());
         for (index, stage) in ordered.into_iter().enumerate() {
-            let domains = if stage.max_workspace_bytes == 0 {
+            let per_row_workspace = if stage.workspace_per_row_bytes == 0 {
+                stage.max_workspace_bytes
+            } else {
+                stage.workspace_per_row_bytes
+            };
+            let domains = if per_row_workspace == 0 {
                 Vec::new()
             } else {
                 let scratch_id = max_domain_id
@@ -163,7 +295,7 @@ pub(crate) fn voxtral_realtime_physical_state_spec(
                     alignment_bytes: 64,
                     zero_on_release: false,
                     formula: WorkspaceFormula {
-                        fixed_bytes: stage.max_workspace_bytes,
+                        fixed_bytes: per_row_workspace,
                         dimensions: vec![],
                         terms: vec![],
                     },

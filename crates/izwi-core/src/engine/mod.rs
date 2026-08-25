@@ -90,8 +90,9 @@ pub use execution::{
     ManagedTensorStateReservation, MembershipSafePoint, ModelInstanceId, NativeBatchMode,
     OutcomeProvenance, OutputVisibility, PhysicalBatch, PhysicalBatchReport,
     PhysicalBatchRowReport, PhysicalLaunchPolicy, PlanId, PrefillMode, ReadyQuantum,
-    RealtimeOperationId, RetryDisposition, SequencePhase, SequenceRestartReason, SessionEpoch,
-    SessionKey, StageDescriptor, StageId, StageProgressKind, StageShapePolicy, StageWorkSelector,
+    RealtimeOperationId, RealtimePreparationMode, RealtimeStageOutcome, RealtimeSubphase,
+    RetryDisposition, SequencePhase, SequenceRestartReason, SessionEpoch, SessionKey,
+    StageDescriptor, StageId, StageProgressKind, StageShapePolicy, StageWorkSelector,
     StateDisposition, TerminalOutcome, WorkCost, WorkUnit, YieldReason,
 };
 pub use executor::{
@@ -162,7 +163,8 @@ pub use metrics::{
 pub use output::{AsrProgress, AsrProgressPhase, OutputProcessor, StreamingOutput};
 pub use request::{
     AsrEngineInput, AudioChatEngineInput, ChatEngineInput, EngineAudioInput, EngineCoreRequest,
-    EngineStreamPolicy, EngineTask, RequestProcessor, RequestStatus, TtsEngineInput, WorkloadClass,
+    EngineStreamPolicy, EngineTask, RealtimeAsrOperationAck, RealtimeAsrOperationKind,
+    RequestProcessor, RequestStatus, TtsEngineInput, WorkloadClass,
 };
 pub use resources::{
     BatchWorkspaceLease, CapacitySource, PhysicalCapacityProvider, PhysicalCapacitySnapshot,
@@ -199,6 +201,48 @@ struct RequestControl {
     session_epoch: SequenceId,
     cancellation: Arc<std::sync::atomic::AtomicBool>,
     model_variant: Option<ModelVariant>,
+}
+
+/// Opaque ownership fence for one exact Engine-managed realtime ASR session.
+#[derive(Debug, Clone)]
+pub(crate) struct RealtimeAsrSessionHandle {
+    session: SessionKey,
+    committed_outputs: Arc<Mutex<mpsc::Receiver<StreamingOutput>>>,
+    operation_gate: Arc<Mutex<()>>,
+}
+
+impl RealtimeAsrSessionHandle {
+    pub(crate) fn request_id(&self) -> &str {
+        &self.session.request_id
+    }
+}
+
+/// Awaitable proof that the exact realtime session has left both executor and
+/// managed-cache ownership. Dropping a receipt does not cancel Core cleanup.
+pub(crate) struct RealtimeAsrCleanupReceipt {
+    confirmation: oneshot::Receiver<Result<()>>,
+}
+
+impl RealtimeAsrCleanupReceipt {
+    pub(crate) async fn confirmed(self) -> Result<()> {
+        self.confirmation.await.map_err(|_| {
+            Error::InferenceError("Engine stopped before realtime ASR cleanup was confirmed".into())
+        })?
+    }
+}
+
+impl PartialEq for RealtimeAsrSessionHandle {
+    fn eq(&self, other: &Self) -> bool {
+        self.session == other.session
+    }
+}
+
+impl Eq for RealtimeAsrSessionHandle {}
+
+impl std::hash::Hash for RealtimeAsrSessionHandle {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.session.hash(state);
+    }
 }
 
 struct CompletionMailbox {
@@ -2049,6 +2093,301 @@ impl Engine {
         self.core.read().await.get_session_key(request_id)
     }
 
+    /// Start a retained realtime ASR session without publishing it through
+    /// RuntimeService capability discovery. The request must already carry the
+    /// exact loaded execution/state binding selected by its owner.
+    pub(crate) async fn start_realtime_asr_session(
+        &self,
+        mut request: EngineCoreRequest,
+    ) -> Result<RealtimeAsrSessionHandle> {
+        let variant = request.model_variant.ok_or_else(|| {
+            Error::InvalidInput("realtime ASR session is missing a model variant".into())
+        })?;
+        if request.task_type != TaskType::ASR
+            || variant.family() != crate::catalog::ModelFamily::Voxtral
+        {
+            return Err(Error::InvalidInput(
+                "Engine realtime ASR sessions currently require a Voxtral ASR request".into(),
+            ));
+        }
+        request.enable_realtime_asr_ingress()?;
+        let (streaming_tx, committed_outputs) =
+            mpsc::channel(Self::streaming_queue_capacity(&request));
+        request.streaming = true;
+        request.streaming_tx = Some(streaming_tx);
+        let cancellation = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        request.set_cancellation_signal(cancellation.clone());
+        let request_id = request.id.clone();
+        let _step = self.step_gate.lock().await;
+        let session = self.core.write().await.add_realtime_asr_session(request)?;
+        self.request_controls
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(
+                request_id,
+                RequestControl {
+                    session_epoch: session.epoch,
+                    cancellation,
+                    model_variant: Some(variant),
+                },
+            );
+        self.wake_notify.notify_one();
+        Ok(RealtimeAsrSessionHandle {
+            session,
+            committed_outputs: Arc::new(Mutex::new(committed_outputs)),
+            operation_gate: Arc::new(Mutex::new(())),
+        })
+    }
+
+    async fn await_realtime_asr_operation_with_outputs(
+        &self,
+        handle: &RealtimeAsrSessionHandle,
+        expected_operation: RealtimeOperationId,
+        mut waiter: request::RealtimeAsrOperationWaiter,
+    ) -> Result<(RealtimeAsrOperationAck, Vec<StreamingOutput>)> {
+        let mut receiver = handle.committed_outputs.lock().await;
+        let mut outputs = Vec::new();
+        let mut receiver_open = true;
+        let outcome = loop {
+            tokio::select! {
+                outcome = &mut waiter => break outcome.map_err(|_| {
+                    Error::InferenceError(
+                        "realtime ASR operation waiter closed without an authoritative result".into(),
+                    )
+                })?,
+                output = receiver.recv(), if receiver_open => match output {
+                    Some(output) => outputs.push(output),
+                    None => receiver_open = false,
+                },
+            }
+        };
+
+        // The engine run loop holds this gate through Core commit and stream
+        // delivery. The waiter can resolve during Core commit. Continue
+        // draining concurrently while waiting to reacquire the gate so a
+        // bounded output channel cannot block that delivery and deadlock the
+        // operation's final barrier.
+        let delivery_barrier = self.step_gate.lock();
+        tokio::pin!(delivery_barrier);
+        let _delivery_barrier = loop {
+            tokio::select! {
+                barrier = &mut delivery_barrier => break barrier,
+                output = receiver.recv(), if receiver_open => match output {
+                    Some(output) => outputs.push(output),
+                    None => receiver_open = false,
+                },
+            }
+        };
+        while let Ok(output) = receiver.try_recv() {
+            outputs.push(output);
+        }
+        let acknowledgement = Self::realtime_operation_result(expected_operation, outcome)?;
+        Ok((acknowledgement, outputs))
+    }
+
+    fn realtime_operation_result(
+        expected_operation: RealtimeOperationId,
+        outcome: request::RealtimeAsrOperationOutcome,
+    ) -> Result<RealtimeAsrOperationAck> {
+        match outcome {
+            Ok(ack) if ack.operation_id() == expected_operation => Ok(ack),
+            Ok(_) => Err(Error::InferenceError(
+                "realtime ASR acknowledgement crossed its operation identity fence".into(),
+            )),
+            Err(request::RealtimeAsrTerminalOutcome::Cancelled) => Err(Error::Cancelled(
+                "realtime ASR session was cancelled".into(),
+            )),
+            Err(request::RealtimeAsrTerminalOutcome::TimedOut) => Err(Error::Timeout(
+                "realtime ASR session exceeded its deadline".into(),
+            )),
+            Err(request::RealtimeAsrTerminalOutcome::Unloaded) => Err(Error::ModelNotFound(
+                "realtime ASR model was unloaded".into(),
+            )),
+            Err(request::RealtimeAsrTerminalOutcome::Completed) => Err(Error::InferenceError(
+                "realtime ASR session completed before this operation committed".into(),
+            )),
+            Err(request::RealtimeAsrTerminalOutcome::Failed(message)) => {
+                Err(Error::InferenceError(message.to_string()))
+            }
+        }
+    }
+
+    /// Queue one exact source-sample interval and wait for its authoritative
+    /// commit acknowledgement. Engine stepping must be running concurrently.
+    pub(crate) async fn push_realtime_asr_samples(
+        &self,
+        handle: &RealtimeAsrSessionHandle,
+        samples: Vec<f32>,
+        sample_rate: u32,
+        max_output_steps: usize,
+        max_cache_append: usize,
+    ) -> Result<RealtimeAsrOperationAck> {
+        self.push_realtime_asr_samples_with_outputs(
+            handle,
+            samples,
+            sample_rate,
+            max_output_steps,
+            max_cache_append,
+        )
+        .await
+        .map(|(ack, _)| ack)
+    }
+
+    pub(crate) async fn push_realtime_asr_samples_with_outputs(
+        &self,
+        handle: &RealtimeAsrSessionHandle,
+        samples: Vec<f32>,
+        sample_rate: u32,
+        max_output_steps: usize,
+        max_cache_append: usize,
+    ) -> Result<(RealtimeAsrOperationAck, Vec<StreamingOutput>)> {
+        let logical_units = u64::try_from(samples.len()).unwrap_or(u64::MAX).max(1);
+        self.push_realtime_asr_samples_with_outputs_and_cost(
+            handle,
+            samples,
+            sample_rate,
+            max_output_steps,
+            max_cache_append,
+            WorkCost::new(logical_units, logical_units, 0),
+        )
+        .await
+    }
+
+    pub(crate) async fn push_realtime_asr_samples_with_outputs_and_cost(
+        &self,
+        handle: &RealtimeAsrSessionHandle,
+        samples: Vec<f32>,
+        sample_rate: u32,
+        max_output_steps: usize,
+        max_cache_append: usize,
+        preparation_cost: WorkCost,
+    ) -> Result<(RealtimeAsrOperationAck, Vec<StreamingOutput>)> {
+        let _operation = handle.operation_gate.lock().await;
+        let (operation_id, waiter) = {
+            let _step = self.step_gate.lock().await;
+            let mut core = self.core.write().await;
+            core.enqueue_realtime_asr_push_with_cost(
+                &handle.session,
+                Arc::from(samples),
+                sample_rate,
+                max_output_steps,
+                max_cache_append,
+                preparation_cost,
+            )
+            .await?
+        };
+        self.wake_notify.notify_one();
+        self.await_realtime_asr_operation_with_outputs(handle, operation_id, waiter)
+            .await
+    }
+
+    /// Fence input and wait until the exact finish operation commits.
+    pub(crate) async fn finish_realtime_asr_session(
+        &self,
+        handle: &RealtimeAsrSessionHandle,
+        max_output_steps: usize,
+        max_cache_append: usize,
+    ) -> Result<RealtimeAsrOperationAck> {
+        self.finish_realtime_asr_session_with_outputs(handle, max_output_steps, max_cache_append)
+            .await
+            .map(|(ack, _)| ack)
+    }
+
+    pub(crate) async fn finish_realtime_asr_session_with_outputs(
+        &self,
+        handle: &RealtimeAsrSessionHandle,
+        max_output_steps: usize,
+        max_cache_append: usize,
+    ) -> Result<(RealtimeAsrOperationAck, Vec<StreamingOutput>)> {
+        self.finish_realtime_asr_session_with_outputs_and_cost(
+            handle,
+            max_output_steps,
+            max_cache_append,
+            WorkCost::new(1, 1, 0),
+        )
+        .await
+    }
+
+    pub(crate) async fn finish_realtime_asr_session_with_outputs_and_cost(
+        &self,
+        handle: &RealtimeAsrSessionHandle,
+        max_output_steps: usize,
+        max_cache_append: usize,
+        preparation_cost: WorkCost,
+    ) -> Result<(RealtimeAsrOperationAck, Vec<StreamingOutput>)> {
+        let _operation = handle.operation_gate.lock().await;
+        let (operation_id, waiter) = {
+            let _step = self.step_gate.lock().await;
+            let mut core = self.core.write().await;
+            core.enqueue_realtime_asr_finish_with_cost(
+                &handle.session,
+                max_output_steps,
+                max_cache_append,
+                preparation_cost,
+            )
+            .await?
+        };
+        self.wake_notify.notify_one();
+        self.await_realtime_asr_operation_with_outputs(handle, operation_id, waiter)
+            .await
+    }
+
+    /// Abort only the exact session incarnation carried by this handle.
+    pub(crate) async fn abort_realtime_asr_session(
+        &self,
+        handle: &RealtimeAsrSessionHandle,
+    ) -> Result<bool> {
+        self.abort_request_session(&handle.session).await
+    }
+
+    /// Begin exact-session cleanup and return proof that executor and managed
+    /// cache ownership have both been released. Acceptance of cancellation is
+    /// deliberately not treated as cleanup confirmation.
+    pub(crate) async fn cleanup_realtime_asr_session(
+        &self,
+        handle: &RealtimeAsrSessionHandle,
+    ) -> Result<RealtimeAsrCleanupReceipt> {
+        {
+            let controls = self
+                .request_controls
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if let Some(control) = controls
+                .get(&handle.session.request_id)
+                .filter(|control| control.session_epoch == handle.session.epoch)
+            {
+                control
+                    .cancellation
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        // Cleanup has no output consumer. Close the bounded receiver before
+        // waiting for confirmation so terminal delivery cannot backpressure
+        // the run loop that owns cleanup retries. An active operation holds
+        // this mutex until cancellation resolves its exact waiter.
+        handle.committed_outputs.lock().await.close();
+        let _step = self.step_gate.lock().await;
+        let confirmation = self
+            .core
+            .write()
+            .await
+            .begin_confirmed_session_cleanup(&handle.session)
+            .await;
+        let mut controls = self
+            .request_controls
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if controls
+            .get(&handle.session.request_id)
+            .is_some_and(|control| control.session_epoch == handle.session.epoch)
+        {
+            controls.remove(&handle.session.request_id);
+        }
+        drop(controls);
+        self.wake_notify.notify_one();
+        Ok(RealtimeAsrCleanupReceipt { confirmation })
+    }
+
     #[cfg(test)]
     pub(crate) async fn hold_core_step_lock_for_test(
         &self,
@@ -3058,6 +3397,67 @@ mod tests {
         let config = EngineCoreConfig::default();
         let engine = Engine::new(config);
         assert!(engine.is_ok());
+    }
+
+    #[tokio::test]
+    async fn realtime_operation_drains_bounded_outputs_before_commit_delivery_barrier() {
+        let engine = Arc::new(Engine::new(EngineCoreConfig::default()).unwrap());
+        let (tx, rx) = mpsc::channel(1);
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let operation_id = RealtimeOperationId::new(7);
+        let handle = RealtimeAsrSessionHandle {
+            session: SessionKey::new("realtime-delivery-barrier".into(), 1),
+            committed_outputs: Arc::new(Mutex::new(rx)),
+            operation_gate: Arc::new(Mutex::new(())),
+        };
+        let barrier = engine.step_gate.lock().await;
+        let task_engine = engine.clone();
+        let task_handle = handle.clone();
+        let drain = tokio::spawn(async move {
+            task_engine
+                .await_realtime_asr_operation_with_outputs(&task_handle, operation_id, ack_rx)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!drain.is_finished());
+        tx.send(StreamingOutput {
+            request_id: handle.request_id().to_string(),
+            sequence: 0,
+            samples: Vec::new(),
+            sample_rate: 0,
+            is_final: false,
+            text: Some("committed".into()),
+            stats: None,
+            asr_progress: None,
+        })
+        .await
+        .unwrap();
+        tx.send(StreamingOutput {
+            request_id: handle.request_id().to_string(),
+            sequence: 1,
+            samples: Vec::new(),
+            sample_rate: 0,
+            is_final: false,
+            text: Some(" tail".into()),
+            stats: None,
+            asr_progress: None,
+        })
+        .await
+        .expect("concurrent drain must free the bounded channel");
+        ack_tx
+            .send(Ok(request::RealtimeAsrOperationAck::for_test(
+                operation_id,
+                request::RealtimeAsrOperationKind::Push,
+                1,
+            )))
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert!(!drain.is_finished());
+        drop(barrier);
+        let (_ack, outputs) = drain.await.unwrap().unwrap();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].text.as_deref(), Some("committed"));
+        assert_eq!(outputs[1].text.as_deref(), Some(" tail"));
     }
 
     #[test]

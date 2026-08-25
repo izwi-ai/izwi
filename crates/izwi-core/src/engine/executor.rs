@@ -49,8 +49,9 @@ use super::execution::{
     DispatchState, ExecutionCapabilities, ExecutionDisposition, ExecutionDomain, ExecutionFailure,
     ExecutionMode, ExecutionProfile, FailureKind, FailureOrigin, FailureScope, FinishReason,
     HealthImpact, ManagedSessionGeneration, NativeBatchMode, OutcomeProvenance, PhysicalBatch,
-    PhysicalLaunchPolicy, PlanId, PrefillMode, RetryDisposition, SequencePhase, SessionKey,
-    StageId, StageProgressKind, StageWorkSelector, WorkUnit, YieldReason,
+    PhysicalLaunchPolicy, PlanId, PrefillMode, ReadyQuantum, RealtimeStageOutcome,
+    RetryDisposition, SequencePhase, SessionKey, StageId, StageProgressKind, StageWorkSelector,
+    WorkUnit, YieldReason,
 };
 use super::metrics::{
     begin_engine_physical_dispatch, record_engine_physical_defer, record_engine_physical_fallback,
@@ -1210,6 +1211,7 @@ pub struct ModelSessionResult {
     /// The result is not authoritative unless Core resolves the exact
     /// executor-owned post-model transaction registered for its plan/session.
     pub(crate) pending_quantum_required: bool,
+    pub(crate) realtime_stage_outcome: Option<RealtimeStageOutcome>,
     pub(crate) clocked_state_completion: Option<crate::backends::state::TensorStateBatchCompletion>,
 }
 
@@ -1246,6 +1248,7 @@ impl ModelSessionResult {
             managed_cache_completions: Vec::new(),
             managed_cache_append: None,
             pending_quantum_required: false,
+            realtime_stage_outcome: None,
             clocked_state_completion: None,
         }
     }
@@ -1260,6 +1263,7 @@ impl ModelSessionResult {
             managed_cache_completions: Vec::new(),
             managed_cache_append: None,
             pending_quantum_required: false,
+            realtime_stage_outcome: None,
             clocked_state_completion: None,
         }
     }
@@ -1289,6 +1293,7 @@ impl ModelSessionResult {
             managed_cache_completions: Vec::new(),
             managed_cache_append: None,
             pending_quantum_required: false,
+            realtime_stage_outcome: None,
             clocked_state_completion: None,
         }
     }
@@ -1304,6 +1309,7 @@ impl ModelSessionResult {
             managed_cache_completions: Vec::new(),
             managed_cache_append: None,
             pending_quantum_required: false,
+            realtime_stage_outcome: None,
             clocked_state_completion: None,
         }
     }
@@ -1319,6 +1325,7 @@ impl ModelSessionResult {
             managed_cache_completions: Vec::new(),
             managed_cache_append: None,
             pending_quantum_required: false,
+            realtime_stage_outcome: None,
             clocked_state_completion: None,
         }
     }
@@ -1348,6 +1355,7 @@ impl ModelSessionResult {
             managed_cache_completions: Vec::new(),
             managed_cache_append: None,
             pending_quantum_required: false,
+            realtime_stage_outcome: None,
             clocked_state_completion: None,
         }
     }
@@ -1372,6 +1380,11 @@ impl ModelSessionResult {
 
     pub(crate) fn requiring_pending_quantum(mut self) -> Self {
         self.pending_quantum_required = true;
+        self
+    }
+
+    pub(crate) fn with_realtime_stage_outcome(mut self, outcome: RealtimeStageOutcome) -> Self {
+        self.realtime_stage_outcome = Some(outcome);
         self
     }
 
@@ -1403,6 +1416,7 @@ pub struct ExecutorStepResult {
     pub(crate) managed_cache_completions: Vec<Arc<crate::backends::kv::KvWriteBatchCompletion>>,
     pub(crate) managed_cache_append: Option<usize>,
     pub(crate) pending_quantum_required: bool,
+    pub(crate) realtime_stage_outcome: Option<RealtimeStageOutcome>,
     pub(crate) clocked_state_completion: Option<crate::backends::state::TensorStateBatchCompletion>,
 }
 
@@ -1433,6 +1447,7 @@ impl ExecutorStepResult {
             managed_cache_completions: session_result.managed_cache_completions,
             managed_cache_append: session_result.managed_cache_append,
             pending_quantum_required: session_result.pending_quantum_required,
+            realtime_stage_outcome: session_result.realtime_stage_outcome,
             clocked_state_completion: session_result.clocked_state_completion,
         }
     }
@@ -1739,9 +1754,9 @@ impl CacheReleaseReport {
 }
 
 enum ExecutorStateSlot<T> {
-    Ready(T),
-    InFlight,
-    Poisoned,
+    Ready { variant: ModelVariant, state: T },
+    InFlight { variant: ModelVariant },
+    Poisoned { variant: ModelVariant },
 }
 
 type ExecutorStateStore<T> = Mutex<HashMap<SessionKey, ExecutorStateSlot<T>>>;
@@ -1759,6 +1774,8 @@ struct ExecutorStateLease<'a, T> {
     session: SessionKey,
     state: Option<T>,
     label: &'static str,
+    requested_variant: ModelVariant,
+    marker_variant: ModelVariant,
     dirty: bool,
     armed: bool,
 }
@@ -1767,6 +1784,7 @@ impl<'a, T> ExecutorStateLease<'a, T> {
     fn checkout(
         store: &'a ExecutorStateStore<T>,
         session: SessionKey,
+        requested_variant: ModelVariant,
         label: &'static str,
     ) -> Result<Self> {
         use std::collections::hash_map::Entry;
@@ -1777,24 +1795,29 @@ impl<'a, T> ExecutorStateLease<'a, T> {
                 .map_err(|_| Error::InferenceError(format!("{label} state mutex poisoned")))?;
             match states.entry(session.clone()) {
                 Entry::Vacant(entry) => {
-                    entry.insert(ExecutorStateSlot::InFlight);
-                    None
+                    entry.insert(ExecutorStateSlot::InFlight {
+                        variant: requested_variant,
+                    });
+                    (None, requested_variant)
                 }
                 Entry::Occupied(mut entry) => match entry.get() {
-                    ExecutorStateSlot::Ready(_) => {
-                        let previous = entry.insert(ExecutorStateSlot::InFlight);
-                        let ExecutorStateSlot::Ready(state) = previous else {
+                    ExecutorStateSlot::Ready { variant, .. } => {
+                        let marker_variant = *variant;
+                        let previous = entry.insert(ExecutorStateSlot::InFlight {
+                            variant: marker_variant,
+                        });
+                        let ExecutorStateSlot::Ready { state, .. } = previous else {
                             unreachable!("ready executor state changed under one mutex guard")
                         };
-                        Some(state)
+                        (Some(state), marker_variant)
                     }
-                    ExecutorStateSlot::InFlight => {
+                    ExecutorStateSlot::InFlight { .. } => {
                         return Err(Error::InferenceError(format!(
                             "{label} session {}:{} is already in flight",
                             session.request_id, session.epoch
                         )))
                     }
-                    ExecutorStateSlot::Poisoned => {
+                    ExecutorStateSlot::Poisoned { .. } => {
                         return Err(Error::InferenceError(format!(
                             "{label} session {}:{} is poisoned and requires cleanup",
                             session.request_id, session.epoch
@@ -1807,8 +1830,10 @@ impl<'a, T> ExecutorStateLease<'a, T> {
         Ok(Self {
             store,
             session,
-            state,
+            state: state.0,
             label,
+            requested_variant,
+            marker_variant: state.1,
             dirty: false,
             armed: true,
         })
@@ -1834,6 +1859,24 @@ impl<'a, T> ExecutorStateLease<'a, T> {
     fn discard_state(&mut self) {
         self.state.take();
         self.dirty = false;
+        if self.marker_variant != self.requested_variant {
+            let mut states = self
+                .store
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if matches!(
+                states.get(&self.session),
+                Some(ExecutorStateSlot::InFlight { variant }) if *variant == self.marker_variant
+            ) {
+                states.insert(
+                    self.session.clone(),
+                    ExecutorStateSlot::InFlight {
+                        variant: self.requested_variant,
+                    },
+                );
+                self.marker_variant = self.requested_variant;
+            }
+        }
     }
 
     fn install_state(&mut self, state: T) -> Result<()> {
@@ -1862,7 +1905,10 @@ impl<'a, T> ExecutorStateLease<'a, T> {
                 self.label, self.session.request_id, self.session.epoch
             ))
         })?;
-        let result = self.replace_in_flight(ExecutorStateSlot::Ready(state));
+        let result = self.replace_in_flight(ExecutorStateSlot::Ready {
+            variant: self.marker_variant,
+            state,
+        });
         if result.is_ok() {
             self.armed = false;
         }
@@ -1875,7 +1921,7 @@ impl<'a, T> ExecutorStateLease<'a, T> {
             .lock()
             .map_err(|_| Error::InferenceError(format!("{} state mutex poisoned", self.label)))?;
         match states.get(&self.session) {
-            Some(ExecutorStateSlot::InFlight) => {
+            Some(ExecutorStateSlot::InFlight { variant }) if *variant == self.marker_variant => {
                 states.remove(&self.session);
                 self.armed = false;
                 Ok(())
@@ -1891,7 +1937,10 @@ impl<'a, T> ExecutorStateLease<'a, T> {
             let states = self.store.lock().map_err(|_| {
                 Error::InferenceError(format!("{} state mutex poisoned", self.label))
             })?;
-            if !matches!(states.get(&self.session), Some(ExecutorStateSlot::InFlight)) {
+            if !matches!(
+                states.get(&self.session),
+                Some(ExecutorStateSlot::InFlight { variant }) if *variant == self.marker_variant
+            ) {
                 return Err(self.transition_collision());
             }
         }
@@ -1905,13 +1954,47 @@ impl<'a, T> ExecutorStateLease<'a, T> {
         Ok(state)
     }
 
+    /// Validate the only fallible ownership checks performed by `defer`.
+    /// Callers sealing a cohort can validate every row before transferring
+    /// any row out of its rollback-capable lease.
+    fn validate_defer(&self) -> Result<()> {
+        let states = self
+            .store
+            .lock()
+            .map_err(|_| Error::InferenceError(format!("{} state mutex poisoned", self.label)))?;
+        if !matches!(
+            states.get(&self.session),
+            Some(ExecutorStateSlot::InFlight { variant }) if *variant == self.marker_variant
+        ) {
+            return Err(self.transition_collision());
+        }
+        if self.state.is_none() {
+            return Err(Error::InferenceError(format!(
+                "{} session {}:{} cannot defer an empty state",
+                self.label, self.session.request_id, self.session.epoch
+            )));
+        }
+        Ok(())
+    }
+
+    /// Transfer a lease after an all-row `validate_defer` barrier. No shared
+    /// state is touched between the barrier and this synchronous conversion.
+    fn defer_validated(mut self) -> T {
+        let state = self
+            .state
+            .take()
+            .expect("validated executor state lease must retain its state");
+        self.armed = false;
+        state
+    }
+
     fn replace_in_flight(&mut self, replacement: ExecutorStateSlot<T>) -> Result<()> {
         let mut states = self
             .store
             .lock()
             .map_err(|_| Error::InferenceError(format!("{} state mutex poisoned", self.label)))?;
         match states.get(&self.session) {
-            Some(ExecutorStateSlot::InFlight) => {
+            Some(ExecutorStateSlot::InFlight { variant }) if *variant == self.marker_variant => {
                 states.insert(self.session.clone(), replacement);
                 Ok(())
             }
@@ -1968,6 +2051,35 @@ impl VoxtralRealtimeStateCoordinator {
         Ok(())
     }
 
+    fn register_batch(
+        &self,
+        rows: Vec<(PlanId, PendingVoxtralRealtimeQuantum)>,
+    ) -> std::result::Result<(), (Error, Vec<(PlanId, PendingVoxtralRealtimeQuantum)>)> {
+        let mut quanta = match self.pending.lock() {
+            Ok(quanta) => quanta,
+            Err(_) => {
+                return Err((
+                    Error::InferenceError("Voxtral pending-quantum mutex poisoned".to_string()),
+                    rows,
+                ));
+            }
+        };
+        let mut plan_ids = std::collections::HashSet::with_capacity(rows.len());
+        if rows
+            .iter()
+            .any(|(plan_id, _)| !plan_ids.insert(*plan_id) || quanta.contains_key(plan_id))
+        {
+            return Err((
+                Error::InferenceError(
+                    "Voxtral cohort contains a duplicate pending plan".to_string(),
+                ),
+                rows,
+            ));
+        }
+        quanta.extend(rows);
+        Ok(())
+    }
+
     fn replace_in_flight(
         &self,
         session: &SessionKey,
@@ -1980,8 +2092,28 @@ impl VoxtralRealtimeStateCoordinator {
             .states
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !matches!(states.get(session), Some(ExecutorStateSlot::InFlight)) {
-            states.insert(session.clone(), ExecutorStateSlot::Poisoned);
+        let marker_variant = match states.get(session) {
+            Some(ExecutorStateSlot::InFlight { variant }) => *variant,
+            _ => replacement
+                .as_ref()
+                .map(|active| active.variant)
+                .ok_or_else(|| {
+                    Error::InferenceError(format!(
+                        "Voxtral realtime session {}:{} lost its pending variant identity",
+                        session.request_id, session.epoch
+                    ))
+                })?,
+        };
+        if !matches!(
+            states.get(session),
+            Some(ExecutorStateSlot::InFlight { variant }) if *variant == marker_variant
+        ) {
+            states.insert(
+                session.clone(),
+                ExecutorStateSlot::Poisoned {
+                    variant: marker_variant,
+                },
+            );
             return Err(Error::InferenceError(format!(
                 "Voxtral realtime session {}:{} lost its pending ownership marker",
                 session.request_id, session.epoch
@@ -1989,7 +2121,24 @@ impl VoxtralRealtimeStateCoordinator {
         }
         match replacement {
             Some(active) => {
-                states.insert(session.clone(), ExecutorStateSlot::Ready(active));
+                if active.variant != marker_variant {
+                    states.insert(
+                        session.clone(),
+                        ExecutorStateSlot::Poisoned {
+                            variant: marker_variant,
+                        },
+                    );
+                    return Err(Error::InferenceError(
+                        "Voxtral pending state crossed its retained model variant".into(),
+                    ));
+                }
+                states.insert(
+                    session.clone(),
+                    ExecutorStateSlot::Ready {
+                        variant: marker_variant,
+                        state: active,
+                    },
+                );
             }
             None => {
                 states.remove(session);
@@ -2003,7 +2152,12 @@ impl VoxtralRealtimeStateCoordinator {
             .states
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        states.insert(session.clone(), ExecutorStateSlot::Poisoned);
+        if let Some(variant) = states.get(session).and_then(|slot| match slot {
+            ExecutorStateSlot::InFlight { variant } => Some(*variant),
+            _ => None,
+        }) {
+            states.insert(session.clone(), ExecutorStateSlot::Poisoned { variant });
+        }
     }
 
     fn resolve_pending(
@@ -2186,11 +2340,21 @@ impl<T> Drop for ExecutorStateLease<'_, T> {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match states.entry(self.session.clone()) {
-            Entry::Occupied(mut entry) if matches!(entry.get(), ExecutorStateSlot::InFlight) => {
+            Entry::Occupied(mut entry)
+                if matches!(
+                    entry.get(),
+                    ExecutorStateSlot::InFlight { variant } if *variant == self.marker_variant
+                ) =>
+            {
                 if self.dirty {
-                    entry.insert(ExecutorStateSlot::Poisoned);
+                    entry.insert(ExecutorStateSlot::Poisoned {
+                        variant: self.marker_variant,
+                    });
                 } else if let Some(state) = self.state.take() {
-                    entry.insert(ExecutorStateSlot::Ready(state));
+                    entry.insert(ExecutorStateSlot::Ready {
+                        variant: self.marker_variant,
+                        state,
+                    });
                 } else {
                     entry.remove();
                 }
@@ -2198,7 +2362,9 @@ impl<T> Drop for ExecutorStateLease<'_, T> {
             Entry::Vacant(entry) => {
                 // A missing marker means another path observed ownership that
                 // was not actually released. Fence the session until cleanup.
-                entry.insert(ExecutorStateSlot::Poisoned);
+                entry.insert(ExecutorStateSlot::Poisoned {
+                    variant: self.marker_variant,
+                });
                 tracing::error!(
                     request_id = %self.session.request_id,
                     epoch = self.session.epoch,
@@ -2207,7 +2373,9 @@ impl<T> Drop for ExecutorStateLease<'_, T> {
                 );
             }
             Entry::Occupied(mut entry) => {
-                entry.insert(ExecutorStateSlot::Poisoned);
+                entry.insert(ExecutorStateSlot::Poisoned {
+                    variant: self.marker_variant,
+                });
                 tracing::error!(
                     request_id = %self.session.request_id,
                     epoch = self.session.epoch,
@@ -2230,6 +2398,62 @@ pub struct NativeExecutor {
 }
 
 impl NativeExecutor {
+    fn execute_voxtral_realtime_batch_with_rows(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+        rows: &[ReadyQuantum],
+        mode: NativeBatchMode,
+    ) -> Result<Vec<ExecutorStepResult>> {
+        let ordered_requests = scheduled
+            .iter()
+            .map(|scheduled| {
+                requests
+                    .iter()
+                    .copied()
+                    .find(|request| request.id == scheduled.request_id)
+                    .ok_or_else(|| {
+                        Error::InferenceError(
+                            "Voxtral native batch lost its request snapshot".into(),
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let managed = scheduled
+            .iter()
+            .zip(&ordered_requests)
+            .map(|(scheduled, request)| {
+                let reservation = rows
+                    .iter()
+                    .find(|row| row.plan_id == scheduled.plan_id)
+                    .and_then(|row| row.managed_cache.as_ref())
+                    .ok_or_else(|| {
+                        Error::InferenceError(
+                            "Voxtral native batch lost its retained reservation".into(),
+                        )
+                    })?;
+                retained_row_managed_state_for_row(request, scheduled, reservation).map(Some)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let outputs =
+            self.voxtral_realtime_batch_with_managed(&ordered_requests, scheduled, managed)?;
+        self.finish_scheduled_execution(
+            requests,
+            scheduled,
+            outputs,
+            match mode {
+                NativeBatchMode::Static => {
+                    BatchDispatch::new(super::BatchDispatchKind::TensorStatic, scheduled.len())
+                }
+                NativeBatchMode::Continuous => {
+                    BatchDispatch::new(super::BatchDispatchKind::TensorContinuous, scheduled.len())
+                }
+                NativeBatchMode::None => BatchDispatch::serial(),
+            },
+            Some(rows),
+        )
+    }
+
     /// Create a new native executor.
     pub fn new(config: WorkerConfig) -> Self {
         Self::with_voxtral_realtime(config, Arc::new(VoxtralRealtimeStateCoordinator::new()))
@@ -2697,6 +2921,42 @@ impl ModelExecutor for NativeExecutor {
                         execution.scheduled,
                         Some(&execution.batch.rows),
                     ),
+                NativeBatchRoute::Audio {
+                    task: TaskType::ASR,
+                    stage: NativeAudioStage::RealtimePreparation,
+                    mode: NativeBatchMode::Static,
+                    ..
+                } if execution.requests.iter().all(|request| {
+                    request.model_variant.is_some_and(|variant| {
+                        variant.family() == crate::catalog::ModelFamily::Voxtral
+                    })
+                }) =>
+                {
+                    self.execute_voxtral_realtime_batch_with_rows(
+                        execution.requests,
+                        execution.scheduled,
+                        &execution.batch.rows,
+                        NativeBatchMode::Static,
+                    )
+                }
+                NativeBatchRoute::Audio {
+                    task: TaskType::ASR,
+                    stage: NativeAudioStage::RealtimeDecodeContinuation,
+                    mode: NativeBatchMode::Continuous,
+                    ..
+                } if execution.requests.iter().all(|request| {
+                    request.model_variant.is_some_and(|variant| {
+                        variant.family() == crate::catalog::ModelFamily::Voxtral
+                    })
+                }) =>
+                {
+                    self.execute_voxtral_realtime_batch_with_rows(
+                        execution.requests,
+                        execution.scheduled,
+                        &execution.batch.rows,
+                        NativeBatchMode::Continuous,
+                    )
+                }
                 NativeBatchRoute::Audio {
                     task: TaskType::ASR,
                     stage: NativeAudioStage::SequencePrefill,
@@ -3464,18 +3724,31 @@ fn cleanup_model_states_locked<T>(
 ) -> StateCleanupSummary {
     let busy = states
         .values()
-        .filter(|state| matches!(state, ExecutorStateSlot::InFlight))
+        .filter(|state| {
+            matches!(state, ExecutorStateSlot::InFlight { variant: owner } if *owner == variant)
+        })
         .count();
     let unknown = states
         .values()
-        .filter(|state| matches!(state, ExecutorStateSlot::Poisoned))
+        .filter(|state| {
+            matches!(state, ExecutorStateSlot::Poisoned { variant: owner } if *owner == variant)
+                || matches!(
+                    state,
+                    ExecutorStateSlot::Ready {
+                        variant: owner,
+                        state: active,
+                    } if (*owner == variant || model_variant(active) == variant)
+                        && *owner != model_variant(active)
+                )
+        })
         .count();
     let sessions = states
         .iter()
         .filter_map(|(session, state)| match state {
-            ExecutorStateSlot::Ready(active) if model_variant(active) == variant => {
-                Some(session.clone())
-            }
+            ExecutorStateSlot::Ready {
+                variant: owner,
+                state: active,
+            } if *owner == variant && model_variant(active) == variant => Some(session.clone()),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -3500,11 +3773,11 @@ fn cleanup_request_states_locked<T>(
             return true;
         }
         match slot {
-            ExecutorStateSlot::InFlight => {
+            ExecutorStateSlot::InFlight { .. } => {
                 summary.busy = summary.busy.saturating_add(1);
                 true
             }
-            ExecutorStateSlot::Ready(_) | ExecutorStateSlot::Poisoned => {
+            ExecutorStateSlot::Ready { .. } | ExecutorStateSlot::Poisoned { .. } => {
                 summary.released = summary.released.saturating_add(1);
                 false
             }
@@ -3518,12 +3791,12 @@ fn cleanup_session_state_locked<T>(
     session: &SessionKey,
 ) -> StateCleanupSummary {
     match states.get(session) {
-        Some(ExecutorStateSlot::InFlight) => StateCleanupSummary {
+        Some(ExecutorStateSlot::InFlight { .. }) => StateCleanupSummary {
             released: 0,
             busy: 1,
             unknown: 0,
         },
-        Some(ExecutorStateSlot::Ready(_) | ExecutorStateSlot::Poisoned) => {
+        Some(ExecutorStateSlot::Ready { .. } | ExecutorStateSlot::Poisoned { .. }) => {
             states.remove(session);
             StateCleanupSummary {
                 released: 1,
@@ -3674,12 +3947,17 @@ mod tests {
     #[test]
     fn executor_state_lease_keeps_in_flight_ownership_visible_to_cleanup() {
         let session = SessionKey::new("visible-in-flight".to_string(), 7);
+        let variant = ModelVariant::Qwen306B;
         let store = Mutex::new(HashMap::from([(
             session.clone(),
-            ExecutorStateSlot::Ready("ready".to_string()),
+            ExecutorStateSlot::Ready {
+                variant,
+                state: "ready".to_string(),
+            },
         )]));
 
-        let lease = ExecutorStateLease::checkout(&store, session.clone(), "test state").unwrap();
+        let lease =
+            ExecutorStateLease::checkout(&store, session.clone(), variant, "test state").unwrap();
         assert_eq!(lease.state().map(String::as_str), Some("ready"));
 
         let summary = {
@@ -3699,29 +3977,35 @@ mod tests {
         let states = store.lock().unwrap();
         assert!(matches!(
             states.get(&session),
-            Some(ExecutorStateSlot::Ready(state)) if state == "ready"
+            Some(ExecutorStateSlot::Ready { state, .. }) if state == "ready"
         ));
     }
 
     #[test]
     fn dirty_executor_state_unwind_is_poisoned_until_cleanup() {
         let session = SessionKey::new("poison-on-unwind".to_string(), 3);
+        let variant = ModelVariant::Qwen306B;
         let store = Mutex::new(HashMap::from([(
             session.clone(),
-            ExecutorStateSlot::Ready(41usize),
+            ExecutorStateSlot::Ready {
+                variant,
+                state: 41usize,
+            },
         )]));
 
         let mut lease =
-            ExecutorStateLease::checkout(&store, session.clone(), "test state").unwrap();
+            ExecutorStateLease::checkout(&store, session.clone(), variant, "test state").unwrap();
         lease.mark_dirty();
         *lease.require_state_mut().unwrap() = 42;
         drop(lease);
 
         assert!(matches!(
             store.lock().unwrap().get(&session),
-            Some(ExecutorStateSlot::Poisoned)
+            Some(ExecutorStateSlot::Poisoned { variant: owner }) if *owner == variant
         ));
-        assert!(ExecutorStateLease::checkout(&store, session.clone(), "test state").is_err());
+        assert!(
+            ExecutorStateLease::checkout(&store, session.clone(), variant, "test state").is_err()
+        );
 
         let summary = {
             let mut states = store.lock().unwrap();
@@ -3743,7 +4027,9 @@ mod tests {
         let session = SessionKey::new("poisoned-model-purge".to_string(), 1);
         let mut states = HashMap::<SessionKey, ExecutorStateSlot<ModelVariant>>::from([(
             session,
-            ExecutorStateSlot::Poisoned,
+            ExecutorStateSlot::Poisoned {
+                variant: ModelVariant::VoxtralMini4BRealtime2602,
+            },
         )]);
 
         let summary = cleanup_model_states_locked(
@@ -3759,21 +4045,93 @@ mod tests {
     }
 
     #[test]
+    fn model_purge_ignores_other_variant_markers() {
+        let requested = ModelVariant::VoxtralMini4BRealtime2602;
+        let other_busy = SessionKey::new("other-busy".to_string(), 1);
+        let other_poisoned = SessionKey::new("other-poisoned".to_string(), 1);
+        let requested_ready = SessionKey::new("requested-ready".to_string(), 1);
+        let mut states = HashMap::from([
+            (
+                other_busy,
+                ExecutorStateSlot::InFlight {
+                    variant: ModelVariant::Qwen306B,
+                },
+            ),
+            (
+                other_poisoned,
+                ExecutorStateSlot::Poisoned {
+                    variant: ModelVariant::Qwen3Asr06BGguf,
+                },
+            ),
+            (
+                requested_ready.clone(),
+                ExecutorStateSlot::Ready {
+                    variant: requested,
+                    state: requested,
+                },
+            ),
+        ]);
+
+        let summary = cleanup_model_states_locked(&mut states, requested, |variant| *variant);
+        assert_eq!(
+            summary,
+            StateCleanupSummary {
+                released: 1,
+                busy: 0,
+                unknown: 0,
+            }
+        );
+        assert!(!states.contains_key(&requested_ready));
+        assert_eq!(states.len(), 2);
+        assert_eq!(
+            cleanup_report(summary).outcome,
+            CacheReleaseOutcome::Confirmed
+        );
+    }
+
+    #[test]
+    fn model_purge_reports_only_requested_variant_busy_marker() {
+        let requested = ModelVariant::VoxtralMini4BRealtime2602;
+        let mut states = HashMap::<SessionKey, ExecutorStateSlot<ModelVariant>>::from([
+            (
+                SessionKey::new("requested-busy".to_string(), 1),
+                ExecutorStateSlot::InFlight { variant: requested },
+            ),
+            (
+                SessionKey::new("other-poisoned".to_string(), 1),
+                ExecutorStateSlot::Poisoned {
+                    variant: ModelVariant::Qwen306B,
+                },
+            ),
+        ]);
+
+        let summary = cleanup_model_states_locked(&mut states, requested, |variant| *variant);
+        assert_eq!(summary.busy, 1);
+        assert_eq!(summary.unknown, 0);
+        assert_eq!(
+            cleanup_report(summary).outcome,
+            CacheReleaseOutcome::BusyInFlight
+        );
+    }
+
+    #[test]
     fn executor_state_lease_explicitly_restores_or_releases() {
         let session = SessionKey::new("explicit-transition".to_string(), 2);
+        let variant = ModelVariant::Qwen306B;
         let store = Mutex::new(HashMap::new());
 
         let mut lease =
-            ExecutorStateLease::checkout(&store, session.clone(), "test state").unwrap();
+            ExecutorStateLease::checkout(&store, session.clone(), variant, "test state").unwrap();
         lease.install_state(9usize).unwrap();
         lease.mark_dirty();
         lease.restore().unwrap();
         assert!(matches!(
             store.lock().unwrap().get(&session),
-            Some(ExecutorStateSlot::Ready(9))
+            Some(ExecutorStateSlot::Ready { state: 9, .. })
         ));
 
-        let lease = ExecutorStateLease::checkout(&store, session.clone(), "test state").unwrap();
+        let lease =
+            ExecutorStateLease::checkout(&store, session.clone(), variant, "test state").unwrap();
         lease.release().unwrap();
         assert!(!store.lock().unwrap().contains_key(&session));
     }
@@ -3782,21 +4140,24 @@ mod tests {
     fn native_cleanup_reports_busy_chat_tts_and_asr_sessions() {
         let executor = NativeExecutor::new(WorkerConfig::default());
         let session = SessionKey::new("all-modalities-in-flight".to_string(), 11);
-        executor
-            .chat_decode_states
-            .lock()
-            .unwrap()
-            .insert(session.clone(), ExecutorStateSlot::InFlight);
-        executor
-            .qwen_tts_decode_states
-            .lock()
-            .unwrap()
-            .insert(session.clone(), ExecutorStateSlot::InFlight);
-        executor
-            .asr_decode_states
-            .lock()
-            .unwrap()
-            .insert(session.clone(), ExecutorStateSlot::InFlight);
+        executor.chat_decode_states.lock().unwrap().insert(
+            session.clone(),
+            ExecutorStateSlot::InFlight {
+                variant: ModelVariant::Qwen306B,
+            },
+        );
+        executor.qwen_tts_decode_states.lock().unwrap().insert(
+            session.clone(),
+            ExecutorStateSlot::InFlight {
+                variant: ModelVariant::Qwen3Tts12Hz06BBase,
+            },
+        );
+        executor.asr_decode_states.lock().unwrap().insert(
+            session.clone(),
+            ExecutorStateSlot::InFlight {
+                variant: ModelVariant::Qwen3Asr06BGguf,
+            },
+        );
 
         let report = executor.cleanup_session(&session);
         assert_eq!(report.outcome, CacheReleaseOutcome::BusyInFlight);

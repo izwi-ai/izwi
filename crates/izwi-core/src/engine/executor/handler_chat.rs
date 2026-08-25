@@ -359,8 +359,12 @@ impl NativeExecutor {
         // Prefill scheduling can happen after preemption; only recover state
         // owned by this exact request incarnation. The in-flight marker remains
         // visible to cleanup until this quantum is committed or released.
-        let mut state_lease =
-            ExecutorStateLease::checkout(&self.chat_decode_states, session, "chat decode")?;
+        let mut state_lease = ExecutorStateLease::checkout(
+            &self.chat_decode_states,
+            session,
+            variant,
+            "chat decode",
+        )?;
         if state_lease
             .state()
             .map(|state| state.variant != variant)
@@ -700,6 +704,7 @@ impl NativeExecutor {
             let lease = ExecutorStateLease::checkout(
                 &self.chat_decode_states,
                 session.clone(),
+                expected_variant,
                 "continuous chat decode",
             )?;
             let state = lease.state().ok_or_else(|| {

@@ -35,7 +35,8 @@ const CONTINUOUS_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1
 const WHISPER_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(17);
 const VIBEVOICE_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(19);
 const GRANITE_SPEECH_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(22);
-const VOXTRAL_REALTIME_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(23);
+pub(crate) const VOXTRAL_REALTIME_ADAPTER_ABI: AdapterAbiRevision =
+    AdapterAbiRevision::new(crate::models::architectures::voxtral::VOXTRAL_REALTIME_EXECUTION_ABI);
 // Architecture ceiling: 8,192 codec frames, 1,920 output samples/frame,
 // f32-width intermediates, and up to 1,024 simultaneous channel-equivalents.
 // Exact request/model-derived costs remain smaller and are installed at
@@ -241,6 +242,15 @@ pub(crate) trait LoadedExecutionAdapter: fmt::Debug + Send + Sync {
     ) -> Result<()> {
         Err(Error::ModelLoadError(
             "loaded adapter does not own Granite Speech ASR preparation".into(),
+        ))
+    }
+
+    fn seal_voxtral_realtime_preparation(
+        &self,
+        _model: &crate::models::architectures::voxtral::realtime::VoxtralRealtimeModel,
+    ) -> Result<()> {
+        Err(Error::ModelLoadError(
+            "loaded adapter does not own Voxtral realtime preparation".into(),
         ))
     }
 
@@ -873,7 +883,7 @@ impl LoadedExecutionAdapterFactory for VoxtralRealtimeAdapterFactory {
     }
 
     fn batch_mode(&self) -> NativeBatchMode {
-        NativeBatchMode::None
+        NativeBatchMode::Continuous
     }
 
     fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
@@ -890,6 +900,7 @@ impl LoadedExecutionAdapterFactory for VoxtralRealtimeAdapterFactory {
             context.model_instance_id,
             metadata,
             context.backend_kind,
+            context.max_tensor_batch_size,
         )))
     }
 }
@@ -1119,6 +1130,7 @@ pub(super) fn built_in_loaded_adapter_factories() -> Vec<Arc<dyn LoadedExecution
     vec![
         Arc::new(PhysicalQwenTtsAdapterFactory),
         Arc::new(NemotronRealtimeAdapterFactory),
+        Arc::new(VoxtralRealtimeAdapterFactory),
         Arc::new(ContinuousPhysicalChatAdapterFactory),
         Arc::new(ContinuousPhysicalAsrAdapterFactory),
         Arc::new(WhisperPhysicalAsrAdapterFactory),
@@ -1135,6 +1147,10 @@ struct VoxtralRealtimeExecutionAdapter {
     adapter_instance_id: AdapterInstanceId,
     metadata: AdapterMetadata,
     backend_kind: BackendKind,
+    max_batch_size: usize,
+    preparation: OnceLock<
+        crate::models::architectures::voxtral::realtime::VoxtralRealtimePreparationStageSeal,
+    >,
 }
 
 impl VoxtralRealtimeExecutionAdapter {
@@ -1143,6 +1159,7 @@ impl VoxtralRealtimeExecutionAdapter {
         model_instance_id: ModelInstanceId,
         metadata: AdapterMetadata,
         backend_kind: BackendKind,
+        max_batch_size: usize,
     ) -> Self {
         Self {
             execution_group_id,
@@ -1152,7 +1169,27 @@ impl VoxtralRealtimeExecutionAdapter {
             ),
             metadata,
             backend_kind,
+            max_batch_size: max_batch_size.max(1),
+            preparation: OnceLock::new(),
         }
+    }
+
+    fn install_preparation_seal(
+        &self,
+        seal: crate::models::architectures::voxtral::realtime::VoxtralRealtimePreparationStageSeal,
+    ) -> Result<()> {
+        if let Some(existing) = self.preparation.get() {
+            return if existing == &seal {
+                Ok(())
+            } else {
+                Err(Error::ModelLoadError(
+                    "Voxtral realtime preparation was resealed with different geometry".into(),
+                ))
+            };
+        }
+        self.preparation.set(seal).map_err(|_| {
+            Error::ModelLoadError("Voxtral realtime preparation seal raced publication".into())
+        })
     }
 }
 
@@ -1169,6 +1206,34 @@ impl LoadedExecutionAdapter for VoxtralRealtimeExecutionAdapter {
         VOXTRAL_REALTIME_ADAPTER_ABI
     }
 
+    fn seal_voxtral_realtime_preparation(
+        &self,
+        model: &crate::models::architectures::voxtral::realtime::VoxtralRealtimeModel,
+    ) -> Result<()> {
+        self.install_preparation_seal(model.realtime_preparation_stage_seal()?)
+    }
+
+    #[cfg(test)]
+    fn install_test_preparation_seal(
+        &self,
+        _backend: BackendKind,
+        max_batch_size: usize,
+    ) -> Result<()> {
+        if max_batch_size.max(1) != self.max_batch_size {
+            return Err(Error::ModelLoadError(
+                "Voxtral realtime test seal crossed its adapter batch width".into(),
+            ));
+        }
+        self.install_preparation_seal(
+            crate::models::architectures::voxtral::realtime::VoxtralRealtimePreparationStageSeal {
+                max_source_samples: 32_000,
+                max_work_units: 32_000,
+                max_materialized_tensor_elements_per_row: 1_000_000,
+                max_workspace_bytes: 4_000_000,
+            },
+        )
+    }
+
     fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
         let metadata = self.metadata();
         let mut execution_profile =
@@ -1176,8 +1241,8 @@ impl LoadedExecutionAdapter for VoxtralRealtimeExecutionAdapter {
         execution_profile.mode = ExecutionMode::Realtime;
         execution_profile.prefill = PrefillMode::None;
         execution_profile.incremental_decode = true;
-        execution_profile.prefill_batch = NativeBatchMode::None;
-        execution_profile.decode_batch = NativeBatchMode::None;
+        execution_profile.prefill_batch = NativeBatchMode::Static;
+        execution_profile.decode_batch = NativeBatchMode::Continuous;
         execution_profile.cache_mode = CacheMode::ExternalPaged;
         execution_profile.cache_namespace = Some(format!(
             "{}:{}:realtime-state-v2",
@@ -1186,32 +1251,98 @@ impl LoadedExecutionAdapter for VoxtralRealtimeExecutionAdapter {
         ));
         execution_profile.kv_dtype = "state_v2_resolved".into();
         execution_profile.cancellation = CancellationGranularity::RealtimeChunk;
-        execution_profile.concurrency = ConcurrencyClass::Exclusive;
+        execution_profile.concurrency = ConcurrencyClass::Batchable;
         execution_profile.recompute_safe = false;
         execution_profile.cache_release_safe = true;
         execution_profile.prefix_reuse_safe = false;
-        execution_profile.max_batch_size = 1;
+        execution_profile.max_batch_size = self.max_batch_size;
         execution_profile.resolved_from_loaded_model = true;
 
-        let mut push = StageDescriptor::from_execution_profile(
-            StageId::new(1),
-            "asr.realtime.voxtral.push",
-            &execution_profile,
-            NativeBatchMode::None,
-        );
-        push.selector = StageWorkSelector::RealtimePush;
-        push.output_visibility = OutputVisibility::AfterQuantumCommit;
-        push.validate()?;
+        let seal = self.preparation.get().ok_or_else(|| {
+            Error::ModelLoadError(
+                "Voxtral realtime graph is unavailable before preparation geometry is sealed"
+                    .into(),
+            )
+        })?;
+        if seal.max_source_samples == 0
+            || seal.max_work_units == 0
+            || seal.max_materialized_tensor_elements_per_row == 0
+            || seal.max_workspace_bytes == 0
+        {
+            return Err(Error::ModelLoadError(
+                "Voxtral realtime preparation seal is not finite and positive".into(),
+            ));
+        }
+        let width = u64::try_from(self.max_batch_size)
+            .map_err(|_| Error::Overloaded("Voxtral realtime batch width exceeds u64".into()))?;
+        let preparation_work = seal
+            .max_work_units
+            .checked_mul(width)
+            .ok_or_else(|| Error::Overloaded("Voxtral preparation work ceiling overflow".into()))?;
+        let preparation_workspace =
+            seal.max_workspace_bytes.checked_mul(width).ok_or_else(|| {
+                Error::Overloaded("Voxtral preparation workspace ceiling overflow".into())
+            })?;
 
-        let mut finish = StageDescriptor::from_execution_profile(
-            StageId::new(2),
-            "asr.realtime.voxtral.finish",
+        let mut preparation = StageDescriptor::from_execution_profile(
+            StageId::new(0),
+            crate::models::architectures::voxtral::VOXTRAL_REALTIME_PREPARATION_STAGE,
+            &execution_profile,
+            NativeBatchMode::Static,
+        );
+        preparation.selector = StageWorkSelector::RealtimePreparation;
+        preparation.max_batch_size = self.max_batch_size;
+        preparation.max_work_units = preparation_work;
+        preparation.workspace_per_row_bytes = seal.max_workspace_bytes;
+        preparation.max_workspace_bytes = preparation_workspace;
+        preparation.shape_policy = StageShapePolicy::Padded;
+        preparation.output_visibility = OutputVisibility::AfterQuantumCommit;
+
+        let mut prompt = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            crate::models::architectures::voxtral::VOXTRAL_REALTIME_PROMPT_PREFILL_STAGE,
             &execution_profile,
             NativeBatchMode::None,
         );
-        finish.selector = StageWorkSelector::RealtimeFinish;
-        finish.output_visibility = OutputVisibility::AfterQuantumCommit;
-        finish.validate()?;
+        prompt.selector = StageWorkSelector::RealtimePromptPrefill;
+        prompt.max_batch_size = 1;
+        prompt.max_work_units = seal.max_work_units;
+        prompt.workspace_per_row_bytes = seal.max_workspace_bytes;
+        prompt.max_workspace_bytes = seal.max_workspace_bytes;
+        prompt.concurrency = ConcurrencyClass::Exclusive;
+        prompt.shape_policy = StageShapePolicy::Exact;
+
+        let mut decode = StageDescriptor::from_execution_profile(
+            StageId::new(2),
+            crate::models::architectures::voxtral::VOXTRAL_REALTIME_DECODE_STAGE,
+            &execution_profile,
+            NativeBatchMode::Continuous,
+        );
+        decode.selector = StageWorkSelector::RealtimeDecodeContinuation;
+        decode.progress = StageProgressKind::Iterative;
+        decode.membership_safe_point = MembershipSafePoint::QuantumBoundary;
+        decode.max_batch_size = self.max_batch_size;
+        decode.max_work_units = width;
+        decode.workspace_per_row_bytes = seal.max_workspace_bytes;
+        decode.max_workspace_bytes = preparation_workspace;
+        decode.shape_policy = StageShapePolicy::Ragged;
+
+        let mut completion = StageDescriptor::from_execution_profile(
+            StageId::new(3),
+            crate::models::architectures::voxtral::VOXTRAL_REALTIME_COMPLETION_STAGE,
+            &execution_profile,
+            NativeBatchMode::None,
+        );
+        completion.selector = StageWorkSelector::RealtimeCompletion;
+        completion.max_batch_size = 1;
+        completion.max_work_units = 1;
+        completion.concurrency = ConcurrencyClass::Exclusive;
+        completion.shape_policy = StageShapePolicy::Exact;
+
+        preparation.validate()?;
+        prompt.validate()?;
+        decode.validate()?;
+        completion.validate()?;
 
         Ok(LoadedExecutionContract {
             execution_group_id: self.execution_group_id,
@@ -1220,7 +1351,7 @@ impl LoadedExecutionAdapter for VoxtralRealtimeExecutionAdapter {
             adapter_abi_revision: self.adapter_abi_revision(),
             metadata,
             execution_profile,
-            stages: Arc::from([push, finish]),
+            stages: Arc::from([preparation, prompt, decode, completion]),
         })
     }
 }
@@ -3086,6 +3217,21 @@ impl LoadedModelBundleDraft {
         execution.seal_granite_speech_asr_preparation(model)
     }
 
+    pub(crate) fn seal_voxtral_realtime_preparation(
+        &self,
+        model: &crate::models::architectures::voxtral::realtime::VoxtralRealtimeModel,
+    ) -> Result<()> {
+        let execution = self
+            .capabilities
+            .get(&CapabilityKind::RealtimeAsr)
+            .ok_or_else(|| {
+                Error::ModelLoadError(
+                    "Voxtral loaded bundle has no realtime ASR capability to seal".into(),
+                )
+            })?;
+        execution.seal_voxtral_realtime_preparation(model)
+    }
+
     pub(crate) fn seal(
         self,
         mut state_publications: HashMap<CapabilityKind, LoadedStatePublication>,
@@ -3625,10 +3771,59 @@ mod tests {
     }
 
     #[test]
-    fn voxtral_realtime_factory_remains_unpublished_without_a_finite_stage_seal() {
+    fn voxtral_realtime_factory_is_published_only_for_its_exact_capability() {
         assert!(built_in_loaded_adapter_factories()
             .iter()
-            .all(|factory| factory.id() != "builtin.voxtral_realtime.physical_paged"));
+            .any(|factory| factory.id() == "builtin.voxtral_realtime.physical_paged"));
+    }
+
+    #[test]
+    fn voxtral_realtime_sealed_graph_is_exact_on_supported_backends() {
+        let metadata = AdapterMetadata {
+            id: "test.voxtral.realtime",
+            capability: CapabilityKind::RealtimeAsr,
+            model_variant: ModelVariant::VoxtralMini4BRealtime2602,
+            streaming_mode: StreamingMode::Realtime,
+            execution_target: ExecutionTargetKind::RealtimeRunner,
+            sequence_execution: SequenceExecutionMode::None,
+            state_requirement: InferenceStateRequirement::RetainedAndInvocation,
+        };
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            let adapter = VoxtralRealtimeExecutionAdapter::new(
+                ExecutionGroupId::new(7),
+                ModelInstanceId::new(9),
+                metadata,
+                backend,
+                3,
+            );
+            adapter
+                .install_preparation_seal(
+                    crate::models::architectures::voxtral::realtime::VoxtralRealtimePreparationStageSeal {
+                        max_source_samples: 32_000,
+                        max_work_units: 32_000,
+                        max_materialized_tensor_elements_per_row: 1_000_000,
+                        max_workspace_bytes: 4_000_000,
+                    },
+                )
+                .expect("finite test seal");
+            let contract = adapter
+                .contract(StreamingRequirements::native(true))
+                .expect("sealed Voxtral graph");
+            assert_eq!(contract.adapter_abi_revision, VOXTRAL_REALTIME_ADAPTER_ABI);
+            assert_eq!(contract.execution_profile.max_batch_size, 3);
+            assert_eq!(contract.stages.len(), 4);
+            assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::Static);
+            assert_eq!(contract.stages[0].shape_policy, StageShapePolicy::Padded);
+            assert_eq!(contract.stages[0].max_workspace_bytes, 12_000_000);
+            assert_eq!(contract.stages[1].max_batch_size, 1);
+            assert_eq!(contract.stages[2].batch_mode, NativeBatchMode::Continuous);
+            assert_eq!(contract.stages[2].shape_policy, StageShapePolicy::Ragged);
+            assert_eq!(contract.stages[3].max_workspace_bytes, 0);
+            crate::models::architectures::voxtral::authenticate_voxtral_realtime_execution_binding(
+                &contract.adapter_binding().expect("binding"),
+            )
+            .expect("exact Voxtral authentication");
+        }
     }
 
     #[test]
@@ -4124,7 +4319,14 @@ mod tests {
                             CapabilityKind::Tts | CapabilityKind::StreamingTts
                         ) && variant.family()
                             == crate::catalog::ModelFamily::Qwen3Tts;
-                        if (qwen3_asr || vibevoice_asr || granite_asr || qwen3_tts)
+                        let voxtral_realtime = execution.metadata().capability
+                            == CapabilityKind::RealtimeAsr
+                            && variant == ModelVariant::VoxtralMini4BRealtime2602;
+                        if (qwen3_asr
+                            || vibevoice_asr
+                            || granite_asr
+                            || qwen3_tts
+                            || voxtral_realtime)
                             && contract.execution_profile.mode == ExecutionMode::Sequence
                         {
                             assert_eq!(
@@ -4133,6 +4335,10 @@ mod tests {
                             );
                             assert_eq!(contract.execution_profile.max_batch_size, 8);
                             assert!(contract.execution_profile.capabilities().native_batch);
+                        } else if voxtral_realtime {
+                            assert_eq!(contract.execution_profile.max_batch_size, 8);
+                            assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::Static);
+                            assert_eq!(contract.stages[2].batch_mode, NativeBatchMode::Continuous);
                         } else if whisper_asr
                             && contract.execution_profile.mode == ExecutionMode::Sequence
                         {
@@ -4377,6 +4583,7 @@ mod tests {
             BackendKind::Cpu,
         )
         .unwrap();
+        install_test_preparation_seals(&draft, BackendKind::Cpu, 1);
 
         let contract = draft
             .execution_contracts(CapabilityKind::Asr)

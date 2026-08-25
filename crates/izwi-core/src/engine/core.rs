@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 use super::cache::composite::{
@@ -29,7 +29,8 @@ use super::execution::{
     ExecutionReport, ExecutionState, ExecutionTracker, FailureOrigin,
     FinishReason as ExecutionFinishReason, ModelInstanceId, NativeBatchMode, OutcomeProvenance,
     OutputVisibility, PhysicalBatch, PhysicalLaunchPolicy, PrefillMode, ReadyQuantum,
-    RetryDisposition, SequencePhase, StageId, StageShapePolicy, WorkCost, WorkUnit,
+    RealtimeStageOutcome, RealtimeSubphase, RetryDisposition, SequencePhase, StageId,
+    StageShapePolicy, WorkCost, WorkUnit,
 };
 use super::execution_group::{
     ExecutedEngineStep, ExecutionGroupRunner, ExecutionPhase, PreparedEngineStep,
@@ -48,7 +49,8 @@ use super::metrics::{
 };
 use super::output::OutputProcessor;
 use super::request::{
-    EngineCoreRequest, FencedStreamProgress, RequestStatus, StreamProgressBudget,
+    EngineCoreRequest, FencedStreamProgress, RealtimeAsrOperationPayload,
+    RealtimeAsrOperationWaiter, RealtimeAsrTerminalOutcome, RequestStatus, StreamProgressBudget,
     STREAM_PROGRESS_MAX_BUFFERED_BYTES, STREAM_PROGRESS_QUEUE_CAPACITY,
 };
 use super::scheduler::{BeginTerminalRelease, Scheduler, SchedulerConfig, TerminalReleaseCause};
@@ -265,16 +267,40 @@ impl PhysicalBatchAssembly {
 
     fn workspace_resources(
         backend: BackendKind,
+        shape_policy: StageShapePolicy,
         base_bytes: u64,
         rows: &[ReadyQuantum],
     ) -> Option<ResourceVector> {
-        let generic = rows.iter().try_fold(
+        let generic = if shape_policy == StageShapePolicy::Padded {
+            let width = u64::try_from(rows.len()).ok()?;
+            let maximum = |select: fn(ResourceVector) -> ResourceAmount| {
+                rows.iter()
+                    .map(|row| match select(row.cost.workspace) {
+                        ResourceAmount::Known(value) => Some(value),
+                        ResourceAmount::Unknown => None,
+                    })
+                    .try_fold(0u64, |maximum, value| Some(maximum.max(value?)))?
+                    .checked_mul(width)
+            };
             ResourceVector {
-                temporary_bytes: ResourceAmount::Known(base_bytes),
-                ..ResourceVector::zero()
-            },
-            |total, row| total.checked_add(row.cost.workspace).ok(),
-        )?;
+                host_bytes: ResourceAmount::Known(maximum(|value| value.host_bytes)?),
+                device_bytes: ResourceAmount::Known(maximum(|value| value.device_bytes)?),
+                unified_bytes: ResourceAmount::Known(maximum(|value| value.unified_bytes)?),
+                kv_bytes: ResourceAmount::Known(maximum(|value| value.kv_bytes)?),
+                temporary_bytes: ResourceAmount::Known(
+                    base_bytes.checked_add(maximum(|value| value.temporary_bytes)?)?,
+                ),
+                compute_slots: ResourceAmount::Known(maximum(|value| value.compute_slots)?),
+            }
+        } else {
+            rows.iter().try_fold(
+                ResourceVector {
+                    temporary_bytes: ResourceAmount::Known(base_bytes),
+                    ..ResourceVector::zero()
+                },
+                |total, row| total.checked_add(row.cost.workspace).ok(),
+            )?
+        };
         if generic.kv_bytes != ResourceAmount::Known(0)
             || generic.compute_slots != ResourceAmount::Known(0)
         {
@@ -333,6 +359,7 @@ impl PhysicalBatchAssembly {
         };
         let Some(workspace) = Self::workspace_resources(
             candidate.lane.backend,
+            self.shape_policy,
             self.workspace_base_bytes,
             &candidate.rows,
         ) else {
@@ -433,6 +460,9 @@ pub struct EngineCore {
     active_managed_cache: HashMap<u64, super::ManagedCacheReservation>,
     /// Terminal sessions whose table release waits for an in-flight row.
     pending_managed_releases: HashSet<super::SessionKey>,
+    /// Exact cleanup confirmations registered by retained Runtime owners.
+    /// Senders remain armed across executor/managed cleanup retries.
+    cleanup_confirmation_waiters: HashMap<super::SessionKey, Vec<oneshot::Sender<Result<()>>>>,
     /// Exact physical envelopes allowed to publish pre-quantum progress.
     active_stream_batches: HashMap<BatchId, ActiveStreamBatch>,
     /// Next sequence number accepted for each exact streaming session.
@@ -1117,6 +1147,60 @@ impl EngineCore {
         }
     }
 
+    fn realtime_work_identity(
+        work: &WorkUnit,
+    ) -> Option<(super::RealtimeOperationId, RealtimeSubphase)> {
+        match work {
+            WorkUnit::RealtimePreparation { operation_id, .. } => {
+                Some((*operation_id, RealtimeSubphase::Preparation))
+            }
+            WorkUnit::RealtimePromptPrefill {
+                operation_id,
+                cache_append,
+                ..
+            } => Some((
+                *operation_id,
+                RealtimeSubphase::PromptPrefill {
+                    cache_append: *cache_append,
+                },
+            )),
+            WorkUnit::RealtimeDecodeContinuation { operation_id, .. } => {
+                Some((*operation_id, RealtimeSubphase::DecodeContinuation))
+            }
+            WorkUnit::RealtimeCompletion { operation_id } => {
+                Some((*operation_id, RealtimeSubphase::Completion))
+            }
+            _ => None,
+        }
+    }
+
+    fn authenticate_realtime_stage_outcome(
+        plan: &ExecutionPlan,
+        outcome: Option<&RealtimeStageOutcome>,
+        authoritative_commit: bool,
+    ) -> Result<()> {
+        match (Self::realtime_work_identity(&plan.work), outcome) {
+            (None, None) => Ok(()),
+            (None, Some(_)) => Err(Error::InferenceError(
+                "non-realtime executor result carried a realtime stage outcome".into(),
+            )),
+            (Some(_), None) if !authoritative_commit => Ok(()),
+            (Some(_), None) => Err(Error::InferenceError(
+                "authoritative realtime executor result omitted its stage outcome".into(),
+            )),
+            (Some((operation_id, subphase)), Some(outcome))
+                if outcome.plan_id == plan.plan_id
+                    && outcome.operation_id == operation_id
+                    && outcome.completed == subphase =>
+            {
+                Ok(())
+            }
+            (Some(_), Some(_)) => Err(Error::InferenceError(
+                "realtime stage outcome crossed its exact plan/operation/subphase fence".into(),
+            )),
+        }
+    }
+
     fn replace_active_result_with_terminal(
         &mut self,
         plan: &ExecutionPlan,
@@ -1322,13 +1406,38 @@ impl EngineCore {
                 None
             }
         };
+        let prospective_authoritative_commit = matches!(
+            result.disposition,
+            ExecutionDisposition::Progress
+                | ExecutionDisposition::Yielded(_)
+                | ExecutionDisposition::Finished(ExecutionFinishReason::Completed)
+        );
+        if let Err(error) = Self::authenticate_realtime_stage_outcome(
+            &plan,
+            result.realtime_stage_outcome.as_ref(),
+            prospective_authoritative_commit,
+        ) {
+            let message = error.to_string();
+            result.output = ExecutorOutput::error(plan.session.request_id.clone(), message.clone());
+            result.disposition =
+                ExecutionDisposition::Failed(ExecutionFailure::invalid_output(message));
+            result.safe_point = true;
+            result.provenance = OutcomeProvenance::failure(
+                FailureOrigin::ExecutorValidation,
+                result.provenance.dispatch_state,
+            );
+            result.staged_stream_outputs.clear();
+            result.managed_cache_completions.clear();
+            result.realtime_stage_outcome = None;
+        }
+        let realtime_stage_outcome = result.realtime_stage_outcome;
         let managed_reservation = self.active_managed_cache.remove(&plan.plan_id);
         let report = Self::report_from_result(&result);
         // Validate the execution transition on a clone before publishing the
         // physical cache table. This keeps invalid/duplicate reports from
         // advancing KV state, while the serialized core lock guarantees that
         // installing the validated tracker cannot race another row commit.
-        let prospective_tracker = self
+        let prospective_state = self
             .execution_trackers
             .get(&plan.session.request_id)
             .cloned()
@@ -1337,11 +1446,31 @@ impl EngineCore {
             })
             .and_then(|mut tracker| {
                 tracker.commit(&plan, &report)?;
-                Ok(tracker)
+                let prepared_realtime = match realtime_stage_outcome {
+                    Some(outcome) if prospective_authoritative_commit => {
+                        let prepared = self
+                            .scheduler
+                            .prepare_realtime_stage_outcome(&plan.session, outcome)?;
+                        if outcome.next.is_none() {
+                            self.requests
+                                .get(&plan.session.request_id)
+                                .ok_or_else(|| {
+                                    Error::InferenceError(
+                                        "committed realtime operation lost its request mailbox"
+                                            .into(),
+                                    )
+                                })?
+                                .realtime_asr_operation(outcome.operation_id)?;
+                        }
+                        Some(prepared)
+                    }
+                    _ => None,
+                };
+                Ok((tracker, prepared_realtime))
             });
 
-        let prospective_tracker = match prospective_tracker {
-            Ok(tracker) => tracker,
+        let (prospective_tracker, prepared_realtime) = match prospective_state {
+            Ok(state) => state,
             Err(err) => {
                 if let Err(abort_error) = self.executor.finalize_pending_quantum(
                     plan.plan_id,
@@ -1508,6 +1637,24 @@ impl EngineCore {
             if let Some(tracker) = self.execution_trackers.get_mut(&plan.session.request_id) {
                 let _ = tracker.commit(&plan, &failure_report);
             }
+        } else if authoritative_commit {
+            if let Some(prepared) = prepared_realtime {
+                if let Some(outcome) =
+                    realtime_stage_outcome.filter(|outcome| outcome.next.is_none())
+                {
+                    self.requests
+                        .get(&plan.session.request_id)
+                        .expect("prepared realtime mailbox remains present until publication")
+                        .complete_realtime_asr_operation(outcome.operation_id)
+                        .expect("prepared realtime operation remains present until publication");
+                }
+                self.scheduler
+                    .publish_prepared_realtime_stage_outcome(&plan.session, prepared);
+            }
+            if !matches!(result.disposition, ExecutionDisposition::RestartSequence(_)) {
+                self.execution_trackers
+                    .insert(plan.session.request_id.clone(), prospective_tracker);
+            }
         } else if !matches!(result.disposition, ExecutionDisposition::RestartSequence(_)) {
             self.execution_trackers
                 .insert(plan.session.request_id.clone(), prospective_tracker);
@@ -1632,6 +1779,32 @@ impl EngineCore {
             ExecutionDisposition::Failed(failure)
                 if failure.retry == RetryDisposition::RetrySameSession =>
             {
+                if let Some((operation_id, subphase)) = Self::realtime_work_identity(&plan.work) {
+                    if self.scheduler.release_realtime_operation_for_retry(
+                        &plan.session,
+                        plan.plan_id,
+                        operation_id,
+                        subphase,
+                    ) {
+                        return None;
+                    }
+                    let message = "scheduler rejected an exact realtime stage retry";
+                    return Some(CommittedExecutorOutput {
+                        session: plan.session.clone(),
+                        output: ExecutorOutput::error(
+                            plan.session.request_id.clone(),
+                            message.to_string(),
+                        ),
+                        disposition: ExecutionDisposition::Failed(
+                            ExecutionFailure::invalid_output(message),
+                        ),
+                        provenance: OutcomeProvenance::failure(
+                            FailureOrigin::StateCommit,
+                            result.provenance.dispatch_state,
+                        ),
+                        staged_stream_outputs: Vec::new(),
+                    });
+                }
                 let attempt = retry_attempt.unwrap_or(1);
                 let retry_at = Instant::now() + self.retry_policy.execution_delay(attempt);
                 if self
@@ -1720,12 +1893,14 @@ impl EngineCore {
             | ExecutionDisposition::Yielded(_)
             | ExecutionDisposition::RestartSequence(_)
             | ExecutionDisposition::Finished(_) => {
-                self.scheduler.update_after_step(
-                    &plan.session.request_id,
-                    result.output.tokens_processed,
-                    result.output.tokens_generated,
-                    step_time_ms,
-                );
+                if Self::realtime_work_identity(&plan.work).is_none() {
+                    self.scheduler.update_after_step(
+                        &plan.session.request_id,
+                        result.output.tokens_processed,
+                        result.output.tokens_generated,
+                        step_time_ms,
+                    );
+                }
             }
             ExecutionDisposition::Failed(_) => {}
         }
@@ -1750,6 +1925,9 @@ impl EngineCore {
         work: &WorkUnit,
         stage: Option<&super::StageDescriptor>,
     ) -> Result<WorkCost> {
+        if let WorkUnit::RealtimePreparation { operation_id, .. } = work {
+            return request.realtime_asr_preparation_cost(*operation_id);
+        }
         if let Some(prepared) = stage.and_then(|stage| request.prepared_stage_cost(stage.id)) {
             if stage.is_some_and(|stage| stage.batch_mode == NativeBatchMode::Continuous) {
                 if let WorkUnit::SequenceStep {
@@ -2185,6 +2363,7 @@ impl EngineCore {
                     .unwrap_or(0);
                 let workspace = PhysicalBatchAssembly::workspace_resources(
                     lane.backend,
+                    shape_policy,
                     workspace_base_bytes,
                     std::slice::from_ref(&row),
                 )
@@ -2433,6 +2612,7 @@ impl EngineCore {
             pending_runner_recovery: None,
             active_managed_cache: HashMap::new(),
             pending_managed_releases: HashSet::new(),
+            cleanup_confirmation_waiters: HashMap::new(),
             active_stream_batches: HashMap::new(),
             stream_sequence_cursors: HashMap::new(),
             incremental_stream_sessions: HashSet::new(),
@@ -2534,6 +2714,232 @@ impl EngineCore {
         Ok(())
     }
 
+    /// Atomically admit an already-authenticated realtime ASR request into its
+    /// dedicated FIFO scheduler state. This route deliberately bypasses normal
+    /// one-shot audio preprocessing; audio enters only through operation rows.
+    pub(crate) fn add_realtime_asr_session(
+        &mut self,
+        mut request: EngineCoreRequest,
+    ) -> Result<super::SessionKey> {
+        let request_id = request.id.clone();
+        if request.task_type != super::TaskType::ASR
+            || !request.is_realtime_asr_session()
+            || request
+                .model_variant
+                .is_none_or(|variant| variant.family() != crate::catalog::ModelFamily::Voxtral)
+        {
+            return Err(Error::InvalidInput(
+                "realtime ASR admission requires an ingress-enabled Voxtral ASR request".into(),
+            ));
+        }
+        if self.requests.contains_key(&request_id) {
+            return Err(Error::InvalidInput(format!(
+                "Request {request_id} already exists"
+            )));
+        }
+        request.seal_execution_preparation()?;
+        let model_instance = request.model_instance_id().ok_or_else(|| {
+            Error::InvalidInput(
+                "realtime ASR admission requires an exact loaded model instance".into(),
+            )
+        })?;
+        let execution = request.execution_adapter_binding().ok_or_else(|| {
+            Error::InvalidInput(
+                "realtime ASR admission requires a loaded execution adapter binding".into(),
+            )
+        })?;
+        crate::models::architectures::voxtral::authenticate_voxtral_realtime_execution_binding(
+            execution,
+        )?;
+        if execution.model_instance_id != model_instance {
+            return Err(Error::InvalidInput(
+                "realtime ASR execution binding crossed its loaded model instance".into(),
+            ));
+        }
+        let descriptor = request.v2_state_descriptor().ok_or_else(|| {
+            Error::InvalidInput("realtime ASR admission requires a state ABI v2 descriptor".into())
+        })?;
+        let runtime = request.v2_state_runtime().ok_or_else(|| {
+            Error::InvalidInput(
+                "realtime ASR admission requires a resolved state ABI v2 runtime".into(),
+            )
+        })?;
+        if descriptor != &runtime.descriptor {
+            return Err(Error::InvalidInput(
+                "realtime ASR state descriptor differs from its resolved runtime".into(),
+            ));
+        }
+        runtime.validate_against(self.managed_kv_cache.worker_backend(), execution)?;
+        let physical = runtime.managed_kv_runtime().ok_or_else(|| {
+            Error::InvalidInput(
+                "realtime ASR admission requires a physical managed paged runtime".into(),
+            )
+        })?;
+        if physical.plan().model_instance != model_instance {
+            return Err(Error::InvalidInput(
+                "realtime ASR managed runtime crossed its loaded model instance".into(),
+            ));
+        }
+        request.install_managed_cache_runtime(physical)?;
+        if !self.scheduler.add_realtime_session(&request) {
+            return Err(Error::InvalidInput(format!(
+                "Request {request_id} already exists or is awaiting cache cleanup"
+            )));
+        }
+        let session = self.get_session_key(&request_id).ok_or_else(|| {
+            Error::InferenceError(format!(
+                "realtime request {request_id} lost its scheduler session"
+            ))
+        })?;
+        self.requests.insert(request_id.clone(), Arc::new(request));
+        self.request_start_times
+            .insert(request_id.clone(), Instant::now());
+        self.request_phase_timings
+            .insert(request_id, RequestPhaseTiming::default());
+        Ok(session)
+    }
+
+    pub(crate) async fn enqueue_realtime_asr_push(
+        &mut self,
+        session: &super::SessionKey,
+        samples: Arc<[f32]>,
+        sample_rate: u32,
+        max_output_steps: usize,
+        max_cache_append: usize,
+    ) -> Result<(super::RealtimeOperationId, RealtimeAsrOperationWaiter)> {
+        let logical_units = u64::try_from(samples.len()).unwrap_or(u64::MAX).max(1);
+        self.enqueue_realtime_asr_push_with_cost(
+            session,
+            samples,
+            sample_rate,
+            max_output_steps,
+            max_cache_append,
+            WorkCost::new(logical_units, logical_units, 0),
+        )
+        .await
+    }
+
+    pub(crate) async fn enqueue_realtime_asr_push_with_cost(
+        &mut self,
+        session: &super::SessionKey,
+        samples: Arc<[f32]>,
+        sample_rate: u32,
+        max_output_steps: usize,
+        max_cache_append: usize,
+        preparation_cost: WorkCost,
+    ) -> Result<(super::RealtimeOperationId, RealtimeAsrOperationWaiter)> {
+        if samples.is_empty() || sample_rate == 0 || max_output_steps == 0 {
+            return Err(Error::InvalidInput(
+                "realtime ASR push requires samples, a sample rate, and an output-step bound"
+                    .into(),
+            ));
+        }
+        let request = self
+            .requests
+            .get(&session.request_id)
+            .filter(|_| self.get_session_key(&session.request_id).as_ref() == Some(session))
+            .cloned()
+            .ok_or_else(|| {
+                Error::InvalidInput("realtime ASR session is stale or missing".into())
+            })?;
+        let (operation_id, input) = self.scheduler.enqueue_realtime_push(
+            session,
+            samples.len(),
+            max_output_steps,
+            max_cache_append,
+        )?;
+        debug_assert_eq!(input.len(), samples.len());
+        match request.install_realtime_asr_operation_with_cost(
+            operation_id,
+            RealtimeAsrOperationPayload::Push {
+                samples,
+                sample_rate,
+            },
+            preparation_cost,
+        ) {
+            Ok(waiter) => Ok((operation_id, waiter)),
+            Err(error) => {
+                let message = error.to_string();
+                let _ = self
+                    .terminate_request_session(
+                        session,
+                        ExecutorOutput::error(session.request_id.clone(), message.clone()),
+                        ExecutionDisposition::Failed(ExecutionFailure::invalid_output(
+                            message.clone(),
+                        )),
+                        OutcomeProvenance::not_started(),
+                    )
+                    .await;
+                Err(Error::InferenceError(format!(
+                    "realtime ASR payload installation failed; session rolled back: {message}"
+                )))
+            }
+        }
+    }
+
+    pub(crate) async fn enqueue_realtime_asr_finish(
+        &mut self,
+        session: &super::SessionKey,
+        max_output_steps: usize,
+        max_cache_append: usize,
+    ) -> Result<(super::RealtimeOperationId, RealtimeAsrOperationWaiter)> {
+        self.enqueue_realtime_asr_finish_with_cost(
+            session,
+            max_output_steps,
+            max_cache_append,
+            WorkCost::new(1, 1, 0),
+        )
+        .await
+    }
+
+    pub(crate) async fn enqueue_realtime_asr_finish_with_cost(
+        &mut self,
+        session: &super::SessionKey,
+        max_output_steps: usize,
+        max_cache_append: usize,
+        preparation_cost: WorkCost,
+    ) -> Result<(super::RealtimeOperationId, RealtimeAsrOperationWaiter)> {
+        if max_output_steps == 0 {
+            return Err(Error::InvalidInput(
+                "realtime ASR finish requires an output-step bound".into(),
+            ));
+        }
+        let request = self
+            .requests
+            .get(&session.request_id)
+            .filter(|_| self.get_session_key(&session.request_id).as_ref() == Some(session))
+            .cloned()
+            .ok_or_else(|| {
+                Error::InvalidInput("realtime ASR session is stale or missing".into())
+            })?;
+        let operation_id =
+            self.scheduler
+                .enqueue_realtime_finish(session, max_output_steps, max_cache_append)?;
+        match request.install_realtime_asr_operation_with_cost(
+            operation_id,
+            RealtimeAsrOperationPayload::Finish,
+            preparation_cost,
+        ) {
+            Ok(waiter) => Ok((operation_id, waiter)),
+            Err(error) => {
+                let message = error.to_string();
+                let _ = self
+                    .terminate_request_session(
+                        session,
+                        ExecutorOutput::error(session.request_id.clone(), message.clone()),
+                        ExecutionDisposition::Failed(ExecutionFailure::invalid_output(
+                            message.clone(),
+                        )),
+                        OutcomeProvenance::not_started(),
+                    )
+                    .await;
+                Err(Error::InferenceError(format!(
+                    "realtime ASR payload installation failed; session rolled back: {message}"
+                )))
+            }
+        }
+    }
+
     fn terminal_release_cause(disposition: &ExecutionDisposition) -> Option<TerminalReleaseCause> {
         match disposition {
             ExecutionDisposition::Finished(ExecutionFinishReason::Completed) => {
@@ -2577,24 +2983,31 @@ impl EngineCore {
         self.incremental_stream_sessions.remove(session);
     }
 
-    fn request_managed_session_release(&mut self, session: &super::SessionKey) {
+    fn request_managed_session_release(&mut self, session: &super::SessionKey) -> bool {
         if self
             .active_managed_cache
             .values()
             .any(|reservation| &reservation.session == session)
         {
             self.pending_managed_releases.insert(session.clone());
-            return;
+            return false;
         }
-        if let Err(error) = self.managed_kv_cache.release_session(session) {
-            warn!(
-                request_id = %session.request_id,
-                session_epoch = session.epoch,
-                error = %error,
-                "Failed to release a managed KV session table"
-            );
+        match self.managed_kv_cache.release_session(session) {
+            Ok(()) => {
+                self.pending_managed_releases.remove(session);
+                true
+            }
+            Err(error) => {
+                self.pending_managed_releases.insert(session.clone());
+                warn!(
+                    request_id = %session.request_id,
+                    session_epoch = session.epoch,
+                    error = %error,
+                    "Failed to release a managed KV session table; retaining cleanup quarantine"
+                );
+                false
+            }
         }
-        self.pending_managed_releases.remove(session);
     }
 
     fn release_managed_session_if_ready(&mut self, session: &super::SessionKey) {
@@ -2604,7 +3017,60 @@ impl EngineCore {
                 .values()
                 .any(|reservation| &reservation.session == session)
         {
-            self.request_managed_session_release(session);
+            let _ = self.request_managed_session_release(session);
+        }
+    }
+
+    fn exact_session_cleanup_absent(&self, session: &super::SessionKey) -> bool {
+        self.scheduler.get_sequence_id(&session.request_id) != Some(session.epoch)
+            && self
+                .scheduler
+                .pending_release_confirmation_required(session)
+                .is_none()
+            && !self.pending_managed_releases.contains(session)
+            && !self
+                .active_managed_cache
+                .values()
+                .any(|reservation| &reservation.session == session)
+    }
+
+    pub(crate) fn register_cleanup_confirmation(
+        &mut self,
+        session: &super::SessionKey,
+    ) -> oneshot::Receiver<Result<()>> {
+        let (sender, receiver) = oneshot::channel();
+        if self.exact_session_cleanup_absent(session) {
+            let _ = sender.send(Ok(()));
+        } else {
+            self.cleanup_confirmation_waiters
+                .entry(session.clone())
+                .or_default()
+                .push(sender);
+        }
+        receiver
+    }
+
+    fn resolve_cleanup_waiters(&mut self, session: &super::SessionKey) {
+        if let Some(waiters) = self.cleanup_confirmation_waiters.remove(session) {
+            for waiter in waiters {
+                let _ = waiter.send(Ok(()));
+            }
+        }
+    }
+
+    fn resolve_all_cleanup_waiters(&mut self) {
+        for (_, waiters) in self.cleanup_confirmation_waiters.drain() {
+            for waiter in waiters {
+                let _ = waiter.send(Ok(()));
+            }
+        }
+    }
+
+    fn fail_all_cleanup_waiters(&mut self, message: &str) {
+        for (_, waiters) in self.cleanup_confirmation_waiters.drain() {
+            for waiter in waiters {
+                let _ = waiter.send(Err(Error::InferenceError(message.to_string())));
+            }
         }
     }
 
@@ -2798,11 +3264,17 @@ impl EngineCore {
             .scheduler
             .pending_release_confirmation_required(session)
         else {
+            if self.exact_session_cleanup_absent(session) {
+                self.resolve_cleanup_waiters(session);
+            }
             return;
         };
         let release = self.executor.cleanup_session(session).await;
-        if release.confirmed || !confirmation_required {
+        if (release.confirmed || !confirmation_required)
+            && self.request_managed_session_release(session)
+        {
             self.scheduler.confirm_session_release(session);
+            self.resolve_cleanup_waiters(session);
         } else {
             self.record_unconfirmed_cleanup(session);
         }
@@ -2813,14 +3285,34 @@ impl EngineCore {
         session: &super::SessionKey,
         cause: TerminalReleaseCause,
     ) {
+        if let Some(request) = self
+            .requests
+            .get(&session.request_id)
+            .filter(|_| self.scheduler.get_sequence_id(&session.request_id) == Some(session.epoch))
+        {
+            let terminal = match cause {
+                TerminalReleaseCause::Completed => RealtimeAsrTerminalOutcome::Completed,
+                TerminalReleaseCause::Cancelled => RealtimeAsrTerminalOutcome::Cancelled,
+                TerminalReleaseCause::TimedOut => RealtimeAsrTerminalOutcome::TimedOut,
+                TerminalReleaseCause::Failed => {
+                    RealtimeAsrTerminalOutcome::Failed(Arc::from("realtime ASR session failed"))
+                }
+            };
+            if request.is_realtime_asr_session() {
+                let _ = request.terminate_realtime_asr_ingress(terminal);
+            }
+        }
         if matches!(
             self.scheduler.begin_terminal_release(session, cause),
             BeginTerminalRelease::Started { .. }
         ) {
             self.attempt_pending_release_cleanup(session).await;
         }
-        self.request_managed_session_release(session);
+        let _ = self.request_managed_session_release(session);
         self.clear_exact_execution_state(session);
+        if self.exact_session_cleanup_absent(session) {
+            self.resolve_cleanup_waiters(session);
+        }
     }
 
     async fn reconcile_due_cleanup(&mut self) {
@@ -3769,6 +4261,19 @@ impl EngineCore {
             .map(|attempt| self.retry_policy.cleanup_delay(attempt.max(1)))
     }
 
+    /// Arm an exact cleanup confirmation before cancellation and drive the
+    /// same idempotent quarantine cleanup path for active, terminal, and
+    /// already-confirmed sessions.
+    pub(crate) async fn begin_confirmed_session_cleanup(
+        &mut self,
+        session: &super::SessionKey,
+    ) -> oneshot::Receiver<Result<()>> {
+        let confirmation = self.register_cleanup_confirmation(session);
+        let _ = self.abort_request_session(session).await;
+        self.attempt_pending_release_cleanup(session).await;
+        confirmation
+    }
+
     pub(crate) fn abandoned_session_cleanup_delay(
         &self,
         session: &super::SessionKey,
@@ -4025,6 +4530,12 @@ impl EngineCore {
 
         let mut aborted = Vec::with_capacity(request_ids.len());
         for request_id in request_ids {
+            if let Some(request) = self.requests.get(&request_id) {
+                if request.is_realtime_asr_session() {
+                    let _ = request
+                        .terminate_realtime_asr_ingress(RealtimeAsrTerminalOutcome::Unloaded);
+                }
+            }
             if self.abort_request(&request_id).await {
                 aborted.push(request_id);
             }
@@ -4406,11 +4917,46 @@ impl EngineCore {
             self.abort_request(&id).await;
         }
 
-        // Shutdown executor
-        self.executor.shutdown().await?;
+        // Executor shutdown is the final model-owned physical-state fence.
+        // Settle every registered receipt explicitly if that fence fails;
+        // dropping the Core must never be the notification mechanism.
+        if let Err(error) = self.executor.shutdown().await {
+            self.fail_all_cleanup_waiters(&format!(
+                "Engine executor shutdown failed before realtime cleanup confirmation: {error}"
+            ));
+            return Err(error);
+        }
+
+        // Abort any managed transactions that were still owned by prepared
+        // plans, then release the exact session tables named by cleanup
+        // receipts. Executor shutdown has already guaranteed that no model
+        // kernel can publish another completion into these transactions.
+        let mut managed_release_errors = Vec::new();
+        for (_, reservation) in std::mem::take(&mut self.active_managed_cache) {
+            if let Err(error) = self.managed_kv_cache.finalize(&reservation, None, false) {
+                managed_release_errors.push(format!(
+                    "{}:{} transaction abort failed: {error}",
+                    reservation.session.request_id, reservation.session.epoch
+                ));
+            }
+        }
+        let cleanup_sessions = self
+            .cleanup_confirmation_waiters
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for session in &cleanup_sessions {
+            if let Err(error) = self.managed_kv_cache.release_session(session) {
+                managed_release_errors.push(format!(
+                    "{}:{} managed release failed: {error}",
+                    session.request_id, session.epoch
+                ));
+            }
+        }
 
         // A successful executor shutdown is the final physical-release fence.
         self.scheduler.force_release_all_after_executor_shutdown();
+        self.pending_managed_releases.clear();
         self.requests.clear();
         self.request_start_times.clear();
         self.request_phase_timings.clear();
@@ -4422,8 +4968,19 @@ impl EngineCore {
         self.incremental_stream_sessions.clear();
         self.pending_terminal_outputs.clear();
         self.execution_retry_attempts.clear();
-
         self.initialized = false;
+
+        if managed_release_errors.is_empty() {
+            self.resolve_all_cleanup_waiters();
+        } else {
+            let message = format!(
+                "Engine shutdown could not confirm managed realtime cleanup: {}",
+                managed_release_errors.join("; ")
+            );
+            self.fail_all_cleanup_waiters(&message);
+            return Err(Error::InferenceError(message));
+        }
+
         info!("Engine core shutdown complete");
 
         Ok(())
@@ -5266,6 +5823,21 @@ mod tests {
         assert_eq!(core.pending_request_count(), 1);
     }
 
+    #[tokio::test]
+    async fn realtime_session_admission_rejects_an_unbound_voxtral_request() {
+        let mut core = EngineCore::new(EngineCoreConfig::default()).unwrap();
+        let mut request = EngineCoreRequest::asr_bytes(Vec::new())
+            .with_model_variant(ModelVariant::VoxtralMini4BRealtime2602);
+        request
+            .enable_realtime_asr_ingress()
+            .expect("realtime ingress");
+        let error = core
+            .add_realtime_asr_session(request)
+            .expect_err("unbound realtime requests must fail before scheduler insertion");
+        assert!(error.to_string().contains("loaded model instance"));
+        assert_eq!(core.pending_request_count(), 0);
+    }
+
     #[test]
     fn v2_state_publication_fails_closed_until_runtime_is_resolved() {
         let mut core = EngineCore::new(EngineCoreConfig::default()).unwrap();
@@ -5595,6 +6167,112 @@ mod tests {
             .count();
         assert!(cleanup_attempts >= 2, "cleanup was not retried");
         assert!(core.add_request(request).is_err());
+    }
+
+    #[tokio::test]
+    async fn cleanup_confirmation_does_not_resolve_on_cancellation_acceptance() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let executor =
+            UnifiedExecutor::new_for_test(Box::new(DeadlineCleanupExecutor::new(events, false)));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                max_batch_size: 1,
+                max_tokens_per_step: 1,
+                block_size: 1,
+                max_blocks: 1,
+                enable_adaptive_batching: false,
+                ..Default::default()
+            },
+            executor,
+        )
+        .unwrap();
+
+        let mut request = EngineCoreRequest::tts("cleanup receipt");
+        request.id = "cleanup-receipt-pending".to_string();
+        request.prompt_tokens = vec![1];
+        core.add_request(request).unwrap();
+        core.step().await.unwrap();
+        let session = core
+            .get_session_key(&"cleanup-receipt-pending".to_string())
+            .unwrap();
+        let mut confirmation = core.begin_confirmed_session_cleanup(&session).await;
+
+        assert!(matches!(
+            confirmation.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cleanup_confirmation_resolves_for_an_already_terminal_session() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let executor =
+            UnifiedExecutor::new_for_test(Box::new(DeadlineCleanupExecutor::new(events, true)));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                max_batch_size: 1,
+                max_tokens_per_step: 1,
+                block_size: 1,
+                max_blocks: 1,
+                enable_adaptive_batching: false,
+                ..Default::default()
+            },
+            executor,
+        )
+        .unwrap();
+
+        let mut request = EngineCoreRequest::tts("finished cleanup receipt");
+        request.id = "cleanup-receipt-terminal".to_string();
+        request.prompt_tokens = vec![1];
+        core.add_request(request).unwrap();
+        core.step().await.unwrap();
+        let session = core
+            .get_session_key(&"cleanup-receipt-terminal".to_string())
+            .unwrap();
+        assert!(core.abort_request_session(&session).await);
+
+        let confirmation = core.begin_confirmed_session_cleanup(&session).await;
+        confirmation
+            .await
+            .expect("already-terminal cleanup sender must remain armed")
+            .expect("already-terminal cleanup must be confirmed");
+    }
+
+    #[tokio::test]
+    async fn orderly_shutdown_settles_a_pending_cleanup_receipt() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let executor =
+            UnifiedExecutor::new_for_test(Box::new(DeadlineCleanupExecutor::new(events, false)));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                max_batch_size: 1,
+                max_tokens_per_step: 1,
+                block_size: 1,
+                max_blocks: 1,
+                enable_adaptive_batching: false,
+                ..Default::default()
+            },
+            executor,
+        )
+        .unwrap();
+
+        let mut request = EngineCoreRequest::tts("shutdown cleanup receipt");
+        request.id = "cleanup-receipt-shutdown".to_string();
+        request.prompt_tokens = vec![1];
+        core.add_request(request).unwrap();
+        core.step().await.unwrap();
+        let session = core
+            .get_session_key(&"cleanup-receipt-shutdown".to_string())
+            .unwrap();
+        let confirmation = core.begin_confirmed_session_cleanup(&session).await;
+
+        core.shutdown().await.expect("orderly shutdown");
+        confirmation
+            .await
+            .expect("shutdown must explicitly settle the receipt")
+            .expect("successful shutdown is a final cleanup fence");
+        assert!(core.cleanup_confirmation_waiters.is_empty());
+        assert!(core.pending_managed_releases.is_empty());
     }
 
     #[tokio::test]
@@ -6189,12 +6867,63 @@ mod tests {
         assert_eq!(
             PhysicalBatchAssembly::workspace_resources(
                 BackendKind::Cuda,
+                StageShapePolicy::Ragged,
                 16,
                 std::slice::from_ref(&row),
             ),
             Some(ResourceVector {
                 host_bytes: ResourceAmount::Known(32),
                 device_bytes: ResourceAmount::Known(8_208),
+                ..ResourceVector::zero()
+            })
+        );
+    }
+
+    #[test]
+    fn padded_batch_charges_every_row_at_cohort_maximum() {
+        let lane = BatchLaneKey {
+            execution_group: super::super::ExecutionGroupId::new(1),
+            model_instance: super::super::ModelInstanceId::new(2),
+            adapter_instance: super::super::AdapterInstanceId::new(3),
+            adapter_abi: super::super::AdapterAbiRevision::new(1),
+            capability_id: "asr".to_string(),
+            stage_id: super::super::StageId::new(4),
+            backend: BackendKind::Cuda,
+            device_ordinal: None,
+            compute_dtype: "f16".to_string(),
+            state_dtype: "f16".to_string(),
+            tensor_layout: "padded".to_string(),
+            quantization: "none".to_string(),
+            state_schema: "test".to_string(),
+            kernel_mode: "static".to_string(),
+            semantic_mode: "preparation".to_string(),
+            shape_bucket: "padded".to_string(),
+        };
+        let row = |id, elements, workspace| ReadyQuantum {
+            plan_id: id,
+            session: super::super::SessionKey::new(format!("padded-{id}"), 1),
+            lane: lane.clone(),
+            work: WorkUnit::AtomicJob {
+                kind: "padded".into(),
+            },
+            cost: WorkCost::new(1, elements, workspace),
+            managed_cache: None,
+        };
+        let rows = [row(1, 100, 1_000), row(2, 400, 4_000)];
+
+        assert_eq!(
+            PhysicalBatchAssembly::materialized_tensor_elements(StageShapePolicy::Padded, &rows),
+            Some(800)
+        );
+        assert_eq!(
+            PhysicalBatchAssembly::workspace_resources(
+                BackendKind::Cuda,
+                StageShapePolicy::Padded,
+                16,
+                &rows,
+            ),
+            Some(ResourceVector {
+                device_bytes: ResourceAmount::Known(8_016),
                 ..ResourceVector::zero()
             })
         );
@@ -6636,6 +7365,39 @@ mod tests {
     }
 
     #[test]
+    fn realtime_preparation_uses_authenticated_operation_cost() {
+        let operation_id = crate::engine::RealtimeOperationId::new(7);
+        let mut request = EngineCoreRequest::asr("");
+        request.enable_realtime_asr_ingress().unwrap();
+        let exact = WorkCost::new(160, 704, 4096);
+        let _waiter = request
+            .install_realtime_asr_operation_with_cost(
+                operation_id,
+                RealtimeAsrOperationPayload::Push {
+                    samples: Arc::from(vec![0.0; 160]),
+                    sample_rate: 16_000,
+                },
+                exact,
+            )
+            .unwrap();
+
+        let cost = EngineCore::work_cost(
+            &request,
+            &WorkUnit::RealtimePreparation {
+                operation_id,
+                mode: super::super::RealtimePreparationMode::Push,
+                input: super::super::InputRange::new(0, 160).unwrap(),
+                max_output_steps: 8,
+                max_cache_append: 32,
+            },
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(cost, exact);
+    }
+
+    #[test]
     fn multi_token_continuous_quantum_cannot_join_another_row() {
         let lane = BatchLaneKey {
             execution_group: ExecutionGroupId::new(1),
@@ -6800,6 +7562,7 @@ mod tests {
                 staged_stream_outputs: Vec::new(),
                 managed_cache_completions: Vec::new(),
                 managed_cache_append: None,
+                realtime_stage_outcome: None,
                 pending_quantum_required: false,
                 clocked_state_completion: None,
             },

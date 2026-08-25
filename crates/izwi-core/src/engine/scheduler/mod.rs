@@ -25,6 +25,7 @@ use crate::model::ModelVariant;
 
 pub(super) const MAX_DECODE_ONLY_STEPS_WITH_WAITING_FULL_PREFILL: usize = 8;
 pub(super) const MAX_DECODE_ONLY_STEPS_WITH_WAITING_INCREMENTAL_PREFILL: usize = 8;
+pub(super) const MAX_REALTIME_ONLY_STEPS_WITH_READY_DECODE: usize = 8;
 
 /// Scheduling policy for the engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -385,6 +386,10 @@ pub struct Scheduler {
     /// scheduler slot. Unlike a full prefill, one incremental span can share
     /// the transaction once this bounded wait expires.
     decode_only_steps_with_waiting_incremental_prefill: usize,
+    /// Transactions in which realtime rows consumed every decode slot while an
+    /// ordinary decode row was ready. One ordinary slot is reserved once this
+    /// bounded debt is reached.
+    realtime_only_steps_with_ready_decode: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -474,6 +479,19 @@ struct RealtimeInFlight {
     plan_id: PlanId,
     operation_id: RealtimeOperationId,
     subphase: RealtimeSubphase,
+}
+
+/// A scheduler-authenticated realtime transition whose publication contains no
+/// remaining fallible work. The scheduler must not be mutated between prepare
+/// and publish; the engine core owns that serialized boundary.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PreparedRealtimeStageOutcome {
+    session_epoch: SequenceId,
+    outcome: RealtimeStageOutcome,
+    remaining_output_steps: usize,
+    committed_cache_append: usize,
+    committed_input_samples: usize,
+    final_stage: bool,
 }
 
 /// Metadata for a request in the scheduler.
@@ -567,6 +585,7 @@ impl Scheduler {
             class_service: HashMap::new(),
             decode_only_steps_with_waiting_full_prefill: 0,
             decode_only_steps_with_waiting_incremental_prefill: 0,
+            realtime_only_steps_with_ready_decode: 0,
         }
     }
 
@@ -910,6 +929,21 @@ impl Scheduler {
         }
         let mut remaining_decode_budget = decode_budget;
 
+        let ordinary_decode_ready = self.running.iter().any(|(request_id, running)| {
+            if !running.prefill_complete || self.realtime_sessions.contains_key(request_id) {
+                return false;
+            }
+            self.requests.get(request_id).is_some_and(|metadata| {
+                metadata
+                    .retry_not_before
+                    .is_none_or(|not_before| not_before <= scheduling_now)
+                    && metadata.max_tokens > running.num_tokens_generated
+            })
+        });
+        let reserve_ordinary_decode = ordinary_decode_ready
+            && self.realtime_only_steps_with_ready_decode
+                >= MAX_REALTIME_ONLY_STEPS_WITH_READY_DECODE;
+
         // Realtime operations are already admitted, session-fenced quanta.
         // Schedule at most one FIFO head per session and keep their source
         // sample clock independent from token-prefill/decode accounting.
@@ -928,6 +962,9 @@ impl Scheduler {
         realtime_candidates.sort_unstable();
         for (_, _, request_id) in realtime_candidates {
             if remaining_batch == 0 || remaining_decode_budget == 0 {
+                break;
+            }
+            if reserve_ordinary_decode && (remaining_batch <= 1 || remaining_decode_budget <= 1) {
                 break;
             }
             let Some(state) = self.realtime_sessions.get_mut(&request_id) else {
@@ -1132,6 +1169,33 @@ impl Scheduler {
             remaining_batch -= 1;
             result.total_tokens += num_tokens;
             self.record_class_service(workload_class, num_tokens);
+        }
+
+        let served_realtime = result.decode_requests.iter().any(|row| {
+            matches!(
+                &row.work,
+                WorkUnit::RealtimePush { .. }
+                    | WorkUnit::RealtimeFinish { .. }
+                    | WorkUnit::RealtimePreparation { .. }
+                    | WorkUnit::RealtimePromptPrefill { .. }
+                    | WorkUnit::RealtimeDecodeContinuation { .. }
+                    | WorkUnit::RealtimeCompletion { .. }
+            )
+        });
+        let served_ordinary_decode = result.decode_requests.iter().any(|row| {
+            matches!(
+                &row.work,
+                WorkUnit::SequenceStep {
+                    phase: SequencePhase::Decode,
+                    ..
+                }
+            )
+        });
+        if !ordinary_decode_ready || served_ordinary_decode {
+            self.realtime_only_steps_with_ready_decode = 0;
+        } else if served_realtime {
+            self.realtime_only_steps_with_ready_decode =
+                self.realtime_only_steps_with_ready_decode.saturating_add(1);
         }
 
         // Phase 2: schedule prefill requests.
@@ -1451,18 +1515,18 @@ impl Scheduler {
         self.update_dynamic_budget();
     }
 
-    pub(crate) fn commit_realtime_stage_outcome(
-        &mut self,
+    pub(crate) fn prepare_realtime_stage_outcome(
+        &self,
         session: &SessionKey,
         outcome: RealtimeStageOutcome,
-    ) -> crate::error::Result<()> {
+    ) -> crate::error::Result<PreparedRealtimeStageOutcome> {
         let state = self
             .realtime_sessions
-            .get_mut(&session.request_id)
+            .get(&session.request_id)
             .ok_or_else(|| {
                 crate::error::Error::InferenceError("committed realtime session is missing".into())
             })?;
-        let head = state.pending.front_mut().ok_or_else(|| {
+        let head = state.pending.front().ok_or_else(|| {
             crate::error::Error::InferenceError(
                 "committed realtime operation queue is empty".into(),
             )
@@ -1593,7 +1657,6 @@ impl Scheduler {
                                 .into(),
                         ));
                     }
-                    state.committed_input_samples = input.end;
                 }
                 RealtimeExternalOperation::Finish { .. } if outcome.input_consumed != 0 => {
                     return Err(crate::error::Error::InferenceError(
@@ -1602,15 +1665,74 @@ impl Scheduler {
                 }
                 RealtimeExternalOperation::Finish { .. } => {}
             }
-            head.remaining_output_steps = remaining_output_steps;
-            head.committed_cache_append = committed_cache_append;
+        }
+        let committed_input_samples = if final_stage {
+            match head.external {
+                RealtimeExternalOperation::Push { input, .. } => input.end,
+                RealtimeExternalOperation::Finish { .. } => state.committed_input_samples,
+            }
+        } else {
+            state.committed_input_samples
+        };
+        Ok(PreparedRealtimeStageOutcome {
+            session_epoch: session.epoch,
+            outcome,
+            remaining_output_steps,
+            committed_cache_append,
+            committed_input_samples,
+            final_stage,
+        })
+    }
+
+    /// Publishes a previously prepared transition. All validation and checked
+    /// arithmetic happened in `prepare_realtime_stage_outcome`; violating the
+    /// serialized prepare/publish boundary is an engine invariant failure.
+    pub(crate) fn publish_prepared_realtime_stage_outcome(
+        &mut self,
+        session: &SessionKey,
+        prepared: PreparedRealtimeStageOutcome,
+    ) {
+        assert_eq!(session.epoch, prepared.session_epoch);
+        let state = self
+            .realtime_sessions
+            .get_mut(&session.request_id)
+            .expect("prepared realtime session remains present until publication");
+        assert_eq!(state.sequence_id, prepared.session_epoch);
+        assert_eq!(
+            state.in_flight,
+            Some(RealtimeInFlight {
+                plan_id: prepared.outcome.plan_id,
+                operation_id: prepared.outcome.operation_id,
+                subphase: prepared.outcome.completed,
+            })
+        );
+        let head = state
+            .pending
+            .front_mut()
+            .expect("prepared realtime FIFO head remains present until publication");
+        assert_eq!(head.id, prepared.outcome.operation_id);
+        assert_eq!(head.phase, prepared.outcome.completed);
+        head.remaining_output_steps = prepared.remaining_output_steps;
+        head.committed_cache_append = prepared.committed_cache_append;
+        if prepared.final_stage {
+            state.committed_input_samples = prepared.committed_input_samples;
             state.pending.pop_front();
         } else {
-            head.remaining_output_steps = remaining_output_steps;
-            head.committed_cache_append = committed_cache_append;
-            head.phase = outcome.next.expect("non-final outcome has a next phase");
+            head.phase = prepared
+                .outcome
+                .next
+                .expect("prepared non-final transition has a next phase");
         }
         state.in_flight = None;
+    }
+
+    pub(crate) fn commit_realtime_stage_outcome(
+        &mut self,
+        session: &SessionKey,
+        outcome: RealtimeStageOutcome,
+    ) -> crate::error::Result<()> {
+        let prepared = self.prepare_realtime_stage_outcome(session, outcome)?;
+        self.publish_prepared_realtime_stage_outcome(session, prepared);
         Ok(())
     }
 
@@ -2784,8 +2906,8 @@ mod tests {
             )
             .is_err());
         assert!(scheduler.schedule().decode_requests.is_empty());
-        scheduler
-            .commit_realtime_stage_outcome(
+        let prepared = scheduler
+            .prepare_realtime_stage_outcome(
                 &session,
                 RealtimeStageOutcome {
                     plan_id: retried.decode_requests[0].plan_id,
@@ -2797,7 +2919,17 @@ mod tests {
                     cache_append: 0,
                 },
             )
-            .expect("preparation transition");
+            .expect("prospective preparation transition");
+        assert_eq!(
+            scheduler.realtime_sessions[&session.request_id]
+                .pending
+                .front()
+                .expect("FIFO head")
+                .phase,
+            RealtimeSubphase::Preparation
+        );
+        assert!(scheduler.schedule().decode_requests.is_empty());
+        scheduler.publish_prepared_realtime_stage_outcome(&session, prepared);
         let prompt = scheduler.schedule();
         assert!(matches!(
             &prompt.decode_requests[0].work,
@@ -2982,6 +3114,49 @@ mod tests {
             WorkUnit::RealtimePreparation { operation_id, .. }
                 if *operation_id == newer_operation
         ));
+    }
+
+    #[test]
+    fn ready_ordinary_decode_receives_bounded_service_amid_realtime_demand() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 1,
+            max_tokens_per_step: 1,
+            min_tokens_per_step: 1,
+            policy: SchedulingPolicy::Priority,
+            enable_adaptive_batching: false,
+            ..Default::default()
+        });
+        let ordinary = build_request(TaskType::Chat, "ordinary-decode", Priority::Normal);
+        scheduler.add_request(&ordinary);
+        let prefill = scheduler.schedule();
+        assert_eq!(prefill.prefill_requests.len(), 1);
+        scheduler.update_after_step(&ordinary.id, 1, 0, 1.0);
+
+        let mut realtime = build_request(TaskType::ASR, "fair-realtime", Priority::High);
+        realtime
+            .enable_realtime_asr_ingress()
+            .expect("realtime ingress");
+        assert!(scheduler.add_realtime_session(&realtime));
+        let session = SessionKey::new(
+            realtime.id.clone(),
+            scheduler.get_sequence_id(&realtime.id).expect("epoch"),
+        );
+        scheduler
+            .enqueue_realtime_push(&session, 80, 1, 2)
+            .expect("realtime push");
+        scheduler.realtime_only_steps_with_ready_decode = MAX_REALTIME_ONLY_STEPS_WITH_READY_DECODE;
+
+        let scheduled = scheduler.schedule();
+        assert_eq!(scheduled.decode_requests.len(), 1);
+        assert_eq!(scheduled.decode_requests[0].request_id, ordinary.id);
+        assert!(matches!(
+            scheduled.decode_requests[0].work,
+            WorkUnit::SequenceStep {
+                phase: SequencePhase::Decode,
+                ..
+            }
+        ));
+        assert_eq!(scheduler.realtime_only_steps_with_ready_decode, 0);
     }
 
     fn allow_incremental_prefill(scheduler: &mut Scheduler, request_id: &str) {

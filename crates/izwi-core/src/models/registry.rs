@@ -88,6 +88,7 @@ use crate::models::architectures::voxtral::realtime::model::{
     VoxtralRealtimePreparationBatchGeometry, VoxtralRealtimePreparationBatchRow,
     VoxtralRealtimePreparationGeometry, VoxtralRealtimePreparationMode,
     VoxtralRealtimePreparationStageSeal, VoxtralRealtimePreparedAudio,
+    VoxtralRealtimePreparedResourceUsage, VoxtralRealtimeStreamPeakReservation,
 };
 use crate::models::architectures::voxtral::realtime::{
     VoxtralRealtimeCheckpoint, VoxtralRealtimeDecodeBatchRow, VoxtralRealtimeModel,
@@ -3576,6 +3577,30 @@ impl VoxtralModelLease {
         self.inner.model.realtime_preparation_stage_seal()
     }
 
+    pub(crate) fn realtime_stream_peak_reservation(
+        &self,
+    ) -> Result<VoxtralRealtimeStreamPeakReservation> {
+        self.inner.model.realtime_stream_peak_reservation()
+    }
+
+    pub(crate) fn realtime_preparation_geometry_for_source_samples(
+        &self,
+        source_samples: usize,
+        sample_rate: u32,
+        mode: VoxtralRealtimePreparationMode,
+    ) -> Result<VoxtralRealtimePreparationGeometry> {
+        self.inner
+            .model
+            .realtime_preparation_geometry_for_source_samples(source_samples, sample_rate, mode)
+    }
+
+    pub(crate) fn realtime_prepared_resource_usage(
+        &self,
+        geometry: VoxtralRealtimePreparationGeometry,
+    ) -> Result<VoxtralRealtimePreparedResourceUsage> {
+        self.inner.model.realtime_prepared_resource_usage(geometry)
+    }
+
     pub(crate) fn prepare_realtime_audio_batch(
         &self,
         rows: &[VoxtralRealtimePreparationBatchRow<'_>],
@@ -3598,6 +3623,33 @@ impl VoxtralModelLease {
         rows: &mut [VoxtralRealtimeDecodeBatchRow<'_>],
     ) -> Result<Vec<VoxtralRealtimeStep>> {
         self.inner.model.decode_realtime_step_batch(rows)
+    }
+
+    pub(crate) fn realtime_prompt_cache_append(
+        &self,
+        state: &VoxtralRealtimeState,
+    ) -> Result<Option<usize>> {
+        self.inner.model.realtime_prompt_cache_append(state)
+    }
+
+    pub(crate) fn realtime_decode_ready(&self, state: &VoxtralRealtimeState) -> bool {
+        self.inner.model.realtime_decode_ready(state)
+    }
+
+    pub(crate) fn prefill_realtime_in_quantum(
+        &self,
+        state: &mut VoxtralRealtimeState,
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<VoxtralRealtimeStep> {
+        self.inner.model.prefill_realtime_in_quantum(state, cache)
+    }
+
+    pub(crate) fn complete_realtime_in_quantum(
+        &self,
+        state: &mut VoxtralRealtimeState,
+        cache: &PhysicalPagedKvCache,
+    ) -> Result<VoxtralRealtimeStep> {
+        self.inner.model.complete_realtime_in_quantum(state, cache)
     }
 }
 

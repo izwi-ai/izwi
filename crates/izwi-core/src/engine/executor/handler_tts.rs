@@ -364,6 +364,9 @@ impl NativeExecutor {
         let stream_tx = Self::stream_sender(request);
         let stream_policy = request.stream_policy;
         let variant = request.model_variant;
+        let marker_variant = variant.ok_or_else(|| {
+            Error::InvalidInput("Qwen TTS request is missing its model variant".into())
+        })?;
         let params = Self::to_tts_params(request);
         let language = request.language.as_deref();
         let session = scheduled.session_key();
@@ -372,6 +375,7 @@ impl NativeExecutor {
             let mut state_lease = ExecutorStateLease::checkout(
                 &self.qwen_tts_decode_states,
                 session,
+                marker_variant,
                 "Qwen TTS decode",
             )?;
             if state_lease
@@ -918,9 +922,13 @@ impl NativeExecutor {
         for index in live_indices.iter().copied() {
             let request = ordered_requests[index];
             let session = scheduled[index].session_key();
+            let marker_variant = request.model_variant.ok_or_else(|| {
+                Error::InvalidInput("continuous Qwen TTS row is missing its model variant".into())
+            })?;
             let lease = ExecutorStateLease::checkout(
                 &self.qwen_tts_decode_states,
                 session.clone(),
+                marker_variant,
                 "continuous Qwen TTS decode",
             )?;
             let state = lease.state().ok_or_else(|| {
