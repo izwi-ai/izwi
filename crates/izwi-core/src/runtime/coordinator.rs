@@ -56,7 +56,7 @@ impl PreparationCancellation {
             .is_ok()
     }
 
-    fn is_cancelled(&self) -> bool {
+    pub(crate) fn is_cancelled(&self) -> bool {
         self.state.load(Ordering::Acquire) == 1
     }
 

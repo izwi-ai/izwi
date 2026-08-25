@@ -774,6 +774,91 @@ impl GraniteSpeechRuntime {
         Ok((embeddings, stats))
     }
 
+    pub(crate) fn audio_embeddings_batch_with_stats(
+        &self,
+        features: &[GraniteSpeechAudioFeatures],
+    ) -> Result<Vec<(Tensor, GraniteSpeechAudioEmbeddingStats)>> {
+        if features.is_empty() {
+            return Err(Error::InvalidInput(
+                "Granite Speech audio embedding batch is empty".into(),
+            ));
+        }
+        if features.len() == 1 {
+            return self
+                .audio_embeddings_with_stats(&features[0])
+                .map(|output| vec![output]);
+        }
+        let dim = features[0].encoder_dim;
+        let max_frames = features
+            .iter()
+            .map(|row| row.encoder_frames)
+            .max()
+            .unwrap_or(0);
+        if dim == 0
+            || max_frames == 0
+            || features.iter().any(|row| {
+                row.encoder_frames == 0
+                    || row.encoder_dim != dim
+                    || row.input_features.len() != row.encoder_frames
+                    || row.input_features.iter().any(|frame| frame.len() != dim)
+            })
+        {
+            return Err(Error::InvalidInput(
+                "Granite Speech audio batch has inconsistent frame geometry".into(),
+            ));
+        }
+        let valid_lengths = features
+            .iter()
+            .map(|row| row.encoder_frames)
+            .collect::<Vec<_>>();
+        let mut flat = Vec::with_capacity(features.len() * max_frames * dim);
+        for row in features {
+            for frame in &row.input_features {
+                flat.extend_from_slice(frame);
+            }
+            flat.resize(flat.len() + (max_frames - row.encoder_frames) * dim, 0.0);
+        }
+        let upload_start = Instant::now();
+        let input = Tensor::from_vec(flat, (features.len(), max_frames, dim), &self.device)?
+            .to_dtype(self.dtype)?;
+        let upload = upload_start.elapsed();
+        let encoder_start = Instant::now();
+        let encoded = self.encoder.forward_valid_lengths(&input, &valid_lengths)?;
+        let encoder = encoder_start.elapsed();
+        let projector_start = Instant::now();
+        let embeddings = self
+            .projector
+            .forward_compact_valid_lengths(&encoded, &valid_lengths)?;
+        let projector = projector_start.elapsed();
+        embeddings
+            .into_iter()
+            .zip(features)
+            .map(|(embeddings, row)| {
+                let windows = self.projector.window_count_for_frames(row.encoder_frames);
+                Ok((
+                    embeddings,
+                    GraniteSpeechAudioEmbeddingStats {
+                        upload,
+                        encoder,
+                        projector,
+                        encoder_frames: row.encoder_frames,
+                        encoder_dim: row.encoder_dim,
+                        conformer_context_size: self.encoder.context_size(),
+                        conformer_blocks: self.encoder.block_count_for_frames(row.encoder_frames),
+                        conformer_pad_frames: self
+                            .encoder
+                            .pad_frames_for_frames(row.encoder_frames),
+                        conformer_layers: self.encoder.layer_count(),
+                        qformer_windows: windows,
+                        qformer_window_size: self.projector.window_size(),
+                        qformer_queries_per_window: self.projector.num_queries(),
+                        qformer_layers: self.projector.layer_count(),
+                    },
+                ))
+            })
+            .collect()
+    }
+
     pub(crate) fn prepare_prompt_embeddings(
         &self,
         prompt: &GraniteSpeechPrompt,
@@ -1318,6 +1403,39 @@ impl GraniteSpeechEncoder {
         }
     }
 
+    fn forward_valid_lengths(&self, input: &Tensor, valid_lengths: &[usize]) -> Result<Tensor> {
+        let (batch, sequence, _) = input.dims3()?;
+        validate_frame_lengths(batch, sequence, valid_lengths)?;
+        let mask = frame_valid_mask(valid_lengths, sequence, input.device(), input.dtype())?;
+        let mut x = self.input_linear.forward(input)?.broadcast_mul(&mask)?;
+        let mut exported = Vec::with_capacity(self.cat_hidden_layers.len() + 1);
+        if self.cat_hidden_layers.contains(&0) {
+            exported.push(x.clone());
+        }
+        let midpoint = self.layers.len() / 2;
+        for (idx, layer) in self.layers.iter().enumerate() {
+            x = layer.forward_valid_lengths(&x, valid_lengths, &mask)?;
+            let layer_idx = idx + 1;
+            if self.cat_hidden_layers.contains(&layer_idx) {
+                exported.push(x.clone());
+            }
+            if layer_idx == midpoint {
+                let mid = self.out.forward(&x)?;
+                let mid = ops::softmax_last_dim(&mid)?;
+                let mid = self.out_mid.forward(&mid)?.broadcast_mul(&mask)?;
+                x = x.broadcast_add(&mid)?.broadcast_mul(&mask)?;
+            }
+        }
+        x = x.broadcast_mul(&mask)?;
+        if exported.is_empty() {
+            Ok(x)
+        } else {
+            exported.push(x);
+            let refs = exported.iter().collect::<Vec<_>>();
+            Tensor::cat(&refs, 2).map_err(Error::from)
+        }
+    }
+
     fn context_size(&self) -> usize {
         self.layers
             .first()
@@ -1370,6 +1488,26 @@ impl GraniteConformerBlock {
         let ff2 = self.ff2.forward(&out)?;
         out = out.broadcast_add(&(ff2 * 0.5)?)?;
         self.post_norm.forward(&out).map_err(Error::from)
+    }
+
+    fn forward_valid_lengths(
+        &self,
+        x: &Tensor,
+        valid_lengths: &[usize],
+        mask: &Tensor,
+    ) -> Result<Tensor> {
+        let ff1 = self.ff1.forward(x)?.broadcast_mul(mask)?;
+        let mut out = x.broadcast_add(&(ff1 * 0.5)?)?.broadcast_mul(mask)?;
+        let attn = self.attn.forward_valid_lengths(&out, valid_lengths)?;
+        out = out.broadcast_add(&attn)?.broadcast_mul(mask)?;
+        let conv = self.conv.forward_valid_lengths(&out, mask)?;
+        out = out.broadcast_add(&conv)?.broadcast_mul(mask)?;
+        let ff2 = self.ff2.forward(&out)?.broadcast_mul(mask)?;
+        out = out.broadcast_add(&(ff2 * 0.5)?)?.broadcast_mul(mask)?;
+        self.post_norm
+            .forward(&out)?
+            .broadcast_mul(mask)
+            .map_err(Error::from)
     }
 
     fn context_size(&self) -> usize {
@@ -1503,6 +1641,75 @@ impl GraniteConformerAttention {
         self.to_out.forward(&out).map_err(Error::from)
     }
 
+    fn forward_valid_lengths(&self, x: &Tensor, valid_lengths: &[usize]) -> Result<Tensor> {
+        let (batch, seq_len, _) = x.dims3()?;
+        validate_frame_lengths(batch, seq_len, valid_lengths)?;
+        let input_mask = frame_valid_mask(valid_lengths, seq_len, x.device(), x.dtype())?;
+        let x = self.pre_norm.forward(x)?.broadcast_mul(&input_mask)?;
+        let nblocks = seq_len.div_ceil(self.context_size);
+        let padded_len = nblocks * self.context_size;
+        let padded = if padded_len > seq_len {
+            x.pad_with_zeros(1, 0, padded_len - seq_len)?
+        } else {
+            x
+        };
+        let q = self.to_q.forward(&padded)?;
+        let kv = self.to_kv.forward(&padded)?;
+        let k = kv.narrow(2, 0, self.num_heads * self.dim_head)?;
+        let v = kv.narrow(
+            2,
+            self.num_heads * self.dim_head,
+            self.num_heads * self.dim_head,
+        )?;
+        let q = encoder_attention_heads(
+            &q,
+            batch,
+            nblocks,
+            self.context_size,
+            self.num_heads,
+            self.dim_head,
+        )?;
+        let k = encoder_attention_heads(
+            &k,
+            batch,
+            nblocks,
+            self.context_size,
+            self.num_heads,
+            self.dim_head,
+        )?;
+        let v = encoder_attention_heads(
+            &v,
+            batch,
+            nblocks,
+            self.context_size,
+            self.num_heads,
+            self.dim_head,
+        )?;
+        let pos_bias = self.relative_position_bias(&q)?;
+        let mut scores = (encoder_attention_scores(&q, &k)?
+            * (1.0 / (self.dim_head as f64).sqrt()))?
+        .broadcast_add(&pos_bias)?;
+        let key_mask = encoder_valid_key_mask(
+            valid_lengths,
+            nblocks,
+            self.context_size,
+            scores.device(),
+            scores.dtype(),
+        )?;
+        scores = scores.broadcast_add(&key_mask)?;
+        let attention =
+            ops::softmax(&scores.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(q.dtype())?;
+        let out = encoder_attention_context(&attention, &v)?
+            .transpose(2, 3)?
+            .reshape((batch, padded_len, self.num_heads * self.dim_head))?
+            .narrow(1, 0, seq_len)?
+            .broadcast_mul(&input_mask)?;
+        self.to_out
+            .forward(&out)?
+            .broadcast_mul(&input_mask)
+            .map_err(Error::from)
+    }
+
     fn relative_position_bias(&self, q: &Tensor) -> Result<Tensor> {
         let out_dtype = q.dtype();
         let rel = self
@@ -1526,6 +1733,66 @@ impl GraniteConformerAttention {
             .to_dtype(out_dtype)
             .map_err(Error::from)
     }
+}
+
+fn validate_frame_lengths(batch: usize, sequence: usize, valid_lengths: &[usize]) -> Result<()> {
+    if batch == 0
+        || sequence == 0
+        || valid_lengths.len() != batch
+        || valid_lengths
+            .iter()
+            .any(|length| *length == 0 || *length > sequence)
+    {
+        return Err(Error::InvalidInput(
+            "Granite Speech valid frame lengths do not match the padded batch".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn frame_valid_mask(
+    valid_lengths: &[usize],
+    sequence: usize,
+    device: &Device,
+    dtype: DType,
+) -> Result<Tensor> {
+    let data = valid_lengths
+        .iter()
+        .flat_map(|length| (0..sequence).map(move |position| (position < *length) as u8 as f32))
+        .collect::<Vec<_>>();
+    Tensor::from_vec(data, (valid_lengths.len(), sequence, 1), device)?
+        .to_dtype(dtype)
+        .map_err(Error::from)
+}
+
+fn encoder_valid_key_mask(
+    valid_lengths: &[usize],
+    nblocks: usize,
+    context: usize,
+    device: &Device,
+    dtype: DType,
+) -> Result<Tensor> {
+    let mut data = Vec::with_capacity(valid_lengths.len() * nblocks * context * context);
+    for valid in valid_lengths {
+        for block in 0..nblocks {
+            for _query in 0..context {
+                for key in 0..context {
+                    data.push(if block * context + key < *valid {
+                        0.0
+                    } else {
+                        -1e4
+                    });
+                }
+            }
+        }
+    }
+    Tensor::from_vec(
+        data,
+        (valid_lengths.len(), nblocks, 1, context, context),
+        device,
+    )?
+    .to_dtype(dtype)
+    .map_err(Error::from)
 }
 
 fn encoder_attention_heads(
@@ -1673,6 +1940,25 @@ impl GraniteConformerConv {
             .map_err(Error::from)
     }
 
+    fn forward_valid_lengths(&self, x: &Tensor, frame_mask: &Tensor) -> Result<Tensor> {
+        let x = self.norm.forward(x)?;
+        let x = x.transpose(1, 2)?.contiguous()?;
+        let channel_mask = frame_mask.transpose(1, 2)?.contiguous()?;
+        let x = self.up_conv.forward(&x)?;
+        let x = glu_channels(&x)?.broadcast_mul(&channel_mask)?;
+        let pad = self.depth_conv_weight_width() / 2;
+        let right = pad.saturating_sub((self.depth_conv_weight_width() + 1) % 2);
+        let x = x.pad_with_zeros(2, pad, right)?;
+        let x = self.depth_conv.forward(&x)?;
+        let x = self.batch_norm.forward_t(&x, false)?.silu()?;
+        self.down_conv
+            .forward(&x)?
+            .broadcast_mul(&channel_mask)?
+            .transpose(1, 2)?
+            .contiguous()
+            .map_err(Error::from)
+    }
+
     fn depth_conv_weight_width(&self) -> usize {
         self.depth_conv.weight().dims().get(2).copied().unwrap_or(1)
     }
@@ -1733,6 +2019,51 @@ impl GraniteSpeechProjector {
         let output = self.qformer.forward(&query, &windows)?;
         let output = output.reshape((batch, nblocks * self.num_queries, output.dim(2)?))?;
         self.linear.forward(&output).map_err(Error::from)
+    }
+
+    fn forward_compact_valid_lengths(
+        &self,
+        hidden: &Tensor,
+        valid_lengths: &[usize],
+    ) -> Result<Vec<Tensor>> {
+        let (batch, sequence, dim) = hidden.dims3()?;
+        validate_frame_lengths(batch, sequence, valid_lengths)?;
+        let mut packed = Vec::new();
+        let mut row_windows = Vec::with_capacity(batch);
+        for (row, valid) in valid_lengths.iter().copied().enumerate() {
+            let windows = self.window_count_for_frames(valid);
+            let padded = windows * self.window_size;
+            let row = hidden.i(row)?.narrow(0, 0, valid)?;
+            let row = if padded > valid {
+                row.pad_with_zeros(0, 0, padded - valid)?
+            } else {
+                row
+            };
+            packed.push(row.reshape((windows, self.window_size, dim))?);
+            row_windows.push(windows);
+        }
+        let refs = packed.iter().collect::<Vec<_>>();
+        let windows = Tensor::cat(&refs, 0)?;
+        let total_windows = windows.dim(0)?;
+        let query =
+            self.query
+                .broadcast_as((total_windows, self.num_queries, self.query.dim(2)?))?;
+        let output = self.qformer.forward(&query, &windows)?;
+        let output = self.linear.forward(&output)?;
+        let output_dim = output.dim(2)?;
+        let mut offset = 0usize;
+        row_windows
+            .into_iter()
+            .map(|windows| {
+                let row = output.narrow(0, offset, windows)?.reshape((
+                    1,
+                    windows * self.num_queries,
+                    output_dim,
+                ))?;
+                offset += windows;
+                Ok(row)
+            })
+            .collect()
     }
 
     fn window_count_for_frames(&self, frames: usize) -> usize {
@@ -3609,6 +3940,7 @@ mod tests {
     use crate::backends::BackendKind;
     use crate::engine::ModelInstanceId;
     use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
+    use candle_nn::VarMap;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -3774,6 +4106,122 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    fn tiny_audio_config() -> GraniteSpeechConfig {
+        GraniteSpeechConfig {
+            architectures: vec![],
+            audio_token_index: 0,
+            downsample_rate: 1,
+            dtype: None,
+            encoder_config: GraniteSpeechEncoderConfig {
+                cat_hidden_layers: vec![],
+                context_size: 2,
+                conv_expansion_factor: 1,
+                conv_kernel_size: 3,
+                dim_head: 1,
+                dropout: 0.0,
+                feedforward_mult: 2,
+                hidden_dim: 2,
+                input_dim: 2,
+                max_pos_emb: 2,
+                model_type: None,
+                num_heads: 2,
+                num_layers: 1,
+                output_dim: 2,
+            },
+            has_lora_adapter: false,
+            projector_config: super::super::config::GraniteSpeechProjectorConfig {
+                attention_probs_dropout_prob: 0.0,
+                encoder_hidden_size: 2,
+                hidden_act: "gelu".into(),
+                hidden_dropout_prob: 0.0,
+                hidden_size: 2,
+                intermediate_size: 4,
+                layer_norm_eps: 1e-5,
+                max_position_embeddings: 16,
+                model_type: None,
+                num_attention_heads: 2,
+                num_hidden_layers: 1,
+                pad_token_id: Some(0),
+                use_qformer_text_input: false,
+                cross_attention_frequency: 1,
+                chunk_size_feed_forward: 0,
+            },
+            text_config: tiny_granite_text_config(),
+            window_size: 2,
+            model_type: None,
+        }
+    }
+
+    #[test]
+    fn unequal_length_audio_batch_matches_scalar_and_zeroes_invalid_frames() {
+        let device = Device::Cpu;
+        let config = tiny_audio_config();
+        let vars = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vars, DType::F32, &device);
+        let encoder = GraniteSpeechEncoder::load(&config.encoder_config, vb.pp("encoder")).unwrap();
+        let projector = GraniteSpeechProjector::load(&config, vb.pp("projector")).unwrap();
+        let row_a =
+            Tensor::from_vec(vec![0.1f32, -0.2, 0.3, 0.4, -0.5, 0.6], (1, 3, 2), &device).unwrap();
+        let row_b = Tensor::from_vec(
+            vec![0.7f32, -0.8, 0.9, 1.0, -1.1, 1.2, 1.3, -1.4, 1.5, 1.6],
+            (1, 5, 2),
+            &device,
+        )
+        .unwrap();
+        let scalar_a = encoder.forward(&row_a).unwrap();
+        let scalar_b = encoder.forward(&row_b).unwrap();
+        let padded_a = row_a.pad_with_zeros(1, 0, 2).unwrap();
+        let input = Tensor::cat(&[&padded_a, &row_b], 0).unwrap();
+        let batch = encoder.forward_valid_lengths(&input, &[3, 5]).unwrap();
+        assert_tensor_close(
+            &scalar_a,
+            &batch
+                .i(0)
+                .unwrap()
+                .narrow(0, 0, 3)
+                .unwrap()
+                .unsqueeze(0)
+                .unwrap(),
+        );
+        assert_tensor_close(&scalar_b, &batch.i(1).unwrap().unsqueeze(0).unwrap());
+        let invalid = batch
+            .i(0)
+            .unwrap()
+            .narrow(0, 3, 2)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert_eq!(invalid, 0.0);
+        let scalar_projected_a = projector.forward(&scalar_a).unwrap();
+        let scalar_projected_b = projector.forward(&scalar_b).unwrap();
+        let projected = projector
+            .forward_compact_valid_lengths(&batch, &[3, 5])
+            .unwrap();
+        assert_tensor_close(&scalar_projected_a, &projected[0]);
+        assert_tensor_close(&scalar_projected_b, &projected[1]);
+    }
+
+    #[test]
+    fn valid_length_audio_batch_rejects_invalid_rows_and_preserves_b1() {
+        let device = Device::Cpu;
+        let config = tiny_audio_config();
+        let vars = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vars, DType::F32, &device);
+        let encoder = GraniteSpeechEncoder::load(&config.encoder_config, vb.pp("encoder")).unwrap();
+        let input = Tensor::zeros((1, 3, 2), DType::F32, &device).unwrap();
+        assert_tensor_close(
+            &encoder.forward(&input).unwrap(),
+            &encoder.forward_valid_lengths(&input, &[3]).unwrap(),
+        );
+        assert!(encoder.forward_valid_lengths(&input, &[]).is_err());
+        assert!(encoder.forward_valid_lengths(&input, &[0]).is_err());
+        assert!(encoder.forward_valid_lengths(&input, &[4]).is_err());
     }
 
     fn tiny_granite_cache() -> PhysicalPagedKvCache {

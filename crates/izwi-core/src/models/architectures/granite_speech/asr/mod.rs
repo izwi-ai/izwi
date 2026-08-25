@@ -131,11 +131,33 @@ pub(crate) struct GraniteSpeechPreparedPromptArtifact {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct GraniteSpeechPreparedGeometry {
+    pub(crate) audio_samples: usize,
+    pub(crate) encoder_frames: usize,
+    pub(crate) encoder_dim: usize,
     pub(crate) prompt_tokens: usize,
     pub(crate) audio_tokens: usize,
     pub(crate) embedding_elements: u64,
     pub(crate) preparation_workspace_bytes: u64,
     pub(crate) retained_device_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GraniteSpeechPreparationBatchRow<'a> {
+    pub(crate) audio: &'a [f32],
+    pub(crate) sample_rate: u32,
+    pub(crate) language: Option<&'a str>,
+    pub(crate) prompt: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GraniteSpeechPreparationBatchGeometry {
+    pub(crate) batch_size: usize,
+    pub(crate) padded_audio_samples_per_row: usize,
+    pub(crate) padded_encoder_frames_per_row: usize,
+    pub(crate) encoder_dim: usize,
+    pub(crate) materialized_tensor_elements_per_row: u64,
+    pub(crate) workspace_per_row_bytes: u64,
+    pub(crate) max_workspace_bytes: u64,
 }
 
 impl GraniteSpeechPreparedGeometry {
@@ -146,6 +168,16 @@ impl GraniteSpeechPreparedGeometry {
             self.preparation_workspace_bytes,
         )
     }
+
+    fn batch_useful_tensor_elements(self) -> Result<u64> {
+        u64::try_from(self.encoder_frames)
+            .ok()
+            .and_then(|frames| frames.checked_mul(u64::try_from(self.encoder_dim).ok()?))
+            .and_then(|encoder| encoder.checked_add(self.embedding_elements))
+            .ok_or_else(|| {
+                Error::Overloaded("Granite Speech useful preparation elements overflow".into())
+            })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,6 +185,7 @@ pub(crate) struct GraniteSpeechAsrPreparationStageSeal {
     pub(crate) backend: BackendKind,
     pub(crate) dtype: String,
     pub(crate) max_work_units: u64,
+    pub(crate) max_materialized_tensor_elements_per_row: u64,
     pub(crate) max_workspace_bytes: u64,
 }
 
@@ -643,12 +676,97 @@ impl GraniteSpeechAsrModel {
             prompt_tokens,
         )?;
         Ok(GraniteSpeechPreparedGeometry {
+            audio_samples: audio.len(),
+            encoder_frames: features.encoder_frames,
+            encoder_dim: features.encoder_dim,
             prompt_tokens,
             audio_tokens,
             embedding_elements,
             preparation_workspace_bytes,
             retained_device_bytes,
         })
+    }
+
+    pub(crate) fn preparation_batch_geometry(
+        &self,
+        rows: &[GraniteSpeechPreparedGeometry],
+    ) -> Result<GraniteSpeechPreparationBatchGeometry> {
+        if rows.is_empty() {
+            return Err(Error::InvalidInput(
+                "Granite Speech preparation batch geometry is empty".into(),
+            ));
+        }
+        let padded_audio_samples_per_row =
+            rows.iter().map(|row| row.audio_samples).max().unwrap_or(0);
+        let padded_encoder_frames_per_row =
+            rows.iter().map(|row| row.encoder_frames).max().unwrap_or(0);
+        let encoder_dim = rows[0].encoder_dim;
+        let max_prompt_tokens = rows.iter().map(|row| row.prompt_tokens).max().unwrap_or(0);
+        if padded_audio_samples_per_row == 0
+            || padded_encoder_frames_per_row == 0
+            || encoder_dim == 0
+            || rows.iter().any(|row| row.encoder_dim != encoder_dim)
+        {
+            return Err(Error::InvalidInput(
+                "Granite Speech preparation rows have incompatible geometry".into(),
+            ));
+        }
+        let input_elements = u64::try_from(padded_encoder_frames_per_row)
+            .ok()
+            .and_then(|frames| frames.checked_mul(u64::try_from(encoder_dim).ok()?))
+            .ok_or_else(|| Error::Overloaded("Granite Speech batch input overflow".into()))?;
+        let prompt_elements = u64::try_from(max_prompt_tokens)
+            .ok()
+            .and_then(|tokens| {
+                tokens.checked_mul(u64::try_from(self.config.text_config.hidden_size).ok()?)
+            })
+            .ok_or_else(|| Error::Overloaded("Granite Speech batch prompt overflow".into()))?;
+        let materialized_tensor_elements_per_row =
+            input_elements.checked_add(prompt_elements).ok_or_else(|| {
+                Error::Overloaded("Granite Speech batch materialization overflow".into())
+            })?;
+        let workspace_per_row_bytes = self.preparation_workspace_bytes(
+            padded_encoder_frames_per_row,
+            encoder_dim,
+            max_prompt_tokens,
+        )?;
+        let max_workspace_bytes = workspace_per_row_bytes
+            .checked_mul(
+                u64::try_from(rows.len()).map_err(|_| {
+                    Error::Overloaded("Granite Speech batch width exceeds u64".into())
+                })?,
+            )
+            .ok_or_else(|| Error::Overloaded("Granite Speech batch workspace overflow".into()))?;
+        Ok(GraniteSpeechPreparationBatchGeometry {
+            batch_size: rows.len(),
+            padded_audio_samples_per_row,
+            padded_encoder_frames_per_row,
+            encoder_dim,
+            materialized_tensor_elements_per_row,
+            workspace_per_row_bytes,
+            max_workspace_bytes,
+        })
+    }
+
+    pub(crate) fn preparation_row_cost_for_batch(
+        &self,
+        index: usize,
+        rows: &[GraniteSpeechPreparedGeometry],
+        batch: GraniteSpeechPreparationBatchGeometry,
+    ) -> Result<crate::engine::WorkCost> {
+        let row = rows.get(index).ok_or_else(|| {
+            Error::InvalidInput("Granite Speech preparation row index is out of range".into())
+        })?;
+        if batch != self.preparation_batch_geometry(rows)? {
+            return Err(Error::InvalidInput(
+                "Granite Speech preparation batch geometry is stale or foreign".into(),
+            ));
+        }
+        Ok(crate::engine::WorkCost::new(
+            row.audio_tokens as u64,
+            row.batch_useful_tensor_elements()?,
+            batch.workspace_per_row_bytes,
+        ))
     }
 
     fn preparation_workspace_bytes(
@@ -803,12 +921,25 @@ impl GraniteSpeechAsrModel {
             .ok_or_else(|| {
                 Error::Overloaded("Granite Speech maximum work units overflow".into())
             })?;
+        let max_materialized_tensor_elements_per_row = u64::try_from(encoder_frames)
+            .ok()
+            .and_then(|frames| frames.checked_mul(u64::try_from(encoder_dim).ok()?))
+            .and_then(|input| {
+                let prompt = u64::try_from(prompt_tokens)
+                    .ok()?
+                    .checked_mul(u64::try_from(self.config.text_config.hidden_size).ok()?)?;
+                input.checked_add(prompt)
+            })
+            .ok_or_else(|| {
+                Error::Overloaded("Granite Speech maximum materialization overflow".into())
+            })?;
         Ok(GraniteSpeechAsrPreparationStageSeal {
             backend,
             dtype: format!("{:?}", self.dtype).to_ascii_lowercase(),
             max_work_units: u64::try_from(audio_tokens).map_err(|_| {
                 Error::Overloaded("Granite Speech maximum work units exceed u64".into())
             })?,
+            max_materialized_tensor_elements_per_row,
             max_workspace_bytes: self.preparation_workspace_bytes(
                 encoder_frames,
                 encoder_dim,
@@ -849,6 +980,70 @@ impl GraniteSpeechAsrModel {
             audio_tokens,
             language: language.map(str::to_string),
         }))
+    }
+
+    pub(crate) fn prepare_prompt_artifact_batch(
+        &self,
+        rows: &[GraniteSpeechPreparationBatchRow<'_>],
+    ) -> Result<Vec<Arc<GraniteSpeechPreparedPromptArtifact>>> {
+        if rows.is_empty() {
+            return Err(Error::InvalidInput(
+                "Granite Speech prompt preparation batch is empty".into(),
+            ));
+        }
+        if rows.len() == 1 {
+            let row = rows[0];
+            let audio = self.prepare_audio_retained(row.audio, row.sample_rate)?;
+            return self
+                .prepare_prompt_artifact(
+                    &audio,
+                    row.language,
+                    GraniteSpeechTask::Asr,
+                    row.prompt,
+                    None,
+                )
+                .map(|artifact| vec![artifact]);
+        }
+        let mut features = Vec::with_capacity(rows.len());
+        let mut prompts = Vec::with_capacity(rows.len());
+        for row in rows {
+            let row_features = self.prepare_audio_features(row.audio, row.sample_rate)?;
+            validate_granite_audio_duration(row_features.audio_seconds)?;
+            let prompt = self.build_prompt(&GraniteSpeechPromptOptions {
+                task: GraniteSpeechTask::Asr,
+                language: row.language.map(str::to_string),
+                custom_prompt: row.prompt.map(str::to_string),
+                ..GraniteSpeechPromptOptions::default()
+            })?;
+            if prompt.audio_token_positions.len() != 1 {
+                return Err(Error::InvalidInput(
+                    "Granite Speech prompt must contain exactly one audio placeholder".into(),
+                ));
+            }
+            features.push(row_features);
+            prompts.push(prompt);
+        }
+        let audio = self.runtime.audio_embeddings_batch_with_stats(&features)?;
+        prompts
+            .iter()
+            .zip(audio)
+            .zip(rows)
+            .map(|((prompt, (audio_embeddings, _stats)), row)| {
+                let (embeddings, prompt_tokens, audio_tokens) =
+                    self.runtime.prepare_prompt_embeddings(
+                        prompt,
+                        self.prompt_tokenizer.special_tokens(),
+                        &audio_embeddings,
+                    )?;
+                Ok(Arc::new(GraniteSpeechPreparedPromptArtifact {
+                    model_identity: self.model_identity,
+                    embeddings,
+                    prompt_tokens,
+                    audio_tokens,
+                    language: row.language.map(str::to_string),
+                }))
+            })
+            .collect()
     }
 
     pub(crate) fn begin_resumable_prefill_managed(
@@ -1505,6 +1700,26 @@ fn granite_speech_physical_state_spec(
                             && stage.max_batch_size == 1
                     })
                 };
+                let preparation = stages.iter().any(|stage| {
+                    if stage.selector != crate::engine::StageWorkSelector::PreSequencePreparation {
+                        return false;
+                    }
+                    if stage.max_batch_size == 1 {
+                        return stage.batch_mode == crate::engine::NativeBatchMode::None
+                            && stage.shape_policy == crate::engine::StageShapePolicy::Exact
+                            && stage.concurrency == crate::engine::ConcurrencyClass::Exclusive;
+                    }
+                    let batch_workspace = u64::try_from(stage.max_batch_size)
+                        .ok()
+                        .and_then(|width| stage.workspace_per_row_bytes.checked_mul(width));
+                    stage.batch_mode == crate::engine::NativeBatchMode::Static
+                        && stage.shape_policy == crate::engine::StageShapePolicy::Padded
+                        && stage.concurrency == crate::engine::ConcurrencyClass::Batchable
+                        && stage.workspace_base_bytes == 0
+                        && stage.workspace_per_row_bytes == 0
+                        && stage.workspace_per_work_unit_bytes == 0
+                        && batch_workspace.is_some_and(|bytes| stage.max_workspace_bytes >= bytes)
+                });
                 let decode = stages.iter().any(|stage| {
                     let batch_workspace = u64::try_from(stage.max_batch_size)
                         .ok()
@@ -1520,13 +1735,13 @@ fn granite_speech_physical_state_spec(
                         && batch_workspace.is_some_and(|bytes| stage.max_workspace_bytes >= bytes)
                 });
                 stages.len() == 3
-                    && scalar_stage(crate::engine::StageWorkSelector::PreSequencePreparation)
+                    && preparation
                     && scalar_stage(crate::engine::StageWorkSelector::SequencePrefill)
                     && decode
             });
         if !valid_normal || atomic_graphs != 1 || stage_graphs.len() != 2 {
             return Err(Error::ModelLoadError(
-                "Granite Speech ASR requires scalar exact preparation/prefill, continuous ragged decode, and one atomic compatibility graph"
+                "Granite Speech ASR requires authenticated preparation batching, scalar exact prefill, continuous ragged decode, and one atomic compatibility graph"
                     .into(),
             ));
         }
@@ -1608,7 +1823,15 @@ fn granite_speech_physical_state_spec(
             }
             invocation_stages.push(InvocationStageWorkspace {
                 stage: stage.id,
-                lease_scope: InvocationLeaseScope::PerRow,
+                lease_scope: if stage.selector
+                    == crate::engine::StageWorkSelector::PreSequencePreparation
+                    && stage.batch_mode == crate::engine::NativeBatchMode::Static
+                    && stage.workspace_per_row_bytes == 0
+                {
+                    InvocationLeaseScope::PerStageBatch
+                } else {
+                    InvocationLeaseScope::PerRow
+                },
                 groups: if uses_invocation_state {
                     invocation.groups.clone()
                 } else {
@@ -2188,6 +2411,36 @@ mod tests {
         stage
     }
 
+    fn granite_test_static_preparation_stage(id: u32) -> StageDescriptor {
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        profile.max_batch_size = 4;
+        let mut stage = StageDescriptor::from_execution_profile(
+            StageId::new(id),
+            format!("granite.test.{id}"),
+            &profile,
+            NativeBatchMode::Static,
+        );
+        stage.selector = StageWorkSelector::PreSequencePreparation;
+        stage.max_workspace_bytes = 128;
+        stage
+    }
+
+    #[test]
+    fn preparation_batch_useful_elements_include_encoder_input_and_artifact() {
+        let geometry = GraniteSpeechPreparedGeometry {
+            audio_samples: 32,
+            encoder_frames: 5,
+            encoder_dim: 3,
+            prompt_tokens: 7,
+            audio_tokens: 2,
+            embedding_elements: 28,
+            preparation_workspace_bytes: 64,
+            retained_device_bytes: 112,
+        };
+        assert_eq!(geometry.batch_useful_tensor_elements().unwrap(), 43);
+    }
+
     #[test]
     fn physical_state_separates_retained_normal_and_atomic_compatibility_graphs() {
         let invocation = granite_test_invocation_contract();
@@ -2234,6 +2487,25 @@ mod tests {
             .stages
             .iter()
             .all(|stage| !stage.groups.is_empty()));
+    }
+
+    #[test]
+    fn physical_state_authenticates_static_padded_preparation() {
+        let invocation = granite_test_invocation_contract();
+        let retained = granite_speech_retained_contract(invocation.clone()).unwrap();
+        let normal = vec![
+            granite_test_static_preparation_stage(0),
+            granite_test_stage(1, StageWorkSelector::SequencePrefill),
+            granite_test_stage(2, StageWorkSelector::SequenceDecode),
+        ];
+        let atomic = vec![granite_test_stage(0, StageWorkSelector::Atomic)];
+        granite_speech_physical_state_spec(
+            &[normal.as_slice(), atomic.as_slice()],
+            retained,
+            invocation,
+            128,
+        )
+        .unwrap();
     }
 
     #[test]

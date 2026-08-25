@@ -30,7 +30,8 @@ use crate::models::architectures::gemma3::chat::{
 use crate::models::architectures::granite_speech::asr::{
     GraniteSpeechAsrGenerationOptions, GraniteSpeechAsrModel, GraniteSpeechAsrTranscriptionOutput,
     GraniteSpeechDecodeCheckpoint, GraniteSpeechDecodeState, GraniteSpeechDecodeStep,
-    GraniteSpeechPhysicalStateSpec, GraniteSpeechPreparedGeometry,
+    GraniteSpeechPhysicalStateSpec, GraniteSpeechPreparationBatchGeometry,
+    GraniteSpeechPreparationBatchRow, GraniteSpeechPreparedGeometry,
     GraniteSpeechPreparedPromptArtifact, GraniteSpeechTask,
 };
 use crate::models::architectures::kokoro::KokoroTtsModel;
@@ -971,6 +972,44 @@ fn granite_speech_asr_options(
 }
 
 impl NativeAsrModel {
+    pub(crate) fn prepare_granite_speech_prompt_artifact_batch(
+        &self,
+        rows: &[GraniteSpeechPreparationBatchRow<'_>],
+    ) -> Result<Vec<Arc<GraniteSpeechPreparedPromptArtifact>>> {
+        match self {
+            Self::GraniteSpeech(model) => model.prepare_prompt_artifact_batch(rows),
+            _ => Err(Error::InvalidInput(
+                "Granite Speech batch preparation was supplied to another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn granite_speech_preparation_batch_geometry(
+        &self,
+        rows: &[GraniteSpeechPreparedGeometry],
+    ) -> Result<GraniteSpeechPreparationBatchGeometry> {
+        match self {
+            Self::GraniteSpeech(model) => model.preparation_batch_geometry(rows),
+            _ => Err(Error::InvalidInput(
+                "Granite Speech batch geometry was requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn granite_speech_preparation_row_cost_for_batch(
+        &self,
+        index: usize,
+        rows: &[GraniteSpeechPreparedGeometry],
+        batch: GraniteSpeechPreparationBatchGeometry,
+    ) -> Result<WorkCost> {
+        match self {
+            Self::GraniteSpeech(model) => model.preparation_row_cost_for_batch(index, rows, batch),
+            _ => Err(Error::InvalidInput(
+                "Granite Speech batch cost was requested from another ASR model".into(),
+            )),
+        }
+    }
+
     pub(crate) fn prepare_qwen3_audio_tower_batch(
         &self,
         rows: &[Qwen3AsrAudioBatchRow<'_>],
@@ -3416,6 +3455,26 @@ pub struct AsrModelLease {
 impl AsrModelLease {
     pub(crate) fn model_arc(&self) -> Arc<NativeAsrModel> {
         self.inner.model.clone()
+    }
+
+    pub(crate) fn granite_speech_preparation_batch_geometry(
+        &self,
+        rows: &[GraniteSpeechPreparedGeometry],
+    ) -> Result<GraniteSpeechPreparationBatchGeometry> {
+        self.inner
+            .model
+            .granite_speech_preparation_batch_geometry(rows)
+    }
+
+    pub(crate) fn granite_speech_preparation_row_cost_for_batch(
+        &self,
+        index: usize,
+        rows: &[GraniteSpeechPreparedGeometry],
+        batch: GraniteSpeechPreparationBatchGeometry,
+    ) -> Result<WorkCost> {
+        self.inner
+            .model
+            .granite_speech_preparation_row_cost_for_batch(index, rows, batch)
     }
 
     pub(crate) fn audio_preparation_batch_geometry(

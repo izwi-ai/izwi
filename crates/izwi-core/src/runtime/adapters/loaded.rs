@@ -34,7 +34,7 @@ const CONTINUOUS_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1
 const CONTINUOUS_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(16);
 const WHISPER_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(17);
 const VIBEVOICE_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(19);
-const GRANITE_SPEECH_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(21);
+const GRANITE_SPEECH_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(22);
 // Architecture ceiling: 8,192 codec frames, 1,920 output samples/frame,
 // f32-width intermediates, and up to 1,024 simultaneous channel-equivalents.
 // Exact request/model-derived costs remain smaller and are installed at
@@ -1788,6 +1788,9 @@ impl LoadedExecutionAdapter for ContinuousAsrExecutionAdapter {
 struct GraniteSpeechAsrExecutionSeal {
     preparation:
         crate::models::architectures::granite_speech::asr::GraniteSpeechAsrPreparationStageSeal,
+    preparation_max_batch_work_units: u64,
+    preparation_max_batch_materialized_tensor_elements: u64,
+    preparation_max_batch_workspace_bytes: u64,
     decode_workspace_per_row_bytes: u64,
 }
 
@@ -1826,6 +1829,12 @@ impl GraniteSpeechAsrExecutionAdapter {
     fn install_preparation_seal(&self, seal: GraniteSpeechAsrExecutionSeal) -> Result<()> {
         if let Some(existing) = self.seal.get() {
             return if existing.preparation == seal.preparation
+                && existing.preparation_max_batch_work_units
+                    == seal.preparation_max_batch_work_units
+                && existing.preparation_max_batch_materialized_tensor_elements
+                    == seal.preparation_max_batch_materialized_tensor_elements
+                && existing.preparation_max_batch_workspace_bytes
+                    == seal.preparation_max_batch_workspace_bytes
                 && existing.decode_workspace_per_row_bytes == seal.decode_workspace_per_row_bytes
             {
                 Ok(())
@@ -1858,8 +1867,31 @@ impl LoadedExecutionAdapter for GraniteSpeechAsrExecutionAdapter {
         &self,
         model: &crate::models::architectures::granite_speech::asr::GraniteSpeechAsrModel,
     ) -> Result<()> {
+        let preparation = model.scalar_preparation_stage_seal(self.backend_kind)?;
+        let width = u64::try_from(self.max_batch_size)
+            .map_err(|_| Error::Overloaded("Granite Speech batch width exceeds u64".into()))?;
         self.install_preparation_seal(GraniteSpeechAsrExecutionSeal {
-            preparation: model.scalar_preparation_stage_seal(self.backend_kind)?,
+            preparation_max_batch_work_units: preparation
+                .max_work_units
+                .checked_mul(width)
+                .ok_or_else(|| {
+                    Error::Overloaded("Granite Speech batch work ceiling overflow".into())
+                })?,
+            preparation_max_batch_materialized_tensor_elements: preparation
+                .max_materialized_tensor_elements_per_row
+                .checked_mul(width)
+                .ok_or_else(|| {
+                    Error::Overloaded(
+                        "Granite Speech batch materialization ceiling overflow".into(),
+                    )
+                })?,
+            preparation_max_batch_workspace_bytes: preparation
+                .max_workspace_bytes
+                .checked_mul(width)
+                .ok_or_else(|| {
+                    Error::Overloaded("Granite Speech batch workspace ceiling overflow".into())
+                })?,
+            preparation,
             decode_workspace_per_row_bytes: model.continuous_decode_workspace_per_row_bytes()?,
         })
     }
@@ -1868,16 +1900,39 @@ impl LoadedExecutionAdapter for GraniteSpeechAsrExecutionAdapter {
     fn install_test_preparation_seal(
         &self,
         backend: BackendKind,
-        _max_batch_size: usize,
+        max_batch_size: usize,
     ) -> Result<()> {
+        if max_batch_size.max(1) != self.max_batch_size {
+            return Err(Error::ModelLoadError(
+                "test Granite Speech preparation width does not match its adapter".into(),
+            ));
+        }
+        let width = u64::try_from(self.max_batch_size)
+            .map_err(|_| Error::Overloaded("test Granite Speech batch width exceeds u64".into()))?;
         self.install_preparation_seal(GraniteSpeechAsrExecutionSeal {
             preparation:
                 crate::models::architectures::granite_speech::asr::GraniteSpeechAsrPreparationStageSeal {
                 backend,
                 dtype: "f32".into(),
                 max_work_units: 10_000,
+                max_materialized_tensor_elements_per_row: 2_000_000,
                 max_workspace_bytes: 1024 * 1024 * 1024,
             },
+            preparation_max_batch_work_units: 10_000_u64
+                .checked_mul(width)
+                .ok_or_else(|| {
+                    Error::Overloaded("test Granite Speech work ceiling overflow".into())
+                })?,
+            preparation_max_batch_materialized_tensor_elements: 2_000_000_u64
+                .checked_mul(width)
+                .ok_or_else(|| {
+                    Error::Overloaded("test Granite Speech materialization ceiling overflow".into())
+                })?,
+            preparation_max_batch_workspace_bytes: (1024_u64 * 1024 * 1024)
+                .checked_mul(width)
+                .ok_or_else(|| {
+                    Error::Overloaded("test Granite Speech workspace ceiling overflow".into())
+                })?,
             decode_workspace_per_row_bytes: 8_192,
         })
     }
@@ -1938,7 +1993,33 @@ impl LoadedExecutionAdapter for GraniteSpeechAsrExecutionAdapter {
                     .into(),
             )
         })?;
-        if seal.preparation.backend != self.backend_kind || seal.decode_workspace_per_row_bytes == 0
+        let width = u64::try_from(self.max_batch_size)
+            .map_err(|_| Error::Overloaded("Granite Speech batch width exceeds u64".into()))?;
+        let valid_batch_ceilings = seal
+            .preparation
+            .max_work_units
+            .checked_mul(width)
+            .is_some_and(|value| value == seal.preparation_max_batch_work_units)
+            && seal
+                .preparation
+                .max_materialized_tensor_elements_per_row
+                .checked_mul(width)
+                .is_some_and(|value| {
+                    value == seal.preparation_max_batch_materialized_tensor_elements
+                })
+            && seal
+                .preparation
+                .max_workspace_bytes
+                .checked_mul(width)
+                .is_some_and(|value| value == seal.preparation_max_batch_workspace_bytes);
+        if seal.preparation.backend != self.backend_kind
+            || seal.preparation.dtype.is_empty()
+            || seal.decode_workspace_per_row_bytes == 0
+            || seal.preparation.max_materialized_tensor_elements_per_row == 0
+            || seal.preparation_max_batch_work_units == 0
+            || seal.preparation_max_batch_materialized_tensor_elements == 0
+            || seal.preparation_max_batch_workspace_bytes == 0
+            || !valid_batch_ceilings
         {
             return Err(Error::ModelLoadError(
                 "Granite Speech ASR preparation seal does not match its loaded adapter identity"
@@ -1967,20 +2048,31 @@ impl LoadedExecutionAdapter for GraniteSpeechAsrExecutionAdapter {
         profile.max_batch_size = self.max_batch_size;
         profile.resolved_from_loaded_model = true;
 
+        let native_preparation = self.max_batch_size > 1;
         let mut preparation = StageDescriptor::from_execution_profile(
             StageId::new(0),
-            "asr.granite.encoder.audio",
+            "asr.encoder.granite_speech",
             &profile,
-            NativeBatchMode::None,
+            if native_preparation {
+                NativeBatchMode::Static
+            } else {
+                NativeBatchMode::None
+            },
         );
         preparation.selector = StageWorkSelector::PreSequencePreparation;
         preparation.progress = StageProgressKind::Atomic;
         preparation.membership_safe_point = MembershipSafePoint::OperationBoundary;
-        preparation.max_batch_size = 1;
-        preparation.max_work_units = seal.preparation.max_work_units;
-        preparation.max_workspace_bytes = seal.preparation.max_workspace_bytes;
-        preparation.concurrency = ConcurrencyClass::Exclusive;
-        preparation.shape_policy = StageShapePolicy::Exact;
+        if native_preparation {
+            preparation.max_batch_size = self.max_batch_size;
+            preparation.max_work_units = seal.preparation_max_batch_work_units;
+            preparation.max_workspace_bytes = seal.preparation_max_batch_workspace_bytes;
+        } else {
+            preparation.max_batch_size = 1;
+            preparation.max_work_units = seal.preparation.max_work_units;
+            preparation.max_workspace_bytes = seal.preparation.max_workspace_bytes;
+            preparation.concurrency = ConcurrencyClass::Exclusive;
+            preparation.shape_policy = StageShapePolicy::Exact;
+        }
         preparation.output_visibility = OutputVisibility::AfterQuantumCommit;
 
         let mut prefill = StageDescriptor::from_execution_profile(
@@ -4721,7 +4813,7 @@ mod tests {
     }
 
     #[test]
-    fn granite_speech_normal_graph_has_continuous_decode_and_long_form_is_atomic() {
+    fn granite_speech_normal_graph_has_static_preparation_continuous_decode_and_atomic_fallback() {
         let registry = RuntimeAdapterRegistry::built_in();
         let metadata = *registry
             .require(CapabilityKind::Asr, ModelVariant::GraniteSpeech412BPlus)
@@ -4734,8 +4826,13 @@ mod tests {
             8,
         );
         adapter
-            .install_test_preparation_seal(BackendKind::Cpu, 1)
+            .install_test_preparation_seal(BackendKind::Cpu, 8)
             .unwrap();
+        let sealed = adapter.seal.get().unwrap();
+        assert_eq!(
+            sealed.preparation_max_batch_materialized_tensor_elements,
+            8 * 2_000_000
+        );
 
         let normal = adapter.contract(StreamingRequirements::NONE).unwrap();
         assert_eq!(normal.adapter_abi_revision, GRANITE_SPEECH_ASR_ADAPTER_ABI);
@@ -4760,9 +4857,14 @@ mod tests {
             StageWorkSelector::SequencePrefill
         );
         assert_eq!(normal.stages[2].selector, StageWorkSelector::SequenceDecode);
-        assert_eq!(normal.stages[0].batch_mode, NativeBatchMode::None);
-        assert_eq!(normal.stages[0].max_batch_size, 1);
-        assert_eq!(normal.stages[0].concurrency, ConcurrencyClass::Exclusive);
+        assert_eq!(normal.stages[0].name, "asr.encoder.granite_speech");
+        assert_eq!(normal.stages[0].batch_mode, NativeBatchMode::Static);
+        assert_eq!(normal.stages[0].shape_policy, StageShapePolicy::Padded);
+        assert_eq!(normal.stages[0].max_batch_size, 8);
+        assert_eq!(normal.stages[0].concurrency, ConcurrencyClass::Batchable);
+        assert_eq!(normal.stages[0].max_work_units, 8 * 10_000);
+        assert_eq!(normal.stages[0].workspace_per_row_bytes, 0);
+        assert_eq!(normal.stages[0].max_workspace_bytes, 8 * 1024 * 1024 * 1024);
         assert_eq!(normal.stages[1].batch_mode, NativeBatchMode::None);
         assert_eq!(normal.stages[1].max_batch_size, 1);
         assert_eq!(normal.stages[1].concurrency, ConcurrencyClass::Exclusive);
@@ -4786,7 +4888,7 @@ mod tests {
     }
 
     #[test]
-    fn granite_speech_continuous_decode_contract_is_backend_truthful() {
+    fn granite_speech_native_batch_contract_is_backend_truthful() {
         let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(8, 1).unwrap();
         let metadata = *registry
             .require(CapabilityKind::Asr, ModelVariant::GraniteSpeech412BPlus)
@@ -4812,11 +4914,46 @@ mod tests {
                 contract.execution_profile.decode_batch,
                 NativeBatchMode::Continuous
             );
+            assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::Static);
+            assert_eq!(contract.stages[0].shape_policy, StageShapePolicy::Padded);
+            assert_eq!(contract.stages[0].max_batch_size, 8);
+            assert_eq!(contract.stages[0].workspace_per_row_bytes, 0);
+            assert_eq!(
+                contract.stages[0].max_workspace_bytes,
+                8 * 1024 * 1024 * 1024
+            );
             assert_eq!(contract.stages[1].concurrency, ConcurrencyClass::Exclusive);
             assert_eq!(contract.stages[2].concurrency, ConcurrencyClass::Batchable);
             assert_eq!(contract.stages[2].workspace_per_row_bytes, 8_192);
             assert_eq!(contract.stages[2].max_workspace_bytes, 8 * 8_192);
         }
+    }
+
+    #[test]
+    fn granite_speech_width_one_keeps_scalar_preparation() {
+        let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(1, 1).unwrap();
+        let metadata = *registry
+            .require(CapabilityKind::Asr, ModelVariant::GraniteSpeech412BPlus)
+            .unwrap();
+        let adapter = GraniteSpeechAsrExecutionAdapter::new(
+            ExecutionGroupId::new(1),
+            ModelInstanceId::new(2),
+            metadata,
+            BackendKind::Cpu,
+            1,
+        );
+        adapter
+            .install_test_preparation_seal(BackendKind::Cpu, 1)
+            .unwrap();
+
+        let contract = adapter.contract(StreamingRequirements::NONE).unwrap();
+        assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::None);
+        assert_eq!(contract.stages[0].shape_policy, StageShapePolicy::Exact);
+        assert_eq!(contract.stages[0].max_batch_size, 1);
+        assert_eq!(contract.stages[0].concurrency, ConcurrencyClass::Exclusive);
+        assert_eq!(contract.stages[1].batch_mode, NativeBatchMode::None);
+        assert_eq!(contract.stages[2].batch_mode, NativeBatchMode::Continuous);
+        assert_eq!(contract.stages[2].max_batch_size, 1);
     }
 
     #[test]
