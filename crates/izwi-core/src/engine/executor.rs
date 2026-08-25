@@ -73,7 +73,7 @@ use crate::models::registry::{AsrModelLease, NativeAsrModel, NativeChatModel, Qw
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::ModelRegistry;
 use crate::runtime::{PhysicalExecutionAdmission, PhysicalExecutionLease};
-use state::{ActiveAsrDecode, ActiveChatDecode, ActiveQwenTtsDecode};
+use state::{ActiveAsrDecode, ActiveChatDecode, ActiveQwenTtsDecode, ActiveVoxtralRealtime};
 
 const QWEN38_TARGET_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(1);
 const QWEN38_MTP_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(4);
@@ -1881,6 +1881,7 @@ pub struct NativeExecutor {
     loaded_tts_model: Option<Arc<Qwen3TtsModel>>,
     chat_decode_states: ExecutorStateStore<ActiveChatDecode>,
     asr_decode_states: ExecutorStateStore<ActiveAsrDecode>,
+    voxtral_realtime_states: ExecutorStateStore<ActiveVoxtralRealtime>,
     qwen_tts_decode_states: ExecutorStateStore<ActiveQwenTtsDecode>,
 }
 
@@ -1893,6 +1894,7 @@ impl NativeExecutor {
             loaded_tts_model: None,
             chat_decode_states: Mutex::new(HashMap::new()),
             asr_decode_states: Mutex::new(HashMap::new()),
+            voxtral_realtime_states: Mutex::new(HashMap::new()),
             qwen_tts_decode_states: Mutex::new(HashMap::new()),
         }
     }
@@ -2499,22 +2501,27 @@ impl ModelExecutor for NativeExecutor {
             .asr_decode_states
             .lock()
             .map_err(|_| Error::InferenceError("ASR decode state mutex poisoned".to_string()))?;
+        let mut voxtral = self.voxtral_realtime_states.lock().map_err(|_| {
+            Error::InferenceError("Voxtral realtime state mutex poisoned".to_string())
+        })?;
         let mut tts = self.qwen_tts_decode_states.lock().map_err(|_| {
             Error::InferenceError("Qwen TTS decode state mutex poisoned".to_string())
         })?;
         chat.clear();
         asr.clear();
+        voxtral.clear();
         tts.clear();
-        drop((chat, asr, tts));
+        drop((chat, asr, voxtral, tts));
         self.initialized = false;
         self.loaded_tts_model = None;
         Ok(())
     }
 
     fn cleanup_request(&self, request_id: &str) -> CacheReleaseReport {
-        let (Ok(mut chat), Ok(mut asr), Ok(mut tts)) = (
+        let (Ok(mut chat), Ok(mut asr), Ok(mut voxtral), Ok(mut tts)) = (
             self.chat_decode_states.lock(),
             self.asr_decode_states.lock(),
+            self.voxtral_realtime_states.lock(),
             self.qwen_tts_decode_states.lock(),
         ) else {
             return CacheReleaseReport::unconfirmed();
@@ -2522,14 +2529,16 @@ impl ModelExecutor for NativeExecutor {
 
         let chat = cleanup_request_states_locked(&mut chat, request_id);
         let asr = cleanup_request_states_locked(&mut asr, request_id);
+        let voxtral = cleanup_request_states_locked(&mut voxtral, request_id);
         let tts = cleanup_request_states_locked(&mut tts, request_id);
-        cleanup_report(chat.combine(asr).combine(tts))
+        cleanup_report(chat.combine(asr).combine(voxtral).combine(tts))
     }
 
     fn cleanup_session(&self, session: &SessionKey) -> CacheReleaseReport {
-        let (Ok(mut chat), Ok(mut asr), Ok(mut tts)) = (
+        let (Ok(mut chat), Ok(mut asr), Ok(mut voxtral), Ok(mut tts)) = (
             self.chat_decode_states.lock(),
             self.asr_decode_states.lock(),
+            self.voxtral_realtime_states.lock(),
             self.qwen_tts_decode_states.lock(),
         ) else {
             return CacheReleaseReport::unconfirmed();
@@ -2537,8 +2546,9 @@ impl ModelExecutor for NativeExecutor {
 
         let chat = cleanup_session_state_locked(&mut chat, session);
         let asr = cleanup_session_state_locked(&mut asr, session);
+        let voxtral = cleanup_session_state_locked(&mut voxtral, session);
         let tts = cleanup_session_state_locked(&mut tts, session);
-        cleanup_report(chat.combine(asr).combine(tts))
+        cleanup_report(chat.combine(asr).combine(voxtral).combine(tts))
     }
 
     fn purge_model_cache(&self, _variant: ModelVariant) -> CacheReleaseReport {
@@ -3397,14 +3407,18 @@ mod tests {
     fn native_audio_stage_authenticates_realtime_push_and_finish_roles() {
         assert_eq!(
             NativeBatchRoute::audio_stage(&WorkUnit::RealtimePush {
+                operation_id: super::super::RealtimeOperationId::new(1),
                 input: super::super::InputRange::new(0, 160).unwrap(),
                 max_output_steps: 2,
+                max_cache_append: 4,
             }),
             NativeAudioStage::RealtimePush
         );
         assert_eq!(
             NativeBatchRoute::audio_stage(&WorkUnit::RealtimeFinish {
+                operation_id: super::super::RealtimeOperationId::new(2),
                 max_output_steps: 4,
+                max_cache_append: 4,
             }),
             NativeAudioStage::RealtimeFinish
         );

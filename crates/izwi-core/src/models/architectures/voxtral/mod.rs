@@ -2,7 +2,10 @@
 
 use candle_core::DType;
 
-use crate::engine::StageDescriptor;
+use crate::engine::{
+    ConcurrencyClass, MembershipSafePoint, NativeBatchMode, OutputVisibility, StageDescriptor,
+    StageProgressKind, StageShapePolicy, StageWorkSelector,
+};
 use crate::error::{Error, Result};
 use crate::kv::v2::{
     stage_graph_fingerprint, CapabilityStateDescriptorV2, CheckpointPolicy, InferenceStateContract,
@@ -102,6 +105,33 @@ pub(crate) fn voxtral_realtime_physical_state_spec(
         return Err(Error::ModelLoadError(
             "Voxtral retained realtime state requires stages and a non-zero context".into(),
         ));
+    }
+    for stages in stage_graphs {
+        let valid_stage = |stage: &StageDescriptor, selector| {
+            stage.selector == selector
+                && stage.progress == StageProgressKind::InputDriven
+                && stage.membership_safe_point == MembershipSafePoint::InputBoundary
+                && stage.output_visibility == OutputVisibility::AfterQuantumCommit
+                && stage.batch_mode == NativeBatchMode::None
+                && stage.max_batch_size == 1
+                && stage.max_work_units < u64::MAX
+                && stage.max_workspace_bytes > 0
+                && stage.shape_policy == StageShapePolicy::Exact
+                && stage.concurrency == ConcurrencyClass::Exclusive
+        };
+        let valid = stages.len() == 2
+            && stages
+                .iter()
+                .any(|stage| valid_stage(stage, StageWorkSelector::RealtimePush))
+            && stages
+                .iter()
+                .any(|stage| valid_stage(stage, StageWorkSelector::RealtimeFinish));
+        if !valid {
+            return Err(Error::ModelLoadError(
+                "Voxtral realtime requires bounded-workspace exact exclusive push and finish stages"
+                    .into(),
+            ));
+        }
     }
     let max_domain_id = retained
         .domains

@@ -15,3 +15,5 @@ pub(crate) mod streaming;
 mod tokenizer;
 
 pub use model::VoxtralRealtimeModel;
+pub(crate) use model::{VoxtralRealtimeCheckpoint, VoxtralRealtimeStep};
+pub(crate) use streaming::{VoxtralRealtimeResourceUsage, VoxtralRealtimeState};

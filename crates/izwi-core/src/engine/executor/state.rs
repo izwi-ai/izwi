@@ -5,8 +5,10 @@ use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::tts::{
     PhysicalTtsDecodeState, PhysicalTtsPrefillState, Qwen3TtsModel,
 };
+use crate::models::architectures::voxtral::realtime::VoxtralRealtimeState;
 use crate::models::registry::{
     AsrModelLease, NativeAsrDecodeState, NativeAsrModel, NativeChatDecodeState, QwenTtsModelLease,
+    VoxtralModelLease,
 };
 
 pub(super) struct ActiveChatDecode {
@@ -29,6 +31,15 @@ pub(super) struct ActiveAsrDecode {
     pub(super) stream_sequence: usize,
     pub(super) input_sample_rate: u32,
     pub(super) input_sample_count: usize,
+}
+
+pub(super) struct ActiveVoxtralRealtime {
+    pub(super) variant: ModelVariant,
+    pub(super) model: VoxtralModelLease,
+    pub(super) state: VoxtralRealtimeState,
+    pub(super) last_tokens_generated: usize,
+    pub(super) stream_sequence: usize,
+    pub(super) input_sample_rate: u32,
 }
 
 pub(super) enum QwenTtsPhysicalState {

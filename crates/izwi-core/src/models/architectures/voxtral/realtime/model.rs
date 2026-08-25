@@ -31,7 +31,9 @@ use crate::models::shared::config::checkpoint_dtype_from_config_json;
 
 use super::audio::{AudioLanguageAdapter, TimeEmbedding};
 use super::config::VoxtralConfig;
-use super::streaming::{VoxtralRealtimeHostCheckpoint, VoxtralRealtimeState};
+use super::streaming::{
+    VoxtralRealtimeHostCheckpoint, VoxtralRealtimeResourceUsage, VoxtralRealtimeState,
+};
 use super::tokenizer::{AudioConfig, VoxtralTokenizer};
 
 /// Voxtral Realtime Model
@@ -279,6 +281,20 @@ impl VoxtralRealtimeModel {
         VoxtralRealtimeState::new(language)
     }
 
+    pub(crate) fn realtime_max_output_steps(&self) -> Result<usize> {
+        self.language_model
+            .model_context_limit()
+            .filter(|limit| *limit > 0)
+            .ok_or_else(|| Error::ModelLoadError("Voxtral has no non-zero context limit".into()))
+    }
+
+    pub(crate) fn realtime_stream_resource_usage(
+        &self,
+        state: &VoxtralRealtimeState,
+    ) -> Result<VoxtralRealtimeResourceUsage> {
+        state.resource_usage()
+    }
+
     pub(crate) fn begin_realtime_quantum(
         &self,
         state: &mut VoxtralRealtimeState,
@@ -407,6 +423,30 @@ impl VoxtralRealtimeModel {
         result
     }
 
+    /// Apply one input chunk inside a checkpoint opened by
+    /// `begin_realtime_quantum`. The handler owns the final cancellation fence
+    /// and must commit or roll back the checkpoint after this returns.
+    pub(crate) fn apply_realtime_push_physical(
+        &self,
+        state: &mut VoxtralRealtimeState,
+        cache: &mut PhysicalPagedKvCache,
+        samples: &[f32],
+        sample_rate: u32,
+        max_output_steps: usize,
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<Vec<VoxtralRealtimeStep>> {
+        if samples.is_empty() {
+            return Err(Error::InvalidInput(
+                "Voxtral realtime push requires a non-empty audio chunk".into(),
+            ));
+        }
+        self.ensure_active_realtime_quantum(state, cache)?;
+        Self::check_realtime_cancelled(should_cancel)?;
+        self.push_realtime_samples(state, samples, sample_rate)?;
+        Self::check_realtime_cancelled(should_cancel)?;
+        self.drain_realtime_steps(state, cache, max_output_steps, should_cancel)
+    }
+
     /// Close input and apply the alignment/right-padding tail exactly once.
     pub(crate) fn finish_realtime_input(&self, state: &mut VoxtralRealtimeState) -> Result<usize> {
         if state.final_padding_applied {
@@ -431,8 +471,120 @@ impl VoxtralRealtimeModel {
         result
     }
 
+    /// Apply input closure inside a checkpoint opened by
+    /// `begin_realtime_quantum`. The handler owns the final cancellation fence
+    /// and must commit or roll back the checkpoint after this returns.
+    pub(crate) fn apply_realtime_finish_physical(
+        &self,
+        state: &mut VoxtralRealtimeState,
+        cache: &mut PhysicalPagedKvCache,
+        max_output_steps: usize,
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<Vec<VoxtralRealtimeStep>> {
+        self.ensure_active_realtime_quantum(state, cache)?;
+        Self::check_realtime_cancelled(should_cancel)?;
+        self.finish_realtime_input(state)?;
+        Self::check_realtime_cancelled(should_cancel)?;
+        self.drain_realtime_steps(state, cache, max_output_steps, should_cancel)
+    }
+
+    fn ensure_active_realtime_quantum(
+        &self,
+        state: &VoxtralRealtimeState,
+        cache: &PhysicalPagedKvCache,
+    ) -> Result<()> {
+        if state.active_quantum.is_none() {
+            return Err(Error::InferenceError(
+                "Voxtral realtime apply requires an active checkpoint".into(),
+            ));
+        }
+        let expected_cursor = if state.prompt_initialized {
+            state.next_audio_frame
+        } else {
+            0
+        };
+        if cache.context_len() != expected_cursor {
+            return Err(Error::InferenceError(format!(
+                "Voxtral realtime host/KV cursors disagree before apply: host {expected_cursor}, cache {}",
+                cache.context_len()
+            )));
+        }
+        Ok(())
+    }
+
+    fn finish_realtime_quantum<T>(
+        &self,
+        state: &mut VoxtralRealtimeState,
+        cache: &mut PhysicalPagedKvCache,
+        checkpoint: &mut VoxtralRealtimeCheckpoint,
+        result: Result<T>,
+    ) -> Result<T> {
+        match result {
+            Ok(output) => {
+                self.commit_realtime_quantum(state, cache, checkpoint)?;
+                Ok(output)
+            }
+            Err(error) => {
+                self.rollback_realtime_quantum(state, cache, checkpoint)
+                    .map_err(|rollback| {
+                        Error::InferenceError(format!(
+                            "{error}; Voxtral realtime rollback also failed: {rollback}"
+                        ))
+                    })?;
+                Err(error)
+            }
+        }
+    }
+
+    fn drain_realtime_steps(
+        &self,
+        state: &mut VoxtralRealtimeState,
+        cache: &mut PhysicalPagedKvCache,
+        max_output_steps: usize,
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<Vec<VoxtralRealtimeStep>> {
+        let mut steps = Vec::with_capacity(max_output_steps.min(64));
+        while steps.len() < max_output_steps && !state.finished {
+            Self::check_realtime_cancelled(should_cancel)?;
+            let step = if state.prompt_initialized {
+                self.decode_realtime_step_unchecked(state, cache)?
+            } else {
+                self.prefill_realtime_unchecked(state, cache)?
+            };
+            let Some(step) = step else {
+                break;
+            };
+            let finished = step.finished;
+            steps.push(step);
+            if finished {
+                break;
+            }
+        }
+        Ok(steps)
+    }
+
+    fn check_realtime_cancelled(should_cancel: &mut dyn FnMut() -> bool) -> Result<()> {
+        if should_cancel() {
+            Err(Error::Cancelled(
+                "Voxtral realtime quantum cancelled".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Prefill the transcription prompt once enough audio frames are stable.
     pub(crate) fn prefill_realtime_physical(
+        &self,
+        state: &mut VoxtralRealtimeState,
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<Option<VoxtralRealtimeStep>> {
+        let mut checkpoint = self.begin_realtime_quantum(state, cache)?;
+        let result = self.prefill_realtime_unchecked(state, cache);
+        self.finish_realtime_quantum(state, cache, &mut checkpoint, result)
+    }
+
+    fn prefill_realtime_unchecked(
         &self,
         state: &mut VoxtralRealtimeState,
         cache: &mut PhysicalPagedKvCache,
@@ -453,43 +605,43 @@ impl VoxtralRealtimeModel {
         if state.prepared_audio_frames < prompt_len {
             return Ok(None);
         }
-        let mut checkpoint = self.begin_realtime_quantum(state, cache)?;
-        let result = (|| {
-            let audio_embeds = state.audio_embeds.as_ref().ok_or_else(|| {
-                Error::InferenceError("Voxtral realtime audio embeddings are unavailable".into())
-            })?;
-            let prompt_tensor =
-                Tensor::from_vec(prompt_tokens, (1, prompt_len), &self.device.device)?;
-            let text_embeds = self.language_model.embeddings(&prompt_tensor)?;
-            let mut audio_prompt = audio_embeds.narrow(1, 0, prompt_len)?;
-            if audio_prompt.dtype() != text_embeds.dtype() {
-                audio_prompt = audio_prompt.to_dtype(text_embeds.dtype())?;
-            }
-            let prompt_embeds = audio_prompt.broadcast_add(&text_embeds)?;
-            let t_cond = self.realtime_time_condition(&prompt_embeds)?;
-            let logits = self.language_model.forward_managed_with_embeds(
-                &prompt_embeds,
-                0,
-                cache,
-                None,
-                Some(&t_cond),
-            )?;
-            let next_logits = logits.i((0, logits.dim(1)? - 1))?;
-            state.prompt_initialized = true;
-            state.next_audio_frame = prompt_len;
-            self.accept_realtime_prediction(state, argmax(&next_logits)?)
-                .map(Some)
-        })();
-        if let Err(error) = result {
-            self.rollback_realtime_quantum(state, cache, &mut checkpoint)?;
-            return Err(error);
+        let audio_embeds = state.audio_embeds.as_ref().ok_or_else(|| {
+            Error::InferenceError("Voxtral realtime audio embeddings are unavailable".into())
+        })?;
+        let prompt_tensor = Tensor::from_vec(prompt_tokens, (1, prompt_len), &self.device.device)?;
+        let text_embeds = self.language_model.embeddings(&prompt_tensor)?;
+        let mut audio_prompt = audio_embeds.narrow(1, 0, prompt_len)?;
+        if audio_prompt.dtype() != text_embeds.dtype() {
+            audio_prompt = audio_prompt.to_dtype(text_embeds.dtype())?;
         }
-        self.commit_realtime_quantum(state, cache, &mut checkpoint)?;
-        result
+        let prompt_embeds = audio_prompt.broadcast_add(&text_embeds)?;
+        let t_cond = self.realtime_time_condition(&prompt_embeds)?;
+        let logits = self.language_model.forward_managed_with_embeds(
+            &prompt_embeds,
+            0,
+            cache,
+            None,
+            Some(&t_cond),
+        )?;
+        let next_logits = logits.i((0, logits.dim(1)? - 1))?;
+        state.prompt_initialized = true;
+        state.next_audio_frame = prompt_len;
+        self.accept_realtime_prediction(state, argmax(&next_logits)?)
+            .map(Some)
     }
 
     /// Advance one retained decoder token against one prepared audio frame.
     pub(crate) fn decode_realtime_step_physical(
+        &self,
+        state: &mut VoxtralRealtimeState,
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<Option<VoxtralRealtimeStep>> {
+        let mut checkpoint = self.begin_realtime_quantum(state, cache)?;
+        let result = self.decode_realtime_step_unchecked(state, cache);
+        self.finish_realtime_quantum(state, cache, &mut checkpoint, result)
+    }
+
+    fn decode_realtime_step_unchecked(
         &self,
         state: &mut VoxtralRealtimeState,
         cache: &mut PhysicalPagedKvCache,
@@ -512,47 +664,38 @@ impl VoxtralRealtimeModel {
         let input_token = state.pending_input_token.ok_or_else(|| {
             Error::InferenceError("Voxtral realtime decoder lost its pending token".into())
         })?;
-        let mut checkpoint = self.begin_realtime_quantum(state, cache)?;
-        let result = (|| {
-            if cache.context_len() != state.next_audio_frame {
-                return Err(Error::InvalidInput(format!(
-                    "Voxtral realtime host/KV cursors disagree: frame {}, cache {}",
-                    state.next_audio_frame,
-                    cache.context_len()
-                )));
-            }
-            let audio_embeds = state.audio_embeds.as_ref().ok_or_else(|| {
-                Error::InferenceError("Voxtral realtime audio embeddings are unavailable".into())
-            })?;
-            let input_tensor = Tensor::from_vec(vec![input_token], (1, 1), &self.device.device)?;
-            let text_embed = self.language_model.embeddings(&input_tensor)?;
-            let mut audio_step = audio_embeds.narrow(1, state.next_audio_frame, 1)?;
-            if audio_step.dtype() != text_embed.dtype() {
-                audio_step = audio_step.to_dtype(text_embed.dtype())?;
-            }
-            let step_embeds = audio_step.broadcast_add(&text_embed)?;
-            let t_cond = self.realtime_time_condition(&step_embeds)?;
-            let logits = self.language_model.forward_managed_with_embeds(
-                &step_embeds,
+        if cache.context_len() != state.next_audio_frame {
+            return Err(Error::InvalidInput(format!(
+                "Voxtral realtime host/KV cursors disagree: frame {}, cache {}",
                 state.next_audio_frame,
-                cache,
-                None,
-                Some(&t_cond),
-            )?;
-            let next_logits = logits.i((0, logits.dim(1)? - 1))?;
-            state.next_audio_frame = state
-                .next_audio_frame
-                .checked_add(1)
-                .ok_or_else(|| Error::InvalidInput("Voxtral realtime cursor overflow".into()))?;
-            self.accept_realtime_prediction(state, argmax(&next_logits)?)
-                .map(Some)
-        })();
-        if let Err(error) = result {
-            self.rollback_realtime_quantum(state, cache, &mut checkpoint)?;
-            return Err(error);
+                cache.context_len()
+            )));
         }
-        self.commit_realtime_quantum(state, cache, &mut checkpoint)?;
-        result
+        let audio_embeds = state.audio_embeds.as_ref().ok_or_else(|| {
+            Error::InferenceError("Voxtral realtime audio embeddings are unavailable".into())
+        })?;
+        let input_tensor = Tensor::from_vec(vec![input_token], (1, 1), &self.device.device)?;
+        let text_embed = self.language_model.embeddings(&input_tensor)?;
+        let mut audio_step = audio_embeds.narrow(1, state.next_audio_frame, 1)?;
+        if audio_step.dtype() != text_embed.dtype() {
+            audio_step = audio_step.to_dtype(text_embed.dtype())?;
+        }
+        let step_embeds = audio_step.broadcast_add(&text_embed)?;
+        let t_cond = self.realtime_time_condition(&step_embeds)?;
+        let logits = self.language_model.forward_managed_with_embeds(
+            &step_embeds,
+            state.next_audio_frame,
+            cache,
+            None,
+            Some(&t_cond),
+        )?;
+        let next_logits = logits.i((0, logits.dim(1)? - 1))?;
+        state.next_audio_frame = state
+            .next_audio_frame
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidInput("Voxtral realtime cursor overflow".into()))?;
+        self.accept_realtime_prediction(state, argmax(&next_logits)?)
+            .map(Some)
     }
 
     /// Transcribe audio (non-streaming)

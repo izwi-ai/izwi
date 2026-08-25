@@ -256,6 +256,21 @@ pub enum SequencePhase {
     Decode,
 }
 
+/// Stable identity for one externally submitted realtime operation within an
+/// exact scheduler session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RealtimeOperationId(u64);
+
+impl RealtimeOperationId {
+    pub(crate) const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum WorkUnit {
     /// A model stage that must complete before the request's execution shape
@@ -278,13 +293,19 @@ pub enum WorkUnit {
     /// interval accepted by this push; output is bounded independently because
     /// a realtime model may emit zero or more events for one input chunk.
     RealtimePush {
+        operation_id: RealtimeOperationId,
         input: InputRange,
         max_output_steps: usize,
+        /// Conservative decoder-KV append ceiling, independent of the source
+        /// sample interval and externally visible output-event count.
+        max_cache_append: usize,
     },
     /// Signal that no more realtime input will arrive and allow the model to
     /// flush at most `max_output_steps` pending output events.
     RealtimeFinish {
+        operation_id: RealtimeOperationId,
         max_output_steps: usize,
+        max_cache_append: usize,
     },
     AtomicJob {
         kind: String,
@@ -2591,6 +2612,7 @@ impl ExecutionReport {
             WorkUnit::RealtimePush {
                 input,
                 max_output_steps,
+                ..
             } => {
                 if input.is_empty() {
                     return Err(Error::InferenceError(
@@ -2612,7 +2634,9 @@ impl ExecutionReport {
                     ));
                 }
             }
-            WorkUnit::RealtimeFinish { max_output_steps } => {
+            WorkUnit::RealtimeFinish {
+                max_output_steps, ..
+            } => {
                 if self.input_consumed != 0 || self.output_produced > max_output_steps {
                     return Err(Error::InferenceError(
                         "executor reported progress beyond the realtime finish quantum".to_string(),
@@ -3234,8 +3258,10 @@ mod tests {
         assert_eq!(
             binding
                 .stage_for_work(&WorkUnit::RealtimePush {
+                    operation_id: RealtimeOperationId::new(1),
                     input: InputRange::new(160, 320).unwrap(),
                     max_output_steps: 2,
+                    max_cache_append: 8,
                 })
                 .unwrap()
                 .id,
@@ -3244,7 +3270,9 @@ mod tests {
         assert_eq!(
             binding
                 .stage_for_work(&WorkUnit::RealtimeFinish {
+                    operation_id: RealtimeOperationId::new(2),
                     max_output_steps: 4,
+                    max_cache_append: 8,
                 })
                 .unwrap()
                 .id,
@@ -4084,8 +4112,10 @@ mod tests {
         let push = plan_for(
             SessionKey::new("realtime-push".to_string(), 1),
             WorkUnit::RealtimePush {
+                operation_id: RealtimeOperationId::new(1),
                 input: InputRange::new(100, 180).unwrap(),
                 max_output_steps: 2,
+                max_cache_append: 4,
             },
         );
         let mut report = report_for(&push, ExecutionDisposition::Progress);
@@ -4098,8 +4128,10 @@ mod tests {
         let empty_push = plan_for(
             SessionKey::new("empty-realtime-push".to_string(), 1),
             WorkUnit::RealtimePush {
+                operation_id: RealtimeOperationId::new(1),
                 input: InputRange::new(100, 100).unwrap(),
                 max_output_steps: 1,
+                max_cache_append: 2,
             },
         );
         assert!(report_for(&empty_push, ExecutionDisposition::Progress)
@@ -4109,7 +4141,9 @@ mod tests {
         let finish = plan_for(
             SessionKey::new("realtime-finish".to_string(), 1),
             WorkUnit::RealtimeFinish {
+                operation_id: RealtimeOperationId::new(2),
                 max_output_steps: 3,
+                max_cache_append: 4,
             },
         );
         let mut report = report_for(&finish, ExecutionDisposition::Progress);

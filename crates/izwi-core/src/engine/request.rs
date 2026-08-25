@@ -16,7 +16,8 @@ use super::output::StreamingOutput;
 use super::types::{GenerationParams, Priority, RequestId, TaskType, TokenId};
 use super::{
     BatchId, BatchLaneKey, ClockedStateProjection, ClockedStateSpan, InputRange, OutputVisibility,
-    PlanId, ResourceAmount, ResourceVector, SessionKey, StageDescriptor, StageId, WorkCost,
+    PlanId, RealtimeOperationId, ResourceAmount, ResourceVector, SessionKey, StageDescriptor,
+    StageId, WorkCost,
 };
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
@@ -160,6 +161,20 @@ pub struct AsrEngineInput {
     pub audio: EngineAudioInput,
     pub language: Option<String>,
     pub prompt: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum RealtimeAsrOperationPayload {
+    Push {
+        samples: Arc<[f32]>,
+        sample_rate: u32,
+    },
+    Finish,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct RealtimeAsrIngress {
+    operations: Mutex<std::collections::HashMap<RealtimeOperationId, RealtimeAsrOperationPayload>>,
 }
 
 #[derive(Debug, Clone)]
@@ -939,6 +954,9 @@ pub struct EngineCoreRequest {
     /// Exact ASR/Qwen-TTS model identity retained for standalone incremental
     /// execution. Public fields cannot manufacture this lifecycle fence.
     pub(super) incremental_model_execution_ready: Option<IncrementalModelExecutionReady>,
+    /// Engine-owned, session-fenced realtime operation payloads. The immutable
+    /// request owns the mailbox; only Engine ingress can install/remove rows.
+    pub(super) realtime_asr_ingress: Option<Arc<RealtimeAsrIngress>>,
     /// Enable streaming output
     pub streaming: bool,
     /// Backpressure behavior for streaming output.
@@ -951,6 +969,81 @@ pub struct EngineCoreRequest {
 }
 
 impl EngineCoreRequest {
+    pub(crate) fn enable_realtime_asr_ingress(&mut self) -> Result<()> {
+        if self.task_type != TaskType::ASR || self.realtime_asr_ingress.is_some() {
+            return Err(Error::InvalidInput(format!(
+                "request {} cannot enable realtime ASR ingress",
+                self.id
+            )));
+        }
+        self.streaming = true;
+        self.realtime_asr_ingress = Some(Arc::new(RealtimeAsrIngress::default()));
+        Ok(())
+    }
+
+    pub(crate) fn is_realtime_asr_session(&self) -> bool {
+        self.realtime_asr_ingress.is_some()
+    }
+
+    pub(crate) fn install_realtime_asr_operation(
+        &self,
+        operation_id: RealtimeOperationId,
+        payload: RealtimeAsrOperationPayload,
+    ) -> Result<()> {
+        let ingress = self.realtime_asr_ingress.as_ref().ok_or_else(|| {
+            Error::InvalidInput("request is not an engine-owned realtime ASR session".into())
+        })?;
+        let mut operations = ingress
+            .operations
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        match operations.entry(operation_id) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(payload);
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {
+                return Err(Error::InferenceError(
+                    "realtime ASR operation identity was installed twice".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn realtime_asr_operation(
+        &self,
+        operation_id: RealtimeOperationId,
+    ) -> Result<RealtimeAsrOperationPayload> {
+        let ingress = self.realtime_asr_ingress.as_ref().ok_or_else(|| {
+            Error::InvalidInput("request is not an engine-owned realtime ASR session".into())
+        })?;
+        ingress
+            .operations
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(&operation_id)
+            .cloned()
+            .ok_or_else(|| {
+                Error::InferenceError(format!(
+                    "realtime ASR operation {} has no retained payload",
+                    operation_id.get()
+                ))
+            })
+    }
+
+    pub(super) fn remove_realtime_asr_operation(&self, operation_id: RealtimeOperationId) -> bool {
+        self.realtime_asr_ingress
+            .as_ref()
+            .and_then(|ingress| {
+                ingress
+                    .operations
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .remove(&operation_id)
+            })
+            .is_some()
+    }
+
     fn sync_task_from_fields(&mut self) {
         if self.task_type == TaskType::Chat {
             self.task = EngineTask::Chat(ChatEngineInput {
@@ -2978,6 +3071,7 @@ impl EngineCoreRequest {
             prompt_tokens: Vec::new(),
             chat_execution_ready: None,
             incremental_model_execution_ready: None,
+            realtime_asr_ingress: None,
             streaming: false,
             stream_policy: EngineStreamPolicy::default(),
             streaming_tx: None,
@@ -3033,6 +3127,7 @@ impl EngineCoreRequest {
             prompt_tokens: Vec::new(),
             chat_execution_ready: None,
             incremental_model_execution_ready: None,
+            realtime_asr_ingress: None,
             streaming: false,
             stream_policy: EngineStreamPolicy::default(),
             streaming_tx: None,
@@ -3088,6 +3183,7 @@ impl EngineCoreRequest {
             prompt_tokens: Vec::new(),
             chat_execution_ready: None,
             incremental_model_execution_ready: None,
+            realtime_asr_ingress: None,
             streaming: false,
             stream_policy: EngineStreamPolicy::default(),
             streaming_tx: None,
@@ -3140,6 +3236,7 @@ impl EngineCoreRequest {
             prompt_tokens: Vec::new(),
             chat_execution_ready: None,
             incremental_model_execution_ready: None,
+            realtime_asr_ingress: None,
             streaming: false,
             stream_policy: EngineStreamPolicy::default(),
             streaming_tx: None,
@@ -3193,6 +3290,7 @@ impl EngineCoreRequest {
             prompt_tokens: Vec::new(),
             chat_execution_ready: None,
             incremental_model_execution_ready: None,
+            realtime_asr_ingress: None,
             streaming: false,
             stream_policy: EngineStreamPolicy::default(),
             streaming_tx: None,
@@ -3246,6 +3344,7 @@ impl EngineCoreRequest {
             prompt_tokens: Vec::new(),
             chat_execution_ready: None,
             incremental_model_execution_ready: None,
+            realtime_asr_ingress: None,
             streaming: false,
             stream_policy: EngineStreamPolicy::default(),
             streaming_tx: None,
@@ -5060,5 +5159,40 @@ mod tests {
 
         let processed = processor.process(request).expect("request should process");
         assert_eq!(processed.params.max_tokens, expected_default);
+    }
+
+    #[test]
+    fn realtime_operation_duplicate_rejection_preserves_authoritative_payload() {
+        let mut request = EngineCoreRequest::asr_bytes(Vec::new());
+        request
+            .enable_realtime_asr_ingress()
+            .expect("ASR session ingress");
+        let operation_id = RealtimeOperationId::new(7);
+        request
+            .install_realtime_asr_operation(
+                operation_id,
+                RealtimeAsrOperationPayload::Push {
+                    samples: Arc::from([1.0_f32, 2.0]),
+                    sample_rate: 16_000,
+                },
+            )
+            .expect("first payload installation");
+
+        assert!(request
+            .install_realtime_asr_operation(operation_id, RealtimeAsrOperationPayload::Finish)
+            .is_err());
+        match request
+            .realtime_asr_operation(operation_id)
+            .expect("original payload remains authoritative")
+        {
+            RealtimeAsrOperationPayload::Push {
+                samples,
+                sample_rate,
+            } => {
+                assert_eq!(&*samples, &[1.0, 2.0]);
+                assert_eq!(sample_rate, 16_000);
+            }
+            RealtimeAsrOperationPayload::Finish => panic!("duplicate replaced original payload"),
+        }
     }
 }

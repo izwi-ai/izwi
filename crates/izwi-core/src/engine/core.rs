@@ -1640,6 +1640,8 @@ impl EngineCore {
             WorkUnit::RealtimePush {
                 input,
                 max_output_steps,
+                max_cache_append,
+                ..
             } => {
                 let input = u64::try_from(input.len()).map_err(|_| {
                     Error::Overloaded("realtime input length exceeds work accounting".to_string())
@@ -1647,15 +1649,30 @@ impl EngineCore {
                 let output = u64::try_from(*max_output_steps).map_err(|_| {
                     Error::Overloaded("realtime output bound exceeds work accounting".to_string())
                 })?;
-                input.max(output).max(1)
+                let cache_append = u64::try_from(*max_cache_append).map_err(|_| {
+                    Error::Overloaded(
+                        "realtime cache append bound exceeds work accounting".to_string(),
+                    )
+                })?;
+                input.max(output).max(cache_append).max(1)
             }
-            WorkUnit::RealtimeFinish { max_output_steps } => u64::try_from(*max_output_steps)
-                .map_err(|_| {
+            WorkUnit::RealtimeFinish {
+                max_output_steps,
+                max_cache_append,
+                ..
+            } => {
+                let output = u64::try_from(*max_output_steps).map_err(|_| {
                     Error::Overloaded(
                         "realtime finish output bound exceeds work accounting".to_string(),
                     )
-                })?
-                .max(1),
+                })?;
+                let cache_append = u64::try_from(*max_cache_append).map_err(|_| {
+                    Error::Overloaded(
+                        "realtime cache append bound exceeds work accounting".to_string(),
+                    )
+                })?;
+                output.max(cache_append).max(1)
+            }
             WorkUnit::AtomicJob { .. } | WorkUnit::PipelineStage { .. } => 1,
         };
         let workspace_bytes = stage.map_or(Ok(0), |stage| {
@@ -6404,8 +6421,10 @@ mod tests {
         let push = EngineCore::work_cost(
             &request,
             &WorkUnit::RealtimePush {
+                operation_id: crate::engine::RealtimeOperationId::new(1),
                 input: super::super::InputRange::new(40, 200).unwrap(),
                 max_output_steps: 4,
+                max_cache_append: 8,
             },
             None,
         )
@@ -6415,12 +6434,14 @@ mod tests {
         let finish = EngineCore::work_cost(
             &request,
             &WorkUnit::RealtimeFinish {
+                operation_id: crate::engine::RealtimeOperationId::new(2),
                 max_output_steps: 7,
+                max_cache_append: 8,
             },
             None,
         )
         .unwrap();
-        assert_eq!(finish, WorkCost::new(7, 7, 0));
+        assert_eq!(finish, WorkCost::new(8, 8, 0));
     }
 
     #[test]

@@ -8,8 +8,9 @@ use crate::error::{Error, Result};
 use crate::models::architectures::sortformer::diarization::{
     production_workspace_authorization, SortformerWorkspaceEstimate, SortformerWorkspaceEvent,
 };
-use crate::models::architectures::voxtral::realtime::VoxtralRealtimeModel;
-use crate::models::registry::{NativeAsrGenerationOptions, NativeAsrModel, NativeAsrTranscription};
+use crate::models::registry::{
+    NativeAsrGenerationOptions, NativeAsrModel, NativeAsrTranscription, VoxtralModelLease,
+};
 use crate::models::shared::chat::{ChatMessage, ChatRole};
 use crate::runtime::adapters::{CapabilityKind, ExecutionTargetKind, InferenceStateRequirement};
 use crate::runtime::audio_io::{
@@ -200,7 +201,7 @@ fn diarization_asr_registry_route(variant: ModelVariant) -> DiarizationAsrRegist
 #[derive(Clone)]
 enum DiarizationAsrModel {
     Native(Arc<NativeAsrModel>),
-    Voxtral(Arc<VoxtralRealtimeModel>),
+    Voxtral(VoxtralModelLease),
 }
 
 impl DiarizationAsrModel {
@@ -677,7 +678,7 @@ impl RuntimeService {
         let asr_model = match diarization_asr_registry_route(asr_variant) {
             DiarizationAsrRegistryRoute::Voxtral => DiarizationAsrModel::Voxtral(
                 self.model_registry
-                    .get_voxtral(asr_variant)
+                    .get_voxtral_lease(asr_variant)
                     .await
                     .ok_or_else(|| Error::ModelNotFound(asr_variant.to_string()))?,
             ),

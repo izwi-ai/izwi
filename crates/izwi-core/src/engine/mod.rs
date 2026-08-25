@@ -90,8 +90,8 @@ pub use execution::{
     ManagedTensorStateReservation, MembershipSafePoint, ModelInstanceId, NativeBatchMode,
     OutcomeProvenance, OutputVisibility, PhysicalBatch, PhysicalBatchReport,
     PhysicalBatchRowReport, PhysicalLaunchPolicy, PlanId, PrefillMode, ReadyQuantum,
-    RetryDisposition, SequencePhase, SequenceRestartReason, SessionEpoch, SessionKey,
-    StageDescriptor, StageId, StageProgressKind, StageShapePolicy, StageWorkSelector,
+    RealtimeOperationId, RetryDisposition, SequencePhase, SequenceRestartReason, SessionEpoch,
+    SessionKey, StageDescriptor, StageId, StageProgressKind, StageShapePolicy, StageWorkSelector,
     StateDisposition, TerminalOutcome, WorkCost, WorkUnit, YieldReason,
 };
 pub use executor::{

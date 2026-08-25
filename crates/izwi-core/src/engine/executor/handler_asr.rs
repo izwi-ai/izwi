@@ -14,12 +14,12 @@ use serde_json::json;
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::super::request::EngineCoreRequest;
+use super::super::request::{EngineCoreRequest, RealtimeAsrOperationPayload};
 use super::super::scheduler::ScheduledRequest;
 use super::super::types::AudioOutput;
 use super::super::{SequenceRestartReason, SessionKey};
 use super::audio::{decode_request_audio_with_rate, AsrChunkTranscription};
-use super::state::ActiveAsrDecode;
+use super::state::{ActiveAsrDecode, ActiveVoxtralRealtime};
 use super::{
     ExecutorOutput, ExecutorPhaseTiming, ExecutorStateLease, ModelSessionResult, NativeExecutor,
 };
@@ -472,6 +472,301 @@ impl NativeExecutor {
         scheduled: &ScheduledRequest,
     ) -> Result<ModelSessionResult> {
         self.transcribe_request_with_managed_cache(request, scheduled, None)
+    }
+
+    fn voxtral_realtime_request(
+        &self,
+        request: &EngineCoreRequest,
+        scheduled: &ScheduledRequest,
+        mut managed_state: super::RetainedRowManagedState,
+    ) -> Result<ModelSessionResult> {
+        let variant = Self::resolve_variant(request)?;
+        if variant.family() != ModelFamily::Voxtral || !request.is_realtime_asr_session() {
+            return Err(Error::InvalidInput(
+                "Voxtral realtime work crossed its exact ASR session route".into(),
+            ));
+        }
+        if request.asr_prompt_for_execution().is_some() {
+            return Err(Error::InvalidInput(
+                "Voxtral realtime ASR does not support an initial text prompt".into(),
+            ));
+        }
+        if managed_state.tensor_state.is_some() {
+            return Err(Error::InferenceError(
+                "Voxtral realtime row unexpectedly received tensor state".into(),
+            ));
+        }
+        let mut cache = managed_state.take_only_paged()?;
+        managed_state.ensure_all_paged_consumed()?;
+        let (operation_id, max_output_steps, max_cache_append) = match &scheduled.work {
+            crate::engine::WorkUnit::RealtimePush {
+                operation_id,
+                max_output_steps,
+                max_cache_append,
+                ..
+            }
+            | crate::engine::WorkUnit::RealtimeFinish {
+                operation_id,
+                max_output_steps,
+                max_cache_append,
+            } => (*operation_id, *max_output_steps, *max_cache_append),
+            _ => {
+                return Err(Error::InvalidInput(
+                    "Voxtral realtime executor received non-realtime work".into(),
+                ));
+            }
+        };
+        let payload = request.realtime_asr_operation(operation_id)?;
+        let session = scheduled.session_key();
+        let mut state_lease = ExecutorStateLease::checkout(
+            &self.voxtral_realtime_states,
+            session,
+            "Voxtral realtime ASR",
+        )?;
+        if state_lease
+            .state()
+            .is_some_and(|active| active.variant != variant)
+        {
+            state_lease.discard_state();
+        }
+        if state_lease.state().is_none() {
+            if !matches!(payload, RealtimeAsrOperationPayload::Push { .. }) {
+                return Err(Error::InferenceError(
+                    "Voxtral realtime session cannot start with finish".into(),
+                ));
+            }
+            let model = self.with_registry(|registry| {
+                registry.try_get_voxtral_lease(variant).ok_or_else(|| {
+                    Error::ModelNotFound(format!(
+                        "Voxtral model {variant} is not loaded in registry"
+                    ))
+                })
+            })?;
+            let state = model.start_realtime_state(request.asr_language_for_execution());
+            state_lease.install_state(ActiveVoxtralRealtime {
+                variant,
+                model,
+                state,
+                last_tokens_generated: 0,
+                stream_sequence: 0,
+                input_sample_rate: 0,
+            })?;
+        }
+
+        let model_max_output_steps = state_lease
+            .require_state_mut()?
+            .model
+            .realtime_max_output_steps()?;
+        if max_output_steps == 0 || max_output_steps > model_max_output_steps {
+            return Err(Error::InvalidInput(format!(
+                "Voxtral realtime quantum requested {max_output_steps} output steps outside the model ceiling {model_max_output_steps}"
+            )));
+        }
+        if max_cache_append == 0 {
+            return Err(Error::InvalidInput(
+                "Voxtral realtime quantum requires a non-zero cache append bound".into(),
+            ));
+        }
+
+        let (prior_tokens, prior_stream_sequence, prior_input_sample_rate, prior_cache_len) = {
+            let active = state_lease.require_state_mut()?;
+            (
+                active.last_tokens_generated,
+                active.stream_sequence,
+                active.input_sample_rate,
+                cache.context_len(),
+            )
+        };
+        let active = state_lease.require_state_mut()?;
+        let mut checkpoint = active
+            .model
+            .begin_realtime_quantum(&mut active.state, &cache)?;
+        state_lease.mark_dirty();
+
+        let execution = (|| {
+            let active = state_lease.require_state_mut()?;
+            let mut should_cancel = || request.is_cancelled();
+            let steps = match (&scheduled.work, payload) {
+                (
+                    crate::engine::WorkUnit::RealtimePush { input, .. },
+                    RealtimeAsrOperationPayload::Push {
+                        samples,
+                        sample_rate,
+                    },
+                ) if input.start == active.state.source_sample_count()
+                    && input.len() == samples.len()
+                    && sample_rate > 0 =>
+                {
+                    if active.input_sample_rate != 0 && active.input_sample_rate != sample_rate {
+                        return Err(Error::InvalidInput(
+                            "Voxtral realtime sample rate changed within one session".into(),
+                        ));
+                    }
+                    active.input_sample_rate = sample_rate;
+                    active.model.apply_realtime_push_physical(
+                        &mut active.state,
+                        &mut cache,
+                        samples.as_ref(),
+                        sample_rate,
+                        max_output_steps,
+                        &mut should_cancel,
+                    )?
+                }
+                (
+                    crate::engine::WorkUnit::RealtimeFinish { .. },
+                    RealtimeAsrOperationPayload::Finish,
+                ) => active.model.apply_realtime_finish_physical(
+                    &mut active.state,
+                    &mut cache,
+                    max_output_steps,
+                    &mut should_cancel,
+                )?,
+                _ => {
+                    return Err(Error::InferenceError(
+                        "Voxtral realtime work and retained operation payload disagree".into(),
+                    ));
+                }
+            };
+            let appended = cache
+                .context_len()
+                .checked_sub(prior_cache_len)
+                .ok_or_else(|| {
+                    Error::InferenceError("Voxtral realtime cache cursor regressed".into())
+                })?;
+            if appended > max_cache_append {
+                return Err(Error::InferenceError(format!(
+                    "Voxtral realtime quantum appended {appended} cache tokens beyond its {max_cache_append}-token bound"
+                )));
+            }
+            if request.is_cancelled() {
+                return Err(Error::Cancelled(
+                    "Voxtral realtime quantum cancelled before commit".into(),
+                ));
+            }
+            if let Some(tx) = Self::stream_sender(request) {
+                for step in &steps {
+                    if !step.delta.is_empty() {
+                        Self::stream_text_with_policy(
+                            &tx,
+                            request.stream_policy,
+                            &request.id,
+                            &mut active.stream_sequence,
+                            step.delta.clone(),
+                        )?;
+                    }
+                    if step.finished {
+                        Self::stream_final_marker_with_policy(
+                            &tx,
+                            request.stream_policy,
+                            &request.id,
+                            &mut active.stream_sequence,
+                        )?;
+                    }
+                }
+            }
+            if request.is_cancelled() {
+                return Err(Error::Cancelled(
+                    "Voxtral realtime quantum cancelled before seal".into(),
+                ));
+            }
+            let staged = request.take_staged_stream_outputs()?;
+            if request.is_cancelled() {
+                return Err(Error::Cancelled(
+                    "Voxtral realtime quantum cancelled during seal".into(),
+                ));
+            }
+            Ok(staged)
+        })();
+
+        let staged = match execution {
+            Ok(staged) => staged,
+            Err(error) => {
+                let _ = request.take_staged_stream_outputs();
+                let active = state_lease.require_state_mut()?;
+                active.stream_sequence = prior_stream_sequence;
+                active.last_tokens_generated = prior_tokens;
+                active.input_sample_rate = prior_input_sample_rate;
+                active.model.rollback_realtime_quantum(
+                    &mut active.state,
+                    &mut cache,
+                    &mut checkpoint,
+                )?;
+                let cancelled = matches!(error, Error::Cancelled(_));
+                if cancelled {
+                    state_lease.release()?;
+                    return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                        request.id.clone(),
+                    )));
+                }
+                state_lease.restore()?;
+                return Err(error);
+            }
+        };
+
+        if request.is_cancelled() {
+            let _ = request.take_staged_stream_outputs();
+            let active = state_lease.require_state_mut()?;
+            active.stream_sequence = prior_stream_sequence;
+            active.last_tokens_generated = prior_tokens;
+            active.input_sample_rate = prior_input_sample_rate;
+            active.model.rollback_realtime_quantum(
+                &mut active.state,
+                &mut cache,
+                &mut checkpoint,
+            )?;
+            state_lease.release()?;
+            return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                request.id.clone(),
+            )));
+        }
+
+        let (tokens_generated, text, finished, sample_rate, sample_count) = {
+            let active = state_lease.require_state_mut()?;
+            active
+                .model
+                .commit_realtime_quantum(&mut active.state, &cache, &mut checkpoint)?;
+            let tokens_generated = active.state.tokens_generated().saturating_sub(prior_tokens);
+            active.last_tokens_generated = active.state.tokens_generated();
+            (
+                tokens_generated,
+                active.state.text().to_string(),
+                active.state.is_finished(),
+                active.input_sample_rate,
+                active.state.source_sample_count(),
+            )
+        };
+        let completions = cache.take_completed_writes();
+        if finished {
+            state_lease.release()?;
+        } else {
+            state_lease.restore()?;
+        }
+        Ok(ModelSessionResult::sequence(ExecutorOutput {
+            request_id: request.id.clone(),
+            audio: Some(AudioOutput {
+                samples: Vec::new(),
+                sample_rate,
+                duration_secs: if sample_rate == 0 {
+                    0.0
+                } else {
+                    sample_count as f32 / sample_rate as f32
+                },
+            }),
+            text: Some(text),
+            input_transcription: None,
+            tokens_processed: match &scheduled.work {
+                crate::engine::WorkUnit::RealtimePush { input, .. } => input.len(),
+                crate::engine::WorkUnit::RealtimeFinish { .. } => 0,
+                _ => unreachable!("realtime work authenticated above"),
+            },
+            tokens_generated,
+            finished,
+            phase_timing_override: None,
+            asr_diagnostics: None,
+            error: None,
+        })
+        .with_staged_stream_outputs(staged)
+        .with_managed_cache_completions(completions))
     }
 
     fn granite_speech_asr_sequence_request(
@@ -2751,6 +3046,12 @@ impl NativeExecutor {
         }
         let variant = Self::resolve_variant(request)?;
         let family = variant.family();
+        if family == ModelFamily::Voxtral && request.is_realtime_asr_session() {
+            let retained = managed_state.take().ok_or_else(|| {
+                Error::InferenceError("Voxtral realtime ASR lost retained paged state".into())
+            })?;
+            return self.voxtral_realtime_request(request, scheduled, retained);
+        }
         if family == ModelFamily::Qwen3Asr && request.uses_asr_retained_sequence() {
             return self.qwen3_asr_sequence_request(request, scheduled, managed_state.take());
         }
@@ -3088,7 +3389,7 @@ impl NativeExecutor {
             let mut sequence = 0usize;
             if matches!(family, ModelFamily::Voxtral) {
                 let model = self.with_registry(|registry| {
-                    registry.try_get_voxtral(variant).ok_or_else(|| {
+                    registry.try_get_voxtral_lease(variant).ok_or_else(|| {
                         Error::ModelNotFound(format!(
                             "Voxtral model {variant} is not loaded in registry"
                         ))

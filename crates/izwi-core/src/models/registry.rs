@@ -84,7 +84,10 @@ use crate::models::architectures::vibevoice::asr::{
 };
 use crate::models::architectures::vibevoice::tts::VibeVoiceTtsModel;
 use crate::models::architectures::vibevoice::VibeVoicePhysicalStateSpec;
-use crate::models::architectures::voxtral::realtime::VoxtralRealtimeModel;
+use crate::models::architectures::voxtral::realtime::{
+    VoxtralRealtimeCheckpoint, VoxtralRealtimeModel, VoxtralRealtimeResourceUsage,
+    VoxtralRealtimeState, VoxtralRealtimeStep,
+};
 use crate::models::architectures::voxtral::tts::VoxtralTtsModel;
 use crate::models::architectures::whisper::asr::{
     AsrTranscriptionOutput as WhisperAsrTranscriptionOutput, WhisperAudioBatchRow,
@@ -3452,6 +3455,106 @@ pub struct AsrModelLease {
     inner: TrackedModelLease<NativeAsrModel>,
 }
 
+/// A loaded Voxtral realtime handle that fences registry unload for its exact
+/// model instance until the final offline or realtime operation releases it.
+#[derive(Clone)]
+pub struct VoxtralModelLease {
+    inner: TrackedModelLease<VoxtralRealtimeModel>,
+}
+
+impl VoxtralModelLease {
+    pub(crate) fn model_arc(&self) -> Arc<VoxtralRealtimeModel> {
+        self.inner.model.clone()
+    }
+
+    pub(crate) fn start_realtime_state(&self, language: Option<&str>) -> VoxtralRealtimeState {
+        self.inner.model.start_realtime_state(language)
+    }
+
+    pub(crate) fn realtime_max_output_steps(&self) -> Result<usize> {
+        self.inner.model.realtime_max_output_steps()
+    }
+
+    pub(crate) fn realtime_stream_resource_usage(
+        &self,
+        state: &VoxtralRealtimeState,
+    ) -> Result<VoxtralRealtimeResourceUsage> {
+        self.inner.model.realtime_stream_resource_usage(state)
+    }
+
+    pub(crate) fn begin_realtime_quantum(
+        &self,
+        state: &mut VoxtralRealtimeState,
+        cache: &PhysicalPagedKvCache,
+    ) -> Result<VoxtralRealtimeCheckpoint> {
+        self.inner.model.begin_realtime_quantum(state, cache)
+    }
+
+    pub(crate) fn commit_realtime_quantum(
+        &self,
+        state: &mut VoxtralRealtimeState,
+        cache: &PhysicalPagedKvCache,
+        checkpoint: &mut VoxtralRealtimeCheckpoint,
+    ) -> Result<()> {
+        self.inner
+            .model
+            .commit_realtime_quantum(state, cache, checkpoint)
+    }
+
+    pub(crate) fn rollback_realtime_quantum(
+        &self,
+        state: &mut VoxtralRealtimeState,
+        cache: &mut PhysicalPagedKvCache,
+        checkpoint: &mut VoxtralRealtimeCheckpoint,
+    ) -> Result<()> {
+        self.inner
+            .model
+            .rollback_realtime_quantum(state, cache, checkpoint)
+    }
+
+    pub(crate) fn apply_realtime_push_physical(
+        &self,
+        state: &mut VoxtralRealtimeState,
+        cache: &mut PhysicalPagedKvCache,
+        samples: &[f32],
+        sample_rate: u32,
+        max_output_steps: usize,
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<Vec<VoxtralRealtimeStep>> {
+        self.inner.model.apply_realtime_push_physical(
+            state,
+            cache,
+            samples,
+            sample_rate,
+            max_output_steps,
+            should_cancel,
+        )
+    }
+
+    pub(crate) fn apply_realtime_finish_physical(
+        &self,
+        state: &mut VoxtralRealtimeState,
+        cache: &mut PhysicalPagedKvCache,
+        max_output_steps: usize,
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<Vec<VoxtralRealtimeStep>> {
+        self.inner.model.apply_realtime_finish_physical(
+            state,
+            cache,
+            max_output_steps,
+            should_cancel,
+        )
+    }
+}
+
+impl Deref for VoxtralModelLease {
+    type Target = VoxtralRealtimeModel;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
 impl AsrModelLease {
     pub(crate) fn model_arc(&self) -> Arc<NativeAsrModel> {
         self.inner.model.clone()
@@ -4605,7 +4708,8 @@ pub struct ModelRegistry {
     diarization_models:
         Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<NativeDiarizationModel>>>>>>,
     chat_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<NativeChatModel>>>>>,
-    voxtral_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<VoxtralRealtimeModel>>>>>>,
+    voxtral_models:
+        Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<VoxtralRealtimeModel>>>>>,
     voxtral_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<VoxtralTtsModel>>>>>>,
     vibevoice_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<VibeVoiceTtsModel>>>>>>,
     fish_s2_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<FishS2TtsModel>>>>>>,
@@ -4963,8 +5067,8 @@ impl ModelRegistry {
 
         {
             let guard = self.voxtral_models.read().await;
-            for (variant, cell) in guard.iter() {
-                if cell.get().is_some() {
+            for (variant, entry) in guard.iter() {
+                if entry.ready_model().is_some() {
                     diagnostics.push(loaded_model_diagnostics_entry(
                         &self.device,
                         *variant,
@@ -5316,17 +5420,23 @@ impl ModelRegistry {
         &self,
         variant: ModelVariant,
         model_dir: &Path,
-    ) -> Result<Arc<VoxtralRealtimeModel>> {
+    ) -> Result<VoxtralModelLease> {
         let registration = resolve_voxtral_loader_registration(variant).ok_or_else(|| {
             Error::InvalidInput(format!("Unsupported Voxtral model variant: {variant}"))
         })?;
 
-        let cell = {
+        let (entry, loading_guard) = {
             let mut guard = self.voxtral_models.write().await;
-            guard
+            let entry = guard
                 .entry(variant)
-                .or_insert_with(|| Arc::new(OnceCell::new()))
-                .clone()
+                .or_insert_with(|| Arc::new(TrackedModelEntry::default()))
+                .clone();
+            let loading_guard = entry.uses.acquire().ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "Voxtral model {variant} exceeded its active-use accounting capacity"
+                ))
+            })?;
+            (entry, loading_guard)
         };
 
         info!(
@@ -5334,7 +5444,8 @@ impl ModelRegistry {
             registration.name
         );
 
-        let model = cell
+        entry
+            .model
             .get_or_try_init({
                 let model_dir = model_dir.to_path_buf();
                 let device = self.device.clone();
@@ -5347,8 +5458,20 @@ impl ModelRegistry {
                 }
             })
             .await?;
-
-        Ok(model.clone())
+        let lease = {
+            let guard = self.voxtral_models.read().await;
+            guard
+                .get(&variant)
+                .filter(|current| Arc::ptr_eq(current, &entry))
+                .and_then(|current| current.acquire())
+                .map(|inner| VoxtralModelLease { inner })
+        };
+        drop(loading_guard);
+        lease.ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "Voxtral model {variant} load was superseded before publication"
+            ))
+        })
     }
 
     pub async fn load_qwen_tts(
@@ -5683,14 +5806,41 @@ impl ModelRegistry {
         guard.get(&variant).and_then(|cell| cell.get().cloned())
     }
 
-    pub async fn get_voxtral(&self, variant: ModelVariant) -> Option<Arc<VoxtralRealtimeModel>> {
+    pub async fn get_voxtral_lease(&self, variant: ModelVariant) -> Option<VoxtralModelLease> {
         let guard = self.voxtral_models.read().await;
-        guard.get(&variant).and_then(|cell| cell.get().cloned())
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire_ready())
+            .map(|inner| VoxtralModelLease { inner })
     }
 
-    pub fn try_get_voxtral(&self, variant: ModelVariant) -> Option<Arc<VoxtralRealtimeModel>> {
+    pub fn try_get_voxtral_lease(&self, variant: ModelVariant) -> Option<VoxtralModelLease> {
         let guard = self.voxtral_models.try_read().ok()?;
-        guard.get(&variant).and_then(|cell| cell.get().cloned())
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire_ready())
+            .map(|inner| VoxtralModelLease { inner })
+    }
+
+    /// Internal lifecycle view before the external Ready publication barrier.
+    pub(crate) async fn get_loading_voxtral(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<Arc<VoxtralRealtimeModel>> {
+        let guard = self.voxtral_models.read().await;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.model.get().cloned())
+    }
+
+    pub(crate) async fn publish_voxtral_ready(&self, variant: ModelVariant) -> Result<()> {
+        let guard = self.voxtral_models.read().await;
+        let entry = guard.get(&variant).ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "cannot publish missing Voxtral model {variant} as ready"
+            ))
+        })?;
+        entry.publish_ready()
     }
 
     pub async fn get_voxtral_tts(&self, variant: ModelVariant) -> Option<Arc<VoxtralTtsModel>> {
@@ -5798,8 +5948,14 @@ impl ModelRegistry {
     }
 
     pub async fn unload_voxtral(&self, variant: ModelVariant) {
-        let mut guard = self.voxtral_models.write().await;
-        guard.remove(&variant);
+        let entry = {
+            let mut guard = self.voxtral_models.write().await;
+            guard.remove(&variant)
+        };
+        if let Some(entry) = entry {
+            entry.reset_ready();
+            entry.uses.wait_until_idle().await;
+        }
     }
 
     pub async fn unload_voxtral_tts(&self, variant: ModelVariant) {

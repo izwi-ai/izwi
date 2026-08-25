@@ -1296,11 +1296,15 @@ impl ModelLifecycleController {
                             "loaded model {variant} requires physical ASR invocation state, but the {backend:?} build has no direct paged-attention runtime"
                         )));
                     }
-                    let loaded = self.model_registry.get_voxtral(variant).await.ok_or_else(|| {
+                    let loaded = self
+                        .model_registry
+                        .get_loading_voxtral(variant)
+                        .await
+                        .ok_or_else(|| {
                         Error::ModelLoadError(format!(
                             "loaded Voxtral model {variant} is missing from the registry"
                         ))
-                    })?;
+                        })?;
                     let contracts = bundle_draft.execution_contracts(CapabilityKind::Asr)?;
                     let stage_graphs = contracts
                         .iter()
@@ -1575,48 +1579,92 @@ impl ModelLifecycleController {
                 .require(CapabilityKind::RealtimeAsr, variant)
                 .is_ok()
             {
-                let model = self
-                    .model_registry
-                    .get_loading_asr(variant)
-                    .await
-                    .ok_or_else(|| {
-                        Error::ModelLoadError(format!(
-                            "loaded realtime ASR model {variant} is missing from the registry"
-                        ))
-                    })?;
                 let contracts =
                     bundle_draft.execution_contracts(CapabilityKind::RealtimeAsr)?;
                 let stage_graphs = contracts
                     .iter()
                     .map(|contract| contract.stages.as_ref())
                     .collect::<Vec<_>>();
-                let physical_spec = model.realtime_physical_state_spec(&stage_graphs)?;
-                let retained = self
-                    .core_engine
-                    .load_retained_tensor_state(
-                        model_instance_id,
-                        &physical_spec.retained,
-                        self.realtime_asr_sequence_capacity,
-                    )
-                    .await?;
-                let retained_uses = contracts
-                    .iter()
-                    .map(|contract| {
-                        Ok((
-                            stage_graph_fingerprint(&contract.stages)?,
-                            RetainedStateUseV2::ExternalTensor,
-                        ))
-                    })
-                    .collect::<Result<HashMap<_, _>>>()?;
-                state_publications.insert(
-                    CapabilityKind::RealtimeAsr,
-                    LoadedStatePublication::PhysicalV2 {
-                        descriptor: physical_spec.descriptor,
-                        retained: Some(retained.into()),
-                        retained_uses,
-                        invocation_workspace: InvocationWorkspaceRuntimeV2::default(),
-                    },
-                );
+                if variant.family() == crate::catalog::ModelFamily::Voxtral {
+                    if !managed_kv_backend_compiled(backend) {
+                        return Err(Error::ModelLoadError(format!(
+                            "loaded model {variant} requires physical realtime ASR state, but the {backend:?} build has no direct paged-attention runtime"
+                        )));
+                    }
+                    let model = self
+                        .model_registry
+                        .get_loading_voxtral(variant)
+                        .await
+                        .ok_or_else(|| {
+                            Error::ModelLoadError(format!(
+                                "loaded Voxtral realtime ASR model {variant} is missing from the registry"
+                            ))
+                        })?;
+                    let physical_spec = model.realtime_physical_state_spec(&stage_graphs)?;
+                    let retained = self
+                        .core_engine
+                        .load_managed_model_state(
+                            model_instance_id,
+                            &physical_spec.retained,
+                            Some(physical_spec.retained_max_tokens),
+                        )
+                        .await?;
+                    let retained_uses = contracts
+                        .iter()
+                        .map(|contract| {
+                            Ok((
+                                stage_graph_fingerprint(&contract.stages)?,
+                                RetainedStateUseV2::ExternalPaged,
+                            ))
+                        })
+                        .collect::<Result<HashMap<_, _>>>()?;
+                    state_publications.insert(
+                        CapabilityKind::RealtimeAsr,
+                        LoadedStatePublication::PhysicalV2 {
+                            descriptor: physical_spec.descriptor,
+                            retained: Some(retained.into()),
+                            retained_uses,
+                            invocation_workspace: InvocationWorkspaceRuntimeV2::default(),
+                        },
+                    );
+                } else {
+                    let model = self
+                        .model_registry
+                        .get_loading_asr(variant)
+                        .await
+                        .ok_or_else(|| {
+                            Error::ModelLoadError(format!(
+                                "loaded realtime ASR model {variant} is missing from the registry"
+                            ))
+                        })?;
+                    let physical_spec = model.realtime_physical_state_spec(&stage_graphs)?;
+                    let retained = self
+                        .core_engine
+                        .load_retained_tensor_state(
+                            model_instance_id,
+                            &physical_spec.retained,
+                            self.realtime_asr_sequence_capacity,
+                        )
+                        .await?;
+                    let retained_uses = contracts
+                        .iter()
+                        .map(|contract| {
+                            Ok((
+                                stage_graph_fingerprint(&contract.stages)?,
+                                RetainedStateUseV2::ExternalTensor,
+                            ))
+                        })
+                        .collect::<Result<HashMap<_, _>>>()?;
+                    state_publications.insert(
+                        CapabilityKind::RealtimeAsr,
+                        LoadedStatePublication::PhysicalV2 {
+                            descriptor: physical_spec.descriptor,
+                            retained: Some(retained.into()),
+                            retained_uses,
+                            invocation_workspace: InvocationWorkspaceRuntimeV2::default(),
+                        },
+                    );
+                }
             }
             if variant.family() == crate::catalog::ModelFamily::SortformerDiarization {
                 let model = self
@@ -1891,6 +1939,9 @@ impl ModelLifecycleController {
                 // The safe transient is Ready-but-hidden; an ASR handle must
                 // never be visible while its slot is still Loading.
                 self.model_registry.publish_asr_ready(variant).await?;
+            }
+            if variant.family() == crate::catalog::ModelFamily::Voxtral {
+                self.model_registry.publish_voxtral_ready(variant).await?;
             }
             self.touch_model_usage(variant).await;
             Ok(())

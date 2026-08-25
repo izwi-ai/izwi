@@ -35,6 +35,7 @@ const CONTINUOUS_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1
 const WHISPER_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(17);
 const VIBEVOICE_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(19);
 const GRANITE_SPEECH_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(22);
+const VOXTRAL_REALTIME_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(23);
 // Architecture ceiling: 8,192 codec frames, 1,920 output samples/frame,
 // f32-width intermediates, and up to 1,024 simultaneous channel-equivalents.
 // Exact request/model-derived costs remain smaller and are installed at
@@ -792,6 +793,11 @@ fn is_nemotron_realtime(metadata: AdapterMetadata) -> bool {
         && metadata.model_variant.family() == crate::catalog::ModelFamily::NemotronAsr
 }
 
+fn is_voxtral_realtime(metadata: AdapterMetadata) -> bool {
+    metadata.capability == CapabilityKind::RealtimeAsr
+        && metadata.model_variant.family() == crate::catalog::ModelFamily::Voxtral
+}
+
 fn is_continuous_physical_chat(metadata: AdapterMetadata) -> bool {
     metadata.capability == CapabilityKind::Chat
         && matches!(
@@ -857,6 +863,36 @@ impl LoadedExecutionAdapterFactory for PhysicalQwenTtsAdapterFactory {
 
 #[derive(Debug, Clone, Copy)]
 struct NemotronRealtimeAdapterFactory;
+
+#[derive(Debug, Clone, Copy)]
+struct VoxtralRealtimeAdapterFactory;
+
+impl LoadedExecutionAdapterFactory for VoxtralRealtimeAdapterFactory {
+    fn id(&self) -> &'static str {
+        "builtin.voxtral_realtime.physical_paged"
+    }
+
+    fn batch_mode(&self) -> NativeBatchMode {
+        NativeBatchMode::None
+    }
+
+    fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
+        is_voxtral_realtime(metadata)
+    }
+
+    fn create(
+        &self,
+        context: LoadedAdapterFactoryContext,
+        metadata: AdapterMetadata,
+    ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
+        Ok(Arc::new(VoxtralRealtimeExecutionAdapter::new(
+            context.execution_group_id,
+            context.model_instance_id,
+            metadata,
+            context.backend_kind,
+        )))
+    }
+}
 
 impl LoadedExecutionAdapterFactory for NemotronRealtimeAdapterFactory {
     fn id(&self) -> &'static str {
@@ -1056,6 +1092,7 @@ impl LoadedExecutionAdapterFactory for ScalarExecutionAdapterFactory {
     fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
         !is_physical_qwen_tts(metadata)
             && !is_nemotron_realtime(metadata)
+            && !is_voxtral_realtime(metadata)
             && !is_continuous_physical_chat(metadata)
             && !is_continuous_physical_asr(metadata)
             && !is_whisper_physical_asr(metadata)
@@ -1089,6 +1126,103 @@ pub(super) fn built_in_loaded_adapter_factories() -> Vec<Arc<dyn LoadedExecution
         Arc::new(GraniteSpeechPhysicalAsrAdapterFactory),
         Arc::new(ScalarExecutionAdapterFactory),
     ]
+}
+
+#[derive(Debug)]
+struct VoxtralRealtimeExecutionAdapter {
+    execution_group_id: ExecutionGroupId,
+    model_instance_id: ModelInstanceId,
+    adapter_instance_id: AdapterInstanceId,
+    metadata: AdapterMetadata,
+    backend_kind: BackendKind,
+}
+
+impl VoxtralRealtimeExecutionAdapter {
+    fn new(
+        execution_group_id: ExecutionGroupId,
+        model_instance_id: ModelInstanceId,
+        metadata: AdapterMetadata,
+        backend_kind: BackendKind,
+    ) -> Self {
+        Self {
+            execution_group_id,
+            model_instance_id,
+            adapter_instance_id: AdapterInstanceId::new(
+                NEXT_ADAPTER_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+            ),
+            metadata,
+            backend_kind,
+        }
+    }
+}
+
+impl LoadedExecutionAdapter for VoxtralRealtimeExecutionAdapter {
+    fn metadata(&self) -> AdapterMetadata {
+        self.metadata
+    }
+
+    fn adapter_instance_id(&self) -> AdapterInstanceId {
+        self.adapter_instance_id
+    }
+
+    fn adapter_abi_revision(&self) -> AdapterAbiRevision {
+        VOXTRAL_REALTIME_ADAPTER_ABI
+    }
+
+    fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
+        let metadata = self.metadata();
+        let mut execution_profile =
+            scalar_execution_profile(metadata, self.backend_kind, streaming.model_native);
+        execution_profile.mode = ExecutionMode::Realtime;
+        execution_profile.prefill = PrefillMode::None;
+        execution_profile.incremental_decode = true;
+        execution_profile.prefill_batch = NativeBatchMode::None;
+        execution_profile.decode_batch = NativeBatchMode::None;
+        execution_profile.cache_mode = CacheMode::ExternalPaged;
+        execution_profile.cache_namespace = Some(format!(
+            "{}:{}:realtime-state-v2",
+            metadata.model_variant,
+            self.backend_kind.as_str()
+        ));
+        execution_profile.kv_dtype = "state_v2_resolved".into();
+        execution_profile.cancellation = CancellationGranularity::RealtimeChunk;
+        execution_profile.concurrency = ConcurrencyClass::Exclusive;
+        execution_profile.recompute_safe = false;
+        execution_profile.cache_release_safe = true;
+        execution_profile.prefix_reuse_safe = false;
+        execution_profile.max_batch_size = 1;
+        execution_profile.resolved_from_loaded_model = true;
+
+        let mut push = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            "asr.realtime.voxtral.push",
+            &execution_profile,
+            NativeBatchMode::None,
+        );
+        push.selector = StageWorkSelector::RealtimePush;
+        push.output_visibility = OutputVisibility::AfterQuantumCommit;
+        push.validate()?;
+
+        let mut finish = StageDescriptor::from_execution_profile(
+            StageId::new(2),
+            "asr.realtime.voxtral.finish",
+            &execution_profile,
+            NativeBatchMode::None,
+        );
+        finish.selector = StageWorkSelector::RealtimeFinish;
+        finish.output_visibility = OutputVisibility::AfterQuantumCommit;
+        finish.validate()?;
+
+        Ok(LoadedExecutionContract {
+            execution_group_id: self.execution_group_id,
+            model_instance_id: self.model_instance_id,
+            adapter_instance_id: self.adapter_instance_id(),
+            adapter_abi_revision: self.adapter_abi_revision(),
+            metadata,
+            execution_profile,
+            stages: Arc::from([push, finish]),
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -3491,6 +3625,13 @@ mod tests {
     }
 
     #[test]
+    fn voxtral_realtime_factory_remains_unpublished_without_a_finite_stage_seal() {
+        assert!(built_in_loaded_adapter_factories()
+            .iter()
+            .all(|factory| factory.id() != "builtin.voxtral_realtime.physical_paged"));
+    }
+
+    #[test]
     fn managed_v2_publication_requires_a_physical_runtime_before_ready() {
         let registry = RuntimeAdapterRegistry::built_in();
         let draft = LoadedModelBundleDraft::build(
@@ -3659,6 +3800,7 @@ mod tests {
             metadata.model_variant != self.excluded_model_variant
                 && !is_physical_qwen_tts(metadata)
                 && !is_nemotron_realtime(metadata)
+                && !is_voxtral_realtime(metadata)
                 && !is_continuous_physical_chat(metadata)
                 && !is_continuous_physical_asr(metadata)
                 && !is_whisper_physical_asr(metadata)

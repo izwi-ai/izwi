@@ -39,6 +39,12 @@ pub(crate) struct VoxtralRealtimeState {
     pub(super) finished: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VoxtralRealtimeResourceUsage {
+    pub(crate) host_bytes: u64,
+    pub(crate) tensor_bytes: u64,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct VoxtralRealtimeHostCheckpoint {
     source_sample_rate: Option<u32>,
@@ -108,6 +114,34 @@ impl VoxtralRealtimeState {
 
     pub(crate) fn tokens_generated(&self) -> usize {
         self.generated.len()
+    }
+
+    pub(crate) fn resource_usage(&self) -> Result<VoxtralRealtimeResourceUsage> {
+        let host_bytes = self
+            .source_samples
+            .capacity()
+            .checked_mul(std::mem::size_of::<f32>())
+            .and_then(|bytes| {
+                self.generated
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<u32>())
+                    .and_then(|tokens| bytes.checked_add(tokens))
+            })
+            .and_then(|bytes| bytes.checked_add(self.assembled.capacity()))
+            .and_then(|bytes| bytes.checked_add(self.language.as_ref().map_or(0, String::capacity)))
+            .ok_or_else(|| Error::InferenceError("Voxtral host usage overflow".into()))?;
+        let tensor_bytes = self.audio_embeds.as_ref().map_or(Ok(0usize), |tensor| {
+            tensor
+                .elem_count()
+                .checked_mul(tensor.dtype().size_in_bytes())
+                .ok_or_else(|| Error::InferenceError("Voxtral tensor usage overflow".into()))
+        })?;
+        Ok(VoxtralRealtimeResourceUsage {
+            host_bytes: u64::try_from(host_bytes)
+                .map_err(|_| Error::InferenceError("Voxtral host usage exceeds u64".into()))?,
+            tensor_bytes: u64::try_from(tensor_bytes)
+                .map_err(|_| Error::InferenceError("Voxtral tensor usage exceeds u64".into()))?,
+        })
     }
 
     pub(super) fn append_source_samples(
