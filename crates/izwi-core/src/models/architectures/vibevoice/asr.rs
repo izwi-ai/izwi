@@ -12,11 +12,12 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use tracing::info;
 
+use crate::backends::state::{PhysicalStateTransactionId, TensorStateArena};
 use crate::backends::{backend_kind_for_device, BackendKind, DeviceKind, DeviceProfile};
 use crate::catalog::ModelFamily;
 use crate::engine::{
-    ClockedStateProjection, ClockedStateSelection, InputRange, InvocationTensorLease,
-    StageDescriptor, WorkCost,
+    ClockedStateProjection, ClockedStateSelection, ClockedStateSpan, InputRange,
+    InvocationTensorLease, StageDescriptor, WorkCost,
 };
 use crate::error::{Error, Result};
 use crate::kv::v2::{
@@ -158,11 +159,11 @@ pub(crate) struct VibeVoiceAsrPreparationStageSeal {
     pub(crate) max_workspace_bytes: u64,
 }
 
-/// Immutable, post-sampling VibeVoice decoder input.
+/// Immutable input for resumable tokenizer and decoder prefill.
 ///
-/// Freezing the mixed embeddings here is semantically important: acoustic
-/// latent sampling is stochastic, so decoder retries must never rebuild this
-/// tensor from audio.
+/// Acoustic sampling noise is authored once during preparation. Retried
+/// tokenizer quanta therefore reproduce the same decoder embeddings without
+/// retaining a fully materialized speech-feature tensor.
 #[derive(Clone)]
 pub(crate) struct VibeVoiceAsrPreparedArtifact {
     model_identity: [u8; 32],
@@ -171,8 +172,39 @@ pub(crate) struct VibeVoiceAsrPreparedArtifact {
     prompt_ids: Arc<[u32]>,
     acoustic_input_range: Range<usize>,
     tokenizer_state_projections: Arc<[ClockedStateProjection]>,
-    mixed_embeddings: Tensor,
+    prompt_embeddings: Tensor,
+    encoder_audio: Tensor,
+    acoustic_noise: Option<Tensor>,
     geometry: VibeVoiceAsrPreparedGeometry,
+}
+
+#[derive(Clone)]
+pub(crate) struct VibeVoiceAsrRetainedTokenizerQuantum {
+    arena: Arc<TensorStateArena>,
+    transaction: PhysicalStateTransactionId,
+    span: ClockedStateSpan,
+}
+
+impl VibeVoiceAsrRetainedTokenizerQuantum {
+    pub(crate) fn new(
+        arena: Arc<TensorStateArena>,
+        transaction: PhysicalStateTransactionId,
+        span: ClockedStateSpan,
+    ) -> Self {
+        Self {
+            arena,
+            transaction,
+            span,
+        }
+    }
+
+    pub(crate) const fn transaction(&self) -> PhysicalStateTransactionId {
+        self.transaction
+    }
+
+    pub(crate) const fn span(&self) -> &ClockedStateSpan {
+        &self.span
+    }
 }
 
 impl VibeVoiceAsrPreparedArtifact {
@@ -228,13 +260,21 @@ impl VibeVoiceAsrPreparedArtifact {
             ));
         }
         let acoustic_frames = acoustic_input_range.len();
-        let mixed_embeddings = Tensor::zeros(
+        let prompt_embeddings = Tensor::zeros(
             (1, prompt_tokens, hidden),
             DType::F32,
             &candle_core::Device::Cpu,
         )?;
-        let embedding_elements = u64::try_from(mixed_embeddings.elem_count())
+        let encoder_audio = Tensor::zeros(
+            (1, 1, encoder_samples),
+            DType::F32,
+            &candle_core::Device::Cpu,
+        )?;
+        let embedding_elements = u64::try_from(prompt_embeddings.elem_count())
             .map_err(|_| Error::Overloaded("test artifact elements exceed u64".into()))?;
+        let retained_device_bytes = tensor_storage_bytes(&prompt_embeddings)?
+            .checked_add(tensor_storage_bytes(&encoder_audio)?)
+            .ok_or_else(|| Error::Overloaded("test artifact bytes overflow".into()))?;
         let tokenizer_state_projections = Arc::from([vibevoice_tokenizer_state_projection(
             acoustic_input_range.clone(),
             encoder_samples,
@@ -246,7 +286,9 @@ impl VibeVoiceAsrPreparedArtifact {
             prompt_ids: vec![0; prompt_tokens].into(),
             acoustic_input_range,
             tokenizer_state_projections,
-            mixed_embeddings,
+            prompt_embeddings,
+            encoder_audio,
+            acoustic_noise: None,
             geometry: VibeVoiceAsrPreparedGeometry {
                 input_samples: encoder_samples,
                 input_sample_rate: 24_000,
@@ -256,7 +298,7 @@ impl VibeVoiceAsrPreparedArtifact {
                 prompt_tokens,
                 embedding_elements,
                 preparation_workspace_bytes: 1,
-                retained_device_bytes: embedding_elements * 4,
+                retained_device_bytes,
                 retained_host_bytes: (prompt_tokens * size_of::<u32>()) as u64,
             },
         })
@@ -455,6 +497,15 @@ impl VibeVoiceAsrModel {
             input_sample_rate,
             self.preprocessor.target_sample_rate(),
         )?;
+        if !retained_tokenizer_geometry_supported(
+            self.config.acoustic_tokenizer_config.causal,
+            &self.config.acoustic_tokenizer_config.encoder_ratios,
+            self.config.semantic_tokenizer_config.causal,
+            &self.config.semantic_tokenizer_config.encoder_ratios,
+            self.preprocessor.speech_tok_compress_ratio,
+        ) {
+            return Ok(VibeVoiceAsrPreparationDecision::LegacyInvocation);
+        }
         let ratio = self.preprocessor.speech_tok_compress_ratio.max(1);
         let acoustic_frames = asr_placeholder_count(processed_samples, ratio);
         let encoder_samples = acoustic_frames.checked_mul(ratio).ok_or_else(|| {
@@ -492,10 +543,29 @@ impl VibeVoiceAsrModel {
                 tokens.checked_mul(u64::try_from(self.language_model.hidden_size()).ok()?)
             })
             .ok_or_else(|| Error::Overloaded("VibeVoice ASR embedding elements overflow".into()))?;
+        let element_bytes = u64::try_from(self.dtype.size_in_bytes()).map_err(|_| {
+            Error::Overloaded("VibeVoice ASR embedding dtype size exceeds u64".into())
+        })?;
+        let audio_elements = u64::try_from(encoder_samples)
+            .map_err(|_| Error::Overloaded("VibeVoice ASR audio elements exceed u64".into()))?;
+        let noise_elements = if !self.acoustic_tokenizer.requires_sampling_noise() {
+            0
+        } else {
+            u64::try_from(acoustic_frames)
+                .ok()
+                .and_then(|frames| {
+                    frames.checked_mul(
+                        u64::try_from(self.config.acoustic_tokenizer_config.vae_dim).ok()?,
+                    )
+                })
+                .ok_or_else(|| {
+                    Error::Overloaded("VibeVoice ASR acoustic noise elements overflow".into())
+                })?
+        };
         let retained_device_bytes = embedding_elements
-            .checked_mul(u64::try_from(self.dtype.size_in_bytes()).map_err(|_| {
-                Error::Overloaded("VibeVoice ASR embedding dtype size exceeds u64".into())
-            })?)
+            .checked_add(audio_elements)
+            .and_then(|elements| elements.checked_add(noise_elements))
+            .and_then(|elements| elements.checked_mul(element_bytes))
             .ok_or_else(|| Error::Overloaded("VibeVoice ASR artifact bytes overflow".into()))?;
         let retained_host_bytes = u64::try_from(prompt_tokens)
             .ok()
@@ -639,17 +709,9 @@ impl VibeVoiceAsrModel {
         })?;
         let mut encoder_audio = processed_audio.clone();
         encoder_audio.resize(encoder_samples, 0.0);
-        let speech = Tensor::from_vec(encoder_audio, (1, 1, encoder_samples), &self.device.device)?
-            .to_dtype(self.dtype)?;
-        // Full encode intentionally avoids invocation tensor state. The
-        // resulting mixed embeddings freeze the acoustic random draw.
-        let speech_features = self.encode_speech_full(&speech)?;
-        if speech_features.dim(1)? != acoustic_frames {
-            return Err(Error::InferenceError(format!(
-                "VibeVoice-ASR tokenizer produced {} frames but preparation reserved {acoustic_frames}",
-                speech_features.dim(1)?
-            )));
-        }
+        let encoder_audio =
+            Tensor::from_vec(encoder_audio, (1, 1, encoder_samples), &self.device.device)?
+                .to_dtype(self.dtype)?;
         let audio_seconds =
             processed_audio.len() as f32 / self.preprocessor.target_sample_rate() as f32;
         let extra = prompt_instruction(language, prompt);
@@ -672,20 +734,34 @@ impl VibeVoiceAsrModel {
             (1, prepared_prompt.input_ids.len()),
             &self.device.device,
         )?;
-        let token_embeddings = self.language_model.embeddings(&input_ids)?;
-        let mixed_embeddings = replace_range_with_features(
-            &token_embeddings,
-            prepared_prompt.acoustic_input_range.clone(),
-            &speech_features.to_dtype(token_embeddings.dtype())?,
-        )?;
-        let embedding_elements = u64::try_from(mixed_embeddings.elem_count())
-            .map_err(|_| Error::Overloaded("VibeVoice ASR embedding elements exceed u64".into()))?;
-        let retained_device_bytes = embedding_elements
-            .checked_mul(
-                u64::try_from(mixed_embeddings.dtype().size_in_bytes()).map_err(|_| {
-                    Error::Overloaded("VibeVoice ASR embedding dtype size exceeds u64".into())
-                })?,
+        let prompt_embeddings = self.language_model.embeddings(&input_ids)?;
+        let acoustic_noise = if !self.acoustic_tokenizer.requires_sampling_noise() {
+            None
+        } else {
+            Some(
+                Tensor::randn(
+                    0f32,
+                    1f32,
+                    (
+                        1,
+                        acoustic_frames,
+                        self.config.acoustic_tokenizer_config.vae_dim,
+                    ),
+                    &self.device.device,
+                )?
+                .to_dtype(self.dtype)?,
             )
+        };
+        let embedding_elements = u64::try_from(prompt_embeddings.elem_count())
+            .map_err(|_| Error::Overloaded("VibeVoice ASR embedding elements exceed u64".into()))?;
+        let acoustic_noise_bytes = acoustic_noise
+            .as_ref()
+            .map(tensor_storage_bytes)
+            .transpose()?
+            .unwrap_or(0);
+        let retained_device_bytes = tensor_storage_bytes(&prompt_embeddings)?
+            .checked_add(tensor_storage_bytes(&encoder_audio)?)
+            .and_then(|bytes| bytes.checked_add(acoustic_noise_bytes))
             .ok_or_else(|| Error::Overloaded("VibeVoice ASR artifact bytes overflow".into()))?;
         let retained_host_bytes = u64::try_from(prepared_prompt.input_ids.len())
             .ok()
@@ -719,7 +795,9 @@ impl VibeVoiceAsrModel {
             prompt_ids: prepared_prompt.input_ids.into(),
             acoustic_input_range: prepared_prompt.acoustic_input_range,
             tokenizer_state_projections,
-            mixed_embeddings,
+            prompt_embeddings,
+            encoder_audio,
+            acoustic_noise,
             geometry,
         })
     }
@@ -733,6 +811,7 @@ impl VibeVoiceAsrModel {
         prompt: Option<&str>,
     ) -> Result<()> {
         validate_vibevoice_artifact_model_identity(artifact, self.model_identity)?;
+        self.validate_retained_artifact_noise(artifact)?;
         if artifact.source_identity != vibevoice_asr_source_identity(audio, sample_rate)
             || artifact.prompt_identity != vibevoice_asr_prompt_identity(language, prompt)
             || artifact.geometry.input_samples != audio.len()
@@ -761,6 +840,7 @@ impl VibeVoiceAsrModel {
         }
         validate_vibevoice_artifact_model_identity(&artifact, self.model_identity)?;
         validate_vibevoice_artifact_storage(&artifact)?;
+        self.validate_retained_artifact_noise(&artifact)?;
         let built_in_stop_tokens = [
             self.tokenizer.specials().im_end,
             self.tokenizer.specials().endoftext,
@@ -791,6 +871,31 @@ impl VibeVoiceAsrModel {
         })
     }
 
+    fn validate_retained_artifact_noise(
+        &self,
+        artifact: &VibeVoiceAsrPreparedArtifact,
+    ) -> Result<()> {
+        let stochastic = self.acoustic_tokenizer.requires_sampling_noise();
+        let valid = match artifact.acoustic_noise.as_ref() {
+            Some(noise) => {
+                stochastic
+                    && noise.dims()
+                        == [
+                            1,
+                            artifact.geometry.acoustic_frames,
+                            self.config.acoustic_tokenizer_config.vae_dim,
+                        ]
+            }
+            None => !stochastic,
+        };
+        if !valid {
+            return Err(Error::InvalidInput(
+                "VibeVoice ASR artifact has stale acoustic sampling noise".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Commit one exact prompt span. Non-final spans retain only physical KV;
     /// decoder logits become visible only after the final span.
     pub(crate) fn continue_resumable_prefill(
@@ -798,6 +903,16 @@ impl VibeVoiceAsrModel {
         state: &mut VibeVoiceAsrDecodeState,
         span_start: usize,
         span_end: usize,
+    ) -> Result<bool> {
+        self.continue_resumable_prefill_retained(state, span_start, span_end, None)
+    }
+
+    pub(crate) fn continue_resumable_prefill_retained(
+        &self,
+        state: &mut VibeVoiceAsrDecodeState,
+        span_start: usize,
+        span_end: usize,
+        tokenizer_quantum: Option<VibeVoiceAsrRetainedTokenizerQuantum>,
     ) -> Result<bool> {
         let prompt_tokens = state.prefill_token_count();
         if state.prefill_progress != span_start
@@ -819,9 +934,101 @@ impl VibeVoiceAsrModel {
         let prepared = state.prepared.as_ref().ok_or_else(|| {
             Error::InferenceError("VibeVoice ASR retained state has no prepared embeddings".into())
         })?;
-        let span = prepared
-            .mixed_embeddings
+        let scheduled = InputRange::new(span_start, span_end)?;
+        let expected_tokenizer_span = prepared
+            .tokenizer_state_projections
+            .first()
+            .ok_or_else(|| {
+                Error::InferenceError("VibeVoice ASR artifact lost its tokenizer projection".into())
+            })?
+            .project(scheduled)?;
+        if expected_tokenizer_span.as_ref()
+            != tokenizer_quantum.as_ref().map(|quantum| &quantum.span)
+        {
+            return Err(Error::InvalidInput(
+                "VibeVoice ASR retained tokenizer quantum does not match the exact decoder span"
+                    .into(),
+            ));
+        }
+        let mut span = prepared
+            .prompt_embeddings
             .narrow(1, span_start, span_end - span_start)?;
+        if let Some(quantum) = tokenizer_quantum.as_ref() {
+            let tokenizer_span = quantum.span.input();
+            let expected_cursor = u64::try_from(tokenizer_span.start).map_err(|_| {
+                Error::InvalidInput("VibeVoice ASR tokenizer cursor exceeds u64".into())
+            })?;
+            let target_cursor = u64::try_from(tokenizer_span.end).map_err(|_| {
+                Error::InvalidInput("VibeVoice ASR tokenizer cursor exceeds u64".into())
+            })?;
+            let audio =
+                prepared
+                    .encoder_audio
+                    .narrow(2, tokenizer_span.start, tokenizer_span.len())?;
+            let acoustic = self.acoustic_tokenizer.encode_streaming_retained(
+                &audio,
+                VIBEVOICE_ASR_ACOUSTIC_DOMAIN,
+                expected_cursor,
+                target_cursor,
+                quantum.transaction,
+                quantum.arena.as_ref(),
+            )?;
+            let projection = prepared
+                .tokenizer_state_projections
+                .first()
+                .expect("validated tokenizer projection exists");
+            let relative_sample_start = tokenizer_span
+                .start
+                .checked_sub(projection.auxiliary().start)
+                .ok_or_else(|| {
+                    Error::InvalidInput(
+                        "VibeVoice ASR tokenizer span precedes its projection".into(),
+                    )
+                })?;
+            if relative_sample_start % projection.scale() != 0
+                || tokenizer_span.len() % projection.scale() != 0
+            {
+                return Err(Error::InvalidInput(
+                    "VibeVoice ASR tokenizer span is not aligned to its acoustic scale".into(),
+                ));
+            }
+            let noise_start = relative_sample_start / projection.scale();
+            let noise_frames = tokenizer_span.len() / projection.scale();
+            let noise = prepared
+                .acoustic_noise
+                .as_ref()
+                .map(|noise| noise.narrow(1, noise_start, noise_frames))
+                .transpose()?;
+            let acoustic = self
+                .acoustic_tokenizer
+                .sample_with_supplied_noise(&acoustic, noise.as_ref())?;
+            let acoustic = self.acoustic_connector.forward(&acoustic)?;
+            let semantic = self.semantic_tokenizer.encode_streaming_retained(
+                &audio,
+                VIBEVOICE_ASR_SEMANTIC_DOMAIN,
+                expected_cursor,
+                target_cursor,
+                quantum.transaction,
+                quantum.arena.as_ref(),
+            )?;
+            let semantic = self.semantic_connector.forward(&semantic.mean)?;
+            let speech_features = self.combine_speech_features(acoustic, semantic)?;
+            if speech_features.dim(1)? != noise_frames {
+                return Err(Error::InferenceError(format!(
+                    "VibeVoice ASR tokenizer quantum produced {} frames for {noise_frames} acoustic placeholders",
+                    speech_features.dim(1)?
+                )));
+            }
+            let acoustic_start = span_start.max(prepared.acoustic_input_range.start);
+            let local_start = acoustic_start.checked_sub(span_start).ok_or_else(|| {
+                Error::InferenceError("VibeVoice ASR local acoustic range underflow".into())
+            })?;
+            span = replace_range_with_features(
+                &span,
+                local_start..local_start + noise_frames,
+                &speech_features.to_dtype(span.dtype())?,
+            )?;
+        }
         let complete = span_end == prompt_tokens;
         if complete {
             let logits = self.language_model.forward_managed_with_embeds(
@@ -1752,19 +1959,33 @@ fn checked_tensor_elements(frames: usize, channels: usize, live_factor: u64) -> 
 }
 
 fn validate_vibevoice_artifact_storage(artifact: &VibeVoiceAsrPreparedArtifact) -> Result<()> {
-    let [batch, tokens, _hidden] = artifact.mixed_embeddings.dims() else {
+    let [batch, tokens, _hidden] = artifact.prompt_embeddings.dims() else {
         return Err(Error::InvalidInput(
             "VibeVoice ASR prepared embeddings are not rank three".into(),
         ));
     };
-    let elements = u64::try_from(artifact.mixed_embeddings.elem_count())
+    let [audio_batch, audio_channels, audio_samples] = artifact.encoder_audio.dims() else {
+        return Err(Error::InvalidInput(
+            "VibeVoice ASR prepared encoder audio is not rank three".into(),
+        ));
+    };
+    let elements = u64::try_from(artifact.prompt_embeddings.elem_count())
         .map_err(|_| Error::Overloaded("VibeVoice ASR embedding elements exceed u64".into()))?;
-    let bytes = elements
-        .checked_mul(
-            u64::try_from(artifact.mixed_embeddings.dtype().size_in_bytes()).map_err(|_| {
-                Error::Overloaded("VibeVoice ASR embedding dtype size exceeds u64".into())
-            })?,
-        )
+    let noise_valid = match artifact.acoustic_noise.as_ref() {
+        Some(noise) => {
+            matches!(noise.dims(), [1, frames, _] if *frames == artifact.geometry.acoustic_frames)
+        }
+        None => true,
+    };
+    let noise_bytes = artifact
+        .acoustic_noise
+        .as_ref()
+        .map(tensor_storage_bytes)
+        .transpose()?
+        .unwrap_or(0);
+    let bytes = tensor_storage_bytes(&artifact.prompt_embeddings)?
+        .checked_add(tensor_storage_bytes(&artifact.encoder_audio)?)
+        .and_then(|bytes| bytes.checked_add(noise_bytes))
         .ok_or_else(|| Error::Overloaded("VibeVoice ASR artifact bytes overflow".into()))?;
     let expected_tokenizer_projection = vibevoice_tokenizer_state_projection(
         artifact.acoustic_input_range.clone(),
@@ -1776,6 +1997,15 @@ fn validate_vibevoice_artifact_storage(artifact: &VibeVoiceAsrPreparedArtifact) 
         || artifact.acoustic_input_range.end > *tokens
         || artifact.acoustic_input_range.end - artifact.acoustic_input_range.start
             != artifact.geometry.acoustic_frames
+        || *audio_batch != 1
+        || *audio_channels != 1
+        || *audio_samples != artifact.geometry.encoder_samples
+        || artifact.encoder_audio.dtype() != artifact.prompt_embeddings.dtype()
+        || artifact
+            .acoustic_noise
+            .as_ref()
+            .is_some_and(|noise| noise.dtype() != artifact.prompt_embeddings.dtype())
+        || !noise_valid
         || elements != artifact.geometry.embedding_elements
         || bytes != artifact.geometry.retained_device_bytes
         || artifact.tokenizer_state_projections.as_ref() != [expected_tokenizer_projection]
@@ -1790,6 +2020,15 @@ fn validate_vibevoice_artifact_storage(artifact: &VibeVoiceAsrPreparedArtifact) 
         ));
     }
     Ok(())
+}
+
+fn tensor_storage_bytes(tensor: &Tensor) -> Result<u64> {
+    u64::try_from(tensor.elem_count())
+        .ok()
+        .and_then(|elements| {
+            elements.checked_mul(u64::try_from(tensor.dtype().size_in_bytes()).ok()?)
+        })
+        .ok_or_else(|| Error::Overloaded("VibeVoice ASR tensor storage bytes overflow".into()))
 }
 
 fn validate_vibevoice_artifact_model_identity(
@@ -2321,6 +2560,26 @@ fn tokenizer_streaming_chunk_samples(sample_rate: u32, speech_tok_compress_ratio
     aligned.max(ratio)
 }
 
+fn retained_tokenizer_geometry_supported(
+    acoustic_causal: bool,
+    acoustic_ratios: &[usize],
+    semantic_causal: bool,
+    semantic_ratios: &[usize],
+    speech_tok_compress_ratio: usize,
+) -> bool {
+    fn encoder_compression_ratio(ratios: &[usize]) -> Option<usize> {
+        ratios
+            .iter()
+            .try_fold(1usize, |product, ratio| product.checked_mul(*ratio))
+    }
+
+    speech_tok_compress_ratio > 0
+        && acoustic_causal
+        && semantic_causal
+        && encoder_compression_ratio(acoustic_ratios) == Some(speech_tok_compress_ratio)
+        && encoder_compression_ratio(semantic_ratios) == Some(speech_tok_compress_ratio)
+}
+
 fn tokenizer_chunk_ranges(total_samples: usize, chunk_samples: usize) -> Vec<(usize, usize)> {
     if total_samples == 0 {
         return Vec::new();
@@ -2435,8 +2694,13 @@ mod tests {
     }
 
     fn test_artifact(prompt_tokens: usize, hidden: usize) -> Arc<VibeVoiceAsrPreparedArtifact> {
-        let mixed_embeddings =
+        let prompt_embeddings =
             Tensor::zeros((1, prompt_tokens, hidden), DType::F32, &Device::Cpu).unwrap();
+        let encoder_audio = Tensor::zeros((1, 1, 3_200), DType::F32, &Device::Cpu).unwrap();
+        let retained_device_bytes = tensor_storage_bytes(&prompt_embeddings)
+            .unwrap()
+            .checked_add(tensor_storage_bytes(&encoder_audio).unwrap())
+            .unwrap();
         Arc::new(VibeVoiceAsrPreparedArtifact {
             model_identity: [1; 32],
             source_identity: [2; 32],
@@ -2448,7 +2712,9 @@ mod tests {
                 3_200,
             )
             .unwrap()]),
-            mixed_embeddings,
+            prompt_embeddings,
+            encoder_audio,
+            acoustic_noise: None,
             geometry: VibeVoiceAsrPreparedGeometry {
                 input_samples: 3_200,
                 input_sample_rate: 24_000,
@@ -2458,7 +2724,7 @@ mod tests {
                 prompt_tokens,
                 embedding_elements: (prompt_tokens * hidden) as u64,
                 preparation_workspace_bytes: 4096,
-                retained_device_bytes: (prompt_tokens * hidden * 4) as u64,
+                retained_device_bytes,
                 retained_host_bytes: (prompt_tokens * size_of::<u32>()) as u64,
             },
         })
@@ -2508,9 +2774,9 @@ mod tests {
     fn retained_artifact_authenticates_source_prompt_and_exact_tensor_bytes() {
         let artifact = test_artifact(5, 8);
         validate_vibevoice_artifact_storage(&artifact).unwrap();
-        assert_eq!(artifact.resident_tensor_bytes(), 160);
+        assert_eq!(artifact.resident_tensor_bytes(), 12_960);
         assert_eq!(artifact.resident_host_bytes(), 20);
-        assert_eq!(artifact.resident_bytes().unwrap(), 180);
+        assert_eq!(artifact.resident_bytes().unwrap(), 12_980);
         assert_eq!(artifact.geometry().work_cost(), WorkCost::new(1, 40, 4096));
         assert_ne!(
             vibevoice_asr_source_identity(&[0.0, 1.0], 24_000),
@@ -2543,6 +2809,22 @@ mod tests {
         assert!(error
             .to_string()
             .contains("different loaded model instance"));
+    }
+
+    #[test]
+    fn retained_artifact_accounts_for_immutable_sampling_noise_exactly() {
+        let mut artifact = (*test_artifact(5, 8)).clone();
+        let noise = Tensor::zeros((1, 1, 3), DType::F32, &Device::Cpu).unwrap();
+        artifact.geometry.retained_device_bytes = artifact
+            .geometry
+            .retained_device_bytes
+            .checked_add(tensor_storage_bytes(&noise).unwrap())
+            .unwrap();
+        artifact.acoustic_noise = Some(noise);
+        validate_vibevoice_artifact_storage(&artifact).unwrap();
+
+        artifact.acoustic_noise = Some(Tensor::zeros((1, 2, 3), DType::F32, &Device::Cpu).unwrap());
+        assert!(validate_vibevoice_artifact_storage(&artifact).is_err());
     }
 
     #[test]
@@ -2895,6 +3177,38 @@ mod tests {
         assert_eq!(tokenizer_streaming_chunk_samples(24_000, 3_200), 1_440_000);
         assert_eq!(tokenizer_streaming_chunk_samples(1_000, 3_200), 57_600);
         assert_eq!(tokenizer_streaming_chunk_samples(10, 3_200), 3_200);
+    }
+
+    #[test]
+    fn retained_tokenizer_requires_causal_matching_encoder_geometry() {
+        assert!(retained_tokenizer_geometry_supported(
+            true,
+            &[8, 5, 5, 8, 2],
+            true,
+            &[8, 5, 5, 8, 2],
+            3_200,
+        ));
+        assert!(!retained_tokenizer_geometry_supported(
+            false,
+            &[8, 5, 5, 8, 2],
+            true,
+            &[8, 5, 5, 8, 2],
+            3_200,
+        ));
+        assert!(!retained_tokenizer_geometry_supported(
+            true,
+            &[8, 5, 5, 8, 2],
+            true,
+            &[8, 5, 5, 8],
+            3_200,
+        ));
+        assert!(!retained_tokenizer_geometry_supported(
+            true,
+            &[usize::MAX, 2],
+            true,
+            &[8, 5, 5, 8, 2],
+            3_200,
+        ));
     }
 
     #[test]

@@ -76,7 +76,7 @@ use crate::models::architectures::vibevoice::asr::{
     VibeVoiceAsrDecodeCheckpoint, VibeVoiceAsrDecodeState, VibeVoiceAsrDecodeStep,
     VibeVoiceAsrGenerationOptions, VibeVoiceAsrModel, VibeVoiceAsrPreparationDecision,
     VibeVoiceAsrPreparationStageSeal, VibeVoiceAsrPreparedArtifact,
-    VibeVoiceAsrTranscriptionOutput,
+    VibeVoiceAsrRetainedTokenizerQuantum, VibeVoiceAsrTranscriptionOutput,
 };
 use crate::models::architectures::vibevoice::tts::VibeVoiceTtsModel;
 use crate::models::architectures::vibevoice::VibeVoicePhysicalStateSpec;
@@ -2527,6 +2527,27 @@ impl NativeAsrModel {
             }
             _ => Err(Error::InvalidInput(
                 "ASR resumable-prefill state does not match loaded ASR model".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn continue_vibevoice_resumable_prefill_retained(
+        &self,
+        state: &mut NativeAsrDecodeState,
+        span_start: usize,
+        span_end: usize,
+        tokenizer_quantum: Option<VibeVoiceAsrRetainedTokenizerQuantum>,
+    ) -> Result<bool> {
+        match (self, state) {
+            (Self::VibeVoice(model), NativeAsrDecodeState::VibeVoice(state)) => model
+                .continue_resumable_prefill_retained(
+                    state,
+                    span_start,
+                    span_end,
+                    tokenizer_quantum,
+                ),
+            _ => Err(Error::InvalidInput(
+                "retained VibeVoice prefill state does not match the loaded ASR model".into(),
             )),
         }
     }

@@ -6,17 +6,18 @@ use std::sync::{Arc, OnceLock};
 use crate::backends::BackendKind;
 use crate::engine::ManagedKvModelRuntime;
 use crate::engine::{
-    AdapterAbiRevision, AdapterInstanceId, CacheMode, CancellationGranularity, ConcurrencyClass,
-    ExecutionAdapterBinding, ExecutionGroupId, ExecutionMode, ExecutionProfile,
-    MembershipSafePoint, ModelInstanceId, NativeBatchMode, OutputVisibility, PhysicalLaunchPolicy,
-    PrefillMode, StageDescriptor, StageId, StageProgressKind, StageShapePolicy, StageWorkSelector,
+    AdapterAbiRevision, AdapterInstanceId, CacheMode, CancellationGranularity,
+    ClockedStateSelection, ConcurrencyClass, ExecutionAdapterBinding, ExecutionGroupId,
+    ExecutionMode, ExecutionProfile, MembershipSafePoint, ModelInstanceId, NativeBatchMode,
+    OutputVisibility, PhysicalLaunchPolicy, PrefillMode, StageDescriptor, StageId,
+    StageProgressKind, StageShapePolicy, StageWorkSelector,
 };
 use crate::error::{Error, Result};
 use crate::kv::v2::{
     stage_graph_fingerprint, CapabilityStateDescriptorV2, CapabilityStateRuntimeV2,
     InferenceStateContract, InvocationCapabilityRuntimeV2, InvocationWorkspaceRuntimeV2,
     ManagedCapabilityRuntimeV2, RetainedStateCapability, RetainedStateRuntimeV2,
-    RetainedStateUseV2, StatelessCapabilityRuntimeV2,
+    RetainedStateUseV2, StateClock, StatelessCapabilityRuntimeV2,
 };
 use crate::model::ModelVariant;
 
@@ -1826,7 +1827,7 @@ impl LoadedExecutionAdapter for VibeVoiceAsrExecutionAdapter {
     fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
         use crate::models::architectures::vibevoice::{
             VIBEVOICE_ASR_DECODE_STAGE, VIBEVOICE_ASR_LEGACY_STAGE, VIBEVOICE_ASR_PREFILL_STAGE,
-            VIBEVOICE_ASR_PREPARATION_STAGE,
+            VIBEVOICE_ASR_PREPARATION_STAGE, VIBEVOICE_ASR_TOKENIZER_GROUP,
         };
 
         let metadata = self.metadata();
@@ -1948,6 +1949,14 @@ impl LoadedExecutionAdapter for VibeVoiceAsrExecutionAdapter {
         prefill.max_batch_size = 1;
         prefill.concurrency = ConcurrencyClass::Exclusive;
         prefill.shape_policy = StageShapePolicy::Exact;
+        // The largest loaded preparation envelope is a conservative upper
+        // bound for any causal tokenizer chunk plus its two connectors. Exact
+        // request work remains supplied by the prepared stage cost.
+        prefill.max_workspace_bytes = seal.preparation.max_workspace_bytes;
+        prefill.retained_state_selections = Some(vec![ClockedStateSelection::new(
+            VIBEVOICE_ASR_TOKENIZER_GROUP,
+            StateClock::AudioSamples,
+        )?]);
         prefill.output_visibility = output_visibility_for(
             streaming.transport_output,
             profile.mode,
@@ -1965,6 +1974,7 @@ impl LoadedExecutionAdapter for VibeVoiceAsrExecutionAdapter {
             Error::Overloaded("VibeVoice ASR batch width exceeds work accounting".into())
         })?;
         decode.max_workspace_bytes = decode_workspace;
+        decode.retained_state_selections = Some(vec![]);
         preparation.validate()?;
         prefill.validate()?;
         decode.validate()?;
@@ -4394,9 +4404,23 @@ mod tests {
         assert_eq!(normal.stages[0].max_batch_size, 1);
         assert_eq!(normal.stages[0].max_work_units, 1_500);
         assert_eq!(normal.stages[1].name, "asr.prefill.scalar");
-        assert!(normal.stages[1].retained_state_selections.is_none());
+        assert_eq!(
+            normal.stages[1].retained_state_selections.as_deref(),
+            Some(
+                [ClockedStateSelection::new(
+                    crate::models::architectures::vibevoice::VIBEVOICE_ASR_TOKENIZER_GROUP,
+                    StateClock::AudioSamples,
+                )
+                .unwrap()]
+                .as_slice()
+            )
+        );
+        assert_eq!(normal.stages[1].max_workspace_bytes, 64 * 1024 * 1024);
         assert_eq!(normal.stages[2].name, "asr.decode.tensor_continuous");
-        assert!(normal.stages[2].retained_state_selections.is_none());
+        assert_eq!(
+            normal.stages[2].retained_state_selections.as_deref(),
+            Some(&[][..])
+        );
         assert_eq!(normal.stages[2].batch_mode, NativeBatchMode::Continuous);
         assert_eq!(normal.stages[2].shape_policy, StageShapePolicy::Ragged);
         assert_eq!(normal.stages[2].max_batch_size, 4);

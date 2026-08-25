@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 use candle_core::DType;
 
 use crate::engine::{
-    ConcurrencyClass, ExecutionDomain, MembershipSafePoint, NativeBatchMode, OutputVisibility,
-    PhysicalLaunchPolicy, StageDescriptor, StageId, StageProgressKind, StageShapePolicy,
-    StageWorkSelector,
+    ClockedStateSelection, ConcurrencyClass, ExecutionDomain, MembershipSafePoint, NativeBatchMode,
+    OutputVisibility, PhysicalLaunchPolicy, StageDescriptor, StageId, StageProgressKind,
+    StageShapePolicy, StageWorkSelector,
 };
 use crate::error::{Error, Result};
 use crate::kv::v2::{
@@ -575,6 +575,14 @@ fn authenticate_vibevoice_asr_graph(stages: &[StageDescriptor]) -> Result<VibeVo
             && prefill.membership_safe_point == MembershipSafePoint::QuantumBoundary
             && prefill.output_visibility == OutputVisibility::AfterQuantumCommit
             && prefill.max_batch_size == 1
+            && prefill.retained_state_selections.as_deref()
+                == Some(
+                    [ClockedStateSelection::new(
+                        VIBEVOICE_ASR_TOKENIZER_GROUP,
+                        StateClock::AudioSamples,
+                    )?]
+                    .as_slice(),
+                )
             && decode.id == StageId::new(2)
             && decode.name == VIBEVOICE_ASR_DECODE_STAGE
             && decode.selector == StageWorkSelector::SequenceDecode
@@ -586,7 +594,8 @@ fn authenticate_vibevoice_asr_graph(stages: &[StageDescriptor]) -> Result<VibeVo
             && decode.physical_launch_policy == PhysicalLaunchPolicy::ExecutionGroupExclusive
             && decode.membership_safe_point == MembershipSafePoint::QuantumBoundary
             && decode.output_visibility == OutputVisibility::AfterQuantumCommit
-            && decode.max_batch_size > 1;
+            && decode.max_batch_size > 1
+            && decode.retained_state_selections.as_deref() == Some(&[]);
         if valid {
             return Ok(VibeVoiceAsrGraphKind::Normal);
         }
@@ -647,14 +656,30 @@ fn vibevoice_asr_retained_contract(
     decoder.header.scope = StateScope::Retained;
     decoder.header.prefix = PrefixPolicy::Disabled;
     decoder.header.checkpoint = CheckpointPolicy::Transactional;
+    let mut retained_domains = vec![StateDomainSpec::PagedAttention(decoder)];
+    for id in [VIBEVOICE_ASR_ACOUSTIC_DOMAIN, VIBEVOICE_ASR_SEMANTIC_DOMAIN] {
+        let StateDomainSpec::Tensor(mut tokenizer) = invocation
+            .domains
+            .iter()
+            .find(|domain| domain.id() == id)
+            .cloned()
+            .ok_or_else(|| {
+                Error::ModelLoadError("VibeVoice ASR tokenizer domain is missing".into())
+            })?
+        else {
+            return Err(Error::ModelLoadError(
+                "VibeVoice ASR tokenizer domain must be tensor state".into(),
+            ));
+        };
+        tokenizer.header.scope = StateScope::Retained;
+        tokenizer.header.prefix = PrefixPolicy::Disabled;
+        tokenizer.header.checkpoint = CheckpointPolicy::Transactional;
+        retained_domains.push(StateDomainSpec::Tensor(tokenizer));
+    }
     let retained = InferenceStateContract {
         abi: CURRENT_INFERENCE_STATE_ABI,
-        domains: vec![StateDomainSpec::PagedAttention(decoder)],
-        groups: vec![StateGroupSpec {
-            id: VIBEVOICE_ASR_DECODER_GROUP,
-            domains: vec![VIBEVOICE_ASR_DECODER_DOMAIN],
-            prefix_shareable: false,
-        }],
+        domains: retained_domains,
+        groups: invocation.groups.clone(),
     };
     retained.validate()?;
     Ok(retained)
@@ -869,7 +894,13 @@ mod tests {
         prefill.shape_policy = StageShapePolicy::Exact;
         prefill.concurrency = ConcurrencyClass::Exclusive;
         prefill.max_batch_size = 1;
+        prefill.max_workspace_bytes = 4096;
         prefill.membership_safe_point = MembershipSafePoint::QuantumBoundary;
+        prefill.retained_state_selections = Some(vec![ClockedStateSelection::new(
+            VIBEVOICE_ASR_TOKENIZER_GROUP,
+            StateClock::AudioSamples,
+        )
+        .unwrap()]);
 
         let mut decode = stage();
         decode.id = StageId::new(2);
@@ -879,6 +910,7 @@ mod tests {
         decode.batch_mode = NativeBatchMode::Continuous;
         decode.shape_policy = StageShapePolicy::Ragged;
         decode.membership_safe_point = MembershipSafePoint::QuantumBoundary;
+        decode.retained_state_selections = Some(vec![]);
         [preparation, prefill, decode]
     }
 
@@ -1084,10 +1116,25 @@ mod tests {
     }
 
     #[test]
-    fn asr_dual_graph_spec_retains_only_decoder_and_projects_exact_workspaces() {
+    fn asr_dual_graph_spec_retains_decoder_and_tokenizers_and_projects_exact_workspaces() {
         let invocation = asr_complete_invocation_contract();
         let normal = asr_normal_stages();
         let legacy = [asr_legacy_stage()];
+        assert_eq!(
+            normal[1].retained_state_selections.as_deref(),
+            Some(
+                [ClockedStateSelection::new(
+                    VIBEVOICE_ASR_TOKENIZER_GROUP,
+                    StateClock::AudioSamples,
+                )
+                .unwrap()]
+                .as_slice()
+            )
+        );
+        assert_eq!(
+            normal[2].retained_state_selections.as_deref(),
+            Some(&[][..])
+        );
         let spec = vibevoice_physical_state_spec(
             &[normal.as_slice(), legacy.as_slice()],
             invocation.clone(),
@@ -1098,9 +1145,13 @@ mod tests {
         assert_eq!(spec.invocation, invocation);
         assert_eq!(spec.retained_max_tokens, Some(4096));
         let retained = spec.retained.as_ref().expect("normal retained contract");
-        assert_eq!(retained.domains.len(), 1);
-        assert_eq!(retained.groups.len(), 1);
+        assert_eq!(retained.domains.len(), 3);
+        assert_eq!(retained.groups.len(), 2);
         assert_eq!(retained.groups[0].domains, [VIBEVOICE_ASR_DECODER_DOMAIN]);
+        assert_eq!(
+            retained.groups[1].domains,
+            [VIBEVOICE_ASR_ACOUSTIC_DOMAIN, VIBEVOICE_ASR_SEMANTIC_DOMAIN]
+        );
         assert!(matches!(
             &retained.domains[0],
             StateDomainSpec::PagedAttention(domain)
@@ -1109,6 +1160,14 @@ mod tests {
                     && domain.header.prefix == PrefixPolicy::Disabled
                     && domain.header.checkpoint == CheckpointPolicy::Transactional
         ));
+        assert!(retained.domains[1..].iter().all(|domain| matches!(
+            domain,
+            StateDomainSpec::Tensor(tokenizer)
+                if tokenizer.header.scope == StateScope::Retained
+                    && tokenizer.header.clock == StateClock::AudioSamples
+                    && tokenizer.header.prefix == PrefixPolicy::Disabled
+                    && tokenizer.header.checkpoint == CheckpointPolicy::Transactional
+        )));
         assert!(matches!(
             &spec.descriptor.retained,
             RetainedStateCapability::Managed { contract } if contract == retained
@@ -1138,7 +1197,16 @@ mod tests {
                 ..
             }]
         ));
-        assert!(normal_profile.stages[1].domains.is_empty());
+        assert!(matches!(
+            normal_profile.stages[1].domains.as_slice(),
+            [InvocationWorkspaceDomain::Scratch {
+                formula: WorkspaceFormula {
+                    fixed_bytes: 4096,
+                    ..
+                },
+                ..
+            }]
+        ));
         assert!(normal_profile.stages[2].domains.is_empty());
 
         let legacy_fingerprint = stage_graph_fingerprint(&legacy).unwrap();
@@ -1246,6 +1314,31 @@ mod tests {
         let mut scalar_decode_width = asr_normal_stages();
         scalar_decode_width[2].max_batch_size = 1;
         assert_rejected(scalar_decode_width);
+
+        let mut implicit_prefill_state = asr_normal_stages();
+        implicit_prefill_state[1].retained_state_selections = None;
+        assert_rejected(implicit_prefill_state);
+
+        let mut wrong_prefill_clock = asr_normal_stages();
+        wrong_prefill_clock[1].retained_state_selections = Some(vec![ClockedStateSelection::new(
+            VIBEVOICE_ASR_TOKENIZER_GROUP,
+            StateClock::DecoderTokens,
+        )
+        .unwrap()]);
+        assert_rejected(wrong_prefill_clock);
+
+        let mut decoder_advances_tokenizer = asr_normal_stages();
+        decoder_advances_tokenizer[2].retained_state_selections =
+            Some(vec![ClockedStateSelection::new(
+                VIBEVOICE_ASR_TOKENIZER_GROUP,
+                StateClock::AudioSamples,
+            )
+            .unwrap()]);
+        assert_rejected(decoder_advances_tokenizer);
+
+        let mut implicit_decode_state = asr_normal_stages();
+        implicit_decode_state[2].retained_state_selections = None;
+        assert_rejected(implicit_decode_state);
     }
 
     #[test]

@@ -1,5 +1,7 @@
+use crate::backends::state::PhysicalStateTransactionId;
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
+use crate::models::architectures::vibevoice::asr::VibeVoiceAsrRetainedTokenizerQuantum;
 use crate::models::architectures::whisper::asr::WhisperTerminalTransition;
 use crate::models::registry::{
     NativeAsrDecodeCheckpoint, NativeAsrDecodeStep, NativeAsrGenerationOptions,
@@ -856,11 +858,48 @@ impl NativeExecutor {
         let mut retained = managed_state.take().ok_or_else(|| {
             Error::InferenceError("VibeVoice ASR sequence lost retained paged state".into())
         })?;
-        if retained.tensor_state.is_some() {
+        let tensor_reservation = retained.tensor_state.clone();
+        let auxiliary_spans = match &scheduled.work {
+            crate::engine::WorkUnit::SequenceStep {
+                auxiliary_state: Some(spans),
+                ..
+            } => spans.as_ref(),
+            _ => &[],
+        };
+        if auxiliary_spans.len() > 1 || auxiliary_spans.is_empty() != tensor_reservation.is_none() {
             return Err(Error::InferenceError(
-                "normal VibeVoice ASR sequence unexpectedly received tokenizer tensor state".into(),
+                "VibeVoice ASR tokenizer reservation does not match its exact auxiliary span"
+                    .into(),
             ));
         }
+        let tensor_arena = request
+            .managed_cache_runtime()
+            .and_then(|runtime| runtime.tensor_state())
+            .cloned();
+        if tensor_reservation.is_some() && tensor_arena.is_none() {
+            return Err(Error::InferenceError(
+                "VibeVoice ASR tokenizer reservation lost its retained tensor arena".into(),
+            ));
+        }
+        let tokenizer_transaction = tensor_reservation
+            .as_ref()
+            .map(|_| PhysicalStateTransactionId::new(scheduled.plan_id))
+            .transpose()?;
+        let tokenizer_quantum = match (
+            tensor_arena.as_ref(),
+            tokenizer_transaction,
+            auxiliary_spans.first(),
+        ) {
+            (Some(arena), Some(transaction), Some(span)) => Some(
+                VibeVoiceAsrRetainedTokenizerQuantum::new(arena.clone(), transaction, span.clone()),
+            ),
+            (_, None, None) => None,
+            _ => {
+                return Err(Error::InferenceError(
+                    "VibeVoice ASR tokenizer quantum identity is incomplete".into(),
+                ));
+            }
+        };
         let cache = retained.take_only_paged()?;
         let prompt_tokens = request.num_prompt_tokens();
         let resumable_span = scheduled
@@ -985,9 +1024,12 @@ impl NativeExecutor {
                 let step = if let Some((start, end)) = resumable_span {
                     let Some(complete) = run_asr_model_call(request, || {
                         Self::run_blocking(|| {
-                            active
-                                .model
-                                .continue_resumable_prefill(&mut active.state, start, end)
+                            active.model.continue_vibevoice_resumable_prefill_retained(
+                                &mut active.state,
+                                start,
+                                end,
+                                tokenizer_quantum.clone(),
+                            )
                         })
                     })?
                     else {
@@ -1111,6 +1153,46 @@ impl NativeExecutor {
                 request.id.clone(),
             )));
         }
+        let clocked_state_completion = match (tensor_arena.as_ref(), tokenizer_transaction) {
+            (Some(arena), Some(transaction)) => match arena.seal_selected_completion(transaction) {
+                Ok(completion) => Some(completion),
+                Err(error) => {
+                    let _ = request.take_staged_stream_outputs()?;
+                    rollback_scalar_asr_quantum(
+                        &mut state_lease,
+                        &mut checkpoint,
+                        outer_checkpoint,
+                        fresh_state,
+                    )?;
+                    return Err(error);
+                }
+            },
+            (_, None) => None,
+            _ => {
+                rollback_scalar_asr_quantum(
+                    &mut state_lease,
+                    &mut checkpoint,
+                    outer_checkpoint,
+                    fresh_state,
+                )?;
+                return Err(Error::InferenceError(
+                    "VibeVoice ASR tokenizer completion identity is incomplete".into(),
+                ));
+            }
+        };
+        if request.is_cancelled() {
+            let _ = request.take_staged_stream_outputs()?;
+            rollback_scalar_asr_quantum(
+                &mut state_lease,
+                &mut checkpoint,
+                outer_checkpoint,
+                fresh_state,
+            )?;
+            state_lease.release()?;
+            return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                request.id.clone(),
+            )));
+        }
         if let Some(checkpoint) = checkpoint.take() {
             if let Err(error) = state_lease
                 .require_state_mut()?
@@ -1131,7 +1213,7 @@ impl NativeExecutor {
         } else {
             state_lease.restore()?;
         }
-        Ok(ModelSessionResult::sequence(ExecutorOutput {
+        let result = ModelSessionResult::sequence(ExecutorOutput {
             request_id: request.id.clone(),
             audio: Some(AudioOutput {
                 samples: Vec::new(),
@@ -1151,7 +1233,11 @@ impl NativeExecutor {
             asr_diagnostics: None,
             error: None,
         })
-        .with_managed_cache_completions(completions))
+        .with_managed_cache_completions(completions);
+        Ok(match clocked_state_completion {
+            Some(completion) => result.with_clocked_state_completion(completion),
+            None => result,
+        })
     }
 
     fn qwen3_asr_sequence_request(
@@ -1752,7 +1838,9 @@ impl NativeExecutor {
             let tensor_arena = request
                 .managed_cache_runtime()
                 .and_then(|runtime| runtime.tensor_state());
-            if tensor_arena.is_some() != tensor_reservation.is_some() {
+            if batch_family != ModelFamily::VibeVoiceAsr
+                && tensor_arena.is_some() != tensor_reservation.is_some()
+            {
                 return Err(Error::InferenceError(
                     "continuous ASR row lost its prepared-input tensor-state reservation"
                         .to_string(),
@@ -1858,15 +1946,17 @@ impl NativeExecutor {
                 continue;
             }
             let request = ordered_requests[index];
-            if let Some(arena) = request
-                .managed_cache_runtime()
-                .and_then(|runtime| runtime.tensor_state())
-            {
-                active_states.rows[row]
-                    .2
-                    .require_state_mut()?
-                    .state
-                    .stage_qwen3_prepared_tensor_state(arena, scheduled[index].plan_id)?;
+            if batch_family == ModelFamily::Qwen3Asr {
+                if let Some(arena) = request
+                    .managed_cache_runtime()
+                    .and_then(|runtime| runtime.tensor_state())
+                {
+                    active_states.rows[row]
+                        .2
+                        .require_state_mut()?
+                        .state
+                        .stage_qwen3_prepared_tensor_state(arena, scheduled[index].plan_id)?;
+                }
             }
             if request.is_cancelled() {
                 let index = active_states.rollback_row(row)?;
