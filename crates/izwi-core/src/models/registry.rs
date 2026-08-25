@@ -76,6 +76,7 @@ use crate::models::architectures::vibevoice::asr::{
     VibeVoiceAsrDecodeCheckpoint, VibeVoiceAsrDecodeState, VibeVoiceAsrDecodeStep,
     VibeVoiceAsrGenerationOptions, VibeVoiceAsrModel, VibeVoiceAsrPreparationDecision,
     VibeVoiceAsrPreparationStageSeal, VibeVoiceAsrPreparedArtifact,
+    VibeVoiceAsrPreparedTokenizerSpan, VibeVoiceAsrRetainedPrefillBatchRow,
     VibeVoiceAsrRetainedTokenizerQuantum, VibeVoiceAsrTranscriptionOutput,
 };
 use crate::models::architectures::vibevoice::tts::VibeVoiceTtsModel;
@@ -639,6 +640,13 @@ pub(crate) enum NativeAsrDecodeCheckpoint {
 }
 
 impl NativeAsrDecodeState {
+    pub(crate) fn vibevoice_prepared_artifact(&self) -> Option<Arc<VibeVoiceAsrPreparedArtifact>> {
+        match self {
+            Self::VibeVoice(state) => state.prepared_artifact(),
+            _ => None,
+        }
+    }
+
     pub(crate) fn uses_managed_qwen3_kv(&self) -> bool {
         match self {
             Self::Qwen3(state) => state.uses_managed_kv(),
@@ -2108,6 +2116,10 @@ impl NativeAsrModel {
         }
     }
 
+    pub fn supports_static_prefill_batch(&self) -> bool {
+        matches!(self, Self::VibeVoice(_))
+    }
+
     pub fn continuous_decode_is_tensor_batched(&self) -> bool {
         matches!(self, Self::Qwen3(model) if model.continuous_decode_is_tensor_batched())
             || matches!(self, Self::VibeVoice(_))
@@ -2548,6 +2560,41 @@ impl NativeAsrModel {
                 ),
             _ => Err(Error::InvalidInput(
                 "retained VibeVoice prefill state does not match the loaded ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn prepare_vibevoice_retained_tokenizer_batch(
+        &self,
+        rows: &[VibeVoiceAsrRetainedPrefillBatchRow],
+    ) -> Result<Vec<VibeVoiceAsrPreparedTokenizerSpan>> {
+        match self {
+            Self::VibeVoice(model) => model.prepare_retained_tokenizer_batch(rows),
+            _ => Err(Error::InvalidInput(
+                "VibeVoice tokenizer batch was supplied to another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn continue_vibevoice_resumable_prefill_prepared(
+        &self,
+        state: &mut NativeAsrDecodeState,
+        span_start: usize,
+        span_end: usize,
+        tokenizer_quantum: VibeVoiceAsrRetainedTokenizerQuantum,
+        prepared: &VibeVoiceAsrPreparedTokenizerSpan,
+    ) -> Result<bool> {
+        match (self, state) {
+            (Self::VibeVoice(model), NativeAsrDecodeState::VibeVoice(state)) => model
+                .continue_resumable_prefill_prepared(
+                    state,
+                    span_start,
+                    span_end,
+                    tokenizer_quantum,
+                    prepared,
+                ),
+            _ => Err(Error::InvalidInput(
+                "prepared VibeVoice tokenizer span does not match the loaded ASR model".into(),
             )),
         }
     }

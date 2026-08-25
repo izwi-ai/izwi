@@ -36,7 +36,7 @@ pub(crate) const VIBEVOICE_ASR_SEMANTIC_DOMAIN: StateDomainId = StateDomainId::n
 pub(crate) const VIBEVOICE_ASR_DECODER_GROUP: StateGroupId = StateGroupId::new(1);
 pub(crate) const VIBEVOICE_ASR_TOKENIZER_GROUP: StateGroupId = StateGroupId::new(2);
 pub(crate) const VIBEVOICE_ASR_PREPARATION_STAGE: &str = "asr.encoder.vibevoice";
-pub(crate) const VIBEVOICE_ASR_PREFILL_STAGE: &str = "asr.prefill.scalar";
+pub(crate) const VIBEVOICE_ASR_PREFILL_STAGE: &str = "asr.prefill.tensor_static";
 pub(crate) const VIBEVOICE_ASR_DECODE_STAGE: &str = "asr.decode.tensor_continuous";
 pub(crate) const VIBEVOICE_ASR_LEGACY_STAGE: &str = "asr.scalar";
 pub(crate) const VIBEVOICE_TTS_POSITIVE_DOMAIN: StateDomainId = StateDomainId::new(1);
@@ -475,6 +475,11 @@ fn vibevoice_asr_physical_state_spec(
                 Vec::new()
             };
             if stage.max_workspace_bytes > 0 {
+                let scratch_bytes = if stage.workspace_per_row_bytes > 0 {
+                    stage.workspace_per_row_bytes
+                } else {
+                    stage.max_workspace_bytes
+                };
                 let ordinal = u32::try_from(index + 1).map_err(|_| {
                     Error::ModelLoadError("VibeVoice ASR stage count exceeds u32".into())
                 })?;
@@ -487,7 +492,7 @@ fn vibevoice_asr_physical_state_spec(
                     alignment_bytes: 64,
                     zero_on_release: false,
                     formula: WorkspaceFormula {
-                        fixed_bytes: stage.max_workspace_bytes,
+                        fixed_bytes: scratch_bytes,
                         dimensions: vec![],
                         terms: vec![],
                     },
@@ -550,6 +555,22 @@ fn authenticate_vibevoice_asr_graph(stages: &[StageDescriptor]) -> Result<VibeVo
         }
     }
     if let [preparation, prefill, decode] = ordered.as_slice() {
+        let native_prefill = prefill.batch_mode == NativeBatchMode::Static
+            && prefill.shape_policy == StageShapePolicy::Padded
+            && prefill.concurrency == ConcurrencyClass::Batchable
+            && prefill.max_batch_size > 1
+            && prefill.workspace_base_bytes == 0
+            && prefill.workspace_per_work_unit_bytes == 0
+            && prefill.workspace_per_row_bytes > 0
+            && u64::try_from(prefill.max_batch_size)
+                .ok()
+                .and_then(|width| prefill.workspace_per_row_bytes.checked_mul(width))
+                == Some(prefill.max_workspace_bytes);
+        let scalar_prefill = prefill.batch_mode == NativeBatchMode::None
+            && prefill.shape_policy == StageShapePolicy::Exact
+            && prefill.concurrency == ConcurrencyClass::Exclusive
+            && prefill.max_batch_size == 1
+            && prefill.workspace_per_row_bytes == 0;
         let valid = preparation.id == StageId::new(0)
             && preparation.name == VIBEVOICE_ASR_PREPARATION_STAGE
             && preparation.selector == StageWorkSelector::PreSequencePreparation
@@ -568,13 +589,12 @@ fn authenticate_vibevoice_asr_graph(stages: &[StageDescriptor]) -> Result<VibeVo
             && prefill.selector == StageWorkSelector::SequencePrefill
             && prefill.domain == ExecutionDomain::ExecutionGroup
             && prefill.progress == StageProgressKind::Iterative
-            && prefill.batch_mode == NativeBatchMode::None
-            && prefill.shape_policy == StageShapePolicy::Exact
-            && prefill.concurrency == ConcurrencyClass::Exclusive
+            && (native_prefill || scalar_prefill)
             && prefill.physical_launch_policy == PhysicalLaunchPolicy::ExecutionGroupExclusive
             && prefill.membership_safe_point == MembershipSafePoint::QuantumBoundary
             && prefill.output_visibility == OutputVisibility::AfterQuantumCommit
-            && prefill.max_batch_size == 1
+            && prefill.max_work_units > 0
+            && prefill.max_workspace_bytes > 0
             && prefill.retained_state_selections.as_deref()
                 == Some(
                     [ClockedStateSelection::new(
@@ -891,10 +911,14 @@ mod tests {
         prefill.name = VIBEVOICE_ASR_PREFILL_STAGE.into();
         prefill.selector = StageWorkSelector::SequencePrefill;
         prefill.progress = StageProgressKind::Iterative;
-        prefill.shape_policy = StageShapePolicy::Exact;
-        prefill.concurrency = ConcurrencyClass::Exclusive;
-        prefill.max_batch_size = 1;
-        prefill.max_workspace_bytes = 4096;
+        prefill.batch_mode = NativeBatchMode::Static;
+        prefill.shape_policy = StageShapePolicy::Padded;
+        prefill.concurrency = ConcurrencyClass::Batchable;
+        prefill.max_batch_size = 2;
+        prefill.max_work_units = 2;
+        prefill.max_padding_basis_points = 10_000;
+        prefill.workspace_per_row_bytes = 4096;
+        prefill.max_workspace_bytes = 8192;
         prefill.membership_safe_point = MembershipSafePoint::QuantumBoundary;
         prefill.retained_state_selections = Some(vec![ClockedStateSelection::new(
             VIBEVOICE_ASR_TOKENIZER_GROUP,
@@ -1288,6 +1312,24 @@ mod tests {
     }
 
     #[test]
+    fn asr_dual_graph_spec_accepts_width_one_prefill_fallback() {
+        let invocation = asr_complete_invocation_contract();
+        let mut normal = asr_normal_stages();
+        normal[1].batch_mode = NativeBatchMode::None;
+        normal[1].shape_policy = StageShapePolicy::Exact;
+        normal[1].concurrency = ConcurrencyClass::Exclusive;
+        normal[1].max_batch_size = 1;
+        normal[1].max_work_units = 1;
+        normal[1].max_padding_basis_points = 0;
+        normal[1].workspace_per_row_bytes = 0;
+        normal[1].max_workspace_bytes = 4096;
+        let legacy = [asr_legacy_stage()];
+
+        vibevoice_physical_state_spec(&[normal.as_slice(), legacy.as_slice()], invocation, 4096)
+            .unwrap();
+    }
+
+    #[test]
     fn asr_dual_graph_spec_authenticates_transaction_boundaries() {
         fn assert_rejected(normal: [StageDescriptor; 3]) {
             let legacy = [asr_legacy_stage()];
@@ -1314,6 +1356,12 @@ mod tests {
         let mut scalar_decode_width = asr_normal_stages();
         scalar_decode_width[2].max_batch_size = 1;
         assert_rejected(scalar_decode_width);
+
+        let mut scalar_prefill = asr_normal_stages();
+        scalar_prefill[1].batch_mode = NativeBatchMode::None;
+        scalar_prefill[1].shape_policy = StageShapePolicy::Independent;
+        scalar_prefill[1].max_padding_basis_points = 0;
+        assert_rejected(scalar_prefill);
 
         let mut implicit_prefill_state = asr_normal_stages();
         implicit_prefill_state[1].retained_state_selections = None;

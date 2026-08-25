@@ -1967,6 +1967,19 @@ fn is_isolated_continuous_model_quantum(scheduled: &[ScheduledRequest]) -> bool 
     scheduled.len() == 1 && !scheduled[0].is_prefill && scheduled[0].num_tokens > 1
 }
 
+fn has_native_vibevoice_tokenizer_batch(scheduled: &[ScheduledRequest]) -> bool {
+    scheduled.len() > 1
+        && scheduled.iter().all(|scheduled| {
+            matches!(
+                &scheduled.work,
+                WorkUnit::SequenceStep {
+                    auxiliary_state: Some(spans),
+                    ..
+                } if !spans.is_empty()
+            )
+        })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct NativeBatchSupport {
     prefill: NativeBatchMode,
@@ -1989,19 +2002,35 @@ impl NativeBatchSupport {
 /// sufficient. Each audio family remains `NONE` until its exact loaded model
 /// and adapter both expose a real multi-row call at this boundary.
 fn loaded_native_batch_support(request: &EngineCoreRequest) -> NativeBatchSupport {
-    let supported = match request.task_type {
-        TaskType::Chat => request
-            .prepared_chat_model_for_executor()
-            .is_ok_and(|model| model.supports_continuous_decode_batch()),
+    let (prefill_supported, decode_supported) = match request.task_type {
+        TaskType::Chat => (
+            false,
+            request
+                .prepared_chat_model_for_executor()
+                .is_ok_and(|model| model.supports_continuous_decode_batch()),
+        ),
         TaskType::ASR => request
             .prepared_asr_model_for_executor()
-            .is_ok_and(|model| model.is_some_and(|model| model.supports_continuous_decode_batch())),
-        TaskType::TTS => request
-            .prepared_qwen_tts_model_for_executor()
-            .is_ok_and(|model| model.is_some_and(|model| model.supports_continuous_decode_batch())),
-        TaskType::SpeechToSpeech => false,
+            .ok()
+            .flatten()
+            .map(|model| {
+                (
+                    model.supports_static_prefill_batch(),
+                    model.supports_continuous_decode_batch(),
+                )
+            })
+            .unwrap_or((false, false)),
+        TaskType::TTS => (
+            false,
+            request
+                .prepared_qwen_tts_model_for_executor()
+                .is_ok_and(|model| {
+                    model.is_some_and(|model| model.supports_continuous_decode_batch())
+                }),
+        ),
+        TaskType::SpeechToSpeech => (false, false),
     };
-    if !supported {
+    if !prefill_supported && !decode_supported {
         return NativeBatchSupport::NONE;
     }
     let Some(binding) = request.execution_adapter_binding() else {
@@ -2013,18 +2042,35 @@ fn loaded_native_batch_support(request: &EngineCoreRequest) -> NativeBatchSuppor
         max_output_steps: 1,
         auxiliary_state: None,
     };
-    let Ok(stage) = binding.stage_for_work(&decode_work) else {
-        return NativeBatchSupport::NONE;
+    let decode = decode_supported
+        && binding.stage_for_work(&decode_work).is_ok_and(|stage| {
+            stage.selector == StageWorkSelector::SequenceDecode
+                && stage.batch_mode == NativeBatchMode::Continuous
+                && stage.concurrency == ConcurrencyClass::Batchable
+        });
+    let prefill_work = WorkUnit::SequenceStep {
+        phase: SequencePhase::Prefill,
+        input: super::InputRange { start: 0, end: 1 },
+        max_output_steps: 1,
+        auxiliary_state: None,
     };
-    if stage.selector != StageWorkSelector::SequenceDecode
-        || stage.batch_mode != NativeBatchMode::Continuous
-        || stage.concurrency != ConcurrencyClass::Batchable
-    {
-        return NativeBatchSupport::NONE;
-    }
+    let prefill = prefill_supported
+        && binding.stage_for_work(&prefill_work).is_ok_and(|stage| {
+            stage.selector == StageWorkSelector::SequencePrefill
+                && stage.batch_mode == NativeBatchMode::Static
+                && stage.concurrency == ConcurrencyClass::Batchable
+        });
     NativeBatchSupport {
-        prefill: NativeBatchMode::None,
-        decode: NativeBatchMode::Continuous,
+        prefill: if prefill {
+            NativeBatchMode::Static
+        } else {
+            NativeBatchMode::None
+        },
+        decode: if decode {
+            NativeBatchMode::Continuous
+        } else {
+            NativeBatchMode::None
+        },
     }
 }
 
@@ -2294,6 +2340,56 @@ impl ModelExecutor for NativeExecutor {
                         execution.scheduled,
                         Some(&execution.batch.rows),
                     ),
+                NativeBatchRoute::Audio {
+                    task: TaskType::ASR,
+                    stage: NativeAudioStage::SequencePrefill,
+                    mode: NativeBatchMode::Static,
+                    ..
+                } if execution.batch.lane.kernel_mode
+                    == crate::models::architectures::vibevoice::VIBEVOICE_ASR_PREFILL_STAGE
+                    && has_native_vibevoice_tokenizer_batch(execution.scheduled)
+                    && execution.requests.iter().all(|request| {
+                        request.model_variant.is_some_and(|variant| {
+                            variant.family() == crate::catalog::ModelFamily::VibeVoiceAsr
+                        })
+                    }) =>
+                {
+                    self.execute_static_vibevoice_prefill_requests_with_rows(
+                        execution.requests,
+                        execution.scheduled,
+                        Some(&execution.batch.rows),
+                    )
+                }
+                NativeBatchRoute::Audio {
+                    task: TaskType::ASR,
+                    stage: NativeAudioStage::SequencePrefill,
+                    mode: NativeBatchMode::Static,
+                    ..
+                } if execution.batch.lane.kernel_mode
+                    == crate::models::architectures::vibevoice::VIBEVOICE_ASR_PREFILL_STAGE
+                    && execution.requests.iter().all(|request| {
+                        request.model_variant.is_some_and(|variant| {
+                            variant.family() == crate::catalog::ModelFamily::VibeVoiceAsr
+                        })
+                    }) =>
+                {
+                    let result = self.execute_requests_with_rows(
+                        execution.requests,
+                        execution.scheduled,
+                        Some(&execution.batch.rows),
+                    );
+                    if result.as_ref().is_ok_and(|outputs| {
+                        outputs.iter().all(|output| output.output.error.is_none())
+                    }) {
+                        crate::engine::metrics::record_engine_model_call(
+                            crate::engine::metrics::EngineModelCall::ScalarRows {
+                                envelope: NativeBatchMode::Static,
+                                rows: execution.scheduled.len(),
+                            },
+                        );
+                    }
+                    result
+                }
                 NativeBatchRoute::Audio {
                     task: TaskType::ASR,
                     stage: NativeAudioStage::SequenceDecode,
@@ -2945,9 +3041,10 @@ mod tests {
     use super::*;
     use crate::engine::request::StreamStagingBuffer;
     use crate::engine::{
-        CapacitySource, ManagedCacheDomainReservation, ManagedCacheReservation,
-        PhysicalCapacityProvider, PhysicalCapacitySnapshot, ResourceAmount,
+        CapacitySource, ClockedStateSpan, ManagedCacheDomainReservation, ManagedCacheReservation,
+        PhysicalCapacityProvider, PhysicalCapacitySnapshot, ResourceAmount, StageShapePolicy,
     };
+    use crate::kv::v2::{StateClock, StateGroupId};
     use crate::model::ModelVariant;
     use base64::Engine;
 
@@ -3160,6 +3257,8 @@ mod tests {
         variant: ModelVariant,
         selector: StageWorkSelector,
         stage_name: &str,
+        mode: NativeBatchMode,
+        phase: SequencePhase,
     ) -> (EngineCoreRequest, ScheduledRequest, PhysicalBatch) {
         let mut profile =
             ExecutionProfile::fail_closed(BackendKind::Cpu, Some(variant), ExecutionMode::Sequence);
@@ -3168,7 +3267,7 @@ mod tests {
             StageId::new(7),
             stage_name,
             &profile,
-            NativeBatchMode::Continuous,
+            mode,
         );
         stage.selector = selector;
         stage.max_work_units = 4;
@@ -3180,7 +3279,7 @@ mod tests {
             adapter_abi_revision: super::super::AdapterAbiRevision::new(4),
             model_variant: variant,
             capability_id: capability.to_string(),
-            stages: Arc::from([stage]),
+            stages: Arc::from([stage.clone()]),
         };
         binding.validate().unwrap();
 
@@ -3198,11 +3297,15 @@ mod tests {
             request_id: request.id.clone(),
             sequence_id: 11,
             num_tokens: 1,
-            is_prefill: false,
-            num_computed_tokens: 1,
+            is_prefill: phase == SequencePhase::Prefill,
+            num_computed_tokens: if phase == SequencePhase::Decode { 1 } else { 0 },
             work: WorkUnit::SequenceStep {
-                phase: SequencePhase::Decode,
-                input: super::super::InputRange { start: 1, end: 2 },
+                phase,
+                input: if phase == SequencePhase::Prefill {
+                    super::super::InputRange { start: 0, end: 1 }
+                } else {
+                    super::super::InputRange { start: 1, end: 2 }
+                },
                 max_output_steps: 1,
                 auxiliary_state: None,
             },
@@ -3218,23 +3321,27 @@ mod tests {
             device_ordinal: None,
             compute_dtype: "f32".to_string(),
             state_dtype: "f32".to_string(),
-            tensor_layout: "ragged".to_string(),
+            tensor_layout: format!("{:?}", stage.shape_policy).to_ascii_lowercase(),
             quantization: "none".to_string(),
             state_schema: "test".to_string(),
             kernel_mode: stage_name.to_string(),
-            semantic_mode: "decode".to_string(),
-            shape_bucket: "ragged".to_string(),
+            semantic_mode: format!("{phase:?}").to_ascii_lowercase(),
+            shape_bucket: if stage.shape_policy == StageShapePolicy::Padded {
+                "padded".to_string()
+            } else {
+                "ragged".to_string()
+            },
         };
         let batch = PhysicalBatch {
             batch_id: BatchId::new(12),
             lane: lane.clone(),
-            mode: NativeBatchMode::Continuous,
+            mode,
             budget: super::super::BatchBudget {
                 max_rows: 4,
                 max_logical_units: 4,
                 max_tensor_elements: 4,
                 max_workspace_bytes: 0,
-                max_padding_basis_points: 0,
+                max_padding_basis_points: stage.max_padding_basis_points,
                 max_formation_delay: Duration::ZERO,
             },
             rows: vec![super::super::ReadyQuantum {
@@ -3260,6 +3367,8 @@ mod tests {
             ModelVariant::Qwen3Tts12Hz06BCustomVoice,
             StageWorkSelector::SequenceDecode,
             "tts.decode.tensor_continuous",
+            NativeBatchMode::Continuous,
+            SequencePhase::Decode,
         );
         let requests = [&request];
         let scheduled = [scheduled];
@@ -3281,6 +3390,69 @@ mod tests {
     }
 
     #[test]
+    fn native_route_authenticates_vibevoice_static_prefill() {
+        let (request, scheduled, batch) = native_route_fixture(
+            TaskType::ASR,
+            "asr",
+            ModelVariant::VibeVoiceAsr,
+            StageWorkSelector::SequencePrefill,
+            crate::models::architectures::vibevoice::VIBEVOICE_ASR_PREFILL_STAGE,
+            NativeBatchMode::Static,
+            SequencePhase::Prefill,
+        );
+        let requests = [&request];
+        let scheduled = [scheduled];
+        assert_eq!(
+            NativeBatchRoute::resolve(&PhysicalBatchExecution {
+                batch: &batch,
+                requests: &requests,
+                scheduled: &scheduled,
+            })
+            .unwrap(),
+            NativeBatchRoute::Audio {
+                task: TaskType::ASR,
+                stage: NativeAudioStage::SequencePrefill,
+                mode: NativeBatchMode::Static,
+                stage_id: StageId::new(7),
+            }
+        );
+    }
+
+    #[test]
+    fn vibevoice_static_prefill_requires_two_selected_audio_rows() {
+        let (_, mut scheduled, _) = native_route_fixture(
+            TaskType::ASR,
+            "asr",
+            ModelVariant::VibeVoiceAsr,
+            StageWorkSelector::SequencePrefill,
+            crate::models::architectures::vibevoice::VIBEVOICE_ASR_PREFILL_STAGE,
+            NativeBatchMode::Static,
+            SequencePhase::Prefill,
+        );
+        assert!(!has_native_vibevoice_tokenizer_batch(&[
+            scheduled.clone(),
+            scheduled.clone(),
+        ]));
+        let WorkUnit::SequenceStep {
+            auxiliary_state, ..
+        } = &mut scheduled.work
+        else {
+            unreachable!()
+        };
+        *auxiliary_state = Some(Arc::from([ClockedStateSpan::new(
+            StateGroupId::new(2),
+            StateClock::AudioSamples,
+            super::super::InputRange::new(0, 3_200).unwrap(),
+        )
+        .unwrap()]));
+        assert!(!has_native_vibevoice_tokenizer_batch(&[scheduled.clone()]));
+        assert!(has_native_vibevoice_tokenizer_batch(&[
+            scheduled.clone(),
+            scheduled,
+        ]));
+    }
+
+    #[test]
     fn native_route_preserves_chat_decode_and_rejects_fallback_stage_proof() {
         let (request, scheduled, batch) = native_route_fixture(
             TaskType::Chat,
@@ -3288,6 +3460,8 @@ mod tests {
             ModelVariant::Qwen306B,
             StageWorkSelector::SequenceDecode,
             "chat.decode.tensor_continuous",
+            NativeBatchMode::Continuous,
+            SequencePhase::Decode,
         );
         let requests = [&request];
         let scheduled = [scheduled];
@@ -3309,6 +3483,8 @@ mod tests {
             ModelVariant::Qwen3Tts12Hz06BCustomVoice,
             StageWorkSelector::Any,
             "tts.compatibility",
+            NativeBatchMode::Continuous,
+            SequencePhase::Decode,
         );
         let requests = [&request];
         let scheduled = [scheduled];

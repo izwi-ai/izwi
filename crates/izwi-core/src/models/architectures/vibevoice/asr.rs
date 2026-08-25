@@ -33,6 +33,7 @@ use crate::models::architectures::vibevoice::connector::SpeechConnector;
 use crate::models::architectures::vibevoice::prompt::VibeVoicePromptTokenizer;
 use crate::models::architectures::vibevoice::tokenizer::{
     VibeVoiceAcousticTokenizer, VibeVoiceSemanticTokenizer, VibeVoiceTokenizerEncoderOutput,
+    VibeVoiceTokenizerRetainedBatchRow,
 };
 use crate::models::architectures::vibevoice::VIBEVOICE_ASR_TOKENIZER_GROUP;
 use crate::models::architectures::vibevoice::{
@@ -183,6 +184,24 @@ pub(crate) struct VibeVoiceAsrRetainedTokenizerQuantum {
     arena: Arc<TensorStateArena>,
     transaction: PhysicalStateTransactionId,
     span: ClockedStateSpan,
+}
+
+pub(crate) struct VibeVoiceAsrRetainedPrefillBatchRow {
+    pub(crate) artifact: Arc<VibeVoiceAsrPreparedArtifact>,
+    pub(crate) span_start: usize,
+    pub(crate) span_end: usize,
+    pub(crate) tokenizer_quantum: VibeVoiceAsrRetainedTokenizerQuantum,
+}
+
+pub(crate) struct VibeVoiceAsrPreparedTokenizerSpan {
+    model_identity: [u8; 32],
+    source_identity: [u8; 32],
+    prompt_identity: [u8; 32],
+    decoder_span: InputRange,
+    tokenizer_span: ClockedStateSpan,
+    arena: Arc<TensorStateArena>,
+    transaction: PhysicalStateTransactionId,
+    speech_features: Tensor,
 }
 
 impl VibeVoiceAsrRetainedTokenizerQuantum {
@@ -896,6 +915,198 @@ impl VibeVoiceAsrModel {
         Ok(())
     }
 
+    /// Execute the causal speech tokenizers and pointwise connectors once for
+    /// a padded scheduler batch. Every returned row remains bound to its
+    /// immutable artifact and selected tensor transaction; decoder KV is not
+    /// mutated here and continues through the independently checkpointed
+    /// scalar prefill path.
+    pub(crate) fn prepare_retained_tokenizer_batch(
+        &self,
+        rows: &[VibeVoiceAsrRetainedPrefillBatchRow],
+    ) -> Result<Vec<VibeVoiceAsrPreparedTokenizerSpan>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let arena = rows[0].tokenizer_quantum.arena.clone();
+        if rows.iter().any(|row| {
+            !Arc::ptr_eq(&arena, &row.tokenizer_quantum.arena)
+                || row.tokenizer_quantum.span.group() != VIBEVOICE_ASR_TOKENIZER_GROUP
+                || row.tokenizer_quantum.span.clock() != &StateClock::AudioSamples
+        }) {
+            return Err(Error::InvalidInput(
+                "VibeVoice ASR tokenizer batch crossed its retained arena or state group".into(),
+            ));
+        }
+
+        let mut audio = Vec::with_capacity(rows.len());
+        let mut noise = Vec::with_capacity(rows.len());
+        let mut frame_counts = Vec::with_capacity(rows.len());
+        for row in rows {
+            validate_vibevoice_artifact_model_identity(&row.artifact, self.model_identity)?;
+            validate_vibevoice_artifact_storage(&row.artifact)?;
+            self.validate_retained_artifact_noise(&row.artifact)?;
+            let decoder_span = InputRange::new(row.span_start, row.span_end)?;
+            let projected = row
+                .artifact
+                .tokenizer_state_projections
+                .first()
+                .ok_or_else(|| {
+                    Error::InferenceError(
+                        "VibeVoice ASR batch artifact lost its tokenizer projection".into(),
+                    )
+                })?
+                .project(decoder_span)?
+                .ok_or_else(|| {
+                    Error::InvalidInput(
+                        "VibeVoice ASR native tokenizer batch received a text-only span".into(),
+                    )
+                })?;
+            if projected != row.tokenizer_quantum.span {
+                return Err(Error::InvalidInput(
+                    "VibeVoice ASR tokenizer batch span is not the artifact projection".into(),
+                ));
+            }
+            let tokenizer_span = projected.input();
+            let projection = row
+                .artifact
+                .tokenizer_state_projections
+                .first()
+                .expect("validated tokenizer projection exists");
+            let relative_sample_start = tokenizer_span
+                .start
+                .checked_sub(projection.auxiliary().start)
+                .ok_or_else(|| {
+                    Error::InvalidInput(
+                        "VibeVoice ASR tokenizer batch precedes its audio projection".into(),
+                    )
+                })?;
+            if relative_sample_start % projection.scale() != 0
+                || tokenizer_span.len() % projection.scale() != 0
+            {
+                return Err(Error::InvalidInput(
+                    "VibeVoice ASR tokenizer batch span is not aligned to its acoustic scale"
+                        .into(),
+                ));
+            }
+            let noise_start = relative_sample_start / projection.scale();
+            let frames = tokenizer_span.len() / projection.scale();
+            audio.push(row.artifact.encoder_audio.narrow(
+                2,
+                tokenizer_span.start,
+                tokenizer_span.len(),
+            )?);
+            noise.push(
+                row.artifact
+                    .acoustic_noise
+                    .as_ref()
+                    .map(|noise| noise.narrow(1, noise_start, frames))
+                    .transpose()?,
+            );
+            frame_counts.push(frames);
+        }
+
+        let tokenizer_rows =
+            rows.iter()
+                .zip(&audio)
+                .map(|(row, audio)| {
+                    Ok(VibeVoiceTokenizerRetainedBatchRow {
+                        audio,
+                        transaction: row.tokenizer_quantum.transaction,
+                        expected_cursor: u64::try_from(row.tokenizer_quantum.span.input().start)
+                            .map_err(|_| {
+                                Error::InvalidInput(
+                                    "VibeVoice ASR tokenizer batch cursor exceeds u64".into(),
+                                )
+                            })?,
+                        target_cursor: u64::try_from(row.tokenizer_quantum.span.input().end)
+                            .map_err(|_| {
+                                Error::InvalidInput(
+                                    "VibeVoice ASR tokenizer batch cursor exceeds u64".into(),
+                                )
+                            })?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+        let acoustic = if tokenizer_rows.len() == 1 {
+            let row = &tokenizer_rows[0];
+            vec![self.acoustic_tokenizer.encode_streaming_retained(
+                row.audio,
+                VIBEVOICE_ASR_ACOUSTIC_DOMAIN,
+                row.expected_cursor,
+                row.target_cursor,
+                row.transaction,
+                arena.as_ref(),
+            )?]
+        } else {
+            self.acoustic_tokenizer.encode_streaming_retained_batch(
+                &tokenizer_rows,
+                VIBEVOICE_ASR_ACOUSTIC_DOMAIN,
+                arena.as_ref(),
+            )?
+        };
+        let semantic = if tokenizer_rows.len() == 1 {
+            let row = &tokenizer_rows[0];
+            vec![self.semantic_tokenizer.encode_streaming_retained(
+                row.audio,
+                VIBEVOICE_ASR_SEMANTIC_DOMAIN,
+                row.expected_cursor,
+                row.target_cursor,
+                row.transaction,
+                arena.as_ref(),
+            )?]
+        } else {
+            self.semantic_tokenizer.encode_streaming_retained_batch(
+                &tokenizer_rows,
+                VIBEVOICE_ASR_SEMANTIC_DOMAIN,
+                arena.as_ref(),
+            )?
+        };
+        if acoustic.len() != rows.len() || semantic.len() != rows.len() {
+            return Err(Error::InferenceError(
+                "VibeVoice ASR tokenizer batch returned the wrong row count".into(),
+            ));
+        }
+
+        let acoustic = acoustic
+            .iter()
+            .zip(&noise)
+            .map(|(output, noise)| {
+                self.acoustic_tokenizer
+                    .sample_with_supplied_noise(output, noise.as_ref())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let semantic = semantic
+            .into_iter()
+            .map(|output| output.mean)
+            .collect::<Vec<_>>();
+        let acoustic = pad_feature_rows(&acoustic, &frame_counts)?;
+        let semantic = pad_feature_rows(&semantic, &frame_counts)?;
+        let connected = self.combine_speech_features(
+            self.acoustic_connector.forward(&acoustic)?,
+            self.semantic_connector.forward(&semantic)?,
+        )?;
+
+        rows.iter()
+            .zip(frame_counts)
+            .enumerate()
+            .map(|(index, (row, frames))| {
+                Ok(VibeVoiceAsrPreparedTokenizerSpan {
+                    model_identity: row.artifact.model_identity,
+                    source_identity: row.artifact.source_identity,
+                    prompt_identity: row.artifact.prompt_identity,
+                    decoder_span: InputRange::new(row.span_start, row.span_end)?,
+                    tokenizer_span: row.tokenizer_quantum.span.clone(),
+                    arena: row.tokenizer_quantum.arena.clone(),
+                    transaction: row.tokenizer_quantum.transaction,
+                    speech_features: connected
+                        .narrow(0, index, 1)?
+                        .narrow(1, 0, frames)?
+                        .contiguous()?,
+                })
+            })
+            .collect()
+    }
+
     /// Commit one exact prompt span. Non-final spans retain only physical KV;
     /// decoder logits become visible only after the final span.
     pub(crate) fn continue_resumable_prefill(
@@ -913,6 +1124,34 @@ impl VibeVoiceAsrModel {
         span_start: usize,
         span_end: usize,
         tokenizer_quantum: Option<VibeVoiceAsrRetainedTokenizerQuantum>,
+    ) -> Result<bool> {
+        self.continue_resumable_prefill_inner(state, span_start, span_end, tokenizer_quantum, None)
+    }
+
+    pub(crate) fn continue_resumable_prefill_prepared(
+        &self,
+        state: &mut VibeVoiceAsrDecodeState,
+        span_start: usize,
+        span_end: usize,
+        tokenizer_quantum: VibeVoiceAsrRetainedTokenizerQuantum,
+        prepared: &VibeVoiceAsrPreparedTokenizerSpan,
+    ) -> Result<bool> {
+        self.continue_resumable_prefill_inner(
+            state,
+            span_start,
+            span_end,
+            Some(tokenizer_quantum),
+            Some(prepared),
+        )
+    }
+
+    fn continue_resumable_prefill_inner(
+        &self,
+        state: &mut VibeVoiceAsrDecodeState,
+        span_start: usize,
+        span_end: usize,
+        tokenizer_quantum: Option<VibeVoiceAsrRetainedTokenizerQuantum>,
+        prepared_tokenizer: Option<&VibeVoiceAsrPreparedTokenizerSpan>,
     ) -> Result<bool> {
         let prompt_tokens = state.prefill_token_count();
         if state.prefill_progress != span_start
@@ -950,6 +1189,11 @@ impl VibeVoiceAsrModel {
                     .into(),
             ));
         }
+        if tokenizer_quantum.is_none() && prepared_tokenizer.is_some() {
+            return Err(Error::InvalidInput(
+                "VibeVoice ASR text-only prefill received prepared tokenizer features".into(),
+            ));
+        }
         let mut span = prepared
             .prompt_embeddings
             .narrow(1, span_start, span_end - span_start)?;
@@ -961,18 +1205,6 @@ impl VibeVoiceAsrModel {
             let target_cursor = u64::try_from(tokenizer_span.end).map_err(|_| {
                 Error::InvalidInput("VibeVoice ASR tokenizer cursor exceeds u64".into())
             })?;
-            let audio =
-                prepared
-                    .encoder_audio
-                    .narrow(2, tokenizer_span.start, tokenizer_span.len())?;
-            let acoustic = self.acoustic_tokenizer.encode_streaming_retained(
-                &audio,
-                VIBEVOICE_ASR_ACOUSTIC_DOMAIN,
-                expected_cursor,
-                target_cursor,
-                quantum.transaction,
-                quantum.arena.as_ref(),
-            )?;
             let projection = prepared
                 .tokenizer_state_projections
                 .first()
@@ -994,25 +1226,54 @@ impl VibeVoiceAsrModel {
             }
             let noise_start = relative_sample_start / projection.scale();
             let noise_frames = tokenizer_span.len() / projection.scale();
-            let noise = prepared
-                .acoustic_noise
-                .as_ref()
-                .map(|noise| noise.narrow(1, noise_start, noise_frames))
-                .transpose()?;
-            let acoustic = self
-                .acoustic_tokenizer
-                .sample_with_supplied_noise(&acoustic, noise.as_ref())?;
-            let acoustic = self.acoustic_connector.forward(&acoustic)?;
-            let semantic = self.semantic_tokenizer.encode_streaming_retained(
-                &audio,
-                VIBEVOICE_ASR_SEMANTIC_DOMAIN,
-                expected_cursor,
-                target_cursor,
-                quantum.transaction,
-                quantum.arena.as_ref(),
-            )?;
-            let semantic = self.semantic_connector.forward(&semantic.mean)?;
-            let speech_features = self.combine_speech_features(acoustic, semantic)?;
+            let speech_features = if let Some(prepared_tokenizer) = prepared_tokenizer {
+                if prepared_tokenizer.model_identity != prepared.model_identity
+                    || prepared_tokenizer.source_identity != prepared.source_identity
+                    || prepared_tokenizer.prompt_identity != prepared.prompt_identity
+                    || prepared_tokenizer.decoder_span != scheduled
+                    || prepared_tokenizer.tokenizer_span != quantum.span
+                    || prepared_tokenizer.transaction != quantum.transaction
+                    || !Arc::ptr_eq(&prepared_tokenizer.arena, &quantum.arena)
+                {
+                    return Err(Error::InvalidInput(
+                        "VibeVoice ASR prepared tokenizer features crossed their artifact or transaction"
+                            .into(),
+                    ));
+                }
+                prepared_tokenizer.speech_features.clone()
+            } else {
+                let audio =
+                    prepared
+                        .encoder_audio
+                        .narrow(2, tokenizer_span.start, tokenizer_span.len())?;
+                let acoustic = self.acoustic_tokenizer.encode_streaming_retained(
+                    &audio,
+                    VIBEVOICE_ASR_ACOUSTIC_DOMAIN,
+                    expected_cursor,
+                    target_cursor,
+                    quantum.transaction,
+                    quantum.arena.as_ref(),
+                )?;
+                let noise = prepared
+                    .acoustic_noise
+                    .as_ref()
+                    .map(|noise| noise.narrow(1, noise_start, noise_frames))
+                    .transpose()?;
+                let acoustic = self
+                    .acoustic_tokenizer
+                    .sample_with_supplied_noise(&acoustic, noise.as_ref())?;
+                let acoustic = self.acoustic_connector.forward(&acoustic)?;
+                let semantic = self.semantic_tokenizer.encode_streaming_retained(
+                    &audio,
+                    VIBEVOICE_ASR_SEMANTIC_DOMAIN,
+                    expected_cursor,
+                    target_cursor,
+                    quantum.transaction,
+                    quantum.arena.as_ref(),
+                )?;
+                let semantic = self.semantic_connector.forward(&semantic.mean)?;
+                self.combine_speech_features(acoustic, semantic)?
+            };
             if speech_features.dim(1)? != noise_frames {
                 return Err(Error::InferenceError(format!(
                     "VibeVoice ASR tokenizer quantum produced {} frames for {noise_frames} acoustic placeholders",
@@ -1610,6 +1871,10 @@ impl VibeVoiceAsrModel {
 }
 
 impl VibeVoiceAsrDecodeState {
+    pub(crate) fn prepared_artifact(&self) -> Option<Arc<VibeVoiceAsrPreparedArtifact>> {
+        self.prepared.clone()
+    }
+
     pub(crate) const fn prefill_progress(&self) -> usize {
         self.prefill_progress
     }
@@ -2115,6 +2380,57 @@ fn prompt_instruction(language: Option<&str>, prompt: Option<&str>) -> Option<St
         parts.push(prompt.trim().to_string());
     }
     (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+fn pad_feature_rows(rows: &[Tensor], valid_lengths: &[usize]) -> Result<Tensor> {
+    if rows.is_empty() || rows.len() != valid_lengths.len() {
+        return Err(Error::InvalidInput(
+            "VibeVoice ASR feature batch has no exact logical row lengths".into(),
+        ));
+    }
+    let prototype = &rows[0];
+    let [prototype_batch, _, width] = prototype.dims() else {
+        return Err(Error::InvalidInput(
+            "VibeVoice ASR feature batch requires rank-three rows".into(),
+        ));
+    };
+    if *prototype_batch != 1 || *width == 0 {
+        return Err(Error::InvalidInput(
+            "VibeVoice ASR feature batch has invalid row geometry".into(),
+        ));
+    }
+    let max_length = valid_lengths.iter().copied().max().unwrap_or(0);
+    let mut padded = Vec::with_capacity(rows.len());
+    for (index, (row, valid_length)) in rows.iter().zip(valid_lengths).enumerate() {
+        let [batch, frames, row_width] = row.dims() else {
+            return Err(Error::InvalidInput(format!(
+                "VibeVoice ASR feature row {index} is not rank three"
+            )));
+        };
+        if *batch != 1
+            || *frames != *valid_length
+            || *valid_length == 0
+            || *row_width != *width
+            || row.dtype() != prototype.dtype()
+            || !row.device().same_device(prototype.device())
+        {
+            return Err(Error::InvalidInput(format!(
+                "VibeVoice ASR feature row {index} has incompatible logical geometry, dtype, or device"
+            )));
+        }
+        if *valid_length == max_length {
+            padded.push(row.clone());
+        } else {
+            let tail = Tensor::zeros(
+                (1, max_length - *valid_length, *width),
+                prototype.dtype(),
+                prototype.device(),
+            )?;
+            padded.push(Tensor::cat(&[row.clone(), tail], 1)?);
+        }
+    }
+    let refs = padded.iter().collect::<Vec<_>>();
+    Tensor::cat(&refs, 0)?.contiguous().map_err(Error::from)
 }
 
 fn replace_range_with_features(
@@ -3337,6 +3653,26 @@ mod tests {
         assert_eq!(
             replaced.i((0, 2, ..)).unwrap().to_vec1::<f32>().unwrap(),
             vec![1.0, 1.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn padded_feature_batch_preserves_logical_rows_and_zeroes_only_tails() {
+        let device = candle_core::Device::Cpu;
+        let short = Tensor::from_vec(vec![1.0f32, 2.0], (1, 1, 2), &device).unwrap();
+        let long =
+            Tensor::from_vec(vec![3.0f32, 4.0, 5.0, 6.0, 7.0, 8.0], (1, 3, 2), &device).unwrap();
+
+        let padded = pad_feature_rows(&[short, long], &[1, 3]).unwrap();
+
+        assert_eq!(padded.dims(), &[2, 3, 2]);
+        assert_eq!(
+            padded.i(0).unwrap().to_vec2::<f32>().unwrap(),
+            vec![vec![1.0, 2.0], vec![0.0, 0.0], vec![0.0, 0.0]]
+        );
+        assert_eq!(
+            padded.i(1).unwrap().to_vec2::<f32>().unwrap(),
+            vec![vec![3.0, 4.0], vec![5.0, 6.0], vec![7.0, 8.0]]
         );
     }
 }

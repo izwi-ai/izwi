@@ -2,6 +2,9 @@ use crate::backends::state::PhysicalStateTransactionId;
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::models::architectures::vibevoice::asr::VibeVoiceAsrRetainedTokenizerQuantum;
+use crate::models::architectures::vibevoice::asr::{
+    VibeVoiceAsrPreparedTokenizerSpan, VibeVoiceAsrRetainedPrefillBatchRow,
+};
 use crate::models::architectures::whisper::asr::WhisperTerminalTransition;
 use crate::models::registry::{
     NativeAsrDecodeCheckpoint, NativeAsrDecodeStep, NativeAsrGenerationOptions,
@@ -839,7 +842,17 @@ impl NativeExecutor {
         &self,
         request: &EngineCoreRequest,
         scheduled: &ScheduledRequest,
+        managed_state: Option<super::RetainedRowManagedState>,
+    ) -> Result<ModelSessionResult> {
+        self.vibevoice_asr_sequence_request_inner(request, scheduled, managed_state, None)
+    }
+
+    fn vibevoice_asr_sequence_request_inner(
+        &self,
+        request: &EngineCoreRequest,
+        scheduled: &ScheduledRequest,
         mut managed_state: Option<super::RetainedRowManagedState>,
+        prepared_tokenizer: Option<&VibeVoiceAsrPreparedTokenizerSpan>,
     ) -> Result<ModelSessionResult> {
         let variant = Self::resolve_variant(request)?;
         let model = request.prepared_asr_model_for_executor()?.ok_or_else(|| {
@@ -1024,12 +1037,28 @@ impl NativeExecutor {
                 let step = if let Some((start, end)) = resumable_span {
                     let Some(complete) = run_asr_model_call(request, || {
                         Self::run_blocking(|| {
-                            active.model.continue_vibevoice_resumable_prefill_retained(
+                            match prepared_tokenizer {
+                            Some(prepared) => active
+                                .model
+                                .continue_vibevoice_resumable_prefill_prepared(
+                                    &mut active.state,
+                                    start,
+                                    end,
+                                    tokenizer_quantum.clone().ok_or_else(|| {
+                                        Error::InferenceError(
+                                            "prepared VibeVoice tokenizer span lost its selected transaction"
+                                                .into(),
+                                        )
+                                    })?,
+                                    prepared,
+                                ),
+                            None => active.model.continue_vibevoice_resumable_prefill_retained(
                                 &mut active.state,
                                 start,
                                 end,
                                 tokenizer_quantum.clone(),
-                            )
+                            ),
+                        }
                         })
                     })?
                     else {
@@ -1699,6 +1728,265 @@ impl NativeExecutor {
             error: None,
         })
         .with_managed_cache_completions(managed_cache_completions))
+    }
+
+    pub(super) fn vibevoice_prefill_batch_with_managed(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+        mut managed_caches: Vec<Option<super::RetainedRowManagedState>>,
+    ) -> Result<(Vec<ModelSessionResult>, bool)> {
+        if scheduled.is_empty()
+            || managed_caches.len() != scheduled.len()
+            || scheduled.iter().any(|row| !row.is_prefill)
+        {
+            return Err(Error::InvalidInput(
+                "static VibeVoice prefill requires one managed prefill row per request".into(),
+            ));
+        }
+        let ordered_requests = scheduled
+            .iter()
+            .map(|scheduled| {
+                requests
+                    .iter()
+                    .copied()
+                    .find(|request| request.id == scheduled.request_id)
+                    .ok_or_else(|| {
+                        Error::InferenceError(format!(
+                            "VibeVoice prefill request {} is missing its snapshot",
+                            scheduled.request_id
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut outputs = (0..scheduled.len())
+            .map(|_| None)
+            .collect::<Vec<Option<ModelSessionResult>>>();
+        let live_indices = ordered_requests
+            .iter()
+            .enumerate()
+            .filter_map(|(index, request)| {
+                if request.is_cancelled() {
+                    outputs[index] = Some(ModelSessionResult::cancelled_before_dispatch(
+                        ExecutorOutput::cancelled(request.id.clone()),
+                    ));
+                    None
+                } else {
+                    Some(index)
+                }
+            })
+            .collect::<Vec<_>>();
+        if live_indices.is_empty() {
+            let outputs = outputs
+                .into_iter()
+                .map(|output| {
+                    output.ok_or_else(|| {
+                        Error::InferenceError(
+                            "cancelled VibeVoice prefill row produced no result".into(),
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            return Ok((outputs, false));
+        }
+
+        let model = ordered_requests[live_indices[0]]
+            .prepared_asr_model_for_executor()?
+            .ok_or_else(|| {
+                Error::InferenceError(
+                    "VibeVoice prefill batch lost its loaded model identity".into(),
+                )
+            })?;
+        for index in live_indices.iter().copied() {
+            let request = ordered_requests[index];
+            if Self::resolve_variant(request)?.family() != ModelFamily::VibeVoiceAsr {
+                return Err(Error::InvalidInput(
+                    "static VibeVoice prefill batch crossed ASR families".into(),
+                ));
+            }
+            let row_model = request.prepared_asr_model_for_executor()?.ok_or_else(|| {
+                Error::InferenceError("VibeVoice prefill row lost its loaded model identity".into())
+            })?;
+            if !Arc::ptr_eq(&model, &row_model) {
+                return Err(Error::InvalidInput(
+                    "static VibeVoice prefill batch spans loaded model instances".into(),
+                ));
+            }
+            if managed_caches[index].is_none() {
+                return Err(Error::InferenceError(
+                    "VibeVoice prefill row lost its managed reservation".into(),
+                ));
+            }
+        }
+
+        let mut tokenizer_inputs = Vec::new();
+        let mut tokenizer_indices = Vec::new();
+        for index in live_indices.iter().copied() {
+            let request = ordered_requests[index];
+            let row = managed_caches[index]
+                .as_ref()
+                .expect("validated VibeVoice managed row");
+            let spans = match &scheduled[index].work {
+                crate::engine::WorkUnit::SequenceStep {
+                    auxiliary_state: Some(spans),
+                    ..
+                } => spans.as_ref(),
+                _ => &[],
+            };
+            if spans.len() > 1 || spans.is_empty() != row.tensor_state.is_none() {
+                return Err(Error::InferenceError(
+                    "VibeVoice prefill row tensor reservation does not match its projected span"
+                        .into(),
+                ));
+            }
+            let Some(span) = spans.first() else {
+                continue;
+            };
+            let arena = request
+                .managed_cache_runtime()
+                .and_then(|runtime| runtime.tensor_state())
+                .cloned()
+                .ok_or_else(|| {
+                    Error::InferenceError(
+                        "VibeVoice prefill row lost its retained tokenizer arena".into(),
+                    )
+                })?;
+            let transaction = PhysicalStateTransactionId::new(scheduled[index].plan_id)?;
+            let decoder_span =
+                resumable_asr_prefill_span(&scheduled[index], request.num_prompt_tokens())?;
+            let artifact = if scheduled[index].num_computed_tokens == 0 {
+                request
+                    .prepared_vibevoice_artifact_for_executor()?
+                    .ok_or_else(|| {
+                        Error::InferenceError(
+                            "initial VibeVoice prefill lost its prepared artifact".into(),
+                        )
+                    })?
+            } else {
+                let session = scheduled[index].session_key();
+                let lease = ExecutorStateLease::checkout(
+                    &self.asr_decode_states,
+                    session,
+                    "VibeVoice prefill artifact snapshot",
+                )?;
+                let active = lease.state().ok_or_else(|| {
+                    Error::InferenceError(
+                        "continuing VibeVoice prefill has no active decode state".into(),
+                    )
+                })?;
+                if active.variant.family() != ModelFamily::VibeVoiceAsr
+                    || !Arc::ptr_eq(&active.model, &model)
+                {
+                    return Err(Error::InferenceError(
+                        "continuing VibeVoice prefill state crossed model identity".into(),
+                    ));
+                }
+                let artifact = active.state.vibevoice_prepared_artifact().ok_or_else(|| {
+                    Error::InferenceError(
+                        "continuing VibeVoice prefill state lost its artifact".into(),
+                    )
+                })?;
+                lease.restore()?;
+                artifact
+            };
+            tokenizer_inputs.push(VibeVoiceAsrRetainedPrefillBatchRow {
+                artifact,
+                span_start: decoder_span.0,
+                span_end: decoder_span.1,
+                tokenizer_quantum: VibeVoiceAsrRetainedTokenizerQuantum::new(
+                    arena,
+                    transaction,
+                    span.clone(),
+                ),
+            });
+            tokenizer_indices.push(index);
+        }
+
+        let used_native_tokenizer_batch = tokenizer_inputs.len() > 1;
+        let prepared_tokenizer = if tokenizer_inputs.is_empty() {
+            Vec::new()
+        } else {
+            Self::run_blocking(|| {
+                model.prepare_vibevoice_retained_tokenizer_batch(&tokenizer_inputs)
+            })?
+        };
+        if prepared_tokenizer.len() != tokenizer_indices.len() {
+            return Err(Error::InferenceError(
+                "VibeVoice tokenizer batch returned the wrong number of prepared rows".into(),
+            ));
+        }
+        if !tokenizer_inputs.is_empty() {
+            crate::engine::metrics::record_engine_model_call(if tokenizer_inputs.len() > 1 {
+                crate::engine::metrics::EngineModelCall::NativeTensor {
+                    mode: crate::engine::NativeBatchMode::Static,
+                    rows: tokenizer_inputs.len(),
+                }
+            } else {
+                crate::engine::metrics::EngineModelCall::ScalarRows {
+                    envelope: crate::engine::NativeBatchMode::Static,
+                    rows: 1,
+                }
+            });
+        }
+        let mut prepared_by_index = (0..scheduled.len())
+            .map(|_| None)
+            .collect::<Vec<Option<VibeVoiceAsrPreparedTokenizerSpan>>>();
+        for (index, prepared) in tokenizer_indices.into_iter().zip(prepared_tokenizer) {
+            prepared_by_index[index] = Some(prepared);
+        }
+
+        let mut scalar_calls = 0usize;
+        for index in live_indices {
+            scalar_calls += 1;
+            let result = self
+                .vibevoice_asr_sequence_request_inner(
+                    ordered_requests[index],
+                    &scheduled[index],
+                    managed_caches[index].take(),
+                    prepared_by_index[index].as_ref(),
+                )
+                .unwrap_or_else(|error| {
+                    ModelSessionResult::sequence(ExecutorOutput::error(
+                        ordered_requests[index].id.clone(),
+                        error.to_string(),
+                    ))
+                });
+            outputs[index] = Some(result);
+        }
+        // The first scalar decoder row may finish while a later row is still
+        // executing. Recheck the entire cohort only after the final row so a
+        // cancellation that arrived during a peer call cannot publish the
+        // earlier row's staged stream events or completion-bearing result.
+        for (index, request) in ordered_requests.iter().enumerate() {
+            if !late_cancelled_batch_row(request.is_cancelled(), outputs[index].is_some()) {
+                continue;
+            }
+            let _ = request.take_staged_stream_outputs()?;
+            let _ = crate::engine::ModelExecutor::cleanup_session(
+                self,
+                &scheduled[index].session_key(),
+            );
+            outputs[index] = Some(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                request.id.clone(),
+            )));
+        }
+        if scalar_calls > 0 {
+            crate::engine::metrics::record_engine_model_call(
+                crate::engine::metrics::EngineModelCall::ScalarRows {
+                    envelope: crate::engine::NativeBatchMode::Static,
+                    rows: scalar_calls,
+                },
+            );
+        }
+        let outputs = outputs
+            .into_iter()
+            .map(|output| {
+                output.ok_or_else(|| {
+                    Error::InferenceError("VibeVoice prefill row produced no result".into())
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((outputs, used_native_tokenizer_batch))
     }
 
     pub(super) fn asr_decode_batch_with_managed(

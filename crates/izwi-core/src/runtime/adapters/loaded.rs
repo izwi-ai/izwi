@@ -33,7 +33,7 @@ const NEMOTRON_REALTIME_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::ne
 const CONTINUOUS_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(15);
 const CONTINUOUS_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(16);
 const WHISPER_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(17);
-const VIBEVOICE_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(18);
+const VIBEVOICE_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(19);
 // Architecture ceiling: 8,192 codec frames, 1,920 output samples/frame,
 // f32-width intermediates, and up to 1,024 simultaneous channel-equivalents.
 // Exact request/model-derived costs remain smaller and are installed at
@@ -1733,6 +1733,8 @@ impl LoadedExecutionAdapter for ContinuousAsrExecutionAdapter {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct VibeVoiceAsrExecutionSeal {
     preparation: crate::models::architectures::vibevoice::asr::VibeVoiceAsrPreparationStageSeal,
+    prefill_max_batch_work_units: u64,
+    prefill_max_batch_workspace_bytes: u64,
     decode_workspace_per_row_bytes: u64,
 }
 
@@ -1786,8 +1788,23 @@ impl LoadedExecutionAdapter for VibeVoiceAsrExecutionAdapter {
         &self,
         model: &crate::models::architectures::vibevoice::asr::VibeVoiceAsrModel,
     ) -> Result<()> {
+        let preparation = model.scalar_preparation_stage_seal(self.backend_kind)?;
+        let width = u64::try_from(self.max_batch_size)
+            .map_err(|_| Error::Overloaded("VibeVoice ASR batch width exceeds u64".into()))?;
         let seal = VibeVoiceAsrExecutionSeal {
-            preparation: model.scalar_preparation_stage_seal(self.backend_kind)?,
+            prefill_max_batch_work_units: preparation
+                .max_work_units
+                .checked_mul(width)
+                .ok_or_else(|| {
+                    Error::Overloaded("VibeVoice ASR prefill work ceiling overflow".into())
+                })?,
+            prefill_max_batch_workspace_bytes: preparation
+                .max_workspace_bytes
+                .checked_mul(width)
+                .ok_or_else(|| {
+                Error::Overloaded("VibeVoice ASR prefill workspace ceiling overflow".into())
+            })?,
+            preparation,
             decode_workspace_per_row_bytes: model.continuous_decode_workspace_per_row_bytes()?,
         };
         if let Some(existing) = self.seal.get() {
@@ -1808,8 +1825,10 @@ impl LoadedExecutionAdapter for VibeVoiceAsrExecutionAdapter {
     fn install_test_preparation_seal(
         &self,
         backend: BackendKind,
-        _max_batch_size: usize,
+        max_batch_size: usize,
     ) -> Result<()> {
+        let width = u64::try_from(max_batch_size)
+            .map_err(|_| Error::Overloaded("VibeVoice ASR test batch width exceeds u64".into()))?;
         self.seal
             .set(VibeVoiceAsrExecutionSeal {
                 preparation:
@@ -1819,6 +1838,16 @@ impl LoadedExecutionAdapter for VibeVoiceAsrExecutionAdapter {
                         max_work_units: 1_500,
                         max_workspace_bytes: 64 * 1024 * 1024,
                     },
+                prefill_max_batch_work_units: 1_500_u64.checked_mul(width).ok_or_else(|| {
+                    Error::Overloaded("VibeVoice ASR test prefill work ceiling overflow".into())
+                })?,
+                prefill_max_batch_workspace_bytes: (64_u64 * 1024 * 1024)
+                    .checked_mul(width)
+                    .ok_or_else(|| {
+                        Error::Overloaded(
+                            "VibeVoice ASR test prefill workspace ceiling overflow".into(),
+                        )
+                    })?,
                 decode_workspace_per_row_bytes: 8_192,
             })
             .map_err(|_| Error::ModelLoadError("test VibeVoice seal was already installed".into()))
@@ -1888,6 +1917,8 @@ impl LoadedExecutionAdapter for VibeVoiceAsrExecutionAdapter {
             || seal.preparation.dtype.is_empty()
             || seal.preparation.max_work_units == 0
             || seal.preparation.max_workspace_bytes == 0
+            || seal.prefill_max_batch_work_units == 0
+            || seal.prefill_max_batch_workspace_bytes == 0
             || seal.decode_workspace_per_row_bytes == 0
         {
             return Err(Error::ModelLoadError(
@@ -1903,10 +1934,15 @@ impl LoadedExecutionAdapter for VibeVoiceAsrExecutionAdapter {
             )
             .ok_or_else(|| Error::Overloaded("VibeVoice ASR decode workspace overflow".into()))?;
         let mut profile = scalar_execution_profile(metadata, self.backend_kind, false);
+        let native_prefill = self.max_batch_size > 1;
         profile.mode = ExecutionMode::Sequence;
         profile.prefill = PrefillMode::Incremental;
         profile.incremental_decode = true;
-        profile.prefill_batch = NativeBatchMode::None;
+        profile.prefill_batch = if native_prefill {
+            NativeBatchMode::Static
+        } else {
+            NativeBatchMode::None
+        };
         profile.decode_batch = NativeBatchMode::Continuous;
         profile.cache_mode = CacheMode::ExternalPaged;
         profile.cache_namespace = Some(format!(
@@ -1943,16 +1979,25 @@ impl LoadedExecutionAdapter for VibeVoiceAsrExecutionAdapter {
             StageId::new(1),
             VIBEVOICE_ASR_PREFILL_STAGE,
             &profile,
-            NativeBatchMode::None,
+            profile.prefill_batch,
         );
         prefill.selector = StageWorkSelector::SequencePrefill;
-        prefill.max_batch_size = 1;
-        prefill.concurrency = ConcurrencyClass::Exclusive;
-        prefill.shape_policy = StageShapePolicy::Exact;
-        // The largest loaded preparation envelope is a conservative upper
-        // bound for any causal tokenizer chunk plus its two connectors. Exact
-        // request work remains supplied by the prepared stage cost.
-        prefill.max_workspace_bytes = seal.preparation.max_workspace_bytes;
+        if native_prefill {
+            prefill.max_batch_size = self.max_batch_size;
+            prefill.max_work_units = seal.prefill_max_batch_work_units;
+            // The largest loaded preparation envelope is a conservative upper
+            // bound for one causal tokenizer row plus its two connectors. The
+            // checked width product seals the padded native batch envelope while
+            // Core charges this per-row ceiling before model entry.
+            prefill.workspace_per_row_bytes = seal.preparation.max_workspace_bytes;
+            prefill.max_workspace_bytes = seal.prefill_max_batch_workspace_bytes;
+        } else {
+            prefill.max_batch_size = 1;
+            prefill.max_work_units = seal.preparation.max_work_units;
+            prefill.max_workspace_bytes = seal.preparation.max_workspace_bytes;
+            prefill.concurrency = ConcurrencyClass::Exclusive;
+            prefill.shape_policy = StageShapePolicy::Exact;
+        }
         prefill.retained_state_selections = Some(vec![ClockedStateSelection::new(
             VIBEVOICE_ASR_TOKENIZER_GROUP,
             StateClock::AudioSamples,
@@ -1960,7 +2005,7 @@ impl LoadedExecutionAdapter for VibeVoiceAsrExecutionAdapter {
         prefill.output_visibility = output_visibility_for(
             streaming.transport_output,
             profile.mode,
-            NativeBatchMode::None,
+            profile.prefill_batch,
         );
 
         let mut decode = StageDescriptor::from_execution_profile(
@@ -4385,6 +4430,8 @@ mod tests {
                         max_work_units: 1_500,
                         max_workspace_bytes: 64 * 1024 * 1024,
                     },
+                prefill_max_batch_work_units: 4 * 1_500,
+                prefill_max_batch_workspace_bytes: 4 * 64 * 1024 * 1024,
                 decode_workspace_per_row_bytes: 8_192,
             })
             .unwrap();
@@ -4392,6 +4439,10 @@ mod tests {
         let normal = adapter.contract(StreamingRequirements::NONE).unwrap();
         assert_eq!(normal.adapter_abi_revision, VIBEVOICE_ASR_ADAPTER_ABI);
         assert_eq!(normal.execution_profile.mode, ExecutionMode::Sequence);
+        assert_eq!(
+            normal.execution_profile.prefill_batch,
+            NativeBatchMode::Static
+        );
         assert_eq!(
             normal.execution_profile.decode_batch,
             NativeBatchMode::Continuous
@@ -4403,7 +4454,13 @@ mod tests {
         assert_eq!(normal.stages[0].concurrency, ConcurrencyClass::Exclusive);
         assert_eq!(normal.stages[0].max_batch_size, 1);
         assert_eq!(normal.stages[0].max_work_units, 1_500);
-        assert_eq!(normal.stages[1].name, "asr.prefill.scalar");
+        assert_eq!(normal.stages[1].name, "asr.prefill.tensor_static");
+        assert_eq!(normal.stages[1].batch_mode, NativeBatchMode::Static);
+        assert_eq!(normal.stages[1].shape_policy, StageShapePolicy::Padded);
+        assert_eq!(normal.stages[1].concurrency, ConcurrencyClass::Batchable);
+        assert_eq!(normal.stages[1].max_batch_size, 4);
+        assert_eq!(normal.stages[1].max_work_units, 4 * 1_500);
+        assert_eq!(normal.stages[1].workspace_per_row_bytes, 64 * 1024 * 1024);
         assert_eq!(
             normal.stages[1].retained_state_selections.as_deref(),
             Some(
@@ -4415,7 +4472,7 @@ mod tests {
                 .as_slice()
             )
         );
-        assert_eq!(normal.stages[1].max_workspace_bytes, 64 * 1024 * 1024);
+        assert_eq!(normal.stages[1].max_workspace_bytes, 4 * 64 * 1024 * 1024);
         assert_eq!(normal.stages[2].name, "asr.decode.tensor_continuous");
         assert_eq!(
             normal.stages[2].retained_state_selections.as_deref(),
@@ -4433,5 +4490,34 @@ mod tests {
         assert_eq!(legacy.stages.len(), 1);
         assert_eq!(legacy.stages[0].name, "asr.scalar");
         assert_eq!(legacy.stages[0].selector, StageWorkSelector::Atomic);
+    }
+
+    #[test]
+    fn vibevoice_prefill_keeps_width_one_scalar_fallback() {
+        let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(1, 1).unwrap();
+        let metadata = *registry
+            .require(CapabilityKind::Asr, ModelVariant::VibeVoiceAsr)
+            .unwrap();
+        let adapter = VibeVoiceAsrExecutionAdapter::new(
+            ExecutionGroupId::new(1),
+            ModelInstanceId::new(2),
+            metadata,
+            BackendKind::Cpu,
+            1,
+        );
+        adapter
+            .install_test_preparation_seal(BackendKind::Cpu, 1)
+            .unwrap();
+
+        let contract = adapter.contract(StreamingRequirements::NONE).unwrap();
+
+        assert_eq!(
+            contract.execution_profile.prefill_batch,
+            NativeBatchMode::None
+        );
+        assert_eq!(contract.stages[1].batch_mode, NativeBatchMode::None);
+        assert_eq!(contract.stages[1].shape_policy, StageShapePolicy::Exact);
+        assert_eq!(contract.stages[1].concurrency, ConcurrencyClass::Exclusive);
+        assert_eq!(contract.stages[1].max_batch_size, 1);
     }
 }

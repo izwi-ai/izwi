@@ -66,6 +66,17 @@ const DISPATCH_ROUTES: &[DispatchRoute] = &[
     },
 ];
 
+fn vibevoice_prefill_dispatch(
+    used_native_tokenizer_batch: bool,
+    scheduled_width: usize,
+) -> BatchDispatch {
+    if used_native_tokenizer_batch {
+        BatchDispatch::new(BatchDispatchKind::TensorStatic, scheduled_width)
+    } else {
+        BatchDispatch::serial()
+    }
+}
+
 impl NativeExecutor {
     fn find_request<'a>(
         requests: &'a [&EngineCoreRequest],
@@ -390,6 +401,36 @@ impl NativeExecutor {
             BatchDispatch::new(BatchDispatchKind::TensorContinuous, scheduled.len()),
             rows,
         )
+    }
+
+    pub(super) fn execute_static_vibevoice_prefill_requests_with_rows(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+        rows: Option<&[ReadyQuantum]>,
+    ) -> Result<Vec<ExecutorStepResult>> {
+        let managed_caches = scheduled
+            .iter()
+            .map(|scheduled| {
+                let reservation = rows
+                    .and_then(|rows| rows.iter().find(|row| row.plan_id == scheduled.plan_id))
+                    .and_then(|row| row.managed_cache.as_ref());
+                let request = Self::find_request(requests, scheduled).ok_or_else(|| {
+                    Error::InferenceError(
+                        "static VibeVoice prefill row has no request snapshot".into(),
+                    )
+                })?;
+                reservation
+                    .map(|reservation| {
+                        super::retained_row_managed_state_for_row(request, scheduled, reservation)
+                    })
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let (outputs, used_native_tokenizer_batch) =
+            self.vibevoice_prefill_batch_with_managed(requests, scheduled, managed_caches)?;
+        let dispatch = vibevoice_prefill_dispatch(used_native_tokenizer_batch, scheduled.len());
+        self.finish_scheduled_execution(requests, scheduled, outputs, dispatch, rows)
     }
 
     pub(super) fn execute_continuous_tts_requests_with_rows(
@@ -721,6 +762,18 @@ mod tests {
                 .iter()
                 .all(|output| output.dispatch.width == expected_width));
         }
+    }
+
+    #[test]
+    fn vibevoice_prefill_dispatch_reports_the_call_that_survived_cancellation() {
+        assert_eq!(
+            vibevoice_prefill_dispatch(true, 2),
+            BatchDispatch::new(BatchDispatchKind::TensorStatic, 2)
+        );
+        assert_eq!(
+            vibevoice_prefill_dispatch(false, 2),
+            BatchDispatch::serial()
+        );
     }
 
     #[test]

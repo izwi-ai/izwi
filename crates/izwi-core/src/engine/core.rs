@@ -1660,7 +1660,14 @@ impl EngineCore {
                     .checked_next_power_of_two()
                     .unwrap_or(u64::MAX)
             ),
-            StageShapePolicy::Padded => "padded".to_string(),
+            StageShapePolicy::Padded => match &plan.work {
+                WorkUnit::SequenceStep {
+                    auxiliary_state: Some(spans),
+                    ..
+                } if !spans.is_empty() => "padded.auxiliary".to_string(),
+                WorkUnit::SequenceStep { .. } => "padded.primary".to_string(),
+                _ => "padded".to_string(),
+            },
             StageShapePolicy::Ragged => "ragged".to_string(),
         };
         BatchLaneKey {
@@ -4209,6 +4216,8 @@ mod tests {
     use super::super::scheduler::ScheduledRequest;
     use super::super::types::{AudioOutput, TaskType};
     use super::*;
+    use crate::engine::{ClockedStateSpan, InputRange, SessionKey};
+    use crate::kv::v2::{StateClock, StateGroupId};
     use crate::model::ModelVariant;
     use crate::models::shared::chat::{ChatMessage, ChatRole};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -6064,6 +6073,66 @@ mod tests {
         assert!(batches
             .iter()
             .all(|batch| { batch.physical_batch().lane.shape_bucket == "independent" }));
+    }
+
+    #[test]
+    fn padded_sequence_lanes_separate_auxiliary_and_primary_only_rows() {
+        let mut profile = ExecutionProfile::fail_closed(
+            BackendKind::Cpu,
+            Some(ModelVariant::VibeVoiceAsr),
+            ExecutionMode::Sequence,
+        );
+        profile.prefill_batch = NativeBatchMode::Static;
+        profile.max_batch_size = 2;
+        let stage = super::super::StageDescriptor::from_execution_profile(
+            StageId::new(19),
+            "asr.prefill.tensor_static",
+            &profile,
+            NativeBatchMode::Static,
+        );
+        let base = ExecutionPlan {
+            plan_id: 1,
+            session: SessionKey::new("padded-lane".into(), 1),
+            work: WorkUnit::SequenceStep {
+                phase: SequencePhase::Prefill,
+                input: InputRange::new(0, 1).unwrap(),
+                max_output_steps: 1,
+                auxiliary_state: Some(Arc::from([])),
+            },
+            batch_key: BatchKey {
+                backend: BackendKind::Cpu,
+                model_variant: Some(ModelVariant::VibeVoiceAsr),
+                task_type: TaskType::ASR,
+                work_kind: "prefill".into(),
+                compute_dtype: "f32".into(),
+                kv_dtype: "state_v2".into(),
+                cache_namespace: "test".into(),
+                adapter: None,
+            },
+            batch_mode: NativeBatchMode::Static,
+            max_batch_size: 2,
+            estimate: ResourceVector::zero(),
+            stage: Some(stage),
+        };
+        let mut auxiliary = base.clone();
+        auxiliary.work = WorkUnit::SequenceStep {
+            phase: SequencePhase::Prefill,
+            input: InputRange::new(0, 1).unwrap(),
+            max_output_steps: 1,
+            auxiliary_state: Some(Arc::from([ClockedStateSpan::new(
+                StateGroupId::new(2),
+                StateClock::AudioSamples,
+                InputRange::new(0, 3_200).unwrap(),
+            )
+            .unwrap()])),
+        };
+
+        let primary_lane = EngineCore::batch_lane(&base, WorkCost::new(1, 1, 0));
+        let auxiliary_lane = EngineCore::batch_lane(&auxiliary, WorkCost::new(1, 1, 0));
+
+        assert_eq!(primary_lane.shape_bucket, "padded.primary");
+        assert_eq!(auxiliary_lane.shape_bucket, "padded.auxiliary");
+        assert_ne!(primary_lane, auxiliary_lane);
     }
 
     #[test]
