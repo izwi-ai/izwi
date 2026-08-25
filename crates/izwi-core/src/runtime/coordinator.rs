@@ -94,7 +94,21 @@ pub(crate) struct PreparationArtifact<T> {
 
 #[derive(Debug)]
 pub(crate) enum PreparationRowOutcome<T> {
-    Committed(PreparationArtifact<T>),
+    Committed {
+        artifact: PreparationArtifact<T>,
+        bridge: PreparationAdmissionBridge,
+    },
+    Cancelled,
+    TimedOut,
+    Failed(Error),
+}
+
+#[derive(Debug)]
+enum PreparationPhysicalOutcome<T> {
+    Committed {
+        artifact: PreparationArtifact<T>,
+        job: JobLease,
+    },
     Cancelled,
     TimedOut,
     Failed(Error),
@@ -1285,26 +1299,40 @@ impl InferenceCoordinator {
                 ));
             }
         }
-        let mut outcomes: Vec<Option<PreparationRowOutcome<T>>> =
+        let mut outcomes: Vec<Option<PreparationPhysicalOutcome<T>>> =
             (0..rows.len()).map(|_| None).collect();
         let now = Instant::now();
         let mut live = Vec::with_capacity(rows.len());
         for (index, row) in rows.iter().enumerate() {
             if row.cancellation.is_cancelled() {
-                outcomes[index] = Some(PreparationRowOutcome::Cancelled);
+                outcomes[index] = Some(PreparationPhysicalOutcome::Cancelled);
             } else if row
                 .job
                 .spec
                 .deadline
                 .is_some_and(|deadline| deadline <= now)
             {
-                outcomes[index] = Some(PreparationRowOutcome::TimedOut);
+                outcomes[index] = Some(PreparationPhysicalOutcome::TimedOut);
             } else {
                 live.push(index);
             }
         }
         if live.is_empty() {
-            return Ok(outcomes.into_iter().map(Option::unwrap).collect());
+            return Ok(outcomes
+                .into_iter()
+                .map(
+                    |outcome| match outcome.expect("non-live row has a terminal outcome") {
+                        PreparationPhysicalOutcome::Cancelled => PreparationRowOutcome::Cancelled,
+                        PreparationPhysicalOutcome::TimedOut => PreparationRowOutcome::TimedOut,
+                        PreparationPhysicalOutcome::Failed(error) => {
+                            PreparationRowOutcome::Failed(error)
+                        }
+                        PreparationPhysicalOutcome::Committed { .. } => {
+                            unreachable!("no model call can commit an empty live batch")
+                        }
+                    },
+                )
+                .collect());
         }
         if live.len() > stage.max_batch_size {
             return Err(Error::Overloaded(format!(
@@ -1426,65 +1454,98 @@ impl InferenceCoordinator {
         let workspace =
             self.reserve_batch_workspace(binding.execution_group_id, batch_id, workspace)?;
         let first = rows[live[0]].job.clone();
-        self.run_blocking_task_with_deadline(
-            &first,
-            deadline,
-            (execution, workspace),
-            "inference",
-            move || {
-                let _contract = contract;
-                let _work = work;
-                let physical = match operation(&live) {
-                    Ok(outputs) if outputs.len() == live.len() => outputs,
-                    Ok(_) => {
-                        return Err(Error::InferenceError(
-                            "native preparation output width does not match live row width"
-                                .to_string(),
-                        ));
-                    }
-                    Err(error) => {
-                        let message = error.to_string();
-                        for index in &live {
-                            outcomes[*index] = Some(PreparationRowOutcome::Failed(
-                                Error::InferenceError(message.clone()),
+        let physical = self
+            .run_blocking_task_with_deadline(
+                &first,
+                deadline,
+                (execution, workspace),
+                "inference",
+                move || {
+                    let _contract = contract;
+                    let _work = work;
+                    let physical = match operation(&live) {
+                        Ok(outputs) if outputs.len() == live.len() => outputs,
+                        Ok(_) => {
+                            return Err(Error::InferenceError(
+                                "native preparation output width does not match live row width"
+                                    .to_string(),
                             ));
                         }
-                        return Ok(outcomes.into_iter().map(Option::unwrap).collect());
-                    }
-                };
-                for (index, output) in live.into_iter().zip(physical) {
-                    let row = &rows[index];
-                    let outcome = match output {
-                        Err(error) => PreparationRowOutcome::Failed(error),
-                        Ok(_artifact)
-                            if row
-                                .job
-                                .spec
-                                .deadline
-                                .is_some_and(|deadline| deadline <= Instant::now()) =>
-                        {
-                            PreparationRowOutcome::TimedOut
-                        }
-                        Ok(artifact) => {
-                            if !row.cancellation.begin_commit() {
-                                PreparationRowOutcome::Cancelled
-                            } else {
-                                let committed = row
-                                    .job
-                                    .record_materialized_usage(artifact.retained)
-                                    .map(|()| PreparationRowOutcome::Committed(artifact))
-                                    .unwrap_or_else(PreparationRowOutcome::Failed);
-                                row.cancellation.finish_commit();
-                                committed
+                        Err(error) => {
+                            let message = error.to_string();
+                            for index in &live {
+                                outcomes[*index] = Some(PreparationPhysicalOutcome::Failed(
+                                    Error::InferenceError(message.clone()),
+                                ));
                             }
+                            return Ok(outcomes
+                                .into_iter()
+                                .map(Option::unwrap)
+                                .collect::<Vec<_>>());
                         }
                     };
-                    outcomes[index] = Some(outcome);
-                }
-                Ok(outcomes.into_iter().map(Option::unwrap).collect())
-            },
-        )
-        .await
+                    let mut rows: Vec<Option<PreparationBatchRow>> =
+                        rows.into_iter().map(Some).collect();
+                    for (index, output) in live.into_iter().zip(physical) {
+                        let row = rows[index]
+                            .take()
+                            .expect("live preparation row is consumed exactly once");
+                        let outcome = match output {
+                            Err(error) => PreparationPhysicalOutcome::Failed(error),
+                            Ok(_artifact)
+                                if row
+                                    .job
+                                    .spec
+                                    .deadline
+                                    .is_some_and(|deadline| deadline <= Instant::now()) =>
+                            {
+                                PreparationPhysicalOutcome::TimedOut
+                            }
+                            Ok(artifact) => {
+                                if !row.cancellation.begin_commit() {
+                                    PreparationPhysicalOutcome::Cancelled
+                                } else {
+                                    let committed = row
+                                        .job
+                                        .record_materialized_usage(artifact.retained)
+                                        .map(|()| PreparationPhysicalOutcome::Committed {
+                                            artifact,
+                                            job: row.job,
+                                        })
+                                        .unwrap_or_else(PreparationPhysicalOutcome::Failed);
+                                    row.cancellation.finish_commit();
+                                    committed
+                                }
+                            }
+                        };
+                        outcomes[index] = Some(outcome);
+                    }
+                    Ok(outcomes.into_iter().map(Option::unwrap).collect())
+                },
+            )
+            .await?;
+        // The blocking helper and its retained task clone are gone after the
+        // await; drop our deadline-anchor clone before requiring unique row
+        // ownership for the admission bridge.
+        drop(first);
+        physical
+            .into_iter()
+            .map(|outcome| {
+                Ok(match outcome {
+                    PreparationPhysicalOutcome::Committed { artifact, job } => {
+                        match self.bridge_preparation_admission(job) {
+                            Ok(bridge) => PreparationRowOutcome::Committed { artifact, bridge },
+                            Err(error) => PreparationRowOutcome::Failed(error),
+                        }
+                    }
+                    PreparationPhysicalOutcome::Cancelled => PreparationRowOutcome::Cancelled,
+                    PreparationPhysicalOutcome::TimedOut => PreparationRowOutcome::TimedOut,
+                    PreparationPhysicalOutcome::Failed(error) => {
+                        PreparationRowOutcome::Failed(error)
+                    }
+                })
+            })
+            .collect()
     }
 
     fn validate_loaded_execution_contract(
@@ -4248,14 +4309,26 @@ Pages free: 10.\n";
 
         assert!(matches!(
             &output[0],
-            PreparationRowOutcome::Committed(PreparationArtifact { value: 11, .. })
+            PreparationRowOutcome::Committed {
+                artifact: PreparationArtifact { value: 11, .. },
+                ..
+            }
         ));
         assert!(matches!(
             &output[1],
-            PreparationRowOutcome::Committed(PreparationArtifact { value: 12, .. })
+            PreparationRowOutcome::Committed {
+                artifact: PreparationArtifact { value: 12, .. },
+                ..
+            }
         ));
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(coordinator.snapshot().active_executions, 0);
+        assert_eq!(coordinator.snapshot().active_preparation_bridges, 2);
+        assert_eq!(
+            coordinator.snapshot().reserved_memory_bytes,
+            2 * 64 * 1024 * 1024
+        );
+        drop(output);
         assert_eq!(coordinator.snapshot().reserved_memory_bytes, 0);
     }
 
@@ -4458,7 +4531,10 @@ Pages free: 10.\n";
             .await
             .unwrap();
 
-        assert!(matches!(&output[0], PreparationRowOutcome::Committed(_)));
+        assert!(matches!(
+            &output[0],
+            PreparationRowOutcome::Committed { .. }
+        ));
         assert!(matches!(&output[1], PreparationRowOutcome::Cancelled));
         assert!(matches!(&output[2], PreparationRowOutcome::TimedOut));
     }
