@@ -65,6 +65,7 @@ const REPETITION_GUARD_MIN_SPAN_TOKENS: usize = 8;
 const REPETITION_GUARD_MAX_SPAN_TOKENS: usize = 96;
 const REPETITION_GUARD_MIN_TOTAL_TOKENS: usize = 20;
 static NEXT_WHISPER_PREPARATION_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_WHISPER_DECODE_STATE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Deserialize, Default)]
 struct WhisperGenerationConfig {
@@ -173,6 +174,43 @@ impl WhisperPreparedWindow {
         }
         Ok(accounting.bytes())
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(memory_tokens: usize, layers: usize, width: usize) -> Result<Self> {
+        if memory_tokens == 0 || layers == 0 || width == 0 {
+            return Err(Error::InvalidInput(
+                "test Whisper prepared-window geometry must be non-zero".into(),
+            ));
+        }
+        let layers = (0..layers)
+            .map(|model_layer| {
+                let model_layer = u32::try_from(model_layer).map_err(|_| {
+                    Error::InvalidInput("test Whisper layer count exceeds u32".into())
+                })?;
+                Ok(StaticAttentionLayerValue {
+                    model_layer,
+                    keys: Tensor::zeros(
+                        (memory_tokens, 1, width),
+                        DType::F32,
+                        &candle_core::Device::Cpu,
+                    )?,
+                    values: Tensor::zeros(
+                        (memory_tokens, 1, width),
+                        DType::F32,
+                        &candle_core::Device::Cpu,
+                    )?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            preparation_id: 1,
+            source_identity: [1; 32],
+            input_samples: SAMPLE_RATE as usize,
+            input_sample_rate: SAMPLE_RATE,
+            memory_tokens,
+            layers,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,7 +221,37 @@ pub(crate) struct WhisperDecodeStep {
     pub(crate) finished: bool,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum WhisperTerminalTransition {
+    Accept {
+        text: String,
+        selected_temperature: f32,
+    },
+    RetryRequired {
+        next_temperature: f32,
+        reasons: Vec<&'static str>,
+        expected_generation: u64,
+        new_generation: u64,
+    },
+    SkipNoSpeech {
+        no_speech_probability: Option<f32>,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WhisperPendingRetry {
+    next_temperature: f32,
+    expected_generation: u64,
+    new_generation: u64,
+    next_attempt_generation: u32,
+}
+
 pub(crate) struct WhisperDecodeState {
+    state_id: u64,
+    next_quantum_nonce: u64,
+    active_quantum: Option<u64>,
+    current_managed_generation: u64,
+    managed_completions_drained: bool,
     self_kv: PhysicalPagedKvCache,
     cross_runtime: Arc<RetainedStaticAttentionRuntimeV2>,
     cross_sequence: Option<RetainedStaticAttentionSequenceId>,
@@ -192,11 +260,49 @@ pub(crate) struct WhisperDecodeState {
     pending_logits: Option<Tensor>,
     generated_tokens: Vec<u32>,
     assembled: String,
+    sum_logprobs: f64,
+    sampled_token_count: usize,
+    no_speech_prob: Option<f32>,
+    ended_with_eot: bool,
+    repetition_loop: bool,
+    decode_steps: usize,
+    best_attempt: Option<(WhisperDecodeAttempt, f32)>,
+    pending_retry: Option<WhisperPendingRetry>,
     temperature: f32,
     attempt_generation: u32,
     max_steps: usize,
     finished: bool,
     rng: StdRng,
+}
+
+pub(crate) struct WhisperDecodeCheckpoint {
+    state_id: u64,
+    quantum_nonce: u64,
+    payload: Option<WhisperDecodeCheckpointPayload>,
+}
+
+struct WhisperDecodeCheckpointPayload {
+    self_kv: PhysicalPagedKvCache,
+    cross_sequence: Option<RetainedStaticAttentionSequenceId>,
+    prefill_progress: usize,
+    pending_logits: Option<Tensor>,
+    generated_tokens: Vec<u32>,
+    assembled: String,
+    sum_logprobs: f64,
+    sampled_token_count: usize,
+    no_speech_prob: Option<f32>,
+    ended_with_eot: bool,
+    repetition_loop: bool,
+    decode_steps: usize,
+    best_attempt: Option<(WhisperDecodeAttempt, f32)>,
+    pending_retry: Option<WhisperPendingRetry>,
+    temperature: f32,
+    attempt_generation: u32,
+    max_steps: usize,
+    finished: bool,
+    rng: StdRng,
+    managed_completions_drained: bool,
+    current_managed_generation: u64,
 }
 
 impl WhisperDecodeState {
@@ -215,6 +321,227 @@ impl WhisperDecodeState {
     pub(crate) fn self_context_len(&self) -> usize {
         self.self_kv.context_len()
     }
+
+    pub(crate) const fn uses_managed_kv(&self) -> bool {
+        true
+    }
+
+    pub(crate) fn take_managed_write_completions(
+        &mut self,
+    ) -> Vec<Arc<crate::backends::kv::KvWriteBatchCompletion>> {
+        let completions = self.self_kv.take_completed_writes();
+        self.managed_completions_drained = true;
+        completions
+    }
+
+    pub(crate) fn install_managed_reservation(
+        &mut self,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<()> {
+        let mut checkpoint = self.begin_managed_quantum(cache)?;
+        self.commit_managed_quantum(&mut checkpoint)?;
+        Ok(())
+    }
+
+    pub(crate) fn begin_managed_quantum(
+        &mut self,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<WhisperDecodeCheckpoint> {
+        if self.active_quantum.is_some() {
+            return Err(Error::InferenceError(
+                "a Whisper managed quantum is already active".into(),
+            ));
+        }
+        if !self.managed_completions_drained {
+            return Err(Error::InferenceError(
+                "Whisper managed KV write completions must be drained before the next quantum"
+                    .into(),
+            ));
+        }
+        if self.self_kv.arena().id() != cache.arena().id()
+            || self.self_kv.arena().config().group != cache.arena().config().group
+        {
+            return Err(Error::InferenceError(
+                "a Whisper session cannot switch managed KV authority".into(),
+            ));
+        }
+        if cache.context_len() != self.self_kv.context_len() {
+            return Err(Error::InferenceError(format!(
+                "managed Whisper reservation starts at {}, but decode state is at {}",
+                cache.context_len(),
+                self.self_kv.context_len()
+            )));
+        }
+        self.activate_managed_checkpoint(cache)
+    }
+
+    pub(crate) fn begin_managed_generation(
+        &mut self,
+        cache: PhysicalPagedKvCache,
+        expected_generation: u64,
+        new_generation: u64,
+    ) -> Result<WhisperDecodeCheckpoint> {
+        if self.active_quantum.is_some() {
+            return Err(Error::InferenceError(
+                "a Whisper managed quantum is already active".into(),
+            ));
+        }
+        if !self.managed_completions_drained {
+            return Err(Error::InferenceError(
+                "Whisper managed KV write completions must be drained before retry generation"
+                    .into(),
+            ));
+        }
+        let pending = self.pending_retry.ok_or_else(|| {
+            Error::InferenceError("Whisper has no pending managed temperature retry".into())
+        })?;
+        if pending.expected_generation != expected_generation
+            || pending.new_generation != new_generation
+            || self.current_managed_generation != expected_generation
+            || expected_generation.checked_add(1) != Some(new_generation)
+        {
+            return Err(Error::InferenceError(
+                "Whisper managed retry generation is stale or out of order".into(),
+            ));
+        }
+        let current_id = self.self_kv.arena().id();
+        let replacement_id = cache.arena().id();
+        if replacement_id != current_id
+            || cache.arena().config().group != self.self_kv.arena().config().group
+        {
+            return Err(Error::InferenceError(
+                "Whisper managed retry cannot switch session KV authority".into(),
+            ));
+        }
+        if cache.context_len() != 0 {
+            return Err(Error::InferenceError(
+                "Whisper managed retry generation must begin at context zero".into(),
+            ));
+        }
+        let sequence = self.cross_sequence.ok_or_else(|| {
+            Error::InferenceError("Whisper retained cross sequence was released".into())
+        })?;
+        self.cross_runtime.read(sequence)?.ok_or_else(|| {
+            Error::InferenceError("Whisper retained cross memory is not installed".into())
+        })?;
+
+        let checkpoint = self.activate_managed_checkpoint(cache)?;
+        let retry_seed = self.rng.gen::<u64>();
+        self.prefill_progress = 0;
+        self.pending_logits = None;
+        self.generated_tokens.clear();
+        self.assembled.clear();
+        self.sum_logprobs = 0.0;
+        self.sampled_token_count = 0;
+        self.no_speech_prob = None;
+        self.ended_with_eot = false;
+        self.repetition_loop = false;
+        self.decode_steps = 0;
+        self.temperature = pending.next_temperature;
+        self.attempt_generation = pending.next_attempt_generation;
+        self.finished = false;
+        self.rng = StdRng::seed_from_u64(retry_seed);
+        self.pending_retry = None;
+        self.current_managed_generation = new_generation;
+        self.managed_completions_drained = true;
+        Ok(checkpoint)
+    }
+
+    pub(crate) fn commit_managed_quantum(
+        &mut self,
+        checkpoint: &mut WhisperDecodeCheckpoint,
+    ) -> Result<()> {
+        self.validate_active_checkpoint(checkpoint)?;
+        let payload = checkpoint.payload.take().ok_or_else(|| {
+            Error::InferenceError("Whisper managed checkpoint was already consumed".into())
+        })?;
+        self.active_quantum = None;
+        drop(payload);
+        Ok(())
+    }
+
+    pub(crate) fn rollback_managed_quantum(
+        &mut self,
+        checkpoint: &mut WhisperDecodeCheckpoint,
+    ) -> Result<()> {
+        self.validate_active_checkpoint(checkpoint)?;
+        let payload = checkpoint.payload.take().ok_or_else(|| {
+            Error::InferenceError("Whisper managed checkpoint was already consumed".into())
+        })?;
+        self.self_kv = payload.self_kv;
+        self.cross_sequence = payload.cross_sequence;
+        self.prefill_progress = payload.prefill_progress;
+        self.pending_logits = payload.pending_logits;
+        self.generated_tokens = payload.generated_tokens;
+        self.assembled = payload.assembled;
+        self.sum_logprobs = payload.sum_logprobs;
+        self.sampled_token_count = payload.sampled_token_count;
+        self.no_speech_prob = payload.no_speech_prob;
+        self.ended_with_eot = payload.ended_with_eot;
+        self.repetition_loop = payload.repetition_loop;
+        self.decode_steps = payload.decode_steps;
+        self.best_attempt = payload.best_attempt;
+        self.pending_retry = payload.pending_retry;
+        self.temperature = payload.temperature;
+        self.attempt_generation = payload.attempt_generation;
+        self.max_steps = payload.max_steps;
+        self.finished = payload.finished;
+        self.rng = payload.rng;
+        self.managed_completions_drained = payload.managed_completions_drained;
+        self.current_managed_generation = payload.current_managed_generation;
+        self.active_quantum = None;
+        Ok(())
+    }
+
+    fn validate_active_checkpoint(&self, checkpoint: &WhisperDecodeCheckpoint) -> Result<()> {
+        if checkpoint.state_id != self.state_id
+            || self.active_quantum != Some(checkpoint.quantum_nonce)
+            || checkpoint.payload.is_none()
+        {
+            return Err(Error::InferenceError(
+                "Whisper managed checkpoint is foreign, stale, or out of order".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn activate_managed_checkpoint(
+        &mut self,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<WhisperDecodeCheckpoint> {
+        let quantum_nonce = self.next_quantum_nonce;
+        self.next_quantum_nonce = self.next_quantum_nonce.checked_add(1).ok_or_else(|| {
+            Error::InferenceError("Whisper managed quantum nonce overflow".into())
+        })?;
+        self.active_quantum = Some(quantum_nonce);
+        Ok(WhisperDecodeCheckpoint {
+            state_id: self.state_id,
+            quantum_nonce,
+            payload: Some(WhisperDecodeCheckpointPayload {
+                self_kv: std::mem::replace(&mut self.self_kv, cache),
+                cross_sequence: self.cross_sequence,
+                prefill_progress: self.prefill_progress,
+                pending_logits: self.pending_logits.clone(),
+                generated_tokens: self.generated_tokens.clone(),
+                assembled: self.assembled.clone(),
+                sum_logprobs: self.sum_logprobs,
+                sampled_token_count: self.sampled_token_count,
+                no_speech_prob: self.no_speech_prob,
+                ended_with_eot: self.ended_with_eot,
+                repetition_loop: self.repetition_loop,
+                decode_steps: self.decode_steps,
+                best_attempt: self.best_attempt.clone(),
+                pending_retry: self.pending_retry,
+                temperature: self.temperature,
+                attempt_generation: self.attempt_generation,
+                max_steps: self.max_steps,
+                finished: self.finished,
+                rng: self.rng.clone(),
+                managed_completions_drained: self.managed_completions_drained,
+                current_managed_generation: self.current_managed_generation,
+            }),
+        })
+    }
 }
 
 impl Drop for WhisperDecodeState {
@@ -230,8 +557,16 @@ struct WhisperDecodeStepSnapshot {
     pending_logits: Option<Tensor>,
     generated_tokens: Vec<u32>,
     assembled: String,
+    sum_logprobs: f64,
+    sampled_token_count: usize,
+    no_speech_prob: Option<f32>,
+    ended_with_eot: bool,
+    repetition_loop: bool,
+    decode_steps: usize,
+    best_attempt: Option<(WhisperDecodeAttempt, f32)>,
     finished: bool,
     rng: StdRng,
+    managed_completions_drained: bool,
 }
 
 impl WhisperDecodeStepSnapshot {
@@ -240,8 +575,16 @@ impl WhisperDecodeStepSnapshot {
             pending_logits: state.pending_logits.clone(),
             generated_tokens: state.generated_tokens.clone(),
             assembled: state.assembled.clone(),
+            sum_logprobs: state.sum_logprobs,
+            sampled_token_count: state.sampled_token_count,
+            no_speech_prob: state.no_speech_prob,
+            ended_with_eot: state.ended_with_eot,
+            repetition_loop: state.repetition_loop,
+            decode_steps: state.decode_steps,
+            best_attempt: state.best_attempt.clone(),
             finished: state.finished,
             rng: state.rng.clone(),
+            managed_completions_drained: state.managed_completions_drained,
         }
     }
 
@@ -249,8 +592,16 @@ impl WhisperDecodeStepSnapshot {
         state.pending_logits = self.pending_logits;
         state.generated_tokens = self.generated_tokens;
         state.assembled = self.assembled;
+        state.sum_logprobs = self.sum_logprobs;
+        state.sampled_token_count = self.sampled_token_count;
+        state.no_speech_prob = self.no_speech_prob;
+        state.ended_with_eot = self.ended_with_eot;
+        state.repetition_loop = self.repetition_loop;
+        state.decode_steps = self.decode_steps;
+        state.best_attempt = self.best_attempt;
         state.finished = self.finished;
         state.rng = self.rng;
+        state.managed_completions_drained = self.managed_completions_drained;
     }
 }
 
@@ -276,7 +627,7 @@ fn with_whisper_decode_step_transaction<T>(
 }
 
 fn restart_whisper_temperature_attempt(
-    state: &mut WhisperDecodeState,
+    _state: &mut WhisperDecodeState,
     temperature: f32,
 ) -> Result<()> {
     if !temperature.is_finite() || temperature < 0.0 {
@@ -284,33 +635,18 @@ fn restart_whisper_temperature_attempt(
             "Whisper retry temperature must be finite and non-negative".into(),
         ));
     }
-    let sequence = state.cross_sequence.ok_or_else(|| {
-        Error::InferenceError("Whisper retained cross sequence was released".into())
-    })?;
-    let before = state.cross_runtime.read(sequence)?.ok_or_else(|| {
-        Error::InferenceError("Whisper retained cross memory is not installed".into())
-    })?;
-    let next_generation = state
-        .attempt_generation
-        .checked_add(1)
-        .ok_or_else(|| Error::InvalidInput("Whisper retry generation overflow".into()))?;
-    state.self_kv.reset_invocation()?;
-    let after = state.cross_runtime.read(sequence)?.ok_or_else(|| {
-        Error::InferenceError("Whisper retained cross memory disappeared during retry".into())
-    })?;
-    if before != after {
-        return Err(Error::InferenceError(
-            "Whisper retry mutated immutable cross memory".into(),
-        ));
-    }
-    state.prefill_progress = 0;
-    state.pending_logits = None;
-    state.generated_tokens.clear();
-    state.assembled.clear();
-    state.temperature = temperature;
-    state.attempt_generation = next_generation;
-    state.finished = false;
-    Ok(())
+    Err(Error::InferenceError(
+        "Whisper managed temperature retry requires a scheduler-owned retained-sequence reset"
+            .into(),
+    ))
+}
+
+fn next_whisper_decode_state_id() -> Result<u64> {
+    NEXT_WHISPER_DECODE_STATE_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .map_err(|_| Error::InferenceError("Whisper decode-state identity overflow".into()))
 }
 
 #[derive(Debug, Clone)]
@@ -467,9 +803,7 @@ impl WhisperModel {
         audio_features: &Tensor,
     ) -> Result<Vec<StaticAttentionLayerValue>> {
         match self {
-            Self::Local(model) => model
-                .decoder
-                .prepare_cross_attention_memory(audio_features),
+            Self::Local(model) => model.decoder.prepare_cross_attention_memory(audio_features),
         }
     }
 
@@ -818,9 +1152,13 @@ impl WhisperTurboAsrModel {
                 .round()
                 .max(1.0) as usize
         };
-        let target_mel_frames = self.config.max_source_positions.checked_mul(2).ok_or_else(|| {
-            Error::Overloaded("Whisper maximum mel-frame geometry overflow".into())
-        })?;
+        let target_mel_frames =
+            self.config
+                .max_source_positions
+                .checked_mul(2)
+                .ok_or_else(|| {
+                    Error::Overloaded("Whisper maximum mel-frame geometry overflow".into())
+                })?;
         let raw_mel_frames = resampled_samples
             .checked_div(whisper::HOP_LENGTH)
             .and_then(|frames| frames.checked_add(1))
@@ -845,9 +1183,9 @@ impl WhisperTurboAsrModel {
         )?;
         let dtype_bytes = u64::try_from(self.model_dtype.size_in_bytes())
             .map_err(|_| Error::Overloaded("Whisper dtype width exceeds u64".into()))?;
-        let retained_artifact_bytes = cross_elements
-            .checked_mul(dtype_bytes)
-            .ok_or_else(|| Error::Overloaded("Whisper retained cross-memory bytes overflow".into()))?;
+        let retained_artifact_bytes = cross_elements.checked_mul(dtype_bytes).ok_or_else(|| {
+            Error::Overloaded("Whisper retained cross-memory bytes overflow".into())
+        })?;
         Ok(WhisperWindowPreparationGeometry {
             input_samples,
             input_sample_rate,
@@ -855,9 +1193,9 @@ impl WhisperTurboAsrModel {
             useful_mel_frames,
             materialized_mel_elements,
             cross_memory_tokens: self.config.max_source_positions,
-            useful_tensor_elements: mel_elements
-                .checked_add(cross_elements)
-                .ok_or_else(|| Error::Overloaded("Whisper useful tensor geometry overflow".into()))?,
+            useful_tensor_elements: mel_elements.checked_add(cross_elements).ok_or_else(|| {
+                Error::Overloaded("Whisper useful tensor geometry overflow".into())
+            })?,
             retained_artifact_bytes,
         })
     }
@@ -888,7 +1226,9 @@ impl WhisperTurboAsrModel {
         let materialized_tensor_elements_per_row = rows[0]
             .materialized_mel_elements
             .checked_add(retained_elements)
-            .ok_or_else(|| Error::Overloaded("Whisper materialized row geometry overflow".into()))?;
+            .ok_or_else(|| {
+                Error::Overloaded("Whisper materialized row geometry overflow".into())
+            })?;
         let width = rows.len();
         let encoder_tokens = self.config.max_source_positions;
         let hidden = self.config.d_model;
@@ -908,27 +1248,29 @@ impl WhisperTurboAsrModel {
         let encoder_hidden_working = batch_hidden
             .checked_mul(4)
             .ok_or_else(|| Error::Overloaded("Whisper encoder hidden workspace overflow".into()))?;
-        let device_elements = checked_product_u64(
-            &[width],
-            "Whisper batch width",
-        )?
-        .checked_mul(materialized_tensor_elements_per_row)
-        .and_then(|value| value.checked_add(encoder_hidden_working))
-        .and_then(|value| value.checked_add(attention))
-        .and_then(|value| value.checked_add(ffn))
-        .ok_or_else(|| Error::Overloaded("Whisper device workspace geometry overflow".into()))?;
+        let device_elements = checked_product_u64(&[width], "Whisper batch width")?
+            .checked_mul(materialized_tensor_elements_per_row)
+            .and_then(|value| value.checked_add(encoder_hidden_working))
+            .and_then(|value| value.checked_add(attention))
+            .and_then(|value| value.checked_add(ffn))
+            .ok_or_else(|| {
+                Error::Overloaded("Whisper device workspace geometry overflow".into())
+            })?;
         let host_elements = rows.iter().try_fold(0_u64, |total, row| {
             total
-                .checked_add(u64::try_from(row.resampled_samples).map_err(|_| {
-                    Error::Overloaded("Whisper resampled row exceeds u64".into())
-                })?)
+                .checked_add(
+                    u64::try_from(row.resampled_samples).map_err(|_| {
+                        Error::Overloaded("Whisper resampled row exceeds u64".into())
+                    })?,
+                )
                 .and_then(|value| value.checked_add(row.materialized_mel_elements))
                 .ok_or_else(|| Error::Overloaded("Whisper host workspace geometry overflow".into()))
         })?;
         let workspace_bytes = device_elements
-            .checked_mul(u64::try_from(self.model_dtype.size_in_bytes()).map_err(|_| {
-                Error::Overloaded("Whisper dtype width exceeds u64".into())
-            })?)
+            .checked_mul(
+                u64::try_from(self.model_dtype.size_in_bytes())
+                    .map_err(|_| Error::Overloaded("Whisper dtype width exceeds u64".into()))?,
+            )
             .and_then(|device| {
                 host_elements
                     .checked_mul(std::mem::size_of::<f32>() as u64)
@@ -1063,9 +1405,11 @@ impl WhisperTurboAsrModel {
     ) -> Result<usize> {
         self.validate_prepared_window(prepared)?;
         let language_token = if let Some(language) = language {
-            self.resolve_language_token(language)?.map(|(token, _)| token)
+            self.resolve_language_token(language)?
+                .map(|(token, _)| token)
         } else if let Some(default) = self.runtime_tuning.default_language.as_deref() {
-            self.resolve_language_token(default)?.map(|(token, _)| token)
+            self.resolve_language_token(default)?
+                .map(|(token, _)| token)
         } else {
             self.language_token_ids.first().copied()
         };
@@ -1092,6 +1436,7 @@ impl WhisperTurboAsrModel {
         cross_sequence: RetainedStaticAttentionSequenceId,
     ) -> Result<WhisperDecodeState> {
         self.validate_prepared_window(prepared)?;
+        let state_id = next_whisper_decode_state_id()?;
         if self_kv.context_len() != 0 || cross_runtime.read(cross_sequence)?.is_some() {
             return Err(Error::InvalidInput(
                 "Whisper retained prefill requires empty self and cross state".into(),
@@ -1147,6 +1492,11 @@ impl WhisperTurboAsrModel {
         };
 
         Ok(WhisperDecodeState {
+            state_id,
+            next_quantum_nonce: 1,
+            active_quantum: None,
+            current_managed_generation: 1,
+            managed_completions_drained: true,
             self_kv,
             cross_runtime,
             cross_sequence: Some(cross_sequence),
@@ -1155,6 +1505,14 @@ impl WhisperTurboAsrModel {
             pending_logits: None,
             generated_tokens: Vec::new(),
             assembled: String::new(),
+            sum_logprobs: 0.0,
+            sampled_token_count: 0,
+            no_speech_prob: None,
+            ended_with_eot: false,
+            repetition_loop: false,
+            decode_steps: 0,
+            best_attempt: None,
+            pending_retry: None,
             temperature: self.decode_temperatures().first().copied().unwrap_or(0.0),
             attempt_generation: 1,
             max_steps,
@@ -1182,8 +1540,8 @@ impl WhisperTurboAsrModel {
             Error::InferenceError("Whisper retained cross sequence was released".into())
         })?;
         let checkpoint = state.self_kv.logical_checkpoint();
-        let tokens = Tensor::new(&state.prompt[span_start..span_end], &self.device.device)?
-            .unsqueeze(0)?;
+        let tokens =
+            Tensor::new(&state.prompt[span_start..span_end], &self.device.device)?.unsqueeze(0)?;
         let output = match self.whisper.decoder_forward_retained_at(
             &tokens,
             span_start,
@@ -1216,6 +1574,7 @@ impl WhisperTurboAsrModel {
         };
         state.prefill_progress = span_end;
         state.pending_logits = pending_logits;
+        state.managed_completions_drained = false;
         Ok(span_end == state.prompt.len())
     }
 
@@ -1225,6 +1584,92 @@ impl WhisperTurboAsrModel {
         temperature: f32,
     ) -> Result<()> {
         restart_whisper_temperature_attempt(state, temperature)
+    }
+
+    pub(crate) fn resolve_terminal_transition(
+        &self,
+        state: &mut WhisperDecodeState,
+    ) -> Result<WhisperTerminalTransition> {
+        if !state.finished {
+            return Err(Error::InvalidInput(
+                "Whisper terminal policy requires a finished decode attempt".into(),
+            ));
+        }
+        let avg_logprob = if state.sampled_token_count > 0 {
+            (state.sum_logprobs / state.sampled_token_count as f64) as f32
+        } else {
+            f32::NEG_INFINITY
+        };
+        let attempt = WhisperDecodeAttempt {
+            text: state.assembled.trim().to_string(),
+            avg_logprob,
+            no_speech_prob: state.no_speech_prob,
+            ended_with_eot: state.ended_with_eot,
+            repetition_loop: state.repetition_loop,
+            compression_ratio: token_compression_ratio(
+                &state.generated_tokens,
+                self.config.vocab_size,
+            ),
+            generated_token_count: state.generated_tokens.len(),
+            sampled_token_count: state.sampled_token_count,
+            decode_steps: state.decode_steps,
+            profile: WhisperDecodeProfile::new(false),
+        };
+        let logprob_threshold = self
+            .generation
+            .logprob_threshold
+            .unwrap_or(DEFAULT_LOGPROB_THRESHOLD);
+        let no_speech_threshold = self
+            .generation
+            .no_speech_threshold
+            .unwrap_or(DEFAULT_NO_SPEECH_THRESHOLD);
+        let temperatures = self.decode_temperatures();
+        let next_temperature = usize::try_from(state.attempt_generation)
+            .ok()
+            .and_then(|index| temperatures.get(index))
+            .copied();
+        let expected_generation = state.current_managed_generation;
+        let new_generation = if next_temperature.is_some() {
+            expected_generation.checked_add(1).ok_or_else(|| {
+                Error::InferenceError("Whisper managed KV generation overflow".into())
+            })?
+        } else {
+            expected_generation
+        };
+        let (transition, best_attempt) = whisper_terminal_policy_transition(
+            attempt,
+            state.temperature,
+            state.best_attempt.take(),
+            next_temperature,
+            logprob_threshold,
+            no_speech_threshold,
+            self.generation.compression_ratio_threshold,
+            expected_generation,
+            new_generation,
+        );
+        state.best_attempt = best_attempt;
+        state.pending_retry = match &transition {
+            WhisperTerminalTransition::RetryRequired {
+                next_temperature,
+                expected_generation,
+                new_generation,
+                ..
+            } => Some(WhisperPendingRetry {
+                next_temperature: *next_temperature,
+                expected_generation: *expected_generation,
+                new_generation: *new_generation,
+                next_attempt_generation: state.attempt_generation.checked_add(1).ok_or_else(
+                    || Error::InferenceError("Whisper retry attempt generation overflow".into()),
+                )?,
+            }),
+            _ => None,
+        };
+        match &transition {
+            WhisperTerminalTransition::Accept { text, .. } => state.assembled = text.clone(),
+            WhisperTerminalTransition::SkipNoSpeech { .. } => state.assembled.clear(),
+            WhisperTerminalTransition::RetryRequired { .. } => {}
+        }
+        Ok(transition)
     }
 
     pub(crate) fn decode_step_retained(
@@ -1254,26 +1699,42 @@ impl WhisperTurboAsrModel {
         &self,
         state: &mut WhisperDecodeState,
     ) -> Result<WhisperDecodeStep> {
-        let logits = state.pending_logits.take().expect("validated pending logits");
+        let logits = state
+            .pending_logits
+            .take()
+            .expect("validated pending logits");
+        let at_begin = state.generated_tokens.is_empty();
         let mut log_probs = Vec::new();
         let mut profile = WhisperDecodeProfile::new(false);
-        let (next, _, _) = self.select_next_token(
+        let (next, next_logprob, step_no_speech_prob) = self.select_next_token(
             &logits,
-            state.generated_tokens.is_empty(),
+            at_begin,
             state.temperature <= 0.0,
             state.temperature,
             &mut state.rng,
             &mut log_probs,
             &mut profile,
         )?;
+        state.decode_steps = state
+            .decode_steps
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidInput("Whisper decode-step count overflow".into()))?;
+        state.sampled_token_count = state
+            .sampled_token_count
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidInput("Whisper sampled-token count overflow".into()))?;
+        state.sum_logprobs += f64::from(next_logprob);
+        if at_begin {
+            state.no_speech_prob = step_no_speech_prob;
+        }
         if next == self.special.eot {
+            state.ended_with_eot = true;
             state.finished = true;
         } else {
-            let generated_after_step = state
-                .generated_tokens
-                .len()
-                .checked_add(1)
-                .ok_or_else(|| Error::InvalidInput("Whisper generated token count overflow".into()))?;
+            let generated_after_step =
+                state.generated_tokens.len().checked_add(1).ok_or_else(|| {
+                    Error::InvalidInput("Whisper generated token count overflow".into())
+                })?;
             let reaches_limit = generated_after_step >= state.max_steps;
             if !reaches_limit {
                 let sequence = state.cross_sequence.ok_or_else(|| {
@@ -1283,7 +1744,9 @@ impl WhisperTurboAsrModel {
                     .prompt
                     .len()
                     .checked_add(state.generated_tokens.len())
-                    .ok_or_else(|| Error::InvalidInput("Whisper decode position overflow".into()))?;
+                    .ok_or_else(|| {
+                        Error::InvalidInput("Whisper decode position overflow".into())
+                    })?;
                 let token = Tensor::new(&[[next]], &self.device.device)?;
                 let output = self.whisper.decoder_forward_retained_at(
                     &token,
@@ -1292,6 +1755,7 @@ impl WhisperTurboAsrModel {
                     state.cross_runtime.as_ref(),
                     sequence,
                 )?;
+                state.managed_completions_drained = false;
                 let next_logits = self
                     .whisper
                     .decoder_final_linear(&output.i((..1, 0..1))?)
@@ -1302,6 +1766,16 @@ impl WhisperTurboAsrModel {
                 state.finished = true;
             }
             state.generated_tokens.push(next);
+            if let Some((span, repeats)) = find_suffix_token_repetition(&state.generated_tokens) {
+                let trim = span.saturating_mul(repeats.saturating_sub(1));
+                if trim > 0 && trim <= state.generated_tokens.len() {
+                    state
+                        .generated_tokens
+                        .truncate(state.generated_tokens.len() - trim);
+                }
+                state.repetition_loop = true;
+                state.finished = true;
+            }
         }
         let decoded = self.decode_generated_text(&state.generated_tokens)?;
         let text = decoded.trim().to_string();
@@ -3223,6 +3697,60 @@ fn decode_retry_reasons(
     reasons
 }
 
+fn whisper_terminal_policy_transition(
+    attempt: WhisperDecodeAttempt,
+    temperature: f32,
+    mut best: Option<(WhisperDecodeAttempt, f32)>,
+    next_temperature: Option<f32>,
+    logprob_threshold: f32,
+    no_speech_threshold: f32,
+    compression_ratio_threshold: Option<f32>,
+    expected_generation: u64,
+    new_generation: u64,
+) -> (
+    WhisperTerminalTransition,
+    Option<(WhisperDecodeAttempt, f32)>,
+) {
+    if should_skip_as_no_speech(&attempt, logprob_threshold, no_speech_threshold) {
+        return (
+            WhisperTerminalTransition::SkipNoSpeech {
+                no_speech_probability: attempt.no_speech_prob,
+            },
+            None,
+        );
+    }
+    let retry_reasons =
+        decode_retry_reasons(&attempt, logprob_threshold, compression_ratio_threshold);
+    if best
+        .as_ref()
+        .map(|(current, _)| is_better_attempt(&attempt, current))
+        .unwrap_or(true)
+    {
+        best = Some((attempt.clone(), temperature));
+    }
+    if !retry_reasons.is_empty() {
+        if let Some(next_temperature) = next_temperature {
+            return (
+                WhisperTerminalTransition::RetryRequired {
+                    next_temperature,
+                    reasons: retry_reasons,
+                    expected_generation,
+                    new_generation,
+                },
+                best,
+            );
+        }
+    }
+    let (selected, selected_temperature) = best.unwrap_or((attempt, temperature));
+    (
+        WhisperTerminalTransition::Accept {
+            text: selected.text.trim().to_string(),
+            selected_temperature,
+        },
+        None,
+    )
+}
+
 fn should_retry_decode(
     attempt: &WhisperDecodeAttempt,
     logprob_threshold: f32,
@@ -3407,8 +3935,9 @@ mod tests {
         tensor_to_f32_vec1, text_delta, token_contains_numeral_or_symbol, trimmed_audio_bounds,
         use_cuda_whisper_dtype_shim, whisper_cross_source_identity,
         whisper_decode_profile_diagnostics, whisper_device_diagnostics, whisper_impl_name,
-        with_whisper_decode_step_transaction, WhisperDecodeAttempt, WhisperDecodeProfile,
-        WhisperDecodeState, WhisperSpecialTokens,
+        whisper_terminal_policy_transition, with_whisper_decode_step_transaction,
+        WhisperDecodeAttempt, WhisperDecodeProfile, WhisperDecodeState, WhisperSpecialTokens,
+        WhisperTerminalTransition,
     };
     use crate::backends::kv::{CpuKvArena, KvArenaConfig, KvLayerConfig};
     use crate::backends::state::{negotiate_state_plan, StateBackendPlanRequest};
@@ -3925,8 +4454,106 @@ mod tests {
         assert!(reasons.contains(&"low_word_diversity"));
     }
 
+    fn terminal_attempt(
+        text: &str,
+        avg_logprob: f32,
+        no_speech_prob: Option<f32>,
+        ended_with_eot: bool,
+    ) -> WhisperDecodeAttempt {
+        WhisperDecodeAttempt {
+            text: text.into(),
+            avg_logprob,
+            no_speech_prob,
+            ended_with_eot,
+            repetition_loop: false,
+            compression_ratio: Some(1.0),
+            generated_token_count: 2,
+            sampled_token_count: 3,
+            decode_steps: 3,
+            profile: WhisperDecodeProfile::default(),
+        }
+    }
+
+    #[test]
+    fn terminal_policy_no_speech_precedes_temperature_retry() {
+        let (transition, best) = whisper_terminal_policy_transition(
+            terminal_attempt("hallucination", -2.0, Some(0.9), false),
+            0.0,
+            None,
+            Some(0.2),
+            -1.0,
+            0.6,
+            Some(2.4),
+            1,
+            2,
+        );
+        assert_eq!(
+            transition,
+            WhisperTerminalTransition::SkipNoSpeech {
+                no_speech_probability: Some(0.9)
+            }
+        );
+        assert!(best.is_none());
+    }
+
+    #[test]
+    fn terminal_policy_requests_configured_retry_and_retains_best_attempt() {
+        let attempt = terminal_attempt("first", -2.0, Some(0.1), false);
+        let (transition, best) = whisper_terminal_policy_transition(
+            attempt.clone(),
+            0.0,
+            None,
+            Some(0.2),
+            -1.0,
+            0.6,
+            Some(2.4),
+            1,
+            2,
+        );
+        let WhisperTerminalTransition::RetryRequired {
+            next_temperature,
+            reasons,
+            expected_generation,
+            new_generation,
+        } = transition
+        else {
+            panic!("low-quality attempt must require retry");
+        };
+        assert_eq!(next_temperature, 0.2);
+        assert_eq!((expected_generation, new_generation), (1, 2));
+        assert!(reasons.contains(&"missing_eot"));
+        assert!(reasons.contains(&"low_logprob"));
+        assert_eq!(best.expect("retained best").0.text, attempt.text);
+    }
+
+    #[test]
+    fn terminal_policy_final_attempt_selects_better_prior_attempt() {
+        let prior = terminal_attempt("better transcript", -0.2, Some(0.1), true);
+        let final_attempt = terminal_attempt("worse", -2.0, Some(0.1), false);
+        let (transition, best) = whisper_terminal_policy_transition(
+            final_attempt,
+            0.2,
+            Some((prior, 0.0)),
+            None,
+            -1.0,
+            0.6,
+            Some(2.4),
+            1,
+            2,
+        );
+        assert_eq!(
+            transition,
+            WhisperTerminalTransition::Accept {
+                text: "better transcript".into(),
+                selected_temperature: 0.0,
+            }
+        );
+        assert!(best.is_none());
+    }
+
     fn transactional_test_state() -> WhisperDecodeState {
-        let model = ModelInstanceId::new(91);
+        let state_id = super::next_whisper_decode_state_id().expect("test state identity");
+        let model = ModelInstanceId::new(90 + state_id);
         let arena_id = KvArenaId {
             model_instance: model,
             backend: BackendKind::Cpu,
@@ -4027,17 +4654,29 @@ mod tests {
             .register_sequence()
             .expect("test static sequence");
         WhisperDecodeState {
+            state_id,
+            next_quantum_nonce: 1,
+            active_quantum: None,
+            current_managed_generation: 1,
+            managed_completions_drained: true,
             self_kv,
             cross_runtime,
             cross_sequence: Some(cross_sequence),
             prompt: vec![1],
             prefill_progress: 1,
             pending_logits: Some(
-                Tensor::from_vec(vec![0.25_f32, 0.75], (2,), &Device::Cpu)
-                    .expect("test logits"),
+                Tensor::from_vec(vec![0.25_f32, 0.75], (2,), &Device::Cpu).expect("test logits"),
             ),
             generated_tokens: vec![],
             assembled: String::new(),
+            sum_logprobs: 0.0,
+            sampled_token_count: 0,
+            no_speech_prob: None,
+            ended_with_eot: false,
+            repetition_loop: false,
+            decode_steps: 0,
+            best_attempt: None,
+            pending_retry: None,
             temperature: 1.0,
             attempt_generation: 1,
             max_steps: 3,
@@ -4055,10 +4694,87 @@ mod tests {
             .self_kv
             .write_and_attend(0, &mut prepared, &qkv, &qkv, &qkv, 1.0)?;
         state.self_kv.commit_prepared(prepared)?;
+        state.managed_completions_drained = false;
         state.pending_logits = None;
         state.generated_tokens.push(token);
         state.assembled = format!("token-{token}");
         Ok(())
+    }
+
+    fn replacement_test_cache(
+        state: &WhisperDecodeState,
+        context_len: usize,
+    ) -> PhysicalPagedKvCache {
+        PhysicalPagedKvCache::new(
+            state.self_kv.arena().clone(),
+            vec![KvLayerBinding {
+                model_layer: 0,
+                physical_layer: 0,
+            }],
+            state.self_kv.blocks.clone(),
+            context_len,
+        )
+        .expect("replacement physical cache")
+    }
+
+    fn generation_test_cache(
+        state: &WhisperDecodeState,
+        _managed_generation: u64,
+        context_len: usize,
+    ) -> PhysicalPagedKvCache {
+        let arena_id = state.self_kv.arena().id();
+        let group = state.self_kv.arena().config().group;
+        let binding = KvLayerBinding {
+            model_layer: 0,
+            physical_layer: 0,
+        };
+        let arena = Arc::new(
+            CpuKvArena::new(KvArenaConfig {
+                id: arena_id,
+                group,
+                page_tokens: 4,
+                capacity_pages: 1,
+                growth: None,
+                dtype: DType::F32,
+                layers: vec![KvLayerConfig {
+                    binding,
+                    num_kv_heads: 1,
+                    key_head_dim: 2,
+                    value_head_dim: 2,
+                }],
+            })
+            .expect("retry-generation arena"),
+        );
+        PhysicalPagedKvCache::new(
+            arena,
+            vec![binding],
+            vec![CacheBlockRef {
+                arena: arena_id,
+                group,
+                index: 0,
+                slot_generation: 1,
+            }],
+            context_len,
+        )
+        .expect("retry-generation cache")
+    }
+
+    fn install_test_cross_memory(state: &WhisperDecodeState) {
+        let sequence = state.cross_sequence.expect("test cross sequence");
+        state
+            .cross_runtime
+            .install(
+                sequence,
+                [7; 32],
+                vec![crate::backends::state::StaticAttentionLayerValue {
+                    model_layer: 0,
+                    keys: Tensor::zeros((1, 1, 2), DType::F32, &Device::Cpu)
+                        .expect("test cross keys"),
+                    values: Tensor::zeros((1, 1, 2), DType::F32, &Device::Cpu)
+                        .expect("test cross values"),
+                }],
+            )
+            .expect("install test cross memory");
     }
 
     #[test]
@@ -4082,7 +4798,9 @@ mod tests {
             ))
         })
         .expect_err("forced text decode failure");
-        assert!(error.to_string().contains("forced post-append text decode failure"));
+        assert!(error
+            .to_string()
+            .contains("forced post-append text decode failure"));
         assert_eq!(state.self_kv.context_len(), 0);
         assert!(state.generated_tokens.is_empty());
         assert!(state.assembled.is_empty());
@@ -4107,6 +4825,312 @@ mod tests {
         assert_eq!(state.self_kv.context_len(), 1);
         assert_eq!(state.generated_tokens, vec![expected_sample]);
         assert_eq!(state.assembled, format!("token-{expected_sample}"));
+    }
+
+    #[test]
+    fn managed_quantum_rollback_restores_reservation_semantics_and_static_identity() {
+        let mut state = transactional_test_state();
+        let static_sequence = state.cross_sequence;
+        let original_logits = state
+            .pending_logits
+            .as_ref()
+            .expect("initial logits")
+            .to_vec1::<f32>()
+            .expect("initial host logits");
+        let replacement = replacement_test_cache(&state, 0);
+        let mut checkpoint = state
+            .begin_managed_quantum(replacement)
+            .expect("begin managed quantum");
+
+        append_test_decode_token(&mut state, 41).expect("append inside quantum");
+        state.prefill_progress = 0;
+        state.temperature = 0.7;
+        state.attempt_generation = 9;
+        state.max_steps = 1;
+        state.finished = true;
+        let _ = state.rng.gen::<u32>();
+        state
+            .rollback_managed_quantum(&mut checkpoint)
+            .expect("rollback managed quantum");
+
+        assert_eq!(state.self_kv.context_len(), 0);
+        assert_eq!(state.cross_sequence, static_sequence);
+        assert_eq!(state.prefill_progress, 1);
+        assert!(state.generated_tokens.is_empty());
+        assert!(state.assembled.is_empty());
+        assert_eq!(state.temperature, 1.0);
+        assert_eq!(state.attempt_generation, 1);
+        assert_eq!(state.max_steps, 3);
+        assert!(!state.finished);
+        assert_eq!(
+            state
+                .pending_logits
+                .as_ref()
+                .expect("restored logits")
+                .to_vec1::<f32>()
+                .expect("restored host logits"),
+            original_logits
+        );
+    }
+
+    #[test]
+    fn managed_quantum_commit_exposes_authenticated_completions_once() {
+        let mut state = transactional_test_state();
+        let static_sequence = state.cross_sequence;
+        let replacement = replacement_test_cache(&state, 0);
+        let mut checkpoint = state
+            .begin_managed_quantum(replacement)
+            .expect("begin managed quantum");
+        append_test_decode_token(&mut state, 17).expect("append inside quantum");
+        let completions = state.take_managed_write_completions();
+        assert_eq!(completions.len(), 1);
+        assert!(state.take_managed_write_completions().is_empty());
+        state
+            .commit_managed_quantum(&mut checkpoint)
+            .expect("commit managed quantum");
+        assert_eq!(state.self_kv.context_len(), 1);
+        assert_eq!(state.cross_sequence, static_sequence);
+
+        let terminal = replacement_test_cache(&state, 1);
+        let mut checkpoint = state
+            .begin_managed_quantum(terminal)
+            .expect("begin zero-append terminal quantum");
+        state.finished = true;
+        assert!(state.take_managed_write_completions().is_empty());
+        state
+            .commit_managed_quantum(&mut checkpoint)
+            .expect("commit zero-append terminal quantum");
+        assert_eq!(state.self_kv.context_len(), 1);
+        assert_eq!(state.cross_sequence, static_sequence);
+    }
+
+    #[test]
+    fn managed_quantum_requires_exact_continuation_position() {
+        let mut state = transactional_test_state();
+        let replacement = replacement_test_cache(&state, 1);
+        let error = match state.begin_managed_quantum(replacement) {
+            Ok(_) => panic!("future reservation must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("reservation starts at 1, but decode state is at 0"));
+        assert_eq!(state.self_kv.context_len(), 0);
+    }
+
+    #[test]
+    fn managed_quantum_rejects_nested_and_undrained_replacement() {
+        let mut state = transactional_test_state();
+        let replacement = replacement_test_cache(&state, 0);
+        let mut checkpoint = state
+            .begin_managed_quantum(replacement)
+            .expect("begin managed quantum");
+        let nested = replacement_test_cache(&state, 0);
+        let error = match state.begin_managed_quantum(nested) {
+            Ok(_) => panic!("nested managed quantum must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("already active"));
+
+        append_test_decode_token(&mut state, 23).expect("append inside quantum");
+        state
+            .commit_managed_quantum(&mut checkpoint)
+            .expect("commit managed quantum");
+        let undrained = replacement_test_cache(&state, 1);
+        let error = match state.begin_managed_quantum(undrained) {
+            Ok(_) => panic!("undrained completions must reject the next quantum"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("must be drained"));
+        assert_eq!(state.take_managed_write_completions().len(), 1);
+        let drained = replacement_test_cache(&state, 1);
+        let mut checkpoint = state
+            .begin_managed_quantum(drained)
+            .expect("drained continuation");
+        state
+            .rollback_managed_quantum(&mut checkpoint)
+            .expect("rollback drained continuation");
+    }
+
+    #[test]
+    fn managed_quantum_rejects_wrong_row_checkpoint_without_consuming_either() {
+        let mut first = transactional_test_state();
+        let mut second = transactional_test_state();
+        let first_replacement = replacement_test_cache(&first, 0);
+        let mut first_checkpoint = first
+            .begin_managed_quantum(first_replacement)
+            .expect("first quantum");
+        let second_replacement = replacement_test_cache(&second, 0);
+        let mut second_checkpoint = second
+            .begin_managed_quantum(second_replacement)
+            .expect("second quantum");
+
+        let error = second
+            .commit_managed_quantum(&mut first_checkpoint)
+            .expect_err("foreign checkpoint must be rejected");
+        assert!(error
+            .to_string()
+            .contains("foreign, stale, or out of order"));
+        first
+            .rollback_managed_quantum(&mut first_checkpoint)
+            .expect("foreign rejection must not consume first checkpoint");
+        second
+            .rollback_managed_quantum(&mut second_checkpoint)
+            .expect("foreign rejection must not clear second active quantum");
+    }
+
+    #[test]
+    fn managed_quantum_checkpoint_is_single_use_and_out_of_order_safe() {
+        let mut state = transactional_test_state();
+        let first_replacement = replacement_test_cache(&state, 0);
+        let mut first = state
+            .begin_managed_quantum(first_replacement)
+            .expect("first quantum");
+        state
+            .commit_managed_quantum(&mut first)
+            .expect("commit first quantum");
+        let stale = state
+            .commit_managed_quantum(&mut first)
+            .expect_err("committed checkpoint must be stale");
+        assert!(stale
+            .to_string()
+            .contains("foreign, stale, or out of order"));
+
+        let second_replacement = replacement_test_cache(&state, 0);
+        let mut second = state
+            .begin_managed_quantum(second_replacement)
+            .expect("second quantum");
+        let out_of_order = state
+            .rollback_managed_quantum(&mut first)
+            .expect_err("older checkpoint must not roll back a newer quantum");
+        assert!(out_of_order
+            .to_string()
+            .contains("foreign, stale, or out of order"));
+        state
+            .rollback_managed_quantum(&mut second)
+            .expect("newer active checkpoint remains valid");
+    }
+
+    #[test]
+    fn managed_generation_resets_attempt_and_preserves_static_cross_identity() {
+        let mut state = transactional_test_state();
+        install_test_cross_memory(&state);
+        let sequence = state.cross_sequence.expect("cross sequence");
+        let cross_before = state
+            .cross_runtime
+            .read(sequence)
+            .expect("read cross memory")
+            .expect("installed cross memory");
+        state.generated_tokens = vec![9, 10];
+        state.assembled = "bad attempt".into();
+        state.sum_logprobs = -8.0;
+        state.sampled_token_count = 2;
+        state.finished = true;
+        state.best_attempt = Some((terminal_attempt("best so far", -0.5, Some(0.1), true), 0.0));
+        state.pending_retry = Some(super::WhisperPendingRetry {
+            next_temperature: 0.2,
+            expected_generation: 1,
+            new_generation: 2,
+            next_attempt_generation: 2,
+        });
+        let replacement = generation_test_cache(&state, 2, 0);
+        let mut checkpoint = state
+            .begin_managed_generation(replacement, 1, 2)
+            .expect("begin retry generation");
+
+        assert_eq!(state.self_kv.arena().id().generation, 1);
+        assert_eq!(state.current_managed_generation, 2);
+        assert_eq!(state.self_kv.context_len(), 0);
+        assert_eq!(state.prefill_progress, 0);
+        assert!(state.pending_logits.is_none());
+        assert!(state.generated_tokens.is_empty());
+        assert!(state.assembled.is_empty());
+        assert_eq!(state.temperature, 0.2);
+        assert_eq!(state.attempt_generation, 2);
+        assert!(!state.finished);
+        assert!(state.pending_retry.is_none());
+        assert_eq!(
+            state.best_attempt.as_ref().expect("preserved best").0.text,
+            "best so far"
+        );
+        assert_eq!(
+            state
+                .cross_runtime
+                .read(sequence)
+                .expect("read preserved cross")
+                .expect("preserved cross memory"),
+            cross_before
+        );
+
+        state
+            .rollback_managed_quantum(&mut checkpoint)
+            .expect("rollback retry generation");
+        assert_eq!(state.self_kv.arena().id().generation, 1);
+        assert_eq!(state.current_managed_generation, 1);
+        assert_eq!(state.generated_tokens, vec![9, 10]);
+        assert_eq!(state.assembled, "bad attempt");
+        assert!(state.pending_retry.is_some());
+        assert_eq!(state.cross_sequence, Some(sequence));
+    }
+
+    #[test]
+    fn managed_generation_rejects_no_pending_and_stale_generations() {
+        let mut state = transactional_test_state();
+        install_test_cross_memory(&state);
+        let no_pending = generation_test_cache(&state, 2, 0);
+        let error = match state.begin_managed_generation(no_pending, 1, 2) {
+            Ok(_) => panic!("retry generation requires pending policy transition"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("no pending"));
+
+        state.pending_retry = Some(super::WhisperPendingRetry {
+            next_temperature: 0.2,
+            expected_generation: 1,
+            new_generation: 2,
+            next_attempt_generation: 2,
+        });
+        let stale = generation_test_cache(&state, 2, 0);
+        let error = match state.begin_managed_generation(stale, 0, 2) {
+            Ok(_) => panic!("stale expected generation must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("stale or out of order"));
+        assert_eq!(state.self_kv.arena().id().generation, 1);
+        assert_eq!(state.current_managed_generation, 1);
+        assert!(state.pending_retry.is_some());
+    }
+
+    #[test]
+    fn managed_generation_rejects_wrong_authority_and_nonzero_context() {
+        let mut state = transactional_test_state();
+        install_test_cross_memory(&state);
+        state.pending_retry = Some(super::WhisperPendingRetry {
+            next_temperature: 0.2,
+            expected_generation: 1,
+            new_generation: 2,
+            next_attempt_generation: 2,
+        });
+        let nonzero = generation_test_cache(&state, 2, 1);
+        let error = match state.begin_managed_generation(nonzero, 1, 2) {
+            Ok(_) => panic!("retry generation must start at zero"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("context zero"));
+
+        let mut foreign = transactional_test_state();
+        install_test_cross_memory(&foreign);
+        foreign.pending_retry = state.pending_retry;
+        let wrong_authority = generation_test_cache(&foreign, 2, 0);
+        let error = match state.begin_managed_generation(wrong_authority, 1, 2) {
+            Ok(_) => panic!("foreign retry cache must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("cannot switch session KV authority"));
+        assert_eq!(state.self_kv.arena().id().generation, 1);
+        assert_eq!(state.current_managed_generation, 1);
     }
 }
 
