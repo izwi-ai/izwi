@@ -29,11 +29,12 @@ use crate::backends::kv::{
 use crate::backends::state::{
     negotiate_state_plan, PhysicalStateSequenceId, PhysicalStateTransactionId,
     StateBackendPlanRequest, StateBackendRegistry, TensorStateArena, TensorStateCapacity,
+    TensorStateSelection,
 };
 use crate::backends::BackendKind;
 use crate::engine::{
     EngineCoreRequest, ManagedCacheDomainReservation, ManagedCacheReceipt, ManagedCacheReservation,
-    ManagedSessionGeneration, ManagedTensorStateReservation, ModelInstanceId, PlanId,
+    ManagedClockedStateReservation, ManagedSessionGeneration, ModelInstanceId, PlanId,
     ReservationClass, ReservationOwner, ResourceAmount, ResourceAuthority, ResourceLease,
     ResourceVector, SessionKey, WorkUnit,
 };
@@ -1035,8 +1036,9 @@ impl ManagedKvCacheManager {
         )?;
         let tensor_state = tensor_capacity
             .map(|capacity| {
-                TensorStateArena::new(
+                TensorStateArena::new_with_contract(
                     Arc::new(state_plan_v2.clone()),
+                    contract,
                     capacity,
                     self.worker_device.clone(),
                 )
@@ -1210,7 +1212,12 @@ impl ManagedKvCacheManager {
         work: &WorkUnit,
         request: Option<&EngineCoreRequest>,
     ) -> Result<Option<ManagedCacheReservation>> {
-        let WorkUnit::SequenceStep { input, .. } = work else {
+        let WorkUnit::SequenceStep {
+            input,
+            auxiliary_state,
+            ..
+        } = work
+        else {
             return Ok(None);
         };
         let target_committed_tokens = u32::try_from(input.end).map_err(|_| {
@@ -1226,11 +1233,49 @@ impl ManagedKvCacheManager {
             ));
         }
         let namespace = managed_prefix_namespace(request, runtime, self.prefix_cache_salt)?;
-        let tensor_transaction = runtime
-            .tensor_state()
-            .map(|_| PhysicalStateTransactionId::new(txn_id))
+        let selected_tensor_state = auxiliary_state
+            .as_ref()
+            .map(|spans| {
+                spans
+                    .iter()
+                    .map(|span| {
+                        let input = span.input();
+                        Ok(TensorStateSelection {
+                            group: span.group(),
+                            clock: span.clock().clone(),
+                            expected_cursor: u64::try_from(input.start).map_err(|_| {
+                                Error::InvalidInput("clocked state cursor exceeds u64".to_string())
+                            })?,
+                            target_cursor: u64::try_from(input.end).map_err(|_| {
+                                Error::InvalidInput("clocked state cursor exceeds u64".to_string())
+                            })?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
             .transpose()?;
-        let needs_tensor_sequence = runtime.tensor_state().is_some()
+        if input.is_empty() && selected_tensor_state.is_none() {
+            return Err(Error::InferenceError(
+                "legacy decoder-coupled tensor state cannot advance without a paged span".into(),
+            ));
+        }
+        let needs_tensor_transaction = runtime.tensor_state().is_some()
+            && selected_tensor_state
+                .as_ref()
+                .is_none_or(|selections| !selections.is_empty());
+        if runtime.tensor_state().is_none()
+            && selected_tensor_state
+                .as_ref()
+                .is_some_and(|selections| !selections.is_empty())
+        {
+            return Err(Error::InferenceError(
+                "clocked state spans selected a model without a tensor-state arena".into(),
+            ));
+        }
+        let tensor_transaction = needs_tensor_transaction
+            .then(|| PhysicalStateTransactionId::new(txn_id))
+            .transpose()?;
+        let needs_tensor_sequence = needs_tensor_transaction
             && self
                 .models
                 .get(&runtime.plan.model_instance)
@@ -1289,6 +1334,15 @@ impl ManagedKvCacheManager {
                 return Err(Error::InferenceError(
                     "scheduled KV target regressed behind the committed cache table".to_string(),
                 ));
+            }
+            if input.is_empty() {
+                if target_committed_tokens != snapshot.committed_tokens {
+                    abort_domains(state, txn_id, &domains);
+                    return Err(Error::InferenceError(
+                        "empty decoder span disagrees with the committed paged cursor".into(),
+                    ));
+                }
+                continue;
             }
             let prefix_eligible = snapshot.committed_tokens == 0
                 && input.start == 0
@@ -1576,7 +1630,10 @@ impl ManagedKvCacheManager {
                 "managed KV transaction duplicated pending prefix publication".into(),
             ));
         }
-        let tensor_state = if let Some(arena) = runtime.tensor_state() {
+        let clocked_state = if needs_tensor_transaction {
+            let arena = runtime
+                .tensor_state()
+                .expect("tensor transaction requires an arena");
             let transaction = tensor_transaction.expect("tensor arena has a transaction");
             let (sequence, newly_registered) =
                 if let Some(sequence) = state.tensor_sequences.get(session).copied() {
@@ -1591,7 +1648,36 @@ impl ManagedKvCacheManager {
                     state.tensor_sequences.insert(session.clone(), sequence);
                     (sequence, true)
                 };
-            if let Err(error) = arena.begin(transaction, sequence) {
+            let managed_reservation = if let Some(selections) = selected_tensor_state.as_ref() {
+                ManagedClockedStateReservation::selected(
+                    runtime.plan().model_instance,
+                    sequence.get(),
+                    selections.clone().into(),
+                )
+            } else {
+                ManagedClockedStateReservation::legacy(
+                    runtime.plan().model_instance,
+                    sequence.get(),
+                )
+            };
+            let managed_reservation = match managed_reservation {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    abort_domains(state, txn_id, &domains);
+                    state.pending_prefixes.remove(&txn_id);
+                    if newly_registered {
+                        state.tensor_sequences.remove(session);
+                        arena.release(sequence)?;
+                    }
+                    return Err(error);
+                }
+            };
+            let begin = if let Some(selections) = selected_tensor_state.as_ref() {
+                arena.begin_selected(transaction, sequence, selections)
+            } else {
+                arena.begin(transaction, sequence)
+            };
+            if let Err(error) = begin {
                 abort_domains(state, txn_id, &domains);
                 state.pending_prefixes.remove(&txn_id);
                 if newly_registered {
@@ -1604,18 +1690,19 @@ impl ManagedKvCacheManager {
                 }
                 return Err(error);
             }
-            Some(ManagedTensorStateReservation {
-                sequence: sequence.get(),
-            })
+            Some(managed_reservation)
         } else {
             None
         };
+        if domains.is_empty() && clocked_state.is_none() {
+            return Ok(None);
+        }
         Ok(Some(ManagedCacheReservation {
             txn_id,
             session: session.clone(),
             session_generation,
             domains,
-            tensor_state,
+            clocked_state,
         }))
     }
 
@@ -1625,11 +1712,15 @@ impl ManagedKvCacheManager {
         receipt: Option<&ManagedCacheReceipt>,
         commit: bool,
     ) -> Result<()> {
-        let model_instance = reservation
-            .domains
-            .first()
-            .map(|domain| domain.arena.model_instance)
-            .ok_or_else(|| Error::InferenceError("managed KV reservation is empty".into()))?;
+        let model_instance = if let Some(domain) = reservation.domains.first() {
+            domain.arena.model_instance
+        } else if let Some(clocked) = reservation.clocked_state.as_ref() {
+            clocked.model_instance()
+        } else {
+            return Err(Error::InferenceError(
+                "managed reservation contains no paged or clocked state".into(),
+            ));
+        };
         let state = self
             .models
             .get_mut(&model_instance)
@@ -1642,6 +1733,17 @@ impl ManagedKvCacheManager {
         if let Err(error) = validate_reservation_session_generation(state, reservation) {
             abort_reservation(state, reservation);
             return Err(error);
+        }
+        if let Some(clocked) = reservation.clocked_state.as_ref() {
+            let sequence = PhysicalStateSequenceId::new(clocked.sequence())?;
+            if clocked.model_instance() != model_instance
+                || state.tensor_sequences.get(&reservation.session) != Some(&sequence)
+            {
+                abort_reservation(state, reservation);
+                return Err(Error::InferenceError(
+                    "clocked-state reservation crossed its model/session sequence fence".into(),
+                ));
+            }
         }
         let receipt = match receipt {
             Some(receipt) => receipt,
@@ -1822,28 +1924,41 @@ impl ManagedKvCacheManager {
                 "managed KV transaction contains a prefix publication for an unknown domain".into(),
             ));
         }
-        if reservation.tensor_state.is_some() {
+        if let Some(clocked_state) = reservation.clocked_state.as_ref() {
             let arena = state.runtime.tensor_state().ok_or_else(|| {
                 Error::InferenceError("tensor-state reservation lost its physical arena".into())
             })?;
-            let target_cursor = reservation
-                .domains
-                .first()
-                .map(|domain| u64::from(accepted_prefix.unwrap_or(domain.target_committed_tokens)))
-                .ok_or_else(|| Error::InferenceError("managed KV reservation is empty".into()))?;
-            if reservation.domains.iter().any(|domain| {
-                u64::from(accepted_prefix.unwrap_or(domain.target_committed_tokens))
-                    != target_cursor
-            }) {
-                abort_reservation(state, reservation);
-                return Err(Error::InferenceError(
-                    "one managed state transaction resolved divergent domain cursors".into(),
-                ));
-            }
-            if let Err(error) = arena.commit(
-                PhysicalStateTransactionId::new(reservation.txn_id)?,
-                target_cursor,
-            ) {
+            let transaction = PhysicalStateTransactionId::new(reservation.txn_id)?;
+            let committed = if clocked_state.selections().is_some() {
+                let completion = receipt
+                    .clocked_state()
+                    .expect("validated selected receipt has a completion")
+                    .completion();
+                arena.commit_selected(transaction, completion)
+            } else {
+                let target_cursor = reservation
+                    .domains
+                    .first()
+                    .map(|domain| {
+                        u64::from(accepted_prefix.unwrap_or(domain.target_committed_tokens))
+                    })
+                    .ok_or_else(|| {
+                        Error::InferenceError(
+                            "legacy tensor transaction requires a paged cursor".into(),
+                        )
+                    })?;
+                if reservation.domains.iter().any(|domain| {
+                    u64::from(accepted_prefix.unwrap_or(domain.target_committed_tokens))
+                        != target_cursor
+                }) {
+                    abort_reservation(state, reservation);
+                    return Err(Error::InferenceError(
+                        "one managed state transaction resolved divergent domain cursors".into(),
+                    ));
+                }
+                arena.commit(transaction, target_cursor)
+            };
+            if let Err(error) = committed {
                 abort_reservation(state, reservation);
                 return Err(error);
             }
@@ -3064,7 +3179,7 @@ fn abort_domains(
 fn abort_reservation(state: &mut ManagedKvModelState, reservation: &ManagedCacheReservation) {
     state.pending_prefixes.remove(&reservation.txn_id);
     abort_domains(state, reservation.txn_id, &reservation.domains);
-    if reservation.tensor_state.is_some() {
+    if reservation.clocked_state.is_some() {
         if let (Some(arena), Ok(transaction)) = (
             state.runtime.tensor_state(),
             PhysicalStateTransactionId::new(reservation.txn_id),
@@ -3160,10 +3275,10 @@ mod tests {
         PhysicalStateSequenceId, PhysicalStateTransactionId, StateComponentValue,
     };
     use crate::engine::{
-        AdapterAbiRevision, AdapterInstanceId, CapacitySource, ExecutionAdapterBinding,
-        ExecutionGroupId, ExecutionMode, ExecutionProfile, InputRange, NativeBatchMode,
-        PhysicalCapacityProvider, PhysicalCapacitySnapshot, SequencePhase, StageDescriptor,
-        StageId,
+        AdapterAbiRevision, AdapterInstanceId, CapacitySource, ClockedStateSpan,
+        ExecutionAdapterBinding, ExecutionGroupId, ExecutionMode, ExecutionProfile, InputRange,
+        NativeBatchMode, PhysicalCapacityProvider, PhysicalCapacitySnapshot, SequencePhase,
+        StageDescriptor, StageId,
     };
     use crate::kv::v2::{
         BoundedShape, PageSizeConstraint, ShapeAxis, ShapeDimension, ShapeExtent, StateClock,
@@ -3274,6 +3389,34 @@ mod tests {
             phase: SequencePhase::Prefill,
             input: InputRange { start, end },
             max_output_steps: end.saturating_sub(start).max(1),
+            auxiliary_state: None,
+        }
+    }
+
+    fn selected_sequence_work(
+        start: usize,
+        end: usize,
+        group: StateGroupId,
+        clock: StateClock,
+        state_start: usize,
+        state_end: usize,
+    ) -> WorkUnit {
+        WorkUnit::SequenceStep {
+            phase: SequencePhase::Prefill,
+            input: InputRange { start, end },
+            max_output_steps: end.saturating_sub(start).max(1),
+            auxiliary_state: Some(
+                vec![ClockedStateSpan::new(
+                    group,
+                    clock,
+                    InputRange {
+                        start: state_start,
+                        end: state_end,
+                    },
+                )
+                .unwrap()]
+                .into(),
+            ),
         }
     }
 
@@ -3423,6 +3566,28 @@ mod tests {
             domains: vec![CacheDomainId::new(3)],
             prefix_shareable: false,
         });
+        contract.validate().unwrap();
+        contract
+    }
+
+    fn independently_clocked_tensor_contract() -> InferenceStateContract {
+        let mut contract = composite_tensor_contract();
+        contract.groups = vec![
+            StateGroupSpec {
+                id: StateGroupId::new(1),
+                domains: vec![StateDomainId::new(1)],
+                prefix_shareable: false,
+            },
+            StateGroupSpec {
+                id: StateGroupId::new(2),
+                domains: vec![StateDomainId::new(2)],
+                prefix_shareable: false,
+            },
+        ];
+        let StateDomainSpec::Tensor(tensor) = &mut contract.domains[1] else {
+            panic!("composite test contract tensor domain changed kind");
+        };
+        tensor.header.clock = StateClock::AudioFrames;
         contract.validate().unwrap();
         contract
     }
@@ -5340,7 +5505,8 @@ mod tests {
             .unwrap()
             .unwrap();
         let sequence =
-            PhysicalStateSequenceId::new(aborted.tensor_state.unwrap().sequence).unwrap();
+            PhysicalStateSequenceId::new(aborted.clocked_state.as_ref().unwrap().sequence())
+                .unwrap();
         let transaction = PhysicalStateTransactionId::new(aborted.txn_id).unwrap();
         arena
             .stage_replace(
@@ -5415,6 +5581,241 @@ mod tests {
     }
 
     #[test]
+    fn selected_clocked_state_commits_with_paged_state_under_one_fence() {
+        let model = ModelInstanceId::new(5210);
+        let session = SessionKey::new("managed-selected-clock".into(), 1);
+        let mut manager = ManagedKvCacheManager::default();
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                8,
+                16,
+                &CacheCapability::Managed(independently_clocked_tensor_contract()),
+            )
+            .unwrap()
+            .unwrap();
+        let arena = runtime.tensor_state().unwrap().clone();
+        let reservation = manager
+            .prepare(
+                &runtime,
+                5211,
+                &session,
+                &selected_sequence_work(
+                    0,
+                    1,
+                    StateGroupId::new(2),
+                    StateClock::AudioFrames,
+                    0,
+                    160,
+                ),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reservation
+                .clocked_state
+                .as_ref()
+                .unwrap()
+                .selections()
+                .unwrap()[0]
+                .target_cursor,
+            160
+        );
+        let transaction = PhysicalStateTransactionId::new(reservation.txn_id).unwrap();
+        arena
+            .stage_replace(
+                transaction,
+                StateDomainId::new(2),
+                0,
+                160,
+                vec![StateComponentValue {
+                    component: StateComponentId::new(1),
+                    tensor: None,
+                }],
+            )
+            .unwrap();
+        let completion = arena.seal_selected_completion(transaction).unwrap();
+        let receipt = reservation
+            .completed_write_receipt_for_test()
+            .with_clocked_state_completion(completion)
+            .unwrap();
+        manager
+            .finalize(&reservation, Some(&receipt), true)
+            .unwrap();
+        let sequence =
+            PhysicalStateSequenceId::new(reservation.clocked_state.as_ref().unwrap().sequence())
+                .unwrap();
+        assert_eq!(
+            arena
+                .read(sequence, StateDomainId::new(2))
+                .unwrap()
+                .unwrap()
+                .cursor,
+            160
+        );
+        assert_eq!(arena.occupancy().unwrap().active_transactions, 0);
+    }
+
+    #[test]
+    fn missing_selected_completion_aborts_paged_and_tensor_state() {
+        let model = ModelInstanceId::new(5220);
+        let session = SessionKey::new("managed-missing-clock-proof".into(), 1);
+        let mut manager = ManagedKvCacheManager::default();
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                8,
+                16,
+                &CacheCapability::Managed(independently_clocked_tensor_contract()),
+            )
+            .unwrap()
+            .unwrap();
+        let arena = runtime.tensor_state().unwrap().clone();
+        let reservation = manager
+            .prepare(
+                &runtime,
+                5221,
+                &session,
+                &selected_sequence_work(
+                    0,
+                    1,
+                    StateGroupId::new(2),
+                    StateClock::AudioFrames,
+                    0,
+                    160,
+                ),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        let transaction = PhysicalStateTransactionId::new(reservation.txn_id).unwrap();
+        arena
+            .stage_replace(
+                transaction,
+                StateDomainId::new(2),
+                0,
+                160,
+                vec![StateComponentValue {
+                    component: StateComponentId::new(1),
+                    tensor: None,
+                }],
+            )
+            .unwrap();
+        let receipt = reservation.completed_write_receipt_for_test();
+        assert!(manager
+            .finalize(&reservation, Some(&receipt), true)
+            .is_err());
+        assert_eq!(arena.occupancy().unwrap().active_transactions, 0);
+        let sequence =
+            PhysicalStateSequenceId::new(reservation.clocked_state.as_ref().unwrap().sequence())
+                .unwrap();
+        assert!(arena
+            .read(sequence, StateDomainId::new(2))
+            .unwrap()
+            .is_none());
+        assert!(manager
+            .runtime_snapshot()
+            .models
+            .iter()
+            .flat_map(|model| &model.arenas)
+            .all(|arena| arena.coordinator.active_transactions == 0));
+    }
+
+    #[test]
+    fn explicit_empty_clock_selection_does_not_open_tensor_transaction() {
+        let model = ModelInstanceId::new(5230);
+        let session = SessionKey::new("managed-no-clocked-work".into(), 1);
+        let mut manager = ManagedKvCacheManager::default();
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                8,
+                16,
+                &CacheCapability::Managed(composite_tensor_contract()),
+            )
+            .unwrap()
+            .unwrap();
+        let arena = runtime.tensor_state().unwrap().clone();
+        let work = WorkUnit::SequenceStep {
+            phase: SequencePhase::Prefill,
+            input: InputRange { start: 0, end: 1 },
+            max_output_steps: 1,
+            auxiliary_state: Some(Arc::from([])),
+        };
+        let reservation = manager
+            .prepare(&runtime, 5231, &session, &work, None)
+            .unwrap()
+            .unwrap();
+        assert!(reservation.clocked_state.is_none());
+        assert_eq!(arena.occupancy().unwrap().active_transactions, 0);
+        manager.finalize(&reservation, None, false).unwrap();
+    }
+
+    #[test]
+    fn selected_clocked_state_can_commit_without_a_paged_append() {
+        let model = ModelInstanceId::new(5240);
+        let session = SessionKey::new("managed-clocked-only".into(), 1);
+        let mut manager = ManagedKvCacheManager::default();
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                8,
+                16,
+                &CacheCapability::Managed(independently_clocked_tensor_contract()),
+            )
+            .unwrap()
+            .unwrap();
+        let arena = runtime.tensor_state().unwrap().clone();
+        let reservation = manager
+            .prepare(
+                &runtime,
+                5241,
+                &session,
+                &selected_sequence_work(0, 0, StateGroupId::new(2), StateClock::AudioFrames, 0, 80),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(reservation.domains.is_empty());
+        let transaction = PhysicalStateTransactionId::new(reservation.txn_id).unwrap();
+        arena
+            .stage_replace(
+                transaction,
+                StateDomainId::new(2),
+                0,
+                80,
+                vec![StateComponentValue {
+                    component: StateComponentId::new(1),
+                    tensor: None,
+                }],
+            )
+            .unwrap();
+        let receipt = reservation
+            .completed_write_receipt_for_test()
+            .with_clocked_state_completion(arena.seal_selected_completion(transaction).unwrap())
+            .unwrap();
+        manager
+            .finalize(&reservation, Some(&receipt), true)
+            .unwrap();
+        let sequence =
+            PhysicalStateSequenceId::new(reservation.clocked_state.as_ref().unwrap().sequence())
+                .unwrap();
+        assert_eq!(
+            arena
+                .read(sequence, StateDomainId::new(2))
+                .unwrap()
+                .unwrap()
+                .cursor,
+            80
+        );
+    }
+
+    #[test]
     fn accepted_prefix_reconciles_two_paged_domains_and_tensor_cursor() {
         const MAX_RESERVED: u32 = 9;
 
@@ -5452,9 +5853,10 @@ mod tests {
             assert_eq!(reservation.domains.len(), 2);
             let sequence = PhysicalStateSequenceId::new(
                 reservation
-                    .tensor_state
+                    .clocked_state
+                    .as_ref()
                     .expect("tensor reservation")
-                    .sequence,
+                    .sequence(),
             )
             .unwrap();
             tensor_arena
@@ -5535,7 +5937,8 @@ mod tests {
             .unwrap()
             .unwrap();
         let sequence =
-            PhysicalStateSequenceId::new(reservation.tensor_state.unwrap().sequence).unwrap();
+            PhysicalStateSequenceId::new(reservation.clocked_state.as_ref().unwrap().sequence())
+                .unwrap();
         tensor_arena
             .stage_replace(
                 PhysicalStateTransactionId::new(reservation.txn_id).unwrap(),

@@ -488,14 +488,14 @@ fn retained_row_managed_state_for_row(
             });
         }
     }
-    if paged.is_empty() && reservation.tensor_state.is_none() {
+    if paged.is_empty() && reservation.clocked_state.is_none() {
         return Err(Error::InvalidInput(
             "retained native row has neither paged nor tensor state".to_string(),
         ));
     }
     Ok(RetainedRowManagedState {
         paged,
-        tensor_state: reservation.tensor_state,
+        tensor_state: reservation.clocked_state.clone(),
         session_generation: reservation.session_generation,
     })
 }
@@ -1187,6 +1187,7 @@ pub struct ModelSessionResult {
     /// The executor reconciles these against the exact row reservation before
     /// it can construct a managed-cache receipt.
     pub(crate) managed_cache_completions: Vec<Arc<crate::backends::kv::KvWriteBatchCompletion>>,
+    pub(crate) clocked_state_completion: Option<crate::backends::state::TensorStateBatchCompletion>,
 }
 
 impl ModelSessionResult {
@@ -1220,6 +1221,7 @@ impl ModelSessionResult {
             provenance,
             staged_stream_outputs: Vec::new(),
             managed_cache_completions: Vec::new(),
+            clocked_state_completion: None,
         }
     }
 
@@ -1231,6 +1233,7 @@ impl ModelSessionResult {
             provenance: OutcomeProvenance::produced_output(),
             staged_stream_outputs: Vec::new(),
             managed_cache_completions: Vec::new(),
+            clocked_state_completion: None,
         }
     }
 
@@ -1257,6 +1260,7 @@ impl ModelSessionResult {
             provenance: OutcomeProvenance::started(),
             staged_stream_outputs: Vec::new(),
             managed_cache_completions: Vec::new(),
+            clocked_state_completion: None,
         }
     }
 
@@ -1269,6 +1273,7 @@ impl ModelSessionResult {
             provenance: OutcomeProvenance::started(),
             staged_stream_outputs: Vec::new(),
             managed_cache_completions: Vec::new(),
+            clocked_state_completion: None,
         }
     }
 
@@ -1281,6 +1286,7 @@ impl ModelSessionResult {
             provenance: OutcomeProvenance::not_started(),
             staged_stream_outputs: Vec::new(),
             managed_cache_completions: Vec::new(),
+            clocked_state_completion: None,
         }
     }
 
@@ -1307,6 +1313,7 @@ impl ModelSessionResult {
             provenance,
             staged_stream_outputs: Vec::new(),
             managed_cache_completions: Vec::new(),
+            clocked_state_completion: None,
         }
     }
 
@@ -1320,6 +1327,14 @@ impl ModelSessionResult {
         completions: Vec<Arc<crate::backends::kv::KvWriteBatchCompletion>>,
     ) -> Self {
         self.managed_cache_completions = completions;
+        self
+    }
+
+    pub(crate) fn with_clocked_state_completion(
+        mut self,
+        completion: crate::backends::state::TensorStateBatchCompletion,
+    ) -> Self {
+        self.clocked_state_completion = Some(completion);
         self
     }
 }
@@ -1341,6 +1356,7 @@ pub struct ExecutorStepResult {
     /// Optional physical KV write acknowledgement for this exact row.
     pub managed_cache: Option<super::ManagedCacheReceipt>,
     pub(crate) managed_cache_completions: Vec<Arc<crate::backends::kv::KvWriteBatchCompletion>>,
+    pub(crate) clocked_state_completion: Option<crate::backends::state::TensorStateBatchCompletion>,
 }
 
 impl ExecutorStepResult {
@@ -1368,6 +1384,7 @@ impl ExecutorStepResult {
             staged_stream_outputs: session_result.staged_stream_outputs,
             managed_cache: None,
             managed_cache_completions: session_result.managed_cache_completions,
+            clocked_state_completion: session_result.clocked_state_completion,
         }
     }
 
@@ -1994,6 +2011,7 @@ fn loaded_native_batch_support(request: &EngineCoreRequest) -> NativeBatchSuppor
         phase: SequencePhase::Decode,
         input: super::InputRange { start: 0, end: 1 },
         max_output_steps: 1,
+        auxiliary_state: None,
     };
     let Ok(stage) = binding.stage_for_work(&decode_work) else {
         return NativeBatchSupport::NONE;
@@ -3121,6 +3139,7 @@ mod tests {
                     end: num_tokens,
                 },
                 max_output_steps: num_tokens,
+                auxiliary_state: None,
             },
         };
 
@@ -3185,6 +3204,7 @@ mod tests {
                 phase: SequencePhase::Decode,
                 input: super::super::InputRange { start: 1, end: 2 },
                 max_output_steps: 1,
+                auxiliary_state: None,
             },
         };
         let lane = BatchLaneKey {
@@ -3320,7 +3340,7 @@ mod tests {
                     writable_blocks: Vec::new(),
                 })
                 .collect(),
-            tensor_state: None,
+            clocked_state: None,
         }
     }
 
@@ -3442,6 +3462,7 @@ mod tests {
             phase: super::super::SequencePhase::Decode,
             input: super::super::InputRange { start: 0, end: 1 },
             max_output_steps: 1,
+            auxiliary_state: None,
         };
         assert!(validate_atomic_scalar_invocation_stage(&scalar, &sequence).is_err());
 

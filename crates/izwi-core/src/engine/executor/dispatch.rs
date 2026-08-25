@@ -140,7 +140,7 @@ impl NativeExecutor {
                             scheduled_req,
                             Some(caches.target),
                             caches.mtp,
-                            reservation.tensor_state,
+                            reservation.clocked_state.clone(),
                         )
                     } else {
                         let cache = super::qwen3_managed_cache_for_row(
@@ -153,7 +153,7 @@ impl NativeExecutor {
                             scheduled_req,
                             Some(cache),
                             None,
-                            reservation.tensor_state,
+                            reservation.clocked_state.clone(),
                         )
                     }
                 }
@@ -177,7 +177,7 @@ impl NativeExecutor {
                         request,
                         scheduled_req,
                         Some(cache),
-                        reservation.tensor_state,
+                        reservation.clocked_state.clone(),
                     )
                 }
                 Some(_) => Err(Error::InferenceError(
@@ -494,6 +494,7 @@ impl NativeExecutor {
                     super::ExecutionDisposition::RestartSequence(_)
                 ) && (!result.staged_stream_outputs.is_empty()
                     || !result.managed_cache_completions.is_empty()
+                    || result.clocked_state_completion.is_some()
                     || result.output.audio.is_some()
                     || result.output.text.is_some()
                     || result.output.input_transcription.is_some()
@@ -522,7 +523,18 @@ impl NativeExecutor {
                         .and_then(|rows| rows.iter().find(|row| row.plan_id == scheduled.plan_id))
                         .and_then(|row| row.managed_cache.as_ref())
                     {
-                        let receipt = if result.output.tokens_processed == scheduled.num_tokens {
+                        let selected_clocked_state = reservation
+                            .clocked_state
+                            .as_ref()
+                            .is_some_and(|state| state.selections().is_some());
+                        let receipt = if selected_clocked_state
+                            && result.output.tokens_processed != scheduled.num_tokens
+                        {
+                            Err(Error::InferenceError(
+                                "selected auxiliary state requires exact scheduled progress"
+                                    .into(),
+                            ))
+                        } else if result.output.tokens_processed == scheduled.num_tokens {
                             reservation.completed_write_receipt(&result.managed_cache_completions)
                         } else {
                             reservation
@@ -553,7 +565,15 @@ impl NativeExecutor {
                                         committed,
                                     )
                                 })
-                        };
+                        }
+                        .and_then(|receipt| {
+                            match result.clocked_state_completion.clone() {
+                                Some(completion) => {
+                                    receipt.with_clocked_state_completion(completion)
+                                }
+                                None => Ok(receipt),
+                            }
+                        });
                         match receipt {
                             Ok(receipt) => result.managed_cache = Some(receipt),
                             Err(error) => {
@@ -570,7 +590,9 @@ impl NativeExecutor {
                                 .with_observed_resources(result.observed_resources);
                             }
                         }
-                    } else if !result.managed_cache_completions.is_empty() {
+                    } else if !result.managed_cache_completions.is_empty()
+                        || result.clocked_state_completion.is_some()
+                    {
                         result = ExecutorStepResult::from_session(
                             scheduled,
                             ModelSessionResult::atomic(ExecutorOutput::error(
@@ -583,6 +605,7 @@ impl NativeExecutor {
                     }
                 }
                 result.managed_cache_completions.clear();
+                result.clocked_state_completion = None;
                 result
             })
             .collect())
@@ -596,13 +619,19 @@ mod tests {
         CpuKvBackendRuntime, KvArenaConfig, KvBackendRuntime, KvLayerConfig, KvWriteArgs,
         KvWriteCompletionCollector,
     };
+    use crate::backends::state::{
+        PhysicalStateSequenceId, PhysicalStateTransactionId, TensorStateBatchCompletion,
+        TensorStateSelection,
+    };
     use crate::backends::BackendKind;
     use crate::engine::cache::coordinator::GroupBlockTable;
     use crate::engine::{
-        AdapterAbiRevision, AdapterInstanceId, BatchDispatchKind, BatchLaneKey, ExecutionGroupId,
-        InputRange, ManagedCacheDomainReservation, ManagedCacheReservation, ModelInstanceId,
-        SequencePhase, StageId, WorkCost, WorkUnit,
+        AdapterAbiRevision, AdapterInstanceId, BatchDispatchKind, BatchLaneKey, ClockedStateSpan,
+        ExecutionGroupId, InputRange, ManagedCacheDomainReservation, ManagedCacheReservation,
+        ManagedClockedStateReservation, ModelInstanceId, SequencePhase, StageId, WorkCost,
+        WorkUnit,
     };
+    use crate::kv::v2::{StateClock, StateGroupId};
     use crate::kv::{CacheBlockRef, CacheDomainId, KvArenaId, KvGroupId};
     use candle_core::{DType, Device, Tensor};
     use std::sync::atomic::AtomicBool;
@@ -620,6 +649,7 @@ mod tests {
                 phase: SequencePhase::Prefill,
                 input: InputRange { start: 0, end: 1 },
                 max_output_steps: 1,
+                auxiliary_state: None,
             },
         }
     }
@@ -642,6 +672,7 @@ mod tests {
                 phase: crate::engine::SequencePhase::Prefill,
                 input: crate::engine::InputRange { start: 0, end: 1 },
                 max_output_steps: 1,
+                auxiliary_state: None,
             },
         };
 
@@ -729,7 +760,7 @@ mod tests {
                 }],
                 writable_blocks: vec![block],
             }],
-            tensor_state: None,
+            clocked_state: None,
         };
         let lane = BatchLaneKey {
             execution_group: ExecutionGroupId::new(1),
@@ -898,6 +929,144 @@ mod tests {
     }
 
     #[test]
+    fn selected_tensor_only_completion_crosses_production_dispatch_exactly() {
+        let executor = NativeExecutor::new(super::super::WorkerConfig::default());
+        let mut request = EngineCoreRequest::tts("clocked receipt");
+        request.id = "clocked-receipt".to_string();
+        let mut scheduled = scheduled(&request.id, 71);
+        let group = StateGroupId::new(2);
+        let clock = StateClock::AudioSamples;
+        scheduled.work = WorkUnit::SequenceStep {
+            phase: SequencePhase::Prefill,
+            input: InputRange::new(0, 1).unwrap(),
+            max_output_steps: 1,
+            auxiliary_state: Some(Arc::from([ClockedStateSpan::new(
+                group,
+                clock.clone(),
+                InputRange::new(0, 3_200).unwrap(),
+            )
+            .unwrap()])),
+        };
+        let physical_selection = TensorStateSelection {
+            group,
+            clock,
+            expected_cursor: 0,
+            target_cursor: 3_200,
+        };
+        let model_instance = ModelInstanceId::new(4);
+        let sequence = PhysicalStateSequenceId::new(9).unwrap();
+        let transaction = PhysicalStateTransactionId::new(scheduled.plan_id).unwrap();
+        let completion = TensorStateBatchCompletion::for_dispatch_test(
+            transaction,
+            sequence,
+            Arc::from([physical_selection.clone()]),
+        );
+        let reservation = ManagedCacheReservation {
+            txn_id: scheduled.plan_id,
+            session: scheduled.session_key(),
+            session_generation: crate::engine::ManagedSessionGeneration::INITIAL,
+            domains: vec![],
+            clocked_state: Some(
+                ManagedClockedStateReservation::selected(
+                    model_instance,
+                    sequence.get(),
+                    Arc::from([physical_selection]),
+                )
+                .unwrap(),
+            ),
+        };
+        let rows = vec![ReadyQuantum {
+            plan_id: scheduled.plan_id,
+            session: scheduled.session_key(),
+            lane: BatchLaneKey {
+                execution_group: ExecutionGroupId::new(1),
+                model_instance,
+                adapter_instance: AdapterInstanceId::new(1),
+                adapter_abi: AdapterAbiRevision::new(1),
+                capability_id: "asr".into(),
+                stage_id: StageId::new(1),
+                backend: BackendKind::Cpu,
+                device_ordinal: None,
+                compute_dtype: "f32".into(),
+                state_dtype: "f32".into(),
+                tensor_layout: "tensor".into(),
+                quantization: "none".into(),
+                state_schema: "clocked".into(),
+                kernel_mode: "reference".into(),
+                semantic_mode: "greedy".into(),
+                shape_bucket: "audio.3200".into(),
+            },
+            work: scheduled.work.clone(),
+            cost: WorkCost::new(1, 1, 0),
+            managed_cache: Some(reservation),
+        }];
+        let output = ModelSessionResult::yielded(
+            ExecutorOutput {
+                request_id: request.id.clone(),
+                audio: None,
+                text: None,
+                input_transcription: None,
+                tokens_processed: 1,
+                tokens_generated: 0,
+                finished: false,
+                phase_timing_override: None,
+                asr_diagnostics: None,
+                error: None,
+            },
+            crate::engine::YieldReason::QuantumExhausted,
+        )
+        .with_clocked_state_completion(completion.clone());
+        let exact = executor
+            .finish_scheduled_execution(
+                &[&request],
+                std::slice::from_ref(&scheduled),
+                vec![output],
+                BatchDispatch::serial(),
+                Some(&rows),
+            )
+            .unwrap();
+        assert_eq!(
+            exact[0]
+                .managed_cache
+                .as_ref()
+                .and_then(|receipt| receipt.clocked_state())
+                .map(|receipt| receipt.completion()),
+            Some(&completion)
+        );
+
+        scheduled.num_tokens = 2;
+        let partial = ModelSessionResult::yielded(
+            ExecutorOutput {
+                request_id: request.id.clone(),
+                audio: None,
+                text: None,
+                input_transcription: None,
+                tokens_processed: 1,
+                tokens_generated: 0,
+                finished: false,
+                phase_timing_override: None,
+                asr_diagnostics: None,
+                error: None,
+            },
+            crate::engine::YieldReason::QuantumExhausted,
+        )
+        .with_clocked_state_completion(completion);
+        let partial = executor
+            .finish_scheduled_execution(
+                &[&request],
+                std::slice::from_ref(&scheduled),
+                vec![partial],
+                BatchDispatch::serial(),
+                Some(&rows),
+            )
+            .unwrap();
+        assert!(partial[0].output.error.as_deref().is_some_and(|message| {
+            message.contains("selected auxiliary state requires exact scheduled progress")
+        }));
+        assert!(partial[0].managed_cache.is_none());
+    }
+
+    #[test]
     fn one_backend_batch_completion_authenticates_each_ragged_row_subset() {
         let arena = KvArenaId {
             model_instance: ModelInstanceId::new(9),
@@ -980,7 +1149,7 @@ mod tests {
                     }],
                     writable_blocks: vec![block],
                 }],
-                tensor_state: None,
+                clocked_state: None,
             };
             let receipt = reservation
                 .completed_write_receipt(std::slice::from_ref(&completion))

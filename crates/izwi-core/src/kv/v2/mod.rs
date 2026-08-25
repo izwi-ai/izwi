@@ -41,12 +41,12 @@ pub(crate) use contract::{
     AppendStateDomainSpec, AttentionLogitSoftcap, AttentionMask, AttentionPattern, BoundedShape,
     CheckpointPolicy, InferenceStateAbi, InferenceStateContract, KeyEncoding, PageSizeConstraint,
     PagedAttentionDomainSpec, PagedAttentionLayerSpec, PlacementPolicy, PositionSemantics,
-    PrefixPolicy, RingStateDomainSpec, ShapeAxis, ShapeDimension, ShapeExtent, StateClock,
-    StateComponentId, StateDType, StateDomainHeader, StateDomainId, StateDomainSpec, StateGroupId,
-    StateGroupSpec, StateScope, StaticAttentionDomainSpec, StaticAttentionLayerSpec,
-    StaticTensorDomainSpec, TensorComponentSpec, TensorRole, TensorStateDomainSpec,
-    CURRENT_INFERENCE_STATE_ABI,
+    PrefixPolicy, RingStateDomainSpec, ShapeAxis, ShapeDimension, ShapeExtent, StateComponentId,
+    StateDType, StateDomainHeader, StateDomainId, StateDomainSpec, StateGroupSpec, StateScope,
+    StaticAttentionDomainSpec, StaticAttentionLayerSpec, StaticTensorDomainSpec,
+    TensorComponentSpec, TensorRole, TensorStateDomainSpec, CURRENT_INFERENCE_STATE_ABI,
 };
+pub use contract::{StateClock, StateGroupId};
 #[allow(unused_imports)]
 pub(crate) use descriptor::{
     minimum_physical_bytes_for_capacity, stage_graph_fingerprint, CapabilityStateDescriptorV2,

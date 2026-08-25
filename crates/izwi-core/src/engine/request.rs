@@ -15,8 +15,8 @@ use super::metrics::record_engine_stream_backpressure;
 use super::output::StreamingOutput;
 use super::types::{GenerationParams, Priority, RequestId, TaskType, TokenId};
 use super::{
-    BatchId, BatchLaneKey, OutputVisibility, PlanId, ResourceAmount, ResourceVector, SessionKey,
-    StageId, WorkCost,
+    BatchId, BatchLaneKey, ClockedStateProjection, ClockedStateSpan, InputRange, OutputVisibility,
+    PlanId, ResourceAmount, ResourceVector, SessionKey, StageDescriptor, StageId, WorkCost,
 };
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
@@ -814,6 +814,13 @@ impl PreparedAsrEncoderArtifactValue {
             Self::VibeVoice(value) => {
                 Ok((value.resident_host_bytes(), value.resident_tensor_bytes()))
             }
+        }
+    }
+
+    fn clocked_state_projections(&self) -> &[ClockedStateProjection] {
+        match self {
+            Self::VibeVoice(value) => value.tokenizer_state_projections(),
+            Self::Qwen3(_) | Self::Whisper(_) => &[],
         }
     }
 }
@@ -2411,6 +2418,78 @@ impl EngineCoreRequest {
             })
     }
 
+    /// Derive independently clocked retained-state work from immutable
+    /// preparation metadata. This method never chooses a model or a stage:
+    /// the already-bound stage authorizes exact group/clock pairs, while Core
+    /// authenticates the returned spans against the physical state plan.
+    pub(crate) fn project_auxiliary_state_spans(
+        &self,
+        stage: &StageDescriptor,
+        input: InputRange,
+    ) -> Result<Option<Arc<[ClockedStateSpan]>>> {
+        let Some(authorized) = stage.retained_state_selections.as_deref() else {
+            return Ok(None);
+        };
+        let projections = if let Some(prepared) = self.prepared_asr_encoder_artifact.as_ref() {
+            if self.model_variant != Some(prepared.model_variant)
+                || self.asr_execution_source_fingerprint(prepared.model_variant)?
+                    != prepared.source_fingerprint
+                || self.uses_asr_long_form_atomic()
+            {
+                return Err(Error::InvalidInput(format!(
+                    "ASR request {} changed after auxiliary state projection preparation",
+                    self.id
+                )));
+            }
+            prepared.artifact.clocked_state_projections()
+        } else {
+            &[]
+        };
+
+        let mut previous = None;
+        let mut spans = Vec::new();
+        for projection in projections {
+            let group = projection.selection().group();
+            let primary = projection.primary();
+            if let Some((previous_group, previous_clock, previous_end)) = previous.as_ref() {
+                if group.get() < *previous_group
+                    || (group.get() == *previous_group
+                        && (projection.selection().clock() != previous_clock
+                            || primary.start < *previous_end))
+                {
+                    return Err(Error::InvalidInput(format!(
+                        "request {} has non-canonical clocked state projections",
+                        self.id
+                    )));
+                }
+            }
+            previous = Some((
+                group.get(),
+                projection.selection().clock().clone(),
+                primary.end,
+            ));
+
+            let Some(span) = projection.project(input)? else {
+                continue;
+            };
+            if !authorized
+                .iter()
+                .any(|selection| selection == projection.selection())
+            {
+                return Err(Error::InvalidInput(format!(
+                    "stage {} does not authorize request {} auxiliary group {} {:?}",
+                    stage.name,
+                    self.id,
+                    group.get(),
+                    projection.selection().clock()
+                )));
+            }
+            spans.push(span);
+        }
+
+        Ok(Some(Arc::from(spans)))
+    }
+
     pub(crate) fn install_prepared_sequence_input_tokens(
         &mut self,
         input_tokens: usize,
@@ -3969,6 +4048,74 @@ mod tests {
         assert!(long
             .install_prepared_sequence_input_tokens(32, 4096)
             .is_err());
+    }
+
+    #[test]
+    fn vibevoice_request_projects_only_acoustic_prefill_into_audio_samples() {
+        let variant = ModelVariant::VibeVoiceAsr;
+        let mut request = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+        request
+            .install_prepared_asr_audio(variant, vec![0.0; 9_600], 24_000)
+            .unwrap();
+        request
+            .install_prepared_sequence_input_tokens(12, 4096)
+            .unwrap();
+        request
+            .install_prepared_vibevoice_artifact(
+                variant,
+                Arc::new(VibeVoiceAsrPreparedArtifact::for_test(12, 4..7, 9_600, 8).unwrap()),
+            )
+            .unwrap();
+
+        let profile = super::super::ExecutionProfile::fail_closed(
+            BackendKind::Cpu,
+            Some(variant),
+            super::super::ExecutionMode::Sequence,
+        );
+        let mut prefill = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            crate::models::architectures::vibevoice::VIBEVOICE_ASR_PREFILL_STAGE,
+            &profile,
+            super::super::NativeBatchMode::None,
+        );
+        prefill.retained_state_selections = Some(vec![super::super::ClockedStateSelection::new(
+            crate::models::architectures::vibevoice::VIBEVOICE_ASR_TOKENIZER_GROUP,
+            crate::kv::v2::StateClock::AudioSamples,
+        )
+        .unwrap()]);
+
+        let before = request
+            .project_auxiliary_state_spans(&prefill, InputRange::new(0, 4).unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(before.is_empty());
+        let overlap = request
+            .project_auxiliary_state_spans(&prefill, InputRange::new(3, 6).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(overlap.len(), 1);
+        assert_eq!(overlap[0].input(), InputRange::new(0, 6_400).unwrap());
+
+        let mut unauthorized = prefill.clone();
+        unauthorized.retained_state_selections = Some(vec![]);
+        assert!(request
+            .project_auxiliary_state_spans(&unauthorized, InputRange::new(4, 5).unwrap())
+            .is_err());
+        let mut legacy = prefill.clone();
+        legacy.retained_state_selections = None;
+        assert!(request
+            .project_auxiliary_state_spans(&legacy, InputRange::new(4, 5).unwrap())
+            .unwrap()
+            .is_none());
+
+        let mut decode = prefill;
+        decode.name = crate::models::architectures::vibevoice::VIBEVOICE_ASR_DECODE_STAGE.into();
+        decode.retained_state_selections = Some(vec![]);
+        assert!(request
+            .project_auxiliary_state_spans(&decode, InputRange::new(12, 13).unwrap())
+            .unwrap()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

@@ -618,6 +618,7 @@ mod tests {
             shape_policy: StageShapePolicy::Exact,
             membership_safe_point: MembershipSafePoint::OperationBoundary,
             output_visibility: OutputVisibility::AfterQuantumCommit,
+            retained_state_selections: None,
         };
         let spec = lfm2_physical_state_spec(&config(), &[&[stage]]).unwrap();
         assert_eq!(spec.invocation.domains.len(), 2);

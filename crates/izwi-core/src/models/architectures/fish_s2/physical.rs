@@ -390,6 +390,7 @@ mod tests {
             shape_policy: StageShapePolicy::Independent,
             membership_safe_point: MembershipSafePoint::OperationBoundary,
             output_visibility: OutputVisibility::AfterQuantumCommit,
+            retained_state_selections: None,
         }
     }
 

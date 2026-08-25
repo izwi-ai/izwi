@@ -478,7 +478,7 @@ impl NativeExecutor {
                     prefill_steps: 0,
                     decode_steps: 0,
                 };
-                if let Some(reservation) = tensor_reservation {
+                if let Some(ref reservation) = tensor_reservation {
                     let QwenTtsPhysicalState::Prefill(state) = &mut active.state else {
                         unreachable!("fresh Qwen3-TTS state is prefill")
                     };
@@ -951,7 +951,7 @@ impl NativeExecutor {
                     "continuous Qwen3-TTS decode requires retained physical state".into(),
                 )
             })?;
-            let tensor_reservation = views.tensor_state;
+            let tensor_reservation = views.tensor_state.clone();
             let tensor_arena = request
                 .managed_cache_runtime()
                 .and_then(|runtime| runtime.tensor_state());
@@ -1202,6 +1202,7 @@ mod tests {
                     end: usize::from(!is_prefill) + num_tokens,
                 },
                 max_output_steps: num_tokens.max(1),
+                auxiliary_state: None,
             },
         }
     }

@@ -7,10 +7,12 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::backends::kv::KvWriteBatchCompletion;
+use crate::backends::state::{TensorStateBatchCompletion, TensorStateSelection};
 use crate::backends::BackendKind;
 use crate::config::PhysicalInFlightLimit;
 use crate::engine::cache::coordinator::GroupBlockTable;
 use crate::error::{Error, Result};
+pub use crate::kv::v2::{StateClock, StateGroupId};
 use crate::kv::{CacheBlockRef, CacheDomainId, KvArenaId, KvSlotRef};
 use crate::model::ModelVariant;
 
@@ -86,6 +88,168 @@ impl InputRange {
     }
 }
 
+/// Load-authored authorization for one independently clocked retained-state
+/// group. A selection permits a stage to advance the group; it does not by
+/// itself require every row or quantum to do so.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ClockedStateSelection {
+    group: StateGroupId,
+    clock: StateClock,
+}
+
+impl ClockedStateSelection {
+    pub fn new(group: StateGroupId, clock: StateClock) -> Result<Self> {
+        if group.get() == 0 {
+            return Err(Error::InvalidInput(
+                "clocked retained-state selection has a zero group id".into(),
+            ));
+        }
+        if matches!(&clock, StateClock::Custom(name) if name.trim().is_empty()) {
+            return Err(Error::InvalidInput(
+                "custom retained-state clock name cannot be empty".into(),
+            ));
+        }
+        Ok(Self { group, clock })
+    }
+
+    pub const fn group(&self) -> StateGroupId {
+        self.group
+    }
+
+    pub const fn clock(&self) -> &StateClock {
+        &self.clock
+    }
+}
+
+/// Exact input interval by which one retained-state group advances in a
+/// sequence quantum. Spans are sealed by Core after exact stage and physical
+/// state-plan authentication; executors may consume but never invent them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ClockedStateSpan {
+    group: StateGroupId,
+    clock: StateClock,
+    input: InputRange,
+}
+
+impl ClockedStateSpan {
+    pub fn new(group: StateGroupId, clock: StateClock, input: InputRange) -> Result<Self> {
+        if group.get() == 0 {
+            return Err(Error::InvalidInput(
+                "clocked retained-state span has a zero group id".into(),
+            ));
+        }
+        if input.is_empty() {
+            return Err(Error::InvalidInput(
+                "clocked retained-state span cannot be empty".into(),
+            ));
+        }
+        Ok(Self {
+            group,
+            clock,
+            input,
+        })
+    }
+
+    pub const fn group(&self) -> StateGroupId {
+        self.group
+    }
+
+    pub const fn clock(&self) -> &StateClock {
+        &self.clock
+    }
+
+    pub const fn input(&self) -> InputRange {
+        self.input
+    }
+}
+
+/// Immutable request-owned mapping from a primary sequence interval to an
+/// independently clocked retained-state interval. Preparation authors these
+/// projections; Core intersects and seals them for each scheduled quantum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClockedStateProjection {
+    primary: InputRange,
+    selection: ClockedStateSelection,
+    auxiliary: InputRange,
+    scale: usize,
+}
+
+impl ClockedStateProjection {
+    pub(crate) fn new(
+        primary: InputRange,
+        selection: ClockedStateSelection,
+        auxiliary: InputRange,
+    ) -> Result<Self> {
+        if primary.is_empty() || auxiliary.is_empty() {
+            return Err(Error::InvalidInput(
+                "clocked retained-state projection ranges cannot be empty".into(),
+            ));
+        }
+        if auxiliary.len() % primary.len() != 0 {
+            return Err(Error::InvalidInput(
+                "clocked retained-state projection has no exact integral scale".into(),
+            ));
+        }
+        let scale = auxiliary.len() / primary.len();
+        if scale == 0 {
+            return Err(Error::InvalidInput(
+                "clocked retained-state projection has a zero scale".into(),
+            ));
+        }
+        Ok(Self {
+            primary,
+            selection,
+            auxiliary,
+            scale,
+        })
+    }
+
+    pub(crate) const fn selection(&self) -> &ClockedStateSelection {
+        &self.selection
+    }
+
+    pub(crate) const fn primary(&self) -> InputRange {
+        self.primary
+    }
+
+    pub(crate) const fn auxiliary(&self) -> InputRange {
+        self.auxiliary
+    }
+
+    pub(crate) const fn scale(&self) -> usize {
+        self.scale
+    }
+
+    pub(crate) fn project(&self, scheduled: InputRange) -> Result<Option<ClockedStateSpan>> {
+        let start = scheduled.start.max(self.primary.start);
+        let end = scheduled.end.min(self.primary.end);
+        if end <= start {
+            return Ok(None);
+        }
+        let mapped_start = start
+            .checked_sub(self.primary.start)
+            .and_then(|offset| offset.checked_mul(self.scale))
+            .and_then(|offset| self.auxiliary.start.checked_add(offset))
+            .ok_or_else(|| Error::InvalidInput("clocked state projection start overflow".into()))?;
+        let mapped_end = end
+            .checked_sub(self.primary.start)
+            .and_then(|offset| offset.checked_mul(self.scale))
+            .and_then(|offset| self.auxiliary.start.checked_add(offset))
+            .ok_or_else(|| Error::InvalidInput("clocked state projection end overflow".into()))?;
+        if mapped_end > self.auxiliary.end {
+            return Err(Error::InvalidInput(
+                "clocked state projection exceeds its authenticated auxiliary interval".into(),
+            ));
+        }
+        ClockedStateSpan::new(
+            self.selection.group(),
+            self.selection.clock().clone(),
+            InputRange::new(mapped_start, mapped_end)?,
+        )
+        .map(Some)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SequencePhase {
     Prefill,
@@ -104,6 +268,11 @@ pub enum WorkUnit {
         phase: SequencePhase,
         input: InputRange,
         max_output_steps: usize,
+        /// Core-sealed retained tensor/static-state work distinct from the
+        /// primary decoder-token interval.
+        /// `None` preserves legacy decoder-coupled retained state. `Some([])`
+        /// is an authenticated explicit selection of no auxiliary group.
+        auxiliary_state: Option<Arc<[ClockedStateSpan]>>,
     },
     AtomicJob {
         kind: String,
@@ -280,6 +449,13 @@ pub struct StageDescriptor {
     pub shape_policy: StageShapePolicy,
     pub membership_safe_point: MembershipSafePoint,
     pub output_visibility: OutputVisibility,
+    /// Canonical load-authored authorization for independently clocked
+    /// retained groups this stage may advance.
+    #[serde(default)]
+    /// `None` preserves the legacy contract in which every retained group is
+    /// coupled to the primary decoder cursor. `Some([])` explicitly selects no
+    /// auxiliary group; a non-empty value authorizes exactly those groups.
+    pub retained_state_selections: Option<Vec<ClockedStateSelection>>,
 }
 
 impl StageDescriptor {
@@ -344,6 +520,7 @@ impl StageDescriptor {
             shape_policy,
             membership_safe_point,
             output_visibility: OutputVisibility::AfterQuantumCommit,
+            retained_state_selections: None,
         }
     }
 
@@ -352,6 +529,22 @@ impl StageDescriptor {
             return Err(Error::InvalidInput(
                 "execution stage name cannot be empty".to_string(),
             ));
+        }
+        let mut previous_group = None;
+        for selection in self
+            .retained_state_selections
+            .as_deref()
+            .unwrap_or_default()
+        {
+            if selection.group().get() == 0
+                || previous_group.is_some_and(|previous| previous >= selection.group().get())
+            {
+                return Err(Error::InvalidInput(
+                    "execution stage retained-state selections must have nonzero, strictly increasing group ids"
+                        .into(),
+                ));
+            }
+            previous_group = Some(selection.group().get());
         }
         if self.max_batch_size == 0 || self.max_work_units == 0 {
             return Err(Error::InvalidInput(
@@ -1049,12 +1242,68 @@ pub struct ManagedCacheReservation {
     pub session: SessionKey,
     pub session_generation: ManagedSessionGeneration,
     pub domains: Vec<ManagedCacheDomainReservation>,
-    pub tensor_state: Option<ManagedTensorStateReservation>,
+    pub clocked_state: Option<ManagedClockedStateReservation>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ManagedTensorStateReservation {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedClockedStateReservation {
+    model_instance: ModelInstanceId,
     pub sequence: u64,
+    /// `None` is a legacy all-domain decoder-coupled transaction; `Some`
+    /// authenticates the exact independently clocked selected groups.
+    selections: Option<Arc<[TensorStateSelection]>>,
+}
+
+/// Compatibility name retained while decoder-coupled model adapters migrate
+/// to the explicit clocked-state vocabulary.
+pub type ManagedTensorStateReservation = ManagedClockedStateReservation;
+
+impl ManagedClockedStateReservation {
+    pub(crate) fn legacy(model_instance: ModelInstanceId, sequence: u64) -> Result<Self> {
+        Self::new(model_instance, sequence, None)
+    }
+
+    pub(crate) fn selected(
+        model_instance: ModelInstanceId,
+        sequence: u64,
+        selections: Arc<[TensorStateSelection]>,
+    ) -> Result<Self> {
+        if selections.is_empty() {
+            return Err(Error::InvalidInput(
+                "managed clocked-state reservation has no selected groups".into(),
+            ));
+        }
+        Self::new(model_instance, sequence, Some(selections))
+    }
+
+    fn new(
+        model_instance: ModelInstanceId,
+        sequence: u64,
+        selections: Option<Arc<[TensorStateSelection]>>,
+    ) -> Result<Self> {
+        if sequence == 0 {
+            return Err(Error::InvalidInput(
+                "managed clocked-state reservation has a zero sequence id".into(),
+            ));
+        }
+        Ok(Self {
+            model_instance,
+            sequence,
+            selections,
+        })
+    }
+
+    pub(crate) const fn model_instance(&self) -> ModelInstanceId {
+        self.model_instance
+    }
+
+    pub(crate) const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub(crate) fn selections(&self) -> Option<&[TensorStateSelection]> {
+        self.selections.as_deref()
+    }
 }
 
 /// One physical cache-domain transaction within a row reservation.
@@ -1083,14 +1332,88 @@ impl ManagedCacheReservation {
                 "managed-cache reservation does not match its physical row".to_string(),
             ));
         }
-        if self.domains.is_empty() {
+        if self.domains.is_empty() && self.clocked_state.is_none() {
             return Err(Error::InvalidInput(
-                "managed-cache reservation has no cache domains".to_string(),
+                "managed-cache reservation has no paged or clocked state".to_string(),
             ));
         }
+        if let Some(clocked) = self.clocked_state.as_ref() {
+            if clocked.model_instance() != row.lane.model_instance
+                || self
+                    .domains
+                    .iter()
+                    .any(|domain| domain.arena.model_instance != clocked.model_instance())
+            {
+                return Err(Error::InvalidInput(
+                    "managed clocked-state reservation crossed its exact model instance".into(),
+                ));
+            }
+        }
+        let auxiliary = match &row.work {
+            WorkUnit::SequenceStep {
+                auxiliary_state, ..
+            } => auxiliary_state.as_deref(),
+            _ => None,
+        };
+        match (auxiliary, self.clocked_state.as_ref()) {
+            (None, Some(reservation)) if reservation.selections().is_some() => {
+                return Err(Error::InvalidInput(
+                    "selected clocked-state reservation was attached to legacy sequence work"
+                        .into(),
+                ));
+            }
+            (Some(spans), None) if !spans.is_empty() => {
+                return Err(Error::InvalidInput(
+                    "clocked-state sequence spans have no physical reservation".into(),
+                ));
+            }
+            (Some(spans), None) if spans.is_empty() => {}
+            (Some(spans), Some(_)) if spans.is_empty() => {
+                return Err(Error::InvalidInput(
+                    "explicit empty clocked-state work cannot reserve a tensor transaction".into(),
+                ));
+            }
+            (Some(spans), Some(reservation)) => {
+                let selections = reservation.selections().ok_or_else(|| {
+                    Error::InvalidInput(
+                        "explicit clocked-state work received a legacy physical reservation".into(),
+                    )
+                })?;
+                if spans.len() != selections.len() {
+                    return Err(Error::InvalidInput(
+                        "clocked-state reservation does not match the row's exact ordered spans"
+                            .into(),
+                    ));
+                }
+                for (span, selection) in spans.iter().zip(selections) {
+                    let expected_cursor = u64::try_from(span.input().start).map_err(|_| {
+                        Error::InvalidInput(
+                            "clocked-state span start exceeds physical cursor width".into(),
+                        )
+                    })?;
+                    let target_cursor = u64::try_from(span.input().end).map_err(|_| {
+                        Error::InvalidInput(
+                            "clocked-state span end exceeds physical cursor width".into(),
+                        )
+                    })?;
+                    if selection.group != span.group()
+                        || &selection.clock != span.clock()
+                        || selection.expected_cursor != expected_cursor
+                        || selection.target_cursor != target_cursor
+                    {
+                        return Err(Error::InvalidInput(
+                            "clocked-state reservation does not match the row's exact ordered spans"
+                                .into(),
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
         if self
-            .tensor_state
-            .is_some_and(|reservation| reservation.sequence == 0)
+            .clocked_state
+            .as_ref()
+            .is_some_and(|reservation| reservation.sequence() == 0)
         {
             return Err(Error::InvalidInput(
                 "managed tensor-state reservation has a zero sequence id".into(),
@@ -1143,7 +1466,7 @@ impl ManagedCacheReservation {
         completions: &[Arc<KvWriteBatchCompletion>],
         accepted_prefix: Option<u32>,
     ) -> Result<ManagedCacheReceipt> {
-        if completions.is_empty() {
+        if completions.is_empty() && !self.domains.is_empty() {
             return Err(Error::InferenceError(
                 "managed-cache row returned no backend write completion".into(),
             ));
@@ -1246,6 +1569,7 @@ impl ManagedCacheReservation {
             reservation: self.clone(),
             domains: receipts,
             accepted_prefix,
+            clocked_state: None,
         })
     }
 
@@ -1264,6 +1588,7 @@ impl ManagedCacheReservation {
                 })
                 .collect(),
             accepted_prefix: None,
+            clocked_state: None,
         }
     }
 
@@ -1312,6 +1637,7 @@ impl ManagedCacheReservation {
             reservation: self.clone(),
             domains,
             accepted_prefix: Some(committed_tokens),
+            clocked_state: None,
         })
     }
 }
@@ -1362,6 +1688,22 @@ pub struct ManagedCacheReceipt {
     // `None` preserves the legacy exact-full-reservation receipt. `Some` is a
     // common accepted cursor authenticated from sealed backend completions.
     accepted_prefix: Option<u32>,
+    clocked_state: Option<ManagedClockedStateReceipt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedClockedStateReceipt {
+    completion: TensorStateBatchCompletion,
+}
+
+impl ManagedClockedStateReceipt {
+    pub(crate) fn new(completion: TensorStateBatchCompletion) -> Self {
+        Self { completion }
+    }
+
+    pub(crate) const fn completion(&self) -> &TensorStateBatchCompletion {
+        &self.completion
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1377,7 +1719,72 @@ impl ManagedCacheReceipt {
         self.accepted_prefix
     }
 
+    pub(crate) const fn clocked_state(&self) -> Option<&ManagedClockedStateReceipt> {
+        self.clocked_state.as_ref()
+    }
+
+    pub(crate) fn with_clocked_state_completion(
+        mut self,
+        completion: TensorStateBatchCompletion,
+    ) -> Result<Self> {
+        if self.clocked_state.is_some() {
+            return Err(Error::InvalidInput(
+                "managed receipt already carries a clocked-state completion".into(),
+            ));
+        }
+        let reservation = self.reservation.clocked_state.as_ref().ok_or_else(|| {
+            Error::InvalidInput(
+                "clocked-state completion has no matching managed reservation".into(),
+            )
+        })?;
+        let selected = reservation.selections().ok_or_else(|| {
+            Error::InvalidInput(
+                "legacy clocked-state reservation cannot accept a selected completion".into(),
+            )
+        })?;
+        if completion.sequence().get() != reservation.sequence()
+            || completion.selections().ne(selected.iter())
+        {
+            return Err(Error::InvalidInput(
+                "clocked-state completion does not match its exact managed reservation".into(),
+            ));
+        }
+        self.clocked_state = Some(ManagedClockedStateReceipt::new(completion));
+        Ok(self)
+    }
+
     pub(crate) fn validate(&self) -> Result<()> {
+        match (
+            self.reservation.clocked_state.as_ref(),
+            self.clocked_state.as_ref(),
+        ) {
+            (Some(reservation), Some(receipt)) => {
+                let selected = reservation.selections().ok_or_else(|| {
+                    Error::InferenceError(
+                        "legacy clocked-state reservation cannot carry a selected completion"
+                            .into(),
+                    )
+                })?;
+                if receipt.completion().sequence().get() != reservation.sequence()
+                    || receipt.completion().selections().ne(selected.iter())
+                {
+                    return Err(Error::InferenceError(
+                        "clocked-state receipt does not match its exact reservation".into(),
+                    ));
+                }
+            }
+            (Some(reservation), None) if reservation.selections().is_some() => {
+                return Err(Error::InferenceError(
+                    "selected clocked-state reservation has no arena completion".into(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(Error::InferenceError(
+                    "clocked-state receipt has no matching reservation".into(),
+                ));
+            }
+            _ => {}
+        }
         if self.domains.len() != self.reservation.domains.len() {
             return Err(Error::InferenceError(
                 "managed-cache receipt does not cover every reserved domain".to_string(),
@@ -2025,6 +2432,7 @@ impl ExecutionReport {
                 "execution report has an invalid dispatch width".to_string(),
             ));
         }
+        validate_plan_clocked_state(plan)?;
         match self.dispatch.kind {
             BatchDispatchKind::NotDispatched
                 if !matches!(
@@ -2221,6 +2629,59 @@ impl ExecutionReport {
     }
 }
 
+fn validate_plan_clocked_state(plan: &ExecutionPlan) -> Result<()> {
+    let WorkUnit::SequenceStep {
+        phase,
+        auxiliary_state,
+        ..
+    } = &plan.work
+    else {
+        return Ok(());
+    };
+    let policy = plan
+        .stage
+        .as_ref()
+        .and_then(|stage| stage.retained_state_selections.as_deref());
+    match (policy, auxiliary_state.as_deref()) {
+        (None, None) => return Ok(()),
+        (Some(_), Some(spans)) if *phase == SequencePhase::Decode && !spans.is_empty() => {
+            return Err(Error::InferenceError(
+                "sequence decode cannot advance auxiliary retained-state clocks".into(),
+            ));
+        }
+        (Some(selections), Some(spans)) => {
+            let mut previous_group = None;
+            for span in spans {
+                if span.input().is_empty()
+                    || previous_group.is_some_and(|previous| previous >= span.group().get())
+                {
+                    return Err(Error::InferenceError(
+                        "sequence auxiliary retained-state spans are not canonical and unique"
+                            .into(),
+                    ));
+                }
+                if selections
+                    .binary_search_by_key(&span.group().get(), |selection| selection.group().get())
+                    .ok()
+                    .and_then(|index| selections.get(index))
+                    .is_none_or(|selection| selection.clock() != span.clock())
+                {
+                    return Err(Error::InferenceError(
+                        "sequence auxiliary retained-state span is not authorized by its exact stage"
+                            .into(),
+                    ));
+                }
+                previous_group = Some(span.group().get());
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+    Err(Error::InferenceError(
+        "sequence auxiliary retained-state policy was not sealed into its plan".into(),
+    ))
+}
+
 #[derive(Debug, Clone)]
 pub struct ExecutionTracker {
     session: SessionKey,
@@ -2359,6 +2820,50 @@ mod tests {
         assert_eq!(stage.get(), 7);
         assert_eq!(batch.get(), 7);
         assert_eq!(AdapterAbiRevision::new(1).get(), 1);
+    }
+
+    #[test]
+    fn clocked_state_projection_maps_split_quanta_exactly() {
+        let projection = ClockedStateProjection::new(
+            InputRange::new(10, 14).unwrap(),
+            ClockedStateSelection::new(StateGroupId::new(2), StateClock::AudioSamples).unwrap(),
+            InputRange::new(1_000, 1_640).unwrap(),
+        )
+        .unwrap();
+        let first = projection
+            .project(InputRange::new(8, 12).unwrap())
+            .unwrap()
+            .unwrap();
+        let second = projection
+            .project(InputRange::new(12, 16).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.input(), InputRange::new(1_000, 1_320).unwrap());
+        assert_eq!(second.input(), InputRange::new(1_320, 1_640).unwrap());
+        assert!(projection
+            .project(InputRange::new(14, 15).unwrap())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn stage_clocked_state_authorization_is_canonical_and_tri_state() {
+        let profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        let mut stage = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            "prefill",
+            &profile,
+            NativeBatchMode::None,
+        );
+        assert!(stage.retained_state_selections.is_none());
+        stage.retained_state_selections = Some(vec![]);
+        stage.validate().unwrap();
+        stage.retained_state_selections = Some(vec![
+            ClockedStateSelection::new(StateGroupId::new(2), StateClock::AudioSamples).unwrap(),
+            ClockedStateSelection::new(StateGroupId::new(1), StateClock::EncoderTokens).unwrap(),
+        ]);
+        assert!(stage.validate().is_err());
     }
 
     #[test]
@@ -2543,11 +3048,13 @@ mod tests {
             phase: SequencePhase::Prefill,
             input: InputRange { start: 0, end: 8 },
             max_output_steps: 1,
+            auxiliary_state: None,
         };
         let decode_work = WorkUnit::SequenceStep {
             phase: SequencePhase::Decode,
             input: InputRange { start: 8, end: 9 },
             max_output_steps: 1,
+            auxiliary_state: None,
         };
         assert_eq!(
             binding.stage_for_work(&prefill_work).unwrap().id,
@@ -2599,6 +3106,7 @@ mod tests {
             phase: SequencePhase::Prefill,
             input: InputRange { start: 0, end: 1 },
             max_output_steps: 0,
+            auxiliary_state: None,
         };
         assert_eq!(
             binding.stage_for_work(&preparation_work).unwrap().id,
@@ -2632,6 +3140,7 @@ mod tests {
             shape_policy: StageShapePolicy::Ragged,
             membership_safe_point: MembershipSafePoint::OperationBoundary,
             output_visibility: OutputVisibility::AfterQuantumCommit,
+            retained_state_selections: None,
         };
         assert!(invalid.validate().is_err());
 
@@ -2926,6 +3435,7 @@ mod tests {
                 phase: SequencePhase::Decode,
                 input: InputRange { start: 0, end: 0 },
                 max_output_steps: 1,
+                auxiliary_state: None,
             },
         );
         plan.batch_mode = NativeBatchMode::Continuous;
@@ -2984,6 +3494,7 @@ mod tests {
                 phase: SequencePhase::Decode,
                 input: InputRange { start: 4, end: 7 },
                 max_output_steps: 1,
+                auxiliary_state: None,
             },
         );
         let arena = KvArenaId {
@@ -3019,7 +3530,7 @@ mod tests {
                 }],
                 writable_blocks: written_blocks.clone(),
             }],
-            tensor_state: None,
+            clocked_state: None,
         };
         let batch = PhysicalBatch {
             batch_id: BatchId::new(99),
@@ -3058,6 +3569,7 @@ mod tests {
                         page_tokens: 1,
                     }],
                     accepted_prefix: None,
+                    clocked_state: None,
                 }),
             }],
         };
@@ -3104,6 +3616,7 @@ mod tests {
             reservation: foreign,
             domains: Vec::new(),
             accepted_prefix: None,
+            clocked_state: None,
         });
         assert!(report.validate_against(&batch, &active).is_err());
     }
@@ -3131,6 +3644,7 @@ mod tests {
                 phase: SequencePhase::Prefill,
                 input: InputRange::new(4, 8).unwrap(),
                 max_output_steps: 1,
+                auxiliary_state: None,
             },
             batch_key: BatchKey {
                 backend: BackendKind::Cpu,
@@ -3161,6 +3675,56 @@ mod tests {
             output_finished: false,
             output_has_error: false,
         };
+        assert!(report.validate_against(&plan).is_err());
+    }
+
+    #[test]
+    fn report_authenticates_exact_clocked_state_policy() {
+        let selection =
+            ClockedStateSelection::new(StateGroupId::new(2), StateClock::AudioSamples).unwrap();
+        let span = ClockedStateSpan::new(
+            selection.group(),
+            selection.clock().clone(),
+            InputRange::new(160, 320).unwrap(),
+        )
+        .unwrap();
+        let mut plan = plan_for(
+            SessionKey::new("clocked".into(), 1),
+            WorkUnit::SequenceStep {
+                phase: SequencePhase::Prefill,
+                input: InputRange::new(1, 2).unwrap(),
+                max_output_steps: 1,
+                auxiliary_state: Some(Arc::from([span])),
+            },
+        );
+        let profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        let mut stage = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            "prefill",
+            &profile,
+            NativeBatchMode::None,
+        );
+        stage.retained_state_selections = Some(vec![selection]);
+        plan.stage = Some(stage);
+        let mut report = report_for(
+            &plan,
+            ExecutionDisposition::Finished(FinishReason::Completed),
+        );
+        report.input_consumed = 1;
+        assert!(report.validate_against(&plan).is_ok());
+
+        if let WorkUnit::SequenceStep {
+            auxiliary_state, ..
+        } = &mut plan.work
+        {
+            *auxiliary_state = Some(Arc::from([ClockedStateSpan::new(
+                StateGroupId::new(2),
+                StateClock::AudioFrames,
+                InputRange::new(1, 2).unwrap(),
+            )
+            .unwrap()]));
+        }
         assert!(report.validate_against(&plan).is_err());
     }
 
@@ -3299,6 +3863,7 @@ mod tests {
                 phase: SequencePhase::Decode,
                 input: InputRange { start: 0, end: 0 },
                 max_output_steps: 1,
+                auxiliary_state: None,
             },
         );
         let mut wrong_epoch = report_for(
@@ -3324,6 +3889,7 @@ mod tests {
                 phase: SequencePhase::Decode,
                 input: InputRange { start: 0, end: 0 },
                 max_output_steps: 1,
+                auxiliary_state: None,
             },
         );
         let no_progress = report_for(&plan, ExecutionDisposition::Progress);
@@ -3347,6 +3913,7 @@ mod tests {
                 phase: SequencePhase::Decode,
                 input: InputRange { start: 4, end: 5 },
                 max_output_steps: 1,
+                auxiliary_state: None,
             },
         );
         let disposition =
@@ -3398,6 +3965,7 @@ mod tests {
                 phase: SequencePhase::Decode,
                 input: InputRange { start: 0, end: 0 },
                 max_output_steps: 1,
+                auxiliary_state: None,
             },
         );
         let mut tracker = ExecutionTracker::new(session);
@@ -3432,6 +4000,7 @@ mod tests {
                 phase: SequencePhase::Decode,
                 input: InputRange { start: 0, end: 0 },
                 max_output_steps: 1,
+                auxiliary_state: None,
             },
         );
         let mut tracker = ExecutionTracker::new(session);
@@ -3477,6 +4046,7 @@ mod tests {
                 phase: SequencePhase::Decode,
                 input: InputRange { start: 0, end: 0 },
                 max_output_steps: 1,
+                auxiliary_state: None,
             },
         );
 
@@ -3507,6 +4077,7 @@ mod tests {
                 phase: SequencePhase::Decode,
                 input: InputRange { start: 0, end: 0 },
                 max_output_steps: 1,
+                auxiliary_state: None,
             },
         );
         let mut failed = report_for(
@@ -3549,6 +4120,7 @@ mod tests {
                 phase: SequencePhase::Decode,
                 input: InputRange { start: 0, end: 0 },
                 max_output_steps: 1,
+                auxiliary_state: None,
             },
         );
         let mut tracker = ExecutionTracker::new(session);

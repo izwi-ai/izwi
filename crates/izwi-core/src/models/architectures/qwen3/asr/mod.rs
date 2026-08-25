@@ -4763,6 +4763,7 @@ mod tests {
             shape_policy: StageShapePolicy::Exact,
             membership_safe_point: MembershipSafePoint::OperationBoundary,
             output_visibility: OutputVisibility::AfterQuantumCommit,
+            retained_state_selections: None,
         }
     }
 

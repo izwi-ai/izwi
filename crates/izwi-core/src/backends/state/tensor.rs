@@ -1,13 +1,16 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use candle_core::{DType, Device, Tensor};
 
 use crate::error::{Error, Result};
 use crate::kv::v2::{
-    ResolvedNonPagedDomainPlan, ResolvedStatePlan, ResolvedTensorComponent, StateComponentId,
-    StateDType, StateDomainId,
+    InferenceStateContract, ResolvedNonPagedDomainPlan, ResolvedStatePlan, ResolvedTensorComponent,
+    StateClock, StateComponentId, StateDType, StateDomainId, StateGroupId,
 };
+
+static NEXT_TENSOR_ARENA_NONCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct PhysicalStateSequenceId(u64);
@@ -62,6 +65,76 @@ struct StagedTransaction {
     sequence: PhysicalStateSequenceId,
     state: SequenceState,
     touched: HashSet<StateDomainId>,
+    selection: TransactionSelection,
+}
+
+#[derive(Clone)]
+enum TransactionSelection {
+    /// Compatibility mode for the original decoder-token-coupled API.
+    AllDomains,
+    Selected(Arc<[ResolvedTensorStateSelection]>),
+}
+
+/// One independently clocked consistency-group transition selected by a
+/// bound execution stage. Domains are resolved and sealed by the arena.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct TensorStateSelection {
+    pub(crate) group: StateGroupId,
+    pub(crate) clock: StateClock,
+    pub(crate) expected_cursor: u64,
+    pub(crate) target_cursor: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ResolvedTensorStateSelection {
+    selection: TensorStateSelection,
+    domains: Arc<[StateDomainId]>,
+}
+
+/// Arena-authenticated proof that every domain in every selected consistency
+/// group reached its independently clocked target. Private fields prevent a
+/// model or dispatcher from fabricating a completion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TensorStateBatchCompletion {
+    arena_nonce: u64,
+    transaction: PhysicalStateTransactionId,
+    sequence: PhysicalStateSequenceId,
+    selections: Arc<[ResolvedTensorStateSelection]>,
+}
+
+impl TensorStateBatchCompletion {
+    pub(crate) const fn transaction(&self) -> PhysicalStateTransactionId {
+        self.transaction
+    }
+
+    pub(crate) const fn sequence(&self) -> PhysicalStateSequenceId {
+        self.sequence
+    }
+
+    pub(crate) fn selections(&self) -> impl ExactSizeIterator<Item = &TensorStateSelection> {
+        self.selections.iter().map(|selection| &selection.selection)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_dispatch_test(
+        transaction: PhysicalStateTransactionId,
+        sequence: PhysicalStateSequenceId,
+        selections: Arc<[TensorStateSelection]>,
+    ) -> Self {
+        Self {
+            arena_nonce: 1,
+            transaction,
+            sequence,
+            selections: selections
+                .iter()
+                .cloned()
+                .map(|selection| ResolvedTensorStateSelection {
+                    selection,
+                    domains: Arc::from([]),
+                })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -175,7 +248,9 @@ pub(crate) struct TensorStateOccupancy {
 /// invisible until every domain in its consistency closure is staged and the
 /// transaction is committed under one lock.
 pub(crate) struct TensorStateArena {
+    nonce: u64,
     plan: Arc<ResolvedStatePlan>,
+    group_clocks: Option<HashMap<StateGroupId, StateClock>>,
     capacity: TensorStateCapacity,
     device: Device,
     state: Mutex<ArenaState>,
@@ -195,6 +270,62 @@ impl std::fmt::Debug for TensorStateArena {
 impl TensorStateArena {
     pub(crate) fn new(
         plan: Arc<ResolvedStatePlan>,
+        capacity: TensorStateCapacity,
+        device: Device,
+    ) -> Result<Self> {
+        Self::new_inner(plan, None, capacity, device)
+    }
+
+    pub(crate) fn new_with_contract(
+        plan: Arc<ResolvedStatePlan>,
+        contract: &InferenceStateContract,
+        capacity: TensorStateCapacity,
+        device: Device,
+    ) -> Result<Self> {
+        if plan.contract_fingerprint != contract.fingerprint()? {
+            return Err(invalid(
+                "tensor state arena contract does not match its resolved plan",
+            ));
+        }
+        let mut clocks = HashMap::new();
+        for group in &contract.groups {
+            if !plan
+                .non_paged
+                .iter()
+                .any(|resolved| resolved.group() == group.id)
+            {
+                continue;
+            }
+            let mut clock = None;
+            for domain_id in &group.domains {
+                let domain = contract
+                    .domains
+                    .iter()
+                    .find(|domain| domain.id() == *domain_id)
+                    .ok_or_else(|| {
+                        invalid("tensor state group references a missing contract domain")
+                    })?;
+                if clock
+                    .as_ref()
+                    .is_some_and(|expected| expected != &domain.header().clock)
+                {
+                    return Err(invalid(
+                        "one tensor state consistency group has divergent semantic clocks",
+                    ));
+                }
+                clock.get_or_insert_with(|| domain.header().clock.clone());
+            }
+            clocks.insert(
+                group.id,
+                clock.expect("validated consistency group has at least one domain"),
+            );
+        }
+        Self::new_inner(plan, Some(clocks), capacity, device)
+    }
+
+    fn new_inner(
+        plan: Arc<ResolvedStatePlan>,
+        group_clocks: Option<HashMap<StateGroupId, StateClock>>,
         capacity: TensorStateCapacity,
         device: Device,
     ) -> Result<Self> {
@@ -228,7 +359,9 @@ impl TensorStateArena {
             ));
         }
         Ok(Self {
+            nonce: allocate_arena_nonce(&NEXT_TENSOR_ARENA_NONCE)?,
             plan,
+            group_clocks,
             capacity,
             device,
             state: Mutex::new(ArenaState::default()),
@@ -241,6 +374,24 @@ impl TensorStateArena {
 
     pub(crate) const fn capacity(&self) -> TensorStateCapacity {
         self.capacity
+    }
+
+    /// Authenticate one load-authored group/clock selection without opening a
+    /// transaction. Core performs canonical list validation before calling.
+    pub(crate) fn validate_group_clock(
+        &self,
+        group: StateGroupId,
+        clock: &StateClock,
+    ) -> Result<()> {
+        let clocks = self.group_clocks.as_ref().ok_or_else(|| {
+            invalid("clocked state selection requires a contract-authenticated arena")
+        })?;
+        if clocks.get(&group) != Some(clock) {
+            return Err(invalid(
+                "clocked state selection does not match a non-paged group clock",
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn occupancy(&self) -> Result<TensorStateOccupancy> {
@@ -307,6 +458,66 @@ impl TensorStateArena {
                 sequence,
                 state: live,
                 touched: HashSet::new(),
+                selection: TransactionSelection::AllDomains,
+            },
+        );
+        Ok(())
+    }
+
+    /// Begin a transaction over only the canonically ordered non-paged
+    /// consistency groups selected by the bound stage.
+    pub(crate) fn begin_selected(
+        &self,
+        transaction: PhysicalStateTransactionId,
+        sequence: PhysicalStateSequenceId,
+        selections: &[TensorStateSelection],
+    ) -> Result<()> {
+        let resolved = self.resolve_selections(selections)?;
+        let mut state = self.lock()?;
+        if state.closed {
+            return Err(invalid("physical state arena is closed"));
+        }
+        if state.transactions.contains_key(&transaction) {
+            return Err(invalid("physical state transaction id is already active"));
+        }
+        if state.transactions.len() >= self.capacity.transaction_capacity as usize {
+            return Err(Error::Backpressure(
+                "tensor state transaction capacity is exhausted".into(),
+            ));
+        }
+        if state
+            .transactions
+            .values()
+            .any(|active| active.sequence == sequence)
+        {
+            return Err(invalid(
+                "physical state sequence already has an active transaction",
+            ));
+        }
+        let live = state
+            .sequences
+            .get(&sequence)
+            .cloned()
+            .ok_or_else(|| invalid("physical state sequence is not registered"))?;
+        for selected in resolved.iter() {
+            let expected = selected.selection.expected_cursor;
+            if selected.domains.iter().any(|domain| {
+                live.domains
+                    .get(domain)
+                    .map(|snapshot| snapshot.cursor)
+                    .unwrap_or(0)
+                    != expected
+            }) {
+                return Err(invalid("physical state selection expected cursor is stale"));
+            }
+        }
+        state.transactions.insert(
+            transaction,
+            StagedTransaction {
+                sequence,
+                state: live,
+                touched: HashSet::new(),
+                selection: TransactionSelection::Selected(resolved),
             },
         );
         Ok(())
@@ -336,6 +547,19 @@ impl TensorStateArena {
             .transactions
             .get_mut(&transaction)
             .ok_or_else(|| invalid("physical state transaction is not active"))?;
+        if let TransactionSelection::Selected(selections) = &staged.selection {
+            let selected = selections
+                .iter()
+                .find(|selected| selected.domains.contains(&domain))
+                .ok_or_else(|| invalid("physical state domain was not selected by this stage"))?;
+            if selected.selection.expected_cursor != expected_cursor
+                || selected.selection.target_cursor != target_cursor
+            {
+                return Err(invalid(
+                    "physical state replacement crossed its selected clock span",
+                ));
+            }
+        }
         let current = staged
             .state
             .domains
@@ -403,6 +627,11 @@ impl TensorStateArena {
             .transactions
             .get(&transaction)
             .ok_or_else(|| invalid("physical state transaction is not active"))?;
+        if !matches!(staged.selection, TransactionSelection::AllDomains) {
+            return Err(invalid(
+                "selected tensor transaction requires its arena-sealed completion",
+            ));
+        }
         if required_domains.iter().any(|domain| {
             !staged.touched.contains(domain)
                 || staged
@@ -425,6 +654,122 @@ impl TensorStateArena {
             .ok_or_else(|| invalid("physical state sequence was released during a transaction"))?;
         *live = staged.state;
         Ok(())
+    }
+
+    /// Seal the exact selected-group completion after all selected domains have
+    /// been staged. This does not publish any state.
+    pub(crate) fn seal_selected_completion(
+        &self,
+        transaction: PhysicalStateTransactionId,
+    ) -> Result<TensorStateBatchCompletion> {
+        let state = self.lock()?;
+        let staged = state
+            .transactions
+            .get(&transaction)
+            .ok_or_else(|| invalid("physical state transaction is not active"))?;
+        let TransactionSelection::Selected(selections) = &staged.selection else {
+            return Err(invalid(
+                "compatibility tensor transaction cannot issue a selected completion",
+            ));
+        };
+        validate_selected_staging(staged, selections)?;
+        Ok(TensorStateBatchCompletion {
+            arena_nonce: self.nonce,
+            transaction,
+            sequence: staged.sequence,
+            selections: selections.clone(),
+        })
+    }
+
+    /// Validate and publish one arena-sealed selected-group completion.
+    pub(crate) fn commit_selected(
+        &self,
+        transaction: PhysicalStateTransactionId,
+        completion: &TensorStateBatchCompletion,
+    ) -> Result<()> {
+        let mut state = self.lock()?;
+        let staged = state
+            .transactions
+            .get(&transaction)
+            .ok_or_else(|| invalid("physical state transaction is not active"))?;
+        let TransactionSelection::Selected(selections) = &staged.selection else {
+            return Err(invalid(
+                "selected completion cannot commit a compatibility tensor transaction",
+            ));
+        };
+        if completion.arena_nonce != self.nonce
+            || completion.transaction != transaction
+            || completion.sequence != staged.sequence
+            || completion.selections.as_ref() != selections.as_ref()
+        {
+            return Err(invalid(
+                "tensor-state completion crossed an arena or transaction fence",
+            ));
+        }
+        validate_selected_staging(staged, selections)?;
+        let staged = state
+            .transactions
+            .remove(&transaction)
+            .expect("validated physical state transaction remains active");
+        let live = state
+            .sequences
+            .get_mut(&staged.sequence)
+            .ok_or_else(|| invalid("physical state sequence was released during a transaction"))?;
+        let TransactionSelection::Selected(selections) = staged.selection else {
+            unreachable!("selected transaction changed mode while locked")
+        };
+        for selected in selections.iter() {
+            for domain in selected.domains.iter() {
+                let snapshot = staged
+                    .state
+                    .domains
+                    .get(domain)
+                    .cloned()
+                    .expect("validated selected domain has staged state");
+                live.domains.insert(*domain, snapshot);
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve_selections(
+        &self,
+        selections: &[TensorStateSelection],
+    ) -> Result<Arc<[ResolvedTensorStateSelection]>> {
+        if selections.is_empty() {
+            return Err(invalid("tensor state transaction selected no groups"));
+        }
+        let mut previous = None;
+        let mut resolved = Vec::with_capacity(selections.len());
+        for selection in selections {
+            if previous.is_some_and(|group| selection.group <= group) {
+                return Err(invalid(
+                    "tensor state selections must be in canonical group order",
+                ));
+            }
+            previous = Some(selection.group);
+            if selection.target_cursor <= selection.expected_cursor {
+                return Err(invalid("selected physical state cursor must advance"));
+            }
+            self.validate_group_clock(selection.group, &selection.clock)?;
+            let domains = self
+                .plan
+                .non_paged
+                .iter()
+                .filter(|domain| domain.group() == selection.group)
+                .map(ResolvedNonPagedDomainPlan::domain)
+                .collect::<Vec<_>>();
+            if domains.is_empty() {
+                return Err(invalid(
+                    "tensor state selection references an unknown non-paged group",
+                ));
+            }
+            resolved.push(ResolvedTensorStateSelection {
+                selection: selection.clone(),
+                domains: domains.into(),
+            });
+        }
+        Ok(resolved.into())
     }
 
     pub(crate) fn abort(&self, transaction: PhysicalStateTransactionId) -> Result<()> {
@@ -525,6 +870,36 @@ impl TensorStateArena {
             .lock()
             .map_err(|_| Error::InferenceError("tensor state arena lock poisoned".into()))
     }
+}
+
+fn validate_selected_staging(
+    staged: &StagedTransaction,
+    selections: &[ResolvedTensorStateSelection],
+) -> Result<()> {
+    for selected in selections {
+        let target = selected.selection.target_cursor;
+        if selected.domains.iter().any(|domain| {
+            !staged.touched.contains(domain)
+                || staged
+                    .state
+                    .domains
+                    .get(domain)
+                    .is_none_or(|snapshot| snapshot.cursor != target)
+        }) {
+            return Err(invalid(
+                "physical state transaction did not stage every selected domain at its target cursor",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn allocate_arena_nonce(counter: &AtomicU64) -> Result<u64> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            (current != 0).then(|| current.checked_add(1)).flatten()
+        })
+        .map_err(|_| invalid("tensor state arena nonce space is exhausted"))
 }
 
 fn validate_tensor(
@@ -634,8 +1009,9 @@ mod tests {
     }
 
     fn arena() -> TensorStateArena {
+        let contract = contract();
         let plan = negotiate_state_plan(
-            &contract(),
+            &contract,
             &StateBackendPlanRequest {
                 backend: BackendKind::Cpu,
                 device_ordinal: None,
@@ -645,7 +1021,58 @@ mod tests {
         )
         .unwrap();
         let capacity = TensorStateCapacity::for_plan(&plan, 2, 2).unwrap();
-        TensorStateArena::new(Arc::new(plan), capacity, Device::Cpu).unwrap()
+        TensorStateArena::new_with_contract(Arc::new(plan), &contract, capacity, Device::Cpu)
+            .unwrap()
+    }
+
+    fn independently_clocked_contract() -> InferenceStateContract {
+        let mut contract = contract();
+        contract
+            .domains
+            .push(StateDomainSpec::Tensor(TensorStateDomainSpec {
+                header: StateDomainHeader {
+                    id: StateDomainId::new(2),
+                    scope: StateScope::Retained,
+                    clock: StateClock::AudioFrames,
+                    placement: PlacementPolicy::BackendLocal,
+                    prefix: PrefixPolicy::Disabled,
+                    checkpoint: CheckpointPolicy::Transactional,
+                },
+                components: vec![TensorComponentSpec {
+                    id: StateComponentId::new(2),
+                    role: TensorRole::RecurrentHidden,
+                    shape: BoundedShape {
+                        dimensions: vec![ShapeDimension {
+                            axis: ShapeAxis::Hidden,
+                            extent: ShapeExtent::RuntimeBounded { min: 1, max: 8 },
+                        }],
+                    },
+                    accepted_dtypes: vec![StateDType::F32],
+                }],
+            }));
+        contract.groups.push(StateGroupSpec {
+            id: StateGroupId::new(2),
+            domains: vec![StateDomainId::new(2)],
+            prefix_shareable: false,
+        });
+        contract
+    }
+
+    fn independently_clocked_arena() -> TensorStateArena {
+        let contract = independently_clocked_contract();
+        let plan = negotiate_state_plan(
+            &contract,
+            &StateBackendPlanRequest {
+                backend: BackendKind::Cpu,
+                device_ordinal: None,
+                page_tokens_hint: None,
+                storage_dtype_hint: None,
+            },
+        )
+        .unwrap();
+        let capacity = TensorStateCapacity::for_plan(&plan, 2, 2).unwrap();
+        TensorStateArena::new_with_contract(Arc::new(plan), &contract, capacity, Device::Cpu)
+            .unwrap()
     }
 
     fn value(values: &[f32]) -> StateComponentValue {
@@ -660,6 +1087,181 @@ mod tests {
             component: StateComponentId::new(1),
             tensor: None,
         }
+    }
+
+    fn absent_component(component: u32) -> StateComponentValue {
+        StateComponentValue {
+            component: StateComponentId::new(component),
+            tensor: None,
+        }
+    }
+
+    #[test]
+    fn selected_groups_commit_at_independent_clock_cursors() {
+        let arena = independently_clocked_arena();
+        let sequence = PhysicalStateSequenceId::new(1).unwrap();
+        let transaction = PhysicalStateTransactionId::new(1).unwrap();
+        arena.register(sequence).unwrap();
+        let selections = [
+            TensorStateSelection {
+                group: StateGroupId::new(1),
+                clock: StateClock::DecoderTokens,
+                expected_cursor: 0,
+                target_cursor: 2,
+            },
+            TensorStateSelection {
+                group: StateGroupId::new(2),
+                clock: StateClock::AudioFrames,
+                expected_cursor: 0,
+                target_cursor: 160,
+            },
+        ];
+        arena
+            .begin_selected(transaction, sequence, &selections)
+            .unwrap();
+        arena
+            .stage_replace(
+                transaction,
+                StateDomainId::new(1),
+                0,
+                2,
+                vec![absent_component(1)],
+            )
+            .unwrap();
+        arena
+            .stage_replace(
+                transaction,
+                StateDomainId::new(2),
+                0,
+                160,
+                vec![absent_component(2)],
+            )
+            .unwrap();
+        let completion = arena.seal_selected_completion(transaction).unwrap();
+        assert_eq!(
+            completion.selections().cloned().collect::<Vec<_>>(),
+            selections
+        );
+        assert!(arena
+            .read(sequence, StateDomainId::new(1))
+            .unwrap()
+            .is_none());
+        assert!(arena
+            .read(sequence, StateDomainId::new(2))
+            .unwrap()
+            .is_none());
+        arena.commit_selected(transaction, &completion).unwrap();
+        assert_eq!(
+            arena
+                .read(sequence, StateDomainId::new(1))
+                .unwrap()
+                .unwrap()
+                .cursor,
+            2
+        );
+        assert_eq!(
+            arena
+                .read(sequence, StateDomainId::new(2))
+                .unwrap()
+                .unwrap()
+                .cursor,
+            160
+        );
+    }
+
+    #[test]
+    fn selected_completion_is_arena_sealed_and_abortable_after_rejection() {
+        let first = arena();
+        let second = arena();
+        let sequence = PhysicalStateSequenceId::new(1).unwrap();
+        let transaction = PhysicalStateTransactionId::new(1).unwrap();
+        let selection = [TensorStateSelection {
+            group: StateGroupId::new(1),
+            clock: StateClock::DecoderTokens,
+            expected_cursor: 0,
+            target_cursor: 1,
+        }];
+        for arena in [&first, &second] {
+            arena.register(sequence).unwrap();
+            arena
+                .begin_selected(transaction, sequence, &selection)
+                .unwrap();
+            arena
+                .stage_replace(
+                    transaction,
+                    StateDomainId::new(1),
+                    0,
+                    1,
+                    vec![absent_value()],
+                )
+                .unwrap();
+        }
+        let foreign = first.seal_selected_completion(transaction).unwrap();
+        assert!(second.commit_selected(transaction, &foreign).is_err());
+        assert_eq!(second.occupancy().unwrap().active_transactions, 1);
+        second.abort(transaction).unwrap();
+        first.abort(transaction).unwrap();
+    }
+
+    #[test]
+    fn selected_transaction_rejects_missing_wrong_and_stale_state() {
+        let arena = arena();
+        let sequence = PhysicalStateSequenceId::new(1).unwrap();
+        arena.register(sequence).unwrap();
+        let selection = TensorStateSelection {
+            group: StateGroupId::new(1),
+            clock: StateClock::DecoderTokens,
+            expected_cursor: 0,
+            target_cursor: 2,
+        };
+        let first = PhysicalStateTransactionId::new(1).unwrap();
+        arena
+            .begin_selected(first, sequence, std::slice::from_ref(&selection))
+            .unwrap();
+        assert!(arena.seal_selected_completion(first).is_err());
+        assert!(arena
+            .stage_replace(first, StateDomainId::new(1), 0, 1, vec![absent_value()],)
+            .is_err());
+        arena
+            .stage_replace(first, StateDomainId::new(1), 0, 2, vec![absent_value()])
+            .unwrap();
+        let completion = arena.seal_selected_completion(first).unwrap();
+        arena.commit_selected(first, &completion).unwrap();
+
+        let stale = PhysicalStateTransactionId::new(2).unwrap();
+        assert!(arena
+            .begin_selected(stale, sequence, std::slice::from_ref(&selection))
+            .is_err());
+        assert_eq!(arena.occupancy().unwrap().active_transactions, 0);
+    }
+
+    #[test]
+    fn selected_transaction_rejects_a_foreign_clock() {
+        let arena = arena();
+        let sequence = PhysicalStateSequenceId::new(1).unwrap();
+        arena.register(sequence).unwrap();
+        assert!(arena
+            .begin_selected(
+                PhysicalStateTransactionId::new(1).unwrap(),
+                sequence,
+                &[TensorStateSelection {
+                    group: StateGroupId::new(1),
+                    clock: StateClock::AudioFrames,
+                    expected_cursor: 0,
+                    target_cursor: 1,
+                }],
+            )
+            .is_err());
+        assert_eq!(arena.occupancy().unwrap().active_transactions, 0);
+    }
+
+    #[test]
+    fn arena_nonce_allocation_fails_closed_before_wraparound() {
+        let counter = AtomicU64::new(u64::MAX);
+        assert!(allocate_arena_nonce(&counter).is_err());
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        let counter = AtomicU64::new(0);
+        assert!(allocate_arena_nonce(&counter).is_err());
     }
 
     #[test]

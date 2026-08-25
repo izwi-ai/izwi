@@ -4394,7 +4394,9 @@ mod tests {
         assert_eq!(normal.stages[0].max_batch_size, 1);
         assert_eq!(normal.stages[0].max_work_units, 1_500);
         assert_eq!(normal.stages[1].name, "asr.prefill.scalar");
+        assert!(normal.stages[1].retained_state_selections.is_none());
         assert_eq!(normal.stages[2].name, "asr.decode.tensor_continuous");
+        assert!(normal.stages[2].retained_state_selections.is_none());
         assert_eq!(normal.stages[2].batch_mode, NativeBatchMode::Continuous);
         assert_eq!(normal.stages[2].shape_policy, StageShapePolicy::Ragged);
         assert_eq!(normal.stages[2].max_batch_size, 4);

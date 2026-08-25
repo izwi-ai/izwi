@@ -14,7 +14,10 @@ use tracing::info;
 
 use crate::backends::{backend_kind_for_device, BackendKind, DeviceKind, DeviceProfile};
 use crate::catalog::ModelFamily;
-use crate::engine::{InvocationTensorLease, StageDescriptor, WorkCost};
+use crate::engine::{
+    ClockedStateProjection, ClockedStateSelection, InputRange, InvocationTensorLease,
+    StageDescriptor, WorkCost,
+};
 use crate::error::{Error, Result};
 use crate::kv::v2::{
     InvocationStateBackingKindV2, InvocationWorkspaceLeaseSetV2, StateClock, StateGroupId,
@@ -30,6 +33,7 @@ use crate::models::architectures::vibevoice::prompt::VibeVoicePromptTokenizer;
 use crate::models::architectures::vibevoice::tokenizer::{
     VibeVoiceAcousticTokenizer, VibeVoiceSemanticTokenizer, VibeVoiceTokenizerEncoderOutput,
 };
+use crate::models::architectures::vibevoice::VIBEVOICE_ASR_TOKENIZER_GROUP;
 use crate::models::architectures::vibevoice::{
     vibevoice_invocation_contract, vibevoice_physical_state_spec, VibeVoicePhysicalStateSpec,
     VibeVoiceTokenizerStateDomain, VIBEVOICE_ASR_ACOUSTIC_DOMAIN, VIBEVOICE_ASR_SEMANTIC_DOMAIN,
@@ -166,6 +170,7 @@ pub(crate) struct VibeVoiceAsrPreparedArtifact {
     prompt_identity: [u8; 32],
     prompt_ids: Arc<[u32]>,
     acoustic_input_range: Range<usize>,
+    tokenizer_state_projections: Arc<[ClockedStateProjection]>,
     mixed_embeddings: Tensor,
     geometry: VibeVoiceAsrPreparedGeometry,
 }
@@ -196,6 +201,65 @@ impl VibeVoiceAsrPreparedArtifact {
 
     pub(crate) fn acoustic_input_range(&self) -> Range<usize> {
         self.acoustic_input_range.clone()
+    }
+
+    /// Exact immutable mapping from decoder acoustic placeholders to the
+    /// padded target-rate samples consumed by both causal tokenizer encoders.
+    /// The frozen mixed embeddings remain authoritative until retained tensor
+    /// span execution is wired end to end.
+    pub(crate) fn tokenizer_state_projections(&self) -> &[ClockedStateProjection] {
+        &self.tokenizer_state_projections
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        prompt_tokens: usize,
+        acoustic_input_range: Range<usize>,
+        encoder_samples: usize,
+        hidden: usize,
+    ) -> Result<Self> {
+        if prompt_tokens == 0
+            || hidden == 0
+            || acoustic_input_range.end > prompt_tokens
+            || acoustic_input_range.is_empty()
+        {
+            return Err(Error::InvalidInput(
+                "VibeVoice ASR test artifact geometry is invalid".into(),
+            ));
+        }
+        let acoustic_frames = acoustic_input_range.len();
+        let mixed_embeddings = Tensor::zeros(
+            (1, prompt_tokens, hidden),
+            DType::F32,
+            &candle_core::Device::Cpu,
+        )?;
+        let embedding_elements = u64::try_from(mixed_embeddings.elem_count())
+            .map_err(|_| Error::Overloaded("test artifact elements exceed u64".into()))?;
+        let tokenizer_state_projections = Arc::from([vibevoice_tokenizer_state_projection(
+            acoustic_input_range.clone(),
+            encoder_samples,
+        )?]);
+        Ok(Self {
+            model_identity: [1; 32],
+            source_identity: [2; 32],
+            prompt_identity: [3; 32],
+            prompt_ids: vec![0; prompt_tokens].into(),
+            acoustic_input_range,
+            tokenizer_state_projections,
+            mixed_embeddings,
+            geometry: VibeVoiceAsrPreparedGeometry {
+                input_samples: encoder_samples,
+                input_sample_rate: 24_000,
+                processed_samples: encoder_samples,
+                encoder_samples,
+                acoustic_frames,
+                prompt_tokens,
+                embedding_elements,
+                preparation_workspace_bytes: 1,
+                retained_device_bytes: embedding_elements * 4,
+                retained_host_bytes: (prompt_tokens * size_of::<u32>()) as u64,
+            },
+        })
     }
 }
 
@@ -644,12 +708,17 @@ impl VibeVoiceAsrModel {
                 "VibeVoice ASR preparation geometry changed during artifact construction".into(),
             ));
         }
+        let tokenizer_state_projections = Arc::from([vibevoice_tokenizer_state_projection(
+            prepared_prompt.acoustic_input_range.clone(),
+            encoder_samples,
+        )?]);
         Ok(VibeVoiceAsrPreparedArtifact {
             model_identity: self.model_identity,
             source_identity: vibevoice_asr_source_identity(audio, sample_rate),
             prompt_identity: vibevoice_asr_prompt_identity(language, prompt),
             prompt_ids: prepared_prompt.input_ids.into(),
             acoustic_input_range: prepared_prompt.acoustic_input_range,
+            tokenizer_state_projections,
             mixed_embeddings,
             geometry,
         })
@@ -1697,6 +1766,10 @@ fn validate_vibevoice_artifact_storage(artifact: &VibeVoiceAsrPreparedArtifact) 
             })?,
         )
         .ok_or_else(|| Error::Overloaded("VibeVoice ASR artifact bytes overflow".into()))?;
+    let expected_tokenizer_projection = vibevoice_tokenizer_state_projection(
+        artifact.acoustic_input_range.clone(),
+        artifact.geometry.encoder_samples,
+    )?;
     if *batch != 1
         || *tokens != artifact.geometry.prompt_tokens
         || artifact.prompt_ids.len() != artifact.geometry.prompt_tokens
@@ -1705,6 +1778,7 @@ fn validate_vibevoice_artifact_storage(artifact: &VibeVoiceAsrPreparedArtifact) 
             != artifact.geometry.acoustic_frames
         || elements != artifact.geometry.embedding_elements
         || bytes != artifact.geometry.retained_device_bytes
+        || artifact.tokenizer_state_projections.as_ref() != [expected_tokenizer_projection]
         || artifact.geometry.retained_host_bytes
             != u64::try_from(artifact.prompt_ids.len())
                 .ok()
@@ -2201,6 +2275,19 @@ fn asr_placeholder_count(samples: usize, speech_tok_compress_ratio: usize) -> us
     samples.saturating_add(ratio - 1) / ratio
 }
 
+fn vibevoice_tokenizer_state_projection(
+    acoustic_input_range: Range<usize>,
+    encoder_samples: usize,
+) -> Result<ClockedStateProjection> {
+    let primary = InputRange::new(acoustic_input_range.start, acoustic_input_range.end)?;
+    let auxiliary = InputRange::new(0, encoder_samples)?;
+    ClockedStateProjection::new(
+        primary,
+        ClockedStateSelection::new(VIBEVOICE_ASR_TOKENIZER_GROUP, StateClock::AudioSamples)?,
+        auxiliary,
+    )
+}
+
 fn vibevoice_asr_max_audio_seconds_hint(device_kind: DeviceKind) -> f32 {
     let cuda_override = std::env::var(CUDA_MAX_AUDIO_SECONDS_ENV).ok();
     vibevoice_asr_max_audio_seconds_hint_for(device_kind, cuda_override.as_deref())
@@ -2356,6 +2443,11 @@ mod tests {
             prompt_identity: [3; 32],
             prompt_ids: vec![0; prompt_tokens].into(),
             acoustic_input_range: 1..2,
+            tokenizer_state_projections: Arc::from([vibevoice_tokenizer_state_projection(
+                1..2,
+                3_200,
+            )
+            .unwrap()]),
             mixed_embeddings,
             geometry: VibeVoiceAsrPreparedGeometry {
                 input_samples: 3_200,
@@ -2722,6 +2814,34 @@ mod tests {
         assert_eq!(asr_placeholder_count(3_201, 3_200), 2);
         assert_eq!(asr_placeholder_count(9_599, 3_200), 3);
         assert_eq!(asr_placeholder_count(9_600, 3_200), 3);
+    }
+
+    #[test]
+    fn tokenizer_projection_maps_placeholder_prefill_to_padded_audio_clock() {
+        let projection = vibevoice_tokenizer_state_projection(4..7, 9_600).unwrap();
+        assert!(projection
+            .project(InputRange::new(0, 4).unwrap())
+            .unwrap()
+            .is_none());
+
+        let first = projection
+            .project(InputRange::new(2, 5).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.group(), VIBEVOICE_ASR_TOKENIZER_GROUP);
+        assert_eq!(first.clock(), &StateClock::AudioSamples);
+        assert_eq!(first.input(), InputRange::new(0, 3_200).unwrap());
+
+        let tail = projection
+            .project(InputRange::new(5, 9).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(tail.input(), InputRange::new(3_200, 9_600).unwrap());
+    }
+
+    #[test]
+    fn tokenizer_projection_rejects_non_integral_placeholder_mapping() {
+        assert!(vibevoice_tokenizer_state_projection(4..7, 9_599).is_err());
     }
 
     #[test]

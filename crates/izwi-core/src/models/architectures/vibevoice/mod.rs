@@ -34,7 +34,7 @@ pub(crate) const VIBEVOICE_ASR_DECODER_DOMAIN: StateDomainId = StateDomainId::ne
 pub(crate) const VIBEVOICE_ASR_ACOUSTIC_DOMAIN: StateDomainId = StateDomainId::new(2);
 pub(crate) const VIBEVOICE_ASR_SEMANTIC_DOMAIN: StateDomainId = StateDomainId::new(3);
 pub(crate) const VIBEVOICE_ASR_DECODER_GROUP: StateGroupId = StateGroupId::new(1);
-const VIBEVOICE_ASR_TOKENIZER_GROUP: StateGroupId = StateGroupId::new(2);
+pub(crate) const VIBEVOICE_ASR_TOKENIZER_GROUP: StateGroupId = StateGroupId::new(2);
 pub(crate) const VIBEVOICE_ASR_PREPARATION_STAGE: &str = "asr.encoder.vibevoice";
 pub(crate) const VIBEVOICE_ASR_PREFILL_STAGE: &str = "asr.prefill.scalar";
 pub(crate) const VIBEVOICE_ASR_DECODE_STAGE: &str = "asr.decode.tensor_continuous";
@@ -768,6 +768,7 @@ mod tests {
             shape_policy: StageShapePolicy::Independent,
             membership_safe_point: MembershipSafePoint::OperationBoundary,
             output_visibility: OutputVisibility::AfterQuantumCommit,
+            retained_state_selections: None,
         }
     }
 

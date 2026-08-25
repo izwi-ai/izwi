@@ -58,6 +58,7 @@ fn sequence_work(start: usize, end: usize) -> WorkUnit {
         },
         input: InputRange { start, end },
         max_output_steps: end.saturating_sub(start).max(1),
+        auxiliary_state: None,
     }
 }
 

@@ -1177,7 +1177,7 @@ impl NativeExecutor {
             ));
         }
         let mut retained = managed_state.take().expect("validated retained ASR state");
-        let tensor_reservation = retained.tensor_state;
+        let tensor_reservation = retained.tensor_state.clone();
         let mut managed_cache = Some(retained.take_only_paged()?);
         let tensor_arena = request
             .managed_cache_runtime()
@@ -1748,7 +1748,7 @@ impl NativeExecutor {
                     "continuous ASR decode requires retained physical KV".to_string(),
                 )
             })?;
-            let tensor_reservation = views.tensor_state;
+            let tensor_reservation = views.tensor_state.clone();
             let tensor_arena = request
                 .managed_cache_runtime()
                 .and_then(|runtime| runtime.tensor_state());
@@ -3442,6 +3442,7 @@ mod tests {
                     end: num_computed_tokens + 4,
                 },
                 max_output_steps: 4,
+                auxiliary_state: None,
             },
         };
         let generation_two = ManagedSessionGeneration::INITIAL.next().unwrap();

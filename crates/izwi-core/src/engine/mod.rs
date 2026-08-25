@@ -76,20 +76,23 @@ pub(crate) use config::resolve_backend_model_context;
 pub(crate) use config::tts_explicit_output_limit;
 pub use config::EngineCoreConfig;
 pub use core::EngineCore;
+pub(crate) use execution::ClockedStateProjection;
 pub use execution::{
     AdapterAbiRevision, AdapterBindingKey, AdapterInstanceId, BatchBudget, BatchDispatch,
     BatchDispatchKind, BatchId, BatchKey, BatchLaneKey, CacheMode, CancellationGranularity,
-    ConcurrencyClass, DeadlinePhase, DispatchState, ExecutionAdapterBinding, ExecutionCapabilities,
-    ExecutionDisposition, ExecutionDomain, ExecutionFailure, ExecutionGroupId, ExecutionMode,
-    ExecutionPlan, ExecutionProfile, ExecutionReport, ExecutionState, ExecutionTracker,
-    FailureKind, FailureOrigin, FailureScope, FinishReason, HealthImpact, InputRange,
-    ManagedCacheDomainReceipt, ManagedCacheDomainReservation, ManagedCacheReceipt,
-    ManagedCacheReservation, ManagedSessionGeneration, ManagedTensorStateReservation,
-    MembershipSafePoint, ModelInstanceId, NativeBatchMode, OutcomeProvenance, OutputVisibility,
-    PhysicalBatch, PhysicalBatchReport, PhysicalBatchRowReport, PhysicalLaunchPolicy, PlanId,
-    PrefillMode, ReadyQuantum, RetryDisposition, SequencePhase, SequenceRestartReason,
-    SessionEpoch, SessionKey, StageDescriptor, StageId, StageProgressKind, StageShapePolicy,
-    StageWorkSelector, StateDisposition, TerminalOutcome, WorkCost, WorkUnit, YieldReason,
+    ClockedStateSelection, ClockedStateSpan, ConcurrencyClass, DeadlinePhase, DispatchState,
+    ExecutionAdapterBinding, ExecutionCapabilities, ExecutionDisposition, ExecutionDomain,
+    ExecutionFailure, ExecutionGroupId, ExecutionMode, ExecutionPlan, ExecutionProfile,
+    ExecutionReport, ExecutionState, ExecutionTracker, FailureKind, FailureOrigin, FailureScope,
+    FinishReason, HealthImpact, InputRange, ManagedCacheDomainReceipt,
+    ManagedCacheDomainReservation, ManagedCacheReceipt, ManagedCacheReservation,
+    ManagedClockedStateReceipt, ManagedClockedStateReservation, ManagedSessionGeneration,
+    ManagedTensorStateReservation, MembershipSafePoint, ModelInstanceId, NativeBatchMode,
+    OutcomeProvenance, OutputVisibility, PhysicalBatch, PhysicalBatchReport,
+    PhysicalBatchRowReport, PhysicalLaunchPolicy, PlanId, PrefillMode, ReadyQuantum,
+    RetryDisposition, SequencePhase, SequenceRestartReason, SessionEpoch, SessionKey,
+    StageDescriptor, StageId, StageProgressKind, StageShapePolicy, StageWorkSelector,
+    StateDisposition, TerminalOutcome, WorkCost, WorkUnit, YieldReason,
 };
 pub use executor::{
     CacheReleaseOutcome, CacheReleaseReport, ExecutorOutput, ExecutorStepResult, ModelExecutor,

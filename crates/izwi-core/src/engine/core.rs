@@ -533,11 +533,13 @@ impl EngineCore {
             phase: super::SequencePhase::Prefill,
             input: super::InputRange { start: 0, end: 0 },
             max_output_steps: 1,
+            auxiliary_state: None,
         };
         let decode_work = WorkUnit::SequenceStep {
             phase: super::SequencePhase::Decode,
             input: super::InputRange { start: 0, end: 0 },
             max_output_steps: 1,
+            auxiliary_state: None,
         };
         let atomic_work = WorkUnit::AtomicJob {
             kind: format!("{:?}", request.task_type).to_ascii_lowercase(),
@@ -694,7 +696,7 @@ impl EngineCore {
                 scheduled.request_id
             )));
         }
-        let work = match profile.mode {
+        let mut work = match profile.mode {
             ExecutionMode::Sequence | ExecutionMode::Realtime
                 if scheduled.is_prefill && profile.prefill == PrefillMode::Full =>
             {
@@ -705,6 +707,7 @@ impl EngineCore {
                         end: request.num_prompt_tokens(),
                     },
                     max_output_steps: 1,
+                    auxiliary_state: None,
                 }
             }
             ExecutionMode::Sequence | ExecutionMode::Realtime => scheduled.work.clone(),
@@ -716,12 +719,6 @@ impl EngineCore {
                 ordinal: 0,
             },
         };
-        let work_kind = match &work {
-            WorkUnit::PreSequencePreparation { kind } => kind.clone(),
-            WorkUnit::SequenceStep { phase, .. } => format!("{phase:?}").to_ascii_lowercase(),
-            WorkUnit::AtomicJob { kind } => kind.clone(),
-            WorkUnit::PipelineStage { name, ordinal } => format!("{name}:{ordinal}"),
-        };
         // Managed arenas are registered once at model scope, while opaque
         // caches are authorized and reconciled from executor-owned tensors.
         // A row therefore never reserves either physical allocation again.
@@ -730,6 +727,52 @@ impl EngineCore {
             .execution_adapter_binding()
             .map(|binding| binding.stage_for_work(&work).cloned())
             .transpose()?;
+        if let WorkUnit::SequenceStep {
+            input,
+            auxiliary_state,
+            ..
+        } = &mut work
+        {
+            if auxiliary_state.is_some() {
+                return Err(Error::InferenceError(
+                    "scheduler attempted to author retained auxiliary state".into(),
+                ));
+            }
+            if let Some(stage) = bound_stage.as_ref() {
+                let projected = request.project_auxiliary_state_spans(stage, *input)?;
+                if let Some(spans) = projected.as_deref().filter(|spans| !spans.is_empty()) {
+                    let runtime = request.managed_cache_runtime().ok_or_else(|| {
+                        Error::InferenceError(
+                            "clocked retained-state stage has no exact managed runtime".into(),
+                        )
+                    })?;
+                    let tensor = runtime.tensor_state().ok_or_else(|| {
+                        Error::InferenceError(
+                            "clocked retained-state stage has no tensor-state arena".into(),
+                        )
+                    })?;
+                    let mut previous_group = None;
+                    for span in spans {
+                        if span.input().is_empty()
+                            || previous_group.is_some_and(|previous| previous >= span.group().get())
+                        {
+                            return Err(Error::InferenceError(
+                                "projected clocked-state spans are not canonical and unique".into(),
+                            ));
+                        }
+                        tensor.validate_group_clock(span.group(), span.clock())?;
+                        previous_group = Some(span.group().get());
+                    }
+                }
+                *auxiliary_state = projected;
+            }
+        }
+        let work_kind = match &work {
+            WorkUnit::PreSequencePreparation { kind } => kind.clone(),
+            WorkUnit::SequenceStep { phase, .. } => format!("{phase:?}").to_ascii_lowercase(),
+            WorkUnit::AtomicJob { kind } => kind.clone(),
+            WorkUnit::PipelineStage { name, ordinal } => format!("{name}:{ordinal}"),
+        };
         let bound_adapter = request
             .execution_adapter_binding()
             .zip(bound_stage.as_ref())
@@ -4276,6 +4319,7 @@ mod tests {
                 phase: crate::engine::SequencePhase::Prefill,
                 input: crate::engine::InputRange { start: 0, end: 1 },
                 max_output_steps: 1,
+                auxiliary_state: None,
             },
         }
     }
@@ -4292,6 +4336,7 @@ mod tests {
                 phase: crate::engine::SequencePhase::Decode,
                 input: crate::engine::InputRange { start: 1, end: 2 },
                 max_output_steps: 1,
+                auxiliary_state: None,
             },
         }
     }
@@ -5887,6 +5932,7 @@ mod tests {
                 phase: super::super::SequencePhase::Decode,
                 input: super::super::InputRange { start: 1, end: 2 },
                 max_output_steps: 1,
+                auxiliary_state: None,
             },
             cost: WorkCost::with_workspace(
                 1,
@@ -6251,6 +6297,7 @@ mod tests {
             phase: SequencePhase::Decode,
             input: super::super::InputRange { start: 9, end: 13 },
             max_output_steps: 4,
+            auxiliary_state: None,
         };
 
         let cost = EngineCore::work_cost(&request, &work, Some(&stage)).unwrap();
@@ -6288,6 +6335,7 @@ mod tests {
                 phase: SequencePhase::Decode,
                 input: super::super::InputRange { start: 1, end: 5 },
                 max_output_steps: 4,
+                auxiliary_state: None,
             },
             cost: WorkCost::new(4, 4, 0),
             managed_cache: None,
@@ -6422,6 +6470,7 @@ mod tests {
                 ),
                 staged_stream_outputs: Vec::new(),
                 managed_cache_completions: Vec::new(),
+                clocked_state_completion: None,
             },
         )
     }

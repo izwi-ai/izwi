@@ -1995,6 +1995,7 @@ mod tests {
                 phase: SequencePhase::Decode,
                 input: InputRange { start: 0, end: 1 },
                 max_output_steps: 1,
+                auxiliary_state: None,
             },
             cost: WorkCost::new(1, 10, 0),
             managed_cache: None,

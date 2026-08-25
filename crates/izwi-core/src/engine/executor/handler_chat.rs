@@ -728,7 +728,7 @@ impl NativeExecutor {
             }
             match managed_cache {
                 Some(mut views) => {
-                    let tensor_reservation = views.tensor_state;
+                    let tensor_reservation = views.tensor_state.clone();
                     let (cache, mtp_cache) = if request.model_variant.is_some_and(|variant| {
                         variant.family() == crate::catalog::ModelFamily::Qwen38Chat
                     }) {
@@ -933,6 +933,7 @@ mod tests {
                 phase: SequencePhase::Prefill,
                 input: InputRange { start: 0, end: 16 },
                 max_output_steps: 16,
+                auxiliary_state: None,
             },
         };
 
@@ -954,6 +955,7 @@ mod tests {
                 phase: SequencePhase::Prefill,
                 input: InputRange { start: 7, end: 16 },
                 max_output_steps: 8,
+                auxiliary_state: None,
             },
         };
 
@@ -1016,6 +1018,7 @@ mod tests {
                 phase: SequencePhase::Prefill,
                 input: InputRange { start: 0, end: 3 },
                 max_output_steps: 1,
+                auxiliary_state: None,
             },
         };
 

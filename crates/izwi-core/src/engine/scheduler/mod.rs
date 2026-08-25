@@ -790,6 +790,7 @@ impl Scheduler {
                         end: num_computed.saturating_add(num_tokens),
                     },
                     max_output_steps: num_tokens,
+                    auxiliary_state: None,
                 },
             });
 
@@ -915,6 +916,7 @@ impl Scheduler {
                         end: num_computed.saturating_add(num_tokens),
                     },
                     max_output_steps: num_tokens.max(1),
+                    auxiliary_state: None,
                 },
             });
 
@@ -1032,6 +1034,7 @@ impl Scheduler {
                         end: num_tokens,
                     },
                     max_output_steps: num_tokens.max(1),
+                    auxiliary_state: None,
                 },
             });
 
@@ -2781,6 +2784,7 @@ mod tests {
                 phase: SequencePhase::Prefill,
                 input: InputRange { start: 4, end: 8 },
                 max_output_steps: 4,
+                auxiliary_state: None,
             }
         );
         scheduler.update_after_step(&request_id, 4, 0, 1.0);
@@ -2836,6 +2840,7 @@ mod tests {
                 phase: SequencePhase::Prefill,
                 input: InputRange { start: 0, end: 8 },
                 max_output_steps: 8,
+                auxiliary_state: None,
             }
         );
     }
@@ -3087,6 +3092,7 @@ mod tests {
                     end: request.num_prompt_tokens() + 1,
                 },
                 max_output_steps: 1,
+                auxiliary_state: None,
             }
         );
     }

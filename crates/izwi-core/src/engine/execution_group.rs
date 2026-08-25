@@ -1941,6 +1941,7 @@ mod tests {
                 phase: SequencePhase::Prefill,
                 input: InputRange { start: 0, end: 1 },
                 max_output_steps: 1,
+                auxiliary_state: None,
             },
         }
     }
@@ -2917,6 +2918,7 @@ mod tests {
                 phase: SequencePhase::Prefill,
                 input: InputRange { start: 0, end: 1 },
                 max_output_steps: 1,
+                auxiliary_state: None,
             },
         };
         let lane = lane();
@@ -3451,6 +3453,7 @@ mod tests {
                 phase: SequencePhase::Prefill,
                 input: InputRange { start: 0, end: 1 },
                 max_output_steps: 1,
+                auxiliary_state: None,
             },
         };
         let lane = lane();

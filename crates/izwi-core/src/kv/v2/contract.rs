@@ -40,14 +40,14 @@ impl StateDomainId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
-pub(crate) struct StateGroupId(u32);
+pub struct StateGroupId(u32);
 
 impl StateGroupId {
-    pub(crate) const fn new(value: u32) -> Self {
+    pub const fn new(value: u32) -> Self {
         Self(value)
     }
 
-    pub(crate) const fn get(self) -> u32 {
+    pub const fn get(self) -> u32 {
         self.0
     }
 }
@@ -336,7 +336,7 @@ impl CheckpointPolicy {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "name", rename_all = "snake_case")]
-pub(crate) enum StateClock {
+pub enum StateClock {
     DecoderTokens,
     EncoderTokens,
     AudioSamples,
