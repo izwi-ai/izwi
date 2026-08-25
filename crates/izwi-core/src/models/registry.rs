@@ -3461,6 +3461,31 @@ pub struct AsrModelLease {
     inner: TrackedModelLease<NativeAsrModel>,
 }
 
+/// A loaded LFM2.5 Audio model handle that fences registry unload for its
+/// exact model instance until the final retained ASR/TTS lease clone drops.
+///
+/// The legacy audio-chat discovery APIs continue to return `Arc` handles so
+/// existing AudioChat and SpeechToSpeech call sites retain their public
+/// behavior. Retained sequence routes must acquire this lease instead.
+#[derive(Clone)]
+pub struct Lfm25AudioModelLease {
+    inner: TrackedModelLease<NativeAudioChatModel>,
+}
+
+impl Lfm25AudioModelLease {
+    pub(crate) fn model_arc(&self) -> Arc<NativeAudioChatModel> {
+        self.inner.model.clone()
+    }
+}
+
+impl Deref for Lfm25AudioModelLease {
+    type Target = NativeAudioChatModel;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
 /// A loaded Voxtral realtime handle that fences registry unload for its exact
 /// model instance until the final offline or realtime operation releases it.
 #[derive(Clone)]
@@ -4810,7 +4835,8 @@ pub struct ModelRegistry {
     models_dir: PathBuf,
     device: DeviceProfile,
     asr_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<NativeAsrModel>>>>>,
-    audio_chat_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<NativeAudioChatModel>>>>>>,
+    audio_chat_models:
+        Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<NativeAudioChatModel>>>>>,
     diarization_models:
         Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<NativeDiarizationModel>>>>>>,
     chat_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<NativeChatModel>>>>>,
@@ -5096,8 +5122,8 @@ impl ModelRegistry {
 
         {
             let guard = self.audio_chat_models.read().await;
-            for (variant, cell) in guard.iter() {
-                let Some(model) = cell.get() else {
+            for (variant, entry) in guard.iter() {
+                let Some(model) = entry.model.get() else {
                     continue;
                 };
                 diagnostics.push(loaded_model_diagnostics_entry(
@@ -5382,12 +5408,18 @@ impl ModelRegistry {
             Error::InvalidInput(format!("Unsupported audio-chat model variant: {variant}"))
         })?;
 
-        let cell = {
+        let (entry, loading_guard) = {
             let mut guard = self.audio_chat_models.write().await;
-            guard
+            let entry = guard
                 .entry(variant)
-                .or_insert_with(|| Arc::new(OnceCell::new()))
-                .clone()
+                .or_insert_with(|| Arc::new(TrackedModelEntry::default()))
+                .clone();
+            let loading_guard = entry.uses.acquire().ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "LFM2.5 Audio model {variant} exceeded its active-use accounting capacity"
+                ))
+            })?;
+            (entry, loading_guard)
         };
 
         info!(
@@ -5395,7 +5427,8 @@ impl ModelRegistry {
             registration.name
         );
 
-        let model = cell
+        entry
+            .model
             .get_or_try_init({
                 let model_dir = model_dir.to_path_buf();
                 let device = self.device.clone();
@@ -5412,7 +5445,19 @@ impl ModelRegistry {
             })
             .await?;
 
-        Ok(model.clone())
+        let model = {
+            let guard = self.audio_chat_models.read().await;
+            guard
+                .get(&variant)
+                .filter(|current| Arc::ptr_eq(current, &entry))
+                .and_then(|current| current.model.get().cloned())
+        };
+        drop(loading_guard);
+        model.ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "LFM2.5 Audio model {variant} load was superseded before publication"
+            ))
+        })
     }
 
     pub async fn load_chat(
@@ -5896,7 +5941,46 @@ impl ModelRegistry {
 
     pub async fn get_audio_chat(&self, variant: ModelVariant) -> Option<Arc<NativeAudioChatModel>> {
         let guard = self.audio_chat_models.read().await;
-        guard.get(&variant).and_then(|cell| cell.get().cloned())
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.model.get().cloned())
+    }
+
+    pub async fn get_lfm25_audio_lease(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<Lfm25AudioModelLease> {
+        let guard = self.audio_chat_models.read().await;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire_ready())
+            .map(|inner| Lfm25AudioModelLease { inner })
+    }
+
+    /// Internal lifecycle view of an instantiated LFM2.5 Audio model before
+    /// its adapter, physical-state, and bundle publications have committed.
+    /// Retained inference must use `get_lfm25_audio_lease` instead.
+    pub(crate) async fn get_loading_lfm25_audio_lease(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<Lfm25AudioModelLease> {
+        let guard = self.audio_chat_models.read().await;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire())
+            .map(|inner| Lfm25AudioModelLease { inner })
+    }
+
+    /// Publish retained LFM2.5 Audio discovery only after lifecycle sealing
+    /// and authoritative slot publication have both committed.
+    pub(crate) async fn publish_lfm25_audio_ready(&self, variant: ModelVariant) -> Result<()> {
+        let guard = self.audio_chat_models.read().await;
+        let entry = guard.get(&variant).ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "cannot publish missing LFM2.5 Audio model {variant} as ready"
+            ))
+        })?;
+        entry.publish_ready()
     }
 
     pub fn try_get_chat(&self, variant: ModelVariant) -> Option<ChatModelLease> {
@@ -5909,7 +5993,17 @@ impl ModelRegistry {
 
     pub fn try_get_audio_chat(&self, variant: ModelVariant) -> Option<Arc<NativeAudioChatModel>> {
         let guard = self.audio_chat_models.try_read().ok()?;
-        guard.get(&variant).and_then(|cell| cell.get().cloned())
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.model.get().cloned())
+    }
+
+    pub fn try_get_lfm25_audio_lease(&self, variant: ModelVariant) -> Option<Lfm25AudioModelLease> {
+        let guard = self.audio_chat_models.try_read().ok()?;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire_ready())
+            .map(|inner| Lfm25AudioModelLease { inner })
     }
 
     pub async fn get_voxtral_lease(&self, variant: ModelVariant) -> Option<VoxtralModelLease> {
@@ -6049,8 +6143,17 @@ impl ModelRegistry {
     }
 
     pub async fn unload_audio_chat(&self, variant: ModelVariant) {
-        let mut guard = self.audio_chat_models.write().await;
-        guard.remove(&variant);
+        let entry = {
+            let mut guard = self.audio_chat_models.write().await;
+            let entry = guard.remove(&variant);
+            if let Some(entry) = &entry {
+                entry.reset_ready();
+            }
+            entry
+        };
+        if let Some(entry) = entry {
+            entry.uses.wait_until_idle().await;
+        }
     }
 
     pub async fn unload_voxtral(&self, variant: ModelVariant) {
@@ -6207,6 +6310,30 @@ mod tests {
         assert!(entry.acquire_ready().is_none());
     }
 
+    #[test]
+    fn lfm25_loading_lease_is_tracked_but_retained_discovery_is_ready_gated() {
+        let entry = TrackedModelEntry::<&'static str>::default();
+        entry
+            .model
+            .set(Arc::new("loading-lfm25-audio"))
+            .expect("seed loading LFM2.5 Audio handle");
+
+        let loading = entry.acquire().expect("lifecycle loading lease");
+        assert_eq!(*loading, "loading-lfm25-audio");
+        assert!(entry.acquire_ready().is_none());
+
+        entry
+            .publish_ready()
+            .expect("publish retained LFM2.5 Audio discovery");
+        let retained = entry.acquire_ready().expect("ready retained lease");
+        assert_eq!(*retained, "loading-lfm25-audio");
+
+        entry.reset_ready();
+        assert!(entry.acquire_ready().is_none());
+        assert_eq!(*loading, "loading-lfm25-audio");
+        assert_eq!(*retained, "loading-lfm25-audio");
+    }
+
     #[tokio::test]
     async fn failed_asr_initialization_never_crosses_publication_barrier() {
         let entry = TrackedModelEntry::<&'static str>::default();
@@ -6271,9 +6398,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn asr_and_qwen_tts_sessions_keep_exact_identity_across_unload_reload() {
+    async fn retained_model_sessions_keep_exact_identity_across_unload_reload() {
         assert_session_lease_survives_concurrent_reload("old-asr", "new-asr").await;
         assert_session_lease_survives_concurrent_reload("old-qwen-tts", "new-qwen-tts").await;
+        assert_session_lease_survives_concurrent_reload("old-lfm25-audio", "new-lfm25-audio").await;
     }
 
     #[test]

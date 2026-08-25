@@ -5,6 +5,7 @@ use std::time::Instant;
 use candle_core::{IndexOp, Tensor};
 use tracing::info;
 
+use crate::backends::state::TensorStateArena;
 use crate::backends::{BackendKind, DeviceProfile};
 use crate::engine::{InvocationTensorLease, StageDescriptor};
 use crate::error::{Error, Result};
@@ -29,6 +30,7 @@ use super::sampling::{
     greedy_from_logits, greedy_token_tensor_from_logits, sample_from_logits,
     Lfm25AudioGenerationConfig, SimpleRng,
 };
+use super::state::{Lfm25AudioRetainedCheckpoint, Lfm25AudioRetainedMode, Lfm25AudioRetainedState};
 use super::tokenizer::{Lfm25SpecialTokenIds, Lfm25TextTokenizer};
 use super::LFM25_AUDIO_DEFAULT_INTERLEAVED_SYSTEM_PROMPT;
 use crate::models::architectures::lfm2::backbone::QuantizedLfm2Backbone;
@@ -232,6 +234,91 @@ impl Lfm25AudioModel {
         stage_graphs: &[&[StageDescriptor]],
     ) -> Result<Lfm25AudioPhysicalStateSpec> {
         lfm25_audio_physical_state_spec(&self.main_config, &self.decoder_config, mode, stage_graphs)
+    }
+
+    pub(crate) fn new_retained_state(
+        &self,
+        mode: Lfm25AudioRetainedMode,
+    ) -> Result<Lfm25AudioRetainedState> {
+        let backbone = self
+            .main_backbone
+            .lock()
+            .map_err(|_| Error::InferenceError("LFM2.5 Audio backbone mutex poisoned".into()))?;
+        Ok(Lfm25AudioRetainedState::new(
+            mode,
+            backbone.new_shortconv_state(),
+            self.decoder_config.codebooks,
+        ))
+    }
+
+    pub(crate) fn begin_retained_main_quantum(
+        &self,
+        state: &mut Lfm25AudioRetainedState,
+        main: &PhysicalPagedKvCache,
+    ) -> Result<Lfm25AudioRetainedCheckpoint> {
+        state.begin_main_quantum(main)
+    }
+
+    pub(crate) fn begin_retained_depthformer_quantum(
+        &self,
+        state: &mut Lfm25AudioRetainedState,
+        main: &PhysicalPagedKvCache,
+        depthformer: &PhysicalPagedKvCache,
+    ) -> Result<Lfm25AudioRetainedCheckpoint> {
+        state.begin_depthformer_quantum(main, depthformer)
+    }
+
+    pub(crate) fn commit_retained_quantum(
+        &self,
+        state: &mut Lfm25AudioRetainedState,
+        main: &PhysicalPagedKvCache,
+        depthformer: Option<&PhysicalPagedKvCache>,
+        checkpoint: &Lfm25AudioRetainedCheckpoint,
+    ) -> Result<()> {
+        state.commit_quantum(main, depthformer, checkpoint)
+    }
+
+    pub(crate) fn rollback_retained_quantum(
+        &self,
+        state: &mut Lfm25AudioRetainedState,
+        main: &mut PhysicalPagedKvCache,
+        depthformer: Option<&mut PhysicalPagedKvCache>,
+        checkpoint: &Lfm25AudioRetainedCheckpoint,
+    ) -> Result<()> {
+        state.rollback_quantum(main, depthformer, checkpoint)
+    }
+
+    pub(crate) fn bind_retained_tensor_sequence(
+        &self,
+        state: &mut Lfm25AudioRetainedState,
+        sequence: u64,
+    ) -> Result<()> {
+        state.bind_tensor_sequence(sequence)
+    }
+
+    pub(crate) fn restore_retained_shortconv(
+        &self,
+        state: &mut Lfm25AudioRetainedState,
+        arena: &TensorStateArena,
+    ) -> Result<()> {
+        state.restore_shortconv(arena)
+    }
+
+    pub(crate) fn stage_retained_shortconv(
+        &self,
+        state: &mut Lfm25AudioRetainedState,
+        arena: &TensorStateArena,
+        transaction: u64,
+    ) -> Result<()> {
+        state.stage_shortconv(arena, transaction)
+    }
+
+    pub(crate) fn reset_retained_depthformer_frame(
+        &self,
+        state: &mut Lfm25AudioRetainedState,
+        depthformer: &mut PhysicalPagedKvCache,
+    ) -> Result<()> {
+        state.reset_depthformer_frame(depthformer)
     }
 
     pub(crate) fn transcribe_to_output_with_callback_physical(

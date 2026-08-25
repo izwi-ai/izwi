@@ -1719,7 +1719,7 @@ impl ModelLifecycleController {
                 }
                 let model = self
                     .model_registry
-                    .get_audio_chat(variant)
+                    .get_loading_lfm25_audio_lease(variant)
                     .await
                     .ok_or_else(|| {
                         Error::ModelLoadError(format!(
@@ -1958,6 +1958,11 @@ impl ModelLifecycleController {
             }
             if variant.family() == crate::catalog::ModelFamily::Voxtral {
                 self.model_registry.publish_voxtral_ready(variant).await?;
+            }
+            if variant.family() == crate::catalog::ModelFamily::Lfm25Audio {
+                self.model_registry
+                    .publish_lfm25_audio_ready(variant)
+                    .await?;
             }
             self.touch_model_usage(variant).await;
             Ok(())

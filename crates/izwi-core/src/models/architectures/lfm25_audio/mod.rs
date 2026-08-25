@@ -9,6 +9,7 @@ mod model;
 pub(crate) mod physical;
 mod preprocessor;
 mod sampling;
+pub(crate) mod state;
 mod tokenizer;
 
 pub const LFM25_AUDIO_BUILT_IN_SPEAKERS: [&str; 4] =
@@ -20,7 +21,6 @@ pub use model::{
     Lfm25AudioGenerationOutput, Lfm25AudioModel, Lfm25AudioStreamConfig, Lfm25AudioTextOutput,
 };
 pub use sampling::{Lfm25AudioGenerationConfig, Lfm25SamplingConfig};
-
 fn normalize_speaker_key(speaker: Option<&str>) -> String {
     speaker
         .unwrap_or("")

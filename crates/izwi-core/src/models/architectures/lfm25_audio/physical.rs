@@ -1,6 +1,8 @@
 //! Physical invocation-state contract for the LFM2.5 Audio capability family.
 
-use crate::engine::{NativeBatchMode, StageDescriptor, StageProgressKind};
+use crate::engine::{
+    NativeBatchMode, OutputVisibility, StageDescriptor, StageProgressKind, StageWorkSelector,
+};
 use crate::error::{Error, Result};
 use crate::kv::v2::{
     stage_graph_fingerprint, AttentionMask, AttentionPattern, CapabilityStateDescriptorV2,
@@ -12,8 +14,8 @@ use crate::kv::v2::{
     StateGroupSpec, WorkspaceFormula, CURRENT_INFERENCE_STATE_ABI,
 };
 use crate::models::architectures::lfm2::physical::{
-    invocation_header, lfm2_main_invocation_contract, paged_f32_invocation_bytes,
-    ring_f32_invocation_bytes, Lfm2StateIds, Lfm2StateLayout,
+    invocation_header, lfm2_main_invocation_contract, lfm2_managed_cache_contract,
+    paged_f32_invocation_bytes, ring_f32_invocation_bytes, Lfm2StateIds, Lfm2StateLayout,
 };
 use crate::models::shared::attention::paged::default_kv_page_size;
 
@@ -21,12 +23,13 @@ use super::config::{
     Lfm25AudioDecoderConfig, Lfm2BackboneConfig, LFM25_DEPTHFORMER_KV_HEADS,
     LFM25_DEPTHFORMER_QUERY_HEADS,
 };
+use super::state::Lfm25AudioRetainedMode;
 
 pub(crate) const LFM25_MAIN_ATTENTION_STATE_DOMAIN: StateDomainId = StateDomainId::new(1);
 pub(crate) const LFM25_MAIN_SHORTCONV_STATE_DOMAIN: StateDomainId = StateDomainId::new(2);
 pub(crate) const LFM25_DEPTHFORMER_STATE_DOMAIN: StateDomainId = StateDomainId::new(3);
-const LFM25_MAIN_STATE_GROUP: StateGroupId = StateGroupId::new(1);
-const LFM25_DEPTHFORMER_STATE_GROUP: StateGroupId = StateGroupId::new(2);
+pub(crate) const LFM25_MAIN_STATE_GROUP: StateGroupId = StateGroupId::new(1);
+pub(crate) const LFM25_DEPTHFORMER_STATE_GROUP: StateGroupId = StateGroupId::new(2);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Lfm25AudioStateMode {
     MainOnly,
@@ -37,6 +40,16 @@ pub(crate) enum Lfm25AudioStateMode {
 pub(crate) struct Lfm25AudioPhysicalStateSpec {
     pub(crate) descriptor: CapabilityStateDescriptorV2,
     pub(crate) invocation: InferenceStateContract,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Lfm25AudioRetainedStateSpec {
+    pub(crate) descriptor: CapabilityStateDescriptorV2,
+    pub(crate) retained: InferenceStateContract,
+    pub(crate) retained_max_tokens: usize,
+    /// TTS resets this invocation cache for every emitted frame. ASR has no
+    /// Depthformer and therefore no invocation state contract here.
+    pub(crate) depthformer_invocation: Option<InferenceStateContract>,
 }
 
 pub(crate) fn lfm25_audio_physical_state_spec(
@@ -206,6 +219,216 @@ pub(crate) fn lfm25_audio_physical_state_spec(
     })
 }
 
+/// Build the fail-closed retained state descriptor used by future ASR/TTS
+/// sequence handlers. The main backbone is scheduler-owned and transactional;
+/// Depthformer remains invocation-owned because the model resets it once per
+/// generated audio frame.
+pub(crate) fn lfm25_audio_retained_state_spec(
+    main_config: &Lfm2BackboneConfig,
+    decoder_config: &Lfm25AudioDecoderConfig,
+    mode: Lfm25AudioRetainedMode,
+    stage_graphs: &[&[StageDescriptor]],
+) -> Result<Lfm25AudioRetainedStateSpec> {
+    if stage_graphs.is_empty() {
+        return Err(Error::ModelLoadError(
+            "LFM2.5 Audio retained state has no execution graph".into(),
+        ));
+    }
+    let retained = lfm2_managed_cache_contract(main_config)?;
+    let retained_max_tokens = main_config.context_length;
+    let depthformer_invocation = if mode == Lfm25AudioRetainedMode::Tts {
+        let domain = depthformer_domain(decoder_config)?;
+        let contract = InferenceStateContract {
+            abi: CURRENT_INFERENCE_STATE_ABI,
+            domains: vec![domain],
+            groups: vec![StateGroupSpec {
+                id: LFM25_DEPTHFORMER_STATE_GROUP,
+                domains: vec![LFM25_DEPTHFORMER_STATE_DOMAIN],
+                prefix_shareable: false,
+            }],
+        };
+        contract.validate()?;
+        Some(contract)
+    } else {
+        None
+    };
+    let depthformer_bytes = depthformer_invocation
+        .as_ref()
+        .map(|contract| {
+            paged_f32_invocation_bytes(
+                contract
+                    .domains
+                    .first()
+                    .expect("Depthformer invocation contract has one domain"),
+                u64::try_from(decoder_config.codebooks).map_err(|_| {
+                    Error::ModelLoadError("LFM2.5 Audio codebook count exceeds u64".into())
+                })?,
+            )
+        })
+        .transpose()?;
+
+    let mut profiles = Vec::with_capacity(stage_graphs.len());
+    let mut has_invocation_workspace = false;
+    for stages in stage_graphs {
+        validate_retained_stage_graph(mode, stages)?;
+        let mut ordered = stages.iter().collect::<Vec<_>>();
+        ordered.sort_unstable_by_key(|stage| stage.id);
+        let mut invocation_stages = Vec::with_capacity(ordered.len());
+        for (index, stage) in ordered.into_iter().enumerate() {
+            let owns_depthformer = mode == Lfm25AudioRetainedMode::Tts
+                && stage.selector == StageWorkSelector::SequenceDecode;
+            let mut groups = Vec::new();
+            let mut domains = Vec::new();
+            if owns_depthformer {
+                let contract = depthformer_invocation
+                    .as_ref()
+                    .expect("TTS retained topology has Depthformer invocation state");
+                groups = contract.groups.clone();
+                let state = contract.domains[0].clone();
+                domains.push(InvocationWorkspaceDomain::State {
+                    placement: state.header().placement,
+                    formula: WorkspaceFormula {
+                        fixed_bytes: depthformer_bytes
+                            .expect("TTS Depthformer invocation bytes were computed"),
+                        dimensions: vec![],
+                        terms: vec![],
+                    },
+                    state,
+                    capacity: InvocationStateCapacity::PagedTokens {
+                        max_tokens: u64::try_from(decoder_config.codebooks).map_err(|_| {
+                            Error::ModelLoadError("LFM2.5 Audio codebook count exceeds u64".into())
+                        })?,
+                    },
+                });
+            }
+            if stage.max_workspace_bytes > 0 {
+                let scratch_id = LFM25_DEPTHFORMER_STATE_DOMAIN
+                    .get()
+                    .checked_add(u32::try_from(index + 1).map_err(|_| {
+                        Error::ModelLoadError(
+                            "LFM2.5 Audio retained stage count exceeds u32".into(),
+                        )
+                    })?)
+                    .ok_or_else(|| {
+                        Error::ModelLoadError(
+                            "LFM2.5 Audio retained scratch domain id overflow".into(),
+                        )
+                    })?;
+                domains.push(InvocationWorkspaceDomain::Scratch {
+                    id: StateDomainId::new(scratch_id),
+                    placement: PlacementPolicy::BackendLocal,
+                    alignment_bytes: 64,
+                    zero_on_release: false,
+                    formula: WorkspaceFormula {
+                        fixed_bytes: stage.max_workspace_bytes,
+                        dimensions: vec![],
+                        terms: vec![],
+                    },
+                });
+            }
+            has_invocation_workspace |= !domains.is_empty();
+            invocation_stages.push(InvocationStageWorkspace {
+                stage: stage.id,
+                lease_scope: InvocationLeaseScope::PerRow,
+                groups,
+                domains,
+            });
+        }
+        profiles.push(InvocationWorkspaceProfile {
+            stage_graph_fingerprint: stage_graph_fingerprint(stages)?,
+            stages: invocation_stages,
+        });
+    }
+    profiles.sort_unstable_by_key(|profile| profile.stage_graph_fingerprint);
+    profiles.dedup();
+    let invocation = if has_invocation_workspace {
+        InvocationWorkspaceSet::Bounded { profiles }
+    } else {
+        InvocationWorkspaceSet::None {
+            stage_graph_fingerprints: profiles
+                .into_iter()
+                .map(|profile| profile.stage_graph_fingerprint)
+                .collect(),
+        }
+    };
+    let descriptor = CapabilityStateDescriptorV2 {
+        abi: CURRENT_INFERENCE_STATE_ABI,
+        retained: RetainedStateCapability::Managed {
+            contract: retained.clone(),
+        },
+        invocation,
+    };
+    for stages in stage_graphs {
+        descriptor.validate_against_stages(stages)?;
+    }
+    Ok(Lfm25AudioRetainedStateSpec {
+        descriptor,
+        retained,
+        retained_max_tokens,
+        depthformer_invocation,
+    })
+}
+
+fn validate_retained_stage_graph(
+    mode: Lfm25AudioRetainedMode,
+    stages: &[StageDescriptor],
+) -> Result<()> {
+    let mut preparations = 0usize;
+    let mut prefills = 0usize;
+    let mut decodes = 0usize;
+    for stage in stages {
+        stage.validate()?;
+        if stage.batch_mode != NativeBatchMode::None || stage.max_batch_size != 1 {
+            return Err(Error::ModelLoadError(
+                "LFM2.5 Audio retained handlers are dormant and cannot advertise native batching"
+                    .into(),
+            ));
+        }
+        if stage.output_visibility != OutputVisibility::AfterQuantumCommit {
+            return Err(Error::ModelLoadError(
+                "LFM2.5 Audio retained state requires post-commit output visibility".into(),
+            ));
+        }
+        if stage.retained_state_selections.is_some() {
+            return Err(Error::ModelLoadError(
+                "LFM2.5 Audio retained main state advances only on the decoder-token clock".into(),
+            ));
+        }
+        match stage.selector {
+            StageWorkSelector::PreSequencePreparation
+                if mode == Lfm25AudioRetainedMode::Asr
+                    && stage.progress == StageProgressKind::Atomic =>
+            {
+                preparations += 1;
+            }
+            StageWorkSelector::SequencePrefill | StageWorkSelector::SequenceDecode
+                if stage.progress == StageProgressKind::Iterative =>
+            {
+                if stage.selector == StageWorkSelector::SequencePrefill {
+                    prefills += 1;
+                } else {
+                    decodes += 1;
+                }
+            }
+            _ => {
+                return Err(Error::ModelLoadError(
+                    "LFM2.5 Audio retained graph contains an unsupported stage".into(),
+                ));
+            }
+        }
+    }
+    let preparation_valid = match mode {
+        Lfm25AudioRetainedMode::Asr => preparations == 1,
+        Lfm25AudioRetainedMode::Tts => preparations == 0,
+    };
+    if !preparation_valid || prefills != 1 || decodes != 1 {
+        return Err(Error::ModelLoadError(
+            "LFM2.5 Audio retained graph has the wrong preparation/prefill/decode topology".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn depthformer_domain(config: &Lfm25AudioDecoderConfig) -> Result<StateDomainSpec> {
     if config.codebooks == 0
         || config.depthformer_layers == 0
@@ -326,6 +549,21 @@ mod tests {
             output_visibility: OutputVisibility::AfterQuantumCommit,
             retained_state_selections: None,
         }
+    }
+
+    fn retained_stage(id: u32, selector: StageWorkSelector, workspace: u64) -> StageDescriptor {
+        let mut stage = stage();
+        stage.id = StageId::new(id);
+        stage.name = format!("lfm25_audio.retained.{id}");
+        stage.selector = selector;
+        stage.progress = if selector == StageWorkSelector::PreSequencePreparation {
+            StageProgressKind::Atomic
+        } else {
+            StageProgressKind::Iterative
+        };
+        stage.workspace_base_bytes = workspace;
+        stage.max_workspace_bytes = workspace;
+        stage
     }
 
     #[test]
@@ -463,5 +701,110 @@ mod tests {
         )
         .expect_err("multi-stage ownership must be rejected");
         assert!(multi_error.to_string().contains("one scalar"));
+    }
+
+    #[test]
+    fn retained_asr_contract_moves_main_state_out_of_invocation_workspaces() {
+        let preparation = retained_stage(0, StageWorkSelector::PreSequencePreparation, 128);
+        let prefill = retained_stage(1, StageWorkSelector::SequencePrefill, 64);
+        let decode = retained_stage(2, StageWorkSelector::SequenceDecode, 32);
+        let stages = [preparation, prefill, decode];
+        let spec = lfm25_audio_retained_state_spec(
+            &main_config(),
+            &decoder_config(),
+            Lfm25AudioRetainedMode::Asr,
+            &[&stages],
+        )
+        .expect("retained ASR contract");
+
+        assert_eq!(spec.retained_max_tokens, 17);
+        assert!(spec.depthformer_invocation.is_none());
+        assert!(spec.retained.domains.iter().all(|domain| {
+            domain.header().scope == crate::kv::v2::StateScope::Retained
+                && domain.header().checkpoint == crate::kv::v2::CheckpointPolicy::Transactional
+        }));
+        assert!(matches!(
+            spec.descriptor.retained,
+            RetainedStateCapability::Managed { .. }
+        ));
+        let InvocationWorkspaceSet::Bounded { profiles } = &spec.descriptor.invocation else {
+            panic!("ASR stage scratch must be bounded");
+        };
+        assert!(profiles[0].stages.iter().all(|stage| stage
+            .domains
+            .iter()
+            .all(|domain| matches!(domain, InvocationWorkspaceDomain::Scratch { .. }))));
+    }
+
+    #[test]
+    fn retained_tts_keeps_depthformer_on_decode_invocation_only() {
+        let prefill = retained_stage(1, StageWorkSelector::SequencePrefill, 0);
+        let decode = retained_stage(2, StageWorkSelector::SequenceDecode, 64);
+        let stages = [prefill, decode];
+        let spec = lfm25_audio_retained_state_spec(
+            &main_config(),
+            &decoder_config(),
+            Lfm25AudioRetainedMode::Tts,
+            &[&stages],
+        )
+        .expect("retained TTS contract");
+
+        assert_eq!(spec.retained.domains.len(), 2);
+        assert!(spec
+            .retained
+            .domains
+            .iter()
+            .all(|domain| domain.id() != LFM25_DEPTHFORMER_STATE_DOMAIN));
+        let depthformer = spec
+            .depthformer_invocation
+            .as_ref()
+            .expect("TTS Depthformer invocation contract");
+        assert_eq!(depthformer.domains.len(), 1);
+        assert_eq!(
+            depthformer.domains[0].header().scope,
+            crate::kv::v2::StateScope::Invocation
+        );
+        assert_eq!(
+            depthformer.domains[0].header().clock,
+            StateClock::CodebookSteps
+        );
+
+        let InvocationWorkspaceSet::Bounded { profiles } = &spec.descriptor.invocation else {
+            panic!("TTS decode invocation state must be bounded");
+        };
+        assert!(profiles[0].stages[0].domains.is_empty());
+        assert!(matches!(
+            profiles[0].stages[1].domains[0],
+            InvocationWorkspaceDomain::State { .. }
+        ));
+    }
+
+    #[test]
+    fn retained_contract_rejects_unimplemented_native_batching_and_atomic_routes() {
+        let prefill = retained_stage(1, StageWorkSelector::SequencePrefill, 0);
+        let mut decode = retained_stage(2, StageWorkSelector::SequenceDecode, 0);
+        decode.batch_mode = NativeBatchMode::Continuous;
+        decode.concurrency = ConcurrencyClass::Batchable;
+        decode.max_batch_size = 2;
+        decode.membership_safe_point = MembershipSafePoint::QuantumBoundary;
+        decode.shape_policy = StageShapePolicy::Ragged;
+        let stages = [prefill.clone(), decode];
+        assert!(lfm25_audio_retained_state_spec(
+            &main_config(),
+            &decoder_config(),
+            Lfm25AudioRetainedMode::Tts,
+            &[&stages],
+        )
+        .is_err());
+
+        let atomic = stage();
+        let stages = [atomic, prefill];
+        assert!(lfm25_audio_retained_state_spec(
+            &main_config(),
+            &decoder_config(),
+            Lfm25AudioRetainedMode::Asr,
+            &[&stages],
+        )
+        .is_err());
     }
 }
