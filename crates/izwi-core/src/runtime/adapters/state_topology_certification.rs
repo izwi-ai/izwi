@@ -12,6 +12,7 @@ enum CertifiedTopology {
     RetainedPaged,
     RetainedPagedRing,
     RetainedPagedTensorAndInvocationPaged,
+    RetainedPagedAndInvocationPagedTensor,
     RetainedPagedStaticAndInvocationPagedStatic,
     RetainedPagedTensorTensor,
     RetainedAppendRingTensor,
@@ -32,6 +33,7 @@ impl CertifiedTopology {
                 InferenceStateRequirement::Retained
             }
             Self::RetainedPagedTensorAndInvocationPaged
+            | Self::RetainedPagedAndInvocationPagedTensor
             | Self::RetainedPagedStaticAndInvocationPagedStatic
             | Self::RetainedAppendRingTensor => InferenceStateRequirement::RetainedAndInvocation,
             Self::InvocationPaged
@@ -81,7 +83,10 @@ fn certified_topology(
         // one retained transaction; long-form leases invocation pages only.
         (Qwen3Asr, Asr) => RetainedPagedTensorAndInvocationPaged,
         (Voxtral, Asr) => InvocationPaged,
-        (VibeVoiceAsr, Asr) => InvocationPagedTensor,
+        // Normal VibeVoice ASR retains decoder pages after freezing its
+        // stochastic tokenizer output; the long/chunk compatibility graph
+        // still leases decoder pages plus acoustic/semantic tensor state.
+        (VibeVoiceAsr, Asr) => RetainedPagedAndInvocationPagedTensor,
         (WhisperAsr, Asr) => RetainedPagedStaticAndInvocationPagedStatic,
         (ParakeetAsr, Asr) => InvocationTensor,
         (GraniteSpeechAsr, Asr | SpeakerAttributedAsr) => InvocationPaged,

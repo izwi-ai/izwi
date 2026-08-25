@@ -4,7 +4,11 @@ use std::collections::BTreeMap;
 
 use candle_core::DType;
 
-use crate::engine::StageDescriptor;
+use crate::engine::{
+    ConcurrencyClass, ExecutionDomain, MembershipSafePoint, NativeBatchMode, OutputVisibility,
+    PhysicalLaunchPolicy, StageDescriptor, StageId, StageProgressKind, StageShapePolicy,
+    StageWorkSelector,
+};
 use crate::error::{Error, Result};
 use crate::kv::v2::{
     stage_graph_fingerprint, CapabilityStateDescriptorV2, CheckpointPolicy, InferenceStateContract,
@@ -29,6 +33,12 @@ pub mod tts;
 pub(crate) const VIBEVOICE_ASR_DECODER_DOMAIN: StateDomainId = StateDomainId::new(1);
 pub(crate) const VIBEVOICE_ASR_ACOUSTIC_DOMAIN: StateDomainId = StateDomainId::new(2);
 pub(crate) const VIBEVOICE_ASR_SEMANTIC_DOMAIN: StateDomainId = StateDomainId::new(3);
+pub(crate) const VIBEVOICE_ASR_DECODER_GROUP: StateGroupId = StateGroupId::new(1);
+const VIBEVOICE_ASR_TOKENIZER_GROUP: StateGroupId = StateGroupId::new(2);
+pub(crate) const VIBEVOICE_ASR_PREPARATION_STAGE: &str = "asr.encoder.vibevoice";
+pub(crate) const VIBEVOICE_ASR_PREFILL_STAGE: &str = "asr.prefill.scalar";
+pub(crate) const VIBEVOICE_ASR_DECODE_STAGE: &str = "asr.decode.tensor_continuous";
+pub(crate) const VIBEVOICE_ASR_LEGACY_STAGE: &str = "asr.scalar";
 pub(crate) const VIBEVOICE_TTS_POSITIVE_DOMAIN: StateDomainId = StateDomainId::new(1);
 pub(crate) const VIBEVOICE_TTS_NEGATIVE_DOMAIN: StateDomainId = StateDomainId::new(2);
 pub(crate) const VIBEVOICE_TTS_ACOUSTIC_DOMAIN: StateDomainId = StateDomainId::new(3);
@@ -37,6 +47,10 @@ pub(crate) const VIBEVOICE_TTS_SEMANTIC_DOMAIN: StateDomainId = StateDomainId::n
 #[derive(Debug, Clone)]
 pub(crate) struct VibeVoicePhysicalStateSpec {
     pub(crate) descriptor: CapabilityStateDescriptorV2,
+    /// Present only for the authenticated normal VibeVoice-ASR sequence graph.
+    /// Legacy VibeVoice ASR and VibeVoice TTS remain invocation-only.
+    pub(crate) retained: Option<InferenceStateContract>,
+    pub(crate) retained_max_tokens: Option<usize>,
     pub(crate) invocation: InferenceStateContract,
 }
 
@@ -347,12 +361,303 @@ pub(crate) fn vibevoice_physical_state_spec(
     invocation: InferenceStateContract,
     max_context_tokens: usize,
 ) -> Result<VibeVoicePhysicalStateSpec> {
+    let has_asr_stage_identity =
+        stage_graphs
+            .iter()
+            .flat_map(|stages| stages.iter())
+            .any(|stage| {
+                matches!(
+                    stage.name.as_str(),
+                    VIBEVOICE_ASR_PREPARATION_STAGE
+                        | VIBEVOICE_ASR_PREFILL_STAGE
+                        | VIBEVOICE_ASR_DECODE_STAGE
+                        | VIBEVOICE_ASR_LEGACY_STAGE
+                )
+            });
+    if has_vibevoice_asr_domain_topology(&invocation) || has_asr_stage_identity {
+        return vibevoice_asr_physical_state_spec(stage_graphs, invocation, max_context_tokens);
+    }
     let descriptor =
         vibevoice_invocation_descriptor(stage_graphs, &invocation, max_context_tokens)?;
     Ok(VibeVoicePhysicalStateSpec {
         descriptor,
+        retained: None,
+        retained_max_tokens: None,
         invocation,
     })
+}
+
+fn has_vibevoice_asr_domain_topology(contract: &InferenceStateContract) -> bool {
+    contract.domains.len() == 3
+        && contract.groups.len() == 2
+        && contract.groups[0].id == VIBEVOICE_ASR_DECODER_GROUP
+        && contract.groups[0].domains == [VIBEVOICE_ASR_DECODER_DOMAIN]
+        && contract.groups[1].id == VIBEVOICE_ASR_TOKENIZER_GROUP
+        && contract.groups[1].domains
+            == [VIBEVOICE_ASR_ACOUSTIC_DOMAIN, VIBEVOICE_ASR_SEMANTIC_DOMAIN]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VibeVoiceAsrGraphKind {
+    Normal,
+    Legacy,
+}
+
+fn vibevoice_asr_physical_state_spec(
+    stage_graphs: &[&[StageDescriptor]],
+    invocation: InferenceStateContract,
+    max_context_tokens: usize,
+) -> Result<VibeVoicePhysicalStateSpec> {
+    if stage_graphs.is_empty() || max_context_tokens == 0 {
+        return Err(Error::ModelLoadError(
+            "VibeVoice ASR physical state requires execution graphs and a non-zero context".into(),
+        ));
+    }
+    let retained = vibevoice_asr_retained_contract(&invocation)?;
+    let max_tokens = u64::try_from(max_context_tokens)
+        .map_err(|_| Error::ModelLoadError("VibeVoice ASR context exceeds u64".into()))?;
+    let max_domain_id = invocation
+        .domains
+        .iter()
+        .map(|domain| domain.id().get())
+        .max()
+        .ok_or_else(|| {
+            Error::ModelLoadError("VibeVoice ASR invocation contract is empty".into())
+        })?;
+
+    let mut profiles = Vec::with_capacity(stage_graphs.len());
+    let mut saw_normal = false;
+    let mut saw_legacy = false;
+    for stages in stage_graphs {
+        let kind = authenticate_vibevoice_asr_graph(stages)?;
+        saw_normal |= kind == VibeVoiceAsrGraphKind::Normal;
+        saw_legacy |= kind == VibeVoiceAsrGraphKind::Legacy;
+        let mut ordered = stages.iter().collect::<Vec<_>>();
+        ordered.sort_unstable_by_key(|stage| stage.id);
+        let mut invocation_stages = Vec::with_capacity(ordered.len());
+        for (index, stage) in ordered.into_iter().enumerate() {
+            let owns_legacy_state = kind == VibeVoiceAsrGraphKind::Legacy;
+            let mut domains = if owns_legacy_state {
+                invocation
+                    .domains
+                    .iter()
+                    .cloned()
+                    .map(|state| {
+                        let (fixed_bytes, capacity) = match &state {
+                            StateDomainSpec::PagedAttention(_) => (
+                                vibevoice_paged_invocation_bytes(&state, max_tokens)?,
+                                InvocationStateCapacity::decoder_context(max_tokens)?,
+                            ),
+                            StateDomainSpec::Tensor(_) => (
+                                vibevoice_tensor_invocation_bytes(&state)?,
+                                InvocationStateCapacity::SemanticBounded,
+                            ),
+                            _ => {
+                                return Err(Error::ModelLoadError(
+                                    "VibeVoice ASR legacy state contains an unsupported domain"
+                                        .into(),
+                                ));
+                            }
+                        };
+                        Ok(InvocationWorkspaceDomain::State {
+                            placement: state.header().placement,
+                            formula: WorkspaceFormula {
+                                fixed_bytes,
+                                dimensions: vec![],
+                                terms: vec![],
+                            },
+                            state,
+                            capacity,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                Vec::new()
+            };
+            if stage.max_workspace_bytes > 0 {
+                let ordinal = u32::try_from(index + 1).map_err(|_| {
+                    Error::ModelLoadError("VibeVoice ASR stage count exceeds u32".into())
+                })?;
+                let scratch_id = max_domain_id.checked_add(ordinal).ok_or_else(|| {
+                    Error::ModelLoadError("VibeVoice ASR scratch domain id overflow".into())
+                })?;
+                domains.push(InvocationWorkspaceDomain::Scratch {
+                    id: StateDomainId::new(scratch_id),
+                    placement: PlacementPolicy::BackendLocal,
+                    alignment_bytes: 64,
+                    zero_on_release: false,
+                    formula: WorkspaceFormula {
+                        fixed_bytes: stage.max_workspace_bytes,
+                        dimensions: vec![],
+                        terms: vec![],
+                    },
+                });
+            }
+            invocation_stages.push(InvocationStageWorkspace {
+                stage: stage.id,
+                lease_scope: InvocationLeaseScope::PerRow,
+                groups: owns_legacy_state
+                    .then(|| invocation.groups.clone())
+                    .unwrap_or_default(),
+                domains,
+            });
+        }
+        profiles.push(InvocationWorkspaceProfile {
+            stage_graph_fingerprint: stage_graph_fingerprint(stages)?,
+            stages: invocation_stages,
+        });
+    }
+    if !saw_normal || !saw_legacy {
+        return Err(Error::ModelLoadError(
+            "VibeVoice ASR must seal both its normal retained and legacy atomic graphs".into(),
+        ));
+    }
+    profiles.sort_unstable_by_key(|profile| profile.stage_graph_fingerprint);
+    profiles.dedup();
+    let descriptor = CapabilityStateDescriptorV2 {
+        abi: CURRENT_INFERENCE_STATE_ABI,
+        retained: RetainedStateCapability::Managed {
+            contract: retained.clone(),
+        },
+        invocation: InvocationWorkspaceSet::Bounded { profiles },
+    };
+    for stages in stage_graphs {
+        descriptor.validate_against_stages(stages)?;
+    }
+    Ok(VibeVoicePhysicalStateSpec {
+        descriptor,
+        retained: Some(retained),
+        retained_max_tokens: Some(max_context_tokens),
+        invocation,
+    })
+}
+
+fn authenticate_vibevoice_asr_graph(stages: &[StageDescriptor]) -> Result<VibeVoiceAsrGraphKind> {
+    for stage in stages {
+        stage.validate()?;
+    }
+    let mut ordered = stages.iter().collect::<Vec<_>>();
+    ordered.sort_unstable_by_key(|stage| stage.id);
+    if let [stage] = ordered.as_slice() {
+        if stage.id == StageId::new(0)
+            && stage.name == VIBEVOICE_ASR_LEGACY_STAGE
+            && stage.selector == StageWorkSelector::Atomic
+            && stage.progress == StageProgressKind::Atomic
+            && stage.batch_mode == NativeBatchMode::None
+            && stage.shape_policy == StageShapePolicy::Exact
+        {
+            return Ok(VibeVoiceAsrGraphKind::Legacy);
+        }
+    }
+    if let [preparation, prefill, decode] = ordered.as_slice() {
+        let valid = preparation.id == StageId::new(0)
+            && preparation.name == VIBEVOICE_ASR_PREPARATION_STAGE
+            && preparation.selector == StageWorkSelector::PreSequencePreparation
+            && preparation.domain == ExecutionDomain::ExecutionGroup
+            && preparation.progress == StageProgressKind::Atomic
+            && preparation.batch_mode == NativeBatchMode::None
+            && preparation.shape_policy == StageShapePolicy::Exact
+            && preparation.concurrency == ConcurrencyClass::Exclusive
+            && preparation.physical_launch_policy == PhysicalLaunchPolicy::ExecutionGroupExclusive
+            && preparation.membership_safe_point == MembershipSafePoint::OperationBoundary
+            && preparation.output_visibility == OutputVisibility::AfterQuantumCommit
+            && preparation.max_batch_size == 1
+            && preparation.max_workspace_bytes > 0
+            && prefill.id == StageId::new(1)
+            && prefill.name == VIBEVOICE_ASR_PREFILL_STAGE
+            && prefill.selector == StageWorkSelector::SequencePrefill
+            && prefill.domain == ExecutionDomain::ExecutionGroup
+            && prefill.progress == StageProgressKind::Iterative
+            && prefill.batch_mode == NativeBatchMode::None
+            && prefill.shape_policy == StageShapePolicy::Exact
+            && prefill.concurrency == ConcurrencyClass::Exclusive
+            && prefill.physical_launch_policy == PhysicalLaunchPolicy::ExecutionGroupExclusive
+            && prefill.membership_safe_point == MembershipSafePoint::QuantumBoundary
+            && prefill.output_visibility == OutputVisibility::AfterQuantumCommit
+            && prefill.max_batch_size == 1
+            && decode.id == StageId::new(2)
+            && decode.name == VIBEVOICE_ASR_DECODE_STAGE
+            && decode.selector == StageWorkSelector::SequenceDecode
+            && decode.domain == ExecutionDomain::ExecutionGroup
+            && decode.progress == StageProgressKind::Iterative
+            && decode.batch_mode == NativeBatchMode::Continuous
+            && decode.shape_policy == StageShapePolicy::Ragged
+            && decode.concurrency == ConcurrencyClass::Batchable
+            && decode.physical_launch_policy == PhysicalLaunchPolicy::ExecutionGroupExclusive
+            && decode.membership_safe_point == MembershipSafePoint::QuantumBoundary
+            && decode.output_visibility == OutputVisibility::AfterQuantumCommit
+            && decode.max_batch_size > 1;
+        if valid {
+            return Ok(VibeVoiceAsrGraphKind::Normal);
+        }
+    }
+    Err(Error::ModelLoadError(
+        "VibeVoice ASR execution graph does not match the sealed normal or legacy graph".into(),
+    ))
+}
+
+fn vibevoice_asr_retained_contract(
+    invocation: &InferenceStateContract,
+) -> Result<InferenceStateContract> {
+    invocation.validate()?;
+    if !has_vibevoice_asr_domain_topology(invocation) {
+        return Err(Error::ModelLoadError(
+            "VibeVoice ASR legacy contract must contain exact decoder and coupled tokenizer domains"
+                .into(),
+        ));
+    }
+    let decoder = invocation
+        .domains
+        .iter()
+        .find(|domain| domain.id() == VIBEVOICE_ASR_DECODER_DOMAIN)
+        .ok_or_else(|| Error::ModelLoadError("VibeVoice ASR decoder domain is missing".into()))?;
+    let StateDomainSpec::PagedAttention(mut decoder) = decoder.clone() else {
+        return Err(Error::ModelLoadError(
+            "VibeVoice ASR decoder domain must be paged attention".into(),
+        ));
+    };
+    if decoder.header.scope != StateScope::Invocation
+        || decoder.header.clock != StateClock::DecoderTokens
+        || decoder.header.prefix != PrefixPolicy::Disabled
+        || decoder.header.checkpoint != CheckpointPolicy::None
+    {
+        return Err(Error::ModelLoadError(
+            "VibeVoice ASR legacy decoder domain has unexpected state semantics".into(),
+        ));
+    }
+    for id in [VIBEVOICE_ASR_ACOUSTIC_DOMAIN, VIBEVOICE_ASR_SEMANTIC_DOMAIN] {
+        let domain = invocation
+            .domains
+            .iter()
+            .find(|domain| domain.id() == id)
+            .ok_or_else(|| {
+                Error::ModelLoadError("VibeVoice ASR tokenizer domain is missing".into())
+            })?;
+        if !matches!(domain, StateDomainSpec::Tensor(_))
+            || domain.header().scope != StateScope::Invocation
+            || domain.header().clock != StateClock::AudioSamples
+            || domain.header().prefix != PrefixPolicy::Disabled
+            || domain.header().checkpoint != CheckpointPolicy::None
+        {
+            return Err(Error::ModelLoadError(
+                "VibeVoice ASR tokenizer domains have unexpected state semantics".into(),
+            ));
+        }
+    }
+    decoder.header.scope = StateScope::Retained;
+    decoder.header.prefix = PrefixPolicy::Disabled;
+    decoder.header.checkpoint = CheckpointPolicy::Transactional;
+    let retained = InferenceStateContract {
+        abi: CURRENT_INFERENCE_STATE_ABI,
+        domains: vec![StateDomainSpec::PagedAttention(decoder)],
+        groups: vec![StateGroupSpec {
+            id: VIBEVOICE_ASR_DECODER_GROUP,
+            domains: vec![VIBEVOICE_ASR_DECODER_DOMAIN],
+            prefix_shareable: false,
+        }],
+    };
+    retained.validate()?;
+    Ok(retained)
 }
 
 fn vibevoice_paged_invocation_bytes(state: &StateDomainSpec, max_tokens: u64) -> Result<u64> {
@@ -531,6 +836,60 @@ mod tests {
                     },
                 )
                 .collect(),
+        )
+        .unwrap()
+    }
+
+    fn asr_legacy_stage() -> StageDescriptor {
+        let mut legacy = stage();
+        legacy.id = StageId::new(0);
+        legacy.name = VIBEVOICE_ASR_LEGACY_STAGE.into();
+        legacy.shape_policy = StageShapePolicy::Exact;
+        legacy.concurrency = ConcurrencyClass::Exclusive;
+        legacy.max_batch_size = 1;
+        legacy
+    }
+
+    fn asr_normal_stages() -> [StageDescriptor; 3] {
+        let mut preparation = stage();
+        preparation.id = StageId::new(0);
+        preparation.name = VIBEVOICE_ASR_PREPARATION_STAGE.into();
+        preparation.selector = StageWorkSelector::PreSequencePreparation;
+        preparation.shape_policy = StageShapePolicy::Exact;
+        preparation.concurrency = ConcurrencyClass::Exclusive;
+        preparation.max_batch_size = 1;
+        preparation.max_workspace_bytes = 4096;
+
+        let mut prefill = stage();
+        prefill.id = StageId::new(1);
+        prefill.name = VIBEVOICE_ASR_PREFILL_STAGE.into();
+        prefill.selector = StageWorkSelector::SequencePrefill;
+        prefill.progress = StageProgressKind::Iterative;
+        prefill.shape_policy = StageShapePolicy::Exact;
+        prefill.concurrency = ConcurrencyClass::Exclusive;
+        prefill.max_batch_size = 1;
+        prefill.membership_safe_point = MembershipSafePoint::QuantumBoundary;
+
+        let mut decode = stage();
+        decode.id = StageId::new(2);
+        decode.name = VIBEVOICE_ASR_DECODE_STAGE.into();
+        decode.selector = StageWorkSelector::SequenceDecode;
+        decode.progress = StageProgressKind::Iterative;
+        decode.batch_mode = NativeBatchMode::Continuous;
+        decode.shape_policy = StageShapePolicy::Ragged;
+        decode.membership_safe_point = MembershipSafePoint::QuantumBoundary;
+        [preparation, prefill, decode]
+    }
+
+    fn asr_complete_invocation_contract() -> InferenceStateContract {
+        let tokenizer = [
+            tokenizer_domain(2, 2, StateClock::AudioSamples, &[(2, 3), (4, 5)]),
+            tokenizer_domain(3, 2, StateClock::AudioSamples, &[(6, 7)]),
+        ];
+        vibevoice_invocation_contract_from_state(
+            state_contract(1, DType::F32),
+            DType::F32,
+            &tokenizer,
         )
         .unwrap()
     }
@@ -721,5 +1080,217 @@ mod tests {
             vibevoice_tensor_invocation_bytes(&contract.domains[1]).unwrap(),
             52
         );
+    }
+
+    #[test]
+    fn asr_dual_graph_spec_retains_only_decoder_and_projects_exact_workspaces() {
+        let invocation = asr_complete_invocation_contract();
+        let normal = asr_normal_stages();
+        let legacy = [asr_legacy_stage()];
+        let spec = vibevoice_physical_state_spec(
+            &[normal.as_slice(), legacy.as_slice()],
+            invocation.clone(),
+            4096,
+        )
+        .unwrap();
+
+        assert_eq!(spec.invocation, invocation);
+        assert_eq!(spec.retained_max_tokens, Some(4096));
+        let retained = spec.retained.as_ref().expect("normal retained contract");
+        assert_eq!(retained.domains.len(), 1);
+        assert_eq!(retained.groups.len(), 1);
+        assert_eq!(retained.groups[0].domains, [VIBEVOICE_ASR_DECODER_DOMAIN]);
+        assert!(matches!(
+            &retained.domains[0],
+            StateDomainSpec::PagedAttention(domain)
+                if domain.header.scope == StateScope::Retained
+                    && domain.header.clock == StateClock::DecoderTokens
+                    && domain.header.prefix == PrefixPolicy::Disabled
+                    && domain.header.checkpoint == CheckpointPolicy::Transactional
+        ));
+        assert!(matches!(
+            &spec.descriptor.retained,
+            RetainedStateCapability::Managed { contract } if contract == retained
+        ));
+
+        let InvocationWorkspaceSet::Bounded { profiles } = &spec.descriptor.invocation else {
+            panic!("dual graph ASR must have bounded graph-specific workspaces")
+        };
+        let normal_fingerprint = stage_graph_fingerprint(&normal).unwrap();
+        let normal_profile = profiles
+            .iter()
+            .find(|profile| profile.stage_graph_fingerprint == normal_fingerprint)
+            .unwrap();
+        assert_eq!(normal_profile.stages.len(), 3);
+        assert_eq!(
+            normal_profile.stages[0].lease_scope,
+            InvocationLeaseScope::PerRow
+        );
+        assert!(normal_profile.stages[0].groups.is_empty());
+        assert!(matches!(
+            normal_profile.stages[0].domains.as_slice(),
+            [InvocationWorkspaceDomain::Scratch {
+                formula: WorkspaceFormula {
+                    fixed_bytes: 4096,
+                    ..
+                },
+                ..
+            }]
+        ));
+        assert!(normal_profile.stages[1].domains.is_empty());
+        assert!(normal_profile.stages[2].domains.is_empty());
+
+        let legacy_fingerprint = stage_graph_fingerprint(&legacy).unwrap();
+        let legacy_profile = profiles
+            .iter()
+            .find(|profile| profile.stage_graph_fingerprint == legacy_fingerprint)
+            .unwrap();
+        assert_eq!(legacy_profile.stages.len(), 1);
+        assert_eq!(legacy_profile.stages[0].groups, invocation.groups);
+        assert_eq!(legacy_profile.stages[0].domains.len(), 3);
+        assert!(matches!(
+            &legacy_profile.stages[0].domains[0],
+            InvocationWorkspaceDomain::State {
+                capacity,
+                formula: WorkspaceFormula { fixed_bytes: 1_048_576, .. },
+                ..
+            } if capacity.paged_max_tokens() == Some(4096)
+        ));
+        assert!(matches!(
+            &legacy_profile.stages[0].domains[1],
+            InvocationWorkspaceDomain::State {
+                capacity: InvocationStateCapacity::SemanticBounded,
+                formula: WorkspaceFormula {
+                    fixed_bytes: 104,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            &legacy_profile.stages[0].domains[2],
+            InvocationWorkspaceDomain::State {
+                capacity: InvocationStateCapacity::SemanticBounded,
+                formula: WorkspaceFormula {
+                    fixed_bytes: 168,
+                    ..
+                },
+                ..
+            }
+        ));
+        spec.descriptor.validate_against_stages(&normal).unwrap();
+        spec.descriptor.validate_against_stages(&legacy).unwrap();
+    }
+
+    #[test]
+    fn asr_dual_graph_spec_rejects_unsealed_decode_shape() {
+        let invocation = asr_complete_invocation_contract();
+        let mut normal = asr_normal_stages();
+        normal[2].shape_policy = StageShapePolicy::Padded;
+        let legacy = [asr_legacy_stage()];
+        let error = vibevoice_physical_state_spec(
+            &[normal.as_slice(), legacy.as_slice()],
+            invocation,
+            4096,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match the sealed normal or legacy graph"));
+    }
+
+    #[test]
+    fn asr_dual_graph_spec_rejects_unimplemented_encoder_batching() {
+        let invocation = asr_complete_invocation_contract();
+        let mut normal = asr_normal_stages();
+        normal[0].batch_mode = NativeBatchMode::Static;
+        normal[0].shape_policy = StageShapePolicy::Padded;
+        normal[0].concurrency = ConcurrencyClass::Batchable;
+        let legacy = [asr_legacy_stage()];
+        let error = vibevoice_physical_state_spec(
+            &[normal.as_slice(), legacy.as_slice()],
+            invocation,
+            4096,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match the sealed normal or legacy graph"));
+    }
+
+    #[test]
+    fn asr_dual_graph_spec_authenticates_transaction_boundaries() {
+        fn assert_rejected(normal: [StageDescriptor; 3]) {
+            let legacy = [asr_legacy_stage()];
+            assert!(vibevoice_physical_state_spec(
+                &[normal.as_slice(), legacy.as_slice()],
+                asr_complete_invocation_contract(),
+                4096,
+            )
+            .is_err());
+        }
+
+        let mut wrong_visibility = asr_normal_stages();
+        wrong_visibility[1].output_visibility = OutputVisibility::IncrementalCommitted;
+        assert_rejected(wrong_visibility);
+
+        let mut wrong_domain = asr_normal_stages();
+        wrong_domain[0].domain = ExecutionDomain::Host;
+        assert_rejected(wrong_domain);
+
+        let mut wrong_safe_point = asr_normal_stages();
+        wrong_safe_point[2].membership_safe_point = MembershipSafePoint::OperationBoundary;
+        assert_rejected(wrong_safe_point);
+
+        let mut scalar_decode_width = asr_normal_stages();
+        scalar_decode_width[2].max_batch_size = 1;
+        assert_rejected(scalar_decode_width);
+    }
+
+    #[test]
+    fn asr_dual_graph_spec_requires_both_authenticated_graphs() {
+        let invocation = asr_complete_invocation_contract();
+        let normal = asr_normal_stages();
+        let error =
+            vibevoice_physical_state_spec(&[normal.as_slice()], invocation, 4096).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("both its normal retained and legacy atomic graphs"));
+    }
+
+    #[test]
+    fn asr_dual_graph_spec_rejects_incomplete_legacy_state() {
+        let invocation = invocation_contract(1);
+        let normal = asr_normal_stages();
+        let legacy = [asr_legacy_stage()];
+        let error = vibevoice_physical_state_spec(
+            &[normal.as_slice(), legacy.as_slice()],
+            invocation,
+            4096,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("exact decoder and coupled tokenizer domains"));
+    }
+
+    #[test]
+    fn tts_non_atomic_selector_does_not_enter_asr_dual_graph_contract() {
+        let tokenizer = [
+            tokenizer_domain(3, 3, StateClock::CodecFrames, &[(2, 3)]),
+            tokenizer_domain(4, 3, StateClock::CodecFrames, &[(4, 5)]),
+        ];
+        let invocation = vibevoice_invocation_contract_from_state(
+            state_contract(2, DType::F32),
+            DType::F32,
+            &tokenizer,
+        )
+        .unwrap();
+        let mut tts = stage();
+        tts.selector = StageWorkSelector::Any;
+        let spec = vibevoice_physical_state_spec(&[&[tts]], invocation, 8192).unwrap();
+        assert!(spec.retained.is_none());
+        assert!(spec.retained_max_tokens.is_none());
+        assert!(spec.descriptor.is_stateless());
     }
 }

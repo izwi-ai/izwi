@@ -43,6 +43,28 @@ fn whisper_prefill_boundary_step(last_tokens_generated: usize) -> NativeAsrDecod
     }
 }
 
+fn vibevoice_prefill_boundary_step(
+    complete: bool,
+    staged: Option<NativeAsrDecodeStep>,
+    last_tokens_generated: usize,
+) -> Result<NativeAsrDecodeStep> {
+    match (complete, staged) {
+        (true, Some(step)) => Ok(step),
+        (true, None) => Err(Error::InferenceError(
+            "final VibeVoice ASR prefill produced no staged decoder output".into(),
+        )),
+        (false, None) => Ok(NativeAsrDecodeStep {
+            delta: String::new(),
+            text: String::new(),
+            tokens_generated: last_tokens_generated,
+            finished: false,
+        }),
+        (false, Some(_)) => Err(Error::InferenceError(
+            "non-final VibeVoice ASR prefill produced premature decoder output".into(),
+        )),
+    }
+}
+
 fn apply_whisper_terminal_transition(
     step: &mut NativeAsrDecodeStep,
     transition: WhisperTerminalTransition,
@@ -123,14 +145,22 @@ fn resolve_asr_execution_audio(
     family: ModelFamily,
     decode: impl FnOnce() -> Result<(Vec<f32>, u32)>,
 ) -> Result<(AsrExecutionAudio, u32, f64)> {
-    if matches!(family, ModelFamily::Qwen3Asr | ModelFamily::WhisperAsr) {
+    if matches!(
+        family,
+        ModelFamily::Qwen3Asr | ModelFamily::WhisperAsr | ModelFamily::VibeVoiceAsr
+    ) {
         if let Some((samples, sample_rate)) = request.prepared_asr_audio_for_executor()? {
             return Ok((AsrExecutionAudio::Prepared(samples), sample_rate, 0.0));
         }
-        if family == ModelFamily::Qwen3Asr {
-            return Err(Error::InferenceError(
-                "Qwen3 ASR execution lost its prepared decoded-audio artifact".to_string(),
-            ));
+        if matches!(family, ModelFamily::Qwen3Asr | ModelFamily::VibeVoiceAsr) {
+            return Err(Error::InferenceError(format!(
+                "{} execution lost its prepared decoded-audio artifact",
+                match family {
+                    ModelFamily::Qwen3Asr => "Qwen3 ASR",
+                    ModelFamily::VibeVoiceAsr => "VibeVoice ASR",
+                    _ => unreachable!("guarded prepared-audio family"),
+                }
+            )));
         }
     }
     let started = Instant::now();
@@ -201,6 +231,10 @@ fn validate_continuous_asr_batch_shape(scheduled: &[ScheduledRequest]) -> Result
     Ok(())
 }
 
+fn late_cancelled_batch_row(cancelled: bool, checkpoint_armed: bool) -> bool {
+    cancelled && checkpoint_armed
+}
+
 struct ContinuousAsrStateBatch<'a> {
     rows: Vec<(
         usize,
@@ -222,12 +256,22 @@ impl<'a> ContinuousAsrStateBatch<'a> {
         }
     }
 
-    fn commit(mut self) -> Vec<(usize, SessionKey, ExecutorStateLease<'a, ActiveAsrDecode>)> {
+    fn commit(
+        mut self,
+    ) -> Result<Vec<(usize, SessionKey, ExecutorStateLease<'a, ActiveAsrDecode>)>> {
+        for (_, _, lease, checkpoint) in &mut self.rows {
+            if let Some((checkpoint, _, _)) = checkpoint.take() {
+                lease
+                    .require_state_mut()?
+                    .state
+                    .commit_managed_quantum(checkpoint)?;
+            }
+        }
         self.armed = false;
-        std::mem::take(&mut self.rows)
+        Ok(std::mem::take(&mut self.rows)
             .into_iter()
             .map(|(index, session, lease, _)| (index, session, lease))
-            .collect()
+            .collect())
     }
 
     fn rollback_row(&mut self, row: usize) -> Result<usize> {
@@ -789,6 +833,327 @@ impl NativeExecutor {
         .with_managed_cache_completions(completions))
     }
 
+    fn vibevoice_asr_sequence_request(
+        &self,
+        request: &EngineCoreRequest,
+        scheduled: &ScheduledRequest,
+        mut managed_state: Option<super::RetainedRowManagedState>,
+    ) -> Result<ModelSessionResult> {
+        let variant = Self::resolve_variant(request)?;
+        let model = request.prepared_asr_model_for_executor()?.ok_or_else(|| {
+            Error::InferenceError(
+                "VibeVoice ASR sequence request lost its loaded model identity".into(),
+            )
+        })?;
+        if variant.family() != ModelFamily::VibeVoiceAsr
+            || !model.supports_resumable_prefill()
+            || !model.supports_continuous_decode_batch()
+        {
+            return Err(Error::InvalidInput(
+                "loaded VibeVoice ASR model has no retained sequence contract".into(),
+            ));
+        }
+        let mut retained = managed_state.take().ok_or_else(|| {
+            Error::InferenceError("VibeVoice ASR sequence lost retained paged state".into())
+        })?;
+        if retained.tensor_state.is_some() {
+            return Err(Error::InferenceError(
+                "normal VibeVoice ASR sequence unexpectedly received tokenizer tensor state".into(),
+            ));
+        }
+        let cache = retained.take_only_paged()?;
+        let prompt_tokens = request.num_prompt_tokens();
+        let resumable_span = scheduled
+            .is_prefill
+            .then(|| resumable_asr_prefill_span(scheduled, prompt_tokens))
+            .transpose()?;
+        let session = scheduled.session_key();
+        let mut state_lease =
+            ExecutorStateLease::checkout(&self.asr_decode_states, session, "VibeVoice ASR decode")?;
+        if state_lease
+            .state()
+            .is_some_and(|active| active.variant != variant || !Arc::ptr_eq(&active.model, &model))
+        {
+            state_lease.discard_state();
+        }
+
+        let mut checkpoint = None;
+        let mut outer_checkpoint = None;
+        let mut fresh_state = false;
+        if state_lease.state().is_some() {
+            let active = state_lease.require_state_mut()?;
+            outer_checkpoint = Some((active.last_tokens_generated, active.stream_sequence));
+            checkpoint = Some(active.state.begin_managed_quantum(cache)?);
+            state_lease.mark_dirty();
+        } else {
+            if !scheduled.is_prefill || scheduled.num_computed_tokens != 0 {
+                return Err(Error::InferenceError(
+                    "VibeVoice ASR sequence lost state before initial prefill".into(),
+                ));
+            }
+            if request.is_cancelled() {
+                state_lease.release()?;
+                return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                    request.id.clone(),
+                )));
+            }
+            let artifact = request
+                .prepared_vibevoice_artifact_for_executor()?
+                .ok_or_else(|| {
+                    Error::InferenceError(
+                        "VibeVoice ASR sequence lost its prepared encoder artifact".into(),
+                    )
+                })?;
+            let (samples, sample_rate) =
+                request.prepared_asr_audio_for_executor()?.ok_or_else(|| {
+                    Error::InferenceError(
+                        "VibeVoice ASR sequence lost its prepared decoded audio".into(),
+                    )
+                })?;
+            let Some(decode_state) = run_asr_model_call(request, || {
+                Self::run_blocking(|| {
+                    model.start_vibevoice_resumable_prefill_managed(
+                        artifact,
+                        Self::asr_generation_options(request),
+                        cache,
+                    )
+                })
+            })?
+            else {
+                state_lease.release()?;
+                return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                    request.id.clone(),
+                )));
+            };
+            if decode_state.prefill_token_count() != Some(prompt_tokens)
+                || decode_state.prefill_progress() != Some(0)
+                || decode_state.sequence_position() != Some(0)
+            {
+                return Err(Error::InferenceError(
+                    "VibeVoice ASR prepared prompt does not match scheduler admission".into(),
+                ));
+            }
+            let model_lease = request
+                .prepared_asr_model_lease_for_executor()?
+                .ok_or_else(|| {
+                    Error::InferenceError("VibeVoice ASR sequence lost model residency".into())
+                })?;
+            state_lease.install_state(ActiveAsrDecode {
+                variant,
+                model: model.clone(),
+                _model_lease: model_lease,
+                state: decode_state,
+                last_tokens_generated: 0,
+                stream_sequence: 0,
+                input_sample_rate: sample_rate,
+                input_sample_count: samples.len(),
+            })?;
+            fresh_state = true;
+        }
+
+        if request.is_cancelled() {
+            rollback_scalar_asr_quantum(
+                &mut state_lease,
+                &mut checkpoint,
+                outer_checkpoint,
+                fresh_state,
+            )?;
+            state_lease.release()?;
+            return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                request.id.clone(),
+            )));
+        }
+
+        state_lease.mark_dirty();
+        let execution = (|| {
+            let active = state_lease.require_state_mut()?;
+            let iterations = if scheduled.is_prefill {
+                1
+            } else {
+                scheduled.num_tokens.max(1)
+            };
+            let mut generated = 0usize;
+            let mut text = String::new();
+            let mut finished = false;
+            let mut cancelled = false;
+            let mut events = Vec::new();
+            for _ in 0..iterations {
+                if request.is_cancelled() {
+                    cancelled = true;
+                    break;
+                }
+                let step = if let Some((start, end)) = resumable_span {
+                    let Some(complete) = run_asr_model_call(request, || {
+                        Self::run_blocking(|| {
+                            active
+                                .model
+                                .continue_resumable_prefill(&mut active.state, start, end)
+                        })
+                    })?
+                    else {
+                        cancelled = true;
+                        break;
+                    };
+                    let staged = active.state.take_staged_asr_decode_step();
+                    vibevoice_prefill_boundary_step(complete, staged, active.last_tokens_generated)?
+                } else {
+                    let Some(step) = run_asr_model_call(request, || {
+                        Self::run_blocking(|| active.model.decode_step(&mut active.state))
+                    })?
+                    else {
+                        cancelled = true;
+                        break;
+                    };
+                    step
+                };
+                if request.is_cancelled() {
+                    cancelled = true;
+                    break;
+                }
+                let row_generated = step
+                    .tokens_generated
+                    .saturating_sub(active.last_tokens_generated);
+                active.last_tokens_generated = step.tokens_generated;
+                generated = generated.saturating_add(row_generated);
+                text = step.text.clone();
+                events.push((step.delta, step.finished));
+                if step.finished {
+                    finished = true;
+                    break;
+                }
+            }
+
+            if !cancelled {
+                if let Some(tx) = Self::stream_sender(request) {
+                    for (delta, event_finished) in events {
+                        if request.is_cancelled() {
+                            cancelled = true;
+                            break;
+                        }
+                        if !delta.is_empty() {
+                            Self::stream_text_with_policy(
+                                &tx,
+                                request.stream_policy,
+                                &request.id,
+                                &mut active.stream_sequence,
+                                delta,
+                            )?;
+                        }
+                        if event_finished {
+                            Self::stream_final_marker_with_policy(
+                                &tx,
+                                request.stream_policy,
+                                &request.id,
+                                &mut active.stream_sequence,
+                            )?;
+                        }
+                    }
+                }
+                cancelled |= request.is_cancelled();
+            }
+            if cancelled {
+                let _ = request.take_staged_stream_outputs()?;
+            }
+            let completions = if cancelled {
+                Vec::new()
+            } else {
+                active.state.take_managed_write_completions()
+            };
+            Ok((
+                generated,
+                text,
+                finished,
+                cancelled,
+                active.input_sample_rate,
+                active.input_sample_count,
+                completions,
+            ))
+        })();
+        let (generated, text, finished, cancelled, sample_rate, sample_count, completions) =
+            match execution {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = request.take_staged_stream_outputs()?;
+                    rollback_scalar_asr_quantum(
+                        &mut state_lease,
+                        &mut checkpoint,
+                        outer_checkpoint,
+                        fresh_state,
+                    )?;
+                    return Err(error);
+                }
+            };
+        if cancelled {
+            rollback_scalar_asr_quantum(
+                &mut state_lease,
+                &mut checkpoint,
+                outer_checkpoint,
+                fresh_state,
+            )?;
+            state_lease.release()?;
+            return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                request.id.clone(),
+            )));
+        }
+        // Cancellation can race the bookkeeping between the last staged event
+        // and checkpoint commit. Output and completions are still private here,
+        // so honor that edge by rolling back the entire scalar quantum.
+        if request.is_cancelled() {
+            let _ = request.take_staged_stream_outputs()?;
+            rollback_scalar_asr_quantum(
+                &mut state_lease,
+                &mut checkpoint,
+                outer_checkpoint,
+                fresh_state,
+            )?;
+            state_lease.release()?;
+            return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                request.id.clone(),
+            )));
+        }
+        if let Some(checkpoint) = checkpoint.take() {
+            if let Err(error) = state_lease
+                .require_state_mut()?
+                .state
+                .commit_managed_quantum(checkpoint)
+            {
+                let _ = request.take_staged_stream_outputs()?;
+                return Err(error);
+            }
+        }
+        let tokens_processed = if scheduled.is_prefill {
+            scheduled.num_tokens
+        } else {
+            scheduled.num_tokens.max(1)
+        };
+        if finished {
+            state_lease.release()?;
+        } else {
+            state_lease.restore()?;
+        }
+        Ok(ModelSessionResult::sequence(ExecutorOutput {
+            request_id: request.id.clone(),
+            audio: Some(AudioOutput {
+                samples: Vec::new(),
+                sample_rate,
+                duration_secs: if sample_rate == 0 {
+                    0.0
+                } else {
+                    sample_count as f32 / sample_rate as f32
+                },
+            }),
+            text: Some(text),
+            input_transcription: None,
+            tokens_processed,
+            tokens_generated: generated,
+            finished,
+            phase_timing_override: None,
+            asr_diagnostics: None,
+            error: None,
+        })
+        .with_managed_cache_completions(completions))
+    }
+
     fn qwen3_asr_sequence_request(
         &self,
         request: &EngineCoreRequest,
@@ -1310,6 +1675,15 @@ impl NativeExecutor {
                     "continuous ASR request has no exact loaded model identity".to_string(),
                 )
             })?;
+        let batch_family = Self::resolve_variant(ordered_requests[live_indices[0]])?.family();
+        if !matches!(
+            batch_family,
+            ModelFamily::Qwen3Asr | ModelFamily::VibeVoiceAsr
+        ) {
+            return Err(Error::InvalidInput(
+                "continuous ASR batch contains a model without retained tensor decode".into(),
+            ));
+        }
         if !model.supports_continuous_decode_batch() {
             return Err(Error::InvalidInput(
                 "loaded ASR model has no continuous tensor decode adapter".to_string(),
@@ -1335,9 +1709,9 @@ impl NativeExecutor {
             let request = ordered_requests[index];
             let session = scheduled[index].session_key();
             let expected_variant = Self::resolve_variant(request)?;
-            if expected_variant.family() != ModelFamily::Qwen3Asr {
+            if expected_variant.family() != batch_family {
                 return Err(Error::InvalidInput(
-                    "continuous ASR batch contains a non-Qwen3 ASR row".to_string(),
+                    "continuous ASR batch spans different ASR families".to_string(),
                 ));
             }
             let lease = ExecutorStateLease::checkout(
@@ -1366,12 +1740,12 @@ impl NativeExecutor {
             let managed_cache = managed_caches[*index].take();
             if request.managed_cache_runtime().is_some() != managed_cache.is_some() {
                 return Err(Error::InferenceError(
-                    "continuous Qwen3 ASR row lost its managed-cache reservation".to_string(),
+                    "continuous ASR row lost its managed-cache reservation".to_string(),
                 ));
             }
             let mut views = managed_cache.ok_or_else(|| {
                 Error::InferenceError(
-                    "continuous Qwen3 ASR decode requires retained physical KV".to_string(),
+                    "continuous ASR decode requires retained physical KV".to_string(),
                 )
             })?;
             let tensor_reservation = views.tensor_state;
@@ -1380,8 +1754,13 @@ impl NativeExecutor {
                 .and_then(|runtime| runtime.tensor_state());
             if tensor_arena.is_some() != tensor_reservation.is_some() {
                 return Err(Error::InferenceError(
-                    "continuous Qwen3 ASR row lost its prepared-input tensor-state reservation"
+                    "continuous ASR row lost its prepared-input tensor-state reservation"
                         .to_string(),
+                ));
+            }
+            if batch_family == ModelFamily::VibeVoiceAsr && tensor_reservation.is_some() {
+                return Err(Error::InferenceError(
+                    "normal VibeVoice ASR decode received forbidden tokenizer tensor state".into(),
                 ));
             }
             let cache = views.take_only_paged()?;
@@ -1399,23 +1778,47 @@ impl NativeExecutor {
             lease.mark_dirty();
         }
 
+        // Cancellation may arrive after reservations were rebound but before
+        // the native launch. Roll those rows back now and exclude them from the
+        // physical batch; the remaining rows keep their independent checkpoints.
+        for row in 0..active_states.rows.len() {
+            let index = active_states.rows[row].0;
+            let request = ordered_requests[index];
+            if request.is_cancelled() {
+                let index = active_states.rollback_row(row)?;
+                let _ = request.take_staged_stream_outputs()?;
+                outputs[index] = Some(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                    request.id.clone(),
+                )));
+            }
+        }
+        let call_rows = active_states
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(row, (index, _, _, _))| outputs[*index].is_none().then_some(row))
+            .collect::<Vec<_>>();
         let mut state_refs = active_states
             .rows
             .iter_mut()
+            .filter(|(index, _, _, _)| outputs[*index].is_none())
             .map(|(_, _, lease, _)| lease.require_state_mut().map(|state| &mut state.state))
             .collect::<Result<Vec<_>>>()?;
         let live_width = state_refs.len();
-        let steps = Self::run_blocking(|| model.decode_step_batch(&mut state_refs))?;
+        let steps = if state_refs.is_empty() {
+            Vec::new()
+        } else {
+            Self::run_blocking(|| model.decode_step_batch(&mut state_refs))?
+        };
         drop(state_refs);
         // One native batch call may outlive cancellation of any subset of its
         // rows. Observe every row before staging tensor state, emitting text,
         // or detaching write completions while all checkpoints remain armed.
-        let cancelled_after_model = active_states
-            .rows
+        let cancelled_after_model = call_rows
             .iter()
-            .map(|(index, _, _, _)| ordered_requests[*index].is_cancelled())
+            .map(|row| ordered_requests[active_states.rows[*row].0].is_cancelled())
             .collect::<Vec<_>>();
-        if steps.len() != active_states.rows.len() {
+        if steps.len() != call_rows.len() {
             return Err(Error::InferenceError(
                 "continuous ASR model returned the wrong number of rows".to_string(),
             ));
@@ -1433,7 +1836,11 @@ impl NativeExecutor {
         };
         crate::engine::metrics::record_engine_model_call(model_call);
 
-        for (row, cancelled) in cancelled_after_model.into_iter().enumerate() {
+        for (row, cancelled) in call_rows
+            .iter()
+            .copied()
+            .zip(cancelled_after_model.into_iter())
+        {
             if !cancelled {
                 continue;
             }
@@ -1472,7 +1879,7 @@ impl NativeExecutor {
         }
 
         let mut continuing = vec![false; scheduled.len()];
-        for (row, step) in steps.into_iter().enumerate() {
+        for (row, step) in call_rows.iter().copied().zip(steps.into_iter()) {
             let index = active_states.rows[row].0;
             if outputs[index].is_some() {
                 continue;
@@ -1526,6 +1933,14 @@ impl NativeExecutor {
             };
             if let Err(error) = stream_result {
                 let _ = request.take_staged_stream_outputs();
+                if batch_family == ModelFamily::VibeVoiceAsr {
+                    for active_index in live_indices.iter().copied() {
+                        let _ = ordered_requests[active_index].take_staged_stream_outputs();
+                    }
+                    return Err(Error::InferenceError(format!(
+                        "continuous VibeVoice ASR stream staging failed: {error}"
+                    )));
+                }
                 let index = active_states.rollback_row(row)?;
                 outputs[index] = Some(ModelSessionResult::sequence(ExecutorOutput::error(
                     request.id.clone(),
@@ -1575,7 +1990,34 @@ impl NativeExecutor {
             }
         }
 
-        let committed_states = active_states.commit();
+        // Recheck every still-armed row immediately before committing any
+        // checkpoint. Earlier rows may be cancelled while later rows are being
+        // sampled or staged; their private outputs and detached completions must
+        // be discarded with the rollback.
+        for row in 0..active_states.rows.len() {
+            let index = active_states.rows[row].0;
+            if late_cancelled_batch_row(
+                ordered_requests[index].is_cancelled(),
+                active_states.rows[row].3.is_some(),
+            ) {
+                let _ = ordered_requests[index].take_staged_stream_outputs()?;
+                let index = active_states.rollback_row(row)?;
+                continuing[index] = false;
+                outputs[index] = Some(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                    ordered_requests[index].id.clone(),
+                )));
+            }
+        }
+
+        let committed_states = match active_states.commit() {
+            Ok(states) => states,
+            Err(error) => {
+                for index in live_indices.iter().copied() {
+                    let _ = ordered_requests[index].take_staged_stream_outputs();
+                }
+                return Err(error);
+            }
+        };
         for (index, _, lease) in committed_states {
             let transition = if continuing[index] {
                 lease.restore()
@@ -1618,6 +2060,9 @@ impl NativeExecutor {
         }
         if family == ModelFamily::WhisperAsr && request.uses_asr_retained_sequence() {
             return self.whisper_asr_sequence_request(request, scheduled, managed_state.take());
+        }
+        if family == ModelFamily::VibeVoiceAsr && request.uses_asr_retained_sequence() {
+            return self.vibevoice_asr_sequence_request(request, scheduled, managed_state.take());
         }
         if managed_state.is_some() {
             return Err(Error::InferenceError(
@@ -2843,6 +3288,55 @@ mod tests {
     }
 
     #[test]
+    fn vibevoice_final_prefill_drains_exactly_the_staged_first_sample() {
+        let staged = crate::models::registry::NativeAsrDecodeStep {
+            delta: "first".into(),
+            text: "first token".into(),
+            tokens_generated: 1,
+            finished: false,
+        };
+
+        let step = super::vibevoice_prefill_boundary_step(true, Some(staged.clone()), 0).unwrap();
+
+        assert_eq!(step.delta, staged.delta);
+        assert_eq!(step.text, staged.text);
+        assert_eq!(step.tokens_generated, 1);
+        assert!(!step.finished);
+        assert!(super::vibevoice_prefill_boundary_step(true, None, 0).is_err());
+    }
+
+    #[test]
+    fn vibevoice_nonfinal_prefill_has_no_output_and_rejects_premature_sample() {
+        let step = super::vibevoice_prefill_boundary_step(false, None, 7).unwrap();
+        assert!(step.delta.is_empty());
+        assert!(step.text.is_empty());
+        assert_eq!(step.tokens_generated, 7);
+        assert!(!step.finished);
+
+        let premature = crate::models::registry::NativeAsrDecodeStep {
+            delta: "premature".into(),
+            text: "premature".into(),
+            tokens_generated: 8,
+            finished: false,
+        };
+        assert!(super::vibevoice_prefill_boundary_step(false, Some(premature), 7).is_err());
+    }
+
+    #[test]
+    fn vibevoice_late_batch_cancellation_selects_only_still_armed_rows() {
+        let rows = [(true, true), (true, false), (false, true), (false, false)];
+        let selected = rows
+            .into_iter()
+            .enumerate()
+            .filter_map(|(row, (cancelled, armed))| {
+                super::late_cancelled_batch_row(cancelled, armed).then_some(row)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(selected, [0]);
+    }
+
+    #[test]
     fn whisper_terminal_accept_and_skip_publish_only_terminal_policy_output() {
         let mut accepted = crate::models::registry::NativeAsrDecodeStep {
             delta: "provisional".into(),
@@ -3022,6 +3516,39 @@ mod tests {
         assert_eq!(audio.samples(), &[0.25, -0.5, 0.75]);
         assert_eq!(sample_rate, 16_000);
         assert_eq!(decode_ms, 0.0);
+    }
+
+    #[test]
+    fn vibevoice_legacy_execution_reuses_prepared_audio_and_fails_closed_without_it() {
+        let variant = ModelVariant::VibeVoiceAsr;
+        let mut request = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+        request
+            .install_prepared_asr_audio(variant, vec![0.25, -0.5, 0.75], 24_000)
+            .unwrap();
+        request.install_prepared_asr_long_form_atomic().unwrap();
+        let decode_calls = Cell::new(0_u32);
+
+        let (audio, sample_rate, decode_ms) =
+            super::resolve_asr_execution_audio(&request, ModelFamily::VibeVoiceAsr, || {
+                decode_calls.set(decode_calls.get() + 1);
+                Ok((vec![1.0], 8_000))
+            })
+            .unwrap();
+
+        assert_eq!(decode_calls.get(), 0);
+        assert_eq!(audio.samples(), &[0.25, -0.5, 0.75]);
+        assert_eq!(sample_rate, 24_000);
+        assert_eq!(decode_ms, 0.0);
+
+        let missing = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+        let error = super::resolve_asr_execution_audio(&missing, ModelFamily::VibeVoiceAsr, || {
+            panic!("VibeVoice promoted execution must not decode a second audio buffer")
+        })
+        .err()
+        .expect("missing promoted VibeVoice audio must fail closed");
+        assert!(error
+            .to_string()
+            .contains("lost its prepared decoded-audio"));
     }
 
     #[test]

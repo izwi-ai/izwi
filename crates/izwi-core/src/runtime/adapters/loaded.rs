@@ -32,6 +32,7 @@ const NEMOTRON_REALTIME_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::ne
 const CONTINUOUS_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(15);
 const CONTINUOUS_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(16);
 const WHISPER_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(17);
+const VIBEVOICE_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(18);
 // Architecture ceiling: 8,192 codec frames, 1,920 output samples/frame,
 // f32-width intermediates, and up to 1,024 simultaneous channel-equivalents.
 // Exact request/model-derived costs remain smaller and are installed at
@@ -221,6 +222,24 @@ pub(crate) trait LoadedExecutionAdapter: fmt::Debug + Send + Sync {
             "loaded adapter does not own Whisper audio preparation".into(),
         ))
     }
+
+    fn seal_vibevoice_asr_preparation(
+        &self,
+        _model: &crate::models::architectures::vibevoice::asr::VibeVoiceAsrModel,
+    ) -> Result<()> {
+        Err(Error::ModelLoadError(
+            "loaded adapter does not own VibeVoice ASR preparation".into(),
+        ))
+    }
+
+    #[cfg(test)]
+    fn install_test_preparation_seal(
+        &self,
+        _backend: BackendKind,
+        _max_batch_size: usize,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Loaded-state publication normalized into an immutable ABI-v2 runtime before
@@ -321,7 +340,9 @@ fn loaded_execution_contracts(
     if metadata.capability == CapabilityKind::Asr
         && matches!(
             metadata.model_variant.family(),
-            crate::catalog::ModelFamily::Qwen3Asr | crate::catalog::ModelFamily::WhisperAsr
+            crate::catalog::ModelFamily::Qwen3Asr
+                | crate::catalog::ModelFamily::WhisperAsr
+                | crate::catalog::ModelFamily::VibeVoiceAsr
         )
     {
         let long_form = requirements
@@ -781,6 +802,11 @@ fn is_whisper_physical_asr(metadata: AdapterMetadata) -> bool {
         && metadata.model_variant.family() == crate::catalog::ModelFamily::WhisperAsr
 }
 
+fn is_vibevoice_physical_asr(metadata: AdapterMetadata) -> bool {
+    metadata.capability == CapabilityKind::Asr
+        && metadata.model_variant.family() == crate::catalog::ModelFamily::VibeVoiceAsr
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PhysicalQwenTtsAdapterFactory;
 
@@ -911,6 +937,37 @@ struct ScalarExecutionAdapterFactory;
 #[derive(Debug, Clone, Copy)]
 struct WhisperPhysicalAsrAdapterFactory;
 
+#[derive(Debug, Clone, Copy)]
+struct VibeVoicePhysicalAsrAdapterFactory;
+
+impl LoadedExecutionAdapterFactory for VibeVoicePhysicalAsrAdapterFactory {
+    fn id(&self) -> &'static str {
+        "builtin.vibevoice_asr.physical_sequence"
+    }
+
+    fn batch_mode(&self) -> NativeBatchMode {
+        NativeBatchMode::Continuous
+    }
+
+    fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
+        is_vibevoice_physical_asr(metadata)
+    }
+
+    fn create(
+        &self,
+        context: LoadedAdapterFactoryContext,
+        metadata: AdapterMetadata,
+    ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
+        Ok(Arc::new(VibeVoiceAsrExecutionAdapter::new(
+            context.execution_group_id,
+            context.model_instance_id,
+            metadata,
+            context.backend_kind,
+            context.max_tensor_batch_size,
+        )))
+    }
+}
+
 impl LoadedExecutionAdapterFactory for WhisperPhysicalAsrAdapterFactory {
     fn id(&self) -> &'static str {
         "builtin.whisper_asr.physical_sequence"
@@ -954,6 +1011,7 @@ impl LoadedExecutionAdapterFactory for ScalarExecutionAdapterFactory {
             && !is_continuous_physical_chat(metadata)
             && !is_continuous_physical_asr(metadata)
             && !is_whisper_physical_asr(metadata)
+            && !is_vibevoice_physical_asr(metadata)
     }
 
     fn create(
@@ -978,6 +1036,7 @@ pub(super) fn built_in_loaded_adapter_factories() -> Vec<Arc<dyn LoadedExecution
         Arc::new(ContinuousPhysicalChatAdapterFactory),
         Arc::new(ContinuousPhysicalAsrAdapterFactory),
         Arc::new(WhisperPhysicalAsrAdapterFactory),
+        Arc::new(VibeVoicePhysicalAsrAdapterFactory),
         Arc::new(ScalarExecutionAdapterFactory),
     ]
 }
@@ -1508,6 +1567,23 @@ impl LoadedExecutionAdapter for ContinuousAsrExecutionAdapter {
         self.install_audio_preparation_seal(seal)
     }
 
+    #[cfg(test)]
+    fn install_test_preparation_seal(
+        &self,
+        backend: BackendKind,
+        max_batch_size: usize,
+    ) -> Result<()> {
+        self.install_audio_preparation_seal(
+            crate::models::architectures::qwen3::asr::Qwen3AsrAudioPreparationStageSeal {
+                backend,
+                audio_dtype: "f32".into(),
+                text_dtype: "f32".into(),
+                max_batch_size,
+                max_workspace_bytes: 64 * 1024 * 1024,
+            },
+        )
+    }
+
     fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
         let metadata = self.metadata();
         if streaming.model_native && metadata.streaming_mode == StreamingMode::None {
@@ -1653,6 +1729,257 @@ impl LoadedExecutionAdapter for ContinuousAsrExecutionAdapter {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VibeVoiceAsrExecutionSeal {
+    preparation: crate::models::architectures::vibevoice::asr::VibeVoiceAsrPreparationStageSeal,
+    decode_workspace_per_row_bytes: u64,
+}
+
+#[derive(Debug)]
+struct VibeVoiceAsrExecutionAdapter {
+    execution_group_id: ExecutionGroupId,
+    model_instance_id: ModelInstanceId,
+    adapter_instance_id: AdapterInstanceId,
+    metadata: AdapterMetadata,
+    backend_kind: BackendKind,
+    max_batch_size: usize,
+    seal: OnceLock<VibeVoiceAsrExecutionSeal>,
+}
+
+impl VibeVoiceAsrExecutionAdapter {
+    fn new(
+        execution_group_id: ExecutionGroupId,
+        model_instance_id: ModelInstanceId,
+        metadata: AdapterMetadata,
+        backend_kind: BackendKind,
+        max_batch_size: usize,
+    ) -> Self {
+        Self {
+            execution_group_id,
+            model_instance_id,
+            adapter_instance_id: AdapterInstanceId::new(
+                NEXT_ADAPTER_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+            ),
+            metadata,
+            backend_kind,
+            max_batch_size: max_batch_size.max(1),
+            seal: OnceLock::new(),
+        }
+    }
+}
+
+impl LoadedExecutionAdapter for VibeVoiceAsrExecutionAdapter {
+    fn metadata(&self) -> AdapterMetadata {
+        self.metadata
+    }
+
+    fn adapter_instance_id(&self) -> AdapterInstanceId {
+        self.adapter_instance_id
+    }
+
+    fn adapter_abi_revision(&self) -> AdapterAbiRevision {
+        VIBEVOICE_ASR_ADAPTER_ABI
+    }
+
+    fn seal_vibevoice_asr_preparation(
+        &self,
+        model: &crate::models::architectures::vibevoice::asr::VibeVoiceAsrModel,
+    ) -> Result<()> {
+        let seal = VibeVoiceAsrExecutionSeal {
+            preparation: model.scalar_preparation_stage_seal(self.backend_kind)?,
+            decode_workspace_per_row_bytes: model.continuous_decode_workspace_per_row_bytes()?,
+        };
+        if let Some(existing) = self.seal.get() {
+            return if existing == &seal {
+                Ok(())
+            } else {
+                Err(Error::ModelLoadError(
+                    "VibeVoice ASR execution was resealed with different geometry".into(),
+                ))
+            };
+        }
+        self.seal.set(seal).map_err(|_| {
+            Error::ModelLoadError("VibeVoice ASR execution seal raced publication".into())
+        })
+    }
+
+    #[cfg(test)]
+    fn install_test_preparation_seal(
+        &self,
+        backend: BackendKind,
+        _max_batch_size: usize,
+    ) -> Result<()> {
+        self.seal
+            .set(VibeVoiceAsrExecutionSeal {
+                preparation:
+                    crate::models::architectures::vibevoice::asr::VibeVoiceAsrPreparationStageSeal {
+                        backend,
+                        dtype: "f32".into(),
+                        max_work_units: 1_500,
+                        max_workspace_bytes: 64 * 1024 * 1024,
+                    },
+                decode_workspace_per_row_bytes: 8_192,
+            })
+            .map_err(|_| Error::ModelLoadError("test VibeVoice seal was already installed".into()))
+    }
+
+    fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
+        use crate::models::architectures::vibevoice::{
+            VIBEVOICE_ASR_DECODE_STAGE, VIBEVOICE_ASR_LEGACY_STAGE, VIBEVOICE_ASR_PREFILL_STAGE,
+            VIBEVOICE_ASR_PREPARATION_STAGE,
+        };
+
+        let metadata = self.metadata();
+        if streaming.model_native {
+            return Err(Error::InvalidInput(format!(
+                "Model {} has no model-native streaming ASR contract",
+                metadata.model_variant
+            )));
+        }
+        if streaming.asr_long_form {
+            let mut profile = scalar_execution_profile(metadata, self.backend_kind, false);
+            profile.mode = ExecutionMode::Atomic;
+            profile.prefill = PrefillMode::None;
+            profile.incremental_decode = false;
+            profile.prefill_batch = NativeBatchMode::None;
+            profile.decode_batch = NativeBatchMode::None;
+            profile.cache_mode = CacheMode::None;
+            profile.cache_namespace = None;
+            profile.kv_dtype = "none".into();
+            profile.cancellation = CancellationGranularity::OperationBoundary;
+            profile.concurrency = ConcurrencyClass::Exclusive;
+            profile.recompute_safe = false;
+            profile.cache_release_safe = false;
+            profile.prefix_reuse_safe = false;
+            profile.max_batch_size = 1;
+            profile.resolved_from_loaded_model = true;
+            let mut stage = StageDescriptor::from_execution_profile(
+                StageId::new(0),
+                VIBEVOICE_ASR_LEGACY_STAGE,
+                &profile,
+                NativeBatchMode::None,
+            );
+            stage.selector = StageWorkSelector::Atomic;
+            stage.shape_policy = StageShapePolicy::Exact;
+            stage.output_visibility = output_visibility_for(
+                streaming.transport_output,
+                profile.mode,
+                NativeBatchMode::None,
+            );
+            stage.validate()?;
+            return Ok(LoadedExecutionContract {
+                execution_group_id: self.execution_group_id,
+                model_instance_id: self.model_instance_id,
+                adapter_instance_id: self.adapter_instance_id(),
+                adapter_abi_revision: self.adapter_abi_revision(),
+                metadata,
+                execution_profile: profile,
+                stages: Arc::from([stage]),
+            });
+        }
+
+        let seal = self.seal.get().ok_or_else(|| {
+            Error::ModelLoadError(
+                "VibeVoice ASR normal graph is unavailable before model geometry is sealed".into(),
+            )
+        })?;
+        if seal.preparation.backend != self.backend_kind
+            || seal.preparation.dtype.is_empty()
+            || seal.preparation.max_work_units == 0
+            || seal.preparation.max_workspace_bytes == 0
+            || seal.decode_workspace_per_row_bytes == 0
+        {
+            return Err(Error::ModelLoadError(
+                "VibeVoice ASR execution seal does not match its loaded adapter".into(),
+            ));
+        }
+        let decode_workspace = seal
+            .decode_workspace_per_row_bytes
+            .checked_mul(
+                u64::try_from(self.max_batch_size).map_err(|_| {
+                    Error::Overloaded("VibeVoice ASR batch width exceeds u64".into())
+                })?,
+            )
+            .ok_or_else(|| Error::Overloaded("VibeVoice ASR decode workspace overflow".into()))?;
+        let mut profile = scalar_execution_profile(metadata, self.backend_kind, false);
+        profile.mode = ExecutionMode::Sequence;
+        profile.prefill = PrefillMode::Incremental;
+        profile.incremental_decode = true;
+        profile.prefill_batch = NativeBatchMode::None;
+        profile.decode_batch = NativeBatchMode::Continuous;
+        profile.cache_mode = CacheMode::ExternalPaged;
+        profile.cache_namespace = Some(format!(
+            "{}:{}:state-v2",
+            metadata.model_variant,
+            self.backend_kind.as_str()
+        ));
+        profile.kv_dtype = "state_v2_resolved".into();
+        profile.cancellation = CancellationGranularity::SequenceStep;
+        profile.concurrency = ConcurrencyClass::Batchable;
+        profile.recompute_safe = true;
+        profile.cache_release_safe = true;
+        profile.prefix_reuse_safe = false;
+        profile.max_batch_size = self.max_batch_size;
+        profile.resolved_from_loaded_model = true;
+
+        let mut preparation = StageDescriptor::from_execution_profile(
+            StageId::new(0),
+            VIBEVOICE_ASR_PREPARATION_STAGE,
+            &profile,
+            NativeBatchMode::None,
+        );
+        preparation.selector = StageWorkSelector::PreSequencePreparation;
+        preparation.progress = StageProgressKind::Atomic;
+        preparation.membership_safe_point = MembershipSafePoint::OperationBoundary;
+        preparation.max_batch_size = 1;
+        preparation.max_work_units = seal.preparation.max_work_units;
+        preparation.max_workspace_bytes = seal.preparation.max_workspace_bytes;
+        preparation.concurrency = ConcurrencyClass::Exclusive;
+        preparation.shape_policy = StageShapePolicy::Exact;
+        preparation.output_visibility = OutputVisibility::AfterQuantumCommit;
+
+        let mut prefill = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            VIBEVOICE_ASR_PREFILL_STAGE,
+            &profile,
+            NativeBatchMode::None,
+        );
+        prefill.selector = StageWorkSelector::SequencePrefill;
+        prefill.max_batch_size = 1;
+        prefill.concurrency = ConcurrencyClass::Exclusive;
+        prefill.shape_policy = StageShapePolicy::Exact;
+        prefill.output_visibility = output_visibility_for(
+            streaming.transport_output,
+            profile.mode,
+            NativeBatchMode::None,
+        );
+
+        let mut decode = StageDescriptor::from_execution_profile(
+            StageId::new(2),
+            VIBEVOICE_ASR_DECODE_STAGE,
+            &profile,
+            NativeBatchMode::Continuous,
+        );
+        decode.selector = StageWorkSelector::SequenceDecode;
+        decode.max_work_units = u64::try_from(decode.max_batch_size).map_err(|_| {
+            Error::Overloaded("VibeVoice ASR batch width exceeds work accounting".into())
+        })?;
+        decode.max_workspace_bytes = decode_workspace;
+        preparation.validate()?;
+        prefill.validate()?;
+        decode.validate()?;
+        Ok(LoadedExecutionContract {
+            execution_group_id: self.execution_group_id,
+            model_instance_id: self.model_instance_id,
+            adapter_instance_id: self.adapter_instance_id(),
+            adapter_abi_revision: self.adapter_abi_revision(),
+            metadata,
+            execution_profile: profile,
+            stages: Arc::from([preparation, prefill, decode]),
+        })
+    }
+}
+
 #[derive(Debug)]
 struct WhisperAsrExecutionAdapter {
     execution_group_id: ExecutionGroupId,
@@ -1717,6 +2044,24 @@ impl LoadedExecutionAdapter for WhisperAsrExecutionAdapter {
         self.audio_preparation.set(seal).map_err(|_| {
             Error::ModelLoadError("Whisper audio preparation seal raced publication".into())
         })
+    }
+
+    #[cfg(test)]
+    fn install_test_preparation_seal(
+        &self,
+        backend: BackendKind,
+        max_batch_size: usize,
+    ) -> Result<()> {
+        self.audio_preparation
+            .set(
+                crate::models::architectures::whisper::asr::WhisperAudioPreparationStageSeal {
+                    backend,
+                    dtype: "f32".into(),
+                    max_batch_size,
+                    max_workspace_bytes: 64 * 1024 * 1024,
+                },
+            )
+            .map_err(|_| Error::ModelLoadError("test Whisper seal was already installed".into()))
     }
 
     fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
@@ -2140,6 +2485,16 @@ impl LoadedModelBundleDraft {
         execution.seal_whisper_audio_preparation(model)
     }
 
+    pub(crate) fn seal_vibevoice_asr_preparation(
+        &self,
+        model: &crate::models::architectures::vibevoice::asr::VibeVoiceAsrModel,
+    ) -> Result<()> {
+        let execution = self.capabilities.get(&CapabilityKind::Asr).ok_or_else(|| {
+            Error::ModelLoadError("VibeVoice loaded bundle has no ASR capability to seal".into())
+        })?;
+        execution.seal_vibevoice_asr_preparation(model)
+    }
+
     pub(crate) fn seal(
         self,
         mut state_publications: HashMap<CapabilityKind, LoadedStatePublication>,
@@ -2313,6 +2668,24 @@ mod tests {
             execution_target: ExecutionTargetKind::TokenEngine,
             sequence_execution: SequenceExecutionMode::StreamingOnly,
             state_requirement: InferenceStateRequirement::Retained,
+        }
+    }
+
+    fn install_test_preparation_seals(
+        draft: &LoadedModelBundleDraft,
+        backend: BackendKind,
+        max_batch_size: usize,
+    ) {
+        for execution in draft.capabilities.values() {
+            execution
+                .install_test_preparation_seal(backend, max_batch_size)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "failed to install test preparation seal for {} {:?}: {error}",
+                        execution.metadata().model_variant,
+                        execution.metadata().capability
+                    )
+                });
         }
     }
 
@@ -2831,6 +3204,8 @@ mod tests {
                 && !is_nemotron_realtime(metadata)
                 && !is_continuous_physical_chat(metadata)
                 && !is_continuous_physical_asr(metadata)
+                && !is_whisper_physical_asr(metadata)
+                && !is_vibevoice_physical_asr(metadata)
         }
 
         fn create(
@@ -2862,6 +3237,7 @@ mod tests {
                 BackendKind::Cpu,
             )
             .unwrap_or_else(|error| panic!("failed to build {variant}: {error}"));
+            install_test_preparation_seals(&draft, BackendKind::Cpu, 1);
             let metadata = registry.capabilities_for(variant);
 
             assert_eq!(draft.capabilities.len(), metadata.len(), "{variant}");
@@ -2934,6 +3310,7 @@ mod tests {
                 .unwrap_or_else(|error| {
                     panic!("failed to build {variant} for {backend:?}: {error}")
                 });
+                install_test_preparation_seals(&draft, backend, 1);
 
                 for execution in draft.capabilities.values() {
                     let metadata = execution.metadata();
@@ -2979,6 +3356,7 @@ mod tests {
                 .unwrap_or_else(|error| {
                     panic!("failed to build {variant} for {backend:?}: {error}")
                 });
+                install_test_preparation_seals(&draft, backend, 1);
                 for execution in draft.capabilities.values() {
                     let metadata = execution.metadata();
                     for contract in
@@ -3006,7 +3384,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_concurrency_evidence_keeps_scalar_audio_width_one_except_native_qwen_tts() {
+    fn missing_concurrency_evidence_keeps_whisper_decoder_scalar_while_encoder_is_static() {
         let request_parallelism = 4;
         let registry =
             RuntimeAdapterRegistry::built_in_with_execution_limits(2, request_parallelism).unwrap();
@@ -3018,11 +3396,12 @@ mod tests {
             BackendKind::Cpu,
         )
         .unwrap();
+        install_test_preparation_seals(&whisper, BackendKind::Cpu, 2);
         let whisper = whisper
             .execution_contracts(CapabilityKind::Asr)
             .unwrap()
             .remove(0);
-        assert_eq!(whisper.execution_profile.max_batch_size, 1);
+        assert_eq!(whisper.execution_profile.max_batch_size, 2);
         assert_eq!(
             whisper.execution_profile.concurrency,
             ConcurrencyClass::Exclusive
@@ -3031,7 +3410,10 @@ mod tests {
             whisper.execution_profile.physical_launch_policy,
             PhysicalLaunchPolicy::ExecutionGroupExclusive
         );
-        assert!(whisper.stages.iter().all(|stage| {
+        assert_eq!(whisper.stages[0].batch_mode, NativeBatchMode::Static);
+        assert_eq!(whisper.stages[0].max_batch_size, 2);
+        assert_eq!(whisper.stages[0].concurrency, ConcurrencyClass::Batchable);
+        assert!(whisper.stages[1..].iter().all(|stage| {
             stage.batch_mode == NativeBatchMode::None
                 && stage.max_batch_size == 1
                 && stage.concurrency == ConcurrencyClass::Exclusive
@@ -3115,6 +3497,7 @@ mod tests {
                 .unwrap_or_else(|error| {
                     panic!("failed to build {variant} for {backend:?}: {error}")
                 });
+                install_test_preparation_seals(&draft, backend, 8);
                 for execution in draft
                     .capabilities
                     .values()
@@ -3130,12 +3513,16 @@ mod tests {
                     {
                         let qwen3_asr = execution.metadata().capability == CapabilityKind::Asr
                             && variant.family() == crate::catalog::ModelFamily::Qwen3Asr;
+                        let vibevoice_asr = execution.metadata().capability == CapabilityKind::Asr
+                            && variant.family() == crate::catalog::ModelFamily::VibeVoiceAsr;
+                        let whisper_asr = execution.metadata().capability == CapabilityKind::Asr
+                            && variant.family() == crate::catalog::ModelFamily::WhisperAsr;
                         let qwen3_tts = matches!(
                             execution.metadata().capability,
                             CapabilityKind::Tts | CapabilityKind::StreamingTts
                         ) && variant.family()
                             == crate::catalog::ModelFamily::Qwen3Tts;
-                        if (qwen3_asr || qwen3_tts)
+                        if (qwen3_asr || vibevoice_asr || qwen3_tts)
                             && contract.execution_profile.mode == ExecutionMode::Sequence
                         {
                             assert_eq!(
@@ -3144,6 +3531,15 @@ mod tests {
                             );
                             assert_eq!(contract.execution_profile.max_batch_size, 8);
                             assert!(contract.execution_profile.capabilities().native_batch);
+                        } else if whisper_asr
+                            && contract.execution_profile.mode == ExecutionMode::Sequence
+                        {
+                            assert_eq!(contract.execution_profile.max_batch_size, 8);
+                            assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::Static);
+                            assert_eq!(contract.stages[0].max_batch_size, 8);
+                            assert!(contract.stages[1..]
+                                .iter()
+                                .all(|stage| stage.batch_mode == NativeBatchMode::None));
                         } else {
                             assert_eq!(contract.execution_profile.max_batch_size, 1);
                             assert_eq!(
@@ -3954,5 +4350,62 @@ mod tests {
         assert_eq!(long.stages.len(), 1);
         assert_eq!(long.stages[0].name, "asr.long_form.atomic");
         assert_eq!(long.stages[0].selector, StageWorkSelector::Atomic);
+    }
+
+    #[test]
+    fn vibevoice_normal_graph_has_scalar_preparation_and_ragged_decode() {
+        let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(4, 1).unwrap();
+        let metadata = *registry
+            .require(CapabilityKind::Asr, ModelVariant::VibeVoiceAsr)
+            .unwrap();
+        let adapter = VibeVoiceAsrExecutionAdapter::new(
+            ExecutionGroupId::new(1),
+            ModelInstanceId::new(2),
+            metadata,
+            BackendKind::Cpu,
+            4,
+        );
+        adapter
+            .seal
+            .set(VibeVoiceAsrExecutionSeal {
+                preparation:
+                    crate::models::architectures::vibevoice::asr::VibeVoiceAsrPreparationStageSeal {
+                        backend: BackendKind::Cpu,
+                        dtype: "f32".into(),
+                        max_work_units: 1_500,
+                        max_workspace_bytes: 64 * 1024 * 1024,
+                    },
+                decode_workspace_per_row_bytes: 8_192,
+            })
+            .unwrap();
+
+        let normal = adapter.contract(StreamingRequirements::NONE).unwrap();
+        assert_eq!(normal.adapter_abi_revision, VIBEVOICE_ASR_ADAPTER_ABI);
+        assert_eq!(normal.execution_profile.mode, ExecutionMode::Sequence);
+        assert_eq!(
+            normal.execution_profile.decode_batch,
+            NativeBatchMode::Continuous
+        );
+        assert_eq!(normal.stages.len(), 3);
+        assert_eq!(normal.stages[0].name, "asr.encoder.vibevoice");
+        assert_eq!(normal.stages[0].batch_mode, NativeBatchMode::None);
+        assert_eq!(normal.stages[0].shape_policy, StageShapePolicy::Exact);
+        assert_eq!(normal.stages[0].concurrency, ConcurrencyClass::Exclusive);
+        assert_eq!(normal.stages[0].max_batch_size, 1);
+        assert_eq!(normal.stages[0].max_work_units, 1_500);
+        assert_eq!(normal.stages[1].name, "asr.prefill.scalar");
+        assert_eq!(normal.stages[2].name, "asr.decode.tensor_continuous");
+        assert_eq!(normal.stages[2].batch_mode, NativeBatchMode::Continuous);
+        assert_eq!(normal.stages[2].shape_policy, StageShapePolicy::Ragged);
+        assert_eq!(normal.stages[2].max_batch_size, 4);
+        assert_eq!(normal.stages[2].max_workspace_bytes, 4 * 8_192);
+
+        let legacy = adapter
+            .contract(StreamingRequirements::NONE.with_asr_long_form(true))
+            .unwrap();
+        assert_eq!(legacy.execution_profile.mode, ExecutionMode::Atomic);
+        assert_eq!(legacy.stages.len(), 1);
+        assert_eq!(legacy.stages[0].name, "asr.scalar");
+        assert_eq!(legacy.stages[0].selector, StageWorkSelector::Atomic);
     }
 }

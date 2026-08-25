@@ -1082,6 +1082,22 @@ impl ModelLifecycleController {
                     )));
                 };
                 bundle_draft.seal_whisper_audio_preparation(model)?;
+            } else if variant.family() == crate::catalog::ModelFamily::VibeVoiceAsr {
+                let loaded = self
+                    .model_registry
+                    .get_loading_asr(variant)
+                    .await
+                    .ok_or_else(|| {
+                        Error::ModelLoadError(format!(
+                            "instantiated VibeVoice ASR model {variant} is missing before adapter sealing"
+                        ))
+                    })?;
+                let NativeAsrModel::VibeVoice(model) = loaded.as_ref() else {
+                    return Err(Error::ModelLoadError(format!(
+                        "instantiated model {variant} does not expose VibeVoice ASR geometry"
+                    )));
+                };
+                bundle_draft.seal_vibevoice_asr_preparation(model)?;
             }
             // Metal records many tensor uploads asynchronously. Flush them
             // before publishing the model so an allocation failure is owned by
@@ -1311,14 +1327,64 @@ impl ModelLifecycleController {
                             .map(|contract| contract.stages.as_ref())
                             .collect::<Vec<_>>();
                         let physical_spec = loaded.vibevoice_physical_state_spec(&stage_graphs)?;
+                        let retained_contract = physical_spec.retained.as_ref().ok_or_else(|| {
+                            Error::ModelLoadError(
+                                "VibeVoice ASR normal graph did not author retained decoder state"
+                                    .into(),
+                            )
+                        })?;
+                        let retained_max_tokens = physical_spec.retained_max_tokens.ok_or_else(|| {
+                            Error::ModelLoadError(
+                                "VibeVoice ASR retained decoder state has no context bound".into(),
+                            )
+                        })?;
+                        let retained = self
+                            .core_engine
+                            .load_managed_model_state_with_portable_copies(
+                                model_instance_id,
+                                retained_contract,
+                                Some(retained_max_tokens),
+                                2,
+                            )
+                            .await?;
+                        self.model_registry.publish_effective_context(
+                            variant,
+                            retained.logical_token_reach(),
+                        )?;
+                        crate::runtime::rollout::validate_managed_state_plan_eligibility(
+                            variant,
+                            CapabilityKind::Asr,
+                            retained.state_plan_v2(),
+                        )?;
+                        let retained_uses = contracts
+                            .iter()
+                            .map(|contract| {
+                                let graph = stage_graph_fingerprint(&contract.stages)?;
+                                let retained_use = match contract.execution_profile.mode {
+                                    crate::engine::ExecutionMode::Sequence => {
+                                        RetainedStateUseV2::ExternalPaged
+                                    }
+                                    crate::engine::ExecutionMode::Atomic => {
+                                        RetainedStateUseV2::Inactive
+                                    }
+                                    _ => {
+                                        return Err(Error::ModelLoadError(
+                                            "VibeVoice ASR graph has an incompatible retained-state profile"
+                                                .into(),
+                                        ));
+                                    }
+                                };
+                                Ok((graph, retained_use))
+                            })
+                            .collect::<Result<HashMap<_, _>>>()?;
                         let publication = self
                             .load_invocation_workspace_publication(
                                 model_instance_id,
                                 &contracts,
                                 physical_spec.descriptor,
                                 &physical_spec.invocation,
-                                None,
-                                HashMap::new(),
+                                Some(retained.into()),
+                                retained_uses,
                             )
                             .await?;
                         state_publications.insert(CapabilityKind::Asr, publication);

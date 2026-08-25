@@ -25,6 +25,7 @@ use crate::models::architectures::qwen3::asr::Qwen3AsrPreparedAudio;
 use crate::models::architectures::qwen3::tts::{
     Qwen3TtsModel, SpeakerReference, TtsGenerationParams, TtsSessionCacheRequest,
 };
+use crate::models::architectures::vibevoice::asr::VibeVoiceAsrPreparedArtifact;
 use crate::models::architectures::whisper::asr::WhisperPreparedWindow;
 use crate::models::registry::{
     AsrModelLease, ChatModelLease, NativeAsrModel, NativeChatModel, NativeChatPreparedPrompt,
@@ -783,6 +784,7 @@ pub(super) struct PreparedAsrEncoderArtifact {
 enum PreparedAsrEncoderArtifactValue {
     Qwen3(Arc<Qwen3AsrPreparedAudio>),
     Whisper(Arc<WhisperPreparedWindow>),
+    VibeVoice(Arc<VibeVoiceAsrPreparedArtifact>),
 }
 
 impl fmt::Debug for PreparedAsrEncoderArtifact {
@@ -801,13 +803,17 @@ impl PreparedAsrEncoderArtifactValue {
         match self {
             Self::Qwen3(_) => "qwen3",
             Self::Whisper(_) => "whisper",
+            Self::VibeVoice(_) => "vibevoice",
         }
     }
 
-    fn resident_tensor_bytes(&self) -> Result<u64> {
+    fn resident_resources(&self) -> Result<(u64, u64)> {
         match self {
-            Self::Qwen3(value) => value.resident_tensor_bytes(),
-            Self::Whisper(value) => value.resident_tensor_bytes(),
+            Self::Qwen3(value) => Ok((0, value.resident_tensor_bytes()?)),
+            Self::Whisper(value) => Ok((0, value.resident_tensor_bytes()?)),
+            Self::VibeVoice(value) => {
+                Ok((value.resident_host_bytes(), value.resident_tensor_bytes()))
+            }
         }
     }
 }
@@ -2269,8 +2275,9 @@ impl EngineCoreRequest {
         }
         match &prepared.artifact {
             PreparedAsrEncoderArtifactValue::Qwen3(value) => Ok(Some(value.clone())),
-            PreparedAsrEncoderArtifactValue::Whisper(_) => Err(Error::InvalidInput(
-                "Whisper encoder artifact was requested through the Qwen3 accessor".into(),
+            PreparedAsrEncoderArtifactValue::Whisper(_)
+            | PreparedAsrEncoderArtifactValue::VibeVoice(_) => Err(Error::InvalidInput(
+                "foreign encoder artifact was requested through the Qwen3 accessor".into(),
             )),
         }
     }
@@ -2323,8 +2330,64 @@ impl EngineCoreRequest {
         }
         match &prepared.artifact {
             PreparedAsrEncoderArtifactValue::Whisper(value) => Ok(Some(value.clone())),
-            PreparedAsrEncoderArtifactValue::Qwen3(_) => Err(Error::InvalidInput(
-                "Qwen3 encoder artifact was requested through the Whisper accessor".into(),
+            PreparedAsrEncoderArtifactValue::Qwen3(_)
+            | PreparedAsrEncoderArtifactValue::VibeVoice(_) => Err(Error::InvalidInput(
+                "foreign encoder artifact was requested through the Whisper accessor".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn install_prepared_vibevoice_artifact(
+        &mut self,
+        model_variant: ModelVariant,
+        artifact: Arc<VibeVoiceAsrPreparedArtifact>,
+    ) -> Result<()> {
+        if model_variant.family() != ModelFamily::VibeVoiceAsr
+            || self.task_type != TaskType::ASR
+            || self.model_variant != Some(model_variant)
+            || self.uses_asr_long_form_atomic()
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} VibeVoice artifact does not match its normal routed model",
+                self.id
+            )));
+        }
+        let source_fingerprint = self.asr_execution_source_fingerprint(model_variant)?;
+        if self.prepared_asr_encoder_artifact.is_some() {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} already owns an encoder artifact",
+                self.id
+            )));
+        }
+        self.prepared_asr_encoder_artifact = Some(PreparedAsrEncoderArtifact {
+            model_variant,
+            artifact: PreparedAsrEncoderArtifactValue::VibeVoice(artifact),
+            source_fingerprint,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn prepared_vibevoice_artifact_for_executor(
+        &self,
+    ) -> Result<Option<Arc<VibeVoiceAsrPreparedArtifact>>> {
+        let Some(prepared) = self.prepared_asr_encoder_artifact.as_ref() else {
+            return Ok(None);
+        };
+        if self.model_variant != Some(prepared.model_variant)
+            || self.asr_execution_source_fingerprint(prepared.model_variant)?
+                != prepared.source_fingerprint
+            || self.uses_asr_long_form_atomic()
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} changed after VibeVoice encoder preparation",
+                self.id
+            )));
+        }
+        match &prepared.artifact {
+            PreparedAsrEncoderArtifactValue::VibeVoice(value) => Ok(Some(value.clone())),
+            PreparedAsrEncoderArtifactValue::Qwen3(_)
+            | PreparedAsrEncoderArtifactValue::Whisper(_) => Err(Error::InvalidInput(
+                "foreign encoder artifact was requested through the VibeVoice accessor".into(),
             )),
         }
     }
@@ -2332,7 +2395,20 @@ impl EngineCoreRequest {
     pub(crate) fn prepared_asr_encoder_artifact_retained_bytes(&self) -> Result<u64> {
         self.prepared_asr_encoder_artifact
             .as_ref()
-            .map_or(Ok(0), |prepared| prepared.artifact.resident_tensor_bytes())
+            .map_or(Ok(0), |prepared| {
+                prepared
+                    .artifact
+                    .resident_resources()
+                    .map(|(_, device)| device)
+            })
+    }
+
+    pub(crate) fn prepared_asr_encoder_artifact_retained_resources(&self) -> Result<(u64, u64)> {
+        self.prepared_asr_encoder_artifact
+            .as_ref()
+            .map_or(Ok((0, 0)), |prepared| {
+                prepared.artifact.resident_resources()
+            })
     }
 
     pub(crate) fn install_prepared_sequence_input_tokens(
@@ -2565,7 +2641,7 @@ impl EngineCoreRequest {
         if matches!(&ready.model, PreparedIncrementalModel::Asr(_))
             && matches!(
                 ready.model_variant.family(),
-                ModelFamily::Qwen3Asr | ModelFamily::WhisperAsr
+                ModelFamily::Qwen3Asr | ModelFamily::WhisperAsr | ModelFamily::VibeVoiceAsr
             )
         {
             if self.prepared_asr_audio_for_executor()?.is_none() {
@@ -2583,6 +2659,9 @@ impl EngineCoreRequest {
                             }
                             ModelFamily::WhisperAsr => {
                                 self.prepared_whisper_window_for_executor()?.is_some()
+                            }
+                            ModelFamily::VibeVoiceAsr => {
+                                self.prepared_vibevoice_artifact_for_executor()?.is_some()
                             }
                             _ => false,
                         } => {}

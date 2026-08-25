@@ -156,12 +156,14 @@ const fn family_inference_state_policy(family: ModelFamily) -> FamilyInferenceSt
             tts: Invocation,
             ..FamilyInferenceStatePolicy::STATELESS
         },
-        ParakeetAsr | VibeVoiceAsr | NemotronAsr | GraniteSpeechAsr | Voxtral => {
-            FamilyInferenceStatePolicy {
-                asr: Invocation,
-                ..FamilyInferenceStatePolicy::STATELESS
-            }
-        }
+        ParakeetAsr | NemotronAsr | GraniteSpeechAsr | Voxtral => FamilyInferenceStatePolicy {
+            asr: Invocation,
+            ..FamilyInferenceStatePolicy::STATELESS
+        },
+        VibeVoiceAsr => FamilyInferenceStatePolicy {
+            asr: RetainedAndInvocation,
+            ..FamilyInferenceStatePolicy::STATELESS
+        },
         WhisperAsr => FamilyInferenceStatePolicy {
             asr: RetainedAndInvocation,
             ..FamilyInferenceStatePolicy::STATELESS
@@ -486,7 +488,7 @@ impl ModelCapabilityAdapter for AsrCapabilityAdapter {
                 execution_target: asr_execution_target(model_variant),
                 sequence_execution: if matches!(
                     model_variant.family(),
-                    ModelFamily::Qwen3Asr | ModelFamily::WhisperAsr
+                    ModelFamily::Qwen3Asr | ModelFamily::WhisperAsr | ModelFamily::VibeVoiceAsr
                 ) {
                     SequenceExecutionMode::Always
                 } else {
@@ -823,7 +825,14 @@ mod tests {
         assert_eq!(whisper.execution_target, ExecutionTargetKind::TokenEngine);
         assert_eq!(
             whisper.state_requirement,
-            InferenceStateRequirement::Invocation
+            InferenceStateRequirement::RetainedAndInvocation
+        );
+        assert_eq!(
+            registry
+                .require(CapabilityKind::Asr, ModelVariant::VibeVoiceAsr)
+                .expect("VibeVoice ASR adapter")
+                .state_requirement,
+            InferenceStateRequirement::RetainedAndInvocation
         );
         assert_eq!(
             registry

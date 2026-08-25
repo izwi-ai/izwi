@@ -12,7 +12,7 @@ use tokio::sync::{Notify, OnceCell, RwLock};
 use tracing::info;
 
 use crate::backends::state::PhysicalStateTransactionId;
-use crate::backends::{DTypeSelectionRequest, DeviceProfile};
+use crate::backends::{BackendKind, DTypeSelectionRequest, DeviceProfile};
 use crate::catalog::{ModelFamily, ModelTask};
 use crate::engine::{
     InvocationStaticAttentionLease, InvocationTensorLease, RetainedStaticAttentionRuntimeV2,
@@ -73,7 +73,10 @@ use crate::models::architectures::sortformer::diarization::{
     SortformerWorkspaceEvent,
 };
 use crate::models::architectures::vibevoice::asr::{
-    VibeVoiceAsrGenerationOptions, VibeVoiceAsrModel, VibeVoiceAsrTranscriptionOutput,
+    VibeVoiceAsrDecodeCheckpoint, VibeVoiceAsrDecodeState, VibeVoiceAsrDecodeStep,
+    VibeVoiceAsrGenerationOptions, VibeVoiceAsrModel, VibeVoiceAsrPreparationDecision,
+    VibeVoiceAsrPreparationStageSeal, VibeVoiceAsrPreparedArtifact,
+    VibeVoiceAsrTranscriptionOutput,
 };
 use crate::models::architectures::vibevoice::tts::VibeVoiceTtsModel;
 use crate::models::architectures::vibevoice::VibeVoicePhysicalStateSpec;
@@ -625,12 +628,14 @@ pub struct NativeAudioChatGeneration {
 pub enum NativeAsrDecodeState {
     Qwen3(Qwen3AsrDecodeState),
     Whisper(WhisperDecodeState),
+    VibeVoice(VibeVoiceAsrDecodeState),
     Nemotron(NemotronStreamingState),
 }
 
 pub(crate) enum NativeAsrDecodeCheckpoint {
     Qwen3(Qwen3AsrDecodeCheckpoint),
     Whisper(WhisperDecodeCheckpoint),
+    VibeVoice(VibeVoiceAsrDecodeCheckpoint),
 }
 
 impl NativeAsrDecodeState {
@@ -638,6 +643,7 @@ impl NativeAsrDecodeState {
         match self {
             Self::Qwen3(state) => state.uses_managed_kv(),
             Self::Whisper(state) => state.uses_managed_kv(),
+            Self::VibeVoice(_) => true,
             Self::Nemotron(_) => false,
         }
     }
@@ -648,6 +654,7 @@ impl NativeAsrDecodeState {
         match self {
             Self::Qwen3(state) => state.take_managed_write_completions(),
             Self::Whisper(state) => state.take_managed_write_completions(),
+            Self::VibeVoice(state) => state.take_managed_write_completions(),
             Self::Nemotron(_) => Vec::new(),
         }
     }
@@ -656,6 +663,7 @@ impl NativeAsrDecodeState {
         match self {
             Self::Qwen3(state) => Some(state.sequence_position()),
             Self::Whisper(state) => Some(state.self_context_len()),
+            Self::VibeVoice(state) => Some(state.sequence_position()),
             Self::Nemotron(_) => None,
         }
     }
@@ -666,7 +674,7 @@ impl NativeAsrDecodeState {
     ) -> Result<()> {
         match self {
             Self::Qwen3(state) => state.install_managed_reservation(cache),
-            Self::Whisper(_) | Self::Nemotron(_) => Err(Error::InvalidInput(
+            Self::Whisper(_) | Self::VibeVoice(_) | Self::Nemotron(_) => Err(Error::InvalidInput(
                 "managed Qwen3 KV cache was supplied to a non-Qwen3 ASR state".to_string(),
             )),
         }
@@ -683,6 +691,9 @@ impl NativeAsrDecodeState {
             Self::Whisper(state) => state
                 .begin_managed_quantum(cache)
                 .map(NativeAsrDecodeCheckpoint::Whisper),
+            Self::VibeVoice(state) => state
+                .begin_managed_quantum(cache)
+                .map(NativeAsrDecodeCheckpoint::VibeVoice),
             Self::Nemotron(_) => Err(Error::InvalidInput(
                 "managed Qwen3 KV cache was supplied to a non-Qwen3 ASR state".to_string(),
             )),
@@ -704,7 +715,7 @@ impl NativeAsrDecodeState {
             Self::Whisper(state) => state
                 .begin_managed_generation(cache, expected_generation, new_generation)
                 .map(NativeAsrDecodeCheckpoint::Whisper),
-            Self::Qwen3(_) | Self::Nemotron(_) => Err(Error::InvalidInput(
+            Self::Qwen3(_) | Self::VibeVoice(_) | Self::Nemotron(_) => Err(Error::InvalidInput(
                 "Whisper managed generation was supplied to another ASR state".into(),
             )),
         }
@@ -722,12 +733,12 @@ impl NativeAsrDecodeState {
             (Self::Whisper(state), NativeAsrDecodeCheckpoint::Whisper(mut checkpoint)) => {
                 state.rollback_managed_quantum(&mut checkpoint)
             }
-            (Self::Whisper(_) | Self::Nemotron(_), NativeAsrDecodeCheckpoint::Qwen3(_))
-            | (Self::Qwen3(_) | Self::Nemotron(_), NativeAsrDecodeCheckpoint::Whisper(_)) => {
-                Err(Error::InvalidInput(
-                    "Qwen3 ASR checkpoint was supplied to a non-Qwen3 ASR state".to_string(),
-                ))
+            (Self::VibeVoice(state), NativeAsrDecodeCheckpoint::VibeVoice(mut checkpoint)) => {
+                state.rollback_managed_quantum(&mut checkpoint)
             }
+            _ => Err(Error::InvalidInput(
+                "ASR managed checkpoint was supplied to a different decoder state".to_string(),
+            )),
         }
     }
 
@@ -737,6 +748,9 @@ impl NativeAsrDecodeState {
     ) -> Result<()> {
         match (self, checkpoint) {
             (Self::Whisper(state), NativeAsrDecodeCheckpoint::Whisper(mut checkpoint)) => {
+                state.commit_managed_quantum(&mut checkpoint)
+            }
+            (Self::VibeVoice(state), NativeAsrDecodeCheckpoint::VibeVoice(mut checkpoint)) => {
                 state.commit_managed_quantum(&mut checkpoint)
             }
             (Self::Qwen3(_), NativeAsrDecodeCheckpoint::Qwen3(_)) => Ok(()),
@@ -749,7 +763,7 @@ impl NativeAsrDecodeState {
     pub(crate) fn bind_qwen3_tensor_sequence(&mut self, sequence: u64) -> Result<()> {
         match self {
             Self::Qwen3(state) => state.bind_tensor_sequence(sequence),
-            Self::Whisper(_) | Self::Nemotron(_) => Err(Error::InvalidInput(
+            Self::Whisper(_) | Self::VibeVoice(_) | Self::Nemotron(_) => Err(Error::InvalidInput(
                 "Qwen3 ASR tensor-state reservation was supplied to a non-Qwen3 state".to_string(),
             )),
         }
@@ -761,7 +775,7 @@ impl NativeAsrDecodeState {
     ) -> Result<()> {
         match self {
             Self::Qwen3(state) => state.restore_prepared_tensor_state(arena),
-            Self::Whisper(_) | Self::Nemotron(_) => Err(Error::InvalidInput(
+            Self::Whisper(_) | Self::VibeVoice(_) | Self::Nemotron(_) => Err(Error::InvalidInput(
                 "Qwen3 ASR tensor-state arena was supplied to a non-Qwen3 state".to_string(),
             )),
         }
@@ -774,7 +788,7 @@ impl NativeAsrDecodeState {
     ) -> Result<()> {
         match self {
             Self::Qwen3(state) => state.stage_prepared_tensor_state(arena, transaction),
-            Self::Whisper(_) | Self::Nemotron(_) => Err(Error::InvalidInput(
+            Self::Whisper(_) | Self::VibeVoice(_) | Self::Nemotron(_) => Err(Error::InvalidInput(
                 "Qwen3 ASR tensor-state arena was supplied to a non-Qwen3 state".to_string(),
             )),
         }
@@ -784,6 +798,7 @@ impl NativeAsrDecodeState {
         match self {
             Self::Qwen3(state) => Some(state.prefill_progress()),
             Self::Whisper(state) => Some(state.prefill_progress()),
+            Self::VibeVoice(state) => Some(state.prefill_progress()),
             Self::Nemotron(_) => None,
         }
     }
@@ -792,7 +807,24 @@ impl NativeAsrDecodeState {
         match self {
             Self::Qwen3(state) => Some(state.prefill_token_count()),
             Self::Whisper(state) => Some(state.prefill_token_count()),
+            Self::VibeVoice(state) => Some(state.prefill_token_count()),
             Self::Nemotron(_) => None,
+        }
+    }
+
+    pub(crate) fn take_staged_asr_decode_step(&mut self) -> Option<NativeAsrDecodeStep> {
+        match self {
+            Self::VibeVoice(state) => {
+                state
+                    .take_staged_decode_step()
+                    .map(|step| NativeAsrDecodeStep {
+                        delta: step.delta,
+                        text: step.text,
+                        tokens_generated: step.tokens_generated,
+                        finished: step.finished,
+                    })
+            }
+            Self::Qwen3(_) | Self::Whisper(_) | Self::Nemotron(_) => None,
         }
     }
 }
@@ -1478,6 +1510,73 @@ impl NativeAsrModel {
         }
     }
 
+    pub(crate) fn vibevoice_scalar_preparation_stage_seal(
+        &self,
+        backend: BackendKind,
+    ) -> Result<VibeVoiceAsrPreparationStageSeal> {
+        match self {
+            Self::VibeVoice(model) => model.scalar_preparation_stage_seal(backend),
+            _ => Err(Error::ModelLoadError(
+                "non-VibeVoice ASR model cannot seal VibeVoice preparation".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn vibevoice_retained_preparation_decision(
+        &self,
+        input_samples: usize,
+        input_sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Result<VibeVoiceAsrPreparationDecision> {
+        match self {
+            Self::VibeVoice(model) => model.retained_preparation_decision(
+                input_samples,
+                input_sample_rate,
+                language,
+                prompt,
+            ),
+            _ => Err(Error::InvalidInput(
+                "VibeVoice preparation route was requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn prepare_vibevoice_retained_artifact(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Result<VibeVoiceAsrPreparedArtifact> {
+        match self {
+            Self::VibeVoice(model) => {
+                model.prepare_retained_artifact(audio, sample_rate, language, prompt)
+            }
+            _ => Err(Error::InvalidInput(
+                "VibeVoice preparation was requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn validate_vibevoice_retained_artifact(
+        &self,
+        artifact: &VibeVoiceAsrPreparedArtifact,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Result<()> {
+        match self {
+            Self::VibeVoice(model) => {
+                model.validate_retained_artifact(artifact, audio, sample_rate, language, prompt)
+            }
+            _ => Err(Error::InvalidInput(
+                "VibeVoice artifact validation was requested from another ASR model".into(),
+            )),
+        }
+    }
+
     pub(crate) fn transcribe_vibevoice_with_details_and_prompt_and_options_physical(
         &self,
         audio: &[f32],
@@ -1994,20 +2093,30 @@ impl NativeAsrModel {
     }
 
     pub fn supports_resumable_prefill(&self) -> bool {
-        matches!(self, Self::Qwen3(model) if model.supports_resumable_prefill())
+        match self {
+            Self::Qwen3(model) => model.supports_resumable_prefill(),
+            Self::VibeVoice(_) => true,
+            _ => false,
+        }
     }
 
     pub fn supports_continuous_decode_batch(&self) -> bool {
-        matches!(self, Self::Qwen3(model) if model.supports_continuous_decode_batch())
+        match self {
+            Self::Qwen3(model) => model.supports_continuous_decode_batch(),
+            Self::VibeVoice(model) => model.supports_continuous_decode_batch(),
+            _ => false,
+        }
     }
 
     pub fn continuous_decode_is_tensor_batched(&self) -> bool {
         matches!(self, Self::Qwen3(model) if model.continuous_decode_is_tensor_batched())
+            || matches!(self, Self::VibeVoice(_))
     }
 
     pub fn continuous_decode_batch_workspace_per_row_bytes(&self) -> Result<u64> {
         match self {
             Self::Qwen3(model) => model.continuous_decode_batch_workspace_per_row_bytes(),
+            Self::VibeVoice(model) => model.continuous_decode_workspace_per_row_bytes(),
             _ => Err(Error::InvalidInput(
                 "Loaded ASR model does not expose continuous tensor decode".to_string(),
             )),
@@ -2383,6 +2492,26 @@ impl NativeAsrModel {
         }
     }
 
+    pub(crate) fn start_vibevoice_resumable_prefill_managed(
+        &self,
+        prepared: Arc<VibeVoiceAsrPreparedArtifact>,
+        options: NativeAsrGenerationOptions,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<NativeAsrDecodeState> {
+        match self {
+            Self::VibeVoice(model) => Ok(NativeAsrDecodeState::VibeVoice(
+                model.begin_resumable_prefill_managed(
+                    prepared,
+                    vibevoice_asr_options(options),
+                    cache,
+                )?,
+            )),
+            _ => Err(Error::InvalidInput(
+                "prepared VibeVoice ASR input was supplied to another ASR model".into(),
+            )),
+        }
+    }
+
     pub(crate) fn continue_resumable_prefill(
         &self,
         state: &mut NativeAsrDecodeState,
@@ -2391,6 +2520,9 @@ impl NativeAsrModel {
     ) -> Result<bool> {
         match (self, state) {
             (Self::Qwen3(model), NativeAsrDecodeState::Qwen3(state)) => {
+                model.continue_resumable_prefill(state, span_start, span_end)
+            }
+            (Self::VibeVoice(model), NativeAsrDecodeState::VibeVoice(state)) => {
                 model.continue_resumable_prefill(state, span_start, span_end)
             }
             _ => Err(Error::InvalidInput(
@@ -2419,6 +2551,15 @@ impl NativeAsrModel {
                     finished: step.finished,
                 })
             }
+            (Self::VibeVoice(model), NativeAsrDecodeState::VibeVoice(state)) => {
+                let step: VibeVoiceAsrDecodeStep = model.decode_step(state)?;
+                Ok(NativeAsrDecodeStep {
+                    delta: step.delta,
+                    text: step.text,
+                    tokens_generated: step.tokens_generated,
+                    finished: step.finished,
+                })
+            }
             _ => Err(Error::InvalidInput(
                 "ASR decode state does not match loaded ASR model".to_string(),
             )),
@@ -2429,33 +2570,55 @@ impl NativeAsrModel {
         &self,
         states: &mut [&mut NativeAsrDecodeState],
     ) -> Result<Vec<NativeAsrDecodeStep>> {
-        let Self::Qwen3(model) = self else {
-            return Err(Error::InvalidInput(
-                "Loaded ASR model does not expose continuous tensor decode".to_string(),
-            ));
-        };
-        let mut qwen_states = states
-            .iter_mut()
-            .map(|state| match &mut **state {
-                NativeAsrDecodeState::Qwen3(state) => Ok(state),
-                NativeAsrDecodeState::Whisper(_) | NativeAsrDecodeState::Nemotron(_) => {
-                    Err(Error::InvalidInput(
-                        "continuous Qwen3 ASR batch contains a non-Qwen3 state".to_string(),
-                    ))
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
-        model.decode_step_batch(&mut qwen_states).map(|steps| {
-            steps
-                .into_iter()
-                .map(|step| NativeAsrDecodeStep {
-                    delta: step.delta,
-                    text: step.text,
-                    tokens_generated: step.tokens_generated,
-                    finished: step.finished,
+        match self {
+            Self::Qwen3(model) => {
+                let mut typed = states
+                    .iter_mut()
+                    .map(|state| match &mut **state {
+                        NativeAsrDecodeState::Qwen3(state) => Ok(state),
+                        _ => Err(Error::InvalidInput(
+                            "continuous Qwen3 ASR batch contains a foreign state".to_string(),
+                        )),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                model.decode_step_batch(&mut typed).map(|steps| {
+                    steps
+                        .into_iter()
+                        .map(|step| NativeAsrDecodeStep {
+                            delta: step.delta,
+                            text: step.text,
+                            tokens_generated: step.tokens_generated,
+                            finished: step.finished,
+                        })
+                        .collect()
                 })
-                .collect()
-        })
+            }
+            Self::VibeVoice(model) => {
+                let mut typed = states
+                    .iter_mut()
+                    .map(|state| match &mut **state {
+                        NativeAsrDecodeState::VibeVoice(state) => Ok(state),
+                        _ => Err(Error::InvalidInput(
+                            "continuous VibeVoice ASR batch contains a foreign state".to_string(),
+                        )),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                model.decode_step_batch(&mut typed).map(|steps| {
+                    steps
+                        .into_iter()
+                        .map(|step| NativeAsrDecodeStep {
+                            delta: step.delta,
+                            text: step.text,
+                            tokens_generated: step.tokens_generated,
+                            finished: step.finished,
+                        })
+                        .collect()
+                })
+            }
+            _ => Err(Error::InvalidInput(
+                "Loaded ASR model does not expose continuous tensor decode".to_string(),
+            )),
+        }
     }
 }
 

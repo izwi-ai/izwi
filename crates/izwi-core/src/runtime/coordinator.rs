@@ -1272,13 +1272,19 @@ impl InferenceCoordinator {
         }
         let binding = self.validate_loaded_execution_contract(&contract)?;
         let stage = binding.stage_for_work(&work)?;
+        let native_batch = stage.batch_mode != NativeBatchMode::None
+            && stage.concurrency == crate::engine::ConcurrencyClass::Batchable;
+        let authenticated_scalar = stage.batch_mode == NativeBatchMode::None
+            && stage.concurrency == crate::engine::ConcurrencyClass::Exclusive
+            && stage.max_batch_size == 1
+            && rows.len() == 1;
         if stage.selector != crate::engine::StageWorkSelector::PreSequencePreparation
             || stage.domain != ExecutionDomain::ExecutionGroup
-            || stage.batch_mode == NativeBatchMode::None
-            || stage.concurrency != crate::engine::ConcurrencyClass::Batchable
+            || (!native_batch && !authenticated_scalar)
         {
             return Err(Error::InvalidInput(
-                "loaded adapter has no exact native pre-sequence preparation stage".to_string(),
+                "loaded adapter has no exact native or width-one pre-sequence preparation stage"
+                    .to_string(),
             ));
         }
         let expected_binding = binding.key_for_stage(stage.id)?;
@@ -4330,6 +4336,56 @@ Pages free: 10.\n";
         );
         drop(output);
         assert_eq!(coordinator.snapshot().reserved_memory_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn scalar_preparation_dispatch_uses_the_authenticated_bridge_path_at_width_one() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 2, 2));
+        let job = coordinator.admit(job("scalar-prep")).await.unwrap();
+        let mut contract = native_preparation_contract(&coordinator, 1, 64);
+        let mut stage = contract.stages[0].clone();
+        stage.batch_mode = NativeBatchMode::None;
+        stage.concurrency = crate::engine::ConcurrencyClass::Exclusive;
+        stage.shape_policy = StageShapePolicy::Exact;
+        stage.max_batch_size = 1;
+        stage.validate().unwrap();
+        contract.stages = Arc::from([stage]);
+        let row = sealed_preparation_row(
+            &coordinator,
+            &contract,
+            job,
+            WorkCost::new(1, 4, 16),
+            4,
+            PreparationCancellation::default(),
+        );
+
+        let outcomes = coordinator
+            .run_loaded_native_preparation_batch(
+                vec![row],
+                contract,
+                WorkUnit::PreSequencePreparation {
+                    kind: "asr.encoder.audio".into(),
+                },
+                |live| {
+                    assert_eq!(live, &[0]);
+                    Ok(vec![Ok(PreparationArtifact {
+                        value: 7usize,
+                        retained: JobResourceObservation::host(8),
+                    })])
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            &outcomes[0],
+            PreparationRowOutcome::Committed {
+                artifact: PreparationArtifact { value: 7, .. },
+                ..
+            }
+        ));
+        assert_eq!(coordinator.snapshot().active_preparation_bridges, 1);
+        drop(outcomes);
+        assert_eq!(coordinator.snapshot().active_preparation_bridges, 0);
     }
 
     #[tokio::test]

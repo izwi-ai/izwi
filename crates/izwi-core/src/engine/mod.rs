@@ -177,6 +177,9 @@ pub use types::{
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::asr::{Qwen3AsrAudioBatchRow, Qwen3AsrPreparedAudio};
+use crate::models::architectures::vibevoice::asr::{
+    VibeVoiceAsrPreparationDecision, VibeVoiceAsrPreparedArtifact,
+};
 use crate::models::architectures::whisper::asr::WhisperAudioBatchRow;
 use crate::models::registry::{ChatModelLease, ModelRegistry, NativeChatPreparedPrompt};
 use std::collections::{HashMap, HashSet};
@@ -1362,6 +1365,102 @@ impl Engine {
                             "Whisper request {request_id} preparation worker failed: {error}"
                         ))
                     })??;
+                } else if variant.family() == crate::catalog::ModelFamily::VibeVoiceAsr
+                    && request.prepared_asr_execution_shape().is_none()
+                {
+                    let model_for_shape = model.clone();
+                    let request_id = request.id.clone();
+                    let deadline = request.deadline;
+                    let context_limit = registry
+                        .effective_context(variant)
+                        .unwrap_or(self.config.max_seq_len);
+                    let acquire_permit = self
+                        .direct_request_preparation_permits
+                        .clone()
+                        .acquire_owned();
+                    let permit = match deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline.into(), acquire_permit)
+                            .await
+                            .map_err(|_| Error::Timeout(request_id.clone()))?,
+                        None => acquire_permit.await,
+                    }
+                    .map_err(|_| {
+                        Error::InferenceError(
+                            "Direct VibeVoice ASR preparation queue is unavailable".into(),
+                        )
+                    })?;
+                    let worker = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        let request = request;
+                        let (samples, sample_rate) =
+                            executor::decode_request_audio_with_rate(&request)?;
+                        let decision = model_for_shape.vibevoice_retained_preparation_decision(
+                            samples.len(),
+                            sample_rate,
+                            request.asr_language_for_execution(),
+                            request.asr_prompt_for_execution(),
+                        )?;
+                        match decision {
+                            VibeVoiceAsrPreparationDecision::LegacyInvocation => {
+                                Self::finalize_direct_vibevoice_asr_preparation(
+                                    request,
+                                    variant,
+                                    samples,
+                                    sample_rate,
+                                    context_limit,
+                                    None,
+                                    None,
+                                )
+                            }
+                            VibeVoiceAsrPreparationDecision::Retained(geometry) => {
+                                let artifact = model_for_shape
+                                    .prepare_vibevoice_retained_artifact(
+                                        &samples,
+                                        sample_rate,
+                                        request.asr_language_for_execution(),
+                                        request.asr_prompt_for_execution(),
+                                    )?;
+                                if artifact.geometry() != geometry
+                                    || artifact.resident_host_bytes()
+                                        != geometry.retained_host_bytes
+                                    || artifact.resident_tensor_bytes()
+                                        != geometry.retained_device_bytes
+                                {
+                                    return Err(Error::InferenceError(
+                                        "Direct VibeVoice ASR artifact disagrees with prepared geometry"
+                                            .into(),
+                                    ));
+                                }
+                                model_for_shape.validate_vibevoice_retained_artifact(
+                                    &artifact,
+                                    &samples,
+                                    sample_rate,
+                                    request.asr_language_for_execution(),
+                                    request.asr_prompt_for_execution(),
+                                )?;
+                                Self::finalize_direct_vibevoice_asr_preparation(
+                                    request,
+                                    variant,
+                                    samples,
+                                    sample_rate,
+                                    context_limit,
+                                    Some(geometry.prompt_tokens),
+                                    Some(Arc::new(artifact)),
+                                )
+                            }
+                        }
+                    });
+                    request = match deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline.into(), worker)
+                            .await
+                            .map_err(|_| Error::Timeout(request_id.clone()))?,
+                        None => worker.await,
+                    }
+                    .map_err(|error| {
+                        Error::InferenceError(format!(
+                            "VibeVoice ASR request {request_id} preparation worker failed: {error}"
+                        ))
+                    })??;
                 }
                 request.install_asr_execution_model(variant, model)?;
             }
@@ -1469,6 +1568,32 @@ impl Engine {
             _ => {
                 return Err(Error::InferenceError(
                     "Direct Whisper route and encoder artifact disagree".into(),
+                ));
+            }
+        }
+        Ok(request)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_direct_vibevoice_asr_preparation(
+        mut request: EngineCoreRequest,
+        variant: ModelVariant,
+        samples: Vec<f32>,
+        sample_rate: u32,
+        context_limit: usize,
+        input_tokens: Option<usize>,
+        artifact: Option<Arc<VibeVoiceAsrPreparedArtifact>>,
+    ) -> Result<EngineCoreRequest> {
+        request.install_prepared_asr_audio(variant, samples, sample_rate)?;
+        match (input_tokens, artifact) {
+            (None, None) => request.install_prepared_asr_long_form_atomic()?,
+            (Some(input_tokens), Some(artifact)) => {
+                request.install_prepared_sequence_input_tokens(input_tokens, context_limit)?;
+                request.install_prepared_vibevoice_artifact(variant, artifact)?;
+            }
+            _ => {
+                return Err(Error::InferenceError(
+                    "Direct VibeVoice route and prepared artifact disagree".into(),
                 ));
             }
         }
@@ -2260,6 +2385,33 @@ mod tests {
                 .prepared_asr_encoder_artifact_retained_bytes()
                 .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn direct_vibevoice_long_form_route_retains_no_prepared_artifact() {
+        let variant = ModelVariant::VibeVoiceAsr;
+        let request = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+        let prepared = Engine::finalize_direct_vibevoice_asr_preparation(
+            request,
+            variant,
+            vec![0.0; 16_000],
+            16_000,
+            4_096,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(prepared.uses_asr_long_form_atomic());
+        assert!(prepared
+            .prepared_vibevoice_artifact_for_executor()
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            prepared
+                .prepared_asr_encoder_artifact_retained_resources()
+                .unwrap(),
+            (0, 0)
         );
     }
 

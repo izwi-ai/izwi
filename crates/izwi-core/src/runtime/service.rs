@@ -56,6 +56,9 @@ use crate::model::ModelResidencyLease;
 use crate::models::architectures::qwen3::asr::{
     Qwen3AsrAudioBatchRow, Qwen3AsrAudioPreparationGeometry, Qwen3AsrPreparedAudio,
 };
+use crate::models::architectures::vibevoice::asr::{
+    VibeVoiceAsrPreparationDecision, VibeVoiceAsrPreparedArtifact, VibeVoiceAsrPreparedGeometry,
+};
 use crate::models::architectures::whisper::asr::{
     WhisperAudioBatchRow, WhisperPreparedWindow, WhisperWindowPreparationGeometry,
 };
@@ -644,7 +647,7 @@ fn asr_encoder_retained_resources(
 ) -> Result<ResourceVector> {
     let total = host_bytes
         .checked_add(accelerator_bytes)
-        .ok_or_else(|| Error::Overloaded("Qwen3 ASR retained resource overflow".to_string()))?;
+        .ok_or_else(|| Error::Overloaded("ASR encoder retained resource overflow".to_string()))?;
     let mut resources = ResourceVector::zero();
     match backend {
         BackendKind::Cpu => resources.host_bytes = ResourceAmount::Known(total),
@@ -775,7 +778,7 @@ fn coordinator_lane_for_metadata(
         }
         TaskType::ASR => matches!(
             variant.family(),
-            ModelFamily::Qwen3Asr | ModelFamily::WhisperAsr
+            ModelFamily::Qwen3Asr | ModelFamily::WhisperAsr | ModelFamily::VibeVoiceAsr
         ),
         TaskType::TTS => variant.family() == ModelFamily::Qwen3Tts,
         TaskType::SpeechToSpeech => false,
@@ -794,7 +797,7 @@ fn coordinator_lane_for_request(request: &EngineCoreRequest) -> CoordinatorLane 
         && request.model_variant.is_some_and(|variant| {
             matches!(
                 variant.family(),
-                ModelFamily::Qwen3Asr | ModelFamily::WhisperAsr
+                ModelFamily::Qwen3Asr | ModelFamily::WhisperAsr | ModelFamily::VibeVoiceAsr
             )
         })
         && request.prepared_asr_execution_shape().is_none()
@@ -886,6 +889,89 @@ struct WhisperEncoderQueueKey {
 struct WhisperEncoderBatcher {
     coordinator: Arc<InferenceCoordinator>,
     state: Mutex<WhisperEncoderBatcherState>,
+}
+
+type VibeVoiceEncoderOutcome = PreparationRowOutcome<VibeVoiceAsrPreparedArtifact>;
+
+struct VibeVoiceEncoderPending {
+    job: JobLease,
+    contract: LoadedExecutionContract,
+    model: AsrModelLease,
+    samples: Arc<[f32]>,
+    sample_rate: u32,
+    language: Option<String>,
+    prompt: Option<String>,
+    geometry: VibeVoiceAsrPreparedGeometry,
+    retained_request_host_bytes: u64,
+    cancellation: PreparationCancellation,
+}
+
+struct VibeVoiceEncoderBatcher {
+    coordinator: Arc<InferenceCoordinator>,
+}
+
+impl VibeVoiceEncoderBatcher {
+    fn new(coordinator: Arc<InferenceCoordinator>) -> Self {
+        Self { coordinator }
+    }
+
+    async fn submit(&self, pending: VibeVoiceEncoderPending) -> Result<VibeVoiceEncoderOutcome> {
+        let work = WorkUnit::PreSequencePreparation {
+            kind: "asr.encoder.vibevoice".into(),
+        };
+        let cost = pending.geometry.work_cost();
+        let cancellation = pending.cancellation.clone();
+        let row = self.coordinator.seal_preparation_row(
+            pending.job,
+            &pending.contract,
+            &work,
+            cost,
+            pending.geometry.embedding_elements,
+            pending.cancellation,
+        )?;
+        let model = pending.model;
+        let samples = pending.samples;
+        let sample_rate = pending.sample_rate;
+        let language = pending.language;
+        let prompt = pending.prompt;
+        let retained_request_host_bytes = pending.retained_request_host_bytes;
+        let mut guard = QwenAsrEncoderCancellationGuard {
+            cancellation,
+            armed: true,
+        };
+        let mut outcomes = self
+            .coordinator
+            .run_loaded_native_preparation_batch(vec![row], pending.contract, work, move |live| {
+                if live != [0] {
+                    return Err(Error::InferenceError(
+                        "VibeVoice scalar preparation received a non-scalar live set".into(),
+                    ));
+                }
+                let artifact = model.prepare_vibevoice_retained_artifact(
+                    samples.as_ref(),
+                    sample_rate,
+                    language.as_deref(),
+                    prompt.as_deref(),
+                )?;
+                let host_bytes = retained_request_host_bytes
+                    .checked_add(artifact.resident_host_bytes())
+                    .ok_or_else(|| {
+                        Error::Overloaded("VibeVoice ASR retained host accounting overflow".into())
+                    })?;
+                Ok(vec![Ok(PreparationArtifact {
+                    retained: JobResourceObservation {
+                        host_bytes,
+                        accelerator_bytes: artifact.resident_tensor_bytes(),
+                    },
+                    value: artifact,
+                })])
+            })
+            .await?;
+        guard.armed = false;
+        outcomes.pop().ok_or_else(|| {
+            Error::InferenceError("VibeVoice scalar preparation returned no outcome".into())
+        })
+    }
 }
 
 impl WhisperEncoderBatcher {
@@ -1398,6 +1484,7 @@ pub struct RuntimeService {
     pub(crate) coordinator: Arc<InferenceCoordinator>,
     qwen_asr_encoder_batcher: Arc<QwenAsrEncoderBatcher>,
     whisper_encoder_batcher: Arc<WhisperEncoderBatcher>,
+    vibevoice_encoder_batcher: Arc<VibeVoiceEncoderBatcher>,
     pub(super) asr_realtime_sessions: RealtimeAsrSessionPolicy,
     telemetry: Arc<RuntimeTelemetryCollector>,
     completion_waiters: Arc<RuntimeCompletionWaiters>,
@@ -1448,7 +1535,7 @@ fn bind_request_to_residency(
     if request.model_variant.is_some_and(|variant| {
         matches!(
             variant.family(),
-            ModelFamily::Qwen3Asr | ModelFamily::WhisperAsr
+            ModelFamily::Qwen3Asr | ModelFamily::WhisperAsr | ModelFamily::VibeVoiceAsr
         ) && request.prepared_asr_execution_shape().is_some()
     }) && request.prepared_asr_audio_for_executor()?.is_none()
     {
@@ -1464,6 +1551,18 @@ fn bind_request_to_residency(
     {
         return Err(Error::InvalidInput(
             "Whisper normal execution shape has no matching prepared window".into(),
+        ));
+    }
+    if request.model_variant.is_some_and(|variant| {
+        variant.family() == ModelFamily::VibeVoiceAsr
+            && request.prepared_asr_execution_shape().is_some()
+            && !request.uses_asr_long_form_atomic()
+    }) && request
+        .prepared_vibevoice_artifact_for_executor()?
+        .is_none()
+    {
+        return Err(Error::InvalidInput(
+            "VibeVoice normal execution shape has no matching prepared artifact".into(),
         ));
     }
     let streaming = if request.streaming && !model_streaming_required {
@@ -1866,6 +1965,7 @@ impl RuntimeService {
         )?);
         let qwen_asr_encoder_batcher = Arc::new(QwenAsrEncoderBatcher::new(coordinator.clone()));
         let whisper_encoder_batcher = Arc::new(WhisperEncoderBatcher::new(coordinator.clone()));
+        let vibevoice_encoder_batcher = Arc::new(VibeVoiceEncoderBatcher::new(coordinator.clone()));
         let asr_realtime_sessions = RealtimeAsrSessionPolicy::from_env()?;
         let realtime_asr_sequence_capacity = asr_realtime_sessions.retained_sequence_capacity()?;
         worker_config.resource_authority = Some(coordinator.resource_authority());
@@ -1905,6 +2005,7 @@ impl RuntimeService {
             coordinator,
             qwen_asr_encoder_batcher,
             whisper_encoder_batcher,
+            vibevoice_encoder_batcher,
             asr_realtime_sessions,
             telemetry: Arc::new(RuntimeTelemetryCollector::new(2048)),
             completion_waiters: Arc::new(Mutex::new(HashMap::new())),
@@ -2550,7 +2651,7 @@ impl RuntimeService {
         let initial_lane = if task_type == TaskType::ASR
             && matches!(
                 variant.family(),
-                ModelFamily::Qwen3Asr | ModelFamily::WhisperAsr
+                ModelFamily::Qwen3Asr | ModelFamily::WhisperAsr | ModelFamily::VibeVoiceAsr
             ) {
             CoordinatorLane::Atomic
         } else {
@@ -2639,7 +2740,7 @@ impl RuntimeService {
                 && request.model_variant.is_some_and(|variant| {
                     matches!(
                         variant.family(),
-                        ModelFamily::Qwen3Asr | ModelFamily::WhisperAsr
+                        ModelFamily::Qwen3Asr | ModelFamily::WhisperAsr | ModelFamily::VibeVoiceAsr
                     )
                 })
                 && request.prepared_asr_audio_for_executor()?.is_some());
@@ -2650,12 +2751,13 @@ impl RuntimeService {
                 self.backend_router.context().backend_kind,
             ))?;
         }
-        let asr_encoder_bytes = request.prepared_asr_encoder_artifact_retained_bytes()?;
-        if asr_encoder_bytes > 0 {
+        let (asr_encoder_host_bytes, asr_encoder_device_bytes) =
+            request.prepared_asr_encoder_artifact_retained_resources()?;
+        if asr_encoder_host_bytes > 0 || asr_encoder_device_bytes > 0 {
             spec.resources = spec.resources.checked_add(asr_encoder_retained_resources(
                 self.backend_router.context().backend_kind,
-                0,
-                asr_encoder_bytes,
+                asr_encoder_host_bytes,
+                asr_encoder_device_bytes,
             )?)?;
         }
         if request.task_type == TaskType::TTS
@@ -3277,6 +3379,213 @@ impl RuntimeService {
         }
     }
 
+    async fn prepare_vibevoice_asr_shape_for_binding(
+        &self,
+        request: EngineCoreRequest,
+        job: JobLease,
+        residency_lease: Option<&ModelResidencyLease>,
+    ) -> Result<(EngineCoreRequest, JobLease)> {
+        if request.task_type != TaskType::ASR
+            || request
+                .model_variant
+                .is_none_or(|variant| variant.family() != ModelFamily::VibeVoiceAsr)
+            || request.prepared_asr_execution_shape().is_some()
+        {
+            return Ok((request, job));
+        }
+        let variant = request.model_variant.expect("validated VibeVoice variant");
+        let model = self
+            .model_registry
+            .get_asr_lease(variant)
+            .await
+            .ok_or_else(|| Error::ModelNotFound(format!("ASR model {variant} is not loaded")))?;
+        let residency = residency_lease.ok_or_else(|| {
+            Error::InferenceError("VibeVoice preparation requires model residency".into())
+        })?;
+        let loaded_bundle = self
+            .model_lifecycle
+            .try_get_ready_bundle(residency.variant());
+        let preparation_contract = loaded_contract_for_residency(
+            residency,
+            loaded_bundle.as_deref(),
+            CapabilityKind::Asr,
+            false,
+            self.coordinator.execution_group_id(),
+            self.backend_router.context().backend_kind,
+            Some(ExecutionTargetKind::TokenEngine),
+        )?;
+        let context_limit = self
+            .model_registry
+            .effective_context(variant)
+            .ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "VibeVoice ASR model {variant} has no effective context"
+                ))
+            })?;
+        let model_for_shape = model.clone();
+        let (prepared, geometry) = self
+            .coordinator
+            .run_host_blocking_stage(&job, move || {
+                let mut request = request;
+                let (samples, sample_rate) =
+                    crate::engine::decode_request_audio_with_rate(&request)?;
+                let decision = model_for_shape.vibevoice_retained_preparation_decision(
+                    samples.len(),
+                    sample_rate,
+                    request.asr_language_for_execution(),
+                    request.asr_prompt_for_execution(),
+                )?;
+                request.install_prepared_asr_audio(variant, samples, sample_rate)?;
+                match decision {
+                    VibeVoiceAsrPreparationDecision::Retained(geometry) => {
+                        request.install_prepared_sequence_input_tokens(
+                            geometry.prompt_tokens,
+                            context_limit,
+                        )?;
+                        Ok((request, Some(geometry)))
+                    }
+                    VibeVoiceAsrPreparationDecision::LegacyInvocation => {
+                        request.install_prepared_asr_long_form_atomic()?;
+                        Ok((request, None))
+                    }
+                }
+            })
+            .await?;
+        let retained_request_host_bytes =
+            u64::try_from(retained_engine_request_input_bytes(&prepared)?).map_err(|_| {
+                Error::Overloaded("VibeVoice ASR retained input exceeds u64".into())
+            })?;
+        job.record_materialized_usage(JobResourceObservation::host(retained_request_host_bytes))?;
+        let bridge = self.coordinator.bridge_preparation_admission(job)?;
+        if prepared.uses_asr_long_form_atomic() {
+            let (spec, observation) = match self.coordinator_job_for_request(&prepared) {
+                Ok(value) => value,
+                Err(error) => {
+                    drop(prepared);
+                    drop(bridge);
+                    return Err(error);
+                }
+            };
+            return match self
+                .coordinator
+                .admit_observed_from_preparation(bridge, spec, observation)
+                .await
+            {
+                Ok(job) => Ok((prepared, job)),
+                Err(failure) => {
+                    drop(prepared);
+                    let error = failure.error;
+                    drop(failure.bridge);
+                    Err(error)
+                }
+            };
+        }
+        let geometry = geometry.ok_or_else(|| {
+            Error::InferenceError("VibeVoice normal route lost preparation geometry".into())
+        })?;
+        let retained_host_bytes = retained_request_host_bytes
+            .checked_add(geometry.retained_host_bytes)
+            .ok_or_else(|| Error::Overloaded("VibeVoice retained host bytes overflow".into()))?;
+        let resources = asr_encoder_retained_resources(
+            self.backend_router.context().backend_kind,
+            retained_host_bytes,
+            geometry.retained_device_bytes,
+        )?;
+        let preparation_spec = JobSpec {
+            request_id: prepared.id.clone(),
+            lane: CoordinatorLane::Atomic,
+            priority: prepared.priority,
+            workload_class: prepared.workload_class,
+            deadline: prepared.deadline,
+            resources,
+        };
+        let preparation_job = match self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                preparation_spec,
+                JobResourceObservation::host(retained_request_host_bytes),
+            )
+            .await
+        {
+            Ok(job) => job,
+            Err(failure) => {
+                drop(prepared);
+                let error = failure.error;
+                drop(failure.bridge);
+                return Err(error);
+            }
+        };
+        let (samples, sample_rate) = prepared
+            .prepared_asr_audio_for_executor()?
+            .ok_or_else(|| Error::InferenceError("VibeVoice decoded audio was lost".into()))?;
+        let outcome = self
+            .vibevoice_encoder_batcher
+            .submit(VibeVoiceEncoderPending {
+                job: preparation_job,
+                contract: preparation_contract,
+                model: model.clone(),
+                samples,
+                sample_rate,
+                language: prepared.asr_language_for_execution().map(str::to_owned),
+                prompt: prepared.asr_prompt_for_execution().map(str::to_owned),
+                geometry,
+                retained_request_host_bytes,
+                cancellation: PreparationCancellation::default(),
+            })
+            .await?;
+        let (artifact, bridge) = match outcome {
+            PreparationRowOutcome::Committed { artifact, bridge } => (artifact.value, bridge),
+            PreparationRowOutcome::Cancelled => return Err(Error::Cancelled(prepared.id.clone())),
+            PreparationRowOutcome::TimedOut => return Err(Error::Timeout(prepared.id.clone())),
+            PreparationRowOutcome::Failed(error) => return Err(error),
+        };
+        if artifact.geometry() != geometry
+            || artifact.resident_host_bytes() != geometry.retained_host_bytes
+            || artifact.resident_tensor_bytes() != geometry.retained_device_bytes
+        {
+            drop(artifact);
+            drop(prepared);
+            drop(bridge);
+            return Err(Error::InferenceError(
+                "VibeVoice ASR preparation artifact drifted from admitted geometry".into(),
+            ));
+        }
+        let mut prepared = prepared;
+        if let Err(error) =
+            prepared.install_prepared_vibevoice_artifact(variant, Arc::new(artifact))
+        {
+            drop(prepared);
+            drop(bridge);
+            return Err(error);
+        }
+        let (execution, _) = match self.coordinator_job_for_request(&prepared) {
+            Ok(value) => value,
+            Err(error) => {
+                drop(prepared);
+                drop(bridge);
+                return Err(error);
+            }
+        };
+        let observation = JobResourceObservation {
+            host_bytes: retained_host_bytes,
+            accelerator_bytes: geometry.retained_device_bytes,
+        };
+        match self
+            .coordinator
+            .admit_observed_from_preparation(bridge, execution, observation)
+            .await
+        {
+            Ok(job) => Ok((prepared, job)),
+            Err(failure) => {
+                drop(prepared);
+                let error = failure.error;
+                drop(failure.bridge);
+                Err(error)
+            }
+        }
+    }
+
     async fn prepare_asr_shape_for_binding(
         &self,
         request: EngineCoreRequest,
@@ -3286,7 +3595,10 @@ impl RuntimeService {
         let (request, job) = self
             .prepare_qwen3_asr_shape_for_binding(request, job, residency_lease)
             .await?;
-        self.prepare_whisper_asr_shape_for_binding(request, job, residency_lease)
+        let (request, job) = self
+            .prepare_whisper_asr_shape_for_binding(request, job, residency_lease)
+            .await?;
+        self.prepare_vibevoice_asr_shape_for_binding(request, job, residency_lease)
             .await
     }
 
@@ -6393,6 +6705,22 @@ mod tests {
             .unwrap();
         assert_eq!(
             coordinator_lane_for_request(&whisper_long),
+            CoordinatorLane::Atomic
+        );
+
+        let vibe_variant = ModelVariant::VibeVoiceAsr;
+        let mut vibe = EngineCoreRequest::asr("audio").with_model_variant(vibe_variant);
+        assert_eq!(coordinator_lane_for_request(&vibe), CoordinatorLane::Atomic);
+        vibe.install_prepared_sequence_input_tokens(32, 4_096)
+            .unwrap();
+        assert_eq!(
+            coordinator_lane_for_request(&vibe),
+            CoordinatorLane::Resumable
+        );
+        let mut vibe_long = EngineCoreRequest::asr("audio").with_model_variant(vibe_variant);
+        vibe_long.install_prepared_asr_long_form_atomic().unwrap();
+        assert_eq!(
+            coordinator_lane_for_request(&vibe_long),
             CoordinatorLane::Atomic
         );
     }
