@@ -770,6 +770,8 @@ impl EngineCore {
         let work_kind = match &work {
             WorkUnit::PreSequencePreparation { kind } => kind.clone(),
             WorkUnit::SequenceStep { phase, .. } => format!("{phase:?}").to_ascii_lowercase(),
+            WorkUnit::RealtimePush { .. } => "realtime_push".to_string(),
+            WorkUnit::RealtimeFinish { .. } => "realtime_finish".to_string(),
             WorkUnit::AtomicJob { kind } => kind.clone(),
             WorkUnit::PipelineStage { name, ordinal } => format!("{name}:{ordinal}"),
         };
@@ -837,6 +839,8 @@ impl EngineCore {
                 phase: super::SequencePhase::Decode,
                 ..
             } => ExecutionState::Decoding,
+            WorkUnit::RealtimePush { .. } => ExecutionState::RealtimeRunning,
+            WorkUnit::RealtimeFinish { .. } => ExecutionState::RealtimeFinishing,
             WorkUnit::AtomicJob { .. } => ExecutionState::AtomicRunning,
             WorkUnit::PipelineStage { .. } => ExecutionState::PipelineRunning,
         };
@@ -1633,6 +1637,25 @@ impl EngineCore {
                 })?;
                 input.max(output).max(1)
             }
+            WorkUnit::RealtimePush {
+                input,
+                max_output_steps,
+            } => {
+                let input = u64::try_from(input.len()).map_err(|_| {
+                    Error::Overloaded("realtime input length exceeds work accounting".to_string())
+                })?;
+                let output = u64::try_from(*max_output_steps).map_err(|_| {
+                    Error::Overloaded("realtime output bound exceeds work accounting".to_string())
+                })?;
+                input.max(output).max(1)
+            }
+            WorkUnit::RealtimeFinish { max_output_steps } => u64::try_from(*max_output_steps)
+                .map_err(|_| {
+                    Error::Overloaded(
+                        "realtime finish output bound exceeds work accounting".to_string(),
+                    )
+                })?
+                .max(1),
             WorkUnit::AtomicJob { .. } | WorkUnit::PipelineStage { .. } => 1,
         };
         let workspace_bytes = stage.map_or(Ok(0), |stage| {
@@ -6373,6 +6396,31 @@ mod tests {
         assert_eq!(cost.logical_units, 4);
         assert_eq!(cost.tensor_elements, 512);
         assert_eq!(cost.workspace.workspace_bytes().unwrap(), 32);
+    }
+
+    #[test]
+    fn realtime_work_cost_accounts_for_bounded_input_and_output() {
+        let request = EngineCoreRequest::asr("");
+        let push = EngineCore::work_cost(
+            &request,
+            &WorkUnit::RealtimePush {
+                input: super::super::InputRange::new(40, 200).unwrap(),
+                max_output_steps: 4,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(push, WorkCost::new(160, 160, 0));
+
+        let finish = EngineCore::work_cost(
+            &request,
+            &WorkUnit::RealtimeFinish {
+                max_output_steps: 7,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(finish, WorkCost::new(7, 7, 0));
     }
 
     #[test]

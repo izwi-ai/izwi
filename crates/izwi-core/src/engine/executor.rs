@@ -109,6 +109,8 @@ pub(super) enum NativeAudioStage {
     PreSequencePreparation,
     SequencePrefill,
     SequenceDecode,
+    RealtimePush,
+    RealtimeFinish,
     Atomic,
     Pipeline { ordinal: usize },
 }
@@ -139,6 +141,8 @@ impl NativeBatchRoute {
                 phase: SequencePhase::Decode,
                 ..
             } => NativeAudioStage::SequenceDecode,
+            WorkUnit::RealtimePush { .. } => NativeAudioStage::RealtimePush,
+            WorkUnit::RealtimeFinish { .. } => NativeAudioStage::RealtimeFinish,
             WorkUnit::AtomicJob { .. } => NativeAudioStage::Atomic,
             WorkUnit::PipelineStage { ordinal, .. } => {
                 NativeAudioStage::Pipeline { ordinal: *ordinal }
@@ -3386,6 +3390,23 @@ mod tests {
                 mode: NativeBatchMode::Continuous,
                 stage_id: StageId::new(7),
             }
+        );
+    }
+
+    #[test]
+    fn native_audio_stage_authenticates_realtime_push_and_finish_roles() {
+        assert_eq!(
+            NativeBatchRoute::audio_stage(&WorkUnit::RealtimePush {
+                input: super::super::InputRange::new(0, 160).unwrap(),
+                max_output_steps: 2,
+            }),
+            NativeAudioStage::RealtimePush
+        );
+        assert_eq!(
+            NativeBatchRoute::audio_stage(&WorkUnit::RealtimeFinish {
+                max_output_steps: 4,
+            }),
+            NativeAudioStage::RealtimeFinish
         );
     }
 

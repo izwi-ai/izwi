@@ -274,6 +274,18 @@ pub enum WorkUnit {
         /// is an authenticated explicit selection of no auxiliary group.
         auxiliary_state: Option<Arc<[ClockedStateSpan]>>,
     },
+    /// One input-driven realtime quantum. `input` is the exact absolute input
+    /// interval accepted by this push; output is bounded independently because
+    /// a realtime model may emit zero or more events for one input chunk.
+    RealtimePush {
+        input: InputRange,
+        max_output_steps: usize,
+    },
+    /// Signal that no more realtime input will arrive and allow the model to
+    /// flush at most `max_output_steps` pending output events.
+    RealtimeFinish {
+        max_output_steps: usize,
+    },
     AtomicJob {
         kind: String,
     },
@@ -355,6 +367,8 @@ pub enum StageWorkSelector {
     PreSequencePreparation,
     SequencePrefill,
     SequenceDecode,
+    RealtimePush,
+    RealtimeFinish,
     Atomic,
     Pipeline { ordinal: Option<usize> },
 }
@@ -378,6 +392,8 @@ impl StageWorkSelector {
                     ..
                 },
             )
+            | (Self::RealtimePush, WorkUnit::RealtimePush { .. })
+            | (Self::RealtimeFinish, WorkUnit::RealtimeFinish { .. })
             | (Self::Atomic, WorkUnit::AtomicJob { .. }) => true,
             (
                 Self::Pipeline { ordinal },
@@ -615,6 +631,17 @@ impl StageDescriptor {
         {
             return Err(Error::InvalidInput(
                 "native tensor stages cannot publish in-flight output checkpoints".to_string(),
+            ));
+        }
+        if matches!(
+            self.selector,
+            StageWorkSelector::RealtimePush | StageWorkSelector::RealtimeFinish
+        ) && (self.progress != StageProgressKind::InputDriven
+            || self.membership_safe_point != MembershipSafePoint::InputBoundary)
+        {
+            return Err(Error::InvalidInput(
+                "realtime work stages require input-driven progress at an input boundary"
+                    .to_string(),
             ));
         }
         Ok(())
@@ -2332,6 +2359,8 @@ pub enum ExecutionState {
     Admitted,
     Prefilling,
     Decoding,
+    RealtimeRunning,
+    RealtimeFinishing,
     AtomicRunning,
     PipelineRunning,
     Cancelling,
@@ -2353,7 +2382,13 @@ impl ExecutionState {
                 )
                 | (
                     Admitted,
-                    Prefilling | Decoding | AtomicRunning | PipelineRunning | Cancelling
+                    Prefilling
+                        | Decoding
+                        | RealtimeRunning
+                        | RealtimeFinishing
+                        | AtomicRunning
+                        | PipelineRunning
+                        | Cancelling
                 )
                 | (
                     Prefilling,
@@ -2364,6 +2399,11 @@ impl ExecutionState {
                     Decoding | Cancelling | PreemptedRecompute | RestartPending
                 )
                 | (AtomicRunning, Cancelling)
+                | (
+                    RealtimeRunning,
+                    RealtimeRunning | RealtimeFinishing | Cancelling
+                )
+                | (RealtimeFinishing, RealtimeFinishing | Cancelling)
                 | (PipelineRunning, PipelineRunning | Cancelling)
                 | (PreemptedRecompute, Admitted | Prefilling | Cancelling)
                 | (RestartPending, Cancelling)
@@ -2372,7 +2412,12 @@ impl ExecutionState {
                     Terminal(TerminalOutcome::Cancelled | TerminalOutcome::TimedOut)
                 )
                 | (
-                    Prefilling | Decoding | AtomicRunning | PipelineRunning,
+                    Prefilling
+                        | Decoding
+                        | RealtimeRunning
+                        | RealtimeFinishing
+                        | AtomicRunning
+                        | PipelineRunning,
                     Terminal(_)
                 )
         );
@@ -2539,6 +2584,45 @@ impl ExecutionReport {
                 {
                     return Err(Error::InferenceError(
                         "executor reported progress without consuming or producing work"
+                            .to_string(),
+                    ));
+                }
+            }
+            WorkUnit::RealtimePush {
+                input,
+                max_output_steps,
+            } => {
+                if input.is_empty() {
+                    return Err(Error::InferenceError(
+                        "realtime push requires a non-empty input interval".to_string(),
+                    ));
+                }
+                if self.input_consumed > input.len() || self.output_produced > max_output_steps {
+                    return Err(Error::InferenceError(
+                        "executor reported progress beyond the realtime push quantum".to_string(),
+                    ));
+                }
+                if matches!(self.disposition, ExecutionDisposition::Progress)
+                    && self.input_consumed == 0
+                    && self.output_produced == 0
+                {
+                    return Err(Error::InferenceError(
+                        "executor reported realtime progress without consuming or producing work"
+                            .to_string(),
+                    ));
+                }
+            }
+            WorkUnit::RealtimeFinish { max_output_steps } => {
+                if self.input_consumed != 0 || self.output_produced > max_output_steps {
+                    return Err(Error::InferenceError(
+                        "executor reported progress beyond the realtime finish quantum".to_string(),
+                    ));
+                }
+                if matches!(self.disposition, ExecutionDisposition::Progress)
+                    && self.output_produced == 0
+                {
+                    return Err(Error::InferenceError(
+                        "executor reported realtime finish progress without producing work"
                             .to_string(),
                     ));
                 }
@@ -3119,6 +3203,76 @@ mod tests {
     }
 
     #[test]
+    fn realtime_selectors_route_push_and_finish_to_distinct_stages() {
+        let profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Realtime);
+        let mut push = StageDescriptor::from_execution_profile(
+            StageId::new(10),
+            "audio.realtime.push",
+            &profile,
+            NativeBatchMode::None,
+        );
+        push.selector = StageWorkSelector::RealtimePush;
+        let mut finish = StageDescriptor::from_execution_profile(
+            StageId::new(11),
+            "audio.realtime.finish",
+            &profile,
+            NativeBatchMode::None,
+        );
+        finish.selector = StageWorkSelector::RealtimeFinish;
+        let binding = ExecutionAdapterBinding {
+            execution_group_id: ExecutionGroupId::new(1),
+            model_instance_id: ModelInstanceId::new(2),
+            adapter_instance_id: AdapterInstanceId::new(3),
+            adapter_abi_revision: AdapterAbiRevision::new(1),
+            model_variant: ModelVariant::VoxtralMini4BRealtime2602,
+            capability_id: "realtime_asr".to_string(),
+            stages: Arc::from([push, finish]),
+        };
+        binding.validate().unwrap();
+
+        assert_eq!(
+            binding
+                .stage_for_work(&WorkUnit::RealtimePush {
+                    input: InputRange::new(160, 320).unwrap(),
+                    max_output_steps: 2,
+                })
+                .unwrap()
+                .id,
+            StageId::new(10)
+        );
+        assert_eq!(
+            binding
+                .stage_for_work(&WorkUnit::RealtimeFinish {
+                    max_output_steps: 4,
+                })
+                .unwrap()
+                .id,
+            StageId::new(11)
+        );
+    }
+
+    #[test]
+    fn realtime_stage_requires_input_driven_input_boundary_contract() {
+        let profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Realtime);
+        let mut stage = StageDescriptor::from_execution_profile(
+            StageId::new(10),
+            "audio.realtime.push",
+            &profile,
+            NativeBatchMode::None,
+        );
+        stage.selector = StageWorkSelector::RealtimePush;
+        stage.validate().unwrap();
+
+        stage.progress = StageProgressKind::Iterative;
+        assert!(stage.validate().is_err());
+        stage.progress = StageProgressKind::InputDriven;
+        stage.membership_safe_point = MembershipSafePoint::QuantumBoundary;
+        assert!(stage.validate().is_err());
+    }
+
+    #[test]
     fn continuous_stage_requires_repeatable_safe_points() {
         let invalid = StageDescriptor {
             id: StageId::new(2),
@@ -3635,6 +3789,27 @@ mod tests {
     }
 
     #[test]
+    fn realtime_lifecycle_closes_input_irreversibly_before_terminal() {
+        let state = ExecutionState::Queued
+            .transition(ExecutionState::Admitted)
+            .unwrap()
+            .transition(ExecutionState::RealtimeRunning)
+            .unwrap()
+            .transition(ExecutionState::RealtimeRunning)
+            .unwrap()
+            .transition(ExecutionState::RealtimeFinishing)
+            .unwrap()
+            .transition(ExecutionState::RealtimeFinishing)
+            .unwrap();
+        assert!(state.transition(ExecutionState::RealtimeRunning).is_err());
+        assert!(state.transition(ExecutionState::Decoding).is_err());
+        assert!(state
+            .transition(ExecutionState::Terminal(TerminalOutcome::Completed))
+            .unwrap()
+            .is_terminal());
+    }
+
+    #[test]
     fn report_cannot_exceed_sequence_plan() {
         let session = SessionKey::new("request".to_string(), 11);
         let plan = ExecutionPlan {
@@ -3902,6 +4077,49 @@ mod tests {
         assert!(yielded.validate_against(&plan).is_ok());
         yielded.safe_point = false;
         assert!(yielded.validate_against(&plan).is_err());
+    }
+
+    #[test]
+    fn realtime_reports_authenticate_push_and_finish_bounds() {
+        let push = plan_for(
+            SessionKey::new("realtime-push".to_string(), 1),
+            WorkUnit::RealtimePush {
+                input: InputRange::new(100, 180).unwrap(),
+                max_output_steps: 2,
+            },
+        );
+        let mut report = report_for(&push, ExecutionDisposition::Progress);
+        report.input_consumed = 80;
+        report.output_produced = 2;
+        assert!(report.validate_against(&push).is_ok());
+        report.input_consumed = 81;
+        assert!(report.validate_against(&push).is_err());
+
+        let empty_push = plan_for(
+            SessionKey::new("empty-realtime-push".to_string(), 1),
+            WorkUnit::RealtimePush {
+                input: InputRange::new(100, 100).unwrap(),
+                max_output_steps: 1,
+            },
+        );
+        assert!(report_for(&empty_push, ExecutionDisposition::Progress)
+            .validate_against(&empty_push)
+            .is_err());
+
+        let finish = plan_for(
+            SessionKey::new("realtime-finish".to_string(), 1),
+            WorkUnit::RealtimeFinish {
+                max_output_steps: 3,
+            },
+        );
+        let mut report = report_for(&finish, ExecutionDisposition::Progress);
+        report.output_produced = 3;
+        assert!(report.validate_against(&finish).is_ok());
+        report.input_consumed = 1;
+        assert!(report.validate_against(&finish).is_err());
+        report.input_consumed = 0;
+        report.output_produced = 4;
+        assert!(report.validate_against(&finish).is_err());
     }
 
     #[test]
