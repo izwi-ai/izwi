@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use candle_core::{Device, Tensor};
+use serde::Serialize;
 
 use crate::backends::state::{
     InvocationStaticAttentionArena, StaticAttentionLayerValue, StaticAttentionMetadata,
@@ -23,7 +24,7 @@ use crate::kv::v2::{
     StateUpdateKind,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub(crate) struct RetainedStaticAttentionRuntimeIdV2 {
     pub(crate) model_instance: ModelInstanceId,
     pub(crate) allocation_generation: u32,

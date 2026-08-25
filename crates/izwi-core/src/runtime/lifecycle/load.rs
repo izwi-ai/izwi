@@ -1066,6 +1066,22 @@ impl ModelLifecycleController {
                 // this model while its exact backend/dtype/width geometry is
                 // being frozen into the already-selected adapter identity.
                 bundle_draft.seal_qwen3_asr_audio_preparation(model)?;
+            } else if variant.family() == crate::catalog::ModelFamily::WhisperAsr {
+                let loaded = self
+                    .model_registry
+                    .get_loading_asr(variant)
+                    .await
+                    .ok_or_else(|| {
+                        Error::ModelLoadError(format!(
+                            "instantiated Whisper ASR model {variant} is missing before adapter sealing"
+                        ))
+                    })?;
+                let NativeAsrModel::WhisperTurbo(model) = loaded.as_ref() else {
+                    return Err(Error::ModelLoadError(format!(
+                        "instantiated model {variant} does not expose Whisper ASR geometry"
+                    )));
+                };
+                bundle_draft.seal_whisper_audio_preparation(model)?;
             }
             // Metal records many tensor uploads asynchronously. Flush them
             // before publishing the model so an allocation failure is owned by
@@ -1318,14 +1334,44 @@ impl ModelLifecycleController {
                             .map(|contract| contract.stages.as_ref())
                             .collect::<Vec<_>>();
                         let physical_spec = loaded.whisper_physical_state_spec(&stage_graphs)?;
+                        let retained = self
+                            .core_engine
+                            .load_composite_retained_state(
+                                model_instance_id,
+                                &physical_spec.retained,
+                                physical_spec.retained_static_domain,
+                                Some(physical_spec.retained_max_tokens),
+                            )
+                            .await?;
+                        let retained_uses = contracts
+                            .iter()
+                            .map(|contract| {
+                                let graph = stage_graph_fingerprint(&contract.stages)?;
+                                let retained_use = if contract.execution_profile.mode
+                                    == crate::engine::ExecutionMode::Sequence
+                                {
+                                    RetainedStateUseV2::ExternalPagedStatic
+                                } else if contract.execution_profile.mode
+                                    == crate::engine::ExecutionMode::Atomic
+                                {
+                                    RetainedStateUseV2::Inactive
+                                } else {
+                                    return Err(Error::ModelLoadError(
+                                        "Whisper graph has an incompatible retained-state profile"
+                                            .into(),
+                                    ));
+                                };
+                                Ok((graph, retained_use))
+                            })
+                            .collect::<Result<HashMap<_, _>>>()?;
                         let publication = self
                             .load_invocation_workspace_publication(
                                 model_instance_id,
                                 &contracts,
                                 physical_spec.descriptor,
                                 &physical_spec.invocation,
-                                None,
-                                HashMap::new(),
+                                Some(retained.into()),
+                                retained_uses,
                             )
                             .await?;
                         state_publications.insert(CapabilityKind::Asr, publication);

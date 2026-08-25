@@ -31,6 +31,7 @@ const CONTINUOUS_TENSOR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::ne
 const NEMOTRON_REALTIME_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(14);
 const CONTINUOUS_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(15);
 const CONTINUOUS_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(16);
+const WHISPER_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(17);
 // Architecture ceiling: 8,192 codec frames, 1,920 output samples/frame,
 // f32-width intermediates, and up to 1,024 simultaneous channel-equivalents.
 // Exact request/model-derived costs remain smaller and are installed at
@@ -211,6 +212,15 @@ pub(crate) trait LoadedExecutionAdapter: fmt::Debug + Send + Sync {
             "loaded adapter does not own Qwen3 ASR audio preparation".into(),
         ))
     }
+
+    fn seal_whisper_audio_preparation(
+        &self,
+        _model: &crate::models::architectures::whisper::asr::WhisperTurboAsrModel,
+    ) -> Result<()> {
+        Err(Error::ModelLoadError(
+            "loaded adapter does not own Whisper audio preparation".into(),
+        ))
+    }
 }
 
 /// Loaded-state publication normalized into an immutable ABI-v2 runtime before
@@ -309,7 +319,10 @@ fn loaded_execution_contracts(
         requirements.push(StreamingRequirements::native(true));
     }
     if metadata.capability == CapabilityKind::Asr
-        && metadata.model_variant.family() == crate::catalog::ModelFamily::Qwen3Asr
+        && matches!(
+            metadata.model_variant.family(),
+            crate::catalog::ModelFamily::Qwen3Asr | crate::catalog::ModelFamily::WhisperAsr
+        )
     {
         let long_form = requirements
             .iter()
@@ -763,6 +776,11 @@ fn is_continuous_physical_asr(metadata: AdapterMetadata) -> bool {
         && metadata.model_variant.family() == crate::catalog::ModelFamily::Qwen3Asr
 }
 
+fn is_whisper_physical_asr(metadata: AdapterMetadata) -> bool {
+    metadata.capability == CapabilityKind::Asr
+        && metadata.model_variant.family() == crate::catalog::ModelFamily::WhisperAsr
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PhysicalQwenTtsAdapterFactory;
 
@@ -890,6 +908,37 @@ impl LoadedExecutionAdapterFactory for ContinuousPhysicalAsrAdapterFactory {
 #[derive(Debug, Clone, Copy)]
 struct ScalarExecutionAdapterFactory;
 
+#[derive(Debug, Clone, Copy)]
+struct WhisperPhysicalAsrAdapterFactory;
+
+impl LoadedExecutionAdapterFactory for WhisperPhysicalAsrAdapterFactory {
+    fn id(&self) -> &'static str {
+        "builtin.whisper_asr.physical_sequence"
+    }
+
+    fn batch_mode(&self) -> NativeBatchMode {
+        NativeBatchMode::Static
+    }
+
+    fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
+        is_whisper_physical_asr(metadata)
+    }
+
+    fn create(
+        &self,
+        context: LoadedAdapterFactoryContext,
+        metadata: AdapterMetadata,
+    ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
+        Ok(Arc::new(WhisperAsrExecutionAdapter::new(
+            context.execution_group_id,
+            context.model_instance_id,
+            metadata,
+            context.backend_kind,
+            context.max_tensor_batch_size,
+        )))
+    }
+}
+
 impl LoadedExecutionAdapterFactory for ScalarExecutionAdapterFactory {
     fn id(&self) -> &'static str {
         "builtin.scalar"
@@ -904,6 +953,7 @@ impl LoadedExecutionAdapterFactory for ScalarExecutionAdapterFactory {
             && !is_nemotron_realtime(metadata)
             && !is_continuous_physical_chat(metadata)
             && !is_continuous_physical_asr(metadata)
+            && !is_whisper_physical_asr(metadata)
     }
 
     fn create(
@@ -927,6 +977,7 @@ pub(super) fn built_in_loaded_adapter_factories() -> Vec<Arc<dyn LoadedExecution
         Arc::new(NemotronRealtimeAdapterFactory),
         Arc::new(ContinuousPhysicalChatAdapterFactory),
         Arc::new(ContinuousPhysicalAsrAdapterFactory),
+        Arc::new(WhisperPhysicalAsrAdapterFactory),
         Arc::new(ScalarExecutionAdapterFactory),
     ]
 }
@@ -1603,6 +1654,205 @@ impl LoadedExecutionAdapter for ContinuousAsrExecutionAdapter {
 }
 
 #[derive(Debug)]
+struct WhisperAsrExecutionAdapter {
+    execution_group_id: ExecutionGroupId,
+    model_instance_id: ModelInstanceId,
+    adapter_instance_id: AdapterInstanceId,
+    metadata: AdapterMetadata,
+    backend_kind: BackendKind,
+    max_batch_size: usize,
+    audio_preparation:
+        OnceLock<crate::models::architectures::whisper::asr::WhisperAudioPreparationStageSeal>,
+}
+
+impl WhisperAsrExecutionAdapter {
+    fn new(
+        execution_group_id: ExecutionGroupId,
+        model_instance_id: ModelInstanceId,
+        metadata: AdapterMetadata,
+        backend_kind: BackendKind,
+        max_batch_size: usize,
+    ) -> Self {
+        Self {
+            execution_group_id,
+            model_instance_id,
+            adapter_instance_id: AdapterInstanceId::new(
+                NEXT_ADAPTER_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+            ),
+            metadata,
+            backend_kind,
+            max_batch_size: max_batch_size.max(1),
+            audio_preparation: OnceLock::new(),
+        }
+    }
+}
+
+impl LoadedExecutionAdapter for WhisperAsrExecutionAdapter {
+    fn metadata(&self) -> AdapterMetadata {
+        self.metadata
+    }
+
+    fn adapter_instance_id(&self) -> AdapterInstanceId {
+        self.adapter_instance_id
+    }
+
+    fn adapter_abi_revision(&self) -> AdapterAbiRevision {
+        WHISPER_ASR_ADAPTER_ABI
+    }
+
+    fn seal_whisper_audio_preparation(
+        &self,
+        model: &crate::models::architectures::whisper::asr::WhisperTurboAsrModel,
+    ) -> Result<()> {
+        let seal = model.window_preparation_stage_seal(self.backend_kind, self.max_batch_size)?;
+        if let Some(existing) = self.audio_preparation.get() {
+            return if existing == &seal {
+                Ok(())
+            } else {
+                Err(Error::ModelLoadError(
+                    "Whisper audio preparation was resealed with different geometry".into(),
+                ))
+            };
+        }
+        self.audio_preparation.set(seal).map_err(|_| {
+            Error::ModelLoadError("Whisper audio preparation seal raced publication".into())
+        })
+    }
+
+    fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
+        let metadata = self.metadata();
+        if streaming.model_native {
+            return Err(Error::InvalidInput(format!(
+                "Model {} has no model-native streaming ASR contract",
+                metadata.model_variant
+            )));
+        }
+        if streaming.asr_long_form {
+            let mut execution_profile =
+                scalar_execution_profile(metadata, self.backend_kind, false);
+            execution_profile.mode = ExecutionMode::Atomic;
+            execution_profile.prefill = PrefillMode::None;
+            execution_profile.incremental_decode = false;
+            execution_profile.cache_mode = CacheMode::None;
+            execution_profile.cache_namespace = None;
+            execution_profile.kv_dtype = "none".to_string();
+            execution_profile.concurrency = ConcurrencyClass::Exclusive;
+            execution_profile.max_batch_size = 1;
+            execution_profile.resolved_from_loaded_model = true;
+            let mut stage = StageDescriptor::from_execution_profile(
+                StageId::new(3),
+                "asr.long_form.atomic",
+                &execution_profile,
+                NativeBatchMode::None,
+            );
+            stage.selector = StageWorkSelector::Atomic;
+            stage.shape_policy = StageShapePolicy::Exact;
+            stage.output_visibility = output_visibility_for(
+                streaming.transport_output,
+                execution_profile.mode,
+                NativeBatchMode::None,
+            );
+            stage.validate()?;
+            return Ok(LoadedExecutionContract {
+                execution_group_id: self.execution_group_id,
+                model_instance_id: self.model_instance_id,
+                adapter_instance_id: self.adapter_instance_id(),
+                adapter_abi_revision: self.adapter_abi_revision(),
+                metadata,
+                execution_profile,
+                stages: Arc::from([stage]),
+            });
+        }
+
+        let seal = self.audio_preparation.get().ok_or_else(|| {
+            Error::ModelLoadError(
+                "Whisper normal execution graph is unavailable before audio preparation is sealed"
+                    .into(),
+            )
+        })?;
+        if seal.backend != self.backend_kind
+            || seal.max_batch_size != self.max_batch_size
+            || seal.dtype.is_empty()
+        {
+            return Err(Error::ModelLoadError(
+                "Whisper audio preparation seal does not match its loaded adapter identity".into(),
+            ));
+        }
+        let mut execution_profile =
+            scalar_execution_profile(metadata, self.backend_kind, streaming.model_native);
+        execution_profile.mode = ExecutionMode::Sequence;
+        execution_profile.prefill = PrefillMode::Incremental;
+        execution_profile.incremental_decode = true;
+        execution_profile.prefill_batch = NativeBatchMode::None;
+        execution_profile.decode_batch = NativeBatchMode::None;
+        execution_profile.cache_mode = CacheMode::ExternalPaged;
+        execution_profile.cache_namespace = Some(format!(
+            "{}:{}:state-v2",
+            metadata.model_variant,
+            self.backend_kind.as_str()
+        ));
+        execution_profile.kv_dtype = "state_v2_resolved".to_string();
+        execution_profile.cancellation = CancellationGranularity::SequenceStep;
+        execution_profile.concurrency = ConcurrencyClass::Exclusive;
+        execution_profile.recompute_safe = true;
+        execution_profile.cache_release_safe = true;
+        // The capability envelope exposes the independently batchable encoder
+        // width; decoder stages below remain explicitly scalar width one.
+        execution_profile.max_batch_size = self.max_batch_size;
+        execution_profile.resolved_from_loaded_model = true;
+
+        let mut preparation = StageDescriptor::from_execution_profile(
+            StageId::new(0),
+            "asr.encoder.whisper",
+            &execution_profile,
+            NativeBatchMode::Static,
+        );
+        preparation.selector = StageWorkSelector::PreSequencePreparation;
+        preparation.progress = StageProgressKind::Atomic;
+        preparation.membership_safe_point = MembershipSafePoint::OperationBoundary;
+        preparation.shape_policy = StageShapePolicy::Padded;
+        preparation.max_batch_size = seal.max_batch_size;
+        preparation.max_workspace_bytes = seal.max_workspace_bytes;
+        preparation.output_visibility = OutputVisibility::AfterQuantumCommit;
+
+        let mut prefill = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            "asr.prefill.scalar",
+            &execution_profile,
+            NativeBatchMode::None,
+        );
+        prefill.selector = StageWorkSelector::SequencePrefill;
+        prefill.max_batch_size = 1;
+        prefill.concurrency = ConcurrencyClass::Exclusive;
+        prefill.shape_policy = StageShapePolicy::Exact;
+
+        let mut decode = StageDescriptor::from_execution_profile(
+            StageId::new(2),
+            "asr.decode.scalar",
+            &execution_profile,
+            NativeBatchMode::None,
+        );
+        decode.selector = StageWorkSelector::SequenceDecode;
+        decode.max_batch_size = 1;
+        decode.concurrency = ConcurrencyClass::Exclusive;
+        decode.shape_policy = StageShapePolicy::Exact;
+        preparation.validate()?;
+        prefill.validate()?;
+        decode.validate()?;
+
+        Ok(LoadedExecutionContract {
+            execution_group_id: self.execution_group_id,
+            model_instance_id: self.model_instance_id,
+            adapter_instance_id: self.adapter_instance_id(),
+            adapter_abi_revision: self.adapter_abi_revision(),
+            metadata,
+            execution_profile,
+            stages: Arc::from([preparation, prefill, decode]),
+        })
+    }
+}
+
+#[derive(Debug)]
 struct ContinuousChatExecutionAdapter {
     execution_group_id: ExecutionGroupId,
     model_instance_id: ModelInstanceId,
@@ -1878,6 +2128,16 @@ impl LoadedModelBundleDraft {
             Error::ModelLoadError("Qwen3 ASR loaded bundle has no ASR capability to seal".into())
         })?;
         execution.seal_qwen3_asr_audio_preparation(model)
+    }
+
+    pub(crate) fn seal_whisper_audio_preparation(
+        &self,
+        model: &crate::models::architectures::whisper::asr::WhisperTurboAsrModel,
+    ) -> Result<()> {
+        let execution = self.capabilities.get(&CapabilityKind::Asr).ok_or_else(|| {
+            Error::ModelLoadError("Whisper loaded bundle has no ASR capability to seal".into())
+        })?;
+        execution.seal_whisper_audio_preparation(model)
     }
 
     pub(crate) fn seal(
@@ -2962,21 +3222,31 @@ mod tests {
     }
 
     #[test]
-    fn whisper_metadata_and_scalar_abi_cannot_manufacture_concurrent_policy() {
+    fn whisper_metadata_and_adapter_abi_cannot_manufacture_concurrent_decode_policy() {
         let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(1, 3).unwrap();
-        let whisper = LoadedModelBundleDraft::build(
-            &registry,
+        let metadata = *registry
+            .require(CapabilityKind::Asr, ModelVariant::WhisperLargeV3Turbo)
+            .unwrap();
+        let whisper = WhisperAsrExecutionAdapter::new(
             ExecutionGroupId::new(43),
             ModelInstanceId::new(2),
-            ModelVariant::WhisperLargeV3Turbo,
+            metadata,
             BackendKind::Cpu,
-        )
-        .unwrap();
-        let mut manufactured = whisper
-            .execution_contracts(CapabilityKind::Asr)
-            .unwrap()
-            .remove(0);
-        assert_eq!(manufactured.adapter_abi_revision, SCALAR_ADAPTER_ABI);
+            3,
+        );
+        whisper
+            .audio_preparation
+            .set(
+                crate::models::architectures::whisper::asr::WhisperAudioPreparationStageSeal {
+                    backend: BackendKind::Cpu,
+                    dtype: "f32".into(),
+                    max_batch_size: 3,
+                    max_workspace_bytes: 1024,
+                },
+            )
+            .unwrap();
+        let mut manufactured = whisper.contract(StreamingRequirements::NONE).unwrap();
+        assert_eq!(manufactured.adapter_abi_revision, WHISPER_ASR_ADAPTER_ABI);
         assert_eq!(
             manufactured.metadata.model_variant,
             ModelVariant::WhisperLargeV3Turbo
@@ -3638,5 +3908,51 @@ mod tests {
             contract.stages[1].max_work_units,
             CONTINUOUS_CHAT_MAX_DECODE_QUANTUM
         );
+    }
+
+    #[test]
+    fn whisper_normal_and_long_form_graphs_are_distinct_and_scalar() {
+        let registry = RuntimeAdapterRegistry::built_in();
+        let metadata = *registry
+            .require(CapabilityKind::Asr, ModelVariant::WhisperLargeV3Turbo)
+            .unwrap();
+        let adapter = WhisperAsrExecutionAdapter::new(
+            ExecutionGroupId::new(1),
+            ModelInstanceId::new(2),
+            metadata,
+            BackendKind::Cpu,
+            4,
+        );
+        adapter
+            .audio_preparation
+            .set(
+                crate::models::architectures::whisper::asr::WhisperAudioPreparationStageSeal {
+                    backend: BackendKind::Cpu,
+                    dtype: "f32".into(),
+                    max_batch_size: 4,
+                    max_workspace_bytes: 1024,
+                },
+            )
+            .unwrap();
+        let normal = adapter.contract(StreamingRequirements::NONE).unwrap();
+        assert_eq!(normal.execution_profile.mode, ExecutionMode::Sequence);
+        assert_eq!(normal.execution_profile.max_batch_size, 4);
+        assert_eq!(normal.execution_profile.decode_batch, NativeBatchMode::None);
+        assert_eq!(normal.stages[0].name, "asr.encoder.whisper");
+        assert_eq!(normal.stages[0].batch_mode, NativeBatchMode::Static);
+        assert_eq!(
+            normal.stages[1].selector,
+            StageWorkSelector::SequencePrefill
+        );
+        assert_eq!(normal.stages[2].selector, StageWorkSelector::SequenceDecode);
+        assert_eq!(normal.stages[2].batch_mode, NativeBatchMode::None);
+
+        let long = adapter
+            .contract(StreamingRequirements::NONE.with_asr_long_form(true))
+            .unwrap();
+        assert_eq!(long.execution_profile.mode, ExecutionMode::Atomic);
+        assert_eq!(long.stages.len(), 1);
+        assert_eq!(long.stages[0].name, "asr.long_form.atomic");
+        assert_eq!(long.stages[0].selector, StageWorkSelector::Atomic);
     }
 }

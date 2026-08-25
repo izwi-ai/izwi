@@ -2302,6 +2302,7 @@ mod tests {
         assert!(paged.lease().is_err());
         drop(paged_lease);
         static_runtime.release_sequence(sequence).unwrap();
+        drop(static_runtime);
         assert!(manager.unload_model(model).unwrap());
         assert_eq!(manager.model_count(), 0);
     }

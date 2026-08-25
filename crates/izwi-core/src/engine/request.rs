@@ -25,6 +25,7 @@ use crate::models::architectures::qwen3::asr::Qwen3AsrPreparedAudio;
 use crate::models::architectures::qwen3::tts::{
     Qwen3TtsModel, SpeakerReference, TtsGenerationParams, TtsSessionCacheRequest,
 };
+use crate::models::architectures::whisper::asr::WhisperPreparedWindow;
 use crate::models::registry::{
     AsrModelLease, ChatModelLease, NativeAsrModel, NativeChatModel, NativeChatPreparedPrompt,
     QwenTtsModelLease,
@@ -774,8 +775,14 @@ pub(super) struct PreparedAsrAudio {
 #[derive(Clone)]
 pub(super) struct PreparedAsrEncoderArtifact {
     model_variant: ModelVariant,
-    artifact: Arc<Qwen3AsrPreparedAudio>,
+    artifact: PreparedAsrEncoderArtifactValue,
     source_fingerprint: u64,
+}
+
+#[derive(Clone)]
+enum PreparedAsrEncoderArtifactValue {
+    Qwen3(Arc<Qwen3AsrPreparedAudio>),
+    Whisper(Arc<WhisperPreparedWindow>),
 }
 
 impl fmt::Debug for PreparedAsrEncoderArtifact {
@@ -783,9 +790,25 @@ impl fmt::Debug for PreparedAsrEncoderArtifact {
         formatter
             .debug_struct("PreparedAsrEncoderArtifact")
             .field("model_variant", &self.model_variant)
-            .field("artifact", &Arc::as_ptr(&self.artifact))
+            .field("artifact", &self.artifact.family_name())
             .field("source_fingerprint", &self.source_fingerprint)
             .finish()
+    }
+}
+
+impl PreparedAsrEncoderArtifactValue {
+    const fn family_name(&self) -> &'static str {
+        match self {
+            Self::Qwen3(_) => "qwen3",
+            Self::Whisper(_) => "whisper",
+        }
+    }
+
+    fn resident_tensor_bytes(&self) -> Result<u64> {
+        match self {
+            Self::Qwen3(value) => value.resident_tensor_bytes(),
+            Self::Whisper(value) => value.resident_tensor_bytes(),
+        }
     }
 }
 
@@ -2211,7 +2234,7 @@ impl EngineCoreRequest {
         if let Some(current) = self.prepared_asr_encoder_artifact.as_ref() {
             if current.model_variant == model_variant
                 && current.source_fingerprint == source_fingerprint
-                && Arc::ptr_eq(&current.artifact, &artifact)
+                && matches!(&current.artifact, PreparedAsrEncoderArtifactValue::Qwen3(value) if Arc::ptr_eq(value, &artifact))
             {
                 return Ok(());
             }
@@ -2222,7 +2245,7 @@ impl EngineCoreRequest {
         }
         self.prepared_asr_encoder_artifact = Some(PreparedAsrEncoderArtifact {
             model_variant,
-            artifact,
+            artifact: PreparedAsrEncoderArtifactValue::Qwen3(artifact),
             source_fingerprint,
         });
         Ok(())
@@ -2244,7 +2267,66 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
-        Ok(Some(prepared.artifact.clone()))
+        match &prepared.artifact {
+            PreparedAsrEncoderArtifactValue::Qwen3(value) => Ok(Some(value.clone())),
+            PreparedAsrEncoderArtifactValue::Whisper(_) => Err(Error::InvalidInput(
+                "Whisper encoder artifact was requested through the Qwen3 accessor".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn install_prepared_whisper_window(
+        &mut self,
+        model_variant: ModelVariant,
+        artifact: Arc<WhisperPreparedWindow>,
+    ) -> Result<()> {
+        if model_variant.family() != crate::catalog::ModelFamily::WhisperAsr
+            || self.task_type != TaskType::ASR
+            || self.model_variant != Some(model_variant)
+            || self.uses_asr_long_form_atomic()
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} Whisper artifact does not match its normal routed model",
+                self.id
+            )));
+        }
+        let source_fingerprint = self.asr_execution_source_fingerprint(model_variant)?;
+        if self.prepared_asr_encoder_artifact.is_some() {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} already owns an encoder artifact",
+                self.id
+            )));
+        }
+        self.prepared_asr_encoder_artifact = Some(PreparedAsrEncoderArtifact {
+            model_variant,
+            artifact: PreparedAsrEncoderArtifactValue::Whisper(artifact),
+            source_fingerprint,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn prepared_whisper_window_for_executor(
+        &self,
+    ) -> Result<Option<Arc<WhisperPreparedWindow>>> {
+        let Some(prepared) = self.prepared_asr_encoder_artifact.as_ref() else {
+            return Ok(None);
+        };
+        if self.model_variant != Some(prepared.model_variant)
+            || self.asr_execution_source_fingerprint(prepared.model_variant)?
+                != prepared.source_fingerprint
+            || self.uses_asr_long_form_atomic()
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} changed after Whisper encoder preparation",
+                self.id
+            )));
+        }
+        match &prepared.artifact {
+            PreparedAsrEncoderArtifactValue::Whisper(value) => Ok(Some(value.clone())),
+            PreparedAsrEncoderArtifactValue::Qwen3(_) => Err(Error::InvalidInput(
+                "Qwen3 encoder artifact was requested through the Whisper accessor".into(),
+            )),
+        }
     }
 
     pub(crate) fn prepared_asr_encoder_artifact_retained_bytes(&self) -> Result<u64> {
@@ -2481,7 +2563,10 @@ impl EngineCoreRequest {
             )));
         }
         if matches!(&ready.model, PreparedIncrementalModel::Asr(_))
-            && ready.model_variant.family() == ModelFamily::Qwen3Asr
+            && matches!(
+                ready.model_variant.family(),
+                ModelFamily::Qwen3Asr | ModelFamily::WhisperAsr
+            )
         {
             if self.prepared_asr_audio_for_executor()?.is_none() {
                 return Err(Error::InvalidInput(format!(
@@ -2492,13 +2577,21 @@ impl EngineCoreRequest {
             match self.prepared_asr_execution_shape {
                 Some(PreparedAsrExecutionShape::RetainedSequence { input_tokens })
                     if self.prepared_sequence_input_tokens == Some(input_tokens)
-                        && self.prepared_asr_encoder_artifact_for_executor()?.is_some() => {}
+                        && match ready.model_variant.family() {
+                            ModelFamily::Qwen3Asr => {
+                                self.prepared_asr_encoder_artifact_for_executor()?.is_some()
+                            }
+                            ModelFamily::WhisperAsr => {
+                                self.prepared_whisper_window_for_executor()?.is_some()
+                            }
+                            _ => false,
+                        } => {}
                 Some(PreparedAsrExecutionShape::LongFormAtomic)
                     if self.prepared_sequence_input_tokens.is_none()
                         && self.prepared_asr_encoder_artifact.is_none() => {}
                 _ => {
                     return Err(Error::InvalidInput(format!(
-                        "Qwen3 ASR request {} is missing a consistent exact media execution shape",
+                        "ASR request {} is missing a consistent exact media execution shape",
                         self.id
                     )));
                 }

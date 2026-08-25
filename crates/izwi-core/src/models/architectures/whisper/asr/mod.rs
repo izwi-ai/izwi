@@ -323,8 +323,7 @@ impl Drop for WhisperCrossSequenceOwner {
 }
 
 fn acquire_whisper_cross_sequence_owner(
-    cross_runtime: Arc<RetainedStaticAttentionRuntimeV2>,
-    cross_sequence: RetainedStaticAttentionSequenceId,
+    owner: WhisperCrossSequenceOwner,
     prepared: &WhisperPreparedWindow,
     expected_preparation_id: u64,
     expected_memory_tokens: usize,
@@ -332,9 +331,6 @@ fn acquire_whisper_cross_sequence_owner(
     self_context_len: usize,
     allocate_state_id: impl FnOnce() -> Result<u64>,
 ) -> Result<(WhisperCrossSequenceOwner, u64)> {
-    // This must remain the first operation: the model owns the registered
-    // sequence even when prepared-window validation fails.
-    let owner = WhisperCrossSequenceOwner::new(cross_runtime, cross_sequence);
     if prepared.preparation_id != expected_preparation_id
         || prepared.memory_tokens != expected_memory_tokens
         || prepared.layers.len() != expected_layers
@@ -1512,9 +1508,10 @@ impl WhisperTurboAsrModel {
         cross_runtime: Arc<RetainedStaticAttentionRuntimeV2>,
         cross_sequence: RetainedStaticAttentionSequenceId,
     ) -> Result<WhisperDecodeState> {
+        // Ownership transfers at entry, before any validation or state access.
+        let cross_owner = WhisperCrossSequenceOwner::new(cross_runtime, cross_sequence);
         let (cross_owner, state_id) = acquire_whisper_cross_sequence_owner(
-            cross_runtime,
-            cross_sequence,
+            cross_owner,
             prepared,
             self.preparation_id,
             self.config.max_source_positions,
@@ -4700,8 +4697,7 @@ mod tests {
         let runtime = early_failure_cross_runtime(ModelInstanceId::new(991));
         let sequence = runtime.register_sequence().expect("validation sequence");
         let error = acquire_whisper_cross_sequence_owner(
-            runtime.clone(),
-            sequence,
+            super::WhisperCrossSequenceOwner::new(runtime.clone(), sequence),
             &prepared,
             2,
             2,
@@ -4717,8 +4713,7 @@ mod tests {
         let runtime = early_failure_cross_runtime(ModelInstanceId::new(992));
         let sequence = runtime.register_sequence().expect("state-id sequence");
         let error = acquire_whisper_cross_sequence_owner(
-            runtime.clone(),
-            sequence,
+            super::WhisperCrossSequenceOwner::new(runtime.clone(), sequence),
             &prepared,
             1,
             2,
@@ -4734,8 +4729,7 @@ mod tests {
         let runtime = early_failure_cross_runtime(ModelInstanceId::new(993));
         let sequence = runtime.register_sequence().expect("self-context sequence");
         let error = acquire_whisper_cross_sequence_owner(
-            runtime.clone(),
-            sequence,
+            super::WhisperCrossSequenceOwner::new(runtime.clone(), sequence),
             &prepared,
             1,
             2,
@@ -4756,8 +4750,7 @@ mod tests {
             .install(sequence, prepared.source_identity, prepared.layers.clone())
             .expect("preinstall cross memory");
         let error = acquire_whisper_cross_sequence_owner(
-            runtime.clone(),
-            sequence,
+            super::WhisperCrossSequenceOwner::new(runtime.clone(), sequence),
             &prepared,
             1,
             2,
@@ -4779,8 +4772,7 @@ mod tests {
         let incompatible =
             WhisperPreparedWindow::for_test(2, 1, 3).expect("incompatible prepared window");
         let (owner, _) = acquire_whisper_cross_sequence_owner(
-            runtime.clone(),
-            sequence,
+            super::WhisperCrossSequenceOwner::new(runtime.clone(), sequence),
             &incompatible,
             1,
             2,
@@ -4807,8 +4799,7 @@ mod tests {
             .register_sequence()
             .expect("post-install failure sequence");
         let (owner, _) = acquire_whisper_cross_sequence_owner(
-            runtime.clone(),
-            sequence,
+            super::WhisperCrossSequenceOwner::new(runtime.clone(), sequence),
             &prepared,
             1,
             2,
@@ -4826,6 +4817,17 @@ mod tests {
             )
             .expect("install before simulated prompt initialization failure");
         drop(owner);
+        assert_cross_sequence_released_for_reuse(runtime.as_ref());
+
+        let runtime = early_failure_cross_runtime(ModelInstanceId::new(997));
+        let sequence = runtime
+            .register_sequence()
+            .expect("foreign-model rejection sequence");
+        let error =
+            crate::models::registry::reject_foreign_whisper_prefill(runtime.clone(), sequence)
+                .err()
+                .expect("foreign model must reject Whisper prefill");
+        assert!(error.to_string().contains("another ASR model"));
         assert_cross_sequence_released_for_reuse(runtime.as_ref());
     }
 

@@ -15,8 +15,8 @@ use crate::backends::state::PhysicalStateTransactionId;
 use crate::backends::{DTypeSelectionRequest, DeviceProfile};
 use crate::catalog::{ModelFamily, ModelTask};
 use crate::engine::{
-    InvocationStaticAttentionLease, InvocationTensorLease, RetainedTensorStateRuntimeV2,
-    StageDescriptor, WorkCost,
+    InvocationStaticAttentionLease, InvocationTensorLease, RetainedStaticAttentionRuntimeV2,
+    RetainedStaticAttentionSequenceId, RetainedTensorStateRuntimeV2, StageDescriptor, WorkCost,
 };
 use crate::error::{Error, Result};
 use crate::kv::v2::{InvocationStateBackingKindV2, InvocationWorkspaceLeaseSetV2};
@@ -80,7 +80,10 @@ use crate::models::architectures::vibevoice::VibeVoicePhysicalStateSpec;
 use crate::models::architectures::voxtral::realtime::VoxtralRealtimeModel;
 use crate::models::architectures::voxtral::tts::VoxtralTtsModel;
 use crate::models::architectures::whisper::asr::{
-    AsrTranscriptionOutput as WhisperAsrTranscriptionOutput, WhisperTurboAsrModel,
+    AsrTranscriptionOutput as WhisperAsrTranscriptionOutput, WhisperAudioBatchRow,
+    WhisperAudioPreparationStageSeal, WhisperDecodeCheckpoint, WhisperDecodeState,
+    WhisperPreparedWindow, WhisperTerminalTransition, WhisperTurboAsrModel,
+    WhisperWindowPreparationBatchGeometry, WhisperWindowPreparationGeometry,
 };
 use crate::models::architectures::whisper::WhisperPhysicalStateSpec;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
@@ -580,6 +583,16 @@ pub enum NativeAsrModel {
     GraniteSpeech(GraniteSpeechAsrModel),
 }
 
+pub(crate) fn reject_foreign_whisper_prefill(
+    cross_runtime: Arc<RetainedStaticAttentionRuntimeV2>,
+    cross_sequence: RetainedStaticAttentionSequenceId,
+) -> Result<NativeAsrDecodeState> {
+    cross_runtime.release_sequence(cross_sequence)?;
+    Err(Error::InvalidInput(
+        "prepared Whisper window was supplied to another ASR model".into(),
+    ))
+}
+
 impl InferenceStateContractProvider for NativeAsrModel {
     fn inference_state_contract(&self) -> Result<InferenceStateCapability> {
         match self {
@@ -608,18 +621,25 @@ pub struct NativeAudioChatGeneration {
     pub diagnostics: Option<serde_json::Value>,
 }
 
+#[allow(private_interfaces)]
 pub enum NativeAsrDecodeState {
     Qwen3(Qwen3AsrDecodeState),
+    Whisper(WhisperDecodeState),
     Nemotron(NemotronStreamingState),
 }
 
 pub(crate) enum NativeAsrDecodeCheckpoint {
     Qwen3(Qwen3AsrDecodeCheckpoint),
+    Whisper(WhisperDecodeCheckpoint),
 }
 
 impl NativeAsrDecodeState {
     pub(crate) fn uses_managed_qwen3_kv(&self) -> bool {
-        matches!(self, Self::Qwen3(state) if state.uses_managed_kv())
+        match self {
+            Self::Qwen3(state) => state.uses_managed_kv(),
+            Self::Whisper(state) => state.uses_managed_kv(),
+            Self::Nemotron(_) => false,
+        }
     }
 
     pub(crate) fn take_managed_write_completions(
@@ -627,6 +647,7 @@ impl NativeAsrDecodeState {
     ) -> Vec<Arc<crate::backends::kv::KvWriteBatchCompletion>> {
         match self {
             Self::Qwen3(state) => state.take_managed_write_completions(),
+            Self::Whisper(state) => state.take_managed_write_completions(),
             Self::Nemotron(_) => Vec::new(),
         }
     }
@@ -634,6 +655,7 @@ impl NativeAsrDecodeState {
     pub(crate) fn sequence_position(&self) -> Option<usize> {
         match self {
             Self::Qwen3(state) => Some(state.sequence_position()),
+            Self::Whisper(state) => Some(state.self_context_len()),
             Self::Nemotron(_) => None,
         }
     }
@@ -644,7 +666,7 @@ impl NativeAsrDecodeState {
     ) -> Result<()> {
         match self {
             Self::Qwen3(state) => state.install_managed_reservation(cache),
-            Self::Nemotron(_) => Err(Error::InvalidInput(
+            Self::Whisper(_) | Self::Nemotron(_) => Err(Error::InvalidInput(
                 "managed Qwen3 KV cache was supplied to a non-Qwen3 ASR state".to_string(),
             )),
         }
@@ -658,8 +680,32 @@ impl NativeAsrDecodeState {
             Self::Qwen3(state) => state
                 .begin_managed_quantum(cache)
                 .map(NativeAsrDecodeCheckpoint::Qwen3),
+            Self::Whisper(state) => state
+                .begin_managed_quantum(cache)
+                .map(NativeAsrDecodeCheckpoint::Whisper),
             Self::Nemotron(_) => Err(Error::InvalidInput(
                 "managed Qwen3 KV cache was supplied to a non-Qwen3 ASR state".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn begin_whisper_managed_generation(
+        &mut self,
+        cache: PhysicalPagedKvCache,
+        new_generation: crate::engine::ManagedSessionGeneration,
+    ) -> Result<NativeAsrDecodeCheckpoint> {
+        let new_generation = new_generation.get();
+        let expected_generation = new_generation.checked_sub(1).ok_or_else(|| {
+            Error::InferenceError(
+                "Whisper managed restart received an invalid zero session generation".into(),
+            )
+        })?;
+        match self {
+            Self::Whisper(state) => state
+                .begin_managed_generation(cache, expected_generation, new_generation)
+                .map(NativeAsrDecodeCheckpoint::Whisper),
+            Self::Qwen3(_) | Self::Nemotron(_) => Err(Error::InvalidInput(
+                "Whisper managed generation was supplied to another ASR state".into(),
             )),
         }
     }
@@ -673,8 +719,29 @@ impl NativeAsrDecodeState {
                 state.rollback_managed_quantum(checkpoint);
                 Ok(())
             }
-            (Self::Nemotron(_), NativeAsrDecodeCheckpoint::Qwen3(_)) => Err(Error::InvalidInput(
-                "Qwen3 ASR checkpoint was supplied to a non-Qwen3 ASR state".to_string(),
+            (Self::Whisper(state), NativeAsrDecodeCheckpoint::Whisper(mut checkpoint)) => {
+                state.rollback_managed_quantum(&mut checkpoint)
+            }
+            (Self::Whisper(_) | Self::Nemotron(_), NativeAsrDecodeCheckpoint::Qwen3(_))
+            | (Self::Qwen3(_) | Self::Nemotron(_), NativeAsrDecodeCheckpoint::Whisper(_)) => {
+                Err(Error::InvalidInput(
+                    "Qwen3 ASR checkpoint was supplied to a non-Qwen3 ASR state".to_string(),
+                ))
+            }
+        }
+    }
+
+    pub(crate) fn commit_managed_quantum(
+        &mut self,
+        checkpoint: NativeAsrDecodeCheckpoint,
+    ) -> Result<()> {
+        match (self, checkpoint) {
+            (Self::Whisper(state), NativeAsrDecodeCheckpoint::Whisper(mut checkpoint)) => {
+                state.commit_managed_quantum(&mut checkpoint)
+            }
+            (Self::Qwen3(_), NativeAsrDecodeCheckpoint::Qwen3(_)) => Ok(()),
+            _ => Err(Error::InvalidInput(
+                "ASR managed checkpoint does not match its decoder state".into(),
             )),
         }
     }
@@ -682,7 +749,7 @@ impl NativeAsrDecodeState {
     pub(crate) fn bind_qwen3_tensor_sequence(&mut self, sequence: u64) -> Result<()> {
         match self {
             Self::Qwen3(state) => state.bind_tensor_sequence(sequence),
-            Self::Nemotron(_) => Err(Error::InvalidInput(
+            Self::Whisper(_) | Self::Nemotron(_) => Err(Error::InvalidInput(
                 "Qwen3 ASR tensor-state reservation was supplied to a non-Qwen3 state".to_string(),
             )),
         }
@@ -694,7 +761,7 @@ impl NativeAsrDecodeState {
     ) -> Result<()> {
         match self {
             Self::Qwen3(state) => state.restore_prepared_tensor_state(arena),
-            Self::Nemotron(_) => Err(Error::InvalidInput(
+            Self::Whisper(_) | Self::Nemotron(_) => Err(Error::InvalidInput(
                 "Qwen3 ASR tensor-state arena was supplied to a non-Qwen3 state".to_string(),
             )),
         }
@@ -707,7 +774,7 @@ impl NativeAsrDecodeState {
     ) -> Result<()> {
         match self {
             Self::Qwen3(state) => state.stage_prepared_tensor_state(arena, transaction),
-            Self::Nemotron(_) => Err(Error::InvalidInput(
+            Self::Whisper(_) | Self::Nemotron(_) => Err(Error::InvalidInput(
                 "Qwen3 ASR tensor-state arena was supplied to a non-Qwen3 state".to_string(),
             )),
         }
@@ -716,6 +783,7 @@ impl NativeAsrDecodeState {
     pub(crate) fn prefill_progress(&self) -> Option<usize> {
         match self {
             Self::Qwen3(state) => Some(state.prefill_progress()),
+            Self::Whisper(state) => Some(state.prefill_progress()),
             Self::Nemotron(_) => None,
         }
     }
@@ -723,6 +791,7 @@ impl NativeAsrDecodeState {
     pub(crate) fn prefill_token_count(&self) -> Option<usize> {
         match self {
             Self::Qwen3(state) => Some(state.prefill_token_count()),
+            Self::Whisper(state) => Some(state.prefill_token_count()),
             Self::Nemotron(_) => None,
         }
     }
@@ -839,6 +908,135 @@ impl NativeAsrModel {
             Self::Qwen3(model) => model.prepare_audio_tower_batch(rows),
             _ => Err(Error::InvalidInput(
                 "Qwen3 ASR audio-tower preparation was supplied to another ASR model".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn whisper_window_preparation_geometry(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+    ) -> Result<WhisperWindowPreparationGeometry> {
+        match self {
+            Self::WhisperTurbo(model) => model.window_preparation_geometry(audio, sample_rate),
+            _ => Err(Error::InvalidInput(
+                "Whisper window geometry was requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn whisper_window_preparation_stage_seal(
+        &self,
+        backend: crate::backends::BackendKind,
+        width: usize,
+    ) -> Result<WhisperAudioPreparationStageSeal> {
+        match self {
+            Self::WhisperTurbo(model) => model.window_preparation_stage_seal(backend, width),
+            _ => Err(Error::InvalidInput(
+                "Whisper preparation seal was requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn prepare_whisper_window_batch(
+        &self,
+        rows: &[WhisperAudioBatchRow<'_>],
+    ) -> Result<Vec<WhisperPreparedWindow>> {
+        match self {
+            Self::WhisperTurbo(model) => model.prepare_window_batch(rows),
+            _ => Err(Error::InvalidInput(
+                "Whisper window preparation was supplied to another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn whisper_incremental_prompt_token_count(
+        &self,
+        prepared: &WhisperPreparedWindow,
+        language: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Result<usize> {
+        match self {
+            Self::WhisperTurbo(model) => model
+                .incremental_prompt_token_count_from_prepared_window(prepared, language, prompt),
+            _ => Err(Error::InvalidInput(
+                "prepared Whisper window was supplied to another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn start_whisper_resumable_prefill(
+        &self,
+        prepared: &WhisperPreparedWindow,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        max_new_tokens: Option<usize>,
+        cache: PhysicalPagedKvCache,
+        cross_runtime: Arc<RetainedStaticAttentionRuntimeV2>,
+        cross_sequence: RetainedStaticAttentionSequenceId,
+    ) -> Result<NativeAsrDecodeState> {
+        match self {
+            Self::WhisperTurbo(model) => Ok(NativeAsrDecodeState::Whisper(
+                model.begin_resumable_prefill_managed_from_prepared_window(
+                    prepared,
+                    language,
+                    prompt,
+                    max_new_tokens,
+                    cache,
+                    cross_runtime,
+                    cross_sequence,
+                )?,
+            )),
+            _ => reject_foreign_whisper_prefill(cross_runtime, cross_sequence),
+        }
+    }
+
+    pub(crate) fn continue_whisper_resumable_prefill(
+        &self,
+        state: &mut NativeAsrDecodeState,
+        start: usize,
+        end: usize,
+    ) -> Result<bool> {
+        match (self, state) {
+            (Self::WhisperTurbo(model), NativeAsrDecodeState::Whisper(state)) => {
+                model.continue_resumable_prefill(state, start, end)
+            }
+            _ => Err(Error::InvalidInput(
+                "Whisper prefill state was routed to another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn decode_whisper_retained_step(
+        &self,
+        state: &mut NativeAsrDecodeState,
+    ) -> Result<NativeAsrDecodeStep> {
+        match (self, state) {
+            (Self::WhisperTurbo(model), NativeAsrDecodeState::Whisper(state)) => {
+                let step = model.decode_step_retained(state)?;
+                Ok(NativeAsrDecodeStep {
+                    delta: step.delta,
+                    text: step.text,
+                    tokens_generated: step.tokens_generated,
+                    finished: step.finished,
+                })
+            }
+            _ => Err(Error::InvalidInput(
+                "Whisper decode state was routed to another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn resolve_whisper_terminal_transition(
+        &self,
+        state: &mut NativeAsrDecodeState,
+    ) -> Result<WhisperTerminalTransition> {
+        match (self, state) {
+            (Self::WhisperTurbo(model), NativeAsrDecodeState::Whisper(state)) => {
+                model.resolve_terminal_transition(state)
+            }
+            _ => Err(Error::InvalidInput(
+                "Whisper terminal state was routed to another ASR model".into(),
             )),
         }
     }
@@ -2240,9 +2438,11 @@ impl NativeAsrModel {
             .iter_mut()
             .map(|state| match &mut **state {
                 NativeAsrDecodeState::Qwen3(state) => Ok(state),
-                NativeAsrDecodeState::Nemotron(_) => Err(Error::InvalidInput(
-                    "continuous Qwen3 ASR batch contains a non-Qwen3 state".to_string(),
-                )),
+                NativeAsrDecodeState::Whisper(_) | NativeAsrDecodeState::Nemotron(_) => {
+                    Err(Error::InvalidInput(
+                        "continuous Qwen3 ASR batch contains a non-Qwen3 state".to_string(),
+                    ))
+                }
             })
             .collect::<Result<Vec<_>>>()?;
         model.decode_step_batch(&mut qwen_states).map(|steps| {
@@ -2897,6 +3097,44 @@ impl AsrModelLease {
             }
             _ => Err(Error::InvalidInput(
                 "Qwen3 ASR preparation cost was requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn whisper_window_preparation_geometry(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+    ) -> Result<WhisperWindowPreparationGeometry> {
+        self.inner
+            .model
+            .whisper_window_preparation_geometry(audio, sample_rate)
+    }
+
+    pub(crate) fn whisper_window_preparation_batch_geometry(
+        &self,
+        rows: &[WhisperWindowPreparationGeometry],
+    ) -> Result<WhisperWindowPreparationBatchGeometry> {
+        match self.inner.model.as_ref() {
+            NativeAsrModel::WhisperTurbo(model) => model.window_preparation_batch_geometry(rows),
+            _ => Err(Error::InvalidInput(
+                "Whisper preparation geometry was requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn whisper_window_preparation_row_cost_for_batch(
+        &self,
+        index: usize,
+        rows: &[WhisperWindowPreparationGeometry],
+        batch: &WhisperWindowPreparationBatchGeometry,
+    ) -> Result<WorkCost> {
+        match self.inner.model.as_ref() {
+            NativeAsrModel::WhisperTurbo(model) => {
+                model.window_preparation_row_cost_for_batch(index, rows, batch)
+            }
+            _ => Err(Error::InvalidInput(
+                "Whisper preparation cost was requested from another ASR model".into(),
             )),
         }
     }

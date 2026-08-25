@@ -48,9 +48,9 @@ use super::execution::{
     BatchDispatch, BatchId, BatchLaneKey, CacheMode, CancellationGranularity, ConcurrencyClass,
     DispatchState, ExecutionCapabilities, ExecutionDisposition, ExecutionDomain, ExecutionFailure,
     ExecutionMode, ExecutionProfile, FailureKind, FailureOrigin, FailureScope, FinishReason,
-    HealthImpact, NativeBatchMode, OutcomeProvenance, PhysicalBatch, PhysicalLaunchPolicy, PlanId,
-    PrefillMode, RetryDisposition, SequencePhase, SessionKey, StageId, StageProgressKind,
-    StageWorkSelector, WorkUnit, YieldReason,
+    HealthImpact, ManagedSessionGeneration, NativeBatchMode, OutcomeProvenance, PhysicalBatch,
+    PhysicalLaunchPolicy, PlanId, PrefillMode, RetryDisposition, SequencePhase, SessionKey,
+    StageId, StageProgressKind, StageWorkSelector, WorkUnit, YieldReason,
 };
 use super::metrics::{
     begin_engine_physical_dispatch, record_engine_physical_defer, record_engine_physical_fallback,
@@ -373,9 +373,14 @@ struct RetainedPagedRowState {
 pub(super) struct RetainedRowManagedState {
     paged: Vec<RetainedPagedRowState>,
     pub(super) tensor_state: Option<super::ManagedTensorStateReservation>,
+    session_generation: ManagedSessionGeneration,
 }
 
 impl RetainedRowManagedState {
+    pub(super) fn session_generation(&self) -> ManagedSessionGeneration {
+        self.session_generation
+    }
+
     pub(super) fn take_paged_domain(
         &mut self,
         domain: CacheDomainId,
@@ -491,6 +496,7 @@ fn retained_row_managed_state_for_row(
     Ok(RetainedRowManagedState {
         paged,
         tensor_state: reservation.tensor_state,
+        session_generation: reservation.session_generation,
     })
 }
 

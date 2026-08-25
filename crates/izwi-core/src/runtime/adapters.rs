@@ -156,12 +156,16 @@ const fn family_inference_state_policy(family: ModelFamily) -> FamilyInferenceSt
             tts: Invocation,
             ..FamilyInferenceStatePolicy::STATELESS
         },
-        ParakeetAsr | WhisperAsr | VibeVoiceAsr | NemotronAsr | GraniteSpeechAsr | Voxtral => {
+        ParakeetAsr | VibeVoiceAsr | NemotronAsr | GraniteSpeechAsr | Voxtral => {
             FamilyInferenceStatePolicy {
                 asr: Invocation,
                 ..FamilyInferenceStatePolicy::STATELESS
             }
         }
+        WhisperAsr => FamilyInferenceStatePolicy {
+            asr: RetainedAndInvocation,
+            ..FamilyInferenceStatePolicy::STATELESS
+        },
         Qwen3Asr => FamilyInferenceStatePolicy {
             asr: RetainedAndInvocation,
             ..FamilyInferenceStatePolicy::STATELESS
@@ -480,7 +484,10 @@ impl ModelCapabilityAdapter for AsrCapabilityAdapter {
                     StreamingMode::None
                 },
                 execution_target: asr_execution_target(model_variant),
-                sequence_execution: if model_variant.family() == ModelFamily::Qwen3Asr {
+                sequence_execution: if matches!(
+                    model_variant.family(),
+                    ModelFamily::Qwen3Asr | ModelFamily::WhisperAsr
+                ) {
                     SequenceExecutionMode::Always
                 } else {
                     SequenceExecutionMode::None
@@ -738,6 +745,9 @@ mod tests {
         let qwen_asr = *registry
             .require(CapabilityKind::Asr, ModelVariant::Qwen3Asr06BGguf)
             .unwrap();
+        let whisper_asr = *registry
+            .require(CapabilityKind::Asr, ModelVariant::WhisperLargeV3Turbo)
+            .unwrap();
 
         assert_eq!(qwen_chat.sequence_execution, SequenceExecutionMode::Always);
         assert_eq!(gemma_chat.sequence_execution, SequenceExecutionMode::Always);
@@ -749,6 +759,14 @@ mod tests {
         assert_eq!(qwen_asr.sequence_execution, SequenceExecutionMode::Always);
         assert_eq!(
             qwen_asr.state_requirement,
+            InferenceStateRequirement::RetainedAndInvocation
+        );
+        assert_eq!(
+            whisper_asr.sequence_execution,
+            SequenceExecutionMode::Always
+        );
+        assert_eq!(
+            whisper_asr.state_requirement,
             InferenceStateRequirement::RetainedAndInvocation
         );
         assert_eq!(lfm_chat.sequence_execution, SequenceExecutionMode::Always);
