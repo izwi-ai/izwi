@@ -1020,10 +1020,29 @@ pub struct ReadyQuantum {
 /// this compact fence in the execution envelope lets report validation reject
 /// a receipt for another plan, request incarnation, arena generation, domain,
 /// or table version before engine state is committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ManagedSessionGeneration(u64);
+
+impl ManagedSessionGeneration {
+    pub const INITIAL: Self = Self(1);
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    pub(crate) fn next(self) -> Result<Self> {
+        self.0
+            .checked_add(1)
+            .map(Self)
+            .ok_or_else(|| Error::InferenceError("managed session generation overflow".into()))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedCacheReservation {
     pub txn_id: PlanId,
     pub session: SessionKey,
+    pub session_generation: ManagedSessionGeneration,
     pub domains: Vec<ManagedCacheDomainReservation>,
     pub tensor_state: Option<ManagedTensorStateReservation>,
 }
@@ -2913,6 +2932,7 @@ mod tests {
         let reservation = ManagedCacheReservation {
             txn_id: plan.plan_id,
             session: session.clone(),
+            session_generation: ManagedSessionGeneration::INITIAL,
             domains: vec![ManagedCacheDomainReservation {
                 arena,
                 domain: CacheDomainId::new(2),

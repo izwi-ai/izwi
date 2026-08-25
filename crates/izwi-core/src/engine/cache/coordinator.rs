@@ -312,6 +312,15 @@ pub(crate) struct KvCoordinatorCommitPlan {
     next_version: u64,
 }
 
+/// Fully validated replacement of one committed table by an empty table in a
+/// newer logical session generation. The engine cache-manager lock prevents
+/// any interleaving mutation between staging and application.
+pub(crate) struct KvCoordinatorTableResetPlan {
+    key: TableKey,
+    previous: KvSnapshot,
+    next_version: u64,
+}
+
 /// Transactional metadata coordinator for one physical arena generation.
 pub struct KvCacheCoordinator {
     arena: KvArenaId,
@@ -347,6 +356,15 @@ impl KvCacheCoordinator {
         session: SessionKey,
         domain: CacheDomainId,
     ) -> KvCoordinatorResult<KvSnapshot> {
+        self.register_table_at_version(session, domain, 0)
+    }
+
+    pub(crate) fn register_table_at_version(
+        &mut self,
+        session: SessionKey,
+        domain: CacheDomainId,
+        version: u64,
+    ) -> KvCoordinatorResult<KvSnapshot> {
         let key = TableKey::new(session.clone(), domain);
         if self.tables.contains_key(&key) {
             return Err(KvCoordinatorError::DuplicateTable);
@@ -355,7 +373,7 @@ impl KvCacheCoordinator {
             arena: self.arena,
             session,
             domain,
-            version: 0,
+            version,
             committed_tokens: 0,
             window_start: 0,
             groups: Vec::new(),
@@ -1079,6 +1097,58 @@ impl KvCacheCoordinator {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn stage_table_reset(
+        &self,
+        session: &SessionKey,
+        domain: CacheDomainId,
+        next_version: u64,
+    ) -> KvCoordinatorResult<KvCoordinatorTableResetPlan> {
+        self.validate_table_release(session, domain)?;
+        let key = TableKey::new(session.clone(), domain);
+        let previous = self
+            .tables
+            .get(&key)
+            .cloned()
+            .ok_or(KvCoordinatorError::MissingTable)?;
+        if next_version <= previous.version {
+            return Err(KvCoordinatorError::VersionConflict);
+        }
+        Ok(KvCoordinatorTableResetPlan {
+            key,
+            previous,
+            next_version,
+        })
+    }
+
+    pub(crate) fn apply_staged_table_reset(
+        &mut self,
+        plan: KvCoordinatorTableResetPlan,
+    ) -> KvSnapshot {
+        let blocks = unique_table_blocks(&plan.previous.groups);
+        let current = self
+            .tables
+            .remove(&plan.key)
+            .expect("staged cache-table reset remains present under the manager lock");
+        debug_assert_eq!(current, plan.previous);
+        for block in blocks {
+            let slot = &mut self.slots[block.index as usize];
+            debug_assert!(slot.table_refs > 0);
+            slot.table_refs -= 1;
+            self.recycle_if_unowned(block.index);
+        }
+        let reset = KvSnapshot {
+            arena: self.arena,
+            session: plan.previous.session,
+            domain: plan.previous.domain,
+            version: plan.next_version,
+            committed_tokens: 0,
+            window_start: 0,
+            groups: Vec::new(),
+        };
+        self.tables.insert(plan.key, reset.clone());
+        reset
     }
 
     /// Release a completed request table. Active reservations must abort first.

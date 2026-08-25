@@ -3272,6 +3272,7 @@ mod tests {
         ManagedCacheReservation {
             txn_id: 1,
             session: SessionKey::new("qwen38-domain-selection".into(), 1),
+            session_generation: crate::engine::ManagedSessionGeneration::INITIAL,
             domains: domains
                 .iter()
                 .map(|(domain, arena)| ManagedCacheDomainReservation {

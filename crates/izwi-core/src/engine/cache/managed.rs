@@ -10,7 +10,8 @@ use sha2::{Digest, Sha256};
 
 use super::coordinator::{
     KvBlockIntent, KvCacheCoordinator, KvCoordinatorCommitPlan, KvCoordinatorError,
-    KvGroupReservation, KvReserveRequest, KvSnapshot, KvWindowReserveRequest, KvWriteReceipt,
+    KvCoordinatorTableResetPlan, KvGroupReservation, KvReserveRequest, KvSnapshot,
+    KvWindowReserveRequest, KvWriteReceipt,
 };
 use super::prefix::{
     CoordinatedPrefixIndex, KvPrefixNamespace, KvPrefixPageKey, KvPrefixPublication,
@@ -32,8 +33,9 @@ use crate::backends::state::{
 use crate::backends::BackendKind;
 use crate::engine::{
     EngineCoreRequest, ManagedCacheDomainReservation, ManagedCacheReceipt, ManagedCacheReservation,
-    ManagedTensorStateReservation, ModelInstanceId, PlanId, ReservationClass, ReservationOwner,
-    ResourceAmount, ResourceAuthority, ResourceLease, ResourceVector, SessionKey, WorkUnit,
+    ManagedSessionGeneration, ManagedTensorStateReservation, ModelInstanceId, PlanId,
+    ReservationClass, ReservationOwner, ResourceAmount, ResourceAuthority, ResourceLease,
+    ResourceVector, SessionKey, WorkUnit,
 };
 use crate::error::{Error, Result};
 use crate::kv::v2::{
@@ -335,6 +337,7 @@ struct ManagedKvModelState {
     prefix_indexes: HashMap<KvArenaId, CoordinatedPrefixIndex>,
     pending_prefixes: HashMap<PlanId, Vec<PendingPrefixCommit>>,
     registered_sessions: HashSet<SessionKey>,
+    session_generations: HashMap<SessionKey, ManagedSessionGeneration>,
     capacity_claims: HashMap<SessionKey, Vec<(KvArenaId, u32)>>,
     tensor_sequences: HashMap<SessionKey, PhysicalStateSequenceId>,
     resource_lease: Option<ResourceLease>,
@@ -1150,6 +1153,7 @@ impl ManagedKvCacheManager {
                 prefix_indexes,
                 pending_prefixes: HashMap::new(),
                 registered_sessions: HashSet::new(),
+                session_generations: HashMap::new(),
                 capacity_claims: HashMap::new(),
                 tensor_sequences: HashMap::new(),
                 resource_lease,
@@ -1261,6 +1265,14 @@ impl ManagedKvCacheManager {
             }
             return Err(error);
         }
+        let session_generation =
+            state
+                .session_generations
+                .get(session)
+                .copied()
+                .ok_or_else(|| {
+                    Error::InferenceError("registered managed session lost its generation".into())
+                })?;
 
         let mut domains = Vec::with_capacity(runtime.plan.groups.len());
         let mut pending_prefixes = Vec::new();
@@ -1286,29 +1298,35 @@ impl ManagedKvCacheManager {
                 && request.is_some_and(|request| input.end <= request.prompt_tokens.len())
                 && target_committed_tokens > 1
                 && prefix_enabled_for_domain(&state.contract, group.domain);
-            let prefix_match = if prefix_eligible {
-                if let Some(namespace) = namespace.as_ref() {
-                    let reusable_tokens =
-                        usize::try_from(target_committed_tokens - 1).unwrap_or(usize::MAX);
-                    state
-                        .prefix_indexes
-                        .get_mut(&group.arena)
-                        .expect("resolved arena has a prefix index")
-                        .lookup_longest(
-                            namespace,
-                            &request
-                                .expect("prefix namespace requires a request")
-                                .prompt_tokens[..reusable_tokens],
-                            group.page_tokens,
-                        )
-                        .map_err(prefix_error)?
+            // A subordinate retained-session generation is a semantic restart
+            // whose model handoff requires an exact context-0 physical cache.
+            // Published pages remain available to unrelated fresh sessions,
+            // but this restarted session must rebuild its first generation
+            // span instead of attaching a prefix and beginning above zero.
+            let prefix_match =
+                if prefix_eligible && session_generation == ManagedSessionGeneration::INITIAL {
+                    if let Some(namespace) = namespace.as_ref() {
+                        let reusable_tokens =
+                            usize::try_from(target_committed_tokens - 1).unwrap_or(usize::MAX);
+                        state
+                            .prefix_indexes
+                            .get_mut(&group.arena)
+                            .expect("resolved arena has a prefix index")
+                            .lookup_longest(
+                                namespace,
+                                &request
+                                    .expect("prefix namespace requires a request")
+                                    .prompt_tokens[..reusable_tokens],
+                                group.page_tokens,
+                            )
+                            .map_err(prefix_error)?
+                    } else {
+                        self.telemetry.record_prefix_rejection();
+                        Default::default()
+                    }
                 } else {
-                    self.telemetry.record_prefix_rejection();
                     Default::default()
-                }
-            } else {
-                Default::default()
-            };
+                };
             let execution_start_tokens = snapshot.committed_tokens.max(prefix_match.reused_tokens);
             let sliding_window = sliding_window_for_domain(&state.contract, group.domain)?;
             let target_window_start = sliding_window
@@ -1595,6 +1613,7 @@ impl ManagedKvCacheManager {
         Ok(Some(ManagedCacheReservation {
             txn_id,
             session: session.clone(),
+            session_generation,
             domains,
             tensor_state,
         }))
@@ -1619,6 +1638,10 @@ impl ManagedKvCacheManager {
             abort_reservation(state, reservation);
             self.telemetry.record_abort();
             return Ok(());
+        }
+        if let Err(error) = validate_reservation_session_generation(state, reservation) {
+            abort_reservation(state, reservation);
+            return Err(error);
         }
         let receipt = match receipt {
             Some(receipt) => receipt,
@@ -1890,9 +1913,90 @@ impl ManagedKvCacheManager {
                     .release(sequence)?;
             }
             state.registered_sessions.remove(session);
+            state.session_generations.remove(session);
             state.capacity_claims.remove(session);
         }
         Ok(())
+    }
+
+    /// Replace every paged table for one exact retained session by an empty
+    /// table in a new subordinate generation. The request/session identity and
+    /// its capacity claim remain owned throughout the reset, so another row
+    /// cannot consume the admitted logical capacity between attempts.
+    pub(crate) fn reset_session_generation(
+        &mut self,
+        runtime: &ManagedKvModelRuntime,
+        session: &SessionKey,
+        expected: ManagedSessionGeneration,
+    ) -> Result<ManagedSessionGeneration> {
+        let state = self
+            .models
+            .get_mut(&runtime.plan.model_instance)
+            .ok_or_else(|| Error::InferenceError("managed KV model state is missing".into()))?;
+        if state.closing || state.runtime.plan.id != runtime.plan.id {
+            return Err(Error::InferenceError(
+                "managed KV reset carries a closing or stale model runtime".into(),
+            ));
+        }
+        if runtime.tensor_state().is_some() {
+            return Err(Error::InferenceError(
+                "managed KV session reset requires a paged-only runtime".into(),
+            ));
+        }
+        if !state.registered_sessions.contains(session) {
+            return Err(Error::InferenceError(
+                "managed KV reset requires a registered session".into(),
+            ));
+        }
+        let current = state
+            .session_generations
+            .get(session)
+            .copied()
+            .ok_or_else(|| {
+                Error::InferenceError("registered managed session lost its generation".into())
+            })?;
+        if current != expected {
+            return Err(Error::InferenceError(format!(
+                "managed KV reset expected session generation {}, found {}",
+                expected.get(),
+                current.get()
+            )));
+        }
+        let next = current.next()?;
+        let mut staged = Vec::<(KvArenaId, KvCoordinatorTableResetPlan)>::with_capacity(
+            state.runtime.plan.groups.len(),
+        );
+        for group in &state.runtime.plan.groups {
+            let coordinator = state
+                .coordinators
+                .get(&group.arena)
+                .expect("resolved arena has a coordinator");
+            let snapshot = coordinator
+                .snapshot(session, group.domain)
+                .map_err(coordinator_error)?;
+            let next_version = snapshot.version.checked_add(1).ok_or_else(|| {
+                Error::InferenceError("managed KV table version overflow during reset".into())
+            })?;
+            staged.push((
+                group.arena,
+                coordinator
+                    .stage_table_reset(session, group.domain, next_version)
+                    .map_err(coordinator_error)?,
+            ));
+        }
+
+        // Every fallible ownership/version check completed above. EngineCore
+        // serializes manager mutation, so applying the staged resets cannot
+        // race another reservation between domains.
+        for (arena, reset) in staged {
+            state
+                .coordinators
+                .get_mut(&arena)
+                .expect("staged reset arena remains registered")
+                .apply_staged_table_reset(reset);
+        }
+        state.session_generations.insert(session.clone(), next);
+        Ok(next)
     }
 
     /// Drain and retire every arena belonging to one exact loaded-model
@@ -2556,6 +2660,10 @@ fn ensure_session_tables(state: &mut ManagedKvModelState, session: &SessionKey) 
     if !state.registered_sessions.insert(session.clone()) {
         return Ok(());
     }
+    let generation = ManagedSessionGeneration::INITIAL;
+    state
+        .session_generations
+        .insert(session.clone(), generation);
     let mut registered = Vec::new();
     for group in &state.runtime.plan.groups {
         let coordinator = state
@@ -2571,9 +2679,33 @@ fn ensure_session_tables(state: &mut ManagedKvModelState, session: &SessionKey) 
                     .release_table(session, domain);
             }
             state.registered_sessions.remove(session);
+            state.session_generations.remove(session);
             return Err(coordinator_error(error));
         }
         registered.push((group.arena, group.domain));
+    }
+    Ok(())
+}
+
+fn validate_reservation_session_generation(
+    state: &ManagedKvModelState,
+    reservation: &ManagedCacheReservation,
+) -> Result<()> {
+    let current = state
+        .session_generations
+        .get(&reservation.session)
+        .copied()
+        .ok_or_else(|| {
+            Error::InferenceError(
+                "managed KV reservation has no registered session generation".into(),
+            )
+        })?;
+    if reservation.session_generation != current {
+        return Err(Error::InferenceError(format!(
+            "managed KV reservation session generation {} is stale; current generation is {}",
+            reservation.session_generation.get(),
+            current.get()
+        )));
     }
     Ok(())
 }
@@ -3281,6 +3413,22 @@ mod tests {
 
     fn two_paged_tensor_contract() -> InferenceStateContract {
         let mut contract = composite_tensor_contract();
+        let mut second_paged = contract.domains[0].clone();
+        if let StateDomainSpec::PagedAttention(domain) = &mut second_paged {
+            domain.header.id = CacheDomainId::new(3);
+        }
+        contract.domains.push(second_paged);
+        contract.groups.push(StateGroupSpec {
+            id: crate::kv::v2::StateGroupId::new(2),
+            domains: vec![CacheDomainId::new(3)],
+            prefix_shareable: false,
+        });
+        contract.validate().unwrap();
+        contract
+    }
+
+    fn two_paged_contract() -> InferenceStateContract {
+        let mut contract = test_contract();
         let mut second_paged = contract.domains[0].clone();
         if let StateDomainSpec::PagedAttention(domain) = &mut second_paged {
             domain.header.id = CacheDomainId::new(3);
@@ -4192,6 +4340,353 @@ mod tests {
 
         manager.release_session(&session).expect("release");
         assert!(manager.snapshot(model, &session, domain).is_none());
+    }
+
+    #[test]
+    fn retained_session_reset_preserves_claim_and_rejects_stale_reservation_receipt() {
+        let model = ModelInstanceId::new(410);
+        let session = SessionKey::new("managed-reset".to_string(), 3);
+        let domain = CacheDomainId::new(1);
+        let mut manager = ManagedKvCacheManager::default();
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                4,
+                16,
+                &CacheCapability::Managed(test_contract()),
+            )
+            .unwrap()
+            .unwrap();
+        let mut request = prefix_request(model, vec![1, 2, 3, 4, 5]);
+        request.params.max_tokens = 3;
+        let first = manager
+            .prepare(
+                &runtime,
+                4101,
+                &session,
+                &sequence_work(0, 5),
+                Some(&request),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.session_generation, ManagedSessionGeneration::INITIAL);
+        let stale_receipt = first.completed_write_receipt_for_test();
+        manager
+            .finalize(&first, Some(&stale_receipt), true)
+            .unwrap();
+        let claim_before = manager.models[&model].capacity_claims[&session].clone();
+        let registered_before = manager.models[&model].registered_sessions.len();
+
+        let next = manager
+            .reset_session_generation(&runtime, &session, ManagedSessionGeneration::INITIAL)
+            .unwrap();
+        assert_eq!(next.get(), 2);
+        let reset = manager.snapshot(model, &session, domain).unwrap();
+        assert_eq!(reset.committed_tokens, 0);
+        assert_eq!(reset.window_start, 0);
+        assert!(reset.groups.is_empty());
+        assert_eq!(reset.version, 2);
+        assert_eq!(
+            manager.models[&model].capacity_claims[&session],
+            claim_before
+        );
+        assert_eq!(
+            manager.models[&model].registered_sessions.len(),
+            registered_before
+        );
+
+        let stale = manager.finalize(&first, Some(&stale_receipt), true);
+        assert!(matches!(stale, Err(Error::InferenceError(message)) if message.contains("stale")));
+
+        let replacement = manager
+            .prepare(&runtime, 4102, &session, &sequence_work(0, 3), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(replacement.session_generation, next);
+        manager
+            .finalize(
+                &replacement,
+                Some(&replacement.completed_write_receipt_for_test()),
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            manager
+                .snapshot(model, &session, domain)
+                .unwrap()
+                .committed_tokens,
+            3
+        );
+    }
+
+    #[test]
+    fn retained_session_reset_fails_closed_while_a_row_transaction_is_active() {
+        let model = ModelInstanceId::new(411);
+        let session = SessionKey::new("managed-reset-active".to_string(), 4);
+        let domain = CacheDomainId::new(1);
+        let mut manager = ManagedKvCacheManager::default();
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                4,
+                16,
+                &CacheCapability::Managed(test_contract()),
+            )
+            .unwrap()
+            .unwrap();
+        let active = manager
+            .prepare(&runtime, 4111, &session, &sequence_work(0, 4), None)
+            .unwrap()
+            .unwrap();
+
+        let reset =
+            manager.reset_session_generation(&runtime, &session, ManagedSessionGeneration::INITIAL);
+        assert!(reset.is_err());
+        let unchanged = manager.snapshot(model, &session, domain).unwrap();
+        assert_eq!(unchanged.version, 0);
+        assert_eq!(unchanged.committed_tokens, 0);
+        assert_eq!(
+            manager.models[&model].session_generations[&session],
+            ManagedSessionGeneration::INITIAL
+        );
+
+        manager.finalize(&active, None, false).unwrap();
+        let next = manager
+            .reset_session_generation(&runtime, &session, ManagedSessionGeneration::INITIAL)
+            .unwrap();
+        assert_eq!(next.get(), 2);
+    }
+
+    #[test]
+    fn retained_session_reset_rejects_stale_expected_generation_without_mutation() {
+        let model = ModelInstanceId::new(412);
+        let session = SessionKey::new("managed-reset-generation".to_string(), 5);
+        let domain = CacheDomainId::new(1);
+        let mut manager = ManagedKvCacheManager::default();
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                4,
+                16,
+                &CacheCapability::Managed(test_contract()),
+            )
+            .unwrap()
+            .unwrap();
+        let reservation = manager
+            .prepare(&runtime, 4121, &session, &sequence_work(0, 2), None)
+            .unwrap()
+            .unwrap();
+        manager.finalize(&reservation, None, false).unwrap();
+        let next = manager
+            .reset_session_generation(&runtime, &session, ManagedSessionGeneration::INITIAL)
+            .unwrap();
+        let version = manager.snapshot(model, &session, domain).unwrap().version;
+
+        assert!(manager
+            .reset_session_generation(&runtime, &session, ManagedSessionGeneration::INITIAL,)
+            .is_err());
+        assert_eq!(
+            manager.snapshot(model, &session, domain).unwrap().version,
+            version
+        );
+        assert_eq!(manager.models[&model].session_generations[&session], next);
+    }
+
+    #[test]
+    fn retained_session_reset_disables_published_prefix_reuse_for_restarted_generation() {
+        let model = ModelInstanceId::new(413);
+        let tokens = (0..65).collect::<Vec<u32>>();
+        let request = prefix_request(model, tokens.clone());
+        let source_session = SessionKey::new("managed-reset-prefix-source".into(), 1);
+        let restarted_session = SessionKey::new("managed-reset-prefix-target".into(), 1);
+        let mut manager = ManagedKvCacheManager::with_prefix_cache_salt(None, Some([11; 32]));
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                4,
+                32,
+                &CacheCapability::Managed(test_contract()),
+            )
+            .unwrap()
+            .unwrap();
+
+        let source = manager
+            .prepare(
+                &runtime,
+                4131,
+                &source_session,
+                &sequence_work(0, tokens.len()),
+                Some(&request),
+            )
+            .unwrap()
+            .unwrap();
+        manager
+            .finalize(
+                &source,
+                Some(&source.completed_write_receipt_for_test()),
+                true,
+            )
+            .unwrap();
+        manager.release_session(&source_session).unwrap();
+        assert_eq!(manager.runtime_snapshot().counters.prefix_retained_pages, 2);
+
+        let initial = manager
+            .prepare(
+                &runtime,
+                4132,
+                &restarted_session,
+                &sequence_work(0, 1),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        manager
+            .finalize(
+                &initial,
+                Some(&initial.completed_write_receipt_for_test()),
+                true,
+            )
+            .unwrap();
+        let next = manager
+            .reset_session_generation(
+                &runtime,
+                &restarted_session,
+                ManagedSessionGeneration::INITIAL,
+            )
+            .unwrap();
+        assert_eq!(next.get(), 2);
+        let hits_before = manager.telemetry_snapshot().prefix_hits;
+
+        let restarted = manager
+            .prepare(
+                &runtime,
+                4133,
+                &restarted_session,
+                &sequence_work(0, tokens.len()),
+                Some(&request),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(restarted.session_generation, next);
+        assert!(restarted
+            .domains
+            .iter()
+            .all(|domain| domain.execution_start_tokens == 0));
+        assert_eq!(manager.telemetry_snapshot().prefix_hits, hits_before);
+        manager.finalize(&restarted, None, false).unwrap();
+    }
+
+    #[test]
+    fn retained_session_reset_stages_every_domain_before_mutation() {
+        let model = ModelInstanceId::new(414);
+        let session = SessionKey::new("managed-reset-two-domains".into(), 1);
+        let mut manager = ManagedKvCacheManager::default();
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                4,
+                16,
+                &CacheCapability::Managed(two_paged_contract()),
+            )
+            .unwrap()
+            .unwrap();
+        let mut request = prefix_request(model, vec![1, 2, 3, 4]);
+        request.params.max_tokens = 4;
+        let committed = manager
+            .prepare(
+                &runtime,
+                4141,
+                &session,
+                &sequence_work(0, 4),
+                Some(&request),
+            )
+            .unwrap()
+            .unwrap();
+        manager
+            .finalize(
+                &committed,
+                Some(&committed.completed_write_receipt_for_test()),
+                true,
+            )
+            .unwrap();
+
+        let first_group = runtime.plan.groups[0].clone();
+        let second_group = runtime.plan.groups[1].clone();
+        let first_before = manager
+            .snapshot(model, &session, first_group.domain)
+            .unwrap();
+        let second_before = manager
+            .snapshot(model, &session, second_group.domain)
+            .unwrap();
+        let claim_before = manager.models[&model].capacity_claims[&session].clone();
+
+        // Hold only the second domain active. Reset staging visits the first
+        // domain successfully, then must reject the second without applying
+        // either replacement.
+        {
+            let state = manager.models.get_mut(&model).unwrap();
+            let coordinator = state.coordinators.get_mut(&second_group.arena).unwrap();
+            let snapshot = coordinator.snapshot(&session, second_group.domain).unwrap();
+            let target = snapshot.committed_tokens + 1;
+            let group = reservation_for_group(
+                second_group.id,
+                second_group.page_tokens,
+                &snapshot,
+                target,
+                &[],
+            )
+            .unwrap();
+            coordinator
+                .reserve(KvReserveRequest {
+                    txn_id: 4142,
+                    expected: snapshot,
+                    target_committed_tokens: target,
+                    target_window_start: 0,
+                    groups: vec![group],
+                })
+                .unwrap();
+        }
+        let runtime_before = manager.runtime_snapshot();
+
+        assert!(manager
+            .reset_session_generation(&runtime, &session, ManagedSessionGeneration::INITIAL)
+            .is_err());
+        assert_eq!(
+            manager
+                .snapshot(model, &session, first_group.domain)
+                .unwrap(),
+            first_before
+        );
+        assert_eq!(
+            manager
+                .snapshot(model, &session, second_group.domain)
+                .unwrap(),
+            second_before
+        );
+        assert_eq!(
+            manager.models[&model].capacity_claims[&session],
+            claim_before
+        );
+        assert_eq!(manager.runtime_snapshot(), runtime_before);
+        assert_eq!(
+            manager.models[&model].session_generations[&session],
+            ManagedSessionGeneration::INITIAL
+        );
+
+        manager
+            .models
+            .get_mut(&model)
+            .unwrap()
+            .coordinators
+            .get_mut(&second_group.arena)
+            .unwrap()
+            .abort(4142)
+            .unwrap();
     }
 
     #[test]

@@ -692,6 +692,7 @@ mod tests {
         let reservation = ManagedCacheReservation {
             txn_id: scheduled.plan_id,
             session: scheduled.session_key(),
+            session_generation: crate::engine::ManagedSessionGeneration::INITIAL,
             domains: vec![ManagedCacheDomainReservation {
                 arena,
                 domain: CacheDomainId::new(0),
@@ -900,6 +901,7 @@ mod tests {
                     request_id: format!("row-{row}"),
                     epoch: 1,
                 },
+                session_generation: crate::engine::ManagedSessionGeneration::INITIAL,
                 domains: vec![ManagedCacheDomainReservation {
                     arena,
                     domain: CacheDomainId::new(1),
