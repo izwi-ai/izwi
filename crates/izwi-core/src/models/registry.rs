@@ -84,9 +84,14 @@ use crate::models::architectures::vibevoice::asr::{
 };
 use crate::models::architectures::vibevoice::tts::VibeVoiceTtsModel;
 use crate::models::architectures::vibevoice::VibeVoicePhysicalStateSpec;
+use crate::models::architectures::voxtral::realtime::model::{
+    VoxtralRealtimePreparationBatchGeometry, VoxtralRealtimePreparationBatchRow,
+    VoxtralRealtimePreparationGeometry, VoxtralRealtimePreparationMode,
+    VoxtralRealtimePreparationStageSeal, VoxtralRealtimePreparedAudio,
+};
 use crate::models::architectures::voxtral::realtime::{
-    VoxtralRealtimeCheckpoint, VoxtralRealtimeModel, VoxtralRealtimeResourceUsage,
-    VoxtralRealtimeState, VoxtralRealtimeStep,
+    VoxtralRealtimeCheckpoint, VoxtralRealtimeDecodeBatchRow, VoxtralRealtimeModel,
+    VoxtralRealtimeResourceUsage, VoxtralRealtimeState, VoxtralRealtimeStep,
 };
 use crate::models::architectures::voxtral::tts::VoxtralTtsModel;
 use crate::models::architectures::whisper::asr::{
@@ -3544,6 +3549,55 @@ impl VoxtralModelLease {
             max_output_steps,
             should_cancel,
         )
+    }
+
+    pub(crate) fn realtime_preparation_geometry(
+        &self,
+        state: &VoxtralRealtimeState,
+        appended_samples: usize,
+        sample_rate: u32,
+        mode: VoxtralRealtimePreparationMode,
+    ) -> Result<VoxtralRealtimePreparationGeometry> {
+        self.inner
+            .model
+            .realtime_preparation_geometry(state, appended_samples, sample_rate, mode)
+    }
+
+    pub(crate) fn realtime_preparation_batch_geometry(
+        &self,
+        rows: &[VoxtralRealtimePreparationGeometry],
+    ) -> Result<VoxtralRealtimePreparationBatchGeometry> {
+        self.inner.model.realtime_preparation_batch_geometry(rows)
+    }
+
+    pub(crate) fn realtime_preparation_stage_seal(
+        &self,
+    ) -> Result<VoxtralRealtimePreparationStageSeal> {
+        self.inner.model.realtime_preparation_stage_seal()
+    }
+
+    pub(crate) fn prepare_realtime_audio_batch(
+        &self,
+        rows: &[VoxtralRealtimePreparationBatchRow<'_>],
+    ) -> Result<Vec<VoxtralRealtimePreparedAudio>> {
+        self.inner.model.prepare_realtime_audio_batch(rows)
+    }
+
+    pub(crate) fn install_realtime_audio_preparation(
+        &self,
+        state: &mut VoxtralRealtimeState,
+        prepared: VoxtralRealtimePreparedAudio,
+    ) -> Result<usize> {
+        self.inner
+            .model
+            .install_realtime_audio_preparation(state, prepared)
+    }
+
+    pub(crate) fn decode_realtime_step_batch(
+        &self,
+        rows: &mut [VoxtralRealtimeDecodeBatchRow<'_>],
+    ) -> Result<Vec<VoxtralRealtimeStep>> {
+        self.inner.model.decode_realtime_step_batch(rows)
     }
 }
 

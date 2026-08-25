@@ -4,19 +4,27 @@
 //! which uses different tensor naming conventions (wq/wk/wv/wo, w1/w2/w3) and
 //! root-level layer structure compared to standard Qwen3.
 
-use candle_core::{DType, Device, Tensor};
+use std::sync::Arc;
+
+use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{ops, Embedding, Linear, Module, RmsNorm, VarBuilder};
 
+use crate::backends::kv::{
+    submit_ordered_after_write, KvSlotMap, KvWriteArgs, KvWriteCompletionCollector,
+    PagedKvDecodeArgs,
+};
 use crate::error::{Error, Result};
 use crate::kv::v2::{
     InferenceStateContract, PositionSemantics, PrefixPolicy, StateClock, StateDomainId,
     StateDomainSpec, StateGroupId, StateGroupSpec, CURRENT_INFERENCE_STATE_ABI,
 };
+use crate::kv::KvDecodeBatchMetadata;
 use crate::models::architectures::qwen3::core::{
     build_mrope_cache, build_rope_cache, qwen3_decoder_cache_domain, Qwen3Config,
     Qwen3DecoderCacheGeometry,
 };
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
+use crate::models::shared::telemetry::{record_decode_attention_path, DecodeAttentionPath};
 
 use super::layers::linear_forward_last_dim;
 
@@ -216,6 +224,182 @@ impl VoxtralLM {
         Ok(hidden)
     }
 
+    /// Decode one token for every retained row while preserving each row's
+    /// absolute position and rotating block-table view.
+    pub(crate) fn forward_managed_decode_batch_with_embeds(
+        &self,
+        embeds: &Tensor,
+        start_positions: &[usize],
+        caches: &mut [&mut PhysicalPagedKvCache],
+        t_cond: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let (batch_size, sequence_len, hidden_size) = embeds.dims3()?;
+        if batch_size == 0
+            || sequence_len != 1
+            || hidden_size != self.cfg.hidden_size
+            || start_positions.len() != batch_size
+            || caches.len() != batch_size
+            || t_cond.is_some_and(|condition| {
+                condition.dims3().ok() != Some((batch_size, 1, self.cfg.hidden_size))
+            })
+        {
+            return Err(Error::InvalidInput(format!(
+                "Voxtral managed decode expects matching [batch,1,{}] rows, got {:?}",
+                self.cfg.hidden_size,
+                embeds.dims()
+            )));
+        }
+        if batch_size == 1 {
+            return self.forward_managed_with_embeds(
+                embeds,
+                start_positions[0],
+                caches[0],
+                None,
+                t_cond,
+            );
+        }
+
+        let attention = self.cfg.attention_geometry()?;
+        for (row, cache) in caches.iter().enumerate() {
+            let end = start_positions[row].checked_add(1).ok_or_else(|| {
+                Error::InvalidInput("Voxtral managed decode position overflow".into())
+            })?;
+            if self.cfg.context_length().is_some_and(|limit| end > limit) {
+                return Err(Error::InvalidInput(format!(
+                    "Voxtral decode row {row} ends at {end}, beyond the loaded model context"
+                )));
+            }
+            cache.validate_model(
+                self.cfg.num_hidden_layers,
+                self.cfg.num_key_value_heads,
+                attention.key_head_dim(),
+            )?;
+            if cache.context_len() != start_positions[row] {
+                return Err(Error::InvalidInput(format!(
+                    "Voxtral decode row {row} starts at {}, but its cache cursor is {}",
+                    start_positions[row],
+                    cache.context_len()
+                )));
+            }
+        }
+        let first = &*caches[0];
+        let arena = first.arena.clone();
+        for cache in caches.iter().skip(1) {
+            if !Arc::ptr_eq(&cache.arena, &first.arena) {
+                return Err(Error::InvalidInput(
+                    "Voxtral managed decode rows must share one physical arena".into(),
+                ));
+            }
+        }
+        for layer_idx in 0..self.cfg.num_hidden_layers {
+            let binding = first.layer_binding(layer_idx)?;
+            for cache in caches.iter().skip(1) {
+                if cache.layer_binding(layer_idx)? != binding {
+                    return Err(Error::InvalidInput(
+                        "Voxtral managed decode rows must share every layer binding".into(),
+                    ));
+                }
+            }
+        }
+
+        let checkpoints = caches
+            .iter()
+            .map(|cache| cache.logical_checkpoint())
+            .collect::<Vec<_>>();
+        let execution = (|| -> Result<Tensor> {
+            if let Some(window) = self.cfg.sliding_window() {
+                for (row, cache) in caches.iter_mut().enumerate() {
+                    cache.advance_sliding_window_for_append(start_positions[row], 1, window)?;
+                }
+            }
+            let combined_slots = caches
+                .iter()
+                .enumerate()
+                .map(|(row, cache)| {
+                    cache
+                        .slots_for_append(start_positions[row], 1)
+                        .map(|slots| slots[0])
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let lowered = arena.lower_slots(&combined_slots)?;
+            let metadata = KvDecodeBatchMetadata {
+                sequences: caches
+                    .iter()
+                    .enumerate()
+                    .map(|(row, cache)| {
+                        let context_len = start_positions[row].checked_add(1).ok_or_else(|| {
+                            Error::InvalidInput("Voxtral decode position overflow".into())
+                        })?;
+                        match self.cfg.sliding_window() {
+                            Some(window) => cache.sequence_table_with_window(context_len, window),
+                            None => cache.sequence_table(context_len),
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            };
+            let mut completions =
+                KvWriteCompletionCollector::new(arena.config(), lowered.logical_slots())?;
+            let layer_result = (|| -> Result<Tensor> {
+                let mut x = embeds.clone();
+                for (layer_idx, layer) in self.layers.iter().enumerate() {
+                    let cache_refs = caches
+                        .iter()
+                        .map(|cache| &**cache)
+                        .collect::<Vec<&PhysicalPagedKvCache>>();
+                    x = layer.forward_managed_decode_batch(
+                        &x,
+                        start_positions,
+                        &cache_refs,
+                        lowered.as_ref(),
+                        &metadata,
+                        &mut completions,
+                        layer_idx,
+                        t_cond,
+                    )?;
+                }
+                let hidden = self.norm.forward(&x)?;
+                self.logits_from_hidden(&hidden)
+            })();
+            let logits = match layer_result {
+                Ok(logits) => logits,
+                Err(error) => {
+                    return match completions.drain() {
+                        Ok(()) => Err(error),
+                        Err(drain) => Err(Error::InferenceError(format!(
+                            "Voxtral decode batch failed: {error}; write-fence drain also failed: {drain}"
+                        ))),
+                    };
+                }
+            };
+            let completion = Arc::new(completions.seal()?);
+            for (committed, cache) in caches.iter_mut().enumerate() {
+                cache.commit_shared_completion(
+                    start_positions[committed],
+                    1,
+                    completion.clone(),
+                )?;
+            }
+            Ok(logits)
+        })();
+        match execution {
+            Ok(logits) => Ok(logits),
+            Err(error) => {
+                let mut rollback_error = None;
+                for (cache, checkpoint) in caches.iter_mut().zip(checkpoints) {
+                    if let Err(rollback) = cache.restore_logical_checkpoint(checkpoint) {
+                        rollback_error.get_or_insert(rollback);
+                    }
+                }
+                match rollback_error {
+                    Some(rollback) => Err(Error::InferenceError(format!(
+                        "Voxtral decode batch failed: {error}; rollback also failed: {rollback}"
+                    ))),
+                    None => Err(error),
+                }
+            }
+        }
+    }
+
     fn prepare_managed_hidden_with_embeds(
         &self,
         embeds: &Tensor,
@@ -375,6 +559,58 @@ impl VoxtralLayer {
         let x = x.broadcast_add(&mlp_out)?;
         Ok(x)
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_managed_decode_batch(
+        &self,
+        x: &Tensor,
+        start_positions: &[usize],
+        caches: &[&PhysicalPagedKvCache],
+        slots: &dyn KvSlotMap,
+        metadata: &KvDecodeBatchMetadata,
+        completions: &mut KvWriteCompletionCollector,
+        layer_idx: usize,
+        t_cond: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let normed = self.input_layernorm.forward(x)?;
+        let attn_out = self
+            .self_attn
+            .forward_managed_decode_batch(
+                &normed,
+                start_positions,
+                caches,
+                slots,
+                metadata,
+                completions,
+                layer_idx,
+            )
+            .map_err(|err| {
+                Error::InferenceError(format!(
+                    "Voxtral LM layer {layer_idx} batched attention failed: {err}"
+                ))
+            })?;
+        let x = x.broadcast_add(&attn_out)?;
+        let mut normed = self.post_attention_layernorm.forward(&x)?;
+        if let Some(ada_rms_norm) = &self.ada_rms_norm {
+            let t_cond = t_cond.ok_or_else(|| {
+                Error::InferenceError(
+                    "Voxtral LM requires delay conditioning for Ada RMSNorm".into(),
+                )
+            })?;
+            let mut scale = ada_rms_norm.forward(t_cond)?;
+            if scale.dtype() != normed.dtype() {
+                scale = scale.to_dtype(normed.dtype())?;
+            }
+            let one = Tensor::ones(scale.shape(), scale.dtype(), scale.device())?;
+            normed = normed.broadcast_mul(&scale.broadcast_add(&one)?)?;
+        }
+        let mlp_out = self.mlp.forward(&normed).map_err(|err| {
+            Error::InferenceError(format!(
+                "Voxtral LM layer {layer_idx} batched feed-forward failed: {err}"
+            ))
+        })?;
+        x.broadcast_add(&mlp_out).map_err(Error::from)
+    }
 }
 
 impl VoxtralAttention {
@@ -470,6 +706,105 @@ impl VoxtralAttention {
             None => cache.write_and_attend(layer_idx, prepared, &q, &k, &v, scale)?,
         };
         let out = out.reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
+        linear_forward_last_dim(&self.o_proj, &out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_managed_decode_batch(
+        &self,
+        x: &Tensor,
+        start_positions: &[usize],
+        caches: &[&PhysicalPagedKvCache],
+        slots: &dyn KvSlotMap,
+        metadata: &KvDecodeBatchMetadata,
+        completions: &mut KvWriteCompletionCollector,
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let (batch, sequence_len, _) = x.dims3()?;
+        if batch == 0
+            || sequence_len != 1
+            || start_positions.len() != batch
+            || caches.len() != batch
+            || metadata.sequences.len() != batch
+        {
+            return Err(Error::InvalidInput(
+                "Voxtral managed decode batch dimensions do not match".into(),
+            ));
+        }
+        let first = caches[0];
+        let binding = first.layer_binding(layer_idx)?;
+        for cache in caches.iter().skip(1) {
+            if !Arc::ptr_eq(&cache.arena, &first.arena)
+                || cache.layer_binding(layer_idx)? != binding
+            {
+                return Err(Error::InvalidInput(
+                    "Voxtral managed decode rows must share one arena and layer binding".into(),
+                ));
+            }
+        }
+        if slots.arena_id() != first.arena.id() || slots.len() != batch {
+            return Err(Error::InvalidInput(
+                "Voxtral managed decode received an incompatible slot map".into(),
+            ));
+        }
+
+        let mut q = linear_forward_last_dim(&self.q_proj, x)?.reshape((
+            batch,
+            1,
+            self.num_heads,
+            self.head_dim,
+        ))?;
+        let mut k = linear_forward_last_dim(&self.k_proj, x)?.reshape((
+            batch,
+            1,
+            self.num_kv_heads,
+            self.head_dim,
+        ))?;
+        let v = linear_forward_last_dim(&self.v_proj, x)?.reshape((
+            batch,
+            1,
+            self.num_kv_heads,
+            self.head_dim,
+        ))?;
+        q = self.apply_qk_norm(q, &self.q_norm, self.num_heads, 1)?;
+        k = self.apply_qk_norm(k, &self.k_norm, self.num_kv_heads, 1)?;
+
+        let mut query_rows = Vec::with_capacity(batch);
+        let mut key_rows = Vec::with_capacity(batch);
+        let mut value_rows = Vec::with_capacity(batch);
+        for (row, position) in start_positions.iter().copied().enumerate() {
+            let q_row = self.apply_rope(q.i(row)?.unsqueeze(0)?, position, None)?;
+            let k_row = self.apply_rope(k.i(row)?.unsqueeze(0)?, position, None)?;
+            query_rows.push(q_row.reshape((self.num_heads, self.head_dim))?);
+            key_rows.push(k_row.reshape((self.num_kv_heads, self.head_dim))?);
+            value_rows.push(v.i(row)?.reshape((self.num_kv_heads, self.head_dim))?);
+        }
+        let queries = Tensor::stack(&query_rows.iter().collect::<Vec<_>>(), 0)?.contiguous()?;
+        let keys = Tensor::stack(&key_rows.iter().collect::<Vec<_>>(), 0)?.contiguous()?;
+        let values = Tensor::stack(&value_rows.iter().collect::<Vec<_>>(), 0)?.contiguous()?;
+        let completion = first.arena.write_slots(
+            binding,
+            KvWriteArgs {
+                keys: &keys,
+                values: &values,
+                slots,
+            },
+        )?;
+        let scale = 1.0f32 / (self.head_dim as f32).sqrt();
+        let (out, completion) = submit_ordered_after_write(completion, || {
+            first.arena.paged_decode(
+                binding,
+                PagedKvDecodeArgs {
+                    queries: &queries,
+                    batch: metadata,
+                    softmax_scale: scale,
+                    softcap: None,
+                },
+            )
+        })?;
+        completions.collect(completion)?;
+        record_decode_attention_path(DecodeAttentionPath::Paged);
+        let out = out.reshape((batch, 1, self.num_heads * self.head_dim))?;
         linear_forward_last_dim(&self.o_proj, &out)
     }
 
@@ -629,6 +964,10 @@ impl VoxtralMlp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::kv::{CpuKvArena, KvArena, KvArenaConfig, KvLayerConfig};
+    use crate::backends::BackendKind;
+    use crate::engine::ModelInstanceId;
+    use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
     use candle_core::DType;
     use std::collections::HashMap;
 
@@ -652,6 +991,251 @@ mod tests {
             ada_rms_norm_t_cond: false,
             ada_rms_norm_t_cond_dim: 0,
         }
+    }
+
+    fn tiny_decode_model(device: &Device, sliding_window: Option<usize>) -> VoxtralLM {
+        let mut cfg = tiny_cfg();
+        cfg.num_hidden_layers = 1;
+        cfg.vocab_size = 16;
+        cfg.max_position_embeddings = Some(32);
+        cfg.sliding_window = sliding_window;
+        cfg.use_sliding_window = sliding_window.is_some();
+        let values = |count: usize, offset: usize| {
+            (0..count)
+                .map(|index| (((index * 7 + offset) % 19) as f32 - 9.0) / 23.0)
+                .collect::<Vec<_>>()
+        };
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "tok_embeddings.weight".into(),
+            Tensor::from_vec(values(64, 1), (16, 4), device).unwrap(),
+        );
+        for name in [
+            "layers.0.attention_norm.weight",
+            "layers.0.ffn_norm.weight",
+            "norm.weight",
+        ] {
+            tensors.insert(name.into(), Tensor::ones(4, DType::F32, device).unwrap());
+        }
+        for (name, shape, offset) in [
+            ("layers.0.attention.wq.weight", (4, 4), 2),
+            ("layers.0.attention.wk.weight", (2, 4), 3),
+            ("layers.0.attention.wv.weight", (2, 4), 4),
+            ("layers.0.attention.wo.weight", (4, 4), 5),
+            ("layers.0.feed_forward.w1.weight", (8, 4), 6),
+            ("layers.0.feed_forward.w3.weight", (8, 4), 7),
+            ("layers.0.feed_forward.w2.weight", (4, 8), 8),
+            ("output.weight", (16, 4), 9),
+        ] {
+            tensors.insert(
+                name.into(),
+                Tensor::from_vec(values(shape.0 * shape.1, offset), shape, device).unwrap(),
+            );
+        }
+        VoxtralLM::load(cfg, VarBuilder::from_tensors(tensors, DType::F32, device)).unwrap()
+    }
+
+    fn shared_decode_caches(
+        rows: usize,
+        model_instance: u64,
+        pages_per_row: usize,
+    ) -> (Arc<CpuKvArena>, Vec<PhysicalPagedKvCache>) {
+        let binding = KvLayerBinding {
+            model_layer: 0,
+            physical_layer: 0,
+        };
+        let arena = Arc::new(
+            CpuKvArena::new(KvArenaConfig {
+                id: KvArenaId {
+                    model_instance: ModelInstanceId::new(model_instance),
+                    backend: BackendKind::Cpu,
+                    device_ordinal: None,
+                    generation: 1,
+                },
+                group: KvGroupId::new(0),
+                page_tokens: 2,
+                capacity_pages: u32::try_from(rows * pages_per_row).unwrap(),
+                growth: None,
+                dtype: DType::F32,
+                layers: vec![KvLayerConfig {
+                    binding,
+                    num_kv_heads: 1,
+                    key_head_dim: 2,
+                    value_head_dim: 2,
+                }],
+            })
+            .unwrap(),
+        );
+        let caches = (0..rows)
+            .map(|row| {
+                let blocks = (row * pages_per_row..(row + 1) * pages_per_row)
+                    .map(|index| CacheBlockRef {
+                        arena: arena.id(),
+                        group: arena.config().group,
+                        index: u32::try_from(index).unwrap(),
+                        slot_generation: 1,
+                    })
+                    .collect();
+                let physical: Arc<dyn KvArena> = arena.clone();
+                PhysicalPagedKvCache::new(physical, vec![binding], blocks, 0).unwrap()
+            })
+            .collect();
+        (arena, caches)
+    }
+
+    fn deterministic_embeds(len: usize, offset: usize, device: &Device) -> Tensor {
+        Tensor::from_vec(
+            (0..len * 4)
+                .map(|index| ((index + offset) as f32 - 5.0) / 11.0)
+                .collect::<Vec<_>>(),
+            (1, len, 4),
+            device,
+        )
+        .unwrap()
+    }
+
+    fn assert_close(left: &Tensor, right: &Tensor) {
+        assert!(
+            max_abs_diff(left, right) < 1e-4,
+            "tensor mismatch: {}",
+            max_abs_diff(left, right)
+        );
+    }
+
+    #[test]
+    fn ragged_decode_matches_scalar_at_unequal_positions_and_dispatches_once() {
+        let device = Device::Cpu;
+        let model = tiny_decode_model(&device, None);
+        let (arena, mut caches) = shared_decode_caches(4, 901, 16);
+        let mut scalar_a = caches.remove(0);
+        let mut scalar_b = caches.remove(0);
+        let mut batch_a = caches.remove(0);
+        let mut batch_b = caches.remove(0);
+        let prompt_a = deterministic_embeds(2, 1, &device);
+        let prompt_b = deterministic_embeds(3, 7, &device);
+        for cache in [&mut scalar_a, &mut batch_a] {
+            model
+                .forward_managed_with_embeds(&prompt_a, 0, cache, None, None)
+                .unwrap();
+            cache.take_completed_writes();
+        }
+        for cache in [&mut scalar_b, &mut batch_b] {
+            model
+                .forward_managed_with_embeds(&prompt_b, 0, cache, None, None)
+                .unwrap();
+            cache.take_completed_writes();
+        }
+        let step_a = deterministic_embeds(1, 17, &device);
+        let step_b = deterministic_embeds(1, 23, &device);
+        let scalar_a_logits = model
+            .forward_managed_with_embeds(&step_a, 2, &mut scalar_a, None, None)
+            .unwrap();
+        let scalar_b_logits = model
+            .forward_managed_with_embeds(&step_b, 3, &mut scalar_b, None, None)
+            .unwrap();
+        let embeds = Tensor::cat(&[&step_a, &step_b], 0).unwrap();
+        let before = arena.operation_stats().paged_decode_dispatches;
+        let batch_logits = model
+            .forward_managed_decode_batch_with_embeds(
+                &embeds,
+                &[2, 3],
+                &mut [&mut batch_a, &mut batch_b],
+                None,
+            )
+            .unwrap();
+
+        assert_close(
+            &scalar_a_logits,
+            &batch_logits.i(0).unwrap().unsqueeze(0).unwrap(),
+        );
+        assert_close(
+            &scalar_b_logits,
+            &batch_logits.i(1).unwrap().unsqueeze(0).unwrap(),
+        );
+        assert_eq!(arena.operation_stats().paged_decode_dispatches - before, 1);
+        assert_eq!((batch_a.context_len(), batch_b.context_len()), (3, 4));
+        assert_eq!(batch_a.take_completed_writes().len(), 1);
+        assert_eq!(batch_b.take_completed_writes().len(), 1);
+    }
+
+    #[test]
+    fn ragged_decode_rotates_each_sliding_window_like_scalar() {
+        let device = Device::Cpu;
+        let model = tiny_decode_model(&device, Some(3));
+        let (_, mut caches) = shared_decode_caches(4, 902, 2);
+        let mut scalar_a = caches.remove(0);
+        let mut scalar_b = caches.remove(0);
+        let mut batch_a = caches.remove(0);
+        let mut batch_b = caches.remove(0);
+        let prompt = deterministic_embeds(4, 3, &device);
+        for cache in [&mut scalar_a, &mut scalar_b, &mut batch_a, &mut batch_b] {
+            model
+                .forward_managed_with_embeds(&prompt, 0, cache, None, None)
+                .unwrap();
+            cache.take_completed_writes();
+        }
+        let step_a = deterministic_embeds(1, 31, &device);
+        let step_b = deterministic_embeds(1, 37, &device);
+        let scalar_a_logits = model
+            .forward_managed_with_embeds(&step_a, 4, &mut scalar_a, None, None)
+            .unwrap();
+        let scalar_b_logits = model
+            .forward_managed_with_embeds(&step_b, 4, &mut scalar_b, None, None)
+            .unwrap();
+        let batch_logits = model
+            .forward_managed_decode_batch_with_embeds(
+                &Tensor::cat(&[&step_a, &step_b], 0).unwrap(),
+                &[4, 4],
+                &mut [&mut batch_a, &mut batch_b],
+                None,
+            )
+            .unwrap();
+
+        assert_close(
+            &scalar_a_logits,
+            &batch_logits.i(0).unwrap().unsqueeze(0).unwrap(),
+        );
+        assert_close(
+            &scalar_b_logits,
+            &batch_logits.i(1).unwrap().unsqueeze(0).unwrap(),
+        );
+        assert_eq!((batch_a.window_start(), batch_b.window_start()), (2, 2));
+    }
+
+    #[test]
+    fn ragged_decode_rejects_mixed_arenas_without_advancing_rows() {
+        let device = Device::Cpu;
+        let model = tiny_decode_model(&device, None);
+        let (_, mut left) = shared_decode_caches(1, 903, 16);
+        let (_, mut right) = shared_decode_caches(1, 904, 16);
+        let mut cache_a = left.remove(0);
+        let mut cache_b = right.remove(0);
+        let prompt = deterministic_embeds(2, 1, &device);
+        for cache in [&mut cache_a, &mut cache_b] {
+            model
+                .forward_managed_with_embeds(&prompt, 0, cache, None, None)
+                .unwrap();
+            cache.take_completed_writes();
+        }
+        let embeds = Tensor::cat(
+            &[
+                &deterministic_embeds(1, 11, &device),
+                &deterministic_embeds(1, 13, &device),
+            ],
+            0,
+        )
+        .unwrap();
+        assert!(model
+            .forward_managed_decode_batch_with_embeds(
+                &embeds,
+                &[2, 2],
+                &mut [&mut cache_a, &mut cache_b],
+                None,
+            )
+            .is_err());
+        assert_eq!((cache_a.context_len(), cache_b.context_len()), (2, 2));
+        assert!(cache_a.take_completed_writes().is_empty());
+        assert!(cache_b.take_completed_writes().is_empty());
     }
 
     fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {

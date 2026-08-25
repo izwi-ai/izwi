@@ -8,6 +8,7 @@ use std::sync::Arc;
 use candle_core::Tensor;
 
 use crate::error::{Error, Result};
+use crate::kv::KvArenaId;
 use crate::models::shared::attention::physical::PhysicalPagedKvSequenceAuthority;
 
 static NEXT_VOXTRAL_REALTIME_STATE_ID: AtomicU64 = AtomicU64::new(1);
@@ -23,6 +24,12 @@ pub(crate) struct VoxtralRealtimeState {
     pub(super) state_id: u64,
     pub(super) next_quantum_nonce: u64,
     pub(super) active_quantum: Option<u64>,
+    pub(super) active_cache_arena: Option<KvArenaId>,
+    pub(super) active_cache_view_id: Option<u64>,
+    /// Monotonic artifact authority. This deliberately is not part of a host
+    /// checkpoint: rolling back a cancelled install must not make its artifact
+    /// replayable by a later operation.
+    pub(super) preparation_generation: u64,
     bound_cache_authority: Option<PhysicalPagedKvSequenceAuthority>,
     pub(super) language: Option<String>,
     pub(super) source_sample_rate: Option<u32>,
@@ -67,6 +74,9 @@ impl VoxtralRealtimeState {
             state_id: NEXT_VOXTRAL_REALTIME_STATE_ID.fetch_add(1, Ordering::Relaxed),
             next_quantum_nonce: 1,
             active_quantum: None,
+            active_cache_arena: None,
+            active_cache_view_id: None,
+            preparation_generation: 1,
             bound_cache_authority: None,
             language: language.map(ToOwned::to_owned),
             source_sample_rate: None,
@@ -191,6 +201,12 @@ impl VoxtralRealtimeState {
                 Ok(())
             }
         }
+    }
+
+    pub(super) fn active_cache_matches(&self, arena: KvArenaId, view_id: u64) -> bool {
+        self.active_quantum.is_some()
+            && self.active_cache_arena == Some(arena)
+            && self.active_cache_view_id == Some(view_id)
     }
 
     pub(super) fn checkpoint(&self) -> VoxtralRealtimeHostCheckpoint {
@@ -361,6 +377,9 @@ impl VoxtralRealtimeBuffer {
 #[cfg(test)]
 mod tests {
     use super::{VoxtralRealtimeBuffer, VoxtralRealtimeState};
+    use crate::backends::BackendKind;
+    use crate::engine::ModelInstanceId;
+    use crate::kv::KvArenaId;
 
     fn tiny_buffer() -> VoxtralRealtimeBuffer {
         let mut buffer = VoxtralRealtimeBuffer::new(10, 100.0, 200.0, 0.0, 10.0);
@@ -438,5 +457,40 @@ mod tests {
         assert!(!state.final_padding_applied);
         assert_eq!(state.next_audio_frame, 0);
         assert_eq!(state.source_samples.as_ref(), &vec![0.1, 0.2]);
+    }
+
+    #[test]
+    fn retained_state_rollback_does_not_rearm_consumed_preparation_generation() {
+        let mut state = VoxtralRealtimeState::new(None);
+        state.append_source_samples(&[0.1, 0.2], 16_000).unwrap();
+        let checkpoint = state.checkpoint();
+        let prior_source = state.source_samples.clone();
+        let consumed_generation = state.preparation_generation;
+
+        state.preparation_generation += 1;
+        state.source_samples = std::sync::Arc::new(vec![0.3, 0.4]);
+        state.restore_checkpoint(checkpoint);
+
+        assert!(std::sync::Arc::ptr_eq(&prior_source, &state.source_samples));
+        assert_ne!(state.preparation_generation, consumed_generation);
+    }
+
+    #[test]
+    fn retained_state_active_quantum_authenticates_exact_cache_view() {
+        let mut state = VoxtralRealtimeState::new(None);
+        let arena = KvArenaId {
+            model_instance: ModelInstanceId::new(7),
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            generation: 3,
+        };
+        state.active_quantum = Some(1);
+        state.active_cache_arena = Some(arena);
+        state.active_cache_view_id = Some(11);
+
+        assert!(state.active_cache_matches(arena, 11));
+        assert!(!state.active_cache_matches(arena, 12));
+        state.active_quantum = None;
+        assert!(!state.active_cache_matches(arena, 11));
     }
 }
