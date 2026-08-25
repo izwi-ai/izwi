@@ -694,7 +694,8 @@ fn validate_retained_state_use(
     } else {
         matches!(
             retained_state_use,
-            RetainedStateUseV2::ExternalPaged if external_paged
+            RetainedStateUseV2::ExternalPaged | RetainedStateUseV2::ExternalPagedStatic
+                if external_paged
         ) || matches!(retained_state_use, RetainedStateUseV2::Inactive if cacheless)
     };
     if !valid {

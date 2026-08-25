@@ -52,6 +52,9 @@ pub(crate) use cache::invocation_tensor::{
     InvocationTensorPoolId, InvocationTensorPoolOwner, InvocationTensorSlotRef,
 };
 
+pub(crate) use cache::composite::{
+    CompositeRetainedStateRuntimeIdV2, CompositeRetainedStateRuntimeV2,
+};
 #[cfg(test)]
 pub(crate) use cache::managed::ManagedKvCacheManager;
 pub(crate) use cache::managed::ManagedKvModelRuntime;

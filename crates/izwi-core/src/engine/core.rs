@@ -13,6 +13,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use super::cache::composite::{
+    allocate_composite_retained_state, project_composite_paged_contract,
+    unload_composite_retained_state, CompositeRetainedStateRuntimeV2,
+};
 use super::cache::managed::{ManagedKvCacheManager, ManagedStateCapacityRequest};
 use super::cache::physical::{InvocationPhysicalKey, PhysicalStateManager};
 use super::config::EngineCoreConfig;
@@ -404,6 +408,8 @@ pub struct EngineCore {
     managed_kv_cache: ManagedKvCacheManager,
     /// Lifecycle owner for invocation-scoped physical state arenas.
     physical_state: PhysicalStateManager,
+    /// Strong load-generation identity for composite retained backings.
+    composite_retained_state: HashMap<ModelInstanceId, Arc<CompositeRetainedStateRuntimeV2>>,
     /// Model executor
     executor: UnifiedExecutor,
     /// Output processor
@@ -1965,6 +1971,7 @@ impl EngineCore {
             scheduler,
             managed_kv_cache,
             physical_state,
+            composite_retained_state: HashMap::new(),
             executor,
             output_processor,
             requests: HashMap::new(),
@@ -3712,6 +3719,56 @@ impl EngineCore {
         Ok(runtime)
     }
 
+    pub(crate) fn load_composite_retained_state(
+        &mut self,
+        model_instance: super::ModelInstanceId,
+        full_contract: &crate::kv::v2::InferenceStateContract,
+        static_domain: crate::kv::v2::StateDomainId,
+        logical_context_tokens: Option<usize>,
+    ) -> Result<Arc<CompositeRetainedStateRuntimeV2>> {
+        if self.composite_retained_state.contains_key(&model_instance) {
+            return Err(Error::InvalidInput(
+                "composite retained state already owns this model generation".into(),
+            ));
+        }
+        let backend = self.managed_kv_cache.worker_backend();
+        let logical_token_reach = self.resolve_managed_token_reach_for_contract(
+            backend,
+            model_instance,
+            &project_composite_paged_contract(full_contract, static_domain)?,
+            logical_context_tokens,
+            1,
+        )?;
+        let sequence_capacity = u32::try_from(self.config.max_retained_sequences)
+            .map_err(|_| Error::InvalidInput("managed state sequence limit exceeds u32".into()))?;
+        let runtime = allocate_composite_retained_state(
+            &mut self.managed_kv_cache,
+            &mut self.physical_state,
+            model_instance,
+            backend,
+            ManagedStateCapacityRequest {
+                total_paged_pages: u32::try_from(self.config.max_blocks).map_err(|_| {
+                    Error::InvalidInput("managed KV page budget exceeds u32".into())
+                })?,
+                logical_token_reach,
+                retained_sequence_rows: sequence_capacity,
+                staged_transaction_rows: u32::try_from(self.config.max_staged_transactions)
+                    .map_err(|_| {
+                        Error::InvalidInput("managed state transaction limit exceeds u32".into())
+                    })?,
+            },
+            self.config.block_size,
+            full_contract,
+            static_domain,
+        )?;
+        let replaced = self
+            .composite_retained_state
+            .insert(model_instance, runtime.clone())
+            .is_some();
+        debug_assert!(!replaced, "fresh composite generation replaced an owner");
+        Ok(runtime)
+    }
+
     fn resolve_managed_token_reach_for_contract(
         &self,
         backend: BackendKind,
@@ -3797,9 +3854,48 @@ impl EngineCore {
         &mut self,
         model_instance: super::ModelInstanceId,
     ) -> Result<bool> {
-        let invocation = self.physical_state.unload_model(model_instance)?;
-        let retained = self.managed_kv_cache.unload_model(model_instance)?;
-        Ok(invocation || retained)
+        if let Some(runtime) = self.composite_retained_state.get(&model_instance) {
+            if Arc::strong_count(runtime) != 1 {
+                return Err(Error::InferenceError(format!(
+                    "composite retained model {} still has live publication/request handles",
+                    model_instance.get()
+                )));
+            }
+            let physical_prepared = self
+                .physical_state
+                .prepare_unload_model_with_static_runtime_owners(model_instance, 2);
+            let paged_prepared = self
+                .managed_kv_cache
+                .prepare_unload_model_with_runtime_owners(model_instance, 2);
+            let (physical_present, paged_present) =
+                match (physical_prepared, paged_prepared) {
+                    (Ok(physical), Ok(paged)) => (physical, paged),
+                    (physical, paged) => {
+                        return Err(Error::InferenceError(format!(
+                            "composite unload did not fence every backing: physical={physical:?}; paged={paged:?}"
+                        )))
+                    }
+                };
+            drop(
+                self.composite_retained_state
+                    .remove(&model_instance)
+                    .expect("composite runtime was authenticated above"),
+            );
+            let physical_removed = physical_present
+                && self
+                    .physical_state
+                    .commit_prepared_unload_model(model_instance);
+            let paged_removed = paged_present
+                && self
+                    .managed_kv_cache
+                    .commit_prepared_unload_model(model_instance);
+            return Ok(physical_removed || paged_removed);
+        }
+        unload_composite_retained_state(
+            &mut self.managed_kv_cache,
+            &mut self.physical_state,
+            model_instance,
+        )
     }
 
     /// Abort every request tracked by the core and release executor state.
@@ -7617,5 +7713,38 @@ mod tests {
             "scheduler prefill timing remains available"
         );
         assert_eq!(latency.decode_ms, 0.0);
+    }
+
+    #[test]
+    fn load_owned_composite_survives_weak_request_upgrade_until_ordered_unload() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
+            Mutex::new(Vec::new()),
+        ))));
+        let config = EngineCoreConfig {
+            block_size: 16,
+            max_blocks: 8,
+            max_retained_sequences: 2,
+            max_staged_transactions: 2,
+            ..Default::default()
+        };
+        let mut core = EngineCore::new_with_unified_executor(config, executor).unwrap();
+        let model = ModelInstanceId::new(76);
+        let loaded = core
+            .load_composite_retained_state(
+                model,
+                &crate::engine::cache::composite::tests::contract(),
+                crate::kv::v2::StateDomainId::new(2),
+                Some(32),
+            )
+            .unwrap();
+        let request_weak = Arc::downgrade(&loaded);
+        drop(loaded);
+        let request_upgrade = request_weak
+            .upgrade()
+            .expect("Core load owner keeps weak request identity live");
+        assert!(core.unload_managed_model_cache(model).is_err());
+        drop(request_upgrade);
+        assert!(core.unload_managed_model_cache(model).unwrap());
+        assert!(request_weak.upgrade().is_none());
     }
 }

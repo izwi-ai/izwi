@@ -231,6 +231,10 @@ pub(crate) struct PhysicalStateManager {
 }
 
 impl PhysicalStateManager {
+    pub(crate) fn contains_model(&self, model_instance: ModelInstanceId) -> bool {
+        self.models.contains_key(&model_instance)
+    }
+
     pub(crate) fn for_worker(
         resource_authority: Option<Arc<ResourceAuthority>>,
         backend: BackendKind,
@@ -254,6 +258,22 @@ impl PhysicalStateManager {
 
     pub(crate) fn cpu(resource_authority: Option<Arc<ResourceAuthority>>) -> Self {
         Self::for_worker(resource_authority, BackendKind::Cpu, Device::Cpu)
+    }
+
+    pub(crate) fn resolve_state_plan(
+        &self,
+        contract: &InferenceStateContract,
+        page_tokens_hint: Option<u32>,
+    ) -> Result<Arc<ResolvedStatePlan>> {
+        Ok(Arc::new(negotiate_state_plan(
+            contract,
+            &StateBackendPlanRequest {
+                backend: self.worker_backend,
+                device_ordinal: self.worker_device_ordinal,
+                page_tokens_hint,
+                storage_dtype_hint: None,
+            },
+        )?))
     }
 
     pub(crate) fn allocate_retained_tensor(
@@ -370,7 +390,41 @@ impl PhysicalStateManager {
         domain: StateDomainId,
         sequence_capacity: u32,
     ) -> Result<Arc<RetainedStaticAttentionRuntimeV2>> {
+        let state_plan = Arc::new(negotiate_state_plan(
+            contract,
+            &StateBackendPlanRequest {
+                backend: self.worker_backend,
+                device_ordinal: self.worker_device_ordinal,
+                page_tokens_hint: None,
+                storage_dtype_hint: None,
+            },
+        )?);
+        self.allocate_retained_static_attention_with_plan(
+            model_instance,
+            contract,
+            state_plan,
+            domain,
+            sequence_capacity,
+        )
+    }
+
+    pub(crate) fn allocate_retained_static_attention_with_plan(
+        &mut self,
+        model_instance: ModelInstanceId,
+        contract: &InferenceStateContract,
+        state_plan: Arc<ResolvedStatePlan>,
+        domain: StateDomainId,
+        sequence_capacity: u32,
+    ) -> Result<Arc<RetainedStaticAttentionRuntimeV2>> {
         contract.validate()?;
+        if state_plan.contract_fingerprint != contract.fingerprint()?
+            || state_plan.backend != self.worker_backend
+            || state_plan.device_ordinal != self.worker_device_ordinal
+        {
+            return Err(invalid(
+                "retained static-attention resolved plan does not match its contract/worker",
+            ));
+        }
         let semantic = contract
             .domains
             .iter()
@@ -395,6 +449,7 @@ impl PhysicalStateManager {
             .and_then(|model| model.retained_static_attention.as_ref())
         {
             if existing.runtime.state_plan_v2().contract_fingerprint != contract.fingerprint()?
+                || existing.runtime.state_plan_v2().id != state_plan.id
                 || existing.runtime.id().domain != domain
                 || existing.runtime.sequence_capacity() != sequence_capacity
             {
@@ -404,15 +459,6 @@ impl PhysicalStateManager {
             }
             return Ok(existing.runtime.clone());
         }
-        let state_plan = Arc::new(negotiate_state_plan(
-            contract,
-            &StateBackendPlanRequest {
-                backend: self.worker_backend,
-                device_ordinal: self.worker_device_ordinal,
-                page_tokens_hint: None,
-                storage_dtype_hint: None,
-            },
-        )?);
         let resolved = state_plan
             .non_paged
             .iter()
@@ -840,9 +886,22 @@ impl PhysicalStateManager {
         Ok(handle)
     }
 
-    /// Close every pool first so a failed active-lease drain cannot admit new
-    /// work. Removal and resource release occur only after all pools fence.
-    pub(crate) fn unload_model(&mut self, model_instance: ModelInstanceId) -> Result<bool> {
+    /// Close and fence every owner without removing its resource lease. A
+    /// composite owner uses this as the first half of a two-manager unload.
+    pub(crate) fn prepare_unload_model(&mut self, model_instance: ModelInstanceId) -> Result<bool> {
+        self.prepare_unload_model_with_static_runtime_owners(model_instance, 1)
+    }
+
+    pub(crate) fn prepare_unload_model_with_static_runtime_owners(
+        &mut self,
+        model_instance: ModelInstanceId,
+        expected_static_runtime_owners: usize,
+    ) -> Result<bool> {
+        if expected_static_runtime_owners == 0 {
+            return Err(invalid(
+                "physical unload expected zero retained static runtime owners",
+            ));
+        }
         let Some(model) = self.models.get(&model_instance) else {
             return Ok(false);
         };
@@ -865,6 +924,14 @@ impl PhysicalStateManager {
         if let Some(retained) = model.retained_static_attention.as_ref() {
             if let Err(error) = retained.runtime.close_and_validate_drained() {
                 drain_error.get_or_insert(error);
+            }
+            if Arc::strong_count(&retained.runtime) != expected_static_runtime_owners {
+                drain_error.get_or_insert_with(|| {
+                    Error::InferenceError(format!(
+                        "retained static-attention runtime has {} owners, expected {expected_static_runtime_owners}",
+                        Arc::strong_count(&retained.runtime)
+                    ))
+                });
             }
         }
         if let Some(error) = drain_error {
@@ -911,12 +978,21 @@ impl PhysicalStateManager {
                 lease.prepare_materialized_release(ResourceVector::zero())?;
             }
         }
-        let removed = self
-            .models
-            .remove(&model_instance)
-            .expect("physical state record was validated under exclusive access");
-        drop(removed);
         Ok(true)
+    }
+
+    pub(crate) fn commit_prepared_unload_model(&mut self, model_instance: ModelInstanceId) -> bool {
+        let removed = self.models.remove(&model_instance);
+        removed.is_some()
+    }
+
+    /// Close every pool first so a failed active-lease drain cannot admit new
+    /// work. Removal and resource release occur only after all pools fence.
+    pub(crate) fn unload_model(&mut self, model_instance: ModelInstanceId) -> Result<bool> {
+        if !self.prepare_unload_model(model_instance)? {
+            return Ok(false);
+        }
+        Ok(self.commit_prepared_unload_model(model_instance))
     }
 
     #[cfg(test)]
@@ -2129,6 +2205,7 @@ mod tests {
         assert!(manager.unload_model(model).is_err());
         assert!(runtime.register_sequence().is_err());
         runtime.release_sequence(sequence).unwrap();
+        drop(runtime);
         assert!(manager.unload_model(model).unwrap());
         assert_eq!(manager.model_count(), 0);
     }

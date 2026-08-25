@@ -11,11 +11,13 @@ use crate::engine::{
     ModelInstanceId,
 };
 use crate::engine::{
-    InvocationPagedKvCompletion, InvocationPagedKvLease, InvocationPagedKvPoolHandle,
-    InvocationPagedKvPoolId,
+    CompositeRetainedStateRuntimeIdV2, CompositeRetainedStateRuntimeV2, ManagedKvModelRuntime,
+    RetainedStaticAttentionRuntimeV2, RetainedTensorStateRuntimeIdV2, RetainedTensorStateRuntimeV2,
+    StageId,
 };
 use crate::engine::{
-    ManagedKvModelRuntime, RetainedTensorStateRuntimeIdV2, RetainedTensorStateRuntimeV2, StageId,
+    InvocationPagedKvCompletion, InvocationPagedKvLease, InvocationPagedKvPoolHandle,
+    InvocationPagedKvPoolId,
 };
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
@@ -38,12 +40,14 @@ const MANAGED_RUNTIME_FINGERPRINT_DOMAIN: &[u8] = b"izwi.inference-state.managed
 pub(crate) enum RetainedStateUseV2 {
     Inactive,
     ExternalPaged,
+    ExternalPagedStatic,
     ExternalTensor,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) enum RetainedStateRuntimeV2 {
     Paged(Arc<ManagedKvModelRuntime>),
+    PagedStatic(Arc<CompositeRetainedStateRuntimeV2>),
     Tensor(Arc<RetainedTensorStateRuntimeV2>),
 }
 
@@ -59,10 +63,17 @@ impl From<Arc<RetainedTensorStateRuntimeV2>> for RetainedStateRuntimeV2 {
     }
 }
 
+impl From<Arc<CompositeRetainedStateRuntimeV2>> for RetainedStateRuntimeV2 {
+    fn from(runtime: Arc<CompositeRetainedStateRuntimeV2>) -> Self {
+        Self::PagedStatic(runtime)
+    }
+}
+
 impl RetainedStateRuntimeV2 {
     pub(crate) fn model_instance(&self) -> ModelInstanceId {
         match self {
             Self::Paged(runtime) => runtime.plan().model_instance,
+            Self::PagedStatic(runtime) => runtime.id().model_instance,
             Self::Tensor(runtime) => runtime.id().model_instance,
         }
     }
@@ -70,6 +81,7 @@ impl RetainedStateRuntimeV2 {
     pub(crate) fn state_plan_v2(&self) -> &ResolvedStatePlan {
         match self {
             Self::Paged(runtime) => runtime.state_plan_v2(),
+            Self::PagedStatic(runtime) => runtime.state_plan_v2(),
             Self::Tensor(runtime) => runtime.state_plan_v2(),
         }
     }
@@ -81,6 +93,9 @@ impl RetainedStateRuntimeV2 {
     fn downgrade(&self) -> WeakRetainedStateRuntimeV2 {
         match self {
             Self::Paged(runtime) => WeakRetainedStateRuntimeV2::Paged(Arc::downgrade(runtime)),
+            Self::PagedStatic(runtime) => {
+                WeakRetainedStateRuntimeV2::PagedStatic(Arc::downgrade(runtime))
+            }
             Self::Tensor(runtime) => WeakRetainedStateRuntimeV2::Tensor(Arc::downgrade(runtime)),
         }
     }
@@ -89,6 +104,9 @@ impl RetainedStateRuntimeV2 {
         match self {
             Self::Paged(runtime) => RetainedStateRuntimeIdentityV2::Paged {
                 plan: runtime.plan().id,
+            },
+            Self::PagedStatic(runtime) => RetainedStateRuntimeIdentityV2::PagedStatic {
+                runtime: runtime.id(),
             },
             Self::Tensor(runtime) => RetainedStateRuntimeIdentityV2::Tensor {
                 runtime: runtime.id(),
@@ -100,6 +118,7 @@ impl RetainedStateRuntimeV2 {
 #[derive(Debug, Clone)]
 enum WeakRetainedStateRuntimeV2 {
     Paged(Weak<ManagedKvModelRuntime>),
+    PagedStatic(Weak<CompositeRetainedStateRuntimeV2>),
     Tensor(Weak<RetainedTensorStateRuntimeV2>),
 }
 
@@ -107,6 +126,9 @@ impl WeakRetainedStateRuntimeV2 {
     fn upgrade(&self) -> Option<RetainedStateRuntimeV2> {
         match self {
             Self::Paged(runtime) => runtime.upgrade().map(RetainedStateRuntimeV2::Paged),
+            Self::PagedStatic(runtime) => {
+                runtime.upgrade().map(RetainedStateRuntimeV2::PagedStatic)
+            }
             Self::Tensor(runtime) => runtime.upgrade().map(RetainedStateRuntimeV2::Tensor),
         }
     }
@@ -121,6 +143,9 @@ fn retained_use_matches(
         RetainedStateUseV2::ExternalPaged => {
             matches!(runtime, RetainedStateRuntimeV2::Paged(_))
         }
+        RetainedStateUseV2::ExternalPagedStatic => {
+            matches!(runtime, RetainedStateRuntimeV2::PagedStatic(_))
+        }
         RetainedStateUseV2::ExternalTensor => {
             matches!(runtime, RetainedStateRuntimeV2::Tensor(_))
         }
@@ -131,6 +156,9 @@ fn retained_use_matches(
 enum RetainedStateRuntimeIdentityV2 {
     Paged {
         plan: crate::kv::KvPlanId,
+    },
+    PagedStatic {
+        runtime: CompositeRetainedStateRuntimeIdV2,
     },
     Tensor {
         runtime: RetainedTensorStateRuntimeIdV2,
@@ -1355,10 +1383,40 @@ impl CapabilityStateRuntimeV2 {
             {
                 match runtime.retained.upgrade()? {
                     RetainedStateRuntimeV2::Paged(physical) => Some(physical),
-                    RetainedStateRuntimeV2::Tensor(_) => None,
+                    RetainedStateRuntimeV2::PagedStatic(_) | RetainedStateRuntimeV2::Tensor(_) => {
+                        None
+                    }
+                }
+            }
+            CapabilityStateRuntimeBackingV2::Managed(runtime)
+                if runtime.retained_state_use == RetainedStateUseV2::ExternalPagedStatic =>
+            {
+                match runtime.retained.upgrade()? {
+                    RetainedStateRuntimeV2::PagedStatic(physical) => Some(physical.paged()),
+                    RetainedStateRuntimeV2::Paged(_) | RetainedStateRuntimeV2::Tensor(_) => None,
                 }
             }
             CapabilityStateRuntimeBackingV2::Managed(_) => None,
+        }
+    }
+
+    pub(crate) fn retained_static_attention_runtime(
+        &self,
+    ) -> Option<Arc<RetainedStaticAttentionRuntimeV2>> {
+        match &self.backing {
+            CapabilityStateRuntimeBackingV2::Managed(runtime)
+                if runtime.retained_state_use == RetainedStateUseV2::ExternalPagedStatic =>
+            {
+                match runtime.retained.upgrade()? {
+                    RetainedStateRuntimeV2::PagedStatic(physical) => {
+                        Some(physical.static_attention())
+                    }
+                    RetainedStateRuntimeV2::Paged(_) | RetainedStateRuntimeV2::Tensor(_) => None,
+                }
+            }
+            CapabilityStateRuntimeBackingV2::Stateless(_)
+            | CapabilityStateRuntimeBackingV2::Invocation(_)
+            | CapabilityStateRuntimeBackingV2::Managed(_) => None,
         }
     }
 
@@ -1371,7 +1429,9 @@ impl CapabilityStateRuntimeV2 {
             {
                 match runtime.retained.upgrade()? {
                     RetainedStateRuntimeV2::Tensor(physical) => Some(physical),
-                    RetainedStateRuntimeV2::Paged(_) => None,
+                    RetainedStateRuntimeV2::Paged(_) | RetainedStateRuntimeV2::PagedStatic(_) => {
+                        None
+                    }
                 }
             }
             CapabilityStateRuntimeBackingV2::Stateless(_)

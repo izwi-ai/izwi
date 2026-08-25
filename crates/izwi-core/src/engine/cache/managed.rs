@@ -328,6 +328,7 @@ impl ManagedKvModelRuntime {
 }
 
 struct ManagedKvModelState {
+    closing: bool,
     contract: InferenceStateContract,
     runtime: Arc<ManagedKvModelRuntime>,
     coordinators: HashMap<KvArenaId, KvCacheCoordinator>,
@@ -364,6 +365,8 @@ pub(crate) struct ManagedKvCacheManager {
     worker_device_ordinal: Option<u32>,
     backend_runtime: Option<Arc<dyn KvBackendRuntime>>,
     backend_unavailable: Option<String>,
+    #[cfg(test)]
+    fail_next_composite_synchronize: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -389,8 +392,21 @@ impl Default for ManagedKvCacheManager {
 }
 
 impl ManagedKvCacheManager {
+    pub(crate) fn contains_model(&self, model_instance: ModelInstanceId) -> bool {
+        self.models.contains_key(&model_instance)
+    }
+
     pub(crate) fn synchronize_worker(&self) -> Result<()> {
         self.worker_device.synchronize().map_err(Error::from)
+    }
+    #[cfg(test)]
+    pub(crate) fn inject_composite_synchronize_failure(&mut self) {
+        self.fail_next_composite_synchronize = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_composite_synchronize_failure(&mut self) -> bool {
+        std::mem::take(&mut self.fail_next_composite_synchronize)
     }
     #[cfg(test)]
     pub(crate) fn model_count(&self) -> usize {
@@ -421,6 +437,8 @@ impl ManagedKvCacheManager {
             worker_device_ordinal: managed_device_ordinal(&device),
             backend_runtime,
             backend_unavailable,
+            #[cfg(test)]
+            fail_next_composite_synchronize: false,
         }
     }
 
@@ -1125,6 +1143,7 @@ impl ManagedKvCacheManager {
         self.models.insert(
             model_instance,
             ManagedKvModelState {
+                closing: false,
                 contract: contract.clone(),
                 runtime: runtime.clone(),
                 coordinators,
@@ -1163,6 +1182,11 @@ impl ManagedKvCacheManager {
                     .to_string(),
             )
         })?;
+        if state.closing {
+            return Err(Error::InferenceError(
+                "managed KV runtime is closing".to_string(),
+            ));
+        }
         if backend != self.worker_backend
             || state.runtime.plan.backend != backend
             || &state.contract != contract
@@ -1188,6 +1212,15 @@ impl ManagedKvCacheManager {
         let target_committed_tokens = u32::try_from(input.end).map_err(|_| {
             Error::InvalidInput("managed KV token position exceeds u32".to_string())
         })?;
+        if self
+            .models
+            .get(&runtime.plan.model_instance)
+            .is_some_and(|state| state.closing)
+        {
+            return Err(Error::InferenceError(
+                "managed KV runtime is closing".to_string(),
+            ));
+        }
         let namespace = managed_prefix_namespace(request, runtime, self.prefix_cache_salt)?;
         let tensor_transaction = runtime
             .tensor_state()
@@ -1866,10 +1899,24 @@ impl ManagedKvCacheManager {
     /// generation. The model-scoped physical lease is retained until no
     /// session, row transaction, device fence, or external runtime handle can
     /// still reference the backing storage.
-    pub(crate) fn unload_model(&mut self, model_instance: ModelInstanceId) -> Result<bool> {
+    pub(crate) fn prepare_unload_model(&mut self, model_instance: ModelInstanceId) -> Result<bool> {
+        self.prepare_unload_model_with_runtime_owners(model_instance, 1)
+    }
+
+    pub(crate) fn prepare_unload_model_with_runtime_owners(
+        &mut self,
+        model_instance: ModelInstanceId,
+        expected_runtime_owners: usize,
+    ) -> Result<bool> {
+        if expected_runtime_owners == 0 {
+            return Err(Error::InvalidInput(
+                "managed KV unload expected zero runtime owners".into(),
+            ));
+        }
         let Some(state) = self.models.get_mut(&model_instance) else {
             return Ok(false);
         };
+        state.closing = true;
         if !state.registered_sessions.is_empty() {
             return Err(Error::InferenceError(format!(
                 "managed KV model {} still has registered sessions",
@@ -1882,10 +1929,11 @@ impl ManagedKvCacheManager {
                 model_instance.get()
             )));
         }
-        if Arc::strong_count(&state.runtime) != 1 {
+        if Arc::strong_count(&state.runtime) != expected_runtime_owners {
             return Err(Error::InferenceError(format!(
-                "managed KV model {} still has live runtime handles",
-                model_instance.get()
+                "managed KV model {} has {} runtime owners, expected {expected_runtime_owners}",
+                model_instance.get(),
+                Arc::strong_count(&state.runtime),
             )));
         }
         for group in &state.runtime.plan.groups {
@@ -1928,12 +1976,18 @@ impl ManagedKvCacheManager {
         if let Some(lease) = state.resource_lease.as_ref() {
             lease.prepare_materialized_release(ResourceVector::zero())?;
         }
-        let removed = self
-            .models
-            .remove(&model_instance)
-            .expect("managed KV state was validated under exclusive manager access");
-        drop(removed);
         Ok(true)
+    }
+
+    pub(crate) fn commit_prepared_unload_model(&mut self, model_instance: ModelInstanceId) -> bool {
+        self.models.remove(&model_instance).is_some()
+    }
+
+    pub(crate) fn unload_model(&mut self, model_instance: ModelInstanceId) -> Result<bool> {
+        if !self.prepare_unload_model(model_instance)? {
+            return Ok(false);
+        }
+        Ok(self.commit_prepared_unload_model(model_instance))
     }
 
     #[cfg(test)]

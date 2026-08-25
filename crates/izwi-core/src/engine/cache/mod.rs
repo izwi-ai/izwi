@@ -1,5 +1,6 @@
 //! Engine cache subsystem.
 
+pub(crate) mod composite;
 pub mod coordinator;
 pub(crate) mod invocation;
 pub(crate) mod invocation_tensor;
