@@ -106,6 +106,7 @@ pub(super) enum NativeBatchRoute {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum NativeAudioStage {
+    PreSequencePreparation,
     SequencePrefill,
     SequenceDecode,
     Atomic,
@@ -129,6 +130,7 @@ impl NativeBatchRoute {
 
     fn audio_stage(work: &WorkUnit) -> NativeAudioStage {
         match work {
+            WorkUnit::PreSequencePreparation { .. } => NativeAudioStage::PreSequencePreparation,
             WorkUnit::SequenceStep {
                 phase: SequencePhase::Prefill,
                 ..

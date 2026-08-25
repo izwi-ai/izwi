@@ -94,6 +94,12 @@ pub enum SequencePhase {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum WorkUnit {
+    /// A model stage that must complete before the request's execution shape
+    /// and persistent sequence state can be admitted. Preparation is a
+    /// distinct transaction: it must not be represented as decoder prefill.
+    PreSequencePreparation {
+        kind: String,
+    },
     SequenceStep {
         phase: SequencePhase,
         input: InputRange,
@@ -177,6 +183,7 @@ pub enum StageProgressKind {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StageWorkSelector {
     Any,
+    PreSequencePreparation,
     SequencePrefill,
     SequenceDecode,
     Atomic,
@@ -187,6 +194,7 @@ impl StageWorkSelector {
     fn matches(self, work: &WorkUnit) -> bool {
         match (self, work) {
             (Self::Any, _) => true,
+            (Self::PreSequencePreparation, WorkUnit::PreSequencePreparation { .. }) => true,
             (
                 Self::SequencePrefill,
                 WorkUnit::SequenceStep {
@@ -555,7 +563,7 @@ impl WorkCost {
         }
     }
 
-    fn checked_add(self, other: Self) -> Option<Self> {
+    pub(crate) fn checked_add(self, other: Self) -> Option<Self> {
         Some(Self {
             logical_units: self.logical_units.checked_add(other.logical_units)?,
             tensor_elements: self.tensor_elements.checked_add(other.tensor_elements)?,
@@ -2031,6 +2039,12 @@ impl ExecutionReport {
             ));
         }
         match plan.work {
+            WorkUnit::PreSequencePreparation { .. } => {
+                return Err(Error::InferenceError(
+                    "pre-sequence preparation must complete before EngineCore admission"
+                        .to_string(),
+                ));
+            }
             WorkUnit::SequenceStep {
                 input,
                 max_output_steps,
@@ -2452,6 +2466,57 @@ mod tests {
         assert_eq!(
             binding.stage_for_work(&decode_work).unwrap().id,
             StageId::new(2)
+        );
+    }
+
+    #[test]
+    fn preparation_selector_is_distinct_from_decoder_prefill() {
+        let profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        let mut preparation = StageDescriptor::from_execution_profile(
+            StageId::new(9),
+            "audio.encoder.prepare",
+            &profile,
+            NativeBatchMode::Static,
+        );
+        preparation.selector = StageWorkSelector::PreSequencePreparation;
+        preparation.progress = StageProgressKind::Atomic;
+        preparation.shape_policy = StageShapePolicy::Ragged;
+        preparation.max_padding_basis_points = 0;
+        preparation.membership_safe_point = MembershipSafePoint::OperationBoundary;
+        let mut prefill = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            "decoder.prefill",
+            &profile,
+            NativeBatchMode::None,
+        );
+        prefill.selector = StageWorkSelector::SequencePrefill;
+        let binding = ExecutionAdapterBinding {
+            execution_group_id: ExecutionGroupId::new(1),
+            model_instance_id: ModelInstanceId::new(2),
+            adapter_instance_id: AdapterInstanceId::new(3),
+            adapter_abi_revision: AdapterAbiRevision::new(1),
+            model_variant: ModelVariant::Qwen306B,
+            capability_id: "asr".to_string(),
+            stages: Arc::from([preparation, prefill]),
+        };
+        binding.validate().unwrap();
+
+        let preparation_work = WorkUnit::PreSequencePreparation {
+            kind: "asr.encoder.audio".to_string(),
+        };
+        let prefill_work = WorkUnit::SequenceStep {
+            phase: SequencePhase::Prefill,
+            input: InputRange { start: 0, end: 1 },
+            max_output_steps: 0,
+        };
+        assert_eq!(
+            binding.stage_for_work(&preparation_work).unwrap().id,
+            StageId::new(9)
+        );
+        assert_eq!(
+            binding.stage_for_work(&prefill_work).unwrap().id,
+            StageId::new(1)
         );
     }
 
@@ -3095,6 +3160,25 @@ mod tests {
             output_finished,
             output_has_error,
         }
+    }
+
+    #[test]
+    fn pre_sequence_preparation_cannot_terminalize_an_engine_core_session() {
+        let plan = plan_for(
+            SessionKey::new("pre-core-preparation".to_string(), 1),
+            WorkUnit::PreSequencePreparation {
+                kind: "asr.encoder.audio".to_string(),
+            },
+        );
+        let report = report_for(
+            &plan,
+            ExecutionDisposition::Finished(FinishReason::Completed),
+        );
+
+        let error = report
+            .validate_against(&plan)
+            .expect_err("pre-sequence preparation must remain outside EngineCore");
+        assert!(error.to_string().contains("before EngineCore admission"));
     }
 
     #[test]

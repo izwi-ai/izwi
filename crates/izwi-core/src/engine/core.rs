@@ -709,6 +709,7 @@ impl EngineCore {
             },
         };
         let work_kind = match &work {
+            WorkUnit::PreSequencePreparation { kind } => kind.clone(),
             WorkUnit::SequenceStep { phase, .. } => format!("{phase:?}").to_ascii_lowercase(),
             WorkUnit::AtomicJob { kind } => kind.clone(),
             WorkUnit::PipelineStage { name, ordinal } => format!("{name}:{ordinal}"),
@@ -772,6 +773,11 @@ impl EngineCore {
             tracker.transition(ExecutionState::Admitted)?;
         }
         let running_state = match plan.work {
+            WorkUnit::PreSequencePreparation { .. } => {
+                return Err(Error::InferenceError(
+                    "pre-sequence preparation cannot enter EngineCore execution".to_string(),
+                ));
+            }
             WorkUnit::SequenceStep {
                 phase: super::SequencePhase::Prefill,
                 ..
@@ -1381,6 +1387,7 @@ impl EngineCore {
             return Ok(prepared);
         }
         let logical_units = match work {
+            WorkUnit::PreSequencePreparation { .. } => 1,
             WorkUnit::SequenceStep {
                 input,
                 max_output_steps,

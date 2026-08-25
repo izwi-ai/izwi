@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -14,15 +14,17 @@ use serde::Serialize;
 
 use crate::backends::{BackendKind, DeviceKind, DeviceProfile};
 use crate::engine::{
-    BatchId, BatchWorkspaceLease, CapacitySource, ExecutionDomain, ExecutionGroupId,
-    ModelInstanceId, NativeBatchMode, PhysicalCapacityProvider, PhysicalCapacitySnapshot,
-    PhysicalLaunchPolicy, Priority, ReservationClass, ReservationOwner, ResourceAmount,
-    ResourceAuthority, ResourceEstimate, ResourceLease, ResourceVector, WorkUnit, WorkloadClass,
+    AdapterBindingKey, BatchId, BatchWorkspaceLease, CapacitySource, ExecutionDomain,
+    ExecutionGroupId, ModelInstanceId, NativeBatchMode, PhysicalCapacityProvider,
+    PhysicalCapacitySnapshot, PhysicalLaunchPolicy, Priority, ReservationClass, ReservationOwner,
+    ResourceAmount, ResourceAuthority, ResourceEstimate, ResourceLease, ResourceVector,
+    StageShapePolicy, WorkCost, WorkUnit, WorkloadClass,
 };
 use crate::error::{Error, Result};
 use crate::runtime::adapters::{LoadedCapabilityBinding, LoadedExecutionContract};
 
 static NEXT_EXECUTION_GROUP_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_DIRECT_BATCH_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CoordinatorLane {
@@ -40,6 +42,62 @@ pub struct JobSpec {
     pub workload_class: WorkloadClass,
     pub deadline: Option<Instant>,
     pub resources: ResourceEstimate,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PreparationCancellation {
+    state: Arc<AtomicU8>,
+}
+
+impl PreparationCancellation {
+    pub(crate) fn cancel(&self) -> bool {
+        self.state
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.state.load(Ordering::Acquire) == 1
+    }
+
+    fn begin_commit(&self) -> bool {
+        self.state
+            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn finish_commit(&self) {
+        self.state.store(3, Ordering::Release);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparationBatchRow {
+    job: JobLease,
+    seal: PreparationRowSeal,
+    cost: WorkCost,
+    materialized_tensor_elements: u64,
+    cancellation: PreparationCancellation,
+}
+
+#[derive(Debug, Clone)]
+struct PreparationRowSeal {
+    job: Weak<JobLeaseInner>,
+    binding: AdapterBindingKey,
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparationArtifact<T> {
+    pub(crate) value: T,
+    pub(crate) retained: JobResourceObservation,
+}
+
+#[derive(Debug)]
+pub(crate) enum PreparationRowOutcome<T> {
+    Committed(PreparationArtifact<T>),
+    Cancelled,
+    TimedOut,
+    Failed(Error),
 }
 
 /// Physical memory currently owned by an admitted direct job. Host and
@@ -68,6 +126,7 @@ impl JobResourceObservation {
 pub struct CoordinatorSnapshot {
     pub capacity: usize,
     pub active_jobs: usize,
+    pub active_preparation_bridges: usize,
     pub active_model_loads: usize,
     pub active_executions: usize,
     /// Total physical memory reserved across every backend memory domain.
@@ -482,6 +541,7 @@ pub struct InferenceCoordinator {
     admission_gate: Mutex<()>,
     idle: Arc<Notify>,
     active_jobs: AtomicUsize,
+    active_preparation_bridges: AtomicUsize,
     active_model_loads: AtomicUsize,
     admitted_total: AtomicU64,
     rejected_total: AtomicU64,
@@ -552,6 +612,7 @@ impl InferenceCoordinator {
             admission_gate: Mutex::new(()),
             idle,
             active_jobs: AtomicUsize::new(0),
+            active_preparation_bridges: AtomicUsize::new(0),
             active_model_loads: AtomicUsize::new(0),
             admitted_total: AtomicU64::new(0),
             rejected_total: AtomicU64::new(0),
@@ -593,6 +654,7 @@ impl InferenceCoordinator {
         CoordinatorSnapshot {
             capacity: self.capacity,
             active_jobs: self.active_jobs.load(Ordering::Relaxed),
+            active_preparation_bridges: self.active_preparation_bridges.load(Ordering::Relaxed),
             active_model_loads: self.active_model_loads.load(Ordering::Relaxed),
             active_executions: self.execution.active(),
             reserved_memory_bytes,
@@ -623,6 +685,7 @@ impl InferenceCoordinator {
         loop {
             let notified = self.idle.notified();
             if self.active_jobs.load(Ordering::Acquire) == 0
+                && self.active_preparation_bridges.load(Ordering::Acquire) == 0
                 && self.active_model_loads.load(Ordering::Acquire) == 0
                 && self.execution.active() == 0
             {
@@ -647,6 +710,140 @@ impl InferenceCoordinator {
         observation: JobResourceObservation,
     ) -> Result<JobLease> {
         self.admit_with_initial_observation(spec, Some(observation))
+    }
+
+    /// Remove preparation lane eligibility while retaining its resource
+    /// authorization. The returned bridge owns no queue permit and cannot run
+    /// work; its reservation remains live until a fresh admission adopts it or
+    /// the bridge is dropped.
+    pub(crate) fn bridge_preparation_admission(
+        self: &Arc<Self>,
+        preparation: JobLease,
+    ) -> Result<PreparationAdmissionBridge> {
+        if Arc::strong_count(&preparation._inner) != 1 {
+            return Err(Error::InferenceError(
+                "preparation handoff cannot proceed while cloned admission leases remain"
+                    .to_string(),
+            ));
+        }
+        let JobLease { _inner, spec } = preparation;
+        let inner = Arc::try_unwrap(_inner).map_err(|_| {
+            Error::InferenceError("preparation admission became shared during handoff".to_string())
+        })?;
+        let JobLeaseInner {
+            coordinator,
+            _permit,
+            reservation,
+            active,
+        } = inner;
+        if !Arc::ptr_eq(self, &coordinator) {
+            return Err(Error::InferenceError(
+                "preparation admission belongs to a different coordinator".to_string(),
+            ));
+        }
+        drop(_permit);
+        self.active_preparation_bridges
+            .fetch_add(1, Ordering::AcqRel);
+        drop(active);
+        Ok(PreparationAdmissionBridge {
+            coordinator,
+            preparation_spec: spec,
+            reservation: Some(reservation),
+        })
+    }
+
+    /// Compete fairly for a fresh job permit, then atomically exchange the
+    /// bridge's retained resource authorization into the resolved admission.
+    pub(crate) async fn admit_observed_from_preparation(
+        self: &Arc<Self>,
+        mut bridge: PreparationAdmissionBridge,
+        execution: JobSpec,
+        observation: JobResourceObservation,
+    ) -> std::result::Result<JobLease, PreparationAdmissionFailure> {
+        macro_rules! fail {
+            ($error:expr) => {
+                return Err(PreparationAdmissionFailure {
+                    error: $error,
+                    bridge,
+                })
+            };
+        }
+        if !Arc::ptr_eq(self, &bridge.coordinator) {
+            fail!(Error::InvalidInput(
+                "preparation bridge belongs to a different coordinator".to_string(),
+            ));
+        }
+        if bridge.preparation_spec.request_id != execution.request_id
+            || bridge.preparation_spec.priority != execution.priority
+            || bridge.preparation_spec.workload_class != execution.workload_class
+            || bridge.preparation_spec.deadline != execution.deadline
+        {
+            fail!(Error::InvalidInput(
+                "preparation handoff changed immutable request admission identity".to_string(),
+            ));
+        }
+        let _gate = self
+            .admission_gate
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if self.draining.load(Ordering::Acquire) {
+            self.rejected_total.fetch_add(1, Ordering::Relaxed);
+            fail!(Error::Overloaded("runtime is draining".to_string()));
+        }
+        if let Err(error) = self.execution.ensure_healthy() {
+            fail!(error);
+        }
+        if execution
+            .deadline
+            .is_some_and(|deadline| deadline <= Instant::now())
+        {
+            self.expired_total.fetch_add(1, Ordering::Relaxed);
+            fail!(Error::Timeout(execution.request_id));
+        }
+        let permit = match self.jobs.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.rejected_total.fetch_add(1, Ordering::Relaxed);
+                fail!(Error::Overloaded(
+                    "global inference queue is full".to_string()
+                ));
+            }
+        };
+        let resources = match effective_resources(execution.resources, self.backend) {
+            Ok(resources) => resources,
+            Err(error) => fail!(error),
+        };
+        let materialized = match observed_resources(observation, self.backend) {
+            Ok(materialized) => materialized,
+            Err(error) => fail!(error),
+        };
+        let mut reservation = match bridge.reservation.take() {
+            Some(reservation) => reservation,
+            None => fail!(Error::InferenceError(
+                "preparation bridge reservation was already consumed".to_string(),
+            )),
+        };
+        if let Err(error) = reservation.resize(resources) {
+            bridge.reservation = Some(reservation);
+            fail!(error);
+        }
+        if let Err(error) = reservation.record_materialized_usage(materialized) {
+            bridge.reservation = Some(reservation);
+            fail!(error);
+        }
+        self.active_jobs.fetch_add(1, Ordering::Relaxed);
+        self.admitted_total.fetch_add(1, Ordering::Relaxed);
+        Ok(JobLease {
+            _inner: Arc::new(JobLeaseInner {
+                coordinator: self.clone(),
+                _permit: permit,
+                reservation,
+                active: ActiveJobGuard {
+                    coordinator: self.clone(),
+                },
+            }),
+            spec: execution,
+        })
     }
 
     fn admit_with_initial_observation(
@@ -700,6 +897,9 @@ impl InferenceCoordinator {
                 coordinator: self.clone(),
                 _permit: permit,
                 reservation,
+                active: ActiveJobGuard {
+                    coordinator: self.clone(),
+                },
             }),
             spec,
         })
@@ -994,6 +1194,299 @@ impl InferenceCoordinator {
         .await
     }
 
+    /// Seal one admitted request to the exact loaded preparation stage. The
+    /// returned row cannot be constructed by sibling runtime modules and its
+    /// seal is bound to this precise `JobLeaseInner` allocation.
+    pub(crate) fn seal_preparation_row(
+        self: &Arc<Self>,
+        job: JobLease,
+        contract: &LoadedExecutionContract,
+        work: &WorkUnit,
+        cost: WorkCost,
+        materialized_tensor_elements: u64,
+        cancellation: PreparationCancellation,
+    ) -> Result<PreparationBatchRow> {
+        if !Arc::ptr_eq(&job._inner.coordinator, self) {
+            return Err(Error::InvalidInput(
+                "preparation job belongs to a different coordinator".to_string(),
+            ));
+        }
+        let binding = self.validate_loaded_execution_contract(contract)?;
+        let stage = binding.stage_for_work(work)?;
+        if stage.selector != crate::engine::StageWorkSelector::PreSequencePreparation {
+            return Err(Error::InvalidInput(
+                "preparation row requires an exact pre-sequence stage".to_string(),
+            ));
+        }
+        Ok(PreparationBatchRow {
+            seal: PreparationRowSeal {
+                job: Arc::downgrade(&job._inner),
+                binding: binding.key_for_stage(stage.id)?,
+            },
+            job,
+            cost,
+            materialized_tensor_elements,
+            cancellation,
+        })
+    }
+
+    /// Execute one model-native, pre-sequence preparation batch against an
+    /// exact loaded adapter generation. Batch formation remains the caller's
+    /// responsibility; this boundary authenticates the stage, holds every row
+    /// admission, reserves its exact transient workspace, and enters the
+    /// physical model once at the declared native width.
+    pub(crate) async fn run_loaded_native_preparation_batch<T, F>(
+        self: &Arc<Self>,
+        rows: Vec<PreparationBatchRow>,
+        contract: LoadedExecutionContract,
+        work: WorkUnit,
+        operation: F,
+    ) -> Result<Vec<PreparationRowOutcome<T>>>
+    where
+        T: Send + 'static,
+        F: FnOnce(&[usize]) -> Result<Vec<Result<PreparationArtifact<T>>>> + Send + 'static,
+    {
+        if rows.is_empty() {
+            return Err(Error::InvalidInput(
+                "native preparation batch has no admitted rows".to_string(),
+            ));
+        }
+        if !matches!(work, WorkUnit::PreSequencePreparation { .. }) {
+            return Err(Error::InvalidInput(
+                "native preparation runner requires pre-sequence preparation work".to_string(),
+            ));
+        }
+        let binding = self.validate_loaded_execution_contract(&contract)?;
+        let stage = binding.stage_for_work(&work)?;
+        if stage.selector != crate::engine::StageWorkSelector::PreSequencePreparation
+            || stage.domain != ExecutionDomain::ExecutionGroup
+            || stage.batch_mode == NativeBatchMode::None
+            || stage.concurrency != crate::engine::ConcurrencyClass::Batchable
+        {
+            return Err(Error::InvalidInput(
+                "loaded adapter has no exact native pre-sequence preparation stage".to_string(),
+            ));
+        }
+        let expected_binding = binding.key_for_stage(stage.id)?;
+        let mut request_ids = std::collections::HashSet::with_capacity(rows.len());
+        for row in &rows {
+            if !Arc::ptr_eq(self, &row.job._inner.coordinator)
+                || row.seal.binding != expected_binding
+                || !row
+                    .seal
+                    .job
+                    .upgrade()
+                    .is_some_and(|sealed| Arc::ptr_eq(&sealed, &row.job._inner))
+                || !request_ids.insert(row.job.spec.request_id.clone())
+            {
+                return Err(Error::InvalidInput(
+                    "native preparation row crossed coordinator or loaded adapter identity"
+                        .to_string(),
+                ));
+            }
+        }
+        let mut outcomes: Vec<Option<PreparationRowOutcome<T>>> =
+            (0..rows.len()).map(|_| None).collect();
+        let now = Instant::now();
+        let mut live = Vec::with_capacity(rows.len());
+        for (index, row) in rows.iter().enumerate() {
+            if row.cancellation.is_cancelled() {
+                outcomes[index] = Some(PreparationRowOutcome::Cancelled);
+            } else if row
+                .job
+                .spec
+                .deadline
+                .is_some_and(|deadline| deadline <= now)
+            {
+                outcomes[index] = Some(PreparationRowOutcome::TimedOut);
+            } else {
+                live.push(index);
+            }
+        }
+        if live.is_empty() {
+            return Ok(outcomes.into_iter().map(Option::unwrap).collect());
+        }
+        if live.len() > stage.max_batch_size {
+            return Err(Error::Overloaded(format!(
+                "native preparation width {} exceeds loaded stage maximum {}",
+                live.len(),
+                stage.max_batch_size
+            )));
+        }
+        let mut aggregate = WorkCost::default();
+        let mut materialized_tensor_elements = 0u64;
+        for index in &live {
+            aggregate = aggregate.checked_add(rows[*index].cost).ok_or_else(|| {
+                Error::Overloaded("native preparation work accounting overflow".to_string())
+            })?;
+            materialized_tensor_elements = materialized_tensor_elements
+                .checked_add(rows[*index].materialized_tensor_elements)
+                .ok_or_else(|| {
+                    Error::Overloaded(
+                        "native preparation materialized work accounting overflow".to_string(),
+                    )
+                })?;
+        }
+        if aggregate.logical_units == 0 || aggregate.logical_units > stage.max_work_units {
+            return Err(Error::Overloaded(format!(
+                "native preparation work {} exceeds loaded stage maximum {}",
+                aggregate.logical_units, stage.max_work_units
+            )));
+        }
+        let useful = aggregate.tensor_elements;
+        if materialized_tensor_elements < useful {
+            return Err(Error::InvalidInput(
+                "native preparation materialized tensor work is below useful work".to_string(),
+            ));
+        }
+        match stage.shape_policy {
+            StageShapePolicy::Independent => {
+                return Err(Error::InvalidInput(
+                    "native preparation stage cannot declare independent scalar shapes".to_string(),
+                ));
+            }
+            StageShapePolicy::Exact => {
+                let first = rows[live[0]].cost.tensor_elements;
+                if live
+                    .iter()
+                    .any(|index| rows[*index].cost.tensor_elements != first)
+                    || materialized_tensor_elements != useful
+                {
+                    return Err(Error::InvalidInput(
+                        "exact native preparation batch contains unequal or padded rows"
+                            .to_string(),
+                    ));
+                }
+            }
+            StageShapePolicy::Ragged => {
+                if materialized_tensor_elements != useful {
+                    return Err(Error::InvalidInput(
+                        "ragged native preparation batch cannot claim padding".to_string(),
+                    ));
+                }
+            }
+            StageShapePolicy::Padded | StageShapePolicy::Bucketed => {
+                let padding = materialized_tensor_elements.saturating_sub(useful);
+                if useful == 0
+                    || padding.saturating_mul(10_000)
+                        > useful.saturating_mul(u64::from(stage.max_padding_basis_points))
+                {
+                    return Err(Error::Overloaded(
+                        "native preparation padding exceeds loaded stage budget".to_string(),
+                    ));
+                }
+            }
+        }
+        let rows_u64 = u64::try_from(live.len()).map_err(|_| {
+            Error::Overloaded("native preparation width exceeds work accounting".to_string())
+        })?;
+        let fixed_workspace = stage
+            .workspace_per_row_bytes
+            .checked_mul(rows_u64)
+            .and_then(|bytes| {
+                stage
+                    .workspace_per_work_unit_bytes
+                    .checked_mul(aggregate.logical_units)
+                    .and_then(|units| bytes.checked_add(units))
+            })
+            .and_then(|bytes| bytes.checked_add(stage.workspace_base_bytes))
+            .ok_or_else(|| {
+                Error::Overloaded("native preparation workspace accounting overflow".to_string())
+            })?;
+        let workspace = aggregate
+            .workspace
+            .checked_add(ResourceVector::temporary_workspace(fixed_workspace))?;
+        let workspace_bytes = workspace.workspace_bytes()?;
+        if workspace_bytes > stage.max_workspace_bytes {
+            return Err(Error::Overloaded(format!(
+                "native preparation workspace {workspace_bytes} exceeds loaded stage maximum {}",
+                stage.max_workspace_bytes
+            )));
+        }
+        let deadline = live
+            .iter()
+            .all(|index| rows[*index].job.spec.deadline.is_some())
+            .then(|| {
+                live.iter()
+                    .filter_map(|index| rows[*index].job.spec.deadline)
+                    .max()
+                    .expect("nonempty live rows have finite deadlines")
+            });
+        let execution = self
+            .acquire_physical_dispatch(
+                binding.execution_group_id,
+                binding.model_instance_id,
+                stage.physical_launch_policy,
+                stage.batch_mode,
+                live.len(),
+                deadline,
+            )
+            .await?;
+        let batch_id = BatchId::new(NEXT_DIRECT_BATCH_ID.fetch_add(1, Ordering::Relaxed));
+        let workspace =
+            self.reserve_batch_workspace(binding.execution_group_id, batch_id, workspace)?;
+        let first = rows[live[0]].job.clone();
+        self.run_blocking_task_with_deadline(
+            &first,
+            deadline,
+            (execution, workspace),
+            "inference",
+            move || {
+                let _contract = contract;
+                let _work = work;
+                let physical = match operation(&live) {
+                    Ok(outputs) if outputs.len() == live.len() => outputs,
+                    Ok(_) => {
+                        return Err(Error::InferenceError(
+                            "native preparation output width does not match live row width"
+                                .to_string(),
+                        ));
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        for index in &live {
+                            outcomes[*index] = Some(PreparationRowOutcome::Failed(
+                                Error::InferenceError(message.clone()),
+                            ));
+                        }
+                        return Ok(outcomes.into_iter().map(Option::unwrap).collect());
+                    }
+                };
+                for (index, output) in live.into_iter().zip(physical) {
+                    let row = &rows[index];
+                    let outcome = match output {
+                        Err(error) => PreparationRowOutcome::Failed(error),
+                        Ok(_artifact)
+                            if row
+                                .job
+                                .spec
+                                .deadline
+                                .is_some_and(|deadline| deadline <= Instant::now()) =>
+                        {
+                            PreparationRowOutcome::TimedOut
+                        }
+                        Ok(artifact) => {
+                            if !row.cancellation.begin_commit() {
+                                PreparationRowOutcome::Cancelled
+                            } else {
+                                let committed = row
+                                    .job
+                                    .record_materialized_usage(artifact.retained)
+                                    .map(|()| PreparationRowOutcome::Committed(artifact))
+                                    .unwrap_or_else(PreparationRowOutcome::Failed);
+                                row.cancellation.finish_commit();
+                                committed
+                            }
+                        }
+                    };
+                    outcomes[index] = Some(outcome);
+                }
+                Ok(outcomes.into_iter().map(Option::unwrap).collect())
+            },
+        )
+        .await
+    }
+
     fn validate_loaded_execution_contract(
         &self,
         contract: &LoadedExecutionContract,
@@ -1182,7 +1675,23 @@ impl InferenceCoordinator {
         F: FnOnce() -> Result<T> + Send + 'static,
         G: Send + 'static,
     {
-        let deadline = job.spec.deadline;
+        self.run_blocking_task_with_deadline(job, job.spec.deadline, guard, task_kind, operation)
+            .await
+    }
+
+    async fn run_blocking_task_with_deadline<T, F, G>(
+        self: &Arc<Self>,
+        job: &JobLease,
+        deadline: Option<Instant>,
+        guard: G,
+        task_kind: &'static str,
+        operation: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T> + Send + 'static,
+        G: Send + 'static,
+    {
         let request_id = job.spec.request_id.clone();
         let retained_job = job.clone();
         let blocking_request_id = request_id.clone();
@@ -1532,14 +2041,46 @@ struct JobLeaseInner {
     coordinator: Arc<InferenceCoordinator>,
     _permit: OwnedSemaphorePermit,
     reservation: ResourceLease,
+    active: ActiveJobGuard,
 }
 
-impl Drop for JobLeaseInner {
+#[derive(Debug)]
+struct ActiveJobGuard {
+    coordinator: Arc<InferenceCoordinator>,
+}
+
+impl Drop for ActiveJobGuard {
     fn drop(&mut self) {
         if self.coordinator.active_jobs.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.coordinator.idle.notify_waiters();
         }
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparationAdmissionBridge {
+    coordinator: Arc<InferenceCoordinator>,
+    preparation_spec: JobSpec,
+    reservation: Option<ResourceLease>,
+}
+
+impl Drop for PreparationAdmissionBridge {
+    fn drop(&mut self) {
+        if self
+            .coordinator
+            .active_preparation_bridges
+            .fetch_sub(1, Ordering::AcqRel)
+            == 1
+        {
+            self.coordinator.idle.notify_waiters();
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparationAdmissionFailure {
+    pub(crate) error: Error,
+    pub(crate) bridge: PreparationAdmissionBridge,
 }
 
 fn effective_resources(requested: ResourceVector, backend: BackendKind) -> Result<ResourceVector> {
@@ -3597,6 +4138,398 @@ Pages free: 10.\n";
         assert!(error.to_string().contains("different execution group"));
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(coordinator.snapshot().active_executions, 0);
+    }
+
+    fn native_preparation_contract(
+        coordinator: &InferenceCoordinator,
+        max_batch_size: usize,
+        max_workspace_bytes: u64,
+    ) -> LoadedExecutionContract {
+        let adapters =
+            RuntimeAdapterRegistry::built_in_with_execution_limits(1, max_batch_size).unwrap();
+        let bundle = LoadedModelBundle::bind(
+            &adapters,
+            coordinator.execution_group_id(),
+            ModelInstanceId::new(41),
+            ModelVariant::Kokoro82M,
+            BackendKind::Cpu,
+        )
+        .unwrap();
+        let mut contract = bundle.contract(CapabilityKind::Tts, false).unwrap();
+        let mut stage = crate::engine::StageDescriptor::from_execution_profile(
+            crate::engine::StageId::new(9),
+            "asr.encoder.audio",
+            &contract.execution_profile,
+            NativeBatchMode::Static,
+        );
+        stage.selector = crate::engine::StageWorkSelector::PreSequencePreparation;
+        stage.progress = crate::engine::StageProgressKind::Atomic;
+        stage.concurrency = crate::engine::ConcurrencyClass::Batchable;
+        stage.max_batch_size = max_batch_size;
+        stage.max_work_units = u64::try_from(max_batch_size).unwrap();
+        stage.max_workspace_bytes = max_workspace_bytes;
+        stage.shape_policy = crate::engine::StageShapePolicy::Ragged;
+        stage.max_padding_basis_points = 0;
+        stage.membership_safe_point = crate::engine::MembershipSafePoint::OperationBoundary;
+        stage.validate().unwrap();
+        contract.stages = Arc::from([stage]);
+        contract
+    }
+
+    fn sealed_preparation_row(
+        coordinator: &Arc<InferenceCoordinator>,
+        contract: &LoadedExecutionContract,
+        job: JobLease,
+        cost: WorkCost,
+        materialized_tensor_elements: u64,
+        cancellation: PreparationCancellation,
+    ) -> PreparationBatchRow {
+        coordinator
+            .seal_preparation_row(
+                job,
+                contract,
+                &WorkUnit::PreSequencePreparation {
+                    kind: "asr.encoder.audio".to_string(),
+                },
+                cost,
+                materialized_tensor_elements,
+                cancellation,
+            )
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn native_preparation_dispatch_authenticates_width_and_releases_workspace() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 4, 4));
+        let first = coordinator.admit(job("native-prep-first")).await.unwrap();
+        let second = coordinator.admit(job("native-prep-second")).await.unwrap();
+        let contract = native_preparation_contract(&coordinator, 2, 64);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let task_calls = calls.clone();
+        let task_coordinator = coordinator.clone();
+        let row = |job| {
+            sealed_preparation_row(
+                &coordinator,
+                &contract,
+                job,
+                WorkCost::new(1, 4, 16),
+                4,
+                PreparationCancellation::default(),
+            )
+        };
+
+        let output = coordinator
+            .run_loaded_native_preparation_batch(
+                vec![row(first), row(second)],
+                contract,
+                WorkUnit::PreSequencePreparation {
+                    kind: "asr.encoder.audio".to_string(),
+                },
+                move |live| {
+                    assert_eq!(live, &[0, 1]);
+                    task_calls.fetch_add(1, Ordering::Relaxed);
+                    let snapshot = task_coordinator.snapshot();
+                    assert_eq!(snapshot.active_jobs, 2);
+                    assert_eq!(snapshot.reserved_memory_bytes, 2 * 64 * 1024 * 1024 + 32);
+                    Ok(vec![
+                        Ok(PreparationArtifact {
+                            value: 11usize,
+                            retained: JobResourceObservation::host(1),
+                        }),
+                        Ok(PreparationArtifact {
+                            value: 12usize,
+                            retained: JobResourceObservation::host(1),
+                        }),
+                    ])
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            &output[0],
+            PreparationRowOutcome::Committed(PreparationArtifact { value: 11, .. })
+        ));
+        assert!(matches!(
+            &output[1],
+            PreparationRowOutcome::Committed(PreparationArtifact { value: 12, .. })
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(coordinator.snapshot().active_executions, 0);
+        assert_eq!(coordinator.snapshot().reserved_memory_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn preparation_bridge_retains_resources_then_readmits_a_fresh_resolved_lane() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 1));
+        let preparation = coordinator.admit(job("handoff")).await.unwrap();
+        let mut execution = job("handoff");
+        execution.lane = CoordinatorLane::Resumable;
+        let admitted_before = coordinator.snapshot().admitted_total;
+
+        let bridge = coordinator
+            .bridge_preparation_admission(preparation)
+            .expect("unique preparation admission becomes a bridge");
+        let bridged = coordinator.snapshot();
+        assert_eq!(bridged.active_jobs, 0);
+        assert_eq!(bridged.reserved_memory_bytes, 64 * 1024 * 1024);
+
+        let execution = coordinator
+            .admit_observed_from_preparation(bridge, execution, JobResourceObservation::host(32))
+            .await
+            .expect("fresh execution admission must reuse capacity released by preparation");
+
+        assert_eq!(execution.spec.lane, CoordinatorLane::Resumable);
+        let snapshot = coordinator.snapshot();
+        assert_eq!(snapshot.active_jobs, 1);
+        assert_eq!(snapshot.admitted_total, admitted_before + 1);
+        drop(execution);
+        assert_eq!(coordinator.snapshot().active_jobs, 0);
+    }
+
+    #[tokio::test]
+    async fn preparation_handoff_fails_closed_while_a_cloned_lease_exists() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 2, 2));
+        let preparation = coordinator.admit(job("cloned-handoff")).await.unwrap();
+        let retained = preparation.clone();
+        let error = coordinator
+            .bridge_preparation_admission(preparation)
+            .expect_err("a live preparation clone must prevent double admission");
+
+        assert!(error.to_string().contains("cloned admission leases"));
+        assert_eq!(coordinator.snapshot().active_jobs, 1);
+        drop(retained);
+        assert_eq!(coordinator.snapshot().active_jobs, 0);
+    }
+
+    #[tokio::test]
+    async fn preparation_bridge_keeps_resources_reserved_when_final_queue_is_full() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 1));
+        let preparation = coordinator.admit(job("bridge-pressure")).await.unwrap();
+        let bridge = coordinator
+            .bridge_preparation_admission(preparation)
+            .expect("unique preparation bridge");
+        assert_eq!(
+            coordinator.snapshot().reserved_memory_bytes,
+            64 * 1024 * 1024
+        );
+        let blocker = coordinator.admit(job("bridge-blocker")).await.unwrap();
+        assert_eq!(
+            coordinator.snapshot().reserved_memory_bytes,
+            128 * 1024 * 1024
+        );
+        let mut execution = job("bridge-pressure");
+        execution.lane = CoordinatorLane::Resumable;
+
+        let failure = coordinator
+            .admit_observed_from_preparation(bridge, execution, JobResourceObservation::host(1))
+            .await
+            .expect_err("fresh execution admission must compete for the queue permit");
+
+        assert!(matches!(failure.error, Error::Overloaded(_)));
+        assert_eq!(
+            coordinator.snapshot().reserved_memory_bytes,
+            128 * 1024 * 1024
+        );
+        assert_eq!(coordinator.snapshot().active_preparation_bridges, 1);
+        drop(failure.bridge);
+        assert_eq!(
+            coordinator.snapshot().reserved_memory_bytes,
+            64 * 1024 * 1024
+        );
+        drop(blocker);
+        assert_eq!(coordinator.snapshot().reserved_memory_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn draining_keeps_bridge_live_until_explicit_drop_and_blocks_idle() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 1));
+        let preparation = coordinator.admit(job("bridge-drain")).await.unwrap();
+        let bridge = coordinator
+            .bridge_preparation_admission(preparation)
+            .expect("unique preparation bridge");
+        coordinator.begin_drain();
+        let mut execution = job("bridge-drain");
+        execution.lane = CoordinatorLane::Resumable;
+
+        let failure = coordinator
+            .admit_observed_from_preparation(bridge, execution, JobResourceObservation::host(1))
+            .await
+            .expect_err("draining must reject the fresh admission without dropping its bridge");
+
+        assert!(matches!(failure.error, Error::Overloaded(_)));
+        assert_eq!(coordinator.snapshot().active_preparation_bridges, 1);
+        assert!(matches!(
+            coordinator
+                .wait_for_idle(Instant::now() + Duration::from_millis(5))
+                .await,
+            Err(Error::Timeout(_))
+        ));
+        drop(failure.bridge);
+        coordinator
+            .wait_for_idle(Instant::now() + Duration::from_millis(50))
+            .await
+            .expect("dropping the bridge completes coordinator drain");
+    }
+
+    #[tokio::test]
+    async fn resize_failure_returns_live_bridge_until_explicit_drop() {
+        let capacity = 80 * 1024 * 1024;
+        let authority = Arc::new(ResourceAuthority::new(provider_for_location(
+            DeviceLocation::Cpu,
+            capacity,
+        )));
+        let coordinator = Arc::new(InferenceCoordinator::with_resource_authority(
+            BackendKind::Cpu,
+            1,
+            1,
+            authority,
+        ));
+        let preparation = coordinator.admit(job("bridge-resize")).await.unwrap();
+        let bridge = coordinator
+            .bridge_preparation_admission(preparation)
+            .expect("unique preparation bridge");
+        let mut execution = job("bridge-resize");
+        execution.lane = CoordinatorLane::Resumable;
+        execution.resources.host_bytes = ResourceAmount::Known(96 * 1024 * 1024);
+
+        let failure = coordinator
+            .admit_observed_from_preparation(bridge, execution, JobResourceObservation::host(1))
+            .await
+            .expect_err("bridge growth beyond physical capacity must fail");
+
+        assert!(matches!(failure.error, Error::Overloaded(_)));
+        assert_eq!(coordinator.snapshot().active_preparation_bridges, 1);
+        assert_eq!(
+            coordinator.snapshot().reserved_memory_bytes,
+            64 * 1024 * 1024
+        );
+        drop(failure.bridge);
+        assert_eq!(coordinator.snapshot().reserved_memory_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn native_preparation_commit_fence_isolates_late_cancel_and_deadline_rows() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 4, 4));
+        let first = coordinator.admit(job("mixed-live")).await.unwrap();
+        let second = coordinator.admit(job("mixed-cancel")).await.unwrap();
+        let mut timed_spec = job("mixed-timeout");
+        timed_spec.deadline = Some(Instant::now() + Duration::from_millis(50));
+        let third = coordinator.admit(timed_spec).await.unwrap();
+        let contract = native_preparation_contract(&coordinator, 3, 64);
+        let cancellation = PreparationCancellation::default();
+        let late_cancel = cancellation.clone();
+        let row = |job, cancellation| {
+            sealed_preparation_row(
+                &coordinator,
+                &contract,
+                job,
+                WorkCost::new(1, 2, 8),
+                2,
+                cancellation,
+            )
+        };
+
+        let output = coordinator
+            .run_loaded_native_preparation_batch(
+                vec![
+                    row(first, PreparationCancellation::default()),
+                    row(second, cancellation),
+                    row(third, PreparationCancellation::default()),
+                ],
+                contract,
+                WorkUnit::PreSequencePreparation {
+                    kind: "asr.encoder.audio".to_string(),
+                },
+                move |live| {
+                    assert_eq!(live, &[0, 1, 2]);
+                    std::thread::sleep(Duration::from_millis(100));
+                    assert!(late_cancel.cancel());
+                    Ok((0..3)
+                        .map(|value| {
+                            Ok(PreparationArtifact {
+                                value,
+                                retained: JobResourceObservation::host(1),
+                            })
+                        })
+                        .collect())
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(&output[0], PreparationRowOutcome::Committed(_)));
+        assert!(matches!(&output[1], PreparationRowOutcome::Cancelled));
+        assert!(matches!(&output[2], PreparationRowOutcome::TimedOut));
+    }
+
+    #[tokio::test]
+    async fn native_preparation_rejects_foreign_identity_and_work_before_model_entry() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 2, 4));
+        let contract = native_preparation_contract(&coordinator, 2, 64);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let task_calls = calls.clone();
+        let sealed = sealed_preparation_row(
+            &coordinator,
+            &contract,
+            coordinator.admit(job("sealed-owner")).await.unwrap(),
+            WorkCost::new(1, 1, 0),
+            1,
+            PreparationCancellation::default(),
+        );
+        let PreparationBatchRow {
+            seal,
+            cost,
+            materialized_tensor_elements,
+            cancellation,
+            ..
+        } = sealed;
+        let row = PreparationBatchRow {
+            job: coordinator.admit(job("foreign-prep-row")).await.unwrap(),
+            seal,
+            cost,
+            materialized_tensor_elements,
+            cancellation,
+        };
+
+        let error = coordinator
+            .run_loaded_native_preparation_batch(
+                vec![row],
+                contract.clone(),
+                WorkUnit::PreSequencePreparation {
+                    kind: "asr.encoder.audio".to_string(),
+                },
+                move |_| {
+                    task_calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(Vec::<Result<PreparationArtifact<usize>>>::new())
+                },
+            )
+            .await
+            .expect_err("foreign row identity must fail before model entry");
+
+        assert!(error.to_string().contains("adapter identity"));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+        let overflow = sealed_preparation_row(
+            &coordinator,
+            &contract,
+            coordinator.admit(job("overflow-prep-row")).await.unwrap(),
+            WorkCost::new(3, 1, 0),
+            1,
+            PreparationCancellation::default(),
+        );
+        let error = coordinator
+            .run_loaded_native_preparation_batch(
+                vec![overflow],
+                contract,
+                WorkUnit::PreSequencePreparation {
+                    kind: "asr.encoder.audio".to_string(),
+                },
+                move |_| Ok(Vec::<Result<PreparationArtifact<usize>>>::new()),
+            )
+            .await
+            .expect_err("work beyond the stage maximum must fail before model entry");
+        assert!(error.to_string().contains("work 3 exceeds"));
     }
 
     #[tokio::test]
