@@ -275,6 +275,83 @@ pub(crate) struct WhisperDecodeState {
     rng: StdRng,
 }
 
+/// Owns a registered retained cross-attention sequence until construction of
+/// [`WhisperDecodeState`] succeeds. The caller transfers ownership at the
+/// model boundary; every fallible validation and installation branch must
+/// therefore release through this guard rather than relying on caller cleanup.
+struct WhisperCrossSequenceOwner {
+    runtime: Arc<RetainedStaticAttentionRuntimeV2>,
+    sequence: Option<RetainedStaticAttentionSequenceId>,
+}
+
+impl WhisperCrossSequenceOwner {
+    fn new(
+        runtime: Arc<RetainedStaticAttentionRuntimeV2>,
+        sequence: RetainedStaticAttentionSequenceId,
+    ) -> Self {
+        Self {
+            runtime,
+            sequence: Some(sequence),
+        }
+    }
+
+    fn sequence(&self) -> RetainedStaticAttentionSequenceId {
+        self.sequence
+            .expect("Whisper cross-sequence owner is armed until state transfer")
+    }
+
+    fn into_decode_state_parts(
+        mut self,
+    ) -> (
+        Arc<RetainedStaticAttentionRuntimeV2>,
+        RetainedStaticAttentionSequenceId,
+    ) {
+        let sequence = self
+            .sequence
+            .take()
+            .expect("Whisper cross-sequence ownership transfers exactly once");
+        (Arc::clone(&self.runtime), sequence)
+    }
+}
+
+impl Drop for WhisperCrossSequenceOwner {
+    fn drop(&mut self) {
+        if let Some(sequence) = self.sequence.take() {
+            let _ = self.runtime.release_sequence(sequence);
+        }
+    }
+}
+
+fn acquire_whisper_cross_sequence_owner(
+    cross_runtime: Arc<RetainedStaticAttentionRuntimeV2>,
+    cross_sequence: RetainedStaticAttentionSequenceId,
+    prepared: &WhisperPreparedWindow,
+    expected_preparation_id: u64,
+    expected_memory_tokens: usize,
+    expected_layers: usize,
+    self_context_len: usize,
+    allocate_state_id: impl FnOnce() -> Result<u64>,
+) -> Result<(WhisperCrossSequenceOwner, u64)> {
+    // This must remain the first operation: the model owns the registered
+    // sequence even when prepared-window validation fails.
+    let owner = WhisperCrossSequenceOwner::new(cross_runtime, cross_sequence);
+    if prepared.preparation_id != expected_preparation_id
+        || prepared.memory_tokens != expected_memory_tokens
+        || prepared.layers.len() != expected_layers
+    {
+        return Err(Error::InvalidInput(
+            "Whisper prepared window belongs to another model or geometry".into(),
+        ));
+    }
+    let state_id = allocate_state_id()?;
+    if self_context_len != 0 || owner.runtime.read(owner.sequence())?.is_some() {
+        return Err(Error::InvalidInput(
+            "Whisper retained prefill requires empty self and cross state".into(),
+        ));
+    }
+    Ok((owner, state_id))
+}
+
 pub(crate) struct WhisperDecodeCheckpoint {
     state_id: u64,
     quantum_nonce: u64,
@@ -1435,27 +1512,28 @@ impl WhisperTurboAsrModel {
         cross_runtime: Arc<RetainedStaticAttentionRuntimeV2>,
         cross_sequence: RetainedStaticAttentionSequenceId,
     ) -> Result<WhisperDecodeState> {
-        self.validate_prepared_window(prepared)?;
-        let state_id = next_whisper_decode_state_id()?;
-        if self_kv.context_len() != 0 || cross_runtime.read(cross_sequence)?.is_some() {
-            return Err(Error::InvalidInput(
-                "Whisper retained prefill requires empty self and cross state".into(),
-            ));
-        }
-        if let Err(error) = cross_runtime.install(
+        let (cross_owner, state_id) = acquire_whisper_cross_sequence_owner(
+            cross_runtime,
+            cross_sequence,
+            prepared,
+            self.preparation_id,
+            self.config.max_source_positions,
+            self.config.decoder_layers,
+            self_kv.context_len(),
+            next_whisper_decode_state_id,
+        )?;
+        let cross_sequence = cross_owner.sequence();
+        cross_owner.runtime.install(
             cross_sequence,
             prepared.source_identity,
             prepared.layers.clone(),
-        ) {
-            let _ = cross_runtime.release_sequence(cross_sequence);
-            return Err(error);
-        }
+        )?;
 
-        let initialized = (|| {
+        let initialized: Result<(Vec<u32>, usize)> = (|| {
             let resolved_language = self.resolve_request_language_retained(
                 language,
                 &mut self_kv,
-                cross_runtime.as_ref(),
+                cross_owner.runtime.as_ref(),
                 cross_sequence,
             )?;
             // Language detection is a complete nested decoder sequence. The
@@ -1483,13 +1561,8 @@ impl WhisperTurboAsrModel {
             )?;
             Ok((prompt, max_steps))
         })();
-        let (prompt, max_steps) = match initialized {
-            Ok(value) => value,
-            Err(error) => {
-                let _ = cross_runtime.release_sequence(cross_sequence);
-                return Err(error);
-            }
-        };
+        let (prompt, max_steps) = initialized?;
+        let (cross_runtime, cross_sequence) = cross_owner.into_decode_state_parts();
 
         Ok(WhisperDecodeState {
             state_id,
@@ -3926,18 +3999,18 @@ mod tests {
     use rand::{Rng, SeedableRng};
 
     use super::{
-        adaptive_decode_budget, apply_whisper_decode_constraints, best_finite_logit,
-        build_whisper_decode_mask_tensors, build_whisper_prompt_prefix, capped_decode_temperatures,
-        contiguous_token_range, decode_retry_reasons, decode_step_budget,
-        find_suffix_token_repetition, greedy_decode_step_from_masked_logits,
-        has_low_word_diversity, logits_to_log_probs, logits_to_log_probs_in_place,
-        pad_or_trim_mel_frames, probability_for_token_from_logits, scaled_logsumexp,
-        tensor_to_f32_vec1, text_delta, token_contains_numeral_or_symbol, trimmed_audio_bounds,
-        use_cuda_whisper_dtype_shim, whisper_cross_source_identity,
+        acquire_whisper_cross_sequence_owner, adaptive_decode_budget,
+        apply_whisper_decode_constraints, best_finite_logit, build_whisper_decode_mask_tensors,
+        build_whisper_prompt_prefix, capped_decode_temperatures, contiguous_token_range,
+        decode_retry_reasons, decode_step_budget, find_suffix_token_repetition,
+        greedy_decode_step_from_masked_logits, has_low_word_diversity, logits_to_log_probs,
+        logits_to_log_probs_in_place, pad_or_trim_mel_frames, probability_for_token_from_logits,
+        scaled_logsumexp, tensor_to_f32_vec1, text_delta, token_contains_numeral_or_symbol,
+        trimmed_audio_bounds, use_cuda_whisper_dtype_shim, whisper_cross_source_identity,
         whisper_decode_profile_diagnostics, whisper_device_diagnostics, whisper_impl_name,
         whisper_terminal_policy_transition, with_whisper_decode_step_transaction,
-        WhisperDecodeAttempt, WhisperDecodeProfile, WhisperDecodeState, WhisperSpecialTokens,
-        WhisperTerminalTransition,
+        WhisperDecodeAttempt, WhisperDecodeProfile, WhisperDecodeState, WhisperPreparedWindow,
+        WhisperSpecialTokens, WhisperTerminalTransition,
     };
     use crate::backends::kv::{CpuKvArena, KvArenaConfig, KvLayerConfig};
     use crate::backends::state::{negotiate_state_plan, StateBackendPlanRequest};
@@ -4549,6 +4622,211 @@ mod tests {
             }
         );
         assert!(best.is_none());
+    }
+
+    fn early_failure_cross_runtime(
+        model: ModelInstanceId,
+    ) -> Arc<RetainedStaticAttentionRuntimeV2> {
+        let static_domain = StateDomainId::new(1);
+        let contract = InferenceStateContract {
+            abi: CURRENT_INFERENCE_STATE_ABI,
+            domains: vec![StateDomainSpec::StaticAttention(
+                StaticAttentionDomainSpec {
+                    header: StateDomainHeader {
+                        id: static_domain,
+                        scope: StateScope::Retained,
+                        clock: StateClock::EncoderTokens,
+                        placement: PlacementPolicy::BackendLocal,
+                        prefix: PrefixPolicy::Disabled,
+                        checkpoint: CheckpointPolicy::Transactional,
+                    },
+                    layers: vec![StaticAttentionLayerSpec {
+                        model_layer: 0,
+                        query_heads: 1,
+                        kv_heads: 1,
+                        key_head_dim: 2,
+                        value_head_dim: 2,
+                        key_encoding: KeyEncoding::Raw,
+                    }],
+                    max_memory_tokens: 2,
+                    accepted_dtypes: vec![StateDType::F32],
+                },
+            )],
+            groups: vec![StateGroupSpec {
+                id: StateGroupId::new(1),
+                domains: vec![static_domain],
+                prefix_shareable: false,
+            }],
+        };
+        let plan = Arc::new(
+            negotiate_state_plan(
+                &contract,
+                &StateBackendPlanRequest {
+                    backend: BackendKind::Cpu,
+                    device_ordinal: None,
+                    page_tokens_hint: None,
+                    storage_dtype_hint: Some(StateDType::F32),
+                },
+            )
+            .expect("test static state plan"),
+        );
+        Arc::new(
+            RetainedStaticAttentionRuntimeV2::new(
+                model,
+                1,
+                &contract,
+                plan,
+                static_domain,
+                1,
+                Device::Cpu,
+            )
+            .expect("test static runtime"),
+        )
+    }
+
+    fn assert_cross_sequence_released_for_reuse(runtime: &RetainedStaticAttentionRuntimeV2) {
+        let replacement = runtime
+            .register_sequence()
+            .expect("failed prefill entry must release capacity for immediate reuse");
+        runtime
+            .release_sequence(replacement)
+            .expect("replacement sequence release");
+    }
+
+    #[test]
+    fn managed_prefill_early_failures_release_cross_sequence_for_reuse() {
+        let prepared = WhisperPreparedWindow::for_test(2, 1, 2).expect("prepared window");
+
+        let runtime = early_failure_cross_runtime(ModelInstanceId::new(991));
+        let sequence = runtime.register_sequence().expect("validation sequence");
+        let error = acquire_whisper_cross_sequence_owner(
+            runtime.clone(),
+            sequence,
+            &prepared,
+            2,
+            2,
+            1,
+            0,
+            || Ok(1),
+        )
+        .err()
+        .expect("foreign prepared identity must fail");
+        assert!(error.to_string().contains("another model or geometry"));
+        assert_cross_sequence_released_for_reuse(runtime.as_ref());
+
+        let runtime = early_failure_cross_runtime(ModelInstanceId::new(992));
+        let sequence = runtime.register_sequence().expect("state-id sequence");
+        let error = acquire_whisper_cross_sequence_owner(
+            runtime.clone(),
+            sequence,
+            &prepared,
+            1,
+            2,
+            1,
+            0,
+            || Err(Error::InferenceError("forced state-id failure".into())),
+        )
+        .err()
+        .expect("state identity allocation must fail deterministically");
+        assert!(error.to_string().contains("forced state-id failure"));
+        assert_cross_sequence_released_for_reuse(runtime.as_ref());
+
+        let runtime = early_failure_cross_runtime(ModelInstanceId::new(993));
+        let sequence = runtime.register_sequence().expect("self-context sequence");
+        let error = acquire_whisper_cross_sequence_owner(
+            runtime.clone(),
+            sequence,
+            &prepared,
+            1,
+            2,
+            1,
+            1,
+            || Ok(1),
+        )
+        .err()
+        .expect("nonempty self context must fail");
+        assert!(error
+            .to_string()
+            .contains("requires empty self and cross state"));
+        assert_cross_sequence_released_for_reuse(runtime.as_ref());
+
+        let runtime = early_failure_cross_runtime(ModelInstanceId::new(994));
+        let sequence = runtime.register_sequence().expect("cross-read sequence");
+        runtime
+            .install(sequence, prepared.source_identity, prepared.layers.clone())
+            .expect("preinstall cross memory");
+        let error = acquire_whisper_cross_sequence_owner(
+            runtime.clone(),
+            sequence,
+            &prepared,
+            1,
+            2,
+            1,
+            0,
+            || Ok(1),
+        )
+        .err()
+        .expect("nonempty cross read must fail");
+        assert!(error
+            .to_string()
+            .contains("requires empty self and cross state"));
+        assert_cross_sequence_released_for_reuse(runtime.as_ref());
+
+        let runtime = early_failure_cross_runtime(ModelInstanceId::new(995));
+        let sequence = runtime
+            .register_sequence()
+            .expect("install-failure sequence");
+        let incompatible =
+            WhisperPreparedWindow::for_test(2, 1, 3).expect("incompatible prepared window");
+        let (owner, _) = acquire_whisper_cross_sequence_owner(
+            runtime.clone(),
+            sequence,
+            &incompatible,
+            1,
+            2,
+            1,
+            0,
+            || Ok(1),
+        )
+        .expect("entry validation before forced install failure");
+        let error = owner
+            .runtime
+            .install(
+                owner.sequence(),
+                incompatible.source_identity,
+                incompatible.layers.clone(),
+            )
+            .err()
+            .expect("incompatible layer width must fail installation");
+        assert!(!error.to_string().is_empty());
+        drop(owner);
+        assert_cross_sequence_released_for_reuse(runtime.as_ref());
+
+        let runtime = early_failure_cross_runtime(ModelInstanceId::new(996));
+        let sequence = runtime
+            .register_sequence()
+            .expect("post-install failure sequence");
+        let (owner, _) = acquire_whisper_cross_sequence_owner(
+            runtime.clone(),
+            sequence,
+            &prepared,
+            1,
+            2,
+            1,
+            0,
+            || Ok(1),
+        )
+        .expect("post-install entry");
+        owner
+            .runtime
+            .install(
+                owner.sequence(),
+                prepared.source_identity,
+                prepared.layers.clone(),
+            )
+            .expect("install before simulated prompt initialization failure");
+        drop(owner);
+        assert_cross_sequence_released_for_reuse(runtime.as_ref());
     }
 
     fn transactional_test_state() -> WhisperDecodeState {
