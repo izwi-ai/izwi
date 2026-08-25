@@ -768,6 +768,67 @@ impl GraniteSpeechRuntime {
         Ok((embeddings, stats))
     }
 
+    pub(crate) fn prepare_prompt_embeddings(
+        &self,
+        prompt: &GraniteSpeechPrompt,
+        special_tokens: &GraniteSpeechSpecialTokens,
+        audio_embeds: &Tensor,
+    ) -> Result<(Tensor, usize, usize)> {
+        let audio_tokens = audio_embeds.dim(1)?;
+        let input_ids = expand_audio_tokens(
+            &prompt.input_ids,
+            &prompt.audio_token_positions,
+            audio_tokens,
+            special_tokens.audio_token_id,
+        )?;
+        let audio_start = prompt
+            .audio_token_positions
+            .first()
+            .copied()
+            .ok_or_else(|| Error::InvalidInput("Granite prompt has no audio token".into()))?;
+        let embeddings = self.text_model.prompt_embeddings_with_audio(
+            &input_ids,
+            audio_start,
+            audio_tokens,
+            audio_embeds,
+        )?;
+        Ok((embeddings, input_ids.len(), audio_tokens))
+    }
+
+    pub(crate) fn prefill_prepared_prompt_span(
+        &self,
+        embeddings: &Tensor,
+        span_start: usize,
+        span_end: usize,
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<Tensor> {
+        let prompt_tokens = embeddings.dim(1)?;
+        if span_start != cache.context_len() || span_start >= span_end || span_end > prompt_tokens {
+            return Err(Error::InvalidInput(format!(
+                "Granite Speech prefill span [{span_start},{span_end}) does not continue cache cursor {} within prompt length {prompt_tokens}",
+                cache.context_len()
+            )));
+        }
+        let span = embeddings.narrow(1, span_start, span_end - span_start)?;
+        self.text_model
+            .forward_with_embeds_profiled(&span, span_start, cache, None, None)
+    }
+
+    pub(crate) fn decode_token(
+        &self,
+        token: u32,
+        position: usize,
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<Tensor> {
+        let token = Tensor::from_vec(vec![token], (1, 1), &self.device)?;
+        self.text_model
+            .forward_profiled(&token, position, cache, None, None)
+    }
+
+    pub(crate) fn greedy_token(&self, logits: &Tensor) -> Result<u32> {
+        argmax_last_logits(logits)
+    }
+
     pub fn generate(
         &self,
         prompt: &GraniteSpeechPrompt,
@@ -2046,6 +2107,18 @@ impl GraniteLanguageModel {
         cache: &mut PhysicalPagedKvCache,
         rope_cache: Option<&GraniteRopeCache>,
     ) -> Result<Tensor> {
+        let merged =
+            self.prompt_embeddings_with_audio(input_ids, audio_start, audio_len, audio_embeds)?;
+        self.forward_with_embeds_profiled(&merged, 0, cache, rope_cache, None)
+    }
+
+    fn prompt_embeddings_with_audio(
+        &self,
+        input_ids: &[u32],
+        audio_start: usize,
+        audio_len: usize,
+        audio_embeds: &Tensor,
+    ) -> Result<Tensor> {
         let mut llm_ids = input_ids.to_vec();
         for idx in audio_start..audio_start + audio_len {
             if idx < llm_ids.len() {
@@ -2067,8 +2140,7 @@ impl GraniteLanguageModel {
             Tensor::zeros((1, 0, hidden), embeds.dtype(), embeds.device())?
         };
         let audio = audio_embeds.to_dtype(embeds.dtype())?;
-        let merged = Tensor::cat(&[before, audio, after], 1)?;
-        self.forward_with_embeds_profiled(&merged, 0, cache, rope_cache, None)
+        Tensor::cat(&[before, audio, after], 1).map_err(Error::from)
     }
 
     fn forward_with_embeds_profiled(
@@ -3195,7 +3267,12 @@ fn maybe_prescale_residual_linear(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::kv::{CpuKvArena, KvArena, KvArenaConfig, KvLayerConfig};
+    use crate::backends::BackendKind;
+    use crate::engine::ModelInstanceId;
+    use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     #[test]
     fn granite_load_completion_synchronizes_cpu_device() {
@@ -3312,6 +3389,133 @@ mod tests {
             Tensor::zeros((4, 8), DType::F32, device).unwrap(),
         );
         tensors
+    }
+
+    fn tiny_granite_language_model(device: &Device) -> GraniteLanguageModel {
+        let mut tensors = tiny_granite_text_tensors(device);
+        let values = |count: usize, offset: usize| {
+            (0..count)
+                .map(|index| (((index * 7 + offset) % 19) as f32 - 9.0) / 23.0)
+                .collect::<Vec<_>>()
+        };
+        tensors.insert(
+            "model.embed_tokens.weight".into(),
+            Tensor::from_vec(values(64, 1), (16, 4), device).unwrap(),
+        );
+        for (name, shape, offset) in [
+            ("model.layers.0.self_attn.q_proj.weight", (4, 4), 2),
+            ("model.layers.0.self_attn.k_proj.weight", (2, 4), 3),
+            ("model.layers.0.self_attn.v_proj.weight", (2, 4), 4),
+            ("model.layers.0.self_attn.o_proj.weight", (4, 4), 5),
+        ] {
+            tensors.insert(
+                name.into(),
+                Tensor::from_vec(values(shape.0 * shape.1, offset), shape, device).unwrap(),
+            );
+        }
+        for (name, shape, offset) in [
+            ("model.layers.0.mlp.gate_proj.weight", (8, 4), 6),
+            ("model.layers.0.mlp.up_proj.weight", (8, 4), 7),
+            ("model.layers.0.mlp.down_proj.weight", (4, 8), 8),
+        ] {
+            tensors.insert(
+                name.into(),
+                Tensor::from_vec(values(shape.0 * shape.1, offset), shape, device).unwrap(),
+            );
+        }
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, device);
+        GraniteLanguageModel::load_with_execution_plan(
+            &tiny_granite_text_config(),
+            vb,
+            GraniteTextExecutionPlan {
+                selective_f16_lm_head: false,
+                selective_f16_qkv: false,
+                f16_attention_core: false,
+                selective_f16_mlp: false,
+                selective_f16_attention_output: false,
+            },
+        )
+        .unwrap()
+    }
+
+    fn tiny_granite_cache() -> PhysicalPagedKvCache {
+        let binding = KvLayerBinding {
+            model_layer: 0,
+            physical_layer: 0,
+        };
+        let arena: Arc<dyn KvArena> = Arc::new(
+            CpuKvArena::new(KvArenaConfig {
+                id: KvArenaId {
+                    model_instance: ModelInstanceId::new(141),
+                    backend: BackendKind::Cpu,
+                    device_ordinal: None,
+                    generation: 1,
+                },
+                group: KvGroupId::new(0),
+                page_tokens: 2,
+                capacity_pages: 8,
+                growth: None,
+                dtype: DType::F32,
+                layers: vec![KvLayerConfig {
+                    binding,
+                    num_kv_heads: 1,
+                    key_head_dim: 2,
+                    value_head_dim: 2,
+                }],
+            })
+            .unwrap(),
+        );
+        let blocks = (0..8)
+            .map(|index| CacheBlockRef {
+                arena: arena.id(),
+                group: arena.config().group,
+                index,
+                slot_generation: 1,
+            })
+            .collect();
+        PhysicalPagedKvCache::new(arena, vec![binding], blocks, 0).unwrap()
+    }
+
+    #[test]
+    fn scalar_chunked_prefill_matches_full_prefill() {
+        let device = Device::Cpu;
+        let model = tiny_granite_language_model(&device);
+        let embeddings = Tensor::from_vec(
+            (0..20)
+                .map(|index| (index as f32 - 7.0) / 13.0)
+                .collect::<Vec<_>>(),
+            (1, 5, 4),
+            &device,
+        )
+        .unwrap();
+        let mut full = tiny_granite_cache();
+        let mut chunked = tiny_granite_cache();
+
+        let full_logits = model
+            .forward_with_embeds_profiled(&embeddings, 0, &mut full, None, None)
+            .unwrap();
+        model
+            .forward_with_embeds_profiled(
+                &embeddings.narrow(1, 0, 2).unwrap(),
+                0,
+                &mut chunked,
+                None,
+                None,
+            )
+            .unwrap();
+        let chunked_logits = model
+            .forward_with_embeds_profiled(
+                &embeddings.narrow(1, 2, 3).unwrap(),
+                2,
+                &mut chunked,
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert_tensor_close(&full_logits, &chunked_logits);
+        assert_eq!(full.context_len(), 5);
+        assert_eq!(chunked.context_len(), 5);
     }
 
     #[test]

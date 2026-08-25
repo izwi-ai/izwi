@@ -3,9 +3,11 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use candle_core::DType;
+use candle_core::{DType, Tensor};
 use serde_json::json;
 use tracing::info;
 
@@ -26,6 +28,7 @@ use crate::models::architectures::qwen3::core::{
 };
 use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
+use crate::tokenizer::IncrementalDecoder;
 
 mod config;
 mod preprocessor;
@@ -68,6 +71,7 @@ const REQUIRED_ARTIFACTS: &[&str] = &[
 
 const DEFAULT_MAX_AUDIO_SECONDS: f32 = 9.0 * 60.0;
 const TIMESTAMP_MAX_AUDIO_SECONDS: f32 = 5.0 * 60.0;
+static NEXT_GRANITE_SPEECH_MODEL_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraniteSpeechAsrTranscriptionOutput {
@@ -94,6 +98,7 @@ impl Default for GraniteSpeechAsrGenerationOptions {
 }
 
 pub struct GraniteSpeechAsrModel {
+    model_identity: u64,
     model_dir: PathBuf,
     device: DeviceProfile,
     dtype: DType,
@@ -105,6 +110,283 @@ pub struct GraniteSpeechAsrModel {
     prompt_tokenizer: GraniteSpeechPromptTokenizer,
     preprocessor: GraniteSpeechPreprocessor,
     runtime: GraniteSpeechRuntime,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GraniteSpeechPreparedAudio {
+    model_identity: u64,
+    features: GraniteSpeechAudioFeatures,
+    embeddings: Tensor,
+    stats: GraniteSpeechAudioEmbeddingStats,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GraniteSpeechPreparedPromptArtifact {
+    model_identity: u64,
+    embeddings: Tensor,
+    prompt_tokens: usize,
+    audio_tokens: usize,
+    language: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GraniteSpeechDecodeStep {
+    pub(crate) delta: String,
+    pub(crate) text: String,
+    pub(crate) tokens_generated: usize,
+    pub(crate) finished: bool,
+}
+
+pub(crate) struct GraniteSpeechDecodeState {
+    cache: PhysicalPagedKvCache,
+    artifact: Arc<GraniteSpeechPreparedPromptArtifact>,
+    prefill_progress: usize,
+    pending_logits: Option<Tensor>,
+    pending_token: Option<u32>,
+    pos: usize,
+    generated_ids: Vec<u32>,
+    incremental_decoder: IncrementalDecoder,
+    rendered: String,
+    published_len: usize,
+    stop_holdback_bytes: usize,
+    stop_tokens: Vec<u32>,
+    stop_sequences: Vec<String>,
+    max_new_tokens: usize,
+    finished: bool,
+    stop_reason: &'static str,
+    stop_token: Option<u32>,
+    state_id: u64,
+    next_quantum_nonce: u64,
+    active_quantum: Option<u64>,
+    managed_completions_drained: bool,
+}
+
+struct GraniteSpeechDecodeCheckpointPayload {
+    cache: PhysicalPagedKvCache,
+    prefill_progress: usize,
+    pending_logits: Option<Tensor>,
+    pending_token: Option<u32>,
+    pos: usize,
+    generated_ids: Vec<u32>,
+    incremental_decoder: IncrementalDecoder,
+    rendered: String,
+    published_len: usize,
+    finished: bool,
+    stop_reason: &'static str,
+    stop_token: Option<u32>,
+    managed_completions_drained: bool,
+}
+
+pub(crate) struct GraniteSpeechDecodeCheckpoint {
+    state_id: u64,
+    quantum_nonce: u64,
+    payload: Option<GraniteSpeechDecodeCheckpointPayload>,
+}
+
+impl GraniteSpeechDecodeState {
+    pub(crate) const fn uses_managed_kv(&self) -> bool {
+        true
+    }
+
+    pub(crate) fn prefill_progress(&self) -> usize {
+        self.prefill_progress
+    }
+
+    pub(crate) fn prefill_token_count(&self) -> usize {
+        self.artifact.prompt_tokens
+    }
+
+    pub(crate) fn sequence_position(&self) -> usize {
+        self.pos
+    }
+
+    pub(crate) fn language(&self) -> Option<&str> {
+        self.artifact.language.as_deref()
+    }
+
+    pub(crate) fn prepared_artifact(&self) -> Arc<GraniteSpeechPreparedPromptArtifact> {
+        self.artifact.clone()
+    }
+
+    pub(crate) fn take_managed_write_completions(
+        &mut self,
+    ) -> Vec<Arc<crate::backends::kv::KvWriteBatchCompletion>> {
+        let completions = self.cache.take_completed_writes();
+        self.managed_completions_drained = true;
+        completions
+    }
+
+    pub(crate) fn begin_managed_quantum(
+        &mut self,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<GraniteSpeechDecodeCheckpoint> {
+        if self.active_quantum.is_some() {
+            return Err(Error::InferenceError(
+                "a Granite Speech managed quantum is already active".into(),
+            ));
+        }
+        if !self.managed_completions_drained {
+            return Err(Error::InferenceError(
+                "Granite Speech managed KV completions must be drained before the next quantum"
+                    .into(),
+            ));
+        }
+        if self.cache.arena().id() != cache.arena().id()
+            || self.cache.arena().config().group != cache.arena().config().group
+        {
+            return Err(Error::InferenceError(
+                "a Granite Speech session cannot switch managed KV authority".into(),
+            ));
+        }
+        if cache.context_len() != self.pos {
+            return Err(Error::InferenceError(format!(
+                "managed Granite Speech reservation starts at {}, but state is at {}",
+                cache.context_len(),
+                self.pos
+            )));
+        }
+        let quantum_nonce = self.next_quantum_nonce;
+        self.next_quantum_nonce = self
+            .next_quantum_nonce
+            .checked_add(1)
+            .ok_or_else(|| Error::InferenceError("Granite Speech quantum nonce overflow".into()))?;
+        self.active_quantum = Some(quantum_nonce);
+        Ok(GraniteSpeechDecodeCheckpoint {
+            state_id: self.state_id,
+            quantum_nonce,
+            payload: Some(GraniteSpeechDecodeCheckpointPayload {
+                cache: std::mem::replace(&mut self.cache, cache),
+                prefill_progress: self.prefill_progress,
+                pending_logits: self.pending_logits.clone(),
+                pending_token: self.pending_token,
+                pos: self.pos,
+                generated_ids: self.generated_ids.clone(),
+                incremental_decoder: self.incremental_decoder.clone(),
+                rendered: self.rendered.clone(),
+                published_len: self.published_len,
+                finished: self.finished,
+                stop_reason: self.stop_reason,
+                stop_token: self.stop_token,
+                managed_completions_drained: self.managed_completions_drained,
+            }),
+        })
+    }
+
+    pub(crate) fn commit_managed_quantum(
+        &mut self,
+        checkpoint: &mut GraniteSpeechDecodeCheckpoint,
+    ) -> Result<()> {
+        self.validate_checkpoint(checkpoint)?;
+        checkpoint.payload.take().ok_or_else(|| {
+            Error::InferenceError("Granite Speech checkpoint was already consumed".into())
+        })?;
+        self.active_quantum = None;
+        Ok(())
+    }
+
+    pub(crate) fn rollback_managed_quantum(
+        &mut self,
+        checkpoint: &mut GraniteSpeechDecodeCheckpoint,
+    ) -> Result<()> {
+        self.validate_checkpoint(checkpoint)?;
+        let payload = checkpoint.payload.take().ok_or_else(|| {
+            Error::InferenceError("Granite Speech checkpoint was already consumed".into())
+        })?;
+        self.cache = payload.cache;
+        self.prefill_progress = payload.prefill_progress;
+        self.pending_logits = payload.pending_logits;
+        self.pending_token = payload.pending_token;
+        self.pos = payload.pos;
+        self.generated_ids = payload.generated_ids;
+        self.incremental_decoder = payload.incremental_decoder;
+        self.rendered = payload.rendered;
+        self.published_len = payload.published_len;
+        self.finished = payload.finished;
+        self.stop_reason = payload.stop_reason;
+        self.stop_token = payload.stop_token;
+        self.managed_completions_drained = payload.managed_completions_drained;
+        self.active_quantum = None;
+        Ok(())
+    }
+
+    fn validate_checkpoint(&self, checkpoint: &GraniteSpeechDecodeCheckpoint) -> Result<()> {
+        if checkpoint.state_id != self.state_id
+            || self.active_quantum != Some(checkpoint.quantum_nonce)
+            || checkpoint.payload.is_none()
+        {
+            return Err(Error::InferenceError(
+                "Granite Speech checkpoint is foreign, stale, or out of order".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl GraniteSpeechPreparedAudio {
+    pub(crate) fn features(&self) -> &GraniteSpeechAudioFeatures {
+        &self.features
+    }
+
+    pub(crate) fn stats(&self) -> GraniteSpeechAudioEmbeddingStats {
+        self.stats
+    }
+}
+
+impl GraniteSpeechPreparedPromptArtifact {
+    pub(crate) fn prompt_tokens(&self) -> usize {
+        self.prompt_tokens
+    }
+
+    pub(crate) fn audio_tokens(&self) -> usize {
+        self.audio_tokens
+    }
+}
+
+fn granite_decode_step(state: &GraniteSpeechDecodeState, delta: String) -> GraniteSpeechDecodeStep {
+    GraniteSpeechDecodeStep {
+        delta,
+        text: state.rendered.clone(),
+        tokens_generated: state.generated_ids.len(),
+        finished: state.finished,
+    }
+}
+
+fn truncate_granite_stop_sequence(text: &mut String, stop_sequences: &[String]) -> bool {
+    for stop in stop_sequences.iter().filter(|stop| !stop.is_empty()) {
+        if let Some(index) = text.find(stop) {
+            text.truncate(index);
+            return true;
+        }
+    }
+    false
+}
+
+fn granite_publish_stable_text(
+    state: &mut GraniteSpeechDecodeState,
+    flush: bool,
+) -> Result<String> {
+    if state.rendered.len() < state.published_len {
+        return Err(Error::InferenceError(
+            "Granite Speech decoded text rewrote an already published prefix".into(),
+        ));
+    }
+    let mut end = if flush {
+        state.rendered.len()
+    } else {
+        state
+            .rendered
+            .len()
+            .saturating_sub(state.stop_holdback_bytes)
+    };
+    while end > state.published_len && !state.rendered.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end < state.published_len {
+        end = state.published_len;
+    }
+    let delta = state.rendered[state.published_len..end].to_string();
+    state.published_len = end;
+    Ok(delta)
 }
 
 #[derive(Debug, Clone)]
@@ -143,6 +425,7 @@ impl GraniteSpeechAsrModel {
         );
 
         Ok(Self {
+            model_identity: NEXT_GRANITE_SPEECH_MODEL_ID.fetch_add(1, Ordering::Relaxed),
             model_dir: model_dir.to_path_buf(),
             device,
             dtype,
@@ -159,6 +442,14 @@ impl GraniteSpeechAsrModel {
 
     pub fn config(&self) -> &GraniteSpeechConfig {
         &self.config
+    }
+
+    pub(crate) const fn supports_resumable_prefill(&self) -> bool {
+        true
+    }
+
+    pub(crate) const fn supports_incremental_decode(&self) -> bool {
+        true
     }
 
     pub(crate) fn physical_state_spec(
@@ -214,6 +505,228 @@ impl GraniteSpeechAsrModel {
         options: &GraniteSpeechPromptOptions,
     ) -> Result<GraniteSpeechPrompt> {
         self.prompt_tokenizer.build_prompt(options)
+    }
+
+    pub(crate) fn prepare_audio_retained(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+    ) -> Result<Arc<GraniteSpeechPreparedAudio>> {
+        let features = self.prepare_audio_features(audio, sample_rate)?;
+        validate_granite_audio_duration(features.audio_seconds)?;
+        let (embeddings, stats) = self.runtime.audio_embeddings_with_stats(&features)?;
+        Ok(Arc::new(GraniteSpeechPreparedAudio {
+            model_identity: self.model_identity,
+            features,
+            embeddings,
+            stats,
+        }))
+    }
+
+    pub(crate) fn prepare_prompt_artifact(
+        &self,
+        audio: &GraniteSpeechPreparedAudio,
+        language: Option<&str>,
+        task: GraniteSpeechTask,
+        prompt: Option<&str>,
+        prefix_text: Option<&str>,
+    ) -> Result<Arc<GraniteSpeechPreparedPromptArtifact>> {
+        if audio.model_identity != self.model_identity {
+            return Err(Error::InvalidInput(
+                "Granite Speech prepared audio belongs to another loaded model".into(),
+            ));
+        }
+        let granite_prompt = self.build_prompt(&GraniteSpeechPromptOptions {
+            task,
+            language: language.map(str::to_string),
+            custom_prompt: prompt.map(str::to_string),
+            prefix_text: prefix_text.map(str::to_string),
+            ..GraniteSpeechPromptOptions::default()
+        })?;
+        let (embeddings, prompt_tokens, audio_tokens) = self.runtime.prepare_prompt_embeddings(
+            &granite_prompt,
+            self.prompt_tokenizer.special_tokens(),
+            &audio.embeddings,
+        )?;
+        Ok(Arc::new(GraniteSpeechPreparedPromptArtifact {
+            model_identity: self.model_identity,
+            embeddings,
+            prompt_tokens,
+            audio_tokens,
+            language: language.map(str::to_string),
+        }))
+    }
+
+    pub(crate) fn begin_resumable_prefill_managed(
+        &self,
+        artifact: Arc<GraniteSpeechPreparedPromptArtifact>,
+        options: GraniteSpeechAsrGenerationOptions,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<GraniteSpeechDecodeState> {
+        if artifact.model_identity != self.model_identity {
+            return Err(Error::InvalidInput(
+                "Granite Speech prepared prompt belongs to another loaded model".into(),
+            ));
+        }
+        if cache.context_len() != 0 {
+            return Err(Error::InvalidInput(
+                "Granite Speech retained prefill must begin with an empty cache".into(),
+            ));
+        }
+        let max_new_tokens = options.max_new_tokens.max(1);
+        let required = artifact
+            .prompt_tokens
+            .checked_add(max_new_tokens)
+            .ok_or_else(|| Error::InvalidInput("Granite Speech context length overflow".into()))?;
+        if required > cache.capacity_tokens() {
+            return Err(Error::InvalidInput(format!(
+                "Granite Speech prompt and decode require {required} KV tokens, but retained cache capacity is {}",
+                cache.capacity_tokens()
+            )));
+        }
+        let special = self.prompt_tokenizer.special_tokens();
+        let mut stop_tokens = BTreeSet::from([special.eos_token_id, special.pad_token_id]);
+        stop_tokens.extend(options.stop_token_ids);
+        Ok(GraniteSpeechDecodeState {
+            cache,
+            artifact,
+            prefill_progress: 0,
+            pending_logits: None,
+            pending_token: None,
+            pos: 0,
+            generated_ids: Vec::new(),
+            incremental_decoder: self.prompt_tokenizer.incremental_decoder(),
+            rendered: String::new(),
+            published_len: 0,
+            stop_holdback_bytes: options
+                .stop_sequences
+                .iter()
+                .map(String::len)
+                .max()
+                .unwrap_or(0)
+                .saturating_sub(1),
+            stop_tokens: stop_tokens.into_iter().collect(),
+            stop_sequences: options.stop_sequences,
+            max_new_tokens,
+            finished: false,
+            stop_reason: "max_tokens",
+            stop_token: None,
+            state_id: NEXT_GRANITE_SPEECH_MODEL_ID.fetch_add(1, Ordering::Relaxed),
+            next_quantum_nonce: 1,
+            active_quantum: None,
+            managed_completions_drained: true,
+        })
+    }
+
+    pub(crate) fn continue_resumable_prefill(
+        &self,
+        state: &mut GraniteSpeechDecodeState,
+        span_start: usize,
+        span_end: usize,
+    ) -> Result<bool> {
+        if state.artifact.model_identity != self.model_identity {
+            return Err(Error::InvalidInput(
+                "Granite Speech retained state belongs to another loaded model".into(),
+            ));
+        }
+        if span_start != state.prefill_progress
+            || span_start >= span_end
+            || span_end > state.artifact.prompt_tokens
+            || state.pos != span_start
+        {
+            return Err(Error::InvalidInput(
+                "Granite Speech prefill span is non-monotonic or out of range".into(),
+            ));
+        }
+        let logits = self.runtime.prefill_prepared_prompt_span(
+            &state.artifact.embeddings,
+            span_start,
+            span_end,
+            &mut state.cache,
+        )?;
+        state.prefill_progress = span_end;
+        state.pos = span_end;
+        if span_end == state.artifact.prompt_tokens {
+            state.pending_logits = Some(logits);
+        }
+        state.managed_completions_drained = false;
+        Ok(span_end == state.artifact.prompt_tokens)
+    }
+
+    pub(crate) fn decode_step(
+        &self,
+        state: &mut GraniteSpeechDecodeState,
+    ) -> Result<GraniteSpeechDecodeStep> {
+        if state.artifact.model_identity != self.model_identity {
+            return Err(Error::InvalidInput(
+                "Granite Speech retained state belongs to another loaded model".into(),
+            ));
+        }
+        if state.finished {
+            return Ok(granite_decode_step(state, String::new()));
+        }
+        if state.prefill_progress != state.artifact.prompt_tokens {
+            return Err(Error::InferenceError(
+                "Granite Speech decode requires completed prefill".into(),
+            ));
+        }
+        if let Some(token) = state.pending_token {
+            let logits = self
+                .runtime
+                .decode_token(token, state.pos, &mut state.cache)?;
+            state.pending_token = None;
+            state.pending_logits = Some(logits);
+            state.pos = state.pos.checked_add(1).ok_or_else(|| {
+                Error::InferenceError("Granite Speech decode position overflow".into())
+            })?;
+            state.managed_completions_drained = false;
+        }
+        let logits = state.pending_logits.as_ref().ok_or_else(|| {
+            Error::InferenceError("Granite Speech decode has no pending logits".into())
+        })?;
+        let token = self.runtime.greedy_token(logits)?;
+        if state.stop_tokens.binary_search(&token).is_ok() {
+            state.rendered.push_str(
+                &self
+                    .prompt_tokenizer
+                    .finish_incremental_decode(&mut state.incremental_decoder)?,
+            );
+            truncate_granite_stop_sequence(&mut state.rendered, &state.stop_sequences);
+            let delta = granite_publish_stable_text(state, true)?;
+            state.pending_logits = None;
+            state.finished = true;
+            state.stop_reason = "stop_token";
+            state.stop_token = Some(token);
+            return Ok(granite_decode_step(state, delta));
+        }
+
+        state.generated_ids.push(token);
+        state.rendered.push_str(
+            &self
+                .prompt_tokenizer
+                .decode_incrementally(&mut state.incremental_decoder, token)?,
+        );
+        let mut stopped_on_sequence =
+            truncate_granite_stop_sequence(&mut state.rendered, &state.stop_sequences);
+        let reached_max_tokens = state.generated_ids.len() >= state.max_new_tokens;
+        if reached_max_tokens && !stopped_on_sequence {
+            state.rendered.push_str(
+                &self
+                    .prompt_tokenizer
+                    .finish_incremental_decode(&mut state.incremental_decoder)?,
+            );
+            stopped_on_sequence =
+                truncate_granite_stop_sequence(&mut state.rendered, &state.stop_sequences);
+        }
+        let finished = stopped_on_sequence || reached_max_tokens;
+        let delta = granite_publish_stable_text(state, finished)?;
+        state.pending_logits = None;
+        state.finished = finished;
+        if stopped_on_sequence {
+            state.stop_reason = "stop_sequence";
+        }
+        state.pending_token = (!finished).then_some(token);
+        Ok(granite_decode_step(state, delta))
     }
 
     pub fn max_audio_seconds_hint(&self) -> Option<f32> {
@@ -1120,7 +1633,11 @@ fn validate_shard_filename(file: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::kv::{CpuKvArena, KvArena, KvArenaConfig, KvLayerConfig};
+    use crate::backends::BackendKind;
     use crate::backends::DeviceCapabilities;
+    use crate::engine::ModelInstanceId;
+    use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
     use uuid::Uuid;
 
     static GRANITE_DTYPE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1151,6 +1668,114 @@ mod tests {
             },
             memory_pool: None,
         }
+    }
+
+    fn retained_test_caches() -> (PhysicalPagedKvCache, PhysicalPagedKvCache) {
+        let binding = KvLayerBinding {
+            model_layer: 0,
+            physical_layer: 0,
+        };
+        let arena: Arc<dyn KvArena> = Arc::new(
+            CpuKvArena::new(KvArenaConfig {
+                id: KvArenaId {
+                    model_instance: ModelInstanceId::new(177),
+                    backend: BackendKind::Cpu,
+                    device_ordinal: None,
+                    generation: 1,
+                },
+                group: KvGroupId::new(0),
+                page_tokens: 2,
+                capacity_pages: 4,
+                growth: None,
+                dtype: DType::F32,
+                layers: vec![KvLayerConfig {
+                    binding,
+                    num_kv_heads: 1,
+                    key_head_dim: 2,
+                    value_head_dim: 2,
+                }],
+            })
+            .unwrap(),
+        );
+        let cache = || {
+            let blocks = (0..4)
+                .map(|index| CacheBlockRef {
+                    arena: arena.id(),
+                    group: arena.config().group,
+                    index,
+                    slot_generation: 1,
+                })
+                .collect();
+            PhysicalPagedKvCache::new(arena.clone(), vec![binding], blocks, 0).unwrap()
+        };
+        (cache(), cache())
+    }
+
+    #[test]
+    fn retained_decode_checkpoint_rolls_back_staged_progress_and_is_single_use() {
+        let (cache, replacement) = retained_test_caches();
+        let artifact = Arc::new(GraniteSpeechPreparedPromptArtifact {
+            model_identity: 9,
+            embeddings: Tensor::zeros((1, 3, 4), DType::F32, &candle_core::Device::Cpu).unwrap(),
+            prompt_tokens: 3,
+            audio_tokens: 1,
+            language: Some("en".into()),
+        });
+        let mut state = GraniteSpeechDecodeState {
+            cache,
+            artifact,
+            prefill_progress: 0,
+            pending_logits: None,
+            pending_token: None,
+            pos: 0,
+            generated_ids: vec![],
+            incremental_decoder: IncrementalDecoder::new(true),
+            rendered: String::new(),
+            published_len: 0,
+            stop_holdback_bytes: 0,
+            stop_tokens: vec![2],
+            stop_sequences: vec![],
+            max_new_tokens: 4,
+            finished: false,
+            stop_reason: "max_tokens",
+            stop_token: None,
+            state_id: 11,
+            next_quantum_nonce: 1,
+            active_quantum: None,
+            managed_completions_drained: true,
+        };
+        let mut checkpoint = state.begin_managed_quantum(replacement).unwrap();
+        state.prefill_progress = 3;
+        state.pos = 3;
+        state.generated_ids.push(7);
+        state.pending_token = Some(7);
+        state.rendered = "staged".into();
+        state.finished = true;
+
+        state.rollback_managed_quantum(&mut checkpoint).unwrap();
+        assert_eq!(state.prefill_progress, 0);
+        assert_eq!(state.sequence_position(), 0);
+        assert!(state.generated_ids.is_empty());
+        assert_eq!(state.pending_token, None);
+        assert!(state.rendered.is_empty());
+        assert!(!state.finished);
+        assert!(state
+            .rollback_managed_quantum(&mut checkpoint)
+            .unwrap_err()
+            .to_string()
+            .contains("foreign, stale, or out of order"));
+
+        state.stop_sequences = vec!["<stop>".into()];
+        state.stop_holdback_bytes = "<stop>".len() - 1;
+        state.rendered = "hello<st".into();
+        let first = granite_publish_stable_text(&mut state, false).unwrap();
+        state.rendered.push_str("op>");
+        assert!(truncate_granite_stop_sequence(
+            &mut state.rendered,
+            &state.stop_sequences
+        ));
+        let final_delta = granite_publish_stable_text(&mut state, true).unwrap();
+        assert_eq!(format!("{first}{final_delta}"), "hello");
     }
 
     #[test]
