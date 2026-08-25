@@ -2368,7 +2368,7 @@ impl NativeExecutor {
         let batch_family = Self::resolve_variant(ordered_requests[live_indices[0]])?.family();
         if !matches!(
             batch_family,
-            ModelFamily::Qwen3Asr | ModelFamily::VibeVoiceAsr
+            ModelFamily::Qwen3Asr | ModelFamily::VibeVoiceAsr | ModelFamily::GraniteSpeechAsr
         ) {
             return Err(Error::InvalidInput(
                 "continuous ASR batch contains a model without retained tensor decode".into(),
@@ -2499,6 +2499,8 @@ impl NativeExecutor {
         let live_width = state_refs.len();
         let steps = if state_refs.is_empty() {
             Vec::new()
+        } else if state_refs.len() == 1 {
+            vec![Self::run_blocking(|| model.decode_step(state_refs[0]))?]
         } else {
             Self::run_blocking(|| model.decode_step_batch(&mut state_refs))?
         };

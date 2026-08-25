@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use candle_core::{DType, Tensor};
+use candle_core::{DType, Tensor, D};
 use serde_json::json;
 use tracing::info;
 
@@ -168,7 +168,6 @@ pub(crate) struct GraniteSpeechDecodeState {
     cache: PhysicalPagedKvCache,
     artifact: Arc<GraniteSpeechPreparedPromptArtifact>,
     prefill_progress: usize,
-    pending_logits: Option<Tensor>,
     pending_token: Option<u32>,
     pos: usize,
     generated_ids: Vec<u32>,
@@ -191,7 +190,6 @@ pub(crate) struct GraniteSpeechDecodeState {
 struct GraniteSpeechDecodeCheckpointPayload {
     cache: PhysicalPagedKvCache,
     prefill_progress: usize,
-    pending_logits: Option<Tensor>,
     pending_token: Option<u32>,
     pos: usize,
     generated_ids: Vec<u32>,
@@ -282,7 +280,6 @@ impl GraniteSpeechDecodeState {
             payload: Some(GraniteSpeechDecodeCheckpointPayload {
                 cache: std::mem::replace(&mut self.cache, cache),
                 prefill_progress: self.prefill_progress,
-                pending_logits: self.pending_logits.clone(),
                 pending_token: self.pending_token,
                 pos: self.pos,
                 generated_ids: self.generated_ids.clone(),
@@ -319,7 +316,6 @@ impl GraniteSpeechDecodeState {
         })?;
         self.cache = payload.cache;
         self.prefill_progress = payload.prefill_progress;
-        self.pending_logits = payload.pending_logits;
         self.pending_token = payload.pending_token;
         self.pos = payload.pos;
         self.generated_ids = payload.generated_ids;
@@ -391,6 +387,27 @@ fn granite_decode_step(state: &GraniteSpeechDecodeState, delta: String) -> Grani
         tokens_generated: state.generated_ids.len(),
         finished: state.finished,
     }
+}
+
+fn stage_granite_first_decode_token(state: &mut GraniteSpeechDecodeState, token: u32) {
+    state.pending_token = Some(token);
+}
+
+fn granite_batch_argmax(logits: &Tensor) -> Result<Vec<u32>> {
+    let (batch, sequence, _vocab) = logits.dims3()?;
+    if batch == 0 || sequence == 0 {
+        return Err(Error::InferenceError(format!(
+            "Granite Speech batch logits have invalid shape {:?}",
+            logits.dims()
+        )));
+    }
+    logits
+        .narrow(1, sequence - 1, 1)?
+        .squeeze(1)?
+        .argmax(D::Minus1)?
+        .to_dtype(DType::U32)?
+        .to_vec1::<u32>()
+        .map_err(Error::from)
 }
 
 fn truncate_granite_stop_sequence(text: &mut String, stop_sequences: &[String]) -> bool {
@@ -868,7 +885,6 @@ impl GraniteSpeechAsrModel {
             cache,
             artifact,
             prefill_progress: 0,
-            pending_logits: None,
             pending_token: None,
             pos: 0,
             generated_ids: Vec::new(),
@@ -924,7 +940,8 @@ impl GraniteSpeechAsrModel {
         state.prefill_progress = span_end;
         state.pos = span_end;
         if span_end == state.artifact.prompt_tokens {
-            state.pending_logits = Some(logits);
+            let token = self.runtime.greedy_token(&logits)?;
+            stage_granite_first_decode_token(state, token);
         }
         state.managed_completions_drained = false;
         Ok(span_end == state.artifact.prompt_tokens)
@@ -947,22 +964,28 @@ impl GraniteSpeechAsrModel {
                 "Granite Speech decode requires completed prefill".into(),
             ));
         }
-        if let Some(token) = state.pending_token {
-            let logits = self
-                .runtime
-                .decode_token(token, state.pos, &mut state.cache)?;
-            state.pending_token = None;
-            state.pending_logits = Some(logits);
-            state.pos = state.pos.checked_add(1).ok_or_else(|| {
-                Error::InferenceError("Granite Speech decode position overflow".into())
-            })?;
-            state.managed_completions_drained = false;
-        }
-        let logits = state.pending_logits.as_ref().ok_or_else(|| {
-            Error::InferenceError("Granite Speech decode has no pending logits".into())
+        let appended = state.pending_token.ok_or_else(|| {
+            Error::InferenceError("Granite Speech decode has no staged input token".into())
         })?;
-        let token = self.runtime.greedy_token(logits)?;
-        if state.stop_tokens.binary_search(&token).is_ok() {
+        let logits = self
+            .runtime
+            .decode_token(appended, state.pos, &mut state.cache)?;
+        let next = self.runtime.greedy_token(&logits)?;
+        state.pending_token = None;
+        state.pos = state.pos.checked_add(1).ok_or_else(|| {
+            Error::InferenceError("Granite Speech decode position overflow".into())
+        })?;
+        state.managed_completions_drained = false;
+        self.finish_appended_decode_token(state, appended, next)
+    }
+
+    fn finish_appended_decode_token(
+        &self,
+        state: &mut GraniteSpeechDecodeState,
+        appended: u32,
+        next: u32,
+    ) -> Result<GraniteSpeechDecodeStep> {
+        if state.stop_tokens.binary_search(&appended).is_ok() {
             state.rendered.push_str(
                 &self
                     .prompt_tokenizer
@@ -970,23 +993,23 @@ impl GraniteSpeechAsrModel {
             );
             truncate_granite_stop_sequence(&mut state.rendered, &state.stop_sequences);
             let delta = granite_publish_stable_text(state, true)?;
-            state.pending_logits = None;
+            state.pending_token = None;
             state.finished = true;
             state.stop_reason = "stop_token";
-            state.stop_token = Some(token);
+            state.stop_token = Some(appended);
             return Ok(granite_decode_step(state, delta));
         }
-
-        state.generated_ids.push(token);
+        state.generated_ids.push(appended);
         state.rendered.push_str(
             &self
                 .prompt_tokenizer
-                .decode_incrementally(&mut state.incremental_decoder, token)?,
+                .decode_incrementally(&mut state.incremental_decoder, appended)?,
         );
         let mut stopped_on_sequence =
             truncate_granite_stop_sequence(&mut state.rendered, &state.stop_sequences);
         let reached_max_tokens = state.generated_ids.len() >= state.max_new_tokens;
-        if reached_max_tokens && !stopped_on_sequence {
+        let stopped_on_token = state.stop_tokens.binary_search(&next).is_ok();
+        if (reached_max_tokens || stopped_on_token) && !stopped_on_sequence {
             state.rendered.push_str(
                 &self
                     .prompt_tokenizer
@@ -995,15 +1018,84 @@ impl GraniteSpeechAsrModel {
             stopped_on_sequence =
                 truncate_granite_stop_sequence(&mut state.rendered, &state.stop_sequences);
         }
-        let finished = stopped_on_sequence || reached_max_tokens;
+        let finished = stopped_on_sequence || reached_max_tokens || stopped_on_token;
         let delta = granite_publish_stable_text(state, finished)?;
-        state.pending_logits = None;
         state.finished = finished;
         if stopped_on_sequence {
             state.stop_reason = "stop_sequence";
+        } else if stopped_on_token {
+            state.stop_reason = "stop_token";
+            state.stop_token = Some(next);
         }
-        state.pending_token = (!finished).then_some(token);
+        state.pending_token = (!finished).then_some(next);
         Ok(granite_decode_step(state, delta))
+    }
+
+    /// One native ragged token step for retained Granite rows sharing one
+    /// physical arena. Text assembly remains isolated per row.
+    pub(crate) fn decode_step_batch(
+        &self,
+        states: &mut [&mut GraniteSpeechDecodeState],
+    ) -> Result<Vec<GraniteSpeechDecodeStep>> {
+        if states.is_empty() {
+            return Ok(Vec::new());
+        }
+        for state in states.iter() {
+            if state.artifact.model_identity != self.model_identity
+                || state.finished
+                || state.prefill_progress != state.artifact.prompt_tokens
+                || state.pending_token.is_none()
+                || state.cache.context_len() != state.pos
+            {
+                return Err(Error::InvalidInput(
+                    "Granite Speech decode batch requires one staged input token per completed retained row"
+                        .into(),
+                ));
+            }
+            state.pos.checked_add(1).ok_or_else(|| {
+                Error::InferenceError("Granite Speech decode position overflow".into())
+            })?;
+        }
+        let appended = states
+            .iter()
+            .map(|state| state.pending_token.expect("validated pending token"))
+            .collect::<Vec<_>>();
+        let positions = states.iter().map(|state| state.pos).collect::<Vec<_>>();
+        let output = {
+            let mut caches = states
+                .iter_mut()
+                .map(|state| &mut state.cache)
+                .collect::<Vec<_>>();
+            self.runtime
+                .decode_tokens_batch(&appended, &positions, &mut caches)?
+        };
+        let sampled = granite_batch_argmax(&output)?;
+        if sampled.len() != states.len() {
+            return Err(Error::InferenceError(
+                "Granite Speech decode batch returned the wrong row count".into(),
+            ));
+        }
+        for state in states.iter_mut() {
+            state.pending_token = None;
+            state.pos += 1;
+            state.managed_completions_drained = false;
+        }
+        let mut steps = Vec::with_capacity(states.len());
+        for ((state, appended), next) in states.iter_mut().zip(appended).zip(sampled) {
+            steps.push(self.finish_appended_decode_token(state, appended, next)?);
+        }
+        Ok(steps)
+    }
+
+    pub(crate) const fn supports_continuous_decode_batch(&self) -> bool {
+        true
+    }
+
+    pub(crate) fn continuous_decode_workspace_per_row_bytes(&self) -> Result<u64> {
+        u64::try_from(self.config.text_config.hidden_size)
+            .ok()
+            .and_then(|hidden| hidden.checked_mul(u64::try_from(self.dtype.size_in_bytes()).ok()?))
+            .ok_or_else(|| Error::Overloaded("Granite Speech decode workspace overflow".into()))
     }
 
     pub fn max_audio_seconds_hint(&self) -> Option<f32> {
@@ -1404,24 +1496,37 @@ fn granite_speech_physical_state_spec(
     if normal_graphs > 0 {
         let valid_normal = normal_graphs == 1
             && stage_graphs.iter().any(|stages| {
-                stages.len() == 3
-                    && stages.iter().all(|stage| {
-                        stage.batch_mode == crate::engine::NativeBatchMode::None
+                let scalar_stage = |selector| {
+                    stages.iter().any(|stage| {
+                        stage.selector == selector
+                            && stage.batch_mode == crate::engine::NativeBatchMode::None
                             && stage.shape_policy == crate::engine::StageShapePolicy::Exact
+                            && stage.concurrency == crate::engine::ConcurrencyClass::Exclusive
+                            && stage.max_batch_size == 1
                     })
-                    && stages.iter().any(|stage| {
-                        stage.selector == crate::engine::StageWorkSelector::PreSequencePreparation
-                    })
-                    && stages.iter().any(|stage| {
-                        stage.selector == crate::engine::StageWorkSelector::SequencePrefill
-                    })
-                    && stages.iter().any(|stage| {
-                        stage.selector == crate::engine::StageWorkSelector::SequenceDecode
-                    })
+                };
+                let decode = stages.iter().any(|stage| {
+                    let batch_workspace = u64::try_from(stage.max_batch_size)
+                        .ok()
+                        .and_then(|width| stage.workspace_per_row_bytes.checked_mul(width));
+                    stage.selector == crate::engine::StageWorkSelector::SequenceDecode
+                        && stage.batch_mode == crate::engine::NativeBatchMode::Continuous
+                        && stage.shape_policy == crate::engine::StageShapePolicy::Ragged
+                        && stage.concurrency == crate::engine::ConcurrencyClass::Batchable
+                        && stage.max_batch_size > 0
+                        && stage.workspace_base_bytes == 0
+                        && stage.workspace_per_row_bytes > 0
+                        && stage.workspace_per_work_unit_bytes == 0
+                        && batch_workspace.is_some_and(|bytes| stage.max_workspace_bytes >= bytes)
+                });
+                stages.len() == 3
+                    && scalar_stage(crate::engine::StageWorkSelector::PreSequencePreparation)
+                    && scalar_stage(crate::engine::StageWorkSelector::SequencePrefill)
+                    && decode
             });
         if !valid_normal || atomic_graphs != 1 || stage_graphs.len() != 2 {
             return Err(Error::ModelLoadError(
-                "Granite Speech ASR requires one exact scalar retained graph and one atomic compatibility graph"
+                "Granite Speech ASR requires scalar exact preparation/prefill, continuous ragged decode, and one atomic compatibility graph"
                     .into(),
             ));
         }
@@ -1475,6 +1580,11 @@ fn granite_speech_physical_state_spec(
                 Vec::new()
             };
             if stage.max_workspace_bytes > 0 {
+                let scratch_bytes = if stage.workspace_per_row_bytes > 0 {
+                    stage.workspace_per_row_bytes
+                } else {
+                    stage.max_workspace_bytes
+                };
                 let scratch_id = max_domain_id
                     .checked_add(u32::try_from(index + 1).map_err(|_| {
                         Error::ModelLoadError(
@@ -1490,7 +1600,7 @@ fn granite_speech_physical_state_spec(
                     alignment_bytes: 64,
                     zero_on_release: false,
                     formula: WorkspaceFormula {
-                        fixed_bytes: stage.max_workspace_bytes,
+                        fixed_bytes: scratch_bytes,
                         dimensions: vec![],
                         terms: vec![],
                     },
@@ -2026,8 +2136,7 @@ mod tests {
     use crate::backends::DeviceCapabilities;
     use crate::engine::ModelInstanceId;
     use crate::engine::{
-        ExecutionMode, ExecutionProfile, NativeBatchMode, StageId, StageShapePolicy,
-        StageWorkSelector,
+        ExecutionMode, ExecutionProfile, NativeBatchMode, StageId, StageWorkSelector,
     };
     use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
     use uuid::Uuid;
@@ -2058,15 +2167,24 @@ mod tests {
             ExecutionMode::Sequence
         };
         let mut profile = ExecutionProfile::fail_closed(BackendKind::Cpu, None, mode);
-        profile.max_batch_size = 1;
+        let batch_mode = if selector == StageWorkSelector::SequenceDecode {
+            profile.max_batch_size = 4;
+            NativeBatchMode::Continuous
+        } else {
+            profile.max_batch_size = 1;
+            NativeBatchMode::None
+        };
         let mut stage = StageDescriptor::from_execution_profile(
             StageId::new(id),
             format!("granite.test.{id}"),
             &profile,
-            NativeBatchMode::None,
+            batch_mode,
         );
         stage.selector = selector;
-        stage.shape_policy = StageShapePolicy::Exact;
+        if selector == StageWorkSelector::SequenceDecode {
+            stage.workspace_per_row_bytes = 16;
+            stage.max_workspace_bytes = 64;
+        }
         stage
     }
 
@@ -2229,6 +2347,70 @@ mod tests {
         (cache(), cache())
     }
 
+    fn retained_test_state(
+        cache: PhysicalPagedKvCache,
+        state_id: u64,
+        pending_token: Option<u32>,
+    ) -> GraniteSpeechDecodeState {
+        GraniteSpeechDecodeState {
+            cache,
+            artifact: Arc::new(GraniteSpeechPreparedPromptArtifact {
+                model_identity: 9,
+                embeddings: Tensor::zeros((1, 1, 4), DType::F32, &candle_core::Device::Cpu)
+                    .unwrap(),
+                prompt_tokens: 0,
+                audio_tokens: 1,
+                language: Some("en".into()),
+            }),
+            prefill_progress: 0,
+            pending_token,
+            pos: 0,
+            generated_ids: vec![],
+            incremental_decoder: IncrementalDecoder::new(true),
+            rendered: String::new(),
+            published_len: 0,
+            stop_holdback_bytes: 0,
+            stop_tokens: vec![2],
+            stop_sequences: vec![],
+            max_new_tokens: 4,
+            finished: false,
+            stop_reason: "max_tokens",
+            stop_token: None,
+            state_id,
+            next_quantum_nonce: 1,
+            active_quantum: None,
+            managed_completions_drained: true,
+        }
+    }
+
+    #[test]
+    fn final_prefill_token_is_staged_without_early_publication() {
+        let (cache_a, _) = retained_test_caches();
+        let mut state = retained_test_state(cache_a, 21, None);
+
+        stage_granite_first_decode_token(&mut state, 2);
+        assert_eq!(state.pending_token, Some(2));
+        assert!(state.generated_ids.is_empty());
+        assert!(state.rendered.is_empty());
+        assert!(!state.finished);
+    }
+
+    #[test]
+    fn decode_checkpoint_restores_staged_token_and_cursor() {
+        let (cache_a, replacement_a) = retained_test_caches();
+        let mut state = retained_test_state(cache_a, 31, Some(6));
+
+        let mut checkpoint = state.begin_managed_quantum(replacement_a).unwrap();
+        state.pending_token = Some(1);
+        state.pos = 1;
+        state.managed_completions_drained = false;
+        state.rollback_managed_quantum(&mut checkpoint).unwrap();
+
+        assert_eq!(state.pending_token, Some(6));
+        assert_eq!(state.pos, 0);
+        assert!(state.managed_completions_drained);
+    }
+
     #[test]
     fn retained_decode_checkpoint_rolls_back_staged_progress_and_is_single_use() {
         let (cache, replacement) = retained_test_caches();
@@ -2243,7 +2425,6 @@ mod tests {
             cache,
             artifact,
             prefill_progress: 0,
-            pending_logits: None,
             pending_token: None,
             pos: 0,
             generated_ids: vec![],

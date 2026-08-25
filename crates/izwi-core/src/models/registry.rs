@@ -2185,6 +2185,7 @@ impl NativeAsrModel {
         match self {
             Self::Qwen3(model) => model.supports_continuous_decode_batch(),
             Self::VibeVoice(model) => model.supports_continuous_decode_batch(),
+            Self::GraniteSpeech(model) => model.supports_continuous_decode_batch(),
             _ => false,
         }
     }
@@ -2195,13 +2196,14 @@ impl NativeAsrModel {
 
     pub fn continuous_decode_is_tensor_batched(&self) -> bool {
         matches!(self, Self::Qwen3(model) if model.continuous_decode_is_tensor_batched())
-            || matches!(self, Self::VibeVoice(_))
+            || matches!(self, Self::VibeVoice(_) | Self::GraniteSpeech(_))
     }
 
     pub fn continuous_decode_batch_workspace_per_row_bytes(&self) -> Result<u64> {
         match self {
             Self::Qwen3(model) => model.continuous_decode_batch_workspace_per_row_bytes(),
             Self::VibeVoice(model) => model.continuous_decode_workspace_per_row_bytes(),
+            Self::GraniteSpeech(model) => model.continuous_decode_workspace_per_row_bytes(),
             _ => Err(Error::InvalidInput(
                 "Loaded ASR model does not expose continuous tensor decode".to_string(),
             )),
@@ -2773,6 +2775,29 @@ impl NativeAsrModel {
                         NativeAsrDecodeState::VibeVoice(state) => Ok(state),
                         _ => Err(Error::InvalidInput(
                             "continuous VibeVoice ASR batch contains a foreign state".to_string(),
+                        )),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                model.decode_step_batch(&mut typed).map(|steps| {
+                    steps
+                        .into_iter()
+                        .map(|step| NativeAsrDecodeStep {
+                            delta: step.delta,
+                            text: step.text,
+                            tokens_generated: step.tokens_generated,
+                            finished: step.finished,
+                        })
+                        .collect()
+                })
+            }
+            Self::GraniteSpeech(model) => {
+                let mut typed = states
+                    .iter_mut()
+                    .map(|state| match &mut **state {
+                        NativeAsrDecodeState::GraniteSpeech(state) => Ok(state),
+                        _ => Err(Error::InvalidInput(
+                            "continuous Granite Speech ASR batch contains a foreign state"
+                                .to_string(),
                         )),
                     })
                     .collect::<Result<Vec<_>>>()?;
