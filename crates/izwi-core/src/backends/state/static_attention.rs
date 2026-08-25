@@ -17,6 +17,7 @@ use crate::kv::v2::{
     ResolvedNonPagedDomainPlan, ResolvedPlacement, ResolvedStatePlan, ResolvedStaticAttentionPlan,
     StateDType, StateDomainId, StateDomainSpec, StateGroupId, StateScope, StateStorageFormat,
     StateUpdateKind, StaticAttentionDomainSpec, StaticAttentionLayerSpec, TensorPhysicalLayout,
+    WorkspaceFormula,
 };
 
 use super::StateBackendRegistry;
@@ -91,7 +92,54 @@ impl InvocationStaticAttentionArena {
         let backend = backend_kind_for_device(&device);
         let ordinal = device_ordinal(&device)?;
         let registry = StateBackendRegistry::new(backend, ordinal)?;
-        Self::new_with_operation_registry(contract, plan, workspace_domain, device, &registry)
+        Self::new_with_operation_registry(
+            contract,
+            plan,
+            workspace_domain,
+            device,
+            StateScope::Invocation,
+            &registry,
+        )
+    }
+
+    pub(crate) fn new_retained(
+        contract: &InferenceStateContract,
+        plan: Arc<ResolvedStatePlan>,
+        domain: StateDomainId,
+        device: Device,
+    ) -> Result<Self> {
+        let state = contract
+            .domains
+            .iter()
+            .find(|state| state.id() == domain)
+            .ok_or_else(|| invalid("retained static-attention domain is absent from its contract"))?
+            .clone();
+        let resolved = plan
+            .non_paged
+            .iter()
+            .find(|candidate| candidate.domain() == domain)
+            .ok_or_else(|| invalid("retained static-attention domain has no resolved backing"))?;
+        let workspace_domain = InvocationWorkspaceDomain::State {
+            placement: state.header().placement,
+            formula: WorkspaceFormula {
+                fixed_bytes: resolved.maximum_bytes(),
+                dimensions: Vec::new(),
+                terms: Vec::new(),
+            },
+            state,
+            capacity: InvocationStateCapacity::SemanticBounded,
+        };
+        let backend = backend_kind_for_device(&device);
+        let ordinal = device_ordinal(&device)?;
+        let registry = StateBackendRegistry::new(backend, ordinal)?;
+        Self::new_with_operation_registry(
+            contract,
+            plan,
+            workspace_domain,
+            device,
+            StateScope::Retained,
+            &registry,
+        )
     }
 
     fn new_with_operation_registry(
@@ -99,6 +147,7 @@ impl InvocationStaticAttentionArena {
         plan: Arc<ResolvedStatePlan>,
         workspace_domain: InvocationWorkspaceDomain,
         device: Device,
+        expected_scope: StateScope,
         registry: &StateBackendRegistry,
     ) -> Result<Self> {
         let backend = backend_kind_for_device(&device);
@@ -137,11 +186,9 @@ impl InvocationStaticAttentionArena {
                 "static-attention arena requires a StaticAttention domain",
             ));
         };
-        if semantic.header.scope != StateScope::Invocation
-            || semantic.header.placement != *placement
-        {
+        if semantic.header.scope != expected_scope || semantic.header.placement != *placement {
             return Err(invalid(
-                "static-attention arena requires invocation-scoped matching placement",
+                "static-attention arena requires its exact requested scope and matching placement",
             ));
         }
 

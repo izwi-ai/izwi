@@ -62,6 +62,12 @@ pub use cache::managed::{
 #[cfg(test)]
 pub(crate) use cache::physical::PhysicalStateManager;
 pub(crate) use cache::physical::{RetainedTensorStateRuntimeIdV2, RetainedTensorStateRuntimeV2};
+#[allow(unused_imports)]
+pub(crate) use cache::retained_static_attention::{
+    RetainedStaticAttentionBatchRow, RetainedStaticAttentionRuntimeIdV2,
+    RetainedStaticAttentionRuntimeV2, RetainedStaticAttentionSequenceId,
+    RetainedStaticAttentionTransactionId,
+};
 pub use cache::telemetry::ManagedKvTelemetrySnapshot;
 pub(crate) use config::resolve_backend_model_context;
 pub(crate) use config::tts_explicit_output_limit;
