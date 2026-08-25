@@ -7,7 +7,9 @@ use crate::backends::state::{
 };
 use crate::error::{Error, Result};
 use crate::models::architectures::lfm2::backbone::Lfm2ShortConvRuntimeState;
-use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PhysicalPagedKvCheckpoint};
+use crate::models::shared::attention::physical::{
+    PhysicalPagedKvCache, PhysicalPagedKvCheckpoint, PhysicalPagedKvSequenceAuthority,
+};
 
 static NEXT_LFM25_AUDIO_RETAINED_STATE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -32,7 +34,7 @@ pub(crate) struct Lfm25AudioRetainedState {
     main_position: usize,
     depthformer_step: usize,
     tensor_sequence: Option<PhysicalStateSequenceId>,
-    main_view_id: Option<u64>,
+    main_cache_authority: Option<PhysicalPagedKvSequenceAuthority>,
     pub(super) shortconv: Lfm2ShortConvRuntimeState,
 }
 
@@ -40,6 +42,8 @@ pub(crate) struct Lfm25AudioRetainedCheckpoint {
     state_id: u64,
     quantum_nonce: u64,
     subphase: Lfm25AudioRetainedSubphase,
+    prior_main_cache_authority: Option<PhysicalPagedKvSequenceAuthority>,
+    main_cache_authority: PhysicalPagedKvSequenceAuthority,
     main_view_id: u64,
     depthformer_view_id: Option<u64>,
     main_kv: PhysicalPagedKvCheckpoint,
@@ -64,7 +68,7 @@ impl Lfm25AudioRetainedState {
             main_position: 0,
             depthformer_step: 0,
             tensor_sequence: None,
-            main_view_id: None,
+            main_cache_authority: None,
             shortconv,
         }
     }
@@ -107,16 +111,15 @@ impl Lfm25AudioRetainedState {
                 "an LFM2.5 Audio retained quantum is already active".into(),
             ));
         }
-        let bind_main = self.validate_caches(subphase, main, depthformer)?;
+        self.validate_caches(subphase, main, depthformer)?;
         let nonce =
             begin_quantum_authority(&mut self.active_quantum, &mut self.next_quantum_nonce)?;
-        if bind_main {
-            self.main_view_id = Some(main.view_id());
-        }
         Ok(Lfm25AudioRetainedCheckpoint {
             state_id: self.state_id,
             quantum_nonce: nonce,
             subphase,
+            prior_main_cache_authority: self.main_cache_authority,
+            main_cache_authority: main.sequence_authority(),
             main_view_id: main.view_id(),
             depthformer_view_id: depthformer.map(PhysicalPagedKvCache::view_id),
             main_kv: main.logical_checkpoint(),
@@ -161,6 +164,11 @@ impl Lfm25AudioRetainedState {
             self.depthformer_step = depthformer.context_len();
         }
         finish_quantum_authority(&mut self.active_quantum, checkpoint.quantum_nonce)?;
+        install_cache_authority_after_commit(
+            &mut self.main_cache_authority,
+            checkpoint.prior_main_cache_authority,
+            checkpoint.main_cache_authority,
+        )?;
         Ok(())
     }
 
@@ -248,7 +256,7 @@ impl Lfm25AudioRetainedState {
         subphase: Lfm25AudioRetainedSubphase,
         main: &PhysicalPagedKvCache,
         depthformer: Option<&PhysicalPagedKvCache>,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         if main.context_len() != self.main_position
             || self.shortconv.cursor() as usize != self.main_position
         {
@@ -264,7 +272,8 @@ impl Lfm25AudioRetainedState {
             depthformer.map(PhysicalPagedKvCache::context_len),
             true,
         )?;
-        validate_exact_view(self.main_view_id, main.view_id(), "main")
+        validate_exact_cache_authority(self.main_cache_authority, main.sequence_authority(), "main")
+            .map(|_| ())
     }
 
     fn authenticate(
@@ -282,7 +291,8 @@ impl Lfm25AudioRetainedState {
             main.view_id(),
             checkpoint.depthformer_view_id,
             depthformer.map(PhysicalPagedKvCache::view_id),
-        ) || self.main_view_id != Some(main.view_id())
+        ) || checkpoint.main_cache_authority != main.sequence_authority()
+            || checkpoint.prior_main_cache_authority != self.main_cache_authority
         {
             return Err(Error::InferenceError(
                 "LFM2.5 Audio checkpoint is stale, foreign, or crossed cache authority".into(),
@@ -309,14 +319,34 @@ fn checkpoint_identity_matches(
         && checkpoint_depth_view == depth_view
 }
 
-fn validate_exact_view(bound: Option<u64>, candidate: u64, label: &str) -> Result<bool> {
+fn validate_exact_cache_authority(
+    bound: Option<PhysicalPagedKvSequenceAuthority>,
+    candidate: PhysicalPagedKvSequenceAuthority,
+    label: &str,
+) -> Result<bool> {
     match bound {
         Some(expected) if expected != candidate => Err(Error::InferenceError(format!(
-            "LFM2.5 Audio {label} cache view identity changed"
+            "LFM2.5 Audio {label} cache sequence authority changed"
         ))),
         Some(_) => Ok(false),
         None => Ok(true),
     }
+}
+
+fn install_cache_authority_after_commit(
+    bound: &mut Option<PhysicalPagedKvSequenceAuthority>,
+    prior: Option<PhysicalPagedKvSequenceAuthority>,
+    candidate: PhysicalPagedKvSequenceAuthority,
+) -> Result<()> {
+    if *bound != prior || prior.is_some_and(|authority| authority != candidate) {
+        return Err(Error::InferenceError(
+            "LFM2.5 Audio main cache sequence authority changed before commit".into(),
+        ));
+    }
+    if bound.is_none() {
+        *bound = Some(candidate);
+    }
+    Ok(())
 }
 
 fn begin_quantum_authority(active: &mut Option<u64>, next: &mut u64) -> Result<u64> {
@@ -379,11 +409,69 @@ fn validate_subphase_binding(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::{
         begin_quantum_authority, checkpoint_identity_matches, finish_quantum_authority,
-        validate_exact_view, validate_subphase_binding, Lfm25AudioRetainedMode,
-        Lfm25AudioRetainedSubphase,
+        install_cache_authority_after_commit, validate_exact_cache_authority,
+        validate_subphase_binding, Lfm25AudioRetainedMode, Lfm25AudioRetainedSubphase,
     };
+    use crate::backends::kv::{CpuKvArena, KvArenaConfig, KvLayerConfig};
+    use crate::backends::BackendKind;
+    use crate::engine::ModelInstanceId;
+    use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
+    use crate::models::shared::attention::physical::PhysicalPagedKvCache;
+    use candle_core::DType;
+
+    fn cache_authority_views() -> (
+        PhysicalPagedKvCache,
+        PhysicalPagedKvCache,
+        PhysicalPagedKvCache,
+    ) {
+        let arena_id = KvArenaId {
+            model_instance: ModelInstanceId::new(25),
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            generation: 1,
+        };
+        let group = KvGroupId::new(1);
+        let binding = KvLayerBinding {
+            model_layer: 0,
+            physical_layer: 0,
+        };
+        let arena = Arc::new(
+            CpuKvArena::new(KvArenaConfig {
+                id: arena_id,
+                group,
+                page_tokens: 4,
+                capacity_pages: 2,
+                growth: None,
+                dtype: DType::F32,
+                layers: vec![KvLayerConfig {
+                    binding,
+                    num_kv_heads: 1,
+                    key_head_dim: 2,
+                    value_head_dim: 2,
+                }],
+            })
+            .expect("test KV arena"),
+        );
+        let block = |index| CacheBlockRef {
+            arena: arena_id,
+            group,
+            index,
+            slot_generation: 1,
+        };
+        let cache = |blocks| {
+            PhysicalPagedKvCache::new(arena.clone(), vec![binding], blocks, 0)
+                .expect("test physical cache")
+        };
+        (
+            cache(vec![block(0)]),
+            cache(vec![block(0)]),
+            cache(vec![block(1)]),
+        )
+    }
 
     #[test]
     fn retained_modes_keep_depthformer_authority_explicit() {
@@ -499,10 +587,29 @@ mod tests {
     }
 
     #[test]
-    fn cache_view_binding_is_permanent_even_at_the_same_clock() {
-        assert_eq!(validate_exact_view(None, 11, "main").unwrap(), true);
-        assert_eq!(validate_exact_view(Some(11), 11, "main").unwrap(), false);
-        assert!(validate_exact_view(Some(11), 12, "main").is_err());
+    fn reconstructed_views_keep_sequence_authority_but_reject_foreign_sequences() {
+        let (first, reconstructed, foreign) = cache_authority_views();
+        assert_ne!(first.view_id(), reconstructed.view_id());
+        assert_eq!(
+            first.sequence_authority(),
+            reconstructed.sequence_authority()
+        );
+        assert_ne!(first.sequence_authority(), foreign.sequence_authority());
+
+        let authority = first.sequence_authority();
+        assert!(validate_exact_cache_authority(None, authority, "main").unwrap());
+        assert!(!validate_exact_cache_authority(
+            Some(authority),
+            reconstructed.sequence_authority(),
+            "main"
+        )
+        .unwrap());
+        assert!(validate_exact_cache_authority(
+            Some(authority),
+            foreign.sequence_authority(),
+            "main"
+        )
+        .is_err());
     }
 
     #[test]
@@ -523,13 +630,33 @@ mod tests {
         assert_eq!(active, None);
         assert_eq!(next, 1);
 
-        let should_bind = validate_exact_view(bound, 11, "main").unwrap();
+        let (main, _, _) = cache_authority_views();
+        let authority = main.sequence_authority();
+        let should_bind = validate_exact_cache_authority(bound, authority, "main").unwrap();
         let nonce = begin_quantum_authority(&mut active, &mut next).unwrap();
         if should_bind {
-            bound = Some(11);
+            install_cache_authority_after_commit(&mut bound, None, authority).unwrap();
         }
-        assert_eq!(bound, Some(11));
+        assert_eq!(bound, Some(authority));
         finish_quantum_authority(&mut active, nonce).unwrap();
+    }
+
+    #[test]
+    fn first_quantum_rollback_leaves_fresh_sequence_authority_retryable() {
+        let (first, _, fresh) = cache_authority_views();
+        let first_authority = first.sequence_authority();
+        let fresh_authority = fresh.sequence_authority();
+        let mut bound = None;
+
+        assert!(validate_exact_cache_authority(bound, first_authority, "main").unwrap());
+        // Beginning and then rolling back the first quantum never publishes
+        // its provisional sequence authority.
+        assert_eq!(bound, None);
+
+        assert!(validate_exact_cache_authority(bound, fresh_authority, "main").unwrap());
+        install_cache_authority_after_commit(&mut bound, None, fresh_authority).unwrap();
+        assert_eq!(bound, Some(fresh_authority));
+        assert!(validate_exact_cache_authority(bound, first_authority, "main").is_err());
     }
 
     #[test]

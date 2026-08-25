@@ -1296,7 +1296,13 @@ impl QuantizedLfm2Backbone {
         Ok(logits)
     }
 
-    fn forward_embeds_retained(
+    /// Advance the retained B1 backbone from caller-supplied embeddings.
+    ///
+    /// This is the model-neutral seam used by LFM2.5 Audio when its prompt
+    /// contains projected audio spans rather than token IDs. The retained KV
+    /// and ShortConv clocks remain authoritative and are advanced atomically
+    /// only after the complete backbone forward succeeds.
+    pub(crate) fn forward_embeds_retained(
         &self,
         input_embeds: &Tensor,
         index_pos: usize,

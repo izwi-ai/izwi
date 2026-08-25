@@ -1,5 +1,6 @@
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use candle_core::{IndexOp, Tensor};
@@ -39,6 +40,7 @@ const DEFAULT_AUDIO_STREAM_DECODE_STRIDE_FRAMES: usize = 6;
 const DEFAULT_AUDIO_STREAM_HOLDBACK_FRAMES: usize = 2;
 const DEFAULT_ASR_STOP_CHECK_INTERVAL: usize = 92;
 const DEFAULT_TTS_AUDIO_STOP_CHECK_INTERVAL: usize = 20;
+static NEXT_LFM25_AUDIO_MODEL_LOAD_NONCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
 pub struct Lfm25AudioTextOutput {
@@ -59,6 +61,34 @@ pub struct Lfm25AudioGenerationOutput {
     pub diagnostics: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct Lfm25AudioPreparedAsrArtifact {
+    model_load_nonce: u64,
+    pub(crate) prompt_embeddings: Tensor,
+    pub(crate) prefix_tokens: usize,
+    pub(crate) suffix_tokens: usize,
+    pub(crate) source_samples: usize,
+    pub(crate) source_sample_rate: u32,
+    pub(crate) resampled_samples: usize,
+    pub(crate) feature_frames: usize,
+    pub(crate) audio_tokens: usize,
+    pub(crate) prompt_tokens: usize,
+    pub(crate) materialized_tensor_elements: u64,
+    pub(crate) retained_host_bytes: u64,
+    preparation_timings: Lfm25AsrPreparationTimings,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct Lfm25AsrPreparationTimings {
+    resample_ms: f64,
+    feature_extract_ms: f64,
+    encoder_forward_ms: f64,
+    prompt_build_ms: f64,
+    prompt_embed_ms: f64,
+    prompt_concat_ms: f64,
+    total_ms: f64,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Lfm25AudioStreamConfig {
     pub decode_stride_frames: usize,
@@ -75,6 +105,7 @@ impl Default for Lfm25AudioStreamConfig {
 }
 
 pub struct Lfm25AudioModel {
+    model_load_nonce: u64,
     device: DeviceProfile,
     bundle_info: Lfm25AudioBundleInfo,
     tokenizer: Lfm25TextTokenizer,
@@ -91,8 +122,6 @@ pub struct Lfm25AudioModel {
 
 #[derive(Debug, Clone, Copy, Default)]
 struct Lfm25AsrProfile {
-    prompt_embed_ms: f64,
-    prompt_concat_ms: f64,
     main_prefill_ms: f64,
     decode_loop_ms: f64,
     decode_argmax_ms: f64,
@@ -185,6 +214,7 @@ impl Lfm25AudioModel {
         );
 
         Ok(Self {
+            model_load_nonce: NEXT_LFM25_AUDIO_MODEL_LOAD_NONCE.fetch_add(1, Ordering::Relaxed),
             device,
             bundle_info,
             tokenizer,
@@ -330,8 +360,28 @@ impl Lfm25AudioModel {
         shortconv: &mut InvocationTensorLease,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<Lfm25AudioTextOutput> {
+        let prepared = self.prepare_asr_artifact(audio, sample_rate)?;
+        self.transcribe_prepared_asr_with_callback_physical(
+            &prepared,
+            max_new_tokens,
+            cache,
+            shortconv,
+            on_delta,
+        )
+    }
+
+    pub(crate) fn prepare_asr_artifact(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+    ) -> Result<Arc<Lfm25AudioPreparedAsrArtifact>> {
         if audio.is_empty() {
             return Err(Error::InvalidInput("Empty audio input".to_string()));
+        }
+        if sample_rate == 0 {
+            return Err(Error::InvalidInput(
+                "LFM2.5 Audio sample rate must be non-zero".to_string(),
+            ));
         }
 
         let total_started = Instant::now();
@@ -361,6 +411,81 @@ impl Lfm25AudioModel {
         let prompt_started = Instant::now();
         let (prefix_ids, suffix_ids) = self.build_asr_prompt_segments()?;
         let prompt_build_ms = elapsed_ms(prompt_started);
+        let prompt_tokens = checked_asr_prompt_tokens(
+            prefix_ids.len(),
+            audio_tokens,
+            suffix_ids.len(),
+            self.main_config.context_length,
+        )?;
+        let prompt_embed_started = Instant::now();
+        let (prefix_embeds, suffix_embeds) = self.with_main_backbone(|main_backbone| {
+            Ok((
+                embed_token_ids(main_backbone, &self.device.device, &prefix_ids)?,
+                embed_token_ids(main_backbone, &self.device.device, &suffix_ids)?,
+            ))
+        })?;
+        let prompt_embed_ms = elapsed_ms(prompt_embed_started);
+
+        let prompt_concat_started = Instant::now();
+        let prompt_embeddings = Tensor::cat(&[&prefix_embeds, &audio_embeds, &suffix_embeds], 1)?;
+        validate_prepared_asr_prompt_shape(
+            prompt_embeddings.dims(),
+            prompt_tokens,
+            self.main_config.embedding_length,
+        )?;
+        let prompt_concat_ms = elapsed_ms(prompt_concat_started);
+        let materialized_tensor_elements =
+            checked_asr_prompt_tensor_elements(prompt_tokens, self.main_config.embedding_length)?;
+        if u64::try_from(prompt_embeddings.elem_count()).ok() != Some(materialized_tensor_elements)
+        {
+            return Err(Error::InferenceError(
+                "Prepared LFM2.5 Audio prompt tensor accounting does not match its shape"
+                    .to_string(),
+            ));
+        }
+
+        Ok(Arc::new(Lfm25AudioPreparedAsrArtifact {
+            model_load_nonce: self.model_load_nonce,
+            prompt_embeddings,
+            prefix_tokens: prefix_ids.len(),
+            suffix_tokens: suffix_ids.len(),
+            source_samples: audio.len(),
+            source_sample_rate: sample_rate,
+            resampled_samples: mono_16khz.len(),
+            feature_frames,
+            audio_tokens,
+            prompt_tokens,
+            materialized_tensor_elements,
+            retained_host_bytes: prepared_asr_retained_host_bytes(),
+            preparation_timings: Lfm25AsrPreparationTimings {
+                resample_ms,
+                feature_extract_ms,
+                encoder_forward_ms,
+                prompt_build_ms,
+                prompt_embed_ms,
+                prompt_concat_ms,
+                total_ms: elapsed_ms(total_started),
+            },
+        }))
+    }
+
+    pub(crate) fn transcribe_prepared_asr_with_callback_physical(
+        &self,
+        prepared: &Lfm25AudioPreparedAsrArtifact,
+        max_new_tokens: usize,
+        cache: &mut PhysicalPagedKvCache,
+        shortconv: &mut InvocationTensorLease,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<Lfm25AudioTextOutput> {
+        validate_prepared_asr_identity(self.model_load_nonce, prepared.model_load_nonce)?;
+        validate_prepared_asr_prompt_shape(
+            prepared.prompt_embeddings.dims(),
+            prepared.prompt_tokens,
+            self.main_config.embedding_length,
+        )?;
+        let total_started = Instant::now();
+        let prompt_embeds = &prepared.prompt_embeddings;
+        let prompt_tokens = prepared.prompt_tokens;
         let vocab_limit = self.tokenizer.vocab_size();
         let specials = self.tokenizer.specials().clone();
 
@@ -369,25 +494,9 @@ impl Lfm25AudioModel {
             let mut profile = Lfm25AsrProfile::default();
             reset_main_state(cache, shortconv)?;
 
-            let prompt_embed_started = Instant::now();
-            let prefix_embeds = embed_token_ids(main_backbone, &self.device.device, &prefix_ids)?;
-            let suffix_embeds = embed_token_ids(main_backbone, &self.device.device, &suffix_ids)?;
-            profile.prompt_embed_ms = elapsed_ms(prompt_embed_started);
-
-            let prompt_concat_started = Instant::now();
-            let prompt_embeds = Tensor::cat(&[&prefix_embeds, &audio_embeds, &suffix_embeds], 1)?;
-            let prompt_tokens = prompt_embeds.dim(1)?;
-            if prompt_tokens >= self.main_config.context_length {
-                return Err(Error::InvalidInput(format!(
-                    "LFM2.5 Audio prompt has {prompt_tokens} tokens and leaves no generation capacity in the {}-token context",
-                    self.main_config.context_length
-                )));
-            }
-            profile.prompt_concat_ms = elapsed_ms(prompt_concat_started);
-
             let prefill_started = Instant::now();
             let hidden =
-                main_backbone.forward_embeds_physical(&prompt_embeds, 0, cache, shortconv)?;
+                main_backbone.forward_embeds_physical(prompt_embeds, 0, cache, shortconv)?;
             let mut logits = main_backbone.project_last_hidden(&hidden)?;
             profile.main_prefill_ms = elapsed_ms(prefill_started);
             let mut position = prompt_tokens;
@@ -538,8 +647,10 @@ impl Lfm25AudioModel {
                 profile,
             ))
         })?;
-        let main_backbone_ms = elapsed_ms(main_started);
-        let model_total_ms = elapsed_ms(total_started);
+        let main_backbone_ms = prepared.preparation_timings.prompt_embed_ms
+            + prepared.preparation_timings.prompt_concat_ms
+            + elapsed_ms(main_started);
+        let model_total_ms = prepared.preparation_timings.total_ms + elapsed_ms(total_started);
         let device_token_select_reads = profile.device_token_steps;
         let host_argmax_reads = if device_token_select_reads > 0 {
             0
@@ -552,14 +663,14 @@ impl Lfm25AudioModel {
             "model": "lfm25_audio",
             "task": "asr",
             "timings_ms": {
-                "resample": resample_ms,
-                "feature_extract": feature_extract_ms,
-                "mel": feature_extract_ms,
-                "encoder_forward": encoder_forward_ms,
-                "audio_encode": encoder_forward_ms,
-                "prompt_build": prompt_build_ms,
-                "prompt_embed": profile.prompt_embed_ms,
-                "prompt_concat": profile.prompt_concat_ms,
+                "resample": prepared.preparation_timings.resample_ms,
+                "feature_extract": prepared.preparation_timings.feature_extract_ms,
+                "mel": prepared.preparation_timings.feature_extract_ms,
+                "encoder_forward": prepared.preparation_timings.encoder_forward_ms,
+                "audio_encode": prepared.preparation_timings.encoder_forward_ms,
+                "prompt_build": prepared.preparation_timings.prompt_build_ms,
+                "prompt_embed": prepared.preparation_timings.prompt_embed_ms,
+                "prompt_concat": prepared.preparation_timings.prompt_concat_ms,
                 "prefill": profile.main_prefill_ms,
                 "main_prefill": profile.main_prefill_ms,
                 "decode": profile.decode_loop_ms,
@@ -573,15 +684,17 @@ impl Lfm25AudioModel {
             },
             "prompt": {
                 "prompt_tokens": output.prompt_tokens,
-                "prefix_tokens": prefix_ids.len(),
-                "suffix_tokens": suffix_ids.len()
+                "prefix_tokens": prepared.prefix_tokens,
+                "suffix_tokens": prepared.suffix_tokens
             },
             "audio": {
-                "input_samples": audio.len(),
-                "input_sample_rate": sample_rate,
-                "resampled_samples": mono_16khz.len(),
-                "feature_frames": feature_frames,
-                "audio_tokens": audio_tokens
+                "input_samples": prepared.source_samples,
+                "input_sample_rate": prepared.source_sample_rate,
+                "resampled_samples": prepared.resampled_samples,
+                "feature_frames": prepared.feature_frames,
+                "audio_tokens": prepared.audio_tokens,
+                "materialized_tensor_elements": prepared.materialized_tensor_elements,
+                "retained_host_bytes": prepared.retained_host_bytes
             },
             "decode": {
                 "generated_tokens": output.tokens_generated,
@@ -1642,6 +1755,64 @@ fn push_normalized_text_word(
     words.push(NormalizedTextWord { normalized, end });
 }
 
+fn checked_asr_prompt_tokens(
+    prefix_tokens: usize,
+    audio_tokens: usize,
+    suffix_tokens: usize,
+    context_length: usize,
+) -> Result<usize> {
+    let prompt_tokens = prefix_tokens
+        .checked_add(audio_tokens)
+        .and_then(|tokens| tokens.checked_add(suffix_tokens))
+        .ok_or_else(|| {
+            Error::InvalidInput("LFM2.5 Audio prompt token count overflowed usize".to_string())
+        })?;
+    if prompt_tokens >= context_length {
+        return Err(Error::InvalidInput(format!(
+            "LFM2.5 Audio prompt has {prompt_tokens} tokens and leaves no generation capacity in the {context_length}-token context"
+        )));
+    }
+    Ok(prompt_tokens)
+}
+
+fn checked_asr_prompt_tensor_elements(prompt_tokens: usize, hidden_size: usize) -> Result<u64> {
+    u64::try_from(prompt_tokens)
+        .ok()
+        .zip(u64::try_from(hidden_size).ok())
+        .and_then(|(tokens, hidden)| tokens.checked_mul(hidden))
+        .ok_or_else(|| {
+            Error::InvalidInput("LFM2.5 Audio prompt tensor elements overflowed u64".to_string())
+        })
+}
+
+fn prepared_asr_retained_host_bytes() -> u64 {
+    // Prefix and suffix token IDs are consumed during preparation. The retained
+    // artifact owns no dynamically-sized host payload, only its device tensor.
+    0
+}
+
+fn validate_prepared_asr_prompt_shape(
+    dims: &[usize],
+    prompt_tokens: usize,
+    hidden_size: usize,
+) -> Result<()> {
+    if dims != [1, prompt_tokens, hidden_size] {
+        return Err(Error::InvalidInput(format!(
+            "Prepared LFM2.5 Audio prompt tensor has shape {dims:?}, expected [1, {prompt_tokens}, {hidden_size}]"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_prepared_asr_identity(expected: u64, actual: u64) -> Result<()> {
+    if expected != actual {
+        return Err(Error::InvalidInput(
+            "Prepared LFM2.5 Audio ASR artifact belongs to a different model load".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn resample_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
     if src_rate == dst_rate || audio.len() < 2 {
         return audio.to_vec();
@@ -1750,6 +1921,30 @@ mod tests {
             lfm25_asr_stop_check_interval_from_env(Some("96".to_string())),
             96
         );
+    }
+
+    #[test]
+    fn prepared_asr_prompt_layout_is_exact_and_leaves_decode_capacity() {
+        assert_eq!(checked_asr_prompt_tokens(3, 7, 2, 13).unwrap(), 12);
+        assert!(checked_asr_prompt_tokens(3, 7, 2, 12).is_err());
+        assert!(checked_asr_prompt_tokens(usize::MAX, 1, 0, usize::MAX).is_err());
+        assert_eq!(checked_asr_prompt_tensor_elements(12, 8).unwrap(), 96);
+        assert_eq!(prepared_asr_retained_host_bytes(), 0);
+    }
+
+    #[test]
+    fn prepared_asr_prompt_shape_authenticates_full_mixed_tensor() {
+        validate_prepared_asr_prompt_shape(&[1, 12, 8], 12, 8).unwrap();
+        assert!(validate_prepared_asr_prompt_shape(&[2, 12, 8], 12, 8).is_err());
+        assert!(validate_prepared_asr_prompt_shape(&[1, 11, 8], 12, 8).is_err());
+        assert!(validate_prepared_asr_prompt_shape(&[1, 12, 7], 12, 8).is_err());
+    }
+
+    #[test]
+    fn prepared_asr_artifact_identity_is_model_load_bound() {
+        validate_prepared_asr_identity(17, 17).unwrap();
+        let error = validate_prepared_asr_identity(17, 18).unwrap_err();
+        assert!(error.to_string().contains("different model load"));
     }
 
     #[test]

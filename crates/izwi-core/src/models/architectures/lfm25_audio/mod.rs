@@ -5,7 +5,7 @@ mod bundle;
 mod config;
 mod conformer;
 mod detokenizer;
-mod model;
+pub(crate) mod model;
 pub(crate) mod physical;
 mod preprocessor;
 mod sampling;
