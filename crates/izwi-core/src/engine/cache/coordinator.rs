@@ -778,23 +778,39 @@ impl KvCacheCoordinator {
                 actual: original.state,
             });
         }
+        let unchanged = receipt.committed_tokens == original.expected.committed_tokens;
         if page_tokens == 0
-            || receipt.committed_tokens <= original.expected.committed_tokens
+            || receipt.committed_tokens < original.expected.committed_tokens
             || receipt.committed_tokens > original.target_committed_tokens
-            || target_window_start < original.expected.window_start
-            || target_window_start > receipt.committed_tokens
-            || target_window_start > original.target_window_start
+            || (!unchanged
+                && (target_window_start < original.expected.window_start
+                    || target_window_start > receipt.committed_tokens
+                    || target_window_start > original.target_window_start))
         {
             return Err(KvCoordinatorError::InvalidTokenRange);
         }
 
         let mut reconciled = original.clone();
-        reconciled.provisional_groups = reconciled_prefix_groups(
-            &original,
-            receipt.committed_tokens,
-            target_window_start,
-            page_tokens,
-        )?;
+        reconciled.provisional_groups = if unchanged {
+            original.expected.groups.clone()
+        } else {
+            reconciled_prefix_groups(
+                &original,
+                receipt.committed_tokens,
+                target_window_start,
+                page_tokens,
+            )?
+        };
+        if unchanged {
+            // No backend mutation occurred. Restore the exact committed table
+            // and discard every provisional write/copy/hold/pin, including an
+            // exclusively writable partially-filled tail that is also present
+            // in the expected table.
+            reconciled.writable_blocks.clear();
+            reconciled.page_copies.clear();
+            reconciled.holds.clear();
+            reconciled.execution_blocks.clear();
+        }
         let retained_blocks = unique_table_blocks(&reconciled.provisional_groups)
             .into_iter()
             .collect::<HashSet<_>>();
@@ -817,7 +833,11 @@ impl KvCacheCoordinator {
             retained_blocks.contains(block) || retained_copy_sources.contains(block)
         });
         reconciled.target_committed_tokens = receipt.committed_tokens;
-        reconciled.target_window_start = target_window_start;
+        reconciled.target_window_start = if unchanged {
+            original.expected.window_start
+        } else {
+            target_window_start
+        };
 
         let expected = reconciled
             .writable_blocks
@@ -829,10 +849,7 @@ impl KvCacheCoordinator {
             .iter()
             .copied()
             .collect::<HashSet<_>>();
-        if expected.is_empty()
-            || written.len() != receipt.written_blocks.len()
-            || written != expected
-        {
+        if written.len() != receipt.written_blocks.len() || written != expected {
             return Err(KvCoordinatorError::InvalidWriteReceipt);
         }
 
@@ -1702,6 +1719,54 @@ mod tests {
             assert_eq!(coordinator.stats().active_transactions, 0);
             coordinator.check_invariants().unwrap();
         }
+    }
+
+    #[test]
+    fn unchanged_prefix_releases_a_reserved_partially_filled_tail() {
+        const PAGE_TOKENS: u32 = 8;
+        let mut coordinator = KvCacheCoordinator::new(arena(1), 2);
+        let key = session("unchanged-tail", 1);
+        let initial = coordinator
+            .register_table(key, CacheDomainId::new(0))
+            .unwrap();
+        reserve_fresh(&mut coordinator, 150, initial, 1, 3);
+        let prepared = prepare_and_complete(&mut coordinator, 150);
+        let expected = coordinator.commit(150, &[]).unwrap();
+        let tail = prepared.writable_blocks[0];
+
+        coordinator
+            .reserve(KvReserveRequest {
+                txn_id: 151,
+                expected: expected.clone(),
+                target_committed_tokens: 5,
+                target_window_start: 0,
+                groups: vec![KvGroupReservation {
+                    group: KvGroupId::new(0),
+                    blocks: vec![KvBlockIntent::Writable(tail)],
+                }],
+            })
+            .unwrap();
+        let prepared = coordinator.prepare(151).unwrap();
+        assert_eq!(prepared.writable_blocks, vec![tail]);
+        coordinator
+            .complete_write_prefix(
+                KvWriteReceipt {
+                    txn_id: 151,
+                    committed_tokens: expected.committed_tokens,
+                    written_blocks: Vec::new(),
+                },
+                expected.window_start,
+                PAGE_TOKENS,
+            )
+            .unwrap();
+        let unchanged = coordinator.commit(151, &[]).unwrap();
+
+        assert_eq!(unchanged.committed_tokens, expected.committed_tokens);
+        assert_eq!(unchanged.window_start, expected.window_start);
+        assert_eq!(unchanged.groups, expected.groups);
+        assert_eq!(coordinator.stats().reservations, 0);
+        assert_eq!(coordinator.stats().active_transactions, 0);
+        coordinator.check_invariants().unwrap();
     }
 
     #[test]

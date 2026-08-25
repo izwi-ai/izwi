@@ -766,7 +766,8 @@ impl NativeExecutor {
             error: None,
         })
         .with_staged_stream_outputs(staged)
-        .with_managed_cache_completions(completions))
+        .with_managed_cache_completions(completions)
+        .with_managed_cache_append(cache.context_len().saturating_sub(prior_cache_len)))
     }
 
     fn granite_speech_asr_sequence_request(

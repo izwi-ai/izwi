@@ -6608,6 +6608,7 @@ mod tests {
                 ),
                 staged_stream_outputs: Vec::new(),
                 managed_cache_completions: Vec::new(),
+                managed_cache_append: None,
                 clocked_state_completion: None,
             },
         )

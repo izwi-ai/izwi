@@ -568,7 +568,35 @@ impl NativeExecutor {
                             .clocked_state
                             .as_ref()
                             .is_some_and(|state| state.selections().is_some());
-                        let receipt = if selected_clocked_state
+                        let receipt = if let Some(appended) = result.managed_cache_append {
+                            reservation
+                                .domains
+                                .first()
+                                .ok_or_else(|| {
+                                    Error::InferenceError(
+                                        "managed-cache reservation has no domains".into(),
+                                    )
+                                })
+                                .and_then(|domain| {
+                                    let appended = u32::try_from(appended).map_err(|_| {
+                                        Error::InferenceError(
+                                            "managed-cache append exceeds u32".into(),
+                                        )
+                                    })?;
+                                    let committed = domain
+                                        .execution_start_tokens
+                                        .checked_add(appended)
+                                        .ok_or_else(|| {
+                                            Error::InferenceError(
+                                                "managed-cache accepted cursor overflowed".into(),
+                                            )
+                                        })?;
+                                    reservation.completed_write_receipt_for_prefix(
+                                        &result.managed_cache_completions,
+                                        committed,
+                                    )
+                                })
+                        } else if selected_clocked_state
                             && result.output.tokens_processed != scheduled.num_tokens
                         {
                             Err(Error::InferenceError(
@@ -814,6 +842,7 @@ mod tests {
                 writable_blocks: vec![block],
             }],
             clocked_state: None,
+            allow_unchanged_prefix: false,
         };
         let lane = BatchLaneKey {
             execution_group: ExecutionGroupId::new(1),
@@ -1027,6 +1056,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            allow_unchanged_prefix: false,
         };
         let rows = vec![ReadyQuantum {
             plan_id: scheduled.plan_id,
@@ -1203,6 +1233,7 @@ mod tests {
                     writable_blocks: vec![block],
                 }],
                 clocked_state: None,
+                allow_unchanged_prefix: false,
             };
             let receipt = reservation
                 .completed_write_receipt(std::slice::from_ref(&completion))

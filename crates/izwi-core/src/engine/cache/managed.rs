@@ -1212,17 +1212,20 @@ impl ManagedKvCacheManager {
         work: &WorkUnit,
         request: Option<&EngineCoreRequest>,
     ) -> Result<Option<ManagedCacheReservation>> {
-        let WorkUnit::SequenceStep {
-            input,
-            auxiliary_state,
-            ..
-        } = work
-        else {
-            return Ok(None);
+        let (sequence_input, auxiliary_state, realtime_cache_append) = match work {
+            WorkUnit::SequenceStep {
+                input,
+                auxiliary_state,
+                ..
+            } => (Some(*input), auxiliary_state.as_ref(), None),
+            WorkUnit::RealtimePush {
+                max_cache_append, ..
+            }
+            | WorkUnit::RealtimeFinish {
+                max_cache_append, ..
+            } => (None, None, Some(*max_cache_append)),
+            _ => return Ok(None),
         };
-        let target_committed_tokens = u32::try_from(input.end).map_err(|_| {
-            Error::InvalidInput("managed KV token position exceeds u32".to_string())
-        })?;
         if self
             .models
             .get(&runtime.plan.model_instance)
@@ -1234,7 +1237,6 @@ impl ManagedKvCacheManager {
         }
         let namespace = managed_prefix_namespace(request, runtime, self.prefix_cache_salt)?;
         let selected_tensor_state = auxiliary_state
-            .as_ref()
             .map(|spans| {
                 spans
                     .iter()
@@ -1254,7 +1256,12 @@ impl ManagedKvCacheManager {
                     .collect::<Result<Vec<_>>>()
             })
             .transpose()?;
-        if input.is_empty() && selected_tensor_state.is_none() {
+        if realtime_cache_append.is_some() && runtime.tensor_state().is_some() {
+            return Err(Error::InferenceError(
+                "realtime paged reservation cannot implicitly advance tensor state".into(),
+            ));
+        }
+        if sequence_input.is_some_and(|input| input.is_empty()) && selected_tensor_state.is_none() {
             return Err(Error::InferenceError(
                 "legacy decoder-coupled tensor state cannot advance without a paged span".into(),
             ));
@@ -1329,13 +1336,29 @@ impl ManagedKvCacheManager {
             let snapshot = coordinator
                 .snapshot(session, group.domain)
                 .map_err(coordinator_error)?;
+            let target_committed_tokens = match (sequence_input, realtime_cache_append) {
+                (Some(input), None) => u32::try_from(input.end).map_err(|_| {
+                    Error::InvalidInput("managed KV token position exceeds u32".to_string())
+                })?,
+                (None, Some(max_cache_append)) => snapshot
+                    .committed_tokens
+                    .checked_add(u32::try_from(max_cache_append).map_err(|_| {
+                        Error::InvalidInput(
+                            "realtime managed KV append ceiling exceeds u32".to_string(),
+                        )
+                    })?)
+                    .ok_or_else(|| {
+                        Error::InvalidInput("realtime managed KV target overflow".to_string())
+                    })?,
+                _ => unreachable!("managed work target was authenticated above"),
+            };
             if target_committed_tokens < snapshot.committed_tokens {
                 abort_domains(state, txn_id, &domains);
                 return Err(Error::InferenceError(
                     "scheduled KV target regressed behind the committed cache table".to_string(),
                 ));
             }
-            if input.is_empty() {
+            if sequence_input.is_some_and(|input| input.is_empty()) {
                 if target_committed_tokens != snapshot.committed_tokens {
                     abort_domains(state, txn_id, &domains);
                     return Err(Error::InferenceError(
@@ -1345,11 +1368,13 @@ impl ManagedKvCacheManager {
                 continue;
             }
             let prefix_eligible = snapshot.committed_tokens == 0
-                && input.start == 0
+                && sequence_input.is_some_and(|input| input.start == 0)
                 // Prefix reuse is bounded by this transaction's committed
                 // target below, so the first scheduler-visible chunk does not
                 // need to cover the entire logical prompt.
-                && request.is_some_and(|request| input.end <= request.prompt_tokens.len())
+                && request.is_some_and(|request| {
+                    sequence_input.is_some_and(|input| input.end <= request.prompt_tokens.len())
+                })
                 && target_committed_tokens > 1
                 && prefix_enabled_for_domain(&state.contract, group.domain);
             // A subordinate retained-session generation is a semantic restart
@@ -1385,9 +1410,11 @@ impl ManagedKvCacheManager {
             let sliding_window = sliding_window_for_domain(&state.contract, group.domain)?;
             let target_window_start = sliding_window
                 .map(|window| {
-                    target_committed_tokens
-                        .saturating_sub(window)
-                        .min(u32::try_from(input.start).unwrap_or(u32::MAX))
+                    target_committed_tokens.saturating_sub(window).min(
+                        sequence_input
+                            .map(|input| u32::try_from(input.start).unwrap_or(u32::MAX))
+                            .unwrap_or(snapshot.committed_tokens),
+                    )
                 })
                 .unwrap_or(0);
             let established_window_table = sliding_window.is_some()
@@ -1703,6 +1730,7 @@ impl ManagedKvCacheManager {
             session_generation,
             domains,
             clocked_state,
+            allow_unchanged_prefix: realtime_cache_append.is_some(),
         }))
     }
 
@@ -1797,7 +1825,7 @@ impl ManagedKvCacheManager {
                 }
             };
             let committed_tokens = accepted_prefix.unwrap_or(domain.target_committed_tokens);
-            if committed_tokens <= domain.execution_start_tokens
+            if committed_tokens < domain.execution_start_tokens
                 || committed_tokens > domain.target_committed_tokens
             {
                 abort_reservation(state, reservation);
@@ -5914,6 +5942,54 @@ mod tests {
                 coordinator.check_invariants().unwrap();
             }
         }
+    }
+
+    #[test]
+    fn realtime_relative_reservation_can_commit_an_unchanged_prefix() {
+        let model = ModelInstanceId::new(777);
+        let session = SessionKey::new("managed-realtime-zero-append".into(), 1);
+        let mut manager = ManagedKvCacheManager::default();
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                8,
+                8,
+                &CacheCapability::Managed(test_contract()),
+            )
+            .unwrap()
+            .unwrap();
+        let work = WorkUnit::RealtimePush {
+            operation_id: crate::engine::RealtimeOperationId::new(1),
+            input: crate::engine::InputRange::new(0, 160).unwrap(),
+            max_output_steps: 2,
+            max_cache_append: 4,
+        };
+        let reservation = manager
+            .prepare(&runtime, 7771, &session, &work, None)
+            .unwrap()
+            .unwrap();
+        assert!(reservation.allow_unchanged_prefix);
+        assert!(reservation.domains.iter().all(|domain| {
+            domain.execution_start_tokens == 0 && domain.target_committed_tokens == 4
+        }));
+
+        let receipt = reservation
+            .completed_write_receipt_for_prefix(&[], 0)
+            .expect("zero append receipt");
+        manager
+            .finalize(&reservation, Some(&receipt), true)
+            .expect("unchanged prefix commit");
+
+        for group in &runtime.plan().groups {
+            let snapshot = manager.snapshot(model, &session, group.domain).unwrap();
+            assert_eq!(snapshot.committed_tokens, 0);
+            assert_eq!(snapshot.version, 1);
+        }
+        assert!(manager.models[&model]
+            .coordinators
+            .values()
+            .all(|coordinator| coordinator.stats().active_transactions == 0));
     }
 
     #[test]

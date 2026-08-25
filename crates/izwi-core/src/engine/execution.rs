@@ -1291,6 +1291,9 @@ pub struct ManagedCacheReservation {
     pub session_generation: ManagedSessionGeneration,
     pub domains: Vec<ManagedCacheDomainReservation>,
     pub clocked_state: Option<ManagedClockedStateReservation>,
+    /// Authenticated at admission from realtime push/finish work. Ordinary
+    /// sequence work must continue to advance every managed KV domain.
+    pub(crate) allow_unchanged_prefix: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1383,6 +1386,15 @@ impl ManagedCacheReservation {
         if self.domains.is_empty() && self.clocked_state.is_none() {
             return Err(Error::InvalidInput(
                 "managed-cache reservation has no paged or clocked state".to_string(),
+            ));
+        }
+        let realtime_work = matches!(
+            &row.work,
+            WorkUnit::RealtimePush { .. } | WorkUnit::RealtimeFinish { .. }
+        );
+        if self.allow_unchanged_prefix != realtime_work {
+            return Err(Error::InvalidInput(
+                "managed-cache zero-append authority does not match the exact row work".into(),
             ));
         }
         if let Some(clocked) = self.clocked_state.as_ref() {
@@ -1499,8 +1511,10 @@ impl ManagedCacheReservation {
     /// scheduler's maximum reservation.
     ///
     /// The receipt retains this exact reservation as its transaction fence.
-    /// `committed_tokens` is an absolute logical cursor and must advance every
-    /// domain beyond its execution start without exceeding any reserved target.
+    /// `committed_tokens` is an absolute logical cursor. It may equal every
+    /// domain's execution start to authenticate a successful zero-append
+    /// realtime quantum; otherwise it must advance without exceeding the
+    /// reserved target.
     pub(crate) fn completed_write_receipt_for_prefix(
         &self,
         completions: &[Arc<KvWriteBatchCompletion>],
@@ -1514,6 +1528,38 @@ impl ManagedCacheReservation {
         completions: &[Arc<KvWriteBatchCompletion>],
         accepted_prefix: Option<u32>,
     ) -> Result<ManagedCacheReceipt> {
+        let unchanged_prefix = accepted_prefix.is_some_and(|committed| {
+            self.domains
+                .iter()
+                .all(|domain| committed == domain.execution_start_tokens)
+        });
+        if unchanged_prefix {
+            if !self.allow_unchanged_prefix {
+                return Err(Error::InferenceError(
+                    "unchanged managed-cache prefix is authorized only for realtime work".into(),
+                ));
+            }
+            if !completions.is_empty() {
+                return Err(Error::InferenceError(
+                    "unchanged managed-cache prefix returned unexpected backend writes".into(),
+                ));
+            }
+            return Ok(ManagedCacheReceipt {
+                reservation: self.clone(),
+                domains: self
+                    .domains
+                    .iter()
+                    .map(|domain| ManagedCacheDomainReceipt {
+                        arena: domain.arena,
+                        domain: domain.domain,
+                        written_blocks: Vec::new(),
+                        page_tokens: 1,
+                    })
+                    .collect(),
+                accepted_prefix,
+                clocked_state: None,
+            });
+        }
         if completions.is_empty() && !self.domains.is_empty() {
             return Err(Error::InferenceError(
                 "managed-cache row returned no backend write completion".into(),
@@ -1522,7 +1568,7 @@ impl ManagedCacheReservation {
         let mut receipts = Vec::with_capacity(self.domains.len());
         for domain in &self.domains {
             let committed_tokens = accepted_prefix.unwrap_or(domain.target_committed_tokens);
-            if committed_tokens <= domain.execution_start_tokens
+            if committed_tokens < domain.execution_start_tokens
                 || committed_tokens > domain.target_committed_tokens
             {
                 return Err(Error::InferenceError(
@@ -1865,7 +1911,8 @@ impl ManagedCacheReceipt {
             let committed_tokens = self
                 .accepted_prefix
                 .unwrap_or(reservation.target_committed_tokens);
-            if committed_tokens <= reservation.execution_start_tokens
+            let unchanged = committed_tokens == reservation.execution_start_tokens;
+            if committed_tokens < reservation.execution_start_tokens
                 || committed_tokens > reservation.target_committed_tokens
                 || receipt.page_tokens == 0
             {
@@ -1878,6 +1925,19 @@ impl ManagedCacheReceipt {
                 .iter()
                 .copied()
                 .collect::<HashSet<_>>();
+            if unchanged {
+                if !self.reservation.allow_unchanged_prefix {
+                    return Err(Error::InferenceError(
+                        "unchanged managed-cache receipt lacks realtime authority".into(),
+                    ));
+                }
+                if !blocks.is_empty() {
+                    return Err(Error::InferenceError(
+                        "unchanged managed-cache receipt acknowledged physical writes".into(),
+                    ));
+                }
+                continue;
+            }
             let group = reservation
                 .provisional_groups
                 .iter()
@@ -3713,7 +3773,13 @@ mod tests {
                 writable_blocks: written_blocks.clone(),
             }],
             clocked_state: None,
+            allow_unchanged_prefix: false,
         };
+        assert!(reservation
+            .completed_write_receipt_for_prefix(&[], 4)
+            .expect_err("ordinary sequence work cannot authenticate a zero KV append")
+            .to_string()
+            .contains("only for realtime"));
         let batch = PhysicalBatch {
             batch_id: BatchId::new(99),
             lane: lane.clone(),

@@ -1191,6 +1191,9 @@ pub struct ModelSessionResult {
     /// The executor reconciles these against the exact row reservation before
     /// it can construct a managed-cache receipt.
     pub(crate) managed_cache_completions: Vec<Arc<crate::backends::kv::KvWriteBatchCompletion>>,
+    /// Exact decoder-KV cursor advance, distinct from source samples consumed
+    /// and user-visible output events for realtime audio work.
+    pub(crate) managed_cache_append: Option<usize>,
     pub(crate) clocked_state_completion: Option<crate::backends::state::TensorStateBatchCompletion>,
 }
 
@@ -1225,6 +1228,7 @@ impl ModelSessionResult {
             provenance,
             staged_stream_outputs: Vec::new(),
             managed_cache_completions: Vec::new(),
+            managed_cache_append: None,
             clocked_state_completion: None,
         }
     }
@@ -1237,6 +1241,7 @@ impl ModelSessionResult {
             provenance: OutcomeProvenance::produced_output(),
             staged_stream_outputs: Vec::new(),
             managed_cache_completions: Vec::new(),
+            managed_cache_append: None,
             clocked_state_completion: None,
         }
     }
@@ -1264,6 +1269,7 @@ impl ModelSessionResult {
             provenance: OutcomeProvenance::started(),
             staged_stream_outputs: Vec::new(),
             managed_cache_completions: Vec::new(),
+            managed_cache_append: None,
             clocked_state_completion: None,
         }
     }
@@ -1277,6 +1283,7 @@ impl ModelSessionResult {
             provenance: OutcomeProvenance::started(),
             staged_stream_outputs: Vec::new(),
             managed_cache_completions: Vec::new(),
+            managed_cache_append: None,
             clocked_state_completion: None,
         }
     }
@@ -1290,6 +1297,7 @@ impl ModelSessionResult {
             provenance: OutcomeProvenance::not_started(),
             staged_stream_outputs: Vec::new(),
             managed_cache_completions: Vec::new(),
+            managed_cache_append: None,
             clocked_state_completion: None,
         }
     }
@@ -1317,6 +1325,7 @@ impl ModelSessionResult {
             provenance,
             staged_stream_outputs: Vec::new(),
             managed_cache_completions: Vec::new(),
+            managed_cache_append: None,
             clocked_state_completion: None,
         }
     }
@@ -1331,6 +1340,11 @@ impl ModelSessionResult {
         completions: Vec<Arc<crate::backends::kv::KvWriteBatchCompletion>>,
     ) -> Self {
         self.managed_cache_completions = completions;
+        self
+    }
+
+    pub(crate) fn with_managed_cache_append(mut self, appended: usize) -> Self {
+        self.managed_cache_append = Some(appended);
         self
     }
 
@@ -1360,6 +1374,7 @@ pub struct ExecutorStepResult {
     /// Optional physical KV write acknowledgement for this exact row.
     pub managed_cache: Option<super::ManagedCacheReceipt>,
     pub(crate) managed_cache_completions: Vec<Arc<crate::backends::kv::KvWriteBatchCompletion>>,
+    pub(crate) managed_cache_append: Option<usize>,
     pub(crate) clocked_state_completion: Option<crate::backends::state::TensorStateBatchCompletion>,
 }
 
@@ -1388,6 +1403,7 @@ impl ExecutorStepResult {
             staged_stream_outputs: session_result.staged_stream_outputs,
             managed_cache: None,
             managed_cache_completions: session_result.managed_cache_completions,
+            managed_cache_append: session_result.managed_cache_append,
             clocked_state_completion: session_result.clocked_state_completion,
         }
     }
@@ -3552,6 +3568,7 @@ mod tests {
                 })
                 .collect(),
             clocked_state: None,
+            allow_unchanged_prefix: false,
         }
     }
 
