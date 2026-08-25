@@ -2498,6 +2498,62 @@ mod tests {
     }
 
     #[test]
+    fn current_audio_adapters_remain_scalar_until_a_family_native_call_opts_in() {
+        let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(8, 4).unwrap();
+        let audio_capability = |capability| {
+            matches!(
+                capability,
+                CapabilityKind::Asr
+                    | CapabilityKind::SpeakerAttributedAsr
+                    | CapabilityKind::RealtimeAsr
+                    | CapabilityKind::Tts
+                    | CapabilityKind::StreamingTts
+            )
+        };
+
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            for (index, variant) in ModelVariant::all().iter().copied().enumerate() {
+                let draft = LoadedModelBundleDraft::build(
+                    &registry,
+                    ExecutionGroupId::new(46),
+                    ModelInstanceId::new(index as u64 + 1),
+                    variant,
+                    backend,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("failed to build {variant} for {backend:?}: {error}")
+                });
+                for execution in draft
+                    .capabilities
+                    .values()
+                    .filter(|execution| audio_capability(execution.metadata().capability))
+                {
+                    for contract in
+                        loaded_execution_contracts(execution.as_ref()).unwrap_or_else(|error| {
+                            panic!(
+                                "failed audio contract for {variant} {:?} on {backend:?}: {error}",
+                                execution.metadata().capability
+                            )
+                        })
+                    {
+                        assert_eq!(contract.execution_profile.max_batch_size, 1);
+                        assert_eq!(
+                            contract.execution_profile.concurrency,
+                            ConcurrencyClass::Exclusive
+                        );
+                        assert!(!contract.execution_profile.capabilities().native_batch);
+                        assert!(contract.stages.iter().all(|stage| {
+                            stage.batch_mode == NativeBatchMode::None
+                                && stage.max_batch_size == 1
+                                && stage.concurrency == ConcurrencyClass::Exclusive
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn loaded_contracts_reject_policy_without_evidence_and_stage_profile_mismatch() {
         let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(1, 3).unwrap();
         let unknown = LoadedModelBundleDraft::build(

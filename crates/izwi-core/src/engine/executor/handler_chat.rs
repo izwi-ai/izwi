@@ -619,7 +619,7 @@ impl NativeExecutor {
         &self,
         requests: &[&EngineCoreRequest],
         scheduled: &[ScheduledRequest],
-        managed_caches: Vec<Option<super::ContinuousRowManagedCache>>,
+        managed_caches: Vec<Option<super::RetainedRowManagedState>>,
     ) -> Result<Vec<ModelSessionResult>> {
         if scheduled.is_empty()
             || scheduled
@@ -727,17 +727,26 @@ impl NativeExecutor {
                 ));
             }
             match managed_cache {
-                Some(views) => {
-                    let (cache, mtp_cache, tensor_reservation) = match views {
-                        super::ContinuousRowManagedCache::Dense {
-                            target,
-                            tensor_state,
-                        } => (target, None, tensor_state),
-                        super::ContinuousRowManagedCache::Hybrid {
-                            target,
+                Some(mut views) => {
+                    let tensor_reservation = views.tensor_state;
+                    let (cache, mtp_cache) = if request.model_variant.is_some_and(|variant| {
+                        variant.family() == crate::catalog::ModelFamily::Qwen38Chat
+                    }) {
+                        let target =
+                            views.take_paged_domain(super::QWEN38_TARGET_ATTENTION_DOMAIN, true)?;
+                        let mtp =
+                            views.take_paged_domain(super::QWEN38_MTP_ATTENTION_DOMAIN, false)?;
+                        views.ensure_all_paged_consumed()?;
+                        (
+                            target.ok_or_else(|| {
+                                Error::InferenceError(
+                                    "continuous Qwen3.8 row lost its target cache".into(),
+                                )
+                            })?,
                             mtp,
-                            tensor_state,
-                        } => (target, mtp, tensor_state),
+                        )
+                    } else {
+                        (views.take_only_paged()?, None)
                     };
                     let tensor_arena = request
                         .managed_cache_runtime()
@@ -789,10 +798,18 @@ impl NativeExecutor {
                 "continuous chat model returned the wrong number of rows".to_string(),
             ));
         }
-        crate::engine::metrics::record_engine_chat_model_dispatch(
-            model.continuous_decode_is_tensor_batched(),
-            live_width,
-        );
+        let model_call = if model.continuous_decode_is_tensor_batched() {
+            crate::engine::metrics::EngineModelCall::NativeTensor {
+                mode: crate::engine::NativeBatchMode::Continuous,
+                rows: live_width,
+            }
+        } else {
+            crate::engine::metrics::EngineModelCall::ScalarRows {
+                envelope: crate::engine::NativeBatchMode::Continuous,
+                rows: live_width,
+            }
+        };
+        crate::engine::metrics::record_engine_model_call(model_call);
 
         for (index, _, lease, _) in &mut active_states.rows {
             if let Some(arena) = ordered_requests[*index]

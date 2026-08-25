@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 use super::{
-    BatchDispatch, BatchDispatchKind, DeadlinePhase, DispatchState, FailureOrigin,
+    BatchDispatch, BatchDispatchKind, DeadlinePhase, DispatchState, FailureOrigin, NativeBatchMode,
     OutcomeProvenance, PhysicalBatch, ResourceAmount,
 };
 
@@ -311,11 +311,11 @@ pub const ENGINE_METRIC_CATALOG: &[EngineMetricDescriptor] = &[
     },
     EngineMetricDescriptor {
         name: ENGINE_EXECUTOR_MODEL_SCALAR_ROW_DISPATCHES_TOTAL,
-        description: "Rows executed through scalar continuous-decode model paths.",
+        description: "Rows observed in actual scalar model calls inside a native batch envelope.",
     },
     EngineMetricDescriptor {
         name: ENGINE_EXECUTOR_MODEL_DECODE_CALLS_TOTAL,
-        description: "Successful shape-valid continuous decode model call-path invocations.",
+        description: "Actual model-call invocations after exact native-route validation.",
     },
     EngineMetricDescriptor {
         name: ENGINE_EXECUTOR_MODEL_TENSOR_MULTIROW_CALLS_TOTAL,
@@ -1086,19 +1086,40 @@ pub(crate) fn record_engine_batch_dispatch(dispatch: BatchDispatch) {
     }
 }
 
-pub(crate) fn record_engine_chat_model_dispatch(tensor_batched: bool, live_rows: usize) {
-    let live_rows = live_rows.max(1) as u64;
-    ENGINE_MODEL_DECODE_CALLS.fetch_add(1, Ordering::Relaxed);
-    if tensor_batched {
-        ENGINE_MODEL_TENSOR_BATCHES.fetch_add(1, Ordering::Relaxed);
-        ENGINE_MODEL_TENSOR_BATCH_ROWS.fetch_add(live_rows, Ordering::Relaxed);
-        ENGINE_MODEL_TENSOR_BATCH_MAX_WIDTH.fetch_max(live_rows, Ordering::Relaxed);
-        if live_rows >= 2 {
-            ENGINE_MODEL_TENSOR_MULTIROW_CALLS.fetch_add(1, Ordering::Relaxed);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EngineModelCall {
+    /// One native tensor call consumed all live rows.
+    NativeTensor { mode: NativeBatchMode, rows: usize },
+    /// The envelope was executed as one scalar call per live row.
+    ScalarRows {
+        envelope: NativeBatchMode,
+        rows: usize,
+    },
+}
+
+pub(crate) fn record_engine_model_call(call: EngineModelCall) {
+    match call {
+        EngineModelCall::NativeTensor { mode, rows } => {
+            debug_assert!(mode != NativeBatchMode::None);
+            let rows = rows.max(1) as u64;
+            ENGINE_MODEL_DECODE_CALLS.fetch_add(1, Ordering::Relaxed);
+            ENGINE_MODEL_TENSOR_BATCHES.fetch_add(1, Ordering::Relaxed);
+            ENGINE_MODEL_TENSOR_BATCH_ROWS.fetch_add(rows, Ordering::Relaxed);
+            ENGINE_MODEL_TENSOR_BATCH_MAX_WIDTH.fetch_max(rows, Ordering::Relaxed);
+            if rows >= 2 {
+                ENGINE_MODEL_TENSOR_MULTIROW_CALLS.fetch_add(1, Ordering::Relaxed);
+            }
         }
-    } else {
-        ENGINE_MODEL_SCALAR_ROW_DISPATCHES.fetch_add(live_rows, Ordering::Relaxed);
-        ENGINE_CONTINUOUS_ENVELOPE_SCALAR_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        EngineModelCall::ScalarRows { envelope, rows } => {
+            let rows = rows.max(1) as u64;
+            // Scalar fallback means one distinct model call per row, not one
+            // tensor call whose width happens to equal the envelope width.
+            ENGINE_MODEL_DECODE_CALLS.fetch_add(rows, Ordering::Relaxed);
+            ENGINE_MODEL_SCALAR_ROW_DISPATCHES.fetch_add(rows, Ordering::Relaxed);
+            if envelope == NativeBatchMode::Continuous {
+                ENGINE_CONTINUOUS_ENVELOPE_SCALAR_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 }
 
@@ -1801,8 +1822,14 @@ mod tests {
     #[test]
     fn model_dispatch_metrics_distinguish_true_tensor_batches_from_scalar_rows() {
         let before = engine_batch_metrics_snapshot();
-        record_engine_chat_model_dispatch(true, 3);
-        record_engine_chat_model_dispatch(false, 2);
+        record_engine_model_call(EngineModelCall::NativeTensor {
+            mode: NativeBatchMode::Continuous,
+            rows: 3,
+        });
+        record_engine_model_call(EngineModelCall::ScalarRows {
+            envelope: NativeBatchMode::Continuous,
+            rows: 2,
+        });
         let after = engine_batch_metrics_snapshot();
 
         assert!(after.model_tensor_batches_total > before.model_tensor_batches_total);

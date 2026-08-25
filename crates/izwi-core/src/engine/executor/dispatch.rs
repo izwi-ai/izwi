@@ -340,11 +340,7 @@ impl NativeExecutor {
                 })?;
                 reservation
                     .map(|reservation| {
-                        super::continuous_row_managed_caches_for_row(
-                            request,
-                            scheduled,
-                            reservation,
-                        )
+                        super::retained_row_managed_state_for_row(request, scheduled, reservation)
                     })
                     .transpose()
             })

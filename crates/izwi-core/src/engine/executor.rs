@@ -38,10 +38,11 @@ pub(super) fn decode_request_audio_with_rate(
 use super::config::EngineCoreConfig;
 use super::execution::{
     BatchDispatch, BatchId, BatchLaneKey, CacheMode, CancellationGranularity, ConcurrencyClass,
-    DispatchState, ExecutionCapabilities, ExecutionDisposition, ExecutionFailure, ExecutionMode,
-    ExecutionProfile, FailureKind, FailureOrigin, FailureScope, FinishReason, HealthImpact,
-    NativeBatchMode, OutcomeProvenance, PhysicalBatch, PhysicalLaunchPolicy, PlanId, PrefillMode,
-    RetryDisposition, SessionKey, StageProgressKind, WorkUnit, YieldReason,
+    DispatchState, ExecutionCapabilities, ExecutionDisposition, ExecutionDomain, ExecutionFailure,
+    ExecutionMode, ExecutionProfile, FailureKind, FailureOrigin, FailureScope, FinishReason,
+    HealthImpact, NativeBatchMode, OutcomeProvenance, PhysicalBatch, PhysicalLaunchPolicy, PlanId,
+    PrefillMode, RetryDisposition, SequencePhase, SessionKey, StageId, StageProgressKind,
+    StageWorkSelector, WorkUnit, YieldReason,
 };
 use super::metrics::{
     begin_engine_physical_dispatch, record_engine_physical_defer, record_engine_physical_fallback,
@@ -51,7 +52,7 @@ use super::output::StreamingOutput;
 use super::request::EngineCoreRequest;
 use super::resources::{BatchWorkspaceLease, ResourceAuthority, ResourceVector};
 use super::scheduler::ScheduledRequest;
-use super::types::AudioOutput;
+use super::types::{AudioOutput, TaskType};
 use crate::backends::{
     can_parallelize_requests, BackendContext, BackendKind, BackendPreference, BackendRouter,
     BackendSelectionSource,
@@ -72,6 +73,158 @@ const QWEN38_MTP_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(4);
 // at 40 Hz bounds cancelled FIFO residency without turning admission into a
 // hot loop.
 const PHYSICAL_ADMISSION_CANCELLATION_POLL: Duration = Duration::from_millis(25);
+
+/// Exact executor-private route for one load-sealed native model call.
+///
+/// The public stage contract already supplies the durable proof surface: the
+/// adapter ABI, opaque stage identity, selector, batch mode, shape policy, and
+/// exact batch lane. This projection prevents the executor from authorizing a
+/// native call from a capability string alone. Audio routes are represented
+/// now so later family adapters can add model calls without weakening the
+/// shared validation boundary; no current audio adapter publishes a native
+/// batch mode, so those variants remain unreachable until an exact opt-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NativeBatchRoute {
+    ChatContinuousDecode {
+        stage_id: StageId,
+    },
+    Audio {
+        task: TaskType,
+        stage: NativeAudioStage,
+        mode: NativeBatchMode,
+        stage_id: StageId,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NativeAudioStage {
+    SequencePrefill,
+    SequenceDecode,
+    Atomic,
+    Pipeline { ordinal: usize },
+}
+
+impl NativeBatchRoute {
+    fn capability_matches_task(task: TaskType, capability: &str) -> bool {
+        match task {
+            TaskType::Chat => capability == "chat",
+            TaskType::ASR => matches!(
+                capability,
+                "asr" | "realtime_asr" | "speaker_attributed_asr"
+            ),
+            TaskType::TTS => matches!(capability, "tts" | "streaming_tts"),
+            TaskType::SpeechToSpeech => {
+                matches!(capability, "audio_chat" | "speech_to_speech")
+            }
+        }
+    }
+
+    fn audio_stage(work: &WorkUnit) -> NativeAudioStage {
+        match work {
+            WorkUnit::SequenceStep {
+                phase: SequencePhase::Prefill,
+                ..
+            } => NativeAudioStage::SequencePrefill,
+            WorkUnit::SequenceStep {
+                phase: SequencePhase::Decode,
+                ..
+            } => NativeAudioStage::SequenceDecode,
+            WorkUnit::AtomicJob { .. } => NativeAudioStage::Atomic,
+            WorkUnit::PipelineStage { ordinal, .. } => {
+                NativeAudioStage::Pipeline { ordinal: *ordinal }
+            }
+        }
+    }
+
+    fn resolve(execution: &PhysicalBatchExecution<'_>) -> Result<Self> {
+        if execution.batch.mode == NativeBatchMode::None {
+            return Err(Error::InvalidInput(
+                "scalar physical work has no native tensor route".to_string(),
+            ));
+        }
+        let first_scheduled = execution.scheduled.first().ok_or_else(|| {
+            Error::InvalidInput("native physical batch has no scheduled rows".to_string())
+        })?;
+        let first_request = execution
+            .requests
+            .iter()
+            .copied()
+            .find(|request| request.id == first_scheduled.request_id)
+            .ok_or_else(|| {
+                Error::InferenceError(
+                    "native physical batch has no request for its first row".to_string(),
+                )
+            })?;
+        let task = first_request.task_type;
+        let role = Self::audio_stage(&first_scheduled.work);
+
+        for scheduled in execution.scheduled {
+            let request = execution
+                .requests
+                .iter()
+                .copied()
+                .find(|request| request.id == scheduled.request_id)
+                .ok_or_else(|| {
+                    Error::InferenceError(format!(
+                        "native physical row {} has no request snapshot",
+                        scheduled.request_id
+                    ))
+                })?;
+            if request.task_type != task || Self::audio_stage(&scheduled.work) != role {
+                return Err(Error::InvalidInput(
+                    "native physical batch mixed task or stage roles".to_string(),
+                ));
+            }
+            let binding = request.execution_adapter_binding().ok_or_else(|| {
+                Error::InferenceError(
+                    "native physical row has no loaded adapter binding".to_string(),
+                )
+            })?;
+            if binding.execution_group_id != execution.batch.lane.execution_group
+                || binding.model_instance_id != execution.batch.lane.model_instance
+                || binding.adapter_instance_id != execution.batch.lane.adapter_instance
+                || binding.adapter_abi_revision != execution.batch.lane.adapter_abi
+                || binding.capability_id != execution.batch.lane.capability_id
+                || request.model_variant != Some(binding.model_variant)
+                || request.model_instance_id() != Some(binding.model_instance_id)
+                || !Self::capability_matches_task(task, &binding.capability_id)
+            {
+                return Err(Error::InvalidInput(
+                    "native physical row crossed its loaded adapter identity".to_string(),
+                ));
+            }
+            let stage = binding.stage_for_work(&scheduled.work)?;
+            if stage.selector == StageWorkSelector::Any
+                || stage.domain != ExecutionDomain::ExecutionGroup
+                || stage.concurrency != ConcurrencyClass::Batchable
+                || stage.batch_mode != execution.batch.mode
+                || stage.id != execution.batch.lane.stage_id
+                || stage.name != execution.batch.lane.kernel_mode
+            {
+                return Err(Error::InvalidInput(
+                    "native physical row has no exact load-sealed model-call stage".to_string(),
+                ));
+            }
+        }
+
+        match (task, role, execution.batch.mode) {
+            (TaskType::Chat, NativeAudioStage::SequenceDecode, NativeBatchMode::Continuous) => {
+                Ok(Self::ChatContinuousDecode {
+                    stage_id: execution.batch.lane.stage_id,
+                })
+            }
+            (TaskType::ASR | TaskType::TTS, stage, mode) => Ok(Self::Audio {
+                task,
+                stage,
+                mode,
+                stage_id: execution.batch.lane.stage_id,
+            }),
+            _ => Err(Error::InvalidInput(
+                "loaded stage has no compatible native executor route".to_string(),
+            )),
+        }
+    }
+}
 
 struct Qwen38ManagedCaches {
     target: PhysicalPagedKvCache,
@@ -194,53 +347,141 @@ fn qwen3_managed_cache_for_row(
     physical_paged_cache_for_row(request, scheduled, reservation, group.domain, group.id)
 }
 
-/// Per-row scheduler-owned KV views for one continuous chat quantum. Dense
-/// families carry a single paged view; hybrid families also own an optional
-/// speculative arena that must swap with the same transaction.
-pub(super) enum ContinuousRowManagedCache {
-    Dense {
-        target: PhysicalPagedKvCache,
-        tensor_state: Option<super::ManagedTensorStateReservation>,
-    },
-    Hybrid {
-        target: PhysicalPagedKvCache,
-        mtp: Option<PhysicalPagedKvCache>,
-        tensor_state: Option<super::ManagedTensorStateReservation>,
-    },
+struct RetainedPagedRowState {
+    domain: CacheDomainId,
+    group: KvGroupId,
+    cache: PhysicalPagedKvCache,
 }
 
-fn continuous_row_managed_caches_for_row(
+/// Complete scheduler-owned retained state projection for one native row.
+///
+/// Unlike the former chat-specific dense/hybrid enum, this preserves every
+/// paged domain/group identity plus the transactional tensor reservation.
+/// Audio adapters can therefore select their exact authored domains without
+/// teaching the shared engine about target, predictor, codec, or transducer
+/// conventions.
+pub(super) struct RetainedRowManagedState {
+    paged: Vec<RetainedPagedRowState>,
+    pub(super) tensor_state: Option<super::ManagedTensorStateReservation>,
+}
+
+impl RetainedRowManagedState {
+    pub(super) fn take_paged_domain(
+        &mut self,
+        domain: CacheDomainId,
+        required: bool,
+    ) -> Result<Option<PhysicalPagedKvCache>> {
+        let matches = self
+            .paged
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| (row.domain == domain).then_some(index))
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            if required {
+                return Err(Error::InferenceError(format!(
+                    "retained row omitted required paged domain {}",
+                    domain.get()
+                )));
+            }
+            return Ok(None);
+        }
+        if matches.len() != 1 {
+            return Err(Error::InvalidInput(format!(
+                "retained row domain {} resolves more than one physical group",
+                domain.get()
+            )));
+        }
+        Ok(Some(self.paged.swap_remove(matches[0]).cache))
+    }
+
+    pub(super) fn take_only_paged(&mut self) -> Result<PhysicalPagedKvCache> {
+        if self.paged.len() != 1 {
+            return Err(Error::InvalidInput(format!(
+                "retained row expected one paged group, found {}",
+                self.paged.len()
+            )));
+        }
+        Ok(self.paged.pop().expect("length checked").cache)
+    }
+
+    pub(super) fn ensure_all_paged_consumed(&self) -> Result<()> {
+        if self.paged.is_empty() {
+            Ok(())
+        } else {
+            let identities = self
+                .paged
+                .iter()
+                .map(|row| format!("{}:{}", row.domain.get(), row.group.get()))
+                .collect::<Vec<_>>()
+                .join(",");
+            Err(Error::InvalidInput(format!(
+                "retained row left unexpected paged domains/groups: {identities}"
+            )))
+        }
+    }
+}
+
+fn retained_row_managed_state_for_row(
     request: &EngineCoreRequest,
     scheduled: &ScheduledRequest,
     reservation: &super::ManagedCacheReservation,
-) -> Result<ContinuousRowManagedCache> {
-    if matches!(
-        request.model_variant,
-        Some(variant) if variant.family() == crate::catalog::ModelFamily::Qwen38Chat
-    ) {
-        let Qwen38ManagedCaches { target, mtp } =
-            qwen38_managed_caches_for_row(request, scheduled, reservation)?;
-        Ok(ContinuousRowManagedCache::Hybrid {
-            target,
-            mtp,
-            tensor_state: reservation.tensor_state,
-        })
-    } else {
-        let tensor_state = matches!(
-            request.model_variant,
-            Some(variant) if matches!(
-                variant.family(),
-                crate::catalog::ModelFamily::Qwen35Chat
-                    | crate::catalog::ModelFamily::Lfm2Chat
-            )
-        )
-        .then_some(reservation.tensor_state)
-        .flatten();
-        Ok(ContinuousRowManagedCache::Dense {
-            target: qwen3_managed_cache_for_row(request, scheduled, reservation)?,
-            tensor_state,
-        })
+) -> Result<RetainedRowManagedState> {
+    if reservation.txn_id != scheduled.plan_id || reservation.session != scheduled.session_key() {
+        return Err(Error::InferenceError(
+            "retained row reservation crossed its scheduled row fence".to_string(),
+        ));
     }
+    let runtime = request.managed_cache_runtime().ok_or_else(|| {
+        Error::InferenceError("retained native row has no physical model runtime".to_string())
+    })?;
+    if request.model_instance_id() != Some(runtime.plan().model_instance) {
+        return Err(Error::InferenceError(
+            "retained native row crossed its loaded model instance".to_string(),
+        ));
+    }
+
+    let mut paged = Vec::new();
+    let mut seen = HashSet::new();
+    for domain in &reservation.domains {
+        for table in &domain.provisional_groups {
+            let mut groups = runtime.plan().groups.iter().filter(|group| {
+                group.domain == domain.domain
+                    && group.id == table.group
+                    && group.arena == domain.arena
+            });
+            let group = groups.next().ok_or_else(|| {
+                Error::InferenceError(
+                    "retained row reservation references an unresolved paged group".to_string(),
+                )
+            })?;
+            if groups.next().is_some() || !seen.insert((group.domain, group.id, group.arena)) {
+                return Err(Error::InvalidInput(
+                    "retained row reservation repeats a paged domain/group".to_string(),
+                ));
+            }
+            paged.push(RetainedPagedRowState {
+                domain: group.domain,
+                group: group.id,
+                cache: physical_paged_cache_for_row(
+                    request,
+                    scheduled,
+                    reservation,
+                    group.domain,
+                    group.id,
+                )?,
+            });
+        }
+    }
+    if paged.is_empty() && reservation.tensor_state.is_none() {
+        return Err(Error::InvalidInput(
+            "retained native row has neither paged nor tensor state".to_string(),
+        ));
+    }
+    Ok(RetainedRowManagedState {
+        paged,
+        tensor_state: reservation.tensor_state,
+    })
 }
 
 /// Resolve one exact scheduler-owned paged-attention view without assuming
@@ -1667,6 +1908,60 @@ fn is_isolated_continuous_model_quantum(scheduled: &[ScheduledRequest]) -> bool 
     scheduled.len() == 1 && !scheduled[0].is_prefill && scheduled[0].num_tokens > 1
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NativeBatchSupport {
+    prefill: NativeBatchMode,
+    decode: NativeBatchMode,
+}
+
+impl NativeBatchSupport {
+    const NONE: Self = Self {
+        prefill: NativeBatchMode::None,
+        decode: NativeBatchMode::None,
+    };
+
+    fn is_native(self) -> bool {
+        self.prefill != NativeBatchMode::None || self.decode != NativeBatchMode::None
+    }
+}
+
+/// Intersect a load-sealed stage declaration with an implemented model call.
+/// Merely publishing `NativeBatchMode` in catalog or request data is not
+/// sufficient. Audio families intentionally return `NONE` until their later
+/// family adapters install a real multi-row call at this boundary.
+fn loaded_native_batch_support(request: &EngineCoreRequest) -> NativeBatchSupport {
+    if request.task_type != TaskType::Chat {
+        return NativeBatchSupport::NONE;
+    }
+    let Ok(model) = request.prepared_chat_model_for_executor() else {
+        return NativeBatchSupport::NONE;
+    };
+    if !model.supports_continuous_decode_batch() {
+        return NativeBatchSupport::NONE;
+    }
+    let Some(binding) = request.execution_adapter_binding() else {
+        return NativeBatchSupport::NONE;
+    };
+    let decode_work = WorkUnit::SequenceStep {
+        phase: SequencePhase::Decode,
+        input: super::InputRange { start: 0, end: 1 },
+        max_output_steps: 1,
+    };
+    let Ok(stage) = binding.stage_for_work(&decode_work) else {
+        return NativeBatchSupport::NONE;
+    };
+    if stage.selector != StageWorkSelector::SequenceDecode
+        || stage.batch_mode != NativeBatchMode::Continuous
+        || stage.concurrency != ConcurrencyClass::Batchable
+    {
+        return NativeBatchSupport::NONE;
+    }
+    NativeBatchSupport {
+        prefill: NativeBatchMode::None,
+        decode: NativeBatchMode::Continuous,
+    }
+}
+
 fn resolved_resumable_prefill_mode(
     chunking_enabled: bool,
     exact_model_proof: Option<bool>,
@@ -1742,17 +2037,7 @@ impl ModelExecutor for NativeExecutor {
                 .and_then(|registry| registry.try_get_audio_chat(variant))
                 .map(|_| false),
         };
-        let continuous_chat_batch = matches!(request.task_type, super::types::TaskType::Chat)
-            && request
-                .prepared_chat_model_for_executor()
-                .ok()
-                .is_some_and(|model| model.supports_continuous_decode_batch())
-            && request.execution_adapter_binding().is_some_and(|binding| {
-                binding
-                    .stages
-                    .iter()
-                    .any(|stage| stage.batch_mode == NativeBatchMode::Continuous)
-            });
+        let native_batch_support = loaded_native_batch_support(request);
         profile.resolved_from_loaded_model = loaded_incremental.is_some();
         let implementation_incremental =
             loaded_incremental.unwrap_or_else(|| match request.task_type {
@@ -1807,9 +2092,9 @@ impl ModelExecutor for NativeExecutor {
             profile.cancellation = CancellationGranularity::OperationBoundary;
         }
 
-        if continuous_chat_batch {
-            profile.prefill_batch = NativeBatchMode::None;
-            profile.decode_batch = NativeBatchMode::Continuous;
+        if native_batch_support.is_native() {
+            profile.prefill_batch = native_batch_support.prefill;
+            profile.decode_batch = native_batch_support.decode;
             profile.concurrency = ConcurrencyClass::Batchable;
             profile.max_batch_size = self.config.max_tensor_batch_size.max(1);
         } else {
@@ -1859,66 +2144,33 @@ impl ModelExecutor for NativeExecutor {
                 FailureOrigin::ExecutorValidation,
             ));
         }
-        if execution.batch.mode == NativeBatchMode::Static {
-            if !execution.is_prefill()
-                || execution.batch.lane.capability_id != "tts"
-                || execution
-                    .requests
-                    .iter()
-                    .any(|request| request.task_type != super::types::TaskType::TTS)
-            {
-                return Err(PhysicalDispatchError::not_started(
-                    Error::InferenceError(
-                        "static tensor batch was routed to an incompatible native stage"
-                            .to_string(),
-                    ),
-                    width,
-                    FailureOrigin::ExecutorValidation,
-                ));
-            }
+        if execution.batch.mode != NativeBatchMode::None {
+            let route = NativeBatchRoute::resolve(&execution).map_err(|error| {
+                PhysicalDispatchError::not_started(error, width, FailureOrigin::ExecutorValidation)
+            })?;
             if execution.scheduled.len() > self.config.max_tensor_batch_size.max(1) {
                 return Err(PhysicalDispatchError::not_started(
                     Error::Overloaded(
-                        "static tensor batch exceeds the backend width cap".to_string(),
+                        "native tensor batch exceeds the backend width cap".to_string(),
                     ),
                     width,
                     FailureOrigin::ExecutorValidation,
                 ));
             }
-            return Err(PhysicalDispatchError::not_started(
-                Error::InferenceError(
-                    "no loaded physical static-batch implementation is registered".to_string(),
-                ),
-                width,
-                FailureOrigin::ExecutorValidation,
-            ));
-        }
-        if execution.batch.mode == NativeBatchMode::Continuous {
-            if execution.is_prefill()
-                || execution.batch.lane.capability_id != "chat"
-                || execution
-                    .requests
-                    .iter()
-                    .any(|request| request.task_type != super::types::TaskType::Chat)
-            {
+            let NativeBatchRoute::ChatContinuousDecode { .. } = route else {
+                // Audio stage identity is recognized, but current family
+                // adapters deliberately publish scalar width-one contracts.
+                // If a future contract reaches this branch before its model
+                // call is installed, reject before model entry rather than
+                // fabricating tensor dispatch evidence.
                 return Err(PhysicalDispatchError::not_started(
                     Error::InferenceError(
-                        "continuous tensor batch was routed to an incompatible native stage"
-                            .to_string(),
+                        "loaded audio stage has no registered native model call".to_string(),
                     ),
                     width,
                     FailureOrigin::ExecutorValidation,
                 ));
-            }
-            if execution.scheduled.len() > self.config.max_tensor_batch_size.max(1) {
-                return Err(PhysicalDispatchError::not_started(
-                    Error::Overloaded(
-                        "continuous tensor batch exceeds the backend width cap".to_string(),
-                    ),
-                    width,
-                    FailureOrigin::ExecutorValidation,
-                ));
-            }
+            };
             if is_isolated_continuous_model_quantum(execution.scheduled) {
                 // An isolated model-preferred quantum is still planned through
                 // the continuous stage so it can yield back to shared
@@ -1935,7 +2187,12 @@ impl ModelExecutor for NativeExecutor {
                     .as_ref()
                     .is_ok_and(|outputs| outputs.iter().all(|output| output.output.error.is_none()))
                 {
-                    crate::engine::metrics::record_engine_chat_model_dispatch(false, 1);
+                    crate::engine::metrics::record_engine_model_call(
+                        crate::engine::metrics::EngineModelCall::ScalarRows {
+                            envelope: NativeBatchMode::Continuous,
+                            rows: 1,
+                        },
+                    );
                 }
                 return result.map_err(|error| {
                     PhysicalDispatchError::started(
@@ -2775,6 +3032,171 @@ mod tests {
             scheduled(1, false),
             scheduled(1, false),
         ]));
+    }
+
+    fn native_route_fixture(
+        task: TaskType,
+        capability: &str,
+        variant: ModelVariant,
+        selector: StageWorkSelector,
+        stage_name: &str,
+    ) -> (EngineCoreRequest, ScheduledRequest, PhysicalBatch) {
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, Some(variant), ExecutionMode::Sequence);
+        profile.max_batch_size = 4;
+        let mut stage = super::super::StageDescriptor::from_execution_profile(
+            StageId::new(7),
+            stage_name,
+            &profile,
+            NativeBatchMode::Continuous,
+        );
+        stage.selector = selector;
+        stage.max_work_units = 4;
+        stage.validate().unwrap();
+        let binding = super::super::ExecutionAdapterBinding {
+            execution_group_id: super::super::ExecutionGroupId::new(1),
+            model_instance_id: super::super::ModelInstanceId::new(2),
+            adapter_instance_id: super::super::AdapterInstanceId::new(3),
+            adapter_abi_revision: super::super::AdapterAbiRevision::new(4),
+            model_variant: variant,
+            capability_id: capability.to_string(),
+            stages: Arc::from([stage]),
+        };
+        binding.validate().unwrap();
+
+        let mut request = match task {
+            TaskType::TTS => EngineCoreRequest::tts("native route"),
+            TaskType::ASR => EngineCoreRequest::asr(""),
+            TaskType::Chat => EngineCoreRequest::chat(Vec::new()),
+            TaskType::SpeechToSpeech => EngineCoreRequest::speech_to_speech(""),
+        };
+        request.id = "native-route".to_string();
+        request.model_variant = Some(variant);
+        request.bind_execution_adapter(binding).unwrap();
+        let scheduled = ScheduledRequest {
+            plan_id: 11,
+            request_id: request.id.clone(),
+            sequence_id: 11,
+            num_tokens: 1,
+            is_prefill: false,
+            num_computed_tokens: 1,
+            work: WorkUnit::SequenceStep {
+                phase: SequencePhase::Decode,
+                input: super::super::InputRange { start: 1, end: 2 },
+                max_output_steps: 1,
+            },
+        };
+        let lane = BatchLaneKey {
+            execution_group: super::super::ExecutionGroupId::new(1),
+            model_instance: super::super::ModelInstanceId::new(2),
+            adapter_instance: super::super::AdapterInstanceId::new(3),
+            adapter_abi: super::super::AdapterAbiRevision::new(4),
+            capability_id: capability.to_string(),
+            stage_id: StageId::new(7),
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            compute_dtype: "f32".to_string(),
+            state_dtype: "f32".to_string(),
+            tensor_layout: "ragged".to_string(),
+            quantization: "none".to_string(),
+            state_schema: "test".to_string(),
+            kernel_mode: stage_name.to_string(),
+            semantic_mode: "decode".to_string(),
+            shape_bucket: "ragged".to_string(),
+        };
+        let batch = PhysicalBatch {
+            batch_id: BatchId::new(12),
+            lane: lane.clone(),
+            mode: NativeBatchMode::Continuous,
+            budget: super::super::BatchBudget {
+                max_rows: 4,
+                max_logical_units: 4,
+                max_tensor_elements: 4,
+                max_workspace_bytes: 0,
+                max_padding_basis_points: 0,
+                max_formation_delay: Duration::ZERO,
+            },
+            rows: vec![super::super::ReadyQuantum {
+                plan_id: scheduled.plan_id,
+                session: scheduled.session_key(),
+                lane,
+                work: scheduled.work.clone(),
+                cost: super::super::WorkCost::new(1, 1, 0),
+                managed_cache: None,
+            }],
+            materialized_tensor_elements: 1,
+            workspace: ResourceVector::zero(),
+        };
+        batch.validate().unwrap();
+        (request, scheduled, batch)
+    }
+
+    #[test]
+    fn native_route_uses_exact_loaded_audio_stage_identity() {
+        let (request, scheduled, batch) = native_route_fixture(
+            TaskType::TTS,
+            "tts",
+            ModelVariant::Qwen3Tts12Hz06BCustomVoice,
+            StageWorkSelector::SequenceDecode,
+            "tts.decode.tensor_continuous",
+        );
+        let requests = [&request];
+        let scheduled = [scheduled];
+        let execution = PhysicalBatchExecution {
+            batch: &batch,
+            requests: &requests,
+            scheduled: &scheduled,
+        };
+        execution.validate().unwrap();
+        assert_eq!(
+            NativeBatchRoute::resolve(&execution).unwrap(),
+            NativeBatchRoute::Audio {
+                task: TaskType::TTS,
+                stage: NativeAudioStage::SequenceDecode,
+                mode: NativeBatchMode::Continuous,
+                stage_id: StageId::new(7),
+            }
+        );
+    }
+
+    #[test]
+    fn native_route_preserves_chat_decode_and_rejects_fallback_stage_proof() {
+        let (request, scheduled, batch) = native_route_fixture(
+            TaskType::Chat,
+            "chat",
+            ModelVariant::Qwen306B,
+            StageWorkSelector::SequenceDecode,
+            "chat.decode.tensor_continuous",
+        );
+        let requests = [&request];
+        let scheduled = [scheduled];
+        let execution = PhysicalBatchExecution {
+            batch: &batch,
+            requests: &requests,
+            scheduled: &scheduled,
+        };
+        assert_eq!(
+            NativeBatchRoute::resolve(&execution).unwrap(),
+            NativeBatchRoute::ChatContinuousDecode {
+                stage_id: StageId::new(7)
+            }
+        );
+
+        let (request, scheduled, batch) = native_route_fixture(
+            TaskType::TTS,
+            "tts",
+            ModelVariant::Qwen3Tts12Hz06BCustomVoice,
+            StageWorkSelector::Any,
+            "tts.compatibility",
+        );
+        let requests = [&request];
+        let scheduled = [scheduled];
+        assert!(NativeBatchRoute::resolve(&PhysicalBatchExecution {
+            batch: &batch,
+            requests: &requests,
+            scheduled: &scheduled,
+        })
+        .is_err());
     }
 
     fn qwen38_test_reservation(domains: &[(CacheDomainId, KvArenaId)]) -> ManagedCacheReservation {
