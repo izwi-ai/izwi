@@ -6,7 +6,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Notify, OnceCell, RwLock};
 use tracing::info;
@@ -16,7 +16,7 @@ use crate::backends::{DTypeSelectionRequest, DeviceProfile};
 use crate::catalog::{ModelFamily, ModelTask};
 use crate::engine::{
     InvocationStaticAttentionLease, InvocationTensorLease, RetainedTensorStateRuntimeV2,
-    StageDescriptor,
+    StageDescriptor, WorkCost,
 };
 use crate::error::{Error, Result};
 use crate::kv::v2::{InvocationStateBackingKindV2, InvocationWorkspaceLeaseSetV2};
@@ -53,7 +53,7 @@ use crate::models::architectures::parakeet::asr::{
 use crate::models::architectures::qwen3::asr::{
     AsrDecodeCheckpoint as Qwen3AsrDecodeCheckpoint, AsrDecodeState as Qwen3AsrDecodeState,
     AsrDecodeStep as Qwen3AsrDecodeStep, AsrTranscriptionOutput as Qwen3AsrTranscriptionOutput,
-    Qwen3AsrModel, Qwen3AsrPhysicalStateSpec,
+    Qwen3AsrAudioBatchRow, Qwen3AsrModel, Qwen3AsrPhysicalStateSpec, Qwen3AsrPreparedAudio,
 };
 use crate::models::architectures::qwen3::chat::{
     ChatDecodeCheckpoint as Qwen3ChatDecodeCheckpoint, ChatDecodeState as Qwen3ChatDecodeState,
@@ -831,6 +831,18 @@ fn granite_speech_asr_options(
 }
 
 impl NativeAsrModel {
+    pub(crate) fn prepare_qwen3_audio_tower_batch(
+        &self,
+        rows: &[Qwen3AsrAudioBatchRow<'_>],
+    ) -> Result<Vec<Qwen3AsrPreparedAudio>> {
+        match self {
+            Self::Qwen3(model) => model.prepare_audio_tower_batch(rows),
+            _ => Err(Error::InvalidInput(
+                "Qwen3 ASR audio-tower preparation was supplied to another ASR model".to_string(),
+            )),
+        }
+    }
+
     /// Execute an atomic ASR operation through its complete lifecycle-owned
     /// invocation workspace. This is the model-adapter boundary used by direct
     /// runtime pipelines; callers never select or omit physical domains.
@@ -2125,6 +2137,54 @@ impl NativeAsrModel {
         }
     }
 
+    pub(crate) fn start_resumable_prefill_from_prepared_audio_managed(
+        &self,
+        prepared: &Qwen3AsrPreparedAudio,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        max_new_tokens: usize,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<NativeAsrDecodeState> {
+        match self {
+            Self::Qwen3(model) => Ok(NativeAsrDecodeState::Qwen3(
+                model.begin_resumable_prefill_managed_from_prepared_audio(
+                    prepared,
+                    language,
+                    prompt,
+                    max_new_tokens,
+                    cache,
+                )?,
+            )),
+            _ => Err(Error::InvalidInput(
+                "prepared Qwen3 ASR audio was supplied to another ASR model".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn start_decode_state_from_prepared_audio_managed(
+        &self,
+        prepared: &Qwen3AsrPreparedAudio,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        max_new_tokens: usize,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<NativeAsrDecodeState> {
+        match self {
+            Self::Qwen3(model) => Ok(NativeAsrDecodeState::Qwen3(
+                model.start_decode_with_prompt_managed_from_prepared_audio(
+                    prepared,
+                    language,
+                    prompt,
+                    max_new_tokens,
+                    cache,
+                )?,
+            )),
+            _ => Err(Error::InvalidInput(
+                "prepared Qwen3 ASR audio was supplied to another ASR model".to_string(),
+            )),
+        }
+    }
+
     pub(crate) fn continue_resumable_prefill(
         &self,
         state: &mut NativeAsrDecodeState,
@@ -2687,6 +2747,7 @@ impl Drop for ModelUseGuard {
 struct TrackedModelEntry<T> {
     model: OnceCell<Arc<T>>,
     uses: Arc<ModelUseState>,
+    ready: AtomicBool,
 }
 
 impl<T> Default for TrackedModelEntry<T> {
@@ -2694,6 +2755,7 @@ impl<T> Default for TrackedModelEntry<T> {
         Self {
             model: OnceCell::new(),
             uses: Arc::new(ModelUseState::default()),
+            ready: AtomicBool::new(false),
         }
     }
 }
@@ -2706,6 +2768,34 @@ impl<T> TrackedModelEntry<T> {
             model,
             _guard: guard,
         })
+    }
+
+    fn ready_model(&self) -> Option<Arc<T>> {
+        self.ready
+            .load(Ordering::Acquire)
+            .then(|| self.model.get().cloned())
+            .flatten()
+    }
+
+    fn acquire_ready(&self) -> Option<TrackedModelLease<T>> {
+        if !self.ready.load(Ordering::Acquire) {
+            return None;
+        }
+        self.acquire()
+    }
+
+    fn publish_ready(&self) -> Result<()> {
+        if self.model.get().is_none() {
+            return Err(Error::ModelLoadError(
+                "cannot publish an uninitialized model entry".into(),
+            ));
+        }
+        self.ready.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn reset_ready(&self) {
+        self.ready.store(false, Ordering::Release);
     }
 }
 
@@ -2765,6 +2855,50 @@ pub struct AsrModelLease {
 impl AsrModelLease {
     pub(crate) fn model_arc(&self) -> Arc<NativeAsrModel> {
         self.inner.model.clone()
+    }
+
+    pub(crate) fn audio_preparation_batch_geometry(
+        &self,
+        rows: &[crate::models::architectures::qwen3::asr::Qwen3AsrAudioPreparationGeometry],
+    ) -> Result<crate::models::architectures::qwen3::asr::Qwen3AsrAudioPreparationBatchGeometry>
+    {
+        match self.inner.model.as_ref() {
+            NativeAsrModel::Qwen3(model) => model.audio_preparation_batch_geometry(rows),
+            _ => Err(Error::InvalidInput(
+                "Qwen3 ASR preparation geometry was requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn audio_preparation_row_geometry(
+        &self,
+        input_samples: usize,
+        input_sample_rate: u32,
+    ) -> Result<crate::models::architectures::qwen3::asr::Qwen3AsrAudioPreparationGeometry> {
+        match self.inner.model.as_ref() {
+            NativeAsrModel::Qwen3(model) => {
+                model.audio_preparation_row_geometry(input_samples, input_sample_rate)
+            }
+            _ => Err(Error::InvalidInput(
+                "Qwen3 ASR preparation geometry was requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn audio_preparation_row_cost_for_batch(
+        &self,
+        row_index: usize,
+        rows: &[crate::models::architectures::qwen3::asr::Qwen3AsrAudioPreparationGeometry],
+        batch: &crate::models::architectures::qwen3::asr::Qwen3AsrAudioPreparationBatchGeometry,
+    ) -> Result<WorkCost> {
+        match self.inner.model.as_ref() {
+            NativeAsrModel::Qwen3(model) => {
+                model.audio_preparation_row_cost_for_batch(row_index, rows, batch)
+            }
+            _ => Err(Error::InvalidInput(
+                "Qwen3 ASR preparation cost was requested from another ASR model".into(),
+            )),
+        }
     }
 }
 
@@ -4075,15 +4209,15 @@ impl ModelRegistry {
         {
             let guard = self.asr_models.read().await;
             for (variant, entry) in guard.iter() {
-                let Some(model) = entry.model.get() else {
+                let Some(model) = entry.ready_model() else {
                     continue;
                 };
-                let (actual_runtime, family_diagnostics) = native_asr_runtime_diagnostics(model);
+                let (actual_runtime, family_diagnostics) = native_asr_runtime_diagnostics(&model);
                 diagnostics.push(loaded_model_diagnostics_entry(
                     &self.device,
                     *variant,
                     "native_asr",
-                    native_asr_model_kind(model),
+                    native_asr_model_kind(&model),
                     actual_runtime,
                     Some(model.supports_incremental_decode()),
                     Some(model.supports_realtime_stream_decode()),
@@ -4788,23 +4922,19 @@ impl ModelRegistry {
 
     pub async fn get_asr(&self, variant: ModelVariant) -> Option<Arc<NativeAsrModel>> {
         let guard = self.asr_models.read().await;
-        guard
-            .get(&variant)
-            .and_then(|entry| entry.model.get().cloned())
+        guard.get(&variant).and_then(|entry| entry.ready_model())
     }
 
     pub fn try_get_asr(&self, variant: ModelVariant) -> Option<Arc<NativeAsrModel>> {
         let guard = self.asr_models.try_read().ok()?;
-        guard
-            .get(&variant)
-            .and_then(|entry| entry.model.get().cloned())
+        guard.get(&variant).and_then(|entry| entry.ready_model())
     }
 
     pub async fn get_asr_lease(&self, variant: ModelVariant) -> Option<AsrModelLease> {
         let guard = self.asr_models.read().await;
         guard
             .get(&variant)
-            .and_then(|entry| entry.acquire())
+            .and_then(|entry| entry.acquire_ready())
             .map(|inner| AsrModelLease { inner })
     }
 
@@ -4812,8 +4942,32 @@ impl ModelRegistry {
         let guard = self.asr_models.try_read().ok()?;
         guard
             .get(&variant)
-            .and_then(|entry| entry.acquire())
+            .and_then(|entry| entry.acquire_ready())
             .map(|inner| AsrModelLease { inner })
+    }
+
+    /// Internal lifecycle view of a fully instantiated ASR handle that has not
+    /// crossed the external Ready publication barrier yet.
+    pub(crate) async fn get_loading_asr(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<Arc<NativeAsrModel>> {
+        let guard = self.asr_models.read().await;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.model.get().cloned())
+    }
+
+    /// Publish an instantiated ASR handle only after adapter sealing, backend
+    /// synchronization, and physical state planning have all committed.
+    pub(crate) async fn publish_asr_ready(&self, variant: ModelVariant) -> Result<()> {
+        let guard = self.asr_models.read().await;
+        let entry = guard.get(&variant).ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "cannot publish missing ASR model {variant} as ready"
+            ))
+        })?;
+        entry.publish_ready()
     }
 
     pub async fn get_diarization(
@@ -4954,7 +5108,11 @@ impl ModelRegistry {
     pub async fn unload_asr(&self, variant: ModelVariant) {
         let entry = {
             let mut guard = self.asr_models.write().await;
-            guard.remove(&variant)
+            let entry = guard.remove(&variant);
+            if let Some(entry) = &entry {
+                entry.reset_ready();
+            }
+            entry
         };
         if let Some(entry) = entry {
             entry.uses.wait_until_idle().await;
@@ -5104,6 +5262,48 @@ mod tests {
             .expect("unload fence should observe the final lease drop")
             .expect("unload fence task should complete");
         assert_eq!(state.active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn asr_registry_publication_barrier_gates_direct_handles_and_leases() {
+        let entry = TrackedModelEntry::<&'static str>::default();
+        entry
+            .model
+            .set(Arc::new("loaded-asr"))
+            .expect("seed loading ASR handle");
+
+        assert!(entry.ready_model().is_none());
+        assert!(entry.acquire_ready().is_none());
+
+        entry.publish_ready().expect("publish ASR ready");
+        assert_eq!(entry.ready_model().as_deref().copied(), Some("loaded-asr"));
+        assert_eq!(
+            entry.acquire_ready().as_deref().copied(),
+            Some("loaded-asr")
+        );
+
+        entry.reset_ready();
+        assert!(entry.ready_model().is_none());
+        assert!(entry.acquire_ready().is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_asr_initialization_never_crosses_publication_barrier() {
+        let entry = TrackedModelEntry::<&'static str>::default();
+        let error = entry
+            .model
+            .get_or_try_init(|| async {
+                Err::<Arc<&'static str>, Error>(Error::ModelLoadError(
+                    "injected ASR load failure".into(),
+                ))
+            })
+            .await
+            .expect_err("injected ASR load must fail");
+
+        assert!(error.to_string().contains("injected ASR load failure"));
+        assert!(entry.ready_model().is_none());
+        assert!(entry.acquire_ready().is_none());
+        assert!(entry.publish_ready().is_err());
     }
 
     async fn assert_session_lease_survives_concurrent_reload(old: &'static str, new: &'static str) {

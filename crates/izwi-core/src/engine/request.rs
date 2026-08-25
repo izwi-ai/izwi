@@ -21,6 +21,7 @@ use super::{
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
+use crate::models::architectures::qwen3::asr::Qwen3AsrPreparedAudio;
 use crate::models::architectures::qwen3::tts::{
     Qwen3TtsModel, SpeakerReference, TtsGenerationParams, TtsSessionCacheRequest,
 };
@@ -770,6 +771,24 @@ pub(super) struct PreparedAsrAudio {
     source_fingerprint: u64,
 }
 
+#[derive(Clone)]
+pub(super) struct PreparedAsrEncoderArtifact {
+    model_variant: ModelVariant,
+    artifact: Arc<Qwen3AsrPreparedAudio>,
+    source_fingerprint: u64,
+}
+
+impl fmt::Debug for PreparedAsrEncoderArtifact {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedAsrEncoderArtifact")
+            .field("model_variant", &self.model_variant)
+            .field("artifact", &Arc::as_ptr(&self.artifact))
+            .field("source_fingerprint", &self.source_fingerprint)
+            .finish()
+    }
+}
+
 impl fmt::Debug for PreparedAsrAudio {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -825,6 +844,7 @@ pub struct EngineCoreRequest {
     pub(super) prepared_sequence_input_tokens: Option<usize>,
     pub(super) prepared_asr_execution_shape: Option<PreparedAsrExecutionShape>,
     pub(super) prepared_asr_audio: Option<PreparedAsrAudio>,
+    pub(super) prepared_asr_encoder_artifact: Option<PreparedAsrEncoderArtifact>,
     /// Executor-produced stream events remain invisible until their exact
     /// execution report has committed.
     pub(super) stream_staging: StreamStagingBuffer,
@@ -2170,6 +2190,69 @@ impl EngineCoreRequest {
         })
     }
 
+    pub(crate) fn install_prepared_asr_encoder_artifact(
+        &mut self,
+        model_variant: ModelVariant,
+        artifact: Arc<Qwen3AsrPreparedAudio>,
+    ) -> Result<()> {
+        if self.task_type != TaskType::ASR || self.model_variant != Some(model_variant) {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} encoder artifact does not match its routed task/model",
+                self.id
+            )));
+        }
+        if self.uses_asr_long_form_atomic() {
+            return Err(Error::InvalidInput(format!(
+                "long-form ASR request {} cannot retain a normal-route encoder artifact",
+                self.id
+            )));
+        }
+        let source_fingerprint = self.asr_execution_source_fingerprint(model_variant)?;
+        if let Some(current) = self.prepared_asr_encoder_artifact.as_ref() {
+            if current.model_variant == model_variant
+                && current.source_fingerprint == source_fingerprint
+                && Arc::ptr_eq(&current.artifact, &artifact)
+            {
+                return Ok(());
+            }
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} changed its prepared encoder artifact",
+                self.id
+            )));
+        }
+        self.prepared_asr_encoder_artifact = Some(PreparedAsrEncoderArtifact {
+            model_variant,
+            artifact,
+            source_fingerprint,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn prepared_asr_encoder_artifact_for_executor(
+        &self,
+    ) -> Result<Option<Arc<Qwen3AsrPreparedAudio>>> {
+        let Some(prepared) = self.prepared_asr_encoder_artifact.as_ref() else {
+            return Ok(None);
+        };
+        if self.model_variant != Some(prepared.model_variant)
+            || self.asr_execution_source_fingerprint(prepared.model_variant)?
+                != prepared.source_fingerprint
+            || self.uses_asr_long_form_atomic()
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} changed after encoder preparation",
+                self.id
+            )));
+        }
+        Ok(Some(prepared.artifact.clone()))
+    }
+
+    pub(crate) fn prepared_asr_encoder_artifact_retained_bytes(&self) -> Result<u64> {
+        self.prepared_asr_encoder_artifact
+            .as_ref()
+            .map_or(Ok(0), |prepared| prepared.artifact.resident_tensor_bytes())
+    }
+
     pub(crate) fn install_prepared_sequence_input_tokens(
         &mut self,
         input_tokens: usize,
@@ -2382,6 +2465,7 @@ impl EngineCoreRequest {
             if self.prepared_sequence_input_tokens.is_some()
                 || self.prepared_asr_execution_shape.is_some()
                 || self.prepared_asr_audio.is_some()
+                || self.prepared_asr_encoder_artifact.is_some()
             {
                 return Err(Error::InvalidInput(format!(
                     "Request {} carries prepared multimodal input without an exact loaded model",
@@ -2407,9 +2491,11 @@ impl EngineCoreRequest {
             }
             match self.prepared_asr_execution_shape {
                 Some(PreparedAsrExecutionShape::RetainedSequence { input_tokens })
-                    if self.prepared_sequence_input_tokens == Some(input_tokens) => {}
+                    if self.prepared_sequence_input_tokens == Some(input_tokens)
+                        && self.prepared_asr_encoder_artifact_for_executor()?.is_some() => {}
                 Some(PreparedAsrExecutionShape::LongFormAtomic)
-                    if self.prepared_sequence_input_tokens.is_none() => {}
+                    if self.prepared_sequence_input_tokens.is_none()
+                        && self.prepared_asr_encoder_artifact.is_none() => {}
                 _ => {
                     return Err(Error::InvalidInput(format!(
                         "Qwen3 ASR request {} is missing a consistent exact media execution shape",
@@ -2546,6 +2632,7 @@ impl EngineCoreRequest {
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
             prepared_asr_audio: None,
+            prepared_asr_encoder_artifact: None,
             stream_staging: StreamStagingBuffer::default(),
             text: Some(text),
             chat_messages: None,
@@ -2600,6 +2687,7 @@ impl EngineCoreRequest {
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
             prepared_asr_audio: None,
+            prepared_asr_encoder_artifact: None,
             stream_staging: StreamStagingBuffer::default(),
             text: None,
             chat_messages: None,
@@ -2654,6 +2742,7 @@ impl EngineCoreRequest {
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
             prepared_asr_audio: None,
+            prepared_asr_encoder_artifact: None,
             stream_staging: StreamStagingBuffer::default(),
             text: None,
             chat_messages: None,
@@ -2705,6 +2794,7 @@ impl EngineCoreRequest {
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
             prepared_asr_audio: None,
+            prepared_asr_encoder_artifact: None,
             stream_staging: StreamStagingBuffer::default(),
             text: None,
             chat_messages: Some(messages),
@@ -2757,6 +2847,7 @@ impl EngineCoreRequest {
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
             prepared_asr_audio: None,
+            prepared_asr_encoder_artifact: None,
             stream_staging: StreamStagingBuffer::default(),
             text: None,
             chat_messages: None,
@@ -2809,6 +2900,7 @@ impl EngineCoreRequest {
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
             prepared_asr_audio: None,
+            prepared_asr_encoder_artifact: None,
             stream_staging: StreamStagingBuffer::default(),
             text: None,
             chat_messages: None,

@@ -23,6 +23,7 @@ use crate::kv::v2::{
 };
 use crate::kv::InferenceStateContractProvider;
 use crate::model::ModelVariant;
+use crate::models::registry::NativeAsrModel;
 use crate::runtime::adapters::{CapabilityKind, LoadedExecutionContract, LoadedStatePublication};
 use crate::runtime::lifecycle::controller::{
     ModelLifecycleController, SharedLoadFailure, SharedLoadOutcome,
@@ -91,6 +92,19 @@ fn loaded_asr_state_publication_route(variant: ModelVariant) -> LoadedAsrStatePu
         crate::catalog::ModelFamily::NemotronAsr => LoadedAsrStatePublicationRoute::NemotronOffline,
         _ => LoadedAsrStatePublicationRoute::LegacyCache,
     }
+}
+
+fn uses_asr_model_registry(variant: ModelVariant) -> bool {
+    matches!(
+        variant.family(),
+        crate::catalog::ModelFamily::ParakeetAsr
+            | crate::catalog::ModelFamily::WhisperAsr
+            | crate::catalog::ModelFamily::Qwen3Asr
+            | crate::catalog::ModelFamily::VibeVoiceAsr
+            | crate::catalog::ModelFamily::NemotronAsr
+            | crate::catalog::ModelFamily::GraniteSpeechAsr
+            | crate::catalog::ModelFamily::Qwen3ForcedAligner
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1033,6 +1047,26 @@ impl ModelLifecycleController {
             // the peak host/device authorization and authoritative Loading slot
             // are both installed above.
             let instantiated = self.instantiate_model(acquired).await?;
+            if variant.family() == crate::catalog::ModelFamily::Qwen3Asr {
+                let loaded = self
+                    .model_registry
+                    .get_loading_asr(variant)
+                    .await
+                    .ok_or_else(|| {
+                        Error::ModelLoadError(format!(
+                            "instantiated Qwen3 ASR model {variant} is missing before adapter sealing"
+                        ))
+                    })?;
+                let NativeAsrModel::Qwen3(model) = loaded.as_ref() else {
+                    return Err(Error::ModelLoadError(format!(
+                        "instantiated model {variant} does not expose Qwen3 ASR geometry"
+                    )));
+                };
+                // The lifecycle slot is still Loading, so no request can bind
+                // this model while its exact backend/dtype/width geometry is
+                // being frozen into the already-selected adapter identity.
+                bundle_draft.seal_qwen3_asr_audio_preparation(model)?;
+            }
             // Metal records many tensor uploads asynchronously. Flush them
             // before publishing the model so an allocation failure is owned by
             // this load transaction rather than a later state/request fence.
@@ -1102,11 +1136,15 @@ impl ModelLifecycleController {
                         "loaded model {variant} requires physical Granite Speech invocation state, but the {backend:?} build has no direct paged-attention runtime"
                     )));
                 }
-                let model = self.model_registry.get_asr(variant).await.ok_or_else(|| {
-                    Error::ModelLoadError(format!(
-                        "loaded Granite Speech model {variant} is missing from the registry"
-                    ))
-                })?;
+                let model = self
+                    .model_registry
+                    .get_loading_asr(variant)
+                    .await
+                    .ok_or_else(|| {
+                        Error::ModelLoadError(format!(
+                            "loaded Granite Speech model {variant} is missing from the registry"
+                        ))
+                    })?;
                 for capability in [
                     CapabilityKind::Asr,
                     CapabilityKind::SpeakerAttributedAsr,
@@ -1168,7 +1206,9 @@ impl ModelLifecycleController {
                         )
                         .await?;
                     state_publications.insert(CapabilityKind::Asr, publication);
-                } else if let Some(loaded) = self.model_registry.get_asr(variant).await {
+                } else if let Some(loaded) =
+                    self.model_registry.get_loading_asr(variant).await
+                {
                     let loaded_cache = loaded.inference_state_contract()?;
                     loaded_cache.validate()?;
                     let publication_route = loaded_asr_state_publication_route(variant);
@@ -1343,11 +1383,15 @@ impl ModelLifecycleController {
                 .require(CapabilityKind::RealtimeAsr, variant)
                 .is_ok()
             {
-                let model = self.model_registry.get_asr(variant).await.ok_or_else(|| {
-                    Error::ModelLoadError(format!(
-                        "loaded realtime ASR model {variant} is missing from the registry"
-                    ))
-                })?;
+                let model = self
+                    .model_registry
+                    .get_loading_asr(variant)
+                    .await
+                    .ok_or_else(|| {
+                        Error::ModelLoadError(format!(
+                            "loaded realtime ASR model {variant} is missing from the registry"
+                        ))
+                    })?;
                 let contracts =
                     bundle_draft.execution_contracts(CapabilityKind::RealtimeAsr)?;
                 let stage_graphs = contracts
@@ -1648,6 +1692,14 @@ impl ModelLifecycleController {
             // Ready while this await is still in progress.
             self.model_manager.mark_loaded(variant).await;
             self.mark_slot_ready_for_instance(variant, model_instance_id)?;
+            if uses_asr_model_registry(variant) {
+                // This is the registry's external publication barrier. Every
+                // adapter seal, backend fence, state plan, and bundle binding
+                // has committed and the authoritative slot is already Ready.
+                // The safe transient is Ready-but-hidden; an ASR handle must
+                // never be visible while its slot is still Loading.
+                self.model_registry.publish_asr_ready(variant).await?;
+            }
             self.touch_model_usage(variant).await;
             Ok(())
         }

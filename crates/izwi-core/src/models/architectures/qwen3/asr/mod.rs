@@ -24,7 +24,7 @@ use crate::backends::state::{
 };
 use crate::backends::{backend_kind_for_device, DTypeSelectionRequest, DeviceKind, DeviceProfile};
 use crate::catalog::ModelFamily;
-use crate::engine::{StageDescriptor, StageProgressKind};
+use crate::engine::{StageDescriptor, StageWorkSelector, WorkCost};
 use crate::error::{Error, Result};
 use crate::kernels::buffer_pool::maybe_init_global_buffer_pool;
 use crate::kv::v2::{
@@ -195,6 +195,325 @@ fn qwen3_asr_retained_state_contract(
 }
 
 impl Qwen3AsrModel {
+    pub(crate) fn audio_preparation_row_geometry(
+        &self,
+        input_samples: usize,
+        input_sample_rate: u32,
+    ) -> Result<Qwen3AsrAudioPreparationGeometry> {
+        if self.is_forced_aligner {
+            return Err(Error::InvalidInput(
+                "Qwen3-ForcedAligner has no transcription audio preparation stage".into(),
+            ));
+        }
+        let mel = self.mel.config();
+        let frontend = qwen3_asr_frontend_geometry(
+            input_samples,
+            input_sample_rate,
+            QWEN3_ASR_SAMPLE_RATE,
+            mel.n_fft,
+            mel.hop_length,
+            qwen_asr_drop_last_mel_frame(),
+            self.device.device.is_cuda(),
+            self.preprocessor.nb_max_frames,
+        )?;
+        if frontend.mel_frames == 0 {
+            return Err(Error::InvalidInput("Empty audio input".into()));
+        }
+        let audio_tokens = self.audio_tower.output_lengths(&[frontend.mel_frames])?[0];
+        if audio_tokens == 0 {
+            return Err(Error::InvalidInput(
+                "Qwen3 ASR audio tower geometry produced no tokens".into(),
+            ));
+        }
+        let (_, _, _, _, _, output_dim) = self.audio_tower.preparation_dimensions();
+        let mel_elements = checked_product_u64(
+            &[frontend.mel_frames, mel.n_mels],
+            "Qwen3 ASR row mel geometry",
+        )?;
+        let output_elements =
+            checked_product_u64(&[audio_tokens, output_dim], "Qwen3 ASR row output geometry")?;
+        let useful_tensor_elements = mel_elements
+            .checked_add(output_elements)
+            .ok_or_else(|| Error::Overloaded("Qwen3 ASR row tensor geometry overflow".into()))?;
+        let retained_artifact_bytes =
+            output_elements
+                .checked_mul(u64::try_from(self.text_dtype.size_in_bytes()).map_err(|_| {
+                    Error::Overloaded("Qwen3 ASR text dtype width exceeds u64".into())
+                })?)
+                .ok_or_else(|| Error::Overloaded("Qwen3 ASR retained audio overflow".into()))?;
+        Ok(Qwen3AsrAudioPreparationGeometry {
+            input_samples,
+            input_sample_rate,
+            resampled_samples: frontend.resampled_samples,
+            mel_frames: frontend.mel_frames,
+            audio_tokens,
+            useful_tensor_elements,
+            retained_artifact_bytes,
+        })
+    }
+
+    pub(crate) fn audio_preparation_batch_geometry(
+        &self,
+        rows: &[Qwen3AsrAudioPreparationGeometry],
+    ) -> Result<Qwen3AsrAudioPreparationBatchGeometry> {
+        if rows.is_empty() {
+            return Err(Error::InvalidInput(
+                "Qwen3 ASR audio preparation batch is empty".into(),
+            ));
+        }
+        let (n_mels, downsample_hidden, d_model, ffn_dim, attention_heads, output_dim) =
+            self.audio_tower.preparation_dimensions();
+        let (chunk_input, attention_window) = self.audio_tower.preparation_chunk_geometry()?;
+        let max_mel_frames = rows.iter().map(|row| row.mel_frames).max().unwrap_or(0);
+        let total_mel_frames = rows.iter().try_fold(0usize, |total, row| {
+            total
+                .checked_add(row.mel_frames)
+                .ok_or_else(|| Error::Overloaded("Qwen3 ASR total mel frames overflow".into()))
+        })?;
+        let max_audio_tokens = rows.iter().map(|row| row.audio_tokens).max().unwrap_or(0);
+        let total_audio_tokens = rows.iter().try_fold(0usize, |total, row| {
+            total
+                .checked_add(row.audio_tokens)
+                .ok_or_else(|| Error::Overloaded("Qwen3 ASR total audio tokens overflow".into()))
+        })?;
+        let total_useful_tensor_elements = rows.iter().try_fold(0u64, |total, row| {
+            total
+                .checked_add(row.useful_tensor_elements)
+                .ok_or_else(|| {
+                    Error::Overloaded("Qwen3 ASR useful tensor elements overflow".into())
+                })
+        })?;
+        let padded_mel_elements_per_row =
+            checked_product_u64(&[max_mel_frames, n_mels], "Qwen3 ASR padded mel row")?;
+        let padded_mel_elements = padded_mel_elements_per_row
+            .checked_mul(
+                u64::try_from(rows.len())
+                    .map_err(|_| Error::Overloaded("Qwen3 ASR batch width exceeds u64".into()))?,
+            )
+            .ok_or_else(|| Error::Overloaded("Qwen3 ASR padded mel batch overflow".into()))?;
+        let padded_output_elements_per_row = checked_product_u64(
+            &[max_audio_tokens, output_dim],
+            "Qwen3 ASR padded output row",
+        )?;
+        let padded_output_elements = padded_output_elements_per_row
+            .checked_mul(
+                u64::try_from(rows.len())
+                    .map_err(|_| Error::Overloaded("Qwen3 ASR batch width exceeds u64".into()))?,
+            )
+            .ok_or_else(|| Error::Overloaded("Qwen3 ASR padded output batch overflow".into()))?;
+
+        let chunks = rows.iter().try_fold(0usize, |total, row| {
+            total
+                .checked_add(row.mel_frames.div_ceil(chunk_input))
+                .ok_or_else(|| Error::Overloaded("Qwen3 ASR chunk count overflow".into()))
+        })?;
+        let mut conv_elements = 0u64;
+        let mut freq = n_mels;
+        let mut time = chunk_input;
+        for _ in 0..3 {
+            freq = freq.div_ceil(2);
+            time = time.div_ceil(2);
+            conv_elements = conv_elements
+                .checked_add(checked_product_u64(
+                    &[chunks, downsample_hidden, freq, time],
+                    "Qwen3 ASR convolution geometry",
+                )?)
+                .ok_or_else(|| {
+                    Error::Overloaded("Qwen3 ASR convolution workspace overflow".into())
+                })?;
+        }
+        let packed_elements = checked_product_u64(
+            &[total_audio_tokens, d_model],
+            "Qwen3 ASR packed encoder geometry",
+        )?;
+        let qkv_elements = packed_elements
+            .checked_mul(3)
+            .ok_or_else(|| Error::Overloaded("Qwen3 ASR QKV workspace overflow".into()))?;
+        let attention_elements = checked_product_u64(
+            &[total_audio_tokens, attention_window, attention_heads],
+            "Qwen3 ASR attention geometry",
+        )?;
+        let ffn_elements =
+            checked_product_u64(&[total_audio_tokens, ffn_dim, 2], "Qwen3 ASR FFN geometry")?;
+        let audio_dtype_bytes = u64::try_from(self.audio_dtype.size_in_bytes())
+            .map_err(|_| Error::Overloaded("Qwen3 ASR audio dtype width exceeds u64".into()))?;
+        let text_dtype_bytes = u64::try_from(self.text_dtype.size_in_bytes())
+            .map_err(|_| Error::Overloaded("Qwen3 ASR text dtype width exceeds u64".into()))?;
+        let host_elements = rows.iter().try_fold(padded_mel_elements, |total, row| {
+            let row_elements =
+                checked_product_u64(&[row.resampled_samples], "Qwen3 ASR resample geometry")?
+                    .checked_add(checked_product_u64(
+                        &[row.mel_frames, n_mels],
+                        "Qwen3 ASR host mel geometry",
+                    )?)
+                    .ok_or_else(|| Error::Overloaded("Qwen3 ASR host frontend overflow".into()))?;
+            total
+                .checked_add(row_elements)
+                .ok_or_else(|| Error::Overloaded("Qwen3 ASR host workspace overflow".into()))
+        })?;
+        let device_audio_elements = padded_mel_elements
+            .checked_add(conv_elements)
+            .and_then(|value| value.checked_add(packed_elements))
+            .and_then(|value| value.checked_add(qkv_elements))
+            .and_then(|value| value.checked_add(attention_elements))
+            .and_then(|value| value.checked_add(ffn_elements))
+            .ok_or_else(|| Error::Overloaded("Qwen3 ASR device workspace overflow".into()))?;
+        let host_bytes = host_elements
+            .checked_mul(std::mem::size_of::<f32>() as u64)
+            .ok_or_else(|| Error::Overloaded("Qwen3 ASR host workspace bytes overflow".into()))?;
+        let device_bytes = device_audio_elements
+            .checked_mul(audio_dtype_bytes)
+            .and_then(|value| {
+                padded_output_elements
+                    .checked_mul(text_dtype_bytes)
+                    .and_then(|output| value.checked_add(output))
+            })
+            .ok_or_else(|| Error::Overloaded("Qwen3 ASR device workspace bytes overflow".into()))?;
+        let workspace_bytes = host_bytes
+            .checked_add(device_bytes)
+            .ok_or_else(|| Error::Overloaded("Qwen3 ASR aggregate workspace overflow".into()))?;
+        Ok(Qwen3AsrAudioPreparationBatchGeometry {
+            rows: rows.len(),
+            max_mel_frames,
+            total_mel_frames,
+            padded_mel_elements,
+            padded_mel_elements_per_row,
+            max_audio_tokens,
+            total_audio_tokens,
+            total_useful_tensor_elements,
+            padded_output_elements,
+            padded_output_elements_per_row,
+            workspace_bytes,
+        })
+    }
+
+    pub(crate) fn audio_preparation_row_cost(
+        &self,
+        row: &Qwen3AsrAudioPreparationGeometry,
+    ) -> WorkCost {
+        WorkCost::new(row.mel_frames as u64, row.useful_tensor_elements, 0)
+    }
+
+    pub(crate) fn audio_preparation_retained_tensor_bytes(
+        &self,
+        row: &Qwen3AsrAudioPreparationGeometry,
+    ) -> u64 {
+        row.retained_artifact_bytes
+    }
+
+    pub(crate) fn audio_preparation_row_cost_for_batch(
+        &self,
+        row_index: usize,
+        rows: &[Qwen3AsrAudioPreparationGeometry],
+        batch: &Qwen3AsrAudioPreparationBatchGeometry,
+    ) -> Result<WorkCost> {
+        let row = rows.get(row_index).ok_or_else(|| {
+            Error::InvalidInput("Qwen3 ASR preparation row index is out of range".into())
+        })?;
+        if rows.len() != batch.rows {
+            return Err(Error::InvalidInput(
+                "Qwen3 ASR preparation cost rows disagree with batch geometry".into(),
+            ));
+        }
+        // Allocate the aggregate workspace deterministically: equal integer
+        // shares plus one byte for each leading remainder row. Summing the row
+        // costs therefore reconstructs the exact physical envelope.
+        let width = u64::try_from(batch.rows)
+            .map_err(|_| Error::Overloaded("Qwen3 ASR batch width exceeds u64".into()))?;
+        let workspace = batch.workspace_bytes / width
+            + u64::from((row_index as u64) < batch.workspace_bytes % width);
+        Ok(WorkCost::new(
+            row.mel_frames as u64,
+            row.useful_tensor_elements,
+            workspace,
+        ))
+    }
+
+    pub(crate) fn audio_preparation_batch_cost(
+        &self,
+        geometry: &Qwen3AsrAudioPreparationBatchGeometry,
+    ) -> Result<WorkCost> {
+        Ok(WorkCost::new(
+            geometry.total_mel_frames as u64,
+            geometry.total_useful_tensor_elements,
+            geometry.workspace_bytes,
+        ))
+    }
+
+    pub(crate) fn audio_preparation_max_batch_workspace_bytes(
+        &self,
+        max_batch_size: usize,
+    ) -> Result<u64> {
+        if max_batch_size == 0 {
+            return Err(Error::InvalidInput(
+                "Qwen3 ASR preparation batch width must be non-zero".into(),
+            ));
+        }
+        let mel = self.mel.config();
+        let max_frames = qwen3_asr_effective_max_frames(
+            self.device.device.is_cuda(),
+            false,
+            self.preprocessor.nb_max_frames,
+            QWEN3_ASR_SAMPLE_RATE as usize,
+            mel.hop_length,
+        );
+        if max_frames == 0 {
+            return Err(Error::ModelLoadError(
+                "Qwen3 ASR preprocessor has no bounded maximum frame count".into(),
+            ));
+        }
+        let (_, _, _, _, _, output_dim) = self.audio_tower.preparation_dimensions();
+        let audio_tokens = self.audio_tower.output_lengths(&[max_frames])?[0];
+        let retained_artifact_bytes = checked_product_u64(
+            &[audio_tokens, output_dim, self.text_dtype.size_in_bytes()],
+            "Qwen3 ASR maximum retained audio",
+        )?;
+        let max_samples = max_frames
+            .checked_mul(mel.hop_length)
+            .and_then(|samples| samples.checked_add(mel.n_fft))
+            .ok_or_else(|| Error::Overloaded("Qwen3 ASR maximum samples overflow".into()))?;
+        let row = Qwen3AsrAudioPreparationGeometry {
+            input_samples: max_samples,
+            input_sample_rate: QWEN3_ASR_SAMPLE_RATE,
+            resampled_samples: max_samples,
+            mel_frames: max_frames,
+            audio_tokens,
+            useful_tensor_elements: checked_product_u64(
+                &[max_frames, mel.n_mels],
+                "Qwen3 ASR maximum mel geometry",
+            )?
+            .checked_add(checked_product_u64(
+                &[audio_tokens, output_dim],
+                "Qwen3 ASR maximum output geometry",
+            )?)
+            .ok_or_else(|| Error::Overloaded("Qwen3 ASR maximum row geometry overflow".into()))?,
+            retained_artifact_bytes,
+        };
+        self.audio_preparation_batch_geometry(&vec![row; max_batch_size])
+            .map(|geometry| geometry.workspace_bytes)
+    }
+
+    pub(crate) fn audio_preparation_stage_seal(
+        &self,
+        backend: crate::backends::BackendKind,
+        max_batch_size: usize,
+    ) -> Result<Qwen3AsrAudioPreparationStageSeal> {
+        let loaded_backend = backend_kind_for_device(&self.device.device);
+        if loaded_backend != backend {
+            return Err(Error::ModelLoadError(format!(
+                "Qwen3 ASR audio preparation backend mismatch: model={loaded_backend:?}, adapter={backend:?}"
+            )));
+        }
+        Ok(Qwen3AsrAudioPreparationStageSeal {
+            backend,
+            audio_dtype: format!("{:?}", self.audio_dtype).to_ascii_lowercase(),
+            text_dtype: format!("{:?}", self.text_dtype).to_ascii_lowercase(),
+            max_batch_size,
+            max_workspace_bytes: self
+                .audio_preparation_max_batch_workspace_bytes(max_batch_size)?,
+        })
+    }
+
     /// Target semantic contract for the shared Qwen3 decoder.
     ///
     /// This is kept separate from the advertised loaded-model capability until
@@ -300,16 +619,16 @@ fn qwen3_asr_physical_state_spec(
         let mut invocation_stages = stages
             .iter()
             .map(|stage| {
-                let atomic = stage.progress == StageProgressKind::Atomic;
-                has_invocation_state |= atomic;
+                let owns_invocation_state = stage.selector == StageWorkSelector::Atomic;
+                has_invocation_state |= owns_invocation_state;
                 InvocationStageWorkspace {
                     stage: stage.id,
                     lease_scope: InvocationLeaseScope::PerRow,
-                    groups: atomic
+                    groups: owns_invocation_state
                         .then(|| invocation_group.clone())
                         .into_iter()
                         .collect(),
-                    domains: atomic
+                    domains: owns_invocation_state
                         .then(|| InvocationWorkspaceDomain::State {
                             state: invocation_domain.clone(),
                             capacity: decoder_capacity,
@@ -685,6 +1004,24 @@ pub(crate) struct Qwen3AsrPreparedAudio {
 }
 
 impl Qwen3AsrPreparedAudio {
+    #[cfg(test)]
+    pub(crate) fn for_test(tokens: usize, width: usize) -> Result<Self> {
+        if tokens == 0 || width == 0 {
+            return Err(Error::InvalidInput(
+                "test prepared audio dimensions must be non-zero".into(),
+            ));
+        }
+        Ok(Self {
+            preparation_id: 0,
+            audio_embeddings: Tensor::zeros(
+                (1, tokens, width),
+                DType::F32,
+                &candle_core::Device::Cpu,
+            )?,
+            frontend: Qwen3AsrPreparedFrontend::default(),
+        })
+    }
+
     pub(crate) fn audio_tokens(&self) -> Result<usize> {
         self.audio_embeddings.dim(1).map_err(Error::from)
     }
@@ -893,6 +1230,55 @@ struct Qwen3AsrFrontendGeometry {
     mel_frames_before_truncate: usize,
     mel_frames: usize,
     mel_last_frame_dropped: bool,
+}
+
+/// Exact scheduler-visible geometry for one Qwen3-ASR audio preparation row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Qwen3AsrAudioPreparationGeometry {
+    pub(crate) input_samples: usize,
+    pub(crate) input_sample_rate: u32,
+    pub(crate) resampled_samples: usize,
+    pub(crate) mel_frames: usize,
+    pub(crate) audio_tokens: usize,
+    pub(crate) useful_tensor_elements: u64,
+    pub(crate) retained_artifact_bytes: u64,
+}
+
+/// Exact padded/packed geometry of one native audio-tower call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Qwen3AsrAudioPreparationBatchGeometry {
+    pub(crate) rows: usize,
+    pub(crate) max_mel_frames: usize,
+    pub(crate) total_mel_frames: usize,
+    pub(crate) padded_mel_elements: u64,
+    pub(crate) padded_mel_elements_per_row: u64,
+    pub(crate) max_audio_tokens: usize,
+    pub(crate) total_audio_tokens: usize,
+    pub(crate) total_useful_tensor_elements: u64,
+    pub(crate) padded_output_elements: u64,
+    pub(crate) padded_output_elements_per_row: u64,
+    pub(crate) workspace_bytes: u64,
+}
+
+/// Load-time identity and capacity of the native audio preparation stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Qwen3AsrAudioPreparationStageSeal {
+    pub(crate) backend: crate::backends::BackendKind,
+    pub(crate) audio_dtype: String,
+    pub(crate) text_dtype: String,
+    pub(crate) max_batch_size: usize,
+    pub(crate) max_workspace_bytes: u64,
+}
+
+fn checked_product_u64(values: &[usize], label: &str) -> Result<u64> {
+    values.iter().try_fold(1u64, |product, value| {
+        product
+            .checked_mul(
+                u64::try_from(*value)
+                    .map_err(|_| Error::Overloaded(format!("{label} exceeds u64")))?,
+            )
+            .ok_or_else(|| Error::Overloaded(format!("{label} overflow")))
+    })
 }
 
 fn qwen3_asr_resampled_sample_count(
@@ -1856,6 +2242,26 @@ impl Qwen3AsrModel {
             Some(cache),
             execution,
         )
+    }
+
+    pub(crate) fn start_decode_with_prompt_managed_from_prepared_audio(
+        &self,
+        prepared: &Qwen3AsrPreparedAudio,
+        language: Option<&str>,
+        system_prompt: Option<&str>,
+        max_new_tokens: usize,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<AsrDecodeState> {
+        let mut state = self.begin_resumable_prefill_managed_from_prepared_audio(
+            prepared,
+            language,
+            system_prompt,
+            max_new_tokens,
+            cache,
+        )?;
+        let prompt_tokens = state.prefill_token_count();
+        self.continue_resumable_prefill(&mut state, 0, prompt_tokens)?;
+        Ok(state)
     }
 
     fn prepare_decode_state(
@@ -4178,7 +4584,7 @@ mod tests {
     use crate::backends::DeviceSelector;
     use crate::engine::{
         ConcurrencyClass, ExecutionDomain, MembershipSafePoint, ModelInstanceId, NativeBatchMode,
-        OutputVisibility, StageId, StageShapePolicy, StageWorkSelector,
+        OutputVisibility, StageId, StageProgressKind, StageShapePolicy, StageWorkSelector,
     };
     use crate::kv::v2::{InvocationWorkspaceSet, RetainedStateCapability};
     use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
@@ -4336,7 +4742,11 @@ mod tests {
         StageDescriptor {
             id: StageId::new(id),
             name: format!("qwen3-asr-{id}"),
-            selector: StageWorkSelector::Any,
+            selector: if progress == StageProgressKind::Atomic {
+                StageWorkSelector::Atomic
+            } else {
+                StageWorkSelector::SequencePrefill
+            },
             domain: ExecutionDomain::ExecutionGroup,
             progress,
             concurrency: ConcurrencyClass::Exclusive,
@@ -4360,7 +4770,14 @@ mod tests {
     fn qwen_asr_physical_spec_separates_offline_and_streaming_state() {
         let offline = [physical_spec_stage(1, StageProgressKind::Atomic)];
         let streaming = [physical_spec_stage(2, StageProgressKind::Iterative)];
-        let graphs = vec![offline.as_slice(), streaming.as_slice()];
+        let mut preparation_stage = physical_spec_stage(3, StageProgressKind::Atomic);
+        preparation_stage.selector = StageWorkSelector::PreSequencePreparation;
+        let preparation = [preparation_stage];
+        let graphs = vec![
+            offline.as_slice(),
+            streaming.as_slice(),
+            preparation.as_slice(),
+        ];
         let retained =
             qwen3_asr_retained_state_contract(crate::kv::test_contract(), 4096, 256, DType::F32)
                 .expect("retained ASR state");
@@ -4401,10 +4818,10 @@ mod tests {
                 .iter()
                 .flat_map(|stage| stage.domains.iter())
                 .count();
-            let atomic = graph
+            let owns_invocation = graph
                 .iter()
-                .any(|stage| stage.progress == StageProgressKind::Atomic);
-            assert_eq!(domain_count, usize::from(atomic));
+                .any(|stage| stage.selector == StageWorkSelector::Atomic);
+            assert_eq!(domain_count, usize::from(owns_invocation));
         }
     }
 

@@ -469,6 +469,13 @@ impl NativeExecutor {
                         "Qwen3 ASR sequence request lost its prepared decoded audio".to_string(),
                     )
                 })?;
+            let prepared_audio = request
+                .prepared_asr_encoder_artifact_for_executor()?
+                .ok_or_else(|| {
+                    Error::InferenceError(
+                        "Qwen3 ASR sequence request lost its prepared encoder artifact".to_string(),
+                    )
+                })?;
             let samples_len = samples.len();
             let chunk_plan = Self::asr_chunk_plan(
                 samples.as_ref(),
@@ -493,9 +500,8 @@ impl NativeExecutor {
             let decode_state = if begins_resumable_asr_prefill_state(scheduled, resumable_prefill) {
                 run_asr_model_call(request, || {
                     Self::run_blocking(|| {
-                        prepared_model.start_resumable_prefill_state_with_prompt_managed(
-                            &samples,
-                            sample_rate,
+                        prepared_model.start_resumable_prefill_from_prepared_audio_managed(
+                            prepared_audio.as_ref(),
                             request.asr_language_for_execution(),
                             request.asr_prompt_for_execution(),
                             max_new_tokens,
@@ -506,9 +512,8 @@ impl NativeExecutor {
             } else {
                 run_asr_model_call(request, || {
                     Self::run_blocking(|| {
-                        prepared_model.start_decode_state_with_prompt_managed(
-                            &samples,
-                            sample_rate,
+                        prepared_model.start_decode_state_from_prepared_audio_managed(
+                            prepared_audio.as_ref(),
                             request.asr_language_for_execution(),
                             request.asr_prompt_for_execution(),
                             max_new_tokens,

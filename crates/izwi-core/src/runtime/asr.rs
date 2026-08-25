@@ -31,9 +31,11 @@ use crate::runtime::audio_io::{
 };
 use crate::runtime::coordinator::{InferenceCoordinator, JobLease, JobResourceObservation};
 use crate::runtime::request::AsrRuntimeRequest;
+#[cfg(test)]
+use crate::runtime::service::retained_engine_request_input_bytes;
 use crate::runtime::service::{
     copy_optional_preparation_string, copy_preparation_bytes, copy_preparation_string,
-    retained_engine_request_input_bytes, AdmittedEngineRequest, RuntimeService,
+    AdmittedEngineRequest, RuntimeService,
 };
 use crate::runtime::types::{
     AsrTranscription, RuntimeRequestContext, SpeakerAttributedAsrResult,
@@ -1384,9 +1386,9 @@ impl RuntimeService {
                     audio_input.retained_bytes(),
                     retained_metadata_bytes,
                 ])?)?;
-                Ok((audio_input, language, prompt, correlation_id, job))
+                Ok((audio_input, language, prompt, correlation_id))
             },
-            move |registry, (audio_input, language, prompt, correlation_id, job)| {
+            move |_registry, (audio_input, language, prompt, correlation_id)| {
                 audio_input.validate_source_size()?;
                 let runtime_request = match audio_input {
                     OwnedAsrAudioInput::Base64(audio_base64) => AsrRuntimeRequest::from_base64(
@@ -1411,46 +1413,6 @@ impl RuntimeService {
                 } else if let Some(auto_max_tokens) = granite_auto_asr_token_ceiling(variant) {
                     request.params.max_tokens = auto_max_tokens;
                     request.asr_auto_max_tokens = true;
-                }
-                if variant.family() == ModelFamily::Qwen3Asr {
-                    let model = registry.try_get_asr(variant).ok_or_else(|| {
-                        Error::ModelNotFound(format!("ASR model {variant} is not loaded"))
-                    })?;
-                    let (samples, sample_rate) =
-                        crate::engine::decode_request_audio_with_rate(&request)?;
-                    let long_form = crate::engine::qwen3_asr_requires_long_form(
-                        &samples,
-                        sample_rate,
-                        model.max_audio_seconds_hint(),
-                    );
-                    let input_tokens = (!long_form)
-                        .then(|| {
-                            model.incremental_prompt_token_count(
-                                &samples,
-                                sample_rate,
-                                request.asr_language_for_execution(),
-                                request.asr_prompt_for_execution(),
-                            )
-                        })
-                        .transpose()?;
-                    request.install_prepared_asr_audio(variant, samples, sample_rate)?;
-                    if long_form {
-                        request.install_prepared_asr_long_form_atomic()?;
-                    } else {
-                        let context_limit =
-                            registry.effective_context(variant).ok_or_else(|| {
-                                Error::ModelLoadError(format!(
-                                "Qwen3 ASR model {variant} has no load-sealed effective context"
-                            ))
-                            })?;
-                        request.install_prepared_sequence_input_tokens(
-                            input_tokens.expect("normal Qwen3 ASR shape"),
-                            context_limit,
-                        )?;
-                    }
-                    job.record_materialized_usage(retained_host_observation(&[
-                        retained_engine_request_input_bytes(&request)?,
-                    ])?)?;
                 }
                 Ok(request)
             },

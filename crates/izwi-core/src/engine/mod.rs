@@ -167,6 +167,7 @@ pub use types::{
 
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
+use crate::models::architectures::qwen3::asr::{Qwen3AsrAudioBatchRow, Qwen3AsrPreparedAudio};
 use crate::models::registry::{ChatModelLease, ModelRegistry, NativeChatPreparedPrompt};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -1162,13 +1163,35 @@ impl Engine {
                 if variant.family() == crate::catalog::ModelFamily::Qwen3Asr
                     && request.prepared_asr_execution_shape().is_none()
                 {
-                    let model_for_shape = model.model_arc();
+                    let model_for_shape = model.clone();
                     let request_id = request.id.clone();
+                    let deadline = request.deadline;
                     let context_limit = registry
                         .effective_context(variant)
                         .unwrap_or(self.config.max_seq_len);
-                    let prepared = tokio::task::spawn_blocking(move || {
-                        let mut request = request;
+                    let acquire_permit = self
+                        .direct_request_preparation_permits
+                        .clone()
+                        .acquire_owned();
+                    let permit = match deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline.into(), acquire_permit)
+                            .await
+                            .map_err(|_| Error::Timeout(request_id.clone()))?,
+                        None => acquire_permit.await,
+                    }
+                    .map_err(|_| {
+                        Error::InferenceError(
+                            "Direct Qwen3 ASR preparation queue is unavailable".to_string(),
+                        )
+                    })?;
+                    let worker = tokio::task::spawn_blocking(move || {
+                        // The tower's transient host/device work is bounded by
+                        // the same Engine-owned preparation capacity as direct
+                        // payload processing. Its immutable result moves into
+                        // EngineCoreRequest and is thereafter bounded by the
+                        // Engine's retained-sequence/request capacity.
+                        let _permit = permit;
+                        let request = request;
                         let (samples, sample_rate) =
                             executor::decode_request_audio_with_rate(&request)?;
                         let long_form = executor::qwen3_asr_requires_long_form(
@@ -1186,18 +1209,51 @@ impl Engine {
                                 )
                             })
                             .transpose()?;
-                        request.install_prepared_asr_audio(variant, samples, sample_rate)?;
-                        if long_form {
-                            request.install_prepared_asr_long_form_atomic()?;
+                        let prepared_encoder = if long_form {
+                            None
                         } else {
-                            request.install_prepared_sequence_input_tokens(
-                                input_tokens.expect("normal Qwen3 ASR shape"),
-                                context_limit,
-                            )?;
-                        }
-                        Ok::<_, Error>(request)
-                    })
-                    .await
+                            let geometry = model_for_shape
+                                .audio_preparation_row_geometry(samples.len(), sample_rate)?;
+                            let rows = [Qwen3AsrAudioBatchRow {
+                                audio: &samples,
+                                sample_rate,
+                            }];
+                            let mut artifacts =
+                                model_for_shape.prepare_qwen3_audio_tower_batch(&rows)?;
+                            let artifact = artifacts.pop().ok_or_else(|| {
+                                Error::InferenceError(
+                                    "Direct Qwen3 ASR width-one encoder returned no artifact"
+                                        .to_string(),
+                                )
+                            })?;
+                            if !artifacts.is_empty()
+                                || artifact.audio_tokens()? != geometry.audio_tokens
+                                || artifact.resident_tensor_bytes()?
+                                    != geometry.retained_artifact_bytes
+                            {
+                                return Err(Error::InferenceError(
+                                    "Direct Qwen3 ASR encoder artifact disagrees with admitted geometry"
+                                        .to_string(),
+                                ));
+                            }
+                            Some(Arc::new(artifact))
+                        };
+                        Self::finalize_direct_qwen_asr_preparation(
+                            request,
+                            variant,
+                            samples,
+                            sample_rate,
+                            context_limit,
+                            input_tokens,
+                            prepared_encoder,
+                        )
+                    });
+                    let prepared = match deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline.into(), worker)
+                            .await
+                            .map_err(|_| Error::Timeout(request_id.clone()))?,
+                        None => worker.await,
+                    }
                     .map_err(|error| {
                         Error::InferenceError(format!(
                             "ASR request {request_id} sequence-shape worker failed: {error}"
@@ -1259,6 +1315,32 @@ impl Engine {
                 )?;
             }
             TaskType::ASR | TaskType::TTS | TaskType::Chat | TaskType::SpeechToSpeech => {}
+        }
+        Ok(request)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_direct_qwen_asr_preparation(
+        mut request: EngineCoreRequest,
+        variant: ModelVariant,
+        samples: Vec<f32>,
+        sample_rate: u32,
+        context_limit: usize,
+        input_tokens: Option<usize>,
+        encoder_artifact: Option<Arc<Qwen3AsrPreparedAudio>>,
+    ) -> Result<EngineCoreRequest> {
+        request.install_prepared_asr_audio(variant, samples, sample_rate)?;
+        match (input_tokens, encoder_artifact) {
+            (None, None) => request.install_prepared_asr_long_form_atomic()?,
+            (Some(input_tokens), Some(artifact)) => {
+                request.install_prepared_sequence_input_tokens(input_tokens, context_limit)?;
+                request.install_prepared_asr_encoder_artifact(variant, artifact)?;
+            }
+            _ => {
+                return Err(Error::InferenceError(
+                    "Direct Qwen3 ASR route and encoder artifact disagree".to_string(),
+                ));
+            }
         }
         Ok(request)
     }
@@ -1906,6 +1988,70 @@ mod tests {
         assert_eq!(request.num_prompt_tokens(), 37);
         assert!(request.uses_asr_retained_sequence());
         assert!(request.install_prepared_asr_long_form_atomic().is_err());
+    }
+
+    #[test]
+    fn direct_qwen_asr_normal_route_installs_the_encoder_artifact_before_core_admission() {
+        let variant = ModelVariant::Qwen3Asr06BGguf;
+        let request = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+        let artifact =
+            Arc::new(Qwen3AsrPreparedAudio::for_test(7, 16).expect("test encoder artifact"));
+
+        let prepared = Engine::finalize_direct_qwen_asr_preparation(
+            request,
+            variant,
+            vec![0.0; 16_000],
+            16_000,
+            4_096,
+            Some(32),
+            Some(artifact.clone()),
+        )
+        .expect("normal direct Qwen3 ASR preparation");
+
+        assert!(prepared.uses_asr_retained_sequence());
+        assert_eq!(prepared.num_prompt_tokens(), 32);
+        assert_eq!(
+            prepared
+                .prepared_asr_encoder_artifact_retained_bytes()
+                .unwrap(),
+            7 * 16 * std::mem::size_of::<f32>() as u64
+        );
+        assert!(Arc::ptr_eq(
+            &prepared
+                .prepared_asr_encoder_artifact_for_executor()
+                .unwrap()
+                .expect("installed artifact"),
+            &artifact,
+        ));
+    }
+
+    #[test]
+    fn direct_qwen_asr_long_form_route_retains_no_encoder_artifact() {
+        let variant = ModelVariant::Qwen3Asr06BGguf;
+        let request = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+
+        let prepared = Engine::finalize_direct_qwen_asr_preparation(
+            request,
+            variant,
+            vec![0.0; 16_000],
+            16_000,
+            4_096,
+            None,
+            None,
+        )
+        .expect("long-form direct Qwen3 ASR preparation");
+
+        assert!(prepared.uses_asr_long_form_atomic());
+        assert!(prepared
+            .prepared_asr_encoder_artifact_for_executor()
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            prepared
+                .prepared_asr_encoder_artifact_retained_bytes()
+                .unwrap(),
+            0
+        );
     }
 
     struct EndlessSequenceExecutor;

@@ -449,6 +449,34 @@ impl AudioTowerBatchOutput {
 }
 
 impl AudioTower {
+    pub(super) fn preparation_dimensions(&self) -> (usize, usize, usize, usize, usize, usize) {
+        (
+            self.cfg.num_mel_bins,
+            self.cfg.downsample_hidden_size,
+            self.cfg.d_model,
+            self.cfg.encoder_ffn_dim,
+            self.cfg.encoder_attention_heads,
+            self.cfg.output_dim,
+        )
+    }
+
+    pub(super) fn preparation_chunk_geometry(&self) -> Result<(usize, usize)> {
+        let chunk_input = self
+            .cfg
+            .n_window
+            .unwrap_or(50)
+            .checked_mul(2)
+            .ok_or_else(|| Error::InvalidInput("Qwen3 ASR audio chunk size overflow".into()))?;
+        if chunk_input == 0 {
+            return Err(Error::InvalidInput("Invalid audio chunk size".into()));
+        }
+        let infer_window = self.cfg.n_window_infer.unwrap_or(800);
+        let output_window = conv_stack_output_len(chunk_input)
+            .checked_mul((infer_window / chunk_input).max(1))
+            .ok_or_else(|| Error::InvalidInput("Audio attention window overflow".into()))?;
+        Ok((chunk_input, output_window.max(1)))
+    }
+
     pub fn load(cfg: AudioConfig, vb: VarBuilder) -> Result<Self> {
         let conv_cfg = Conv2dConfig {
             stride: 2,

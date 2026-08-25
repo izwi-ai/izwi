@@ -1,15 +1,15 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::backends::BackendKind;
 use crate::engine::ManagedKvModelRuntime;
 use crate::engine::{
     AdapterAbiRevision, AdapterInstanceId, CacheMode, CancellationGranularity, ConcurrencyClass,
-    ExecutionAdapterBinding, ExecutionGroupId, ExecutionMode, ExecutionProfile, ModelInstanceId,
-    NativeBatchMode, OutputVisibility, PhysicalLaunchPolicy, PrefillMode, StageDescriptor, StageId,
-    StageShapePolicy, StageWorkSelector,
+    ExecutionAdapterBinding, ExecutionGroupId, ExecutionMode, ExecutionProfile,
+    MembershipSafePoint, ModelInstanceId, NativeBatchMode, OutputVisibility, PhysicalLaunchPolicy,
+    PrefillMode, StageDescriptor, StageId, StageProgressKind, StageShapePolicy, StageWorkSelector,
 };
 use crate::error::{Error, Result};
 use crate::kv::v2::{
@@ -202,6 +202,15 @@ pub(crate) trait LoadedExecutionAdapter: fmt::Debug + Send + Sync {
     fn adapter_instance_id(&self) -> AdapterInstanceId;
     fn adapter_abi_revision(&self) -> AdapterAbiRevision;
     fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract>;
+
+    fn seal_qwen3_asr_audio_preparation(
+        &self,
+        _model: &crate::models::architectures::qwen3::asr::Qwen3AsrModel,
+    ) -> Result<()> {
+        Err(Error::ModelLoadError(
+            "loaded adapter does not own Qwen3 ASR audio preparation".into(),
+        ))
+    }
 }
 
 /// Loaded-state publication normalized into an immutable ABI-v2 runtime before
@@ -1382,6 +1391,8 @@ struct ContinuousAsrExecutionAdapter {
     metadata: AdapterMetadata,
     backend_kind: BackendKind,
     max_batch_size: usize,
+    audio_preparation:
+        OnceLock<crate::models::architectures::qwen3::asr::Qwen3AsrAudioPreparationStageSeal>,
 }
 
 impl ContinuousAsrExecutionAdapter {
@@ -1401,7 +1412,26 @@ impl ContinuousAsrExecutionAdapter {
             metadata,
             backend_kind,
             max_batch_size: max_batch_size.max(1),
+            audio_preparation: OnceLock::new(),
         }
+    }
+
+    fn install_audio_preparation_seal(
+        &self,
+        seal: crate::models::architectures::qwen3::asr::Qwen3AsrAudioPreparationStageSeal,
+    ) -> Result<()> {
+        if let Some(existing) = self.audio_preparation.get() {
+            return if existing == &seal {
+                Ok(())
+            } else {
+                Err(Error::ModelLoadError(
+                    "Qwen3 ASR audio preparation was resealed with different geometry".into(),
+                ))
+            };
+        }
+        self.audio_preparation.set(seal).map_err(|_| {
+            Error::ModelLoadError("Qwen3 ASR audio preparation seal raced publication".into())
+        })
     }
 }
 
@@ -1416,6 +1446,14 @@ impl LoadedExecutionAdapter for ContinuousAsrExecutionAdapter {
 
     fn adapter_abi_revision(&self) -> AdapterAbiRevision {
         CONTINUOUS_ASR_ADAPTER_ABI
+    }
+
+    fn seal_qwen3_asr_audio_preparation(
+        &self,
+        model: &crate::models::architectures::qwen3::asr::Qwen3AsrModel,
+    ) -> Result<()> {
+        let seal = model.audio_preparation_stage_seal(self.backend_kind, self.max_batch_size)?;
+        self.install_audio_preparation_seal(seal)
     }
 
     fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
@@ -1471,6 +1509,22 @@ impl LoadedExecutionAdapter for ContinuousAsrExecutionAdapter {
         }
         let mut execution_profile =
             scalar_execution_profile(metadata, self.backend_kind, streaming.model_native);
+        let audio_preparation = self.audio_preparation.get().ok_or_else(|| {
+            Error::ModelLoadError(
+                "Qwen3 ASR normal execution graph is unavailable before loaded-model audio preparation is sealed"
+                    .into(),
+            )
+        })?;
+        if audio_preparation.backend != self.backend_kind
+            || audio_preparation.max_batch_size != self.max_batch_size
+            || audio_preparation.audio_dtype.is_empty()
+            || audio_preparation.text_dtype.is_empty()
+        {
+            return Err(Error::ModelLoadError(
+                "Qwen3 ASR audio preparation seal does not match its loaded adapter identity"
+                    .into(),
+            ));
+        }
         execution_profile.mode = ExecutionMode::Sequence;
         execution_profile.prefill = PrefillMode::Incremental;
         execution_profile.incremental_decode = true;
@@ -1490,6 +1544,19 @@ impl LoadedExecutionAdapter for ContinuousAsrExecutionAdapter {
         execution_profile.prefix_reuse_safe = false;
         execution_profile.max_batch_size = self.max_batch_size;
         execution_profile.resolved_from_loaded_model = true;
+
+        let mut preparation = StageDescriptor::from_execution_profile(
+            StageId::new(0),
+            "asr.encoder.audio",
+            &execution_profile,
+            NativeBatchMode::Static,
+        );
+        preparation.selector = StageWorkSelector::PreSequencePreparation;
+        preparation.progress = StageProgressKind::Atomic;
+        preparation.membership_safe_point = MembershipSafePoint::OperationBoundary;
+        preparation.shape_policy = StageShapePolicy::Padded;
+        preparation.max_workspace_bytes = audio_preparation.max_workspace_bytes;
+        preparation.output_visibility = OutputVisibility::AfterQuantumCommit;
 
         let mut prefill = StageDescriptor::from_execution_profile(
             StageId::new(1),
@@ -1518,6 +1585,7 @@ impl LoadedExecutionAdapter for ContinuousAsrExecutionAdapter {
             Error::Overloaded("continuous ASR batch width exceeds work accounting".to_string())
         })?;
         decode.max_workspace_bytes = CONTINUOUS_ASR_MAX_BATCH_WORKSPACE_BYTES;
+        preparation.validate()?;
         prefill.validate()?;
         decode.validate()?;
 
@@ -1528,7 +1596,7 @@ impl LoadedExecutionAdapter for ContinuousAsrExecutionAdapter {
             adapter_abi_revision: self.adapter_abi_revision(),
             metadata,
             execution_profile,
-            stages: Arc::from([prefill, decode]),
+            stages: Arc::from([preparation, prefill, decode]),
         })
     }
 }
@@ -1799,6 +1867,16 @@ impl LoadedModelBundleDraft {
             ))
         })?;
         loaded_execution_contracts(execution.as_ref())
+    }
+
+    pub(crate) fn seal_qwen3_asr_audio_preparation(
+        &self,
+        model: &crate::models::architectures::qwen3::asr::Qwen3AsrModel,
+    ) -> Result<()> {
+        let execution = self.capabilities.get(&CapabilityKind::Asr).ok_or_else(|| {
+            Error::ModelLoadError("Qwen3 ASR loaded bundle has no ASR capability to seal".into())
+        })?;
+        execution.seal_qwen3_asr_audio_preparation(model)
     }
 
     pub(crate) fn seal(
@@ -2126,7 +2204,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen_asr_rejects_retained_only_publication_without_long_form_workspace() {
+    fn qwen_asr_direct_binding_fails_closed_before_model_geometry_is_sealed() {
         let registry = RuntimeAdapterRegistry::built_in();
         let model_instance = ModelInstanceId::new(81);
         let state_contract = crate::kv::test_contract();
@@ -2155,10 +2233,8 @@ mod tests {
                 },
             )]),
         )
-        .expect_err("Qwen3 ASR must publish both retained and long-form invocation state");
-        assert!(error.to_string().contains(
-            "requiring invocation state cannot publish a retained-only physical runtime"
-        ));
+        .expect_err("Qwen3 ASR direct binding must not invent unloaded model geometry");
+        assert!(error.to_string().contains("audio preparation is sealed"));
     }
 
     #[test]
@@ -3461,24 +3537,38 @@ mod tests {
         let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(8, 1).unwrap();
 
         for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
-            let draft = LoadedModelBundleDraft::build(
-                &registry,
+            let metadata = *registry
+                .require(CapabilityKind::Asr, ModelVariant::Qwen3Asr06BGguf)
+                .unwrap();
+            let adapter = ContinuousAsrExecutionAdapter::new(
                 ExecutionGroupId::new(61),
                 ModelInstanceId::new(62),
-                ModelVariant::Qwen3Asr06BGguf,
+                metadata,
                 backend,
-            )
-            .unwrap();
+                8,
+            );
+            assert!(adapter.contract(StreamingRequirements::NONE).is_err());
+            let long_form = adapter
+                .contract(StreamingRequirements::NONE.with_asr_long_form(true))
+                .unwrap();
+            assert_eq!(long_form.stages.len(), 1);
+            assert_eq!(long_form.stages[0].name, "asr.long_form.atomic");
+            adapter
+                .install_audio_preparation_seal(
+                    crate::models::architectures::qwen3::asr::Qwen3AsrAudioPreparationStageSeal {
+                        backend,
+                        audio_dtype: "f32".into(),
+                        text_dtype: "f32".into(),
+                        max_batch_size: 8,
+                        max_workspace_bytes: 64 * 1024 * 1024,
+                    },
+                )
+                .unwrap();
             for streaming in [
                 StreamingRequirements::NONE,
                 StreamingRequirements::native(true),
             ] {
-                let contract = draft
-                    .capabilities
-                    .get(&CapabilityKind::Asr)
-                    .unwrap()
-                    .contract(streaming)
-                    .unwrap();
+                let contract = adapter.contract(streaming).unwrap();
                 assert_eq!(contract.adapter_abi_revision, CONTINUOUS_ASR_ADAPTER_ABI);
                 assert_eq!(contract.execution_profile.mode, ExecutionMode::Sequence);
                 assert_eq!(contract.execution_profile.prefill, PrefillMode::Incremental);
@@ -3494,22 +3584,30 @@ mod tests {
                 assert!(contract.execution_profile.recompute_safe);
                 assert!(contract.execution_profile.cache_release_safe);
                 assert!(!contract.execution_profile.prefix_reuse_safe);
-                assert_eq!(contract.stages.len(), 2);
+                assert_eq!(contract.stages.len(), 3);
                 assert_eq!(
                     contract.stages[0].selector,
-                    StageWorkSelector::SequencePrefill
+                    StageWorkSelector::PreSequencePreparation
                 );
-                assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::None);
-                assert_eq!(contract.stages[0].max_batch_size, 1);
+                assert_eq!(contract.stages[0].name, "asr.encoder.audio");
+                assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::Static);
+                assert_eq!(contract.stages[0].max_batch_size, 8);
+                assert_eq!(contract.stages[0].max_workspace_bytes, 64 * 1024 * 1024);
                 assert_eq!(
                     contract.stages[1].selector,
+                    StageWorkSelector::SequencePrefill
+                );
+                assert_eq!(contract.stages[1].batch_mode, NativeBatchMode::None);
+                assert_eq!(contract.stages[1].max_batch_size, 1);
+                assert_eq!(
+                    contract.stages[2].selector,
                     StageWorkSelector::SequenceDecode
                 );
-                assert_eq!(contract.stages[1].batch_mode, NativeBatchMode::Continuous);
-                assert_eq!(contract.stages[1].max_batch_size, 8);
-                assert_eq!(contract.stages[1].max_work_units, 8);
+                assert_eq!(contract.stages[2].batch_mode, NativeBatchMode::Continuous);
+                assert_eq!(contract.stages[2].max_batch_size, 8);
+                assert_eq!(contract.stages[2].max_work_units, 8);
                 assert_eq!(
-                    contract.stages[1].max_workspace_bytes,
+                    contract.stages[2].max_workspace_bytes,
                     CONTINUOUS_ASR_MAX_BATCH_WORKSPACE_BYTES
                 );
             }

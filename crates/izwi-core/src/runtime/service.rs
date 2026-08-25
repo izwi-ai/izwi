@@ -1,6 +1,6 @@
 //! Runtime service orchestrator.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -19,10 +19,10 @@ use crate::backends::{
 use crate::catalog::{ModelFamily, ModelInfo, ModelVariant};
 use crate::config::{EngineConfig, PrefixCachePolicy, ResolvedKvCachePolicy};
 use crate::engine::{
-    engine_batch_metrics_snapshot, engine_stream_metrics_snapshot, Engine as CoreEngine,
-    EngineAudioInput, EngineCoreConfig, EngineCoreRequest, EngineOutput, EngineStreamPolicy,
-    EngineTask, GenerationParams, OutputFinishReason, ResourceAmount, ResourceVector, SessionKey,
-    StreamingOutput, TaskType, WorkerConfig, WorkloadClass,
+    engine_batch_metrics_snapshot, engine_stream_metrics_snapshot, AdapterBindingKey,
+    Engine as CoreEngine, EngineAudioInput, EngineCoreConfig, EngineCoreRequest, EngineOutput,
+    EngineStreamPolicy, EngineTask, GenerationParams, OutputFinishReason, ResourceAmount,
+    ResourceVector, SessionKey, StreamingOutput, TaskType, WorkUnit, WorkerConfig, WorkloadClass,
     ENGINE_EXECUTOR_BATCH_WORKSPACE_BYTES_TOTAL,
     ENGINE_EXECUTOR_BATCH_WORKSPACE_DOMAIN_BYTES_TOTAL,
     ENGINE_EXECUTOR_CONTINUOUS_ENVELOPE_SCALAR_FALLBACKS_TOTAL,
@@ -53,6 +53,10 @@ use crate::engine::{
 };
 use crate::error::{Error, Result};
 use crate::model::ModelResidencyLease;
+use crate::models::architectures::qwen3::asr::{
+    Qwen3AsrAudioBatchRow, Qwen3AsrAudioPreparationGeometry, Qwen3AsrPreparedAudio,
+};
+use crate::models::registry::AsrModelLease;
 use crate::models::shared::chat::{ChatMessage, ChatRequestConfig};
 use crate::runtime::adapters::{
     CapabilityKind, ExecutionTargetKind, LoadedCapabilityBinding, LoadedExecutionContract,
@@ -64,7 +68,7 @@ use crate::runtime::broker::{
 };
 use crate::runtime::coordinator::{
     CoordinatorLane, CoordinatorSnapshot, InferenceCoordinator, JobLease, JobResourceObservation,
-    JobSpec,
+    JobSpec, PreparationArtifact, PreparationCancellation, PreparationRowOutcome,
 };
 use crate::runtime::lifecycle::controller::ModelLifecycleController;
 use crate::runtime::pipeline::{PipelineExecutor, PipelineGraph};
@@ -630,6 +634,26 @@ fn host_input_observation(input_bytes: usize) -> Result<JobResourceObservation> 
     ))
 }
 
+fn qwen_asr_retained_resources(
+    backend: BackendKind,
+    host_bytes: u64,
+    accelerator_bytes: u64,
+) -> Result<ResourceVector> {
+    let total = host_bytes
+        .checked_add(accelerator_bytes)
+        .ok_or_else(|| Error::Overloaded("Qwen3 ASR retained resource overflow".to_string()))?;
+    let mut resources = ResourceVector::zero();
+    match backend {
+        BackendKind::Cpu => resources.host_bytes = ResourceAmount::Known(total),
+        BackendKind::Metal => resources.unified_bytes = ResourceAmount::Known(total),
+        BackendKind::Cuda => {
+            resources.host_bytes = ResourceAmount::Known(host_bytes);
+            resources.device_bytes = ResourceAmount::Known(accelerator_bytes);
+        }
+    }
+    Ok(resources)
+}
+
 fn ensure_preparation_copy_deadline(job: &JobLease) -> Result<()> {
     if job
         .spec
@@ -760,6 +784,17 @@ fn coordinator_lane_for_metadata(
 }
 
 fn coordinator_lane_for_request(request: &EngineCoreRequest) -> CoordinatorLane {
+    if request.task_type == TaskType::ASR
+        && request
+            .model_variant
+            .is_some_and(|variant| variant.family() == ModelFamily::Qwen3Asr)
+        && request.prepared_asr_execution_shape().is_none()
+    {
+        // This admission owns only decoded-media preparation. It must not be
+        // eligible for retained decoder execution before the exact route and
+        // immutable audio-tower artifact are known.
+        return CoordinatorLane::Atomic;
+    }
     if request.workload_class != WorkloadClass::Realtime && request.uses_asr_long_form_atomic() {
         return CoordinatorLane::Atomic;
     }
@@ -769,6 +804,321 @@ fn coordinator_lane_for_request(request: &EngineCoreRequest) -> CoordinatorLane 
         request.streaming,
         request.workload_class,
     )
+}
+
+type QwenAsrEncoderOutcome = PreparationRowOutcome<Qwen3AsrPreparedAudio>;
+
+struct QwenAsrEncoderPending {
+    job: JobLease,
+    contract: LoadedExecutionContract,
+    model: AsrModelLease,
+    samples: Arc<[f32]>,
+    sample_rate: u32,
+    geometry: Qwen3AsrAudioPreparationGeometry,
+    retained_host_bytes: u64,
+    cancellation: PreparationCancellation,
+    response: Option<oneshot::Sender<QwenAsrEncoderOutcome>>,
+}
+
+struct QwenAsrEncoderCancellationGuard {
+    cancellation: PreparationCancellation,
+    armed: bool,
+}
+
+impl Drop for QwenAsrEncoderCancellationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancellation.cancel();
+        }
+    }
+}
+
+#[derive(Default)]
+struct QwenAsrEncoderBatcherState {
+    pending: HashMap<QwenAsrEncoderQueueKey, VecDeque<QwenAsrEncoderPending>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct QwenAsrEncoderQueueKey {
+    binding: AdapterBindingKey,
+    mel_frame_bucket: usize,
+}
+
+struct QwenAsrEncoderBatcher {
+    coordinator: Arc<InferenceCoordinator>,
+    state: Mutex<QwenAsrEncoderBatcherState>,
+}
+
+impl QwenAsrEncoderBatcher {
+    fn new(coordinator: Arc<InferenceCoordinator>) -> Self {
+        Self {
+            coordinator,
+            state: Mutex::new(QwenAsrEncoderBatcherState::default()),
+        }
+    }
+
+    async fn submit(
+        self: &Arc<Self>,
+        pending: QwenAsrEncoderPending,
+    ) -> Result<QwenAsrEncoderOutcome> {
+        let work = WorkUnit::PreSequencePreparation {
+            kind: "asr.encoder.audio".to_string(),
+        };
+        let binding = pending.contract.adapter_binding()?;
+        let stage = binding.stage_for_work(&work)?;
+        if stage.name != "asr.encoder.audio" {
+            return Err(Error::InvalidInput(
+                "Qwen3 ASR loaded contract did not select asr.encoder.audio".to_string(),
+            ));
+        }
+        let key = QwenAsrEncoderQueueKey {
+            binding: binding.key_for_stage(stage.id)?,
+            // The loaded padded-stage contract allows at most 100% padding.
+            // Power-of-two duration buckets keep every admitted row within a
+            // factor of two while preserving ragged logical lengths.
+            mel_frame_bucket: pending
+                .geometry
+                .mel_frames
+                .checked_next_power_of_two()
+                .ok_or_else(|| {
+                    Error::Overloaded("Qwen3 ASR mel-frame bucket overflow".to_string())
+                })?,
+        };
+        let max_width = stage.max_batch_size.max(1);
+        let formation_delay = stage.max_formation_delay;
+        let deadline = pending.job.spec.deadline;
+        let cancellation = pending.cancellation.clone();
+        let (response, receiver) = oneshot::channel();
+        let mut pending = pending;
+        pending.response = Some(response);
+
+        let mut immediate = None;
+        let first;
+        {
+            let mut state = self.state.lock().await;
+            let queue = state.pending.entry(key.clone()).or_default();
+            first = queue.is_empty();
+            queue.push_back(pending);
+            let deadline_pressure = deadline.is_some_and(|deadline| {
+                deadline
+                    <= Instant::now()
+                        .checked_add(formation_delay)
+                        .unwrap_or(deadline)
+            });
+            if queue.len() >= max_width || deadline_pressure {
+                immediate = Some(Self::drain(queue, max_width));
+                if queue.is_empty() {
+                    state.pending.remove(&key);
+                }
+            }
+        }
+
+        if let Some(batch) = immediate {
+            self.spawn_batch(batch);
+        } else if first {
+            let batcher = self.clone();
+            tokio::spawn(async move {
+                // A zero-delay stage still yields once so requests already
+                // runnable in this executor turn can join without imposing a
+                // timer-derived latency floor.
+                yield_now().await;
+                if !formation_delay.is_zero() {
+                    let should_wait = {
+                        let state = batcher.state.lock().await;
+                        state.pending.get(&key).is_some_and(|queue| {
+                            !queue.iter().any(|row| {
+                                row.job.spec.deadline.is_some_and(|deadline| {
+                                    deadline
+                                        <= Instant::now()
+                                            .checked_add(formation_delay)
+                                            .unwrap_or(deadline)
+                                })
+                            })
+                        })
+                    };
+                    if should_wait {
+                        tokio::time::sleep(formation_delay).await;
+                    }
+                }
+                if let Some(batch) = batcher.take_batch(&key, max_width).await {
+                    batcher.spawn_batch(batch);
+                }
+            });
+        }
+
+        let mut guard = QwenAsrEncoderCancellationGuard {
+            cancellation,
+            armed: true,
+        };
+        let outcome = receiver.await.map_err(|_| {
+            Error::InferenceError("Qwen3 ASR encoder batch worker stopped before reply".to_string())
+        })?;
+        guard.armed = false;
+        Ok(outcome)
+    }
+
+    fn drain(
+        queue: &mut VecDeque<QwenAsrEncoderPending>,
+        max_width: usize,
+    ) -> Vec<QwenAsrEncoderPending> {
+        let width = queue.len().min(max_width);
+        queue.drain(..width).collect()
+    }
+
+    async fn take_batch(
+        &self,
+        key: &QwenAsrEncoderQueueKey,
+        max_width: usize,
+    ) -> Option<Vec<QwenAsrEncoderPending>> {
+        let mut state = self.state.lock().await;
+        let queue = state.pending.get_mut(key)?;
+        let batch = Self::drain(queue, max_width);
+        if queue.is_empty() {
+            state.pending.remove(key);
+        }
+        (!batch.is_empty()).then_some(batch)
+    }
+
+    fn spawn_batch(self: &Arc<Self>, batch: Vec<QwenAsrEncoderPending>) {
+        let batcher = self.clone();
+        tokio::spawn(async move {
+            batcher.run_batch(batch).await;
+        });
+    }
+
+    async fn run_batch(&self, mut batch: Vec<QwenAsrEncoderPending>) {
+        let Some(first) = batch.first() else {
+            return;
+        };
+        let contract = first.contract.clone();
+        let model = first.model.clone();
+        let geometries = batch.iter().map(|row| row.geometry).collect::<Vec<_>>();
+        let batch_geometry = match model.audio_preparation_batch_geometry(&geometries) {
+            Ok(geometry) => geometry,
+            Err(error) => {
+                Self::fail_batch(batch, error);
+                return;
+            }
+        };
+        let materialized_per_row = match batch_geometry
+            .padded_mel_elements_per_row
+            .checked_add(batch_geometry.padded_output_elements_per_row)
+        {
+            Some(value) => value,
+            None => {
+                Self::fail_batch(
+                    batch,
+                    Error::Overloaded("Qwen3 ASR padded work accounting overflow".to_string()),
+                );
+                return;
+            }
+        };
+        let work = WorkUnit::PreSequencePreparation {
+            kind: "asr.encoder.audio".to_string(),
+        };
+        let mut sealed = Vec::with_capacity(batch.len());
+        for (index, row) in batch.iter().enumerate() {
+            let cost = match model.audio_preparation_row_cost_for_batch(
+                index,
+                &geometries,
+                &batch_geometry,
+            ) {
+                Ok(cost) => cost,
+                Err(error) => {
+                    Self::fail_batch(batch, error);
+                    return;
+                }
+            };
+            match self.coordinator.seal_preparation_row(
+                row.job.clone(),
+                &row.contract,
+                &work,
+                cost,
+                materialized_per_row,
+                row.cancellation.clone(),
+            ) {
+                Ok(seal) => sealed.push(seal),
+                Err(error) => {
+                    Self::fail_batch(batch, error);
+                    return;
+                }
+            }
+        }
+        // The sealed rows now own the only JobLease clones used by the
+        // physical transaction. Drop the queue-owned originals before the
+        // runner converts successful jobs into unique admission bridges.
+        let samples = batch
+            .iter()
+            .map(|row| {
+                (
+                    row.samples.clone(),
+                    row.sample_rate,
+                    row.retained_host_bytes,
+                )
+            })
+            .collect::<Vec<_>>();
+        let senders = batch
+            .drain(..)
+            .map(|mut row| {
+                row.response
+                    .take()
+                    .expect("queued Qwen3 ASR row has a response channel")
+            })
+            .collect::<Vec<_>>();
+        let physical_model = model.clone();
+        let result = self
+            .coordinator
+            .run_loaded_native_preparation_batch(sealed, contract, work, move |live| {
+                let selected = live
+                    .iter()
+                    .map(|index| Qwen3AsrAudioBatchRow {
+                        audio: samples[*index].0.as_ref(),
+                        sample_rate: samples[*index].1,
+                    })
+                    .collect::<Vec<_>>();
+                let prepared = physical_model.prepare_qwen3_audio_tower_batch(&selected)?;
+                Ok(prepared
+                    .into_iter()
+                    .zip(live.iter())
+                    .map(|(artifact, index)| {
+                        Ok(PreparationArtifact {
+                            retained: JobResourceObservation {
+                                host_bytes: samples[*index].2,
+                                accelerator_bytes: artifact.resident_tensor_bytes()?,
+                            },
+                            value: artifact,
+                        })
+                    })
+                    .collect::<Vec<Result<PreparationArtifact<Qwen3AsrPreparedAudio>>>>())
+            })
+            .await;
+        match result {
+            Ok(outcomes) => {
+                for (sender, outcome) in senders.into_iter().zip(outcomes) {
+                    let _ = sender.send(outcome);
+                }
+            }
+            Err(error) => {
+                let message = error.to_string();
+                for sender in senders {
+                    let _ = sender.send(PreparationRowOutcome::Failed(Error::InferenceError(
+                        message.clone(),
+                    )));
+                }
+            }
+        }
+    }
+
+    fn fail_batch(batch: Vec<QwenAsrEncoderPending>, error: Error) {
+        let message = error.to_string();
+        for row in batch {
+            if let Some(response) = row.response {
+                let _ = response.send(PreparationRowOutcome::Failed(Error::InferenceError(
+                    message.clone(),
+                )));
+            }
+        }
+    }
 }
 
 /// Main inference engine runtime.
@@ -786,6 +1136,7 @@ pub struct RuntimeService {
     pub(crate) streaming_config: StreamingConfig,
     pub(crate) core_engine: Arc<CoreEngine>,
     pub(crate) coordinator: Arc<InferenceCoordinator>,
+    qwen_asr_encoder_batcher: Arc<QwenAsrEncoderBatcher>,
     pub(super) asr_realtime_sessions: RealtimeAsrSessionPolicy,
     telemetry: Arc<RuntimeTelemetryCollector>,
     completion_waiters: Arc<RuntimeCompletionWaiters>,
@@ -1240,6 +1591,7 @@ impl RuntimeService {
             execution_parallelism,
             core_config.max_queued_requests,
         )?);
+        let qwen_asr_encoder_batcher = Arc::new(QwenAsrEncoderBatcher::new(coordinator.clone()));
         let asr_realtime_sessions = RealtimeAsrSessionPolicy::from_env()?;
         let realtime_asr_sequence_capacity = asr_realtime_sessions.retained_sequence_capacity()?;
         worker_config.resource_authority = Some(coordinator.resource_authority());
@@ -1277,6 +1629,7 @@ impl RuntimeService {
             streaming_config: StreamingConfig::default(),
             core_engine,
             coordinator,
+            qwen_asr_encoder_batcher,
             asr_realtime_sessions,
             telemetry: Arc::new(RuntimeTelemetryCollector::new(2048)),
             completion_waiters: Arc::new(Mutex::new(HashMap::new())),
@@ -1919,14 +2272,20 @@ impl RuntimeService {
             effective_context.workload_class = WorkloadClass::Streaming;
         }
         let request_id = uuid::Uuid::new_v4().to_string();
+        let initial_lane =
+            if task_type == TaskType::ASR && variant.family() == ModelFamily::Qwen3Asr {
+                CoordinatorLane::Atomic
+            } else {
+                coordinator_lane_for_metadata(
+                    task_type,
+                    Some(variant),
+                    streaming,
+                    effective_context.workload_class,
+                )
+            };
         let mut spec = self.coordinator_job_for_input(
             request_id,
-            coordinator_lane_for_metadata(
-                task_type,
-                Some(variant),
-                streaming,
-                effective_context.workload_class,
-            ),
+            initial_lane,
             effective_context,
             input_bytes,
         );
@@ -2009,6 +2368,14 @@ impl RuntimeService {
             spec.resources = spec.resources.checked_add(audio_decode_resources(
                 self.backend_router.context().backend_kind,
             ))?;
+        }
+        let asr_encoder_bytes = request.prepared_asr_encoder_artifact_retained_bytes()?;
+        if asr_encoder_bytes > 0 {
+            spec.resources = spec.resources.checked_add(qwen_asr_retained_resources(
+                self.backend_router.context().backend_kind,
+                0,
+                asr_encoder_bytes,
+            )?)?;
         }
         if request.task_type == TaskType::TTS
             && request
@@ -2173,21 +2540,40 @@ impl RuntimeService {
     async fn prepare_qwen3_asr_shape_for_binding(
         &self,
         request: EngineCoreRequest,
-        job: &JobLease,
-    ) -> Result<EngineCoreRequest> {
+        job: JobLease,
+        residency_lease: Option<&ModelResidencyLease>,
+    ) -> Result<(EngineCoreRequest, JobLease)> {
         if request.task_type != TaskType::ASR
             || request
                 .model_variant
                 .is_none_or(|variant| variant.family() != ModelFamily::Qwen3Asr)
             || request.prepared_asr_execution_shape().is_some()
         {
-            return Ok(request);
+            return Ok((request, job));
         }
         let variant = request.model_variant.expect("validated Qwen3 ASR variant");
-        let model =
-            self.model_registry.get_asr(variant).await.ok_or_else(|| {
-                Error::ModelNotFound(format!("ASR model {variant} is not loaded"))
-            })?;
+        let model = self
+            .model_registry
+            .get_asr_lease(variant)
+            .await
+            .ok_or_else(|| Error::ModelNotFound(format!("ASR model {variant} is not loaded")))?;
+        let residency_lease = residency_lease.ok_or_else(|| {
+            Error::InferenceError(
+                "Qwen3 ASR preparation requires authoritative model residency".to_string(),
+            )
+        })?;
+        let loaded_bundle = self
+            .model_lifecycle
+            .try_get_ready_bundle(residency_lease.variant());
+        let encoder_contract = loaded_contract_for_residency(
+            residency_lease,
+            loaded_bundle.as_deref(),
+            CapabilityKind::Asr,
+            false,
+            self.coordinator.execution_group_id(),
+            self.backend_router.context().backend_kind,
+            Some(ExecutionTargetKind::TokenEngine),
+        )?;
         let context_limit = self
             .model_registry
             .effective_context(variant)
@@ -2196,20 +2582,26 @@ impl RuntimeService {
                     "Qwen3 ASR model {variant} has no load-sealed effective context"
                 ))
             })?;
-        let prepared = self
+        let model_for_shape = model.clone();
+        let (prepared, geometry) = self
             .coordinator
-            .run_host_blocking_stage(job, move || {
+            .run_host_blocking_stage(&job, move || {
                 let mut request = request;
                 let (samples, sample_rate) =
                     crate::engine::decode_request_audio_with_rate(&request)?;
                 let long_form = crate::engine::qwen3_asr_requires_long_form(
                     &samples,
                     sample_rate,
-                    model.max_audio_seconds_hint(),
+                    model_for_shape.max_audio_seconds_hint(),
                 );
+                let geometry = (!long_form)
+                    .then(|| {
+                        model_for_shape.audio_preparation_row_geometry(samples.len(), sample_rate)
+                    })
+                    .transpose()?;
                 let input_tokens = (!long_form)
                     .then(|| {
-                        model.incremental_prompt_token_count(
+                        model_for_shape.incremental_prompt_token_count(
                             &samples,
                             sample_rate,
                             request.asr_language_for_execution(),
@@ -2226,13 +2618,149 @@ impl RuntimeService {
                         context_limit,
                     )?;
                 }
-                Ok(request)
+                Ok((request, geometry))
             })
             .await?;
-        job.record_materialized_usage(host_input_observation(
-            retained_engine_request_input_bytes(&prepared)?,
-        )?)?;
-        Ok(prepared)
+        let retained_host_bytes = u64::try_from(retained_engine_request_input_bytes(&prepared)?)
+            .map_err(|_| Error::Overloaded("Qwen3 ASR retained host input exceeds u64".into()))?;
+        job.record_materialized_usage(JobResourceObservation::host(retained_host_bytes))?;
+        let initial_bridge = self.coordinator.bridge_preparation_admission(job)?;
+
+        if prepared.uses_asr_long_form_atomic() {
+            let (execution, observation) = self.coordinator_job_for_request(&prepared)?;
+            let execution_job = match self
+                .coordinator
+                .admit_observed_from_preparation(initial_bridge, execution, observation)
+                .await
+            {
+                Ok(job) => job,
+                Err(failure) => {
+                    drop(prepared);
+                    let error = failure.error;
+                    drop(failure.bridge);
+                    return Err(error);
+                }
+            };
+            return Ok((prepared, execution_job));
+        }
+
+        let geometry = geometry.ok_or_else(|| {
+            Error::InferenceError("normal Qwen3 ASR route lost encoder geometry".to_string())
+        })?;
+        let encoder_resources = qwen_asr_retained_resources(
+            self.backend_router.context().backend_kind,
+            retained_host_bytes,
+            geometry.retained_artifact_bytes,
+        )?;
+        let encoder_spec = JobSpec {
+            request_id: prepared.id.clone(),
+            lane: CoordinatorLane::Atomic,
+            priority: prepared.priority,
+            workload_class: prepared.workload_class,
+            deadline: prepared.deadline,
+            resources: encoder_resources,
+        };
+        let encoder_job = match self
+            .coordinator
+            .admit_observed_from_preparation(
+                initial_bridge,
+                encoder_spec,
+                JobResourceObservation::host(retained_host_bytes),
+            )
+            .await
+        {
+            Ok(job) => job,
+            Err(failure) => {
+                drop(prepared);
+                let error = failure.error;
+                drop(failure.bridge);
+                return Err(error);
+            }
+        };
+        let (samples, sample_rate) = prepared
+            .prepared_asr_audio_for_executor()?
+            .ok_or_else(|| Error::InferenceError("Qwen3 ASR decoded audio was lost".into()))?;
+        let outcome = self
+            .qwen_asr_encoder_batcher
+            .submit(QwenAsrEncoderPending {
+                job: encoder_job,
+                contract: encoder_contract,
+                model,
+                samples,
+                sample_rate,
+                geometry,
+                retained_host_bytes,
+                cancellation: PreparationCancellation::default(),
+                response: None,
+            })
+            .await?;
+        let (artifact, bridge) = match outcome {
+            PreparationRowOutcome::Committed { artifact, bridge } => (artifact.value, bridge),
+            PreparationRowOutcome::Cancelled => return Err(Error::Cancelled(prepared.id.clone())),
+            PreparationRowOutcome::TimedOut => return Err(Error::Timeout(prepared.id.clone())),
+            PreparationRowOutcome::Failed(error) => return Err(error),
+        };
+        let artifact_audio_tokens = match artifact.audio_tokens() {
+            Ok(tokens) => tokens,
+            Err(error) => {
+                drop(artifact);
+                drop(bridge);
+                return Err(error);
+            }
+        };
+        if artifact_audio_tokens != geometry.audio_tokens {
+            drop(artifact);
+            drop(bridge);
+            return Err(Error::InferenceError(
+                "Qwen3 ASR encoder artifact token geometry drifted after admission".to_string(),
+            ));
+        }
+        let accelerator_bytes = match artifact.resident_tensor_bytes() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                drop(artifact);
+                drop(bridge);
+                return Err(error);
+            }
+        };
+        let artifact = Arc::new(artifact);
+        let mut prepared = prepared;
+        if let Err(error) =
+            prepared.install_prepared_asr_encoder_artifact(variant, artifact.clone())
+        {
+            drop(artifact);
+            drop(prepared);
+            drop(bridge);
+            return Err(error);
+        }
+        let execution = match self.coordinator_job_for_request(&prepared) {
+            Ok((execution, _)) => execution,
+            Err(error) => {
+                drop(artifact);
+                drop(prepared);
+                drop(bridge);
+                return Err(error);
+            }
+        };
+        let observation = JobResourceObservation {
+            host_bytes: retained_host_bytes,
+            accelerator_bytes,
+        };
+        let execution_job = match self
+            .coordinator
+            .admit_observed_from_preparation(bridge, execution, observation)
+            .await
+        {
+            Ok(job) => job,
+            Err(failure) => {
+                drop(artifact);
+                drop(prepared);
+                let error = failure.error;
+                drop(failure.bridge);
+                return Err(error);
+            }
+        };
+        Ok((prepared, execution_job))
     }
 
     async fn run_request_after_admission(
@@ -2241,8 +2769,8 @@ impl RuntimeService {
         job: JobLease,
         residency_lease: Option<ModelResidencyLease>,
     ) -> Result<EngineOutput> {
-        let mut request = self
-            .prepare_qwen3_asr_shape_for_binding(request, &job)
+        let (mut request, job) = self
+            .prepare_qwen3_asr_shape_for_binding(request, job, residency_lease.as_ref())
             .await?;
         let loaded_bundle = residency_lease
             .as_ref()
@@ -2525,8 +3053,8 @@ impl RuntimeService {
         F: FnMut(StreamingOutput) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
-        let mut request = self
-            .prepare_qwen3_asr_shape_for_binding(request, &job)
+        let (mut request, job) = self
+            .prepare_qwen3_asr_shape_for_binding(request, job, residency_lease.as_ref())
             .await?;
         let loaded_bundle = residency_lease
             .as_ref()
@@ -5191,12 +5719,12 @@ mod tests {
         offline_asr.model_variant = Some(ModelVariant::Qwen3Asr06BGguf);
         assert_eq!(
             coordinator_lane_for_request(&offline_asr),
-            CoordinatorLane::Resumable
+            CoordinatorLane::Atomic
         );
         offline_asr.streaming = true;
         assert_eq!(
             coordinator_lane_for_request(&offline_asr),
-            CoordinatorLane::Resumable
+            CoordinatorLane::Atomic
         );
         offline_asr
             .install_prepared_asr_audio(ModelVariant::Qwen3Asr06BGguf, vec![0.0; 16_000], 16_000)
