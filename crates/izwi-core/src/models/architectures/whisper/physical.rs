@@ -4,7 +4,9 @@ use candle_core::DType;
 use candle_transformers::models::whisper::Config;
 
 use crate::backends::BackendKind;
-use crate::engine::{NativeBatchMode, StageDescriptor, StageProgressKind};
+use crate::engine::{
+    NativeBatchMode, StageDescriptor, StageProgressKind, StageWorkSelector,
+};
 use crate::error::{Error, Result};
 use crate::kv::v2::{
     stage_graph_fingerprint, AttentionMask, AttentionPattern, CapabilityStateDescriptorV2,
@@ -27,6 +29,10 @@ const CUDA_STATIC_ATTENTION_TOKEN_ALIGNMENT: u64 = 32;
 
 #[derive(Debug, Clone)]
 pub(crate) struct WhisperPhysicalStateSpec {
+    pub(crate) retained: InferenceStateContract,
+    pub(crate) retained_max_tokens: usize,
+    pub(crate) retained_static_domain: StateDomainId,
+    pub(crate) retained_static_group: StateGroupId,
     pub(crate) descriptor: CapabilityStateDescriptorV2,
     pub(crate) invocation: InferenceStateContract,
 }
@@ -47,7 +53,20 @@ pub(crate) fn whisper_physical_state_spec(
         "Whisper decoder context exceeds u64",
     )?;
     let cross_capacity = whisper_cross_capacity(config.max_source_positions, backend)?;
-    let invocation = whisper_invocation_contract(config, state_dtype, cross_capacity)?;
+    let retained = whisper_state_contract(
+        config,
+        state_dtype,
+        cross_capacity,
+        StateScope::Retained,
+        CheckpointPolicy::Transactional,
+    )?;
+    let invocation = whisper_state_contract(
+        config,
+        state_dtype,
+        cross_capacity,
+        StateScope::Invocation,
+        CheckpointPolicy::None,
+    )?;
     let self_state = invocation
         .domains
         .iter()
@@ -70,18 +89,42 @@ pub(crate) fn whisper_physical_state_spec(
         .ok_or_else(|| model_load("Whisper invocation contract is empty"))?;
 
     let mut profiles = Vec::with_capacity(stage_graphs.len());
+    let mut has_invocation_workspace = false;
     for stages in stage_graphs {
         if stages.is_empty() {
             return Err(model_load("Whisper execution graph has no stages"));
         }
         for stage in *stages {
             stage.validate()?;
-            if stage.progress != StageProgressKind::Atomic
-                || stage.batch_mode != NativeBatchMode::None
-            {
-                return Err(model_load(
-                    "Whisper physical state requires independently scheduled atomic rows",
-                ));
+            match stage.selector {
+                StageWorkSelector::Atomic => {
+                    if stage.progress != StageProgressKind::Atomic
+                        || stage.batch_mode != NativeBatchMode::None
+                    {
+                        return Err(model_load(
+                            "Whisper long-form state requires independently scheduled atomic rows",
+                        ));
+                    }
+                }
+                StageWorkSelector::PreSequencePreparation => {
+                    if stage.batch_mode != NativeBatchMode::Static {
+                        return Err(model_load(
+                            "Whisper encoder preparation requires a static native batch",
+                        ));
+                    }
+                }
+                StageWorkSelector::SequencePrefill | StageWorkSelector::SequenceDecode => {
+                    if stage.batch_mode != NativeBatchMode::None {
+                        return Err(model_load(
+                            "Whisper scalar sequence stages cannot advertise native decoder batching",
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(model_load(
+                        "Whisper execution graph contains an unsupported stage selector",
+                    ));
+                }
             }
         }
 
@@ -89,20 +132,27 @@ pub(crate) fn whisper_physical_state_spec(
         ordered.sort_unstable_by_key(|stage| stage.id);
         let mut invocation_stages = Vec::with_capacity(ordered.len());
         for (index, stage) in ordered.into_iter().enumerate() {
-            let mut domains = vec![
-                InvocationWorkspaceDomain::State {
-                    placement: self_state.header().placement,
-                    formula: fixed_formula(self_bytes),
-                    state: self_state.clone(),
-                    capacity: InvocationStateCapacity::decoder_context(self_capacity)?,
-                },
-                InvocationWorkspaceDomain::State {
-                    placement: cross_state.header().placement,
-                    formula: fixed_formula(cross_bytes),
-                    state: cross_state.clone(),
-                    capacity: InvocationStateCapacity::SemanticBounded,
-                },
-            ];
+            let owns_legacy_state = stage.selector == StageWorkSelector::Atomic;
+            has_invocation_workspace |= owns_legacy_state || stage.max_workspace_bytes > 0;
+            let mut domains = Vec::new();
+            let mut groups = Vec::new();
+            if owns_legacy_state {
+                groups = invocation.groups.clone();
+                domains.extend([
+                    InvocationWorkspaceDomain::State {
+                        placement: self_state.header().placement,
+                        formula: fixed_formula(self_bytes),
+                        state: self_state.clone(),
+                        capacity: InvocationStateCapacity::decoder_context(self_capacity)?,
+                    },
+                    InvocationWorkspaceDomain::State {
+                        placement: cross_state.header().placement,
+                        formula: fixed_formula(cross_bytes),
+                        state: cross_state.clone(),
+                        capacity: InvocationStateCapacity::SemanticBounded,
+                    },
+                ]);
+            }
             if stage.max_workspace_bytes > 0 {
                 let ordinal = u32::try_from(index + 1)
                     .map_err(|_| model_load("Whisper execution stage count exceeds u32"))?;
@@ -119,8 +169,12 @@ pub(crate) fn whisper_physical_state_spec(
             }
             invocation_stages.push(InvocationStageWorkspace {
                 stage: stage.id,
-                lease_scope: InvocationLeaseScope::PerRow,
-                groups: invocation.groups.clone(),
+                lease_scope: if stage.selector == StageWorkSelector::PreSequencePreparation {
+                    InvocationLeaseScope::PerStageBatch
+                } else {
+                    InvocationLeaseScope::PerRow
+                },
+                groups,
                 domains,
             });
         }
@@ -132,24 +186,43 @@ pub(crate) fn whisper_physical_state_spec(
     profiles.sort_unstable_by_key(|profile| profile.stage_graph_fingerprint);
     profiles.dedup();
 
+    let invocation_workspaces = if has_invocation_workspace {
+        InvocationWorkspaceSet::Bounded { profiles }
+    } else {
+        InvocationWorkspaceSet::None {
+            stage_graph_fingerprints: profiles
+                .into_iter()
+                .map(|profile| profile.stage_graph_fingerprint)
+                .collect(),
+        }
+    };
+
     let descriptor = CapabilityStateDescriptorV2 {
         abi: CURRENT_INFERENCE_STATE_ABI,
-        retained: RetainedStateCapability::Stateless,
-        invocation: InvocationWorkspaceSet::Bounded { profiles },
+        retained: RetainedStateCapability::Managed {
+            contract: retained.clone(),
+        },
+        invocation: invocation_workspaces,
     };
     for stages in stage_graphs {
         descriptor.validate_against_stages(stages)?;
     }
     Ok(WhisperPhysicalStateSpec {
+        retained,
+        retained_max_tokens: config.max_target_positions,
+        retained_static_domain: WHISPER_CROSS_STATE_DOMAIN,
+        retained_static_group: WHISPER_CROSS_STATE_GROUP,
         descriptor,
         invocation,
     })
 }
 
-fn whisper_invocation_contract(
+fn whisper_state_contract(
     config: &Config,
     dtype: StateDType,
     cross_capacity: u64,
+    scope: StateScope,
+    checkpoint: CheckpointPolicy,
 ) -> Result<InferenceStateContract> {
     let query_heads = usize_to_u32(
         config.decoder_attention_heads,
@@ -188,11 +261,11 @@ fn whisper_invocation_contract(
         .collect::<Result<Vec<_>>>()?;
     let header = |id, clock| StateDomainHeader {
         id,
-        scope: StateScope::Invocation,
+        scope,
         clock,
         placement: PlacementPolicy::BackendLocal,
         prefix: PrefixPolicy::Disabled,
-        checkpoint: CheckpointPolicy::None,
+        checkpoint,
     };
     let contract = InferenceStateContract {
         abi: CURRENT_INFERENCE_STATE_ABI,
@@ -459,8 +532,15 @@ mod tests {
             .expect("physical state");
             assert!(matches!(
                 &spec.descriptor.retained,
-                RetainedStateCapability::Stateless
+                RetainedStateCapability::Managed { contract } if contract == &spec.retained
             ));
+            assert_eq!(spec.retained_max_tokens, 65);
+            assert_eq!(spec.retained_static_domain, WHISPER_CROSS_STATE_DOMAIN);
+            assert_eq!(spec.retained_static_group, WHISPER_CROSS_STATE_GROUP);
+            assert!(spec.retained.domains.iter().all(|domain| {
+                domain.scope() == StateScope::Retained
+                    && domain.header().checkpoint == CheckpointPolicy::Transactional
+            }));
             assert_eq!(
                 spec.invocation.groups,
                 vec![
@@ -615,6 +695,46 @@ mod tests {
             &[&[native_batch]],
         )
         .is_err());
+    }
+
+    #[test]
+    fn normal_graph_uses_retained_state_and_no_legacy_invocation_domains() {
+        let mut encoder = stage(64);
+        encoder.selector = StageWorkSelector::PreSequencePreparation;
+        encoder.batch_mode = NativeBatchMode::Static;
+        encoder.max_batch_size = 4;
+        encoder.max_work_units = 4;
+        encoder.concurrency = ConcurrencyClass::Batchable;
+        encoder.shape_policy = StageShapePolicy::Padded;
+
+        let mut prefill = stage(0);
+        prefill.id = StageId::new(2);
+        prefill.selector = StageWorkSelector::SequencePrefill;
+        prefill.progress = StageProgressKind::Iterative;
+        let mut decode = prefill.clone();
+        decode.id = StageId::new(3);
+        decode.selector = StageWorkSelector::SequenceDecode;
+
+        let stages = [encoder, prefill, decode];
+        let spec = whisper_physical_state_spec(
+            &config(),
+            DType::F32,
+            BackendKind::Cpu,
+            &[&stages],
+        )
+        .expect("normal retained Whisper graph");
+        let InvocationWorkspaceSet::Bounded { profiles } = &spec.descriptor.invocation
+        else {
+            panic!("normal graph must authenticate encoder scratch");
+        };
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].stages[0].domains.len(), 1);
+        assert!(matches!(
+            profiles[0].stages[0].domains[0],
+            InvocationWorkspaceDomain::Scratch { .. }
+        ));
+        assert!(profiles[0].stages[1].domains.is_empty());
+        assert!(profiles[0].stages[2].domains.is_empty());
     }
 
     #[test]

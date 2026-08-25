@@ -8,7 +8,10 @@ use candle_transformers::models::whisper::Config;
 use candle_transformers::models::with_tracing::{linear, linear_no_bias, Linear};
 
 use crate::backends::state::{StaticAttentionLayerValue, StaticAttentionRaggedRow};
-use crate::engine::InvocationStaticAttentionLease;
+use crate::engine::{
+    InvocationStaticAttentionLease, RetainedStaticAttentionRuntimeV2,
+    RetainedStaticAttentionSequenceId,
+};
 use crate::error::{Error, Result};
 use crate::kv::v2::{DomainStepIntent, StateUpdateKind};
 use crate::models::shared::attention::flash::try_fused_self_attention;
@@ -376,6 +379,54 @@ impl ResidualAttentionBlock {
         )?;
         Ok((x + mlp)?)
     }
+
+    fn forward_decoder_retained(
+        &self,
+        model_layer: usize,
+        x: &Tensor,
+        self_kv: &PhysicalPagedKvCache,
+        prepared: &mut PreparedPhysicalPagedStep,
+        cross_runtime: &RetainedStaticAttentionRuntimeV2,
+        cross_sequence: RetainedStaticAttentionSequenceId,
+    ) -> Result<Tensor> {
+        let _enter = self.span.enter();
+        let self_input = self.attn_ln.forward(x)?;
+        let (q, k, v) = self
+            .attn
+            .project_self_attention_qkv_token_major(&self_input)?;
+        let head_dim = q.dim(2)?;
+        let scale = 1.0_f32 / (head_dim as f32).sqrt();
+        let attended = self_kv.write_and_attend(model_layer, prepared, &q, &k, &v, scale)?;
+        let mut x = (x + self.attn.project_output_token_major(&attended)?)?;
+
+        let (cross_attn, cross_ln) = self.cross_attn.as_ref().ok_or_else(|| {
+            Error::InvalidInput("Whisper decoder layer has no cross attention".into())
+        })?;
+        let cross_query = cross_attn.project_cross_attention_query(&cross_ln.forward(&x)?)?;
+        let query_len = u32::try_from(cross_query.dim(0)?)
+            .map_err(|_| Error::InvalidInput("Whisper query length exceeds u32".into()))?;
+        let model_layer = u32::try_from(model_layer)
+            .map_err(|_| Error::InvalidInput("Whisper layer index exceeds u32".into()))?;
+        let cross_attended = cross_runtime.attend(
+            cross_sequence,
+            model_layer,
+            &cross_query,
+            &[StaticAttentionRaggedRow {
+                query_start: 0,
+                query_len,
+            }],
+            scale,
+        )?;
+        x = (&x + cross_attn.project_output_token_major(&cross_attended)?)?;
+
+        let mlp = self.mlp_linear2.forward(
+            &self
+                .mlp_linear1
+                .forward(&self.mlp_ln.forward(&x)?)?
+                .gelu()?,
+        )?;
+        Ok((x + mlp)?)
+    }
 }
 
 fn sinusoids(length: usize, channels: usize, device: &Device, dtype: DType) -> Result<Tensor> {
@@ -470,6 +521,16 @@ impl AudioEncoder {
         let x = self.ln_post.forward(&x)?;
         Ok(x)
     }
+
+    pub(crate) fn forward_batch(&self, x: &Tensor) -> Result<Tensor> {
+        let (batch, _, frames) = x.dims3()?;
+        if batch == 0 || frames == 0 {
+            return Err(Error::InvalidInput(
+                "Whisper encoder batch requires non-empty rows and frames".into(),
+            ));
+        }
+        self.forward(x)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -533,14 +594,31 @@ impl TextDecoder {
             },
         };
         cross_kv.begin_install(&intent)?;
-        for (model_layer, block) in self.blocks.iter().enumerate() {
-            let model_layer = u32::try_from(model_layer)
-                .map_err(|_| Error::InvalidInput("Whisper layer index exceeds u32".into()))?;
-            cross_kv.install_layer(
-                block.project_cross_attention_memory(model_layer, audio_features)?,
-            )?;
+        for layer in self.prepare_cross_attention_memory(audio_features)? {
+            cross_kv.install_layer(layer)?;
         }
         cross_kv.commit_install()
+    }
+
+    pub(crate) fn prepare_cross_attention_memory(
+        &self,
+        audio_features: &Tensor,
+    ) -> Result<Vec<StaticAttentionLayerValue>> {
+        let (batch, memory_tokens, _) = audio_features.dims3()?;
+        if batch != 1 || memory_tokens == 0 {
+            return Err(Error::InvalidInput(format!(
+                "Whisper cross attention requires one non-empty encoder row, got batch {batch} and {memory_tokens} tokens"
+            )));
+        }
+        self.blocks
+            .iter()
+            .enumerate()
+            .map(|(model_layer, block)| {
+                let model_layer = u32::try_from(model_layer)
+                    .map_err(|_| Error::InvalidInput("Whisper layer index exceeds u32".into()))?;
+                block.project_cross_attention_memory(model_layer, audio_features)
+            })
+            .collect()
     }
 
     pub(crate) fn forward_physical_at(
@@ -598,6 +676,69 @@ impl TextDecoder {
                 self_kv,
                 &mut prepared,
                 cross_kv,
+            )?;
+        }
+        let x = self.ln.forward(&x)?;
+        self_kv.commit_prepared(prepared)?;
+        Ok(x)
+    }
+
+    pub(crate) fn forward_retained_at(
+        &self,
+        tokens: &Tensor,
+        position_offset: usize,
+        self_kv: &mut PhysicalPagedKvCache,
+        cross_runtime: &RetainedStaticAttentionRuntimeV2,
+        cross_sequence: RetainedStaticAttentionSequenceId,
+    ) -> Result<Tensor> {
+        let _enter = self.span.enter();
+        let (batch, token_count) = tokens.dims2()?;
+        if batch != 1 || token_count == 0 {
+            return Err(Error::InvalidInput(format!(
+                "Whisper retained decoder requires one non-empty token row, got batch {batch} and {token_count} tokens"
+            )));
+        }
+        if position_offset != self_kv.context_len() {
+            return Err(Error::InvalidInput(format!(
+                "Whisper decoder position {position_offset} does not match physical cache cursor {}",
+                self_kv.context_len()
+            )));
+        }
+        let hidden_size = self.token_embedding.embeddings().dim(1)?;
+        if self.n_head == 0 || hidden_size % self.n_head != 0 {
+            return Err(Error::InvalidInput(
+                "Whisper decoder hidden size is not divisible by its head count".into(),
+            ));
+        }
+        self_kv.validate_model(self.blocks.len(), self.n_head, hidden_size / self.n_head)?;
+        if cross_runtime.read(cross_sequence)?.is_none() {
+            return Err(Error::InvalidInput(
+                "Whisper retained cross-attention memory is not installed".into(),
+            ));
+        }
+        let position_end = position_offset
+            .checked_add(token_count)
+            .ok_or_else(|| Error::InvalidInput("Whisper decoder position overflow".into()))?;
+        if position_end > self.positional_embedding.dim(0)? {
+            return Err(Error::InvalidInput(format!(
+                "Whisper decoder position {position_end} exceeds its positional capacity"
+            )));
+        }
+        let token_embedding = self.token_embedding.forward(tokens)?;
+        let positional_embedding =
+            self.positional_embedding
+                .narrow(0, position_offset, token_count)?;
+        let positional_embedding = to_add_dtype(positional_embedding, token_embedding.dtype())?;
+        let mut x = token_embedding.broadcast_add(&positional_embedding)?;
+        let mut prepared = self_kv.prepare_append(position_offset, token_count)?;
+        for (model_layer, block) in self.blocks.iter().enumerate() {
+            x = block.forward_decoder_retained(
+                model_layer,
+                &x,
+                self_kv,
+                &mut prepared,
+                cross_runtime,
+                cross_sequence,
             )?;
         }
         let x = self.ln.forward(&x)?;
