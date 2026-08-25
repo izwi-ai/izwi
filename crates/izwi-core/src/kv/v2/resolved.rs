@@ -577,6 +577,11 @@ impl StateStorageFormat {
                 .checked_mul(2)
                 .ok_or_else(|| invalid("state page byte calculation overflow")),
             Self::Dense {
+                dtype: StateDType::I64,
+            } => elements
+                .checked_mul(8)
+                .ok_or_else(|| invalid("state page byte calculation overflow")),
+            Self::Dense {
                 dtype: StateDType::I8,
             } => Ok(elements),
             Self::Dense {

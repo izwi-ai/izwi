@@ -849,6 +849,7 @@ fn minimum_dtype_bytes(elements: u64, dtypes: &[super::contract::StateDType]) ->
             super::contract::StateDType::F16 | super::contract::StateDType::Bf16 => {
                 elements.checked_mul(2)
             }
+            super::contract::StateDType::I64 => elements.checked_mul(8),
             super::contract::StateDType::I8 => Some(elements),
             super::contract::StateDType::Q4 => elements.checked_add(1).map(|value| value / 2),
         })

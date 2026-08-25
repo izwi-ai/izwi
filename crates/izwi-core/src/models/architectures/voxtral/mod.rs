@@ -181,7 +181,7 @@ fn voxtral_paged_invocation_bytes(state: &StateDomainSpec, max_tokens: u64) -> R
         .map(|dtype| match dtype {
             StateDType::F32 => Ok(4_u64),
             StateDType::F16 | StateDType::Bf16 => Ok(2_u64),
-            StateDType::I8 | StateDType::Q4 => Err(Error::ModelLoadError(
+            StateDType::I64 | StateDType::I8 | StateDType::Q4 => Err(Error::ModelLoadError(
                 "Voxtral invocation paging requires a dense loaded KV dtype".into(),
             )),
         })

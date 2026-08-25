@@ -152,6 +152,7 @@ const fn dtype_bytes(dtype: StateDType) -> u64 {
     match dtype {
         StateDType::F32 => 4,
         StateDType::F16 | StateDType::Bf16 => 2,
+        StateDType::I64 => 8,
         StateDType::I8 => 1,
         StateDType::Q4 => 1,
     }

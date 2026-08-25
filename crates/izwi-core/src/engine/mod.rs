@@ -32,6 +32,7 @@ mod core;
 pub mod execution;
 mod execution_group;
 mod executor;
+pub(crate) use executor::{decode_request_audio_with_rate, qwen3_asr_requires_long_form};
 pub mod metrics;
 mod output;
 mod request;
@@ -1158,35 +1159,43 @@ impl Engine {
                 let model = registry.get_asr_lease(variant).await.ok_or_else(|| {
                     Error::ModelNotFound(format!("ASR model {variant} is not loaded"))
                 })?;
-                let managed_incremental = request.streaming
-                    && request
-                        .v2_state_runtime()
-                        .and_then(|runtime| runtime.managed_kv_runtime())
-                        .is_some();
-                if managed_incremental {
+                if variant.family() == crate::catalog::ModelFamily::Qwen3Asr
+                    && request.prepared_asr_execution_shape().is_none()
+                {
                     let model_for_shape = model.model_arc();
-                    let language = request.asr_language_for_execution().map(str::to_string);
-                    let prompt = request.asr_prompt_for_execution().map(str::to_string);
                     let request_id = request.id.clone();
+                    let context_limit = registry
+                        .effective_context(variant)
+                        .unwrap_or(self.config.max_seq_len);
                     let prepared = tokio::task::spawn_blocking(move || {
+                        let mut request = request;
                         let (samples, sample_rate) =
                             executor::decode_request_audio_with_rate(&request)?;
-                        if model_for_shape.max_audio_seconds_hint().is_some_and(|limit| {
-                            sample_rate > 0
-                                && samples.len() as f32 / sample_rate as f32 > limit
-                        }) {
-                            return Err(Error::InvalidInput(
-                                "managed incremental ASR requires one bounded model input; long-form audio must select the chunked graph"
-                                    .to_string(),
-                            ));
-                        }
-                        let input_tokens = model_for_shape.incremental_prompt_token_count(
+                        let long_form = executor::qwen3_asr_requires_long_form(
                             &samples,
                             sample_rate,
-                            language.as_deref(),
-                            prompt.as_deref(),
-                        )?;
-                        Ok::<_, Error>((request, input_tokens))
+                            model_for_shape.max_audio_seconds_hint(),
+                        );
+                        let input_tokens = (!long_form)
+                            .then(|| {
+                                model_for_shape.incremental_prompt_token_count(
+                                    &samples,
+                                    sample_rate,
+                                    request.asr_language_for_execution(),
+                                    request.asr_prompt_for_execution(),
+                                )
+                            })
+                            .transpose()?;
+                        request.install_prepared_asr_audio(variant, samples, sample_rate)?;
+                        if long_form {
+                            request.install_prepared_asr_long_form_atomic()?;
+                        } else {
+                            request.install_prepared_sequence_input_tokens(
+                                input_tokens.expect("normal Qwen3 ASR shape"),
+                                context_limit,
+                            )?;
+                        }
+                        Ok::<_, Error>(request)
                     })
                     .await
                     .map_err(|error| {
@@ -1194,11 +1203,7 @@ impl Engine {
                             "ASR request {request_id} sequence-shape worker failed: {error}"
                         ))
                     })??;
-                    request = prepared.0;
-                    let context_limit = registry
-                        .effective_context(variant)
-                        .unwrap_or(self.config.max_seq_len);
-                    request.install_prepared_sequence_input_tokens(prepared.1, context_limit)?;
+                    request = prepared;
                 }
                 request.install_asr_execution_model(variant, model)?;
             }
@@ -1884,6 +1889,24 @@ mod tests {
     use crate::backends::{BackendKind, DeviceProfile};
     use crate::error::Error;
     use crate::models::shared::chat::{ChatMediaInput, ChatMediaKind, ChatMessage, ChatRole};
+
+    #[test]
+    fn non_streaming_qwen_asr_shape_replaces_the_placeholder_before_admission() {
+        let mut request = EngineCoreRequest::asr_bytes(vec![1, 2, 3]);
+        assert!(!request.streaming);
+        assert_eq!(
+            request.num_prompt_tokens(),
+            1,
+            "fixture starts with a placeholder"
+        );
+
+        request
+            .install_prepared_sequence_input_tokens(37, 64)
+            .expect("exact multimodal shape");
+        assert_eq!(request.num_prompt_tokens(), 37);
+        assert!(request.uses_asr_retained_sequence());
+        assert!(request.install_prepared_asr_long_form_atomic().is_err());
+    }
 
     struct EndlessSequenceExecutor;
 

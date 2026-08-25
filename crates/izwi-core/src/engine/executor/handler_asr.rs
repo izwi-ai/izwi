@@ -1,23 +1,221 @@
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
-use crate::models::registry::NativeAsrGenerationOptions;
+use crate::models::registry::{
+    NativeAsrDecodeCheckpoint, NativeAsrDecodeStep, NativeAsrGenerationOptions,
+};
 use crate::runtime::granite_auto_asr_max_tokens_for_duration;
 use serde_json::json;
+use std::sync::Arc;
 use std::time::Instant;
 
 use super::super::request::EngineCoreRequest;
 use super::super::scheduler::ScheduledRequest;
 use super::super::types::AudioOutput;
+use super::super::SessionKey;
 use super::audio::{decode_request_audio_with_rate, AsrChunkTranscription};
 use super::state::ActiveAsrDecode;
 use super::{
     ExecutorOutput, ExecutorPhaseTiming, ExecutorStateLease, ModelSessionResult, NativeExecutor,
 };
-use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 
 const MAX_ASR_NEW_TOKENS: usize = 512;
 const GRANITE_ASR_PREFIX_REPLAY_WORDS: usize = 0;
 const GRANITE_ASR_PREFIX_REPLAY_WORDS_MAX: usize = 240;
+
+enum AsrExecutionAudio {
+    Prepared(Arc<[f32]>),
+    Decoded(Vec<f32>),
+}
+
+impl AsrExecutionAudio {
+    fn samples(&self) -> &[f32] {
+        match self {
+            Self::Prepared(samples) => samples,
+            Self::Decoded(samples) => samples,
+        }
+    }
+}
+
+fn resolve_asr_execution_audio(
+    request: &EngineCoreRequest,
+    family: ModelFamily,
+    decode: impl FnOnce() -> Result<(Vec<f32>, u32)>,
+) -> Result<(AsrExecutionAudio, u32, f64)> {
+    if family == ModelFamily::Qwen3Asr {
+        let (samples, sample_rate) =
+            request.prepared_asr_audio_for_executor()?.ok_or_else(|| {
+                Error::InferenceError(
+                    "Qwen3 ASR execution lost its prepared decoded-audio artifact".to_string(),
+                )
+            })?;
+        return Ok((AsrExecutionAudio::Prepared(samples), sample_rate, 0.0));
+    }
+    let started = Instant::now();
+    let (samples, sample_rate) = decode()?;
+    Ok((
+        AsrExecutionAudio::Decoded(samples),
+        sample_rate,
+        started.elapsed().as_secs_f64() * 1000.0,
+    ))
+}
+
+fn begins_resumable_asr_prefill_state(
+    scheduled: &ScheduledRequest,
+    resumable_prefill: bool,
+) -> bool {
+    scheduled.is_prefill && resumable_prefill && scheduled.num_computed_tokens == 0
+}
+
+fn resumable_asr_prefill_span(
+    scheduled: &ScheduledRequest,
+    prompt_tokens: usize,
+) -> Result<(usize, usize)> {
+    let start = scheduled.num_computed_tokens;
+    let end = start.checked_add(scheduled.num_tokens).ok_or_else(|| {
+        Error::InvalidInput("resumable ASR prefill span overflowed prompt accounting".into())
+    })?;
+    let crate::engine::WorkUnit::SequenceStep { phase, input, .. } = &scheduled.work else {
+        return Err(Error::InvalidInput(
+            "resumable ASR prefill requires sequence-prefill work".into(),
+        ));
+    };
+    if *phase != crate::engine::SequencePhase::Prefill
+        || input.start != start
+        || input.end != end
+        || start >= end
+        || end > prompt_tokens
+    {
+        return Err(Error::InvalidInput(format!(
+            "resumable ASR prefill work [{}, {}) disagrees with scheduler span [{start}, {end}) for {prompt_tokens} prompt tokens",
+            input.start, input.end
+        )));
+    }
+    Ok((start, end))
+}
+
+/// Run one physical ASR model call and observe cooperative cancellation before
+/// any caller can publish output or detach the transaction checkpoint. Native
+/// device calls are not preemptible, so this post-call edge is the first safe
+/// point at which a cancellation that arrived during the call can be honored.
+fn run_asr_model_call<T>(
+    request: &EngineCoreRequest,
+    run: impl FnOnce() -> Result<T>,
+) -> Result<Option<T>> {
+    let output = run()?;
+    Ok((!request.is_cancelled()).then_some(output))
+}
+
+fn validate_continuous_asr_batch_shape(scheduled: &[ScheduledRequest]) -> Result<()> {
+    if scheduled.is_empty()
+        || scheduled
+            .iter()
+            .any(|scheduled| scheduled.is_prefill || scheduled.num_tokens != 1)
+    {
+        return Err(Error::InvalidInput(
+            "continuous ASR execution requires one decode token per row".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+struct ContinuousAsrStateBatch<'a> {
+    rows: Vec<(
+        usize,
+        SessionKey,
+        ExecutorStateLease<'a, ActiveAsrDecode>,
+        Option<(NativeAsrDecodeCheckpoint, usize, usize)>,
+    )>,
+    armed: bool,
+}
+
+impl<'a> ContinuousAsrStateBatch<'a> {
+    fn new(rows: Vec<(usize, SessionKey, ExecutorStateLease<'a, ActiveAsrDecode>)>) -> Self {
+        Self {
+            rows: rows
+                .into_iter()
+                .map(|(index, session, lease)| (index, session, lease, None))
+                .collect(),
+            armed: true,
+        }
+    }
+
+    fn commit(mut self) -> Vec<(usize, SessionKey, ExecutorStateLease<'a, ActiveAsrDecode>)> {
+        self.armed = false;
+        std::mem::take(&mut self.rows)
+            .into_iter()
+            .map(|(index, session, lease, _)| (index, session, lease))
+            .collect()
+    }
+
+    fn rollback_row(&mut self, row: usize) -> Result<usize> {
+        let (index, _, lease, checkpoint) = self.rows.get_mut(row).ok_or_else(|| {
+            Error::InferenceError("continuous ASR rollback row is out of range".to_string())
+        })?;
+        let (checkpoint, last_tokens_generated, stream_sequence) =
+            checkpoint.take().ok_or_else(|| {
+                Error::InferenceError(
+                    "continuous ASR row has no armed checkpoint to roll back".to_string(),
+                )
+            })?;
+        let state = lease.require_state_mut()?;
+        state.state.rollback_managed_quantum(checkpoint)?;
+        state.last_tokens_generated = last_tokens_generated;
+        state.stream_sequence = stream_sequence;
+        lease.mark_clean();
+        Ok(*index)
+    }
+}
+
+impl Drop for ContinuousAsrStateBatch<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        for (_, session, lease, checkpoint) in &mut self.rows {
+            if let Some((checkpoint, last_tokens_generated, stream_sequence)) = checkpoint.take() {
+                let rollback = lease.require_state_mut().and_then(|state| {
+                    state.state.rollback_managed_quantum(checkpoint)?;
+                    state.last_tokens_generated = last_tokens_generated;
+                    state.stream_sequence = stream_sequence;
+                    Ok(())
+                });
+                match rollback {
+                    Ok(()) => lease.mark_clean(),
+                    Err(error) => {
+                        tracing::error!(
+                            request_id = %session.request_id,
+                            epoch = session.epoch,
+                            %error,
+                            "continuous ASR rollback failed; state fenced until cleanup"
+                        );
+                    }
+                }
+            }
+        }
+        self.rows.clear();
+    }
+}
+
+fn rollback_scalar_asr_quantum(
+    state_lease: &mut ExecutorStateLease<'_, ActiveAsrDecode>,
+    checkpoint: &mut Option<NativeAsrDecodeCheckpoint>,
+    outer_checkpoint: Option<(usize, usize)>,
+    fresh_state: bool,
+) -> Result<()> {
+    if let Some(checkpoint) = checkpoint.take() {
+        let active_state = state_lease.require_state_mut()?;
+        active_state.state.rollback_managed_quantum(checkpoint)?;
+        if let Some((last_tokens_generated, stream_sequence)) = outer_checkpoint {
+            active_state.last_tokens_generated = last_tokens_generated;
+            active_state.stream_sequence = stream_sequence;
+        }
+        state_lease.mark_clean();
+    } else if fresh_state {
+        state_lease.discard_state();
+        state_lease.mark_clean();
+    }
+    Ok(())
+}
 
 fn with_single_invocation_cache<T>(
     request: &EngineCoreRequest,
@@ -137,29 +335,834 @@ impl NativeExecutor {
         self.transcribe_request_with_managed_cache(request, scheduled, None)
     }
 
+    fn qwen3_asr_sequence_request(
+        &self,
+        request: &EngineCoreRequest,
+        scheduled: &ScheduledRequest,
+        mut managed_state: Option<super::RetainedRowManagedState>,
+    ) -> Result<ModelSessionResult> {
+        let variant = Self::resolve_variant(request)?;
+        let prepared_model = request.prepared_asr_model_for_executor()?.ok_or_else(|| {
+            Error::InferenceError(
+                "Qwen3 ASR sequence request has no exact loaded model identity".to_string(),
+            )
+        })?;
+        if !prepared_model.supports_incremental_decode() {
+            return Err(Error::InvalidInput(
+                "loaded Qwen3 ASR model has no retained sequence decoder".to_string(),
+            ));
+        }
+        if request.managed_cache_runtime().is_none() || managed_state.is_none() {
+            return Err(Error::InferenceError(
+                "Qwen3 ASR sequence execution requires scheduler-owned retained state".to_string(),
+            ));
+        }
+        let mut retained = managed_state.take().expect("validated retained ASR state");
+        let tensor_reservation = retained.tensor_state;
+        let mut managed_cache = Some(retained.take_only_paged()?);
+        let tensor_arena = request
+            .managed_cache_runtime()
+            .and_then(|runtime| runtime.tensor_state());
+        if tensor_arena.is_some() != tensor_reservation.is_some() {
+            return Err(Error::InferenceError(
+                "Qwen3 ASR sequence lost its prepared-input tensor-state reservation".to_string(),
+            ));
+        }
+
+        let resumable_prefill =
+            self.config.enable_chunked_prefill && prepared_model.supports_resumable_prefill();
+        let prompt_tokens = request.num_prompt_tokens();
+        let resumable_span = (scheduled.is_prefill && resumable_prefill)
+            .then(|| resumable_asr_prefill_span(scheduled, prompt_tokens))
+            .transpose()?;
+        if scheduled.is_prefill
+            && !resumable_prefill
+            && (scheduled.num_computed_tokens != 0 || scheduled.num_tokens != prompt_tokens)
+        {
+            return Err(Error::InvalidInput(
+                "managed Qwen3 ASR full prefill requires one exact multimodal prompt quantum"
+                    .to_string(),
+            ));
+        }
+
+        let session = scheduled.session_key();
+        let mut state_lease =
+            ExecutorStateLease::checkout(&self.asr_decode_states, session, "ASR decode")?;
+        if state_lease
+            .state()
+            .map(|state| state.variant != variant)
+            .unwrap_or(false)
+        {
+            state_lease.discard_state();
+        }
+
+        let mut checkpoint = None;
+        let mut outer_checkpoint = None;
+        let mut fresh_state = false;
+        let initial_media_decode_ms = None;
+        if let Some(active) = state_lease.state() {
+            if !Arc::ptr_eq(&active.model, &prepared_model) {
+                return Err(Error::InferenceError(
+                    "Qwen3 ASR sequence state belongs to a different loaded model instance"
+                        .to_string(),
+                ));
+            }
+            let cache = managed_cache.take().ok_or_else(|| {
+                Error::InferenceError(
+                    "Qwen3 ASR continuation lost its managed-cache reservation".to_string(),
+                )
+            })?;
+            outer_checkpoint = Some((active.last_tokens_generated, active.stream_sequence));
+            let next_checkpoint = state_lease
+                .require_state_mut()?
+                .state
+                .begin_managed_quantum(cache)?;
+            checkpoint = Some(next_checkpoint);
+            if let (Some(arena), Some(reservation)) = (tensor_arena, tensor_reservation) {
+                let hydration = state_lease
+                    .require_state_mut()?
+                    .state
+                    .bind_qwen3_tensor_sequence(reservation.sequence)
+                    .and_then(|()| {
+                        state_lease
+                            .require_state_mut()?
+                            .state
+                            .restore_qwen3_prepared_tensor_state(arena)
+                    });
+                if let Err(error) = hydration {
+                    state_lease
+                        .require_state_mut()?
+                        .state
+                        .rollback_managed_quantum(
+                            checkpoint
+                                .take()
+                                .expect("checkpoint installed before hydration"),
+                        )?;
+                    state_lease.mark_clean();
+                    return Err(error);
+                }
+            }
+            state_lease.mark_dirty();
+        } else {
+            if !scheduled.is_prefill {
+                return Err(Error::InferenceError(format!(
+                    "Qwen3 ASR request {} lost its decode state before continuation",
+                    request.id
+                )));
+            }
+            if resumable_prefill && scheduled.num_computed_tokens != 0 {
+                return Err(Error::InferenceError(format!(
+                    "resumable Qwen3 ASR request {} lost its state before prompt span continuation",
+                    request.id
+                )));
+            }
+            if request.is_cancelled() {
+                state_lease.release()?;
+                return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                    request.id.clone(),
+                )));
+            }
+
+            let (samples, sample_rate) =
+                request.prepared_asr_audio_for_executor()?.ok_or_else(|| {
+                    Error::InferenceError(
+                        "Qwen3 ASR sequence request lost its prepared decoded audio".to_string(),
+                    )
+                })?;
+            let samples_len = samples.len();
+            let chunk_plan = Self::asr_chunk_plan(
+                samples.as_ref(),
+                sample_rate,
+                prepared_model.max_audio_seconds_hint(),
+                false,
+                false,
+            );
+            if chunk_plan.requires_chunk_path() {
+                return Err(Error::InvalidInput(
+                    "managed Qwen3 ASR cannot switch a retained sequence row to the long-audio chunk executor"
+                        .to_string(),
+                ));
+            }
+
+            let max_new_tokens = request.params.max_tokens.clamp(1, MAX_ASR_NEW_TOKENS);
+            let cache = managed_cache.take().ok_or_else(|| {
+                Error::InferenceError(
+                    "Qwen3 ASR prefill lost its managed-cache reservation".to_string(),
+                )
+            })?;
+            let decode_state = if begins_resumable_asr_prefill_state(scheduled, resumable_prefill) {
+                run_asr_model_call(request, || {
+                    Self::run_blocking(|| {
+                        prepared_model.start_resumable_prefill_state_with_prompt_managed(
+                            &samples,
+                            sample_rate,
+                            request.asr_language_for_execution(),
+                            request.asr_prompt_for_execution(),
+                            max_new_tokens,
+                            cache,
+                        )
+                    })
+                })?
+            } else {
+                run_asr_model_call(request, || {
+                    Self::run_blocking(|| {
+                        prepared_model.start_decode_state_with_prompt_managed(
+                            &samples,
+                            sample_rate,
+                            request.asr_language_for_execution(),
+                            request.asr_prompt_for_execution(),
+                            max_new_tokens,
+                            cache,
+                        )
+                    })
+                })?
+            };
+            let Some(mut decode_state) = decode_state else {
+                state_lease.release()?;
+                return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                    request.id.clone(),
+                )));
+            };
+            if decode_state.prefill_token_count() != Some(prompt_tokens) {
+                return Err(Error::InferenceError(
+                    "Qwen3 ASR prepared multimodal span does not match scheduler admission"
+                        .to_string(),
+                ));
+            }
+            let expected_position = if resumable_prefill { 0 } else { prompt_tokens };
+            if decode_state.sequence_position() != Some(expected_position)
+                || decode_state.prefill_progress() != Some(expected_position)
+            {
+                return Err(Error::InferenceError(
+                    "Qwen3 ASR decoder state started at an unexpected prefill cursor".to_string(),
+                ));
+            }
+            if let Some(reservation) = tensor_reservation {
+                decode_state.bind_qwen3_tensor_sequence(reservation.sequence)?;
+            }
+            let model_lease = request
+                .prepared_asr_model_lease_for_executor()?
+                .ok_or_else(|| {
+                    Error::InferenceError(
+                        "Qwen3 ASR sequence request lost its model residency lease".to_string(),
+                    )
+                })?;
+            state_lease.install_state(ActiveAsrDecode {
+                variant,
+                model: prepared_model.clone(),
+                _model_lease: model_lease,
+                state: decode_state,
+                last_tokens_generated: 0,
+                stream_sequence: 0,
+                input_sample_rate: sample_rate,
+                input_sample_count: samples_len,
+            })?;
+            fresh_state = true;
+        }
+
+        if request.is_cancelled() {
+            rollback_scalar_asr_quantum(
+                &mut state_lease,
+                &mut checkpoint,
+                outer_checkpoint,
+                fresh_state,
+            )?;
+            state_lease.release()?;
+            return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                request.id.clone(),
+            )));
+        }
+
+        state_lease.mark_dirty();
+        let execution = (|| {
+            let active_state = state_lease.require_state_mut()?;
+            let mut decode_steps_ran = 0usize;
+            let mut total_tokens_generated = 0usize;
+            let mut final_text = String::new();
+            let mut finished = false;
+            let mut cancelled = false;
+            let mut stream_events = Vec::new();
+            let iterations = if scheduled.is_prefill {
+                1
+            } else {
+                scheduled.num_tokens.max(1)
+            };
+
+            for _ in 0..iterations {
+                if request.is_cancelled() {
+                    cancelled = true;
+                    break;
+                }
+                let step = if let Some((span_start, span_end)) = resumable_span {
+                    let Some(prefill_complete) = run_asr_model_call(request, || {
+                        Self::run_blocking(|| {
+                            active_state.model.continue_resumable_prefill(
+                                &mut active_state.state,
+                                span_start,
+                                span_end,
+                            )
+                        })
+                    })?
+                    else {
+                        cancelled = true;
+                        break;
+                    };
+                    if prefill_complete {
+                        let Some(step) = run_asr_model_call(request, || {
+                            Self::run_blocking(|| {
+                                active_state.model.decode_step(&mut active_state.state)
+                            })
+                        })?
+                        else {
+                            cancelled = true;
+                            break;
+                        };
+                        step
+                    } else {
+                        NativeAsrDecodeStep {
+                            delta: String::new(),
+                            text: String::new(),
+                            tokens_generated: active_state.last_tokens_generated,
+                            finished: false,
+                        }
+                    }
+                } else {
+                    let Some(step) = run_asr_model_call(request, || {
+                        Self::run_blocking(|| {
+                            active_state.model.decode_step(&mut active_state.state)
+                        })
+                    })?
+                    else {
+                        cancelled = true;
+                        break;
+                    };
+                    step
+                };
+                if request.is_cancelled() {
+                    cancelled = true;
+                    break;
+                }
+                if !scheduled.is_prefill
+                    || resumable_span.is_some_and(|(_, end)| end == prompt_tokens)
+                {
+                    decode_steps_ran = decode_steps_ran.saturating_add(1);
+                }
+                let step_tokens_generated = step
+                    .tokens_generated
+                    .saturating_sub(active_state.last_tokens_generated);
+                active_state.last_tokens_generated = step.tokens_generated;
+                total_tokens_generated =
+                    total_tokens_generated.saturating_add(step_tokens_generated);
+                final_text = step.text.clone();
+                stream_events.push((step.delta, step.finished));
+                if step.finished {
+                    finished = true;
+                    break;
+                }
+            }
+
+            if !cancelled {
+                if let Some(arena) = tensor_arena {
+                    active_state
+                        .state
+                        .stage_qwen3_prepared_tensor_state(arena, scheduled.plan_id)?;
+                }
+                cancelled = request.is_cancelled();
+            }
+            if !cancelled {
+                if let Some(tx) = Self::stream_sender(request) {
+                    for (delta, event_finished) in stream_events {
+                        if request.is_cancelled() {
+                            cancelled = true;
+                            break;
+                        }
+                        if !delta.is_empty() {
+                            Self::stream_text_with_policy(
+                                &tx,
+                                request.stream_policy,
+                                &request.id,
+                                &mut active_state.stream_sequence,
+                                delta,
+                            )?;
+                        }
+                        if event_finished {
+                            Self::stream_final_marker_with_policy(
+                                &tx,
+                                request.stream_policy,
+                                &request.id,
+                                &mut active_state.stream_sequence,
+                            )?;
+                        }
+                    }
+                }
+                cancelled |= request.is_cancelled();
+            }
+            if cancelled {
+                // All Qwen3 ASR output is commit-fenced. Drain this quantum's
+                // staged events before returning cancellation so no text from a
+                // rolled-back physical call can be attached to its result.
+                let _ = request.take_staged_stream_outputs()?;
+            }
+            let completions = if cancelled {
+                Vec::new()
+            } else {
+                active_state.state.take_managed_write_completions()
+            };
+            Ok((
+                decode_steps_ran,
+                total_tokens_generated,
+                final_text,
+                finished,
+                cancelled,
+                active_state.input_sample_rate,
+                active_state.input_sample_count,
+                completions,
+            ))
+        })();
+
+        let (
+            decode_steps_ran,
+            total_tokens_generated,
+            final_text,
+            finished,
+            cancelled,
+            input_sample_rate,
+            input_sample_count,
+            managed_cache_completions,
+        ) = match execution {
+            Ok(execution) => execution,
+            Err(error) => {
+                rollback_scalar_asr_quantum(
+                    &mut state_lease,
+                    &mut checkpoint,
+                    outer_checkpoint,
+                    fresh_state,
+                )?;
+                return Err(error);
+            }
+        };
+
+        if cancelled {
+            rollback_scalar_asr_quantum(
+                &mut state_lease,
+                &mut checkpoint,
+                outer_checkpoint,
+                fresh_state,
+            )?;
+            state_lease.release()?;
+            return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                request.id.clone(),
+            )));
+        }
+        drop(checkpoint);
+
+        let tokens_processed = if scheduled.is_prefill {
+            scheduled.num_tokens
+        } else {
+            decode_steps_ran
+        };
+        if finished {
+            state_lease.release()?;
+        } else {
+            state_lease.restore()?;
+        }
+
+        Ok(ModelSessionResult::sequence(ExecutorOutput {
+            request_id: request.id.clone(),
+            audio: Some(AudioOutput {
+                samples: Vec::new(),
+                sample_rate: input_sample_rate,
+                duration_secs: if input_sample_rate > 0 {
+                    input_sample_count as f32 / input_sample_rate as f32
+                } else {
+                    0.0
+                },
+            }),
+            text: Some(final_text),
+            input_transcription: None,
+            tokens_processed,
+            tokens_generated: total_tokens_generated,
+            finished,
+            phase_timing_override: initial_media_decode_ms
+                .map(ExecutorPhaseTiming::with_media_decode_ms),
+            asr_diagnostics: None,
+            error: None,
+        })
+        .with_managed_cache_completions(managed_cache_completions))
+    }
+
+    pub(super) fn asr_decode_batch_with_managed(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+        managed_caches: Vec<Option<super::RetainedRowManagedState>>,
+    ) -> Result<Vec<ModelSessionResult>> {
+        validate_continuous_asr_batch_shape(scheduled)?;
+        if managed_caches.len() != scheduled.len() {
+            return Err(Error::InvalidInput(
+                "continuous ASR managed-cache rows do not match batch width".to_string(),
+            ));
+        }
+        let ordered_requests = scheduled
+            .iter()
+            .map(|scheduled| {
+                requests
+                    .iter()
+                    .copied()
+                    .find(|request| request.id == scheduled.request_id)
+                    .ok_or_else(|| {
+                        Error::InferenceError(format!(
+                            "continuous ASR request {} is missing its snapshot",
+                            scheduled.request_id
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let live_indices = ordered_requests
+            .iter()
+            .enumerate()
+            .filter_map(|(index, request)| (!request.is_cancelled()).then_some(index))
+            .collect::<Vec<_>>();
+        let mut outputs = (0..scheduled.len())
+            .map(|_| None)
+            .collect::<Vec<Option<ModelSessionResult>>>();
+        for (index, request) in ordered_requests.iter().enumerate() {
+            if request.is_cancelled() {
+                outputs[index] = Some(ModelSessionResult::cancelled_before_dispatch(
+                    ExecutorOutput::cancelled(request.id.clone()),
+                ));
+            }
+        }
+        if live_indices.is_empty() {
+            return outputs
+                .into_iter()
+                .map(|output| {
+                    output.ok_or_else(|| {
+                        Error::InferenceError("cancelled ASR row produced no result".into())
+                    })
+                })
+                .collect();
+        }
+
+        let model = ordered_requests[live_indices[0]]
+            .prepared_asr_model_for_executor()?
+            .ok_or_else(|| {
+                Error::InferenceError(
+                    "continuous ASR request has no exact loaded model identity".to_string(),
+                )
+            })?;
+        if !model.supports_continuous_decode_batch() {
+            return Err(Error::InvalidInput(
+                "loaded ASR model has no continuous tensor decode adapter".to_string(),
+            ));
+        }
+        for index in live_indices.iter().copied().skip(1) {
+            let row_model = ordered_requests[index]
+                .prepared_asr_model_for_executor()?
+                .ok_or_else(|| {
+                    Error::InferenceError(
+                        "continuous ASR row has no exact loaded model identity".to_string(),
+                    )
+                })?;
+            if !Arc::ptr_eq(&model, &row_model) {
+                return Err(Error::InferenceError(
+                    "continuous ASR batch spans different loaded model instances".to_string(),
+                ));
+            }
+        }
+
+        let mut checked_out_states = Vec::with_capacity(live_indices.len());
+        for index in live_indices.iter().copied() {
+            let request = ordered_requests[index];
+            let session = scheduled[index].session_key();
+            let expected_variant = Self::resolve_variant(request)?;
+            if expected_variant.family() != ModelFamily::Qwen3Asr {
+                return Err(Error::InvalidInput(
+                    "continuous ASR batch contains a non-Qwen3 ASR row".to_string(),
+                ));
+            }
+            let lease = ExecutorStateLease::checkout(
+                &self.asr_decode_states,
+                session.clone(),
+                "continuous ASR decode",
+            )?;
+            let state = lease.state().ok_or_else(|| {
+                Error::InferenceError(format!(
+                    "continuous ASR session {}:{} has no active decode state",
+                    session.request_id, session.epoch
+                ))
+            })?;
+            if state.variant != expected_variant || !Arc::ptr_eq(&state.model, &model) {
+                return Err(Error::InferenceError(
+                    "continuous ASR state identity does not match its request".to_string(),
+                ));
+            }
+            checked_out_states.push((index, session, lease));
+        }
+
+        let mut active_states = ContinuousAsrStateBatch::new(checked_out_states);
+        let mut managed_caches = managed_caches;
+        for (index, _, lease, checkpoint) in &mut active_states.rows {
+            let request = ordered_requests[*index];
+            let managed_cache = managed_caches[*index].take();
+            if request.managed_cache_runtime().is_some() != managed_cache.is_some() {
+                return Err(Error::InferenceError(
+                    "continuous Qwen3 ASR row lost its managed-cache reservation".to_string(),
+                ));
+            }
+            let mut views = managed_cache.ok_or_else(|| {
+                Error::InferenceError(
+                    "continuous Qwen3 ASR decode requires retained physical KV".to_string(),
+                )
+            })?;
+            let tensor_reservation = views.tensor_state;
+            let tensor_arena = request
+                .managed_cache_runtime()
+                .and_then(|runtime| runtime.tensor_state());
+            if tensor_arena.is_some() != tensor_reservation.is_some() {
+                return Err(Error::InferenceError(
+                    "continuous Qwen3 ASR row lost its prepared-input tensor-state reservation"
+                        .to_string(),
+                ));
+            }
+            let cache = views.take_only_paged()?;
+            let state = lease.require_state_mut()?;
+            let last_tokens_generated = state.last_tokens_generated;
+            let stream_sequence = state.stream_sequence;
+            let native_checkpoint = state.state.begin_managed_quantum(cache)?;
+            *checkpoint = Some((native_checkpoint, last_tokens_generated, stream_sequence));
+            if let (Some(arena), Some(reservation)) = (tensor_arena, tensor_reservation) {
+                state
+                    .state
+                    .bind_qwen3_tensor_sequence(reservation.sequence)?;
+                state.state.restore_qwen3_prepared_tensor_state(arena)?;
+            }
+            lease.mark_dirty();
+        }
+
+        let mut state_refs = active_states
+            .rows
+            .iter_mut()
+            .map(|(_, _, lease, _)| lease.require_state_mut().map(|state| &mut state.state))
+            .collect::<Result<Vec<_>>>()?;
+        let live_width = state_refs.len();
+        let steps = Self::run_blocking(|| model.decode_step_batch(&mut state_refs))?;
+        drop(state_refs);
+        // One native batch call may outlive cancellation of any subset of its
+        // rows. Observe every row before staging tensor state, emitting text,
+        // or detaching write completions while all checkpoints remain armed.
+        let cancelled_after_model = active_states
+            .rows
+            .iter()
+            .map(|(index, _, _, _)| ordered_requests[*index].is_cancelled())
+            .collect::<Vec<_>>();
+        if steps.len() != active_states.rows.len() {
+            return Err(Error::InferenceError(
+                "continuous ASR model returned the wrong number of rows".to_string(),
+            ));
+        }
+        let model_call = if live_width > 1 && model.continuous_decode_is_tensor_batched() {
+            crate::engine::metrics::EngineModelCall::NativeTensor {
+                mode: crate::engine::NativeBatchMode::Continuous,
+                rows: live_width,
+            }
+        } else {
+            crate::engine::metrics::EngineModelCall::ScalarRows {
+                envelope: crate::engine::NativeBatchMode::Continuous,
+                rows: live_width,
+            }
+        };
+        crate::engine::metrics::record_engine_model_call(model_call);
+
+        for (row, cancelled) in cancelled_after_model.into_iter().enumerate() {
+            if !cancelled {
+                continue;
+            }
+            let index = active_states.rollback_row(row)?;
+            let request = ordered_requests[index];
+            let _ = request.take_staged_stream_outputs()?;
+            outputs[index] = Some(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                request.id.clone(),
+            )));
+        }
+
+        for row in 0..active_states.rows.len() {
+            let index = active_states.rows[row].0;
+            if outputs[index].is_some() {
+                continue;
+            }
+            let request = ordered_requests[index];
+            if let Some(arena) = request
+                .managed_cache_runtime()
+                .and_then(|runtime| runtime.tensor_state())
+            {
+                active_states.rows[row]
+                    .2
+                    .require_state_mut()?
+                    .state
+                    .stage_qwen3_prepared_tensor_state(arena, scheduled[index].plan_id)?;
+            }
+            if request.is_cancelled() {
+                let index = active_states.rollback_row(row)?;
+                let request = ordered_requests[index];
+                let _ = request.take_staged_stream_outputs()?;
+                outputs[index] = Some(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                    request.id.clone(),
+                )));
+            }
+        }
+
+        let mut continuing = vec![false; scheduled.len()];
+        for (row, step) in steps.into_iter().enumerate() {
+            let index = active_states.rows[row].0;
+            if outputs[index].is_some() {
+                continue;
+            }
+            let request = ordered_requests[index];
+            if request.is_cancelled() {
+                let index = active_states.rollback_row(row)?;
+                let request = ordered_requests[index];
+                let _ = request.take_staged_stream_outputs()?;
+                outputs[index] = Some(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                    request.id.clone(),
+                )));
+                continue;
+            }
+
+            let (step_tokens_generated, input_sample_rate, input_sample_count, stream_result) = {
+                let active_state = active_states.rows[row].2.require_state_mut()?;
+                let step_tokens_generated = step
+                    .tokens_generated
+                    .saturating_sub(active_state.last_tokens_generated);
+                active_state.last_tokens_generated = step.tokens_generated;
+                let stream_result = (|| -> Result<()> {
+                    let Some(tx) = Self::stream_sender(request) else {
+                        return Ok(());
+                    };
+                    if !step.delta.is_empty() {
+                        Self::stream_text_with_policy(
+                            &tx,
+                            request.stream_policy,
+                            &request.id,
+                            &mut active_state.stream_sequence,
+                            step.delta.clone(),
+                        )?;
+                    }
+                    if step.finished {
+                        Self::stream_final_marker_with_policy(
+                            &tx,
+                            request.stream_policy,
+                            &request.id,
+                            &mut active_state.stream_sequence,
+                        )?;
+                    }
+                    Ok(())
+                })();
+                (
+                    step_tokens_generated,
+                    active_state.input_sample_rate,
+                    active_state.input_sample_count,
+                    stream_result,
+                )
+            };
+            if let Err(error) = stream_result {
+                let _ = request.take_staged_stream_outputs();
+                let index = active_states.rollback_row(row)?;
+                outputs[index] = Some(ModelSessionResult::sequence(ExecutorOutput::error(
+                    request.id.clone(),
+                    format!("continuous ASR stream staging failed: {error}"),
+                )));
+                continue;
+            }
+            if request.is_cancelled() {
+                let _ = request.take_staged_stream_outputs()?;
+                let index = active_states.rollback_row(row)?;
+                outputs[index] = Some(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                    request.id.clone(),
+                )));
+                continue;
+            }
+
+            let managed_cache_completions = active_states.rows[row]
+                .2
+                .require_state_mut()?
+                .state
+                .take_managed_write_completions();
+            outputs[index] = Some(
+                ModelSessionResult::sequence(ExecutorOutput {
+                    request_id: request.id.clone(),
+                    audio: Some(AudioOutput {
+                        samples: Vec::new(),
+                        sample_rate: input_sample_rate,
+                        duration_secs: if input_sample_rate > 0 {
+                            input_sample_count as f32 / input_sample_rate as f32
+                        } else {
+                            0.0
+                        },
+                    }),
+                    text: Some(step.text),
+                    input_transcription: None,
+                    tokens_processed: 1,
+                    tokens_generated: step_tokens_generated,
+                    finished: step.finished,
+                    phase_timing_override: None,
+                    asr_diagnostics: None,
+                    error: None,
+                })
+                .with_managed_cache_completions(managed_cache_completions),
+            );
+            if !step.finished {
+                continuing[index] = true;
+            }
+        }
+
+        let committed_states = active_states.commit();
+        for (index, _, lease) in committed_states {
+            let transition = if continuing[index] {
+                lease.restore()
+            } else {
+                lease.release()
+            };
+            if let Err(error) = transition {
+                outputs[index] = Some(ModelSessionResult::sequence(ExecutorOutput::error(
+                    ordered_requests[index].id.clone(),
+                    format!("continuous ASR state transition failed: {error}"),
+                )));
+            }
+        }
+        outputs
+            .into_iter()
+            .map(|output| {
+                output.ok_or_else(|| {
+                    Error::InferenceError("continuous ASR row produced no result".into())
+                })
+            })
+            .collect()
+    }
+
     pub(super) fn transcribe_request_with_managed_cache(
         &self,
         request: &EngineCoreRequest,
         scheduled: &ScheduledRequest,
-        mut managed_cache: Option<PhysicalPagedKvCache>,
+        mut managed_state: Option<super::RetainedRowManagedState>,
     ) -> Result<ModelSessionResult> {
-        if request.managed_cache_runtime().is_some() != managed_cache.is_some() {
+        if request.managed_cache_runtime().is_some() != managed_state.is_some() {
             return Err(Error::InferenceError(
-                "Qwen3 ASR request and scheduler reservation disagree on managed KV authority"
+                "Qwen3 ASR request and scheduler reservation disagree on retained-state authority"
                     .to_string(),
-            ));
-        }
-        if managed_cache.is_some()
-            && scheduled.is_prefill
-            && (scheduled.num_computed_tokens != 0
-                || scheduled.num_tokens != request.num_prompt_tokens())
-        {
-            return Err(Error::InferenceError(
-                "managed Qwen3 ASR requires one exact full multimodal prefill quantum".to_string(),
             ));
         }
         let variant = Self::resolve_variant(request)?;
         let family = variant.family();
+        if family == ModelFamily::Qwen3Asr && request.uses_asr_retained_sequence() {
+            return self.qwen3_asr_sequence_request(request, scheduled, managed_state.take());
+        }
+        if managed_state.is_some() {
+            return Err(Error::InferenceError(
+                "retained ASR state was routed outside the Qwen3 sequence executor".to_string(),
+            ));
+        }
+        let mut managed_cache = None;
         let language = request.asr_language_for_execution();
         let asr_prompt = request.asr_prompt_for_execution();
         let generation_options = Self::asr_generation_options(request);
@@ -187,6 +1190,7 @@ impl NativeExecutor {
 
                 if model.supports_incremental_decode()
                     && !matches!(family, ModelFamily::NemotronAsr)
+                    && !request.uses_asr_long_form_atomic()
                 {
                     let mut initial_media_decode_ms = None;
                     if state_lease.state().is_some() {
@@ -463,10 +1467,11 @@ impl NativeExecutor {
             ));
         }
 
-        let audio_decode_started = Instant::now();
-        let (samples, sample_rate) =
-            Self::run_blocking(|| decode_request_audio_with_rate(request))?;
-        let audio_decode_ms = audio_decode_started.elapsed().as_secs_f64() * 1000.0;
+        let (execution_audio, sample_rate, audio_decode_ms) =
+            resolve_asr_execution_audio(request, family, || {
+                Self::run_blocking(|| decode_request_audio_with_rate(request))
+            })?;
+        let samples = execution_audio.samples();
         let samples_len = samples.len();
 
         let (text, asr_diagnostics) = Self::run_blocking(|| {
@@ -1330,10 +2335,56 @@ fn with_granite_loop_recovery_diagnostics(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
     use super::NativeExecutor;
     use crate::catalog::ModelFamily;
     use crate::engine::request::EngineCoreRequest;
+    use crate::model::ModelVariant;
     use crate::models::registry::NativeAsrGenerationOptions;
+
+    #[test]
+    fn asr_model_call_observes_cancellation_that_arrives_during_forward() {
+        let signal = Arc::new(AtomicBool::new(false));
+        let mut request = EngineCoreRequest::asr_bytes(vec![1, 2, 3]);
+        request.set_cancellation_signal(signal.clone());
+        let physical_call_completed = Cell::new(false);
+
+        let output = super::run_asr_model_call(&request, || {
+            physical_call_completed.set(true);
+            signal.store(true, Ordering::Release);
+            Ok(17_u32)
+        })
+        .unwrap();
+
+        assert!(physical_call_completed.get());
+        assert_eq!(output, None);
+        assert!(request.is_cancelled());
+    }
+
+    #[test]
+    fn qwen_asr_execution_reuses_prepared_audio_without_decoding_again() {
+        let variant = ModelVariant::Qwen3Asr06BGguf;
+        let mut request = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+        request
+            .install_prepared_asr_audio(variant, vec![0.25, -0.5, 0.75], 16_000)
+            .unwrap();
+        let decode_calls = Cell::new(0_u32);
+
+        let (audio, sample_rate, decode_ms) =
+            super::resolve_asr_execution_audio(&request, ModelFamily::Qwen3Asr, || {
+                decode_calls.set(decode_calls.get() + 1);
+                Ok((vec![1.0], 8_000))
+            })
+            .unwrap();
+
+        assert_eq!(decode_calls.get(), 0);
+        assert_eq!(audio.samples(), &[0.25, -0.5, 0.75]);
+        assert_eq!(sample_rate, 16_000);
+        assert_eq!(decode_ms, 0.0);
+    }
 
     #[test]
     fn audio_decode_timing_preserves_whisper_model_diagnostics() {

@@ -33,7 +33,7 @@ use crate::runtime::coordinator::{InferenceCoordinator, JobLease, JobResourceObs
 use crate::runtime::request::AsrRuntimeRequest;
 use crate::runtime::service::{
     copy_optional_preparation_string, copy_preparation_bytes, copy_preparation_string,
-    AdmittedEngineRequest, RuntimeService,
+    retained_engine_request_input_bytes, AdmittedEngineRequest, RuntimeService,
 };
 use crate::runtime::types::{
     AsrTranscription, RuntimeRequestContext, SpeakerAttributedAsrResult,
@@ -1384,9 +1384,9 @@ impl RuntimeService {
                     audio_input.retained_bytes(),
                     retained_metadata_bytes,
                 ])?)?;
-                Ok((audio_input, language, prompt, correlation_id))
+                Ok((audio_input, language, prompt, correlation_id, job))
             },
-            move |_registry, (audio_input, language, prompt, correlation_id)| {
+            move |registry, (audio_input, language, prompt, correlation_id, job)| {
                 audio_input.validate_source_size()?;
                 let runtime_request = match audio_input {
                     OwnedAsrAudioInput::Base64(audio_base64) => AsrRuntimeRequest::from_base64(
@@ -1411,6 +1411,46 @@ impl RuntimeService {
                 } else if let Some(auto_max_tokens) = granite_auto_asr_token_ceiling(variant) {
                     request.params.max_tokens = auto_max_tokens;
                     request.asr_auto_max_tokens = true;
+                }
+                if variant.family() == ModelFamily::Qwen3Asr {
+                    let model = registry.try_get_asr(variant).ok_or_else(|| {
+                        Error::ModelNotFound(format!("ASR model {variant} is not loaded"))
+                    })?;
+                    let (samples, sample_rate) =
+                        crate::engine::decode_request_audio_with_rate(&request)?;
+                    let long_form = crate::engine::qwen3_asr_requires_long_form(
+                        &samples,
+                        sample_rate,
+                        model.max_audio_seconds_hint(),
+                    );
+                    let input_tokens = (!long_form)
+                        .then(|| {
+                            model.incremental_prompt_token_count(
+                                &samples,
+                                sample_rate,
+                                request.asr_language_for_execution(),
+                                request.asr_prompt_for_execution(),
+                            )
+                        })
+                        .transpose()?;
+                    request.install_prepared_asr_audio(variant, samples, sample_rate)?;
+                    if long_form {
+                        request.install_prepared_asr_long_form_atomic()?;
+                    } else {
+                        let context_limit =
+                            registry.effective_context(variant).ok_or_else(|| {
+                                Error::ModelLoadError(format!(
+                                "Qwen3 ASR model {variant} has no load-sealed effective context"
+                            ))
+                            })?;
+                        request.install_prepared_sequence_input_tokens(
+                            input_tokens.expect("normal Qwen3 ASR shape"),
+                            context_limit,
+                        )?;
+                    }
+                    job.record_materialized_usage(retained_host_observation(&[
+                        retained_engine_request_input_bytes(&request)?,
+                    ])?)?;
                 }
                 Ok(request)
             },
@@ -3697,7 +3737,7 @@ mod tests {
     use super::*;
     use crate::backends::BackendPreference;
     use crate::config::EngineConfig;
-    use crate::engine::{ModelInstanceId, Priority, WorkloadClass};
+    use crate::engine::{EngineCoreRequest, ModelInstanceId, Priority, WorkloadClass};
     use crate::runtime::adapters::{LoadedModelBundleDraft, RuntimeAdapterRegistry};
     use crate::runtime::coordinator::JobSpec;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4402,6 +4442,26 @@ mod tests {
         assert_eq!(
             decoded.host_bytes,
             (input.len() + 12 * std::mem::size_of::<f32>()) as u64
+        );
+    }
+
+    #[test]
+    fn qwen_asr_build_route_accounts_retained_prepared_audio_once() {
+        let variant = ModelVariant::Qwen3Asr06BGguf;
+        let mut request =
+            EngineCoreRequest::asr_bytes(vec![1, 2, 3, 4]).with_model_variant(variant);
+        let source_only = retained_engine_request_input_bytes(&request).unwrap();
+        request
+            .install_prepared_asr_audio(variant, vec![0.0; 513], 16_000)
+            .unwrap();
+        request
+            .install_prepared_sequence_input_tokens(48, 4096)
+            .unwrap();
+        let retained = retained_engine_request_input_bytes(&request).unwrap();
+        assert_eq!(retained - source_only, 513 * std::mem::size_of::<f32>());
+        assert_eq!(
+            retained_host_observation(&[retained]).unwrap().host_bytes,
+            retained as u64
         );
     }
 

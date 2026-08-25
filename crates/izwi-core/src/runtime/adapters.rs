@@ -481,7 +481,7 @@ impl ModelCapabilityAdapter for AsrCapabilityAdapter {
                 },
                 execution_target: asr_execution_target(model_variant),
                 sequence_execution: if model_variant.family() == ModelFamily::Qwen3Asr {
-                    SequenceExecutionMode::StreamingOnly
+                    SequenceExecutionMode::Always
                 } else {
                     SequenceExecutionMode::None
                 },
@@ -746,10 +746,7 @@ mod tests {
             InferenceStateRequirement::Retained
         );
         assert_eq!(qwen_tts.sequence_execution, SequenceExecutionMode::Always);
-        assert_eq!(
-            qwen_asr.sequence_execution,
-            SequenceExecutionMode::StreamingOnly
-        );
+        assert_eq!(qwen_asr.sequence_execution, SequenceExecutionMode::Always);
         assert_eq!(
             qwen_asr.state_requirement,
             InferenceStateRequirement::RetainedAndInvocation
@@ -761,7 +758,7 @@ mod tests {
         );
         assert_eq!(
             scalar_execution_profile(qwen_asr, BackendKind::Cpu, false).mode,
-            ExecutionMode::Atomic
+            ExecutionMode::Sequence
         );
         assert_eq!(
             scalar_execution_profile(qwen_asr, BackendKind::Cpu, true).mode,
@@ -793,6 +790,8 @@ mod tests {
             assert!(variants.contains(&ModelVariant::Gemma31BIt));
             assert!(variants.contains(&ModelVariant::Gemma34BIt));
             assert!(variants.contains(&ModelVariant::Qwen3508BGguf));
+            assert!(variants.contains(&ModelVariant::Qwen3Asr06BGguf));
+            assert!(variants.contains(&ModelVariant::Qwen3Asr17BGguf));
         }
     }
 

@@ -14,8 +14,8 @@ use serde::Serialize;
 use crate::backends::kv::{KvArena, KvWriteBatchCompletion};
 use crate::error::{Error, Result};
 use crate::kv::v2::{
-    InvocationWorkspaceDomain, ResolvedStatePlan, StateDType,
-    StateDomainId, StateDomainSpec, StateGroupId, StatePhysicalLayout, StatePlanId, StateScope,
+    InvocationWorkspaceDomain, ResolvedStatePlan, StateDType, StateDomainId, StateDomainSpec,
+    StateGroupId, StatePhysicalLayout, StatePlanId, StateScope,
 };
 use crate::kv::{CacheBlockRef, KvArenaId, KvLayerBinding, KvSlotRef};
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
@@ -138,9 +138,7 @@ impl InvocationPagedKvPoolOwner {
             ));
         };
         let max_tokens = capacity.paged_max_tokens().ok_or_else(|| {
-            invalid(
-                "invocation paged workspace requires a typed invocation paged-attention domain",
-            )
+            invalid("invocation paged workspace requires a typed invocation paged-attention domain")
         })?;
         let domain = semantic.header.id;
         if domain.get() == 0
@@ -780,6 +778,11 @@ fn validate_arena_geometry(
         StateDType::F32 => DType::F32,
         StateDType::F16 => DType::F16,
         StateDType::Bf16 => DType::BF16,
+        StateDType::I64 => {
+            return Err(invalid(
+                "invocation paged workspace cannot use integer position state",
+            ));
+        }
         StateDType::I8 | StateDType::Q4 => {
             return Err(invalid(
                 "invocation paged workspace has no dense physical arena ABI for quantized state",

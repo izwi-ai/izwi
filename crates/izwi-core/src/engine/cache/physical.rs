@@ -841,12 +841,12 @@ fn validate_invocation_allocation(
         || matches!(
             (state, capacity),
             (
-            StateDomainSpec::StaticAttention(_)
-                | StateDomainSpec::Tensor(_)
-                | StateDomainSpec::Append(_)
-                | StateDomainSpec::Ring(_)
-                | StateDomainSpec::StaticTensor(_),
-            InvocationStateCapacity::SemanticBounded
+                StateDomainSpec::StaticAttention(_)
+                    | StateDomainSpec::Tensor(_)
+                    | StateDomainSpec::Append(_)
+                    | StateDomainSpec::Ring(_)
+                    | StateDomainSpec::StaticTensor(_),
+                InvocationStateCapacity::SemanticBounded
             )
         );
     if !capacity_matches {
@@ -908,6 +908,7 @@ fn candle_dtype(dtype: StateDType) -> Result<DType> {
         StateDType::F32 => Ok(DType::F32),
         StateDType::F16 => Ok(DType::F16),
         StateDType::Bf16 => Ok(DType::BF16),
+        StateDType::I64 => Ok(DType::I64),
         StateDType::I8 | StateDType::Q4 => Err(invalid(
             "dense invocation arenas cannot allocate quantized state",
         )),

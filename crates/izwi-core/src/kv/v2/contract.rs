@@ -361,6 +361,7 @@ pub enum StateDType {
     F32,
     F16,
     Bf16,
+    I64,
     I8,
     Q4,
 }

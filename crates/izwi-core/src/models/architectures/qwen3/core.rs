@@ -2807,7 +2807,39 @@ impl Qwen3Model {
         Ok(hidden)
     }
 
+    /// Commit caller-provided embeddings to managed KV without retaining a
+    /// decoder output or projecting logits.
+    ///
+    /// Resumable multimodal prefill uses this for every non-final scheduler
+    /// span. Only the current span's transient layer tensor exists during the
+    /// call; processed spans are represented solely by their committed KV.
+    pub fn forward_managed_prefill_only_with_embeds(
+        &self,
+        embeds: &Tensor,
+        start_pos: usize,
+        cache: &mut PhysicalPagedKvCache,
+        position_ids: Option<&Tensor>,
+    ) -> Result<()> {
+        let (_last_layer, prepared) =
+            self.prepare_managed_layers_with_embeds(embeds, start_pos, cache, position_ids)?;
+        cache.commit_prepared(prepared)?;
+        Ok(())
+    }
+
     fn prepare_managed_hidden_with_embeds(
+        &self,
+        embeds: &Tensor,
+        start_pos: usize,
+        cache: &PhysicalPagedKvCache,
+        position_ids: Option<&Tensor>,
+    ) -> Result<(Tensor, PreparedPhysicalPagedStep)> {
+        let (x, prepared) =
+            self.prepare_managed_layers_with_embeds(embeds, start_pos, cache, position_ids)?;
+        let hidden = self.norm.forward(&x)?;
+        Ok((hidden, prepared))
+    }
+
+    fn prepare_managed_layers_with_embeds(
         &self,
         embeds: &Tensor,
         start_pos: usize,
@@ -2847,8 +2879,7 @@ impl Qwen3Model {
                 layer_idx,
             )?;
         }
-        let hidden = self.norm.forward(&x)?;
-        Ok((hidden, prepared))
+        Ok((x, prepared))
     }
 
     /// One direct paged-attention call per layer for a ragged batch of native
@@ -3332,6 +3363,11 @@ fn qwen3_rope_kernel_policy(is_metal: bool, is_cuda: bool, override_enabled: Opt
 }
 
 #[cfg(test)]
+pub(crate) fn tiny_qwen3_model_for_test(device: &Device) -> Qwen3Model {
+    tests::tiny_qwen3_model(device)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::backends::kv::{CpuKvArena, KvArenaConfig, KvLayerConfig};
@@ -3524,7 +3560,7 @@ mod tests {
         })
     }
 
-    fn tiny_qwen3_model(device: &Device) -> Qwen3Model {
+    pub(super) fn tiny_qwen3_model(device: &Device) -> Qwen3Model {
         let cfg = Qwen3Config {
             hidden_size: 4,
             intermediate_size: 8,

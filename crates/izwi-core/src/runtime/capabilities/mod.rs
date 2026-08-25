@@ -109,7 +109,7 @@ impl<'a> CapabilityExecutionRegistry<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::ExecutionMode;
+    use crate::engine::{ExecutionMode, PrefillMode};
     use crate::model::ModelVariant;
 
     #[test]
@@ -190,7 +190,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen_asr_route_only_claims_sequence_execution_for_streaming_today() {
+    fn qwen_asr_route_claims_the_same_retained_decoder_for_offline_and_streaming() {
         let adapters = RuntimeAdapterRegistry::built_in();
         let registry = CapabilityExecutionRegistry::new(&adapters);
         let offline = registry
@@ -211,8 +211,12 @@ mod tests {
             )
             .expect("streaming ASR plan");
 
-        assert_eq!(offline.execution_profile.mode, ExecutionMode::Atomic);
+        assert_eq!(offline.execution_profile.mode, ExecutionMode::Sequence);
         assert_eq!(streaming.execution_profile.mode, ExecutionMode::Sequence);
+        // The catalog-only plan has no exact loaded-model proof. Loaded
+        // Qwen ASR adapters upgrade this to Incremental after sealing.
+        assert_eq!(offline.execution_profile.prefill, PrefillMode::Full);
+        assert_eq!(streaming.execution_profile.prefill, PrefillMode::Full);
         assert_eq!(streaming.execution_profile.backend, BackendKind::Metal);
     }
 }

@@ -2949,7 +2949,7 @@ fn candle_dtype(dtype: KvStorageDType) -> Result<DType> {
         KvStorageDType::F32 => Ok(DType::F32),
         KvStorageDType::F16 => Ok(DType::F16),
         KvStorageDType::Bf16 => Ok(DType::BF16),
-        KvStorageDType::I8 | KvStorageDType::Q4 => Err(Error::InvalidInput(
+        KvStorageDType::I64 | KvStorageDType::I8 | KvStorageDType::Q4 => Err(Error::InvalidInput(
             "dense KV arena cannot allocate quantized storage".to_string(),
         )),
     }

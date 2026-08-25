@@ -11,7 +11,6 @@ enum CertifiedTopology {
     Stateless,
     RetainedPaged,
     RetainedPagedRing,
-    RetainedPagedAndInvocationPaged,
     RetainedPagedTensorAndInvocationPaged,
     RetainedPagedTensorTensor,
     RetainedAppendRingTensor,
@@ -31,9 +30,9 @@ impl CertifiedTopology {
             Self::RetainedPaged | Self::RetainedPagedRing | Self::RetainedPagedTensorTensor => {
                 InferenceStateRequirement::Retained
             }
-            Self::RetainedPagedAndInvocationPaged
-            | Self::RetainedPagedTensorAndInvocationPaged
-            | Self::RetainedAppendRingTensor => InferenceStateRequirement::RetainedAndInvocation,
+            Self::RetainedPagedTensorAndInvocationPaged | Self::RetainedAppendRingTensor => {
+                InferenceStateRequirement::RetainedAndInvocation
+            }
             Self::InvocationPaged
             | Self::InvocationPagedPaged
             | Self::InvocationPagedRing
@@ -77,9 +76,9 @@ fn certified_topology(
         (VibeVoiceTts, Tts) => InvocationPagedTensor,
         (FishS2Tts, Tts) => InvocationPagedPaged,
 
-        // ASR routes publish exact invocation state except Qwen's optional
-        // streaming path, which also retains the scheduler-owned page domain.
-        (Qwen3Asr, Asr) => RetainedPagedAndInvocationPaged,
+        // Qwen ASR commits decoder pages and immutable prepared inputs under
+        // one retained transaction; long-form leases invocation pages only.
+        (Qwen3Asr, Asr) => RetainedPagedTensorAndInvocationPaged,
         (Voxtral, Asr) => InvocationPaged,
         (VibeVoiceAsr, Asr) => InvocationPagedTensor,
         (WhisperAsr, Asr) => InvocationPagedStaticAttention,

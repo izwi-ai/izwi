@@ -514,7 +514,7 @@ fn add_audio_input_allocation(
     }
 }
 
-fn retained_engine_request_input_bytes(request: &EngineCoreRequest) -> Result<usize> {
+pub(super) fn retained_engine_request_input_bytes(request: &EngineCoreRequest) -> Result<usize> {
     let mut total = 0usize;
     add_owned_string_capacity(&mut total, &request.id, "request ID")?;
     add_optional_string_capacity(&mut total, request.text.as_ref(), "request text")?;
@@ -613,10 +613,12 @@ fn retained_engine_request_input_bytes(request: &EngineCoreRequest) -> Result<us
         }
     }
 
-    // Prepared multimodal tensors are deliberately excluded here. Their
-    // decoder/tensor authorization remains pending until preparation creates
-    // them; an already-prepared direct request is conservatively double-counted
-    // instead of falsely reporting accelerator bytes as materialized.
+    total = total
+        .checked_add(request.prepared_asr_audio_retained_bytes()?)
+        .ok_or_else(|| Error::Overloaded("prepared ASR input storage overflowed".to_string()))?;
+    // Device-resident prepared multimodal tensors remain excluded here. The
+    // decoded Qwen3 ASR artifact above is host-owned and therefore counted
+    // exactly by its immutable f32 slice length.
     Ok(total)
 }
 
@@ -728,7 +730,7 @@ pub(crate) fn media_preparation_resources(
 fn coordinator_lane_for_metadata(
     task_type: TaskType,
     model_variant: Option<ModelVariant>,
-    streaming: bool,
+    _streaming: bool,
     workload_class: WorkloadClass,
 ) -> CoordinatorLane {
     let sequence = model_variant.is_some_and(|variant| match task_type {
@@ -744,7 +746,7 @@ fn coordinator_lane_for_metadata(
                     | ModelVariant::Qwen317B4Bit
             )
         }
-        TaskType::ASR => variant.family() == ModelFamily::Qwen3Asr && streaming,
+        TaskType::ASR => variant.family() == ModelFamily::Qwen3Asr,
         TaskType::TTS => variant.family() == ModelFamily::Qwen3Tts,
         TaskType::SpeechToSpeech => false,
     });
@@ -758,6 +760,9 @@ fn coordinator_lane_for_metadata(
 }
 
 fn coordinator_lane_for_request(request: &EngineCoreRequest) -> CoordinatorLane {
+    if request.workload_class != WorkloadClass::Realtime && request.uses_asr_long_form_atomic() {
+        return CoordinatorLane::Atomic;
+    }
     coordinator_lane_for_metadata(
         request.task_type,
         request.model_variant,
@@ -828,11 +833,21 @@ fn bind_request_to_residency(
             "loaded execution bundle does not match authoritative model residency".to_string(),
         ));
     }
+    if request.model_variant.is_some_and(|variant| {
+        variant.family() == ModelFamily::Qwen3Asr
+            && request.prepared_asr_execution_shape().is_some()
+    }) && request.prepared_asr_audio_for_executor()?.is_none()
+    {
+        return Err(Error::InvalidInput(
+            "Qwen3 ASR execution shape has no matching decoded-audio artifact".to_string(),
+        ));
+    }
     let streaming = if request.streaming && !model_streaming_required {
         StreamingRequirements::transport_only()
     } else {
         StreamingRequirements::native(model_streaming_required)
-    };
+    }
+    .with_asr_long_form(request.uses_asr_long_form_atomic());
     let LoadedCapabilityBinding { execution, state } = bundle.capability_binding_for_streaming(
         CapabilityKind::for_engine_task(request.task_type),
         streaming,
@@ -1982,7 +1997,13 @@ impl RuntimeService {
             },
             input_bytes,
         );
-        if task_decodes_audio(request.task_type)
+        let audio_decode_required = task_decodes_audio(request.task_type)
+            && !(request.task_type == TaskType::ASR
+                && request
+                    .model_variant
+                    .is_some_and(|variant| variant.family() == ModelFamily::Qwen3Asr)
+                && request.prepared_asr_audio_for_executor()?.is_some());
+        if audio_decode_required
             || (request.task_type == TaskType::TTS && request.has_tts_reference_for_execution())
         {
             spec.resources = spec.resources.checked_add(audio_decode_resources(
@@ -2127,12 +2148,80 @@ impl RuntimeService {
             .await
     }
 
+    async fn prepare_qwen3_asr_shape_for_binding(
+        &self,
+        request: EngineCoreRequest,
+        job: &JobLease,
+    ) -> Result<EngineCoreRequest> {
+        if request.task_type != TaskType::ASR
+            || request
+                .model_variant
+                .is_none_or(|variant| variant.family() != ModelFamily::Qwen3Asr)
+            || request.prepared_asr_execution_shape().is_some()
+        {
+            return Ok(request);
+        }
+        let variant = request.model_variant.expect("validated Qwen3 ASR variant");
+        let model =
+            self.model_registry.get_asr(variant).await.ok_or_else(|| {
+                Error::ModelNotFound(format!("ASR model {variant} is not loaded"))
+            })?;
+        let context_limit = self
+            .model_registry
+            .effective_context(variant)
+            .ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "Qwen3 ASR model {variant} has no load-sealed effective context"
+                ))
+            })?;
+        let prepared = self
+            .coordinator
+            .run_host_blocking_stage(job, move || {
+                let mut request = request;
+                let (samples, sample_rate) =
+                    crate::engine::decode_request_audio_with_rate(&request)?;
+                let long_form = crate::engine::qwen3_asr_requires_long_form(
+                    &samples,
+                    sample_rate,
+                    model.max_audio_seconds_hint(),
+                );
+                let input_tokens = (!long_form)
+                    .then(|| {
+                        model.incremental_prompt_token_count(
+                            &samples,
+                            sample_rate,
+                            request.asr_language_for_execution(),
+                            request.asr_prompt_for_execution(),
+                        )
+                    })
+                    .transpose()?;
+                request.install_prepared_asr_audio(variant, samples, sample_rate)?;
+                if long_form {
+                    request.install_prepared_asr_long_form_atomic()?;
+                } else {
+                    request.install_prepared_sequence_input_tokens(
+                        input_tokens.expect("normal Qwen3 ASR shape"),
+                        context_limit,
+                    )?;
+                }
+                Ok(request)
+            })
+            .await?;
+        job.record_materialized_usage(host_input_observation(
+            retained_engine_request_input_bytes(&prepared)?,
+        )?)?;
+        Ok(prepared)
+    }
+
     async fn run_request_after_admission(
         &self,
-        mut request: EngineCoreRequest,
+        request: EngineCoreRequest,
         job: JobLease,
         residency_lease: Option<ModelResidencyLease>,
     ) -> Result<EngineOutput> {
+        let mut request = self
+            .prepare_qwen3_asr_shape_for_binding(request, &job)
+            .await?;
         let loaded_bundle = residency_lease
             .as_ref()
             .and_then(|lease| self.model_lifecycle.try_get_ready_bundle(lease.variant()));
@@ -2404,7 +2493,7 @@ impl RuntimeService {
 
     async fn run_streaming_request_after_admission<F, Fut>(
         &self,
-        mut request: EngineCoreRequest,
+        request: EngineCoreRequest,
         mut on_chunk: F,
         job: JobLease,
         residency_lease: Option<ModelResidencyLease>,
@@ -2414,6 +2503,9 @@ impl RuntimeService {
         F: FnMut(StreamingOutput) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
+        let mut request = self
+            .prepare_qwen3_asr_shape_for_binding(request, &job)
+            .await?;
         let loaded_bundle = residency_lease
             .as_ref()
             .and_then(|lease| self.model_lifecycle.try_get_ready_bundle(lease.variant()));
@@ -3320,6 +3412,7 @@ mod tests {
                 StreamingRequirements {
                     transport_output: false,
                     model_native: true,
+                    asr_long_form: false,
                 },
             )
             .expect("native TTS contract")
@@ -5041,6 +5134,29 @@ mod tests {
     }
 
     #[test]
+    fn direct_qwen_asr_job_accounts_the_prepared_audio_artifact_exactly() {
+        let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+        let backend = runtime.backend_context().backend_kind;
+        let variant = ModelVariant::Qwen3Asr06BGguf;
+        let mut request = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+        let before = retained_engine_request_input_bytes(&request).unwrap();
+        request
+            .install_prepared_asr_audio(variant, vec![0.0; 257], 16_000)
+            .unwrap();
+        request
+            .install_prepared_sequence_input_tokens(32, 4096)
+            .unwrap();
+        let after = retained_engine_request_input_bytes(&request).unwrap();
+        assert_eq!(after - before, 257 * std::mem::size_of::<f32>());
+
+        let (spec, observation) = runtime
+            .coordinator_job_for_request(&request)
+            .expect("prepared Qwen ASR coordinator job");
+        assert_eq!(observation.host_bytes, after as u64);
+        assert_eq!(spec.resources, transient_resources(backend, after));
+    }
+
+    #[test]
     fn engine_requests_use_truthful_controller_lanes() {
         let mut qwen_tts = EngineCoreRequest::tts("hello");
         qwen_tts.model_variant = Some(ModelVariant::Qwen3Tts12Hz06BBase);
@@ -5053,12 +5169,20 @@ mod tests {
         offline_asr.model_variant = Some(ModelVariant::Qwen3Asr06BGguf);
         assert_eq!(
             coordinator_lane_for_request(&offline_asr),
-            CoordinatorLane::Atomic
+            CoordinatorLane::Resumable
         );
         offline_asr.streaming = true;
         assert_eq!(
             coordinator_lane_for_request(&offline_asr),
             CoordinatorLane::Resumable
+        );
+        offline_asr
+            .install_prepared_asr_audio(ModelVariant::Qwen3Asr06BGguf, vec![0.0; 16_000], 16_000)
+            .unwrap();
+        offline_asr.install_prepared_asr_long_form_atomic().unwrap();
+        assert_eq!(
+            coordinator_lane_for_request(&offline_asr),
+            CoordinatorLane::Atomic
         );
         offline_asr.workload_class = WorkloadClass::Realtime;
         assert_eq!(

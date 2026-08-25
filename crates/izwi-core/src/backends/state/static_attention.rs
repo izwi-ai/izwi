@@ -1148,6 +1148,7 @@ fn candle_dtype(storage: StateStorageFormat) -> Result<DType> {
         StateDType::F32 => Ok(DType::F32),
         StateDType::F16 => Ok(DType::F16),
         StateDType::Bf16 => Ok(DType::BF16),
+        StateDType::I64 => Ok(DType::I64),
         StateDType::I8 | StateDType::Q4 => Err(invalid(
             "quantized static-attention state requires an explicit packing ABI",
         )),

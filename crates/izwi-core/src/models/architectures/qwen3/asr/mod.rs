@@ -18,16 +18,22 @@ use serde_json::json;
 use tracing::{debug, info, warn};
 
 use crate::audio::{MelConfig, MelNorm, MelScale, MelSpectrogram};
+use crate::backends::state::{
+    PhysicalStateSequenceId, PhysicalStateTransactionId, StateComponentValue, TensorStateArena,
+};
 use crate::backends::{backend_kind_for_device, DTypeSelectionRequest, DeviceKind, DeviceProfile};
 use crate::catalog::ModelFamily;
 use crate::engine::{StageDescriptor, StageProgressKind};
 use crate::error::{Error, Result};
 use crate::kernels::buffer_pool::maybe_init_global_buffer_pool;
 use crate::kv::v2::{
-    stage_graph_fingerprint, CapabilityStateDescriptorV2, CheckpointPolicy, InvocationLeaseScope,
-    InvocationStageWorkspace, InvocationStateCapacity, InvocationWorkspaceDomain,
-    InvocationWorkspaceProfile, InvocationWorkspaceSet, PrefixPolicy, RetainedStateCapability,
-    StateDType, StateDomainSpec, StateScope, WorkspaceFormula, CURRENT_INFERENCE_STATE_ABI,
+    stage_graph_fingerprint, BoundedShape, CapabilityStateDescriptorV2, CheckpointPolicy,
+    InvocationLeaseScope, InvocationStageWorkspace, InvocationStateCapacity,
+    InvocationWorkspaceDomain, InvocationWorkspaceProfile, InvocationWorkspaceSet, PlacementPolicy,
+    PrefixPolicy, RetainedStateCapability, ShapeAxis, ShapeDimension, ShapeExtent, StateClock,
+    StateComponentId, StateDType, StateDomainHeader, StateDomainId, StateDomainSpec, StateScope,
+    TensorComponentSpec, TensorRole, TensorStateDomainSpec, WorkspaceFormula,
+    CURRENT_INFERENCE_STATE_ABI,
 };
 use crate::kv::{InferenceStateCapability, InferenceStateContractProvider};
 use crate::model::ModelVariant;
@@ -46,6 +52,8 @@ use crate::models::shared::weights::gguf::{var_builder_from_gguf_filtered, GgufL
 use audio::{get_cnn_output_lengths, AudioTower};
 use config::Qwen3AsrConfig;
 use tokenizer::{AsrTokenizer, SpecialTokenIds};
+
+const QWEN3_ASR_PREPARED_INPUT_DOMAIN: StateDomainId = StateDomainId::new(2);
 
 #[derive(Debug, Deserialize)]
 struct PreprocessorConfig {
@@ -87,6 +95,99 @@ pub(crate) struct Qwen3AsrPhysicalStateSpec {
     pub(crate) invocation: crate::kv::v2::InferenceStateContract,
 }
 
+fn qwen3_asr_state_dtype(dtype: DType) -> Result<StateDType> {
+    match dtype {
+        DType::F32 => Ok(StateDType::F32),
+        DType::F16 => Ok(StateDType::F16),
+        DType::BF16 => Ok(StateDType::Bf16),
+        other => Err(Error::ModelLoadError(format!(
+            "Qwen3 ASR retained prepared inputs do not support {other:?}"
+        ))),
+    }
+}
+
+fn qwen3_asr_retained_state_contract(
+    mut contract: crate::kv::v2::InferenceStateContract,
+    max_sequence: usize,
+    hidden: usize,
+    dtype: DType,
+) -> Result<crate::kv::v2::InferenceStateContract> {
+    let max_sequence = u64::try_from(max_sequence)
+        .map_err(|_| Error::ModelLoadError("Qwen3 ASR context exceeds u64".to_string()))?;
+    let hidden = u64::try_from(hidden)
+        .map_err(|_| Error::ModelLoadError("Qwen3 ASR hidden size exceeds u64".to_string()))?;
+    for domain in &mut contract.domains {
+        if let StateDomainSpec::PagedAttention(domain) = domain {
+            domain.header.prefix = PrefixPolicy::Disabled;
+            domain.header.checkpoint = CheckpointPolicy::Transactional;
+        }
+    }
+    for group in &mut contract.groups {
+        group.domains.push(QWEN3_ASR_PREPARED_INPUT_DOMAIN);
+        group.prefix_shareable = false;
+    }
+    contract
+        .domains
+        .push(StateDomainSpec::Tensor(TensorStateDomainSpec {
+            header: StateDomainHeader {
+                id: QWEN3_ASR_PREPARED_INPUT_DOMAIN,
+                scope: StateScope::Retained,
+                clock: StateClock::DecoderTokens,
+                placement: PlacementPolicy::BackendLocal,
+                prefix: PrefixPolicy::Disabled,
+                checkpoint: CheckpointPolicy::Transactional,
+            },
+            components: vec![
+                TensorComponentSpec {
+                    id: StateComponentId::new(1),
+                    role: TensorRole::RetainedEmbedding,
+                    shape: BoundedShape {
+                        dimensions: vec![
+                            ShapeDimension {
+                                axis: ShapeAxis::Batch,
+                                extent: ShapeExtent::Fixed { value: 1 },
+                            },
+                            ShapeDimension {
+                                axis: ShapeAxis::Sequence,
+                                extent: ShapeExtent::RuntimeBounded {
+                                    min: 1,
+                                    max: max_sequence,
+                                },
+                            },
+                            ShapeDimension {
+                                axis: ShapeAxis::Hidden,
+                                extent: ShapeExtent::Fixed { value: hidden },
+                            },
+                        ],
+                    },
+                    accepted_dtypes: vec![qwen3_asr_state_dtype(dtype)?],
+                },
+                TensorComponentSpec {
+                    id: StateComponentId::new(2),
+                    role: TensorRole::Control,
+                    shape: BoundedShape {
+                        dimensions: vec![
+                            ShapeDimension {
+                                axis: ShapeAxis::Channels,
+                                extent: ShapeExtent::Fixed { value: 3 },
+                            },
+                            ShapeDimension {
+                                axis: ShapeAxis::Sequence,
+                                extent: ShapeExtent::RuntimeBounded {
+                                    min: 1,
+                                    max: max_sequence,
+                                },
+                            },
+                        ],
+                    },
+                    accepted_dtypes: vec![StateDType::I64],
+                },
+            ],
+        }));
+    contract.validate()?;
+    Ok(contract)
+}
+
 impl Qwen3AsrModel {
     /// Target semantic contract for the shared Qwen3 decoder.
     ///
@@ -95,22 +196,23 @@ impl Qwen3AsrModel {
     pub(crate) fn managed_inference_state_contract(
         &self,
     ) -> Result<crate::kv::v2::InferenceStateContract> {
-        let mut contract = self.text_model.managed_inference_state_contract(
+        let contract = self.text_model.managed_inference_state_contract(
             crate::kv::v2::StateDomainId::new(1),
             self.text_dtype,
             default_kv_page_size(),
         )?;
-        for domain in &mut contract.domains {
-            if let StateDomainSpec::PagedAttention(domain) = domain {
-                domain.header.prefix = PrefixPolicy::Disabled;
-                domain.header.checkpoint = CheckpointPolicy::Transactional;
-            }
-        }
-        for group in &mut contract.groups {
-            group.prefix_shareable = false;
-        }
-        contract.validate()?;
-        Ok(contract)
+        let max_sequence = self.text_context_tokens.ok_or_else(|| {
+            Error::ModelLoadError(
+                "Qwen3 ASR text config is missing max_position_embeddings; prepared decoder inputs cannot be bounded"
+                    .to_string(),
+            )
+        })?;
+        qwen3_asr_retained_state_contract(
+            contract,
+            max_sequence,
+            self.text_model.hidden_size(),
+            self.text_dtype,
+        )
     }
 
     /// Author the retained streaming state and invocation-only offline state
@@ -162,6 +264,14 @@ fn qwen3_asr_physical_state_spec(
     }
 
     let mut invocation_contract = retained.clone();
+    invocation_contract
+        .domains
+        .retain(|domain| domain.id() != QWEN3_ASR_PREPARED_INPUT_DOMAIN);
+    for group in &mut invocation_contract.groups {
+        group
+            .domains
+            .retain(|domain| *domain != QWEN3_ASR_PREPARED_INPUT_DOMAIN);
+    }
     let StateDomainSpec::PagedAttention(invocation_domain) = &mut invocation_contract.domains[0]
     else {
         return Err(Error::ModelLoadError(
@@ -278,6 +388,7 @@ fn qwen3_asr_invocation_workspace_bytes(domain: &StateDomainSpec, max_tokens: u6
         .map(|dtype| match dtype {
             StateDType::F32 => elements.checked_mul(4),
             StateDType::F16 | StateDType::Bf16 => elements.checked_mul(2),
+            StateDType::I64 => elements.checked_mul(8),
             StateDType::I8 => Some(elements),
             StateDType::Q4 => elements.checked_add(1).map(|value| value / 2),
         })
@@ -300,6 +411,15 @@ impl InferenceStateContractProvider for Qwen3AsrModel {
 
 pub struct AsrDecodeState {
     cache: Option<PhysicalPagedKvCache>,
+    physical_tensor_sequence: Option<PhysicalStateSequenceId>,
+    /// Immutable decoder input assembled from text and audio embeddings.
+    /// Scheduler spans borrow slices from this tensor; processed spans are
+    /// never concatenated or retained as decoder activations.
+    prepared_prompt_embeddings: Option<Tensor>,
+    /// Immutable multimodal RoPE positions paired with the prepared prompt.
+    prepared_position_ids: Option<Tensor>,
+    /// Exact scheduler-visible cursor through the prepared multimodal prompt.
+    prefill_progress: usize,
     /// Model output awaiting sampling inside the current executor quantum.
     /// This slot is always empty before an incremental state is yielded.
     unconsumed_output: Option<Tensor>,
@@ -321,12 +441,33 @@ pub struct AsrDecodeState {
     finished: bool,
 }
 
-enum AsrForwardCache<'a> {
-    Managed(&'a mut PhysicalPagedKvCache),
-    None,
+pub(crate) struct AsrDecodeCheckpoint {
+    cache: PhysicalPagedKvCache,
+    physical_tensor_sequence: Option<PhysicalStateSequenceId>,
+    prepared_prompt_embeddings: Option<Tensor>,
+    prepared_position_ids: Option<Tensor>,
+    prefill_progress: usize,
+    unconsumed_output: Option<Tensor>,
+    pos: usize,
+    pending_token: Option<u32>,
+    generated_ids: Vec<u32>,
+    visible_generated_ids: Vec<u32>,
+    decoded_visible_tokens: usize,
+    tokens_since_resync: usize,
+    assembled: String,
+    diagnostics: Qwen3AsrDiagnostics,
+    finished: bool,
 }
 
 impl AsrDecodeState {
+    pub(crate) fn prefill_progress(&self) -> usize {
+        self.prefill_progress
+    }
+
+    pub(crate) fn prefill_token_count(&self) -> usize {
+        self.diagnostics.prompt_tokens
+    }
+
     pub(crate) fn uses_managed_kv(&self) -> bool {
         self.cache.is_some()
     }
@@ -348,6 +489,15 @@ impl AsrDecodeState {
         &mut self,
         cache: PhysicalPagedKvCache,
     ) -> Result<()> {
+        let checkpoint = self.begin_managed_quantum(cache)?;
+        drop(checkpoint);
+        Ok(())
+    }
+
+    pub(crate) fn begin_managed_quantum(
+        &mut self,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<AsrDecodeCheckpoint> {
         let Some(current) = &self.cache else {
             return Err(Error::InferenceError(
                 "an invocation-scoped Qwen3 ASR decode cannot switch to retained KV".to_string(),
@@ -367,7 +517,129 @@ impl AsrDecodeState {
                 self.pos
             )));
         }
-        self.cache = Some(cache);
+        let checkpoint = AsrDecodeCheckpoint {
+            cache: self
+                .cache
+                .replace(cache)
+                .expect("validated managed ASR cache"),
+            physical_tensor_sequence: self.physical_tensor_sequence,
+            prepared_prompt_embeddings: self.prepared_prompt_embeddings.clone(),
+            prepared_position_ids: self.prepared_position_ids.clone(),
+            prefill_progress: self.prefill_progress,
+            unconsumed_output: self.unconsumed_output.clone(),
+            pos: self.pos,
+            pending_token: self.pending_token,
+            generated_ids: self.generated_ids.clone(),
+            visible_generated_ids: self.visible_generated_ids.clone(),
+            decoded_visible_tokens: self.decoded_visible_tokens,
+            tokens_since_resync: self.tokens_since_resync,
+            assembled: self.assembled.clone(),
+            diagnostics: self.diagnostics.clone(),
+            finished: self.finished,
+        };
+        Ok(checkpoint)
+    }
+
+    pub(crate) fn rollback_managed_quantum(&mut self, checkpoint: AsrDecodeCheckpoint) {
+        self.cache = Some(checkpoint.cache);
+        self.physical_tensor_sequence = checkpoint.physical_tensor_sequence;
+        self.prepared_prompt_embeddings = checkpoint.prepared_prompt_embeddings;
+        self.prepared_position_ids = checkpoint.prepared_position_ids;
+        self.prefill_progress = checkpoint.prefill_progress;
+        self.unconsumed_output = checkpoint.unconsumed_output;
+        self.pos = checkpoint.pos;
+        self.pending_token = checkpoint.pending_token;
+        self.generated_ids = checkpoint.generated_ids;
+        self.visible_generated_ids = checkpoint.visible_generated_ids;
+        self.decoded_visible_tokens = checkpoint.decoded_visible_tokens;
+        self.tokens_since_resync = checkpoint.tokens_since_resync;
+        self.assembled = checkpoint.assembled;
+        self.diagnostics = checkpoint.diagnostics;
+        self.finished = checkpoint.finished;
+    }
+
+    pub(crate) fn bind_tensor_sequence(&mut self, sequence: u64) -> Result<()> {
+        let sequence = PhysicalStateSequenceId::new(sequence)?;
+        if self
+            .physical_tensor_sequence
+            .is_some_and(|current| current != sequence)
+        {
+            return Err(Error::InferenceError(
+                "Qwen3 ASR prepared-input tensor sequence identity changed".to_string(),
+            ));
+        }
+        self.physical_tensor_sequence = Some(sequence);
+        Ok(())
+    }
+
+    pub(crate) fn restore_prepared_tensor_state(&mut self, arena: &TensorStateArena) -> Result<()> {
+        let sequence = self.physical_tensor_sequence.ok_or_else(|| {
+            Error::InferenceError(
+                "Qwen3 ASR retained state has no prepared-input tensor sequence".to_string(),
+            )
+        })?;
+        let snapshot = arena
+            .read(sequence, QWEN3_ASR_PREPARED_INPUT_DOMAIN)?
+            .ok_or_else(|| {
+                Error::InferenceError(
+                    "Qwen3 ASR prepared-input tensor state has no committed snapshot".to_string(),
+                )
+            })?;
+        if snapshot.components.len() != 2
+            || snapshot.components[0].component != StateComponentId::new(1)
+            || snapshot.components[1].component != StateComponentId::new(2)
+            || snapshot.cursor != self.pos as u64
+        {
+            return Err(Error::InferenceError(
+                "Qwen3 ASR prepared-input tensor snapshot is incomplete or stale".to_string(),
+            ));
+        }
+        self.prepared_prompt_embeddings = snapshot.components[0].tensor.clone();
+        self.prepared_position_ids = snapshot.components[1].tensor.clone();
+        Ok(())
+    }
+
+    pub(crate) fn stage_prepared_tensor_state(
+        &mut self,
+        arena: &TensorStateArena,
+        transaction: u64,
+    ) -> Result<()> {
+        let transaction = PhysicalStateTransactionId::new(transaction)?;
+        let expected_cursor = arena
+            .read_transaction_base(transaction, QWEN3_ASR_PREPARED_INPUT_DOMAIN)?
+            .map_or(0, |snapshot| snapshot.cursor);
+        let target_cursor = self
+            .cache
+            .as_ref()
+            .ok_or_else(|| {
+                Error::InferenceError(
+                    "Qwen3 ASR retained prepared inputs have no managed KV cursor".to_string(),
+                )
+            })?
+            .context_len() as u64;
+        if target_cursor != self.pos as u64 {
+            return Err(Error::InferenceError(
+                "Qwen3 ASR prepared-input and managed-KV cursors diverged".to_string(),
+            ));
+        }
+        arena.stage_replace(
+            transaction,
+            QWEN3_ASR_PREPARED_INPUT_DOMAIN,
+            expected_cursor,
+            target_cursor,
+            vec![
+                StateComponentValue {
+                    component: StateComponentId::new(1),
+                    tensor: self.prepared_prompt_embeddings.clone(),
+                },
+                StateComponentValue {
+                    component: StateComponentId::new(2),
+                    tensor: self.prepared_position_ids.clone(),
+                },
+            ],
+        )?;
+        self.prepared_prompt_embeddings = None;
+        self.prepared_position_ids = None;
         Ok(())
     }
 }
@@ -1074,14 +1346,13 @@ impl Qwen3AsrModel {
                 "Qwen3 ASR invocation cache must start at context zero".to_string(),
             ));
         }
-        let mut state = self.start_decode_with_prompt_and_cache(
+        let mut state = self.start_decode_with_prompt_invocation(
             audio,
             sample_rate,
             language,
             system_prompt,
             DEFAULT_TRANSCRIBE_MAX_NEW_TOKENS,
-            None,
-            Some(cache),
+            cache,
         )?;
         self.finish_transcription(&mut state, language, on_delta, Some(cache))
     }
@@ -1148,26 +1419,94 @@ impl Qwen3AsrModel {
                 "Qwen3 ASR managed cache must start with an empty multimodal context".to_string(),
             ));
         }
-        self.start_decode_with_prompt_and_cache(
+        let mut state = self.begin_resumable_prefill_managed(
             audio,
             sample_rate,
             language,
             system_prompt,
             max_new_tokens,
-            Some(cache),
-            None,
-        )
+            cache,
+        )?;
+        let prompt_tokens = state.prefill_token_count();
+        self.continue_resumable_prefill(&mut state, 0, prompt_tokens)?;
+        Ok(state)
     }
 
-    fn start_decode_with_prompt_and_cache(
+    /// Prepare immutable multimodal decoder inputs without writing model KV.
+    ///
+    /// The scheduler may subsequently commit exact monotonic spans with
+    /// [`Self::continue_resumable_prefill`]. The physical cache must be empty:
+    /// ASR audio embeddings make token-only prefix reconstruction unsafe.
+    pub(crate) fn begin_resumable_prefill_managed(
         &self,
         audio: &[f32],
         sample_rate: u32,
         language: Option<&str>,
         system_prompt: Option<&str>,
         max_new_tokens: usize,
-        managed_cache: Option<PhysicalPagedKvCache>,
-        invocation_cache: Option<&mut PhysicalPagedKvCache>,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<AsrDecodeState> {
+        if cache.context_len() != 0 {
+            return Err(Error::InvalidInput(
+                "Qwen3 ASR resumable prefill requires empty physical KV".to_string(),
+            ));
+        }
+        let execution = self.execution_diagnostics_for_physical(&cache);
+        self.prepare_decode_state(
+            audio,
+            sample_rate,
+            language,
+            system_prompt,
+            max_new_tokens,
+            Some(cache),
+            execution,
+        )
+    }
+
+    /// Commit one exact scheduler-owned span of the prepared multimodal
+    /// prompt. Intermediate spans update KV only; logits become visible only
+    /// after the final span commits.
+    pub(crate) fn continue_resumable_prefill(
+        &self,
+        state: &mut AsrDecodeState,
+        span_start: usize,
+        span_end: usize,
+    ) -> Result<bool> {
+        continue_asr_resumable_prefill(&self.text_model, state, span_start, span_end)
+    }
+
+    fn start_decode_with_prompt_invocation(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        system_prompt: Option<&str>,
+        max_new_tokens: usize,
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<AsrDecodeState> {
+        let execution = self.execution_diagnostics_for_physical(cache);
+        let mut state = self.prepare_decode_state(
+            audio,
+            sample_rate,
+            language,
+            system_prompt,
+            max_new_tokens,
+            None,
+            execution,
+        )?;
+        complete_asr_invocation_prefill(&self.text_model, &mut state, cache)?;
+        Ok(state)
+    }
+
+    fn prepare_decode_state(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        system_prompt: Option<&str>,
+        max_new_tokens: usize,
+        cache: Option<PhysicalPagedKvCache>,
+        execution: Qwen3AsrExecutionDiagnostics,
     ) -> Result<AsrDecodeState> {
         if self.is_forced_aligner {
             return Err(Error::InvalidInput(
@@ -1237,36 +1576,14 @@ impl Qwen3AsrModel {
             (1, prompt.ids.len()),
             &self.device.device,
         )?;
-
         let max_new_tokens = max_new_tokens.max(1);
-        if managed_cache.is_some() == invocation_cache.is_some() {
-            return Err(Error::InferenceError(
-                "Qwen3 ASR decode requires exactly one physical cache authority".to_string(),
-            ));
-        }
-        let mut cache = managed_cache;
-        let execution = if let Some(cache) = invocation_cache.as_deref() {
-            self.execution_diagnostics_for_physical(cache)
-        } else {
-            self.execution_diagnostics_for_physical(
-                cache.as_ref().expect("retained Qwen3 ASR cache"),
-            )
-        };
-        let prefill_started = Instant::now();
-        let forward_cache = if let Some(cache) = invocation_cache {
-            AsrForwardCache::Managed(cache)
-        } else {
-            AsrForwardCache::Managed(cache.as_mut().expect("retained Qwen3 ASR cache"))
-        };
-        let embeds = self.forward_with_audio(
-            &input_ids,
-            &audio_embeds,
-            prompt.audio_pad_start,
-            prompt.audio_pad_len,
-            forward_cache,
-        )?;
-        let prefill_ms = elapsed_ms(prefill_started);
-        let pos = embeds.dim(1)?;
+        let (prepared_prompt_embeddings, prepared_position_ids) = self
+            .prepare_audio_prompt_embeddings(
+                &input_ids,
+                &audio_embeds,
+                prompt.audio_pad_start,
+                prompt.audio_pad_len,
+            )?;
         let diagnostics = Qwen3AsrDiagnostics {
             input_sample_rate: sample_rate,
             input_samples,
@@ -1297,7 +1614,7 @@ impl Qwen3AsrModel {
                 mel_ms,
                 mel_flatten_upload_ms,
                 audio_encode_ms,
-                prefill_ms,
+                prefill_ms: 0.0,
                 decode_ms: 0.0,
                 total_ms: elapsed_ms(total_started),
             },
@@ -1305,8 +1622,12 @@ impl Qwen3AsrModel {
 
         Ok(AsrDecodeState {
             cache,
-            unconsumed_output: Some(embeds),
-            pos,
+            physical_tensor_sequence: None,
+            prepared_prompt_embeddings: Some(prepared_prompt_embeddings),
+            prepared_position_ids,
+            prefill_progress: 0,
+            unconsumed_output: None,
+            pos: 0,
             pending_token: None,
             language: language.map(ToString::to_string),
             generated_ids: Vec::new(),
@@ -1417,6 +1738,15 @@ impl Qwen3AsrModel {
                 state.diagnostics.profile.argmax_calls.saturating_add(1);
             state.diagnostics.profile.argmax_ms += elapsed_ms(started);
         }
+        self.finish_decode_sample(state, next, emit_delta)
+    }
+
+    fn finish_decode_sample(
+        &self,
+        state: &mut AsrDecodeState,
+        next: u32,
+        emit_delta: bool,
+    ) -> Result<AsrDecodeStep> {
         if state.stop_tokens.contains(&next) {
             state.finished = true;
             self.refresh_full_decoded_text(state)?;
@@ -1456,6 +1786,80 @@ impl Qwen3AsrModel {
             tokens_generated: state.generated_ids.len(),
             finished: state.finished,
         })
+    }
+
+    /// Decode one scheduled token for a changing set of independent retained
+    /// ASR sessions. Rows may have different physical positions, but a native
+    /// multi-row call requires their page tables to share the Qwen KV arena.
+    /// A one-row batch deliberately uses the scalar managed forward as the
+    /// compatibility fallback.
+    pub fn decode_step_batch(
+        &self,
+        states: &mut [&mut AsrDecodeState],
+    ) -> Result<Vec<AsrDecodeStep>> {
+        if states.is_empty() {
+            return Ok(Vec::new());
+        }
+        for state in states.iter() {
+            if state.finished || state.generated_ids.len() >= state.max_new_tokens {
+                return Err(Error::InvalidInput(
+                    "continuous Qwen3 ASR batch contains a terminal decode state".to_string(),
+                ));
+            }
+            if state.prefill_progress != state.prefill_token_count()
+                || state.prepared_prompt_embeddings.is_some()
+                || state.prepared_position_ids.is_some()
+                || state.unconsumed_output.is_some()
+                || state.pending_token.is_none()
+                || state.cache.is_none()
+            {
+                return Err(Error::InferenceError(
+                    "continuous Qwen3 ASR decode requires a completed prefill and one scheduled input token per retained row"
+                        .to_string(),
+                ));
+            }
+        }
+
+        let argmax_started = Instant::now();
+        let output =
+            forward_asr_pending_decode_batch(&self.text_model, &self.device.device, states)?;
+        let sampled = batched_decode_argmax(&output)?;
+        let argmax_ms = elapsed_ms(argmax_started);
+        let mut steps = Vec::with_capacity(states.len());
+        for (state, next) in states.iter_mut().zip(sampled) {
+            if state.diagnostics.profile.qwen3_profile_enabled {
+                state.diagnostics.profile.argmax_calls =
+                    state.diagnostics.profile.argmax_calls.saturating_add(1);
+                state.diagnostics.profile.argmax_ms += argmax_ms;
+            }
+            steps.push(self.finish_decode_sample(state, next, true)?);
+        }
+        Ok(steps)
+    }
+
+    pub fn supports_resumable_prefill(&self) -> bool {
+        !self.is_forced_aligner
+    }
+
+    pub fn supports_continuous_decode_batch(&self) -> bool {
+        !self.is_forced_aligner
+    }
+
+    pub fn continuous_decode_is_tensor_batched(&self) -> bool {
+        !self.is_forced_aligner
+    }
+
+    pub fn continuous_decode_batch_workspace_per_row_bytes(&self) -> Result<u64> {
+        u64::try_from(self.text_model.hidden_size())
+            .ok()
+            .and_then(|hidden| {
+                hidden.checked_mul(u64::try_from(self.text_dtype.size_in_bytes()).ok()?)
+            })
+            .ok_or_else(|| {
+                Error::Overloaded(
+                    "Qwen3 ASR continuous decode workspace estimate overflow".to_string(),
+                )
+            })
     }
 
     /// Forced alignment: align reference text with audio timestamps.
@@ -1554,7 +1958,6 @@ impl Qwen3AsrModel {
             &audio_embeds,
             prompt.audio_pad_start,
             prompt.audio_pad_len,
-            AsrForwardCache::None,
         )?;
 
         let segment_time_ms = self.timestamp_segment_time_ms.unwrap_or(20).max(1);
@@ -1646,8 +2049,24 @@ impl Qwen3AsrModel {
         audio_embeds: &Tensor,
         audio_pad_start: usize,
         audio_pad_len: usize,
-        cache: AsrForwardCache<'_>,
     ) -> Result<Tensor> {
+        let (embeds, position_ids) = self.prepare_audio_prompt_embeddings(
+            input_ids,
+            audio_embeds,
+            audio_pad_start,
+            audio_pad_len,
+        )?;
+        self.text_model
+            .forward_stateless_with_embeds(&embeds, 0, position_ids.as_ref())
+    }
+
+    fn prepare_audio_prompt_embeddings(
+        &self,
+        input_ids: &Tensor,
+        audio_embeds: &Tensor,
+        audio_pad_start: usize,
+        audio_pad_len: usize,
+    ) -> Result<(Tensor, Option<Tensor>)> {
         let embeds = self.text_model.embeddings(input_ids)?;
         let seq_len = embeds.dim(1)?;
         let model_audio_len = audio_embeds.dim(1)?;
@@ -1693,18 +2112,7 @@ impl Qwen3AsrModel {
         } else {
             None
         };
-        match cache {
-            AsrForwardCache::Managed(cache) => self.text_model.forward_managed_with_embeds(
-                &embeds,
-                0,
-                cache,
-                position_ids.as_ref(),
-            ),
-            AsrForwardCache::None => {
-                self.text_model
-                    .forward_stateless_with_embeds(&embeds, 0, position_ids.as_ref())
-            }
-        }
+        Ok((embeds, position_ids))
     }
 
     fn build_prompt(
@@ -1733,6 +2141,217 @@ impl Qwen3AsrModel {
 
         Tensor::from_vec(data, (3, seq_len), &self.device.device).map_err(Error::from)
     }
+}
+
+fn continue_asr_resumable_prefill(
+    text_model: &Qwen3Model,
+    state: &mut AsrDecodeState,
+    span_start: usize,
+    span_end: usize,
+) -> Result<bool> {
+    let prompt_tokens = state.prefill_token_count();
+    if state.prefill_progress != span_start
+        || span_start >= span_end
+        || span_end > prompt_tokens
+        || state.finished
+        || state.unconsumed_output.is_some()
+        || state.pending_token.is_some()
+        || !state.generated_ids.is_empty()
+    {
+        return Err(Error::InvalidInput(format!(
+            "Qwen3 ASR resumable prefill span [{span_start},{span_end}) is incompatible with cursor {} and prompt length {prompt_tokens}",
+            state.prefill_progress
+        )));
+    }
+    let physical_start = state
+        .cache
+        .as_ref()
+        .ok_or_else(|| {
+            Error::InferenceError(
+                "Qwen3 ASR resumable prefill has no retained cache authority".to_string(),
+            )
+        })?
+        .context_len();
+    if state.pos != physical_start || physical_start != span_start {
+        return Err(Error::InferenceError(format!(
+            "Qwen3 ASR resumable prefill physical cursor {physical_start} is incompatible with logical span [{span_start},{span_end})"
+        )));
+    }
+
+    let prepared = state.prepared_prompt_embeddings.as_ref().ok_or_else(|| {
+        Error::InferenceError(
+            "Qwen3 ASR resumable prefill has no immutable prompt embeddings".to_string(),
+        )
+    })?;
+    let (batch, prepared_tokens, _hidden) = prepared.dims3()?;
+    if batch != 1 || prepared_tokens != prompt_tokens {
+        return Err(Error::InferenceError(format!(
+            "Qwen3 ASR prepared prompt shape {:?} does not match {prompt_tokens} admitted tokens",
+            prepared.dims()
+        )));
+    }
+    let span_len = span_end - span_start;
+    let span_embeddings = prepared.narrow(1, span_start, span_len)?;
+    let span_position_ids = state
+        .prepared_position_ids
+        .as_ref()
+        .map(|positions| positions.narrow(1, span_start, span_len))
+        .transpose()?;
+    let complete = span_end == prompt_tokens;
+    let prefill_started = Instant::now();
+    let output = {
+        let cache = state.cache.as_mut().expect("validated retained ASR cache");
+        if complete {
+            Some(text_model.forward_managed_with_embeds(
+                &span_embeddings,
+                span_start,
+                cache,
+                span_position_ids.as_ref(),
+            )?)
+        } else {
+            text_model.forward_managed_prefill_only_with_embeds(
+                &span_embeddings,
+                span_start,
+                cache,
+                span_position_ids.as_ref(),
+            )?;
+            None
+        }
+    };
+    let physical_end = state
+        .cache
+        .as_ref()
+        .expect("validated retained ASR cache")
+        .context_len();
+    if physical_end != span_end {
+        return Err(Error::InferenceError(format!(
+            "Qwen3 ASR resumable prefill committed physical cursor {physical_end} instead of {span_end}"
+        )));
+    }
+
+    let prefill_ms = elapsed_ms(prefill_started);
+    state.diagnostics.timings.prefill_ms += prefill_ms;
+    state.diagnostics.timings.total_ms += prefill_ms;
+    state.pos = span_end;
+    state.prefill_progress = span_end;
+    state.unconsumed_output = output;
+    if complete {
+        state.prepared_prompt_embeddings = None;
+        state.prepared_position_ids = None;
+    }
+    Ok(complete)
+}
+
+fn complete_asr_invocation_prefill(
+    text_model: &Qwen3Model,
+    state: &mut AsrDecodeState,
+    cache: &mut PhysicalPagedKvCache,
+) -> Result<()> {
+    let prompt_tokens = state.prefill_token_count();
+    if cache.context_len() != 0
+        || state.cache.is_some()
+        || state.prefill_progress != 0
+        || state.pos != 0
+        || state.unconsumed_output.is_some()
+    {
+        return Err(Error::InferenceError(
+            "Qwen3 ASR invocation prefill must start from empty state".to_string(),
+        ));
+    }
+    let prepared = state.prepared_prompt_embeddings.as_ref().ok_or_else(|| {
+        Error::InferenceError("Qwen3 ASR invocation has no prepared prompt".to_string())
+    })?;
+    let position_ids = state.prepared_position_ids.as_ref();
+    let prefill_started = Instant::now();
+    let output = text_model.forward_managed_with_embeds(prepared, 0, cache, position_ids)?;
+    if cache.context_len() != prompt_tokens {
+        return Err(Error::InferenceError(format!(
+            "Qwen3 ASR invocation prefill committed physical cursor {} instead of {prompt_tokens}",
+            cache.context_len()
+        )));
+    }
+    let prefill_ms = elapsed_ms(prefill_started);
+    state.diagnostics.timings.prefill_ms += prefill_ms;
+    state.diagnostics.timings.total_ms += prefill_ms;
+    state.pos = prompt_tokens;
+    state.prefill_progress = prompt_tokens;
+    state.unconsumed_output = Some(output);
+    state.prepared_prompt_embeddings = None;
+    state.prepared_position_ids = None;
+    Ok(())
+}
+
+fn forward_asr_pending_decode_batch(
+    text_model: &Qwen3Model,
+    device: &candle_core::Device,
+    states: &mut [&mut AsrDecodeState],
+) -> Result<Tensor> {
+    if states.is_empty() {
+        return Err(Error::InvalidInput(
+            "Qwen3 ASR decode batch must contain at least one row".to_string(),
+        ));
+    }
+    let pending_tokens = states
+        .iter()
+        .map(|state| {
+            state.pending_token.ok_or_else(|| {
+                Error::InferenceError(
+                    "continuous Qwen3 ASR row has no scheduled input token".to_string(),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let positions = states
+        .iter()
+        .map(|state| {
+            state.pos.checked_add(1).ok_or_else(|| {
+                Error::InferenceError("Qwen3 ASR decode position overflow".to_string())
+            })?;
+            Ok(state.pos)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if states.iter().any(|state| state.cache.is_none()) {
+        return Err(Error::InferenceError(
+            "continuous Qwen3 ASR row has no retained cache authority".to_string(),
+        ));
+    }
+    let input_ids = Tensor::from_vec(pending_tokens, (states.len(), 1), device)?;
+    let output = if states.len() == 1 {
+        let state = &mut *states[0];
+        text_model.forward_managed(
+            &input_ids,
+            positions[0],
+            state.cache.as_mut().expect("validated retained ASR cache"),
+        )?
+    } else {
+        let mut caches = states
+            .iter_mut()
+            .map(|state| state.cache.as_mut().expect("validated retained ASR cache"))
+            .collect::<Vec<_>>();
+        text_model.forward_managed_decode_batch(&input_ids, &positions, &mut caches)?
+    };
+    for state in states.iter_mut() {
+        state.pending_token = None;
+        state.pos += 1;
+    }
+    Ok(output)
+}
+
+fn batched_decode_argmax(output: &Tensor) -> Result<Vec<u32>> {
+    let (batch, sequence, _width) = output.dims3()?;
+    if batch == 0 || sequence == 0 {
+        return Err(Error::InferenceError(format!(
+            "Qwen3 ASR batched decode output expects [batch,sequence,width], got {:?}",
+            output.dims()
+        )));
+    }
+    output
+        .narrow(1, sequence - 1, 1)?
+        .squeeze(1)?
+        .argmax(D::Minus1)?
+        .to_dtype(DType::U32)?
+        .to_vec1::<u32>()
+        .map_err(Error::from)
 }
 
 fn extract_alignment_words(text: &str) -> Vec<String> {
@@ -3211,16 +3830,129 @@ fn batched_timestamp_argmax(logits: &Tensor, positions: &[usize]) -> Result<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::DType;
+    use candle_core::{DType, Device};
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::Duration;
 
+    use crate::backends::kv::{CpuKvArena, KvArena, KvArenaConfig, KvLayerConfig};
+    use crate::backends::state::{
+        negotiate_state_plan, StateBackendPlanRequest, TensorStateCapacity,
+    };
+    use crate::backends::BackendKind;
     use crate::backends::DeviceSelector;
     use crate::engine::{
-        ConcurrencyClass, ExecutionDomain, MembershipSafePoint, NativeBatchMode, OutputVisibility,
-        StageId, StageShapePolicy, StageWorkSelector,
+        ConcurrencyClass, ExecutionDomain, MembershipSafePoint, ModelInstanceId, NativeBatchMode,
+        OutputVisibility, StageId, StageShapePolicy, StageWorkSelector,
     };
     use crate::kv::v2::{InvocationWorkspaceSet, RetainedStateCapability};
+    use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
+    use crate::models::architectures::qwen3::core::tiny_qwen3_model_for_test;
+
+    fn test_managed_arena() -> (Arc<dyn KvArena>, Vec<KvLayerBinding>) {
+        let binding = KvLayerBinding {
+            model_layer: 0,
+            physical_layer: 0,
+        };
+        let arena = CpuKvArena::new(KvArenaConfig {
+            id: KvArenaId {
+                model_instance: ModelInstanceId::new(193),
+                backend: BackendKind::Cpu,
+                device_ordinal: None,
+                generation: 1,
+            },
+            group: KvGroupId::new(0),
+            page_tokens: 2,
+            capacity_pages: 24,
+            growth: None,
+            dtype: DType::F32,
+            layers: vec![KvLayerConfig {
+                binding,
+                num_kv_heads: 1,
+                key_head_dim: 2,
+                value_head_dim: 2,
+            }],
+        })
+        .expect("ASR test arena");
+        (Arc::new(arena), vec![binding])
+    }
+
+    fn test_managed_cache(
+        arena: Arc<dyn KvArena>,
+        bindings: Vec<KvLayerBinding>,
+        first_page: u32,
+        context_len: usize,
+    ) -> PhysicalPagedKvCache {
+        let blocks = (first_page..first_page + 4)
+            .map(|index| CacheBlockRef {
+                arena: arena.id(),
+                group: arena.config().group,
+                index,
+                slot_generation: 1,
+            })
+            .collect();
+        PhysicalPagedKvCache::new(arena, bindings, blocks, context_len)
+            .expect("ASR test managed cache")
+    }
+
+    fn test_decode_state(
+        cache: PhysicalPagedKvCache,
+        prepared_prompt_embeddings: Option<Tensor>,
+        prompt_tokens: usize,
+        prefill_progress: usize,
+        pos: usize,
+        pending_token: Option<u32>,
+    ) -> AsrDecodeState {
+        AsrDecodeState {
+            cache: Some(cache),
+            physical_tensor_sequence: None,
+            prepared_prompt_embeddings,
+            prepared_position_ids: None,
+            prefill_progress,
+            unconsumed_output: None,
+            pos,
+            pending_token,
+            language: None,
+            generated_ids: Vec::new(),
+            visible_generated_ids: Vec::new(),
+            decoded_visible_tokens: 0,
+            tokens_since_resync: 0,
+            assembled: String::new(),
+            diagnostics: Qwen3AsrDiagnostics {
+                prompt_tokens,
+                max_new_tokens: 8,
+                ..Default::default()
+            },
+            profile_start: Qwen3RuntimeProfileSnapshot::default(),
+            stop_tokens: vec![u32::MAX],
+            max_new_tokens: 8,
+            finished: false,
+        }
+    }
+
+    fn assert_tensor_close(lhs: &Tensor, rhs: &Tensor) {
+        assert_eq!(lhs.dims(), rhs.dims());
+        let lhs = lhs
+            .to_dtype(DType::F32)
+            .expect("lhs dtype")
+            .flatten_all()
+            .expect("lhs flatten")
+            .to_vec1::<f32>()
+            .expect("lhs values");
+        let rhs = rhs
+            .to_dtype(DType::F32)
+            .expect("rhs dtype")
+            .flatten_all()
+            .expect("rhs flatten")
+            .to_vec1::<f32>()
+            .expect("rhs values");
+        for (idx, (lhs, rhs)) in lhs.iter().zip(rhs.iter()).enumerate() {
+            assert!(
+                (lhs - rhs).abs() <= 1e-5,
+                "tensor mismatch at {idx}: {lhs} != {rhs}"
+            );
+        }
+    }
 
     #[test]
     fn gguf_context_falls_back_to_revisioned_variant_manifest() {
@@ -3294,13 +4026,30 @@ mod tests {
         let offline = [physical_spec_stage(1, StageProgressKind::Atomic)];
         let streaming = [physical_spec_stage(2, StageProgressKind::Iterative)];
         let graphs = vec![offline.as_slice(), streaming.as_slice()];
-        let spec = qwen3_asr_physical_state_spec(&crate::kv::test_contract(), 4096, &graphs)
-            .expect("physical ASR spec");
+        let retained =
+            qwen3_asr_retained_state_contract(crate::kv::test_contract(), 4096, 256, DType::F32)
+                .expect("retained ASR state");
+        let spec =
+            qwen3_asr_physical_state_spec(&retained, 4096, &graphs).expect("physical ASR spec");
 
         assert!(matches!(
             spec.descriptor.retained,
             RetainedStateCapability::Managed { .. }
         ));
+        assert_eq!(spec.retained.domains.len(), 2);
+        assert!(matches!(
+            spec.retained.domains[1],
+            StateDomainSpec::Tensor(_)
+        ));
+        assert_eq!(spec.invocation.domains.len(), 1);
+        assert!(matches!(
+            spec.invocation.domains[0],
+            StateDomainSpec::PagedAttention(_)
+        ));
+        assert_eq!(
+            spec.invocation.groups[0].domains,
+            vec![StateDomainId::new(1)]
+        );
         let InvocationWorkspaceSet::Bounded { profiles } = &spec.descriptor.invocation else {
             panic!("offline Qwen3 ASR must declare invocation pages");
         };
@@ -3322,6 +4071,492 @@ mod tests {
                 .any(|stage| stage.progress == StageProgressKind::Atomic);
             assert_eq!(domain_count, usize::from(atomic));
         }
+    }
+
+    #[test]
+    fn qwen_asr_prepared_input_contract_accounts_embeddings_and_i64_mrope_exactly() {
+        let contract =
+            qwen3_asr_retained_state_contract(crate::kv::test_contract(), 8, 4, DType::F32)
+                .expect("retained ASR state");
+        let StateDomainSpec::Tensor(prepared) = &contract.domains[1] else {
+            panic!("prepared inputs must be tensor state");
+        };
+        assert_eq!(prepared.components.len(), 2);
+        assert_eq!(
+            prepared.components[0].accepted_dtypes,
+            vec![StateDType::F32]
+        );
+        assert_eq!(
+            prepared.components[1].accepted_dtypes,
+            vec![StateDType::I64]
+        );
+
+        let plan = negotiate_state_plan(
+            &contract,
+            &StateBackendPlanRequest {
+                backend: BackendKind::Cpu,
+                device_ordinal: None,
+                page_tokens_hint: Some(16),
+                storage_dtype_hint: Some(StateDType::F16),
+            },
+        )
+        .expect("CPU composite state plan");
+        assert_eq!(plan.non_paged.len(), 1);
+        // [1, 8, 4] F32 embeddings plus [3, 8] I64 MRoPE.
+        assert_eq!(plan.non_paged[0].maximum_bytes(), 128 + 192);
+        let capacity = TensorStateCapacity::for_plan(&plan, 1, 1).expect("tensor capacity");
+        assert_eq!(capacity.per_sequence_bytes(), 320);
+        assert_eq!(capacity.authorized_bytes(), 640);
+    }
+
+    #[test]
+    fn qwen_asr_prepared_inputs_roundtrip_through_transactional_tensor_state() {
+        let contract =
+            qwen3_asr_retained_state_contract(crate::kv::test_contract(), 4, 4, DType::F32)
+                .expect("retained ASR state");
+        let plan = negotiate_state_plan(
+            &contract,
+            &StateBackendPlanRequest {
+                backend: BackendKind::Cpu,
+                device_ordinal: None,
+                page_tokens_hint: Some(16),
+                storage_dtype_hint: Some(StateDType::F16),
+            },
+        )
+        .expect("CPU composite state plan");
+        let capacity = TensorStateCapacity::for_plan(&plan, 1, 1).expect("tensor capacity");
+        let tensor_arena = TensorStateArena::new(Arc::new(plan), capacity, Device::Cpu)
+            .expect("prepared-input tensor arena");
+        let sequence = PhysicalStateSequenceId::new(7).unwrap();
+        tensor_arena.register(sequence).unwrap();
+
+        let embeddings = Tensor::from_vec(
+            (0..16).map(|value| value as f32).collect::<Vec<_>>(),
+            (1, 4, 4),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let mrope = Tensor::from_vec(
+            (0..12).map(i64::from).collect::<Vec<_>>(),
+            (3, 4),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let (kv_arena, bindings) = test_managed_arena();
+        let mut state = test_decode_state(
+            test_managed_cache(kv_arena, bindings, 0, 2),
+            Some(embeddings.clone()),
+            4,
+            2,
+            2,
+            None,
+        );
+        state.prepared_position_ids = Some(mrope.clone());
+        state.bind_tensor_sequence(sequence.get()).unwrap();
+
+        let transaction = PhysicalStateTransactionId::new(11).unwrap();
+        tensor_arena.begin(transaction, sequence).unwrap();
+        state
+            .stage_prepared_tensor_state(&tensor_arena, transaction.get())
+            .unwrap();
+        assert!(state.prepared_prompt_embeddings.is_none());
+        assert!(state.prepared_position_ids.is_none());
+        tensor_arena.commit(transaction, 2).unwrap();
+
+        state.restore_prepared_tensor_state(&tensor_arena).unwrap();
+        assert_tensor_close(
+            state.prepared_prompt_embeddings.as_ref().unwrap(),
+            &embeddings,
+        );
+        assert_eq!(
+            state
+                .prepared_position_ids
+                .as_ref()
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<i64>()
+                .unwrap(),
+            mrope.flatten_all().unwrap().to_vec1::<i64>().unwrap()
+        );
+
+        let aborted = PhysicalStateTransactionId::new(12).unwrap();
+        tensor_arena.begin(aborted, sequence).unwrap();
+        state
+            .stage_prepared_tensor_state(&tensor_arena, aborted.get())
+            .unwrap();
+        tensor_arena.abort(aborted).unwrap();
+        state.restore_prepared_tensor_state(&tensor_arena).unwrap();
+        assert_tensor_close(
+            state.prepared_prompt_embeddings.as_ref().unwrap(),
+            &embeddings,
+        );
+    }
+
+    #[test]
+    fn qwen_asr_resumable_prefill_matches_monolithic_final_logits() {
+        let device = Device::Cpu;
+        let model = tiny_qwen3_model_for_test(&device);
+        let prompt = Tensor::from_vec(vec![0u32, 1, 2, 3], (1, 4), &device).unwrap();
+        let prepared = model.embeddings(&prompt).unwrap();
+        let (arena, bindings) = test_managed_arena();
+        let mut full = test_decode_state(
+            test_managed_cache(arena.clone(), bindings.clone(), 0, 0),
+            Some(prepared.clone()),
+            4,
+            0,
+            0,
+            None,
+        );
+        let mut chunked = test_decode_state(
+            test_managed_cache(arena, bindings, 4, 0),
+            Some(prepared),
+            4,
+            0,
+            0,
+            None,
+        );
+
+        assert!(continue_asr_resumable_prefill(&model, &mut full, 0, 4).unwrap());
+        assert!(!continue_asr_resumable_prefill(&model, &mut chunked, 0, 2).unwrap());
+        assert_eq!(chunked.prefill_progress, 2);
+        assert_eq!(chunked.pos, 2);
+        assert_eq!(chunked.cache.as_ref().unwrap().context_len(), 2);
+        assert!(chunked.unconsumed_output.is_none());
+        assert_eq!(
+            chunked.prepared_prompt_embeddings.as_ref().unwrap().dims(),
+            &[1, 4, 4]
+        );
+
+        assert!(continue_asr_resumable_prefill(&model, &mut chunked, 2, 4).unwrap());
+        assert!(chunked.prepared_prompt_embeddings.is_none());
+        assert!(chunked.prepared_position_ids.is_none());
+        let full_output = full.unconsumed_output.as_ref().unwrap();
+        let chunked_output = chunked.unconsumed_output.as_ref().unwrap();
+        assert_tensor_close(
+            &full_output.narrow(1, 3, 1).unwrap(),
+            &chunked_output.narrow(1, 1, 1).unwrap(),
+        );
+        assert_eq!(
+            full.cache.as_mut().unwrap().take_completed_writes().len(),
+            1
+        );
+        assert_eq!(
+            chunked
+                .cache
+                .as_mut()
+                .unwrap()
+                .take_completed_writes()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn qwen_asr_resumable_prefill_rejects_non_monotonic_spans_without_progress() {
+        let device = Device::Cpu;
+        let model = tiny_qwen3_model_for_test(&device);
+        let prompt = Tensor::from_vec(vec![0u32, 1, 2, 3], (1, 4), &device).unwrap();
+        let prepared = model.embeddings(&prompt).unwrap();
+        let (arena, bindings) = test_managed_arena();
+        let mut state = test_decode_state(
+            test_managed_cache(arena, bindings, 0, 0),
+            Some(prepared),
+            4,
+            0,
+            0,
+            None,
+        );
+
+        let error = continue_asr_resumable_prefill(&model, &mut state, 1, 2)
+            .expect_err("prefill may not skip its first span");
+        assert!(error.to_string().contains("incompatible with cursor 0"));
+        assert_eq!(state.prefill_progress, 0);
+        assert_eq!(state.pos, 0);
+        assert_eq!(state.cache.as_ref().unwrap().context_len(), 0);
+
+        assert!(!continue_asr_resumable_prefill(&model, &mut state, 0, 2).unwrap());
+        let error = continue_asr_resumable_prefill(&model, &mut state, 3, 4)
+            .expect_err("prefill may not leave a cursor gap");
+        assert!(error.to_string().contains("incompatible with cursor 2"));
+        assert_eq!(state.prefill_progress, 2);
+        assert_eq!(state.pos, 2);
+        assert_eq!(state.cache.as_ref().unwrap().context_len(), 2);
+        assert!(state.unconsumed_output.is_none());
+    }
+
+    #[test]
+    fn qwen_asr_first_middle_and_final_prefill_transactions_roll_back_exactly() {
+        let device = Device::Cpu;
+        let model = tiny_qwen3_model_for_test(&device);
+        let prompt = Tensor::from_vec(vec![0u32, 1, 2, 3, 4], (1, 5), &device).unwrap();
+        let prepared = model.embeddings(&prompt).unwrap();
+        let (arena, bindings) = test_managed_arena();
+        let mut state = test_decode_state(
+            test_managed_cache(arena.clone(), bindings.clone(), 0, 0),
+            Some(prepared),
+            5,
+            0,
+            0,
+            None,
+        );
+
+        for (span_index, (start, end, expected_complete)) in
+            [(0, 2, false), (2, 4, false), (4, 5, true)]
+                .into_iter()
+                .enumerate()
+        {
+            let baseline_embeddings = state
+                .prepared_prompt_embeddings
+                .as_ref()
+                .expect("uncommitted span retains immutable prompt input")
+                .clone();
+            let first_page = 4 + u32::try_from(span_index).unwrap() * 4;
+            let checkpoint = state
+                .begin_managed_quantum(test_managed_cache(
+                    arena.clone(),
+                    bindings.clone(),
+                    first_page,
+                    start,
+                ))
+                .unwrap();
+
+            assert_eq!(
+                continue_asr_resumable_prefill(&model, &mut state, start, end).unwrap(),
+                expected_complete
+            );
+            assert_eq!(state.prefill_progress, end);
+            assert_eq!(state.pos, end);
+            assert_eq!(state.cache.as_ref().unwrap().context_len(), end);
+
+            state.rollback_managed_quantum(checkpoint);
+            assert_eq!(state.prefill_progress, start);
+            assert_eq!(state.pos, start);
+            assert_eq!(state.cache.as_ref().unwrap().context_len(), start);
+            assert!(state.unconsumed_output.is_none());
+            assert_tensor_close(
+                state.prepared_prompt_embeddings.as_ref().unwrap(),
+                &baseline_embeddings,
+            );
+
+            let checkpoint = state
+                .begin_managed_quantum(test_managed_cache(
+                    arena.clone(),
+                    bindings.clone(),
+                    first_page,
+                    start,
+                ))
+                .unwrap();
+            assert_eq!(
+                continue_asr_resumable_prefill(&model, &mut state, start, end).unwrap(),
+                expected_complete
+            );
+            drop(checkpoint);
+            assert_eq!(
+                state.cache.as_mut().unwrap().take_completed_writes().len(),
+                1
+            );
+            assert_eq!(state.prefill_progress, end);
+            assert_eq!(state.pos, end);
+            assert_eq!(state.unconsumed_output.is_some(), expected_complete);
+        }
+
+        assert!(state.prepared_prompt_embeddings.is_none());
+        assert!(state.prepared_position_ids.is_none());
+    }
+
+    #[test]
+    fn qwen_asr_managed_quantum_rollback_restores_cache_cursor_and_pending_token() {
+        let (arena, bindings) = test_managed_arena();
+        let mut state = test_decode_state(
+            test_managed_cache(arena.clone(), bindings.clone(), 0, 4),
+            None,
+            4,
+            4,
+            4,
+            Some(7),
+        );
+        state.generated_ids.push(7);
+        let old_next_slot = state
+            .cache
+            .as_ref()
+            .unwrap()
+            .slots_for_append(4, 1)
+            .unwrap()[0];
+        let replacement = test_managed_cache(arena, bindings, 4, 4);
+
+        let checkpoint = state.begin_managed_quantum(replacement).unwrap();
+        let replacement_next_slot = state
+            .cache
+            .as_ref()
+            .unwrap()
+            .slots_for_append(4, 1)
+            .unwrap()[0];
+        assert_ne!(old_next_slot, replacement_next_slot);
+        state.pos = 5;
+        state.prefill_progress = 5;
+        state.pending_token = None;
+        state.generated_ids.push(6);
+        state.finished = true;
+
+        state.rollback_managed_quantum(checkpoint);
+        assert_eq!(state.pos, 4);
+        assert_eq!(state.prefill_progress, 4);
+        assert_eq!(state.pending_token, Some(7));
+        assert_eq!(state.generated_ids, vec![7]);
+        assert!(!state.finished);
+        assert_eq!(state.cache.as_ref().unwrap().context_len(), 4);
+        assert_eq!(
+            state
+                .cache
+                .as_ref()
+                .unwrap()
+                .slots_for_append(4, 1)
+                .unwrap()[0],
+            old_next_slot
+        );
+    }
+
+    #[test]
+    fn qwen_asr_ragged_decode_batch_matches_scalar_and_isolates_row_state() {
+        let device = Device::Cpu;
+        let model = tiny_qwen3_model_for_test(&device);
+        let (arena, bindings) = test_managed_arena();
+        let mut serial_a_cache = test_managed_cache(arena.clone(), bindings.clone(), 0, 0);
+        let mut serial_b_cache = test_managed_cache(arena.clone(), bindings.clone(), 4, 0);
+        let mut batch_a_cache = test_managed_cache(arena.clone(), bindings.clone(), 8, 0);
+        let mut batch_b_cache = test_managed_cache(arena, bindings, 12, 0);
+        let prompt_a = Tensor::from_vec(vec![0u32, 1], (1, 2), &device).unwrap();
+        let prompt_b = Tensor::from_vec(vec![2u32, 3, 4], (1, 3), &device).unwrap();
+        for cache in [&mut serial_a_cache, &mut batch_a_cache] {
+            model.forward_managed(&prompt_a, 0, cache).unwrap();
+            assert_eq!(cache.take_completed_writes().len(), 1);
+        }
+        for cache in [&mut serial_b_cache, &mut batch_b_cache] {
+            model.forward_managed(&prompt_b, 0, cache).unwrap();
+            assert_eq!(cache.take_completed_writes().len(), 1);
+        }
+        let mut serial_a = test_decode_state(serial_a_cache, None, 2, 2, 2, Some(5));
+        let mut serial_b = test_decode_state(serial_b_cache, None, 3, 3, 3, Some(6));
+        let mut batch_a = test_decode_state(batch_a_cache, None, 2, 2, 2, Some(5));
+        let mut batch_b = test_decode_state(batch_b_cache, None, 3, 3, 3, Some(6));
+
+        let scalar_a = {
+            let mut rows = [&mut serial_a];
+            forward_asr_pending_decode_batch(&model, &device, &mut rows).unwrap()
+        };
+        let scalar_b = {
+            let mut rows = [&mut serial_b];
+            forward_asr_pending_decode_batch(&model, &device, &mut rows).unwrap()
+        };
+        let batched = {
+            let mut rows = [&mut batch_a, &mut batch_b];
+            forward_asr_pending_decode_batch(&model, &device, &mut rows).unwrap()
+        };
+
+        assert_tensor_close(&scalar_a, &batched.i(0).unwrap().unsqueeze(0).unwrap());
+        assert_tensor_close(&scalar_b, &batched.i(1).unwrap().unsqueeze(0).unwrap());
+        assert_eq!(batch_a.pos, 3);
+        assert_eq!(batch_b.pos, 4);
+        assert_eq!(batch_a.cache.as_ref().unwrap().context_len(), 3);
+        assert_eq!(batch_b.cache.as_ref().unwrap().context_len(), 4);
+        assert_eq!(batch_a.pending_token, None);
+        assert_eq!(batch_b.pending_token, None);
+        assert!(batch_a.generated_ids.is_empty());
+        assert!(batch_b.generated_ids.is_empty());
+        let completion_a = batch_a.cache.as_mut().unwrap().take_completed_writes();
+        let completion_b = batch_b.cache.as_mut().unwrap().take_completed_writes();
+        assert_eq!(completion_a.len(), 1);
+        assert_eq!(completion_b.len(), 1);
+        assert!(Arc::ptr_eq(&completion_a[0], &completion_b[0]));
+    }
+
+    #[test]
+    fn qwen_asr_mixed_batch_rollback_restores_only_the_cancelled_row() {
+        let device = Device::Cpu;
+        let model = tiny_qwen3_model_for_test(&device);
+        let (arena, bindings) = test_managed_arena();
+        let mut a_cache = test_managed_cache(arena.clone(), bindings.clone(), 0, 0);
+        let mut b_cache = test_managed_cache(arena.clone(), bindings.clone(), 4, 0);
+        let prompt_a = Tensor::from_vec(vec![0u32, 1], (1, 2), &device).unwrap();
+        let prompt_b = Tensor::from_vec(vec![2u32, 3, 4], (1, 3), &device).unwrap();
+        model.forward_managed(&prompt_a, 0, &mut a_cache).unwrap();
+        model.forward_managed(&prompt_b, 0, &mut b_cache).unwrap();
+        assert_eq!(a_cache.take_completed_writes().len(), 1);
+        assert_eq!(b_cache.take_completed_writes().len(), 1);
+
+        let mut cancelled = test_decode_state(a_cache, None, 2, 2, 2, Some(5));
+        let mut live = test_decode_state(b_cache, None, 3, 3, 3, Some(6));
+        let cancelled_checkpoint = cancelled
+            .begin_managed_quantum(test_managed_cache(arena.clone(), bindings.clone(), 8, 2))
+            .unwrap();
+        let live_checkpoint = live
+            .begin_managed_quantum(test_managed_cache(arena, bindings, 12, 3))
+            .unwrap();
+
+        let output = {
+            let mut rows = [&mut cancelled, &mut live];
+            forward_asr_pending_decode_batch(&model, &device, &mut rows).unwrap()
+        };
+        assert_eq!(output.dims()[0], 2);
+
+        // Model execution was shared, but cancellation resolves under each
+        // row's independent checkpoint before the engine publishes receipts.
+        cancelled.rollback_managed_quantum(cancelled_checkpoint);
+        drop(live_checkpoint);
+
+        assert_eq!(cancelled.pos, 2);
+        assert_eq!(cancelled.prefill_progress, 2);
+        assert_eq!(cancelled.pending_token, Some(5));
+        assert_eq!(cancelled.cache.as_ref().unwrap().context_len(), 2);
+        assert!(cancelled
+            .cache
+            .as_mut()
+            .unwrap()
+            .take_completed_writes()
+            .is_empty());
+
+        assert_eq!(live.pos, 4);
+        assert_eq!(live.prefill_progress, 3);
+        assert_eq!(live.pending_token, None);
+        assert_eq!(live.cache.as_ref().unwrap().context_len(), 4);
+        assert_eq!(
+            live.cache.as_mut().unwrap().take_completed_writes().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn qwen_asr_decode_batch_validation_preserves_all_rows() {
+        let device = Device::Cpu;
+        let model = tiny_qwen3_model_for_test(&device);
+        let (arena, bindings) = test_managed_arena();
+        let mut a = test_decode_state(
+            test_managed_cache(arena.clone(), bindings.clone(), 0, 2),
+            None,
+            2,
+            2,
+            2,
+            Some(5),
+        );
+        let mut b = test_decode_state(
+            test_managed_cache(arena, bindings, 4, 3),
+            None,
+            3,
+            3,
+            3,
+            None,
+        );
+        let mut rows = [&mut a, &mut b];
+        let error = forward_asr_pending_decode_batch(&model, &device, &mut rows)
+            .expect_err("missing row token must fail before any forward");
+        assert!(error.to_string().contains("no scheduled input token"));
+        assert_eq!(a.pending_token, Some(5));
+        assert_eq!(b.pending_token, None);
+        assert_eq!(a.pos, 2);
+        assert_eq!(b.pos, 3);
+        assert_eq!(a.cache.as_ref().unwrap().context_len(), 2);
+        assert_eq!(b.cache.as_ref().unwrap().context_len(), 3);
     }
 
     #[test]
@@ -3865,6 +5100,22 @@ mod tests {
         let logits = Tensor::from_vec(vec![0.1f32; 8], (2, 4), &device).expect("logits");
         let err = argmax(&logits).expect_err("argmax should reject batched rank2");
         assert!(format!("{err}").contains("Unexpected batched logits for argmax"));
+    }
+
+    #[test]
+    fn batched_decode_argmax_selects_each_rows_last_sequence_output() {
+        let device = candle_core::Device::Cpu;
+        let logits = Tensor::from_vec(
+            vec![
+                9.0f32, 1.0, 0.0, 0.0, 7.0, 2.0, // row 0, last token => 1
+                0.0, 8.0, 1.0, 6.0, 0.0, 2.0, // row 1, last token => 0
+            ],
+            (2, 2, 3),
+            &device,
+        )
+        .expect("logits");
+
+        assert_eq!(batched_decode_argmax(&logits).unwrap(), vec![1, 0]);
     }
 
     #[test]

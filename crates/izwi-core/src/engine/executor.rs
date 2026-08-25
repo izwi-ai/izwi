@@ -29,10 +29,18 @@ pub(crate) use streaming::{
     StreamDeliveryFailure, StreamDeliveryFailureKind,
 };
 
-pub(super) fn decode_request_audio_with_rate(
+pub(crate) fn decode_request_audio_with_rate(
     request: &EngineCoreRequest,
 ) -> Result<(Vec<f32>, u32)> {
     audio::decode_request_audio_with_rate(request)
+}
+
+pub(crate) fn qwen3_asr_requires_long_form(
+    samples: &[f32],
+    sample_rate: u32,
+    model_max_chunk_secs: Option<f32>,
+) -> bool {
+    audio::qwen3_asr_requires_long_form(samples, sample_rate, model_max_chunk_secs)
 }
 
 use super::config::EngineCoreConfig;
@@ -1927,16 +1935,19 @@ impl NativeBatchSupport {
 
 /// Intersect a load-sealed stage declaration with an implemented model call.
 /// Merely publishing `NativeBatchMode` in catalog or request data is not
-/// sufficient. Audio families intentionally return `NONE` until their later
-/// family adapters install a real multi-row call at this boundary.
+/// sufficient. Each audio family remains `NONE` until its exact loaded model
+/// and adapter both expose a real multi-row call at this boundary.
 fn loaded_native_batch_support(request: &EngineCoreRequest) -> NativeBatchSupport {
-    if request.task_type != TaskType::Chat {
-        return NativeBatchSupport::NONE;
-    }
-    let Ok(model) = request.prepared_chat_model_for_executor() else {
-        return NativeBatchSupport::NONE;
+    let supported = match request.task_type {
+        TaskType::Chat => request
+            .prepared_chat_model_for_executor()
+            .is_ok_and(|model| model.supports_continuous_decode_batch()),
+        TaskType::ASR => request
+            .prepared_asr_model_for_executor()
+            .is_ok_and(|model| model.is_some_and(|model| model.supports_continuous_decode_batch())),
+        TaskType::TTS | TaskType::SpeechToSpeech => false,
     };
-    if !model.supports_continuous_decode_batch() {
+    if !supported {
         return NativeBatchSupport::NONE;
     }
     let Some(binding) = request.execution_adapter_binding() else {
@@ -2039,8 +2050,10 @@ impl ModelExecutor for NativeExecutor {
         };
         let native_batch_support = loaded_native_batch_support(request);
         profile.resolved_from_loaded_model = loaded_incremental.is_some();
-        let implementation_incremental =
-            loaded_incremental.unwrap_or_else(|| match request.task_type {
+        let asr_long_form =
+            request.task_type == super::types::TaskType::ASR && request.uses_asr_long_form_atomic();
+        let implementation_incremental = !asr_long_form
+            && loaded_incremental.unwrap_or_else(|| match request.task_type {
                 super::types::TaskType::Chat => {
                     matches!(
                         variant.family(),
@@ -2062,18 +2075,20 @@ impl ModelExecutor for NativeExecutor {
                 }
                 super::types::TaskType::SpeechToSpeech => false,
             });
-        let resumable_prefill_proof = if matches!(request.task_type, super::types::TaskType::Chat) {
-            request
+        let resumable_prefill_proof = match request.task_type {
+            super::types::TaskType::Chat => request
                 .prepared_chat_model_for_executor()
                 .ok()
-                .map(|model| model.supports_resumable_prefill())
-        } else {
-            None
+                .map(|model| model.supports_resumable_prefill()),
+            super::types::TaskType::ASR => request
+                .prepared_asr_model_for_executor()
+                .ok()
+                .flatten()
+                .map(|model| model.supports_resumable_prefill()),
+            super::types::TaskType::TTS | super::types::TaskType::SpeechToSpeech => None,
         };
 
-        if implementation_incremental
-            && (!matches!(request.task_type, super::types::TaskType::ASR) || request.streaming)
-        {
+        if implementation_incremental {
             profile.mode = ExecutionMode::Sequence;
             // Scheduler-level spans require a stronger capability than
             // incremental decode: the exact loaded family must publish a
@@ -2086,10 +2101,25 @@ impl ModelExecutor for NativeExecutor {
             profile.recompute_safe = profile.resolved_from_loaded_model;
             profile.cache_release_safe = profile.resolved_from_loaded_model;
         }
-        if matches!(request.task_type, super::types::TaskType::ASR) {
+        if matches!(request.task_type, super::types::TaskType::ASR) && !implementation_incremental {
             // Long audio can switch to a full chunk-plan operation after media
             // decode, so cancellation is conservatively operation-boundary.
             profile.cancellation = CancellationGranularity::OperationBoundary;
+        }
+        if asr_long_form {
+            profile.mode = ExecutionMode::Atomic;
+            profile.prefill = PrefillMode::None;
+            profile.incremental_decode = false;
+            profile.prefill_batch = NativeBatchMode::None;
+            profile.decode_batch = NativeBatchMode::None;
+            profile.cache_mode = CacheMode::None;
+            profile.cache_namespace = None;
+            profile.kv_dtype = "none".to_string();
+            profile.concurrency = ConcurrencyClass::Exclusive;
+            profile.max_batch_size = 1;
+            profile.recompute_safe = false;
+            profile.cache_release_safe = false;
+            profile.prefix_reuse_safe = false;
         }
 
         if native_batch_support.is_native() {
@@ -2114,6 +2144,15 @@ impl ModelExecutor for NativeExecutor {
         }
         if request.managed_cache_runtime().is_some() {
             profile.cache_mode = CacheMode::ExternalPaged;
+        }
+        if asr_long_form {
+            profile.prefill_batch = NativeBatchMode::None;
+            profile.decode_batch = NativeBatchMode::None;
+            profile.concurrency = ConcurrencyClass::Exclusive;
+            profile.max_batch_size = 1;
+            profile.cache_mode = CacheMode::None;
+            profile.cache_namespace = None;
+            profile.kv_dtype = "none".to_string();
         }
         if matches!(request.task_type, super::types::TaskType::Chat) {
             profile.preferred_decode_tokens = request
@@ -2157,20 +2196,6 @@ impl ModelExecutor for NativeExecutor {
                     FailureOrigin::ExecutorValidation,
                 ));
             }
-            let NativeBatchRoute::ChatContinuousDecode { .. } = route else {
-                // Audio stage identity is recognized, but current family
-                // adapters deliberately publish scalar width-one contracts.
-                // If a future contract reaches this branch before its model
-                // call is installed, reject before model entry rather than
-                // fabricating tensor dispatch evidence.
-                return Err(PhysicalDispatchError::not_started(
-                    Error::InferenceError(
-                        "loaded audio stage has no registered native model call".to_string(),
-                    ),
-                    width,
-                    FailureOrigin::ExecutorValidation,
-                ));
-            };
             if is_isolated_continuous_model_quantum(execution.scheduled) {
                 // An isolated model-preferred quantum is still planned through
                 // the continuous stage so it can yield back to shared
@@ -2202,15 +2227,39 @@ impl ModelExecutor for NativeExecutor {
                     )
                 });
             }
-            return self
-                .execute_continuous_chat_requests_with_rows(
+            let result = match route {
+                NativeBatchRoute::ChatContinuousDecode { .. } => self
+                    .execute_continuous_chat_requests_with_rows(
+                        execution.requests,
+                        execution.scheduled,
+                        Some(&execution.batch.rows),
+                    ),
+                NativeBatchRoute::Audio {
+                    task: TaskType::ASR,
+                    stage: NativeAudioStage::SequenceDecode,
+                    mode: NativeBatchMode::Continuous,
+                    ..
+                } => self.execute_continuous_asr_requests_with_rows(
                     execution.requests,
                     execution.scheduled,
                     Some(&execution.batch.rows),
-                )
-                .map_err(|error| {
-                    PhysicalDispatchError::started(error, expected_dispatch, FailureOrigin::Model)
-                });
+                ),
+                NativeBatchRoute::Audio { .. } => {
+                    // An exact audio stage without a registered family call
+                    // fails before model entry; catalog identity alone never
+                    // fabricates native tensor execution.
+                    return Err(PhysicalDispatchError::not_started(
+                        Error::InferenceError(
+                            "loaded audio stage has no registered native model call".to_string(),
+                        ),
+                        width,
+                        FailureOrigin::ExecutorValidation,
+                    ));
+                }
+            };
+            return result.map_err(|error| {
+                PhysicalDispatchError::started(error, expected_dispatch, FailureOrigin::Model)
+            });
         }
         let result = self.execute_requests_with_rows(
             execution.requests,
@@ -3883,6 +3932,41 @@ mod tests {
             resolved_resumable_prefill_mode(true, None),
             PrefillMode::Full
         );
+    }
+
+    #[test]
+    fn qwen_asr_raw_profile_uses_the_exact_prepared_execution_route() {
+        let executor = NativeExecutor::new(WorkerConfig {
+            backend: BackendKind::Cpu,
+            request_parallelism: 4,
+            enable_chunked_prefill: true,
+            ..Default::default()
+        });
+        let mut normal = EngineCoreRequest::asr_bytes(vec![1, 2, 3]);
+        normal.model_variant = Some(ModelVariant::Qwen3Asr06BGguf);
+        normal
+            .install_prepared_asr_audio(ModelVariant::Qwen3Asr06BGguf, vec![0.0; 160], 16_000)
+            .unwrap();
+        normal
+            .install_prepared_sequence_input_tokens(32, 4096)
+            .unwrap();
+        let normal_profile = executor.execution_profile(&normal).unwrap();
+        assert_eq!(normal_profile.mode, ExecutionMode::Sequence);
+        assert!(normal_profile.incremental_decode);
+
+        let mut long = EngineCoreRequest::asr_bytes(vec![1, 2, 3]);
+        long.model_variant = Some(ModelVariant::Qwen3Asr06BGguf);
+        long.install_prepared_asr_audio(ModelVariant::Qwen3Asr06BGguf, vec![0.0; 160], 16_000)
+            .unwrap();
+        long.install_prepared_asr_long_form_atomic().unwrap();
+        let long_profile = executor.execution_profile(&long).unwrap();
+        assert_eq!(long_profile.mode, ExecutionMode::Atomic);
+        assert_eq!(long_profile.prefill, PrefillMode::None);
+        assert!(!long_profile.incremental_decode);
+        assert_eq!(long_profile.cache_mode, CacheMode::None);
+        assert_eq!(long_profile.decode_batch, NativeBatchMode::None);
+        assert_eq!(long_profile.concurrency, ConcurrencyClass::Exclusive);
+        assert_eq!(long_profile.max_batch_size, 1);
     }
 
     #[test]

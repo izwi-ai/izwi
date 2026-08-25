@@ -666,9 +666,15 @@ const fn non_paged_backend_compiled(backend: BackendKind) -> bool {
 
 const fn tensor_dtype_is_supported(backend: BackendKind, dtype: StateDType) -> bool {
     match backend {
-        BackendKind::Cpu => matches!(dtype, StateDType::F32 | StateDType::F16 | StateDType::Bf16),
-        BackendKind::Metal => matches!(dtype, StateDType::F32 | StateDType::F16),
-        BackendKind::Cuda => matches!(dtype, StateDType::F32 | StateDType::F16 | StateDType::Bf16),
+        BackendKind::Cpu => matches!(
+            dtype,
+            StateDType::F32 | StateDType::F16 | StateDType::Bf16 | StateDType::I64
+        ),
+        BackendKind::Metal => matches!(dtype, StateDType::F32 | StateDType::F16 | StateDType::I64),
+        BackendKind::Cuda => matches!(
+            dtype,
+            StateDType::F32 | StateDType::F16 | StateDType::Bf16 | StateDType::I64
+        ),
     }
 }
 

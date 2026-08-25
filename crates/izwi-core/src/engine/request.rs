@@ -753,6 +753,35 @@ fn escaped_json_string_upper_bound(value: &str) -> Result<usize> {
         .ok_or_else(|| Error::InvalidInput("Direct chat JSON string size overflow".to_string()))
 }
 
+/// Exact Qwen3 ASR execution shape resolved from decoded media before
+/// scheduler admission. Retained sequence rows use managed KV; long-form rows
+/// use only their invocation-scoped atomic pipeline workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreparedAsrExecutionShape {
+    RetainedSequence { input_tokens: usize },
+    LongFormAtomic,
+}
+
+#[derive(Clone)]
+pub(super) struct PreparedAsrAudio {
+    model_variant: ModelVariant,
+    samples: Arc<[f32]>,
+    sample_rate: u32,
+    source_fingerprint: u64,
+}
+
+impl fmt::Debug for PreparedAsrAudio {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedAsrAudio")
+            .field("model_variant", &self.model_variant)
+            .field("samples", &self.samples.len())
+            .field("sample_rate", &self.sample_rate)
+            .field("source_fingerprint", &self.source_fingerprint)
+            .finish()
+    }
+}
+
 /// A request to the engine core.
 #[derive(Debug, Clone)]
 pub struct EngineCoreRequest {
@@ -794,6 +823,8 @@ pub struct EngineCoreRequest {
     /// `prompt_tokens`; speech and future multimodal adapters publish it here
     /// instead of manufacturing placeholder token IDs.
     pub(super) prepared_sequence_input_tokens: Option<usize>,
+    pub(super) prepared_asr_execution_shape: Option<PreparedAsrExecutionShape>,
+    pub(super) prepared_asr_audio: Option<PreparedAsrAudio>,
     /// Executor-produced stream events remain invisible until their exact
     /// execution report has committed.
     pub(super) stream_staging: StreamStagingBuffer,
@@ -996,6 +1027,33 @@ impl EngineCoreRequest {
 
     pub(crate) fn asr_prompt_for_execution(&self) -> Option<&str> {
         self.selected_asr_prompt().map(String::as_str)
+    }
+
+    fn asr_execution_source_fingerprint(&self, model_variant: ModelVariant) -> Result<u64> {
+        if self.task_type != TaskType::ASR || self.model_variant != Some(model_variant) {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} source identity does not match its routed task/model",
+                self.id
+            )));
+        }
+        let audio = self.selected_audio_input().ok_or_else(|| {
+            Error::InvalidInput(format!("ASR request {} is missing audio input", self.id))
+        })?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        model_variant.hash(&mut hasher);
+        match audio {
+            BorrowedEngineAudioInput::Base64(value) => {
+                0_u8.hash(&mut hasher);
+                value.as_bytes().hash(&mut hasher);
+            }
+            BorrowedEngineAudioInput::Bytes(value) => {
+                1_u8.hash(&mut hasher);
+                value.as_slice().hash(&mut hasher);
+            }
+        }
+        self.asr_language_for_execution().hash(&mut hasher);
+        self.asr_prompt_for_execution().hash(&mut hasher);
+        Ok(hasher.finish())
     }
 
     pub(crate) fn speech_messages_for_execution(&self) -> &[ChatMessage] {
@@ -1797,11 +1855,10 @@ impl EngineCoreRequest {
                     self.id
                 )))
             }
-            None
-                if matches!(
-                    model_variant.family(),
-                    ModelFamily::Qwen35Chat | ModelFamily::Qwen38Chat
-                ) =>
+            None if matches!(
+                model_variant.family(),
+                ModelFamily::Qwen35Chat | ModelFamily::Qwen38Chat
+            ) =>
             {
                 Err(Error::InvalidInput(format!(
                     "Chat request {} is missing its prepared hybrid-Qwen prompt artifact",
@@ -1899,12 +1956,138 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
+        let prepared_continuous_cost = self
+            .uses_asr_retained_sequence()
+            .then(|| {
+                Self::continuous_asr_stage_cost(self.execution_adapter_binding.as_ref(), &model)
+            })
+            .transpose()?
+            .flatten();
+        self.prepared_stage_costs.clear();
         self.incremental_model_execution_ready = Some(IncrementalModelExecutionReady {
             model_variant,
             model: PreparedIncrementalModel::Asr(model),
             qwen_tts: None,
         });
+        if let Some((stage_id, cost)) = prepared_continuous_cost {
+            self.install_prepared_stage_cost(stage_id, cost)?;
+        }
         Ok(())
+    }
+
+    fn continuous_asr_stage_cost(
+        binding: Option<&super::ExecutionAdapterBinding>,
+        model: &NativeAsrModel,
+    ) -> Result<Option<(StageId, WorkCost)>> {
+        let Some(stage) = binding.and_then(|binding| {
+            binding
+                .stages
+                .iter()
+                .find(|stage| stage.batch_mode == super::NativeBatchMode::Continuous)
+        }) else {
+            return Ok(None);
+        };
+        if !model.supports_continuous_decode_batch() {
+            return Err(Error::InvalidInput(
+                "loaded adapter selected continuous decode for an incompatible ASR model"
+                    .to_string(),
+            ));
+        }
+        let accelerator_bytes = model.continuous_decode_batch_workspace_per_row_bytes()?;
+        let host_bytes = u64::try_from(
+            std::mem::size_of::<u32>() + 4 * std::mem::size_of::<usize>(),
+        )
+        .map_err(|_| {
+            Error::Overloaded("continuous ASR host workspace estimate overflow".to_string())
+        })?;
+        let cost = WorkCost::with_workspace(
+            1,
+            1,
+            ResourceVector {
+                host_bytes: ResourceAmount::Known(host_bytes),
+                temporary_bytes: ResourceAmount::Known(accelerator_bytes),
+                ..ResourceVector::zero()
+            },
+        );
+        if !cost
+            .workspace
+            .workspace_bytes()
+            .is_ok_and(|bytes| bytes <= stage.max_workspace_bytes)
+        {
+            return Err(Error::Overloaded(
+                "continuous ASR decode workspace exceeds its loaded adapter budget".to_string(),
+            ));
+        }
+        Ok(Some((stage.id, cost)))
+    }
+
+    pub(crate) fn install_prepared_asr_audio(
+        &mut self,
+        model_variant: ModelVariant,
+        samples: Vec<f32>,
+        sample_rate: u32,
+    ) -> Result<()> {
+        if sample_rate == 0 || samples.is_empty() {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} decoded to an empty or zero-rate audio artifact",
+                self.id
+            )));
+        }
+        if samples.iter().any(|sample| !sample.is_finite()) {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} decoded to non-finite audio samples",
+                self.id
+            )));
+        }
+        let source_fingerprint = self.asr_execution_source_fingerprint(model_variant)?;
+        if let Some(current) = self.prepared_asr_audio.as_ref() {
+            if current.model_variant == model_variant
+                && current.sample_rate == sample_rate
+                && current.source_fingerprint == source_fingerprint
+                && current.samples.as_ref() == samples.as_slice()
+            {
+                return Ok(());
+            }
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} changed its prepared decoded-audio artifact",
+                self.id
+            )));
+        }
+        self.prepared_asr_audio = Some(PreparedAsrAudio {
+            model_variant,
+            samples: Arc::from(samples.into_boxed_slice()),
+            sample_rate,
+            source_fingerprint,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn prepared_asr_audio_for_executor(&self) -> Result<Option<(Arc<[f32]>, u32)>> {
+        let Some(prepared) = self.prepared_asr_audio.as_ref() else {
+            return Ok(None);
+        };
+        if self.model_variant != Some(prepared.model_variant)
+            || self.asr_execution_source_fingerprint(prepared.model_variant)?
+                != prepared.source_fingerprint
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} changed after decoded-audio preparation",
+                self.id
+            )));
+        }
+        Ok(Some((prepared.samples.clone(), prepared.sample_rate)))
+    }
+
+    pub(crate) fn prepared_asr_audio_retained_bytes(&self) -> Result<usize> {
+        self.prepared_asr_audio.as_ref().map_or(Ok(0), |prepared| {
+            prepared
+                .samples
+                .len()
+                .checked_mul(std::mem::size_of::<f32>())
+                .ok_or_else(|| {
+                    Error::Overloaded("prepared ASR decoded-audio storage overflowed".to_string())
+                })
+        })
     }
 
     pub(crate) fn install_prepared_sequence_input_tokens(
@@ -1916,6 +2099,12 @@ impl EngineCoreRequest {
             return Err(Error::InvalidInput(format!(
                 "Request {} cannot install multimodal sequence shape for {:?}",
                 self.id, self.task_type
+            )));
+        }
+        if self.prepared_asr_execution_shape == Some(PreparedAsrExecutionShape::LongFormAtomic) {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} cannot change its prepared long-form route to retained sequence execution",
+                self.id
             )));
         }
         if input_tokens == 0 || input_tokens >= max_sequence_tokens {
@@ -1939,7 +2128,46 @@ impl EngineCoreRequest {
             .max(1)
             .min(max_sequence_tokens - input_tokens);
         self.prepared_sequence_input_tokens = Some(input_tokens);
+        self.prepared_asr_execution_shape =
+            Some(PreparedAsrExecutionShape::RetainedSequence { input_tokens });
         Ok(())
+    }
+
+    pub(crate) fn install_prepared_asr_long_form_atomic(&mut self) -> Result<()> {
+        if self.task_type != TaskType::ASR {
+            return Err(Error::InvalidInput(format!(
+                "Request {} cannot install an ASR long-form route for {:?}",
+                self.id, self.task_type
+            )));
+        }
+        if self.prepared_sequence_input_tokens.is_some()
+            || matches!(
+                self.prepared_asr_execution_shape,
+                Some(PreparedAsrExecutionShape::RetainedSequence { .. })
+            )
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} cannot change its prepared retained sequence route to long-form execution",
+                self.id
+            )));
+        }
+        self.prepared_asr_execution_shape = Some(PreparedAsrExecutionShape::LongFormAtomic);
+        Ok(())
+    }
+
+    pub(crate) fn prepared_asr_execution_shape(&self) -> Option<PreparedAsrExecutionShape> {
+        self.prepared_asr_execution_shape
+    }
+
+    pub(crate) fn uses_asr_retained_sequence(&self) -> bool {
+        matches!(
+            self.prepared_asr_execution_shape,
+            Some(PreparedAsrExecutionShape::RetainedSequence { .. })
+        )
+    }
+
+    pub(crate) fn uses_asr_long_form_atomic(&self) -> bool {
+        self.prepared_asr_execution_shape == Some(PreparedAsrExecutionShape::LongFormAtomic)
     }
 
     pub(crate) fn install_qwen_tts_execution_model(
@@ -2052,9 +2280,12 @@ impl EngineCoreRequest {
 
     fn validate_incremental_model_execution_preparation(&self) -> Result<()> {
         let Some(ready) = self.incremental_model_execution_ready.as_ref() else {
-            if self.prepared_sequence_input_tokens.is_some() {
+            if self.prepared_sequence_input_tokens.is_some()
+                || self.prepared_asr_execution_shape.is_some()
+                || self.prepared_asr_audio.is_some()
+            {
                 return Err(Error::InvalidInput(format!(
-                    "Request {} carries a multimodal sequence shape without an exact loaded model",
+                    "Request {} carries prepared multimodal input without an exact loaded model",
                     self.id
                 )));
             }
@@ -2065,6 +2296,28 @@ impl EngineCoreRequest {
                 "Request {} changed model after incremental model preparation",
                 self.id
             )));
+        }
+        if matches!(&ready.model, PreparedIncrementalModel::Asr(_))
+            && ready.model_variant.family() == ModelFamily::Qwen3Asr
+        {
+            if self.prepared_asr_audio_for_executor()?.is_none() {
+                return Err(Error::InvalidInput(format!(
+                    "Qwen3 ASR request {} is missing its exact decoded-audio artifact",
+                    self.id
+                )));
+            }
+            match self.prepared_asr_execution_shape {
+                Some(PreparedAsrExecutionShape::RetainedSequence { input_tokens })
+                    if self.prepared_sequence_input_tokens == Some(input_tokens) => {}
+                Some(PreparedAsrExecutionShape::LongFormAtomic)
+                    if self.prepared_sequence_input_tokens.is_none() => {}
+                _ => {
+                    return Err(Error::InvalidInput(format!(
+                        "Qwen3 ASR request {} is missing a consistent exact media execution shape",
+                        self.id
+                    )));
+                }
+            }
         }
         match (&ready.model, self.task_type) {
             (PreparedIncrementalModel::Asr(_), TaskType::ASR) if ready.qwen_tts.is_none() => Ok(()),
@@ -2192,6 +2445,8 @@ impl EngineCoreRequest {
             managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
             prepared_sequence_input_tokens: None,
+            prepared_asr_execution_shape: None,
+            prepared_asr_audio: None,
             stream_staging: StreamStagingBuffer::default(),
             text: Some(text),
             chat_messages: None,
@@ -2244,6 +2499,8 @@ impl EngineCoreRequest {
             managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
             prepared_sequence_input_tokens: None,
+            prepared_asr_execution_shape: None,
+            prepared_asr_audio: None,
             stream_staging: StreamStagingBuffer::default(),
             text: None,
             chat_messages: None,
@@ -2296,6 +2553,8 @@ impl EngineCoreRequest {
             managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
             prepared_sequence_input_tokens: None,
+            prepared_asr_execution_shape: None,
+            prepared_asr_audio: None,
             stream_staging: StreamStagingBuffer::default(),
             text: None,
             chat_messages: None,
@@ -2345,6 +2604,8 @@ impl EngineCoreRequest {
             managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
             prepared_sequence_input_tokens: None,
+            prepared_asr_execution_shape: None,
+            prepared_asr_audio: None,
             stream_staging: StreamStagingBuffer::default(),
             text: None,
             chat_messages: Some(messages),
@@ -2395,6 +2656,8 @@ impl EngineCoreRequest {
             managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
             prepared_sequence_input_tokens: None,
+            prepared_asr_execution_shape: None,
+            prepared_asr_audio: None,
             stream_staging: StreamStagingBuffer::default(),
             text: None,
             chat_messages: None,
@@ -2445,6 +2708,8 @@ impl EngineCoreRequest {
             managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
             prepared_sequence_input_tokens: None,
+            prepared_asr_execution_shape: None,
+            prepared_asr_audio: None,
             stream_staging: StreamStagingBuffer::default(),
             text: None,
             chat_messages: None,
@@ -2525,8 +2790,22 @@ impl EngineCoreRequest {
             .map(|ready| Self::continuous_chat_stage_cost(Some(&binding), &ready.model))
             .transpose()?
             .flatten();
+        let prepared_asr_continuous_cost = self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| match &ready.model {
+                PreparedIncrementalModel::Asr(model) => Some(model),
+                PreparedIncrementalModel::QwenTts(_) => None,
+            })
+            .filter(|_| self.uses_asr_retained_sequence())
+            .map(|model| Self::continuous_asr_stage_cost(Some(&binding), model))
+            .transpose()?
+            .flatten();
         self.execution_adapter_binding = Some(binding);
         if let Some((stage_id, cost)) = prepared_continuous_cost {
+            self.install_prepared_stage_cost(stage_id, cost)?;
+        }
+        if let Some((stage_id, cost)) = prepared_asr_continuous_cost {
             self.install_prepared_stage_cost(stage_id, cost)?;
         }
         Ok(())
@@ -3227,6 +3506,61 @@ mod tests {
     use crate::backends::BackendKind;
     use crate::model::ModelVariant;
     use crate::models::shared::chat::ChatRole;
+
+    #[test]
+    fn prepared_asr_audio_is_arc_retained_exactly_and_rejects_source_drift() {
+        let variant = ModelVariant::Qwen3Asr06BGguf;
+        let mut request = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+        request.asr_prompt = Some("original".to_string());
+        request
+            .install_prepared_asr_audio(variant, vec![0.25, -0.5, 0.75, 0.0], 16_000)
+            .unwrap();
+        assert_eq!(
+            request.prepared_asr_audio_retained_bytes().unwrap(),
+            4 * std::mem::size_of::<f32>()
+        );
+        let (first, sample_rate) = request
+            .prepared_asr_audio_for_executor()
+            .unwrap()
+            .expect("prepared audio");
+        assert_eq!(sample_rate, 16_000);
+        let cloned = request.clone();
+        let (second, _) = cloned
+            .prepared_asr_audio_for_executor()
+            .unwrap()
+            .expect("cloned prepared audio");
+        assert!(Arc::ptr_eq(&first, &second));
+
+        request.asr_prompt = Some("changed".to_string());
+        assert!(request
+            .prepared_asr_audio_for_executor()
+            .unwrap_err()
+            .to_string()
+            .contains("changed after decoded-audio preparation"));
+    }
+
+    #[test]
+    fn prepared_qwen_asr_routes_are_mutually_exclusive() {
+        let variant = ModelVariant::Qwen3Asr06BGguf;
+        let mut normal = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+        normal
+            .install_prepared_asr_audio(variant, vec![0.0; 16], 16_000)
+            .unwrap();
+        normal
+            .install_prepared_sequence_input_tokens(32, 4096)
+            .unwrap();
+        assert!(normal.uses_asr_retained_sequence());
+        assert!(normal.install_prepared_asr_long_form_atomic().is_err());
+
+        let mut long = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+        long.install_prepared_asr_audio(variant, vec![0.0; 16], 16_000)
+            .unwrap();
+        long.install_prepared_asr_long_form_atomic().unwrap();
+        assert!(long.uses_asr_long_form_atomic());
+        assert!(long
+            .install_prepared_sequence_input_tokens(32, 4096)
+            .is_err());
+    }
 
     #[test]
     fn maximal_stream_backpressure_timeout_fails_without_panicking() {

@@ -29,8 +29,10 @@ const SCALAR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(11);
 const STATIC_TENSOR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(12);
 const CONTINUOUS_TENSOR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(13);
 const NEMOTRON_REALTIME_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(14);
+const CONTINUOUS_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(15);
 const STATIC_TTS_MAX_BATCH_WORKSPACE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const CONTINUOUS_CHAT_MAX_BATCH_WORKSPACE_BYTES: u64 = 16 * 1024 * 1024;
+const CONTINUOUS_ASR_MAX_BATCH_WORKSPACE_BYTES: u64 = 16 * 1024 * 1024;
 // Qwen3.8 MTP supports draft depths one through three, which requires an
 // isolated target quantum of depth + 1. Shared continuous batches remain one
 // work unit per row; this is an aggregate stage ceiling, not a default grant.
@@ -44,18 +46,24 @@ static NEXT_ADAPTER_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 pub(crate) struct StreamingRequirements {
     pub(crate) transport_output: bool,
     pub(crate) model_native: bool,
+    /// Exact ASR media route, independent of transport streaming. This bit is
+    /// part of stage-graph/state identity so long-form atomic work cannot
+    /// acquire the retained sequence runtime.
+    pub(crate) asr_long_form: bool,
 }
 
 impl StreamingRequirements {
     pub(crate) const NONE: Self = Self {
         transport_output: false,
         model_native: false,
+        asr_long_form: false,
     };
 
     pub(crate) const fn native(required: bool) -> Self {
         Self {
             transport_output: required,
             model_native: required,
+            asr_long_form: false,
         }
     }
 
@@ -63,7 +71,13 @@ impl StreamingRequirements {
         Self {
             transport_output: true,
             model_native: false,
+            asr_long_form: false,
         }
+    }
+
+    pub(crate) const fn with_asr_long_form(mut self, required: bool) -> Self {
+        self.asr_long_form = required;
+        self
     }
 }
 
@@ -275,8 +289,19 @@ fn loaded_execution_contracts(
         requirements.push(StreamingRequirements {
             transport_output: false,
             model_native: true,
+            asr_long_form: false,
         });
         requirements.push(StreamingRequirements::native(true));
+    }
+    if metadata.capability == CapabilityKind::Asr
+        && metadata.model_variant.family() == crate::catalog::ModelFamily::Qwen3Asr
+    {
+        let long_form = requirements
+            .iter()
+            .copied()
+            .map(|requirements| requirements.with_asr_long_form(true))
+            .collect::<Vec<_>>();
+        requirements.extend(long_form);
     }
     let contracts = requirements
         .into_iter()
@@ -717,6 +742,11 @@ fn is_continuous_physical_chat(metadata: AdapterMetadata) -> bool {
         )
 }
 
+fn is_continuous_physical_asr(metadata: AdapterMetadata) -> bool {
+    metadata.capability == CapabilityKind::Asr
+        && metadata.model_variant.family() == crate::catalog::ModelFamily::Qwen3Asr
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PhysicalQwenTtsAdapterFactory;
 
@@ -810,6 +840,37 @@ impl LoadedExecutionAdapterFactory for ContinuousPhysicalChatAdapterFactory {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct ContinuousPhysicalAsrAdapterFactory;
+
+impl LoadedExecutionAdapterFactory for ContinuousPhysicalAsrAdapterFactory {
+    fn id(&self) -> &'static str {
+        "builtin.qwen3_asr.tensor_continuous"
+    }
+
+    fn batch_mode(&self) -> NativeBatchMode {
+        NativeBatchMode::Continuous
+    }
+
+    fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
+        is_continuous_physical_asr(metadata)
+    }
+
+    fn create(
+        &self,
+        context: LoadedAdapterFactoryContext,
+        metadata: AdapterMetadata,
+    ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
+        Ok(Arc::new(ContinuousAsrExecutionAdapter::new(
+            context.execution_group_id,
+            context.model_instance_id,
+            metadata,
+            context.backend_kind,
+            context.max_tensor_batch_size,
+        )))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 struct ScalarExecutionAdapterFactory;
 
 impl LoadedExecutionAdapterFactory for ScalarExecutionAdapterFactory {
@@ -825,6 +886,7 @@ impl LoadedExecutionAdapterFactory for ScalarExecutionAdapterFactory {
         !is_physical_qwen_tts(metadata)
             && !is_nemotron_realtime(metadata)
             && !is_continuous_physical_chat(metadata)
+            && !is_continuous_physical_asr(metadata)
     }
 
     fn create(
@@ -847,6 +909,7 @@ pub(super) fn built_in_loaded_adapter_factories() -> Vec<Arc<dyn LoadedExecution
         Arc::new(PhysicalQwenTtsAdapterFactory),
         Arc::new(NemotronRealtimeAdapterFactory),
         Arc::new(ContinuousPhysicalChatAdapterFactory),
+        Arc::new(ContinuousPhysicalAsrAdapterFactory),
         Arc::new(ScalarExecutionAdapterFactory),
     ]
 }
@@ -1291,6 +1354,165 @@ impl LoadedExecutionAdapter for StaticTtsExecutionAdapter {
             metadata,
             execution_profile,
             stages: Arc::from([stage, scalar]),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ContinuousAsrExecutionAdapter {
+    execution_group_id: ExecutionGroupId,
+    model_instance_id: ModelInstanceId,
+    adapter_instance_id: AdapterInstanceId,
+    metadata: AdapterMetadata,
+    backend_kind: BackendKind,
+    max_batch_size: usize,
+}
+
+impl ContinuousAsrExecutionAdapter {
+    fn new(
+        execution_group_id: ExecutionGroupId,
+        model_instance_id: ModelInstanceId,
+        metadata: AdapterMetadata,
+        backend_kind: BackendKind,
+        max_batch_size: usize,
+    ) -> Self {
+        Self {
+            execution_group_id,
+            model_instance_id,
+            adapter_instance_id: AdapterInstanceId::new(
+                NEXT_ADAPTER_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+            ),
+            metadata,
+            backend_kind,
+            max_batch_size: max_batch_size.max(1),
+        }
+    }
+}
+
+impl LoadedExecutionAdapter for ContinuousAsrExecutionAdapter {
+    fn metadata(&self) -> AdapterMetadata {
+        self.metadata
+    }
+
+    fn adapter_instance_id(&self) -> AdapterInstanceId {
+        self.adapter_instance_id
+    }
+
+    fn adapter_abi_revision(&self) -> AdapterAbiRevision {
+        CONTINUOUS_ASR_ADAPTER_ABI
+    }
+
+    fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
+        let metadata = self.metadata();
+        if streaming.model_native && metadata.streaming_mode == StreamingMode::None {
+            return Err(Error::InvalidInput(format!(
+                "Model {} has no streaming ASR contract",
+                metadata.model_variant
+            )));
+        }
+        if streaming.asr_long_form {
+            let mut execution_profile =
+                scalar_execution_profile(metadata, self.backend_kind, false);
+            execution_profile.mode = ExecutionMode::Atomic;
+            execution_profile.prefill = PrefillMode::None;
+            execution_profile.incremental_decode = false;
+            execution_profile.prefill_batch = NativeBatchMode::None;
+            execution_profile.decode_batch = NativeBatchMode::None;
+            execution_profile.cache_mode = CacheMode::None;
+            execution_profile.cache_namespace = None;
+            execution_profile.kv_dtype = "none".to_string();
+            execution_profile.cancellation = CancellationGranularity::OperationBoundary;
+            execution_profile.concurrency = ConcurrencyClass::Exclusive;
+            execution_profile.recompute_safe = false;
+            execution_profile.cache_release_safe = false;
+            execution_profile.prefix_reuse_safe = false;
+            execution_profile.max_batch_size = 1;
+            execution_profile.resolved_from_loaded_model = true;
+
+            let mut stage = StageDescriptor::from_execution_profile(
+                StageId::new(3),
+                "asr.long_form.atomic",
+                &execution_profile,
+                NativeBatchMode::None,
+            );
+            stage.selector = StageWorkSelector::Atomic;
+            stage.shape_policy = StageShapePolicy::Exact;
+            stage.output_visibility = output_visibility_for(
+                streaming.transport_output,
+                execution_profile.mode,
+                NativeBatchMode::None,
+            );
+            stage.validate()?;
+            return Ok(LoadedExecutionContract {
+                execution_group_id: self.execution_group_id,
+                model_instance_id: self.model_instance_id,
+                adapter_instance_id: self.adapter_instance_id(),
+                adapter_abi_revision: self.adapter_abi_revision(),
+                metadata,
+                execution_profile,
+                stages: Arc::from([stage]),
+            });
+        }
+        let mut execution_profile =
+            scalar_execution_profile(metadata, self.backend_kind, streaming.model_native);
+        execution_profile.mode = ExecutionMode::Sequence;
+        execution_profile.prefill = PrefillMode::Incremental;
+        execution_profile.incremental_decode = true;
+        execution_profile.prefill_batch = NativeBatchMode::None;
+        execution_profile.decode_batch = NativeBatchMode::Continuous;
+        execution_profile.cache_mode = CacheMode::ExternalPaged;
+        execution_profile.cache_namespace = Some(format!(
+            "{}:{}:state-v2",
+            metadata.model_variant,
+            self.backend_kind.as_str()
+        ));
+        execution_profile.kv_dtype = "state_v2_resolved".to_string();
+        execution_profile.cancellation = CancellationGranularity::SequenceStep;
+        execution_profile.concurrency = ConcurrencyClass::Batchable;
+        execution_profile.recompute_safe = true;
+        execution_profile.cache_release_safe = true;
+        execution_profile.prefix_reuse_safe = false;
+        execution_profile.max_batch_size = self.max_batch_size;
+        execution_profile.resolved_from_loaded_model = true;
+
+        let mut prefill = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            "asr.prefill.scalar",
+            &execution_profile,
+            NativeBatchMode::None,
+        );
+        prefill.selector = StageWorkSelector::SequencePrefill;
+        prefill.max_batch_size = 1;
+        prefill.concurrency = ConcurrencyClass::Exclusive;
+        prefill.shape_policy = StageShapePolicy::Exact;
+        prefill.output_visibility = output_visibility_for(
+            streaming.transport_output,
+            execution_profile.mode,
+            NativeBatchMode::None,
+        );
+
+        let mut decode = StageDescriptor::from_execution_profile(
+            StageId::new(2),
+            "asr.decode.tensor_continuous",
+            &execution_profile,
+            NativeBatchMode::Continuous,
+        );
+        decode.selector = StageWorkSelector::SequenceDecode;
+        decode.max_work_units = u64::try_from(decode.max_batch_size).map_err(|_| {
+            Error::Overloaded("continuous ASR batch width exceeds work accounting".to_string())
+        })?;
+        decode.max_workspace_bytes = CONTINUOUS_ASR_MAX_BATCH_WORKSPACE_BYTES;
+        prefill.validate()?;
+        decode.validate()?;
+
+        Ok(LoadedExecutionContract {
+            execution_group_id: self.execution_group_id,
+            model_instance_id: self.model_instance_id,
+            adapter_instance_id: self.adapter_instance_id(),
+            adapter_abi_revision: self.adapter_abi_revision(),
+            metadata,
+            execution_profile,
+            stages: Arc::from([prefill, decode]),
         })
     }
 }
@@ -1888,7 +2110,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen_asr_rejects_retained_only_publication() {
+    fn qwen_asr_rejects_retained_only_publication_without_long_form_workspace() {
         let registry = RuntimeAdapterRegistry::built_in();
         let model_instance = ModelInstanceId::new(81);
         let state_contract = crate::kv::test_contract();
@@ -1917,10 +2139,10 @@ mod tests {
                 },
             )]),
         )
-        .expect_err("Qwen3 ASR needs both retained and invocation backing");
-        assert!(error
-            .to_string()
-            .contains("invocation state cannot publish a retained-only"));
+        .expect_err("Qwen3 ASR must publish both retained and long-form invocation state");
+        assert!(error.to_string().contains(
+            "requiring invocation state cannot publish a retained-only physical runtime"
+        ));
     }
 
     #[test]
@@ -2255,6 +2477,7 @@ mod tests {
                 && !is_physical_qwen_tts(metadata)
                 && !is_nemotron_realtime(metadata)
                 && !is_continuous_physical_chat(metadata)
+                && !is_continuous_physical_asr(metadata)
         }
 
         fn create(
@@ -2498,7 +2721,7 @@ mod tests {
     }
 
     #[test]
-    fn current_audio_adapters_remain_scalar_until_a_family_native_call_opts_in() {
+    fn audio_adapters_remain_scalar_except_for_exact_family_native_opt_ins() {
         let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(8, 4).unwrap();
         let audio_capability = |capability| {
             matches!(
@@ -2536,17 +2759,28 @@ mod tests {
                             )
                         })
                     {
-                        assert_eq!(contract.execution_profile.max_batch_size, 1);
-                        assert_eq!(
-                            contract.execution_profile.concurrency,
-                            ConcurrencyClass::Exclusive
-                        );
-                        assert!(!contract.execution_profile.capabilities().native_batch);
-                        assert!(contract.stages.iter().all(|stage| {
-                            stage.batch_mode == NativeBatchMode::None
-                                && stage.max_batch_size == 1
-                                && stage.concurrency == ConcurrencyClass::Exclusive
-                        }));
+                        let qwen3_asr = execution.metadata().capability == CapabilityKind::Asr
+                            && variant.family() == crate::catalog::ModelFamily::Qwen3Asr;
+                        if qwen3_asr && contract.execution_profile.mode == ExecutionMode::Sequence {
+                            assert_eq!(
+                                contract.execution_profile.decode_batch,
+                                NativeBatchMode::Continuous
+                            );
+                            assert_eq!(contract.execution_profile.max_batch_size, 8);
+                            assert!(contract.execution_profile.capabilities().native_batch);
+                        } else {
+                            assert_eq!(contract.execution_profile.max_batch_size, 1);
+                            assert_eq!(
+                                contract.execution_profile.concurrency,
+                                ConcurrencyClass::Exclusive
+                            );
+                            assert!(!contract.execution_profile.capabilities().native_batch);
+                            assert!(contract.stages.iter().all(|stage| {
+                                stage.batch_mode == NativeBatchMode::None
+                                    && stage.max_batch_size == 1
+                                    && stage.concurrency == ConcurrencyClass::Exclusive
+                            }));
+                        }
                     }
                 }
             }
@@ -3156,6 +3390,66 @@ mod tests {
             contract.stages[1].max_workspace_bytes,
             CONTINUOUS_CHAT_MAX_BATCH_WORKSPACE_BYTES
         );
+    }
+
+    #[test]
+    fn qwen_asr_native_factory_publishes_incremental_scalar_prefill_and_ragged_decode() {
+        let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(8, 1).unwrap();
+
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            let draft = LoadedModelBundleDraft::build(
+                &registry,
+                ExecutionGroupId::new(61),
+                ModelInstanceId::new(62),
+                ModelVariant::Qwen3Asr06BGguf,
+                backend,
+            )
+            .unwrap();
+            for streaming in [
+                StreamingRequirements::NONE,
+                StreamingRequirements::native(true),
+            ] {
+                let contract = draft
+                    .capabilities
+                    .get(&CapabilityKind::Asr)
+                    .unwrap()
+                    .contract(streaming)
+                    .unwrap();
+                assert_eq!(contract.adapter_abi_revision, CONTINUOUS_ASR_ADAPTER_ABI);
+                assert_eq!(contract.execution_profile.mode, ExecutionMode::Sequence);
+                assert_eq!(contract.execution_profile.prefill, PrefillMode::Incremental);
+                assert_eq!(
+                    contract.execution_profile.prefill_batch,
+                    NativeBatchMode::None
+                );
+                assert_eq!(
+                    contract.execution_profile.decode_batch,
+                    NativeBatchMode::Continuous
+                );
+                assert_eq!(contract.execution_profile.max_batch_size, 8);
+                assert!(contract.execution_profile.recompute_safe);
+                assert!(contract.execution_profile.cache_release_safe);
+                assert!(!contract.execution_profile.prefix_reuse_safe);
+                assert_eq!(contract.stages.len(), 2);
+                assert_eq!(
+                    contract.stages[0].selector,
+                    StageWorkSelector::SequencePrefill
+                );
+                assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::None);
+                assert_eq!(contract.stages[0].max_batch_size, 1);
+                assert_eq!(
+                    contract.stages[1].selector,
+                    StageWorkSelector::SequenceDecode
+                );
+                assert_eq!(contract.stages[1].batch_mode, NativeBatchMode::Continuous);
+                assert_eq!(contract.stages[1].max_batch_size, 8);
+                assert_eq!(contract.stages[1].max_work_units, 8);
+                assert_eq!(
+                    contract.stages[1].max_workspace_bytes,
+                    CONTINUOUS_ASR_MAX_BATCH_WORKSPACE_BYTES
+                );
+            }
+        }
     }
 
     #[test]

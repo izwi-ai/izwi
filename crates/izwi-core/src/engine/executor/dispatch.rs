@@ -158,9 +158,12 @@ impl NativeExecutor {
                     }
                 }
                 Some(reservation) if request.task_type == TaskType::ASR => {
-                    let cache =
-                        super::qwen3_managed_cache_for_row(request, scheduled_req, reservation)?;
-                    self.transcribe_request_with_managed_cache(request, scheduled_req, Some(cache))
+                    let state = super::retained_row_managed_state_for_row(
+                        request,
+                        scheduled_req,
+                        reservation,
+                    )?;
+                    self.transcribe_request_with_managed_cache(request, scheduled_req, Some(state))
                 }
                 Some(reservation)
                     if request.task_type == TaskType::TTS
@@ -346,6 +349,40 @@ impl NativeExecutor {
             })
             .collect::<Result<Vec<_>>>()?;
         let outputs = self.chat_decode_batch_with_managed(requests, scheduled, managed_caches)?;
+        self.finish_scheduled_execution(
+            requests,
+            scheduled,
+            outputs,
+            BatchDispatch::new(BatchDispatchKind::TensorContinuous, scheduled.len()),
+            rows,
+        )
+    }
+
+    pub(super) fn execute_continuous_asr_requests_with_rows(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+        rows: Option<&[ReadyQuantum]>,
+    ) -> Result<Vec<ExecutorStepResult>> {
+        let managed_caches = scheduled
+            .iter()
+            .map(|scheduled| {
+                let reservation = rows
+                    .and_then(|rows| rows.iter().find(|row| row.plan_id == scheduled.plan_id))
+                    .and_then(|row| row.managed_cache.as_ref());
+                let request = Self::find_request(requests, scheduled).ok_or_else(|| {
+                    Error::InferenceError(
+                        "continuous ASR managed-cache row has no request snapshot".to_string(),
+                    )
+                })?;
+                reservation
+                    .map(|reservation| {
+                        super::retained_row_managed_state_for_row(request, scheduled, reservation)
+                    })
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let outputs = self.asr_decode_batch_with_managed(requests, scheduled, managed_caches)?;
         self.finish_scheduled_execution(
             requests,
             scheduled,

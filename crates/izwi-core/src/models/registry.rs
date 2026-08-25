@@ -51,9 +51,9 @@ use crate::models::architectures::parakeet::asr::{
     ParakeetAsrModel, ParakeetAsrTranscriptionOutput, ParakeetPhysicalStateSpec,
 };
 use crate::models::architectures::qwen3::asr::{
-    AsrDecodeState as Qwen3AsrDecodeState, AsrDecodeStep as Qwen3AsrDecodeStep,
-    AsrTranscriptionOutput as Qwen3AsrTranscriptionOutput, Qwen3AsrModel,
-    Qwen3AsrPhysicalStateSpec,
+    AsrDecodeCheckpoint as Qwen3AsrDecodeCheckpoint, AsrDecodeState as Qwen3AsrDecodeState,
+    AsrDecodeStep as Qwen3AsrDecodeStep, AsrTranscriptionOutput as Qwen3AsrTranscriptionOutput,
+    Qwen3AsrModel, Qwen3AsrPhysicalStateSpec,
 };
 use crate::models::architectures::qwen3::chat::{
     ChatDecodeCheckpoint as Qwen3ChatDecodeCheckpoint, ChatDecodeState as Qwen3ChatDecodeState,
@@ -613,6 +613,10 @@ pub enum NativeAsrDecodeState {
     Nemotron(NemotronStreamingState),
 }
 
+pub(crate) enum NativeAsrDecodeCheckpoint {
+    Qwen3(Qwen3AsrDecodeCheckpoint),
+}
+
 impl NativeAsrDecodeState {
     pub(crate) fn uses_managed_qwen3_kv(&self) -> bool {
         matches!(self, Self::Qwen3(state) if state.uses_managed_kv())
@@ -643,6 +647,83 @@ impl NativeAsrDecodeState {
             Self::Nemotron(_) => Err(Error::InvalidInput(
                 "managed Qwen3 KV cache was supplied to a non-Qwen3 ASR state".to_string(),
             )),
+        }
+    }
+
+    pub(crate) fn begin_managed_quantum(
+        &mut self,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<NativeAsrDecodeCheckpoint> {
+        match self {
+            Self::Qwen3(state) => state
+                .begin_managed_quantum(cache)
+                .map(NativeAsrDecodeCheckpoint::Qwen3),
+            Self::Nemotron(_) => Err(Error::InvalidInput(
+                "managed Qwen3 KV cache was supplied to a non-Qwen3 ASR state".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn rollback_managed_quantum(
+        &mut self,
+        checkpoint: NativeAsrDecodeCheckpoint,
+    ) -> Result<()> {
+        match (self, checkpoint) {
+            (Self::Qwen3(state), NativeAsrDecodeCheckpoint::Qwen3(checkpoint)) => {
+                state.rollback_managed_quantum(checkpoint);
+                Ok(())
+            }
+            (Self::Nemotron(_), NativeAsrDecodeCheckpoint::Qwen3(_)) => Err(Error::InvalidInput(
+                "Qwen3 ASR checkpoint was supplied to a non-Qwen3 ASR state".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn bind_qwen3_tensor_sequence(&mut self, sequence: u64) -> Result<()> {
+        match self {
+            Self::Qwen3(state) => state.bind_tensor_sequence(sequence),
+            Self::Nemotron(_) => Err(Error::InvalidInput(
+                "Qwen3 ASR tensor-state reservation was supplied to a non-Qwen3 state".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn restore_qwen3_prepared_tensor_state(
+        &mut self,
+        arena: &crate::backends::state::TensorStateArena,
+    ) -> Result<()> {
+        match self {
+            Self::Qwen3(state) => state.restore_prepared_tensor_state(arena),
+            Self::Nemotron(_) => Err(Error::InvalidInput(
+                "Qwen3 ASR tensor-state arena was supplied to a non-Qwen3 state".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn stage_qwen3_prepared_tensor_state(
+        &mut self,
+        arena: &crate::backends::state::TensorStateArena,
+        transaction: u64,
+    ) -> Result<()> {
+        match self {
+            Self::Qwen3(state) => state.stage_prepared_tensor_state(arena, transaction),
+            Self::Nemotron(_) => Err(Error::InvalidInput(
+                "Qwen3 ASR tensor-state arena was supplied to a non-Qwen3 state".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn prefill_progress(&self) -> Option<usize> {
+        match self {
+            Self::Qwen3(state) => Some(state.prefill_progress()),
+            Self::Nemotron(_) => None,
+        }
+    }
+
+    pub(crate) fn prefill_token_count(&self) -> Option<usize> {
+        match self {
+            Self::Qwen3(state) => Some(state.prefill_token_count()),
+            Self::Nemotron(_) => None,
         }
     }
 }
@@ -1702,6 +1783,27 @@ impl NativeAsrModel {
         matches!(self, Self::Qwen3(_))
     }
 
+    pub fn supports_resumable_prefill(&self) -> bool {
+        matches!(self, Self::Qwen3(model) if model.supports_resumable_prefill())
+    }
+
+    pub fn supports_continuous_decode_batch(&self) -> bool {
+        matches!(self, Self::Qwen3(model) if model.supports_continuous_decode_batch())
+    }
+
+    pub fn continuous_decode_is_tensor_batched(&self) -> bool {
+        matches!(self, Self::Qwen3(model) if model.continuous_decode_is_tensor_batched())
+    }
+
+    pub fn continuous_decode_batch_workspace_per_row_bytes(&self) -> Result<u64> {
+        match self {
+            Self::Qwen3(model) => model.continuous_decode_batch_workspace_per_row_bytes(),
+            _ => Err(Error::InvalidInput(
+                "Loaded ASR model does not expose continuous tensor decode".to_string(),
+            )),
+        }
+    }
+
     pub fn supports_realtime_stream_decode(&self) -> bool {
         matches!(self, Self::Nemotron(_))
     }
@@ -1994,6 +2096,51 @@ impl NativeAsrModel {
         }
     }
 
+    /// Prepare Qwen3 ASR's immutable multimodal decoder input while leaving
+    /// its scheduler-owned physical KV empty. Exact prompt spans are committed
+    /// later through [`Self::continue_resumable_prefill`].
+    pub(crate) fn start_resumable_prefill_state_with_prompt_managed(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        max_new_tokens: usize,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<NativeAsrDecodeState> {
+        match self {
+            Self::Qwen3(model) => Ok(NativeAsrDecodeState::Qwen3(
+                model.begin_resumable_prefill_managed(
+                    audio,
+                    sample_rate,
+                    language,
+                    prompt,
+                    max_new_tokens,
+                    cache,
+                )?,
+            )),
+            _ => Err(Error::InvalidInput(
+                "resumable Qwen3 KV prefill was supplied to a non-Qwen3 ASR model".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn continue_resumable_prefill(
+        &self,
+        state: &mut NativeAsrDecodeState,
+        span_start: usize,
+        span_end: usize,
+    ) -> Result<bool> {
+        match (self, state) {
+            (Self::Qwen3(model), NativeAsrDecodeState::Qwen3(state)) => {
+                model.continue_resumable_prefill(state, span_start, span_end)
+            }
+            _ => Err(Error::InvalidInput(
+                "ASR resumable-prefill state does not match loaded ASR model".to_string(),
+            )),
+        }
+    }
+
     pub fn decode_step(&self, state: &mut NativeAsrDecodeState) -> Result<NativeAsrDecodeStep> {
         match (self, state) {
             (Self::Qwen3(model), NativeAsrDecodeState::Qwen3(state)) => {
@@ -2018,6 +2165,37 @@ impl NativeAsrModel {
                 "ASR decode state does not match loaded ASR model".to_string(),
             )),
         }
+    }
+
+    pub(crate) fn decode_step_batch(
+        &self,
+        states: &mut [&mut NativeAsrDecodeState],
+    ) -> Result<Vec<NativeAsrDecodeStep>> {
+        let Self::Qwen3(model) = self else {
+            return Err(Error::InvalidInput(
+                "Loaded ASR model does not expose continuous tensor decode".to_string(),
+            ));
+        };
+        let mut qwen_states = states
+            .iter_mut()
+            .map(|state| match &mut **state {
+                NativeAsrDecodeState::Qwen3(state) => Ok(state),
+                NativeAsrDecodeState::Nemotron(_) => Err(Error::InvalidInput(
+                    "continuous Qwen3 ASR batch contains a non-Qwen3 state".to_string(),
+                )),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        model.decode_step_batch(&mut qwen_states).map(|steps| {
+            steps
+                .into_iter()
+                .map(|step| NativeAsrDecodeStep {
+                    delta: step.delta,
+                    text: step.text,
+                    tokens_generated: step.tokens_generated,
+                    finished: step.finished,
+                })
+                .collect()
+        })
     }
 }
 
