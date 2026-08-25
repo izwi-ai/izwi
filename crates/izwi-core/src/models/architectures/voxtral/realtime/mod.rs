@@ -10,8 +10,8 @@
 
 mod audio;
 mod config;
-mod model;
-mod streaming;
+pub(crate) mod model;
+pub(crate) mod streaming;
 mod tokenizer;
 
 pub use model::VoxtralRealtimeModel;

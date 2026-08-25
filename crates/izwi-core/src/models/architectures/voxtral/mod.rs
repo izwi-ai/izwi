@@ -25,6 +25,13 @@ pub(crate) struct VoxtralPhysicalStateSpec {
     pub(crate) invocation: InferenceStateContract,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct VoxtralRealtimePhysicalStateSpec {
+    pub(crate) descriptor: CapabilityStateDescriptorV2,
+    pub(crate) retained: InferenceStateContract,
+    pub(crate) retained_max_tokens: usize,
+}
+
 pub(crate) fn voxtral_invocation_contract(
     model: &VoxtralLM,
     dtype: DType,
@@ -64,6 +71,103 @@ pub(crate) fn voxtral_invocation_contract(
     }
     contract.validate()?;
     Ok(contract)
+}
+
+pub(crate) fn voxtral_retained_contract(
+    mut contract: InferenceStateContract,
+) -> Result<InferenceStateContract> {
+    for domain in &mut contract.domains {
+        let StateDomainSpec::PagedAttention(domain) = domain else {
+            return Err(Error::ModelLoadError(
+                "Voxtral retained state must be paged attention".into(),
+            ));
+        };
+        domain.header.scope = StateScope::Retained;
+        domain.header.prefix = PrefixPolicy::Disabled;
+        domain.header.checkpoint = CheckpointPolicy::Transactional;
+    }
+    for group in &mut contract.groups {
+        group.prefix_shareable = false;
+    }
+    contract.validate()?;
+    Ok(contract)
+}
+
+pub(crate) fn voxtral_realtime_physical_state_spec(
+    stage_graphs: &[&[StageDescriptor]],
+    retained: InferenceStateContract,
+    max_context_tokens: usize,
+) -> Result<VoxtralRealtimePhysicalStateSpec> {
+    if stage_graphs.is_empty() || max_context_tokens == 0 {
+        return Err(Error::ModelLoadError(
+            "Voxtral retained realtime state requires stages and a non-zero context".into(),
+        ));
+    }
+    let max_domain_id = retained
+        .domains
+        .iter()
+        .map(|domain| domain.id().get())
+        .max()
+        .ok_or_else(|| Error::ModelLoadError("Voxtral retained contract is empty".into()))?;
+    let mut profiles = Vec::with_capacity(stage_graphs.len());
+    for stages in stage_graphs {
+        let mut ordered = stages.iter().collect::<Vec<_>>();
+        ordered.sort_unstable_by_key(|stage| stage.id);
+        let mut invocation_stages = Vec::with_capacity(ordered.len());
+        for (index, stage) in ordered.into_iter().enumerate() {
+            let domains = if stage.max_workspace_bytes == 0 {
+                Vec::new()
+            } else {
+                let scratch_id = max_domain_id
+                    .checked_add(u32::try_from(index + 1).map_err(|_| {
+                        Error::ModelLoadError(
+                            "Voxtral realtime execution stage count exceeds u32".into(),
+                        )
+                    })?)
+                    .ok_or_else(|| {
+                        Error::ModelLoadError("Voxtral realtime scratch domain overflow".into())
+                    })?;
+                vec![InvocationWorkspaceDomain::Scratch {
+                    id: StateDomainId::new(scratch_id),
+                    placement: PlacementPolicy::BackendLocal,
+                    alignment_bytes: 64,
+                    zero_on_release: false,
+                    formula: WorkspaceFormula {
+                        fixed_bytes: stage.max_workspace_bytes,
+                        dimensions: vec![],
+                        terms: vec![],
+                    },
+                }]
+            };
+            invocation_stages.push(InvocationStageWorkspace {
+                stage: stage.id,
+                lease_scope: InvocationLeaseScope::PerRow,
+                groups: Vec::new(),
+                domains,
+            });
+        }
+        profiles.push(InvocationWorkspaceProfile {
+            stage_graph_fingerprint: stage_graph_fingerprint(stages)?,
+            stages: invocation_stages,
+        });
+    }
+    profiles.sort_unstable_by_key(|profile| profile.stage_graph_fingerprint);
+    profiles.dedup();
+    let descriptor = CapabilityStateDescriptorV2 {
+        abi: CURRENT_INFERENCE_STATE_ABI,
+        retained: RetainedStateCapability::Managed {
+            contract: retained.clone(),
+        },
+        invocation: InvocationWorkspaceSet::Bounded { profiles },
+    };
+    for stages in stage_graphs {
+        descriptor.validate_against_stages(stages)?;
+    }
+    Ok(VoxtralRealtimePhysicalStateSpec {
+        descriptor,
+        retained,
+        retained_max_tokens: max_context_tokens,
+    })
 }
 
 pub(crate) fn voxtral_physical_state_spec(
@@ -193,4 +297,42 @@ fn voxtral_paged_invocation_bytes(state: &StateDomainSpec, max_tokens: u64) -> R
         .checked_mul(rounded_tokens)
         .and_then(|elements| elements.checked_mul(element_bytes))
         .ok_or_else(|| Error::ModelLoadError("Voxtral invocation byte bound overflow".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::voxtral_retained_contract;
+    use crate::kv::v2::{
+        test_contract, CheckpointPolicy, PrefixPolicy, RetainedStateCapability, StateScope,
+    };
+
+    #[test]
+    fn realtime_contract_is_transactional_retained_and_not_prefix_shareable() {
+        let mut invocation = test_contract();
+        for domain in &mut invocation.domains {
+            match domain {
+                crate::kv::v2::StateDomainSpec::PagedAttention(domain) => {
+                    domain.header.scope = StateScope::Invocation;
+                    domain.header.checkpoint = CheckpointPolicy::None;
+                }
+                other => panic!("unexpected test domain: {other:?}"),
+            }
+        }
+
+        let retained = voxtral_retained_contract(invocation).unwrap();
+
+        assert!(retained.domains.iter().all(|domain| {
+            domain.header().scope == StateScope::Retained
+                && domain.header().checkpoint == CheckpointPolicy::Transactional
+                && domain.header().prefix == PrefixPolicy::Disabled
+        }));
+        assert!(retained.groups.iter().all(|group| !group.prefix_shareable));
+        let capability = RetainedStateCapability::Managed {
+            contract: retained.clone(),
+        };
+        assert!(matches!(
+            capability,
+            RetainedStateCapability::Managed { contract } if contract == retained
+        ));
+    }
 }

@@ -1,6 +1,7 @@
 //! Model-neutral session view over scheduler-owned paged-attention storage.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use candle_core::Tensor;
@@ -31,6 +32,7 @@ pub(crate) struct PreparedPhysicalPagedStep {
 /// A generation-pinned logical block table over one physical paged-attention
 /// arena. Models retain only this view; K/V tensors remain backend-owned.
 pub struct PhysicalPagedKvCache {
+    view_id: u64,
     pub(crate) arena: Arc<dyn KvArena>,
     layer_bindings: Vec<KvLayerBinding>,
     pub(crate) blocks: Vec<CacheBlockRef>,
@@ -39,6 +41,8 @@ pub struct PhysicalPagedKvCache {
     logical_generation: u32,
     completed_writes: Vec<Arc<KvWriteBatchCompletion>>,
 }
+
+static NEXT_PHYSICAL_PAGED_KV_VIEW_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Logical rollback point for a cache whose submitted writes are already
 /// backend-fenced. The physical pages remain owned by the cache; restoring a
@@ -133,6 +137,7 @@ impl PhysicalPagedKvCache {
             previous_model_layer = Some(binding.model_layer);
         }
         Ok(Self {
+            view_id: NEXT_PHYSICAL_PAGED_KV_VIEW_ID.fetch_add(1, Ordering::Relaxed),
             arena,
             layer_bindings,
             blocks,
@@ -141,6 +146,16 @@ impl PhysicalPagedKvCache {
             logical_generation: 1,
             completed_writes: Vec::new(),
         })
+    }
+
+    /// Process-local authority for this concrete logical cache view.
+    ///
+    /// Multiple sequences normally share an arena, so the arena identifier is
+    /// insufficient for authenticating a transactional checkpoint. The view
+    /// identifier remains stable while this cache is moved and is never copied
+    /// into another independently constructed cache.
+    pub(crate) fn view_id(&self) -> u64 {
+        self.view_id
     }
 
     pub fn context_len(&self) -> usize {
@@ -870,6 +885,15 @@ mod tests {
             })
             .collect();
         PhysicalPagedKvCache::new(arena, bindings, blocks, 0).unwrap()
+    }
+
+    #[test]
+    fn independently_constructed_cache_views_have_distinct_authority() {
+        let first = prefix_test_cache(1);
+        let second = prefix_test_cache(1);
+
+        assert_ne!(first.view_id(), second.view_id());
+        assert_eq!(first.arena().id(), second.arena().id());
     }
 
     fn submit_prepared_writes(
