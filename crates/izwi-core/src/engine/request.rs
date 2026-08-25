@@ -21,6 +21,7 @@ use super::{
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
+use crate::models::architectures::granite_speech::asr::GraniteSpeechPreparedPromptArtifact;
 use crate::models::architectures::qwen3::asr::Qwen3AsrPreparedAudio;
 use crate::models::architectures::qwen3::tts::{
     Qwen3TtsModel, SpeakerReference, TtsGenerationParams, TtsSessionCacheRequest,
@@ -785,6 +786,7 @@ enum PreparedAsrEncoderArtifactValue {
     Qwen3(Arc<Qwen3AsrPreparedAudio>),
     Whisper(Arc<WhisperPreparedWindow>),
     VibeVoice(Arc<VibeVoiceAsrPreparedArtifact>),
+    GraniteSpeech(Arc<GraniteSpeechPreparedPromptArtifact>),
 }
 
 impl fmt::Debug for PreparedAsrEncoderArtifact {
@@ -804,6 +806,7 @@ impl PreparedAsrEncoderArtifactValue {
             Self::Qwen3(_) => "qwen3",
             Self::Whisper(_) => "whisper",
             Self::VibeVoice(_) => "vibevoice",
+            Self::GraniteSpeech(_) => "granite_speech",
         }
     }
 
@@ -814,13 +817,16 @@ impl PreparedAsrEncoderArtifactValue {
             Self::VibeVoice(value) => {
                 Ok((value.resident_host_bytes(), value.resident_tensor_bytes()))
             }
+            Self::GraniteSpeech(value) => {
+                Ok((value.resident_host_bytes(), value.resident_tensor_bytes()?))
+            }
         }
     }
 
     fn clocked_state_projections(&self) -> &[ClockedStateProjection] {
         match self {
             Self::VibeVoice(value) => value.tokenizer_state_projections(),
-            Self::Qwen3(_) | Self::Whisper(_) => &[],
+            Self::Qwen3(_) | Self::Whisper(_) | Self::GraniteSpeech(_) => &[],
         }
     }
 }
@@ -2283,7 +2289,8 @@ impl EngineCoreRequest {
         match &prepared.artifact {
             PreparedAsrEncoderArtifactValue::Qwen3(value) => Ok(Some(value.clone())),
             PreparedAsrEncoderArtifactValue::Whisper(_)
-            | PreparedAsrEncoderArtifactValue::VibeVoice(_) => Err(Error::InvalidInput(
+            | PreparedAsrEncoderArtifactValue::VibeVoice(_)
+            | PreparedAsrEncoderArtifactValue::GraniteSpeech(_) => Err(Error::InvalidInput(
                 "foreign encoder artifact was requested through the Qwen3 accessor".into(),
             )),
         }
@@ -2338,7 +2345,8 @@ impl EngineCoreRequest {
         match &prepared.artifact {
             PreparedAsrEncoderArtifactValue::Whisper(value) => Ok(Some(value.clone())),
             PreparedAsrEncoderArtifactValue::Qwen3(_)
-            | PreparedAsrEncoderArtifactValue::VibeVoice(_) => Err(Error::InvalidInput(
+            | PreparedAsrEncoderArtifactValue::VibeVoice(_)
+            | PreparedAsrEncoderArtifactValue::GraniteSpeech(_) => Err(Error::InvalidInput(
                 "foreign encoder artifact was requested through the Whisper accessor".into(),
             )),
         }
@@ -2393,8 +2401,65 @@ impl EngineCoreRequest {
         match &prepared.artifact {
             PreparedAsrEncoderArtifactValue::VibeVoice(value) => Ok(Some(value.clone())),
             PreparedAsrEncoderArtifactValue::Qwen3(_)
-            | PreparedAsrEncoderArtifactValue::Whisper(_) => Err(Error::InvalidInput(
+            | PreparedAsrEncoderArtifactValue::Whisper(_)
+            | PreparedAsrEncoderArtifactValue::GraniteSpeech(_) => Err(Error::InvalidInput(
                 "foreign encoder artifact was requested through the VibeVoice accessor".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn install_prepared_granite_speech_artifact(
+        &mut self,
+        model_variant: ModelVariant,
+        artifact: Arc<GraniteSpeechPreparedPromptArtifact>,
+    ) -> Result<()> {
+        if model_variant.family() != ModelFamily::GraniteSpeechAsr
+            || self.task_type != TaskType::ASR
+            || self.model_variant != Some(model_variant)
+            || self.uses_asr_long_form_atomic()
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} Granite Speech artifact does not match its normal routed model",
+                self.id
+            )));
+        }
+        let source_fingerprint = self.asr_execution_source_fingerprint(model_variant)?;
+        if self.prepared_asr_encoder_artifact.is_some() {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} already owns an encoder artifact",
+                self.id
+            )));
+        }
+        self.prepared_asr_encoder_artifact = Some(PreparedAsrEncoderArtifact {
+            model_variant,
+            artifact: PreparedAsrEncoderArtifactValue::GraniteSpeech(artifact),
+            source_fingerprint,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn prepared_granite_speech_artifact_for_executor(
+        &self,
+    ) -> Result<Option<Arc<GraniteSpeechPreparedPromptArtifact>>> {
+        let Some(prepared) = self.prepared_asr_encoder_artifact.as_ref() else {
+            return Ok(None);
+        };
+        if self.model_variant != Some(prepared.model_variant)
+            || self.asr_execution_source_fingerprint(prepared.model_variant)?
+                != prepared.source_fingerprint
+            || self.uses_asr_long_form_atomic()
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} changed after Granite Speech preparation",
+                self.id
+            )));
+        }
+        match &prepared.artifact {
+            PreparedAsrEncoderArtifactValue::GraniteSpeech(value) => Ok(Some(value.clone())),
+            PreparedAsrEncoderArtifactValue::Qwen3(_)
+            | PreparedAsrEncoderArtifactValue::Whisper(_)
+            | PreparedAsrEncoderArtifactValue::VibeVoice(_) => Err(Error::InvalidInput(
+                "foreign encoder artifact was requested through the Granite Speech accessor".into(),
             )),
         }
     }
@@ -2720,7 +2785,10 @@ impl EngineCoreRequest {
         if matches!(&ready.model, PreparedIncrementalModel::Asr(_))
             && matches!(
                 ready.model_variant.family(),
-                ModelFamily::Qwen3Asr | ModelFamily::WhisperAsr | ModelFamily::VibeVoiceAsr
+                ModelFamily::Qwen3Asr
+                    | ModelFamily::WhisperAsr
+                    | ModelFamily::VibeVoiceAsr
+                    | ModelFamily::GraniteSpeechAsr
             )
         {
             if self.prepared_asr_audio_for_executor()?.is_none() {
@@ -2742,6 +2810,9 @@ impl EngineCoreRequest {
                             ModelFamily::VibeVoiceAsr => {
                                 self.prepared_vibevoice_artifact_for_executor()?.is_some()
                             }
+                            ModelFamily::GraniteSpeechAsr => self
+                                .prepared_granite_speech_artifact_for_executor()?
+                                .is_some(),
                             _ => false,
                         } => {}
                 Some(PreparedAsrExecutionShape::LongFormAtomic)

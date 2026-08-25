@@ -1464,6 +1464,94 @@ impl Engine {
                             "VibeVoice ASR request {request_id} preparation worker failed: {error}"
                         ))
                     })??;
+                } else if variant.family() == crate::catalog::ModelFamily::GraniteSpeechAsr
+                    && request.prepared_asr_execution_shape().is_none()
+                {
+                    let model_for_shape = model.clone();
+                    let request_id = request.id.clone();
+                    let deadline = request.deadline;
+                    let context_limit = registry
+                        .effective_context(variant)
+                        .unwrap_or(self.config.max_seq_len);
+                    let acquire_permit = self
+                        .direct_request_preparation_permits
+                        .clone()
+                        .acquire_owned();
+                    let permit = match deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline.into(), acquire_permit)
+                            .await
+                            .map_err(|_| Error::Timeout(request_id.clone()))?,
+                        None => acquire_permit.await,
+                    }
+                    .map_err(|_| {
+                        Error::InferenceError(
+                            "Direct Granite Speech preparation queue is unavailable".into(),
+                        )
+                    })?;
+                    let worker = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        let request = request;
+                        let (samples, sample_rate) =
+                            executor::decode_request_audio_with_rate(&request)?;
+                        let long_form = executor::qwen3_asr_requires_long_form(
+                            &samples,
+                            sample_rate,
+                            model_for_shape.max_audio_seconds_hint(),
+                        );
+                        if long_form {
+                            return Self::finalize_direct_granite_speech_asr_preparation(
+                                request,
+                                variant,
+                                samples,
+                                sample_rate,
+                                context_limit,
+                                None,
+                                None,
+                            );
+                        }
+                        let geometry = model_for_shape
+                            .granite_speech_retained_preparation_geometry(
+                                &samples,
+                                sample_rate,
+                                request.asr_language_for_execution(),
+                                request.asr_prompt_for_execution(),
+                            )?;
+                        let artifact = model_for_shape.prepare_granite_speech_prompt_artifact(
+                            &samples,
+                            sample_rate,
+                            request.asr_language_for_execution(),
+                            request.asr_prompt_for_execution(),
+                        )?;
+                        if artifact.prompt_tokens() != geometry.prompt_tokens
+                            || artifact.audio_tokens() != geometry.audio_tokens
+                            || artifact.resident_tensor_bytes()? != geometry.retained_device_bytes
+                        {
+                            return Err(Error::InferenceError(
+                                "Direct Granite Speech artifact disagrees with prepared geometry"
+                                    .into(),
+                            ));
+                        }
+                        Self::finalize_direct_granite_speech_asr_preparation(
+                            request,
+                            variant,
+                            samples,
+                            sample_rate,
+                            context_limit,
+                            Some(geometry.prompt_tokens),
+                            Some(artifact),
+                        )
+                    });
+                    request = match deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline.into(), worker)
+                            .await
+                            .map_err(|_| Error::Timeout(request_id.clone()))?,
+                        None => worker.await,
+                    }
+                    .map_err(|error| {
+                        Error::InferenceError(format!(
+                            "Granite Speech request {request_id} preparation worker failed: {error}"
+                        ))
+                    })??;
                 }
                 request.install_asr_execution_model(variant, model)?;
             }
@@ -1597,6 +1685,34 @@ impl Engine {
             _ => {
                 return Err(Error::InferenceError(
                     "Direct VibeVoice route and prepared artifact disagree".into(),
+                ));
+            }
+        }
+        Ok(request)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_direct_granite_speech_asr_preparation(
+        mut request: EngineCoreRequest,
+        variant: ModelVariant,
+        samples: Vec<f32>,
+        sample_rate: u32,
+        context_limit: usize,
+        input_tokens: Option<usize>,
+        artifact: Option<
+            Arc<crate::models::architectures::granite_speech::asr::GraniteSpeechPreparedPromptArtifact>,
+        >,
+    ) -> Result<EngineCoreRequest> {
+        request.install_prepared_asr_audio(variant, samples, sample_rate)?;
+        match (input_tokens, artifact) {
+            (None, None) => request.install_prepared_asr_long_form_atomic()?,
+            (Some(input_tokens), Some(artifact)) => {
+                request.install_prepared_sequence_input_tokens(input_tokens, context_limit)?;
+                request.install_prepared_granite_speech_artifact(variant, artifact)?;
+            }
+            _ => {
+                return Err(Error::InferenceError(
+                    "Direct Granite Speech route and prepared artifact disagree".into(),
                 ));
             }
         }

@@ -42,6 +42,16 @@ pub struct PhysicalPagedKvCache {
     completed_writes: Vec<Arc<KvWriteBatchCompletion>>,
 }
 
+/// Stable authority shared by successive cache views of one managed sequence.
+/// The first physical page is reserved exclusively to that sequence for its
+/// lifetime; later growth may append pages but cannot change this identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PhysicalPagedKvSequenceAuthority {
+    arena: KvArenaId,
+    group: crate::kv::KvGroupId,
+    first_block: CacheBlockRef,
+}
+
 static NEXT_PHYSICAL_PAGED_KV_VIEW_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Logical rollback point for a cache whose submitted writes are already
@@ -156,6 +166,14 @@ impl PhysicalPagedKvCache {
     /// into another independently constructed cache.
     pub(crate) fn view_id(&self) -> u64 {
         self.view_id
+    }
+
+    pub(crate) fn sequence_authority(&self) -> PhysicalPagedKvSequenceAuthority {
+        PhysicalPagedKvSequenceAuthority {
+            arena: self.arena.id(),
+            group: self.arena.config().group,
+            first_block: self.blocks[0],
+        }
     }
 
     pub fn context_len(&self) -> usize {
@@ -894,6 +912,7 @@ mod tests {
 
         assert_ne!(first.view_id(), second.view_id());
         assert_eq!(first.arena().id(), second.arena().id());
+        assert_eq!(first.sequence_authority(), second.sequence_authority());
     }
 
     fn submit_prepared_writes(

@@ -156,8 +156,12 @@ const fn family_inference_state_policy(family: ModelFamily) -> FamilyInferenceSt
             tts: Invocation,
             ..FamilyInferenceStatePolicy::STATELESS
         },
-        ParakeetAsr | NemotronAsr | GraniteSpeechAsr | Voxtral => FamilyInferenceStatePolicy {
+        ParakeetAsr | NemotronAsr | Voxtral => FamilyInferenceStatePolicy {
             asr: Invocation,
+            ..FamilyInferenceStatePolicy::STATELESS
+        },
+        GraniteSpeechAsr => FamilyInferenceStatePolicy {
+            asr: RetainedAndInvocation,
             ..FamilyInferenceStatePolicy::STATELESS
         },
         VibeVoiceAsr => FamilyInferenceStatePolicy {
@@ -488,7 +492,10 @@ impl ModelCapabilityAdapter for AsrCapabilityAdapter {
                 execution_target: asr_execution_target(model_variant),
                 sequence_execution: if matches!(
                     model_variant.family(),
-                    ModelFamily::Qwen3Asr | ModelFamily::WhisperAsr | ModelFamily::VibeVoiceAsr
+                    ModelFamily::Qwen3Asr
+                        | ModelFamily::WhisperAsr
+                        | ModelFamily::VibeVoiceAsr
+                        | ModelFamily::GraniteSpeechAsr
                 ) {
                     SequenceExecutionMode::Always
                 } else {
@@ -987,8 +994,9 @@ mod tests {
         assert_eq!(adapter.streaming_mode, StreamingMode::None);
         assert_eq!(
             adapter.state_requirement,
-            InferenceStateRequirement::Invocation
+            InferenceStateRequirement::RetainedAndInvocation
         );
+        assert_eq!(adapter.sequence_execution, SequenceExecutionMode::Always);
         let attributed = registry
             .require(CapabilityKind::SpeakerAttributedAsr, variant)
             .expect("granite speaker-attributed ASR adapter");

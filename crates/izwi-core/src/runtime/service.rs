@@ -778,7 +778,10 @@ fn coordinator_lane_for_metadata(
         }
         TaskType::ASR => matches!(
             variant.family(),
-            ModelFamily::Qwen3Asr | ModelFamily::WhisperAsr | ModelFamily::VibeVoiceAsr
+            ModelFamily::Qwen3Asr
+                | ModelFamily::WhisperAsr
+                | ModelFamily::VibeVoiceAsr
+                | ModelFamily::GraniteSpeechAsr
         ),
         TaskType::TTS => variant.family() == ModelFamily::Qwen3Tts,
         TaskType::SpeechToSpeech => false,
@@ -797,7 +800,10 @@ fn coordinator_lane_for_request(request: &EngineCoreRequest) -> CoordinatorLane 
         && request.model_variant.is_some_and(|variant| {
             matches!(
                 variant.family(),
-                ModelFamily::Qwen3Asr | ModelFamily::WhisperAsr | ModelFamily::VibeVoiceAsr
+                ModelFamily::Qwen3Asr
+                    | ModelFamily::WhisperAsr
+                    | ModelFamily::VibeVoiceAsr
+                    | ModelFamily::GraniteSpeechAsr
             )
         })
         && request.prepared_asr_execution_shape().is_none()
@@ -832,12 +838,12 @@ struct QwenAsrEncoderPending {
     response: Option<oneshot::Sender<QwenAsrEncoderOutcome>>,
 }
 
-struct QwenAsrEncoderCancellationGuard {
+struct PreparationCancellationGuard {
     cancellation: PreparationCancellation,
     armed: bool,
 }
 
-impl Drop for QwenAsrEncoderCancellationGuard {
+impl Drop for PreparationCancellationGuard {
     fn drop(&mut self) {
         if self.armed {
             self.cancellation.cancel();
@@ -935,7 +941,7 @@ impl VibeVoiceEncoderBatcher {
         let language = pending.language;
         let prompt = pending.prompt;
         let retained_request_host_bytes = pending.retained_request_host_bytes;
-        let mut guard = QwenAsrEncoderCancellationGuard {
+        let mut guard = PreparationCancellationGuard {
             cancellation,
             armed: true,
         };
@@ -1292,7 +1298,7 @@ impl QwenAsrEncoderBatcher {
             });
         }
 
-        let mut guard = QwenAsrEncoderCancellationGuard {
+        let mut guard = PreparationCancellationGuard {
             cancellation,
             armed: true,
         };
@@ -1535,7 +1541,10 @@ fn bind_request_to_residency(
     if request.model_variant.is_some_and(|variant| {
         matches!(
             variant.family(),
-            ModelFamily::Qwen3Asr | ModelFamily::WhisperAsr | ModelFamily::VibeVoiceAsr
+            ModelFamily::Qwen3Asr
+                | ModelFamily::WhisperAsr
+                | ModelFamily::VibeVoiceAsr
+                | ModelFamily::GraniteSpeechAsr
         ) && request.prepared_asr_execution_shape().is_some()
     }) && request.prepared_asr_audio_for_executor()?.is_none()
     {
@@ -1551,6 +1560,18 @@ fn bind_request_to_residency(
     {
         return Err(Error::InvalidInput(
             "Whisper normal execution shape has no matching prepared window".into(),
+        ));
+    }
+    if request.model_variant.is_some_and(|variant| {
+        variant.family() == ModelFamily::GraniteSpeechAsr
+            && request.prepared_asr_execution_shape().is_some()
+            && !request.uses_asr_long_form_atomic()
+    }) && request
+        .prepared_granite_speech_artifact_for_executor()?
+        .is_none()
+    {
+        return Err(Error::InvalidInput(
+            "Granite Speech normal execution shape has no matching prepared artifact".into(),
         ));
     }
     if request.model_variant.is_some_and(|variant| {
@@ -2651,7 +2672,10 @@ impl RuntimeService {
         let initial_lane = if task_type == TaskType::ASR
             && matches!(
                 variant.family(),
-                ModelFamily::Qwen3Asr | ModelFamily::WhisperAsr | ModelFamily::VibeVoiceAsr
+                ModelFamily::Qwen3Asr
+                    | ModelFamily::WhisperAsr
+                    | ModelFamily::VibeVoiceAsr
+                    | ModelFamily::GraniteSpeechAsr
             ) {
             CoordinatorLane::Atomic
         } else {
@@ -2740,7 +2764,10 @@ impl RuntimeService {
                 && request.model_variant.is_some_and(|variant| {
                     matches!(
                         variant.family(),
-                        ModelFamily::Qwen3Asr | ModelFamily::WhisperAsr | ModelFamily::VibeVoiceAsr
+                        ModelFamily::Qwen3Asr
+                            | ModelFamily::WhisperAsr
+                            | ModelFamily::VibeVoiceAsr
+                            | ModelFamily::GraniteSpeechAsr
                     )
                 })
                 && request.prepared_asr_audio_for_executor()?.is_some());
@@ -3586,6 +3613,246 @@ impl RuntimeService {
         }
     }
 
+    async fn prepare_granite_speech_asr_shape_for_binding(
+        &self,
+        request: EngineCoreRequest,
+        job: JobLease,
+        residency_lease: Option<&ModelResidencyLease>,
+    ) -> Result<(EngineCoreRequest, JobLease)> {
+        if request.task_type != TaskType::ASR
+            || request
+                .model_variant
+                .is_none_or(|variant| variant.family() != ModelFamily::GraniteSpeechAsr)
+            || request.prepared_asr_execution_shape().is_some()
+        {
+            return Ok((request, job));
+        }
+        let variant = request
+            .model_variant
+            .expect("validated Granite Speech variant");
+        let model = self
+            .model_registry
+            .get_asr_lease(variant)
+            .await
+            .ok_or_else(|| Error::ModelNotFound(format!("ASR model {variant} is not loaded")))?;
+        let residency = residency_lease.ok_or_else(|| {
+            Error::InferenceError("Granite Speech preparation requires model residency".into())
+        })?;
+        let loaded_bundle = self
+            .model_lifecycle
+            .try_get_ready_bundle(residency.variant());
+        let preparation_contract = loaded_contract_for_residency(
+            residency,
+            loaded_bundle.as_deref(),
+            CapabilityKind::Asr,
+            false,
+            self.coordinator.execution_group_id(),
+            self.backend_router.context().backend_kind,
+            Some(ExecutionTargetKind::TokenEngine),
+        )?;
+        let context_limit = self
+            .model_registry
+            .effective_context(variant)
+            .ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "Granite Speech model {variant} has no effective context"
+                ))
+            })?;
+        let model_for_shape = model.clone();
+        let (prepared, geometry) = self
+            .coordinator
+            .run_host_blocking_stage(&job, move || {
+                let mut request = request;
+                let (samples, sample_rate) =
+                    crate::engine::decode_request_audio_with_rate(&request)?;
+                let long_form = crate::engine::qwen3_asr_requires_long_form(
+                    &samples,
+                    sample_rate,
+                    model_for_shape.max_audio_seconds_hint(),
+                );
+                let geometry = (!long_form)
+                    .then(|| {
+                        model_for_shape.granite_speech_retained_preparation_geometry(
+                            &samples,
+                            sample_rate,
+                            request.asr_language_for_execution(),
+                            request.asr_prompt_for_execution(),
+                        )
+                    })
+                    .transpose()?;
+                request.install_prepared_asr_audio(variant, samples, sample_rate)?;
+                if let Some(geometry) = geometry {
+                    request.install_prepared_sequence_input_tokens(
+                        geometry.prompt_tokens,
+                        context_limit,
+                    )?;
+                    Ok((request, Some(geometry)))
+                } else {
+                    request.install_prepared_asr_long_form_atomic()?;
+                    Ok((request, None))
+                }
+            })
+            .await?;
+        let retained_host_bytes = u64::try_from(retained_engine_request_input_bytes(&prepared)?)
+            .map_err(|_| Error::Overloaded("Granite Speech retained input exceeds u64".into()))?;
+        job.record_materialized_usage(JobResourceObservation::host(retained_host_bytes))?;
+        let bridge = self.coordinator.bridge_preparation_admission(job)?;
+        if prepared.uses_asr_long_form_atomic() {
+            let (spec, observation) = self.coordinator_job_for_request(&prepared)?;
+            return match self
+                .coordinator
+                .admit_observed_from_preparation(bridge, spec, observation)
+                .await
+            {
+                Ok(job) => Ok((prepared, job)),
+                Err(failure) => {
+                    drop(prepared);
+                    let error = failure.error;
+                    drop(failure.bridge);
+                    Err(error)
+                }
+            };
+        }
+        let geometry = geometry.ok_or_else(|| {
+            Error::InferenceError("Granite Speech normal route lost preparation geometry".into())
+        })?;
+        let artifact_host_bytes = u64::try_from(
+            prepared.asr_language_for_execution().map_or(0, str::len),
+        )
+        .map_err(|_| Error::Overloaded("Granite Speech language bytes exceed u64".into()))?;
+        let total_retained_host_bytes = retained_host_bytes
+            .checked_add(artifact_host_bytes)
+            .ok_or_else(|| {
+                Error::Overloaded("Granite Speech retained host bytes overflow".into())
+            })?;
+        let resources = asr_encoder_retained_resources(
+            self.backend_router.context().backend_kind,
+            total_retained_host_bytes,
+            geometry.retained_device_bytes,
+        )?;
+        let prep_spec = JobSpec {
+            request_id: prepared.id.clone(),
+            lane: CoordinatorLane::Atomic,
+            priority: prepared.priority,
+            workload_class: prepared.workload_class,
+            deadline: prepared.deadline,
+            resources,
+        };
+        let prep_job = match self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                prep_spec,
+                JobResourceObservation::host(retained_host_bytes),
+            )
+            .await
+        {
+            Ok(job) => job,
+            Err(failure) => {
+                drop(prepared);
+                let error = failure.error;
+                drop(failure.bridge);
+                return Err(error);
+            }
+        };
+        let (samples, sample_rate) = prepared
+            .prepared_asr_audio_for_executor()?
+            .ok_or_else(|| Error::InferenceError("Granite Speech decoded audio was lost".into()))?;
+        let language = prepared.asr_language_for_execution().map(str::to_owned);
+        let prompt = prepared.asr_prompt_for_execution().map(str::to_owned);
+        let work = WorkUnit::PreSequencePreparation {
+            kind: "asr.encoder.granite_speech".into(),
+        };
+        let cost = geometry.work_cost();
+        let cancellation = PreparationCancellation::default();
+        let mut guard = PreparationCancellationGuard {
+            cancellation: cancellation.clone(),
+            armed: true,
+        };
+        let row = self.coordinator.seal_preparation_row(
+            prep_job,
+            &preparation_contract,
+            &work,
+            cost,
+            geometry.embedding_elements,
+            cancellation,
+        )?;
+        let model_for_preparation = model.clone();
+        let mut outcomes = self
+            .coordinator
+            .run_loaded_native_preparation_batch(
+                vec![row],
+                preparation_contract,
+                work,
+                move |live| {
+                    if live != [0] {
+                        return Err(Error::InferenceError(
+                            "Granite Speech preparation received a non-scalar live set".into(),
+                        ));
+                    }
+                    let artifact = model_for_preparation.prepare_granite_speech_prompt_artifact(
+                        samples.as_ref(),
+                        sample_rate,
+                        language.as_deref(),
+                        prompt.as_deref(),
+                    )?;
+                    Ok(vec![Ok(PreparationArtifact {
+                        retained: JobResourceObservation {
+                            host_bytes: total_retained_host_bytes,
+                            accelerator_bytes: artifact.resident_tensor_bytes()?,
+                        },
+                        value: artifact,
+                    })])
+                },
+            )
+            .await?;
+        guard.armed = false;
+        let outcome = outcomes.pop().ok_or_else(|| {
+            Error::InferenceError("Granite Speech preparation returned no outcome".into())
+        })?;
+        let (artifact, bridge) = match outcome {
+            PreparationRowOutcome::Committed { artifact, bridge } => (artifact.value, bridge),
+            PreparationRowOutcome::Cancelled => return Err(Error::Cancelled(prepared.id.clone())),
+            PreparationRowOutcome::TimedOut => return Err(Error::Timeout(prepared.id.clone())),
+            PreparationRowOutcome::Failed(error) => return Err(error),
+        };
+        if artifact.prompt_tokens() != geometry.prompt_tokens
+            || artifact.audio_tokens() != geometry.audio_tokens
+            || artifact.resident_host_bytes() != artifact_host_bytes
+            || artifact.resident_tensor_bytes()? != geometry.retained_device_bytes
+        {
+            drop(artifact);
+            drop(prepared);
+            drop(bridge);
+            return Err(Error::InferenceError(
+                "Granite Speech artifact drifted from admitted geometry".into(),
+            ));
+        }
+        let mut prepared = prepared;
+        prepared.install_prepared_granite_speech_artifact(variant, artifact)?;
+        let (execution, _) = self.coordinator_job_for_request(&prepared)?;
+        match self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                execution,
+                JobResourceObservation {
+                    host_bytes: total_retained_host_bytes,
+                    accelerator_bytes: geometry.retained_device_bytes,
+                },
+            )
+            .await
+        {
+            Ok(job) => Ok((prepared, job)),
+            Err(failure) => {
+                drop(prepared);
+                let error = failure.error;
+                drop(failure.bridge);
+                Err(error)
+            }
+        }
+    }
+
     async fn prepare_asr_shape_for_binding(
         &self,
         request: EngineCoreRequest,
@@ -3598,7 +3865,10 @@ impl RuntimeService {
         let (request, job) = self
             .prepare_whisper_asr_shape_for_binding(request, job, residency_lease)
             .await?;
-        self.prepare_vibevoice_asr_shape_for_binding(request, job, residency_lease)
+        let (request, job) = self
+            .prepare_vibevoice_asr_shape_for_binding(request, job, residency_lease)
+            .await?;
+        self.prepare_granite_speech_asr_shape_for_binding(request, job, residency_lease)
             .await
     }
 

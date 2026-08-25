@@ -1098,6 +1098,22 @@ impl ModelLifecycleController {
                     )));
                 };
                 bundle_draft.seal_vibevoice_asr_preparation(model)?;
+            } else if variant.family() == crate::catalog::ModelFamily::GraniteSpeechAsr {
+                let loaded = self
+                    .model_registry
+                    .get_loading_asr(variant)
+                    .await
+                    .ok_or_else(|| {
+                        Error::ModelLoadError(format!(
+                            "instantiated Granite Speech ASR model {variant} is missing before adapter sealing"
+                        ))
+                    })?;
+                let NativeAsrModel::GraniteSpeech(model) = loaded.as_ref() else {
+                    return Err(Error::ModelLoadError(format!(
+                        "instantiated model {variant} does not expose Granite Speech ASR geometry"
+                    )));
+                };
+                bundle_draft.seal_granite_speech_asr_preparation(model)?;
             }
             // Metal records many tensor uploads asynchronously. Flush them
             // before publishing the model so an allocation failure is owned by
@@ -1191,14 +1207,78 @@ impl ModelLifecycleController {
                         .collect::<Vec<_>>();
                     let physical_spec =
                         model.granite_speech_physical_state_spec(&stage_graphs)?;
+                    let (retained, retained_uses) = if capability == CapabilityKind::Asr {
+                        let retained_contract = physical_spec.retained.as_ref().ok_or_else(|| {
+                            Error::ModelLoadError(
+                                "Granite Speech ASR graph did not author retained decoder state"
+                                    .into(),
+                            )
+                        })?;
+                        let retained_max_tokens =
+                            physical_spec.retained_max_tokens.ok_or_else(|| {
+                                Error::ModelLoadError(
+                                    "Granite Speech retained decoder has no context bound".into(),
+                                )
+                            })?;
+                        let retained = self
+                            .core_engine
+                            .load_managed_model_state_with_portable_copies(
+                                model_instance_id,
+                                retained_contract,
+                                Some(retained_max_tokens),
+                                2,
+                            )
+                            .await?;
+                        self.model_registry.publish_effective_context(
+                            variant,
+                            retained.logical_token_reach(),
+                        )?;
+                        crate::runtime::rollout::validate_managed_state_plan_eligibility(
+                            variant,
+                            CapabilityKind::Asr,
+                            retained.state_plan_v2(),
+                        )?;
+                        let uses = contracts
+                            .iter()
+                            .map(|contract| {
+                                let graph = stage_graph_fingerprint(&contract.stages)?;
+                                let use_kind = match contract.execution_profile.mode {
+                                    crate::engine::ExecutionMode::Sequence => {
+                                        RetainedStateUseV2::ExternalPaged
+                                    }
+                                    crate::engine::ExecutionMode::Atomic => {
+                                        RetainedStateUseV2::Inactive
+                                    }
+                                    _ => {
+                                        return Err(Error::ModelLoadError(
+                                            "Granite Speech ASR graph has an incompatible retained-state profile"
+                                                .into(),
+                                        ));
+                                    }
+                                };
+                                Ok((graph, use_kind))
+                            })
+                            .collect::<Result<HashMap<_, _>>>()?;
+                        (Some(retained.into()), uses)
+                    } else {
+                        if physical_spec.retained.is_some()
+                            || physical_spec.retained_max_tokens.is_some()
+                        {
+                            return Err(Error::ModelLoadError(
+                                "speaker-attributed Granite Speech graph unexpectedly requested retained state"
+                                    .into(),
+                            ));
+                        }
+                        (None, HashMap::new())
+                    };
                     let publication = self
                         .load_invocation_workspace_publication(
                             model_instance_id,
                             &contracts,
                             physical_spec.descriptor,
                             &physical_spec.invocation,
-                            None,
-                            HashMap::new(),
+                            retained,
+                            retained_uses,
                         )
                         .await?;
                     state_publications.insert(capability, publication);

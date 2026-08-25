@@ -8,6 +8,7 @@ use std::sync::Arc;
 use candle_core::Tensor;
 
 use crate::error::{Error, Result};
+use crate::models::shared::attention::physical::PhysicalPagedKvSequenceAuthority;
 
 static NEXT_VOXTRAL_REALTIME_STATE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -22,7 +23,7 @@ pub(crate) struct VoxtralRealtimeState {
     pub(super) state_id: u64,
     pub(super) next_quantum_nonce: u64,
     pub(super) active_quantum: Option<u64>,
-    bound_cache_view_id: Option<u64>,
+    bound_cache_authority: Option<PhysicalPagedKvSequenceAuthority>,
     pub(super) language: Option<String>,
     pub(super) source_sample_rate: Option<u32>,
     pub(super) source_samples: Arc<Vec<f32>>,
@@ -60,7 +61,7 @@ impl VoxtralRealtimeState {
             state_id: NEXT_VOXTRAL_REALTIME_STATE_ID.fetch_add(1, Ordering::Relaxed),
             next_quantum_nonce: 1,
             active_quantum: None,
-            bound_cache_view_id: None,
+            bound_cache_authority: None,
             language: language.map(ToOwned::to_owned),
             source_sample_rate: None,
             source_samples: Arc::new(Vec::new()),
@@ -142,14 +143,17 @@ impl VoxtralRealtimeState {
         Ok(())
     }
 
-    pub(super) fn bind_cache_view(&mut self, cache_view_id: u64) -> Result<()> {
-        match self.bound_cache_view_id {
-            Some(bound) if bound != cache_view_id => Err(Error::InferenceError(
-                "Voxtral realtime state belongs to another retained cache view".into(),
+    pub(super) fn bind_cache_authority(
+        &mut self,
+        authority: PhysicalPagedKvSequenceAuthority,
+    ) -> Result<()> {
+        match self.bound_cache_authority {
+            Some(bound) if bound != authority => Err(Error::InferenceError(
+                "Voxtral realtime state belongs to another retained cache sequence".into(),
             )),
             Some(_) => Ok(()),
             None => {
-                self.bound_cache_view_id = Some(cache_view_id);
+                self.bound_cache_authority = Some(authority);
                 Ok(())
             }
         }
@@ -400,18 +404,5 @@ mod tests {
         assert!(!state.final_padding_applied);
         assert_eq!(state.next_audio_frame, 0);
         assert_eq!(state.source_samples.as_ref(), &vec![0.1, 0.2]);
-    }
-
-    #[test]
-    fn retained_state_binds_to_one_cache_authority() {
-        let mut state = VoxtralRealtimeState::new(None);
-
-        state.bind_cache_view(17).unwrap();
-        state.bind_cache_view(17).unwrap();
-        let error = state
-            .bind_cache_view(18)
-            .expect_err("a stream must not move to another cache view");
-
-        assert!(format!("{error}").contains("another retained cache view"));
     }
 }

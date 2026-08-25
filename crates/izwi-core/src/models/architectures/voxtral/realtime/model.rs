@@ -304,7 +304,7 @@ impl VoxtralRealtimeModel {
         let next_quantum_nonce = state.next_quantum_nonce.checked_add(1).ok_or_else(|| {
             Error::InferenceError("Voxtral realtime quantum nonce overflow".into())
         })?;
-        state.bind_cache_view(cache.view_id())?;
+        state.bind_cache_authority(cache.sequence_authority())?;
         state.next_quantum_nonce = next_quantum_nonce;
         state.active_quantum = Some(quantum_nonce);
         Ok(VoxtralRealtimeCheckpoint {

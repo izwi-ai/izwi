@@ -152,17 +152,24 @@ fn resolve_asr_execution_audio(
 ) -> Result<(AsrExecutionAudio, u32, f64)> {
     if matches!(
         family,
-        ModelFamily::Qwen3Asr | ModelFamily::WhisperAsr | ModelFamily::VibeVoiceAsr
+        ModelFamily::Qwen3Asr
+            | ModelFamily::WhisperAsr
+            | ModelFamily::VibeVoiceAsr
+            | ModelFamily::GraniteSpeechAsr
     ) {
         if let Some((samples, sample_rate)) = request.prepared_asr_audio_for_executor()? {
             return Ok((AsrExecutionAudio::Prepared(samples), sample_rate, 0.0));
         }
-        if matches!(family, ModelFamily::Qwen3Asr | ModelFamily::VibeVoiceAsr) {
+        if matches!(
+            family,
+            ModelFamily::Qwen3Asr | ModelFamily::VibeVoiceAsr | ModelFamily::GraniteSpeechAsr
+        ) {
             return Err(Error::InferenceError(format!(
                 "{} execution lost its prepared decoded-audio artifact",
                 match family {
                     ModelFamily::Qwen3Asr => "Qwen3 ASR",
                     ModelFamily::VibeVoiceAsr => "VibeVoice ASR",
+                    ModelFamily::GraniteSpeechAsr => "Granite Speech ASR",
                     _ => unreachable!("guarded prepared-audio family"),
                 }
             )));
@@ -465,6 +472,315 @@ impl NativeExecutor {
         scheduled: &ScheduledRequest,
     ) -> Result<ModelSessionResult> {
         self.transcribe_request_with_managed_cache(request, scheduled, None)
+    }
+
+    fn granite_speech_asr_sequence_request(
+        &self,
+        request: &EngineCoreRequest,
+        scheduled: &ScheduledRequest,
+        mut managed_state: Option<super::RetainedRowManagedState>,
+    ) -> Result<ModelSessionResult> {
+        let variant = Self::resolve_variant(request)?;
+        let model = request.prepared_asr_model_for_executor()?.ok_or_else(|| {
+            Error::InferenceError("Granite Speech sequence lost its loaded model".into())
+        })?;
+        if variant.family() != ModelFamily::GraniteSpeechAsr
+            || !model.supports_resumable_prefill()
+            || !model.supports_incremental_decode()
+        {
+            return Err(Error::InvalidInput(
+                "loaded Granite Speech model has no retained sequence contract".into(),
+            ));
+        }
+        let mut retained = managed_state.take().ok_or_else(|| {
+            Error::InferenceError("Granite Speech sequence lost retained paged state".into())
+        })?;
+        if retained.tensor_state.is_some() {
+            return Err(Error::InferenceError(
+                "Granite Speech retained sequence unexpectedly received tensor state".into(),
+            ));
+        }
+        let cache = retained.take_only_paged()?;
+        let prompt_tokens = request.num_prompt_tokens();
+        let resumable_span = scheduled
+            .is_prefill
+            .then(|| resumable_asr_prefill_span(scheduled, prompt_tokens))
+            .transpose()?;
+        let session = scheduled.session_key();
+        let mut state_lease = ExecutorStateLease::checkout(
+            &self.asr_decode_states,
+            session,
+            "Granite Speech ASR decode",
+        )?;
+        if state_lease
+            .state()
+            .is_some_and(|active| active.variant != variant || !Arc::ptr_eq(&active.model, &model))
+        {
+            state_lease.discard_state();
+        }
+
+        let mut checkpoint = None;
+        let mut outer_checkpoint = None;
+        let mut fresh_state = false;
+        if state_lease.state().is_some() {
+            let active = state_lease.require_state_mut()?;
+            outer_checkpoint = Some((active.last_tokens_generated, active.stream_sequence));
+            checkpoint = Some(active.state.begin_managed_quantum(cache)?);
+            state_lease.mark_dirty();
+        } else {
+            if !scheduled.is_prefill || scheduled.num_computed_tokens != 0 {
+                return Err(Error::InferenceError(
+                    "Granite Speech sequence lost state before initial prefill".into(),
+                ));
+            }
+            if request.is_cancelled() {
+                state_lease.release()?;
+                return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                    request.id.clone(),
+                )));
+            }
+            let artifact = request
+                .prepared_granite_speech_artifact_for_executor()?
+                .ok_or_else(|| {
+                    Error::InferenceError(
+                        "Granite Speech sequence lost its prepared prompt artifact".into(),
+                    )
+                })?;
+            let (samples, sample_rate) =
+                request.prepared_asr_audio_for_executor()?.ok_or_else(|| {
+                    Error::InferenceError("Granite Speech sequence lost decoded audio".into())
+                })?;
+            let options = Self::asr_chunk_generation_options(
+                request,
+                ModelFamily::GraniteSpeechAsr,
+                samples.len(),
+                sample_rate,
+                &Self::asr_generation_options(request),
+            );
+            let Some(decode_state) = run_asr_model_call(request, || {
+                Self::run_blocking(|| {
+                    model.start_granite_speech_resumable_prefill_managed(artifact, options, cache)
+                })
+            })?
+            else {
+                state_lease.release()?;
+                return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                    request.id.clone(),
+                )));
+            };
+            if decode_state.prefill_token_count() != Some(prompt_tokens)
+                || decode_state.prefill_progress() != Some(0)
+                || decode_state.sequence_position() != Some(0)
+            {
+                return Err(Error::InferenceError(
+                    "Granite Speech prompt geometry differs from scheduler admission".into(),
+                ));
+            }
+            let model_lease = request
+                .prepared_asr_model_lease_for_executor()?
+                .ok_or_else(|| {
+                    Error::InferenceError("Granite Speech sequence lost model residency".into())
+                })?;
+            state_lease.install_state(ActiveAsrDecode {
+                variant,
+                model: model.clone(),
+                _model_lease: model_lease,
+                state: decode_state,
+                last_tokens_generated: 0,
+                stream_sequence: 0,
+                input_sample_rate: sample_rate,
+                input_sample_count: samples.len(),
+            })?;
+            fresh_state = true;
+        }
+
+        if request.is_cancelled() {
+            rollback_scalar_asr_quantum(
+                &mut state_lease,
+                &mut checkpoint,
+                outer_checkpoint,
+                fresh_state,
+            )?;
+            state_lease.release()?;
+            return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                request.id.clone(),
+            )));
+        }
+
+        state_lease.mark_dirty();
+        let execution = (|| {
+            let active = state_lease.require_state_mut()?;
+            let iterations = if scheduled.is_prefill {
+                1
+            } else {
+                scheduled.num_tokens.max(1)
+            };
+            let mut generated = 0usize;
+            let mut text = String::new();
+            let mut finished = false;
+            let mut cancelled = false;
+            let mut events = Vec::new();
+            for _ in 0..iterations {
+                if request.is_cancelled() {
+                    cancelled = true;
+                    break;
+                }
+                let step = if let Some((start, end)) = resumable_span {
+                    let Some(_complete) = run_asr_model_call(request, || {
+                        Self::run_blocking(|| {
+                            active
+                                .model
+                                .continue_resumable_prefill(&mut active.state, start, end)
+                        })
+                    })?
+                    else {
+                        cancelled = true;
+                        break;
+                    };
+                    crate::models::registry::NativeAsrDecodeStep {
+                        delta: String::new(),
+                        text: String::new(),
+                        tokens_generated: active.last_tokens_generated,
+                        finished: false,
+                    }
+                } else {
+                    let Some(step) = run_asr_model_call(request, || {
+                        Self::run_blocking(|| active.model.decode_step(&mut active.state))
+                    })?
+                    else {
+                        cancelled = true;
+                        break;
+                    };
+                    step
+                };
+                if request.is_cancelled() {
+                    cancelled = true;
+                    break;
+                }
+                generated = generated.saturating_add(
+                    step.tokens_generated
+                        .saturating_sub(active.last_tokens_generated),
+                );
+                active.last_tokens_generated = step.tokens_generated;
+                text = step.text.clone();
+                if !scheduled.is_prefill {
+                    events.push((step.delta, step.finished));
+                }
+                if step.finished {
+                    finished = true;
+                    break;
+                }
+            }
+            if !cancelled {
+                if let Some(tx) = Self::stream_sender(request) {
+                    for (delta, event_finished) in events {
+                        if request.is_cancelled() {
+                            cancelled = true;
+                            break;
+                        }
+                        if !delta.is_empty() {
+                            Self::stream_text_with_policy(
+                                &tx,
+                                request.stream_policy,
+                                &request.id,
+                                &mut active.stream_sequence,
+                                delta,
+                            )?;
+                        }
+                        if event_finished {
+                            Self::stream_final_marker_with_policy(
+                                &tx,
+                                request.stream_policy,
+                                &request.id,
+                                &mut active.stream_sequence,
+                            )?;
+                        }
+                    }
+                }
+                cancelled |= request.is_cancelled();
+            }
+            if cancelled {
+                let _ = request.take_staged_stream_outputs()?;
+            }
+            let completions = if cancelled {
+                Vec::new()
+            } else {
+                active.state.take_managed_write_completions()
+            };
+            Ok((
+                generated,
+                text,
+                finished,
+                cancelled,
+                active.input_sample_rate,
+                active.input_sample_count,
+                completions,
+            ))
+        })();
+        let (generated, text, finished, cancelled, sample_rate, sample_count, completions) =
+            match execution {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = request.take_staged_stream_outputs()?;
+                    rollback_scalar_asr_quantum(
+                        &mut state_lease,
+                        &mut checkpoint,
+                        outer_checkpoint,
+                        fresh_state,
+                    )?;
+                    return Err(error);
+                }
+            };
+        if cancelled || request.is_cancelled() {
+            let _ = request.take_staged_stream_outputs()?;
+            rollback_scalar_asr_quantum(
+                &mut state_lease,
+                &mut checkpoint,
+                outer_checkpoint,
+                fresh_state,
+            )?;
+            state_lease.release()?;
+            return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                request.id.clone(),
+            )));
+        }
+        if let Some(checkpoint) = checkpoint.take() {
+            state_lease
+                .require_state_mut()?
+                .state
+                .commit_managed_quantum(checkpoint)?;
+        }
+        let tokens_processed = if scheduled.is_prefill {
+            scheduled.num_tokens
+        } else {
+            scheduled.num_tokens.max(1)
+        };
+        if finished {
+            state_lease.release()?;
+        } else {
+            state_lease.restore()?;
+        }
+        Ok(ModelSessionResult::sequence(ExecutorOutput {
+            request_id: request.id.clone(),
+            audio: Some(AudioOutput {
+                samples: Vec::new(),
+                sample_rate,
+                duration_secs: if sample_rate == 0 {
+                    0.0
+                } else {
+                    sample_count as f32 / sample_rate as f32
+                },
+            }),
+            text: Some(text),
+            input_transcription: None,
+            tokens_processed,
+            tokens_generated: generated,
+            finished,
+            phase_timing_override: None,
+            asr_diagnostics: None,
+            error: None,
+        })
+        .with_managed_cache_completions(completions))
     }
 
     fn whisper_asr_sequence_request(
@@ -2441,6 +2757,13 @@ impl NativeExecutor {
         }
         if family == ModelFamily::VibeVoiceAsr && request.uses_asr_retained_sequence() {
             return self.vibevoice_asr_sequence_request(request, scheduled, managed_state.take());
+        }
+        if family == ModelFamily::GraniteSpeechAsr && request.uses_asr_retained_sequence() {
+            return self.granite_speech_asr_sequence_request(
+                request,
+                scheduled,
+                managed_state.take(),
+            );
         }
         if managed_state.is_some() {
             return Err(Error::InferenceError(

@@ -11,7 +11,7 @@ use candle_core::{DType, Tensor};
 use serde_json::json;
 use tracing::info;
 
-use crate::backends::{parse_dtype_name, DeviceKind, DeviceProfile};
+use crate::backends::{parse_dtype_name, BackendKind, DeviceKind, DeviceProfile};
 use crate::catalog::ModelFamily;
 use crate::engine::StageDescriptor;
 use crate::error::{Error, Result};
@@ -129,6 +129,33 @@ pub(crate) struct GraniteSpeechPreparedPromptArtifact {
     language: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GraniteSpeechPreparedGeometry {
+    pub(crate) prompt_tokens: usize,
+    pub(crate) audio_tokens: usize,
+    pub(crate) embedding_elements: u64,
+    pub(crate) preparation_workspace_bytes: u64,
+    pub(crate) retained_device_bytes: u64,
+}
+
+impl GraniteSpeechPreparedGeometry {
+    pub(crate) fn work_cost(self) -> crate::engine::WorkCost {
+        crate::engine::WorkCost::new(
+            self.audio_tokens as u64,
+            self.embedding_elements,
+            self.preparation_workspace_bytes,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GraniteSpeechAsrPreparationStageSeal {
+    pub(crate) backend: BackendKind,
+    pub(crate) dtype: String,
+    pub(crate) max_work_units: u64,
+    pub(crate) max_workspace_bytes: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GraniteSpeechDecodeStep {
     pub(crate) delta: String,
@@ -231,9 +258,7 @@ impl GraniteSpeechDecodeState {
                     .into(),
             ));
         }
-        if self.cache.arena().id() != cache.arena().id()
-            || self.cache.arena().config().group != cache.arena().config().group
-        {
+        if self.cache.sequence_authority() != cache.sequence_authority() {
             return Err(Error::InferenceError(
                 "a Granite Speech session cannot switch managed KV authority".into(),
             ));
@@ -340,6 +365,23 @@ impl GraniteSpeechPreparedPromptArtifact {
     pub(crate) fn audio_tokens(&self) -> usize {
         self.audio_tokens
     }
+
+    pub(crate) fn resident_tensor_bytes(&self) -> Result<u64> {
+        u64::try_from(self.embeddings.elem_count())
+            .ok()
+            .and_then(|elements| {
+                elements.checked_mul(u64::try_from(self.embeddings.dtype().size_in_bytes()).ok()?)
+            })
+            .ok_or_else(|| {
+                Error::Overloaded("Granite Speech prepared artifact size overflow".into())
+            })
+    }
+
+    pub(crate) fn resident_host_bytes(&self) -> u64 {
+        self.language
+            .as_ref()
+            .map_or(0, |language| language.len() as u64)
+    }
 }
 
 fn granite_decode_step(state: &GraniteSpeechDecodeState, delta: String) -> GraniteSpeechDecodeStep {
@@ -392,6 +434,8 @@ fn granite_publish_stable_text(
 #[derive(Debug, Clone)]
 pub(crate) struct GraniteSpeechPhysicalStateSpec {
     pub(crate) descriptor: CapabilityStateDescriptorV2,
+    pub(crate) retained: Option<InferenceStateContract>,
+    pub(crate) retained_max_tokens: Option<usize>,
     pub(crate) invocation: InferenceStateContract,
 }
 
@@ -461,8 +505,10 @@ impl GraniteSpeechAsrModel {
             self.runtime.kv_dtype(),
             default_kv_page_size(),
         )?;
+        let retained = granite_speech_retained_contract(invocation.clone())?;
         granite_speech_physical_state_spec(
             stage_graphs,
+            retained,
             invocation,
             self.config.text_config.max_position_embeddings,
         )
@@ -521,6 +567,237 @@ impl GraniteSpeechAsrModel {
             embeddings,
             stats,
         }))
+    }
+
+    pub(crate) fn retained_preparation_geometry(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Result<GraniteSpeechPreparedGeometry> {
+        let features = self.prepare_audio_features(audio, sample_rate)?;
+        validate_granite_audio_duration(features.audio_seconds)?;
+        let windows = features
+            .encoder_frames
+            .saturating_add(self.config.window_size.max(1) - 1)
+            / self.config.window_size.max(1);
+        let queries = self.config.window_size.max(1) / self.config.downsample_rate.max(1);
+        let audio_tokens = windows.checked_mul(queries).ok_or_else(|| {
+            Error::Overloaded("Granite Speech audio token geometry overflow".into())
+        })?;
+        if audio_tokens == 0 {
+            return Err(Error::InvalidInput(
+                "Granite Speech projected zero audio tokens".into(),
+            ));
+        }
+        let granite_prompt = self.build_prompt(&GraniteSpeechPromptOptions {
+            task: GraniteSpeechTask::Asr,
+            language: language.map(str::to_string),
+            custom_prompt: prompt.map(str::to_string),
+            ..GraniteSpeechPromptOptions::default()
+        })?;
+        if granite_prompt.audio_token_positions.len() != 1 {
+            return Err(Error::InvalidInput(
+                "Granite Speech prompt must contain exactly one audio placeholder".into(),
+            ));
+        }
+        let prompt_tokens = granite_prompt
+            .input_ids
+            .len()
+            .checked_add(audio_tokens.saturating_sub(1))
+            .ok_or_else(|| Error::Overloaded("Granite Speech prompt geometry overflow".into()))?;
+        let embedding_elements = u64::try_from(prompt_tokens)
+            .ok()
+            .and_then(|tokens| {
+                tokens.checked_mul(u64::try_from(self.config.text_config.hidden_size).ok()?)
+            })
+            .ok_or_else(|| Error::Overloaded("Granite Speech artifact geometry overflow".into()))?;
+        let retained_device_bytes = embedding_elements
+            .checked_mul(
+                u64::try_from(self.dtype.size_in_bytes()).map_err(|_| {
+                    Error::Overloaded("Granite Speech dtype size exceeds u64".into())
+                })?,
+            )
+            .ok_or_else(|| Error::Overloaded("Granite Speech artifact bytes overflow".into()))?;
+        let preparation_workspace_bytes = self.preparation_workspace_bytes(
+            features.encoder_frames,
+            features.encoder_dim,
+            prompt_tokens,
+        )?;
+        Ok(GraniteSpeechPreparedGeometry {
+            prompt_tokens,
+            audio_tokens,
+            embedding_elements,
+            preparation_workspace_bytes,
+            retained_device_bytes,
+        })
+    }
+
+    fn preparation_workspace_bytes(
+        &self,
+        encoder_frames: usize,
+        encoder_dim: usize,
+        prompt_tokens: usize,
+    ) -> Result<u64> {
+        let frames = u64::try_from(encoder_frames)
+            .map_err(|_| Error::Overloaded("Granite Speech encoder frames exceed u64".into()))?;
+        let input_dim = u64::try_from(encoder_dim)
+            .map_err(|_| Error::Overloaded("Granite Speech encoder width exceeds u64".into()))?;
+        let encoder_hidden =
+            u64::try_from(self.config.encoder_config.hidden_dim).map_err(|_| {
+                Error::Overloaded("Granite Speech encoder hidden width exceeds u64".into())
+            })?;
+        let encoder_output = u64::try_from(self.config.projector_config.encoder_hidden_size)
+            .map_err(|_| {
+                Error::Overloaded("Granite Speech projector input width exceeds u64".into())
+            })?;
+        let q_hidden = u64::try_from(self.config.projector_config.hidden_size)
+            .map_err(|_| Error::Overloaded("Granite Speech projector width exceeds u64".into()))?;
+        let q_intermediate = u64::try_from(self.config.projector_config.intermediate_size)
+            .map_err(|_| {
+                Error::Overloaded("Granite Speech projector MLP width exceeds u64".into())
+            })?;
+        let text_hidden = u64::try_from(self.config.text_config.hidden_size)
+            .map_err(|_| Error::Overloaded("Granite Speech text width exceeds u64".into()))?;
+        let windows = u64::try_from(
+            encoder_frames.saturating_add(self.config.window_size.max(1) - 1)
+                / self.config.window_size.max(1),
+        )
+        .map_err(|_| Error::Overloaded("Granite Speech projector windows exceed u64".into()))?;
+        let window = u64::try_from(self.config.window_size.max(1))
+            .map_err(|_| Error::Overloaded("Granite Speech projector window exceeds u64".into()))?;
+        let queries =
+            u64::try_from(self.config.window_size.max(1) / self.config.downsample_rate.max(1))
+                .map_err(|_| {
+                    Error::Overloaded("Granite Speech projector queries exceed u64".into())
+                })?;
+        let retained_encoder_rows = u64::try_from(
+            self.config
+                .encoder_config
+                .cat_hidden_layers
+                .len()
+                .saturating_add(10),
+        )
+        .map_err(|_| Error::Overloaded("Granite Speech encoder workspace exceeds u64".into()))?;
+
+        // This is a conservative live-set envelope, not an allocation sum. It
+        // covers preprocessing/upload, the Conformer residual/QKV/MLP live
+        // set plus retained concatenation rows, QFormer window attention/MLP,
+        // and prompt embedding assembly. The same formula authors both the
+        // request-shaped reservation and the loaded-model ceiling.
+        let encoder_elements = input_dim
+            .checked_add(
+                encoder_hidden
+                    .checked_mul(retained_encoder_rows)
+                    .ok_or_else(|| {
+                        Error::Overloaded("Granite Speech encoder workspace overflow".into())
+                    })?,
+            )
+            .and_then(|width| {
+                encoder_output
+                    .checked_mul(2)
+                    .and_then(|output| width.checked_add(output))
+            })
+            .and_then(|width| frames.checked_mul(width))
+            .ok_or_else(|| Error::Overloaded("Granite Speech encoder workspace overflow".into()))?;
+        let projector_width = window
+            .checked_mul(encoder_output)
+            .and_then(|elements| elements.checked_mul(2))
+            .and_then(|elements| {
+                queries
+                    .checked_mul(q_hidden.checked_mul(12)?)
+                    .and_then(|q| elements.checked_add(q))
+            })
+            .and_then(|elements| {
+                queries
+                    .checked_mul(q_intermediate.checked_mul(2)?)
+                    .and_then(|q| elements.checked_add(q))
+            })
+            .and_then(|elements| {
+                queries
+                    .checked_mul(text_hidden)
+                    .and_then(|q| elements.checked_add(q))
+            })
+            .ok_or_else(|| {
+                Error::Overloaded("Granite Speech projector workspace overflow".into())
+            })?;
+        let projector_elements = windows.checked_mul(projector_width).ok_or_else(|| {
+            Error::Overloaded("Granite Speech projector workspace overflow".into())
+        })?;
+        let prompt_elements = u64::try_from(prompt_tokens)
+            .ok()
+            .and_then(|tokens| tokens.checked_mul(text_hidden))
+            .and_then(|elements| elements.checked_mul(3))
+            .ok_or_else(|| Error::Overloaded("Granite Speech prompt workspace overflow".into()))?;
+        let live_elements = encoder_elements
+            .checked_add(projector_elements)
+            .and_then(|elements| elements.checked_add(prompt_elements))
+            .ok_or_else(|| {
+                Error::Overloaded("Granite Speech preparation workspace overflow".into())
+            })?;
+        let element_bytes =
+            u64::try_from(self.dtype.size_in_bytes().max(std::mem::size_of::<f32>()))
+                .map_err(|_| Error::Overloaded("Granite Speech dtype size exceeds u64".into()))?;
+        live_elements
+            .checked_mul(element_bytes)
+            .filter(|bytes| *bytes > 0)
+            .ok_or_else(|| {
+                Error::Overloaded("Granite Speech preparation workspace overflow".into())
+            })
+    }
+
+    pub(crate) fn scalar_preparation_stage_seal(
+        &self,
+        backend: BackendKind,
+    ) -> Result<GraniteSpeechAsrPreparationStageSeal> {
+        let loaded = match self.device.kind {
+            DeviceKind::Cpu => BackendKind::Cpu,
+            DeviceKind::Metal => BackendKind::Metal,
+            DeviceKind::Cuda => BackendKind::Cuda,
+        };
+        if loaded != backend {
+            return Err(Error::ModelLoadError(format!(
+                "Granite Speech ASR preparation backend mismatch: model={loaded:?}, adapter={backend:?}"
+            )));
+        }
+        let sample_rate = u64::from(self.processor.sample_rate());
+        let samples = sample_rate
+            .checked_mul(DEFAULT_MAX_AUDIO_SECONDS as u64)
+            .ok_or_else(|| {
+                Error::Overloaded("Granite Speech maximum sample count overflow".into())
+            })?;
+        let hop = u64::try_from(
+            self.processor
+                .audio_processor
+                .melspec_kwargs
+                .hop_length
+                .max(1),
+        )
+        .map_err(|_| Error::Overloaded("Granite Speech hop length exceeds u64".into()))?;
+        let encoder_frames = usize::try_from(samples / hop / 2 + 2)
+            .map_err(|_| Error::Overloaded("Granite Speech maximum frames exceed usize".into()))?;
+        let encoder_dim = self.config.encoder_config.input_dim;
+        let prompt_tokens = self.config.text_config.max_position_embeddings;
+        let windows = encoder_frames.saturating_add(self.config.window_size.max(1) - 1)
+            / self.config.window_size.max(1);
+        let audio_tokens = windows
+            .checked_mul(self.config.window_size.max(1) / self.config.downsample_rate.max(1))
+            .ok_or_else(|| {
+                Error::Overloaded("Granite Speech maximum work units overflow".into())
+            })?;
+        Ok(GraniteSpeechAsrPreparationStageSeal {
+            backend,
+            dtype: format!("{:?}", self.dtype).to_ascii_lowercase(),
+            max_work_units: u64::try_from(audio_tokens).map_err(|_| {
+                Error::Overloaded("Granite Speech maximum work units exceed u64".into())
+            })?,
+            max_workspace_bytes: self.preparation_workspace_bytes(
+                encoder_frames,
+                encoder_dim,
+                prompt_tokens,
+            )?,
+        })
     }
 
     pub(crate) fn prepare_prompt_artifact(
@@ -1064,14 +1341,93 @@ fn granite_speech_invocation_contract(
     Ok(contract)
 }
 
+fn granite_speech_retained_contract(
+    mut contract: InferenceStateContract,
+) -> Result<InferenceStateContract> {
+    for domain in &mut contract.domains {
+        let StateDomainSpec::PagedAttention(domain) = domain else {
+            return Err(Error::ModelLoadError(
+                "Granite Speech retained state must be paged attention".into(),
+            ));
+        };
+        domain.header.scope = StateScope::Retained;
+        domain.header.prefix = PrefixPolicy::Disabled;
+        domain.header.checkpoint = CheckpointPolicy::Transactional;
+    }
+    contract.validate()?;
+    Ok(contract)
+}
+
 fn granite_speech_physical_state_spec(
     stage_graphs: &[&[StageDescriptor]],
+    retained: InferenceStateContract,
     invocation: InferenceStateContract,
     max_context_tokens: usize,
 ) -> Result<GraniteSpeechPhysicalStateSpec> {
     if stage_graphs.is_empty() || max_context_tokens == 0 {
         return Err(Error::ModelLoadError(
             "Granite Speech invocation state requires stages and a non-zero text context".into(),
+        ));
+    }
+    let normal_graphs = stage_graphs
+        .iter()
+        .filter(|stages| {
+            stages.iter().any(|stage| {
+                matches!(
+                    stage.selector,
+                    crate::engine::StageWorkSelector::SequencePrefill
+                        | crate::engine::StageWorkSelector::SequenceDecode
+                )
+            })
+        })
+        .count();
+    let atomic_graphs = stage_graphs
+        .iter()
+        .filter(|stages| {
+            stages.len() == 1
+                && stages[0].selector == crate::engine::StageWorkSelector::Atomic
+                && stages[0].batch_mode == crate::engine::NativeBatchMode::None
+        })
+        .count();
+    let pipeline_graphs = stage_graphs
+        .iter()
+        .filter(|stages| {
+            stages.len() == 1
+                && matches!(
+                    stages[0].selector,
+                    crate::engine::StageWorkSelector::Pipeline { ordinal: None }
+                )
+                && stages[0].batch_mode == crate::engine::NativeBatchMode::None
+                && stages[0].shape_policy == crate::engine::StageShapePolicy::Exact
+        })
+        .count();
+    if normal_graphs > 0 {
+        let valid_normal = normal_graphs == 1
+            && stage_graphs.iter().any(|stages| {
+                stages.len() == 3
+                    && stages.iter().all(|stage| {
+                        stage.batch_mode == crate::engine::NativeBatchMode::None
+                            && stage.shape_policy == crate::engine::StageShapePolicy::Exact
+                    })
+                    && stages.iter().any(|stage| {
+                        stage.selector == crate::engine::StageWorkSelector::PreSequencePreparation
+                    })
+                    && stages.iter().any(|stage| {
+                        stage.selector == crate::engine::StageWorkSelector::SequencePrefill
+                    })
+                    && stages.iter().any(|stage| {
+                        stage.selector == crate::engine::StageWorkSelector::SequenceDecode
+                    })
+            });
+        if !valid_normal || atomic_graphs != 1 || stage_graphs.len() != 2 {
+            return Err(Error::ModelLoadError(
+                "Granite Speech ASR requires one exact scalar retained graph and one atomic compatibility graph"
+                    .into(),
+            ));
+        }
+    } else if pipeline_graphs != stage_graphs.len() {
+        return Err(Error::ModelLoadError(
+            "Granite Speech invocation-only capability requires exact pipeline graphs".into(),
         ));
     }
     let max_tokens = u64::try_from(max_context_tokens)
@@ -1090,23 +1446,34 @@ fn granite_speech_physical_state_spec(
         ordered.sort_unstable_by_key(|stage| stage.id);
         let mut invocation_stages = Vec::with_capacity(ordered.len());
         for (index, stage) in ordered.into_iter().enumerate() {
-            let mut domains = invocation
-                .domains
-                .iter()
-                .cloned()
-                .map(|state| {
-                    Ok(InvocationWorkspaceDomain::State {
-                        placement: state.header().placement,
-                        formula: WorkspaceFormula {
-                            fixed_bytes: granite_speech_paged_invocation_bytes(&state, max_tokens)?,
-                            dimensions: vec![],
-                            terms: vec![],
-                        },
-                        state,
-                        capacity: InvocationStateCapacity::decoder_context(max_tokens)?,
+            let uses_invocation_state = matches!(
+                stage.selector,
+                crate::engine::StageWorkSelector::Atomic
+                    | crate::engine::StageWorkSelector::Pipeline { ordinal: None }
+            );
+            let mut domains = if uses_invocation_state {
+                invocation
+                    .domains
+                    .iter()
+                    .cloned()
+                    .map(|state| {
+                        Ok(InvocationWorkspaceDomain::State {
+                            placement: state.header().placement,
+                            formula: WorkspaceFormula {
+                                fixed_bytes: granite_speech_paged_invocation_bytes(
+                                    &state, max_tokens,
+                                )?,
+                                dimensions: vec![],
+                                terms: vec![],
+                            },
+                            state,
+                            capacity: InvocationStateCapacity::decoder_context(max_tokens)?,
+                        })
                     })
-                })
-                .collect::<Result<Vec<_>>>()?;
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                Vec::new()
+            };
             if stage.max_workspace_bytes > 0 {
                 let scratch_id = max_domain_id
                     .checked_add(u32::try_from(index + 1).map_err(|_| {
@@ -1132,7 +1499,11 @@ fn granite_speech_physical_state_spec(
             invocation_stages.push(InvocationStageWorkspace {
                 stage: stage.id,
                 lease_scope: InvocationLeaseScope::PerRow,
-                groups: invocation.groups.clone(),
+                groups: if uses_invocation_state {
+                    invocation.groups.clone()
+                } else {
+                    Vec::new()
+                },
                 domains,
             });
         }
@@ -1143,9 +1514,24 @@ fn granite_speech_physical_state_spec(
     }
     profiles.sort_unstable_by_key(|profile| profile.stage_graph_fingerprint);
     profiles.dedup();
+    let uses_retained = stage_graphs.iter().any(|stages| {
+        stages.iter().any(|stage| {
+            matches!(
+                stage.selector,
+                crate::engine::StageWorkSelector::SequencePrefill
+                    | crate::engine::StageWorkSelector::SequenceDecode
+            )
+        })
+    });
     let descriptor = CapabilityStateDescriptorV2 {
         abi: CURRENT_INFERENCE_STATE_ABI,
-        retained: RetainedStateCapability::Stateless,
+        retained: if uses_retained {
+            RetainedStateCapability::Managed {
+                contract: retained.clone(),
+            }
+        } else {
+            RetainedStateCapability::Stateless
+        },
         invocation: InvocationWorkspaceSet::Bounded { profiles },
     };
     for stages in stage_graphs {
@@ -1153,6 +1539,8 @@ fn granite_speech_physical_state_spec(
     }
     Ok(GraniteSpeechPhysicalStateSpec {
         descriptor,
+        retained: uses_retained.then_some(retained),
+        retained_max_tokens: uses_retained.then_some(max_context_tokens),
         invocation,
     })
 }
@@ -1637,10 +2025,140 @@ mod tests {
     use crate::backends::BackendKind;
     use crate::backends::DeviceCapabilities;
     use crate::engine::ModelInstanceId;
+    use crate::engine::{
+        ExecutionMode, ExecutionProfile, NativeBatchMode, StageId, StageShapePolicy,
+        StageWorkSelector,
+    };
     use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
     use uuid::Uuid;
 
     static GRANITE_DTYPE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn granite_test_invocation_contract() -> InferenceStateContract {
+        let mut contract = crate::kv::v2::test_contract();
+        for domain in &mut contract.domains {
+            let StateDomainSpec::PagedAttention(domain) = domain else {
+                panic!("test contract must be paged attention")
+            };
+            domain.header.scope = StateScope::Invocation;
+            domain.header.checkpoint = CheckpointPolicy::None;
+            domain.header.prefix = PrefixPolicy::Disabled;
+        }
+        for group in &mut contract.groups {
+            group.prefix_shareable = false;
+        }
+        contract.validate().unwrap();
+        contract
+    }
+
+    fn granite_test_stage(id: u32, selector: StageWorkSelector) -> StageDescriptor {
+        let mode = if selector == StageWorkSelector::Atomic {
+            ExecutionMode::Atomic
+        } else {
+            ExecutionMode::Sequence
+        };
+        let mut profile = ExecutionProfile::fail_closed(BackendKind::Cpu, None, mode);
+        profile.max_batch_size = 1;
+        let mut stage = StageDescriptor::from_execution_profile(
+            StageId::new(id),
+            format!("granite.test.{id}"),
+            &profile,
+            NativeBatchMode::None,
+        );
+        stage.selector = selector;
+        stage.shape_policy = StageShapePolicy::Exact;
+        stage
+    }
+
+    #[test]
+    fn physical_state_separates_retained_normal_and_atomic_compatibility_graphs() {
+        let invocation = granite_test_invocation_contract();
+        let retained = granite_speech_retained_contract(invocation.clone()).unwrap();
+        let normal = vec![
+            granite_test_stage(0, StageWorkSelector::PreSequencePreparation),
+            granite_test_stage(1, StageWorkSelector::SequencePrefill),
+            granite_test_stage(2, StageWorkSelector::SequenceDecode),
+        ];
+        let atomic = vec![granite_test_stage(0, StageWorkSelector::Atomic)];
+
+        let spec = granite_speech_physical_state_spec(
+            &[normal.as_slice(), atomic.as_slice()],
+            retained,
+            invocation,
+            128,
+        )
+        .unwrap();
+
+        assert!(spec.retained.is_some());
+        assert_eq!(spec.retained_max_tokens, Some(128));
+        assert!(matches!(
+            spec.descriptor.retained,
+            RetainedStateCapability::Managed { .. }
+        ));
+        let InvocationWorkspaceSet::Bounded { profiles } = &spec.descriptor.invocation else {
+            panic!("Granite test descriptor must use bounded invocation profiles")
+        };
+        let normal_fingerprint = stage_graph_fingerprint(&normal).unwrap();
+        let normal_profile = profiles
+            .iter()
+            .find(|profile| profile.stage_graph_fingerprint == normal_fingerprint)
+            .unwrap();
+        assert!(normal_profile
+            .stages
+            .iter()
+            .all(|stage| stage.groups.is_empty()));
+        let atomic_fingerprint = stage_graph_fingerprint(&atomic).unwrap();
+        let atomic_profile = profiles
+            .iter()
+            .find(|profile| profile.stage_graph_fingerprint == atomic_fingerprint)
+            .unwrap();
+        assert!(atomic_profile
+            .stages
+            .iter()
+            .all(|stage| !stage.groups.is_empty()));
+    }
+
+    #[test]
+    fn physical_state_rejects_incomplete_retained_graph() {
+        let invocation = granite_test_invocation_contract();
+        let retained = granite_speech_retained_contract(invocation.clone()).unwrap();
+        let incomplete = vec![
+            granite_test_stage(0, StageWorkSelector::PreSequencePreparation),
+            granite_test_stage(1, StageWorkSelector::SequencePrefill),
+        ];
+        let atomic = vec![granite_test_stage(0, StageWorkSelector::Atomic)];
+
+        assert!(granite_speech_physical_state_spec(
+            &[incomplete.as_slice(), atomic.as_slice()],
+            retained,
+            invocation,
+            128,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn invocation_only_physical_state_authenticates_pipeline_work() {
+        let invocation = granite_test_invocation_contract();
+        let retained = granite_speech_retained_contract(invocation.clone()).unwrap();
+        let pipeline = vec![granite_test_stage(
+            0,
+            StageWorkSelector::Pipeline { ordinal: None },
+        )];
+
+        let spec =
+            granite_speech_physical_state_spec(&[pipeline.as_slice()], retained, invocation, 128)
+                .unwrap();
+        assert!(spec.retained.is_none());
+        let InvocationWorkspaceSet::Bounded { profiles } = &spec.descriptor.invocation else {
+            panic!("Granite test descriptor must use bounded invocation profiles")
+        };
+        assert_eq!(profiles.len(), 1);
+        assert!(profiles[0]
+            .stages
+            .iter()
+            .all(|stage| !stage.groups.is_empty()));
+    }
 
     fn temp_model_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("granite-speech-test-{}", Uuid::new_v4()));

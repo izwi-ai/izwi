@@ -13,6 +13,7 @@ enum CertifiedTopology {
     RetainedPagedRing,
     RetainedPagedTensorAndInvocationPaged,
     RetainedPagedAndInvocationPagedTensor,
+    RetainedPagedAndInvocationPaged,
     RetainedPagedStaticAndInvocationPagedStatic,
     RetainedPagedTensorTensor,
     RetainedAppendRingTensor,
@@ -33,6 +34,7 @@ impl CertifiedTopology {
                 InferenceStateRequirement::Retained
             }
             Self::RetainedPagedTensorAndInvocationPaged
+            | Self::RetainedPagedAndInvocationPaged
             | Self::RetainedPagedAndInvocationPagedTensor
             | Self::RetainedPagedStaticAndInvocationPagedStatic
             | Self::RetainedAppendRingTensor => InferenceStateRequirement::RetainedAndInvocation,
@@ -89,7 +91,8 @@ fn certified_topology(
         (VibeVoiceAsr, Asr) => RetainedPagedAndInvocationPagedTensor,
         (WhisperAsr, Asr) => RetainedPagedStaticAndInvocationPagedStatic,
         (ParakeetAsr, Asr) => InvocationTensor,
-        (GraniteSpeechAsr, Asr | SpeakerAttributedAsr) => InvocationPaged,
+        (GraniteSpeechAsr, Asr) => RetainedPagedAndInvocationPaged,
+        (GraniteSpeechAsr, SpeakerAttributedAsr) => InvocationPaged,
         (NemotronAsr, Asr) => InvocationTensorStatic,
         // Realtime Nemotron retains append/ring/tensor streaming state and
         // uses invocation-scoped workspace for the exact graph.
