@@ -423,8 +423,7 @@ fn commit_sortformer_streaming_state(
     state: &SortformerStreamingState,
     device: &Device,
 ) -> Result<()> {
-    if cfg.fifo_len == 0
-        || state.spkcache.len() > cfg.spkcache_len
+    if state.spkcache.len() > cfg.spkcache_len
         || state.fifo.len() > cfg.fifo_len
         || state
             .spkcache_preds
@@ -448,9 +447,6 @@ fn commit_sortformer_streaming_state(
         cfg.spkcache_len,
         device,
     )?;
-    let fifo_embeddings =
-        padded_embedding_tensor(&state.fifo, cfg.fifo_len, cfg.fc_d_model, device)?;
-    let fifo_predictions = padded_prediction_tensor(&state.fifo_preds, cfg.fifo_len, device)?;
     let silence_mean = Tensor::from_vec(state.mean_sil_emb.clone(), cfg.fc_d_model, device)?;
     let control = Tensor::from_vec(
         vec![
@@ -462,59 +458,117 @@ fn commit_sortformer_streaming_state(
         4,
         device,
     )?;
-    let tensors = [
-        speaker_embeddings,
-        speaker_predictions,
-        fifo_embeddings,
-        fifo_predictions,
-        silence_mean,
-        control,
+    let mut components = vec![
+        InvocationTensorComponentValue {
+            component: StateComponentId::new(1),
+            tensor: speaker_embeddings,
+        },
+        InvocationTensorComponentValue {
+            component: StateComponentId::new(2),
+            tensor: speaker_predictions,
+        },
+        InvocationTensorComponentValue {
+            component: StateComponentId::new(5),
+            tensor: silence_mean,
+        },
+        InvocationTensorComponentValue {
+            component: StateComponentId::new(6),
+            tensor: control,
+        },
     ];
-    let shapes = [
-        vec![
-            (ShapeAxis::Frames, cfg.spkcache_len as u64),
-            (ShapeAxis::Hidden, cfg.fc_d_model as u64),
-        ],
-        vec![
-            (ShapeAxis::Frames, cfg.spkcache_len as u64),
-            (
-                ShapeAxis::Custom("speakers".into()),
-                MAX_SUPPORTED_SPEAKERS as u64,
-            ),
-        ],
-        vec![
-            (ShapeAxis::Frames, cfg.fifo_len as u64),
-            (ShapeAxis::Hidden, cfg.fc_d_model as u64),
-        ],
-        vec![
-            (ShapeAxis::Frames, cfg.fifo_len as u64),
-            (
-                ShapeAxis::Custom("speakers".into()),
-                MAX_SUPPORTED_SPEAKERS as u64,
-            ),
-        ],
-        vec![(ShapeAxis::Hidden, cfg.fc_d_model as u64)],
-        vec![(ShapeAxis::Custom("control".into()), 4)],
+    let mut declared = vec![
+        ComponentShapeInstantiation {
+            component: StateComponentId::new(1),
+            dimensions: vec![
+                ShapeDimensionValue {
+                    axis: ShapeAxis::Frames,
+                    units: cfg.spkcache_len as u64,
+                },
+                ShapeDimensionValue {
+                    axis: ShapeAxis::Hidden,
+                    units: cfg.fc_d_model as u64,
+                },
+            ],
+        },
+        ComponentShapeInstantiation {
+            component: StateComponentId::new(2),
+            dimensions: vec![
+                ShapeDimensionValue {
+                    axis: ShapeAxis::Frames,
+                    units: cfg.spkcache_len as u64,
+                },
+                ShapeDimensionValue {
+                    axis: ShapeAxis::Custom("speakers".into()),
+                    units: MAX_SUPPORTED_SPEAKERS as u64,
+                },
+            ],
+        },
+        ComponentShapeInstantiation {
+            component: StateComponentId::new(5),
+            dimensions: vec![ShapeDimensionValue {
+                axis: ShapeAxis::Hidden,
+                units: cfg.fc_d_model as u64,
+            }],
+        },
+        ComponentShapeInstantiation {
+            component: StateComponentId::new(6),
+            dimensions: vec![ShapeDimensionValue {
+                axis: ShapeAxis::Custom("control".into()),
+                units: 4,
+            }],
+        },
     ];
-    let components = tensors
-        .into_iter()
-        .enumerate()
-        .map(|(index, tensor)| InvocationTensorComponentValue {
-            component: StateComponentId::new((index + 1) as u32),
-            tensor,
-        })
-        .collect::<Vec<_>>();
-    let declared = shapes
-        .into_iter()
-        .enumerate()
-        .map(|(index, dimensions)| ComponentShapeInstantiation {
-            component: StateComponentId::new((index + 1) as u32),
-            dimensions: dimensions
-                .into_iter()
-                .map(|(axis, units)| ShapeDimensionValue { axis, units })
-                .collect(),
-        })
-        .collect();
+    if cfg.fifo_len > 0 {
+        let fifo_embeddings =
+            padded_embedding_tensor(&state.fifo, cfg.fifo_len, cfg.fc_d_model, device)?;
+        let fifo_predictions = padded_prediction_tensor(&state.fifo_preds, cfg.fifo_len, device)?;
+        components.insert(
+            2,
+            InvocationTensorComponentValue {
+                component: StateComponentId::new(3),
+                tensor: fifo_embeddings,
+            },
+        );
+        components.insert(
+            3,
+            InvocationTensorComponentValue {
+                component: StateComponentId::new(4),
+                tensor: fifo_predictions,
+            },
+        );
+        declared.insert(
+            2,
+            ComponentShapeInstantiation {
+                component: StateComponentId::new(3),
+                dimensions: vec![
+                    ShapeDimensionValue {
+                        axis: ShapeAxis::Frames,
+                        units: cfg.fifo_len as u64,
+                    },
+                    ShapeDimensionValue {
+                        axis: ShapeAxis::Hidden,
+                        units: cfg.fc_d_model as u64,
+                    },
+                ],
+            },
+        );
+        declared.insert(
+            3,
+            ComponentShapeInstantiation {
+                component: StateComponentId::new(4),
+                dimensions: vec![
+                    ShapeDimensionValue {
+                        axis: ShapeAxis::Frames,
+                        units: cfg.fifo_len as u64,
+                    },
+                    ShapeDimensionValue {
+                        axis: ShapeAxis::Custom("speakers".into()),
+                        units: MAX_SUPPORTED_SPEAKERS as u64,
+                    },
+                ],
+            },
+        );
+    }
     lease.apply_intent(
         &DomainStepIntent {
             domain: physical::SORTFORMER_STREAMING_STATE_DOMAIN,

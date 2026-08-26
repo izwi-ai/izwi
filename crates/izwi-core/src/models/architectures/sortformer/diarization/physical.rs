@@ -50,7 +50,7 @@ fn sortformer_invocation_contract(
             fixed(width_axis, width as u64),
         ]
     };
-    let components = vec![
+    let mut components = vec![
         component(
             1,
             TensorRole::RetainedEmbedding,
@@ -66,20 +66,6 @@ fn sortformer_invocation_contract(
             ),
         ),
         component(
-            3,
-            TensorRole::EncoderMemory,
-            rows(cfg.fifo_len, ShapeAxis::Hidden, cfg.fc_d_model),
-        ),
-        component(
-            4,
-            TensorRole::RetainedLogits,
-            rows(
-                cfg.fifo_len,
-                ShapeAxis::Custom("speakers".into()),
-                MAX_SUPPORTED_SPEAKERS,
-            ),
-        ),
-        component(
             5,
             TensorRole::RetainedEmbedding,
             vec![fixed(ShapeAxis::Hidden, cfg.fc_d_model as u64)],
@@ -90,6 +76,28 @@ fn sortformer_invocation_contract(
             vec![fixed(ShapeAxis::Custom("control".into()), 4)],
         ),
     ];
+    if cfg.fifo_len > 0 {
+        components.insert(
+            2,
+            component(
+                3,
+                TensorRole::EncoderMemory,
+                rows(cfg.fifo_len, ShapeAxis::Hidden, cfg.fc_d_model),
+            ),
+        );
+        components.insert(
+            3,
+            component(
+                4,
+                TensorRole::RetainedLogits,
+                rows(
+                    cfg.fifo_len,
+                    ShapeAxis::Custom("speakers".into()),
+                    MAX_SUPPORTED_SPEAKERS,
+                ),
+            ),
+        );
+    }
     let contract = InferenceStateContract {
         abi: CURRENT_INFERENCE_STATE_ABI,
         domains: vec![StateDomainSpec::Tensor(TensorStateDomainSpec {
@@ -143,6 +151,30 @@ mod tests {
         assert_eq!(
             contract.groups[0].domains,
             vec![SORTFORMER_STREAMING_STATE_DOMAIN]
+        );
+    }
+
+    #[test]
+    fn zero_fifo_model_profile_omits_empty_tensor_components() {
+        let cfg = super::super::resolve_streaming_config(
+            crate::catalog::ModelVariant::DiarStreamingSortformer4SpkV21,
+            &super::super::SortformerModulesConfig::default(),
+            512,
+        )
+        .unwrap();
+        assert_eq!(cfg.fifo_len, 0);
+
+        let contract = sortformer_invocation_contract(cfg).unwrap();
+        let StateDomainSpec::Tensor(state) = &contract.domains[0] else {
+            panic!("Sortformer state must be a tensor domain");
+        };
+        assert_eq!(
+            state
+                .components
+                .iter()
+                .map(|component| component.id.get())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 5, 6]
         );
     }
 }
