@@ -2251,6 +2251,19 @@ impl LoadedExecutionAdapter for Lfm25AudioTtsExecutionAdapter {
         profile.cache_release_safe = true;
         profile.max_batch_size = 1;
         profile.resolved_from_loaded_model = true;
+        let mut preparation = StageDescriptor::from_execution_profile(
+            StageId::new(0),
+            "tts.prepare.lfm25_audio",
+            &profile,
+            NativeBatchMode::None,
+        );
+        preparation.selector = StageWorkSelector::PreSequencePreparation;
+        preparation.progress = StageProgressKind::Atomic;
+        preparation.shape_policy = StageShapePolicy::Exact;
+        preparation.max_work_units = u64::try_from(ceiling.max_prompt_tokens)
+            .map_err(|_| Error::Overloaded("LFM2.5 Audio TTS prompt ceiling exceeds u64".into()))?;
+        preparation.max_workspace_bytes = ceiling.max_workspace_bytes;
+        preparation.output_visibility = OutputVisibility::AfterQuantumCommit;
         let mut prefill = StageDescriptor::from_execution_profile(
             StageId::new(1),
             "tts.prefill.lfm25_audio.scalar",
@@ -2277,6 +2290,7 @@ impl LoadedExecutionAdapter for Lfm25AudioTtsExecutionAdapter {
             })?;
         decode.max_workspace_bytes = ceiling.max_workspace_bytes;
         decode.output_visibility = OutputVisibility::AfterQuantumCommit;
+        preparation.validate()?;
         prefill.validate()?;
         decode.validate()?;
         Ok(LoadedExecutionContract {
@@ -2286,7 +2300,7 @@ impl LoadedExecutionAdapter for Lfm25AudioTtsExecutionAdapter {
             adapter_abi_revision: self.adapter_abi_revision(),
             metadata: self.metadata,
             execution_profile: profile,
-            stages: Arc::from([prefill, decode]),
+            stages: Arc::from([preparation, prefill, decode]),
         })
     }
 }
@@ -5655,9 +5669,10 @@ mod tests {
                 contract.execution_profile.decode_batch,
                 NativeBatchMode::None
             );
-            assert_eq!(contract.stages.len(), 2);
-            assert_eq!(contract.stages[0].name, "tts.prefill.lfm25_audio.scalar");
-            assert_eq!(contract.stages[1].name, "tts.decode.lfm25_audio.scalar");
+            assert_eq!(contract.stages.len(), 3);
+            assert_eq!(contract.stages[0].name, "tts.prepare.lfm25_audio");
+            assert_eq!(contract.stages[1].name, "tts.prefill.lfm25_audio.scalar");
+            assert_eq!(contract.stages[2].name, "tts.decode.lfm25_audio.scalar");
             assert!(contract.stages.iter().all(|stage| {
                 stage.output_visibility == OutputVisibility::AfterQuantumCommit
                     && stage.max_batch_size == 1
