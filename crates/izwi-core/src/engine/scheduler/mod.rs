@@ -422,7 +422,7 @@ impl RealtimePendingOperation {
         }
     }
 
-    fn work(&self, committed_input_samples: usize) -> WorkUnit {
+    fn work(&self, committed_input_samples: usize, committed_decode_steps: usize) -> WorkUnit {
         match self.phase {
             RealtimeSubphase::Preparation => {
                 let (mode, input) = match self.external {
@@ -443,6 +443,11 @@ impl RealtimePendingOperation {
                     input,
                     max_output_steps: self.remaining_output_steps,
                     max_cache_append: self.max_cache_append(),
+                    retained_state_input: InputRange {
+                        start: self.id.get().saturating_sub(1) as usize,
+                        end: self.id.get() as usize,
+                    },
+                    auxiliary_state: None,
                 }
             }
             RealtimeSubphase::PromptPrefill { cache_append } => WorkUnit::RealtimePromptPrefill {
@@ -454,6 +459,11 @@ impl RealtimePendingOperation {
                 operation_id: self.id,
                 max_output_steps: self.remaining_output_steps,
                 max_cache_append: 1,
+                retained_state_input: InputRange {
+                    start: committed_decode_steps,
+                    end: committed_decode_steps.saturating_add(1),
+                },
+                auxiliary_state: None,
             },
             RealtimeSubphase::Completion => WorkUnit::RealtimeCompletion {
                 operation_id: self.id,
@@ -466,6 +476,7 @@ impl RealtimePendingOperation {
 struct RealtimeSchedulerState {
     sequence_id: SequenceId,
     committed_input_samples: usize,
+    committed_decode_steps: usize,
     enqueued_input_samples: usize,
     next_operation_id: u64,
     pending: VecDeque<RealtimePendingOperation>,
@@ -491,6 +502,7 @@ pub(crate) struct PreparedRealtimeStageOutcome {
     remaining_output_steps: usize,
     committed_cache_append: usize,
     committed_input_samples: usize,
+    committed_decode_steps: usize,
     final_stage: bool,
 }
 
@@ -727,6 +739,7 @@ impl Scheduler {
             RealtimeSchedulerState {
                 sequence_id,
                 committed_input_samples: 0,
+                committed_decode_steps: 0,
                 enqueued_input_samples: 0,
                 next_operation_id: 1,
                 pending: VecDeque::new(),
@@ -986,7 +999,7 @@ impl Scheduler {
                 .checked_add(1)
                 .expect("realtime service clock capacity was reserved");
             let num_computed_tokens = state.committed_input_samples;
-            let work = operation.work(state.committed_input_samples);
+            let work = operation.work(state.committed_input_samples, state.committed_decode_steps);
             result.decode_requests.push(ScheduledRequest {
                 plan_id,
                 request_id,
@@ -1562,8 +1575,7 @@ impl Scheduler {
                 Some(RealtimeSubphase::DecodeContinuation | RealtimeSubphase::Completion)
             ) | (RealtimeSubphase::Completion, None)
         ) || (outcome.next.is_none()
-            && !matches!(head.phase, RealtimeSubphase::Completion)
-            && matches!(head.external, RealtimeExternalOperation::Push { .. }));
+            && !matches!(head.phase, RealtimeSubphase::Completion));
         if !transition_valid {
             return Err(crate::error::Error::InferenceError(
                 "realtime stage outcome requested an invalid subphase transition".into(),
@@ -1674,12 +1686,21 @@ impl Scheduler {
         } else {
             state.committed_input_samples
         };
+        let committed_decode_steps = state
+            .committed_decode_steps
+            .checked_add(outcome.output_steps)
+            .ok_or_else(|| {
+                crate::error::Error::InferenceError(
+                    "realtime retained decode clock overflow".into(),
+                )
+            })?;
         Ok(PreparedRealtimeStageOutcome {
             session_epoch: session.epoch,
             outcome,
             remaining_output_steps,
             committed_cache_append,
             committed_input_samples,
+            committed_decode_steps,
             final_stage,
         })
     }
@@ -1714,6 +1735,7 @@ impl Scheduler {
         assert_eq!(head.phase, prepared.outcome.completed);
         head.remaining_output_steps = prepared.remaining_output_steps;
         head.committed_cache_append = prepared.committed_cache_append;
+        state.committed_decode_steps = prepared.committed_decode_steps;
         if prepared.final_stage {
             state.committed_input_samples = prepared.committed_input_samples;
             state.pending.pop_front();
@@ -2871,8 +2893,11 @@ mod tests {
                 operation_id,
                 mode: RealtimePreparationMode::Push,
                 input,
+                retained_state_input,
                 ..
-            } if *operation_id == first_id && *input == first_input
+            } if *operation_id == first_id
+                && *input == first_input
+                && *retained_state_input == InputRange::new(0, 1).unwrap()
         ));
         assert!(scheduler.release_realtime_operation_for_retry(
             &session,
@@ -2956,8 +2981,12 @@ mod tests {
         let decode = scheduler.schedule();
         assert!(matches!(
             &decode.decode_requests[0].work,
-            WorkUnit::RealtimeDecodeContinuation { operation_id, .. }
-                if *operation_id == first_id
+            WorkUnit::RealtimeDecodeContinuation {
+                operation_id,
+                retained_state_input,
+                ..
+            } if *operation_id == first_id
+                && *retained_state_input == InputRange::new(1, 2).unwrap()
         ));
         scheduler
             .commit_realtime_stage_outcome(

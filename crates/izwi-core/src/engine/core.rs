@@ -24,9 +24,9 @@ use super::config::EngineCoreConfig;
 use super::execution::CacheMode;
 use super::execution::{
     AdapterAbiRevision, AdapterInstanceId, BatchBudget, BatchDispatch, BatchId, BatchKey,
-    BatchLaneKey, ConcurrencyClass, DeadlinePhase, DispatchState, ExecutionDisposition,
-    ExecutionFailure, ExecutionGroupId, ExecutionMode, ExecutionPlan, ExecutionProfile,
-    ExecutionReport, ExecutionState, ExecutionTracker, FailureOrigin,
+    BatchLaneKey, ClockedStateSpan, ConcurrencyClass, DeadlinePhase, DispatchState,
+    ExecutionDisposition, ExecutionFailure, ExecutionGroupId, ExecutionMode, ExecutionPlan,
+    ExecutionProfile, ExecutionReport, ExecutionState, ExecutionTracker, FailureOrigin,
     FinishReason as ExecutionFinishReason, ModelInstanceId, NativeBatchMode, OutcomeProvenance,
     OutputVisibility, PhysicalBatch, PhysicalLaunchPolicy, PrefillMode, ReadyQuantum,
     RealtimeStageOutcome, RealtimeSubphase, RetryDisposition, SequencePhase, StageId,
@@ -796,6 +796,58 @@ impl EngineCore {
                     }
                 }
                 *auxiliary_state = projected;
+            }
+        }
+        let realtime_state = match &mut work {
+            WorkUnit::RealtimePreparation {
+                retained_state_input,
+                auxiliary_state,
+                ..
+            }
+            | WorkUnit::RealtimeDecodeContinuation {
+                retained_state_input,
+                auxiliary_state,
+                ..
+            } => Some((*retained_state_input, auxiliary_state)),
+            _ => None,
+        };
+        if let Some((state_input, auxiliary_state)) = realtime_state {
+            if auxiliary_state.is_some() {
+                return Err(Error::InferenceError(
+                    "scheduler attempted to author retained realtime state".into(),
+                ));
+            }
+            if let Some(selections) = bound_stage
+                .as_ref()
+                .and_then(|stage| stage.retained_state_selections.as_deref())
+            {
+                let runtime = request.managed_cache_runtime().ok_or_else(|| {
+                    Error::InferenceError(
+                        "retained realtime stage has no exact managed runtime".into(),
+                    )
+                })?;
+                let tensor = runtime.tensor_state().ok_or_else(|| {
+                    Error::InferenceError(
+                        "retained realtime stage has no tensor-state arena".into(),
+                    )
+                })?;
+                let mut spans = Vec::with_capacity(selections.len());
+                let mut previous_group = None;
+                for selection in selections {
+                    if previous_group.is_some_and(|previous| previous >= selection.group().get()) {
+                        return Err(Error::InferenceError(
+                            "retained realtime selections are not canonical and unique".into(),
+                        ));
+                    }
+                    tensor.validate_group_clock(selection.group(), selection.clock())?;
+                    spans.push(ClockedStateSpan::new(
+                        selection.group(),
+                        selection.clock().clone(),
+                        state_input,
+                    )?);
+                    previous_group = Some(selection.group().get());
+                }
+                *auxiliary_state = Some(Arc::from(spans));
             }
         }
         let work_kind = match &work {
@@ -2724,12 +2776,16 @@ impl EngineCore {
         let request_id = request.id.clone();
         if request.task_type != super::TaskType::ASR
             || !request.is_realtime_asr_session()
-            || request
-                .model_variant
-                .is_none_or(|variant| variant.family() != crate::catalog::ModelFamily::Voxtral)
+            || request.model_variant.is_none_or(|variant| {
+                !matches!(
+                    variant.family(),
+                    crate::catalog::ModelFamily::Voxtral | crate::catalog::ModelFamily::NemotronAsr
+                )
+            })
         {
             return Err(Error::InvalidInput(
-                "realtime ASR admission requires an ingress-enabled Voxtral ASR request".into(),
+                "realtime ASR admission requires an ingress-enabled authenticated ASR request"
+                    .into(),
             ));
         }
         if self.requests.contains_key(&request_id) {
@@ -2748,9 +2804,11 @@ impl EngineCore {
                 "realtime ASR admission requires a loaded execution adapter binding".into(),
             )
         })?;
-        crate::models::architectures::voxtral::authenticate_voxtral_realtime_execution_binding(
-            execution,
-        )?;
+        match request.model_variant.expect("validated realtime variant").family() {
+            crate::catalog::ModelFamily::Voxtral => crate::models::architectures::voxtral::authenticate_voxtral_realtime_execution_binding(execution)?,
+            crate::catalog::ModelFamily::NemotronAsr => crate::models::architectures::nemotron::asr::authenticate_realtime_execution_binding(execution)?,
+            _ => unreachable!("validated realtime family"),
+        }
         if execution.model_instance_id != model_instance {
             return Err(Error::InvalidInput(
                 "realtime ASR execution binding crossed its loaded model instance".into(),
@@ -2772,7 +2830,7 @@ impl EngineCore {
         runtime.validate_against(self.managed_kv_cache.worker_backend(), execution)?;
         let physical = runtime.managed_kv_runtime().ok_or_else(|| {
             Error::InvalidInput(
-                "realtime ASR admission requires a physical managed paged runtime".into(),
+                "realtime ASR admission requires a physical managed state runtime".into(),
             )
         })?;
         if physical.plan().model_instance != model_instance {
@@ -7389,6 +7447,8 @@ mod tests {
                 input: super::super::InputRange::new(0, 160).unwrap(),
                 max_output_steps: 8,
                 max_cache_append: 32,
+                retained_state_input: super::super::InputRange::new(0, 1).unwrap(),
+                auxiliary_state: None,
             },
             None,
         )

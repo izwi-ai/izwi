@@ -342,6 +342,11 @@ pub enum WorkUnit {
         input: InputRange,
         max_output_steps: usize,
         max_cache_append: usize,
+        /// Scheduler-authored semantic revision for retained preparation state.
+        retained_state_input: InputRange,
+        /// Core-sealed retained state advanced once for this external
+        /// operation. Paged-only realtime models leave this unset.
+        auxiliary_state: Option<Arc<[ClockedStateSpan]>>,
     },
     /// One scalar prompt-prefill transaction whose exact KV append was learned
     /// from the committed preparation outcome.
@@ -356,6 +361,10 @@ pub enum WorkUnit {
         operation_id: RealtimeOperationId,
         max_output_steps: usize,
         max_cache_append: usize,
+        /// Scheduler-authored global decode-step interval for retained state.
+        retained_state_input: InputRange,
+        /// Core-sealed retained state advanced by this decode quantum.
+        auxiliary_state: Option<Arc<[ClockedStateSpan]>>,
     },
     /// Zero-tensor control phase used to seal a closed/exhausted stream and its
     /// final marker without claiming a decode dispatch.
@@ -3455,6 +3464,8 @@ mod tests {
                 input: InputRange::new(0, 160).unwrap(),
                 max_output_steps: 2,
                 max_cache_append: 4,
+                retained_state_input: InputRange::new(8, 9).unwrap(),
+                auxiliary_state: None,
             },
             WorkUnit::RealtimePromptPrefill {
                 operation_id,
@@ -3465,6 +3476,8 @@ mod tests {
                 operation_id,
                 max_output_steps: 1,
                 max_cache_append: 1,
+                retained_state_input: InputRange::new(4, 5).unwrap(),
+                auxiliary_state: None,
             },
             WorkUnit::RealtimeCompletion { operation_id },
         ];

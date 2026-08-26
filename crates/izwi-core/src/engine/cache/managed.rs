@@ -1233,9 +1233,10 @@ impl ManagedKvCacheManager {
             | WorkUnit::RealtimeFinish {
                 max_cache_append, ..
             } => (None, None, Some(*max_cache_append), true, false),
-            WorkUnit::RealtimePreparation { .. } | WorkUnit::RealtimeCompletion { .. } => {
-                (None, None, Some(0), true, false)
-            }
+            WorkUnit::RealtimePreparation {
+                auxiliary_state, ..
+            } => (None, auxiliary_state.as_ref(), Some(0), true, false),
+            WorkUnit::RealtimeCompletion { .. } => (None, None, Some(0), true, false),
             WorkUnit::RealtimePromptPrefill { cache_append, .. } => {
                 if *cache_append == 0 {
                     return Err(Error::InvalidInput(
@@ -1245,14 +1246,16 @@ impl ManagedKvCacheManager {
                 (None, None, Some(*cache_append), false, true)
             }
             WorkUnit::RealtimeDecodeContinuation {
-                max_cache_append, ..
+                max_cache_append,
+                auxiliary_state,
+                ..
             } => {
                 if *max_cache_append != 1 {
                     return Err(Error::InvalidInput(
                         "realtime decode continuation requires exactly one cache append".into(),
                     ));
                 }
-                (None, None, Some(1), false, true)
+                (None, auxiliary_state.as_ref(), Some(1), false, true)
             }
             _ => return Ok(None),
         };
@@ -1286,7 +1289,10 @@ impl ManagedKvCacheManager {
                     .collect::<Result<Vec<_>>>()
             })
             .transpose()?;
-        if realtime_cache_append.is_some() && runtime.tensor_state().is_some() {
+        if realtime_cache_append.is_some()
+            && runtime.tensor_state().is_some()
+            && selected_tensor_state.is_none()
+        {
             return Err(Error::InferenceError(
                 "realtime paged reservation cannot implicitly advance tensor state".into(),
             ));
@@ -5907,7 +5913,10 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        assert!(reservation.domains.is_empty());
+        assert!(reservation
+            .domains
+            .iter()
+            .all(|domain| { domain.target_committed_tokens == domain.execution_start_tokens }));
         let transaction = PhysicalStateTransactionId::new(reservation.txn_id).unwrap();
         arena
             .stage_replace(
@@ -5938,6 +5947,78 @@ mod tests {
                 .unwrap()
                 .cursor,
             80
+        );
+    }
+
+    #[test]
+    fn realtime_selected_tensor_state_commits_without_implicit_paged_advance() {
+        let model = ModelInstanceId::new(5242);
+        let session = SessionKey::new("managed-realtime-clocked-only".into(), 1);
+        let mut manager = ManagedKvCacheManager::default();
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                8,
+                16,
+                &CacheCapability::Managed(independently_clocked_tensor_contract()),
+            )
+            .unwrap()
+            .unwrap();
+        let arena = runtime.tensor_state().unwrap().clone();
+        let span = ClockedStateSpan::new(
+            StateGroupId::new(2),
+            StateClock::AudioFrames,
+            InputRange::new(0, 1).unwrap(),
+        )
+        .unwrap();
+        let work = WorkUnit::RealtimePreparation {
+            operation_id: crate::engine::RealtimeOperationId::new(1),
+            mode: crate::engine::RealtimePreparationMode::Push,
+            input: InputRange::new(0, 160).unwrap(),
+            max_output_steps: 2,
+            max_cache_append: 4,
+            retained_state_input: InputRange::new(0, 1).unwrap(),
+            auxiliary_state: Some(Arc::from([span])),
+        };
+        let reservation = manager
+            .prepare(&runtime, 5243, &session, &work, None)
+            .unwrap()
+            .unwrap();
+        assert!(reservation
+            .domains
+            .iter()
+            .all(|domain| { domain.target_committed_tokens == domain.execution_start_tokens }));
+        let transaction = PhysicalStateTransactionId::new(reservation.txn_id).unwrap();
+        arena
+            .stage_replace(
+                transaction,
+                StateDomainId::new(2),
+                0,
+                1,
+                vec![StateComponentValue {
+                    component: StateComponentId::new(1),
+                    tensor: None,
+                }],
+            )
+            .unwrap();
+        let receipt = reservation
+            .completed_write_receipt_for_test()
+            .with_clocked_state_completion(arena.seal_selected_completion(transaction).unwrap())
+            .unwrap();
+        manager
+            .finalize(&reservation, Some(&receipt), true)
+            .unwrap();
+        let sequence =
+            PhysicalStateSequenceId::new(reservation.clocked_state.as_ref().unwrap().sequence())
+                .unwrap();
+        assert_eq!(
+            arena
+                .read(sequence, StateDomainId::new(2))
+                .unwrap()
+                .unwrap()
+                .cursor,
+            1
         );
     }
 
@@ -6116,6 +6197,8 @@ mod tests {
                     input: crate::engine::InputRange::new(0, 160).unwrap(),
                     max_output_steps: 2,
                     max_cache_append: 4,
+                    retained_state_input: crate::engine::InputRange::new(0, 1).unwrap(),
+                    auxiliary_state: None,
                 },
             ),
             (7782, WorkUnit::RealtimeCompletion { operation_id }),
@@ -6192,6 +6275,8 @@ mod tests {
                     operation_id,
                     max_output_steps: 1,
                     max_cache_append: 1,
+                    retained_state_input: crate::engine::InputRange::new(0, 1).unwrap(),
+                    auxiliary_state: None,
                 },
                 None,
             )
@@ -6216,6 +6301,8 @@ mod tests {
                     operation_id,
                     max_output_steps: 1,
                     max_cache_append: 2,
+                    retained_state_input: crate::engine::InputRange::new(1, 2).unwrap(),
+                    auxiliary_state: None,
                 },
                 None,
             )
