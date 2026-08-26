@@ -1125,6 +1125,7 @@ impl ModelLifecycleController {
                         ))
                     })?;
                 bundle_draft.seal_lfm25_audio_asr_preparation(&model)?;
+                bundle_draft.seal_lfm25_audio_tts_preparation(&model)?;
             } else if variant.family() == crate::catalog::ModelFamily::Voxtral
                 && self
                     .adapter_registry
@@ -1801,6 +1802,51 @@ impl ModelLifecycleController {
                                 &contracts,
                                 physical_spec.descriptor,
                                 main_invocation,
+                                Some(retained.into()),
+                                retained_uses,
+                            )
+                            .await?;
+                        state_publications.insert(capability, publication);
+                        continue;
+                    }
+                    if capability == CapabilityKind::Tts {
+                        let physical_spec = model.retained_tts_state_spec(&stage_graphs)?;
+                        let retained = self
+                            .core_engine
+                            .load_managed_model_state(
+                                model_instance_id,
+                                &physical_spec.retained,
+                                Some(physical_spec.retained_max_tokens),
+                            )
+                            .await?;
+                        crate::runtime::rollout::validate_managed_state_plan_eligibility(
+                            variant,
+                            CapabilityKind::Tts,
+                            retained.state_plan_v2(),
+                        )?;
+                        let retained_uses = contracts
+                            .iter()
+                            .map(|contract| {
+                                Ok((
+                                    stage_graph_fingerprint(&contract.stages)?,
+                                    RetainedStateUseV2::ExternalPaged,
+                                ))
+                            })
+                            .collect::<Result<HashMap<_, _>>>()?;
+                        let depthformer = physical_spec.depthformer_invocation.as_ref().ok_or_else(
+                            || {
+                                Error::ModelLoadError(
+                                    "LFM2.5 Audio TTS topology is missing Depthformer invocation state"
+                                        .into(),
+                                )
+                            },
+                        )?;
+                        let publication = self
+                            .load_invocation_workspace_publication(
+                                model_instance_id,
+                                &contracts,
+                                physical_spec.descriptor,
+                                depthformer,
                                 Some(retained.into()),
                                 retained_uses,
                             )

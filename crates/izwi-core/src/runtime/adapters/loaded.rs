@@ -36,6 +36,7 @@ const WHISPER_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(17);
 const VIBEVOICE_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(19);
 const GRANITE_SPEECH_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(22);
 const LFM25_AUDIO_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(23);
+const LFM25_AUDIO_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(24);
 pub(crate) const VOXTRAL_REALTIME_ADAPTER_ABI: AdapterAbiRevision =
     AdapterAbiRevision::new(crate::models::architectures::voxtral::VOXTRAL_REALTIME_EXECUTION_ABI);
 // Architecture ceiling: 8,192 codec frames, 1,920 output samples/frame,
@@ -252,6 +253,15 @@ pub(crate) trait LoadedExecutionAdapter: fmt::Debug + Send + Sync {
     ) -> Result<()> {
         Err(Error::ModelLoadError(
             "loaded adapter does not own LFM2.5 Audio ASR preparation".into(),
+        ))
+    }
+
+    fn seal_lfm25_audio_tts_preparation(
+        &self,
+        _model: &crate::models::registry::NativeAudioChatModel,
+    ) -> Result<()> {
+        Err(Error::ModelLoadError(
+            "loaded adapter does not own LFM2.5 Audio TTS preparation".into(),
         ))
     }
 
@@ -856,6 +866,11 @@ fn is_lfm25_audio_physical_asr(metadata: AdapterMetadata) -> bool {
         && metadata.model_variant.family() == crate::catalog::ModelFamily::Lfm25Audio
 }
 
+fn is_lfm25_audio_physical_tts(metadata: AdapterMetadata) -> bool {
+    metadata.capability == CapabilityKind::Tts
+        && metadata.model_variant.family() == crate::catalog::ModelFamily::Lfm25Audio
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PhysicalQwenTtsAdapterFactory;
 
@@ -1026,6 +1041,36 @@ struct GraniteSpeechPhysicalAsrAdapterFactory;
 #[derive(Debug, Clone, Copy)]
 struct Lfm25AudioPhysicalAsrAdapterFactory;
 
+#[derive(Debug, Clone, Copy)]
+struct Lfm25AudioPhysicalTtsAdapterFactory;
+
+impl LoadedExecutionAdapterFactory for Lfm25AudioPhysicalTtsAdapterFactory {
+    fn id(&self) -> &'static str {
+        "builtin.lfm25_audio_tts.physical_sequence"
+    }
+
+    fn batch_mode(&self) -> NativeBatchMode {
+        NativeBatchMode::None
+    }
+
+    fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
+        is_lfm25_audio_physical_tts(metadata)
+    }
+
+    fn create(
+        &self,
+        context: LoadedAdapterFactoryContext,
+        metadata: AdapterMetadata,
+    ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
+        Ok(Arc::new(Lfm25AudioTtsExecutionAdapter::new(
+            context.execution_group_id,
+            context.model_instance_id,
+            metadata,
+            context.backend_kind,
+        )))
+    }
+}
+
 impl LoadedExecutionAdapterFactory for Lfm25AudioPhysicalAsrAdapterFactory {
     fn id(&self) -> &'static str {
         "builtin.lfm25_audio_asr.physical_sequence"
@@ -1157,6 +1202,7 @@ impl LoadedExecutionAdapterFactory for ScalarExecutionAdapterFactory {
             && !is_vibevoice_physical_asr(metadata)
             && !is_granite_speech_physical_asr(metadata)
             && !is_lfm25_audio_physical_asr(metadata)
+            && !is_lfm25_audio_physical_tts(metadata)
     }
 
     fn create(
@@ -1185,6 +1231,7 @@ pub(super) fn built_in_loaded_adapter_factories() -> Vec<Arc<dyn LoadedExecution
         Arc::new(VibeVoicePhysicalAsrAdapterFactory),
         Arc::new(GraniteSpeechPhysicalAsrAdapterFactory),
         Arc::new(Lfm25AudioPhysicalAsrAdapterFactory),
+        Arc::new(Lfm25AudioPhysicalTtsAdapterFactory),
         Arc::new(ScalarExecutionAdapterFactory),
     ]
 }
@@ -2094,6 +2141,152 @@ impl LoadedExecutionAdapter for ContinuousAsrExecutionAdapter {
             metadata,
             execution_profile,
             stages: Arc::from([preparation, prefill, decode]),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct Lfm25AudioTtsExecutionAdapter {
+    execution_group_id: ExecutionGroupId,
+    model_instance_id: ModelInstanceId,
+    adapter_instance_id: AdapterInstanceId,
+    metadata: AdapterMetadata,
+    backend_kind: BackendKind,
+    ceiling: OnceLock<crate::models::architectures::lfm25_audio::model::Lfm25AudioTtsStageCeiling>,
+}
+
+impl Lfm25AudioTtsExecutionAdapter {
+    fn new(
+        execution_group_id: ExecutionGroupId,
+        model_instance_id: ModelInstanceId,
+        metadata: AdapterMetadata,
+        backend_kind: BackendKind,
+    ) -> Self {
+        Self {
+            execution_group_id,
+            model_instance_id,
+            adapter_instance_id: AdapterInstanceId::new(
+                NEXT_ADAPTER_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+            ),
+            metadata,
+            backend_kind,
+            ceiling: OnceLock::new(),
+        }
+    }
+}
+
+impl LoadedExecutionAdapter for Lfm25AudioTtsExecutionAdapter {
+    fn metadata(&self) -> AdapterMetadata {
+        self.metadata
+    }
+    fn adapter_instance_id(&self) -> AdapterInstanceId {
+        self.adapter_instance_id
+    }
+    fn adapter_abi_revision(&self) -> AdapterAbiRevision {
+        LFM25_AUDIO_TTS_ADAPTER_ABI
+    }
+
+    fn seal_lfm25_audio_tts_preparation(
+        &self,
+        model: &crate::models::registry::NativeAudioChatModel,
+    ) -> Result<()> {
+        let ceiling = model.lfm25_audio_tts_stage_ceiling()?;
+        if let Some(existing) = self.ceiling.get() {
+            return if *existing == ceiling {
+                Ok(())
+            } else {
+                Err(Error::ModelLoadError(
+                    "LFM2.5 Audio TTS adapter was resealed with different geometry".into(),
+                ))
+            };
+        }
+        self.ceiling.set(ceiling).map_err(|_| {
+            Error::ModelLoadError(
+                "LFM2.5 Audio TTS adapter preparation seal raced publication".into(),
+            )
+        })
+    }
+
+    #[cfg(test)]
+    fn install_test_preparation_seal(
+        &self,
+        backend: BackendKind,
+        _max_batch_size: usize,
+    ) -> Result<()> {
+        self.ceiling
+            .set(
+                crate::models::architectures::lfm25_audio::model::Lfm25AudioTtsStageCeiling {
+                    backend,
+                    max_prompt_tokens: 4_096,
+                    max_codebooks: 8,
+                    max_materialized_tensor_elements: 4_096 * 2_048,
+                    max_retained_resident_bytes: 4_096 * 2_048 * 4,
+                    max_workspace_bytes: 64 * 1024 * 1024,
+                },
+            )
+            .map_err(|_| Error::ModelLoadError("test LFM TTS seal already installed".into()))
+    }
+
+    fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
+        let ceiling = self.ceiling.get().ok_or_else(|| {
+            Error::ModelLoadError("LFM2.5 Audio TTS adapter is not preparation-sealed".into())
+        })?;
+        let mut profile =
+            scalar_execution_profile(self.metadata, self.backend_kind, streaming.model_native);
+        profile.mode = ExecutionMode::Sequence;
+        profile.prefill = PrefillMode::Incremental;
+        profile.incremental_decode = true;
+        profile.prefill_batch = NativeBatchMode::None;
+        profile.decode_batch = NativeBatchMode::None;
+        profile.cache_mode = CacheMode::ExternalPaged;
+        profile.cache_namespace = Some(format!(
+            "{}:tts:{}:state-v2",
+            self.metadata.model_variant,
+            self.backend_kind.as_str()
+        ));
+        profile.kv_dtype = "state_v2_resolved".into();
+        profile.cancellation = CancellationGranularity::SequenceStep;
+        profile.concurrency = ConcurrencyClass::Exclusive;
+        profile.recompute_safe = true;
+        profile.cache_release_safe = true;
+        profile.max_batch_size = 1;
+        profile.resolved_from_loaded_model = true;
+        let mut prefill = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            "tts.prefill.lfm25_audio.scalar",
+            &profile,
+            NativeBatchMode::None,
+        );
+        prefill.selector = StageWorkSelector::SequencePrefill;
+        prefill.shape_policy = StageShapePolicy::Exact;
+        prefill.max_work_units = u64::try_from(ceiling.max_prompt_tokens)
+            .map_err(|_| Error::Overloaded("LFM2.5 Audio TTS prompt ceiling exceeds u64".into()))?;
+        prefill.max_workspace_bytes = ceiling.max_workspace_bytes;
+        prefill.output_visibility = OutputVisibility::AfterQuantumCommit;
+        let mut decode = StageDescriptor::from_execution_profile(
+            StageId::new(2),
+            "tts.decode.lfm25_audio.scalar",
+            &profile,
+            NativeBatchMode::None,
+        );
+        decode.selector = StageWorkSelector::SequenceDecode;
+        decode.shape_policy = StageShapePolicy::Exact;
+        decode.max_work_units =
+            u64::try_from(ceiling.max_codebooks.saturating_add(1)).map_err(|_| {
+                Error::Overloaded("LFM2.5 Audio TTS codebook ceiling exceeds u64".into())
+            })?;
+        decode.max_workspace_bytes = ceiling.max_workspace_bytes;
+        decode.output_visibility = OutputVisibility::AfterQuantumCommit;
+        prefill.validate()?;
+        decode.validate()?;
+        Ok(LoadedExecutionContract {
+            execution_group_id: self.execution_group_id,
+            model_instance_id: self.model_instance_id,
+            adapter_instance_id: self.adapter_instance_id,
+            adapter_abi_revision: self.adapter_abi_revision(),
+            metadata: self.metadata,
+            execution_profile: profile,
+            stages: Arc::from([prefill, decode]),
         })
     }
 }
@@ -3522,6 +3715,16 @@ impl LoadedModelBundleDraft {
         execution.seal_lfm25_audio_asr_preparation(model)
     }
 
+    pub(crate) fn seal_lfm25_audio_tts_preparation(
+        &self,
+        model: &crate::models::registry::NativeAudioChatModel,
+    ) -> Result<()> {
+        let execution = self.capabilities.get(&CapabilityKind::Tts).ok_or_else(|| {
+            Error::ModelLoadError("LFM2.5 Audio loaded bundle has no TTS capability to seal".into())
+        })?;
+        execution.seal_lfm25_audio_tts_preparation(model)
+    }
+
     pub(crate) fn seal_voxtral_realtime_preparation(
         &self,
         model: &crate::models::architectures::voxtral::realtime::VoxtralRealtimeModel,
@@ -4307,6 +4510,7 @@ mod tests {
                 && !is_vibevoice_physical_asr(metadata)
                 && !is_granite_speech_physical_asr(metadata)
                 && !is_lfm25_audio_physical_asr(metadata)
+                && !is_lfm25_audio_physical_tts(metadata)
         }
 
         fn create(
@@ -5423,6 +5627,42 @@ mod tests {
             contract.stages[1].max_work_units,
             CONTINUOUS_CHAT_MAX_DECODE_QUANTUM
         );
+    }
+
+    #[test]
+    fn lfm25_audio_tts_factory_publishes_sealed_scalar_sequence_graph() {
+        let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(8, 1).unwrap();
+        let scalar = ScalarExecutionAdapterFactory;
+        let factory = Lfm25AudioPhysicalTtsAdapterFactory;
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            let metadata = *registry
+                .require(CapabilityKind::Tts, ModelVariant::Lfm25Audio15BGguf)
+                .unwrap();
+            assert!(factory.supports(metadata, backend));
+            assert!(!scalar.supports(metadata, backend));
+            let adapter = Lfm25AudioTtsExecutionAdapter::new(
+                ExecutionGroupId::new(73),
+                ModelInstanceId::new(74),
+                metadata,
+                backend,
+            );
+            assert!(adapter.contract(StreamingRequirements::NONE).is_err());
+            adapter.install_test_preparation_seal(backend, 1).unwrap();
+            let contract = adapter.contract(StreamingRequirements::NONE).unwrap();
+            assert_eq!(contract.adapter_abi_revision, LFM25_AUDIO_TTS_ADAPTER_ABI);
+            assert_eq!(contract.execution_profile.mode, ExecutionMode::Sequence);
+            assert_eq!(
+                contract.execution_profile.decode_batch,
+                NativeBatchMode::None
+            );
+            assert_eq!(contract.stages.len(), 2);
+            assert_eq!(contract.stages[0].name, "tts.prefill.lfm25_audio.scalar");
+            assert_eq!(contract.stages[1].name, "tts.decode.lfm25_audio.scalar");
+            assert!(contract.stages.iter().all(|stage| {
+                stage.output_visibility == OutputVisibility::AfterQuantumCommit
+                    && stage.max_batch_size == 1
+            }));
+        }
     }
 
     #[test]

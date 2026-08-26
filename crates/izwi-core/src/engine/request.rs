@@ -2468,6 +2468,58 @@ impl EngineCoreRequest {
         Ok(Some((stage.id, cost)))
     }
 
+    fn lfm25_audio_tts_stage_costs(
+        binding: Option<&super::ExecutionAdapterBinding>,
+        model: &crate::models::registry::NativeAudioChatModel,
+        prompt_tokens: usize,
+        max_new_tokens: usize,
+    ) -> Result<Vec<(StageId, WorkCost)>> {
+        let Some(binding) = binding else {
+            return Ok(Vec::new());
+        };
+        let mut costs = Vec::new();
+        for stage in binding.stages.iter().filter(|stage| {
+            matches!(
+                stage.selector,
+                super::StageWorkSelector::SequencePrefill
+                    | super::StageWorkSelector::SequenceDecode
+            )
+        }) {
+            let envelope = if stage.selector == super::StageWorkSelector::SequencePrefill {
+                model.lfm25_audio_tts_prefill_resource_envelope(0, prompt_tokens, prompt_tokens)?
+            } else {
+                let position = prompt_tokens
+                    .checked_add(max_new_tokens.max(1))
+                    .and_then(|value| value.checked_sub(1))
+                    .ok_or_else(|| {
+                        Error::Overloaded("LFM2.5 Audio TTS position overflowed".into())
+                    })?;
+                model.lfm25_audio_tts_decode_resource_envelope(position, true)?
+            };
+            let cost = WorkCost::with_workspace(
+                envelope.work_units,
+                envelope.materialized_tensor_elements,
+                ResourceVector {
+                    host_bytes: ResourceAmount::Known(envelope.host_workspace_bytes),
+                    device_bytes: ResourceAmount::Known(envelope.device_workspace_bytes),
+                    unified_bytes: ResourceAmount::Known(envelope.unified_workspace_bytes),
+                    ..ResourceVector::zero()
+                },
+            );
+            if !cost
+                .workspace
+                .workspace_bytes()
+                .is_ok_and(|bytes| bytes <= stage.max_workspace_bytes)
+            {
+                return Err(Error::Overloaded(
+                    "LFM2.5 Audio TTS workspace exceeds its loaded adapter budget".into(),
+                ));
+            }
+            costs.push((stage.id, cost));
+        }
+        Ok(costs)
+    }
+
     fn continuous_tts_stage_cost(
         binding: Option<&super::ExecutionAdapterBinding>,
         model: &Qwen3TtsModel,
@@ -3170,6 +3222,12 @@ impl EngineCoreRequest {
                 "LFM2.5 Audio TTS request leaves no output capacity".into(),
             ));
         }
+        let stage_costs = Self::lfm25_audio_tts_stage_costs(
+            self.execution_adapter_binding.as_ref(),
+            &model,
+            artifact.prompt_tokens,
+            self.params.max_tokens,
+        )?;
         self.prepared_stage_costs.clear();
         self.prepared_sequence_input_tokens = Some(artifact.prompt_tokens);
         self.incremental_model_execution_ready = Some(IncrementalModelExecutionReady {
@@ -3178,6 +3236,9 @@ impl EngineCoreRequest {
             qwen_tts: None,
             lfm25_audio_tts: Some(artifact),
         });
+        for (stage, cost) in stage_costs {
+            self.install_prepared_stage_cost(stage, cost)?;
+        }
         Ok(())
     }
 
@@ -4005,6 +4066,27 @@ impl EngineCoreRequest {
             })
             .transpose()?
             .flatten();
+        let prepared_lfm25_tts_costs = self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(
+                |ready| match (&ready.model, ready.lfm25_audio_tts.as_ref()) {
+                    (PreparedIncrementalModel::Lfm25AudioTts(model), Some(artifact)) => {
+                        Some((model, artifact.prompt_tokens))
+                    }
+                    _ => None,
+                },
+            )
+            .map(|(model, prompt_tokens)| {
+                Self::lfm25_audio_tts_stage_costs(
+                    Some(&binding),
+                    model,
+                    prompt_tokens,
+                    self.params.max_tokens,
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
         let prepared_tts_continuous_cost = self
             .incremental_model_execution_ready
             .as_ref()
@@ -4056,6 +4138,9 @@ impl EngineCoreRequest {
             self.install_prepared_stage_cost(stage_id, cost)?;
         }
         if let Some((stage_id, cost)) = prepared_lfm25_asr_continuous_cost {
+            self.install_prepared_stage_cost(stage_id, cost)?;
+        }
+        for (stage_id, cost) in prepared_lfm25_tts_costs {
             self.install_prepared_stage_cost(stage_id, cost)?;
         }
         if let Some((stage_id, cost)) = prepared_tts_continuous_cost {

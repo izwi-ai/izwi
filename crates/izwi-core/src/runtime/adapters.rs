@@ -181,7 +181,7 @@ const fn family_inference_state_policy(family: ModelFamily) -> FamilyInferenceSt
             ..FamilyInferenceStatePolicy::STATELESS
         },
         Lfm25Audio => FamilyInferenceStatePolicy {
-            tts: Invocation,
+            tts: RetainedAndInvocation,
             asr: RetainedAndInvocation,
             ..FamilyInferenceStatePolicy::STATELESS
         },

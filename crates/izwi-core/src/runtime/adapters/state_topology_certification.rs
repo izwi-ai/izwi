@@ -108,7 +108,8 @@ fn certified_topology(
         // LFM2.5 Audio shares paged+ShortConv state across all advertised
         // audio capabilities; generation additionally adds Depthformer pages.
         (Lfm25Audio, Asr) => RetainedPagedRingAndInvocationPagedRing,
-        (Lfm25Audio, Tts | AudioChat | SpeechToSpeech) => InvocationPagedRing,
+        (Lfm25Audio, Tts) => RetainedPagedRingAndInvocationPagedRing,
+        (Lfm25Audio, AudioChat | SpeechToSpeech) => InvocationPagedRing,
 
         (SortformerDiarization, Diarization) => InvocationTensor,
         (Qwen3ForcedAligner, ForcedAlignment) => Stateless,

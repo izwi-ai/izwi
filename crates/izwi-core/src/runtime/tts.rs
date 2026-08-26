@@ -290,7 +290,6 @@ fn uses_direct_tts_runtime(variant: ModelVariant) -> bool {
     matches!(
         variant.family(),
         ModelFamily::KokoroTts
-            | ModelFamily::Lfm25Audio
             | ModelFamily::VoxtralTts
             | ModelFamily::VibeVoiceTts
             | ModelFamily::FishS2Tts

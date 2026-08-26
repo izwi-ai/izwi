@@ -788,7 +788,10 @@ fn coordinator_lane_for_metadata(
                 | ModelFamily::GraniteSpeechAsr
                 | ModelFamily::Lfm25Audio
         ),
-        TaskType::TTS => variant.family() == ModelFamily::Qwen3Tts,
+        TaskType::TTS => matches!(
+            variant.family(),
+            ModelFamily::Qwen3Tts | ModelFamily::Lfm25Audio
+        ),
         TaskType::SpeechToSpeech => false,
     });
     if workload_class == WorkloadClass::Realtime {
