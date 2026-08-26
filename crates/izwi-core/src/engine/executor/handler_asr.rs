@@ -43,6 +43,29 @@ const MAX_ASR_NEW_TOKENS: usize = 512;
 const GRANITE_ASR_PREFIX_REPLAY_WORDS: usize = 0;
 const GRANITE_ASR_PREFIX_REPLAY_WORDS_MAX: usize = 240;
 
+fn retained_asr_batch_model_call(
+    mode: crate::engine::NativeBatchMode,
+    live_kernel_rows: usize,
+) -> Option<crate::engine::metrics::EngineModelCall> {
+    match live_kernel_rows {
+        0 => None,
+        1 => Some(crate::engine::metrics::EngineModelCall::ScalarRows {
+            envelope: mode,
+            rows: 1,
+        }),
+        rows => Some(crate::engine::metrics::EngineModelCall::NativeTensor { mode, rows }),
+    }
+}
+
+fn late_cancelled_lfm_asr_prefill_rows(cancelled: &[bool], armed: &[bool]) -> Vec<usize> {
+    cancelled
+        .iter()
+        .zip(armed)
+        .enumerate()
+        .filter_map(|(row, (cancelled, armed))| (*cancelled && *armed).then_some(row))
+        .collect()
+}
+
 enum AsrExecutionAudio {
     Prepared(Arc<[f32]>),
     Decoded(Vec<f32>),
@@ -4853,6 +4876,295 @@ impl NativeExecutor {
         Ok((outputs, used_native_tokenizer_batch))
     }
 
+    pub(super) fn lfm25_audio_asr_prefill_batch_with_managed(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+        mut managed: Vec<Option<super::RetainedRowManagedState>>,
+    ) -> Result<Vec<ModelSessionResult>> {
+        if requests.len() != scheduled.len() || managed.len() != scheduled.len() {
+            return Err(Error::InvalidInput(
+                "LFM2.5 Audio ASR prefill batch rows do not match".into(),
+            ));
+        }
+        let mut outputs = (0..scheduled.len()).map(|_| None).collect::<Vec<_>>();
+        let live = requests
+            .iter()
+            .enumerate()
+            .filter_map(|(index, request)| {
+                if request.is_cancelled() {
+                    outputs[index] = Some(ModelSessionResult::cancelled_before_dispatch(
+                        ExecutorOutput::cancelled(request.id.clone()),
+                    ));
+                    None
+                } else {
+                    Some(index)
+                }
+            })
+            .collect::<Vec<_>>();
+        if live.is_empty() {
+            return outputs
+                .into_iter()
+                .map(|output| {
+                    output
+                        .ok_or_else(|| Error::InferenceError("LFM ASR prefill lost output".into()))
+                })
+                .collect();
+        }
+        let model = requests[live[0]]
+            .prepared_lfm25_audio_asr_model_lease_for_executor()?
+            .ok_or_else(|| Error::InferenceError("LFM ASR prefill lost model".into()))?;
+        let model_arc = model.model_arc();
+        let mut rows = Vec::with_capacity(live.len());
+        for index in live.iter().copied() {
+            let request = requests[index];
+            if !scheduled[index].is_prefill || request.uses_asr_long_form_atomic() {
+                return Err(Error::InvalidInput(
+                    "LFM ASR prefill batch crossed stage identity".into(),
+                ));
+            }
+            let variant = Self::resolve_variant(request)?;
+            if variant.family() != ModelFamily::Lfm25Audio {
+                return Err(Error::InvalidInput(
+                    "LFM ASR prefill batch crossed model family".into(),
+                ));
+            }
+            let row_model = request
+                .prepared_lfm25_audio_asr_model_lease_for_executor()?
+                .ok_or_else(|| Error::InferenceError("LFM ASR prefill row lost model".into()))?;
+            if !Arc::ptr_eq(&model_arc, &row_model.model_arc()) {
+                return Err(Error::InferenceError(
+                    "LFM ASR prefill crossed model identity".into(),
+                ));
+            }
+            let mut retained = managed[index].take().ok_or_else(|| {
+                Error::InferenceError("LFM ASR prefill lost retained state".into())
+            })?;
+            let tensor = retained.tensor_state.clone().ok_or_else(|| {
+                Error::InferenceError("LFM ASR prefill lost ShortConv reservation".into())
+            })?;
+            let arena = request
+                .managed_cache_runtime()
+                .and_then(|runtime| runtime.tensor_state())
+                .ok_or_else(|| {
+                    Error::InferenceError("LFM ASR prefill lost ShortConv arena".into())
+                })?;
+            let cache = retained.take_only_paged()?;
+            retained.ensure_all_paged_consumed()?;
+            let session = scheduled[index].session_key();
+            let mut lease = ExecutorStateLease::checkout(
+                &self.lfm25_asr_decode_states,
+                session.clone(),
+                variant,
+                "batched LFM2.5 Audio ASR prefill",
+            )?;
+            if lease.state().is_some_and(|active| {
+                active.variant != variant || !Arc::ptr_eq(&active.model.model_arc(), &model_arc)
+            }) {
+                lease.discard_state();
+            }
+            if lease.state().is_none() {
+                if scheduled[index].num_computed_tokens != 0 {
+                    return Err(Error::InferenceError(
+                        "LFM ASR prefill lost state after initial quantum".into(),
+                    ));
+                }
+                let artifact = request
+                    .prepared_lfm25_audio_asr_artifact_for_executor()?
+                    .ok_or_else(|| Error::InferenceError("LFM ASR prefill lost prompt".into()))?;
+                let (samples, sample_rate) =
+                    request.prepared_asr_audio_for_executor()?.ok_or_else(|| {
+                        Error::InferenceError("LFM ASR prefill lost decoded audio".into())
+                    })?;
+                if artifact.prompt_tokens != request.num_prompt_tokens()
+                    || artifact.source_samples != samples.len()
+                    || artifact.source_sample_rate != sample_rate
+                {
+                    return Err(Error::InferenceError(
+                        "LFM ASR prefill artifact differs from admission".into(),
+                    ));
+                }
+                let state = model.new_lfm25_audio_retained_asr_state(
+                    artifact,
+                    request.params.max_tokens.max(1),
+                )?;
+                lease.install_state(ActiveLfm25AsrDecode {
+                    variant,
+                    model: model.clone(),
+                    state,
+                    last_tokens_generated: 0,
+                    stream_sequence: 0,
+                    input_sample_rate: sample_rate,
+                    input_sample_count: samples.len(),
+                })?;
+            }
+            let active = lease.require_state_mut()?;
+            if active.state.prompt_tokens() != request.num_prompt_tokens() {
+                return Err(Error::InferenceError(
+                    "LFM ASR prefill state differs from admission".into(),
+                ));
+            }
+            active.state.bind_tensor_sequence(tensor.sequence)?;
+            active.state.restore_shortconv(arena)?;
+            if active.state.prefill_cursor() != scheduled[index].num_computed_tokens {
+                return Err(Error::InferenceError(
+                    "LFM ASR prefill cursor differs from admission".into(),
+                ));
+            }
+            let prior_last_tokens_generated = active.last_tokens_generated;
+            let prior_stream_sequence = active.stream_sequence;
+            let checkpoint = active.state.begin_quantum(&cache)?;
+            lease.mark_dirty();
+            rows.push(ContinuousLfm25AsrRow {
+                index,
+                session,
+                lease,
+                cache,
+                checkpoint: Some(checkpoint),
+                prior_last_tokens_generated,
+                prior_stream_sequence,
+            });
+        }
+        let mut batch = ContinuousLfm25AsrStateBatch::new(rows);
+        for row in 0..batch.rows.len() {
+            let index = batch.rows[row].index;
+            if requests[index].is_cancelled() {
+                batch.rollback_row(row)?;
+                outputs[index] = Some(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                    requests[index].id.clone(),
+                )));
+            }
+        }
+        let call_rows = batch
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(row, state)| state.checkpoint.is_some().then_some(row))
+            .collect::<Vec<_>>();
+        if !call_rows.is_empty() {
+            let mut states = Vec::with_capacity(call_rows.len());
+            let mut caches = Vec::with_capacity(call_rows.len());
+            let mut checkpoints = Vec::with_capacity(call_rows.len());
+            let mut spans = Vec::with_capacity(call_rows.len());
+            for (row_index, row) in batch.rows.iter_mut().enumerate() {
+                if !call_rows.contains(&row_index) {
+                    continue;
+                }
+                states.push(&mut row.lease.require_state_mut()?.state);
+                caches.push(&mut row.cache);
+                checkpoints.push(
+                    row.checkpoint
+                        .as_ref()
+                        .expect("armed LFM ASR prefill checkpoint"),
+                );
+                spans.push(scheduled[row.index].num_tokens);
+            }
+            let native = Self::run_blocking(|| {
+                model.lfm25_audio_asr_prefill_batch(&mut states, &mut caches, &checkpoints, &spans)
+            })?;
+            if native.steps.len() != call_rows.len() {
+                return Err(Error::InferenceError(
+                    "LFM ASR prefill returned wrong row count".into(),
+                ));
+            }
+            for width in native.launch_widths {
+                if let Some(call) =
+                    retained_asr_batch_model_call(crate::engine::NativeBatchMode::Static, width)
+                {
+                    crate::engine::metrics::record_engine_model_call(call);
+                }
+            }
+            for (row, step) in call_rows.iter().copied().zip(native.steps) {
+                let index = batch.rows[row].index;
+                let expected_end = scheduled[index]
+                    .num_computed_tokens
+                    .checked_add(scheduled[index].num_tokens)
+                    .ok_or_else(|| Error::InvalidInput("LFM ASR prefill span overflowed".into()))?;
+                if step.consumed_tokens != scheduled[index].num_tokens
+                    || step.prefill_cursor != expected_end
+                    || step.prompt_tokens != requests[index].num_prompt_tokens()
+                    || step.complete != (expected_end == step.prompt_tokens)
+                    || step.pending_token.is_some() != step.complete
+                {
+                    return Err(Error::InferenceError(
+                        "LFM ASR prefill progress differs from admission".into(),
+                    ));
+                }
+            }
+        }
+        for row in 0..batch.rows.len() {
+            let index = batch.rows[row].index;
+            if batch.rows[row].checkpoint.is_none() {
+                continue;
+            }
+            let arena = requests[index]
+                .managed_cache_runtime()
+                .and_then(|runtime| runtime.tensor_state())
+                .ok_or_else(|| {
+                    Error::InferenceError("LFM ASR prefill lost ShortConv arena".into())
+                })?;
+            batch.rows[row]
+                .lease
+                .require_state_mut()?
+                .state
+                .stage_shortconv(arena, scheduled[index].plan_id)?;
+        }
+        let cancelled = batch
+            .rows
+            .iter()
+            .map(|row| requests[row.index].is_cancelled())
+            .collect::<Vec<_>>();
+        let armed = batch
+            .rows
+            .iter()
+            .map(|row| row.checkpoint.is_some())
+            .collect::<Vec<_>>();
+        for row in late_cancelled_lfm_asr_prefill_rows(&cancelled, &armed) {
+            let index = batch.rollback_row(row)?;
+            outputs[index] = Some(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                requests[index].id.clone(),
+            )));
+        }
+        let committed = batch.commit()?;
+        for (index, lease, completions) in committed {
+            let active = lease.state().ok_or_else(|| {
+                Error::InferenceError("committed LFM ASR prefill lost state".into())
+            })?;
+            let sample_rate = active.input_sample_rate;
+            let sample_count = active.input_sample_count;
+            lease.restore()?;
+            outputs[index] = Some(
+                ModelSessionResult::sequence(ExecutorOutput {
+                    request_id: requests[index].id.clone(),
+                    audio: Some(AudioOutput {
+                        samples: Vec::new(),
+                        sample_rate,
+                        duration_secs: if sample_rate > 0 {
+                            sample_count as f32 / sample_rate as f32
+                        } else {
+                            0.0
+                        },
+                    }),
+                    text: Some(String::new()),
+                    input_transcription: None,
+                    tokens_processed: scheduled[index].num_tokens,
+                    tokens_generated: 0,
+                    finished: false,
+                    phase_timing_override: None,
+                    asr_diagnostics: None,
+                    error: None,
+                })
+                .with_managed_cache_completions(completions),
+            );
+        }
+        outputs
+            .into_iter()
+            .map(|output| {
+                output.ok_or_else(|| Error::InferenceError("LFM ASR prefill lost output".into()))
+            })
+            .collect()
+    }
+
     fn lfm25_audio_asr_decode_batch_with_managed(
         &self,
         ordered_requests: &[&EngineCoreRequest],
@@ -6896,6 +7208,39 @@ mod tests {
     use crate::model::ModelVariant;
     use crate::models::architectures::whisper::asr::WhisperTerminalTransition;
     use crate::models::registry::NativeAsrGenerationOptions;
+
+    #[test]
+    fn retained_lfm_asr_prefill_telemetry_distinguishes_b1_and_native_cohorts() {
+        assert!(
+            super::retained_asr_batch_model_call(crate::engine::NativeBatchMode::Static, 0)
+                .is_none()
+        );
+        assert!(matches!(
+            super::retained_asr_batch_model_call(crate::engine::NativeBatchMode::Static, 1),
+            Some(crate::engine::metrics::EngineModelCall::ScalarRows {
+                envelope: crate::engine::NativeBatchMode::Static,
+                rows: 1
+            })
+        ));
+        assert!(matches!(
+            super::retained_asr_batch_model_call(crate::engine::NativeBatchMode::Static, 3),
+            Some(crate::engine::metrics::EngineModelCall::NativeTensor {
+                mode: crate::engine::NativeBatchMode::Static,
+                rows: 3
+            })
+        ));
+    }
+
+    #[test]
+    fn retained_lfm_asr_prefill_mixed_cancellation_selects_only_armed_rows() {
+        assert_eq!(
+            super::late_cancelled_lfm_asr_prefill_rows(
+                &[true, false, true, true],
+                &[true, true, false, true]
+            ),
+            vec![0, 3]
+        );
+    }
 
     #[test]
     fn asr_model_call_observes_cancellation_that_arrives_during_forward() {
