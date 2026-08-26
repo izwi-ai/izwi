@@ -414,6 +414,10 @@ fn kokoro_cpu_predecoder_parallel_enabled() -> bool {
 
 #[derive(Debug, Clone)]
 pub struct KokoroPreparedRequest {
+    pub source_text: String,
+    pub requested_speaker: Option<String>,
+    pub requested_language: Option<String>,
+    pub requested_speed: f32,
     pub phonemes: String,
     pub token_ids: Vec<u32>,
     pub ref_style: Tensor,
@@ -622,6 +626,9 @@ impl KokoroTtsModel {
         language: Option<&str>,
         speed: f32,
     ) -> Result<KokoroPreparedRequest> {
+        let requested_speaker = speaker.map(str::to_owned);
+        let requested_language = language.map(str::to_owned);
+        let requested_speed = speed;
         let speaker = self.resolve_speaker(speaker)?;
         let phonemes = self.phonemizer.phonemize(text, language, Some(&speaker))?;
         let phoneme_len = phonemes.chars().count();
@@ -658,6 +665,10 @@ impl KokoroTtsModel {
         let speed = normalize_kokoro_speed(speed)?;
 
         Ok(KokoroPreparedRequest {
+            source_text: text.to_string(),
+            requested_speaker,
+            requested_language,
+            requested_speed,
             phonemes,
             token_ids,
             ref_style,
@@ -1156,6 +1167,10 @@ mod tests {
 
     fn prepared_with_width(width: usize) -> KokoroPreparedRequest {
         KokoroPreparedRequest {
+            source_text: "a".repeat(width),
+            requested_speaker: None,
+            requested_language: None,
+            requested_speed: 1.0,
             phonemes: "a".repeat(width),
             token_ids: vec![1; width],
             ref_style: Tensor::zeros((1, 256), DType::F32, &candle_core::Device::Cpu)

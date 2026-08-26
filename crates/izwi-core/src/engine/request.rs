@@ -24,6 +24,7 @@ use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::fish_s2::{FishS2GenerationParams, FishS2PreparedArtifact};
 use crate::models::architectures::granite_speech::asr::GraniteSpeechPreparedPromptArtifact;
+use crate::models::architectures::kokoro::KokoroPreparedRequest;
 use crate::models::architectures::lfm25_audio::{
     lfm25_audio_tts_system_prompt, model::Lfm25AudioPreparedAsrArtifact,
     tts_retained::Lfm25AudioPreparedTtsArtifact, Lfm25AudioGenerationConfig,
@@ -41,9 +42,9 @@ use crate::models::architectures::voxtral::tts::retained::VoxtralTtsPreparedArti
 use crate::models::architectures::voxtral::tts::VoxtralTtsGenerationParams;
 use crate::models::architectures::whisper::asr::WhisperPreparedWindow;
 use crate::models::registry::{
-    AsrModelLease, ChatModelLease, FishS2TtsModelLease, Lfm25AudioModelLease, NativeAsrModel,
-    NativeChatModel, NativeChatPreparedPrompt, QwenTtsModelLease, VibeVoiceTtsModelLease,
-    VoxtralTtsModelLease,
+    AsrModelLease, ChatModelLease, FishS2TtsModelLease, KokoroTtsModelLease, Lfm25AudioModelLease,
+    NativeAsrModel, NativeChatModel, NativeChatPreparedPrompt, QwenTtsModelLease,
+    VibeVoiceTtsModelLease, VoxtralTtsModelLease,
 };
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRequestConfig, ChatRole};
 use crate::runtime::audio_io::{
@@ -359,6 +360,7 @@ enum PreparedIncrementalModel {
     VibeVoiceTts(VibeVoiceTtsModelLease),
     FishS2Tts(FishS2TtsModelLease),
     VoxtralTts(VoxtralTtsModelLease),
+    KokoroTts(KokoroTtsModelLease),
 }
 
 impl fmt::Debug for PreparedIncrementalModel {
@@ -371,6 +373,7 @@ impl fmt::Debug for PreparedIncrementalModel {
             Self::VibeVoiceTts(model) => write!(formatter, "VibeVoiceTts({:p})", &**model),
             Self::FishS2Tts(model) => write!(formatter, "FishS2Tts({:p})", &**model),
             Self::VoxtralTts(model) => write!(formatter, "VoxtralTts({:p})", &**model),
+            Self::KokoroTts(model) => write!(formatter, "KokoroTts({:p})", &**model),
         }
     }
 }
@@ -387,6 +390,7 @@ pub(super) struct IncrementalModelExecutionReady {
     fish_s2_tts_params: Option<FishS2GenerationParams>,
     voxtral_tts: Option<Arc<VoxtralTtsPreparedArtifact>>,
     voxtral_tts_params: Option<VoxtralTtsGenerationParams>,
+    kokoro_tts: Option<Arc<KokoroPreparedRequest>>,
 }
 
 #[derive(Debug, Clone)]
@@ -2392,6 +2396,7 @@ impl EngineCoreRequest {
             fish_s2_tts_params: None,
             voxtral_tts: None,
             voxtral_tts_params: None,
+            kokoro_tts: None,
         });
         if let Some((stage_id, cost)) = prepared_continuous_cost {
             self.install_prepared_stage_cost(stage_id, cost)?;
@@ -2425,6 +2430,7 @@ impl EngineCoreRequest {
             fish_s2_tts_params: None,
             voxtral_tts: None,
             voxtral_tts_params: None,
+            kokoro_tts: None,
         });
         Ok(())
     }
@@ -3350,6 +3356,7 @@ impl EngineCoreRequest {
             fish_s2_tts_params: None,
             voxtral_tts: None,
             voxtral_tts_params: None,
+            kokoro_tts: None,
         });
         for (stage, cost) in stage_costs {
             self.install_prepared_stage_cost(stage, cost)?;
@@ -3395,6 +3402,7 @@ impl EngineCoreRequest {
             fish_s2_tts_params: None,
             voxtral_tts: None,
             voxtral_tts_params: None,
+            kokoro_tts: None,
         });
         Ok(())
     }
@@ -3433,6 +3441,7 @@ impl EngineCoreRequest {
             fish_s2_tts_params: Some(params),
             voxtral_tts: None,
             voxtral_tts_params: None,
+            kokoro_tts: None,
         });
         Ok(())
     }
@@ -3471,6 +3480,63 @@ impl EngineCoreRequest {
             fish_s2_tts_params: None,
             voxtral_tts: Some(artifact),
             voxtral_tts_params: Some(params),
+            kokoro_tts: None,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn install_kokoro_tts_execution_model(
+        &mut self,
+        model_variant: ModelVariant,
+        model: KokoroTtsModelLease,
+        artifact: Arc<KokoroPreparedRequest>,
+        max_sequence_tokens: usize,
+    ) -> Result<()> {
+        let text = self
+            .text
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| Error::InvalidInput("Kokoro TTS request is missing text".into()))?;
+        let speaker = self
+            .params
+            .speaker
+            .as_deref()
+            .or(self.params.voice.as_deref());
+        let input_tokens =
+            artifact.token_ids.len().checked_add(2).ok_or_else(|| {
+                Error::InvalidInput("Kokoro prepared token count overflowed".into())
+            })?;
+        if self.task_type != TaskType::TTS
+            || self.model_variant != Some(model_variant)
+            || model_variant.family() != ModelFamily::KokoroTts
+            || artifact.source_text != text
+            || artifact.requested_speaker.as_deref() != speaker
+            || artifact.requested_language.as_deref() != self.language.as_deref()
+            || artifact.requested_speed.to_bits() != self.params.speed.to_bits()
+            || artifact.token_ids.is_empty()
+            || artifact.phonemes.is_empty()
+            || !artifact.speed.is_finite()
+            || input_tokens > max_sequence_tokens
+        {
+            return Err(Error::InvalidInput(format!(
+                "Kokoro TTS request {} preparation does not match its routed input/model/context",
+                self.id
+            )));
+        }
+        self.prepared_stage_costs.clear();
+        self.prepared_sequence_input_tokens = Some(input_tokens);
+        self.incremental_model_execution_ready = Some(IncrementalModelExecutionReady {
+            model_variant,
+            model: PreparedIncrementalModel::KokoroTts(model),
+            qwen_tts: None,
+            lfm25_audio_tts: None,
+            vibevoice_tts: None,
+            vibevoice_tts_params: None,
+            fish_s2_tts: None,
+            fish_s2_tts_params: None,
+            voxtral_tts: None,
+            voxtral_tts_params: None,
+            kokoro_tts: Some(artifact),
         });
         Ok(())
     }
@@ -3570,6 +3636,7 @@ impl EngineCoreRequest {
             fish_s2_tts_params: None,
             voxtral_tts: None,
             voxtral_tts_params: None,
+            kokoro_tts: None,
         });
         if let Some((stage_id, cost)) = prepared_continuous_cost {
             self.install_prepared_stage_cost(stage_id, cost)?;
@@ -3797,6 +3864,38 @@ impl EngineCoreRequest {
                 )));
             }
         }
+        if matches!(&ready.model, PreparedIncrementalModel::KokoroTts(_)) {
+            let prepared = ready.kokoro_tts.as_ref().ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "Kokoro TTS request {} is missing its prepared input",
+                    self.id
+                ))
+            })?;
+            let text = self.text.as_deref().unwrap_or_default();
+            let speaker = self
+                .params
+                .speaker
+                .as_deref()
+                .or(self.params.voice.as_deref());
+            let input_tokens = prepared.token_ids.len().checked_add(2).ok_or_else(|| {
+                Error::InvalidInput("Kokoro prepared token count overflowed".into())
+            })?;
+            if ready.model_variant.family() != ModelFamily::KokoroTts
+                || prepared.source_text != text
+                || prepared.requested_speaker.as_deref() != speaker
+                || prepared.requested_language.as_deref() != self.language.as_deref()
+                || prepared.requested_speed.to_bits() != self.params.speed.to_bits()
+                || prepared.token_ids.is_empty()
+                || prepared.phonemes.is_empty()
+                || !prepared.speed.is_finite()
+                || self.prepared_sequence_input_tokens != Some(input_tokens)
+            {
+                return Err(Error::InvalidInput(format!(
+                    "Kokoro TTS request {} changed after preparation",
+                    self.id
+                )));
+            }
+        }
         match (&ready.model, self.task_type) {
             (PreparedIncrementalModel::Asr(_), TaskType::ASR) if ready.qwen_tts.is_none() => Ok(()),
             (PreparedIncrementalModel::Lfm25AudioAsr(_), TaskType::ASR)
@@ -3839,6 +3938,12 @@ impl EngineCoreRequest {
             {
                 Ok(())
             }
+            (PreparedIncrementalModel::KokoroTts(_), TaskType::TTS)
+                if ready.model_variant.family() == ModelFamily::KokoroTts
+                    && ready.kokoro_tts.is_some() =>
+            {
+                Ok(())
+            }
             _ => Err(Error::InvalidInput(format!(
                 "Request {} carries incremental preparation for a different task",
                 self.id
@@ -3858,7 +3963,8 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::QwenTts(_) => None,
                 PreparedIncrementalModel::VibeVoiceTts(_)
                 | PreparedIncrementalModel::FishS2Tts(_)
-                | PreparedIncrementalModel::VoxtralTts(_) => None,
+                | PreparedIncrementalModel::VoxtralTts(_)
+                | PreparedIncrementalModel::KokoroTts(_) => None,
             }))
     }
 
@@ -3874,7 +3980,8 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::QwenTts(_) => None,
                 PreparedIncrementalModel::VibeVoiceTts(_)
                 | PreparedIncrementalModel::FishS2Tts(_)
-                | PreparedIncrementalModel::VoxtralTts(_) => None,
+                | PreparedIncrementalModel::VoxtralTts(_)
+                | PreparedIncrementalModel::KokoroTts(_) => None,
             }))
     }
 
@@ -3892,7 +3999,8 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::QwenTts(_) => None,
                 PreparedIncrementalModel::VibeVoiceTts(_)
                 | PreparedIncrementalModel::FishS2Tts(_)
-                | PreparedIncrementalModel::VoxtralTts(_) => None,
+                | PreparedIncrementalModel::VoxtralTts(_)
+                | PreparedIncrementalModel::KokoroTts(_) => None,
             }))
     }
 
@@ -4018,6 +4126,29 @@ impl EngineCoreRequest {
             .and_then(|ready| ready.voxtral_tts_params))
     }
 
+    pub(crate) fn prepared_kokoro_tts_model_lease_for_executor(
+        &self,
+    ) -> Result<Option<KokoroTtsModelLease>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| match &ready.model {
+                PreparedIncrementalModel::KokoroTts(model) => Some(model.clone()),
+                _ => None,
+            }))
+    }
+
+    pub(crate) fn prepared_kokoro_tts_artifact_for_executor(
+        &self,
+    ) -> Result<Option<Arc<KokoroPreparedRequest>>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| ready.kokoro_tts.clone()))
+    }
+
     pub(crate) fn prepared_qwen_tts_model_for_executor(
         &self,
     ) -> Result<Option<Arc<Qwen3TtsModel>>> {
@@ -4032,7 +4163,8 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::Lfm25AudioTts(_) => None,
                 PreparedIncrementalModel::VibeVoiceTts(_)
                 | PreparedIncrementalModel::FishS2Tts(_)
-                | PreparedIncrementalModel::VoxtralTts(_) => None,
+                | PreparedIncrementalModel::VoxtralTts(_)
+                | PreparedIncrementalModel::KokoroTts(_) => None,
             }))
     }
 
@@ -4050,7 +4182,8 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::Lfm25AudioTts(_) => None,
                 PreparedIncrementalModel::VibeVoiceTts(_)
                 | PreparedIncrementalModel::FishS2Tts(_)
-                | PreparedIncrementalModel::VoxtralTts(_) => None,
+                | PreparedIncrementalModel::VoxtralTts(_)
+                | PreparedIncrementalModel::KokoroTts(_) => None,
             }))
     }
 
@@ -4481,7 +4614,8 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::QwenTts(_) => None,
                 PreparedIncrementalModel::VibeVoiceTts(_)
                 | PreparedIncrementalModel::FishS2Tts(_)
-                | PreparedIncrementalModel::VoxtralTts(_) => None,
+                | PreparedIncrementalModel::VoxtralTts(_)
+                | PreparedIncrementalModel::KokoroTts(_) => None,
             })
             .filter(|_| self.uses_asr_retained_sequence())
             .map(|model| Self::continuous_asr_stage_cost(Some(&binding), model))
