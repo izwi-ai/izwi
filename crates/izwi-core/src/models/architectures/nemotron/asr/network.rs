@@ -884,6 +884,125 @@ impl NemotronNetwork {
         })
     }
 
+    /// Decodes independent streaming sessions as a single physical RNNT cohort.
+    ///
+    /// Rows leave the active set independently on blank, guard, or end-of-input.
+    /// Live states are not modified until every tensor operation and host-side
+    /// decision for the cohort has succeeded.
+    pub(super) fn decode_rnnt_streaming_cohort(
+        &self,
+        states: &mut [&mut NemotronRnntStreamState],
+        encoded: &[&Tensor],
+        encoded_lens: &[usize],
+    ) -> Result<Vec<Vec<usize>>> {
+        let width = states.len();
+        if width == 0 || encoded.len() != width || encoded_lens.len() != width {
+            return Err(Error::InvalidInput(
+                "Nemotron RNNT cohort geometry mismatch".into(),
+            ));
+        }
+        for (row, (&tensor, &len)) in encoded.iter().zip(encoded_lens).enumerate() {
+            let (batch, frames, _) = tensor.dims3().map_err(|_| {
+                Error::InvalidInput(format!(
+                    "Nemotron RNNT cohort encoded row {row} must be [1,T,D]"
+                ))
+            })?;
+            if batch != 1 || len > frames {
+                return Err(Error::InvalidInput(format!(
+                    "Nemotron RNNT cohort encoded row {row} has incompatible length {len} for shape {:?}",
+                    tensor.shape().dims()
+                )));
+            }
+        }
+
+        let borrowed = states.iter().map(|state| &**state).collect::<Vec<_>>();
+        let mut cohort = NemotronRnntStreamState::gather_cohort(&borrowed)?;
+        let mut emitted = vec![Vec::new(); width];
+        let max_frames = encoded_lens.iter().copied().max().unwrap_or(0);
+
+        for frame in 0..max_frames {
+            let mut frame_active = encoded_lens
+                .iter()
+                .map(|len| frame < *len)
+                .collect::<Vec<_>>();
+            let mut symbols = vec![0usize; width];
+            while frame_active.iter().any(|active| *active) {
+                let indices = frame_active
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, active)| active.then_some(index))
+                    .collect::<Vec<_>>();
+                let encoder_rows = indices
+                    .iter()
+                    .map(|index| encoded[*index].i((0, frame, ..)))
+                    .collect::<candle_core::Result<Vec<_>>>()?;
+                let encoder_rows = Tensor::stack(&encoder_rows.iter().collect::<Vec<_>>(), 0)?;
+                let predictor_rows = indices
+                    .iter()
+                    .map(|index| cohort.predictor_out.narrow(0, *index, 1))
+                    .collect::<candle_core::Result<Vec<_>>>()?;
+                let predictor_rows = Tensor::cat(&predictor_rows.iter().collect::<Vec<_>>(), 0)?;
+                let logits = self
+                    .joint
+                    .joint_batch_rows(&encoder_rows, &predictor_rows)?;
+
+                let mut predictor_active = vec![false; width];
+                let mut labels = vec![0usize; width];
+                for (batch_row, index) in indices.into_iter().enumerate() {
+                    let row_logits = logits.i(batch_row)?;
+                    let stats = &mut cohort.rows[index].stats;
+                    stats.joint_steps = stats.joint_steps.saturating_add(1);
+                    if argmax_uses_device(&row_logits) {
+                        stats.device_argmax_reads = stats.device_argmax_reads.saturating_add(1);
+                    } else {
+                        stats.host_argmax_reads = stats.host_argmax_reads.saturating_add(1);
+                    }
+                    let label = argmax_1d(&row_logits)?;
+                    if label == self.blank_idx {
+                        stats.blank_frames = stats.blank_frames.saturating_add(1);
+                        frame_active[index] = false;
+                        continue;
+                    }
+                    if label > self.blank_idx {
+                        return Err(Error::InferenceError(format!(
+                            "Nemotron RNNT emitted invalid cohort label {label}; blank_idx={}",
+                            self.blank_idx
+                        )));
+                    }
+                    if cohort.rows[index].token_ids.len() >= cohort.rows[index].max_output_tokens {
+                        return Err(Error::InvalidInput(format!(
+                            "Nemotron realtime cohort row {index} exceeded its model-derived output limit of {} tokens",
+                            cohort.rows[index].max_output_tokens
+                        )));
+                    }
+                    labels[index] = label;
+                    predictor_active[index] = true;
+                    emitted[index].push(label);
+                    symbols[index] = symbols[index].saturating_add(1);
+                    if symbols[index] >= self.max_symbols_per_frame {
+                        cohort.rows[index].stats.guard_exits =
+                            cohort.rows[index].stats.guard_exits.saturating_add(1);
+                        frame_active[index] = false;
+                    }
+                }
+                cohort.step_predictor_masked(
+                    &self.predictor,
+                    &self.joint,
+                    &labels,
+                    &predictor_active,
+                )?;
+            }
+            for (index, len) in encoded_lens.iter().copied().enumerate() {
+                if frame < len {
+                    cohort.rows[index].stats.encoded_frames =
+                        cohort.rows[index].stats.encoded_frames.saturating_add(1);
+                }
+            }
+        }
+        cohort.scatter(states)?;
+        Ok(emitted)
+    }
+
     fn decode_rnnt_greedy_cuda_cached(
         &self,
         encoded: &Tensor,
@@ -1279,6 +1398,7 @@ pub(super) struct NemotronStreamingEncoderChunk {
     pub is_final: bool,
 }
 
+#[derive(Clone)]
 pub(super) struct NemotronRnntStreamState {
     predictor_state: PredictorState,
     predictor_out: Option<Tensor>,
@@ -1286,6 +1406,192 @@ pub(super) struct NemotronRnntStreamState {
     token_ids: Vec<usize>,
     max_output_tokens: usize,
     stats: NemotronDecodeStats,
+}
+
+#[derive(Clone)]
+pub(super) struct NemotronRnntStreamCheckpoint(NemotronRnntStreamState);
+
+pub(super) struct NemotronRnntStreamCohort {
+    rows: Vec<NemotronRnntStreamState>,
+    predictor_state: PredictorState,
+    predictor_out: Tensor,
+    predictor_projection: Option<Tensor>,
+}
+
+impl NemotronRnntStreamCohort {
+    fn step_predictor_masked(
+        &mut self,
+        predictor: &Predictor,
+        joint: &Joint,
+        labels: &[usize],
+        active: &[bool],
+    ) -> Result<()> {
+        if labels.len() != self.rows.len() || active.len() != self.rows.len() {
+            return Err(Error::InvalidInput(
+                "Nemotron cohort mask geometry mismatch".into(),
+            ));
+        }
+        if labels
+            .iter()
+            .zip(active)
+            .any(|(label, active)| *active && *label >= predictor.blank_idx)
+        {
+            return Err(Error::InvalidInput(
+                "Nemotron predictor cohort labels must be non-blank vocabulary ids".into(),
+            ));
+        }
+        let indices = active
+            .iter()
+            .enumerate()
+            .filter_map(|(index, active)| active.then_some(index))
+            .collect::<Vec<_>>();
+        if indices.is_empty() {
+            return Ok(());
+        }
+        let gather_component = |value: &Option<Tensor>| -> Result<Tensor> {
+            let value = value.as_ref().ok_or_else(|| {
+                Error::InferenceError("Nemotron cohort predictor state is not hydrated".into())
+            })?;
+            let parts = indices
+                .iter()
+                .map(|index| value.narrow(0, *index, 1))
+                .collect::<candle_core::Result<Vec<_>>>()?;
+            Tensor::cat(&parts.iter().collect::<Vec<_>>(), 0).map_err(Error::from)
+        };
+        let mut selected = PredictorState {
+            h0: Some(gather_component(&self.predictor_state.h0)?),
+            c0: Some(gather_component(&self.predictor_state.c0)?),
+            h1: Some(gather_component(&self.predictor_state.h1)?),
+            c1: Some(gather_component(&self.predictor_state.c1)?),
+        };
+        let selected_labels = indices
+            .iter()
+            .map(|index| labels[*index])
+            .collect::<Vec<_>>();
+        let selected_output =
+            predictor.step_batch(&selected_labels, &mut selected, predictor.embed.device())?;
+        let selected_projection = self
+            .predictor_projection
+            .as_ref()
+            .map(|_| joint.project_predictor(&selected_output))
+            .transpose()?;
+
+        let merge = |original: &Tensor, replacement: &Tensor| -> Result<Tensor> {
+            let mut replacement_index = 0usize;
+            let rows = active
+                .iter()
+                .enumerate()
+                .map(|(index, active)| {
+                    if *active {
+                        let row = replacement.narrow(0, replacement_index, 1);
+                        replacement_index += 1;
+                        row
+                    } else {
+                        original.narrow(0, index, 1)
+                    }
+                })
+                .collect::<candle_core::Result<Vec<_>>>()?;
+            Tensor::cat(&rows.iter().collect::<Vec<_>>(), 0).map_err(Error::from)
+        };
+        let h0 = merge(
+            self.predictor_state.h0.as_ref().unwrap(),
+            selected.h0.as_ref().unwrap(),
+        )?;
+        let c0 = merge(
+            self.predictor_state.c0.as_ref().unwrap(),
+            selected.c0.as_ref().unwrap(),
+        )?;
+        let h1 = merge(
+            self.predictor_state.h1.as_ref().unwrap(),
+            selected.h1.as_ref().unwrap(),
+        )?;
+        let c1 = merge(
+            self.predictor_state.c1.as_ref().unwrap(),
+            selected.c1.as_ref().unwrap(),
+        )?;
+        let output = merge(&self.predictor_out, &selected_output)?;
+        let projection = match (
+            self.predictor_projection.as_ref(),
+            selected_projection.as_ref(),
+        ) {
+            (Some(original), Some(replacement)) => Some(merge(original, replacement)?),
+            (None, None) => None,
+            _ => {
+                return Err(Error::InferenceError(
+                    "Nemotron predictor projection hydration changed during cohort step".into(),
+                ));
+            }
+        };
+        self.predictor_state = PredictorState {
+            h0: Some(h0),
+            c0: Some(c0),
+            h1: Some(h1),
+            c1: Some(c1),
+        };
+        self.predictor_out = output;
+        self.predictor_projection = projection;
+        for (index, label) in labels.iter().copied().enumerate() {
+            if active[index] {
+                self.rows[index].token_ids.push(label);
+                self.rows[index].stats.emitted_tokens = self.rows[index].token_ids.len();
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn scatter(self, targets: &mut [&mut NemotronRnntStreamState]) -> Result<()> {
+        if targets.len() != self.rows.len() {
+            return Err(Error::InvalidInput(
+                "Nemotron cohort scatter geometry mismatch".into(),
+            ));
+        }
+        let mut provisional = self.rows;
+        for (index, row) in provisional.iter_mut().enumerate() {
+            row.install_retained_tensors([
+                Some(
+                    self.predictor_state
+                        .h0
+                        .as_ref()
+                        .unwrap()
+                        .narrow(0, index, 1)?
+                        .contiguous()?,
+                ),
+                Some(
+                    self.predictor_state
+                        .c0
+                        .as_ref()
+                        .unwrap()
+                        .narrow(0, index, 1)?
+                        .contiguous()?,
+                ),
+                Some(
+                    self.predictor_state
+                        .h1
+                        .as_ref()
+                        .unwrap()
+                        .narrow(0, index, 1)?
+                        .contiguous()?,
+                ),
+                Some(
+                    self.predictor_state
+                        .c1
+                        .as_ref()
+                        .unwrap()
+                        .narrow(0, index, 1)?
+                        .contiguous()?,
+                ),
+                Some(self.predictor_out.narrow(0, index, 1)?.contiguous()?),
+                self.predictor_projection
+                    .as_ref()
+                    .map(|value| value.narrow(0, index, 1).and_then(|row| row.contiguous()))
+                    .transpose()?,
+            ]);
+        }
+        for (target, value) in targets.iter_mut().zip(provisional) {
+            **target = value;
+        }
+        Ok(())
+    }
 }
 
 pub(super) struct NemotronRnntStreamStep {
@@ -1587,6 +1893,60 @@ impl NemotronStreamingEncoderState {
 }
 
 impl NemotronRnntStreamState {
+    pub(super) fn checkpoint(&self) -> NemotronRnntStreamCheckpoint {
+        NemotronRnntStreamCheckpoint(self.clone())
+    }
+
+    pub(super) fn rollback(&mut self, checkpoint: &NemotronRnntStreamCheckpoint) {
+        *self = checkpoint.0.clone();
+    }
+
+    pub(super) fn gather_cohort(rows: &[&Self]) -> Result<NemotronRnntStreamCohort> {
+        if rows.is_empty() {
+            return Err(Error::InvalidInput(
+                "Nemotron RNNT cohort cannot be empty".into(),
+            ));
+        }
+        let gather = |select: fn(&Self) -> Option<&Tensor>, name: &str| -> Result<Tensor> {
+            let tensors = rows
+                .iter()
+                .map(|row| {
+                    select(row).ok_or_else(|| {
+                        Error::InferenceError(format!("Nemotron cohort row has no {name}"))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Tensor::cat(&tensors, 0).map_err(Error::from)
+        };
+        let projections = rows
+            .iter()
+            .map(|row| row.predictor_projection.as_ref())
+            .collect::<Vec<_>>();
+        let predictor_projection = if projections.iter().all(|value| value.is_some()) {
+            Some(Tensor::cat(
+                &projections.into_iter().flatten().collect::<Vec<_>>(),
+                0,
+            )?)
+        } else if projections.iter().all(|value| value.is_none()) {
+            None
+        } else {
+            return Err(Error::InvalidInput(
+                "Nemotron cohort mixed projected and unprojected rows".into(),
+            ));
+        };
+        Ok(NemotronRnntStreamCohort {
+            rows: rows.iter().map(|row| (*row).clone()).collect(),
+            predictor_state: PredictorState {
+                h0: Some(gather(|row| row.predictor_state.h0.as_ref(), "h0")?),
+                c0: Some(gather(|row| row.predictor_state.c0.as_ref(), "c0")?),
+                h1: Some(gather(|row| row.predictor_state.h1.as_ref(), "h1")?),
+                c1: Some(gather(|row| row.predictor_state.c1.as_ref(), "c1")?),
+            },
+            predictor_out: gather(|row| row.predictor_out.as_ref(), "predictor output")?,
+            predictor_projection,
+        })
+    }
+
     pub(super) fn token_ids(&self) -> &[usize] {
         &self.token_ids
     }
@@ -4095,5 +4455,101 @@ mod tests {
             .unwrap();
 
         assert_eq!(cached, uncached);
+    }
+
+    #[test]
+    fn rnnt_cohort_matches_scalar_oracle_with_mixed_lengths() {
+        let network = rnnt_test_network(vec![1.0, 0.0, -1.0], 2);
+        let long = Tensor::zeros((1, 2, ENCODER_DIM), DType::F32, &Device::Cpu).unwrap();
+        let short = Tensor::zeros((1, 1, ENCODER_DIM), DType::F32, &Device::Cpu).unwrap();
+        let mut batched_long = network.start_rnnt_stream(8).unwrap();
+        let mut batched_short = network.start_rnnt_stream(8).unwrap();
+        let emitted = network
+            .decode_rnnt_streaming_cohort(
+                &mut [&mut batched_long, &mut batched_short],
+                &[&long, &short],
+                &[2, 1],
+            )
+            .unwrap();
+        let mut scalar_long = network.start_rnnt_stream(8).unwrap();
+        let mut scalar_short = network.start_rnnt_stream(8).unwrap();
+        let mut long_emitted = Vec::new();
+        let mut short_emitted = Vec::new();
+        network
+            .decode_rnnt_streaming_chunk(&mut scalar_long, &long, 2, &mut |token| {
+                long_emitted.push(token)
+            })
+            .unwrap();
+        network
+            .decode_rnnt_streaming_chunk(&mut scalar_short, &short, 1, &mut |token| {
+                short_emitted.push(token)
+            })
+            .unwrap();
+
+        assert_eq!(emitted, vec![long_emitted, short_emitted]);
+        for (batched, scalar) in [
+            (&batched_long, &scalar_long),
+            (&batched_short, &scalar_short),
+        ] {
+            assert_eq!(batched.token_ids, scalar.token_ids);
+            assert_eq!(batched.stats.encoded_frames, scalar.stats.encoded_frames);
+            assert_eq!(batched.stats.emitted_tokens, scalar.stats.emitted_tokens);
+            assert_eq!(batched.stats.guard_exits, scalar.stats.guard_exits);
+            assert_eq!(batched.stats.joint_steps, scalar.stats.joint_steps);
+            for (batched, scalar) in batched
+                .retained_tensors()
+                .iter()
+                .zip(scalar.retained_tensors().iter())
+            {
+                match (batched, scalar) {
+                    (Some(batched), Some(scalar)) => assert_tensor_close(batched, scalar, 0.0),
+                    (None, None) => {}
+                    _ => panic!("scalar and cohort tensor hydration differ"),
+                }
+            }
+        }
+        assert_eq!(batched_long.stats.encoded_frames, 2);
+        assert_eq!(batched_short.stats.encoded_frames, 1);
+    }
+
+    #[test]
+    fn rnnt_cohort_blank_rows_are_isolated_and_failure_rolls_back() {
+        let blank_network = rnnt_test_network(vec![-1.0, 0.0, 1.0], 2);
+        let long = Tensor::zeros((1, 2, ENCODER_DIM), DType::F32, &Device::Cpu).unwrap();
+        let short = Tensor::zeros((1, 1, ENCODER_DIM), DType::F32, &Device::Cpu).unwrap();
+        let mut first = blank_network.start_rnnt_stream(8).unwrap();
+        let mut second = blank_network.start_rnnt_stream(8).unwrap();
+        let first_before = first.checkpoint();
+        let second_before = second.checkpoint();
+        let emitted = blank_network
+            .decode_rnnt_streaming_cohort(&mut [&mut first, &mut second], &[&long, &short], &[2, 1])
+            .unwrap();
+        assert_eq!(emitted, vec![Vec::<usize>::new(), Vec::new()]);
+        assert_eq!(first.stats.blank_frames, 2);
+        assert_eq!(second.stats.blank_frames, 1);
+        assert_eq!(first.token_ids(), first_before.0.token_ids());
+        assert_eq!(second.token_ids(), second_before.0.token_ids());
+        for (after, before) in first
+            .retained_tensors()
+            .iter()
+            .zip(first_before.0.retained_tensors().iter())
+        {
+            match (after, before) {
+                (Some(after), Some(before)) => assert_tensor_close(after, before, 0.0),
+                (None, None) => {}
+                _ => panic!("blank row changed predictor tensor hydration"),
+            }
+        }
+
+        let failing_network = rnnt_test_network(vec![1.0, 0.0, -1.0], 2);
+        let mut limited = failing_network.start_rnnt_stream(0).unwrap();
+        let checkpoint = limited.checkpoint();
+        assert!(failing_network
+            .decode_rnnt_streaming_cohort(&mut [&mut limited], &[&short], &[1])
+            .is_err());
+        assert_eq!(limited.token_ids(), checkpoint.0.token_ids());
+        assert_eq!(limited.stats.joint_steps, checkpoint.0.stats.joint_steps);
+        limited.rollback(&checkpoint);
+        assert_eq!(limited.token_ids(), checkpoint.0.token_ids());
     }
 }
