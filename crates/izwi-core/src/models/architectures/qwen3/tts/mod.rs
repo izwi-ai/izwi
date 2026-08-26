@@ -53,6 +53,7 @@ use crate::models::shared::attention::paged::{default_kv_page_size, KvCacheQuant
 use crate::models::shared::sampling::{
     bounded_device_sampling_candidates, device_candidates_cover_top_p, sample_device_candidates,
 };
+use crate::models::shared::state::exact_stage_scratch_domain;
 
 const NEWLINE_TOKEN_ID: u32 = 198;
 const ENV_QWEN_TTS_CUDA_CHUNKED_CODEC_STREAM: &str = "IZWI_QWEN_TTS_CUDA_CHUNKED_CODEC_STREAM";
@@ -1034,6 +1035,7 @@ impl Qwen3TtsModel {
         predictor_contract.validate()?;
         let predictor_domain = predictor_contract.domains[0].clone();
         let predictor_group = predictor_contract.groups[0].clone();
+        let max_invocation_domain_id = predictor_domain.id().get();
         let predictor_workspace_tokens = u64::try_from(self.physical_predictor_workspace_tokens())
             .map_err(|_| {
                 Error::ModelLoadError("Qwen3-TTS predictor workspace exceeds u64".into())
@@ -1048,31 +1050,52 @@ impl Qwen3TtsModel {
         for stages in stage_graphs {
             let mut invocation_stages = stages
                 .iter()
-                .map(|stage| {
+                .enumerate()
+                .map(|(index, stage)| {
                     let decode = stage.selector == StageWorkSelector::SequenceDecode;
-                    InvocationStageWorkspace {
+                    let lease_scope = if decode || stage.max_batch_size == 1 {
+                        InvocationLeaseScope::PerRow
+                    } else {
+                        InvocationLeaseScope::PerStageBatch
+                    };
+                    let mut domains = decode
+                        .then(|| InvocationWorkspaceDomain::State {
+                            state: predictor_domain.clone(),
+                            capacity: predictor_capacity,
+                            placement: predictor_domain.header().placement,
+                            formula: WorkspaceFormula {
+                                fixed_bytes: predictor_physical_bytes,
+                                dimensions: vec![],
+                                terms: vec![],
+                            },
+                        })
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    let scratch_id = max_invocation_domain_id
+                        .checked_add(u32::try_from(index + 1).map_err(|_| {
+                            Error::ModelLoadError("Qwen3 TTS stage count exceeds u32".into())
+                        })?)
+                        .ok_or_else(|| {
+                            Error::ModelLoadError("Qwen3 TTS scratch domain id overflow".into())
+                        })?;
+                    if let Some(scratch) = exact_stage_scratch_domain(
+                        stage,
+                        StateDomainId::new(scratch_id),
+                        lease_scope,
+                    )? {
+                        domains.push(scratch);
+                    }
+                    Ok(InvocationStageWorkspace {
                         stage: stage.id,
-                        lease_scope: InvocationLeaseScope::PerRow,
+                        lease_scope,
                         groups: decode
                             .then(|| predictor_group.clone())
                             .into_iter()
                             .collect(),
-                        domains: decode
-                            .then(|| InvocationWorkspaceDomain::State {
-                                state: predictor_domain.clone(),
-                                capacity: predictor_capacity,
-                                placement: predictor_domain.header().placement,
-                                formula: WorkspaceFormula {
-                                    fixed_bytes: predictor_physical_bytes,
-                                    dimensions: vec![],
-                                    terms: vec![],
-                                },
-                            })
-                            .into_iter()
-                            .collect(),
-                    }
+                        domains,
+                    })
                 })
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>>>()?;
             invocation_stages.sort_unstable_by_key(|stage| stage.stage);
             profiles.push(InvocationWorkspaceProfile {
                 stage_graph_fingerprint: stage_graph_fingerprint(stages)?,

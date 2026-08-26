@@ -14,6 +14,35 @@ use crate::kv::v2::{
     CURRENT_INFERENCE_STATE_ABI,
 };
 
+/// Lower one loaded stage's aggregate scratch ceiling into the exact formula
+/// implied by its invocation lease scope.
+pub(crate) fn exact_stage_scratch_domain(
+    stage: &StageDescriptor,
+    id: crate::kv::v2::StateDomainId,
+    lease_scope: InvocationLeaseScope,
+) -> Result<Option<InvocationWorkspaceDomain>> {
+    if stage.max_workspace_bytes == 0 {
+        return Ok(None);
+    }
+    let slots = match lease_scope {
+        InvocationLeaseScope::PerStageBatch => 1_u64,
+        InvocationLeaseScope::PerRow => u64::try_from(stage.max_batch_size)
+            .map_err(|_| model_load("invocation scratch row count exceeds u64"))?,
+    };
+    if slots == 0 || stage.max_workspace_bytes % slots != 0 {
+        return Err(model_load(
+            "invocation scratch ceiling cannot be partitioned across its lease slots",
+        ));
+    }
+    Ok(Some(InvocationWorkspaceDomain::Scratch {
+        id,
+        placement: PlacementPolicy::BackendLocal,
+        alignment_bytes: 64,
+        zero_on_release: false,
+        formula: fixed_formula(stage.max_workspace_bytes / slots),
+    }))
+}
+
 pub(crate) fn typed_invocation_descriptor(
     stage_graphs: &[&[StageDescriptor]],
     contract: &InferenceStateContract,
@@ -168,4 +197,50 @@ const fn fixed_formula(fixed_bytes: u64) -> WorkspaceFormula {
 
 fn model_load(message: impl Into<String>) -> Error {
     Error::ModelLoadError(message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backends::BackendKind;
+    use crate::engine::{
+        ExecutionMode, ExecutionProfile, NativeBatchMode, StageId, StageWorkSelector,
+    };
+
+    #[test]
+    fn exact_scratch_formula_tracks_batch_and_row_lease_scopes() {
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        profile.max_batch_size = 4;
+        let mut stage = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            "test.scratch",
+            &profile,
+            NativeBatchMode::Continuous,
+        );
+        stage.selector = StageWorkSelector::SequenceDecode;
+        stage.max_workspace_bytes = 128;
+
+        let InvocationWorkspaceDomain::Scratch { formula, .. } = exact_stage_scratch_domain(
+            &stage,
+            crate::kv::v2::StateDomainId::new(1),
+            InvocationLeaseScope::PerRow,
+        )
+        .unwrap()
+        .unwrap() else {
+            panic!("scratch domain");
+        };
+        assert_eq!(formula.fixed_bytes, 32);
+
+        let InvocationWorkspaceDomain::Scratch { formula, .. } = exact_stage_scratch_domain(
+            &stage,
+            crate::kv::v2::StateDomainId::new(1),
+            InvocationLeaseScope::PerStageBatch,
+        )
+        .unwrap()
+        .unwrap() else {
+            panic!("scratch domain");
+        };
+        assert_eq!(formula.fixed_bytes, 128);
+    }
 }

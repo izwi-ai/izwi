@@ -51,6 +51,7 @@ use crate::models::shared::memory::accounting::{
     deep_copy_tensor_storage, TensorStorageAccounting,
 };
 use crate::models::shared::memory::metal::metal_pool_for_device;
+use crate::models::shared::state::exact_stage_scratch_domain;
 use crate::models::shared::weights::gguf::{var_builder_from_gguf_filtered, GgufLoader};
 
 use audio::AudioTower;
@@ -610,40 +611,60 @@ fn qwen3_asr_physical_state_spec(
     invocation_contract.validate()?;
     let invocation_domain = invocation_contract.domains[0].clone();
     let invocation_group = invocation_contract.groups[0].clone();
+    let max_invocation_domain_id = invocation_domain.id().get();
     let physical_bytes = qwen3_asr_invocation_workspace_bytes(&invocation_domain, max_tokens)?;
     let decoder_capacity = InvocationStateCapacity::decoder_context(max_tokens)?;
 
     let mut profiles = Vec::with_capacity(stage_graphs.len());
-    let mut has_invocation_state = false;
+    let mut has_invocation_workspace = false;
     for stages in stage_graphs {
         let mut invocation_stages = stages
             .iter()
-            .map(|stage| {
+            .enumerate()
+            .map(|(index, stage)| {
                 let owns_invocation_state = stage.selector == StageWorkSelector::Atomic;
-                has_invocation_state |= owns_invocation_state;
-                InvocationStageWorkspace {
+                let lease_scope = if owns_invocation_state || stage.max_batch_size == 1 {
+                    InvocationLeaseScope::PerRow
+                } else {
+                    InvocationLeaseScope::PerStageBatch
+                };
+                let mut domains = owns_invocation_state
+                    .then(|| InvocationWorkspaceDomain::State {
+                        state: invocation_domain.clone(),
+                        capacity: decoder_capacity,
+                        placement: invocation_domain.header().placement,
+                        formula: WorkspaceFormula {
+                            fixed_bytes: physical_bytes,
+                            dimensions: vec![],
+                            terms: vec![],
+                        },
+                    })
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                let scratch_id = max_invocation_domain_id
+                    .checked_add(u32::try_from(index + 1).map_err(|_| {
+                        Error::ModelLoadError("Qwen3 ASR stage count exceeds u32".into())
+                    })?)
+                    .ok_or_else(|| {
+                        Error::ModelLoadError("Qwen3 ASR scratch domain id overflow".into())
+                    })?;
+                if let Some(scratch) =
+                    exact_stage_scratch_domain(stage, StateDomainId::new(scratch_id), lease_scope)?
+                {
+                    domains.push(scratch);
+                }
+                has_invocation_workspace |= !domains.is_empty();
+                Ok(InvocationStageWorkspace {
                     stage: stage.id,
-                    lease_scope: InvocationLeaseScope::PerRow,
+                    lease_scope,
                     groups: owns_invocation_state
                         .then(|| invocation_group.clone())
                         .into_iter()
                         .collect(),
-                    domains: owns_invocation_state
-                        .then(|| InvocationWorkspaceDomain::State {
-                            state: invocation_domain.clone(),
-                            capacity: decoder_capacity,
-                            placement: invocation_domain.header().placement,
-                            formula: WorkspaceFormula {
-                                fixed_bytes: physical_bytes,
-                                dimensions: vec![],
-                                terms: vec![],
-                            },
-                        })
-                        .into_iter()
-                        .collect(),
-                }
+                    domains,
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         invocation_stages.sort_unstable_by_key(|stage| stage.stage);
         profiles.push(InvocationWorkspaceProfile {
             stage_graph_fingerprint: stage_graph_fingerprint(stages)?,
@@ -652,7 +673,7 @@ fn qwen3_asr_physical_state_spec(
     }
     profiles.sort_unstable_by_key(|profile| profile.stage_graph_fingerprint);
     profiles.dedup();
-    let invocation = if has_invocation_state {
+    let invocation = if has_invocation_workspace {
         InvocationWorkspaceSet::Bounded { profiles }
     } else {
         InvocationWorkspaceSet::None {
@@ -4773,6 +4794,10 @@ mod tests {
         let streaming = [physical_spec_stage(2, StageProgressKind::Iterative)];
         let mut preparation_stage = physical_spec_stage(3, StageProgressKind::Atomic);
         preparation_stage.selector = StageWorkSelector::PreSequencePreparation;
+        preparation_stage.batch_mode = NativeBatchMode::Static;
+        preparation_stage.concurrency = ConcurrencyClass::Batchable;
+        preparation_stage.max_batch_size = 4;
+        preparation_stage.max_workspace_bytes = 128;
         let preparation = [preparation_stage];
         let graphs = vec![
             offline.as_slice(),
@@ -4814,15 +4839,29 @@ mod tests {
                     profile.stage_graph_fingerprint == stage_graph_fingerprint(graph).unwrap()
                 })
                 .expect("exact graph profile");
-            let domain_count = profile
+            let state_count = profile
                 .stages
                 .iter()
                 .flat_map(|stage| stage.domains.iter())
+                .filter(|domain| matches!(domain, InvocationWorkspaceDomain::State { .. }))
+                .count();
+            let scratch_count = profile
+                .stages
+                .iter()
+                .flat_map(|stage| stage.domains.iter())
+                .filter(|domain| matches!(domain, InvocationWorkspaceDomain::Scratch { .. }))
                 .count();
             let owns_invocation = graph
                 .iter()
                 .any(|stage| stage.selector == StageWorkSelector::Atomic);
-            assert_eq!(domain_count, usize::from(owns_invocation));
+            assert_eq!(state_count, usize::from(owns_invocation));
+            assert_eq!(
+                scratch_count,
+                graph
+                    .iter()
+                    .filter(|stage| stage.max_workspace_bytes > 0)
+                    .count()
+            );
         }
     }
 
