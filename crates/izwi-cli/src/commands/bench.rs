@@ -6218,6 +6218,41 @@ concurrent = [1, 2]
     }
 
     #[test]
+    fn backend_audio_performance_manifests_cover_all_asr_and_tts_families_at_c1_to_c8() {
+        let manifest_root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/manifests");
+        for name in [
+            "cpu-audio-concurrency.toml",
+            "metal-audio-concurrency.toml",
+            "cuda-audio-concurrency.toml",
+        ] {
+            let text = std::fs::read_to_string(manifest_root.join(name))
+                .expect("audio performance manifest");
+            let manifest: BenchmarkManifest =
+                toml::from_str(&text).expect("valid audio performance manifest");
+            let cases = expand_manifest_cases(&manifest).expect("unique audio performance cases");
+            assert_eq!(cases.len(), 56, "{name}");
+            assert!(
+                cases
+                    .iter()
+                    .all(|case| matches!(case.command.as_str(), "asr" | "tts")),
+                "{name}"
+            );
+            assert!(cases.iter().all(|case| case.model.is_some()), "{name}");
+            for concurrency in [1, 2, 4, 8] {
+                assert_eq!(
+                    cases
+                        .iter()
+                        .filter(|case| case.concurrent == Some(concurrency))
+                        .count(),
+                    14,
+                    "{name} c{concurrency}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn manifest_matrix_rejects_duplicate_expanded_names() {
         let manifest: BenchmarkManifest = toml::from_str(
             r#"

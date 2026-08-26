@@ -1,0 +1,55 @@
+# Exact-SHA metal ASR/TTS concurrency evidence matrix.
+# This workload records portable correctness and c1/c2/c4/c8 responsiveness.
+# Accelerator throughput is certified only when this manifest is run on the
+# exact named device and retained with its runtime/hardware artifacts.
+
+[[benchmarks]]
+name = "asr-metal-concurrency"
+command = "asr"
+file = "../../data/test.wav"
+iterations = 8
+warmup = true
+
+[benchmarks.matrix]
+model = [
+  "Parakeet-TDT-0.6B-v3",
+  "Whisper-Large-v3-Turbo",
+  "Qwen3-ASR-0.6B-GGUF",
+  "VibeVoice-ASR",
+  "Nemotron-3.5-ASR-Streaming-0.6B",
+  "Granite-Speech-4.1-2B-Plus",
+  "Voxtral-Mini-4B-Realtime-2602",
+  "LFM2.5-Audio-1.5B-GGUF",
+]
+concurrent = [1, 2, 4, 8]
+
+[[benchmarks]]
+name = "tts-metal-concurrency"
+command = "tts"
+iterations = 8
+warmup = true
+text = "Continuous audio batching should remain responsive and clear."
+
+[benchmarks.matrix]
+model = [
+  "Qwen3-TTS-12Hz-0.6B-Base",
+  "Kokoro-82M",
+  "Voxtral-4B-TTS-2603",
+  "FishAudio-S2-Pro",
+  "LFM2.5-Audio-1.5B-GGUF",
+]
+concurrent = [1, 2, 4, 8]
+
+[[benchmarks]]
+name = "vibevoice-tts-metal-concurrency"
+command = "tts"
+model = "VibeVoice-1.5B"
+iterations = 8
+warmup = true
+text = "Continuous audio batching should remain responsive and clear."
+reference_audio = "../../data/fox.wav"
+reference_text_file = "../../data/fox.md"
+
+[benchmarks.matrix]
+concurrent = [1, 2, 4, 8]
+
