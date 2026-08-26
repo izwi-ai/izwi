@@ -2512,7 +2512,7 @@ impl LoadedExecutionAdapter for Lfm25AudioTtsExecutionAdapter {
         profile.mode = ExecutionMode::Sequence;
         profile.prefill = PrefillMode::Incremental;
         profile.incremental_decode = true;
-        profile.prefill_batch = NativeBatchMode::None;
+        profile.prefill_batch = NativeBatchMode::Static;
         profile.decode_batch = NativeBatchMode::Continuous;
         profile.cache_mode = CacheMode::ExternalPaged;
         profile.cache_namespace = Some(format!(
@@ -2544,17 +2544,27 @@ impl LoadedExecutionAdapter for Lfm25AudioTtsExecutionAdapter {
         preparation.output_visibility = OutputVisibility::AfterQuantumCommit;
         let mut prefill = StageDescriptor::from_execution_profile(
             StageId::new(1),
-            "tts.prefill.lfm25_audio.scalar",
+            "tts.prefill.lfm25_audio.tensor_static",
             &profile,
-            NativeBatchMode::None,
+            NativeBatchMode::Static,
         );
         prefill.selector = StageWorkSelector::SequencePrefill;
-        prefill.max_batch_size = 1;
-        prefill.concurrency = ConcurrencyClass::Exclusive;
         prefill.shape_policy = StageShapePolicy::Exact;
+        prefill.max_padding_basis_points = 0;
         prefill.max_work_units = u64::try_from(ceiling.max_prompt_tokens)
-            .map_err(|_| Error::Overloaded("LFM2.5 Audio TTS prompt ceiling exceeds u64".into()))?;
-        prefill.max_workspace_bytes = ceiling.max_workspace_bytes;
+            .map_err(|_| Error::Overloaded("LFM2.5 Audio TTS prompt ceiling exceeds u64".into()))?
+            .checked_mul(u64::try_from(self.max_batch_size).map_err(|_| {
+                Error::Overloaded("LFM2.5 Audio TTS batch ceiling exceeds u64".into())
+            })?)
+            .ok_or_else(|| Error::Overloaded("LFM2.5 Audio TTS prefill work overflow".into()))?;
+        prefill.max_workspace_bytes = ceiling
+            .max_workspace_bytes
+            .checked_mul(u64::try_from(self.max_batch_size).map_err(|_| {
+                Error::Overloaded("LFM2.5 Audio TTS batch ceiling exceeds u64".into())
+            })?)
+            .ok_or_else(|| {
+                Error::Overloaded("LFM2.5 Audio TTS prefill workspace overflow".into())
+            })?;
         prefill.output_visibility = OutputVisibility::AfterQuantumCommit;
         let mut decode = StageDescriptor::from_execution_profile(
             StageId::new(2),
@@ -5974,21 +5984,28 @@ mod tests {
             assert_eq!(contract.adapter_abi_revision, LFM25_AUDIO_TTS_ADAPTER_ABI);
             assert_eq!(contract.execution_profile.mode, ExecutionMode::Sequence);
             assert_eq!(
+                contract.execution_profile.prefill_batch,
+                NativeBatchMode::Static
+            );
+            assert_eq!(
                 contract.execution_profile.decode_batch,
                 NativeBatchMode::Continuous
             );
             assert_eq!(contract.stages.len(), 3);
             assert_eq!(contract.stages[0].name, "tts.prepare.lfm25_audio");
-            assert_eq!(contract.stages[1].name, "tts.prefill.lfm25_audio.scalar");
+            assert_eq!(
+                contract.stages[1].name,
+                "tts.prefill.lfm25_audio.tensor_static"
+            );
             assert_eq!(
                 contract.stages[2].name,
                 "tts.decode.lfm25_audio.tensor_continuous"
             );
             assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::None);
-            assert_eq!(contract.stages[1].batch_mode, NativeBatchMode::None);
+            assert_eq!(contract.stages[1].batch_mode, NativeBatchMode::Static);
             assert_eq!(contract.stages[2].batch_mode, NativeBatchMode::Continuous);
             assert_eq!(contract.stages[0].max_batch_size, 1);
-            assert_eq!(contract.stages[1].max_batch_size, 1);
+            assert_eq!(contract.stages[1].max_batch_size, 8);
             assert_eq!(contract.stages[2].max_batch_size, 8);
             assert!(contract
                 .stages
