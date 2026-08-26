@@ -626,7 +626,79 @@ fn plan_invocation_allocations(
     Ok(allocations)
 }
 
+fn validate_scratch_only_invocation_publication(
+    descriptor: &CapabilityStateDescriptorV2,
+    executions: &[LoadedExecutionContract],
+) -> Result<()> {
+    if executions.is_empty() {
+        return Err(invalid_invocation_publication(
+            "scratch-only invocation publication has no execution stage graphs",
+        ));
+    }
+    let execution_graphs = executions
+        .iter()
+        .map(|execution| stage_graph_fingerprint(&execution.stages))
+        .collect::<Result<HashSet<_>>>()?;
+    let profile_graphs = match &descriptor.invocation {
+        InvocationWorkspaceSet::None {
+            stage_graph_fingerprints,
+        } => stage_graph_fingerprints
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>(),
+        InvocationWorkspaceSet::Bounded { profiles } => {
+            if profiles.iter().any(|profile| {
+                profile.stages.iter().any(|stage| {
+                    stage
+                        .domains
+                        .iter()
+                        .any(|domain| matches!(domain, InvocationWorkspaceDomain::State { .. }))
+                })
+            }) {
+                return Err(invalid_invocation_publication(
+                    "scratch-only invocation publication contains typed state",
+                ));
+            }
+            profiles
+                .iter()
+                .map(|profile| profile.stage_graph_fingerprint)
+                .collect::<HashSet<_>>()
+        }
+    };
+    if profile_graphs != execution_graphs {
+        return Err(invalid_invocation_publication(
+            "scratch-only invocation profiles do not map exactly to the loaded stage graphs",
+        ));
+    }
+    for execution in executions {
+        descriptor.validate_against_stages(&execution.stages)?;
+    }
+    Ok(())
+}
+
 impl ModelLifecycleController {
+    fn load_scratch_only_workspace_publication(
+        &self,
+        executions: &[LoadedExecutionContract],
+        descriptor: CapabilityStateDescriptorV2,
+        retained: Option<RetainedStateRuntimeV2>,
+        retained_uses: HashMap<[u8; 32], RetainedStateUseV2>,
+    ) -> Result<LoadedStatePublication> {
+        validate_physical_publication_backing(
+            &descriptor,
+            executions,
+            retained.as_ref(),
+            &retained_uses,
+        )?;
+        validate_scratch_only_invocation_publication(&descriptor, executions)?;
+        Ok(LoadedStatePublication::PhysicalV2 {
+            descriptor,
+            retained,
+            retained_uses,
+            invocation_workspace: InvocationWorkspaceRuntimeV2::default(),
+        })
+    }
+
     fn fit_invocation_decoder_context(
         &self,
         variant: ModelVariant,
@@ -1589,16 +1661,18 @@ impl ModelLifecycleController {
                                 Ok((graph, RetainedStateUseV2::ExternalTensor))
                             })
                             .collect::<Result<HashMap<_, _>>>()?;
-                        let publication = self
-                            .load_invocation_workspace_publication(
-                                model_instance_id,
-                                &contracts,
-                                physical_spec.descriptor,
-                                &physical_spec.invocation,
-                                Some(retained.into()),
-                                retained_uses,
-                            )
-                            .await?;
+                        if physical_spec.invocation.is_some() {
+                            return Err(Error::ModelLoadError(
+                                "Parakeet sequence graph unexpectedly published invocation predictor state"
+                                    .into(),
+                            ));
+                        }
+                        let publication = self.load_scratch_only_workspace_publication(
+                            &contracts,
+                            physical_spec.descriptor,
+                            Some(retained.into()),
+                            retained_uses,
+                        )?;
                         state_publications.insert(CapabilityKind::Asr, publication);
                     } else if publication_route
                         == LoadedAsrStatePublicationRoute::NemotronOffline
@@ -2328,9 +2402,10 @@ mod tests {
         loaded_asr_state_publication_route, managed_chat_capacity_policy, model_memory_estimate,
         model_resource_plan, plan_invocation_allocations, qwen38_representation_memory_estimate,
         qwen38_resource_plan, residency_budget_has_capacity, select_lru_eviction_candidate,
-        LoadedAsrStatePublicationRoute, ModelMemoryEstimate, QWEN38_BF16_ELEMENTS,
-        QWEN38_CUDA_DEVICE_CONVERSION_SCRATCH_BYTES, QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES,
-        QWEN38_FP8_ELEMENTS, QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES, QWEN38_Q8_0_BLOCK_BYTES,
+        validate_scratch_only_invocation_publication, LoadedAsrStatePublicationRoute,
+        ModelMemoryEstimate, QWEN38_BF16_ELEMENTS, QWEN38_CUDA_DEVICE_CONVERSION_SCRATCH_BYTES,
+        QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES, QWEN38_FP8_ELEMENTS,
+        QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES, QWEN38_Q8_0_BLOCK_BYTES,
         QWEN38_Q8_0_BLOCK_ELEMENTS,
     };
     use crate::backends::kv::managed_kv_backend_compiled;
@@ -2764,6 +2839,27 @@ mod tests {
             &[execution, foreign_execution]
         )
         .is_err());
+    }
+
+    #[test]
+    fn scratch_only_publication_accepts_stage_scratch_and_rejects_typed_state() {
+        let mut execution = invocation_execution(1);
+        let mut stage = execution.stages[0].clone();
+        stage.max_workspace_bytes = 4096;
+        stage.validate().unwrap();
+        execution.stages = Arc::from([stage]);
+        let descriptor =
+            CapabilityStateDescriptorV2::stateless_for_stage_graphs(&[execution.stages.as_ref()])
+                .unwrap();
+        validate_scratch_only_invocation_publication(&descriptor, std::slice::from_ref(&execution))
+            .unwrap();
+
+        let contract = invocation_contract(1);
+        let typed = invocation_descriptor(&execution, &contract, InvocationLeaseScope::PerRow);
+        let error =
+            validate_scratch_only_invocation_publication(&typed, std::slice::from_ref(&execution))
+                .unwrap_err();
+        assert!(error.to_string().contains("contains typed state"));
     }
 
     fn one_byte_host_reservation() -> ResourceVector {

@@ -20,7 +20,10 @@ pub(crate) const PARAKEET_PREDICTOR_STATE_GROUP: StateGroupId = StateGroupId::ne
 pub(crate) struct ParakeetPhysicalStateSpec {
     pub(crate) descriptor: CapabilityStateDescriptorV2,
     pub(crate) retained: Option<InferenceStateContract>,
-    pub(crate) invocation: InferenceStateContract,
+    /// Atomic compatibility graphs lease predictor tensors per invocation.
+    /// Sequence graphs own the same tensors as retained state and therefore
+    /// publish scratch-only invocation workspace.
+    pub(crate) invocation: Option<InferenceStateContract>,
 }
 
 pub(crate) fn parakeet_physical_state_spec(
@@ -55,7 +58,7 @@ pub(crate) fn parakeet_physical_state_spec(
     Ok(ParakeetPhysicalStateSpec {
         descriptor,
         retained: uses_retained.then_some(retained),
-        invocation,
+        invocation: uses_atomic.then_some(invocation),
     })
 }
 
@@ -178,6 +181,7 @@ mod tests {
             stage(2, StageWorkSelector::SequenceDecode),
         ];
         let spec = parakeet_physical_state_spec(&[&stages]).unwrap();
+        assert!(spec.invocation.is_none());
         let retained = spec.retained.expect("retained Parakeet contract");
         assert_eq!(retained.domains.len(), 1);
         let StateDomainSpec::Tensor(domain) = &retained.domains[0] else {
@@ -197,6 +201,16 @@ mod tests {
         let error = parakeet_physical_state_spec(&[&retained, &atomic])
             .expect_err("mixed Parakeet state lifetimes must fail closed");
         assert!(error.to_string().contains("must be published separately"));
+    }
+
+    #[test]
+    fn atomic_graph_publishes_invocation_predictor_state() {
+        let mut atomic_stage = stage(1, StageWorkSelector::Atomic);
+        atomic_stage.progress = crate::engine::StageProgressKind::Atomic;
+        let atomic = vec![atomic_stage];
+        let spec = parakeet_physical_state_spec(&[&atomic]).unwrap();
+        assert!(spec.retained.is_none());
+        assert_eq!(spec.invocation.unwrap().domains.len(), 1);
     }
 
     #[test]
