@@ -67,6 +67,7 @@ use crate::models::architectures::vibevoice::asr::{
 use crate::models::architectures::vibevoice::tts::{
     vibevoice_tts_auto_max_frames_for_text, VibeVoiceSpeakerReference, VibeVoiceTtsGenerationParams,
 };
+use crate::models::architectures::voxtral::tts::VoxtralTtsGenerationParams;
 use crate::models::architectures::whisper::asr::{
     WhisperAudioBatchRow, WhisperPreparedWindow, WhisperWindowPreparationGeometry,
 };
@@ -4474,6 +4475,202 @@ impl RuntimeService {
         }
     }
 
+    async fn prepare_parakeet_asr_shape_for_binding(
+        &self,
+        request: EngineCoreRequest,
+        job: JobLease,
+        residency_lease: Option<&ModelResidencyLease>,
+    ) -> Result<(EngineCoreRequest, JobLease)> {
+        if request.task_type != TaskType::ASR
+            || request
+                .model_variant
+                .is_none_or(|variant| variant.family() != ModelFamily::ParakeetAsr)
+            || request.prepared_asr_execution_shape().is_some()
+        {
+            return Ok((request, job));
+        }
+        let variant = request.model_variant.expect("validated Parakeet variant");
+        let model = self
+            .model_registry
+            .get_asr_lease(variant)
+            .await
+            .ok_or_else(|| Error::ModelNotFound(format!("ASR model {variant} is not loaded")))?;
+        let model_arc = model.model_arc();
+        let crate::models::registry::NativeAsrModel::Parakeet(_) = model_arc.as_ref()
+        else {
+            return Err(Error::ModelLoadError(
+                "Parakeet registry lease crossed model family".into(),
+            ));
+        };
+        let residency = residency_lease.ok_or_else(|| {
+            Error::InferenceError("Parakeet preparation requires model residency".into())
+        })?;
+        let loaded_bundle = self.model_lifecycle.try_get_ready_bundle(residency.variant());
+        let contract = loaded_contract_for_residency(
+            residency,
+            loaded_bundle.as_deref(),
+            CapabilityKind::Asr,
+            false,
+            self.coordinator.execution_group_id(),
+            self.backend_router.context().backend_kind,
+            Some(ExecutionTargetKind::TokenEngine),
+        )?;
+        let context_limit = self.model_registry.effective_context(variant).ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "Parakeet model {variant} has no effective context"
+            ))
+        })?;
+        let prepared = self
+            .coordinator
+            .run_host_blocking_stage(&job, move || {
+                let mut request = request;
+                let (samples, sample_rate) =
+                    crate::engine::decode_request_audio_with_rate(&request)?;
+                request.install_prepared_asr_audio(variant, samples, sample_rate)?;
+                request.install_prepared_sequence_input_tokens(1, context_limit)?;
+                Ok(request)
+            })
+            .await?;
+        let retained_host_bytes = u64::try_from(retained_engine_request_input_bytes(&prepared)?)
+            .map_err(|_| Error::Overloaded("Parakeet retained input exceeds u64".into()))?;
+        job.record_materialized_usage(JobResourceObservation::host(retained_host_bytes))?;
+        let (samples, sample_rate) = prepared
+            .prepared_asr_audio_for_executor()?
+            .ok_or_else(|| Error::InferenceError("Parakeet decoded audio was lost".into()))?;
+        if sample_rate == 0 {
+            return Err(Error::InvalidInput(
+                "Parakeet sample rate must be greater than zero".into(),
+            ));
+        }
+        let resampled = samples
+            .len()
+            .checked_mul(16_000)
+            .and_then(|value| value.checked_add(sample_rate as usize - 1))
+            .map(|value| value / sample_rate as usize)
+            .ok_or_else(|| Error::Overloaded("Parakeet resampled length overflowed".into()))?;
+        let feature_frames = resampled.div_ceil(160).max(1);
+        let encoded_frames = feature_frames.div_ceil(8).max(1);
+        let retained_device_ceiling = u64::try_from(encoded_frames)
+            .ok()
+            .and_then(|frames| frames.checked_mul(1024 * 4))
+            .ok_or_else(|| Error::Overloaded("Parakeet retained tensor estimate overflowed".into()))?;
+        let materialized_elements = u64::try_from(feature_frames)
+            .ok()
+            .and_then(|frames| frames.checked_mul(1024 * 16))
+            .ok_or_else(|| Error::Overloaded("Parakeet preparation geometry overflowed".into()))?;
+        let workspace_bytes = materialized_elements
+            .checked_mul(4)
+            .ok_or_else(|| Error::Overloaded("Parakeet preparation workspace overflowed".into()))?;
+        let bridge = self.coordinator.bridge_preparation_admission(job)?;
+        let prep_spec = JobSpec {
+            request_id: prepared.id.clone(),
+            lane: CoordinatorLane::Atomic,
+            priority: prepared.priority,
+            workload_class: prepared.workload_class,
+            deadline: prepared.deadline,
+            resources: asr_encoder_retained_resources(
+                self.backend_router.context().backend_kind,
+                retained_host_bytes,
+                retained_device_ceiling,
+            )?,
+        };
+        let prep_job = match self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                prep_spec,
+                JobResourceObservation::host(retained_host_bytes),
+            )
+            .await
+        {
+            Ok(job) => job,
+            Err(failure) => return Err(failure.error),
+        };
+        let work = WorkUnit::PreSequencePreparation {
+            kind: "asr.encoder.parakeet".into(),
+        };
+        let cost = crate::engine::WorkCost::with_workspace(
+            u64::try_from(samples.len())
+                .map_err(|_| Error::Overloaded("Parakeet sample work exceeds u64".into()))?,
+            materialized_elements,
+            ResourceVector {
+                device_bytes: ResourceAmount::Known(workspace_bytes),
+                ..ResourceVector::zero()
+            },
+        );
+        let cancellation = PreparationCancellation::default();
+        let row = self.coordinator.seal_preparation_row(
+            prep_job,
+            &contract,
+            &work,
+            cost,
+            materialized_elements,
+            cancellation.clone(),
+        )?;
+        let language = prepared.asr_language_for_execution().map(str::to_owned);
+        let model_for_preparation = model.clone();
+        let mut guard = PreparationCancellationGuard {
+            cancellation,
+            armed: true,
+        };
+        let mut outcomes = self
+            .coordinator
+            .run_loaded_native_preparation_batch(vec![row], contract, work, move |live| {
+                if live != [0] {
+                    return Err(Error::InferenceError(
+                        "Parakeet encoder preparation must remain scalar".into(),
+                    ));
+                }
+                let model_arc = model_for_preparation.model_arc();
+                let crate::models::registry::NativeAsrModel::Parakeet(model) = model_arc.as_ref()
+                else {
+                    return Err(Error::InferenceError(
+                        "Parakeet preparation crossed model family".into(),
+                    ));
+                };
+                let artifact = Arc::new(model.prepare_retained_encoder(
+                    samples.as_ref(),
+                    sample_rate,
+                    language.as_deref(),
+                )?);
+                let accelerator_bytes = artifact.resident_tensor_bytes()?;
+                if accelerator_bytes > retained_device_ceiling {
+                    return Err(Error::InferenceError(format!(
+                        "Parakeet encoder artifact exceeded its admitted ceiling: {accelerator_bytes} > {retained_device_ceiling}"
+                    )));
+                }
+                Ok(vec![Ok(PreparationArtifact {
+                    retained: JobResourceObservation {
+                        host_bytes: retained_host_bytes,
+                        accelerator_bytes,
+                    },
+                    value: artifact,
+                })])
+            })
+            .await?;
+        guard.armed = false;
+        let outcome = outcomes.pop().ok_or_else(|| {
+            Error::InferenceError("Parakeet preparation returned no outcome".into())
+        })?;
+        let (artifact, bridge) = match outcome {
+            PreparationRowOutcome::Committed { artifact, bridge } => (artifact, bridge),
+            PreparationRowOutcome::Cancelled => return Err(Error::Cancelled(prepared.id.clone())),
+            PreparationRowOutcome::TimedOut => return Err(Error::Timeout(prepared.id.clone())),
+            PreparationRowOutcome::Failed(error) => return Err(error),
+        };
+        let mut prepared = prepared;
+        prepared.install_prepared_parakeet_artifact(variant, artifact.value)?;
+        let (execution, _) = self.coordinator_job_for_request(&prepared)?;
+        match self
+            .coordinator
+            .admit_observed_from_preparation(bridge, execution, artifact.retained)
+            .await
+        {
+            Ok(job) => Ok((prepared, job)),
+            Err(failure) => Err(failure.error),
+        }
+    }
+
     async fn prepare_asr_shape_for_binding(
         &self,
         request: EngineCoreRequest,
@@ -4491,6 +4688,9 @@ impl RuntimeService {
             .await?;
         let (request, job) = self
             .prepare_granite_speech_asr_shape_for_binding(request, job, residency_lease)
+            .await?;
+        let (request, job) = self
+            .prepare_parakeet_asr_shape_for_binding(request, job, residency_lease)
             .await?;
         self.prepare_lfm25_audio_asr_shape_for_binding(request, job, residency_lease)
             .await
@@ -4879,6 +5079,169 @@ impl RuntimeService {
         }
     }
 
+    async fn prepare_voxtral_tts_for_binding(
+        &self,
+        request: EngineCoreRequest,
+        job: JobLease,
+        residency_lease: Option<&ModelResidencyLease>,
+    ) -> Result<(EngineCoreRequest, JobLease)> {
+        if request.task_type != TaskType::TTS
+            || request
+                .model_variant
+                .is_none_or(|variant| variant.family() != ModelFamily::VoxtralTts)
+            || request
+                .prepared_voxtral_tts_artifact_for_executor()?
+                .is_some()
+        {
+            return Ok((request, job));
+        }
+        let variant = request
+            .model_variant
+            .expect("validated Voxtral TTS variant");
+        let model = self
+            .model_registry
+            .get_voxtral_tts_lease(variant)
+            .await
+            .ok_or_else(|| {
+                Error::ModelNotFound(format!("Voxtral TTS model {variant} is not loaded"))
+            })?;
+        let residency = residency_lease.ok_or_else(|| {
+            Error::InferenceError("Voxtral TTS preparation requires model residency".into())
+        })?;
+        let loaded_bundle = self
+            .model_lifecycle
+            .try_get_ready_bundle(residency.variant());
+        let contract = loaded_contract_for_residency(
+            residency,
+            loaded_bundle.as_deref(),
+            CapabilityKind::Tts,
+            false,
+            self.coordinator.execution_group_id(),
+            self.backend_router.context().backend_kind,
+            Some(ExecutionTargetKind::TokenEngine),
+        )?;
+        let context_limit = self
+            .model_registry
+            .effective_context(variant)
+            .ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "Voxtral TTS model {variant} has no effective context"
+                ))
+            })?;
+        let text = request
+            .tts_text_for_execution()
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| Error::InvalidInput("Voxtral TTS request is missing text".into()))?
+            .trim()
+            .to_string();
+        let voice = request
+            .tts_speaker_for_execution()
+            .map(str::to_string)
+            .or_else(|| model.available_speakers().into_iter().next())
+            .ok_or_else(|| Error::InvalidInput("Voxtral TTS has no available voice".into()))?;
+        let params = VoxtralTtsGenerationParams {
+            max_frames: request
+                .params
+                .max_tokens
+                .max(1)
+                .min(context_limit.saturating_sub(1)),
+            ..Default::default()
+        };
+        let retained_request_bytes = u64::try_from(retained_engine_request_input_bytes(&request)?)
+            .map_err(|_| Error::Overloaded("Voxtral TTS retained request exceeds u64".into()))?;
+        job.record_materialized_usage(JobResourceObservation::host(retained_request_bytes))?;
+        let bridge = self.coordinator.bridge_preparation_admission(job)?;
+        let preparation_job = self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                JobSpec {
+                    request_id: request.id.clone(),
+                    lane: CoordinatorLane::Atomic,
+                    priority: request.priority,
+                    workload_class: request.workload_class,
+                    deadline: request.deadline,
+                    resources: asr_encoder_retained_resources(
+                        self.backend_router.context().backend_kind,
+                        retained_request_bytes,
+                        512 * 1024 * 1024,
+                    )?,
+                },
+                JobResourceObservation::host(retained_request_bytes),
+            )
+            .await
+            .map_err(|failure| failure.error)?;
+        let work = WorkUnit::PreSequencePreparation {
+            kind: "tts.prepare.voxtral".into(),
+        };
+        let cost = crate::engine::WorkCost::with_workspace(
+            context_limit as u64,
+            context_limit as u64,
+            lfm25_audio_tts_preparation_workspace(
+                self.backend_router.context().backend_kind,
+                512 * 1024 * 1024,
+            ),
+        );
+        let cancellation = PreparationCancellation::default();
+        let row = self.coordinator.seal_preparation_row(
+            preparation_job,
+            &contract,
+            &work,
+            cost,
+            context_limit as u64,
+            cancellation.clone(),
+        )?;
+        let model_for_preparation = model.clone();
+        let mut cancellation_guard = PreparationCancellationGuard {
+            cancellation,
+            armed: true,
+        };
+        let mut outcomes = self
+            .coordinator
+            .run_loaded_native_preparation_batch(vec![row], contract, work, move |live| {
+                if live != [0] {
+                    return Err(Error::InferenceError(
+                        "Voxtral TTS preparation must remain scalar".into(),
+                    ));
+                }
+                let artifact = model_for_preparation.prepare_retained_artifact(&text, &voice)?;
+                let retained = retained_request_bytes
+                    .checked_add(artifact.retained_resident_bytes)
+                    .ok_or_else(|| {
+                        Error::Overloaded("Voxtral TTS retained bytes overflow".into())
+                    })?;
+                Ok(vec![Ok(PreparationArtifact {
+                    retained: JobResourceObservation::host(retained),
+                    value: artifact,
+                })])
+            })
+            .await?;
+        cancellation_guard.armed = false;
+        let (artifact, bridge) = match outcomes.pop().ok_or_else(|| {
+            Error::InferenceError("Voxtral TTS preparation returned no outcome".into())
+        })? {
+            PreparationRowOutcome::Committed { artifact, bridge } => (artifact, bridge),
+            PreparationRowOutcome::Cancelled => return Err(Error::Cancelled(request.id.clone())),
+            PreparationRowOutcome::TimedOut => return Err(Error::Timeout(request.id.clone())),
+            PreparationRowOutcome::Failed(error) => return Err(error),
+        };
+        let retained = artifact.retained;
+        let mut prepared = request;
+        prepared.install_voxtral_tts_execution_model(
+            variant,
+            model,
+            artifact.value,
+            params,
+            context_limit,
+        )?;
+        let (execution, _) = self.coordinator_job_for_request(&prepared)?;
+        self.coordinator
+            .admit_observed_from_preparation(bridge, execution, retained)
+            .await
+            .map(|job| (prepared, job))
+            .map_err(|failure| failure.error)
+    }
+
     async fn prepare_lfm25_audio_tts_for_binding(
         &self,
         request: EngineCoreRequest,
@@ -5105,6 +5468,9 @@ impl RuntimeService {
             .await?;
         let (request, job) = self
             .prepare_fish_s2_tts_for_binding(request, job, residency_lease.as_ref())
+            .await?;
+        let (request, job) = self
+            .prepare_voxtral_tts_for_binding(request, job, residency_lease.as_ref())
             .await?;
         let (mut request, job) = self
             .prepare_lfm25_audio_tts_for_binding(request, job, residency_lease.as_ref())
