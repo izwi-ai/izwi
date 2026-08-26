@@ -1114,6 +1114,17 @@ impl ModelLifecycleController {
                     )));
                 };
                 bundle_draft.seal_granite_speech_asr_preparation(model)?;
+            } else if variant.family() == crate::catalog::ModelFamily::Lfm25Audio {
+                let model = self
+                    .model_registry
+                    .get_loading_lfm25_audio_lease(variant)
+                    .await
+                    .ok_or_else(|| {
+                        Error::ModelLoadError(format!(
+                            "instantiated LFM2.5 Audio model {variant} is missing before ASR adapter sealing"
+                        ))
+                    })?;
+                bundle_draft.seal_lfm25_audio_asr_preparation(&model)?;
             } else if variant.family() == crate::catalog::ModelFamily::Voxtral
                 && self
                     .adapter_registry
@@ -1737,6 +1748,66 @@ impl ModelLifecycleController {
                         .iter()
                         .map(|contract| contract.stages.as_ref())
                         .collect::<Vec<_>>();
+                    if capability == CapabilityKind::Asr {
+                        let physical_spec = model.retained_asr_state_spec(&stage_graphs)?;
+                        let retained = self
+                            .core_engine
+                            .load_managed_model_state_with_portable_copies(
+                                model_instance_id,
+                                &physical_spec.retained,
+                                Some(physical_spec.retained_max_tokens),
+                                2,
+                            )
+                            .await?;
+                        self.model_registry.publish_effective_context(
+                            variant,
+                            retained.logical_token_reach(),
+                        )?;
+                        crate::runtime::rollout::validate_managed_state_plan_eligibility(
+                            variant,
+                            CapabilityKind::Asr,
+                            retained.state_plan_v2(),
+                        )?;
+                        let retained_uses = contracts
+                            .iter()
+                            .map(|contract| {
+                                let graph = stage_graph_fingerprint(&contract.stages)?;
+                                let retained_use = match contract.execution_profile.mode {
+                                    crate::engine::ExecutionMode::Sequence => {
+                                        RetainedStateUseV2::ExternalPaged
+                                    }
+                                    crate::engine::ExecutionMode::Atomic => {
+                                        RetainedStateUseV2::Inactive
+                                    }
+                                    _ => {
+                                        return Err(Error::ModelLoadError(
+                                            "LFM2.5 Audio ASR graph has an incompatible retained-state profile"
+                                                .into(),
+                                        ));
+                                    }
+                                };
+                                Ok((graph, retained_use))
+                            })
+                            .collect::<Result<HashMap<_, _>>>()?;
+                        let main_invocation = physical_spec.main_invocation.as_ref().ok_or_else(|| {
+                            Error::ModelLoadError(
+                                "LFM2.5 Audio ASR retained topology is missing long-form main invocation state"
+                                    .into(),
+                            )
+                        })?;
+                        let publication = self
+                            .load_invocation_workspace_publication(
+                                model_instance_id,
+                                &contracts,
+                                physical_spec.descriptor,
+                                main_invocation,
+                                Some(retained.into()),
+                                retained_uses,
+                            )
+                            .await?;
+                        state_publications.insert(capability, publication);
+                        continue;
+                    }
                     let mode = if capability == CapabilityKind::Asr {
                         crate::models::architectures::lfm25_audio::physical::Lfm25AudioStateMode::MainOnly
                     } else {
