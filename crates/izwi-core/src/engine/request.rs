@@ -2618,6 +2618,27 @@ impl EngineCoreRequest {
         Ok(Some((stage.id, cost)))
     }
 
+    fn kokoro_tts_stage_cost(
+        binding: Option<&super::ExecutionAdapterBinding>,
+        prepared: &KokoroPreparedRequest,
+    ) -> Result<Option<(StageId, WorkCost)>> {
+        let Some(stage) = binding.and_then(|binding| {
+            binding.stages.iter().find(|stage| {
+                stage.selector == super::StageWorkSelector::Atomic
+                    && stage.batch_mode == super::NativeBatchMode::Static
+            })
+        }) else {
+            return Ok(None);
+        };
+        let tensor_elements = prepared
+            .token_ids
+            .len()
+            .checked_add(prepared.ref_style.elem_count())
+            .and_then(|elements| u64::try_from(elements).ok())
+            .ok_or_else(|| Error::Overloaded("Kokoro prepared tensor size overflowed".into()))?;
+        Ok(Some((stage.id, WorkCost::new(1, tensor_elements, 0))))
+    }
+
     fn resumable_tts_prefill_stage_cost(
         binding: Option<&super::ExecutionAdapterBinding>,
         model: &Qwen3TtsModel,
@@ -3523,6 +3544,8 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
+        let prepared_stage_cost =
+            Self::kokoro_tts_stage_cost(self.execution_adapter_binding.as_ref(), &artifact)?;
         self.prepared_stage_costs.clear();
         self.prepared_sequence_input_tokens = Some(input_tokens);
         self.incremental_model_execution_ready = Some(IncrementalModelExecutionReady {
@@ -3538,6 +3561,9 @@ impl EngineCoreRequest {
             voxtral_tts_params: None,
             kokoro_tts: Some(artifact),
         });
+        if let Some((stage, cost)) = prepared_stage_cost {
+            self.install_prepared_stage_cost(stage, cost)?;
+        }
         Ok(())
     }
 
@@ -4710,6 +4736,16 @@ impl EngineCoreRequest {
             })
             .transpose()?
             .flatten();
+        let prepared_kokoro_tts_cost = self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| match (&ready.model, ready.kokoro_tts.as_ref()) {
+                (PreparedIncrementalModel::KokoroTts(_), Some(prepared)) => Some(prepared),
+                _ => None,
+            })
+            .map(|prepared| Self::kokoro_tts_stage_cost(Some(&binding), prepared))
+            .transpose()?
+            .flatten();
         self.execution_adapter_binding = Some(binding);
         if let Some((stage_id, cost)) = prepared_continuous_cost {
             self.install_prepared_stage_cost(stage_id, cost)?;
@@ -4727,6 +4763,9 @@ impl EngineCoreRequest {
             self.install_prepared_stage_cost(stage_id, cost)?;
         }
         if let Some((stage_id, cost)) = prepared_tts_prefill_cost {
+            self.install_prepared_stage_cost(stage_id, cost)?;
+        }
+        if let Some((stage_id, cost)) = prepared_kokoro_tts_cost {
             self.install_prepared_stage_cost(stage_id, cost)?;
         }
         Ok(())
