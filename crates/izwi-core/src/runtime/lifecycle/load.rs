@@ -1560,14 +1560,43 @@ impl ModelLifecycleController {
                             .map(|contract| contract.stages.as_ref())
                             .collect::<Vec<_>>();
                         let physical_spec = loaded.parakeet_physical_state_spec(&stage_graphs)?;
+                        let retained_contract = physical_spec.retained.as_ref().ok_or_else(|| {
+                            Error::ModelLoadError(
+                                "Parakeet sequence graph did not author retained recurrent state"
+                                    .into(),
+                            )
+                        })?;
+                        let retained = self
+                            .core_engine
+                            .load_retained_tensor_state(
+                                model_instance_id,
+                                retained_contract,
+                                self.realtime_asr_sequence_capacity,
+                            )
+                            .await?;
+                        let retained_uses = contracts
+                            .iter()
+                            .map(|contract| {
+                                let graph = stage_graph_fingerprint(&contract.stages)?;
+                                if contract.execution_profile.mode
+                                    != crate::engine::ExecutionMode::Sequence
+                                {
+                                    return Err(Error::ModelLoadError(
+                                        "Parakeet retained graph has an incompatible execution mode"
+                                            .into(),
+                                    ));
+                                }
+                                Ok((graph, RetainedStateUseV2::ExternalTensor))
+                            })
+                            .collect::<Result<HashMap<_, _>>>()?;
                         let publication = self
                             .load_invocation_workspace_publication(
                                 model_instance_id,
                                 &contracts,
                                 physical_spec.descriptor,
                                 &physical_spec.invocation,
-                                None,
-                                HashMap::new(),
+                                Some(retained.into()),
+                                retained_uses,
                             )
                             .await?;
                         state_publications.insert(CapabilityKind::Asr, publication);

@@ -39,6 +39,7 @@ const LFM25_AUDIO_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(
 const LFM25_AUDIO_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(24);
 const VIBEVOICE_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(26);
 const FISH_S2_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(27);
+const PARAKEET_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(28);
 pub(crate) const VOXTRAL_REALTIME_ADAPTER_ABI: AdapterAbiRevision =
     AdapterAbiRevision::new(crate::models::architectures::voxtral::VOXTRAL_REALTIME_EXECUTION_ABI);
 // Architecture ceiling: 8,192 codec frames, 1,920 output samples/frame,
@@ -882,6 +883,11 @@ fn is_lfm25_audio_physical_asr(metadata: AdapterMetadata) -> bool {
         && metadata.model_variant.family() == crate::catalog::ModelFamily::Lfm25Audio
 }
 
+fn is_parakeet_physical_asr(metadata: AdapterMetadata) -> bool {
+    metadata.capability == CapabilityKind::Asr
+        && metadata.model_variant.family() == crate::catalog::ModelFamily::ParakeetAsr
+}
+
 fn is_lfm25_audio_physical_tts(metadata: AdapterMetadata) -> bool {
     metadata.capability == CapabilityKind::Tts
         && metadata.model_variant.family() == crate::catalog::ModelFamily::Lfm25Audio
@@ -1069,6 +1075,9 @@ struct GraniteSpeechPhysicalAsrAdapterFactory;
 struct Lfm25AudioPhysicalAsrAdapterFactory;
 
 #[derive(Debug, Clone, Copy)]
+struct ParakeetPhysicalAsrAdapterFactory;
+
+#[derive(Debug, Clone, Copy)]
 struct Lfm25AudioPhysicalTtsAdapterFactory;
 
 #[derive(Debug, Clone, Copy)]
@@ -1185,6 +1194,34 @@ impl LoadedExecutionAdapterFactory for Lfm25AudioPhysicalAsrAdapterFactory {
     }
 }
 
+impl LoadedExecutionAdapterFactory for ParakeetPhysicalAsrAdapterFactory {
+    fn id(&self) -> &'static str {
+        "builtin.parakeet_asr.physical_recurrent"
+    }
+
+    fn batch_mode(&self) -> NativeBatchMode {
+        NativeBatchMode::Continuous
+    }
+
+    fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
+        is_parakeet_physical_asr(metadata)
+    }
+
+    fn create(
+        &self,
+        context: LoadedAdapterFactoryContext,
+        metadata: AdapterMetadata,
+    ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
+        Ok(Arc::new(ParakeetAsrExecutionAdapter::new(
+            context.execution_group_id,
+            context.model_instance_id,
+            metadata,
+            context.backend_kind,
+            context.max_tensor_batch_size,
+        )))
+    }
+}
+
 impl LoadedExecutionAdapterFactory for GraniteSpeechPhysicalAsrAdapterFactory {
     fn id(&self) -> &'static str {
         "builtin.granite_speech_asr.physical_sequence"
@@ -1288,6 +1325,7 @@ impl LoadedExecutionAdapterFactory for ScalarExecutionAdapterFactory {
             && !is_vibevoice_physical_asr(metadata)
             && !is_granite_speech_physical_asr(metadata)
             && !is_lfm25_audio_physical_asr(metadata)
+            && !is_parakeet_physical_asr(metadata)
             && !is_lfm25_audio_physical_tts(metadata)
             && !is_vibevoice_physical_tts(metadata)
             && !is_fish_s2_physical_tts(metadata)
@@ -1319,6 +1357,7 @@ pub(super) fn built_in_loaded_adapter_factories() -> Vec<Arc<dyn LoadedExecution
         Arc::new(VibeVoicePhysicalAsrAdapterFactory),
         Arc::new(GraniteSpeechPhysicalAsrAdapterFactory),
         Arc::new(Lfm25AudioPhysicalAsrAdapterFactory),
+        Arc::new(ParakeetPhysicalAsrAdapterFactory),
         Arc::new(Lfm25AudioPhysicalTtsAdapterFactory),
         Arc::new(VibeVoicePhysicalTtsAdapterFactory),
         Arc::new(FishS2PhysicalTtsAdapterFactory),
@@ -2788,6 +2827,153 @@ impl LoadedExecutionAdapter for Lfm25AudioTtsExecutionAdapter {
             adapter_instance_id: self.adapter_instance_id,
             adapter_abi_revision: self.adapter_abi_revision(),
             metadata: self.metadata,
+            execution_profile: profile,
+            stages: Arc::from([preparation, prefill, decode]),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ParakeetAsrExecutionAdapter {
+    execution_group_id: ExecutionGroupId,
+    model_instance_id: ModelInstanceId,
+    adapter_instance_id: AdapterInstanceId,
+    metadata: AdapterMetadata,
+    backend_kind: BackendKind,
+    max_batch_size: usize,
+}
+
+impl ParakeetAsrExecutionAdapter {
+    fn new(
+        execution_group_id: ExecutionGroupId,
+        model_instance_id: ModelInstanceId,
+        metadata: AdapterMetadata,
+        backend_kind: BackendKind,
+        max_batch_size: usize,
+    ) -> Self {
+        Self {
+            execution_group_id,
+            model_instance_id,
+            adapter_instance_id: AdapterInstanceId::new(
+                NEXT_ADAPTER_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+            ),
+            metadata,
+            backend_kind,
+            max_batch_size: max_batch_size.max(1),
+        }
+    }
+}
+
+impl LoadedExecutionAdapter for ParakeetAsrExecutionAdapter {
+    fn metadata(&self) -> AdapterMetadata {
+        self.metadata
+    }
+
+    fn adapter_instance_id(&self) -> AdapterInstanceId {
+        self.adapter_instance_id
+    }
+
+    fn adapter_abi_revision(&self) -> AdapterAbiRevision {
+        PARAKEET_ASR_ADAPTER_ABI
+    }
+
+    fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
+        let metadata = self.metadata();
+        if streaming.model_native {
+            return Err(Error::InvalidInput(format!(
+                "Model {} has no native streaming ASR contract",
+                metadata.model_variant
+            )));
+        }
+        let width = u64::try_from(self.max_batch_size)
+            .map_err(|_| Error::Overloaded("Parakeet batch width exceeds u64".into()))?;
+        let workspace_per_row =
+            crate::models::architectures::parakeet::asr::PARAKEET_RETAINED_WORKSPACE_PER_ROW_BYTES;
+        let batch_workspace = workspace_per_row
+            .checked_mul(width)
+            .ok_or_else(|| Error::Overloaded("Parakeet batch workspace overflowed".into()))?;
+
+        let mut profile = scalar_execution_profile(metadata, self.backend_kind, false);
+        profile.mode = ExecutionMode::Sequence;
+        profile.prefill = PrefillMode::Incremental;
+        profile.incremental_decode = true;
+        profile.prefill_batch = NativeBatchMode::Static;
+        profile.decode_batch = NativeBatchMode::Continuous;
+        // Parakeet retains recurrent tensors, not attention pages.
+        profile.cache_mode = CacheMode::None;
+        profile.cache_namespace = None;
+        profile.kv_dtype = "none".into();
+        profile.cancellation = CancellationGranularity::SequenceStep;
+        profile.concurrency = ConcurrencyClass::Batchable;
+        profile.recompute_safe = true;
+        profile.cache_release_safe = true;
+        profile.prefix_reuse_safe = false;
+        profile.max_batch_size = self.max_batch_size;
+        profile.resolved_from_loaded_model = true;
+
+        let mut preparation = StageDescriptor::from_execution_profile(
+            StageId::new(0),
+            "asr.encoder.parakeet",
+            &profile,
+            NativeBatchMode::None,
+        );
+        preparation.selector = StageWorkSelector::PreSequencePreparation;
+        preparation.progress = StageProgressKind::Atomic;
+        preparation.membership_safe_point = MembershipSafePoint::OperationBoundary;
+        preparation.max_batch_size = 1;
+        preparation.max_work_units = 64 * 1024 * 1024;
+        preparation.max_workspace_bytes = 4 * 1024 * 1024 * 1024;
+        preparation.concurrency = ConcurrencyClass::Exclusive;
+        preparation.shape_policy = StageShapePolicy::Exact;
+        preparation.output_visibility = OutputVisibility::AfterQuantumCommit;
+
+        let selection = ClockedStateSelection::new(
+            crate::models::architectures::parakeet::asr::PARAKEET_PREDICTOR_STATE_GROUP,
+            StateClock::DecoderTokens,
+        )?;
+        let mut prefill = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            crate::models::architectures::parakeet::asr::PARAKEET_RETAINED_PREFILL_STAGE,
+            &profile,
+            NativeBatchMode::Static,
+        );
+        prefill.selector = StageWorkSelector::SequencePrefill;
+        prefill.progress = StageProgressKind::Iterative;
+        prefill.membership_safe_point = MembershipSafePoint::QuantumBoundary;
+        prefill.max_work_units = width;
+        prefill.workspace_per_row_bytes = workspace_per_row;
+        prefill.max_workspace_bytes = batch_workspace;
+        prefill.shape_policy = StageShapePolicy::Ragged;
+        prefill.max_padding_basis_points = 0;
+        prefill.retained_state_selections = Some(vec![selection.clone()]);
+        prefill.output_visibility = OutputVisibility::AfterQuantumCommit;
+
+        let mut decode = StageDescriptor::from_execution_profile(
+            StageId::new(2),
+            crate::models::architectures::parakeet::asr::PARAKEET_RETAINED_DECODE_STAGE,
+            &profile,
+            NativeBatchMode::Continuous,
+        );
+        decode.selector = StageWorkSelector::SequenceDecode;
+        decode.progress = StageProgressKind::Iterative;
+        decode.membership_safe_point = MembershipSafePoint::QuantumBoundary;
+        decode.max_work_units = width;
+        decode.workspace_per_row_bytes = workspace_per_row;
+        decode.max_workspace_bytes = batch_workspace;
+        decode.shape_policy = StageShapePolicy::Ragged;
+        decode.max_padding_basis_points = 0;
+        decode.retained_state_selections = Some(vec![selection]);
+        decode.output_visibility = OutputVisibility::AfterQuantumCommit;
+
+        preparation.validate()?;
+        prefill.validate()?;
+        decode.validate()?;
+        Ok(LoadedExecutionContract {
+            execution_group_id: self.execution_group_id,
+            model_instance_id: self.model_instance_id,
+            adapter_instance_id: self.adapter_instance_id(),
+            adapter_abi_revision: self.adapter_abi_revision(),
+            metadata,
             execution_profile: profile,
             stages: Arc::from([preparation, prefill, decode]),
         })
@@ -5680,10 +5866,21 @@ mod tests {
             .contract(StreamingRequirements::transport_only())
             .expect("offline ASR must expose atomic executor progress");
         assert_eq!(transport.metadata.streaming_mode, StreamingMode::None);
-        assert_eq!(transport.execution_profile.mode, ExecutionMode::Atomic);
+        assert_eq!(transport.execution_profile.mode, ExecutionMode::Sequence);
+        assert_eq!(transport.execution_profile.cache_mode, CacheMode::None);
+        assert_eq!(transport.stages.len(), 3);
+        assert_eq!(transport.stages[0].batch_mode, NativeBatchMode::None);
+        assert_eq!(transport.stages[1].batch_mode, NativeBatchMode::Static);
+        assert_eq!(transport.stages[2].batch_mode, NativeBatchMode::Continuous);
         assert_eq!(
-            transport.stages[0].output_visibility,
-            OutputVisibility::IncrementalCommitted
+            transport.stages[2].retained_state_selections.as_deref(),
+            Some(
+                &[ClockedStateSelection::new(
+                    crate::models::architectures::parakeet::asr::PARAKEET_PREDICTOR_STATE_GROUP,
+                    StateClock::DecoderTokens,
+                )
+                .unwrap()][..]
+            )
         );
     }
 

@@ -160,7 +160,11 @@ const fn family_inference_state_policy(family: ModelFamily) -> FamilyInferenceSt
             tts: Invocation,
             ..FamilyInferenceStatePolicy::STATELESS
         },
-        ParakeetAsr | NemotronAsr | Voxtral => FamilyInferenceStatePolicy {
+        ParakeetAsr => FamilyInferenceStatePolicy {
+            asr: RetainedAndInvocation,
+            ..FamilyInferenceStatePolicy::STATELESS
+        },
+        NemotronAsr | Voxtral => FamilyInferenceStatePolicy {
             asr: Invocation,
             ..FamilyInferenceStatePolicy::STATELESS
         },
@@ -858,7 +862,7 @@ mod tests {
                 .require(CapabilityKind::Asr, ModelVariant::ParakeetTdt06BV3)
                 .expect("parakeet asr adapter")
                 .state_requirement,
-            InferenceStateRequirement::Invocation
+            InferenceStateRequirement::RetainedAndInvocation
         );
         assert_eq!(
             registry

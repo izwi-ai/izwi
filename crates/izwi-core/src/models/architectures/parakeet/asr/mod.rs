@@ -32,7 +32,7 @@ use crate::tokenizer::Tokenizer;
 
 use decode::decode_tokens;
 use nemo::{ensure_parakeet_artifacts, ParakeetArtifacts};
-pub(crate) use physical::ParakeetPhysicalStateSpec;
+pub(crate) use physical::{ParakeetPhysicalStateSpec, PARAKEET_PREDICTOR_STATE_GROUP};
 use preprocessor::ParakeetPreprocessor;
 
 const SAMPLE_RATE: u32 = 16_000;
@@ -47,6 +47,9 @@ const CONV_KERNEL_1D: usize = 9;
 const SUBSAMPLING_FACTOR: usize = 8;
 const FRAME_HOP_MS: f32 = 10.0;
 const DEFAULT_MAX_SYMBOLS: usize = 10;
+pub(crate) const PARAKEET_RETAINED_PREFILL_STAGE: &str = "asr.prefill.parakeet.predictor";
+pub(crate) const PARAKEET_RETAINED_DECODE_STAGE: &str = "asr.decode.parakeet.joint";
+pub(crate) const PARAKEET_RETAINED_WORKSPACE_PER_ROW_BYTES: u64 = 16 * 1024 * 1024;
 
 pub struct ParakeetAsrTranscriptionOutput {
     pub text: String,
@@ -264,20 +267,42 @@ impl ParakeetAsrModel {
     }
 
     pub(crate) fn start_retained_decode(&self) -> Result<ParakeetRetainedDecodeState> {
-        let mut predictor = self.new_predictor_batch_state(1)?;
-        let predictor_out = self.predictor_step_batch(&[self.blank_idx], &mut predictor)?;
-        Ok(ParakeetRetainedDecodeState {
-            predictor,
-            predictor_out,
-            t: 0,
-            last_emit_t: usize::MAX,
-            emit_count_at_t: 0,
-            guard_steps: 0,
-            token_ids: Vec::new(),
-            assembled: String::new(),
-            counters: ParakeetDecodeCounters::default(),
-            finished: false,
-        })
+        self.start_retained_decode_batch(1)?
+            .pop()
+            .ok_or_else(|| Error::InferenceError("Parakeet B1 prefill produced no row".into()))
+    }
+
+    pub(crate) fn start_retained_decode_batch(
+        &self,
+        batch: usize,
+    ) -> Result<Vec<ParakeetRetainedDecodeState>> {
+        let mut cohort = self.new_predictor_batch_state(batch)?;
+        let labels = vec![self.blank_idx; batch];
+        let outputs = self.predictor_step_batch(&labels, &mut cohort)?;
+        let mut predictors = (0..batch)
+            .map(|_| self.new_predictor_batch_state(1))
+            .collect::<Result<Vec<_>>>()?;
+        let mut targets = predictors.iter_mut().collect::<Vec<_>>();
+        cohort.scatter_rows(&mut targets)?;
+        drop(targets);
+        predictors
+            .into_iter()
+            .enumerate()
+            .map(|(index, predictor)| {
+                Ok(ParakeetRetainedDecodeState {
+                    predictor,
+                    predictor_out: outputs.narrow(0, index, 1)?.contiguous()?,
+                    t: 0,
+                    last_emit_t: usize::MAX,
+                    emit_count_at_t: 0,
+                    guard_steps: 0,
+                    token_ids: Vec::new(),
+                    assembled: String::new(),
+                    counters: ParakeetDecodeCounters::default(),
+                    finished: false,
+                })
+            })
+            .collect()
     }
 
     pub(crate) fn hydrate_retained_decode_physical_state(

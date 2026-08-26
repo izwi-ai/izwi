@@ -37,10 +37,13 @@ use crate::models::architectures::vibevoice::asr::VibeVoiceAsrPreparedArtifact;
 use crate::models::architectures::vibevoice::tts::{
     VibeVoiceTtsGenerationParams, VibeVoiceTtsPreparedArtifact,
 };
+use crate::models::architectures::voxtral::tts::retained::VoxtralTtsPreparedArtifact;
+use crate::models::architectures::voxtral::tts::VoxtralTtsGenerationParams;
 use crate::models::architectures::whisper::asr::WhisperPreparedWindow;
 use crate::models::registry::{
     AsrModelLease, ChatModelLease, FishS2TtsModelLease, Lfm25AudioModelLease, NativeAsrModel,
     NativeChatModel, NativeChatPreparedPrompt, QwenTtsModelLease, VibeVoiceTtsModelLease,
+    VoxtralTtsModelLease,
 };
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRequestConfig, ChatRole};
 use crate::runtime::audio_io::{
@@ -355,6 +358,7 @@ enum PreparedIncrementalModel {
     QwenTts(QwenTtsModelLease),
     VibeVoiceTts(VibeVoiceTtsModelLease),
     FishS2Tts(FishS2TtsModelLease),
+    VoxtralTts(VoxtralTtsModelLease),
 }
 
 impl fmt::Debug for PreparedIncrementalModel {
@@ -366,6 +370,7 @@ impl fmt::Debug for PreparedIncrementalModel {
             Self::QwenTts(model) => write!(formatter, "QwenTts({:p})", &**model),
             Self::VibeVoiceTts(model) => write!(formatter, "VibeVoiceTts({:p})", &**model),
             Self::FishS2Tts(model) => write!(formatter, "FishS2Tts({:p})", &**model),
+            Self::VoxtralTts(model) => write!(formatter, "VoxtralTts({:p})", &**model),
         }
     }
 }
@@ -380,6 +385,8 @@ pub(super) struct IncrementalModelExecutionReady {
     vibevoice_tts_params: Option<VibeVoiceTtsGenerationParams>,
     fish_s2_tts: Option<Arc<FishS2PreparedArtifact>>,
     fish_s2_tts_params: Option<FishS2GenerationParams>,
+    voxtral_tts: Option<Arc<VoxtralTtsPreparedArtifact>>,
+    voxtral_tts_params: Option<VoxtralTtsGenerationParams>,
 }
 
 #[derive(Debug, Clone)]
@@ -2383,6 +2390,8 @@ impl EngineCoreRequest {
             vibevoice_tts_params: None,
             fish_s2_tts: None,
             fish_s2_tts_params: None,
+            voxtral_tts: None,
+            voxtral_tts_params: None,
         });
         if let Some((stage_id, cost)) = prepared_continuous_cost {
             self.install_prepared_stage_cost(stage_id, cost)?;
@@ -2414,6 +2423,8 @@ impl EngineCoreRequest {
             vibevoice_tts_params: None,
             fish_s2_tts: None,
             fish_s2_tts_params: None,
+            voxtral_tts: None,
+            voxtral_tts_params: None,
         });
         Ok(())
     }
@@ -3337,6 +3348,8 @@ impl EngineCoreRequest {
             vibevoice_tts_params: None,
             fish_s2_tts: None,
             fish_s2_tts_params: None,
+            voxtral_tts: None,
+            voxtral_tts_params: None,
         });
         for (stage, cost) in stage_costs {
             self.install_prepared_stage_cost(stage, cost)?;
@@ -3380,6 +3393,8 @@ impl EngineCoreRequest {
             vibevoice_tts_params: Some(params),
             fish_s2_tts: None,
             fish_s2_tts_params: None,
+            voxtral_tts: None,
+            voxtral_tts_params: None,
         });
         Ok(())
     }
@@ -3416,6 +3431,46 @@ impl EngineCoreRequest {
             vibevoice_tts_params: None,
             fish_s2_tts: Some(artifact),
             fish_s2_tts_params: Some(params),
+            voxtral_tts: None,
+            voxtral_tts_params: None,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn install_voxtral_tts_execution_model(
+        &mut self,
+        model_variant: ModelVariant,
+        model: VoxtralTtsModelLease,
+        artifact: Arc<VoxtralTtsPreparedArtifact>,
+        params: VoxtralTtsGenerationParams,
+        max_sequence_tokens: usize,
+    ) -> Result<()> {
+        if self.task_type != TaskType::TTS
+            || self.model_variant != Some(model_variant)
+            || model_variant.family() != ModelFamily::VoxtralTts
+            || artifact.prompt_tokens == 0
+            || artifact.prompt_tokens >= max_sequence_tokens
+            || params.max_frames == 0
+        {
+            return Err(Error::InvalidInput(format!(
+                "Voxtral TTS request {} preparation does not match its routed model/context",
+                self.id
+            )));
+        }
+        self.prepared_stage_costs.clear();
+        self.prepared_sequence_input_tokens = Some(artifact.prompt_tokens);
+        self.params.max_tokens = params.max_frames;
+        self.incremental_model_execution_ready = Some(IncrementalModelExecutionReady {
+            model_variant,
+            model: PreparedIncrementalModel::VoxtralTts(model),
+            qwen_tts: None,
+            lfm25_audio_tts: None,
+            vibevoice_tts: None,
+            vibevoice_tts_params: None,
+            fish_s2_tts: None,
+            fish_s2_tts_params: None,
+            voxtral_tts: Some(artifact),
+            voxtral_tts_params: Some(params),
         });
         Ok(())
     }
@@ -3513,6 +3568,8 @@ impl EngineCoreRequest {
             vibevoice_tts_params: None,
             fish_s2_tts: None,
             fish_s2_tts_params: None,
+            voxtral_tts: None,
+            voxtral_tts_params: None,
         });
         if let Some((stage_id, cost)) = prepared_continuous_cost {
             self.install_prepared_stage_cost(stage_id, cost)?;
@@ -3717,6 +3774,29 @@ impl EngineCoreRequest {
                 )));
             }
         }
+        if matches!(&ready.model, PreparedIncrementalModel::VoxtralTts(_)) {
+            let prepared = ready.voxtral_tts.as_ref().ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "Voxtral TTS request {} is missing its prepared prompt",
+                    self.id
+                ))
+            })?;
+            let params = ready.voxtral_tts_params.as_ref().ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "Voxtral TTS request {} is missing its sealed generation geometry",
+                    self.id
+                ))
+            })?;
+            if ready.model_variant.family() != ModelFamily::VoxtralTts
+                || self.prepared_sequence_input_tokens != Some(prepared.prompt_tokens)
+                || self.params.max_tokens != params.max_frames
+            {
+                return Err(Error::InvalidInput(format!(
+                    "Voxtral TTS request {} changed after preparation",
+                    self.id
+                )));
+            }
+        }
         match (&ready.model, self.task_type) {
             (PreparedIncrementalModel::Asr(_), TaskType::ASR) if ready.qwen_tts.is_none() => Ok(()),
             (PreparedIncrementalModel::Lfm25AudioAsr(_), TaskType::ASR)
@@ -3752,6 +3832,13 @@ impl EngineCoreRequest {
             {
                 Ok(())
             }
+            (PreparedIncrementalModel::VoxtralTts(_), TaskType::TTS)
+                if ready.model_variant.family() == ModelFamily::VoxtralTts
+                    && ready.voxtral_tts.is_some()
+                    && ready.voxtral_tts_params.is_some() =>
+            {
+                Ok(())
+            }
             _ => Err(Error::InvalidInput(format!(
                 "Request {} carries incremental preparation for a different task",
                 self.id
@@ -3770,7 +3857,8 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::Lfm25AudioTts(_)
                 | PreparedIncrementalModel::QwenTts(_) => None,
                 PreparedIncrementalModel::VibeVoiceTts(_)
-                | PreparedIncrementalModel::FishS2Tts(_) => None,
+                | PreparedIncrementalModel::FishS2Tts(_)
+                | PreparedIncrementalModel::VoxtralTts(_) => None,
             }))
     }
 
@@ -3785,7 +3873,8 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::Lfm25AudioTts(_)
                 | PreparedIncrementalModel::QwenTts(_) => None,
                 PreparedIncrementalModel::VibeVoiceTts(_)
-                | PreparedIncrementalModel::FishS2Tts(_) => None,
+                | PreparedIncrementalModel::FishS2Tts(_)
+                | PreparedIncrementalModel::VoxtralTts(_) => None,
             }))
     }
 
@@ -3802,7 +3891,8 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::Lfm25AudioTts(_)
                 | PreparedIncrementalModel::QwenTts(_) => None,
                 PreparedIncrementalModel::VibeVoiceTts(_)
-                | PreparedIncrementalModel::FishS2Tts(_) => None,
+                | PreparedIncrementalModel::FishS2Tts(_)
+                | PreparedIncrementalModel::VoxtralTts(_) => None,
             }))
     }
 
@@ -3895,6 +3985,39 @@ impl EngineCoreRequest {
             .and_then(|ready| ready.fish_s2_tts_params.clone()))
     }
 
+    pub(crate) fn prepared_voxtral_tts_model_lease_for_executor(
+        &self,
+    ) -> Result<Option<VoxtralTtsModelLease>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| match &ready.model {
+                PreparedIncrementalModel::VoxtralTts(model) => Some(model.clone()),
+                _ => None,
+            }))
+    }
+
+    pub(crate) fn prepared_voxtral_tts_artifact_for_executor(
+        &self,
+    ) -> Result<Option<Arc<VoxtralTtsPreparedArtifact>>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| ready.voxtral_tts.clone()))
+    }
+
+    pub(crate) fn voxtral_tts_generation_params_for_executor(
+        &self,
+    ) -> Result<Option<VoxtralTtsGenerationParams>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| ready.voxtral_tts_params))
+    }
+
     pub(crate) fn prepared_qwen_tts_model_for_executor(
         &self,
     ) -> Result<Option<Arc<Qwen3TtsModel>>> {
@@ -3908,7 +4031,8 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::Lfm25AudioAsr(_)
                 | PreparedIncrementalModel::Lfm25AudioTts(_) => None,
                 PreparedIncrementalModel::VibeVoiceTts(_)
-                | PreparedIncrementalModel::FishS2Tts(_) => None,
+                | PreparedIncrementalModel::FishS2Tts(_)
+                | PreparedIncrementalModel::VoxtralTts(_) => None,
             }))
     }
 
@@ -3925,7 +4049,8 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::Lfm25AudioAsr(_)
                 | PreparedIncrementalModel::Lfm25AudioTts(_) => None,
                 PreparedIncrementalModel::VibeVoiceTts(_)
-                | PreparedIncrementalModel::FishS2Tts(_) => None,
+                | PreparedIncrementalModel::FishS2Tts(_)
+                | PreparedIncrementalModel::VoxtralTts(_) => None,
             }))
     }
 
@@ -4355,7 +4480,8 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::Lfm25AudioTts(_)
                 | PreparedIncrementalModel::QwenTts(_) => None,
                 PreparedIncrementalModel::VibeVoiceTts(_)
-                | PreparedIncrementalModel::FishS2Tts(_) => None,
+                | PreparedIncrementalModel::FishS2Tts(_)
+                | PreparedIncrementalModel::VoxtralTts(_) => None,
             })
             .filter(|_| self.uses_asr_retained_sequence())
             .map(|model| Self::continuous_asr_stage_cost(Some(&binding), model))
