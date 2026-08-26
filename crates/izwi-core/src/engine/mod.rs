@@ -2317,10 +2317,13 @@ impl Engine {
             Error::InvalidInput("realtime ASR session is missing a model variant".into())
         })?;
         if request.task_type != TaskType::ASR
-            || variant.family() != crate::catalog::ModelFamily::Voxtral
+            || !matches!(
+                variant.family(),
+                crate::catalog::ModelFamily::Voxtral | crate::catalog::ModelFamily::NemotronAsr
+            )
         {
             return Err(Error::InvalidInput(
-                "Engine realtime ASR sessions currently require a Voxtral ASR request".into(),
+                "Engine realtime ASR sessions require an authenticated realtime ASR family".into(),
             ));
         }
         request.enable_realtime_asr_ingress()?;

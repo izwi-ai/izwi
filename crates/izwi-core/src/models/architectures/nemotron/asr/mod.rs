@@ -16,7 +16,9 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use tracing::info;
 
-use crate::backends::state::{PhysicalStateTransactionId, StateComponentValue};
+use crate::backends::state::{
+    PhysicalStateTransactionId, StateComponentValue, StateDomainSnapshot, TensorStateArena,
+};
 use crate::backends::{DTypeSelection, DTypeSelectionRequest, DeviceProfile};
 use crate::catalog::ModelFamily;
 use crate::engine::{InvocationTensorLease, RetainedTensorStateRuntimeV2, StageDescriptor};
@@ -71,6 +73,42 @@ const SUPPORTED_TARGET_LANGS: &[&str] = &[
     "hu-HU", "ro-RO", "et-EE", "el-GR", "lt-LT", "lv-LV", "mt-MT", "sl-SI", "he-IL", "th-TH",
     "nn-NO",
 ];
+
+pub(crate) fn authenticate_realtime_execution_binding(
+    binding: &crate::engine::ExecutionAdapterBinding,
+) -> Result<()> {
+    if binding.model_variant.family() != ModelFamily::NemotronAsr
+        || binding.capability_id != "realtime_asr"
+        || binding.adapter_abi_revision != crate::engine::AdapterAbiRevision::new(25)
+        || binding.stages.len() != 3
+    {
+        return Err(Error::InvalidInput(
+            "realtime ASR request is not bound to the exact Nemotron execution ABI".into(),
+        ));
+    }
+    let expected = [
+        (
+            NEMOTRON_REALTIME_FALLBACK_STAGE,
+            crate::engine::StageWorkSelector::Atomic,
+        ),
+        (
+            NEMOTRON_REALTIME_ENCODER_STAGE,
+            crate::engine::StageWorkSelector::RealtimePreparation,
+        ),
+        (
+            NEMOTRON_REALTIME_RNNT_STAGE,
+            crate::engine::StageWorkSelector::RealtimeDecodeContinuation,
+        ),
+    ];
+    for (stage, (name, selector)) in binding.stages.iter().zip(expected) {
+        if stage.name != name || stage.selector != selector {
+            return Err(Error::InvalidInput(
+                "Nemotron realtime execution graph differs from its sealed ABI".into(),
+            ));
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 pub struct NemotronAsrTranscriptionOutput {
@@ -1227,20 +1265,86 @@ fn nemotron_realtime_state_contract(
     Ok(contract)
 }
 
+pub(crate) trait NemotronRetainedStateRuntime {
+    fn read_base(
+        &self,
+        transaction: PhysicalStateTransactionId,
+        domain: StateDomainId,
+    ) -> Result<Option<StateDomainSnapshot>>;
+    fn stage(
+        &self,
+        transaction: PhysicalStateTransactionId,
+        domain: StateDomainId,
+        expected_cursor: u64,
+        target_cursor: u64,
+        components: Vec<StateComponentValue>,
+    ) -> Result<()>;
+}
+
+impl NemotronRetainedStateRuntime for RetainedTensorStateRuntimeV2 {
+    fn read_base(
+        &self,
+        transaction: PhysicalStateTransactionId,
+        domain: StateDomainId,
+    ) -> Result<Option<StateDomainSnapshot>> {
+        self.read_transaction_base(transaction, domain)
+    }
+    fn stage(
+        &self,
+        transaction: PhysicalStateTransactionId,
+        domain: StateDomainId,
+        expected_cursor: u64,
+        target_cursor: u64,
+        components: Vec<StateComponentValue>,
+    ) -> Result<()> {
+        self.stage_replace(
+            transaction,
+            domain,
+            expected_cursor,
+            target_cursor,
+            components,
+        )
+    }
+}
+
+impl NemotronRetainedStateRuntime for TensorStateArena {
+    fn read_base(
+        &self,
+        transaction: PhysicalStateTransactionId,
+        domain: StateDomainId,
+    ) -> Result<Option<StateDomainSnapshot>> {
+        self.read_transaction_base(transaction, domain)
+    }
+    fn stage(
+        &self,
+        transaction: PhysicalStateTransactionId,
+        domain: StateDomainId,
+        expected_cursor: u64,
+        target_cursor: u64,
+        components: Vec<StateComponentValue>,
+    ) -> Result<()> {
+        self.stage_replace(
+            transaction,
+            domain,
+            expected_cursor,
+            target_cursor,
+            components,
+        )
+    }
+}
+
 fn physical_components(
-    runtime: &RetainedTensorStateRuntimeV2,
+    runtime: &impl NemotronRetainedStateRuntime,
     transaction: PhysicalStateTransactionId,
     domain: StateDomainId,
     expected_components: usize,
 ) -> Result<Vec<Option<Tensor>>> {
-    let snapshot = runtime
-        .read_transaction_base(transaction, domain)?
-        .ok_or_else(|| {
-            Error::InferenceError(format!(
-                "Nemotron physical domain {} has no committed snapshot",
-                domain.get()
-            ))
-        })?;
+    let snapshot = runtime.read_base(transaction, domain)?.ok_or_else(|| {
+        Error::InferenceError(format!(
+            "Nemotron physical domain {} has no committed snapshot",
+            domain.get()
+        ))
+    })?;
     if snapshot.components.len() != expected_components {
         return Err(Error::InferenceError(format!(
             "Nemotron physical domain {} expected {} components, found {}",
@@ -1266,14 +1370,14 @@ fn physical_components(
 }
 
 fn stage_physical_components(
-    runtime: &RetainedTensorStateRuntimeV2,
+    runtime: &impl NemotronRetainedStateRuntime,
     transaction: PhysicalStateTransactionId,
     domain: StateDomainId,
     target_cursor: u64,
     tensors: Vec<Option<Tensor>>,
 ) -> Result<()> {
     let expected_cursor = runtime
-        .read_transaction_base(transaction, domain)?
+        .read_base(transaction, domain)?
         .map_or(0, |snapshot| snapshot.cursor);
     let values = tensors
         .into_iter()
@@ -1287,7 +1391,7 @@ fn stage_physical_components(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    runtime.stage_replace(transaction, domain, expected_cursor, target_cursor, values)
+    runtime.stage(transaction, domain, expected_cursor, target_cursor, values)
 }
 
 fn estimate_realtime_resource_reservation(
@@ -1607,7 +1711,7 @@ impl NemotronAsrModel {
     pub(crate) fn hydrate_realtime_physical_state(
         &self,
         state: &mut NemotronStreamingState,
-        runtime: &RetainedTensorStateRuntimeV2,
+        runtime: &impl NemotronRetainedStateRuntime,
         transaction: PhysicalStateTransactionId,
     ) -> Result<()> {
         self.hydrate_realtime_encoder_physical_state(state, runtime, transaction)?;
@@ -1617,7 +1721,7 @@ impl NemotronAsrModel {
     pub(crate) fn hydrate_realtime_encoder_physical_state(
         &self,
         state: &mut NemotronStreamingState,
-        runtime: &RetainedTensorStateRuntimeV2,
+        runtime: &impl NemotronRetainedStateRuntime,
         transaction: PhysicalStateTransactionId,
     ) -> Result<()> {
         let feature =
@@ -1650,7 +1754,7 @@ impl NemotronAsrModel {
     pub(crate) fn hydrate_realtime_rnnt_physical_state(
         &self,
         state: &mut NemotronStreamingState,
-        runtime: &RetainedTensorStateRuntimeV2,
+        runtime: &impl NemotronRetainedStateRuntime,
         transaction: PhysicalStateTransactionId,
     ) -> Result<()> {
         let rnnt = physical_components(runtime, transaction, NEMOTRON_RNNT_STATE_DOMAIN, 6)?;
@@ -1666,7 +1770,7 @@ impl NemotronAsrModel {
     pub(crate) fn stage_realtime_physical_state(
         &self,
         state: &mut NemotronStreamingState,
-        runtime: &RetainedTensorStateRuntimeV2,
+        runtime: &impl NemotronRetainedStateRuntime,
         transaction: PhysicalStateTransactionId,
         target_cursor: u64,
     ) -> Result<()> {
@@ -1677,7 +1781,7 @@ impl NemotronAsrModel {
     pub(crate) fn stage_realtime_encoder_physical_state(
         &self,
         state: &mut NemotronStreamingState,
-        runtime: &RetainedTensorStateRuntimeV2,
+        runtime: &impl NemotronRetainedStateRuntime,
         transaction: PhysicalStateTransactionId,
         target_cursor: u64,
     ) -> Result<()> {
@@ -1718,7 +1822,7 @@ impl NemotronAsrModel {
     pub(crate) fn stage_realtime_rnnt_physical_state(
         &self,
         state: &mut NemotronStreamingState,
-        runtime: &RetainedTensorStateRuntimeV2,
+        runtime: &impl NemotronRetainedStateRuntime,
         transaction: PhysicalStateTransactionId,
         target_cursor: u64,
     ) -> Result<()> {

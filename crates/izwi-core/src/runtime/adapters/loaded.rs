@@ -1725,7 +1725,7 @@ impl LoadedExecutionAdapter for NemotronRealtimeExecutionAdapter {
         fallback.retained_state_selections = Some(vec![
             ClockedStateSelection::new(
                 crate::models::architectures::nemotron::asr::NEMOTRON_ENCODER_STATE_GROUP,
-                StateClock::AudioFrames,
+                StateClock::Custom("realtime_operation_revision".into()),
             )?,
             ClockedStateSelection::new(
                 crate::models::architectures::nemotron::asr::NEMOTRON_RNNT_STATE_GROUP,
@@ -1748,7 +1748,7 @@ impl LoadedExecutionAdapter for NemotronRealtimeExecutionAdapter {
         encoder.shape_policy = StageShapePolicy::Exact;
         encoder.retained_state_selections = Some(vec![ClockedStateSelection::new(
             crate::models::architectures::nemotron::asr::NEMOTRON_ENCODER_STATE_GROUP,
-            StateClock::AudioFrames,
+            StateClock::Custom("realtime_operation_revision".into()),
         )?]);
 
         let mut rnnt = StageDescriptor::from_execution_profile(

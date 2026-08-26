@@ -1,9 +1,13 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Instant;
 
 use crate::model::ModelVariant;
 use crate::models::architectures::lfm25_audio::asr_retained::Lfm25AudioAsrRetainedState;
 use crate::models::architectures::lfm25_audio::tts_retained::Lfm25AudioTtsRetainedState;
+use crate::models::architectures::nemotron::asr::{
+    NemotronRealtimePreparedChunk, NemotronStreamingState,
+};
 use crate::models::architectures::qwen3::tts::{
     PhysicalTtsDecodeState, PhysicalTtsPrefillState, Qwen3TtsModel,
 };
@@ -72,6 +76,28 @@ pub(super) struct ActiveVoxtralRealtime {
     pub(super) last_tokens_generated: usize,
     pub(super) stream_sequence: usize,
     pub(super) input_sample_rate: u32,
+}
+
+#[derive(Clone)]
+pub(super) struct ActiveNemotronRealtime {
+    pub(super) variant: ModelVariant,
+    pub(super) model: AsrModelLease,
+    pub(super) state: NemotronStreamingState,
+    pub(super) prepared: VecDeque<NemotronRealtimePreparedChunk>,
+    pub(super) stream_sequence: usize,
+    pub(super) input_sample_rate: u32,
+}
+
+pub(super) struct PendingNemotronRealtimeQuantum {
+    pub(super) session: crate::engine::SessionKey,
+    pub(super) active: ActiveNemotronRealtime,
+    pub(super) checkpoint: ActiveNemotronRealtime,
+    pub(super) finished: bool,
+}
+
+pub(super) struct PreparedNemotronRealtimeQuantum {
+    pub(super) session: crate::engine::SessionKey,
+    pub(super) replacement: Option<ActiveNemotronRealtime>,
 }
 
 /// A Voxtral host/cache transaction that has completed model execution but is

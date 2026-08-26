@@ -4,6 +4,9 @@ use crate::error::{Error, Result};
 use crate::models::architectures::lfm25_audio::asr_retained::{
     Lfm25AudioAsrDecodeStep, Lfm25AudioAsrQuantumCheckpoint,
 };
+use crate::models::architectures::nemotron::asr::{
+    NemotronRealtimeBatchInput, NemotronRealtimeDecodeBatchRow,
+};
 use crate::models::architectures::vibevoice::asr::VibeVoiceAsrRetainedTokenizerQuantum;
 use crate::models::architectures::vibevoice::asr::{
     VibeVoiceAsrPreparedTokenizerSpan, VibeVoiceAsrRetainedPrefillBatchRow,
@@ -29,7 +32,9 @@ use super::super::{
     SessionKey, WorkUnit,
 };
 use super::audio::{decode_request_audio_with_rate, AsrChunkTranscription};
-use super::state::{ActiveAsrDecode, ActiveLfm25AsrDecode, ActiveVoxtralRealtime};
+use super::state::{
+    ActiveAsrDecode, ActiveLfm25AsrDecode, ActiveNemotronRealtime, ActiveVoxtralRealtime,
+};
 use super::{
     ExecutorOutput, ExecutorPhaseTiming, ExecutorStateLease, ModelSessionResult, NativeExecutor,
 };
@@ -583,6 +588,590 @@ fn with_nemotron_offline_state<T>(
 }
 
 impl NativeExecutor {
+    pub(super) fn nemotron_realtime_batch_with_managed(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+        mut managed: Vec<super::RetainedRowManagedState>,
+    ) -> Result<Vec<ModelSessionResult>> {
+        if requests.len() != scheduled.len()
+            || managed.len() != scheduled.len()
+            || requests.is_empty()
+        {
+            return Err(Error::InvalidInput(
+                "Nemotron realtime cohort width mismatch".into(),
+            ));
+        }
+        if requests.len() == 1 {
+            return Ok(vec![self.nemotron_realtime_staged_request(
+                requests[0],
+                &scheduled[0],
+                managed.remove(0),
+            )?]);
+        }
+        let mut leases = Vec::with_capacity(requests.len());
+        let mut checkpoints = Vec::with_capacity(requests.len());
+        let mut chunks = Vec::with_capacity(requests.len());
+        let mut arenas = Vec::with_capacity(requests.len());
+        let mut transactions = Vec::with_capacity(requests.len());
+        let mut target_cursors = Vec::with_capacity(requests.len());
+        let mut operation_ids = Vec::with_capacity(requests.len());
+        for ((request, row), retained) in requests.iter().zip(scheduled).zip(managed.iter_mut()) {
+            let variant = Self::resolve_variant(request)?;
+            if variant.family() != ModelFamily::NemotronAsr || !request.is_realtime_asr_session() {
+                return Err(Error::InvalidInput(
+                    "Nemotron cohort crossed its realtime route".into(),
+                ));
+            }
+            retained.ensure_all_paged_consumed()?;
+            drop(retained.tensor_state.take().ok_or_else(|| {
+                Error::InferenceError("Nemotron cohort row lost tensor reservation".into())
+            })?);
+            let (operation_id, span) = match &row.work {
+                WorkUnit::RealtimeDecodeContinuation {
+                    operation_id,
+                    auxiliary_state: Some(spans),
+                    ..
+                } if spans.len() == 1 => (*operation_id, &spans[0]),
+                _ => {
+                    return Err(Error::InvalidInput(
+                        "Nemotron cohort contains a non-decode row".into(),
+                    ))
+                }
+            };
+            let arena = request
+                .managed_cache_runtime()
+                .and_then(|runtime| runtime.tensor_state())
+                .cloned()
+                .ok_or_else(|| Error::InferenceError("Nemotron cohort lost tensor arena".into()))?;
+            let transaction = PhysicalStateTransactionId::new(row.plan_id)?;
+            let session = row.session_key();
+            let mut lease = ExecutorStateLease::checkout(
+                &self.nemotron_realtime.states,
+                session,
+                variant,
+                "Nemotron RNNT cohort",
+            )?;
+            let checkpoint = lease.require_state_mut()?.clone();
+            lease.mark_dirty();
+            let active = lease.require_state_mut()?;
+            let model_arc = active.model.model_arc();
+            let crate::models::registry::NativeAsrModel::Nemotron(model) = model_arc.as_ref()
+            else {
+                return Err(Error::InferenceError(
+                    "Nemotron cohort lease crossed model family".into(),
+                ));
+            };
+            model.hydrate_realtime_rnnt_physical_state(
+                &mut active.state,
+                arena.as_ref(),
+                transaction,
+            )?;
+            let chunk = active.prepared.pop_front().ok_or_else(|| {
+                Error::InferenceError("Nemotron cohort row has no prepared chunk".into())
+            })?;
+            leases.push(lease);
+            checkpoints.push(checkpoint);
+            chunks.push(chunk);
+            arenas.push(arena);
+            transactions.push(transaction);
+            target_cursors.push(span.input().end as u64);
+            operation_ids.push(operation_id);
+        }
+        let model_arc = leases[0].require_state_mut()?.model.model_arc();
+        let crate::models::registry::NativeAsrModel::Nemotron(model) = model_arc.as_ref() else {
+            unreachable!()
+        };
+        for lease in leases.iter_mut().skip(1) {
+            if !Arc::ptr_eq(&lease.require_state_mut()?.model.model_arc(), &model_arc) {
+                return Err(Error::InvalidInput(
+                    "Nemotron cohort crossed model identity".into(),
+                ));
+            }
+        }
+        let mut batch = leases
+            .iter_mut()
+            .zip(&chunks)
+            .map(|(lease, chunk)| {
+                lease
+                    .require_state_mut()
+                    .map(|active| NemotronRealtimeDecodeBatchRow {
+                        state: &mut active.state,
+                        chunk,
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let events = model.decode_realtime_prepared_batch(&mut batch);
+        drop(batch);
+        let events = match events {
+            Ok(events) => events,
+            Err(error) => {
+                for (lease, checkpoint) in leases.iter_mut().zip(checkpoints.iter().cloned()) {
+                    *lease.require_state_mut()? = checkpoint;
+                    lease.mark_clean();
+                }
+                for lease in leases {
+                    lease.restore()?;
+                }
+                return Err(error);
+            }
+        };
+        let sealing = (|| {
+            let mut completions = Vec::with_capacity(leases.len());
+            let mut staged = Vec::with_capacity(leases.len());
+            for index in 0..leases.len() {
+                let active = leases[index].require_state_mut()?;
+                model.stage_realtime_rnnt_physical_state(
+                    &mut active.state,
+                    arenas[index].as_ref(),
+                    transactions[index],
+                    target_cursors[index],
+                )?;
+                if requests[index].is_cancelled() {
+                    return Err(Error::Cancelled(
+                        "Nemotron cohort row cancelled after RNNT execution".into(),
+                    ));
+                }
+                if let Some(tx) = Self::stream_sender(requests[index]) {
+                    for event in &events[index] {
+                        if !event.delta.is_empty() {
+                            Self::stream_text_with_policy(
+                                &tx,
+                                requests[index].stream_policy,
+                                &requests[index].id,
+                                &mut active.stream_sequence,
+                                event.delta.clone(),
+                            )?;
+                        }
+                        if event.is_final {
+                            Self::stream_final_marker_with_policy(
+                                &tx,
+                                requests[index].stream_policy,
+                                &requests[index].id,
+                                &mut active.stream_sequence,
+                            )?;
+                        }
+                    }
+                }
+                staged.push(requests[index].take_staged_stream_outputs()?);
+                completions.push(arenas[index].seal_selected_completion(transactions[index])?);
+            }
+            Ok((staged, completions))
+        })();
+        let (staged, completions) = match sealing {
+            Ok(values) => values,
+            Err(error) => {
+                for (request, (lease, checkpoint)) in requests
+                    .iter()
+                    .zip(leases.iter_mut().zip(checkpoints.iter().cloned()))
+                {
+                    let _ = request.take_staged_stream_outputs();
+                    *lease.require_state_mut()? = checkpoint;
+                    lease.mark_clean();
+                }
+                for lease in leases {
+                    lease.restore()?;
+                }
+                return Err(error);
+            }
+        };
+        let mut pending = Vec::with_capacity(leases.len());
+        let mut outputs = Vec::with_capacity(leases.len());
+        for (index, lease) in leases.into_iter().enumerate() {
+            let session = scheduled[index].session_key();
+            let active = lease.defer()?;
+            let next =
+                (!active.prepared.is_empty()).then_some(RealtimeSubphase::DecodeContinuation);
+            let payload = requests[index].realtime_asr_operation(operation_ids[index])?;
+            let finishing = matches!(payload, RealtimeAsrOperationPayload::Finish);
+            let finished = finishing && next.is_none();
+            let input_consumed = if next.is_none() {
+                match payload {
+                    RealtimeAsrOperationPayload::Push { samples, .. } => samples.len(),
+                    RealtimeAsrOperationPayload::Finish => 0,
+                }
+            } else {
+                0
+            };
+            let text = active.state.text().to_string();
+            let sample_rate = active.input_sample_rate;
+            let sample_count = active.state.consumed_samples();
+            pending.push((
+                scheduled[index].plan_id,
+                super::PendingNemotronRealtimeQuantum {
+                    session,
+                    active,
+                    checkpoint: checkpoints[index].clone(),
+                    finished,
+                },
+            ));
+            outputs.push(
+                ModelSessionResult::sequence(ExecutorOutput {
+                    request_id: requests[index].id.clone(),
+                    audio: Some(AudioOutput {
+                        samples: Vec::new(),
+                        sample_rate,
+                        duration_secs: if sample_rate == 0 {
+                            0.0
+                        } else {
+                            sample_count as f32 / sample_rate as f32
+                        },
+                    }),
+                    text: Some(text),
+                    input_transcription: None,
+                    tokens_processed: input_consumed,
+                    tokens_generated: 1,
+                    finished,
+                    phase_timing_override: None,
+                    asr_diagnostics: None,
+                    error: None,
+                })
+                .with_staged_stream_outputs(staged[index].clone())
+                .with_clocked_state_completion(completions[index].clone())
+                .requiring_pending_quantum()
+                .with_realtime_stage_outcome(RealtimeStageOutcome {
+                    plan_id: scheduled[index].plan_id,
+                    operation_id: operation_ids[index],
+                    completed: RealtimeSubphase::DecodeContinuation,
+                    next,
+                    input_consumed,
+                    output_steps: 1,
+                    cache_append: 1,
+                }),
+            );
+        }
+        if let Err((error, pending)) = self.nemotron_realtime.register_batch(pending) {
+            for (_, row) in pending {
+                self.nemotron_realtime
+                    .replace_in_flight(&row.session, Some(row.checkpoint))?;
+            }
+            return Err(error);
+        }
+        crate::engine::metrics::record_engine_model_call(
+            crate::engine::metrics::EngineModelCall::NativeTensor {
+                mode: crate::engine::NativeBatchMode::Continuous,
+                rows: requests.len(),
+            },
+        );
+        Ok(outputs)
+    }
+
+    fn nemotron_realtime_staged_request(
+        &self,
+        request: &EngineCoreRequest,
+        scheduled: &ScheduledRequest,
+        mut managed_state: super::RetainedRowManagedState,
+    ) -> Result<ModelSessionResult> {
+        let variant = Self::resolve_variant(request)?;
+        if variant.family() != ModelFamily::NemotronAsr || !request.is_realtime_asr_session() {
+            return Err(Error::InvalidInput(
+                "Nemotron realtime work crossed its exact session route".into(),
+            ));
+        }
+        managed_state.ensure_all_paged_consumed()?;
+        let tensor_reservation = managed_state.tensor_state.take().ok_or_else(|| {
+            Error::InferenceError("Nemotron realtime row lost retained tensor state".into())
+        })?;
+        drop(tensor_reservation);
+        let arena = request
+            .managed_cache_runtime()
+            .and_then(|runtime| runtime.tensor_state())
+            .cloned()
+            .ok_or_else(|| {
+                Error::InferenceError("Nemotron realtime row lost its tensor arena".into())
+            })?;
+        let (operation_id, completed, span) = match &scheduled.work {
+            WorkUnit::RealtimePreparation {
+                operation_id,
+                auxiliary_state: Some(spans),
+                ..
+            } if spans.len() == 1 => (*operation_id, RealtimeSubphase::Preparation, &spans[0]),
+            WorkUnit::RealtimeDecodeContinuation {
+                operation_id,
+                auxiliary_state: Some(spans),
+                ..
+            } if spans.len() == 1 => (
+                *operation_id,
+                RealtimeSubphase::DecodeContinuation,
+                &spans[0],
+            ),
+            _ => {
+                return Err(Error::InferenceError(
+                    "Nemotron realtime stage lacks one exact retained-state span".into(),
+                ));
+            }
+        };
+        let transaction = PhysicalStateTransactionId::new(scheduled.plan_id)?;
+        let payload = request.realtime_asr_operation(operation_id)?;
+        let session = scheduled.session_key();
+        let mut lease = ExecutorStateLease::checkout(
+            &self.nemotron_realtime.states,
+            session.clone(),
+            variant,
+            "Nemotron realtime ASR",
+        )?;
+        if lease.state().is_none() {
+            if !matches!(
+                (&scheduled.work, &payload),
+                (
+                    WorkUnit::RealtimePreparation {
+                        mode: RealtimePreparationMode::Push,
+                        ..
+                    },
+                    RealtimeAsrOperationPayload::Push { .. }
+                )
+            ) {
+                return Err(Error::InferenceError(
+                    "Nemotron realtime state must start with push preparation".into(),
+                ));
+            }
+            let model = self.with_registry(|registry| {
+                registry.try_get_asr_lease(variant).ok_or_else(|| {
+                    Error::ModelNotFound(format!("Nemotron model {variant} is not loaded"))
+                })
+            })?;
+            let native = model.start_realtime_stream_state(
+                request.asr_language_for_execution(),
+                request.asr_prompt_for_execution(),
+                None,
+            )?;
+            let crate::models::registry::NativeAsrRealtimeState::Nemotron(state) = native;
+            lease.install_state(ActiveNemotronRealtime {
+                variant,
+                model,
+                state,
+                prepared: Default::default(),
+                stream_sequence: 0,
+                input_sample_rate: 0,
+            })?;
+        }
+        let checkpoint = lease.require_state_mut()?.clone();
+        lease.mark_dirty();
+        let execution = (|| {
+            let active = lease.require_state_mut()?;
+            let model_arc = active.model.model_arc();
+            let crate::models::registry::NativeAsrModel::Nemotron(model) = model_arc.as_ref()
+            else {
+                return Err(Error::InferenceError(
+                    "Nemotron realtime lease resolved another model family".into(),
+                ));
+            };
+            let mut events = Vec::new();
+            match (&scheduled.work, payload) {
+                (
+                    WorkUnit::RealtimePreparation { .. },
+                    RealtimeAsrOperationPayload::Push {
+                        samples,
+                        sample_rate,
+                    },
+                ) => {
+                    if active.input_sample_rate != 0 && active.input_sample_rate != sample_rate {
+                        return Err(Error::InvalidInput(
+                            "Nemotron realtime sample rate changed within one session".into(),
+                        ));
+                    }
+                    active.input_sample_rate = sample_rate;
+                    model.hydrate_realtime_encoder_physical_state(
+                        &mut active.state,
+                        arena.as_ref(),
+                        transaction,
+                    )?;
+                    active.prepared.extend(model.prepare_realtime_input(
+                        &mut active.state,
+                        NemotronRealtimeBatchInput::Push {
+                            samples: samples.as_ref(),
+                            sample_rate,
+                        },
+                    )?);
+                    model.stage_realtime_encoder_physical_state(
+                        &mut active.state,
+                        arena.as_ref(),
+                        transaction,
+                        span.input().end as u64,
+                    )?;
+                }
+                (WorkUnit::RealtimePreparation { .. }, RealtimeAsrOperationPayload::Finish) => {
+                    model.hydrate_realtime_encoder_physical_state(
+                        &mut active.state,
+                        arena.as_ref(),
+                        transaction,
+                    )?;
+                    active.prepared.extend(model.prepare_realtime_input(
+                        &mut active.state,
+                        NemotronRealtimeBatchInput::Finish,
+                    )?);
+                    model.stage_realtime_encoder_physical_state(
+                        &mut active.state,
+                        arena.as_ref(),
+                        transaction,
+                        span.input().end as u64,
+                    )?;
+                }
+                (WorkUnit::RealtimeDecodeContinuation { .. }, payload) => {
+                    let chunk = active.prepared.pop_front().ok_or_else(|| {
+                        Error::InferenceError(
+                            "Nemotron decode continuation has no prepared encoder chunk".into(),
+                        )
+                    })?;
+                    model.hydrate_realtime_rnnt_physical_state(
+                        &mut active.state,
+                        arena.as_ref(),
+                        transaction,
+                    )?;
+                    events = model
+                        .decode_realtime_prepared_batch(&mut [NemotronRealtimeDecodeBatchRow {
+                            state: &mut active.state,
+                            chunk: &chunk,
+                        }])?
+                        .pop()
+                        .unwrap_or_default();
+                    model.stage_realtime_rnnt_physical_state(
+                        &mut active.state,
+                        arena.as_ref(),
+                        transaction,
+                        span.input().end as u64,
+                    )?;
+                    if !matches!(
+                        payload,
+                        RealtimeAsrOperationPayload::Push { .. }
+                            | RealtimeAsrOperationPayload::Finish
+                    ) {
+                        unreachable!();
+                    }
+                }
+                _ => {
+                    return Err(Error::InferenceError(
+                        "Nemotron realtime work and payload disagree".into(),
+                    ));
+                }
+            }
+            if request.is_cancelled() {
+                return Err(Error::Cancelled(
+                    "Nemotron realtime quantum cancelled after model execution".into(),
+                ));
+            }
+            if let Some(tx) = Self::stream_sender(request) {
+                for event in &events {
+                    if !event.delta.is_empty() {
+                        Self::stream_text_with_policy(
+                            &tx,
+                            request.stream_policy,
+                            &request.id,
+                            &mut active.stream_sequence,
+                            event.delta.clone(),
+                        )?;
+                    }
+                    if event.is_final {
+                        Self::stream_final_marker_with_policy(
+                            &tx,
+                            request.stream_policy,
+                            &request.id,
+                            &mut active.stream_sequence,
+                        )?;
+                    }
+                }
+            }
+            let staged = request.take_staged_stream_outputs()?;
+            let completion = arena.seal_selected_completion(transaction)?;
+            let finishing = matches!(
+                request.realtime_asr_operation(operation_id)?,
+                RealtimeAsrOperationPayload::Finish
+            );
+            let next = if !active.prepared.is_empty() {
+                Some(RealtimeSubphase::DecodeContinuation)
+            } else {
+                None
+            };
+            let finished = finishing && next.is_none();
+            Ok((staged, completion, next, finished))
+        })();
+        let (staged, completion, next, finished) = match execution {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = request.take_staged_stream_outputs();
+                *lease.require_state_mut()? = checkpoint;
+                lease.mark_clean();
+                if matches!(error, Error::Cancelled(_)) {
+                    lease.release()?;
+                    return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                        request.id.clone(),
+                    )));
+                }
+                lease.restore()?;
+                return Err(error);
+            }
+        };
+        let active = lease.defer()?;
+        let text = active.state.text().to_string();
+        let sample_rate = active.input_sample_rate;
+        let sample_count = active.state.consumed_samples();
+        let generated = usize::from(matches!(completed, RealtimeSubphase::DecodeContinuation));
+        let pending = super::PendingNemotronRealtimeQuantum {
+            session: session.clone(),
+            active,
+            checkpoint: checkpoint.clone(),
+            finished,
+        };
+        if let Err((error, pending)) = self.nemotron_realtime.register(scheduled.plan_id, pending) {
+            self.nemotron_realtime
+                .replace_in_flight(&session, Some(pending.checkpoint))?;
+            return Err(error);
+        }
+        let input_consumed = if next.is_none() {
+            match &scheduled.work {
+                WorkUnit::RealtimePreparation { input, .. }
+                    if matches!(
+                        request.realtime_asr_operation(operation_id)?,
+                        RealtimeAsrOperationPayload::Push { .. }
+                    ) =>
+                {
+                    input.len()
+                }
+                WorkUnit::RealtimeDecodeContinuation { .. } => {
+                    match request.realtime_asr_operation(operation_id)? {
+                        RealtimeAsrOperationPayload::Push { samples, .. } => samples.len(),
+                        RealtimeAsrOperationPayload::Finish => 0,
+                    }
+                }
+                _ => 0,
+            }
+        } else {
+            0
+        };
+        Ok(ModelSessionResult::sequence(ExecutorOutput {
+            request_id: request.id.clone(),
+            audio: Some(AudioOutput {
+                samples: Vec::new(),
+                sample_rate,
+                duration_secs: if sample_rate == 0 {
+                    0.0
+                } else {
+                    sample_count as f32 / sample_rate as f32
+                },
+            }),
+            text: Some(text),
+            input_transcription: None,
+            tokens_processed: input_consumed,
+            tokens_generated: generated,
+            finished,
+            phase_timing_override: None,
+            asr_diagnostics: None,
+            error: None,
+        })
+        .with_staged_stream_outputs(staged)
+        .with_clocked_state_completion(completion)
+        .requiring_pending_quantum()
+        .with_realtime_stage_outcome(RealtimeStageOutcome {
+            plan_id: scheduled.plan_id,
+            operation_id,
+            completed,
+            next,
+            input_consumed,
+            output_steps: generated,
+            cache_append: generated,
+        }))
+    }
+
     pub(super) fn voxtral_realtime_batch_with_managed(
         &self,
         requests: &[&EngineCoreRequest],
@@ -1770,6 +2359,7 @@ impl NativeExecutor {
                 operation_id,
                 max_output_steps,
                 max_cache_append,
+                ..
             } => (
                 operation_id,
                 RealtimeSubphase::DecodeContinuation,
@@ -5078,6 +5668,12 @@ impl NativeExecutor {
         }
         let variant = Self::resolve_variant(request)?;
         let family = variant.family();
+        if family == ModelFamily::NemotronAsr && request.is_realtime_asr_session() {
+            let retained = managed_state.take().ok_or_else(|| {
+                Error::InferenceError("Nemotron realtime ASR lost retained tensor state".into())
+            })?;
+            return self.nemotron_realtime_staged_request(request, scheduled, retained);
+        }
         if family == ModelFamily::Voxtral && request.is_realtime_asr_session() {
             let retained = managed_state.take().ok_or_else(|| {
                 Error::InferenceError("Voxtral realtime ASR lost retained paged state".into())

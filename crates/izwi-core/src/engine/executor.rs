@@ -76,8 +76,9 @@ use crate::models::ModelRegistry;
 use crate::runtime::{PhysicalExecutionAdmission, PhysicalExecutionLease};
 use state::{
     ActiveAsrDecode, ActiveChatDecode, ActiveLfm25AsrDecode, ActiveLfm25TtsDecode,
-    ActiveQwenTtsDecode, ActiveVibeVoiceTtsDecode, ActiveVoxtralRealtime,
-    PendingVoxtralRealtimeQuantum, PreparedVoxtralRealtimeQuantum,
+    ActiveNemotronRealtime, ActiveQwenTtsDecode, ActiveVibeVoiceTtsDecode, ActiveVoxtralRealtime,
+    PendingNemotronRealtimeQuantum, PendingVoxtralRealtimeQuantum, PreparedNemotronRealtimeQuantum,
+    PreparedVoxtralRealtimeQuantum,
 };
 
 const QWEN38_TARGET_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(1);
@@ -2329,6 +2330,291 @@ impl PendingQuantumFinalizer for VoxtralRealtimeStateCoordinator {
     }
 }
 
+struct NemotronRealtimeStateCoordinator {
+    states: ExecutorStateStore<ActiveNemotronRealtime>,
+    pending: Mutex<HashMap<PlanId, PendingNemotronRealtimeQuantum>>,
+    prepared: Mutex<HashMap<PlanId, PreparedNemotronRealtimeQuantum>>,
+}
+
+impl NemotronRealtimeStateCoordinator {
+    fn new() -> Self {
+        Self {
+            states: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
+            prepared: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn register(
+        &self,
+        plan_id: PlanId,
+        pending: PendingNemotronRealtimeQuantum,
+    ) -> std::result::Result<(), (Error, PendingNemotronRealtimeQuantum)> {
+        let mut rows = match self.pending.lock() {
+            Ok(rows) => rows,
+            Err(_) => {
+                return Err((
+                    Error::InferenceError("Nemotron pending state mutex poisoned".into()),
+                    pending,
+                ))
+            }
+        };
+        if rows.contains_key(&plan_id) {
+            return Err((
+                Error::InferenceError(format!(
+                    "Nemotron pending quantum already exists for plan {plan_id}"
+                )),
+                pending,
+            ));
+        }
+        rows.insert(plan_id, pending);
+        Ok(())
+    }
+
+    fn register_batch(
+        &self,
+        rows: Vec<(PlanId, PendingNemotronRealtimeQuantum)>,
+    ) -> std::result::Result<(), (Error, Vec<(PlanId, PendingNemotronRealtimeQuantum)>)> {
+        let mut pending = match self.pending.lock() {
+            Ok(pending) => pending,
+            Err(_) => {
+                return Err((
+                    Error::InferenceError("Nemotron pending state mutex poisoned".into()),
+                    rows,
+                ))
+            }
+        };
+        let mut ids = HashSet::with_capacity(rows.len());
+        if rows
+            .iter()
+            .any(|(id, _)| !ids.insert(*id) || pending.contains_key(id))
+        {
+            return Err((
+                Error::InferenceError("Nemotron cohort contains duplicate pending plans".into()),
+                rows,
+            ));
+        }
+        pending.extend(rows);
+        Ok(())
+    }
+
+    fn replace_in_flight(
+        &self,
+        session: &SessionKey,
+        replacement: Option<ActiveNemotronRealtime>,
+    ) -> Result<()> {
+        let mut states = self
+            .states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let variant = match states.get(session) {
+            Some(ExecutorStateSlot::InFlight { variant }) => *variant,
+            _ => {
+                return Err(Error::InferenceError(
+                    "Nemotron pending state lost its ownership marker".into(),
+                ))
+            }
+        };
+        match replacement {
+            Some(active) if active.variant == variant => {
+                states.insert(
+                    session.clone(),
+                    ExecutorStateSlot::Ready {
+                        variant,
+                        state: active,
+                    },
+                );
+            }
+            Some(_) => {
+                states.insert(session.clone(), ExecutorStateSlot::Poisoned { variant });
+                return Err(Error::InferenceError(
+                    "Nemotron pending state crossed model variants".into(),
+                ));
+            }
+            None => {
+                states.remove(session);
+            }
+        }
+        Ok(())
+    }
+
+    fn abort_matching(
+        &self,
+        predicate: impl Fn(&PendingNemotronRealtimeQuantum) -> bool,
+    ) -> Result<usize> {
+        let rows = {
+            let mut pending = self.pending.lock().map_err(|_| {
+                Error::InferenceError("Nemotron pending state mutex poisoned".into())
+            })?;
+            let ids = pending
+                .iter()
+                .filter_map(|(id, row)| predicate(row).then_some(*id))
+                .collect::<Vec<_>>();
+            ids.into_iter()
+                .filter_map(|id| pending.remove(&id))
+                .collect::<Vec<_>>()
+        };
+        let count = rows.len();
+        for row in rows {
+            self.replace_in_flight(&row.session, Some(row.checkpoint))?;
+        }
+        Ok(count)
+    }
+
+    fn has_prepared(&self) -> bool {
+        !self
+            .prepared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
+    }
+}
+
+impl PendingQuantumFinalizer for NemotronRealtimeStateCoordinator {
+    fn contains(&self, plan_id: PlanId, session: &SessionKey) -> bool {
+        self.pending
+            .lock()
+            .ok()
+            .and_then(|rows| rows.get(&plan_id).map(|row| &row.session == session))
+            .unwrap_or(false)
+    }
+
+    fn prepare(
+        &self,
+        plan_id: PlanId,
+        session: &SessionKey,
+        decision: PendingQuantumDecision,
+    ) -> Result<PendingQuantumFinalizeStatus> {
+        let row = {
+            let mut rows = self.pending.lock().map_err(|_| {
+                Error::InferenceError("Nemotron pending state mutex poisoned".into())
+            })?;
+            let Some(row) = rows.get(&plan_id) else {
+                return Ok(PendingQuantumFinalizeStatus::NotFound);
+            };
+            if &row.session != session {
+                return Err(Error::InferenceError(
+                    "Nemotron pending plan crossed sessions".into(),
+                ));
+            }
+            rows.remove(&plan_id).expect("pending row present")
+        };
+        let replacement = if decision == PendingQuantumDecision::Commit {
+            (!row.finished).then_some(row.active)
+        } else {
+            Some(row.checkpoint)
+        };
+        let prepared = PreparedNemotronRealtimeQuantum {
+            session: row.session,
+            replacement,
+        };
+        if self
+            .prepared
+            .lock()
+            .map_err(|_| Error::InferenceError("Nemotron prepared state mutex poisoned".into()))?
+            .insert(plan_id, prepared)
+            .is_some()
+        {
+            return Err(Error::InferenceError(
+                "duplicate Nemotron prepared quantum".into(),
+            ));
+        }
+        Ok(PendingQuantumFinalizeStatus::Finalized)
+    }
+
+    fn publish(
+        &self,
+        plan_id: PlanId,
+        session: &SessionKey,
+    ) -> Result<PendingQuantumFinalizeStatus> {
+        let Some(prepared) = self
+            .prepared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&plan_id)
+        else {
+            return Ok(PendingQuantumFinalizeStatus::NotFound);
+        };
+        if &prepared.session != session {
+            return Err(Error::InferenceError(
+                "Nemotron prepared plan crossed sessions".into(),
+            ));
+        }
+        self.replace_in_flight(session, prepared.replacement)?;
+        Ok(PendingQuantumFinalizeStatus::Finalized)
+    }
+
+    fn discard(&self, plan_id: PlanId, session: &SessionKey) {
+        let row = self
+            .prepared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&plan_id);
+        let mut states = self
+            .states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let target = row.as_ref().map_or(session, |row| &row.session);
+        if let Some(ExecutorStateSlot::InFlight { variant }) = states.get(target) {
+            let variant = *variant;
+            states.insert(target.clone(), ExecutorStateSlot::Poisoned { variant });
+        }
+    }
+}
+
+struct RealtimePendingQuantumFinalizer {
+    voxtral: Arc<VoxtralRealtimeStateCoordinator>,
+    nemotron: Arc<NemotronRealtimeStateCoordinator>,
+}
+
+impl PendingQuantumFinalizer for RealtimePendingQuantumFinalizer {
+    fn contains(&self, plan_id: PlanId, session: &SessionKey) -> bool {
+        self.voxtral.contains(plan_id, session) || self.nemotron.contains(plan_id, session)
+    }
+    fn prepare(
+        &self,
+        plan_id: PlanId,
+        session: &SessionKey,
+        decision: PendingQuantumDecision,
+    ) -> Result<PendingQuantumFinalizeStatus> {
+        if self.nemotron.contains(plan_id, session) {
+            self.nemotron.prepare(plan_id, session, decision)
+        } else {
+            self.voxtral.prepare(plan_id, session, decision)
+        }
+    }
+    fn publish(
+        &self,
+        plan_id: PlanId,
+        session: &SessionKey,
+    ) -> Result<PendingQuantumFinalizeStatus> {
+        if self
+            .nemotron
+            .prepared
+            .lock()
+            .ok()
+            .is_some_and(|rows| rows.contains_key(&plan_id))
+        {
+            self.nemotron.publish(plan_id, session)
+        } else {
+            self.voxtral.publish(plan_id, session)
+        }
+    }
+    fn discard(&self, plan_id: PlanId, session: &SessionKey) {
+        if self
+            .nemotron
+            .prepared
+            .lock()
+            .ok()
+            .is_some_and(|rows| rows.contains_key(&plan_id))
+        {
+            self.nemotron.discard(plan_id, session)
+        } else {
+            self.voxtral.discard(plan_id, session)
+        }
+    }
+}
+
 impl<T> Drop for ExecutorStateLease<'_, T> {
     fn drop(&mut self) {
         if !self.armed {
@@ -2398,6 +2684,7 @@ pub struct NativeExecutor {
     lfm25_tts_decode_states: ExecutorStateStore<ActiveLfm25TtsDecode>,
     vibevoice_tts_decode_states: ExecutorStateStore<ActiveVibeVoiceTtsDecode>,
     voxtral_realtime: Arc<VoxtralRealtimeStateCoordinator>,
+    nemotron_realtime: Arc<NemotronRealtimeStateCoordinator>,
     qwen_tts_decode_states: ExecutorStateStore<ActiveQwenTtsDecode>,
 }
 
@@ -2458,14 +2745,66 @@ impl NativeExecutor {
         )
     }
 
-    /// Create a new native executor.
-    pub fn new(config: WorkerConfig) -> Self {
-        Self::with_voxtral_realtime(config, Arc::new(VoxtralRealtimeStateCoordinator::new()))
+    fn execute_nemotron_realtime_batch_with_rows(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+        rows: &[ReadyQuantum],
+        mode: NativeBatchMode,
+    ) -> Result<Vec<ExecutorStepResult>> {
+        let ordered = scheduled
+            .iter()
+            .map(|row| {
+                requests
+                    .iter()
+                    .copied()
+                    .find(|request| request.id == row.request_id)
+                    .ok_or_else(|| {
+                        Error::InferenceError("Nemotron batch lost request snapshot".into())
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let managed = scheduled
+            .iter()
+            .zip(&ordered)
+            .map(|(scheduled, request)| {
+                let reservation = rows
+                    .iter()
+                    .find(|row| row.plan_id == scheduled.plan_id)
+                    .and_then(|row| row.managed_cache.as_ref())
+                    .ok_or_else(|| {
+                        Error::InferenceError("Nemotron batch lost retained reservation".into())
+                    })?;
+                retained_row_managed_state_for_row(request, scheduled, reservation)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let outputs = self.nemotron_realtime_batch_with_managed(&ordered, scheduled, managed)?;
+        self.finish_scheduled_execution(
+            requests,
+            scheduled,
+            outputs,
+            if mode == NativeBatchMode::Continuous {
+                BatchDispatch::new(super::BatchDispatchKind::TensorContinuous, scheduled.len())
+            } else {
+                BatchDispatch::serial()
+            },
+            Some(rows),
+        )
     }
 
-    fn with_voxtral_realtime(
+    /// Create a new native executor.
+    pub fn new(config: WorkerConfig) -> Self {
+        Self::with_realtime_coordinators(
+            config,
+            Arc::new(VoxtralRealtimeStateCoordinator::new()),
+            Arc::new(NemotronRealtimeStateCoordinator::new()),
+        )
+    }
+
+    fn with_realtime_coordinators(
         config: WorkerConfig,
         voxtral_realtime: Arc<VoxtralRealtimeStateCoordinator>,
+        nemotron_realtime: Arc<NemotronRealtimeStateCoordinator>,
     ) -> Self {
         Self {
             config,
@@ -2477,6 +2816,7 @@ impl NativeExecutor {
             lfm25_tts_decode_states: Mutex::new(HashMap::new()),
             vibevoice_tts_decode_states: Mutex::new(HashMap::new()),
             voxtral_realtime,
+            nemotron_realtime,
             qwen_tts_decode_states: Mutex::new(HashMap::new()),
         }
     }
@@ -2974,6 +3314,24 @@ impl ModelExecutor for NativeExecutor {
                     ..
                 } if execution.requests.iter().all(|request| {
                     request.model_variant.is_some_and(|variant| {
+                        variant.family() == crate::catalog::ModelFamily::NemotronAsr
+                    })
+                }) =>
+                {
+                    self.execute_nemotron_realtime_batch_with_rows(
+                        execution.requests,
+                        execution.scheduled,
+                        &execution.batch.rows,
+                        NativeBatchMode::Continuous,
+                    )
+                }
+                NativeBatchRoute::Audio {
+                    task: TaskType::ASR,
+                    stage: NativeAudioStage::RealtimeDecodeContinuation,
+                    mode: NativeBatchMode::Continuous,
+                    ..
+                } if execution.requests.iter().all(|request| {
+                    request.model_variant.is_some_and(|variant| {
                         variant.family() == crate::catalog::ModelFamily::Voxtral
                     })
                 }) =>
@@ -3176,9 +3534,20 @@ impl ModelExecutor for NativeExecutor {
                 "cannot shut down with a prepared Voxtral realtime quantum".to_string(),
             ));
         }
+        if self.nemotron_realtime.abort_matching(|_| true).is_err()
+            || self.nemotron_realtime.has_prepared()
+        {
+            return Err(Error::InferenceError(
+                "cannot shut down with unresolved Nemotron realtime state".into(),
+            ));
+        }
         let mut voxtral = self.voxtral_realtime.states.lock().map_err(|_| {
             Error::InferenceError("Voxtral realtime state mutex poisoned".to_string())
         })?;
+        let mut nemotron =
+            self.nemotron_realtime.states.lock().map_err(|_| {
+                Error::InferenceError("Nemotron realtime state mutex poisoned".into())
+            })?;
         let mut tts = self.qwen_tts_decode_states.lock().map_err(|_| {
             Error::InferenceError("Qwen TTS decode state mutex poisoned".to_string())
         })?;
@@ -3188,8 +3557,18 @@ impl ModelExecutor for NativeExecutor {
         lfm25_tts.clear();
         vibevoice_tts.clear();
         voxtral.clear();
+        nemotron.clear();
         tts.clear();
-        drop((chat, asr, lfm25_asr, lfm25_tts, vibevoice_tts, voxtral, tts));
+        drop((
+            chat,
+            asr,
+            lfm25_asr,
+            lfm25_tts,
+            vibevoice_tts,
+            voxtral,
+            nemotron,
+            tts,
+        ));
         self.initialized = false;
         self.loaded_tts_model = None;
         Ok(())
@@ -3203,6 +3582,13 @@ impl ModelExecutor for NativeExecutor {
         {
             return CacheReleaseReport::unconfirmed();
         }
+        if self
+            .nemotron_realtime
+            .abort_matching(|pending| pending.session.request_id == request_id)
+            .is_err()
+        {
+            return CacheReleaseReport::unconfirmed();
+        }
         let (
             Ok(mut chat),
             Ok(mut asr),
@@ -3210,6 +3596,7 @@ impl ModelExecutor for NativeExecutor {
             Ok(mut lfm25_tts),
             Ok(mut vibevoice_tts),
             Ok(mut voxtral),
+            Ok(mut nemotron),
             Ok(mut tts),
         ) = (
             self.chat_decode_states.lock(),
@@ -3218,6 +3605,7 @@ impl ModelExecutor for NativeExecutor {
             self.lfm25_tts_decode_states.lock(),
             self.vibevoice_tts_decode_states.lock(),
             self.voxtral_realtime.states.lock(),
+            self.nemotron_realtime.states.lock(),
             self.qwen_tts_decode_states.lock(),
         )
         else {
@@ -3230,6 +3618,7 @@ impl ModelExecutor for NativeExecutor {
         let lfm25_tts = cleanup_request_states_locked(&mut lfm25_tts, request_id);
         let vibevoice_tts = cleanup_request_states_locked(&mut vibevoice_tts, request_id);
         let voxtral = cleanup_request_states_locked(&mut voxtral, request_id);
+        let nemotron = cleanup_request_states_locked(&mut nemotron, request_id);
         let tts = cleanup_request_states_locked(&mut tts, request_id);
         cleanup_report(
             chat.combine(asr)
@@ -3237,6 +3626,7 @@ impl ModelExecutor for NativeExecutor {
                 .combine(lfm25_tts)
                 .combine(vibevoice_tts)
                 .combine(voxtral)
+                .combine(nemotron)
                 .combine(tts),
         )
     }
@@ -3249,6 +3639,13 @@ impl ModelExecutor for NativeExecutor {
         {
             return CacheReleaseReport::unconfirmed();
         }
+        if self
+            .nemotron_realtime
+            .abort_matching(|pending| &pending.session == session)
+            .is_err()
+        {
+            return CacheReleaseReport::unconfirmed();
+        }
         let (
             Ok(mut chat),
             Ok(mut asr),
@@ -3256,6 +3653,7 @@ impl ModelExecutor for NativeExecutor {
             Ok(mut lfm25_tts),
             Ok(mut vibevoice_tts),
             Ok(mut voxtral),
+            Ok(mut nemotron),
             Ok(mut tts),
         ) = (
             self.chat_decode_states.lock(),
@@ -3264,6 +3662,7 @@ impl ModelExecutor for NativeExecutor {
             self.lfm25_tts_decode_states.lock(),
             self.vibevoice_tts_decode_states.lock(),
             self.voxtral_realtime.states.lock(),
+            self.nemotron_realtime.states.lock(),
             self.qwen_tts_decode_states.lock(),
         )
         else {
@@ -3276,6 +3675,7 @@ impl ModelExecutor for NativeExecutor {
         let lfm25_tts = cleanup_session_state_locked(&mut lfm25_tts, session);
         let vibevoice_tts = cleanup_session_state_locked(&mut vibevoice_tts, session);
         let voxtral = cleanup_session_state_locked(&mut voxtral, session);
+        let nemotron = cleanup_session_state_locked(&mut nemotron, session);
         let tts = cleanup_session_state_locked(&mut tts, session);
         cleanup_report(
             chat.combine(asr)
@@ -3283,6 +3683,7 @@ impl ModelExecutor for NativeExecutor {
                 .combine(lfm25_tts)
                 .combine(vibevoice_tts)
                 .combine(voxtral)
+                .combine(nemotron)
                 .combine(tts),
         )
     }
@@ -3295,14 +3696,24 @@ impl ModelExecutor for NativeExecutor {
         {
             return CacheReleaseReport::unconfirmed();
         }
-        let Ok(mut states) = self.voxtral_realtime.states.lock() else {
+        if self
+            .nemotron_realtime
+            .abort_matching(|pending| pending.active.variant == variant)
+            .is_err()
+        {
+            return CacheReleaseReport::unconfirmed();
+        }
+        let (Ok(mut states), Ok(mut nemotron)) = (
+            self.voxtral_realtime.states.lock(),
+            self.nemotron_realtime.states.lock(),
+        ) else {
             return CacheReleaseReport::unconfirmed();
         };
-        cleanup_report(cleanup_model_states_locked(
-            &mut states,
-            variant,
-            |active| active.variant,
-        ))
+        cleanup_report(
+            cleanup_model_states_locked(&mut states, variant, |active| active.variant).combine(
+                cleanup_model_states_locked(&mut nemotron, variant, |active| active.variant),
+            ),
+        )
     }
 }
 
@@ -3348,13 +3759,21 @@ impl UnifiedExecutor {
                     authority: authority.clone(),
                 });
         let voxtral_realtime = Arc::new(VoxtralRealtimeStateCoordinator::new());
+        let nemotron_realtime = Arc::new(NemotronRealtimeStateCoordinator::new());
         Self {
             inner: Arc::new(RwLock::new(Box::new(
-                NativeExecutor::with_voxtral_realtime(config, voxtral_realtime.clone()),
+                NativeExecutor::with_realtime_coordinators(
+                    config,
+                    voxtral_realtime.clone(),
+                    nemotron_realtime.clone(),
+                ),
             ))),
             batch_workspace,
             physical_execution_admission,
-            pending_quantum_finalizer: Some(voxtral_realtime),
+            pending_quantum_finalizer: Some(Arc::new(RealtimePendingQuantumFinalizer {
+                voxtral: voxtral_realtime,
+                nemotron: nemotron_realtime,
+            })),
         }
     }
 
