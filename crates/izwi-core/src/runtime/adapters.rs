@@ -382,8 +382,7 @@ pub(crate) fn scalar_execution_profile(
 }
 
 fn tts_execution_target(model_variant: ModelVariant) -> ExecutionTargetKind {
-    if model_variant.is_kokoro()
-        || model_variant.is_lfm25_audio_gguf()
+    if model_variant.is_lfm25_audio_gguf()
         || matches!(
             model_variant.family(),
             crate::catalog::ModelFamily::VoxtralTts
@@ -392,6 +391,14 @@ fn tts_execution_target(model_variant: ModelVariant) -> ExecutionTargetKind {
         ExecutionTargetKind::DirectModel
     } else {
         ExecutionTargetKind::TokenEngine
+    }
+}
+
+fn streaming_tts_execution_target(model_variant: ModelVariant) -> ExecutionTargetKind {
+    if model_variant.is_kokoro() {
+        ExecutionTargetKind::DirectModel
+    } else {
+        tts_execution_target(model_variant)
     }
 }
 
@@ -472,7 +479,7 @@ impl ModelCapabilityAdapter for StreamingTtsCapabilityAdapter {
             capability: CapabilityKind::StreamingTts,
             model_variant,
             streaming_mode: StreamingMode::Chunked,
-            execution_target: tts_execution_target(model_variant),
+            execution_target: streaming_tts_execution_target(model_variant),
             sequence_execution: if model_variant.family() == ModelFamily::Qwen3Tts {
                 SequenceExecutionMode::Always
             } else {
@@ -735,6 +742,18 @@ mod tests {
         assert_eq!(qwen.id, "builtin.tts");
         assert_eq!(qwen.streaming_mode, StreamingMode::Chunked);
         assert_eq!(qwen.execution_target, ExecutionTargetKind::TokenEngine);
+
+        let kokoro = registry
+            .require(CapabilityKind::Tts, ModelVariant::Kokoro82M)
+            .expect("Kokoro TTS adapter");
+        assert_eq!(kokoro.execution_target, ExecutionTargetKind::TokenEngine);
+        let kokoro_streaming = registry
+            .require(CapabilityKind::StreamingTts, ModelVariant::Kokoro82M)
+            .expect("Kokoro streaming TTS adapter");
+        assert_eq!(
+            kokoro_streaming.execution_target,
+            ExecutionTargetKind::DirectModel
+        );
 
         let lfm = registry
             .require(CapabilityKind::Tts, ModelVariant::Lfm25Audio15BGguf)

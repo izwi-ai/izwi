@@ -287,10 +287,11 @@ impl DirectTtsObservationContext {
 }
 
 fn uses_direct_tts_runtime(variant: ModelVariant) -> bool {
-    matches!(
-        variant.family(),
-        ModelFamily::KokoroTts | ModelFamily::VoxtralTts
-    )
+    matches!(variant.family(), ModelFamily::VoxtralTts)
+}
+
+fn uses_direct_streaming_tts_runtime(variant: ModelVariant) -> bool {
+    uses_direct_tts_runtime(variant) || matches!(variant.family(), ModelFamily::KokoroTts)
 }
 
 pub(super) fn direct_tts_retained_input_bytes(request: &GenerationRequest) -> Result<usize> {
@@ -1064,7 +1065,7 @@ impl RuntimeService {
         chunk_tx: mpsc::Sender<AudioChunk>,
     ) -> Result<()> {
         let resolved_variant = self.resolve_tts_variant_for_request(&request).await?;
-        if uses_direct_tts_runtime(resolved_variant) {
+        if uses_direct_streaming_tts_runtime(resolved_variant) {
             let observation = DirectTtsObservationContext::new(&request, resolved_variant, true);
             let retained_input_bytes = direct_tts_retained_input_bytes(&request)?;
             let observed_input_bytes = u64::try_from(retained_input_bytes).map_err(|_| {
@@ -1166,6 +1167,12 @@ fn core_params_from_generation(config: &GenerationConfig) -> CoreGenParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kokoro_uses_engine_for_atomic_generation_and_direct_native_streaming() {
+        assert!(!uses_direct_tts_runtime(ModelVariant::Kokoro82M));
+        assert!(uses_direct_streaming_tts_runtime(ModelVariant::Kokoro82M));
+    }
     use crate::backends::BackendKind;
     use crate::engine::{Priority, ResourceAmount, ResourceVector, WorkloadClass};
     use crate::runtime::coordinator::{InferenceCoordinator, JobSpec};
