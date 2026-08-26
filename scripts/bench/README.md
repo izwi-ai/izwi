@@ -113,6 +113,27 @@ The protected workflow runs this stricter check separately from broad family
 coverage so generic Candle CUDA execution is not mislabeled as an optimized
 custom kernel.
 
+Audio concurrency evidence uses the `cpu-audio-concurrency.toml`,
+`metal-audio-concurrency.toml`, and `cuda-audio-concurrency.toml` manifests.
+Each manifest covers every benchmarkable ASR and TTS family at c1/c2/c4/c8
+through the SSE endpoints. The CLI records first-audio and inter-audio-chunk
+latency for TTS, plus first-transcript and inter-transcript-delta latency for
+ASR. Require the complete matrix with the fail-closed gate:
+
+```bash
+scripts/bench/run-model-evidence.sh --backend metal \
+  --manifest benchmarks/manifests/metal-audio-concurrency.toml \
+  --server http://127.0.0.1:8080 \
+  --output target/metal-audio-evidence \
+  --require-audio-streaming-evidence
+```
+
+The gate rejects a missing concurrency cell, non-streaming case, missing first
+output, or a route that never produces an inter-output sample. A locally
+passing CPU report does not certify Metal or CUDA; accelerator certificates
+remain bound to the exact selected device, runtime backend, clean Git SHA, and
+captured telemetry.
+
 Continuous batching uses CPU, Metal, and CUDA concurrent manifests covering
 Qwen3, Qwen3.5, Qwen3.8, LFM2, and Gemma. The
 certificate rejects missing run-local multi-row continuous batches, zero work,
