@@ -8,6 +8,7 @@ pub mod acoustic;
 pub mod codec;
 pub mod config;
 pub mod model;
+pub(crate) mod retained;
 pub mod sampling;
 pub mod tokenizer;
 pub mod voice;

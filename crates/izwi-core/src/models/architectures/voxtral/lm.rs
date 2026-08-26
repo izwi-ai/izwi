@@ -233,6 +233,29 @@ impl VoxtralLM {
         caches: &mut [&mut PhysicalPagedKvCache],
         t_cond: Option<&Tensor>,
     ) -> Result<Tensor> {
+        self.forward_managed_decode_batch_impl(embeds, start_positions, caches, t_cond, true)
+    }
+
+    /// Decode one embedded token per retained row and return the normalized
+    /// last hidden state instead of projecting vocabulary logits.
+    pub(crate) fn forward_managed_decode_batch_hidden_with_embeds(
+        &self,
+        embeds: &Tensor,
+        start_positions: &[usize],
+        caches: &mut [&mut PhysicalPagedKvCache],
+        t_cond: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        self.forward_managed_decode_batch_impl(embeds, start_positions, caches, t_cond, false)
+    }
+
+    fn forward_managed_decode_batch_impl(
+        &self,
+        embeds: &Tensor,
+        start_positions: &[usize],
+        caches: &mut [&mut PhysicalPagedKvCache],
+        t_cond: Option<&Tensor>,
+        project_logits: bool,
+    ) -> Result<Tensor> {
         let (batch_size, sequence_len, hidden_size) = embeds.dims3()?;
         if batch_size == 0
             || sequence_len != 1
@@ -250,13 +273,23 @@ impl VoxtralLM {
             )));
         }
         if batch_size == 1 {
-            return self.forward_managed_with_embeds(
-                embeds,
-                start_positions[0],
-                caches[0],
-                None,
-                t_cond,
-            );
+            return if project_logits {
+                self.forward_managed_with_embeds(
+                    embeds,
+                    start_positions[0],
+                    caches[0],
+                    None,
+                    t_cond,
+                )
+            } else {
+                self.forward_managed_hidden_with_embeds(
+                    embeds,
+                    start_positions[0],
+                    caches[0],
+                    None,
+                    t_cond,
+                )
+            };
         }
 
         let attention = self.cfg.attention_geometry()?;
@@ -358,7 +391,11 @@ impl VoxtralLM {
                     )?;
                 }
                 let hidden = self.norm.forward(&x)?;
-                self.logits_from_hidden(&hidden)
+                if project_logits {
+                    self.logits_from_hidden(&hidden)
+                } else {
+                    Ok(hidden)
+                }
             })();
             let logits = match layer_result {
                 Ok(logits) => logits,
@@ -1103,6 +1140,90 @@ mod tests {
     }
 
     #[test]
+    fn managed_hidden_batch_width_one_matches_scalar_and_commits_once() {
+        let device = Device::Cpu;
+        let model = tiny_decode_model(&device, None);
+        let (_, mut caches) = shared_decode_caches(2, 900, 16);
+        let mut scalar = caches.remove(0);
+        let mut batch = caches.remove(0);
+        let prompt = deterministic_embeds(2, 1, &device);
+        for cache in [&mut scalar, &mut batch] {
+            model
+                .forward_managed_hidden_with_embeds(&prompt, 0, cache, None, None)
+                .unwrap();
+            cache.take_completed_writes();
+        }
+        let step = deterministic_embeds(1, 13, &device);
+        let scalar_hidden = model
+            .forward_managed_hidden_with_embeds(&step, 2, &mut scalar, None, None)
+            .unwrap();
+        let batch_hidden = model
+            .forward_managed_decode_batch_hidden_with_embeds(&step, &[2], &mut [&mut batch], None)
+            .unwrap();
+
+        assert_close(&scalar_hidden, &batch_hidden);
+        assert_eq!(batch.context_len(), 3);
+        assert_eq!(batch.take_completed_writes().len(), 1);
+    }
+
+    #[test]
+    fn hidden_batch_preserves_ragged_row_identity_and_shared_fence() {
+        let device = Device::Cpu;
+        let model = tiny_decode_model(&device, None);
+        let (arena, mut caches) = shared_decode_caches(4, 905, 16);
+        let mut scalar_a = caches.remove(0);
+        let mut scalar_b = caches.remove(0);
+        let mut batch_a = caches.remove(0);
+        let mut batch_b = caches.remove(0);
+        let prompt_a = deterministic_embeds(2, 1, &device);
+        let prompt_b = deterministic_embeds(3, 7, &device);
+        for cache in [&mut scalar_a, &mut batch_a] {
+            model
+                .forward_managed_hidden_with_embeds(&prompt_a, 0, cache, None, None)
+                .unwrap();
+            cache.take_completed_writes();
+        }
+        for cache in [&mut scalar_b, &mut batch_b] {
+            model
+                .forward_managed_hidden_with_embeds(&prompt_b, 0, cache, None, None)
+                .unwrap();
+            cache.take_completed_writes();
+        }
+        let step_a = deterministic_embeds(1, 17, &device);
+        let step_b = deterministic_embeds(1, 23, &device);
+        let scalar_a_hidden = model
+            .forward_managed_hidden_with_embeds(&step_a, 2, &mut scalar_a, None, None)
+            .unwrap();
+        let scalar_b_hidden = model
+            .forward_managed_hidden_with_embeds(&step_b, 3, &mut scalar_b, None, None)
+            .unwrap();
+        let before = arena.operation_stats().paged_decode_dispatches;
+        let batch_hidden = model
+            .forward_managed_decode_batch_hidden_with_embeds(
+                &Tensor::cat(&[&step_a, &step_b], 0).unwrap(),
+                &[2, 3],
+                &mut [&mut batch_a, &mut batch_b],
+                None,
+            )
+            .unwrap();
+
+        assert_close(
+            &scalar_a_hidden,
+            &batch_hidden.i(0).unwrap().unsqueeze(0).unwrap(),
+        );
+        assert_close(
+            &scalar_b_hidden,
+            &batch_hidden.i(1).unwrap().unsqueeze(0).unwrap(),
+        );
+        assert_eq!(arena.operation_stats().paged_decode_dispatches - before, 1);
+        assert_eq!((batch_a.context_len(), batch_b.context_len()), (3, 4));
+        let completions_a = batch_a.take_completed_writes();
+        let completions_b = batch_b.take_completed_writes();
+        assert_eq!((completions_a.len(), completions_b.len()), (1, 1));
+        assert!(Arc::ptr_eq(&completions_a[0], &completions_b[0]));
+    }
+
+    #[test]
     fn ragged_decode_matches_scalar_at_unequal_positions_and_dispatches_once() {
         let device = Device::Cpu;
         let model = tiny_decode_model(&device, None);
@@ -1226,7 +1347,7 @@ mod tests {
         )
         .unwrap();
         assert!(model
-            .forward_managed_decode_batch_with_embeds(
+            .forward_managed_decode_batch_hidden_with_embeds(
                 &embeds,
                 &[2, 2],
                 &mut [&mut cache_a, &mut cache_b],
