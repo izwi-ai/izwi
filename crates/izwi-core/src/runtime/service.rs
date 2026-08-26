@@ -786,6 +786,7 @@ fn coordinator_lane_for_metadata(
                 | ModelFamily::WhisperAsr
                 | ModelFamily::VibeVoiceAsr
                 | ModelFamily::GraniteSpeechAsr
+                | ModelFamily::Lfm25Audio
         ),
         TaskType::TTS => variant.family() == ModelFamily::Qwen3Tts,
         TaskType::SpeechToSpeech => false,
@@ -808,6 +809,7 @@ fn coordinator_lane_for_request(request: &EngineCoreRequest) -> CoordinatorLane 
                     | ModelFamily::WhisperAsr
                     | ModelFamily::VibeVoiceAsr
                     | ModelFamily::GraniteSpeechAsr
+                    | ModelFamily::Lfm25Audio
             )
         })
         && request.prepared_asr_execution_shape().is_none()
@@ -1898,6 +1900,7 @@ fn bind_request_to_residency(
                 | ModelFamily::WhisperAsr
                 | ModelFamily::VibeVoiceAsr
                 | ModelFamily::GraniteSpeechAsr
+                | ModelFamily::Lfm25Audio
         ) && request.prepared_asr_execution_shape().is_some()
     }) && request.prepared_asr_audio_for_executor()?.is_none()
     {
@@ -1937,6 +1940,18 @@ fn bind_request_to_residency(
     {
         return Err(Error::InvalidInput(
             "VibeVoice normal execution shape has no matching prepared artifact".into(),
+        ));
+    }
+    if request.model_variant.is_some_and(|variant| {
+        variant.family() == ModelFamily::Lfm25Audio
+            && request.prepared_asr_execution_shape().is_some()
+            && !request.uses_asr_long_form_atomic()
+    }) && request
+        .prepared_lfm25_audio_asr_artifact_for_executor()?
+        .is_none()
+    {
+        return Err(Error::InvalidInput(
+            "LFM2.5 Audio normal execution shape has no matching prepared artifact".into(),
         ));
     }
     let streaming = if request.streaming && !model_streaming_required {
@@ -3032,6 +3047,7 @@ impl RuntimeService {
                     | ModelFamily::WhisperAsr
                     | ModelFamily::VibeVoiceAsr
                     | ModelFamily::GraniteSpeechAsr
+                    | ModelFamily::Lfm25Audio
             ) {
             CoordinatorLane::Atomic
         } else {
@@ -3124,6 +3140,7 @@ impl RuntimeService {
                             | ModelFamily::WhisperAsr
                             | ModelFamily::VibeVoiceAsr
                             | ModelFamily::GraniteSpeechAsr
+                            | ModelFamily::Lfm25Audio
                     )
                 })
                 && request.prepared_asr_audio_for_executor()?.is_some());
@@ -4174,6 +4191,264 @@ impl RuntimeService {
         }
     }
 
+    async fn prepare_lfm25_audio_asr_shape_for_binding(
+        &self,
+        request: EngineCoreRequest,
+        job: JobLease,
+        residency_lease: Option<&ModelResidencyLease>,
+    ) -> Result<(EngineCoreRequest, JobLease)> {
+        if request.task_type != TaskType::ASR
+            || request
+                .model_variant
+                .is_none_or(|variant| variant.family() != ModelFamily::Lfm25Audio)
+            || request.prepared_asr_execution_shape().is_some()
+        {
+            return Ok((request, job));
+        }
+        let variant = request
+            .model_variant
+            .expect("validated LFM2.5 Audio variant");
+        let model = self
+            .model_registry
+            .get_lfm25_audio_lease(variant)
+            .await
+            .ok_or_else(|| {
+                Error::ModelNotFound(format!("LFM2.5 Audio model {variant} is not loaded"))
+            })?;
+        let residency = residency_lease.ok_or_else(|| {
+            Error::InferenceError("LFM2.5 Audio ASR preparation requires model residency".into())
+        })?;
+        let loaded_bundle = self
+            .model_lifecycle
+            .try_get_ready_bundle(residency.variant());
+        let preparation_contract = loaded_contract_for_residency(
+            residency,
+            loaded_bundle.as_deref(),
+            CapabilityKind::Asr,
+            false,
+            self.coordinator.execution_group_id(),
+            self.backend_router.context().backend_kind,
+            Some(ExecutionTargetKind::TokenEngine),
+        )?;
+        let context_limit = self
+            .model_registry
+            .effective_context(variant)
+            .ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "LFM2.5 Audio model {variant} has no effective context"
+                ))
+            })?;
+        let model_for_shape = model.clone();
+        let (prepared, envelope) = self
+            .coordinator
+            .run_host_blocking_stage(&job, move || {
+                let mut request = request;
+                let (samples, sample_rate) =
+                    crate::engine::decode_request_audio_with_rate(&request)?;
+                let long_form = model_for_shape.asr_requires_long_form(&samples, sample_rate);
+                let envelope = (!long_form)
+                    .then(|| {
+                        model_for_shape.lfm25_audio_asr_preparation_resource_envelope(
+                            samples.len(),
+                            sample_rate,
+                        )
+                    })
+                    .transpose()?;
+                request.install_prepared_asr_audio(variant, samples, sample_rate)?;
+                if let Some(envelope) = envelope {
+                    request.install_prepared_sequence_input_tokens(
+                        envelope.geometry.prompt_tokens,
+                        context_limit,
+                    )?;
+                    Ok((request, Some(envelope)))
+                } else {
+                    request.install_prepared_asr_long_form_atomic()?;
+                    Ok((request, None))
+                }
+            })
+            .await?;
+        let retained_request_host_bytes =
+            u64::try_from(retained_engine_request_input_bytes(&prepared)?).map_err(|_| {
+                Error::Overloaded("LFM2.5 Audio ASR retained input exceeds u64".into())
+            })?;
+        job.record_materialized_usage(JobResourceObservation::host(retained_request_host_bytes))?;
+        let bridge = self.coordinator.bridge_preparation_admission(job)?;
+        if prepared.uses_asr_long_form_atomic() {
+            let (spec, observation) = self.coordinator_job_for_request(&prepared)?;
+            return match self
+                .coordinator
+                .admit_observed_from_preparation(bridge, spec, observation)
+                .await
+            {
+                Ok(job) => Ok((prepared, job)),
+                Err(failure) => {
+                    drop(prepared);
+                    let error = failure.error;
+                    drop(failure.bridge);
+                    Err(error)
+                }
+            };
+        }
+        let envelope = envelope.ok_or_else(|| {
+            Error::InferenceError("LFM2.5 Audio normal route lost preparation envelope".into())
+        })?;
+        if envelope.backend != self.backend_router.context().backend_kind {
+            drop(prepared);
+            drop(bridge);
+            return Err(Error::InferenceError(
+                "LFM2.5 Audio preparation envelope used the wrong backend domain".into(),
+            ));
+        }
+        let preparation_resources = asr_encoder_retained_resources(
+            self.backend_router.context().backend_kind,
+            retained_request_host_bytes,
+            envelope.max_retained_resident_bytes,
+        )?;
+        let preparation_spec = JobSpec {
+            request_id: prepared.id.clone(),
+            lane: CoordinatorLane::Atomic,
+            priority: prepared.priority,
+            workload_class: prepared.workload_class,
+            deadline: prepared.deadline,
+            resources: preparation_resources,
+        };
+        let preparation_job = match self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                preparation_spec,
+                JobResourceObservation::host(retained_request_host_bytes),
+            )
+            .await
+        {
+            Ok(job) => job,
+            Err(failure) => {
+                drop(prepared);
+                let error = failure.error;
+                drop(failure.bridge);
+                return Err(error);
+            }
+        };
+        let (samples, sample_rate) = prepared
+            .prepared_asr_audio_for_executor()?
+            .ok_or_else(|| Error::InferenceError("LFM2.5 Audio decoded audio was lost".into()))?;
+        let work = WorkUnit::PreSequencePreparation {
+            kind: "asr.encoder.lfm25_audio".into(),
+        };
+        let cost = crate::engine::WorkCost::with_workspace(
+            envelope.max_work_units,
+            envelope.max_materialized_tensor_elements,
+            ResourceVector {
+                host_bytes: ResourceAmount::Known(envelope.max_host_workspace_bytes),
+                device_bytes: ResourceAmount::Known(envelope.max_device_workspace_bytes),
+                unified_bytes: ResourceAmount::Known(envelope.max_unified_workspace_bytes),
+                ..ResourceVector::zero()
+            },
+        );
+        let cancellation = PreparationCancellation::default();
+        let row = self.coordinator.seal_preparation_row(
+            preparation_job,
+            &preparation_contract,
+            &work,
+            cost,
+            envelope.max_materialized_tensor_elements,
+            cancellation.clone(),
+        )?;
+        let model_for_preparation = model.clone();
+        let mut cancellation_guard = PreparationCancellationGuard {
+            cancellation,
+            armed: true,
+        };
+        let mut outcomes = self
+            .coordinator
+            .run_loaded_native_preparation_batch(
+                vec![row],
+                preparation_contract,
+                work,
+                move |live| {
+                    if live != [0] {
+                        return Err(Error::InferenceError(
+                            "LFM2.5 Audio scalar preparation received a non-scalar live set".into(),
+                        ));
+                    }
+                    let artifact = model_for_preparation
+                        .prepare_lfm25_audio_asr_artifact(samples.as_ref(), sample_rate)?;
+                    let retained_host_bytes = retained_request_host_bytes
+                        .checked_add(artifact.retained_host_bytes)
+                        .ok_or_else(|| {
+                            Error::Overloaded(
+                                "LFM2.5 Audio ASR retained host accounting overflow".into(),
+                            )
+                        })?;
+                    Ok(vec![Ok(PreparationArtifact {
+                        retained: JobResourceObservation {
+                            host_bytes: retained_host_bytes,
+                            accelerator_bytes: artifact.retained_resident_bytes,
+                        },
+                        value: artifact,
+                    })])
+                },
+            )
+            .await?;
+        cancellation_guard.armed = false;
+        let outcome = outcomes.pop().ok_or_else(|| {
+            Error::InferenceError("LFM2.5 Audio scalar preparation returned no outcome".into())
+        })?;
+        let (artifact, bridge) = match outcome {
+            PreparationRowOutcome::Committed { artifact, bridge } => (artifact.value, bridge),
+            PreparationRowOutcome::Cancelled => return Err(Error::Cancelled(prepared.id.clone())),
+            PreparationRowOutcome::TimedOut => return Err(Error::Timeout(prepared.id.clone())),
+            PreparationRowOutcome::Failed(error) => return Err(error),
+        };
+        if artifact.source_samples != envelope.geometry.source_samples
+            || artifact.source_sample_rate != envelope.geometry.source_sample_rate
+            || artifact.resampled_samples != envelope.geometry.resampled_samples
+            || artifact.mel_frames != envelope.geometry.total_mel_frames
+            || artifact.effective_feature_frames != envelope.geometry.effective_feature_frames
+            || artifact.audio_tokens != envelope.geometry.encoder_frames
+            || artifact.prompt_tokens != envelope.geometry.prompt_tokens
+            || artifact.materialized_tensor_elements
+                != envelope.geometry.materialized_tensor_elements
+            || artifact.retained_resident_bytes != envelope.geometry.retained_resident_bytes
+        {
+            drop(artifact);
+            drop(prepared);
+            drop(bridge);
+            return Err(Error::InferenceError(
+                "LFM2.5 Audio ASR artifact drifted from admitted geometry".into(),
+            ));
+        }
+        let retained_host_bytes = retained_request_host_bytes
+            .checked_add(artifact.retained_host_bytes)
+            .ok_or_else(|| {
+                Error::Overloaded("LFM2.5 Audio ASR retained host accounting overflow".into())
+            })?;
+        let accelerator_bytes = artifact.retained_resident_bytes;
+        let mut prepared = prepared;
+        prepared.install_prepared_lfm25_audio_asr_artifact(variant, artifact)?;
+        let (execution, _) = self.coordinator_job_for_request(&prepared)?;
+        match self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                execution,
+                JobResourceObservation {
+                    host_bytes: retained_host_bytes,
+                    accelerator_bytes,
+                },
+            )
+            .await
+        {
+            Ok(job) => Ok((prepared, job)),
+            Err(failure) => {
+                drop(prepared);
+                let error = failure.error;
+                drop(failure.bridge);
+                Err(error)
+            }
+        }
+    }
+
     async fn prepare_asr_shape_for_binding(
         &self,
         request: EngineCoreRequest,
@@ -4189,7 +4464,10 @@ impl RuntimeService {
         let (request, job) = self
             .prepare_vibevoice_asr_shape_for_binding(request, job, residency_lease)
             .await?;
-        self.prepare_granite_speech_asr_shape_for_binding(request, job, residency_lease)
+        let (request, job) = self
+            .prepare_granite_speech_asr_shape_for_binding(request, job, residency_lease)
+            .await?;
+        self.prepare_lfm25_audio_asr_shape_for_binding(request, job, residency_lease)
             .await
     }
 
@@ -7326,6 +7604,22 @@ mod tests {
         vibe_long.install_prepared_asr_long_form_atomic().unwrap();
         assert_eq!(
             coordinator_lane_for_request(&vibe_long),
+            CoordinatorLane::Atomic
+        );
+
+        let lfm_variant = ModelVariant::Lfm25Audio15BGguf;
+        let mut lfm = EngineCoreRequest::asr("audio").with_model_variant(lfm_variant);
+        assert_eq!(coordinator_lane_for_request(&lfm), CoordinatorLane::Atomic);
+        lfm.install_prepared_sequence_input_tokens(32, 4_096)
+            .unwrap();
+        assert_eq!(
+            coordinator_lane_for_request(&lfm),
+            CoordinatorLane::Resumable
+        );
+        let mut lfm_long = EngineCoreRequest::asr("audio").with_model_variant(lfm_variant);
+        lfm_long.install_prepared_asr_long_form_atomic().unwrap();
+        assert_eq!(
+            coordinator_lane_for_request(&lfm_long),
             CoordinatorLane::Atomic
         );
     }
