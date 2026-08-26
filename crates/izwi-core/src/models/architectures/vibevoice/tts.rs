@@ -208,6 +208,17 @@ pub(crate) struct VibeVoiceTtsPreparedArtifact {
     preparation_profile: VibeVoiceTtsProfile,
 }
 
+impl std::fmt::Debug for VibeVoiceTtsPreparedArtifact {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VibeVoiceTtsPreparedArtifact")
+            .field("model_identity", &self.model_identity)
+            .field("prompt_tokens", &self.input_ids.len())
+            .field("retained_tensor_bytes", &self.retained_tensor_bytes().ok())
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VibeVoiceTtsRetainedPrefillStep {
     pub(crate) consumed_positive_tokens: usize,

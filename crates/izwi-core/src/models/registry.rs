@@ -40,8 +40,8 @@ use crate::models::architectures::lfm2::chat::{
 };
 use crate::models::architectures::lfm25_audio::{
     asr_retained::{
-        Lfm25AudioAsrDecodeStep, Lfm25AudioAsrPrefillStep, Lfm25AudioAsrQuantumCheckpoint,
-        Lfm25AudioAsrRetainedState,
+        Lfm25AudioAsrDecodeStep, Lfm25AudioAsrPrefillBatch, Lfm25AudioAsrPrefillStep,
+        Lfm25AudioAsrQuantumCheckpoint, Lfm25AudioAsrRetainedState,
     },
     model::{
         Lfm25AudioAsrPreparationResourceEnvelope, Lfm25AudioAsrPreparationStageCeiling,
@@ -55,8 +55,8 @@ use crate::models::architectures::lfm25_audio::{
     },
     state::Lfm25AudioRetainedMode,
     tts_retained::{
-        Lfm25AudioPreparedTtsArtifact, Lfm25AudioTtsDecodeStep, Lfm25AudioTtsPrefillStep,
-        Lfm25AudioTtsQuantumCheckpoint, Lfm25AudioTtsRetainedState,
+        Lfm25AudioPreparedTtsArtifact, Lfm25AudioTtsDecodeStep, Lfm25AudioTtsPrefillBatch,
+        Lfm25AudioTtsPrefillStep, Lfm25AudioTtsQuantumCheckpoint, Lfm25AudioTtsRetainedState,
     },
     Lfm25AudioGenerationConfig, Lfm25AudioModel, Lfm25AudioStreamConfig,
 };
@@ -3071,6 +3071,20 @@ impl NativeAudioChatModel {
         }
     }
 
+    pub(crate) fn lfm25_audio_tts_prefill_batch(
+        &self,
+        states: &mut [&mut Lfm25AudioTtsRetainedState],
+        mains: &mut [&mut PhysicalPagedKvCache],
+        checkpoints: &[&Lfm25AudioTtsQuantumCheckpoint],
+        max_tokens: &[usize],
+    ) -> Result<Lfm25AudioTtsPrefillBatch> {
+        match self {
+            Self::Lfm25Audio(model) => {
+                model.retained_tts_prefill_batch(states, mains, checkpoints, max_tokens)
+            }
+        }
+    }
+
     pub(crate) fn lfm25_audio_tts_decode_step(
         &self,
         state: &mut Lfm25AudioTtsRetainedState,
@@ -3192,6 +3206,20 @@ impl NativeAudioChatModel {
         match self {
             Self::Lfm25Audio(model) => {
                 model.retained_asr_prefill_step(state, cache, checkpoint, max_tokens)
+            }
+        }
+    }
+
+    pub(crate) fn lfm25_audio_asr_prefill_batch(
+        &self,
+        states: &mut [&mut Lfm25AudioAsrRetainedState],
+        caches: &mut [&mut PhysicalPagedKvCache],
+        checkpoints: &[&Lfm25AudioAsrQuantumCheckpoint],
+        max_tokens: &[usize],
+    ) -> Result<Lfm25AudioAsrPrefillBatch> {
+        match self {
+            Self::Lfm25Audio(model) => {
+                model.retained_asr_prefill_batch(states, caches, checkpoints, max_tokens)
             }
         }
     }
@@ -4090,6 +4118,27 @@ impl QwenTtsModelLease {
 
 impl Deref for QwenTtsModelLease {
     type Target = Qwen3TtsModel;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+/// A loaded VibeVoice TTS handle that fences unload for the exact model
+/// instance retained by an admitted incremental request.
+#[derive(Clone)]
+pub struct VibeVoiceTtsModelLease {
+    inner: TrackedModelLease<VibeVoiceTtsModel>,
+}
+
+impl VibeVoiceTtsModelLease {
+    pub(crate) fn model_arc(&self) -> Arc<VibeVoiceTtsModel> {
+        self.inner.model.clone()
+    }
+}
+
+impl Deref for VibeVoiceTtsModelLease {
+    type Target = VibeVoiceTtsModel;
 
     fn deref(&self) -> &Self::Target {
         &self.inner
@@ -5116,7 +5165,8 @@ pub struct ModelRegistry {
     voxtral_models:
         Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<VoxtralRealtimeModel>>>>>,
     voxtral_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<VoxtralTtsModel>>>>>>,
-    vibevoice_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<VibeVoiceTtsModel>>>>>>,
+    vibevoice_tts_models:
+        Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<VibeVoiceTtsModel>>>>>,
     fish_s2_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<FishS2TtsModel>>>>>>,
     qwen_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<Qwen3TtsModel>>>>>,
     kokoro_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<KokoroTtsModel>>>>>>,
@@ -5509,7 +5559,7 @@ impl ModelRegistry {
         {
             let guard = self.vibevoice_tts_models.read().await;
             for (variant, cell) in guard.iter() {
-                let Some(model) = cell.get() else {
+                let Some(model) = cell.model.get() else {
                     continue;
                 };
                 let model_diagnostics = model.diagnostics();
@@ -6017,12 +6067,18 @@ impl ModelRegistry {
             ))
         })?;
 
-        let cell = {
+        let (entry, loading_guard) = {
             let mut guard = self.vibevoice_tts_models.write().await;
-            guard
+            let entry = guard
                 .entry(variant)
-                .or_insert_with(|| Arc::new(OnceCell::new()))
-                .clone()
+                .or_insert_with(|| Arc::new(TrackedModelEntry::default()))
+                .clone();
+            let loading_guard = entry.uses.acquire().ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "VibeVoice TTS model {variant} exceeded its active-use accounting capacity"
+                ))
+            })?;
+            (entry, loading_guard)
         };
 
         info!(
@@ -6030,7 +6086,8 @@ impl ModelRegistry {
             registration.name
         );
 
-        let model = cell
+        entry
+            .model
             .get_or_try_init({
                 let model_dir = model_dir.to_path_buf();
                 let device = self.device.clone();
@@ -6043,8 +6100,19 @@ impl ModelRegistry {
                 }
             })
             .await?;
-
-        Ok(model.clone())
+        let model = {
+            let guard = self.vibevoice_tts_models.read().await;
+            guard
+                .get(&variant)
+                .filter(|current| Arc::ptr_eq(current, &entry))
+                .and_then(|current| current.model.get().cloned())
+        };
+        drop(loading_guard);
+        model.ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "VibeVoice TTS model {variant} load was superseded before publication"
+            ))
+        })
     }
 
     pub async fn load_fish_s2_tts(
@@ -6328,12 +6396,54 @@ impl ModelRegistry {
 
     pub async fn get_vibevoice_tts(&self, variant: ModelVariant) -> Option<Arc<VibeVoiceTtsModel>> {
         let guard = self.vibevoice_tts_models.read().await;
-        guard.get(&variant).and_then(|cell| cell.get().cloned())
+        guard.get(&variant).and_then(|entry| entry.ready_model())
     }
 
     pub fn try_get_vibevoice_tts(&self, variant: ModelVariant) -> Option<Arc<VibeVoiceTtsModel>> {
         let guard = self.vibevoice_tts_models.try_read().ok()?;
-        guard.get(&variant).and_then(|cell| cell.get().cloned())
+        guard.get(&variant).and_then(|entry| entry.ready_model())
+    }
+
+    pub async fn get_vibevoice_tts_lease(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<VibeVoiceTtsModelLease> {
+        let guard = self.vibevoice_tts_models.read().await;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire_ready())
+            .map(|inner| VibeVoiceTtsModelLease { inner })
+    }
+
+    pub fn try_get_vibevoice_tts_lease(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<VibeVoiceTtsModelLease> {
+        let guard = self.vibevoice_tts_models.try_read().ok()?;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire_ready())
+            .map(|inner| VibeVoiceTtsModelLease { inner })
+    }
+
+    pub(crate) async fn get_loading_vibevoice_tts(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<Arc<VibeVoiceTtsModel>> {
+        let guard = self.vibevoice_tts_models.read().await;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.model.get().cloned())
+    }
+
+    pub(crate) async fn publish_vibevoice_tts_ready(&self, variant: ModelVariant) -> Result<()> {
+        let guard = self.vibevoice_tts_models.read().await;
+        let entry = guard.get(&variant).ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "cannot publish missing VibeVoice TTS model {variant} as ready"
+            ))
+        })?;
+        entry.publish_ready()
     }
 
     pub async fn get_fish_s2_tts(&self, variant: ModelVariant) -> Option<Arc<FishS2TtsModel>> {
@@ -6446,8 +6556,17 @@ impl ModelRegistry {
     }
 
     pub async fn unload_vibevoice_tts(&self, variant: ModelVariant) {
-        let mut guard = self.vibevoice_tts_models.write().await;
-        guard.remove(&variant);
+        let entry = {
+            let mut guard = self.vibevoice_tts_models.write().await;
+            let entry = guard.remove(&variant);
+            if let Some(entry) = &entry {
+                entry.reset_ready();
+            }
+            entry
+        };
+        if let Some(entry) = entry {
+            entry.uses.wait_until_idle().await;
+        }
     }
 
     pub async fn unload_fish_s2_tts(&self, variant: ModelVariant) {

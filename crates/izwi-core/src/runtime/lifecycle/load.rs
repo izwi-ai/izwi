@@ -1963,7 +1963,7 @@ impl ModelLifecycleController {
                 }
                 let model = self
                     .model_registry
-                    .get_vibevoice_tts(variant)
+                    .get_loading_vibevoice_tts(variant)
                     .await
                     .ok_or_else(|| {
                         Error::ModelLoadError(format!(
@@ -2079,6 +2079,11 @@ impl ModelLifecycleController {
             if variant.family() == crate::catalog::ModelFamily::Lfm25Audio {
                 self.model_registry
                     .publish_lfm25_audio_ready(variant)
+                    .await?;
+            }
+            if variant.family() == crate::catalog::ModelFamily::VibeVoiceTts {
+                self.model_registry
+                    .publish_vibevoice_tts_ready(variant)
                     .await?;
             }
             self.touch_model_usage(variant).await;

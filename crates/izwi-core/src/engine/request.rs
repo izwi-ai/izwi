@@ -32,10 +32,13 @@ use crate::models::architectures::qwen3::tts::{
     Qwen3TtsModel, SpeakerReference, TtsGenerationParams, TtsSessionCacheRequest,
 };
 use crate::models::architectures::vibevoice::asr::VibeVoiceAsrPreparedArtifact;
+use crate::models::architectures::vibevoice::tts::{
+    VibeVoiceTtsGenerationParams, VibeVoiceTtsPreparedArtifact,
+};
 use crate::models::architectures::whisper::asr::WhisperPreparedWindow;
 use crate::models::registry::{
     AsrModelLease, ChatModelLease, Lfm25AudioModelLease, NativeAsrModel, NativeChatModel,
-    NativeChatPreparedPrompt, QwenTtsModelLease,
+    NativeChatPreparedPrompt, QwenTtsModelLease, VibeVoiceTtsModelLease,
 };
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRequestConfig, ChatRole};
 use crate::runtime::audio_io::{
@@ -348,6 +351,7 @@ enum PreparedIncrementalModel {
     Lfm25AudioAsr(Lfm25AudioModelLease),
     Lfm25AudioTts(Lfm25AudioModelLease),
     QwenTts(QwenTtsModelLease),
+    VibeVoiceTts(VibeVoiceTtsModelLease),
 }
 
 impl fmt::Debug for PreparedIncrementalModel {
@@ -357,6 +361,7 @@ impl fmt::Debug for PreparedIncrementalModel {
             Self::Lfm25AudioAsr(model) => write!(formatter, "Lfm25AudioAsr({:p})", &**model),
             Self::Lfm25AudioTts(model) => write!(formatter, "Lfm25AudioTts({:p})", &**model),
             Self::QwenTts(model) => write!(formatter, "QwenTts({:p})", &**model),
+            Self::VibeVoiceTts(model) => write!(formatter, "VibeVoiceTts({:p})", &**model),
         }
     }
 }
@@ -367,6 +372,8 @@ pub(super) struct IncrementalModelExecutionReady {
     model: PreparedIncrementalModel,
     qwen_tts: Option<PreparedQwenTtsInput>,
     lfm25_audio_tts: Option<Arc<Lfm25AudioPreparedTtsArtifact>>,
+    vibevoice_tts: Option<Arc<VibeVoiceTtsPreparedArtifact>>,
+    vibevoice_tts_params: Option<VibeVoiceTtsGenerationParams>,
 }
 
 #[derive(Debug, Clone)]
@@ -2348,6 +2355,8 @@ impl EngineCoreRequest {
             model: PreparedIncrementalModel::Asr(model),
             qwen_tts: None,
             lfm25_audio_tts: None,
+            vibevoice_tts: None,
+            vibevoice_tts_params: None,
         });
         if let Some((stage_id, cost)) = prepared_continuous_cost {
             self.install_prepared_stage_cost(stage_id, cost)?;
@@ -2375,6 +2384,8 @@ impl EngineCoreRequest {
             model: PreparedIncrementalModel::Lfm25AudioAsr(model),
             qwen_tts: None,
             lfm25_audio_tts: None,
+            vibevoice_tts: None,
+            vibevoice_tts_params: None,
         });
         Ok(())
     }
@@ -3235,6 +3246,8 @@ impl EngineCoreRequest {
             model: PreparedIncrementalModel::Lfm25AudioTts(model),
             qwen_tts: None,
             lfm25_audio_tts: Some(artifact),
+            vibevoice_tts: None,
+            vibevoice_tts_params: None,
         });
         for (stage, cost) in stage_costs {
             self.install_prepared_stage_cost(stage, cost)?;
@@ -3244,6 +3257,40 @@ impl EngineCoreRequest {
 
     pub(crate) fn lfm25_audio_tts_generation_config(&self) -> Lfm25AudioGenerationConfig {
         Lfm25AudioGenerationConfig::default()
+    }
+
+    pub(crate) fn install_vibevoice_tts_execution_model(
+        &mut self,
+        model_variant: ModelVariant,
+        model: VibeVoiceTtsModelLease,
+        artifact: Arc<VibeVoiceTtsPreparedArtifact>,
+        params: VibeVoiceTtsGenerationParams,
+        max_sequence_tokens: usize,
+    ) -> Result<()> {
+        if self.task_type != TaskType::TTS
+            || self.model_variant != Some(model_variant)
+            || model_variant.family() != ModelFamily::VibeVoiceTts
+            || artifact.prompt_tokens() == 0
+            || artifact.prompt_tokens() >= max_sequence_tokens
+            || params.max_frames == 0
+        {
+            return Err(Error::InvalidInput(format!(
+                "VibeVoice TTS request {} preparation does not match its routed model/context",
+                self.id
+            )));
+        }
+        self.prepared_stage_costs.clear();
+        self.prepared_sequence_input_tokens = Some(artifact.prompt_tokens());
+        self.params.max_tokens = params.max_frames;
+        self.incremental_model_execution_ready = Some(IncrementalModelExecutionReady {
+            model_variant,
+            model: PreparedIncrementalModel::VibeVoiceTts(model),
+            qwen_tts: None,
+            lfm25_audio_tts: None,
+            vibevoice_tts: Some(artifact),
+            vibevoice_tts_params: Some(params),
+        });
+        Ok(())
     }
 
     pub(crate) fn install_qwen_tts_execution_model(
@@ -3335,6 +3382,8 @@ impl EngineCoreRequest {
                 max_frames: layout.max_frames,
             }),
             lfm25_audio_tts: None,
+            vibevoice_tts: None,
+            vibevoice_tts_params: None,
         });
         if let Some((stage_id, cost)) = prepared_continuous_cost {
             self.install_prepared_stage_cost(stage_id, cost)?;
@@ -3489,6 +3538,29 @@ impl EngineCoreRequest {
                 )));
             }
         }
+        if matches!(&ready.model, PreparedIncrementalModel::VibeVoiceTts(_)) {
+            let prepared = ready.vibevoice_tts.as_ref().ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "VibeVoice TTS request {} is missing its prepared prompt",
+                    self.id
+                ))
+            })?;
+            let params = ready.vibevoice_tts_params.as_ref().ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "VibeVoice TTS request {} is missing its sealed generation geometry",
+                    self.id
+                ))
+            })?;
+            if ready.model_variant.family() != ModelFamily::VibeVoiceTts
+                || self.prepared_sequence_input_tokens != Some(prepared.prompt_tokens())
+                || self.params.max_tokens != params.max_frames
+            {
+                return Err(Error::InvalidInput(format!(
+                    "VibeVoice TTS request {} changed after preparation",
+                    self.id
+                )));
+            }
+        }
         match (&ready.model, self.task_type) {
             (PreparedIncrementalModel::Asr(_), TaskType::ASR) if ready.qwen_tts.is_none() => Ok(()),
             (PreparedIncrementalModel::Lfm25AudioAsr(_), TaskType::ASR)
@@ -3510,6 +3582,13 @@ impl EngineCoreRequest {
             {
                 Ok(())
             }
+            (PreparedIncrementalModel::VibeVoiceTts(_), TaskType::TTS)
+                if ready.model_variant.family() == ModelFamily::VibeVoiceTts
+                    && ready.vibevoice_tts.is_some()
+                    && ready.vibevoice_tts_params.is_some() =>
+            {
+                Ok(())
+            }
             _ => Err(Error::InvalidInput(format!(
                 "Request {} carries incremental preparation for a different task",
                 self.id
@@ -3527,6 +3606,7 @@ impl EngineCoreRequest {
                 PreparedIncrementalModel::Lfm25AudioAsr(_)
                 | PreparedIncrementalModel::Lfm25AudioTts(_)
                 | PreparedIncrementalModel::QwenTts(_) => None,
+                PreparedIncrementalModel::VibeVoiceTts(_) => None,
             }))
     }
 
@@ -3540,6 +3620,7 @@ impl EngineCoreRequest {
                 PreparedIncrementalModel::Lfm25AudioAsr(_)
                 | PreparedIncrementalModel::Lfm25AudioTts(_)
                 | PreparedIncrementalModel::QwenTts(_) => None,
+                PreparedIncrementalModel::VibeVoiceTts(_) => None,
             }))
     }
 
@@ -3555,6 +3636,7 @@ impl EngineCoreRequest {
                 PreparedIncrementalModel::Asr(_)
                 | PreparedIncrementalModel::Lfm25AudioTts(_)
                 | PreparedIncrementalModel::QwenTts(_) => None,
+                PreparedIncrementalModel::VibeVoiceTts(_) => None,
             }))
     }
 
@@ -3581,6 +3663,39 @@ impl EngineCoreRequest {
             .and_then(|ready| ready.lfm25_audio_tts.clone()))
     }
 
+    pub(crate) fn prepared_vibevoice_tts_model_lease_for_executor(
+        &self,
+    ) -> Result<Option<VibeVoiceTtsModelLease>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| match &ready.model {
+                PreparedIncrementalModel::VibeVoiceTts(model) => Some(model.clone()),
+                _ => None,
+            }))
+    }
+
+    pub(crate) fn prepared_vibevoice_tts_artifact_for_executor(
+        &self,
+    ) -> Result<Option<Arc<VibeVoiceTtsPreparedArtifact>>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| ready.vibevoice_tts.clone()))
+    }
+
+    pub(crate) fn vibevoice_tts_generation_params_for_executor(
+        &self,
+    ) -> Result<Option<VibeVoiceTtsGenerationParams>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| ready.vibevoice_tts_params.clone()))
+    }
+
     pub(crate) fn prepared_qwen_tts_model_for_executor(
         &self,
     ) -> Result<Option<Arc<Qwen3TtsModel>>> {
@@ -3593,6 +3708,7 @@ impl EngineCoreRequest {
                 PreparedIncrementalModel::Asr(_)
                 | PreparedIncrementalModel::Lfm25AudioAsr(_)
                 | PreparedIncrementalModel::Lfm25AudioTts(_) => None,
+                PreparedIncrementalModel::VibeVoiceTts(_) => None,
             }))
     }
 
@@ -3608,6 +3724,7 @@ impl EngineCoreRequest {
                 PreparedIncrementalModel::Asr(_)
                 | PreparedIncrementalModel::Lfm25AudioAsr(_)
                 | PreparedIncrementalModel::Lfm25AudioTts(_) => None,
+                PreparedIncrementalModel::VibeVoiceTts(_) => None,
             }))
     }
 
@@ -4036,6 +4153,7 @@ impl EngineCoreRequest {
                 PreparedIncrementalModel::Lfm25AudioAsr(_)
                 | PreparedIncrementalModel::Lfm25AudioTts(_)
                 | PreparedIncrementalModel::QwenTts(_) => None,
+                PreparedIncrementalModel::VibeVoiceTts(_) => None,
             })
             .filter(|_| self.uses_asr_retained_sequence())
             .map(|model| Self::continuous_asr_stage_cost(Some(&binding), model))
