@@ -1208,6 +1208,54 @@ pub(crate) struct ParakeetPredictorBatchState {
     c1: Tensor,
 }
 
+impl ParakeetPredictorBatchState {
+    pub(crate) fn gather_rows(rows: &[&Self]) -> Result<Self> {
+        if rows.is_empty() {
+            return Err(Error::InvalidInput(
+                "Parakeet predictor cohort cannot be empty".into(),
+            ));
+        }
+        let gather = |select: fn(&Self) -> &Tensor| {
+            let tensors = rows.iter().map(|row| select(row)).collect::<Vec<_>>();
+            Tensor::cat(&tensors, 0).map_err(Error::from)
+        };
+        Ok(Self {
+            h0: gather(|state| &state.h0)?,
+            c0: gather(|state| &state.c0)?,
+            h1: gather(|state| &state.h1)?,
+            c1: gather(|state| &state.c1)?,
+        })
+    }
+
+    pub(crate) fn scatter_rows(&self, rows: &mut [&mut Self]) -> Result<()> {
+        let batch = self.h0.dim(0)?;
+        if batch == 0
+            || rows.len() != batch
+            || [self.c0.dim(0)?, self.h1.dim(0)?, self.c1.dim(0)?]
+                .into_iter()
+                .any(|value| value != batch)
+        {
+            return Err(Error::InvalidInput(
+                "Parakeet predictor cohort scatter has incompatible geometry".into(),
+            ));
+        }
+        let provisional = (0..batch)
+            .map(|index| {
+                Ok(Self {
+                    h0: self.h0.narrow(0, index, 1)?.contiguous()?,
+                    c0: self.c0.narrow(0, index, 1)?.contiguous()?,
+                    h1: self.h1.narrow(0, index, 1)?.contiguous()?,
+                    c1: self.c1.narrow(0, index, 1)?.contiguous()?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for (target, value) in rows.iter_mut().zip(provisional) {
+            **target = value;
+        }
+        Ok(())
+    }
+}
+
 impl Predictor {
     fn load(vb: VarBuilder) -> Result<Self> {
         let embed = vb.pp("embed").get_unchecked_dtype("weight", DType::F32)?;
@@ -1740,6 +1788,24 @@ mod tests {
                 expected.to_vec2::<f32>().unwrap()
             );
         }
+
+        let scalar_refs = scalar_states.iter().collect::<Vec<_>>();
+        let gathered = super::ParakeetPredictorBatchState::gather_rows(&scalar_refs).unwrap();
+        assert_eq!(gathered.h0.dims(), batch_state.h0.dims());
+        let mut scattered = vec![
+            predictor.initial_state(1, &device).unwrap(),
+            predictor.initial_state(1, &device).unwrap(),
+        ];
+        let mut targets = scattered.iter_mut().collect::<Vec<_>>();
+        gathered.scatter_rows(&mut targets).unwrap();
+        assert_eq!(
+            scattered[0].h0.to_vec2::<f32>().unwrap(),
+            scalar_states[0].h0.to_vec2::<f32>().unwrap()
+        );
+        let before = scattered[0].h0.to_vec2::<f32>().unwrap();
+        let mut short_targets = vec![&mut scattered[0]];
+        assert!(gathered.scatter_rows(&mut short_targets).is_err());
+        assert_eq!(scattered[0].h0.to_vec2::<f32>().unwrap(), before);
     }
 
     #[test]

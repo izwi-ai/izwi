@@ -1,4 +1,4 @@
-//! Physical invocation state authored by the loaded Parakeet decoder.
+//! Physical recurrent state authored by the loaded Parakeet decoder.
 
 use crate::engine::StageDescriptor;
 use crate::error::{Error, Result};
@@ -19,6 +19,7 @@ const PARAKEET_PREDICTOR_STATE_GROUP: StateGroupId = StateGroupId::new(1);
 #[derive(Debug, Clone)]
 pub(crate) struct ParakeetPhysicalStateSpec {
     pub(crate) descriptor: CapabilityStateDescriptorV2,
+    pub(crate) retained: Option<InferenceStateContract>,
     pub(crate) invocation: InferenceStateContract,
 }
 
@@ -26,11 +27,55 @@ pub(crate) fn parakeet_physical_state_spec(
     stage_graphs: &[&[StageDescriptor]],
 ) -> Result<ParakeetPhysicalStateSpec> {
     let invocation = parakeet_invocation_contract()?;
-    let descriptor = typed_invocation_descriptor(stage_graphs, &invocation)?;
+    let retained = parakeet_retained_contract(invocation.clone())?;
+    let uses_retained = stage_graphs.iter().any(|stages| {
+        stages.iter().any(|stage| {
+            matches!(
+                stage.selector,
+                crate::engine::StageWorkSelector::SequencePrefill
+                    | crate::engine::StageWorkSelector::SequenceDecode
+            )
+        })
+    });
+    let uses_atomic = stage_graphs.iter().any(|stages| {
+        stages
+            .iter()
+            .any(|stage| stage.selector == crate::engine::StageWorkSelector::Atomic)
+    });
+    if uses_retained && uses_atomic {
+        return Err(Error::ModelLoadError(
+            "Parakeet retained and atomic compatibility graphs must be published separately".into(),
+        ));
+    }
+    let descriptor = if uses_retained {
+        CapabilityStateDescriptorV2::managed_for_stage_graphs(retained.clone(), stage_graphs)?
+    } else {
+        typed_invocation_descriptor(stage_graphs, &invocation)?
+    };
     Ok(ParakeetPhysicalStateSpec {
         descriptor,
+        retained: uses_retained.then_some(retained),
         invocation,
     })
+}
+
+fn parakeet_retained_contract(
+    mut contract: InferenceStateContract,
+) -> Result<InferenceStateContract> {
+    for domain in &mut contract.domains {
+        let StateDomainSpec::Tensor(domain) = domain else {
+            return Err(Error::ModelLoadError(
+                "Parakeet retained predictor state must be tensor state".into(),
+            ));
+        };
+        domain.header.scope = StateScope::Retained;
+        domain.header.checkpoint = CheckpointPolicy::Transactional;
+        domain.header.prefix = PrefixPolicy::Disabled;
+    }
+    contract.validate().map_err(|error| {
+        Error::ModelLoadError(format!("invalid retained Parakeet state contract: {error}"))
+    })?;
+    Ok(contract)
 }
 
 fn parakeet_invocation_contract() -> Result<InferenceStateContract> {
