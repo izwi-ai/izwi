@@ -50,6 +50,9 @@ use crate::models::architectures::qwen3::core::{
     qwen3_decoder_cache_domain, Qwen3DecoderCacheGeometry,
 };
 use crate::models::shared::attention::paged::{default_kv_page_size, KvCacheQuantization};
+use crate::models::shared::sampling::{
+    bounded_device_sampling_candidates, device_candidates_cover_top_p, sample_device_candidates,
+};
 
 const NEWLINE_TOKEN_ID: u32 = 198;
 const ENV_QWEN_TTS_CUDA_CHUNKED_CODEC_STREAM: &str = "IZWI_QWEN_TTS_CUDA_CHUNKED_CODEC_STREAM";
@@ -3725,6 +3728,25 @@ fn sample_semantic(
     };
     let vocab_len = logits.dim(0)?;
     let semantic_len = (semantic_vocab_size as usize).min(vocab_len);
+    let (sampling_vocab, allowed_mask) =
+        semantic_sampling_vocab_and_mask(vocab_len, semantic_len, eos_token_id, allow_eos);
+    if let Some(candidates) = bounded_device_sampling_candidates(
+        &logits,
+        sampling_vocab,
+        params.top_k,
+        params.temperature,
+        history,
+        params.repetition_penalty,
+        0.0,
+        Some(&allowed_mask),
+    )? {
+        if device_candidates_cover_top_p(&candidates, params.top_p) {
+            if let Some(token) = sample_device_candidates(&candidates, params.top_p, rng.next_f32())
+            {
+                return Ok(token);
+            }
+        }
+    }
     let mut values = collect_semantic_sampling_values(&logits, semantic_len, params, history)?;
 
     let eos_idx = eos_token_id as usize;
@@ -3826,6 +3848,24 @@ fn sample_semantic(
         .map(|(idx, _)| *idx)
         .or(Some(if allow_eos { eos_token_id } else { 0 }))
         .ok_or_else(|| Error::InferenceError("Failed to sample semantic token".to_string()))
+}
+
+fn semantic_sampling_vocab_and_mask(
+    vocab_len: usize,
+    semantic_len: usize,
+    eos_token_id: u32,
+    allow_eos: bool,
+) -> (usize, Vec<bool>) {
+    let eos_index = eos_token_id as usize;
+    let sampling_vocab = if allow_eos && eos_index < vocab_len {
+        semantic_len.max(eos_index.saturating_add(1))
+    } else {
+        semantic_len
+    };
+    let allowed = (0..sampling_vocab)
+        .map(|index| index < semantic_len || (allow_eos && index == eos_index))
+        .collect();
+    (sampling_vocab, allowed)
 }
 
 fn sample_semantic_reference(
@@ -5133,6 +5173,24 @@ mod tests {
             sample_semantic(&logits, 5, 99, false, &params, &[0], &mut device_rng, true).unwrap();
 
         assert_eq!(reference, device);
+    }
+
+    #[test]
+    fn semantic_device_sampling_mask_keeps_only_semantic_tokens_and_optional_eos() {
+        let (vocab, mask) = semantic_sampling_vocab_and_mask(12, 4, 9, true);
+        assert_eq!(vocab, 10);
+        assert_eq!(
+            mask,
+            vec![true, true, true, true, false, false, false, false, false, true]
+        );
+
+        let (vocab, mask) = semantic_sampling_vocab_and_mask(12, 4, 9, false);
+        assert_eq!(vocab, 4);
+        assert_eq!(mask, vec![true; 4]);
+
+        let (vocab, mask) = semantic_sampling_vocab_and_mask(5, 4, 9, true);
+        assert_eq!(vocab, 4);
+        assert_eq!(mask, vec![true; 4]);
     }
 
     #[test]
