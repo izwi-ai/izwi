@@ -5,8 +5,8 @@
 //! user prompt text, chat messages, transcript text, or audio samples.
 
 use crate::catalog::ModelVariant;
-use crate::runtime::ConformanceCapability;
 use crate::runtime::telemetry::RuntimeTracePhase;
+use crate::runtime::ConformanceCapability;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplayRedaction {
@@ -32,10 +32,7 @@ pub struct RuntimeReplayRecord {
 }
 
 impl RuntimeReplayRecord {
-    pub fn sanitized(
-        request_id: impl Into<String>,
-        capability: ConformanceCapability,
-    ) -> Self {
+    pub fn sanitized(request_id: impl Into<String>, capability: ConformanceCapability) -> Self {
         Self {
             request_id: request_id.into(),
             correlation_id: None,
@@ -70,8 +67,7 @@ impl RuntimeReplayRecord {
     }
 }
 
-pub const RUNTIME_REPLAY_REDACTION: ReplayRedaction =
-    ReplayRedaction::SanitizedMetadataOnly;
+pub const RUNTIME_REPLAY_REDACTION: ReplayRedaction = ReplayRedaction::SanitizedMetadataOnly;
 
 pub fn sanitized_replay_record(
     request_id: impl Into<String>,
@@ -98,13 +94,10 @@ mod tests {
 
     #[test]
     fn replay_record_is_sanitized_metadata_only() {
-        let record = RuntimeReplayRecord::sanitized(
-            "req-1",
-            ConformanceCapability::Chat,
-        )
-        .with_correlation_id("corr-1")
-        .with_model_variant(ModelVariant::Qwen38BGguf)
-        .with_phase(RuntimeTracePhase::Decode);
+        let record = RuntimeReplayRecord::sanitized("req-1", ConformanceCapability::Chat)
+            .with_correlation_id("corr-1")
+            .with_model_variant(ModelVariant::Qwen38BGguf)
+            .with_phase(RuntimeTracePhase::Decode);
 
         assert_eq!(record.request_id, "req-1");
         assert_eq!(record.correlation_id.as_deref(), Some("corr-1"));
@@ -128,14 +121,8 @@ mod tests {
 
         assert_eq!(record.request_id, "req-audio");
         assert_eq!(record.correlation_id.as_deref(), Some("corr-audio"));
-        assert_eq!(
-            record.capability,
-            ConformanceCapability::SpeechToSpeech
-        );
-        assert_eq!(
-            record.model_variant,
-            Some(ModelVariant::Lfm25Audio15BGguf)
-        );
+        assert_eq!(record.capability, ConformanceCapability::SpeechToSpeech);
+        assert_eq!(record.model_variant, Some(ModelVariant::Lfm25Audio15BGguf));
         assert_eq!(record.phase, RuntimeTracePhase::FirstChunk);
         assert!(!record.contains_payload());
     }

@@ -1,9 +1,7 @@
 //! Downstream-facing compile and serialized-configuration compatibility fixture.
 
 use izwi_core::backends::BackendPreference;
-use izwi_core::config::{
-    ContextLengthPreference, EngineConfig, KvCacheDtype, PrefixCachePolicy,
-};
+use izwi_core::config::{ContextLengthPreference, EngineConfig, KvCacheDtype, PrefixCachePolicy};
 use izwi_core::ManagedKvRuntimeSnapshot;
 
 const BETA17_CONFIG: &str = include_str!("fixtures/engine-config-beta17.json");

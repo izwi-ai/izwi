@@ -1,7 +1,7 @@
 //! VibeVoice diffusion prediction head and scheduler helpers.
 
-use candle_core::{D, DType, Device, Tensor};
-use candle_nn::{Linear, Module, RmsNorm, VarBuilder, ops};
+use candle_core::{DType, Device, Tensor, D};
+use candle_nn::{ops, Linear, Module, RmsNorm, VarBuilder};
 
 use crate::error::{Error, Result};
 use crate::kernels::{try_fused_rms_norm, try_fused_silu_mul};

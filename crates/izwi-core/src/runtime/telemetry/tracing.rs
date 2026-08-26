@@ -129,9 +129,7 @@ pub fn runtime_trace_contracts() -> &'static [RuntimeTraceContract] {
     RUNTIME_TRACE_CONTRACTS
 }
 
-pub fn trace_contract_for_phase(
-    phase: RuntimeTracePhase,
-) -> Option<&'static RuntimeTraceContract> {
+pub fn trace_contract_for_phase(phase: RuntimeTracePhase) -> Option<&'static RuntimeTraceContract> {
     runtime_trace_contracts()
         .iter()
         .find(|contract| contract.phase == phase)

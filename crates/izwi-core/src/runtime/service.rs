@@ -4530,8 +4530,7 @@ impl RuntimeService {
             .await
             .ok_or_else(|| Error::ModelNotFound(format!("ASR model {variant} is not loaded")))?;
         let model_arc = model.model_arc();
-        let crate::models::registry::NativeAsrModel::Parakeet(_) = model_arc.as_ref()
-        else {
+        let crate::models::registry::NativeAsrModel::Parakeet(_) = model_arc.as_ref() else {
             return Err(Error::ModelLoadError(
                 "Parakeet registry lease crossed model family".into(),
             ));
@@ -4539,7 +4538,9 @@ impl RuntimeService {
         let residency = residency_lease.ok_or_else(|| {
             Error::InferenceError("Parakeet preparation requires model residency".into())
         })?;
-        let loaded_bundle = self.model_lifecycle.try_get_ready_bundle(residency.variant());
+        let loaded_bundle = self
+            .model_lifecycle
+            .try_get_ready_bundle(residency.variant());
         let contract = loaded_contract_for_residency(
             residency,
             loaded_bundle.as_deref(),
@@ -4549,11 +4550,12 @@ impl RuntimeService {
             self.backend_router.context().backend_kind,
             Some(ExecutionTargetKind::TokenEngine),
         )?;
-        let context_limit = self.model_registry.effective_context(variant).ok_or_else(|| {
-            Error::ModelLoadError(format!(
-                "Parakeet model {variant} has no effective context"
-            ))
-        })?;
+        let context_limit = self
+            .model_registry
+            .effective_context(variant)
+            .ok_or_else(|| {
+                Error::ModelLoadError(format!("Parakeet model {variant} has no effective context"))
+            })?;
         let prepared = self
             .coordinator
             .run_host_blocking_stage(&job, move || {
@@ -4587,7 +4589,9 @@ impl RuntimeService {
         let retained_device_ceiling = u64::try_from(encoded_frames)
             .ok()
             .and_then(|frames| frames.checked_mul(1024 * 4))
-            .ok_or_else(|| Error::Overloaded("Parakeet retained tensor estimate overflowed".into()))?;
+            .ok_or_else(|| {
+                Error::Overloaded("Parakeet retained tensor estimate overflowed".into())
+            })?;
         let materialized_elements = u64::try_from(feature_frames)
             .ok()
             .and_then(|frames| frames.checked_mul(1024 * 16))
@@ -4891,9 +4895,9 @@ impl RuntimeService {
             context_limit,
         )?;
         let (mut execution, _) = self.coordinator_job_for_request(&prepared)?;
-        let prepared_text = prepared.tts_text_for_execution().ok_or_else(|| {
-            Error::InferenceError("prepared Kokoro request lost its text".into())
-        })?;
+        let prepared_text = prepared
+            .tts_text_for_execution()
+            .ok_or_else(|| Error::InferenceError("prepared Kokoro request lost its text".into()))?;
         execution.resources = execution.resources.checked_add(kokoro_synthesis_resources(
             self.backend_router.context().backend_kind,
             prepared_text,

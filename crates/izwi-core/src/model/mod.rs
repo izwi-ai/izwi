@@ -8,10 +8,10 @@ mod manager;
 pub mod weights;
 
 pub use crate::catalog::{ModelInfo, ModelStatus, ModelVariant};
-pub use download::{DownloadProgress, ModelDownloader};
-pub use manager::ModelManager;
 pub use crate::residency::{
     ModelArtifactState, ModelLifecycleSnapshot, ModelResidency, ModelResidencyLease,
     ModelResidencyState,
 };
+pub use download::{DownloadProgress, ModelDownloader};
+pub use manager::ModelManager;
 pub use weights::ModelWeights;

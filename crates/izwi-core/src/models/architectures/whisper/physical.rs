@@ -4,9 +4,7 @@ use candle_core::DType;
 use candle_transformers::models::whisper::Config;
 
 use crate::backends::BackendKind;
-use crate::engine::{
-    NativeBatchMode, StageDescriptor, StageProgressKind, StageWorkSelector,
-};
+use crate::engine::{NativeBatchMode, StageDescriptor, StageProgressKind, StageWorkSelector};
 use crate::error::{Error, Result};
 use crate::kv::v2::{
     stage_graph_fingerprint, AttentionMask, AttentionPattern, CapabilityStateDescriptorV2,
@@ -717,15 +715,9 @@ mod tests {
         decode.selector = StageWorkSelector::SequenceDecode;
 
         let stages = [encoder, prefill, decode];
-        let spec = whisper_physical_state_spec(
-            &config(),
-            DType::F32,
-            BackendKind::Cpu,
-            &[&stages],
-        )
-        .expect("normal retained Whisper graph");
-        let InvocationWorkspaceSet::Bounded { profiles } = &spec.descriptor.invocation
-        else {
+        let spec = whisper_physical_state_spec(&config(), DType::F32, BackendKind::Cpu, &[&stages])
+            .expect("normal retained Whisper graph");
+        let InvocationWorkspaceSet::Bounded { profiles } = &spec.descriptor.invocation else {
             panic!("normal graph must authenticate encoder scratch");
         };
         assert_eq!(profiles.len(), 1);
