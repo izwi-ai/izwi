@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::model::ModelVariant;
+use crate::models::architectures::fish_s2::FishS2RetainedState;
 use crate::models::architectures::lfm25_audio::asr_retained::Lfm25AudioAsrRetainedState;
 use crate::models::architectures::lfm25_audio::tts_retained::Lfm25AudioTtsRetainedState;
 use crate::models::architectures::nemotron::asr::{
@@ -16,7 +17,7 @@ use crate::models::architectures::voxtral::realtime::{
     VoxtralRealtimeCheckpoint, VoxtralRealtimeState,
 };
 use crate::models::registry::{
-    AsrModelLease, Lfm25AudioModelLease, NativeAsrDecodeState, NativeAsrModel,
+    AsrModelLease, FishS2TtsModelLease, Lfm25AudioModelLease, NativeAsrDecodeState, NativeAsrModel,
     NativeChatDecodeState, QwenTtsModelLease, VibeVoiceTtsModelLease, VoxtralModelLease,
 };
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
@@ -65,6 +66,14 @@ pub(super) struct ActiveVibeVoiceTtsDecode {
     pub(super) variant: ModelVariant,
     pub(super) model: VibeVoiceTtsModelLease,
     pub(super) state: VibeVoiceTtsRetainedState,
+    pub(super) last_frames_generated: usize,
+    pub(super) stream_sequence: usize,
+}
+
+pub(super) struct ActiveFishS2TtsDecode {
+    pub(super) variant: ModelVariant,
+    pub(super) model: FishS2TtsModelLease,
+    pub(super) state: FishS2RetainedState,
     pub(super) last_frames_generated: usize,
     pub(super) stream_sequence: usize,
 }

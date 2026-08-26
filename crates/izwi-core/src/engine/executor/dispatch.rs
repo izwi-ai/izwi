@@ -223,6 +223,19 @@ impl NativeExecutor {
                 Some(reservation)
                     if request.task_type == TaskType::TTS
                         && request.model_variant.is_some_and(|variant| {
+                            variant.family() == crate::catalog::ModelFamily::FishS2Tts
+                        }) =>
+                {
+                    let state = super::retained_row_managed_state_for_row(
+                        request,
+                        scheduled_req,
+                        reservation,
+                    )?;
+                    self.fish_s2_tts_request_with_managed_cache(request, scheduled_req, Some(state))
+                }
+                Some(reservation)
+                    if request.task_type == TaskType::TTS
+                        && request.model_variant.is_some_and(|variant| {
                             variant.family() == crate::catalog::ModelFamily::Qwen3Tts
                         }) =>
                 {

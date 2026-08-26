@@ -15,7 +15,8 @@ use super::super::scheduler::ScheduledRequest;
 use super::super::types::AudioOutput;
 use super::super::SessionKey;
 use super::state::{
-    ActiveLfm25TtsDecode, ActiveQwenTtsDecode, ActiveVibeVoiceTtsDecode, QwenTtsPhysicalState,
+    ActiveFishS2TtsDecode, ActiveLfm25TtsDecode, ActiveQwenTtsDecode, ActiveVibeVoiceTtsDecode,
+    QwenTtsPhysicalState,
 };
 use super::{
     ExecutorOutput, ExecutorPhaseTiming, ExecutorStateLease, ModelSessionResult, NativeExecutor,
@@ -621,6 +622,171 @@ impl NativeExecutor {
         } else {
             (Vec::new(), 24_000)
         };
+        lease.mark_clean();
+        if finished {
+            lease.release()?;
+        } else {
+            lease.restore()?;
+        }
+        Ok(ModelSessionResult::sequence(ExecutorOutput {
+            request_id: request.id.clone(),
+            audio: Some(AudioOutput::new(samples, sample_rate)),
+            text: None,
+            input_transcription: None,
+            tokens_processed: scheduled.num_tokens,
+            tokens_generated: generated,
+            finished,
+            phase_timing_override: None,
+            asr_diagnostics: None,
+            error: None,
+        })
+        .with_managed_cache_completions(completions))
+    }
+
+    pub(super) fn fish_s2_tts_request_with_managed_cache(
+        &self,
+        request: &EngineCoreRequest,
+        scheduled: &ScheduledRequest,
+        retained: Option<super::RetainedRowManagedState>,
+    ) -> Result<ModelSessionResult> {
+        use crate::models::architectures::fish_s2::FishS2RetainedStep;
+
+        let variant = Self::resolve_variant(request)?;
+        if variant.family() != ModelFamily::FishS2Tts {
+            return Err(Error::InvalidInput("foreign Fish S2 TTS request".into()));
+        }
+        let model = request
+            .prepared_fish_s2_tts_model_lease_for_executor()?
+            .ok_or_else(|| Error::InferenceError("Fish S2 TTS lost model residency".into()))?;
+        let mut retained = retained.ok_or_else(|| {
+            Error::InferenceError("Fish S2 TTS lost retained physical state".into())
+        })?;
+        let slow = retained
+            .take_paged_domain(crate::kv::CacheDomainId::new(1), true)?
+            .expect("required Fish S2 slow cache");
+        let fast = retained
+            .take_paged_domain(crate::kv::CacheDomainId::new(2), true)?
+            .expect("required Fish S2 fast cache");
+        retained.ensure_all_paged_consumed()?;
+        let mut lease = ExecutorStateLease::checkout(
+            &self.fish_s2_tts_decode_states,
+            scheduled.session_key(),
+            variant,
+            "Fish S2 TTS decode",
+        )?;
+        if lease.state().is_some_and(|active| {
+            active.variant != variant || !Arc::ptr_eq(&active.model.model_arc(), &model.model_arc())
+        }) {
+            lease.discard_state();
+        }
+        let fresh = lease.state().is_none();
+        let mut checkpoint = if fresh {
+            if !scheduled.is_prefill || scheduled.num_computed_tokens != 0 {
+                return Err(Error::InferenceError(
+                    "Fish S2 TTS lost state before initial prefill".into(),
+                ));
+            }
+            let artifact = request
+                .prepared_fish_s2_tts_artifact_for_executor()?
+                .ok_or_else(|| Error::InferenceError("Fish S2 TTS lost prompt".into()))?;
+            let params = request
+                .fish_s2_tts_generation_params_for_executor()?
+                .ok_or_else(|| Error::InferenceError("Fish S2 TTS lost geometry".into()))?;
+            let (state, checkpoint) =
+                model.new_retained_state_in_quantum(artifact, params, slow, fast)?;
+            lease.install_state(ActiveFishS2TtsDecode {
+                variant,
+                model: model.clone(),
+                state,
+                last_frames_generated: 0,
+                stream_sequence: 0,
+            })?;
+            checkpoint
+        } else {
+            lease
+                .require_state_mut()?
+                .state
+                .begin_managed_quantum(slow, fast)?
+        };
+        lease.mark_dirty();
+        let result = (|| {
+            let active = lease.require_state_mut()?;
+            let step = if scheduled.is_prefill {
+                let step = model.retained_prefill_step(&mut active.state, scheduled.num_tokens)?;
+                if !matches!(
+                    step,
+                    FishS2RetainedStep::Prefill { consumed, .. }
+                        if consumed == scheduled.num_tokens
+                ) {
+                    return Err(Error::InferenceError(
+                        "Fish S2 TTS prefill progress differs from scheduler".into(),
+                    ));
+                }
+                Some(step)
+            } else {
+                Some(model.retained_decode_step(&mut active.state)?)
+            };
+            if request.is_cancelled() {
+                return Err(Error::Cancelled(request.id.clone()));
+            }
+            Ok::<_, Error>(step)
+        })();
+        let step = match result {
+            Ok(step) if !request.is_cancelled() => step,
+            result => {
+                if fresh {
+                    let _ = lease
+                        .require_state_mut()?
+                        .state
+                        .take_managed_write_completions();
+                    lease.discard_state();
+                } else {
+                    lease
+                        .require_state_mut()?
+                        .state
+                        .rollback_managed_quantum(&mut checkpoint)?;
+                }
+                lease.mark_clean();
+                return result.and_then(|_| Err(Error::Cancelled(request.id.clone())));
+            }
+        };
+        let completions = lease
+            .require_state_mut()?
+            .state
+            .take_managed_write_completions();
+        let staged = lease.require_state_mut()?.state.take_staged_step();
+        if step.is_some() && staged != step {
+            if fresh {
+                lease.discard_state();
+            } else {
+                lease
+                    .require_state_mut()?
+                    .state
+                    .rollback_managed_quantum(&mut checkpoint)?;
+            }
+            lease.mark_clean();
+            return Err(Error::InferenceError(
+                "Fish S2 TTS staged output changed before commit".into(),
+            ));
+        }
+        lease
+            .require_state_mut()?
+            .state
+            .commit_managed_quantum(&mut checkpoint)?;
+        let active = lease.require_state_mut()?;
+        let frames_generated = active.state.frames_generated();
+        let generated = frames_generated.saturating_sub(active.last_frames_generated);
+        active.last_frames_generated = frames_generated;
+        let finished = matches!(step, Some(FishS2RetainedStep::Finished { .. }));
+        let (samples, sample_rate) = if finished {
+            let output = model.finalize_retained_state(&active.state)?;
+            (output.samples, output.sample_rate)
+        } else {
+            (Vec::new(), model.diagnostics().sample_rate)
+        };
+        if generated > 0 {
+            active.stream_sequence = active.stream_sequence.saturating_add(1);
+        }
         lease.mark_clean();
         if finished {
             lease.release()?;

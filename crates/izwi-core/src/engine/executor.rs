@@ -75,10 +75,10 @@ use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::ModelRegistry;
 use crate::runtime::{PhysicalExecutionAdmission, PhysicalExecutionLease};
 use state::{
-    ActiveAsrDecode, ActiveChatDecode, ActiveLfm25AsrDecode, ActiveLfm25TtsDecode,
-    ActiveNemotronRealtime, ActiveQwenTtsDecode, ActiveVibeVoiceTtsDecode, ActiveVoxtralRealtime,
-    PendingNemotronRealtimeQuantum, PendingVoxtralRealtimeQuantum, PreparedNemotronRealtimeQuantum,
-    PreparedVoxtralRealtimeQuantum,
+    ActiveAsrDecode, ActiveChatDecode, ActiveFishS2TtsDecode, ActiveLfm25AsrDecode,
+    ActiveLfm25TtsDecode, ActiveNemotronRealtime, ActiveQwenTtsDecode, ActiveVibeVoiceTtsDecode,
+    ActiveVoxtralRealtime, PendingNemotronRealtimeQuantum, PendingVoxtralRealtimeQuantum,
+    PreparedNemotronRealtimeQuantum, PreparedVoxtralRealtimeQuantum,
 };
 
 const QWEN38_TARGET_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(1);
@@ -2683,6 +2683,7 @@ pub struct NativeExecutor {
     lfm25_asr_decode_states: ExecutorStateStore<ActiveLfm25AsrDecode>,
     lfm25_tts_decode_states: ExecutorStateStore<ActiveLfm25TtsDecode>,
     vibevoice_tts_decode_states: ExecutorStateStore<ActiveVibeVoiceTtsDecode>,
+    fish_s2_tts_decode_states: ExecutorStateStore<ActiveFishS2TtsDecode>,
     voxtral_realtime: Arc<VoxtralRealtimeStateCoordinator>,
     nemotron_realtime: Arc<NemotronRealtimeStateCoordinator>,
     qwen_tts_decode_states: ExecutorStateStore<ActiveQwenTtsDecode>,
@@ -2815,6 +2816,7 @@ impl NativeExecutor {
             lfm25_asr_decode_states: Mutex::new(HashMap::new()),
             lfm25_tts_decode_states: Mutex::new(HashMap::new()),
             vibevoice_tts_decode_states: Mutex::new(HashMap::new()),
+            fish_s2_tts_decode_states: Mutex::new(HashMap::new()),
             voxtral_realtime,
             nemotron_realtime,
             qwen_tts_decode_states: Mutex::new(HashMap::new()),
@@ -3073,11 +3075,15 @@ impl ModelExecutor for NativeExecutor {
                     || request
                         .prepared_vibevoice_tts_model_lease_for_executor()
                         .is_ok_and(|model| model.is_some())
+                    || request
+                        .prepared_fish_s2_tts_model_lease_for_executor()
+                        .is_ok_and(|model| model.is_some())
                     || (self.config.model_registry.is_none() && self.loaded_tts_model.is_some());
                 loaded.then_some(matches!(
                     variant.family(),
                     crate::catalog::ModelFamily::Qwen3Tts
                         | crate::catalog::ModelFamily::VibeVoiceTts
+                        | crate::catalog::ModelFamily::FishS2Tts
                 ))
             }
             super::types::TaskType::SpeechToSpeech => self
@@ -3114,6 +3120,7 @@ impl ModelExecutor for NativeExecutor {
                         variant.family(),
                         crate::catalog::ModelFamily::Qwen3Tts
                             | crate::catalog::ModelFamily::VibeVoiceTts
+                            | crate::catalog::ModelFamily::FishS2Tts
                     )
                 }
                 super::types::TaskType::SpeechToSpeech => false,
@@ -3136,6 +3143,13 @@ impl ModelExecutor for NativeExecutor {
                 .or_else(|| {
                     request
                         .prepared_vibevoice_tts_model_lease_for_executor()
+                        .ok()
+                        .flatten()
+                        .map(|_| true)
+                })
+                .or_else(|| {
+                    request
+                        .prepared_fish_s2_tts_model_lease_for_executor()
                         .ok()
                         .flatten()
                         .map(|_| true)
@@ -3541,6 +3555,9 @@ impl ModelExecutor for NativeExecutor {
         let mut vibevoice_tts = self.vibevoice_tts_decode_states.lock().map_err(|_| {
             Error::InferenceError("VibeVoice TTS decode state mutex poisoned".to_string())
         })?;
+        let mut fish_s2_tts = self.fish_s2_tts_decode_states.lock().map_err(|_| {
+            Error::InferenceError("Fish S2 TTS decode state mutex poisoned".to_string())
+        })?;
         if self.voxtral_realtime.abort_matching(|_| true).is_err() {
             return Err(Error::InferenceError(
                 "failed to abort pending Voxtral realtime state during shutdown".to_string(),
@@ -3573,6 +3590,7 @@ impl ModelExecutor for NativeExecutor {
         lfm25_asr.clear();
         lfm25_tts.clear();
         vibevoice_tts.clear();
+        fish_s2_tts.clear();
         voxtral.clear();
         nemotron.clear();
         tts.clear();
@@ -3582,6 +3600,7 @@ impl ModelExecutor for NativeExecutor {
             lfm25_asr,
             lfm25_tts,
             vibevoice_tts,
+            fish_s2_tts,
             voxtral,
             nemotron,
             tts,
@@ -3612,6 +3631,7 @@ impl ModelExecutor for NativeExecutor {
             Ok(mut lfm25_asr),
             Ok(mut lfm25_tts),
             Ok(mut vibevoice_tts),
+            Ok(mut fish_s2_tts),
             Ok(mut voxtral),
             Ok(mut nemotron),
             Ok(mut tts),
@@ -3621,6 +3641,7 @@ impl ModelExecutor for NativeExecutor {
             self.lfm25_asr_decode_states.lock(),
             self.lfm25_tts_decode_states.lock(),
             self.vibevoice_tts_decode_states.lock(),
+            self.fish_s2_tts_decode_states.lock(),
             self.voxtral_realtime.states.lock(),
             self.nemotron_realtime.states.lock(),
             self.qwen_tts_decode_states.lock(),
@@ -3634,6 +3655,7 @@ impl ModelExecutor for NativeExecutor {
         let lfm25_asr = cleanup_request_states_locked(&mut lfm25_asr, request_id);
         let lfm25_tts = cleanup_request_states_locked(&mut lfm25_tts, request_id);
         let vibevoice_tts = cleanup_request_states_locked(&mut vibevoice_tts, request_id);
+        let fish_s2_tts = cleanup_request_states_locked(&mut fish_s2_tts, request_id);
         let voxtral = cleanup_request_states_locked(&mut voxtral, request_id);
         let nemotron = cleanup_request_states_locked(&mut nemotron, request_id);
         let tts = cleanup_request_states_locked(&mut tts, request_id);
@@ -3642,6 +3664,7 @@ impl ModelExecutor for NativeExecutor {
                 .combine(lfm25_asr)
                 .combine(lfm25_tts)
                 .combine(vibevoice_tts)
+                .combine(fish_s2_tts)
                 .combine(voxtral)
                 .combine(nemotron)
                 .combine(tts),
@@ -3669,6 +3692,7 @@ impl ModelExecutor for NativeExecutor {
             Ok(mut lfm25_asr),
             Ok(mut lfm25_tts),
             Ok(mut vibevoice_tts),
+            Ok(mut fish_s2_tts),
             Ok(mut voxtral),
             Ok(mut nemotron),
             Ok(mut tts),
@@ -3678,6 +3702,7 @@ impl ModelExecutor for NativeExecutor {
             self.lfm25_asr_decode_states.lock(),
             self.lfm25_tts_decode_states.lock(),
             self.vibevoice_tts_decode_states.lock(),
+            self.fish_s2_tts_decode_states.lock(),
             self.voxtral_realtime.states.lock(),
             self.nemotron_realtime.states.lock(),
             self.qwen_tts_decode_states.lock(),
@@ -3691,6 +3716,7 @@ impl ModelExecutor for NativeExecutor {
         let lfm25_asr = cleanup_session_state_locked(&mut lfm25_asr, session);
         let lfm25_tts = cleanup_session_state_locked(&mut lfm25_tts, session);
         let vibevoice_tts = cleanup_session_state_locked(&mut vibevoice_tts, session);
+        let fish_s2_tts = cleanup_session_state_locked(&mut fish_s2_tts, session);
         let voxtral = cleanup_session_state_locked(&mut voxtral, session);
         let nemotron = cleanup_session_state_locked(&mut nemotron, session);
         let tts = cleanup_session_state_locked(&mut tts, session);
@@ -3699,6 +3725,7 @@ impl ModelExecutor for NativeExecutor {
                 .combine(lfm25_asr)
                 .combine(lfm25_tts)
                 .combine(vibevoice_tts)
+                .combine(fish_s2_tts)
                 .combine(voxtral)
                 .combine(nemotron)
                 .combine(tts),

@@ -289,7 +289,7 @@ impl DirectTtsObservationContext {
 fn uses_direct_tts_runtime(variant: ModelVariant) -> bool {
     matches!(
         variant.family(),
-        ModelFamily::KokoroTts | ModelFamily::VoxtralTts | ModelFamily::FishS2Tts
+        ModelFamily::KokoroTts | ModelFamily::VoxtralTts
     )
 }
 
