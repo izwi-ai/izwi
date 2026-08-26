@@ -14,7 +14,7 @@ mod voice;
 
 pub use config::KokoroConfig;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -29,7 +29,8 @@ use crate::error::{Error, Result};
 
 use self::phonemizer::EspeakPhonemizer;
 use self::prosody::{
-    build_alignment_matrix, KokoroProsodyDebugOutput, KokoroProsodyOutput, KokoroProsodyPredictor,
+    build_alignment_matrix, build_alignment_matrix_batch, KokoroProsodyBatchOutput,
+    KokoroProsodyDebugOutput, KokoroProsodyOutput, KokoroProsodyPredictor,
 };
 use self::text_encoder::KokoroTextEncoder;
 use self::voice::VoiceLibrary;
@@ -246,6 +247,50 @@ fn normalize_kokoro_speed(speed: f32) -> Result<f32> {
     Ok(speed.clamp(KOKORO_MIN_SPEED, KOKORO_MAX_SPEED))
 }
 
+fn kokoro_static_token_buckets(prepared: &[KokoroPreparedRequest]) -> Vec<Vec<usize>> {
+    let mut buckets = BTreeMap::<usize, Vec<usize>>::new();
+    for (index, row) in prepared.iter().enumerate() {
+        buckets.entry(row.token_ids.len()).or_default().push(index);
+    }
+    buckets.into_values().collect()
+}
+
+fn kokoro_duration_buckets(expanded_frames: &[usize]) -> Vec<Vec<usize>> {
+    let mut buckets = BTreeMap::<usize, Vec<usize>>::new();
+    for (index, &frames) in expanded_frames.iter().enumerate() {
+        buckets.entry(frames).or_default().push(index);
+    }
+    buckets.into_values().collect()
+}
+
+fn select_trimmed_batch(tensor: &Tensor, rows: &[usize], frames: usize) -> Result<Tensor> {
+    let selected = rows
+        .iter()
+        .map(|&row| {
+            tensor
+                .narrow(0, row, 1)
+                .and_then(|tensor| tensor.narrow(2, 0, frames))
+                .map_err(Error::from)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let refs = selected.iter().collect::<Vec<_>>();
+    Tensor::cat(&refs, 0).map_err(Error::from)
+}
+
+fn select_trimmed_batch_2d(tensor: &Tensor, rows: &[usize], frames: usize) -> Result<Tensor> {
+    let selected = rows
+        .iter()
+        .map(|&row| {
+            tensor
+                .narrow(0, row, 1)
+                .and_then(|tensor| tensor.narrow(1, 0, frames))
+                .map_err(Error::from)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let refs = selected.iter().collect::<Vec<_>>();
+    Tensor::cat(&refs, 0).map_err(Error::from)
+}
+
 fn kokoro_samples_per_duration_frame(config: &KokoroConfig) -> Result<usize> {
     if config.istftnet.gen_istft_hop_size == 0
         || config.istftnet.upsample_rates.is_empty()
@@ -394,6 +439,12 @@ pub struct KokoroPredecoderDebugOutput {
 struct KokoroPredecoderOutput {
     prosody: KokoroProsodyOutput,
     text_encoder_shape: Vec<usize>,
+    asr: Tensor,
+}
+
+#[derive(Debug, Clone)]
+struct KokoroPredecoderBatchOutput {
+    prosody: KokoroProsodyBatchOutput,
     asr: Tensor,
 }
 
@@ -624,36 +675,106 @@ impl KokoroTtsModel {
         let t0 = Instant::now();
         let prepared = self.prepare_request(text, speaker, language, speed)?;
         log_kokoro_profile("tts.prepare_request", t0.elapsed());
-        let t1 = Instant::now();
-        let predecoder = self.run_predecoder(&prepared)?;
-        log_kokoro_profile("tts.predecoder", t1.elapsed());
-        let style = prepared
-            .ref_style
-            .i((.., 0..self.config.style_dim))
-            .map_err(Error::from)?;
-        let max_samples = self.output_sample_limit(predecoder.prosody.expanded_frames)?;
-        let t2 = Instant::now();
-        let samples = self.decoder.forward(
-            &predecoder.asr,
-            &predecoder.prosody.f0,
-            &predecoder.prosody.n,
-            &style,
-        )?;
-        if samples.len() > max_samples || samples.capacity() > max_samples {
-            return Err(Error::InferenceError(format!(
-                "Kokoro decoder output exceeded its hard sample contract: len={}, capacity={}, max={max_samples}",
-                samples.len(),
-                samples.capacity()
+        let mut results = self.generate_prepared_batch(&[prepared])?;
+        results.pop().ok_or_else(|| {
+            Error::InferenceError("Kokoro returned an empty scalar synthesis batch".to_string())
+        })
+    }
+
+    /// Executes a ragged cohort as static token-width sub-batches followed by
+    /// exact expanded-duration decoder buckets. Every multi-row bucket reaches
+    /// ALBERT/text/prosody or the decoder as one native `B > 1` tensor call.
+    pub fn generate_prepared_batch(
+        &self,
+        prepared: &[KokoroPreparedRequest],
+    ) -> Result<Vec<KokoroSynthesisResult>> {
+        if prepared.is_empty() {
+            return Ok(Vec::new());
+        }
+        let max_batch_size = self.max_native_batch_size();
+        if prepared.len() > max_batch_size {
+            return Err(Error::Overloaded(format!(
+                "Kokoro native batch width {} exceeds this backend's static limit {max_batch_size}",
+                prepared.len()
             )));
         }
-        log_kokoro_profile("tts.decoder", t2.elapsed());
-        log_kokoro_profile("tts.total", t0.elapsed());
-        Ok(KokoroSynthesisResult {
-            tokens_generated: prepared.token_ids.len(),
-            phonemes: prepared.phonemes,
-            sample_rate: KokoroConfig::TARGET_SAMPLE_RATE,
-            samples,
-        })
+        let mut results = vec![None; prepared.len()];
+        let token_buckets = kokoro_static_token_buckets(prepared);
+        for bucket in token_buckets {
+            self.generate_token_bucket(prepared, &bucket, &mut results)?;
+        }
+        results
+            .into_iter()
+            .enumerate()
+            .map(|(row, result)| {
+                result.ok_or_else(|| {
+                    Error::InferenceError(format!(
+                        "Kokoro synthesis batch did not produce row {row}"
+                    ))
+                })
+            })
+            .collect()
+    }
+
+    pub fn max_native_batch_size(&self) -> usize {
+        self.device.capabilities.recommended_batch_size.max(1)
+    }
+
+    fn generate_token_bucket(
+        &self,
+        prepared: &[KokoroPreparedRequest],
+        indices: &[usize],
+        results: &mut [Option<KokoroSynthesisResult>],
+    ) -> Result<()> {
+        let rows = indices
+            .iter()
+            .map(|&index| &prepared[index])
+            .collect::<Vec<_>>();
+        let t1 = Instant::now();
+        let predecoder = self.run_predecoder_batch(&rows)?;
+        log_kokoro_profile("tts.predecoder", t1.elapsed());
+        let duration_buckets = kokoro_duration_buckets(&predecoder.prosody.expanded_frames);
+        for duration_bucket in duration_buckets {
+            let expanded_frames = predecoder.prosody.expanded_frames[duration_bucket[0]];
+            let asr = select_trimmed_batch(&predecoder.asr, &duration_bucket, expanded_frames)?;
+            let f0 =
+                select_trimmed_batch_2d(&predecoder.prosody.f0, &duration_bucket, expanded_frames)?;
+            let n =
+                select_trimmed_batch_2d(&predecoder.prosody.n, &duration_bucket, expanded_frames)?;
+            let style_rows = duration_bucket
+                .iter()
+                .map(|&row| {
+                    rows[row]
+                        .ref_style
+                        .i((.., 0..self.config.style_dim))
+                        .map_err(Error::from)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let style_refs = style_rows.iter().collect::<Vec<_>>();
+            let style = Tensor::cat(&style_refs, 0).map_err(Error::from)?;
+            let seeds = vec![None; duration_bucket.len()];
+            let t2 = Instant::now();
+            let samples = self.decoder.forward_batch(&asr, &f0, &n, &style, &seeds)?;
+            log_kokoro_profile("tts.decoder", t2.elapsed());
+            for (&bucket_row, samples) in duration_bucket.iter().zip(samples) {
+                let request_index = indices[bucket_row];
+                let max_samples = self.output_sample_limit(expanded_frames)?;
+                if samples.len() > max_samples || samples.capacity() > max_samples {
+                    return Err(Error::InferenceError(format!(
+                        "Kokoro decoder output exceeded its hard sample contract: len={}, capacity={}, max={max_samples}",
+                        samples.len(),
+                        samples.capacity()
+                    )));
+                }
+                results[request_index] = Some(KokoroSynthesisResult {
+                    tokens_generated: prepared[request_index].token_ids.len(),
+                    phonemes: prepared[request_index].phonemes.clone(),
+                    sample_rate: KokoroConfig::TARGET_SAMPLE_RATE,
+                    samples,
+                });
+            }
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -805,6 +926,67 @@ impl KokoroTtsModel {
             text_encoder_shape,
             asr,
         })
+    }
+
+    fn run_predecoder_batch(
+        &self,
+        prepared: &[&KokoroPreparedRequest],
+    ) -> Result<KokoroPredecoderBatchOutput> {
+        let Some(first) = prepared.first() else {
+            return Err(Error::InvalidInput(
+                "Kokoro predecoder batch cannot be empty".to_string(),
+            ));
+        };
+        if prepared.len() == 1 {
+            let scalar = self.run_predecoder(first)?;
+            return Ok(KokoroPredecoderBatchOutput {
+                prosody: KokoroProsodyBatchOutput {
+                    duration_frames: vec![scalar.prosody.duration_frames],
+                    expanded_frames: vec![scalar.prosody.expanded_frames],
+                    f0: scalar.prosody.f0,
+                    n: scalar.prosody.n,
+                },
+                asr: scalar.asr,
+            });
+        }
+        let token_width = first.token_ids.len();
+        if prepared
+            .iter()
+            .any(|row| row.token_ids.len() != token_width)
+        {
+            return Err(Error::InvalidInput(
+                "Kokoro static predecoder batch requires equal token widths".to_string(),
+            ));
+        }
+        let input_rows = prepared
+            .iter()
+            .map(|row| self.build_model_input_ids(row))
+            .collect::<Result<Vec<_>>>()?;
+        let input_refs = input_rows.iter().collect::<Vec<_>>();
+        let input_ids = Tensor::cat(&input_refs, 0).map_err(Error::from)?;
+        let style_refs = prepared
+            .iter()
+            .map(|row| &row.ref_style)
+            .collect::<Vec<_>>();
+        let ref_style = Tensor::cat(&style_refs, 0).map_err(Error::from)?;
+        let speeds = prepared.iter().map(|row| row.speed).collect::<Vec<_>>();
+
+        let bert_hidden = self.bert.forward(&input_ids, None)?;
+        let d_en = self
+            .bert_encoder
+            .forward(&bert_hidden)
+            .map_err(Error::from)?
+            .transpose(1, 2)
+            .map_err(Error::from)?;
+        let prosody = self.prosody.forward_batch(&d_en, &ref_style, &speeds)?;
+        let t_en = self.text_encoder.forward(&input_ids)?;
+        let pred_aln = build_alignment_matrix_batch(&prosody.duration_frames, &self.device.device)?;
+        let asr = t_en
+            .contiguous()
+            .map_err(Error::from)?
+            .matmul(&pred_aln.contiguous().map_err(Error::from)?)
+            .map_err(Error::from)?;
+        Ok(KokoroPredecoderBatchOutput { prosody, asr })
     }
 
     fn run_predecoder_branches(
@@ -971,6 +1153,53 @@ mod tests {
     use rustfft::num_complex::Complex32;
     use rustfft::FftPlanner;
     use std::path::Path;
+
+    fn prepared_with_width(width: usize) -> KokoroPreparedRequest {
+        KokoroPreparedRequest {
+            phonemes: "a".repeat(width),
+            token_ids: vec![1; width],
+            ref_style: Tensor::zeros((1, 256), DType::F32, &candle_core::Device::Cpu)
+                .expect("style"),
+            speed: 1.0,
+        }
+    }
+
+    #[test]
+    fn ragged_requests_are_bucketed_by_static_token_width_stably() {
+        let prepared = vec![
+            prepared_with_width(7),
+            prepared_with_width(3),
+            prepared_with_width(7),
+            prepared_with_width(5),
+            prepared_with_width(3),
+        ];
+        assert_eq!(
+            kokoro_static_token_buckets(&prepared),
+            vec![vec![1, 4], vec![3], vec![0, 2]]
+        );
+    }
+
+    #[test]
+    fn decoder_rows_are_bucketed_by_exact_predicted_duration_stably() {
+        assert_eq!(
+            kokoro_duration_buckets(&[11, 7, 11, 9, 7]),
+            vec![vec![1, 4], vec![3], vec![0, 2]]
+        );
+    }
+
+    #[test]
+    fn ragged_alignment_batch_pads_only_the_frame_axis() {
+        let alignment = build_alignment_matrix_batch(
+            &[vec![1, 2, 1], vec![2, 2, 2]],
+            &candle_core::Device::Cpu,
+        )
+        .expect("alignment");
+        assert_eq!(alignment.shape().dims(), &[2, 3, 6]);
+        let rows = alignment.to_vec3::<f32>().expect("alignment values");
+        assert_eq!(rows[0][0], vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(rows[0][1], vec![0.0, 1.0, 1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(rows[0][2], vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+    }
 
     fn canonical_config() -> KokoroConfig {
         KokoroConfig {
@@ -1176,6 +1405,28 @@ mod tests {
         assert!(!result.samples.is_empty());
         assert!(result.samples.iter().all(|v| v.is_finite()));
         assert!(result.samples.len() > 100);
+    }
+
+    #[test]
+    fn kokoro_local_native_two_row_generate_if_env_set() {
+        let Some(model_dir) = std::env::var_os("IZWI_KOKORO_MODEL_DIR") else {
+            return;
+        };
+        let device = DeviceSelector::detect_with_preference(Some("cpu"))
+            .expect("detect cpu device for Kokoro batch smoke");
+        let model =
+            KokoroTtsModel::load(Path::new(&model_dir), device).expect("load local Kokoro model");
+        let first = model
+            .prepare_request("Hello world.", Some("af_heart"), Some("en-US"), 1.0)
+            .expect("prepare first Kokoro row");
+        let second = model
+            .prepare_request("Hello world.", Some("af_heart"), Some("en-US"), 1.0)
+            .expect("prepare second Kokoro row");
+        let outputs = model
+            .generate_prepared_batch(&[first, second])
+            .expect("run native Kokoro B=2 generation");
+        assert_eq!(outputs.len(), 2);
+        assert!(outputs.iter().all(|output| !output.samples.is_empty()));
     }
 
     #[test]

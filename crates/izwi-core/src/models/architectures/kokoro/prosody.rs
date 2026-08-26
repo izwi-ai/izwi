@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 #[cfg(feature = "metal")]
 use std::collections::HashMap;
 #[cfg(feature = "metal")]
@@ -109,6 +110,16 @@ pub(crate) struct KokoroProsodyOutput {
     pub n: Tensor,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct KokoroProsodyBatchOutput {
+    pub duration_frames: Vec<Vec<u32>>,
+    pub expanded_frames: Vec<usize>,
+    /// Padded to the largest expanded-frame count in this batch.
+    pub f0: Tensor,
+    /// Padded to the largest expanded-frame count in this batch.
+    pub n: Tensor,
+}
+
 #[derive(Debug)]
 pub struct KokoroProsodyPredictor {
     duration_encoder: DurationEncoder,
@@ -188,19 +199,44 @@ impl KokoroProsodyPredictor {
         ref_style: &Tensor, // [B, 256]
         speed: f32,
     ) -> Result<KokoroProsodyOutput> {
-        let (_b, c, t) = d_en.dims3().map_err(Error::from)?;
+        let batch = self.forward_batch(d_en, ref_style, &[speed])?;
+        let duration_frames = batch.duration_frames.into_iter().next().ok_or_else(|| {
+            Error::InferenceError("Kokoro prosody returned an empty scalar batch".to_string())
+        })?;
+        let expanded_frames = batch.expanded_frames[0];
+        Ok(KokoroProsodyOutput {
+            duration_frames,
+            expanded_frames,
+            f0: batch.f0,
+            n: batch.n,
+        })
+    }
+
+    pub(crate) fn forward_batch(
+        &self,
+        d_en: &Tensor,      // [B, hidden_dim, T]
+        ref_style: &Tensor, // [B, 256]
+        speeds: &[f32],
+    ) -> Result<KokoroProsodyBatchOutput> {
+        let (b, c, t) = d_en.dims3().map_err(Error::from)?;
+        if b == 0 || speeds.len() != b {
+            return Err(Error::InvalidInput(format!(
+                "Kokoro prosody batch has {b} rows but {} speeds",
+                speeds.len()
+            )));
+        }
         if c != self.hidden_dim {
             return Err(Error::InferenceError(format!(
                 "Kokoro prosody debug expected d_en channels {}, got {}",
                 self.hidden_dim, c
             )));
         }
-        let (_b_style, style_total) = ref_style.dims2().map_err(Error::from)?;
-        if style_total < self.style_dim * 2 {
+        let (b_style, style_total) = ref_style.dims2().map_err(Error::from)?;
+        if b_style != b || style_total < self.style_dim * 2 {
             return Err(Error::InferenceError(format!(
-                "Kokoro ref_style must have >= {} dims, got {}",
+                "Kokoro ref_style must be [{b}, >= {}], got {:?}",
                 self.style_dim * 2,
-                style_total
+                ref_style.shape().dims()
             )));
         }
 
@@ -213,40 +249,85 @@ impl KokoroProsodyPredictor {
         let duration_logits = self.duration_proj.forward(&x).map_err(Error::from)?; // [B,T,max_dur]
         let duration = ops::sigmoid(&duration_logits).map_err(Error::from)?;
         let duration = duration.sum_keepdim(2).map_err(Error::from)?; // [B,T,1]
-        let speed = f64::from(speed);
-        if !speed.is_finite() || speed <= 0.0 {
+        if speeds
+            .iter()
+            .any(|speed| !speed.is_finite() || *speed <= 0.0)
+        {
             return Err(Error::InvalidInput(
-                "Kokoro speed must be finite and greater than zero".to_string(),
+                "Kokoro speeds must be finite and greater than zero".to_string(),
             ));
         }
-        let duration = (duration / speed).map_err(Error::from)?;
-        let duration = duration.squeeze(2).map_err(Error::from)?; // [B,T]
-
-        // Batch size >1 is not used in Kokoro TTS inference; keep implementation scoped.
-        let (b, _t2) = duration.dims2().map_err(Error::from)?;
-        if b != 1 {
-            return Err(Error::InferenceError(
-                "Kokoro prosody debug currently supports batch size 1 only".to_string(),
-            ));
-        }
+        let speed = Tensor::from_vec(speeds.to_vec(), (b, 1), d_en.device())?;
+        let duration = duration
+            .squeeze(2)
+            .map_err(Error::from)?
+            .broadcast_div(&speed)
+            .map_err(Error::from)?;
         let duration_vec = duration.to_vec2::<f32>().map_err(Error::from)?;
-        let dur_row = duration_vec.first().cloned().unwrap_or_default();
-        let max_frames_per_token = ((self.max_dur as f64) / speed).ceil() as usize;
-        let max_expanded_frames = t
-            .checked_mul(max_frames_per_token)
-            .ok_or_else(|| {
-                Error::Overloaded("Kokoro duration-frame contract overflowed".to_string())
-            })?
-            .min(super::KOKORO_MAX_EXPANDED_FRAMES_PER_CHUNK);
-        let (pred_dur, expanded_frames) = bounded_duration_frames(dur_row, max_expanded_frames)?;
-        let pred_aln = build_alignment_matrix(&pred_dur, d.device())?; // [1,T,frames]
-
+        let mut duration_frames = Vec::with_capacity(b);
+        let mut expanded_frames = Vec::with_capacity(b);
+        for (dur_row, speed) in duration_vec.into_iter().zip(speeds) {
+            let max_frames_per_token = ((self.max_dur as f64) / f64::from(*speed)).ceil() as usize;
+            let max_expanded_frames = t
+                .checked_mul(max_frames_per_token)
+                .ok_or_else(|| {
+                    Error::Overloaded("Kokoro duration-frame contract overflowed".to_string())
+                })?
+                .min(super::KOKORO_MAX_EXPANDED_FRAMES_PER_CHUNK);
+            let (pred_dur, frames) = bounded_duration_frames(dur_row, max_expanded_frames)?;
+            duration_frames.push(pred_dur);
+            expanded_frames.push(frames);
+        }
         let d_t = d.transpose(1, 2).map_err(Error::from)?; // [B, hidden+style, T]
-        let en = d_t.matmul(&pred_aln).map_err(Error::from)?; // [B, hidden+style, frames]
-        let (f0, n) = self.f0n_train(&en, &style)?;
+        let max_frames = expanded_frames.iter().copied().max().unwrap_or(1);
+        let mut f0_rows = vec![None; b];
+        let mut n_rows = vec![None; b];
+        let mut duration_buckets = BTreeMap::<usize, Vec<usize>>::new();
+        for (row, &frames) in expanded_frames.iter().enumerate() {
+            duration_buckets.entry(frames).or_default().push(row);
+        }
+        // The shared bidirectional F0/N LSTM must not see padded duration
+        // frames: padding would alter the backward recurrence of valid frames.
+        // Bucket after the one native duration pass and pad only completed
+        // outputs for transport to the duration-aware decoder scheduler.
+        for (frames, rows) in duration_buckets {
+            let durations = rows
+                .iter()
+                .map(|&row| duration_frames[row].clone())
+                .collect::<Vec<_>>();
+            let pred_aln = build_alignment_matrix_batch(&durations, d.device())?;
+            let d_rows = select_batch_rows(&d_t, &rows)?;
+            let style_rows = select_batch_rows(&style, &rows)?;
+            let en = d_rows.matmul(&pred_aln).map_err(Error::from)?;
+            let (f0, n) = self.f0n_train(&en, &style_rows)?;
+            for (bucket_row, &original_row) in rows.iter().enumerate() {
+                f0_rows[original_row] = Some(
+                    f0.narrow(0, bucket_row, 1)
+                        .map_err(Error::from)?
+                        .pad_with_zeros(1, 0, max_frames - frames)
+                        .map_err(Error::from)?,
+                );
+                n_rows[original_row] = Some(
+                    n.narrow(0, bucket_row, 1)
+                        .map_err(Error::from)?
+                        .pad_with_zeros(1, 0, max_frames - frames)
+                        .map_err(Error::from)?,
+                );
+            }
+        }
+        let f0_rows = f0_rows
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| Error::InferenceError("Kokoro omitted an F0 batch row".to_string()))?;
+        let n_rows = n_rows
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| Error::InferenceError("Kokoro omitted a noise batch row".to_string()))?;
+        let f0 = Tensor::cat(&f0_rows.iter().collect::<Vec<_>>(), 0).map_err(Error::from)?;
+        let n = Tensor::cat(&n_rows.iter().collect::<Vec<_>>(), 0).map_err(Error::from)?;
 
-        Ok(KokoroProsodyOutput {
-            duration_frames: pred_dur,
+        Ok(KokoroProsodyBatchOutput {
+            duration_frames,
             expanded_frames,
             f0,
             n,
@@ -286,6 +367,14 @@ impl KokoroProsodyPredictor {
         let n = n.squeeze(1).map_err(Error::from)?;
         Ok((f0, n))
     }
+}
+
+fn select_batch_rows(tensor: &Tensor, rows: &[usize]) -> Result<Tensor> {
+    let selected = rows
+        .iter()
+        .map(|&row| tensor.narrow(0, row, 1).map_err(Error::from))
+        .collect::<Result<Vec<_>>>()?;
+    Tensor::cat(&selected.iter().collect::<Vec<_>>(), 0).map_err(Error::from)
 }
 
 fn bounded_duration_frames(
@@ -1131,6 +1220,43 @@ pub(crate) fn build_alignment_matrix(
         }
     }
     Tensor::from_vec(data, (1, t, frames), device).map_err(Error::from)
+}
+
+pub(crate) fn build_alignment_matrix_batch(
+    durations: &[Vec<u32>],
+    device: &candle_core::Device,
+) -> Result<Tensor> {
+    let Some(first) = durations.first() else {
+        return Err(Error::InvalidInput(
+            "Kokoro alignment batch cannot be empty".to_string(),
+        ));
+    };
+    let tokens = first.len();
+    if durations.iter().any(|row| row.len() != tokens) {
+        return Err(Error::InvalidInput(
+            "Kokoro static alignment batch requires equal token widths".to_string(),
+        ));
+    }
+    let max_frames = durations
+        .iter()
+        .map(|row| row.iter().map(|&value| value as usize).sum::<usize>())
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let mut data = vec![0.0f32; durations.len() * tokens * max_frames];
+    for (batch, row) in durations.iter().enumerate() {
+        let mut col = 0usize;
+        for (token, &duration) in row.iter().enumerate() {
+            for _ in 0..duration.max(1) as usize {
+                if col >= max_frames {
+                    break;
+                }
+                data[(batch * tokens + token) * max_frames + col] = 1.0;
+                col += 1;
+            }
+        }
+    }
+    Tensor::from_vec(data, (durations.len(), tokens, max_frames), device).map_err(Error::from)
 }
 
 fn upsample_nearest_2x_1d(x: &Tensor) -> Result<Tensor> {

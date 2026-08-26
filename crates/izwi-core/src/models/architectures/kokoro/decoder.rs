@@ -206,6 +206,27 @@ impl KokoroDecoder {
         style: &Tensor,    // [B, 128]
         rng_seed: Option<u64>,
     ) -> Result<Vec<f32>> {
+        let mut rows = self.forward_batch(asr, f0_curve, n_curve, style, &[rng_seed])?;
+        rows.pop().ok_or_else(|| {
+            Error::InferenceError("Kokoro decoder returned an empty scalar batch".to_string())
+        })
+    }
+
+    pub(crate) fn forward_batch(
+        &self,
+        asr: &Tensor,      // [B, 512, T]
+        f0_curve: &Tensor, // [B, 2T]
+        n_curve: &Tensor,  // [B, 2T]
+        style: &Tensor,    // [B, 128]
+        rng_seeds: &[Option<u64>],
+    ) -> Result<Vec<Vec<f32>>> {
+        let (batch, _, _) = asr.dims3().map_err(Error::from)?;
+        if batch == 0 || rng_seeds.len() != batch {
+            return Err(Error::InvalidInput(format!(
+                "Kokoro decoder batch has {batch} rows but {} RNG seeds",
+                rng_seeds.len()
+            )));
+        }
         thread::scope(|scope| {
             let profile = kokoro_profile_enabled();
             let t0 = Instant::now();
@@ -215,7 +236,7 @@ impl KokoroDecoder {
                 let generator = &self.generator;
                 Some(scope.spawn(move || {
                     generator
-                        .harmonic_features(f0_curve, f0_curve.device(), rng_seed)
+                        .harmonic_features_batch(f0_curve, f0_curve.device(), rng_seeds)
                         .map_err(|e| e.to_string())
                 }))
             } else {
@@ -273,7 +294,8 @@ impl KokoroDecoder {
                 }
                 self.generator.forward_with_harmonic(&x, style, &har)?
             } else {
-                self.generator.forward(&x, style, f0_curve, rng_seed)?
+                self.generator
+                    .forward_batch(&x, style, f0_curve, rng_seeds)?
             };
             if profile {
                 log_kokoro_profile("decoder.generator_total", t2.elapsed());
@@ -465,9 +487,22 @@ impl KokoroIstftGenerator {
         f0_curve: &Tensor,
         rng_seed: Option<u64>,
     ) -> Result<Vec<f32>> {
+        let mut rows = self.forward_batch(x, style, f0_curve, &[rng_seed])?;
+        rows.pop().ok_or_else(|| {
+            Error::InferenceError("Kokoro generator returned an empty scalar batch".to_string())
+        })
+    }
+
+    fn forward_batch(
+        &self,
+        x: &Tensor,
+        style: &Tensor,
+        f0_curve: &Tensor,
+        rng_seeds: &[Option<u64>],
+    ) -> Result<Vec<Vec<f32>>> {
         let profile = kokoro_profile_enabled();
         let t0 = Instant::now();
-        let har = self.harmonic_features(f0_curve, x.device(), rng_seed)?; // [B, n_fft+2, T_har]
+        let har = self.harmonic_features_batch(f0_curve, x.device(), rng_seeds)?; // [B, n_fft+2, T_har]
         if profile {
             log_kokoro_profile("generator.harmonic_features", t0.elapsed());
         }
@@ -478,7 +513,12 @@ impl KokoroIstftGenerator {
         Ok(out)
     }
 
-    fn forward_with_harmonic(&self, x: &Tensor, style: &Tensor, har: &Tensor) -> Result<Vec<f32>> {
+    fn forward_with_harmonic(
+        &self,
+        x: &Tensor,
+        style: &Tensor,
+        har: &Tensor,
+    ) -> Result<Vec<Vec<f32>>> {
         let profile = kokoro_profile_enabled();
         let t1 = Instant::now();
         let mut x = x.clone();
@@ -574,58 +614,89 @@ impl KokoroIstftGenerator {
         device: &candle_core::Device,
         rng_seed: Option<u64>,
     ) -> Result<Tensor> {
+        self.harmonic_features_batch(f0_curve, device, &[rng_seed])
+    }
+
+    fn harmonic_features_batch(
+        &self,
+        f0_curve: &Tensor,
+        device: &candle_core::Device,
+        rng_seeds: &[Option<u64>],
+    ) -> Result<Tensor> {
         let profile = kokoro_profile_enabled();
         let t0 = Instant::now();
-        let f0_curve = f0_curve.squeeze(0).map_err(Error::from)?;
-        let f0 = f0_curve.to_vec1::<f32>().map_err(Error::from)?;
+        let (batch, _) = f0_curve.dims2().map_err(Error::from)?;
+        if batch == 0 || rng_seeds.len() != batch {
+            return Err(Error::InvalidInput(format!(
+                "Kokoro harmonic batch has {batch} rows but {} RNG seeds",
+                rng_seeds.len()
+            )));
+        }
+        // Candle does not currently expose an exact device STFT/phase-accumulation
+        // primitive on every supported backend. Download the complete cohort once,
+        // then upload one stacked harmonic tensor rather than synchronizing per row.
+        let f0_rows = f0_curve.to_vec2::<f32>().map_err(Error::from)?;
         if profile {
             log_kokoro_profile("generator.harmonic.f0_download", t0.elapsed());
         }
-        if f0_curve.rank() != 1 {
-            return Err(Error::InferenceError(
-                "Kokoro generator currently supports batch size 1 for harmonic source".to_string(),
-            ));
-        }
-        if f0.is_empty() {
+        if f0_rows.iter().any(Vec::is_empty) {
             return Err(Error::InferenceError(
                 "Kokoro generator received empty F0 curve".to_string(),
             ));
         }
         let t1 = Instant::now();
-        let upsampled_f0 = repeat_nearest(&f0, self.total_scale);
-        let seed = rng_seed.unwrap_or_else(rand::random::<u64>);
-        let mut rng = ChaCha8Rng::seed_from_u64(seed);
-        let har_source = synth_harmonic_source_kokoro(
-            &upsampled_f0,
-            self.harmonic_num,
-            self.total_scale,
-            self.sine_amp,
-            self.noise_std,
-            self.voiced_threshold,
-            &self.source_linear_w,
-            self.source_linear_b,
-            KokoroConfig::TARGET_SAMPLE_RATE as f32,
-            &mut rng,
-        );
+        let mut harmonic_rows = Vec::with_capacity(batch);
+        for (f0, rng_seed) in f0_rows.iter().zip(rng_seeds) {
+            let upsampled_f0 = repeat_nearest(f0, self.total_scale);
+            let seed = rng_seed.unwrap_or_else(rand::random::<u64>);
+            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+            harmonic_rows.push(synth_harmonic_source_kokoro(
+                &upsampled_f0,
+                self.harmonic_num,
+                self.total_scale,
+                self.sine_amp,
+                self.noise_std,
+                self.voiced_threshold,
+                &self.source_linear_w,
+                self.source_linear_b,
+                KokoroConfig::TARGET_SAMPLE_RATE as f32,
+                &mut rng,
+            ));
+        }
         if profile {
             log_kokoro_profile("generator.harmonic.source", t1.elapsed());
         }
         let t2 = Instant::now();
-        let (mag, phase) = self.stft.transform(&har_source)?;
+        let spectra = harmonic_rows
+            .iter()
+            .map(|source| self.stft.transform(source))
+            .collect::<Result<Vec<_>>>()?;
         if profile {
             log_kokoro_profile("generator.harmonic.stft", t2.elapsed());
         }
         let n_bins = self.cfg.gen_istft_n_fft / 2 + 1;
-        let frames = if n_bins == 0 { 0 } else { mag.len() / n_bins };
-        let mut har = vec![0.0f32; n_bins * 2 * frames];
-        for k in 0..n_bins {
-            for t in 0..frames {
-                har[k * frames + t] = mag[t * n_bins + k];
-                har[(n_bins + k) * frames + t] = phase[t * n_bins + k];
+        let frames = spectra
+            .first()
+            .map(|(mag, _)| if n_bins == 0 { 0 } else { mag.len() / n_bins })
+            .unwrap_or(0);
+        let mut har = vec![0.0f32; batch * n_bins * 2 * frames];
+        for (batch_index, (mag, phase)) in spectra.iter().enumerate() {
+            if mag.len() != n_bins * frames || phase.len() != n_bins * frames {
+                return Err(Error::InferenceError(
+                    "Kokoro duration bucket produced mismatched harmonic widths".to_string(),
+                ));
+            }
+            let row_base = batch_index * n_bins * 2 * frames;
+            for k in 0..n_bins {
+                for t in 0..frames {
+                    har[row_base + k * frames + t] = mag[t * n_bins + k];
+                    har[row_base + (n_bins + k) * frames + t] = phase[t * n_bins + k];
+                }
             }
         }
         let t3 = Instant::now();
-        let har_t = Tensor::from_vec(har, (1, n_bins * 2, frames), device).map_err(Error::from)?;
+        let har_t =
+            Tensor::from_vec(har, (batch, n_bins * 2, frames), device).map_err(Error::from)?;
         if profile {
             log_kokoro_profile("generator.harmonic.tensor_upload", t3.elapsed());
             log_kokoro_profile("generator.harmonic.total", t0.elapsed());
@@ -1237,12 +1308,12 @@ impl KokoroStft {
         Ok((mag, phase))
     }
 
-    fn inverse(&self, magnitude: &Tensor, phase: &Tensor) -> Result<Vec<f32>> {
+    fn inverse(&self, magnitude: &Tensor, phase: &Tensor) -> Result<Vec<Vec<f32>>> {
         let (b, n_bins, frames) = magnitude.dims3().map_err(Error::from)?;
         let (b2, n_bins2, frames2) = phase.dims3().map_err(Error::from)?;
-        if b != 1 || b2 != 1 || n_bins != n_bins2 || frames != frames2 {
+        if b == 0 || b != b2 || n_bins != n_bins2 || frames != frames2 {
             return Err(Error::InferenceError(format!(
-                "Kokoro iSTFT expects matching [1,n_bins,frames] tensors, got mag={:?}, phase={:?}",
+                "Kokoro iSTFT expects matching non-empty [B,n_bins,frames] tensors, got mag={:?}, phase={:?}",
                 magnitude.shape().dims(),
                 phase.shape().dims(),
             )));
@@ -1259,53 +1330,57 @@ impl KokoroStft {
             .map_err(Error::from)?;
 
         if frames == 0 {
-            return Ok(Vec::new());
+            return Ok(vec![Vec::new(); b]);
         }
         let output_len = (frames - 1) * self.hop + self.n_fft;
-        let mut output = vec![0.0f32; output_len];
-        let mut envelope = vec![0.0f32; output_len];
-        let mut spectrum = vec![Complex32::new(0.0, 0.0); self.n_fft];
+        let mut outputs = Vec::with_capacity(b);
+        for batch_index in 0..b {
+            let mut output = vec![0.0f32; output_len];
+            let mut envelope = vec![0.0f32; output_len];
+            let mut spectrum = vec![Complex32::new(0.0, 0.0); self.n_fft];
+            let batch_base = batch_index * n_bins * frames;
 
-        for frame_idx in 0..frames {
-            spectrum.fill(Complex32::new(0.0, 0.0));
-            for k in 0..n_bins {
-                let idx = k * frames + frame_idx;
-                let m = mag[idx].max(0.0);
-                let p = ph[idx];
-                spectrum[k] = Complex32::from_polar(m, p);
+            for frame_idx in 0..frames {
+                spectrum.fill(Complex32::new(0.0, 0.0));
+                for k in 0..n_bins {
+                    let idx = batch_base + k * frames + frame_idx;
+                    let m = mag[idx].max(0.0);
+                    let p = ph[idx];
+                    spectrum[k] = Complex32::from_polar(m, p);
+                }
+                for k in 1..(n_bins.saturating_sub(1)) {
+                    spectrum[self.n_fft - k] = spectrum[k].conj();
+                }
+                self.fft_inv.process(&mut spectrum);
+                let start = frame_idx * self.hop;
+                for n in 0..self.n_fft {
+                    let sample = (spectrum[n].re / self.n_fft as f32) * self.window[n];
+                    let idx = start + n;
+                    output[idx] += sample;
+                    envelope[idx] += self.window[n] * self.window[n];
+                }
             }
-            for k in 1..(n_bins.saturating_sub(1)) {
-                spectrum[self.n_fft - k] = spectrum[k].conj();
-            }
-            self.fft_inv.process(&mut spectrum);
-            let start = frame_idx * self.hop;
-            for n in 0..self.n_fft {
-                let sample = (spectrum[n].re / self.n_fft as f32) * self.window[n];
-                let idx = start + n;
-                output[idx] += sample;
-                envelope[idx] += self.window[n] * self.window[n];
-            }
-        }
 
-        for (y, env) in output.iter_mut().zip(envelope.iter()) {
-            if *env > 1e-8 {
-                *y /= *env;
+            for (y, env) in output.iter_mut().zip(envelope.iter()) {
+                if *env > 1e-8 {
+                    *y /= *env;
+                }
+                if !y.is_finite() {
+                    *y = 0.0;
+                }
             }
-            if !y.is_finite() {
-                *y = 0.0;
+            let pad = self.n_fft / 2;
+            let mut trimmed = if output.len() > pad * 2 {
+                output[pad..output.len() - pad].to_vec()
+            } else {
+                output
+            };
+            for sample in &mut trimmed {
+                *sample = sample.clamp(-1.0, 1.0);
             }
+            outputs.push(trimmed);
         }
-
-        let pad = self.n_fft / 2;
-        let mut trimmed = if output.len() > pad * 2 {
-            output[pad..output.len() - pad].to_vec()
-        } else {
-            output
-        };
-        for s in &mut trimmed {
-            *s = s.clamp(-1.0, 1.0);
-        }
-        Ok(trimmed)
+        Ok(outputs)
     }
 }
 
@@ -1684,8 +1759,21 @@ mod tests {
         let phase_t =
             Tensor::from_vec(phase_ch, (1, n_bins, frames), &device).expect("phase tensor");
         let y = stft.inverse(&mag_t, &phase_t).expect("istft inverse");
-        assert!(!y.is_empty());
-        assert!(y.iter().all(|v| v.is_finite()));
+        assert_eq!(y.len(), 1);
+        assert!(!y[0].is_empty());
+        assert!(y.iter().flatten().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn kokoro_stft_inverse_executes_native_two_row_output() {
+        let stft = KokoroStft::new(20, 5);
+        let device = candle_core::Device::Cpu;
+        let magnitude = Tensor::ones((2, 11, 4), DType::F32, &device).expect("magnitude");
+        let phase = Tensor::zeros((2, 11, 4), DType::F32, &device).expect("phase");
+        let rows = stft.inverse(&magnitude, &phase).expect("batched inverse");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].len(), rows[1].len());
+        assert!(rows.iter().flatten().all(|value| value.is_finite()));
     }
 
     #[test]
