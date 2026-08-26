@@ -4306,6 +4306,7 @@ mod tests {
                 && !is_whisper_physical_asr(metadata)
                 && !is_vibevoice_physical_asr(metadata)
                 && !is_granite_speech_physical_asr(metadata)
+                && !is_lfm25_audio_physical_asr(metadata)
         }
 
         fn create(
@@ -4619,6 +4620,9 @@ mod tests {
                             && variant.family() == crate::catalog::ModelFamily::GraniteSpeechAsr;
                         let whisper_asr = execution.metadata().capability == CapabilityKind::Asr
                             && variant.family() == crate::catalog::ModelFamily::WhisperAsr;
+                        let lfm25_audio_asr = execution.metadata().capability
+                            == CapabilityKind::Asr
+                            && variant.family() == crate::catalog::ModelFamily::Lfm25Audio;
                         let qwen3_tts = matches!(
                             execution.metadata().capability,
                             CapabilityKind::Tts | CapabilityKind::StreamingTts
@@ -4630,6 +4634,7 @@ mod tests {
                         if (qwen3_asr
                             || vibevoice_asr
                             || granite_asr
+                            || lfm25_audio_asr
                             || qwen3_tts
                             || voxtral_realtime)
                             && contract.execution_profile.mode == ExecutionMode::Sequence
