@@ -446,20 +446,20 @@ impl ParakeetAsrModel {
                 .map(|row| &row.state.predictor_out)
                 .collect::<Vec<_>>();
             let predictor = Tensor::cat(&predictor_rows, 0)?;
-            let logits = self
-                .joint_batch_rows(&encoded, &predictor)?
-                .to_vec2::<f32>()?;
+            let logits = self.joint_batch_rows(&encoded, &predictor)?;
+            let (_, output_width) = logits.dims2()?;
             let mut emitted = Vec::new();
-            for (index, (row, logits)) in rows.iter_mut().zip(&logits).enumerate() {
+            for (index, row) in rows.iter_mut().enumerate() {
                 let token_end = self.blank_idx + 1;
-                if logits.len() < token_end + self.num_durations {
+                if output_width < token_end + self.num_durations {
                     return Err(Error::InferenceError(
                         "Parakeet retained joint output has invalid geometry".into(),
                     ));
                 }
-                let label = argmax_slice(&logits[..token_end])?;
-                let duration =
-                    argmax_slice(&logits[token_end..])?.min(self.num_durations.saturating_sub(1));
+                let row_logits = logits.i(index)?;
+                let label = argmax_1d(&row_logits.narrow(0, 0, token_end)?)?;
+                let duration = argmax_1d(&row_logits.narrow(0, token_end, self.num_durations)?)?
+                    .min(self.num_durations.saturating_sub(1));
                 let mut jump = duration;
                 if label == self.blank_idx && jump == 0 {
                     jump = 1;
@@ -2052,30 +2052,6 @@ fn argmax_1d(x: &Tensor) -> Result<usize> {
     let idx = idx.to_dtype(DType::U32)?.to_scalar::<u32>()?;
     usize::try_from(idx)
         .map_err(|_| Error::InferenceError(format!("Parakeet argmax index exceeds usize: {idx}")))
-}
-
-fn argmax_slice(values: &[f32]) -> Result<usize> {
-    let mut values = values.iter().copied().enumerate();
-    let (mut best_index, mut best_value) = values.next().ok_or_else(|| {
-        Error::InferenceError("Parakeet argmax received empty logits".to_string())
-    })?;
-    if !best_value.is_finite() {
-        return Err(Error::InferenceError(
-            "Parakeet argmax received non-finite logits".to_string(),
-        ));
-    }
-    for (index, value) in values {
-        if !value.is_finite() {
-            return Err(Error::InferenceError(
-                "Parakeet argmax received non-finite logits".to_string(),
-            ));
-        }
-        if value > best_value {
-            best_index = index;
-            best_value = value;
-        }
-    }
-    Ok(best_index)
 }
 
 fn resample_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
