@@ -14,6 +14,7 @@ enum CertifiedTopology {
     RetainedPagedRotatingAndInvocationScratch,
     RetainedPagedTensorAndInvocationPaged,
     RetainedPagedPagedTensorAndInvocationPagedPagedTensor,
+    RetainedTensorAndInvocationTensor,
     RetainedPagedAndInvocationPagedTensor,
     RetainedPagedAndInvocationPaged,
     RetainedPagedRingAndInvocationPagedRing,
@@ -44,6 +45,9 @@ impl CertifiedTopology {
             | Self::RetainedPagedRotatingAndInvocationScratch
             | Self::RetainedAppendRingTensor => InferenceStateRequirement::RetainedAndInvocation,
             Self::RetainedPagedPagedTensorAndInvocationPagedPagedTensor => {
+                InferenceStateRequirement::RetainedAndInvocation
+            }
+            Self::RetainedTensorAndInvocationTensor => {
                 InferenceStateRequirement::RetainedAndInvocation
             }
             Self::InvocationPaged
@@ -101,7 +105,7 @@ fn certified_topology(
         // still leases decoder pages plus acoustic/semantic tensor state.
         (VibeVoiceAsr, Asr) => RetainedPagedAndInvocationPagedTensor,
         (WhisperAsr, Asr) => RetainedPagedStaticAndInvocationPagedStatic,
-        (ParakeetAsr, Asr) => InvocationTensor,
+        (ParakeetAsr, Asr) => RetainedTensorAndInvocationTensor,
         (GraniteSpeechAsr, Asr) => RetainedPagedAndInvocationPaged,
         (GraniteSpeechAsr, SpeakerAttributedAsr) => InvocationPaged,
         (NemotronAsr, Asr) => InvocationTensorStatic,
