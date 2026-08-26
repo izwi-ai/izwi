@@ -2186,6 +2186,9 @@ impl ModelLifecycleController {
                     .publish_fish_s2_tts_ready(variant)
                     .await?;
             }
+            if variant.family() == crate::catalog::ModelFamily::KokoroTts {
+                self.model_registry.publish_kokoro_ready(variant).await?;
+            }
             if variant.family() == crate::catalog::ModelFamily::VoxtralTts {
                 self.model_registry
                     .publish_voxtral_tts_ready(variant)
