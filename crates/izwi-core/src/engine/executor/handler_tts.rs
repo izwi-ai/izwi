@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::tts::{
     PhysicalTtsManagedQuantumCheckpoint, PhysicalTtsPrefillManagedCheckpoint, SpeakerReference,
@@ -12,7 +13,7 @@ use super::super::request::EngineCoreRequest;
 use super::super::scheduler::ScheduledRequest;
 use super::super::types::AudioOutput;
 use super::super::SessionKey;
-use super::state::{ActiveQwenTtsDecode, QwenTtsPhysicalState};
+use super::state::{ActiveLfm25TtsDecode, ActiveQwenTtsDecode, QwenTtsPhysicalState};
 use super::{
     ExecutorOutput, ExecutorPhaseTiming, ExecutorStateLease, ModelSessionResult, NativeExecutor,
 };
@@ -331,6 +332,205 @@ impl NativeExecutor {
             text: ref_text.to_string(),
             sample_rate,
         }))
+    }
+
+    pub(super) fn lfm25_audio_tts_request_with_managed_cache(
+        &self,
+        request: &EngineCoreRequest,
+        scheduled: &ScheduledRequest,
+        retained: Option<super::RetainedRowManagedState>,
+    ) -> Result<ModelSessionResult> {
+        let variant = Self::resolve_variant(request)?;
+        if variant.family() != ModelFamily::Lfm25Audio {
+            return Err(Error::InvalidInput(
+                "foreign LFM2.5 Audio TTS request".into(),
+            ));
+        }
+        let model = request
+            .prepared_lfm25_audio_tts_model_lease_for_executor()?
+            .ok_or_else(|| Error::InferenceError("LFM2.5 Audio TTS lost model residency".into()))?;
+        let mut retained = retained
+            .ok_or_else(|| Error::InferenceError("LFM2.5 Audio TTS lost retained state".into()))?;
+        let tensor = retained.tensor_state.clone().ok_or_else(|| {
+            Error::InferenceError("LFM2.5 Audio TTS lost ShortConv reservation".into())
+        })?;
+        let arena = request
+            .managed_cache_runtime()
+            .and_then(|runtime| runtime.tensor_state())
+            .ok_or_else(|| Error::InferenceError("LFM2.5 Audio TTS lost ShortConv arena".into()))?;
+        let mut main = retained.take_only_paged()?;
+        retained.ensure_all_paged_consumed()?;
+        let mut lease = ExecutorStateLease::checkout(
+            &self.lfm25_tts_decode_states,
+            scheduled.session_key(),
+            variant,
+            "LFM2.5 Audio TTS decode",
+        )?;
+        if lease.state().is_some_and(|active| {
+            active.variant != variant || !Arc::ptr_eq(&active.model.model_arc(), &model.model_arc())
+        }) {
+            lease.discard_state();
+        }
+        let fresh = lease.state().is_none();
+        if fresh {
+            if !scheduled.is_prefill || scheduled.num_computed_tokens != 0 {
+                return Err(Error::InferenceError(
+                    "LFM2.5 Audio TTS lost state before initial prefill".into(),
+                ));
+            }
+            let artifact = request
+                .prepared_lfm25_audio_tts_artifact_for_executor()?
+                .ok_or_else(|| Error::InferenceError("LFM2.5 Audio TTS lost prompt".into()))?;
+            if artifact.prompt_tokens != request.num_prompt_tokens() {
+                return Err(Error::InferenceError(
+                    "LFM2.5 Audio TTS prompt differs from admission".into(),
+                ));
+            }
+            let state = model.new_lfm25_audio_retained_tts_state(
+                artifact,
+                request.params.max_tokens.max(1),
+                request.lfm25_audio_tts_generation_config(),
+            )?;
+            lease.install_state(ActiveLfm25TtsDecode {
+                variant,
+                model: model.clone(),
+                state,
+                last_tokens_generated: 0,
+                stream_sequence: 0,
+            })?;
+        }
+        let prior = {
+            let active = lease.require_state_mut()?;
+            active.state.bind_tensor_sequence(tensor.sequence)?;
+            active.state.restore_shortconv(arena)?;
+            (active.last_tokens_generated, active.stream_sequence)
+        };
+        let needs_depth =
+            !scheduled.is_prefill && lease.require_state_mut()?.state.decode_needs_depthformer();
+        let mut depth = needs_depth
+            .then(|| super::invocation_paged_lease_for_row(request, scheduled))
+            .transpose()?;
+        let checkpoint = lease
+            .require_state_mut()?
+            .state
+            .reset_and_begin_quantum(&main, depth.as_mut().map(|depth| depth.cache_mut()))?;
+        lease.mark_dirty();
+        let step = (|| {
+            let active = lease.require_state_mut()?;
+            let step = if scheduled.is_prefill {
+                if active.state.prefill_cursor() != scheduled.num_computed_tokens {
+                    return Err(Error::InferenceError(
+                        "LFM2.5 Audio TTS prefill cursor differs from admission".into(),
+                    ));
+                }
+                let step = model.lfm25_audio_tts_prefill_step(
+                    &mut active.state,
+                    &mut main,
+                    &checkpoint,
+                    scheduled.num_tokens,
+                )?;
+                if step.consumed_tokens != scheduled.num_tokens {
+                    return Err(Error::InferenceError(
+                        "LFM2.5 Audio TTS prefill progress is inconsistent".into(),
+                    ));
+                }
+                None
+            } else {
+                Some(model.lfm25_audio_tts_decode_step(
+                    &mut active.state,
+                    &mut main,
+                    depth.as_mut().map(|depth| depth.cache_mut()),
+                    &checkpoint,
+                )?)
+            };
+            if request.is_cancelled() {
+                return Err(Error::Cancelled(request.id.clone()));
+            }
+            active.state.stage_shortconv(arena, scheduled.plan_id)?;
+            Ok::<_, Error>(step)
+        })();
+        let step = match step {
+            Ok(step) if !request.is_cancelled() => step,
+            result => {
+                let active = lease.require_state_mut()?;
+                active.state.rollback_quantum(
+                    &mut main,
+                    depth.as_mut().map(|depth| depth.cache_mut()),
+                    &checkpoint,
+                )?;
+                active.last_tokens_generated = prior.0;
+                active.stream_sequence = prior.1;
+                lease.mark_clean();
+                if request.is_cancelled() || matches!(result, Err(Error::Cancelled(_))) {
+                    lease.release()?;
+                    if let Some(depth) = depth {
+                        let _ = depth.release()?;
+                    }
+                    return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                        request.id.clone(),
+                    )));
+                }
+                if fresh {
+                    lease.discard_state();
+                }
+                return Err(result.expect_err("non-cancelled failed TTS quantum"));
+            }
+        };
+        let completions = main.take_completed_writes();
+        lease.require_state_mut()?.state.commit_quantum(
+            &main,
+            depth.as_ref().map(|depth| depth.cache()),
+            &checkpoint,
+        )?;
+        if let Some(depth) = depth {
+            let _ = depth.release()?;
+        }
+        let (text, generated, finished, samples, sample_rate) = {
+            let active = lease.require_state_mut()?;
+            let generated = step.as_ref().map_or(0, |step| {
+                step.tokens_generated
+                    .saturating_sub(active.last_tokens_generated)
+            });
+            if let Some(step) = step.as_ref() {
+                active.last_tokens_generated = step.tokens_generated;
+            }
+            let finished = step.as_ref().is_some_and(|step| step.finished);
+            let samples = if finished {
+                model.detokenize_lfm25_audio_retained_tts_state(&active.state)?
+            } else {
+                Vec::new()
+            };
+            (
+                active.state.text().to_string(),
+                generated,
+                finished,
+                samples,
+                model.lfm25_audio_tts_output_sample_rate(),
+            )
+        };
+        lease.mark_clean();
+        if finished {
+            lease.release()?;
+        } else {
+            lease.restore()?;
+        }
+        Ok(ModelSessionResult::sequence(ExecutorOutput {
+            request_id: request.id.clone(),
+            audio: Some(AudioOutput {
+                duration_secs: samples.len() as f32 / sample_rate as f32,
+                samples,
+                sample_rate,
+            }),
+            text: Some(text),
+            input_transcription: None,
+            tokens_processed: scheduled.num_tokens,
+            tokens_generated: generated,
+            finished,
+            phase_timing_override: None,
+            asr_diagnostics: None,
+            error: None,
+        })
+        .with_managed_cache_completions(completions))
     }
 
     pub(super) fn qwen_tts_request(

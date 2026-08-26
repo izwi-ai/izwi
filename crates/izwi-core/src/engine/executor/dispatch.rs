@@ -41,6 +41,16 @@ impl DispatchRoute {
 
 const DISPATCH_ROUTES: &[DispatchRoute] = &[
     DispatchRoute {
+        name: "lfm25_audio_tts",
+        task: TaskType::TTS,
+        variant_matcher: Some(|variant| {
+            variant.family() == crate::catalog::ModelFamily::Lfm25Audio
+        }),
+        handler: |executor, request, scheduled| {
+            executor.lfm25_audio_tts_request_with_managed_cache(request, scheduled, None)
+        },
+    },
+    DispatchRoute {
         name: "tts",
         task: TaskType::TTS,
         variant_matcher: None,
@@ -175,6 +185,23 @@ impl NativeExecutor {
                         reservation,
                     )?;
                     self.transcribe_request_with_managed_cache(request, scheduled_req, Some(state))
+                }
+                Some(reservation)
+                    if request.task_type == TaskType::TTS
+                        && request.model_variant.is_some_and(|variant| {
+                            variant.family() == crate::catalog::ModelFamily::Lfm25Audio
+                        }) =>
+                {
+                    let state = super::retained_row_managed_state_for_row(
+                        request,
+                        scheduled_req,
+                        reservation,
+                    )?;
+                    self.lfm25_audio_tts_request_with_managed_cache(
+                        request,
+                        scheduled_req,
+                        Some(state),
+                    )
                 }
                 Some(reservation)
                     if request.task_type == TaskType::TTS
