@@ -43,12 +43,18 @@ pub(crate) const VIBEVOICE_TTS_POSITIVE_DOMAIN: StateDomainId = StateDomainId::n
 pub(crate) const VIBEVOICE_TTS_NEGATIVE_DOMAIN: StateDomainId = StateDomainId::new(2);
 pub(crate) const VIBEVOICE_TTS_ACOUSTIC_DOMAIN: StateDomainId = StateDomainId::new(3);
 pub(crate) const VIBEVOICE_TTS_SEMANTIC_DOMAIN: StateDomainId = StateDomainId::new(4);
+pub(crate) const VIBEVOICE_TTS_POSITIVE_GROUP: StateGroupId = StateGroupId::new(1);
+pub(crate) const VIBEVOICE_TTS_NEGATIVE_GROUP: StateGroupId = StateGroupId::new(2);
+pub(crate) const VIBEVOICE_TTS_TOKENIZER_GROUP: StateGroupId = StateGroupId::new(3);
+pub(crate) const VIBEVOICE_TTS_PREPARATION_STAGE: &str = "tts.prepare.vibevoice";
+pub(crate) const VIBEVOICE_TTS_PREFILL_STAGE: &str = "tts.prefill.vibevoice";
+pub(crate) const VIBEVOICE_TTS_DECODE_STAGE: &str = "tts.decode.vibevoice";
+pub(crate) const VIBEVOICE_TTS_LEGACY_STAGE: &str = "tts.scalar";
 
 #[derive(Debug, Clone)]
 pub(crate) struct VibeVoicePhysicalStateSpec {
     pub(crate) descriptor: CapabilityStateDescriptorV2,
-    /// Present only for the authenticated normal VibeVoice-ASR sequence graph.
-    /// Legacy VibeVoice ASR and VibeVoice TTS remain invocation-only.
+    /// Present for authenticated normal retained ASR/TTS sequence graphs.
     pub(crate) retained: Option<InferenceStateContract>,
     pub(crate) retained_max_tokens: Option<usize>,
     pub(crate) invocation: InferenceStateContract,
@@ -377,6 +383,22 @@ pub(crate) fn vibevoice_physical_state_spec(
     if has_vibevoice_asr_domain_topology(&invocation) || has_asr_stage_identity {
         return vibevoice_asr_physical_state_spec(stage_graphs, invocation, max_context_tokens);
     }
+    let has_tts_stage_identity =
+        stage_graphs
+            .iter()
+            .flat_map(|stages| stages.iter())
+            .any(|stage| {
+                matches!(
+                    stage.name.as_str(),
+                    VIBEVOICE_TTS_PREPARATION_STAGE
+                        | VIBEVOICE_TTS_PREFILL_STAGE
+                        | VIBEVOICE_TTS_DECODE_STAGE
+                        | VIBEVOICE_TTS_LEGACY_STAGE
+                )
+            });
+    if has_vibevoice_tts_domain_topology(&invocation) || has_tts_stage_identity {
+        return vibevoice_asr_physical_state_spec(stage_graphs, invocation, max_context_tokens);
+    }
     let descriptor =
         vibevoice_invocation_descriptor(stage_graphs, &invocation, max_context_tokens)?;
     Ok(VibeVoicePhysicalStateSpec {
@@ -385,6 +407,18 @@ pub(crate) fn vibevoice_physical_state_spec(
         retained_max_tokens: None,
         invocation,
     })
+}
+
+fn has_vibevoice_tts_domain_topology(contract: &InferenceStateContract) -> bool {
+    contract.domains.len() == 4
+        && contract.groups.len() == 3
+        && contract.groups[0].id == VIBEVOICE_TTS_POSITIVE_GROUP
+        && contract.groups[0].domains == [VIBEVOICE_TTS_POSITIVE_DOMAIN]
+        && contract.groups[1].id == VIBEVOICE_TTS_NEGATIVE_GROUP
+        && contract.groups[1].domains == [VIBEVOICE_TTS_NEGATIVE_DOMAIN]
+        && contract.groups[2].id == VIBEVOICE_TTS_TOKENIZER_GROUP
+        && contract.groups[2].domains
+            == [VIBEVOICE_TTS_ACOUSTIC_DOMAIN, VIBEVOICE_TTS_SEMANTIC_DOMAIN]
 }
 
 fn has_vibevoice_asr_domain_topology(contract: &InferenceStateContract) -> bool {
@@ -545,7 +579,10 @@ fn authenticate_vibevoice_asr_graph(stages: &[StageDescriptor]) -> Result<VibeVo
     ordered.sort_unstable_by_key(|stage| stage.id);
     if let [stage] = ordered.as_slice() {
         if stage.id == StageId::new(0)
-            && stage.name == VIBEVOICE_ASR_LEGACY_STAGE
+            && matches!(
+                stage.name.as_str(),
+                VIBEVOICE_ASR_LEGACY_STAGE | VIBEVOICE_TTS_LEGACY_STAGE
+            )
             && stage.selector == StageWorkSelector::Atomic
             && stage.progress == StageProgressKind::Atomic
             && stage.batch_mode == NativeBatchMode::None
@@ -555,6 +592,12 @@ fn authenticate_vibevoice_asr_graph(stages: &[StageDescriptor]) -> Result<VibeVo
         }
     }
     if let [preparation, prefill, decode] = ordered.as_slice() {
+        let is_asr = preparation.name == VIBEVOICE_ASR_PREPARATION_STAGE
+            && prefill.name == VIBEVOICE_ASR_PREFILL_STAGE
+            && decode.name == VIBEVOICE_ASR_DECODE_STAGE;
+        let is_tts = preparation.name == VIBEVOICE_TTS_PREPARATION_STAGE
+            && prefill.name == VIBEVOICE_TTS_PREFILL_STAGE
+            && decode.name == VIBEVOICE_TTS_DECODE_STAGE;
         let native_prefill = prefill.batch_mode == NativeBatchMode::Static
             && prefill.shape_policy == StageShapePolicy::Padded
             && prefill.concurrency == ConcurrencyClass::Batchable
@@ -572,7 +615,7 @@ fn authenticate_vibevoice_asr_graph(stages: &[StageDescriptor]) -> Result<VibeVo
             && prefill.max_batch_size == 1
             && prefill.workspace_per_row_bytes == 0;
         let valid = preparation.id == StageId::new(0)
-            && preparation.name == VIBEVOICE_ASR_PREPARATION_STAGE
+            && (is_asr || is_tts)
             && preparation.selector == StageWorkSelector::PreSequencePreparation
             && preparation.domain == ExecutionDomain::ExecutionGroup
             && preparation.progress == StageProgressKind::Atomic
@@ -585,7 +628,6 @@ fn authenticate_vibevoice_asr_graph(stages: &[StageDescriptor]) -> Result<VibeVo
             && preparation.max_batch_size == 1
             && preparation.max_workspace_bytes > 0
             && prefill.id == StageId::new(1)
-            && prefill.name == VIBEVOICE_ASR_PREFILL_STAGE
             && prefill.selector == StageWorkSelector::SequencePrefill
             && prefill.domain == ExecutionDomain::ExecutionGroup
             && prefill.progress == StageProgressKind::Iterative
@@ -595,16 +637,17 @@ fn authenticate_vibevoice_asr_graph(stages: &[StageDescriptor]) -> Result<VibeVo
             && prefill.output_visibility == OutputVisibility::AfterQuantumCommit
             && prefill.max_work_units > 0
             && prefill.max_workspace_bytes > 0
-            && prefill.retained_state_selections.as_deref()
-                == Some(
-                    [ClockedStateSelection::new(
-                        VIBEVOICE_ASR_TOKENIZER_GROUP,
-                        StateClock::AudioSamples,
-                    )?]
-                    .as_slice(),
-                )
+            && ((is_asr
+                && prefill.retained_state_selections.as_deref()
+                    == Some(
+                        [ClockedStateSelection::new(
+                            VIBEVOICE_ASR_TOKENIZER_GROUP,
+                            StateClock::AudioSamples,
+                        )?]
+                        .as_slice(),
+                    ))
+                || (is_tts && prefill.retained_state_selections.as_deref() == Some(&[])))
             && decode.id == StageId::new(2)
-            && decode.name == VIBEVOICE_ASR_DECODE_STAGE
             && decode.selector == StageWorkSelector::SequenceDecode
             && decode.domain == ExecutionDomain::ExecutionGroup
             && decode.progress == StageProgressKind::Iterative
@@ -629,6 +672,9 @@ fn vibevoice_asr_retained_contract(
     invocation: &InferenceStateContract,
 ) -> Result<InferenceStateContract> {
     invocation.validate()?;
+    if has_vibevoice_tts_domain_topology(invocation) {
+        return vibevoice_tts_retained_contract(invocation);
+    }
     if !has_vibevoice_asr_domain_topology(invocation) {
         return Err(Error::ModelLoadError(
             "VibeVoice ASR legacy contract must contain exact decoder and coupled tokenizer domains"
@@ -699,6 +745,61 @@ fn vibevoice_asr_retained_contract(
     let retained = InferenceStateContract {
         abi: CURRENT_INFERENCE_STATE_ABI,
         domains: retained_domains,
+        groups: invocation.groups.clone(),
+    };
+    retained.validate()?;
+    Ok(retained)
+}
+
+fn vibevoice_tts_retained_contract(
+    invocation: &InferenceStateContract,
+) -> Result<InferenceStateContract> {
+    let mut domains = Vec::with_capacity(invocation.domains.len());
+    for domain in &invocation.domains {
+        let expected_clock = match domain.id() {
+            VIBEVOICE_TTS_POSITIVE_DOMAIN | VIBEVOICE_TTS_NEGATIVE_DOMAIN => {
+                StateClock::DecoderTokens
+            }
+            VIBEVOICE_TTS_ACOUSTIC_DOMAIN | VIBEVOICE_TTS_SEMANTIC_DOMAIN => {
+                StateClock::CodecFrames
+            }
+            _ => {
+                return Err(Error::ModelLoadError(
+                    "VibeVoice TTS retained state contains a foreign domain".into(),
+                ));
+            }
+        };
+        if domain.header().scope != StateScope::Invocation
+            || domain.header().clock != expected_clock
+            || domain.header().prefix != PrefixPolicy::Disabled
+            || domain.header().checkpoint != CheckpointPolicy::None
+        {
+            return Err(Error::ModelLoadError(
+                "VibeVoice TTS invocation state has unexpected clock/scope semantics".into(),
+            ));
+        }
+        let retained = match domain.clone() {
+            StateDomainSpec::PagedAttention(mut state) => {
+                state.header.scope = StateScope::Retained;
+                state.header.checkpoint = CheckpointPolicy::Transactional;
+                StateDomainSpec::PagedAttention(state)
+            }
+            StateDomainSpec::Tensor(mut state) => {
+                state.header.scope = StateScope::Retained;
+                state.header.checkpoint = CheckpointPolicy::Transactional;
+                StateDomainSpec::Tensor(state)
+            }
+            _ => {
+                return Err(Error::ModelLoadError(
+                    "VibeVoice TTS retained state contains an unsupported domain".into(),
+                ));
+            }
+        };
+        domains.push(retained);
+    }
+    let retained = InferenceStateContract {
+        abi: CURRENT_INFERENCE_STATE_ABI,
+        domains,
         groups: invocation.groups.clone(),
     };
     retained.validate()?;
@@ -1417,7 +1518,7 @@ mod tests {
     }
 
     #[test]
-    fn tts_non_atomic_selector_does_not_enter_asr_dual_graph_contract() {
+    fn tts_dual_graph_publishes_four_transactional_domains() {
         let tokenizer = [
             tokenizer_domain(3, 3, StateClock::CodecFrames, &[(2, 3)]),
             tokenizer_domain(4, 3, StateClock::CodecFrames, &[(4, 5)]),
@@ -1428,11 +1529,25 @@ mod tests {
             &tokenizer,
         )
         .unwrap();
-        let mut tts = stage();
-        tts.selector = StageWorkSelector::Any;
-        let spec = vibevoice_physical_state_spec(&[&[tts]], invocation, 8192).unwrap();
-        assert!(spec.retained.is_none());
-        assert!(spec.retained_max_tokens.is_none());
-        assert!(spec.descriptor.is_stateless());
+        let mut normal = asr_normal_stages();
+        normal[0].name = VIBEVOICE_TTS_PREPARATION_STAGE.into();
+        normal[1].name = VIBEVOICE_TTS_PREFILL_STAGE.into();
+        normal[1].retained_state_selections = Some(vec![]);
+        normal[2].name = VIBEVOICE_TTS_DECODE_STAGE.into();
+        let mut legacy = asr_legacy_stage();
+        legacy.name = VIBEVOICE_TTS_LEGACY_STAGE.into();
+        let spec = vibevoice_physical_state_spec(
+            &[normal.as_slice(), std::slice::from_ref(&legacy)],
+            invocation,
+            8192,
+        )
+        .unwrap();
+        let retained = spec.retained.expect("TTS retained contract");
+        assert_eq!(retained.domains.len(), 4);
+        assert_eq!(retained.groups.len(), 3);
+        assert!(retained.domains.iter().all(|domain| {
+            domain.scope() == StateScope::Retained
+                && domain.header().checkpoint == CheckpointPolicy::Transactional
+        }));
     }
 }
