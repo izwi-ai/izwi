@@ -976,11 +976,14 @@ mod tests {
             asr.state_requirement,
             InferenceStateRequirement::RetainedAndInvocation
         );
-        for capability in [
-            CapabilityKind::Tts,
-            CapabilityKind::AudioChat,
-            CapabilityKind::SpeechToSpeech,
-        ] {
+        assert_eq!(
+            registry
+                .require(CapabilityKind::Tts, ModelVariant::Lfm25Audio15BGguf)
+                .expect("lfm audio TTS capability")
+                .state_requirement,
+            InferenceStateRequirement::RetainedAndInvocation
+        );
+        for capability in [CapabilityKind::AudioChat, CapabilityKind::SpeechToSpeech] {
             assert_eq!(
                 registry
                     .require(capability, ModelVariant::Lfm25Audio15BGguf)

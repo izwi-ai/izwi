@@ -4154,7 +4154,9 @@ Pages free: 10.\n";
             BackendKind::Cpu,
         )
         .unwrap();
-        let contract = bundle.contract(CapabilityKind::Tts, false).unwrap();
+        let contract = bundle
+            .contract(CapabilityKind::StreamingTts, false)
+            .unwrap();
         assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::None);
         assert_eq!(contract.stages[0].max_batch_size, 1);
         let calls = Arc::new(AtomicUsize::new(0));
@@ -4185,7 +4187,9 @@ Pages free: 10.\n";
             BackendKind::Cpu,
         )
         .unwrap();
-        let contract = wrong_group.contract(CapabilityKind::Tts, false).unwrap();
+        let contract = wrong_group
+            .contract(CapabilityKind::StreamingTts, false)
+            .unwrap();
         let task_calls = calls.clone();
         let error = coordinator
             .run_loaded_blocking_stage(
@@ -4724,7 +4728,9 @@ Pages free: 10.\n";
             BackendKind::Cpu,
         )
         .unwrap();
-        let contract = bundle.contract(CapabilityKind::Tts, false).unwrap();
+        let contract = bundle
+            .contract(CapabilityKind::StreamingTts, false)
+            .unwrap();
         assert_eq!(
             contract.execution_profile.physical_launch_policy,
             PhysicalLaunchPolicy::ExecutionGroupExclusive

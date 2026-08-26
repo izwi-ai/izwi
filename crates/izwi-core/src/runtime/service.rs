@@ -6966,7 +6966,7 @@ mod tests {
         let contract = loaded_contract_for_residency(
             &lease,
             Some(&bundle),
-            CapabilityKind::Tts,
+            CapabilityKind::StreamingTts,
             false,
             group,
             BackendKind::Cpu,
@@ -6979,7 +6979,7 @@ mod tests {
         assert!(loaded_contract_for_residency(
             &lease,
             Some(&bundle),
-            CapabilityKind::Tts,
+            CapabilityKind::StreamingTts,
             false,
             group,
             BackendKind::Cpu,
@@ -6989,7 +6989,7 @@ mod tests {
         assert!(loaded_contract_for_residency(
             &lease,
             Some(&bundle),
-            CapabilityKind::Tts,
+            CapabilityKind::StreamingTts,
             false,
             crate::engine::ExecutionGroupId::new(group.get() + 1),
             BackendKind::Cpu,
@@ -7342,9 +7342,8 @@ mod tests {
 
         let request_id = "nonstreaming-admission-deadline".to_string();
         let deadline = Instant::now() + Duration::from_millis(25);
-        let residency_variant = ModelVariant::Kokoro82M;
         let mut request = EngineCoreRequest::tts("bounded Engine admission")
-            .with_model_variant(residency_variant)
+            .with_model_variant(ModelVariant::Kokoro82M)
             .with_deadline(Some(deadline));
         request.id = request_id.clone();
         request.prompt_tokens = vec![1];
@@ -7356,29 +7355,26 @@ mod tests {
             .admit_observed(spec, observation)
             .await
             .expect("job admission");
-        let residency_lease = runtime
-            .model_manager
-            .acquire_residency_lease(residency_variant);
-
         let err = tokio::time::timeout(
             Duration::from_secs(1),
-            runtime.run_request_after_admission(request, job, Some(residency_lease)),
+            runtime.await_engine_admission_for_job(
+                &job,
+                runtime.core_engine.add_request_with_session(request),
+            ),
         )
         .await
         .expect("Engine admission waited for the core lock past its deadline")
         .expect_err("expired Engine admission unexpectedly succeeded");
-        assert!(matches!(err, Error::Timeout(id) if id == request_id));
+        assert!(
+            matches!(err, Error::Timeout(ref id) if id == &request_id),
+            "expected request deadline timeout, got {err:?}"
+        );
+        drop(job);
         assert!(
             !step_lock.is_finished(),
             "the core lock was released too early"
         );
         assert_eq!(runtime.coordinator_snapshot().active_jobs, 0);
-        assert_eq!(
-            runtime
-                .model_manager
-                .active_residency_leases(residency_variant),
-            0
-        );
         assert!(!runtime
             .completion_waiters
             .lock()

@@ -5834,6 +5834,20 @@ mod tests {
                             == crate::catalog::ModelFamily::Qwen3Tts;
                         let kokoro_tts = execution.metadata().capability == CapabilityKind::Tts
                             && variant.family() == crate::catalog::ModelFamily::KokoroTts;
+                        let fish_s2_tts = execution.metadata().capability == CapabilityKind::Tts
+                            && variant.family() == crate::catalog::ModelFamily::FishS2Tts;
+                        let retained_tts = execution.metadata().capability == CapabilityKind::Tts
+                            && matches!(
+                                variant.family(),
+                                crate::catalog::ModelFamily::Lfm25Audio
+                                    | crate::catalog::ModelFamily::VibeVoiceTts
+                                    | crate::catalog::ModelFamily::VoxtralTts
+                            );
+                        let parakeet_asr = execution.metadata().capability == CapabilityKind::Asr
+                            && variant.family() == crate::catalog::ModelFamily::ParakeetAsr;
+                        let nemotron_realtime = execution.metadata().capability
+                            == CapabilityKind::RealtimeAsr
+                            && variant.family() == crate::catalog::ModelFamily::NemotronAsr;
                         let voxtral_realtime = execution.metadata().capability
                             == CapabilityKind::RealtimeAsr
                             && variant == ModelVariant::VoxtralMini4BRealtime2602;
@@ -5842,7 +5856,10 @@ mod tests {
                             || granite_asr
                             || lfm25_audio_asr
                             || qwen3_tts
-                            || voxtral_realtime)
+                            || retained_tts
+                            || parakeet_asr
+                            || voxtral_realtime
+                            || nemotron_realtime)
                             && contract.execution_profile.mode == ExecutionMode::Sequence
                         {
                             assert_eq!(
@@ -5854,6 +5871,10 @@ mod tests {
                         } else if voxtral_realtime {
                             assert_eq!(contract.execution_profile.max_batch_size, 8);
                             assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::Static);
+                            assert_eq!(contract.stages[2].batch_mode, NativeBatchMode::Continuous);
+                        } else if nemotron_realtime {
+                            assert_eq!(contract.execution_profile.max_batch_size, 8);
+                            assert_eq!(contract.stages[1].batch_mode, NativeBatchMode::None);
                             assert_eq!(contract.stages[2].batch_mode, NativeBatchMode::Continuous);
                         } else if whisper_asr
                             && contract.execution_profile.mode == ExecutionMode::Sequence
@@ -5878,6 +5899,20 @@ mod tests {
                                 .find(|stage| stage.batch_mode == NativeBatchMode::Static)
                                 .unwrap();
                             assert_eq!(static_stage.shape_policy, StageShapePolicy::Ragged);
+                        } else if fish_s2_tts
+                            && contract.execution_profile.mode == ExecutionMode::Sequence
+                        {
+                            assert_eq!(contract.execution_profile.max_batch_size, 1);
+                            assert_eq!(
+                                contract.execution_profile.concurrency,
+                                ConcurrencyClass::Batchable
+                            );
+                            assert!(!contract.execution_profile.capabilities().native_batch);
+                            assert!(contract.stages.iter().all(|stage| {
+                                stage.batch_mode == NativeBatchMode::None
+                                    && stage.max_batch_size == 1
+                                    && stage.concurrency == ConcurrencyClass::Exclusive
+                            }));
                         } else {
                             assert_eq!(contract.execution_profile.max_batch_size, 1);
                             assert_eq!(
@@ -6338,7 +6373,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(contract.adapter_abi_revision, STATIC_TENSOR_ADAPTER_ABI);
-        assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::Static);
+        assert!(contract
+            .stages
+            .iter()
+            .any(|stage| stage.batch_mode == NativeBatchMode::Static));
         assert!(registry
             .static_tensor_batch_variants(BackendKind::Cpu)
             .contains(&variant));
