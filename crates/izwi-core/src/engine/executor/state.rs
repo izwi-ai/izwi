@@ -3,6 +3,7 @@ use std::time::Instant;
 
 use crate::model::ModelVariant;
 use crate::models::architectures::lfm25_audio::asr_retained::Lfm25AudioAsrRetainedState;
+use crate::models::architectures::lfm25_audio::tts_retained::Lfm25AudioTtsRetainedState;
 use crate::models::architectures::qwen3::tts::{
     PhysicalTtsDecodeState, PhysicalTtsPrefillState, Qwen3TtsModel,
 };
@@ -45,6 +46,14 @@ pub(super) struct ActiveLfm25AsrDecode {
     pub(super) stream_sequence: usize,
     pub(super) input_sample_rate: u32,
     pub(super) input_sample_count: usize,
+}
+
+pub(super) struct ActiveLfm25TtsDecode {
+    pub(super) variant: ModelVariant,
+    pub(super) model: Lfm25AudioModelLease,
+    pub(super) state: Lfm25AudioTtsRetainedState,
+    pub(super) last_tokens_generated: usize,
+    pub(super) stream_sequence: usize,
 }
 
 pub(super) struct ActiveVoxtralRealtime {

@@ -3094,6 +3094,12 @@ impl NativeAudioChatModel {
         }
     }
 
+    pub(crate) fn lfm25_audio_tts_output_sample_rate(&self) -> u32 {
+        match self {
+            Self::Lfm25Audio(model) => model.decoder_config().output_sample_rate,
+        }
+    }
+
     pub(crate) fn asr_requires_long_form(&self, audio: &[f32], sample_rate: u32) -> bool {
         lfm25_audio_asr_requires_long_form(audio, sample_rate)
     }
