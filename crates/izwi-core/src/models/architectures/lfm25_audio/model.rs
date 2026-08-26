@@ -14,7 +14,10 @@ use crate::model::ModelVariant;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::chat::{ChatMessage, ChatRole};
 
-use super::asr_retained::Lfm25AudioAsrRetainedState;
+use super::asr_retained::{
+    Lfm25AudioAsrDecodeStep, Lfm25AudioAsrPrefillStep, Lfm25AudioAsrQuantumCheckpoint,
+    Lfm25AudioAsrRetainedState,
+};
 use super::audio_output::{Lfm25AudioHead, Lfm25SampledAudioFrame};
 use super::bundle::{Lfm25AudioBundle, Lfm25AudioBundleInfo};
 use super::config::{
@@ -395,6 +398,53 @@ impl Lfm25AudioModel {
             requested_max_new_tokens,
             self.main_config.context_length,
         )
+    }
+
+    pub(crate) fn retained_asr_prefill_step(
+        &self,
+        state: &mut Lfm25AudioAsrRetainedState,
+        cache: &mut PhysicalPagedKvCache,
+        checkpoint: &Lfm25AudioAsrQuantumCheckpoint,
+        max_tokens: usize,
+    ) -> Result<Lfm25AudioAsrPrefillStep> {
+        self.with_main_backbone(|backbone| {
+            state.prefill_step(backbone, cache, checkpoint, max_tokens)
+        })
+    }
+
+    pub(crate) fn retained_asr_decode_step(
+        &self,
+        state: &mut Lfm25AudioAsrRetainedState,
+        cache: &mut PhysicalPagedKvCache,
+        checkpoint: &Lfm25AudioAsrQuantumCheckpoint,
+    ) -> Result<Lfm25AudioAsrDecodeStep> {
+        self.with_main_backbone(|backbone| {
+            state.decode_step(backbone, &self.tokenizer, cache, checkpoint)
+        })
+    }
+
+    pub(crate) fn retained_asr_decode_will_append(
+        &self,
+        state: &Lfm25AudioAsrRetainedState,
+    ) -> Result<bool> {
+        state.decode_will_append(&self.tokenizer)
+    }
+
+    pub(crate) fn retained_asr_decode_append_batch(
+        &self,
+        states: &mut [&mut Lfm25AudioAsrRetainedState],
+        caches: &mut [&mut PhysicalPagedKvCache],
+        checkpoints: &[&Lfm25AudioAsrQuantumCheckpoint],
+    ) -> Result<Vec<Lfm25AudioAsrDecodeStep>> {
+        self.with_main_backbone(|backbone| {
+            Lfm25AudioAsrRetainedState::decode_append_batch(
+                backbone,
+                &self.tokenizer,
+                states,
+                caches,
+                checkpoints,
+            )
+        })
     }
 
     pub(crate) fn begin_retained_main_quantum(
