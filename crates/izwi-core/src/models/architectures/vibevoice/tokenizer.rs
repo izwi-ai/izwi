@@ -336,6 +336,45 @@ impl VibeVoiceAcousticTokenizer {
         )?;
         Ok(output)
     }
+
+    pub(crate) fn decode_streaming_retained(
+        &self,
+        latents: &Tensor,
+        domain: StateDomainId,
+        expected_cursor: u64,
+        target_cursor: u64,
+        transaction: PhysicalStateTransactionId,
+        arena: &TensorStateArena,
+    ) -> Result<Tensor> {
+        let advance = target_cursor.checked_sub(expected_cursor).ok_or_else(|| {
+            Error::InvalidInput("VibeVoice acoustic retained frame moves backwards".into())
+        })?;
+        if advance != 1 {
+            return Err(Error::InvalidInput(
+                "VibeVoice acoustic retained decode must advance exactly one codec frame".into(),
+            ));
+        }
+        let mut cache = TokenizerStreamingState::new();
+        hydrate_retained_decoder_base(
+            arena,
+            transaction,
+            domain,
+            expected_cursor,
+            &self.decoder,
+            &mut cache,
+            "acoustic decoder",
+        )?;
+        let output = self.decode_streaming(latents, &mut cache)?;
+        let values = retained_state_values(self.decoder.collect_streaming_state(
+            cache.decoder.as_ref().ok_or_else(|| {
+                Error::InferenceError(
+                    "VibeVoice acoustic retained decoder did not initialize state".into(),
+                )
+            })?,
+        )?)?;
+        arena.stage_replace(transaction, domain, expected_cursor, target_cursor, values)?;
+        Ok(output)
+    }
 }
 
 pub struct VibeVoiceSemanticTokenizer {
@@ -438,6 +477,45 @@ impl VibeVoiceSemanticTokenizer {
             arena,
             "semantic",
         )
+    }
+
+    pub(crate) fn encode_streaming_retained_frame(
+        &self,
+        audio: &Tensor,
+        domain: StateDomainId,
+        expected_cursor: u64,
+        target_cursor: u64,
+        transaction: PhysicalStateTransactionId,
+        arena: &TensorStateArena,
+    ) -> Result<VibeVoiceTokenizerEncoderOutput> {
+        let advance = target_cursor.checked_sub(expected_cursor).ok_or_else(|| {
+            Error::InvalidInput("VibeVoice semantic retained frame moves backwards".into())
+        })?;
+        if advance != 1 || audio.dim(2)? == 0 {
+            return Err(Error::InvalidInput(
+                "VibeVoice semantic retained encode must consume one non-empty codec frame".into(),
+            ));
+        }
+        let mut cache = TokenizerStreamingState::new();
+        hydrate_retained_encoder_base(
+            arena,
+            transaction,
+            domain,
+            expected_cursor,
+            &self.encoder,
+            &mut cache,
+            "semantic encoder",
+        )?;
+        let output = self.encode_streaming(audio, &mut cache)?;
+        let values = retained_state_values(self.encoder.collect_streaming_state(
+            cache.encoder.as_ref().ok_or_else(|| {
+                Error::InferenceError(
+                    "VibeVoice semantic retained encoder did not initialize state".into(),
+                )
+            })?,
+        )?)?;
+        arena.stage_replace(transaction, domain, expected_cursor, target_cursor, values)?;
+        Ok(output)
     }
 
     pub(crate) fn encode_streaming_retained_batch(
@@ -1742,6 +1820,56 @@ fn hydrate_decoder_cache(
     let components = invocation_component_slices(&snapshot.components);
     hydrate_decoder_from_slices(decoder, cache, &components)?;
     Ok(expected_cursor)
+}
+
+fn hydrate_retained_encoder_base(
+    arena: &TensorStateArena,
+    transaction: PhysicalStateTransactionId,
+    domain: StateDomainId,
+    expected_cursor: u64,
+    encoder: &TokenizerEncoder,
+    cache: &mut TokenizerStreamingState,
+    context: &str,
+) -> Result<()> {
+    match arena.read_transaction_base(transaction, domain)? {
+        None if expected_cursor == 0 => Ok(()),
+        None => Err(Error::InferenceError(format!(
+            "VibeVoice {context} retained state is absent at cursor {expected_cursor}"
+        ))),
+        Some(snapshot) if snapshot.cursor == expected_cursor && expected_cursor > 0 => {
+            let components = retained_component_slices(&snapshot, context)?;
+            hydrate_encoder_from_slices(encoder, cache, &components)
+        }
+        Some(snapshot) => Err(Error::InferenceError(format!(
+            "VibeVoice {context} retained cursor {} does not match expected {expected_cursor}",
+            snapshot.cursor
+        ))),
+    }
+}
+
+fn hydrate_retained_decoder_base(
+    arena: &TensorStateArena,
+    transaction: PhysicalStateTransactionId,
+    domain: StateDomainId,
+    expected_cursor: u64,
+    decoder: &TokenizerDecoder,
+    cache: &mut TokenizerStreamingState,
+    context: &str,
+) -> Result<()> {
+    match arena.read_transaction_base(transaction, domain)? {
+        None if expected_cursor == 0 => Ok(()),
+        None => Err(Error::InferenceError(format!(
+            "VibeVoice {context} retained state is absent at cursor {expected_cursor}"
+        ))),
+        Some(snapshot) if snapshot.cursor == expected_cursor && expected_cursor > 0 => {
+            let components = retained_component_slices(&snapshot, context)?;
+            hydrate_decoder_from_slices(decoder, cache, &components)
+        }
+        Some(snapshot) => Err(Error::InferenceError(format!(
+            "VibeVoice {context} retained cursor {} does not match expected {expected_cursor}",
+            snapshot.cursor
+        ))),
+    }
 }
 
 fn encode_encoder_span_retained(

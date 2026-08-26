@@ -1,13 +1,17 @@
 //! Native VibeVoice-1.5B TTS model path.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
+use crate::backends::state::{PhysicalStateTransactionId, TensorStateArena};
 use crate::backends::{DeviceKind, DeviceProfile};
 use crate::catalog::{ModelFamily, ModelVariant};
 use crate::engine::{InvocationTensorLease, StageDescriptor};
@@ -39,6 +43,7 @@ use crate::models::shared::attention::flash::{
     should_enable_flash_attention_v2,
 };
 use crate::models::shared::attention::paged::default_kv_page_size;
+use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::telemetry::{
     snapshot as kernel_telemetry_snapshot, KernelPathTelemetrySnapshot,
 };
@@ -54,6 +59,8 @@ const AUTO_PADDING_SECONDS: f32 = 0.8;
 const DEFAULT_CFG_SCALE: f32 = 1.5;
 const VIBEVOICE_CFG_BATCHING_ENV: &str = "IZWI_VIBEVOICE_CFG_BATCHING";
 const VIBEVOICE_CUDA_DDPM_STEPS_ENV: &str = "IZWI_VIBEVOICE_CUDA_DDPM_STEPS";
+static NEXT_VIBEVOICE_TTS_STATE_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_VIBEVOICE_TTS_MODEL_LOAD_NONCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
 pub struct VibeVoiceSpeakerReference {
@@ -146,6 +153,7 @@ pub struct VibeVoiceTtsDiagnostics {
     pub cuda_flash_attention_active: bool,
 }
 
+#[derive(Clone)]
 struct EncodedReference {
     scaled_latents: Tensor,
     normalization: LatentNormalization,
@@ -172,6 +180,7 @@ struct VibeVoiceDiffusionPlanStep {
     cuda_batched_timestep_embedding: Option<Tensor>,
 }
 
+#[derive(Clone)]
 struct LatentNormalization {
     bias: Tensor,
     scale: Tensor,
@@ -189,6 +198,79 @@ struct CheckpointLatentNormalization {
     scale: Tensor,
 }
 
+#[derive(Clone)]
+pub(crate) struct VibeVoiceTtsPreparedArtifact {
+    model_identity: [u8; 32],
+    input_ids: Arc<[u32]>,
+    input_embeds: Tensor,
+    negative_embed: Tensor,
+    normalization: LatentNormalization,
+    preparation_profile: VibeVoiceTtsProfile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VibeVoiceTtsRetainedPrefillStep {
+    pub(crate) consumed_positive_tokens: usize,
+    pub(crate) positive_position: usize,
+    pub(crate) negative_position: usize,
+    pub(crate) complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VibeVoiceTtsRetainedDecodeStep {
+    pub(crate) frames_generated: usize,
+    pub(crate) finished: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct VibeVoiceTtsTokenizerQuantum {
+    pub(crate) arena: Arc<TensorStateArena>,
+    pub(crate) transaction: PhysicalStateTransactionId,
+}
+
+pub(crate) struct VibeVoiceTtsRetainedState {
+    state_id: u64,
+    model_identity: [u8; 32],
+    artifact: Arc<VibeVoiceTtsPreparedArtifact>,
+    params: VibeVoiceTtsGenerationParams,
+    positive_cache: PhysicalPagedKvCache,
+    negative_cache: PhysicalPagedKvCache,
+    positive_position: usize,
+    negative_position: usize,
+    last_hidden: Option<Tensor>,
+    negative_last_hidden: Option<Tensor>,
+    acoustic_clock: u64,
+    semantic_clock: u64,
+    scaled_latents: Vec<Tensor>,
+    frame_noises: Vec<Tensor>,
+    finished: bool,
+    active_quantum: Option<u64>,
+    next_quantum: u64,
+    staged_step: Option<VibeVoiceTtsRetainedDecodeStep>,
+    managed_completions_drained: bool,
+}
+
+pub(crate) struct VibeVoiceTtsRetainedCheckpoint {
+    state_id: u64,
+    quantum: u64,
+    payload: Option<VibeVoiceTtsRetainedCheckpointPayload>,
+}
+
+struct VibeVoiceTtsRetainedCheckpointPayload {
+    positive_cache: PhysicalPagedKvCache,
+    negative_cache: PhysicalPagedKvCache,
+    positive_position: usize,
+    negative_position: usize,
+    last_hidden: Option<Tensor>,
+    negative_last_hidden: Option<Tensor>,
+    acoustic_clock: u64,
+    semantic_clock: u64,
+    scaled_latents: Vec<Tensor>,
+    finished: bool,
+    staged_step: Option<VibeVoiceTtsRetainedDecodeStep>,
+    managed_completions_drained: bool,
+}
+
 pub struct VibeVoiceTtsModel {
     model_dir: PathBuf,
     device: DeviceProfile,
@@ -203,6 +285,7 @@ pub struct VibeVoiceTtsModel {
     semantic_connector: SpeechConnector,
     language_model: Qwen3Model,
     prediction_head: VibeVoiceDiffusionHead,
+    model_identity: [u8; 32],
 }
 
 impl VibeVoiceTtsModel {
@@ -279,6 +362,8 @@ impl VibeVoiceTtsModel {
         } else {
             "reference_statistics"
         };
+        let load_nonce = next_vibevoice_tts_model_load_nonce()?;
+        let model_identity = vibevoice_tts_model_identity(model_dir, dtype, &config, load_nonce);
         info!(
             "Loaded VibeVoice-1.5B TTS from {:?} on {:?} with dtype {:?} (sample_rate={}, latent_normalization={}, dense_projections={}, dense_bias_projections={}, quantized_projections={})",
             model_dir,
@@ -304,6 +389,7 @@ impl VibeVoiceTtsModel {
             semantic_connector,
             language_model,
             prediction_head,
+            model_identity,
         })
     }
 
@@ -407,6 +493,438 @@ impl VibeVoiceTtsModel {
         leases: &mut InvocationWorkspaceLeaseSetV2,
     ) -> Result<VibeVoiceTtsOutput> {
         self.generate_with_reference_internal(text, reference, speaker, params, leases)
+    }
+
+    pub(crate) fn prepare_retained_artifact(
+        &self,
+        text: &str,
+        reference: &VibeVoiceSpeakerReference,
+        speaker: Option<&str>,
+    ) -> Result<Arc<VibeVoiceTtsPreparedArtifact>> {
+        validate_vibevoice_tts_inputs(text, reference)?;
+        let mut preparation_profile = VibeVoiceTtsProfile::default();
+        let started = Instant::now();
+        let reference = self.encode_reference(reference)?;
+        preparation_profile.reference_encode_ms = elapsed_ms(started);
+        let started = Instant::now();
+        let prompt = self.tokenizer.build_tts_prompt(
+            text.trim(),
+            speaker.unwrap_or("Speaker 0"),
+            reference.scaled_latents.dim(1)?,
+        )?;
+        let input_ids = Tensor::from_vec(
+            prompt.input_ids.clone(),
+            (1, prompt.input_ids.len()),
+            &self.device.device,
+        )?;
+        let input_embeds = self.language_model.embeddings(&input_ids)?;
+        let input_embeds = if let Some(range) = prompt.reference_voice_range {
+            let reference_embeds = self
+                .acoustic_connector
+                .forward(&reference.scaled_latents.to_dtype(input_embeds.dtype())?)?;
+            replace_range_with_features(&input_embeds, range, &reference_embeds)?
+        } else {
+            input_embeds
+        };
+        let negative_id = vibevoice_tts_negative_prefill_token(self.tokenizer.specials());
+        let negative_ids = Tensor::from_vec(vec![negative_id], (1, 1), &self.device.device)?;
+        let negative_embed = self.language_model.embeddings(&negative_ids)?;
+        preparation_profile.prompt_embed_ms = elapsed_ms(started);
+        Ok(Arc::new(VibeVoiceTtsPreparedArtifact {
+            model_identity: self.model_identity,
+            input_ids: prompt.input_ids.into(),
+            input_embeds,
+            negative_embed,
+            normalization: reference.normalization,
+            preparation_profile,
+        }))
+    }
+
+    pub(crate) fn new_retained_state(
+        &self,
+        artifact: Arc<VibeVoiceTtsPreparedArtifact>,
+        params: VibeVoiceTtsGenerationParams,
+        positive_cache: PhysicalPagedKvCache,
+        negative_cache: PhysicalPagedKvCache,
+    ) -> Result<VibeVoiceTtsRetainedState> {
+        if artifact.model_identity != self.model_identity {
+            return Err(Error::InvalidInput(
+                "VibeVoice TTS artifact belongs to another model load".into(),
+            ));
+        }
+        if positive_cache.context_len() != 0
+            || negative_cache.context_len() != 0
+            || positive_cache.arena().id() == negative_cache.arena().id()
+        {
+            return Err(Error::InvalidInput(
+                "VibeVoice retained TTS requires empty domain-isolated LM caches".into(),
+            ));
+        }
+        let max_frames = params.max_frames.max(1);
+        let frame_noises = (0..max_frames)
+            .map(|_| {
+                Tensor::randn(
+                    0f32,
+                    1f32,
+                    (1, self.config.acoustic_vae_dim()),
+                    &self.device.device,
+                )?
+                .to_dtype(self.dtype)
+                .map_err(Error::from)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(VibeVoiceTtsRetainedState {
+            state_id: next_vibevoice_tts_state_id()?,
+            model_identity: self.model_identity,
+            artifact,
+            params,
+            positive_cache,
+            negative_cache,
+            positive_position: 0,
+            negative_position: 0,
+            last_hidden: None,
+            negative_last_hidden: None,
+            acoustic_clock: 0,
+            semantic_clock: 0,
+            scaled_latents: Vec::with_capacity(max_frames),
+            frame_noises,
+            finished: false,
+            active_quantum: None,
+            next_quantum: 1,
+            staged_step: None,
+            managed_completions_drained: true,
+        })
+    }
+
+    pub(crate) fn retained_prefill_step(
+        &self,
+        state: &mut VibeVoiceTtsRetainedState,
+        max_tokens: usize,
+    ) -> Result<VibeVoiceTtsRetainedPrefillStep> {
+        self.validate_retained_state(state)?;
+        if max_tokens == 0 {
+            return Err(Error::InvalidInput(
+                "VibeVoice retained prefill quantum must be nonzero".into(),
+            ));
+        }
+        if state.active_quantum.is_none() {
+            return Err(Error::InferenceError(
+                "VibeVoice retained prefill requires an active managed quantum".into(),
+            ));
+        }
+        let prompt_tokens = state.artifact.input_ids.len();
+        let remaining = prompt_tokens.saturating_sub(state.positive_position);
+        let take = remaining.min(max_tokens);
+        if take > 0 {
+            let embeds = state
+                .artifact
+                .input_embeds
+                .narrow(1, state.positive_position, take)?;
+            let hidden = self.language_model.forward_managed_hidden_with_embeds(
+                &embeds,
+                state.positive_position,
+                &mut state.positive_cache,
+                None,
+            )?;
+            state.positive_position += take;
+            state.last_hidden = Some(last_sequence_hidden(
+                &hidden,
+                "VibeVoice retained TTS positive prefill",
+            )?);
+            state.managed_completions_drained = false;
+        }
+        if state.negative_position == 0 {
+            let hidden = self.language_model.forward_managed_hidden_with_embeds(
+                &state.artifact.negative_embed,
+                0,
+                &mut state.negative_cache,
+                None,
+            )?;
+            state.negative_position = 1;
+            state.negative_last_hidden = Some(last_sequence_hidden(
+                &hidden,
+                "VibeVoice retained TTS negative prefill",
+            )?);
+            state.managed_completions_drained = false;
+        }
+        Ok(VibeVoiceTtsRetainedPrefillStep {
+            consumed_positive_tokens: take,
+            positive_position: state.positive_position,
+            negative_position: state.negative_position,
+            complete: state.positive_position == prompt_tokens && state.negative_position == 1,
+        })
+    }
+
+    pub(crate) fn retained_decode_step(
+        &self,
+        state: &mut VibeVoiceTtsRetainedState,
+        tokenizer_quantum: &VibeVoiceTtsTokenizerQuantum,
+    ) -> Result<VibeVoiceTtsRetainedDecodeStep> {
+        self.validate_retained_state(state)?;
+        if state.active_quantum.is_none() || state.staged_step.is_some() {
+            return Err(Error::InferenceError(
+                "VibeVoice retained decode requires one clean active quantum".into(),
+            ));
+        }
+        let generated_frames = state.scaled_latents.len();
+        if state.positive_position != state.artifact.input_ids.len() + generated_frames
+            || state.negative_position != 1 + generated_frames
+        {
+            return Err(Error::InferenceError(
+                "VibeVoice retained decode cannot run before prefill completes".into(),
+            ));
+        }
+        if state.finished {
+            return Ok(VibeVoiceTtsRetainedDecodeStep {
+                frames_generated: state.scaled_latents.len(),
+                finished: true,
+            });
+        }
+        if state.scaled_latents.len() >= state.params.max_frames.max(1) {
+            state.finished = true;
+            let step = VibeVoiceTtsRetainedDecodeStep {
+                frames_generated: state.scaled_latents.len(),
+                finished: true,
+            };
+            state.staged_step = Some(step.clone());
+            return Ok(step);
+        }
+        if state.scaled_latents.len() >= MIN_FRAMES_BEFORE_STOP {
+            let predicted = next_tts_control_token_from_hidden(
+                &self.language_model,
+                state.last_hidden.as_ref().ok_or_else(|| {
+                    Error::InferenceError("VibeVoice retained TTS has no positive hidden".into())
+                })?,
+                self.tokenizer.specials(),
+            )?;
+            if predicted == self.tokenizer.specials().speech_end
+                || predicted == self.tokenizer.specials().endoftext
+            {
+                state.finished = true;
+                let step = VibeVoiceTtsRetainedDecodeStep {
+                    frames_generated: state.scaled_latents.len(),
+                    finished: true,
+                };
+                state.staged_step = Some(step.clone());
+                return Ok(step);
+            }
+        }
+        let plan = vibevoice_diffusion_plan(
+            &self.prediction_head,
+            VibeVoiceDiffusionScheduler::new(
+                self.prediction_head.config().ddpm_num_steps,
+                vibevoice_effective_diffusion_steps(self.device.kind, state.params.diffusion_steps),
+            ),
+            &self.device.device,
+            self.dtype,
+            state.params.cfg_scale,
+            self.device.kind,
+        )?;
+        let frame = state.scaled_latents.len();
+        let latent = self.sample_speech_latent_from_noise(
+            state.last_hidden.as_ref().unwrap(),
+            state.negative_last_hidden.as_ref(),
+            &plan,
+            &state.frame_noises[frame],
+        )?;
+        let latent_frame = latent.unsqueeze(1)?;
+        let feedback = self.generated_speech_embed_retained(
+            &latent_frame,
+            &state.artifact.normalization,
+            state.acoustic_clock,
+            state.semantic_clock,
+            tokenizer_quantum,
+        )?;
+        let hidden = self.language_model.forward_managed_hidden_with_embeds(
+            &feedback.embed,
+            state.positive_position,
+            &mut state.positive_cache,
+            None,
+        )?;
+        let negative_hidden = self.language_model.forward_managed_hidden_with_embeds(
+            &feedback.embed,
+            state.negative_position,
+            &mut state.negative_cache,
+            None,
+        )?;
+        state.positive_position += 1;
+        state.negative_position += 1;
+        state.acoustic_clock += 1;
+        state.semantic_clock += 1;
+        state.last_hidden = Some(last_sequence_hidden(
+            &hidden,
+            "VibeVoice retained TTS positive decode",
+        )?);
+        state.negative_last_hidden = Some(last_sequence_hidden(
+            &negative_hidden,
+            "VibeVoice retained TTS negative decode",
+        )?);
+        state.scaled_latents.push(latent_frame);
+        state.managed_completions_drained = false;
+        state.finished = state.scaled_latents.len() >= state.params.max_frames.max(1);
+        let step = VibeVoiceTtsRetainedDecodeStep {
+            frames_generated: state.scaled_latents.len(),
+            finished: state.finished,
+        };
+        state.staged_step = Some(step.clone());
+        Ok(step)
+    }
+
+    /// Native cross-request diffusion cohort. Tokenizer feedback and Qwen
+    /// custom-embedding decode remain scalar because their existing physical
+    /// APIs do not expose a truthful B>1 entry point.
+    pub(crate) fn retained_decode_step_batch(
+        &self,
+        states: &mut [&mut VibeVoiceTtsRetainedState],
+        tokenizer_quanta: &[VibeVoiceTtsTokenizerQuantum],
+    ) -> Result<Vec<VibeVoiceTtsRetainedDecodeStep>> {
+        if states.is_empty() {
+            return Ok(Vec::new());
+        }
+        if states.len() != tokenizer_quanta.len() {
+            return Err(Error::InvalidInput(
+                "VibeVoice retained TTS batch state/tokenizer widths differ".into(),
+            ));
+        }
+        let params = states[0].params.clone();
+        for state in states.iter() {
+            self.validate_retained_state(state)?;
+            if state.params != params
+                || state.active_quantum.is_none()
+                || state.staged_step.is_some()
+                || state.finished
+                || state.positive_position
+                    != state.artifact.input_ids.len() + state.scaled_latents.len()
+                || state.negative_position != 1 + state.scaled_latents.len()
+                || state.scaled_latents.len() >= state.params.max_frames.max(1)
+            {
+                return Err(Error::InvalidInput(
+                    "VibeVoice retained diffusion batch requires compatible live rows".into(),
+                ));
+            }
+            if state.scaled_latents.len() >= MIN_FRAMES_BEFORE_STOP {
+                let predicted = next_tts_control_token_from_hidden(
+                    &self.language_model,
+                    state.last_hidden.as_ref().unwrap(),
+                    self.tokenizer.specials(),
+                )?;
+                if predicted != self.tokenizer.specials().speech_pad {
+                    return Err(Error::InvalidInput(
+                        "VibeVoice terminal control rows require scalar fallback".into(),
+                    ));
+                }
+            }
+        }
+        let plan = vibevoice_diffusion_plan(
+            &self.prediction_head,
+            VibeVoiceDiffusionScheduler::new(
+                self.prediction_head.config().ddpm_num_steps,
+                vibevoice_effective_diffusion_steps(self.device.kind, params.diffusion_steps),
+            ),
+            &self.device.device,
+            self.dtype,
+            params.cfg_scale,
+            self.device.kind,
+        )?;
+        let latents = self.sample_speech_latent_cross_request_batch(states, &plan)?;
+        let mut steps = Vec::with_capacity(states.len());
+        for ((state, quantum), latent) in states
+            .iter_mut()
+            .zip(tokenizer_quanta)
+            .zip(latents.into_iter())
+        {
+            let latent_frame = latent.unsqueeze(1)?;
+            let feedback = self.generated_speech_embed_retained(
+                &latent_frame,
+                &state.artifact.normalization,
+                state.acoustic_clock,
+                state.semantic_clock,
+                quantum,
+            )?;
+            let hidden = self.language_model.forward_managed_hidden_with_embeds(
+                &feedback.embed,
+                state.positive_position,
+                &mut state.positive_cache,
+                None,
+            )?;
+            let negative_hidden = self.language_model.forward_managed_hidden_with_embeds(
+                &feedback.embed,
+                state.negative_position,
+                &mut state.negative_cache,
+                None,
+            )?;
+            state.positive_position += 1;
+            state.negative_position += 1;
+            state.acoustic_clock += 1;
+            state.semantic_clock += 1;
+            state.last_hidden = Some(last_sequence_hidden(
+                &hidden,
+                "VibeVoice retained TTS batched positive decode",
+            )?);
+            state.negative_last_hidden = Some(last_sequence_hidden(
+                &negative_hidden,
+                "VibeVoice retained TTS batched negative decode",
+            )?);
+            state.scaled_latents.push(latent_frame);
+            state.managed_completions_drained = false;
+            state.finished = state.scaled_latents.len() >= state.params.max_frames.max(1);
+            let step = VibeVoiceTtsRetainedDecodeStep {
+                frames_generated: state.scaled_latents.len(),
+                finished: state.finished,
+            };
+            state.staged_step = Some(step.clone());
+            steps.push(step);
+        }
+        Ok(steps)
+    }
+
+    pub(crate) fn finalize_retained_state(
+        &self,
+        state: &VibeVoiceTtsRetainedState,
+    ) -> Result<VibeVoiceTtsOutput> {
+        self.validate_retained_state(state)?;
+        if !state.finished || state.scaled_latents.is_empty() || state.active_quantum.is_some() {
+            return Err(Error::InferenceError(
+                "VibeVoice retained TTS can finalize only a committed non-empty terminal state"
+                    .into(),
+            ));
+        }
+        let mut profile = state.artifact.preparation_profile.clone();
+        profile.frames_generated = state.scaled_latents.len();
+        profile.diffusion_steps =
+            vibevoice_effective_diffusion_steps(self.device.kind, state.params.diffusion_steps);
+        let scaled_latents = Tensor::cat(&state.scaled_latents, 1)?;
+        let unscaled = unscale_latents(
+            &scaled_latents,
+            &state.artifact.normalization.bias,
+            &state.artifact.normalization.scale,
+        )?;
+        let started = Instant::now();
+        let audio = self.acoustic_tokenizer.decode(&unscaled)?;
+        profile.final_decode_ms = elapsed_ms(started);
+        let started = Instant::now();
+        let samples = audio
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        profile.host_audio_ms = elapsed_ms(started);
+        Ok(VibeVoiceTtsOutput {
+            samples,
+            sample_rate: self.preprocessor.target_sample_rate(),
+            frames_generated: state.scaled_latents.len(),
+            profile,
+        })
+    }
+
+    fn validate_retained_state(&self, state: &VibeVoiceTtsRetainedState) -> Result<()> {
+        if state.model_identity != self.model_identity
+            || state.artifact.model_identity != self.model_identity
+        {
+            return Err(Error::InvalidInput(
+                "VibeVoice retained TTS state belongs to another model load".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn generate_with_reference_internal(
@@ -755,6 +1273,65 @@ impl VibeVoiceTtsModel {
         })
     }
 
+    fn generated_speech_embed_retained(
+        &self,
+        scaled_latent_frame: &Tensor,
+        normalization: &LatentNormalization,
+        acoustic_clock: u64,
+        semantic_clock: u64,
+        quantum: &VibeVoiceTtsTokenizerQuantum,
+    ) -> Result<GeneratedSpeechFeedback> {
+        if acoustic_clock != semantic_clock {
+            return Err(Error::InferenceError(
+                "VibeVoice retained tokenizer clocks diverged".into(),
+            ));
+        }
+        let started = Instant::now();
+        let acoustic_embed = self.acoustic_connector.forward(scaled_latent_frame)?;
+        let connector_acoustic_ms = elapsed_ms(started);
+        let unscaled_frame = unscale_latents(
+            scaled_latent_frame,
+            &normalization.bias,
+            &normalization.scale,
+        )?;
+        let started = Instant::now();
+        let audio_chunk = self.acoustic_tokenizer.decode_streaming_retained(
+            &unscaled_frame,
+            VIBEVOICE_TTS_ACOUSTIC_DOMAIN,
+            acoustic_clock,
+            acoustic_clock + 1,
+            quantum.transaction,
+            &quantum.arena,
+        )?;
+        let acoustic_decode_ms = elapsed_ms(started);
+        let started = Instant::now();
+        let semantic = self
+            .semantic_tokenizer
+            .encode_streaming_retained_frame(
+                &audio_chunk,
+                VIBEVOICE_TTS_SEMANTIC_DOMAIN,
+                semantic_clock,
+                semantic_clock + 1,
+                quantum.transaction,
+                &quantum.arena,
+            )?
+            .mode();
+        let semantic_encode_ms = elapsed_ms(started);
+        let started = Instant::now();
+        let semantic_embed = self.semantic_connector.forward(&semantic)?;
+        let embed = combine_speech_embeddings(
+            &acoustic_embed,
+            &semantic_embed,
+            "VibeVoice retained TTS generated frame",
+        )?;
+        Ok(GeneratedSpeechFeedback {
+            embed,
+            acoustic_decode_ms,
+            semantic_encode_ms,
+            connector_ms: connector_acoustic_ms + elapsed_ms(started),
+        })
+    }
+
     fn sample_speech_latent(
         &self,
         condition: &Tensor,
@@ -835,6 +1412,278 @@ impl VibeVoiceTtsModel {
             )?;
         }
         Ok(speech)
+    }
+
+    fn sample_speech_latent_from_noise(
+        &self,
+        condition: &Tensor,
+        negative_condition: Option<&Tensor>,
+        plan: &VibeVoiceDiffusionPlan,
+        noise: &Tensor,
+    ) -> Result<Tensor> {
+        let condition = self.prediction_head.condition_projection(condition)?;
+        let negative_condition = if plan.cfg_tensor.is_some() {
+            negative_condition
+                .map(|condition| self.prediction_head.condition_projection(condition))
+                .transpose()?
+        } else {
+            None
+        };
+        let mut speech = noise.clone();
+        for step in &plan.steps {
+            let model_output = if let (Some(negative), Some(cfg)) =
+                (negative_condition.as_ref(), plan.cfg_tensor.as_ref())
+            {
+                let conditions = Tensor::cat(&[condition.clone(), negative.clone()], 0)?;
+                let latents = Tensor::cat(&[speech.clone(), speech.clone()], 0)?;
+                let timestep = Tensor::cat(
+                    &[
+                        step.timestep_embedding.clone(),
+                        step.timestep_embedding.clone(),
+                    ],
+                    0,
+                )?;
+                let outputs = self.prediction_head.forward_with_precomputed(
+                    &latents,
+                    &timestep,
+                    &conditions,
+                )?;
+                let positive = outputs.narrow(0, 0, 1)?;
+                let negative = outputs.narrow(0, 1, 1)?;
+                negative.broadcast_add(&positive.broadcast_sub(&negative)?.broadcast_mul(cfg)?)?
+            } else {
+                self.prediction_head.forward_with_precomputed(
+                    &speech,
+                    &step.timestep_embedding,
+                    &condition,
+                )?
+            };
+            speech = plan.scheduler.step_v_prediction_with_tensors(
+                &model_output,
+                &speech,
+                &step.tensors,
+            )?;
+        }
+        Ok(speech)
+    }
+
+    fn sample_speech_latent_cross_request_batch(
+        &self,
+        states: &[&mut VibeVoiceTtsRetainedState],
+        plan: &VibeVoiceDiffusionPlan,
+    ) -> Result<Vec<Tensor>> {
+        let batch = states.len();
+        let conditions = states
+            .iter()
+            .map(|state| state.last_hidden.as_ref().unwrap())
+            .collect::<Vec<_>>();
+        let condition = self
+            .prediction_head
+            .condition_projection(&Tensor::cat(&conditions, 0)?)?;
+        let negative_condition = if plan.cfg_tensor.is_some() {
+            let negative = states
+                .iter()
+                .map(|state| state.negative_last_hidden.as_ref().unwrap())
+                .collect::<Vec<_>>();
+            Some(
+                self.prediction_head
+                    .condition_projection(&Tensor::cat(&negative, 0)?)?,
+            )
+        } else {
+            None
+        };
+        let noises = states
+            .iter()
+            .map(|state| &state.frame_noises[state.scaled_latents.len()])
+            .collect::<Vec<_>>();
+        let mut speech = Tensor::cat(&noises, 0)?;
+        for step in &plan.steps {
+            let model_output = if let (Some(negative), Some(cfg)) =
+                (negative_condition.as_ref(), plan.cfg_tensor.as_ref())
+            {
+                let all_conditions = Tensor::cat(&[condition.clone(), negative.clone()], 0)?;
+                let all_latents = Tensor::cat(&[speech.clone(), speech.clone()], 0)?;
+                let timestep = step
+                    .timestep_embedding
+                    .broadcast_as((batch * 2, step.timestep_embedding.dim(1)?))?;
+                let outputs = self.prediction_head.forward_with_precomputed(
+                    &all_latents,
+                    &timestep,
+                    &all_conditions,
+                )?;
+                let positive = outputs.narrow(0, 0, batch)?;
+                let negative = outputs.narrow(0, batch, batch)?;
+                negative.broadcast_add(&positive.broadcast_sub(&negative)?.broadcast_mul(cfg)?)?
+            } else {
+                let timestep = step
+                    .timestep_embedding
+                    .broadcast_as((batch, step.timestep_embedding.dim(1)?))?;
+                self.prediction_head
+                    .forward_with_precomputed(&speech, &timestep, &condition)?
+            };
+            speech = plan.scheduler.step_v_prediction_with_tensors(
+                &model_output,
+                &speech,
+                &step.tensors,
+            )?;
+        }
+        (0..batch)
+            .map(|row| speech.narrow(0, row, 1).map_err(Error::from))
+            .collect()
+    }
+}
+
+impl VibeVoiceTtsPreparedArtifact {
+    pub(crate) fn prompt_tokens(&self) -> usize {
+        self.input_ids.len()
+    }
+
+    pub(crate) fn retained_tensor_bytes(&self) -> Result<u64> {
+        [&self.input_embeds, &self.negative_embed]
+            .into_iter()
+            .try_fold(0u64, |bytes, tensor| {
+                let tensor_bytes = u64::try_from(tensor.elem_count())
+                    .ok()
+                    .and_then(|elements| {
+                        elements.checked_mul(u64::try_from(tensor.dtype().size_in_bytes()).ok()?)
+                    })
+                    .ok_or_else(|| {
+                        Error::Overloaded("VibeVoice TTS artifact bytes overflow".into())
+                    })?;
+                bytes.checked_add(tensor_bytes).ok_or_else(|| {
+                    Error::Overloaded("VibeVoice TTS artifact bytes overflow".into())
+                })
+            })
+    }
+}
+
+impl VibeVoiceTtsRetainedState {
+    pub(crate) fn begin_managed_quantum(
+        &mut self,
+        positive_cache: PhysicalPagedKvCache,
+        negative_cache: PhysicalPagedKvCache,
+    ) -> Result<VibeVoiceTtsRetainedCheckpoint> {
+        if self.active_quantum.is_some()
+            || self.staged_step.is_some()
+            || !self.managed_completions_drained
+        {
+            return Err(Error::InferenceError(
+                "VibeVoice TTS retained quantum is already active or has staged output".into(),
+            ));
+        }
+        if positive_cache.arena().id() != self.positive_cache.arena().id()
+            || negative_cache.arena().id() != self.negative_cache.arena().id()
+            || positive_cache.context_len() != self.positive_position
+            || negative_cache.context_len() != self.negative_position
+        {
+            return Err(Error::InvalidInput(
+                "VibeVoice TTS managed cache authority or position changed".into(),
+            ));
+        }
+        let quantum = self.next_quantum;
+        self.next_quantum = self
+            .next_quantum
+            .checked_add(1)
+            .ok_or_else(|| Error::InferenceError("VibeVoice TTS quantum overflow".into()))?;
+        self.active_quantum = Some(quantum);
+        Ok(VibeVoiceTtsRetainedCheckpoint {
+            state_id: self.state_id,
+            quantum,
+            payload: Some(VibeVoiceTtsRetainedCheckpointPayload {
+                positive_cache: std::mem::replace(&mut self.positive_cache, positive_cache),
+                negative_cache: std::mem::replace(&mut self.negative_cache, negative_cache),
+                positive_position: self.positive_position,
+                negative_position: self.negative_position,
+                last_hidden: self.last_hidden.clone(),
+                negative_last_hidden: self.negative_last_hidden.clone(),
+                acoustic_clock: self.acoustic_clock,
+                semantic_clock: self.semantic_clock,
+                scaled_latents: self.scaled_latents.clone(),
+                finished: self.finished,
+                staged_step: self.staged_step.clone(),
+                managed_completions_drained: self.managed_completions_drained,
+            }),
+        })
+    }
+
+    pub(crate) fn commit_managed_quantum(
+        &mut self,
+        checkpoint: &mut VibeVoiceTtsRetainedCheckpoint,
+    ) -> Result<()> {
+        self.validate_checkpoint(checkpoint)?;
+        if !self.managed_completions_drained {
+            return Err(Error::InferenceError(
+                "VibeVoice TTS managed completions must be drained before commit".into(),
+            ));
+        }
+        checkpoint.payload.take();
+        self.active_quantum = None;
+        Ok(())
+    }
+
+    pub(crate) fn rollback_managed_quantum(
+        &mut self,
+        checkpoint: &mut VibeVoiceTtsRetainedCheckpoint,
+    ) -> Result<()> {
+        self.validate_checkpoint(checkpoint)?;
+        let payload = checkpoint.payload.take().ok_or_else(|| {
+            Error::InferenceError("VibeVoice TTS checkpoint was already consumed".into())
+        })?;
+        self.positive_cache = payload.positive_cache;
+        self.negative_cache = payload.negative_cache;
+        self.positive_position = payload.positive_position;
+        self.negative_position = payload.negative_position;
+        self.last_hidden = payload.last_hidden;
+        self.negative_last_hidden = payload.negative_last_hidden;
+        self.acoustic_clock = payload.acoustic_clock;
+        self.semantic_clock = payload.semantic_clock;
+        self.scaled_latents = payload.scaled_latents;
+        self.finished = payload.finished;
+        self.staged_step = payload.staged_step;
+        self.managed_completions_drained = payload.managed_completions_drained;
+        self.active_quantum = None;
+        Ok(())
+    }
+
+    fn validate_checkpoint(&self, checkpoint: &VibeVoiceTtsRetainedCheckpoint) -> Result<()> {
+        if checkpoint.state_id != self.state_id
+            || self.active_quantum != Some(checkpoint.quantum)
+            || checkpoint.payload.is_none()
+        {
+            return Err(Error::InferenceError(
+                "VibeVoice TTS checkpoint is foreign, stale, or out of order".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn take_staged_step(&mut self) -> Option<VibeVoiceTtsRetainedDecodeStep> {
+        self.staged_step.take()
+    }
+
+    pub(crate) fn take_managed_write_completions(
+        &mut self,
+    ) -> Vec<Arc<crate::backends::kv::KvWriteBatchCompletion>> {
+        let mut completions = self.positive_cache.take_completed_writes();
+        completions.extend(self.negative_cache.take_completed_writes());
+        self.managed_completions_drained = true;
+        completions
+    }
+
+    pub(crate) const fn positive_position(&self) -> usize {
+        self.positive_position
+    }
+
+    pub(crate) const fn negative_position(&self) -> usize {
+        self.negative_position
+    }
+
+    pub(crate) const fn acoustic_clock(&self) -> u64 {
+        self.acoustic_clock
+    }
+
+    pub(crate) const fn semantic_clock(&self) -> u64 {
+        self.semantic_clock
     }
 }
 
@@ -968,6 +1817,59 @@ fn vibevoice_cfg_batching_default(device_kind: DeviceKind) -> bool {
 
 fn vibevoice_tts_negative_prefill_token(specials: &VibeVoiceSpecialTokens) -> u32 {
     specials.speech_start
+}
+
+fn validate_vibevoice_tts_inputs(text: &str, reference: &VibeVoiceSpeakerReference) -> Result<()> {
+    if text.trim().is_empty() {
+        return Err(Error::InvalidInput(
+            "VibeVoice TTS text input cannot be empty".to_string(),
+        ));
+    }
+    if reference.text.trim().is_empty() {
+        return Err(Error::InvalidInput(
+            "VibeVoice TTS reference_text cannot be empty".to_string(),
+        ));
+    }
+    if reference.audio_samples.is_empty() {
+        return Err(Error::InvalidInput(
+            "VibeVoice TTS reference_audio cannot be empty".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn next_vibevoice_tts_state_id() -> Result<u64> {
+    NEXT_VIBEVOICE_TTS_STATE_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .map_err(|_| Error::InferenceError("VibeVoice TTS state identity overflow".into()))
+}
+
+fn next_vibevoice_tts_model_load_nonce() -> Result<u64> {
+    NEXT_VIBEVOICE_TTS_MODEL_LOAD_NONCE
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .map_err(|_| Error::ModelLoadError("VibeVoice TTS load nonce overflow".into()))
+}
+
+fn vibevoice_tts_model_identity(
+    model_dir: &Path,
+    dtype: DType,
+    config: &VibeVoiceConfig,
+    load_nonce: u64,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"izwi-vibevoice-tts-model-v1");
+    hasher.update(load_nonce.to_le_bytes());
+    hasher.update(model_dir.as_os_str().as_encoded_bytes());
+    hasher.update(format!("{dtype:?}:{config:?}").as_bytes());
+    let mut identity: [u8; 32] = hasher.finalize().into();
+    if identity.iter().all(|byte| *byte == 0) {
+        identity[0] = 1;
+    }
+    identity
 }
 
 fn apply_kernel_telemetry_delta(
@@ -1376,6 +2278,50 @@ mod tests {
     use std::collections::HashMap;
 
     use candle_nn::VarBuilder;
+
+    #[test]
+    fn retained_artifact_accounts_for_model_bound_prompt_tensors() {
+        let artifact = VibeVoiceTtsPreparedArtifact {
+            model_identity: [7; 32],
+            input_ids: vec![1, 2, 3].into(),
+            input_embeds: Tensor::zeros((1, 3, 4), DType::F32, &Device::Cpu).unwrap(),
+            negative_embed: Tensor::zeros((1, 1, 4), DType::F32, &Device::Cpu).unwrap(),
+            normalization: LatentNormalization {
+                bias: Tensor::new(0f32, &Device::Cpu).unwrap(),
+                scale: Tensor::new(1f32, &Device::Cpu).unwrap(),
+                source: LatentNormalizationSource::Checkpoint,
+            },
+            preparation_profile: VibeVoiceTtsProfile::default(),
+        };
+        assert_eq!(artifact.prompt_tokens(), 3);
+        assert_eq!(artifact.retained_tensor_bytes().unwrap(), 64);
+    }
+
+    #[test]
+    fn retained_model_and_state_identities_are_unique() {
+        let first_model = next_vibevoice_tts_model_load_nonce().unwrap();
+        let second_model = next_vibevoice_tts_model_load_nonce().unwrap();
+        assert_eq!(first_model.checked_add(1), Some(second_model));
+        let first_state = next_vibevoice_tts_state_id().unwrap();
+        let second_state = next_vibevoice_tts_state_id().unwrap();
+        assert_eq!(first_state.checked_add(1), Some(second_state));
+    }
+
+    #[test]
+    fn retained_preparation_rejects_incomplete_reference_inputs() {
+        let reference = VibeVoiceSpeakerReference {
+            audio_samples: Vec::new(),
+            sample_rate: 24_000,
+            text: "reference".into(),
+        };
+        assert!(validate_vibevoice_tts_inputs("hello", &reference).is_err());
+        let reference = VibeVoiceSpeakerReference {
+            audio_samples: vec![0.1],
+            sample_rate: 24_000,
+            text: String::new(),
+        };
+        assert!(validate_vibevoice_tts_inputs("hello", &reference).is_err());
+    }
 
     #[test]
     fn auto_budget_scales_with_text_length() {
