@@ -2417,6 +2417,49 @@ impl EngineCoreRequest {
         Ok(Some((stage.id, cost)))
     }
 
+    fn continuous_lfm25_audio_asr_stage_cost(
+        binding: Option<&super::ExecutionAdapterBinding>,
+        model: &crate::models::registry::NativeAudioChatModel,
+        prompt_tokens: usize,
+        max_new_tokens: usize,
+    ) -> Result<Option<(StageId, WorkCost)>> {
+        let Some(stage) = binding.and_then(|binding| {
+            binding
+                .stages
+                .iter()
+                .find(|stage| stage.batch_mode == super::NativeBatchMode::Continuous)
+        }) else {
+            return Ok(None);
+        };
+        let position = prompt_tokens
+            .checked_add(max_new_tokens.max(1))
+            .and_then(|value| value.checked_sub(1))
+            .ok_or_else(|| {
+                Error::Overloaded("LFM2.5 Audio ASR decode position overflowed".into())
+            })?;
+        let envelope = model.lfm25_audio_asr_decode_resource_envelope(position)?;
+        let cost = WorkCost::with_workspace(
+            envelope.work_units,
+            envelope.materialized_tensor_elements,
+            ResourceVector {
+                host_bytes: ResourceAmount::Known(envelope.host_workspace_bytes),
+                device_bytes: ResourceAmount::Known(envelope.device_workspace_bytes),
+                unified_bytes: ResourceAmount::Known(envelope.unified_workspace_bytes),
+                ..ResourceVector::zero()
+            },
+        );
+        if !cost
+            .workspace
+            .workspace_bytes()
+            .is_ok_and(|bytes| bytes <= stage.max_workspace_bytes)
+        {
+            return Err(Error::Overloaded(
+                "LFM2.5 Audio ASR decode workspace exceeds its loaded adapter budget".into(),
+            ));
+        }
+        Ok(Some((stage.id, cost)))
+    }
+
     fn continuous_tts_stage_cost(
         binding: Option<&super::ExecutionAdapterBinding>,
         model: &Qwen3TtsModel,
@@ -2824,11 +2867,31 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
+        let prepared_cost = self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| match &ready.model {
+                PreparedIncrementalModel::Lfm25AudioAsr(model) => Some(model),
+                _ => None,
+            })
+            .map(|model| {
+                Self::continuous_lfm25_audio_asr_stage_cost(
+                    self.execution_adapter_binding.as_ref(),
+                    model,
+                    artifact.prompt_tokens,
+                    self.params.max_tokens,
+                )
+            })
+            .transpose()?
+            .flatten();
         self.prepared_asr_encoder_artifact = Some(PreparedAsrEncoderArtifact {
             model_variant,
             artifact: PreparedAsrEncoderArtifactValue::Lfm25Audio(artifact),
             source_fingerprint,
         });
+        if let Some((stage_id, cost)) = prepared_cost {
+            self.install_prepared_stage_cost(stage_id, cost)?;
+        }
         Ok(())
     }
 
@@ -3766,6 +3829,31 @@ impl EngineCoreRequest {
             .map(|model| Self::continuous_asr_stage_cost(Some(&binding), model))
             .transpose()?
             .flatten();
+        let prepared_lfm25_asr_continuous_cost = self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| match &ready.model {
+                PreparedIncrementalModel::Lfm25AudioAsr(model) => Some(model),
+                _ => None,
+            })
+            .zip(self.prepared_asr_encoder_artifact.as_ref())
+            .and_then(|(model, prepared)| match &prepared.artifact {
+                PreparedAsrEncoderArtifactValue::Lfm25Audio(artifact) => {
+                    Some((model, artifact.prompt_tokens))
+                }
+                _ => None,
+            })
+            .filter(|_| self.uses_asr_retained_sequence())
+            .map(|(model, prompt_tokens)| {
+                Self::continuous_lfm25_audio_asr_stage_cost(
+                    Some(&binding),
+                    model,
+                    prompt_tokens,
+                    self.params.max_tokens,
+                )
+            })
+            .transpose()?
+            .flatten();
         let prepared_tts_continuous_cost = self
             .incremental_model_execution_ready
             .as_ref()
@@ -3814,6 +3902,9 @@ impl EngineCoreRequest {
             self.install_prepared_stage_cost(stage_id, cost)?;
         }
         if let Some((stage_id, cost)) = prepared_asr_continuous_cost {
+            self.install_prepared_stage_cost(stage_id, cost)?;
+        }
+        if let Some((stage_id, cost)) = prepared_lfm25_asr_continuous_cost {
             self.install_prepared_stage_cost(stage_id, cost)?;
         }
         if let Some((stage_id, cost)) = prepared_tts_continuous_cost {
