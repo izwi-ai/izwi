@@ -1274,6 +1274,9 @@ pub struct Qwen3TtsDiagnostics {
     pub vocab_size: usize,
     pub text_vocab_size: usize,
     pub num_code_groups: usize,
+    /// Whether bounded candidate selection can execute on the selected device.
+    pub device_sampling: bool,
+    /// Backward-compatible CUDA-specific capability flag.
     pub cuda_sampling: bool,
 }
 
@@ -1333,8 +1336,8 @@ fn select_qwen3_tts_dtypes(
     }
 }
 
-fn qwen_tts_uses_cuda_sampling(device: &DeviceProfile) -> bool {
-    device.kind.is_cuda()
+fn qwen_tts_uses_device_sampling(device: &DeviceProfile) -> bool {
+    device.kind.is_cuda() || device.kind.is_metal()
 }
 
 fn qwen_tts_allows_eos(frames_generated: usize) -> bool {
@@ -1832,7 +1835,8 @@ impl Qwen3TtsModel {
             vocab_size: self.config.talker_config.vocab_size,
             text_vocab_size: self.config.talker_config.text_vocab_size,
             num_code_groups: self.config.talker_config.num_code_groups,
-            cuda_sampling: qwen_tts_uses_cuda_sampling(&self.device),
+            device_sampling: qwen_tts_uses_device_sampling(&self.device),
+            cuda_sampling: self.device.kind.is_cuda(),
         }
     }
 
@@ -2209,7 +2213,7 @@ impl Qwen3TtsModel {
             &state.params,
             &state.semantic_history,
             &mut next_rng,
-            qwen_tts_uses_cuda_sampling(&self.device),
+            qwen_tts_uses_device_sampling(&self.device),
         )?;
         if allow_eos && semantic_token == self.specials.codec_eos_token_id {
             return Ok(PreparedTtsFrameStage::Terminal(PreparedTtsTerminalStage {
@@ -2721,7 +2725,7 @@ impl Qwen3TtsModel {
             &state.params,
             &state.semantic_history,
             &mut next_rng,
-            qwen_tts_uses_cuda_sampling(&self.device),
+            qwen_tts_uses_device_sampling(&self.device),
         )?;
         let semantic_ms = semantic_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -5060,14 +5064,14 @@ mod tests {
     }
 
     #[test]
-    fn qwen_tts_optimized_sampling_is_cuda_only() {
+    fn qwen_tts_optimized_sampling_is_accelerator_neutral() {
         let cpu = dtype_test_profile(DeviceKind::Cpu, false, false);
         let metal = dtype_test_profile(DeviceKind::Metal, false, false);
         let cuda = dtype_test_profile(DeviceKind::Cuda, true, true);
 
-        assert!(!qwen_tts_uses_cuda_sampling(&cpu));
-        assert!(!qwen_tts_uses_cuda_sampling(&metal));
-        assert!(qwen_tts_uses_cuda_sampling(&cuda));
+        assert!(!qwen_tts_uses_device_sampling(&cpu));
+        assert!(qwen_tts_uses_device_sampling(&metal));
+        assert!(qwen_tts_uses_device_sampling(&cuda));
     }
 
     #[test]
