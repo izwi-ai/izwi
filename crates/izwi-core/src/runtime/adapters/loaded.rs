@@ -909,6 +909,11 @@ fn is_voxtral_physical_tts(metadata: AdapterMetadata) -> bool {
         && metadata.model_variant.family() == crate::catalog::ModelFamily::VoxtralTts
 }
 
+fn is_kokoro_static_tts(metadata: AdapterMetadata) -> bool {
+    metadata.capability == CapabilityKind::Tts
+        && metadata.model_variant.family() == crate::catalog::ModelFamily::KokoroTts
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PhysicalQwenTtsAdapterFactory;
 
@@ -1095,6 +1100,38 @@ struct FishS2PhysicalTtsAdapterFactory;
 #[derive(Debug, Clone, Copy)]
 struct VoxtralPhysicalTtsAdapterFactory;
 
+#[derive(Debug, Clone, Copy)]
+struct KokoroStaticTtsAdapterFactory;
+
+impl LoadedExecutionAdapterFactory for KokoroStaticTtsAdapterFactory {
+    fn id(&self) -> &'static str {
+        "builtin.kokoro_tts.tensor_static"
+    }
+
+    fn batch_mode(&self) -> NativeBatchMode {
+        NativeBatchMode::Static
+    }
+
+    fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
+        is_kokoro_static_tts(metadata)
+    }
+
+    fn create(
+        &self,
+        context: LoadedAdapterFactoryContext,
+        metadata: AdapterMetadata,
+    ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
+        Ok(Arc::new(StaticTtsExecutionAdapter::new(
+            context.execution_group_id,
+            context.model_instance_id,
+            metadata,
+            context.backend_kind,
+            context.max_tensor_batch_size,
+            context.request_parallelism,
+        )))
+    }
+}
+
 impl LoadedExecutionAdapterFactory for VoxtralPhysicalTtsAdapterFactory {
     fn id(&self) -> &'static str {
         "builtin.voxtral_tts.physical_sequence"
@@ -1126,7 +1163,10 @@ impl LoadedExecutionAdapterFactory for FishS2PhysicalTtsAdapterFactory {
     }
 
     fn batch_mode(&self) -> NativeBatchMode {
-        NativeBatchMode::Continuous
+        // Fish slow/fast physical kernels are currently width-one. The
+        // scheduler can interleave retained rows, but the factory must not
+        // advertise a native multi-row tensor call.
+        NativeBatchMode::None
     }
 
     fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
@@ -1364,6 +1404,7 @@ impl LoadedExecutionAdapterFactory for ScalarExecutionAdapterFactory {
             && !is_vibevoice_physical_tts(metadata)
             && !is_fish_s2_physical_tts(metadata)
             && !is_voxtral_physical_tts(metadata)
+            && !is_kokoro_static_tts(metadata)
     }
 
     fn create(
@@ -1397,6 +1438,7 @@ pub(super) fn built_in_loaded_adapter_factories() -> Vec<Arc<dyn LoadedExecution
         Arc::new(VibeVoicePhysicalTtsAdapterFactory),
         Arc::new(FishS2PhysicalTtsAdapterFactory),
         Arc::new(VoxtralPhysicalTtsAdapterFactory),
+        Arc::new(KokoroStaticTtsAdapterFactory),
         Arc::new(ScalarExecutionAdapterFactory),
     ]
 }
@@ -2097,22 +2139,42 @@ impl LoadedExecutionAdapter for StaticTtsExecutionAdapter {
         execution_profile.kv_dtype = "none".to_string();
         execution_profile.cache_namespace = None;
 
+        let kokoro = self.metadata.model_variant.family() == crate::catalog::ModelFamily::KokoroTts;
         let mut stage = StageDescriptor::from_execution_profile(
             StageId::new(1),
-            "tts.generate.tensor_static",
+            if kokoro {
+                "tts.generate.kokoro.tensor_static"
+            } else {
+                "tts.generate.tensor_static"
+            },
             &execution_profile,
             NativeBatchMode::Static,
         );
         stage.selector = StageWorkSelector::Atomic;
-        stage.shape_policy = crate::engine::StageShapePolicy::Exact;
+        stage.shape_policy = if kokoro {
+            crate::engine::StageShapePolicy::Ragged
+        } else {
+            crate::engine::StageShapePolicy::Exact
+        };
         stage.max_padding_basis_points = 0;
         stage.max_work_units = u64::try_from(stage.max_batch_size).map_err(|_| {
             Error::Overloaded("static TTS batch width exceeds work accounting".to_string())
         })?;
-        stage.max_workspace_bytes = STATIC_TTS_MAX_BATCH_WORKSPACE_BYTES;
+        // Kokoro is architecturally stateless/cacheless. Its request-shaped
+        // synthesis workspace is admitted by RuntimeService and must not be
+        // relabelled as load-owned invocation state by this stage contract.
+        stage.max_workspace_bytes = if kokoro {
+            0
+        } else {
+            STATIC_TTS_MAX_BATCH_WORKSPACE_BYTES
+        };
         let mut scalar = StageDescriptor::from_execution_profile(
             StageId::new(0),
-            "tts.generate.scalar",
+            if kokoro {
+                "tts.generate.kokoro.scalar"
+            } else {
+                "tts.generate.scalar"
+            },
             &execution_profile,
             NativeBatchMode::None,
         );
@@ -5390,7 +5452,12 @@ mod tests {
                 && !is_vibevoice_physical_asr(metadata)
                 && !is_granite_speech_physical_asr(metadata)
                 && !is_lfm25_audio_physical_asr(metadata)
+                && !is_parakeet_physical_asr(metadata)
                 && !is_lfm25_audio_physical_tts(metadata)
+                && !is_vibevoice_physical_tts(metadata)
+                && !is_fish_s2_physical_tts(metadata)
+                && !is_voxtral_physical_tts(metadata)
+                && !is_kokoro_static_tts(metadata)
         }
 
         fn create(
@@ -5443,10 +5510,16 @@ mod tests {
                     assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::None);
                 } else {
                     assert_ne!(contract.adapter_abi_revision, SCALAR_ADAPTER_ABI);
-                    assert!(contract
-                        .stages
-                        .iter()
-                        .any(|stage| stage.batch_mode == factory.batch_mode()));
+                    assert!(
+                        contract
+                            .stages
+                            .iter()
+                            .any(|stage| stage.batch_mode == factory.batch_mode()),
+                        "{variant} {:?} factory {} did not publish {:?}",
+                        metadata.capability,
+                        factory.id(),
+                        factory.batch_mode()
+                    );
                 }
                 assert!(contract
                     .stages
@@ -5620,16 +5693,25 @@ mod tests {
                     contract.execution_profile.physical_launch_policy,
                     PhysicalLaunchPolicy::ExecutionGroupExclusive
                 );
-                assert_eq!(contract.execution_profile.max_batch_size, 1);
-                assert_eq!(
-                    contract.execution_profile.concurrency,
-                    ConcurrencyClass::Exclusive
-                );
-                assert!(!contract.execution_profile.capabilities().native_batch);
-                assert!(contract
+                if contract
                     .stages
                     .iter()
-                    .all(|stage| stage.batch_mode == NativeBatchMode::None));
+                    .any(|stage| stage.batch_mode == NativeBatchMode::Static)
+                {
+                    assert_eq!(contract.execution_profile.max_batch_size, 2);
+                    assert_eq!(
+                        contract.execution_profile.concurrency,
+                        ConcurrencyClass::Batchable
+                    );
+                    assert!(contract.execution_profile.capabilities().native_batch);
+                } else {
+                    assert_eq!(contract.execution_profile.max_batch_size, 1);
+                    assert_eq!(
+                        contract.execution_profile.concurrency,
+                        ConcurrencyClass::Exclusive
+                    );
+                    assert!(!contract.execution_profile.capabilities().native_batch);
+                }
             }
         }
 
@@ -5712,6 +5794,8 @@ mod tests {
                             CapabilityKind::Tts | CapabilityKind::StreamingTts
                         ) && variant.family()
                             == crate::catalog::ModelFamily::Qwen3Tts;
+                        let kokoro_tts = execution.metadata().capability == CapabilityKind::Tts
+                            && variant.family() == crate::catalog::ModelFamily::KokoroTts;
                         let voxtral_realtime = execution.metadata().capability
                             == CapabilityKind::RealtimeAsr
                             && variant == ModelVariant::VoxtralMini4BRealtime2602;
@@ -5742,6 +5826,17 @@ mod tests {
                             assert!(contract.stages[1..]
                                 .iter()
                                 .all(|stage| stage.batch_mode == NativeBatchMode::None));
+                        } else if kokoro_tts
+                            && contract
+                                .stages
+                                .iter()
+                                .any(|stage| stage.batch_mode == NativeBatchMode::Static)
+                        {
+                            assert_eq!(contract.execution_profile.mode, ExecutionMode::Atomic);
+                            assert_eq!(contract.execution_profile.max_batch_size, 8);
+                            assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::Static);
+                            assert_eq!(contract.stages[0].shape_policy, StageShapePolicy::Ragged);
+                            assert_eq!(contract.stages[1].batch_mode, NativeBatchMode::None);
                         } else {
                             assert_eq!(contract.execution_profile.max_batch_size, 1);
                             assert_eq!(
@@ -5778,7 +5873,7 @@ mod tests {
             .remove(0);
         assert_eq!(
             base.execution_profile.concurrency,
-            ConcurrencyClass::Exclusive
+            ConcurrencyClass::Batchable
         );
         assert_eq!(
             base.execution_profile.physical_launch_policy,
@@ -5935,7 +6030,7 @@ mod tests {
             BackendKind::Metal,
         )
         .unwrap();
-        let contract = metal.contract(CapabilityKind::Tts, false).unwrap();
+        let contract = metal.contract(CapabilityKind::StreamingTts, false).unwrap();
         assert_eq!(contract.execution_profile.max_batch_size, 1);
         assert_eq!(
             contract.execution_profile.concurrency,
@@ -6168,9 +6263,12 @@ mod tests {
     fn replacing_the_scalar_factory_adds_an_optimized_model_without_bundle_branching() {
         let variant = ModelVariant::Kokoro82M;
         let mut registry = RuntimeAdapterRegistry::built_in();
-        registry
-            .loaded_adapter_factories
-            .retain(|factory| factory.id() != "builtin.scalar");
+        registry.loaded_adapter_factories.retain(|factory| {
+            !matches!(
+                factory.id(),
+                "builtin.scalar" | "builtin.kokoro_tts.tensor_static"
+            )
+        });
         registry
             .loaded_adapter_factories
             .push(Arc::new(TestScalarFactory {
@@ -6206,12 +6304,48 @@ mod tests {
     }
 
     #[test]
+    fn kokoro_factory_publishes_stateless_ragged_static_generation() {
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(4, 2).unwrap();
+            let draft = LoadedModelBundleDraft::build(
+                &registry,
+                ExecutionGroupId::new(1),
+                ModelInstanceId::new(2),
+                ModelVariant::Kokoro82M,
+                backend,
+            )
+            .unwrap();
+            let contract = draft
+                .capabilities
+                .get(&CapabilityKind::Tts)
+                .unwrap()
+                .contract(StreamingRequirements::NONE)
+                .unwrap();
+
+            assert_eq!(contract.adapter_abi_revision, STATIC_TENSOR_ADAPTER_ABI);
+            assert_eq!(contract.execution_profile.mode, ExecutionMode::Atomic);
+            assert_eq!(contract.execution_profile.cache_mode, CacheMode::None);
+            assert_eq!(contract.execution_profile.max_batch_size, 4);
+            assert_eq!(contract.stages.len(), 2);
+            assert_eq!(contract.stages[0].selector, StageWorkSelector::Atomic);
+            assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::Static);
+            assert_eq!(contract.stages[0].shape_policy, StageShapePolicy::Ragged);
+            assert_eq!(contract.stages[0].max_batch_size, 4);
+            assert_eq!(contract.stages[1].batch_mode, NativeBatchMode::None);
+            assert_eq!(contract.stages[1].max_batch_size, 1);
+        }
+    }
+
+    #[test]
     fn missing_loaded_factory_fails_closed() {
         let variant = ModelVariant::Kokoro82M;
         let mut registry = RuntimeAdapterRegistry::built_in();
-        registry
-            .loaded_adapter_factories
-            .retain(|factory| factory.id() != "builtin.scalar");
+        registry.loaded_adapter_factories.retain(|factory| {
+            !matches!(
+                factory.id(),
+                "builtin.scalar" | "builtin.kokoro_tts.tensor_static"
+            )
+        });
         let metadata = *registry.require(CapabilityKind::Tts, variant).unwrap();
 
         let error = registry
