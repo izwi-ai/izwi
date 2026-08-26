@@ -2082,7 +2082,7 @@ impl RuntimeService {
         max_tokens: Option<usize>,
         correlation_id: Option<&str>,
     ) -> Result<AsrTranscription> {
-        if variant.is_audio_chat() {
+        if variant.is_audio_chat() && variant.family() != ModelFamily::Lfm25Audio {
             self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), false)?;
             let context = RuntimeRequestContext::default();
             return self
@@ -2182,7 +2182,7 @@ impl RuntimeService {
     where
         F: FnMut(String) + Send + 'static,
     {
-        if variant.is_audio_chat() {
+        if variant.is_audio_chat() && variant.family() != ModelFamily::Lfm25Audio {
             self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), true)?;
             let context = RuntimeRequestContext::new(crate::engine::WorkloadClass::Streaming);
             return self
@@ -2302,7 +2302,7 @@ impl RuntimeService {
         correlation_id: Option<&str>,
         runtime_context: RuntimeRequestContext,
     ) -> Result<AsrTranscription> {
-        if variant.is_audio_chat() {
+        if variant.is_audio_chat() && variant.family() != ModelFamily::Lfm25Audio {
             self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), false)?;
             return self
                 .asr_transcribe_audio_chat(
@@ -2466,7 +2466,7 @@ impl RuntimeService {
         F: FnMut(String) + Send + 'static,
         P: FnMut(AsrProgress) + Send + 'static,
     {
-        if variant.is_audio_chat() {
+        if variant.is_audio_chat() && variant.family() != ModelFamily::Lfm25Audio {
             self.observe_broker_capability_request(
                 CapabilityKind::Asr,
                 Some(variant),
