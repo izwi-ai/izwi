@@ -319,6 +319,56 @@ fn retained_tts_batch_model_call(
     }
 }
 
+fn kokoro_live_row_indices(cancelled: &[bool]) -> Vec<usize> {
+    cancelled
+        .iter()
+        .enumerate()
+        .filter_map(|(index, cancelled)| (!cancelled).then_some(index))
+        .collect()
+}
+
+fn validate_exact_kokoro_model<T>(expected: &mut Option<Arc<T>>, candidate: Arc<T>) -> Result<()> {
+    if expected
+        .as_ref()
+        .is_some_and(|expected| !Arc::ptr_eq(expected, &candidate))
+    {
+        return Err(Error::InferenceError(
+            "Kokoro static cohort mixed exact model instances".into(),
+        ));
+    }
+    if expected.is_none() {
+        *expected = Some(candidate);
+    }
+    Ok(())
+}
+
+fn scatter_kokoro_rows<T>(
+    width: usize,
+    live_indices: &[usize],
+    results: Vec<T>,
+) -> Result<Vec<Option<T>>> {
+    if results.len() != live_indices.len() {
+        return Err(Error::InferenceError(format!(
+            "Kokoro returned {} results for {} live rows",
+            results.len(),
+            live_indices.len()
+        )));
+    }
+    let mut scattered = (0..width).map(|_| None).collect::<Vec<_>>();
+    for (index, result) in live_indices.iter().copied().zip(results) {
+        let slot = scattered.get_mut(index).ok_or_else(|| {
+            Error::InferenceError("Kokoro live row index exceeded cohort width".into())
+        })?;
+        if slot.is_some() {
+            return Err(Error::InferenceError(
+                "Kokoro live row index was duplicated".into(),
+            ));
+        }
+        *slot = Some(result);
+    }
+    Ok(scattered)
+}
+
 fn validate_voxtral_tts_prefill_step(
     row: usize,
     scheduled: &ScheduledRequest,
@@ -511,6 +561,130 @@ impl Drop for ContinuousTtsStateBatch<'_> {
 }
 
 impl NativeExecutor {
+    pub(super) fn kokoro_tts_request(
+        &self,
+        request: &EngineCoreRequest,
+        scheduled: &ScheduledRequest,
+    ) -> Result<ModelSessionResult> {
+        let mut outputs = self.kokoro_tts_batch(&[request], std::slice::from_ref(scheduled))?;
+        outputs.pop().ok_or_else(|| {
+            Error::InferenceError("Kokoro scalar synthesis returned no result".into())
+        })
+    }
+
+    pub(super) fn kokoro_tts_batch(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+    ) -> Result<Vec<ModelSessionResult>> {
+        if requests.len() != scheduled.len() || requests.is_empty() {
+            return Err(Error::InvalidInput(
+                "Kokoro static synthesis requires one non-empty request per scheduled row".into(),
+            ));
+        }
+        if scheduled
+            .iter()
+            .any(|row| !matches!(row.work, crate::engine::WorkUnit::AtomicJob { .. }))
+        {
+            return Err(Error::InvalidInput(
+                "Kokoro static synthesis requires atomic scheduled work".into(),
+            ));
+        }
+
+        let mut outputs = vec![None; requests.len()];
+        let pre_call_cancelled = requests
+            .iter()
+            .map(|request| request.is_cancelled())
+            .collect::<Vec<_>>();
+        let live_indices = kokoro_live_row_indices(&pre_call_cancelled);
+        let mut artifacts = Vec::with_capacity(requests.len());
+        let mut model = None;
+        for (index, request) in requests.iter().enumerate() {
+            if request.id != scheduled[index].request_id {
+                return Err(Error::InvalidInput(format!(
+                    "Kokoro static row {index} request identity differs from its scheduled row"
+                )));
+            }
+            if pre_call_cancelled[index] {
+                outputs[index] = Some(ModelSessionResult::cancelled_before_dispatch(
+                    ExecutorOutput::cancelled(request.id.clone()),
+                ));
+                continue;
+            }
+            let lease = request
+                .prepared_kokoro_tts_model_lease_for_executor()?
+                .ok_or_else(|| {
+                    Error::InferenceError("Kokoro request lost its exact model lease".into())
+                })?;
+            let model_arc = lease.model_arc();
+            validate_exact_kokoro_model(&mut model, model_arc)?;
+            let artifact = request
+                .prepared_kokoro_tts_artifact_for_executor()?
+                .ok_or_else(|| {
+                    Error::InferenceError("Kokoro request lost its prepared artifact".into())
+                })?;
+            artifacts.push((*artifact).clone());
+        }
+
+        if !live_indices.is_empty() {
+            let model = model.expect("live Kokoro rows establish an exact model");
+            let results = Self::run_blocking(|| model.generate_prepared_batch(&artifacts))?;
+            let mut results = scatter_kokoro_rows(requests.len(), &live_indices, results)?;
+            if let Some(call) = retained_tts_batch_model_call(
+                crate::engine::NativeBatchMode::Static,
+                live_indices.len(),
+            ) {
+                crate::engine::metrics::record_engine_model_call(call);
+            }
+            for index in live_indices {
+                let request = requests[index];
+                if request.is_cancelled() {
+                    outputs[index] = Some(ModelSessionResult::cancelled(
+                        ExecutorOutput::cancelled(request.id.clone()),
+                    ));
+                    continue;
+                }
+                let result = results[index].take().ok_or_else(|| {
+                    Error::InferenceError(format!("Kokoro result row {index} was absent"))
+                })?;
+                if result.sample_rate == 0 {
+                    return Err(Error::InferenceError(format!(
+                        "Kokoro result row {index} has a zero sample rate"
+                    )));
+                }
+                let duration_secs = result.samples.len() as f32 / result.sample_rate as f32;
+                outputs[index] = Some(ModelSessionResult::atomic(ExecutorOutput {
+                    request_id: request.id.clone(),
+                    audio: Some(AudioOutput {
+                        samples: result.samples,
+                        sample_rate: result.sample_rate,
+                        duration_secs,
+                    }),
+                    text: Some(result.phonemes),
+                    input_transcription: None,
+                    tokens_processed: scheduled[index].num_tokens,
+                    tokens_generated: result.tokens_generated,
+                    finished: true,
+                    phase_timing_override: None,
+                    asr_diagnostics: None,
+                    error: None,
+                }));
+            }
+        }
+
+        outputs
+            .into_iter()
+            .enumerate()
+            .map(|(index, output)| {
+                output.ok_or_else(|| {
+                    Error::InferenceError(format!(
+                        "Kokoro static synthesis did not resolve row {index}"
+                    ))
+                })
+            })
+            .collect()
+    }
+
     pub(super) fn to_tts_params(request: &EngineCoreRequest) -> TtsGenerationParams {
         request.qwen_tts_generation_params()
     }
@@ -3402,6 +3576,60 @@ mod tests {
             ),
             vec![0, 3]
         );
+    }
+
+    #[test]
+    fn kokoro_static_batch_excludes_cancelled_rows_before_model_entry() {
+        assert_eq!(
+            kokoro_live_row_indices(&[false, true, false, true]),
+            vec![0, 2]
+        );
+        assert!(kokoro_live_row_indices(&[true, true]).is_empty());
+    }
+
+    #[test]
+    fn kokoro_static_batch_rechecks_mixed_cancellation_after_model_entry() {
+        let entered = kokoro_live_row_indices(&[false, false, false]);
+        let publishable = kokoro_live_row_indices(&[false, true, false]);
+        assert_eq!(entered, vec![0, 1, 2]);
+        assert_eq!(publishable, vec![0, 2]);
+    }
+
+    #[test]
+    fn kokoro_static_batch_preserves_live_result_order() {
+        let scattered = scatter_kokoro_rows(5, &[0, 2, 4], vec!["a", "c", "e"]).unwrap();
+        assert_eq!(scattered, vec![Some("a"), None, Some("c"), None, Some("e")]);
+        assert!(scatter_kokoro_rows(2, &[1], vec!["x", "y"]).is_err());
+        assert!(scatter_kokoro_rows(1, &[1], vec!["x"]).is_err());
+    }
+
+    #[test]
+    fn kokoro_static_batch_rejects_mixed_exact_model_identity() {
+        let first = Arc::new(());
+        let same = first.clone();
+        let other = Arc::new(());
+        let mut expected = None;
+        validate_exact_kokoro_model(&mut expected, first).unwrap();
+        validate_exact_kokoro_model(&mut expected, same).unwrap();
+        assert!(validate_exact_kokoro_model(&mut expected, other).is_err());
+    }
+
+    #[test]
+    fn kokoro_static_batch_reports_b1_fallback_and_native_batched_rows_truthfully() {
+        assert!(matches!(
+            retained_tts_batch_model_call(crate::engine::NativeBatchMode::Static, 1),
+            Some(crate::engine::metrics::EngineModelCall::ScalarRows {
+                envelope: crate::engine::NativeBatchMode::Static,
+                rows: 1,
+            })
+        ));
+        assert!(matches!(
+            retained_tts_batch_model_call(crate::engine::NativeBatchMode::Static, 2),
+            Some(crate::engine::metrics::EngineModelCall::NativeTensor {
+                mode: crate::engine::NativeBatchMode::Static,
+                rows: 2,
+            })
+        ));
     }
 
     #[test]

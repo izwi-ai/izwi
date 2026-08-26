@@ -3462,6 +3462,23 @@ impl ModelExecutor for NativeExecutor {
                 ),
                 NativeBatchRoute::Audio {
                     task: TaskType::TTS,
+                    stage: NativeAudioStage::Atomic,
+                    mode: NativeBatchMode::Static,
+                    ..
+                } if execution.requests.iter().all(|request| {
+                    request.model_variant.is_some_and(|variant| {
+                        variant.family() == crate::catalog::ModelFamily::KokoroTts
+                    })
+                }) =>
+                {
+                    self.execute_static_kokoro_tts_requests_with_rows(
+                        execution.requests,
+                        execution.scheduled,
+                        Some(&execution.batch.rows),
+                    )
+                }
+                NativeBatchRoute::Audio {
+                    task: TaskType::TTS,
                     stage: NativeAudioStage::SequencePrefill,
                     mode: NativeBatchMode::Static,
                     ..

@@ -41,6 +41,12 @@ impl DispatchRoute {
 
 const DISPATCH_ROUTES: &[DispatchRoute] = &[
     DispatchRoute {
+        name: "kokoro_tts",
+        task: TaskType::TTS,
+        variant_matcher: Some(|variant| variant.family() == crate::catalog::ModelFamily::KokoroTts),
+        handler: NativeExecutor::kokoro_tts_request,
+    },
+    DispatchRoute {
         name: "lfm25_audio_tts",
         task: TaskType::TTS,
         variant_matcher: Some(|variant| {
@@ -703,6 +709,30 @@ impl NativeExecutor {
             })
             .collect::<Result<Vec<_>>>()?;
         let outputs = self.voxtral_tts_batch_with_managed(&ordered, scheduled, managed)?;
+        self.finish_scheduled_execution(
+            requests,
+            scheduled,
+            outputs,
+            BatchDispatch::new(BatchDispatchKind::TensorStatic, scheduled.len()),
+            rows,
+        )
+    }
+
+    pub(super) fn execute_static_kokoro_tts_requests_with_rows(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+        rows: Option<&[ReadyQuantum]>,
+    ) -> Result<Vec<ExecutorStepResult>> {
+        let ordered = scheduled
+            .iter()
+            .map(|scheduled| {
+                Self::find_request(requests, scheduled).ok_or_else(|| {
+                    Error::InferenceError("static Kokoro TTS row lost request snapshot".into())
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let outputs = self.kokoro_tts_batch(&ordered, scheduled)?;
         self.finish_scheduled_execution(
             requests,
             scheduled,
