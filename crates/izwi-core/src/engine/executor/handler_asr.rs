@@ -7,6 +7,7 @@ use crate::models::architectures::lfm25_audio::asr_retained::{
 use crate::models::architectures::nemotron::asr::{
     NemotronRealtimeBatchInput, NemotronRealtimeDecodeBatchRow,
 };
+use crate::models::architectures::parakeet::asr::ParakeetRetainedDecodeBatchRow;
 use crate::models::architectures::vibevoice::asr::VibeVoiceAsrRetainedTokenizerQuantum;
 use crate::models::architectures::vibevoice::asr::{
     VibeVoiceAsrPreparedTokenizerSpan, VibeVoiceAsrRetainedPrefillBatchRow,
@@ -17,7 +18,7 @@ use crate::models::architectures::voxtral::realtime::{
 };
 use crate::models::architectures::whisper::asr::WhisperTerminalTransition;
 use crate::models::registry::{
-    NativeAsrDecodeCheckpoint, NativeAsrDecodeStep, NativeAsrGenerationOptions,
+    NativeAsrDecodeCheckpoint, NativeAsrDecodeStep, NativeAsrGenerationOptions, NativeAsrModel,
 };
 use crate::runtime::granite_auto_asr_max_tokens_for_duration;
 use serde_json::json;
@@ -33,7 +34,8 @@ use super::super::{
 };
 use super::audio::{decode_request_audio_with_rate, AsrChunkTranscription};
 use super::state::{
-    ActiveAsrDecode, ActiveLfm25AsrDecode, ActiveNemotronRealtime, ActiveVoxtralRealtime,
+    ActiveAsrDecode, ActiveLfm25AsrDecode, ActiveNemotronRealtime, ActiveParakeetAsrDecode,
+    ActiveVoxtralRealtime,
 };
 use super::{
     ExecutorOutput, ExecutorPhaseTiming, ExecutorStateLease, ModelSessionResult, NativeExecutor,
@@ -5524,6 +5526,413 @@ impl NativeExecutor {
             .collect()
     }
 
+    pub(super) fn parakeet_asr_prefill_batch_with_managed(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+        mut managed: Vec<Option<super::RetainedRowManagedState>>,
+    ) -> Result<Vec<ModelSessionResult>> {
+        if requests.len() != scheduled.len() || managed.len() != scheduled.len() {
+            return Err(Error::InvalidInput(
+                "Parakeet prefill batch geometry is inconsistent".into(),
+            ));
+        }
+        let mut outputs = (0..requests.len()).map(|_| None).collect::<Vec<_>>();
+        let live = requests
+            .iter()
+            .enumerate()
+            .filter_map(|(index, request)| {
+                if request.is_cancelled() {
+                    outputs[index] = Some(ModelSessionResult::cancelled_before_dispatch(
+                        ExecutorOutput::cancelled(request.id.clone()),
+                    ));
+                    None
+                } else {
+                    Some(index)
+                }
+            })
+            .collect::<Vec<_>>();
+        if live.is_empty() {
+            return outputs
+                .into_iter()
+                .map(|output| {
+                    output.ok_or_else(|| {
+                        Error::InferenceError("Parakeet prefill lost cancelled output".into())
+                    })
+                })
+                .collect();
+        }
+        let model_lease = requests[live[0]]
+            .prepared_asr_model_lease_for_executor()?
+            .ok_or_else(|| Error::InferenceError("Parakeet prefill lost model residency".into()))?;
+        let model_arc = model_lease.model_arc();
+        let NativeAsrModel::Parakeet(model) = model_arc.as_ref() else {
+            return Err(Error::InvalidInput(
+                "Parakeet prefill crossed model family".into(),
+            ));
+        };
+        let mut rows = Vec::with_capacity(live.len());
+        for index in live.iter().copied() {
+            let request = requests[index];
+            let variant = Self::resolve_variant(request)?;
+            let row_model = request
+                .prepared_asr_model_lease_for_executor()?
+                .ok_or_else(|| {
+                    Error::InferenceError("Parakeet prefill row lost model residency".into())
+                })?;
+            if variant.family() != ModelFamily::ParakeetAsr
+                || !Arc::ptr_eq(&row_model.model_arc(), &model_arc)
+                || !scheduled[index].is_prefill
+                || scheduled[index].num_computed_tokens != 0
+            {
+                return Err(Error::InvalidInput(
+                    "Parakeet prefill batch crossed its loaded sequence identity".into(),
+                ));
+            }
+            let mut retained = managed[index].take().ok_or_else(|| {
+                Error::InferenceError("Parakeet prefill lost retained tensor state".into())
+            })?;
+            retained.ensure_all_paged_consumed()?;
+            drop(retained.tensor_state.take().ok_or_else(|| {
+                Error::InferenceError("Parakeet prefill lost tensor reservation".into())
+            })?);
+            let arena = request
+                .managed_cache_runtime()
+                .and_then(|runtime| runtime.tensor_state())
+                .cloned()
+                .ok_or_else(|| {
+                    Error::InferenceError("Parakeet prefill lost tensor arena".into())
+                })?;
+            let artifact = request
+                .prepared_parakeet_artifact_for_executor()?
+                .ok_or_else(|| {
+                    Error::InferenceError("Parakeet prefill lost encoder artifact".into())
+                })?;
+            let (samples, sample_rate) =
+                request.prepared_asr_audio_for_executor()?.ok_or_else(|| {
+                    Error::InferenceError("Parakeet prefill lost decoded audio".into())
+                })?;
+            let lease = ExecutorStateLease::checkout(
+                &self.parakeet_asr_decode_states,
+                scheduled[index].session_key(),
+                variant,
+                "Parakeet ASR prefill",
+            )?;
+            if lease.state().is_some() {
+                return Err(Error::InferenceError(
+                    "Parakeet initial prefill found an existing session state".into(),
+                ));
+            }
+            let target = u64::try_from(
+                scheduled[index]
+                    .num_computed_tokens
+                    .checked_add(scheduled[index].num_tokens)
+                    .ok_or_else(|| Error::Overloaded("Parakeet prefill cursor overflow".into()))?,
+            )
+            .map_err(|_| Error::Overloaded("Parakeet prefill cursor exceeds u64".into()))?;
+            rows.push((
+                index,
+                variant,
+                row_model,
+                artifact,
+                arena,
+                target,
+                samples.len(),
+                sample_rate,
+                lease,
+            ));
+        }
+        let states = Self::run_blocking(|| model.start_retained_decode_batch(rows.len()))?;
+        if states.len() != rows.len() {
+            return Err(Error::InferenceError(
+                "Parakeet native prefill returned the wrong row count".into(),
+            ));
+        }
+        if let Some(call) =
+            retained_asr_batch_model_call(crate::engine::NativeBatchMode::Static, states.len())
+        {
+            crate::engine::metrics::record_engine_model_call(call);
+        }
+        for (
+            (
+                index,
+                variant,
+                row_model,
+                artifact,
+                arena,
+                target,
+                sample_count,
+                sample_rate,
+                mut lease,
+            ),
+            state,
+        ) in rows.into_iter().zip(states)
+        {
+            let request = requests[index];
+            if request.is_cancelled() {
+                lease.release()?;
+                outputs[index] = Some(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                    request.id.clone(),
+                )));
+                continue;
+            }
+            model.stage_retained_decode_physical_state(
+                &state,
+                arena.as_ref(),
+                PhysicalStateTransactionId::new(scheduled[index].plan_id)?,
+                target,
+            )?;
+            lease.install_state(ActiveParakeetAsrDecode {
+                variant,
+                model: row_model,
+                artifact,
+                state,
+                last_tokens_generated: 0,
+                stream_sequence: 0,
+                input_sample_rate: sample_rate,
+                input_sample_count: sample_count,
+            })?;
+            lease.restore()?;
+            outputs[index] = Some(ModelSessionResult::sequence(ExecutorOutput {
+                request_id: request.id.clone(),
+                audio: Some(AudioOutput::new(Vec::new(), sample_rate)),
+                text: Some(String::new()),
+                input_transcription: None,
+                tokens_processed: scheduled[index].num_tokens,
+                tokens_generated: 0,
+                finished: false,
+                phase_timing_override: None,
+                asr_diagnostics: None,
+                error: None,
+            }));
+        }
+        outputs
+            .into_iter()
+            .map(|output| {
+                output.ok_or_else(|| Error::InferenceError("Parakeet prefill lost output".into()))
+            })
+            .collect()
+    }
+
+    fn parakeet_asr_decode_batch_with_managed(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+        mut managed: Vec<Option<super::RetainedRowManagedState>>,
+    ) -> Result<Vec<ModelSessionResult>> {
+        let mut outputs = (0..requests.len()).map(|_| None).collect::<Vec<_>>();
+        let live = requests
+            .iter()
+            .enumerate()
+            .filter_map(|(index, request)| {
+                if request.is_cancelled() {
+                    outputs[index] = Some(ModelSessionResult::cancelled_before_dispatch(
+                        ExecutorOutput::cancelled(request.id.clone()),
+                    ));
+                    None
+                } else {
+                    Some(index)
+                }
+            })
+            .collect::<Vec<_>>();
+        if live.is_empty() {
+            return outputs
+                .into_iter()
+                .map(|output| {
+                    output.ok_or_else(|| {
+                        Error::InferenceError("Parakeet decode lost cancelled output".into())
+                    })
+                })
+                .collect();
+        }
+        let model_lease = requests[live[0]]
+            .prepared_asr_model_lease_for_executor()?
+            .ok_or_else(|| Error::InferenceError("Parakeet decode lost model residency".into()))?;
+        let model_arc = model_lease.model_arc();
+        let NativeAsrModel::Parakeet(model) = model_arc.as_ref() else {
+            return Err(Error::InvalidInput(
+                "Parakeet decode crossed model family".into(),
+            ));
+        };
+        let mut rows = Vec::with_capacity(live.len());
+        for index in live.iter().copied() {
+            let request = requests[index];
+            let variant = Self::resolve_variant(request)?;
+            let row_model = request
+                .prepared_asr_model_lease_for_executor()?
+                .ok_or_else(|| {
+                    Error::InferenceError("Parakeet decode row lost model residency".into())
+                })?;
+            if variant.family() != ModelFamily::ParakeetAsr
+                || !Arc::ptr_eq(&row_model.model_arc(), &model_arc)
+                || scheduled[index].is_prefill
+            {
+                return Err(Error::InvalidInput(
+                    "Parakeet decode batch crossed its loaded sequence identity".into(),
+                ));
+            }
+            let mut retained = managed[index].take().ok_or_else(|| {
+                Error::InferenceError("Parakeet decode lost retained tensor state".into())
+            })?;
+            retained.ensure_all_paged_consumed()?;
+            drop(retained.tensor_state.take().ok_or_else(|| {
+                Error::InferenceError("Parakeet decode lost tensor reservation".into())
+            })?);
+            let arena = request
+                .managed_cache_runtime()
+                .and_then(|runtime| runtime.tensor_state())
+                .cloned()
+                .ok_or_else(|| Error::InferenceError("Parakeet decode lost tensor arena".into()))?;
+            let mut lease = ExecutorStateLease::checkout(
+                &self.parakeet_asr_decode_states,
+                scheduled[index].session_key(),
+                variant,
+                "Parakeet ASR decode",
+            )?;
+            let active = lease.require_state_mut()?;
+            if active.variant != variant
+                || !Arc::ptr_eq(&active.model.model_arc(), &model_arc)
+                || !Arc::ptr_eq(
+                    &active.artifact,
+                    &request
+                        .prepared_parakeet_artifact_for_executor()?
+                        .ok_or_else(|| {
+                            Error::InferenceError("Parakeet decode lost encoder artifact".into())
+                        })?,
+                )
+            {
+                return Err(Error::InferenceError(
+                    "Parakeet decode state identity differs from its request".into(),
+                ));
+            }
+            let checkpoint = active.state.clone();
+            model.hydrate_retained_decode_physical_state(
+                &mut active.state,
+                arena.as_ref(),
+                PhysicalStateTransactionId::new(scheduled[index].plan_id)?,
+            )?;
+            lease.mark_dirty();
+            let target = u64::try_from(
+                scheduled[index]
+                    .num_computed_tokens
+                    .checked_add(scheduled[index].num_tokens)
+                    .ok_or_else(|| Error::Overloaded("Parakeet decode cursor overflow".into()))?,
+            )
+            .map_err(|_| Error::Overloaded("Parakeet decode cursor exceeds u64".into()))?;
+            rows.push((index, arena, target, checkpoint, lease));
+        }
+        let mut batch = rows
+            .iter_mut()
+            .map(|(_, _, _, _, lease)| {
+                let active = lease.require_state_mut()?;
+                Ok(ParakeetRetainedDecodeBatchRow {
+                    artifact: active.artifact.as_ref(),
+                    state: &mut active.state,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let steps = Self::run_blocking(|| model.retained_decode_step_batch(&mut batch));
+        drop(batch);
+        let steps = match steps {
+            Ok(steps) => steps,
+            Err(error) => {
+                for (_, _, _, checkpoint, mut lease) in rows.into_iter() {
+                    lease.require_state_mut()?.state = checkpoint;
+                    lease.mark_clean();
+                    lease.restore()?;
+                }
+                return Err(error);
+            }
+        };
+        if steps.len() != rows.len() {
+            return Err(Error::InferenceError(
+                "Parakeet native decode returned the wrong row count".into(),
+            ));
+        }
+        if let Some(call) =
+            retained_asr_batch_model_call(crate::engine::NativeBatchMode::Continuous, steps.len())
+        {
+            crate::engine::metrics::record_engine_model_call(call);
+        }
+        for ((index, arena, target, checkpoint, mut lease), step) in rows.into_iter().zip(steps) {
+            let request = requests[index];
+            if request.is_cancelled() {
+                lease.require_state_mut()?.state = checkpoint;
+                lease.mark_clean();
+                lease.release()?;
+                outputs[index] = Some(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                    request.id.clone(),
+                )));
+                continue;
+            }
+            let active = lease.require_state_mut()?;
+            model.stage_retained_decode_physical_state(
+                &active.state,
+                arena.as_ref(),
+                PhysicalStateTransactionId::new(scheduled[index].plan_id)?,
+                target,
+            )?;
+            let generated = step
+                .tokens_generated
+                .saturating_sub(active.last_tokens_generated);
+            active.last_tokens_generated = step.tokens_generated;
+            if let Some(tx) = Self::stream_sender(request) {
+                if !step.delta.is_empty() {
+                    Self::stream_text_with_policy(
+                        &tx,
+                        request.stream_policy,
+                        &request.id,
+                        &mut active.stream_sequence,
+                        step.delta.clone(),
+                    )?;
+                }
+                if step.finished {
+                    Self::stream_final_marker_with_policy(
+                        &tx,
+                        request.stream_policy,
+                        &request.id,
+                        &mut active.stream_sequence,
+                    )?;
+                }
+            }
+            let diagnostics = step
+                .finished
+                .then(|| {
+                    model
+                        .retained_decode_output(active.artifact.as_ref(), &active.state)
+                        .diagnostics
+                })
+                .flatten();
+            let sample_rate = active.input_sample_rate;
+            let sample_count = active.input_sample_count;
+            lease.mark_clean();
+            if step.finished {
+                lease.release()?;
+            } else {
+                lease.restore()?;
+            }
+            outputs[index] = Some(ModelSessionResult::sequence(ExecutorOutput {
+                request_id: request.id.clone(),
+                audio: Some(AudioOutput::new(Vec::new(), sample_rate)),
+                text: Some(step.text),
+                input_transcription: None,
+                tokens_processed: scheduled[index].num_tokens,
+                tokens_generated: generated,
+                finished: step.finished,
+                phase_timing_override: None,
+                asr_diagnostics: diagnostics,
+                error: None,
+            }));
+            let _ = sample_count;
+        }
+        outputs
+            .into_iter()
+            .map(|output| {
+                output.ok_or_else(|| Error::InferenceError("Parakeet decode lost output".into()))
+            })
+            .collect()
+    }
+
     pub(super) fn asr_decode_batch_with_managed(
         &self,
         requests: &[&EngineCoreRequest],
@@ -5581,6 +5990,15 @@ impl NativeExecutor {
             == ModelFamily::Lfm25Audio
         {
             return self.lfm25_audio_asr_decode_batch_with_managed(
+                &ordered_requests,
+                scheduled,
+                managed_caches,
+            );
+        }
+        if Self::resolve_variant(ordered_requests[live_indices[0]])?.family()
+            == ModelFamily::ParakeetAsr
+        {
+            return self.parakeet_asr_decode_batch_with_managed(
                 &ordered_requests,
                 scheduled,
                 managed_caches,
@@ -6010,6 +6428,24 @@ impl NativeExecutor {
         }
         if family == ModelFamily::Lfm25Audio && request.uses_asr_retained_sequence() {
             return self.lfm25_audio_asr_sequence_request(request, scheduled, managed_state.take());
+        }
+        if family == ModelFamily::ParakeetAsr && request.uses_asr_retained_sequence() {
+            let mut outputs = if scheduled.is_prefill {
+                self.parakeet_asr_prefill_batch_with_managed(
+                    &[request],
+                    std::slice::from_ref(scheduled),
+                    vec![managed_state.take()],
+                )?
+            } else {
+                self.parakeet_asr_decode_batch_with_managed(
+                    &[request],
+                    std::slice::from_ref(scheduled),
+                    vec![managed_state.take()],
+                )?
+            };
+            return outputs.pop().ok_or_else(|| {
+                Error::InferenceError("Parakeet B1 fallback returned no output".into())
+            });
         }
         if managed_state.is_some() {
             return Err(Error::InferenceError(

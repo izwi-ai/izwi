@@ -9,6 +9,9 @@ use crate::models::architectures::lfm25_audio::tts_retained::Lfm25AudioTtsRetain
 use crate::models::architectures::nemotron::asr::{
     NemotronRealtimePreparedChunk, NemotronStreamingState,
 };
+use crate::models::architectures::parakeet::asr::{
+    ParakeetPreparedEncoderArtifact, ParakeetRetainedDecodeState,
+};
 use crate::models::architectures::qwen3::tts::{
     PhysicalTtsDecodeState, PhysicalTtsPrefillState, Qwen3TtsModel,
 };
@@ -50,6 +53,17 @@ pub(super) struct ActiveLfm25AsrDecode {
     pub(super) variant: ModelVariant,
     pub(super) model: Lfm25AudioModelLease,
     pub(super) state: Lfm25AudioAsrRetainedState,
+    pub(super) last_tokens_generated: usize,
+    pub(super) stream_sequence: usize,
+    pub(super) input_sample_rate: u32,
+    pub(super) input_sample_count: usize,
+}
+
+pub(super) struct ActiveParakeetAsrDecode {
+    pub(super) variant: ModelVariant,
+    pub(super) model: AsrModelLease,
+    pub(super) artifact: Arc<ParakeetPreparedEncoderArtifact>,
+    pub(super) state: ParakeetRetainedDecodeState,
     pub(super) last_tokens_generated: usize,
     pub(super) stream_sequence: usize,
     pub(super) input_sample_rate: u32,
