@@ -145,7 +145,7 @@ jq -n --arg git_sha "$git_sha" '{
   models: [{
     model: "audio-model", task: "asr", concurrency: [1, 2, 4, 8],
     correctness: {samples_compared: 8, mismatches: 0},
-    fairness: {requests: 8, completed: 8, starved: 0, max_queue_wait_ms: 10},
+    fairness: {requests: 8, completed: 8, starved: 0, max_queue_wait_ms: 10, queue_wait_limit_ms: 20},
     cancellation: {cancelled_requests: 1, post_cancel_outputs: 0, live_peers_completed: 1, retained_sessions_after: 0},
     cache_pressure: {pressure_events: 1, rejections: 1, recovered_requests: 1, retained_bytes_after: 0},
     unload_drain: {attempts: 1, completed: 1, active_requests_after: 0, retained_sessions_after: 0},

@@ -16,7 +16,7 @@ jq -n '
   def row($model; $task): {
     model: $model, task: $task, concurrency: [1, 2, 4, 8],
     correctness: {samples_compared: 8, mismatches: 0},
-    fairness: {requests: 8, completed: 8, starved: 0, max_queue_wait_ms: 12.0},
+    fairness: {requests: 8, completed: 8, starved: 0, max_queue_wait_ms: 12.0, queue_wait_limit_ms: 20.0},
     cancellation: {cancelled_requests: 1, post_cancel_outputs: 0, live_peers_completed: 1, retained_sessions_after: 0},
     cache_pressure: {pressure_events: 1, rejections: 1, recovered_requests: 1, retained_bytes_after: 0},
     unload_drain: {attempts: 1, completed: 1, active_requests_after: 0, retained_sessions_after: 0},
@@ -34,10 +34,11 @@ jq -n '
 "${validator}" --evidence "${tmp_dir}/valid.json" --report "${tmp_dir}/report.json" \
     --backend cpu --expected-git-sha deadbeef >/dev/null
 
-for mutation in cancellation memory fallback coverage duplicate concurrency task nonfinite device sha; do
+for mutation in cancellation memory fairness fallback coverage duplicate concurrency task nonfinite device sha; do
     case "${mutation}" in
         cancellation) filter='.models[0].cancellation.post_cancel_outputs = 1' ;;
         memory) filter='.models[0].memory.plateau = false' ;;
+        fairness) filter='.models[0].fairness.max_queue_wait_ms = 21' ;;
         fallback) filter='.models[0].fallback.unexpected_backend_fallbacks = 1' ;;
         coverage) filter='.models = [.models[0]]' ;;
         duplicate) filter='.models += [.models[0]]' ;;

@@ -76,6 +76,8 @@ if ! jq -e \
         .fairness.completed == .fairness.requests and
         .fairness.starved == 0 and
         (.fairness.max_queue_wait_ms | finite_nonnegative) and
+        (.fairness.queue_wait_limit_ms | finite_nonnegative) and
+        .fairness.max_queue_wait_ms <= .fairness.queue_wait_limit_ms and
         .cancellation.cancelled_requests > 0 and
         .cancellation.post_cancel_outputs == 0 and
         .cancellation.live_peers_completed > 0 and
