@@ -2988,6 +2988,17 @@ impl NativeAudioChatModel {
         }
     }
 
+    pub(crate) fn retained_tts_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<Lfm25AudioRetainedStateSpec> {
+        match self {
+            Self::Lfm25Audio(model) => {
+                model.retained_state_spec(Lfm25AudioRetainedMode::Tts, stage_graphs)
+            }
+        }
+    }
+
     pub(crate) fn asr_requires_long_form(&self, audio: &[f32], sample_rate: u32) -> bool {
         lfm25_audio_asr_requires_long_form(audio, sample_rate)
     }
