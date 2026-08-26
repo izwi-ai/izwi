@@ -1667,7 +1667,8 @@ fn granite_speech_physical_state_spec(
                 )
             })
         })
-        .count();
+        .copied()
+        .collect::<Vec<_>>();
     let atomic_graphs = stage_graphs
         .iter()
         .filter(|stages| {
@@ -1688,60 +1689,62 @@ fn granite_speech_physical_state_spec(
                 && stages[0].shape_policy == crate::engine::StageShapePolicy::Exact
         })
         .count();
-    if normal_graphs > 0 {
-        let valid_normal = normal_graphs == 1
-            && stage_graphs.iter().any(|stages| {
-                let scalar_stage = |selector| {
-                    stages.iter().any(|stage| {
-                        stage.selector == selector
-                            && stage.batch_mode == crate::engine::NativeBatchMode::None
-                            && stage.shape_policy == crate::engine::StageShapePolicy::Exact
-                            && stage.concurrency == crate::engine::ConcurrencyClass::Exclusive
-                            && stage.max_batch_size == 1
-                    })
-                };
-                let preparation = stages.iter().any(|stage| {
-                    if stage.selector != crate::engine::StageWorkSelector::PreSequencePreparation {
-                        return false;
-                    }
-                    if stage.max_batch_size == 1 {
-                        return stage.batch_mode == crate::engine::NativeBatchMode::None
-                            && stage.shape_policy == crate::engine::StageShapePolicy::Exact
-                            && stage.concurrency == crate::engine::ConcurrencyClass::Exclusive;
-                    }
-                    let batch_workspace = u64::try_from(stage.max_batch_size)
-                        .ok()
-                        .and_then(|width| stage.workspace_per_row_bytes.checked_mul(width));
-                    stage.batch_mode == crate::engine::NativeBatchMode::Static
-                        && stage.shape_policy == crate::engine::StageShapePolicy::Padded
-                        && stage.concurrency == crate::engine::ConcurrencyClass::Batchable
-                        && stage.workspace_base_bytes == 0
-                        && stage.workspace_per_row_bytes == 0
-                        && stage.workspace_per_work_unit_bytes == 0
-                        && batch_workspace.is_some_and(|bytes| stage.max_workspace_bytes >= bytes)
-                });
-                let decode = stages.iter().any(|stage| {
-                    let batch_workspace = u64::try_from(stage.max_batch_size)
-                        .ok()
-                        .and_then(|width| stage.workspace_per_row_bytes.checked_mul(width));
-                    stage.selector == crate::engine::StageWorkSelector::SequenceDecode
-                        && stage.batch_mode == crate::engine::NativeBatchMode::Continuous
-                        && stage.shape_policy == crate::engine::StageShapePolicy::Ragged
-                        && stage.concurrency == crate::engine::ConcurrencyClass::Batchable
-                        && stage.max_batch_size > 0
-                        && stage.workspace_base_bytes == 0
-                        && stage.workspace_per_row_bytes > 0
-                        && stage.workspace_per_work_unit_bytes == 0
-                        && batch_workspace.is_some_and(|bytes| stage.max_workspace_bytes >= bytes)
-                });
-                stages.len() == 3
-                    && preparation
-                    && scalar_stage(crate::engine::StageWorkSelector::SequencePrefill)
-                    && decode
+    if !normal_graphs.is_empty() {
+        let valid_normal = normal_graphs.iter().all(|stages| {
+            let scalar_stage = |selector| {
+                stages.iter().any(|stage| {
+                    stage.selector == selector
+                        && stage.batch_mode == crate::engine::NativeBatchMode::None
+                        && stage.shape_policy == crate::engine::StageShapePolicy::Exact
+                        && stage.concurrency == crate::engine::ConcurrencyClass::Exclusive
+                        && stage.max_batch_size == 1
+                })
+            };
+            let preparation = stages.iter().any(|stage| {
+                if stage.selector != crate::engine::StageWorkSelector::PreSequencePreparation {
+                    return false;
+                }
+                if stage.max_batch_size == 1 {
+                    return stage.batch_mode == crate::engine::NativeBatchMode::None
+                        && stage.shape_policy == crate::engine::StageShapePolicy::Exact
+                        && stage.concurrency == crate::engine::ConcurrencyClass::Exclusive;
+                }
+                let batch_workspace = u64::try_from(stage.max_batch_size)
+                    .ok()
+                    .and_then(|width| stage.workspace_per_row_bytes.checked_mul(width));
+                stage.batch_mode == crate::engine::NativeBatchMode::Static
+                    && stage.shape_policy == crate::engine::StageShapePolicy::Padded
+                    && stage.concurrency == crate::engine::ConcurrencyClass::Batchable
+                    && stage.workspace_base_bytes == 0
+                    && stage.workspace_per_row_bytes == 0
+                    && stage.workspace_per_work_unit_bytes == 0
+                    && batch_workspace.is_some_and(|bytes| stage.max_workspace_bytes >= bytes)
             });
-        if !valid_normal || atomic_graphs != 1 || stage_graphs.len() != 2 {
+            let decode = stages.iter().any(|stage| {
+                let batch_workspace = u64::try_from(stage.max_batch_size)
+                    .ok()
+                    .and_then(|width| stage.workspace_per_row_bytes.checked_mul(width));
+                stage.selector == crate::engine::StageWorkSelector::SequenceDecode
+                    && stage.batch_mode == crate::engine::NativeBatchMode::Continuous
+                    && stage.shape_policy == crate::engine::StageShapePolicy::Ragged
+                    && stage.concurrency == crate::engine::ConcurrencyClass::Batchable
+                    && stage.max_batch_size > 0
+                    && stage.workspace_base_bytes == 0
+                    && stage.workspace_per_row_bytes > 0
+                    && stage.workspace_per_work_unit_bytes == 0
+                    && batch_workspace.is_some_and(|bytes| stage.max_workspace_bytes >= bytes)
+            });
+            stages.len() == 3
+                && preparation
+                && scalar_stage(crate::engine::StageWorkSelector::SequencePrefill)
+                && decode
+        });
+        if !valid_normal
+            || atomic_graphs == 0
+            || normal_graphs.len() + atomic_graphs != stage_graphs.len()
+        {
             return Err(Error::ModelLoadError(
-                "Granite Speech ASR requires authenticated preparation batching, scalar exact prefill, continuous ragged decode, and one atomic compatibility graph"
+                "Granite Speech ASR requires authenticated preparation batching, scalar exact prefill, continuous ragged decode, and an atomic compatibility graph"
                     .into(),
             ));
         }
@@ -2501,6 +2504,31 @@ mod tests {
         let atomic = vec![granite_test_stage(0, StageWorkSelector::Atomic)];
         granite_speech_physical_state_spec(
             &[normal.as_slice(), atomic.as_slice()],
+            retained,
+            invocation,
+            128,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn physical_state_accepts_enumerated_transport_variants_of_each_graph() {
+        let invocation = granite_test_invocation_contract();
+        let retained = granite_speech_retained_contract(invocation.clone()).unwrap();
+        let normal = vec![
+            granite_test_static_preparation_stage(0),
+            granite_test_stage(1, StageWorkSelector::SequencePrefill),
+            granite_test_stage(2, StageWorkSelector::SequenceDecode),
+        ];
+        let atomic = vec![granite_test_stage(0, StageWorkSelector::Atomic)];
+
+        granite_speech_physical_state_spec(
+            &[
+                normal.as_slice(),
+                normal.as_slice(),
+                atomic.as_slice(),
+                atomic.as_slice(),
+            ],
             retained,
             invocation,
             128,
