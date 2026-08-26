@@ -58,6 +58,7 @@ use crate::models::architectures::granite_speech::asr::{
     GraniteSpeechPreparationBatchRow, GraniteSpeechPreparedGeometry,
     GraniteSpeechPreparedPromptArtifact,
 };
+use crate::models::architectures::kokoro::{kokoro_output_budget, kokoro_peak_workspace};
 use crate::models::architectures::qwen3::asr::{
     Qwen3AsrAudioBatchRow, Qwen3AsrAudioPreparationGeometry, Qwen3AsrPreparedAudio,
 };
@@ -667,7 +668,7 @@ fn lfm25_audio_tts_preparation_workspace(backend: BackendKind, bytes: u64) -> Re
     workspace
 }
 
-fn asr_encoder_retained_resources(
+fn retained_artifact_resources(
     backend: BackendKind,
     host_bytes: u64,
     accelerator_bytes: u64,
@@ -685,6 +686,39 @@ fn asr_encoder_retained_resources(
         }
     }
     Ok(resources)
+}
+
+fn asr_encoder_retained_resources(
+    backend: BackendKind,
+    host_bytes: u64,
+    accelerator_bytes: u64,
+) -> Result<ResourceVector> {
+    retained_artifact_resources(backend, host_bytes, accelerator_bytes)
+}
+
+fn kokoro_synthesis_resources(
+    backend: BackendKind,
+    text: &str,
+    speed: f32,
+) -> Result<ResourceVector> {
+    let budget = kokoro_output_budget(text, speed)?;
+    let workspace = kokoro_peak_workspace(
+        u64::try_from(budget.max_chunk_expanded_frames)
+            .map_err(|_| Error::Overloaded("Kokoro frame budget exceeds u64".into()))?,
+    )?;
+    let output_bytes = u64::try_from(budget.max_samples)
+        .ok()
+        .and_then(|samples| samples.checked_mul(std::mem::size_of::<f32>() as u64))
+        .ok_or_else(|| Error::Overloaded("Kokoro output reservation overflowed".into()))?;
+    let host_bytes = output_bytes
+        .checked_add(workspace.host_bytes)
+        .ok_or_else(|| Error::Overloaded("Kokoro host reservation overflowed".into()))?;
+    super::tts::direct_tts_physical_resources(
+        backend,
+        host_bytes,
+        workspace.cpu_tensor_bytes,
+        workspace.accelerator_tensor_bytes,
+    )
 }
 
 fn ensure_preparation_copy_deadline(job: &JobLease) -> Result<()> {
@@ -4696,6 +4730,185 @@ impl RuntimeService {
             .await
     }
 
+    async fn prepare_kokoro_tts_for_binding(
+        &self,
+        request: EngineCoreRequest,
+        job: JobLease,
+        residency_lease: Option<&ModelResidencyLease>,
+    ) -> Result<(EngineCoreRequest, JobLease)> {
+        if request.task_type != TaskType::TTS
+            || request
+                .model_variant
+                .is_none_or(|variant| variant.family() != ModelFamily::KokoroTts)
+            || request
+                .prepared_kokoro_tts_artifact_for_executor()?
+                .is_some()
+        {
+            return Ok((request, job));
+        }
+        let variant = request.model_variant.expect("validated Kokoro TTS variant");
+        let model = self
+            .model_registry
+            .get_kokoro_lease(variant)
+            .await
+            .ok_or_else(|| {
+                Error::ModelNotFound(format!("Kokoro TTS model {variant} is not loaded"))
+            })?;
+        let residency = residency_lease.ok_or_else(|| {
+            Error::InferenceError("Kokoro TTS preparation requires model residency".into())
+        })?;
+        let loaded_bundle = self
+            .model_lifecycle
+            .try_get_ready_bundle(residency.variant());
+        let contract = loaded_contract_for_residency(
+            residency,
+            loaded_bundle.as_deref(),
+            CapabilityKind::Tts,
+            false,
+            self.coordinator.execution_group_id(),
+            self.backend_router.context().backend_kind,
+            Some(ExecutionTargetKind::TokenEngine),
+        )?;
+        let context_limit = self
+            .model_registry
+            .effective_context(variant)
+            .ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "Kokoro TTS model {variant} has no effective context"
+                ))
+            })?;
+        let text = request
+            .tts_text_for_execution()
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| Error::InvalidInput("Kokoro TTS request is missing text".into()))?
+            .to_string();
+        let speaker = request.tts_speaker_for_execution().map(str::to_string);
+        let language = request.language.clone();
+        let speed = request.params.speed;
+        let budget = kokoro_output_budget(&text, speed)?;
+        let retained_request_bytes = u64::try_from(retained_engine_request_input_bytes(&request)?)
+            .map_err(|_| Error::Overloaded("Kokoro retained request exceeds u64".into()))?;
+        job.record_materialized_usage(JobResourceObservation::host(retained_request_bytes))?;
+        let bridge = self.coordinator.bridge_preparation_admission(job)?;
+        let artifact_host_ceiling = retained_request_bytes
+            .checked_mul(2)
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    u64::try_from(budget.max_model_tokens)
+                        .ok()?
+                        .checked_mul(8)?,
+                )
+            })
+            .ok_or_else(|| Error::Overloaded("Kokoro artifact ceiling overflowed".into()))?;
+        let preparation_spec = JobSpec {
+            request_id: request.id.clone(),
+            lane: CoordinatorLane::Atomic,
+            priority: request.priority,
+            workload_class: request.workload_class,
+            deadline: request.deadline,
+            resources: retained_artifact_resources(
+                self.backend_router.context().backend_kind,
+                artifact_host_ceiling,
+                256 * std::mem::size_of::<f32>() as u64,
+            )?,
+        };
+        let preparation_job = match self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                preparation_spec,
+                JobResourceObservation::host(retained_request_bytes),
+            )
+            .await
+        {
+            Ok(job) => job,
+            Err(failure) => return Err(failure.error),
+        };
+        let work = WorkUnit::PreSequencePreparation {
+            kind: "tts.prepare.kokoro".into(),
+        };
+        let max_model_tokens = u64::try_from(budget.max_model_tokens)
+            .map_err(|_| Error::Overloaded("Kokoro token budget exceeds u64".into()))?;
+        let cost = crate::engine::WorkCost::new(1, max_model_tokens, 0);
+        let cancellation = PreparationCancellation::default();
+        let row = self.coordinator.seal_preparation_row(
+            preparation_job,
+            &contract,
+            &work,
+            cost,
+            max_model_tokens,
+            cancellation.clone(),
+        )?;
+        let model_for_preparation = model.clone();
+        let mut cancellation_guard = PreparationCancellationGuard {
+            cancellation,
+            armed: true,
+        };
+        let mut outcomes = self
+            .coordinator
+            .run_loaded_native_preparation_batch(vec![row], contract, work, move |live| {
+                if live != [0] {
+                    return Err(Error::InferenceError(
+                        "Kokoro preparation must remain scalar".into(),
+                    ));
+                }
+                let artifact = Arc::new(model_for_preparation.prepare_request(
+                    &text,
+                    speaker.as_deref(),
+                    language.as_deref(),
+                    speed,
+                )?);
+                let retained = JobResourceObservation {
+                    host_bytes: retained_request_bytes
+                        .checked_add(artifact.retained_host_bytes()?)
+                        .ok_or_else(|| {
+                            Error::Overloaded("Kokoro retained bytes overflowed".into())
+                        })?,
+                    accelerator_bytes: artifact.retained_tensor_bytes()?,
+                };
+                Ok(vec![Ok(PreparationArtifact {
+                    retained,
+                    value: artifact,
+                })])
+            })
+            .await?;
+        cancellation_guard.armed = false;
+        let (artifact, bridge) = match outcomes
+            .pop()
+            .ok_or_else(|| Error::InferenceError("Kokoro preparation returned no outcome".into()))?
+        {
+            PreparationRowOutcome::Committed { artifact, bridge } => (artifact, bridge),
+            PreparationRowOutcome::Cancelled => return Err(Error::Cancelled(request.id.clone())),
+            PreparationRowOutcome::TimedOut => return Err(Error::Timeout(request.id.clone())),
+            PreparationRowOutcome::Failed(error) => return Err(error),
+        };
+        let retained = artifact.retained;
+        let mut prepared = request;
+        prepared.install_kokoro_tts_execution_model(
+            variant,
+            model,
+            artifact.value,
+            context_limit,
+        )?;
+        let (mut execution, _) = self.coordinator_job_for_request(&prepared)?;
+        let prepared_text = prepared.tts_text_for_execution().ok_or_else(|| {
+            Error::InferenceError("prepared Kokoro request lost its text".into())
+        })?;
+        execution.resources = execution.resources.checked_add(kokoro_synthesis_resources(
+            self.backend_router.context().backend_kind,
+            prepared_text,
+            prepared.params.speed,
+        )?)?;
+        match self
+            .coordinator
+            .admit_observed_from_preparation(bridge, execution, retained)
+            .await
+        {
+            Ok(job) => Ok((prepared, job)),
+            Err(failure) => Err(failure.error),
+        }
+    }
+
     async fn prepare_vibevoice_tts_for_binding(
         &self,
         request: EngineCoreRequest,
@@ -5460,6 +5673,9 @@ impl RuntimeService {
     ) -> Result<EngineOutput> {
         let (request, job) = self
             .prepare_asr_shape_for_binding(request, job, residency_lease.as_ref())
+            .await?;
+        let (request, job) = self
+            .prepare_kokoro_tts_for_binding(request, job, residency_lease.as_ref())
             .await?;
         let (request, job) = self
             .prepare_vibevoice_tts_for_binding(request, job, residency_lease.as_ref())

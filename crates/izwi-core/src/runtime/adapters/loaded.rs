@@ -2192,6 +2192,31 @@ impl LoadedExecutionAdapter for StaticTtsExecutionAdapter {
         stage.validate()?;
         scalar.validate()?;
 
+        if kokoro {
+            let mut preparation = StageDescriptor::from_execution_profile(
+                StageId::new(2),
+                "tts.prepare.kokoro",
+                &execution_profile,
+                NativeBatchMode::None,
+            );
+            preparation.selector = StageWorkSelector::PreSequencePreparation;
+            preparation.max_batch_size = 1;
+            preparation.max_work_units = 1;
+            preparation.max_workspace_bytes = 0;
+            preparation.concurrency = ConcurrencyClass::Exclusive;
+            preparation.shape_policy = StageShapePolicy::Exact;
+            preparation.validate()?;
+            return Ok(LoadedExecutionContract {
+                execution_group_id: self.execution_group_id,
+                model_instance_id: self.model_instance_id,
+                adapter_instance_id: self.adapter_instance_id(),
+                adapter_abi_revision: self.adapter_abi_revision(),
+                metadata,
+                execution_profile,
+                stages: Arc::from([preparation, stage, scalar]),
+            });
+        }
+
         Ok(LoadedExecutionContract {
             execution_group_id: self.execution_group_id,
             model_instance_id: self.model_instance_id,
@@ -5847,9 +5872,12 @@ mod tests {
                         {
                             assert_eq!(contract.execution_profile.mode, ExecutionMode::Atomic);
                             assert_eq!(contract.execution_profile.max_batch_size, 8);
-                            assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::Static);
-                            assert_eq!(contract.stages[0].shape_policy, StageShapePolicy::Ragged);
-                            assert_eq!(contract.stages[1].batch_mode, NativeBatchMode::None);
+                            let static_stage = contract
+                                .stages
+                                .iter()
+                                .find(|stage| stage.batch_mode == NativeBatchMode::Static)
+                                .unwrap();
+                            assert_eq!(static_stage.shape_policy, StageShapePolicy::Ragged);
                         } else {
                             assert_eq!(contract.execution_profile.max_batch_size, 1);
                             assert_eq!(
@@ -6339,13 +6367,22 @@ mod tests {
             assert_eq!(contract.execution_profile.mode, ExecutionMode::Atomic);
             assert_eq!(contract.execution_profile.cache_mode, CacheMode::None);
             assert_eq!(contract.execution_profile.max_batch_size, 4);
-            assert_eq!(contract.stages.len(), 2);
-            assert_eq!(contract.stages[0].selector, StageWorkSelector::Atomic);
-            assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::Static);
-            assert_eq!(contract.stages[0].shape_policy, StageShapePolicy::Ragged);
-            assert_eq!(contract.stages[0].max_batch_size, 4);
-            assert_eq!(contract.stages[1].batch_mode, NativeBatchMode::None);
-            assert_eq!(contract.stages[1].max_batch_size, 1);
+            assert_eq!(contract.stages.len(), 3);
+            let preparation = contract
+                .stages
+                .iter()
+                .find(|stage| stage.selector == StageWorkSelector::PreSequencePreparation)
+                .unwrap();
+            assert_eq!(preparation.batch_mode, NativeBatchMode::None);
+            assert_eq!(preparation.max_batch_size, 1);
+            let static_stage = contract
+                .stages
+                .iter()
+                .find(|stage| stage.batch_mode == NativeBatchMode::Static)
+                .unwrap();
+            assert_eq!(static_stage.selector, StageWorkSelector::Atomic);
+            assert_eq!(static_stage.shape_policy, StageShapePolicy::Ragged);
+            assert_eq!(static_stage.max_batch_size, 4);
         }
     }
 

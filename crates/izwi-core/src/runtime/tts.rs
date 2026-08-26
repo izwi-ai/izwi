@@ -152,7 +152,7 @@ fn direct_tts_generation_shape(
     })
 }
 
-fn direct_tts_physical_resources(
+pub(super) fn direct_tts_physical_resources(
     backend: BackendKind,
     host_bytes: u64,
     cpu_tensor_bytes: u64,
