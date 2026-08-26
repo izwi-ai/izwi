@@ -37,6 +37,7 @@ const VIBEVOICE_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(19
 const GRANITE_SPEECH_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(22);
 const LFM25_AUDIO_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(23);
 const LFM25_AUDIO_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(24);
+const VIBEVOICE_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(26);
 pub(crate) const VOXTRAL_REALTIME_ADAPTER_ABI: AdapterAbiRevision =
     AdapterAbiRevision::new(crate::models::architectures::voxtral::VOXTRAL_REALTIME_EXECUTION_ABI);
 // Architecture ceiling: 8,192 codec frames, 1,920 output samples/frame,
@@ -395,6 +396,20 @@ fn loaded_execution_contracts(
             .map(|requirements| requirements.with_asr_long_form(true))
             .collect::<Vec<_>>();
         requirements.extend(long_form);
+    }
+    // VibeVoice TTS retains its public/direct atomic route as a separately
+    // authenticated invocation graph while normal requests use the retained
+    // sequence graph. The internal long-form bit is only a graph-enumeration
+    // discriminator here; request routing never labels TTS as ASR.
+    if metadata.capability == CapabilityKind::Tts
+        && metadata.model_variant.family() == crate::catalog::ModelFamily::VibeVoiceTts
+    {
+        let atomic = requirements
+            .iter()
+            .copied()
+            .map(|requirements| requirements.with_asr_long_form(true))
+            .collect::<Vec<_>>();
+        requirements.extend(atomic);
     }
     let contracts = requirements
         .into_iter()
@@ -871,6 +886,11 @@ fn is_lfm25_audio_physical_tts(metadata: AdapterMetadata) -> bool {
         && metadata.model_variant.family() == crate::catalog::ModelFamily::Lfm25Audio
 }
 
+fn is_vibevoice_physical_tts(metadata: AdapterMetadata) -> bool {
+    metadata.capability == CapabilityKind::Tts
+        && metadata.model_variant.family() == crate::catalog::ModelFamily::VibeVoiceTts
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PhysicalQwenTtsAdapterFactory;
 
@@ -1045,6 +1065,34 @@ struct Lfm25AudioPhysicalAsrAdapterFactory;
 #[derive(Debug, Clone, Copy)]
 struct Lfm25AudioPhysicalTtsAdapterFactory;
 
+#[derive(Debug, Clone, Copy)]
+struct VibeVoicePhysicalTtsAdapterFactory;
+
+impl LoadedExecutionAdapterFactory for VibeVoicePhysicalTtsAdapterFactory {
+    fn id(&self) -> &'static str {
+        "builtin.vibevoice_tts.physical_sequence"
+    }
+    fn batch_mode(&self) -> NativeBatchMode {
+        NativeBatchMode::Continuous
+    }
+    fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
+        is_vibevoice_physical_tts(metadata)
+    }
+    fn create(
+        &self,
+        context: LoadedAdapterFactoryContext,
+        metadata: AdapterMetadata,
+    ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
+        Ok(Arc::new(VibeVoiceTtsExecutionAdapter::new(
+            context.execution_group_id,
+            context.model_instance_id,
+            metadata,
+            context.backend_kind,
+            context.max_tensor_batch_size,
+        )))
+    }
+}
+
 impl LoadedExecutionAdapterFactory for Lfm25AudioPhysicalTtsAdapterFactory {
     fn id(&self) -> &'static str {
         "builtin.lfm25_audio_tts.physical_sequence"
@@ -1205,6 +1253,7 @@ impl LoadedExecutionAdapterFactory for ScalarExecutionAdapterFactory {
             && !is_granite_speech_physical_asr(metadata)
             && !is_lfm25_audio_physical_asr(metadata)
             && !is_lfm25_audio_physical_tts(metadata)
+            && !is_vibevoice_physical_tts(metadata)
     }
 
     fn create(
@@ -1234,6 +1283,7 @@ pub(super) fn built_in_loaded_adapter_factories() -> Vec<Arc<dyn LoadedExecution
         Arc::new(GraniteSpeechPhysicalAsrAdapterFactory),
         Arc::new(Lfm25AudioPhysicalAsrAdapterFactory),
         Arc::new(Lfm25AudioPhysicalTtsAdapterFactory),
+        Arc::new(VibeVoicePhysicalTtsAdapterFactory),
         Arc::new(ScalarExecutionAdapterFactory),
     ]
 }
@@ -2209,6 +2259,160 @@ impl LoadedExecutionAdapter for ContinuousAsrExecutionAdapter {
             adapter_abi_revision: self.adapter_abi_revision(),
             metadata,
             execution_profile,
+            stages: Arc::from([preparation, prefill, decode]),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct VibeVoiceTtsExecutionAdapter {
+    execution_group_id: ExecutionGroupId,
+    model_instance_id: ModelInstanceId,
+    adapter_instance_id: AdapterInstanceId,
+    metadata: AdapterMetadata,
+    backend_kind: BackendKind,
+    max_batch_size: usize,
+}
+
+impl VibeVoiceTtsExecutionAdapter {
+    fn new(
+        execution_group_id: ExecutionGroupId,
+        model_instance_id: ModelInstanceId,
+        metadata: AdapterMetadata,
+        backend_kind: BackendKind,
+        max_batch_size: usize,
+    ) -> Self {
+        Self {
+            execution_group_id,
+            model_instance_id,
+            adapter_instance_id: AdapterInstanceId::new(
+                NEXT_ADAPTER_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+            ),
+            metadata,
+            backend_kind,
+            max_batch_size: max_batch_size.max(1),
+        }
+    }
+}
+
+impl LoadedExecutionAdapter for VibeVoiceTtsExecutionAdapter {
+    fn metadata(&self) -> AdapterMetadata {
+        self.metadata
+    }
+    fn adapter_instance_id(&self) -> AdapterInstanceId {
+        self.adapter_instance_id
+    }
+    fn adapter_abi_revision(&self) -> AdapterAbiRevision {
+        VIBEVOICE_TTS_ADAPTER_ABI
+    }
+
+    fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
+        use crate::models::architectures::vibevoice::{
+            VIBEVOICE_TTS_DECODE_STAGE, VIBEVOICE_TTS_LEGACY_STAGE, VIBEVOICE_TTS_PREFILL_STAGE,
+            VIBEVOICE_TTS_PREPARATION_STAGE,
+        };
+        if streaming.asr_long_form {
+            let mut profile = scalar_execution_profile(self.metadata, self.backend_kind, false);
+            profile.mode = ExecutionMode::Atomic;
+            profile.cache_mode = CacheMode::None;
+            profile.cache_namespace = None;
+            profile.kv_dtype = "none".into();
+            profile.max_batch_size = 1;
+            profile.resolved_from_loaded_model = true;
+            let mut stage = StageDescriptor::from_execution_profile(
+                StageId::new(0),
+                VIBEVOICE_TTS_LEGACY_STAGE,
+                &profile,
+                NativeBatchMode::None,
+            );
+            stage.selector = StageWorkSelector::Atomic;
+            stage.shape_policy = StageShapePolicy::Exact;
+            stage.validate()?;
+            return Ok(LoadedExecutionContract {
+                execution_group_id: self.execution_group_id,
+                model_instance_id: self.model_instance_id,
+                adapter_instance_id: self.adapter_instance_id,
+                adapter_abi_revision: self.adapter_abi_revision(),
+                metadata: self.metadata,
+                execution_profile: profile,
+                stages: Arc::from([stage]),
+            });
+        }
+        let mut profile = scalar_execution_profile(self.metadata, self.backend_kind, false);
+        profile.mode = ExecutionMode::Sequence;
+        profile.prefill = PrefillMode::Incremental;
+        profile.incremental_decode = true;
+        profile.decode_batch = NativeBatchMode::Continuous;
+        profile.cache_mode = CacheMode::ExternalPaged;
+        profile.cache_namespace = Some(format!(
+            "{}:tts:{}:state-v2",
+            self.metadata.model_variant,
+            self.backend_kind.as_str()
+        ));
+        profile.kv_dtype = "state_v2_resolved".into();
+        profile.cancellation = CancellationGranularity::SequenceStep;
+        profile.concurrency = ConcurrencyClass::Batchable;
+        profile.recompute_safe = true;
+        profile.cache_release_safe = true;
+        profile.max_batch_size = self.max_batch_size;
+        profile.resolved_from_loaded_model = true;
+
+        let mut preparation = StageDescriptor::from_execution_profile(
+            StageId::new(0),
+            VIBEVOICE_TTS_PREPARATION_STAGE,
+            &profile,
+            NativeBatchMode::None,
+        );
+        preparation.selector = StageWorkSelector::PreSequencePreparation;
+        preparation.progress = StageProgressKind::Atomic;
+        preparation.max_batch_size = 1;
+        preparation.concurrency = ConcurrencyClass::Exclusive;
+        preparation.shape_policy = StageShapePolicy::Exact;
+        preparation.max_work_units = 16_384;
+        preparation.max_workspace_bytes = 512 * 1024 * 1024;
+        preparation.output_visibility = OutputVisibility::AfterQuantumCommit;
+
+        let mut prefill = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            VIBEVOICE_TTS_PREFILL_STAGE,
+            &profile,
+            NativeBatchMode::None,
+        );
+        prefill.selector = StageWorkSelector::SequencePrefill;
+        prefill.max_batch_size = 1;
+        prefill.concurrency = ConcurrencyClass::Exclusive;
+        prefill.shape_policy = StageShapePolicy::Exact;
+        prefill.max_work_units = 16_384;
+        prefill.max_workspace_bytes = 512 * 1024 * 1024;
+        prefill.retained_state_selections = Some(vec![]);
+        prefill.output_visibility = OutputVisibility::AfterQuantumCommit;
+
+        let mut decode = StageDescriptor::from_execution_profile(
+            StageId::new(2),
+            VIBEVOICE_TTS_DECODE_STAGE,
+            &profile,
+            NativeBatchMode::Continuous,
+        );
+        decode.selector = StageWorkSelector::SequenceDecode;
+        decode.shape_policy = StageShapePolicy::Ragged;
+        decode.max_work_units = u64::try_from(self.max_batch_size)
+            .map_err(|_| Error::Overloaded("VibeVoice TTS batch width exceeds u64".into()))?;
+        decode.workspace_per_row_bytes = 512 * 1024 * 1024;
+        decode.max_workspace_bytes = decode
+            .workspace_per_row_bytes
+            .checked_mul(decode.max_work_units)
+            .ok_or_else(|| Error::Overloaded("VibeVoice TTS decode workspace overflow".into()))?;
+        decode.retained_state_selections = Some(vec![]);
+        preparation.validate()?;
+        prefill.validate()?;
+        decode.validate()?;
+        Ok(LoadedExecutionContract {
+            execution_group_id: self.execution_group_id,
+            model_instance_id: self.model_instance_id,
+            adapter_instance_id: self.adapter_instance_id,
+            adapter_abi_revision: self.adapter_abi_revision(),
+            metadata: self.metadata,
+            execution_profile: profile,
             stages: Arc::from([preparation, prefill, decode]),
         })
     }
