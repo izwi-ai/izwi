@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use candle_core::Tensor;
+use candle_core::{IndexOp, Tensor};
 
 use crate::backends::state::TensorStateArena;
 use crate::error::{Error, Result};
@@ -84,6 +84,100 @@ pub(crate) struct Lfm25AudioAsrRetainedState {
 }
 
 impl Lfm25AudioAsrRetainedState {
+    pub(crate) fn decode_will_append(&self, tokenizer: &Lfm25TextTokenizer) -> Result<bool> {
+        if self.finished || self.prefill_cursor != self.artifact.prompt_tokens {
+            return Ok(false);
+        }
+        let token = self.pending_token.ok_or_else(|| {
+            Error::InferenceError("LFM2.5 Audio ASR decode has no staged token".into())
+        })?;
+        if is_stop_token(token, &self.specials) {
+            return Ok(false);
+        }
+        let mut ids = self.generated_ids.clone();
+        ids.push(token);
+        let decoded = tokenizer.decode_text(&ids)?;
+        Ok(!has_token_repetition_loop(&ids) && trim_repeated_phrase_tail(&decoded).is_none())
+    }
+
+    pub(crate) fn decode_append_batch(
+        backbone: &QuantizedLfm2Backbone,
+        tokenizer: &Lfm25TextTokenizer,
+        states: &mut [&mut Self],
+        caches: &mut [&mut PhysicalPagedKvCache],
+        checkpoints: &[&Lfm25AudioAsrQuantumCheckpoint],
+    ) -> Result<Vec<Lfm25AudioAsrDecodeStep>> {
+        if states.is_empty() || states.len() != caches.len() || states.len() != checkpoints.len() {
+            return Err(Error::InvalidInput(
+                "LFM2.5 Audio ASR decode batch rows do not match".into(),
+            ));
+        }
+        let mut tokens = Vec::with_capacity(states.len());
+        let mut positions = Vec::with_capacity(states.len());
+        let mut next_host = Vec::with_capacity(states.len());
+        for row in 0..states.len() {
+            states[row].authenticate_step(caches[row], checkpoints[row])?;
+            if !states[row].decode_will_append(tokenizer)? {
+                return Err(Error::InvalidInput(
+                    "LFM2.5 Audio native decode batch contains a zero-append terminal row".into(),
+                ));
+            }
+            let token = states[row].pending_token.expect("append row has a token");
+            let mut ids = states[row].generated_ids.clone();
+            ids.push(token);
+            let assembled = tokenizer.decode_text(&ids)?;
+            let delta = text_delta(&states[row].assembled, &assembled);
+            tokens.push(token);
+            positions.push(states[row].main_position()?);
+            next_host.push((ids, assembled, delta));
+        }
+        let mut shortconv = states
+            .iter_mut()
+            .map(|state| &mut state.retained.shortconv)
+            .collect::<Vec<_>>();
+        let logits = backbone.forward_token_ids_retained_batch(
+            &tokens,
+            &positions,
+            &mut shortconv,
+            caches,
+        )?;
+        drop(shortconv);
+        if logits.dim(0)? != states.len() {
+            return Err(Error::InferenceError(
+                "LFM2.5 Audio native decode returned the wrong row count".into(),
+            ));
+        }
+        // Finish every fallible per-row calculation before publishing any
+        // host state. The caller's armed outer checkpoints can then roll back
+        // the already-completed physical cohort without partial host updates.
+        let mut post_kernel = Vec::with_capacity(states.len());
+        for (row, state) in states.iter().enumerate() {
+            let reached_budget = next_host[row].0.len() >= state.max_new_tokens;
+            let next_pending = if reached_budget {
+                None
+            } else {
+                Some(greedy_from_logits(&logits.i(row)?, state.vocab_limit)?)
+            };
+            let appended_count = state.decode_tokens_appended.checked_add(1).ok_or_else(|| {
+                Error::InferenceError("LFM2.5 Audio ASR decode cursor overflowed".into())
+            })?;
+            post_kernel.push((reached_budget, next_pending, appended_count));
+        }
+        let mut outcomes = Vec::with_capacity(states.len());
+        for (row, state) in states.iter_mut().enumerate() {
+            let (ids, assembled, delta) = std::mem::take(&mut next_host[row]);
+            let (reached_budget, next_pending, appended_count) = post_kernel[row];
+            state.decode_tokens_appended = appended_count;
+            state.pending_token = next_pending;
+            state.generated_ids = ids;
+            state.assembled = assembled;
+            state.finished = reached_budget;
+            state.stop_reason = reached_budget.then_some(Lfm25AudioAsrStopReason::MaxTokens);
+            outcomes.push(state.decode_outcome(Some(tokens[row]), Some(tokens[row]), delta));
+        }
+        Ok(outcomes)
+    }
+
     pub(crate) fn new(
         artifact: Arc<Lfm25AudioPreparedAsrArtifact>,
         retained: Lfm25AudioRetainedState,
