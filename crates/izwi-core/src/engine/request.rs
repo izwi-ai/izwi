@@ -23,6 +23,7 @@ use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::granite_speech::asr::GraniteSpeechPreparedPromptArtifact;
+use crate::models::architectures::lfm25_audio::model::Lfm25AudioPreparedAsrArtifact;
 use crate::models::architectures::qwen3::asr::Qwen3AsrPreparedAudio;
 use crate::models::architectures::qwen3::tts::{
     Qwen3TtsModel, SpeakerReference, TtsGenerationParams, TtsSessionCacheRequest,
@@ -30,8 +31,8 @@ use crate::models::architectures::qwen3::tts::{
 use crate::models::architectures::vibevoice::asr::VibeVoiceAsrPreparedArtifact;
 use crate::models::architectures::whisper::asr::WhisperPreparedWindow;
 use crate::models::registry::{
-    AsrModelLease, ChatModelLease, NativeAsrModel, NativeChatModel, NativeChatPreparedPrompt,
-    QwenTtsModelLease,
+    AsrModelLease, ChatModelLease, Lfm25AudioModelLease, NativeAsrModel, NativeChatModel,
+    NativeChatPreparedPrompt, QwenTtsModelLease,
 };
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRequestConfig};
 use crate::runtime::audio_io::{
@@ -341,6 +342,7 @@ enum PreparedChatModel {
 #[derive(Clone)]
 enum PreparedIncrementalModel {
     Asr(AsrModelLease),
+    Lfm25AudioAsr(Lfm25AudioModelLease),
     QwenTts(QwenTtsModelLease),
 }
 
@@ -348,6 +350,7 @@ impl fmt::Debug for PreparedIncrementalModel {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Asr(model) => write!(formatter, "Asr({:p})", &**model),
+            Self::Lfm25AudioAsr(model) => write!(formatter, "Lfm25AudioAsr({:p})", &**model),
             Self::QwenTts(model) => write!(formatter, "QwenTts({:p})", &**model),
         }
     }
@@ -903,6 +906,7 @@ enum PreparedAsrEncoderArtifactValue {
     Whisper(Arc<WhisperPreparedWindow>),
     VibeVoice(Arc<VibeVoiceAsrPreparedArtifact>),
     GraniteSpeech(Arc<GraniteSpeechPreparedPromptArtifact>),
+    Lfm25Audio(Arc<Lfm25AudioPreparedAsrArtifact>),
 }
 
 impl fmt::Debug for PreparedAsrEncoderArtifact {
@@ -923,6 +927,7 @@ impl PreparedAsrEncoderArtifactValue {
             Self::Whisper(_) => "whisper",
             Self::VibeVoice(_) => "vibevoice",
             Self::GraniteSpeech(_) => "granite_speech",
+            Self::Lfm25Audio(_) => "lfm25_audio",
         }
     }
 
@@ -936,13 +941,16 @@ impl PreparedAsrEncoderArtifactValue {
             Self::GraniteSpeech(value) => {
                 Ok((value.resident_host_bytes(), value.resident_tensor_bytes()?))
             }
+            Self::Lfm25Audio(value) => {
+                Ok((value.retained_host_bytes, value.retained_resident_bytes))
+            }
         }
     }
 
     fn clocked_state_projections(&self) -> &[ClockedStateProjection] {
         match self {
             Self::VibeVoice(value) => value.tokenizer_state_projections(),
-            Self::Qwen3(_) | Self::Whisper(_) | Self::GraniteSpeech(_) => &[],
+            Self::Qwen3(_) | Self::Whisper(_) | Self::GraniteSpeech(_) | Self::Lfm25Audio(_) => &[],
         }
     }
 }
@@ -2340,6 +2348,29 @@ impl EngineCoreRequest {
         Ok(())
     }
 
+    pub(crate) fn install_lfm25_audio_asr_execution_model(
+        &mut self,
+        model_variant: ModelVariant,
+        model: Lfm25AudioModelLease,
+    ) -> Result<()> {
+        if model_variant.family() != ModelFamily::Lfm25Audio
+            || self.task_type != TaskType::ASR
+            || self.model_variant != Some(model_variant)
+        {
+            return Err(Error::InvalidInput(format!(
+                "LFM2.5 Audio ASR request {} model preparation does not match its routed task/model",
+                self.id
+            )));
+        }
+        self.prepared_stage_costs.clear();
+        self.incremental_model_execution_ready = Some(IncrementalModelExecutionReady {
+            model_variant,
+            model: PreparedIncrementalModel::Lfm25AudioAsr(model),
+            qwen_tts: None,
+        });
+        Ok(())
+    }
+
     fn continuous_asr_stage_cost(
         binding: Option<&super::ExecutionAdapterBinding>,
         model: &NativeAsrModel,
@@ -2593,7 +2624,8 @@ impl EngineCoreRequest {
             PreparedAsrEncoderArtifactValue::Qwen3(value) => Ok(Some(value.clone())),
             PreparedAsrEncoderArtifactValue::Whisper(_)
             | PreparedAsrEncoderArtifactValue::VibeVoice(_)
-            | PreparedAsrEncoderArtifactValue::GraniteSpeech(_) => Err(Error::InvalidInput(
+            | PreparedAsrEncoderArtifactValue::GraniteSpeech(_)
+            | PreparedAsrEncoderArtifactValue::Lfm25Audio(_) => Err(Error::InvalidInput(
                 "foreign encoder artifact was requested through the Qwen3 accessor".into(),
             )),
         }
@@ -2649,7 +2681,8 @@ impl EngineCoreRequest {
             PreparedAsrEncoderArtifactValue::Whisper(value) => Ok(Some(value.clone())),
             PreparedAsrEncoderArtifactValue::Qwen3(_)
             | PreparedAsrEncoderArtifactValue::VibeVoice(_)
-            | PreparedAsrEncoderArtifactValue::GraniteSpeech(_) => Err(Error::InvalidInput(
+            | PreparedAsrEncoderArtifactValue::GraniteSpeech(_)
+            | PreparedAsrEncoderArtifactValue::Lfm25Audio(_) => Err(Error::InvalidInput(
                 "foreign encoder artifact was requested through the Whisper accessor".into(),
             )),
         }
@@ -2705,7 +2738,8 @@ impl EngineCoreRequest {
             PreparedAsrEncoderArtifactValue::VibeVoice(value) => Ok(Some(value.clone())),
             PreparedAsrEncoderArtifactValue::Qwen3(_)
             | PreparedAsrEncoderArtifactValue::Whisper(_)
-            | PreparedAsrEncoderArtifactValue::GraniteSpeech(_) => Err(Error::InvalidInput(
+            | PreparedAsrEncoderArtifactValue::GraniteSpeech(_)
+            | PreparedAsrEncoderArtifactValue::Lfm25Audio(_) => Err(Error::InvalidInput(
                 "foreign encoder artifact was requested through the VibeVoice accessor".into(),
             )),
         }
@@ -2761,8 +2795,66 @@ impl EngineCoreRequest {
             PreparedAsrEncoderArtifactValue::GraniteSpeech(value) => Ok(Some(value.clone())),
             PreparedAsrEncoderArtifactValue::Qwen3(_)
             | PreparedAsrEncoderArtifactValue::Whisper(_)
-            | PreparedAsrEncoderArtifactValue::VibeVoice(_) => Err(Error::InvalidInput(
+            | PreparedAsrEncoderArtifactValue::VibeVoice(_)
+            | PreparedAsrEncoderArtifactValue::Lfm25Audio(_) => Err(Error::InvalidInput(
                 "foreign encoder artifact was requested through the Granite Speech accessor".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn install_prepared_lfm25_audio_asr_artifact(
+        &mut self,
+        model_variant: ModelVariant,
+        artifact: Arc<Lfm25AudioPreparedAsrArtifact>,
+    ) -> Result<()> {
+        if model_variant.family() != ModelFamily::Lfm25Audio
+            || self.task_type != TaskType::ASR
+            || self.model_variant != Some(model_variant)
+            || self.uses_asr_long_form_atomic()
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} LFM2.5 Audio artifact does not match its normal routed model",
+                self.id
+            )));
+        }
+        let source_fingerprint = self.asr_execution_source_fingerprint(model_variant)?;
+        if self.prepared_asr_encoder_artifact.is_some() {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} already owns an encoder artifact",
+                self.id
+            )));
+        }
+        self.prepared_asr_encoder_artifact = Some(PreparedAsrEncoderArtifact {
+            model_variant,
+            artifact: PreparedAsrEncoderArtifactValue::Lfm25Audio(artifact),
+            source_fingerprint,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn prepared_lfm25_audio_asr_artifact_for_executor(
+        &self,
+    ) -> Result<Option<Arc<Lfm25AudioPreparedAsrArtifact>>> {
+        let Some(prepared) = self.prepared_asr_encoder_artifact.as_ref() else {
+            return Ok(None);
+        };
+        if self.model_variant != Some(prepared.model_variant)
+            || self.asr_execution_source_fingerprint(prepared.model_variant)?
+                != prepared.source_fingerprint
+            || self.uses_asr_long_form_atomic()
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} changed after LFM2.5 Audio preparation",
+                self.id
+            )));
+        }
+        match &prepared.artifact {
+            PreparedAsrEncoderArtifactValue::Lfm25Audio(value) => Ok(Some(value.clone())),
+            PreparedAsrEncoderArtifactValue::Qwen3(_)
+            | PreparedAsrEncoderArtifactValue::Whisper(_)
+            | PreparedAsrEncoderArtifactValue::VibeVoice(_)
+            | PreparedAsrEncoderArtifactValue::GraniteSpeech(_) => Err(Error::InvalidInput(
+                "foreign encoder artifact was requested through the LFM2.5 Audio accessor".into(),
             )),
         }
     }
@@ -3129,8 +3221,39 @@ impl EngineCoreRequest {
                 }
             }
         }
+        if matches!(&ready.model, PreparedIncrementalModel::Lfm25AudioAsr(_)) {
+            if ready.model_variant.family() != ModelFamily::Lfm25Audio
+                || self.prepared_asr_audio_for_executor()?.is_none()
+            {
+                return Err(Error::InvalidInput(format!(
+                    "LFM2.5 Audio ASR request {} is missing its exact decoded-audio artifact",
+                    self.id
+                )));
+            }
+            match self.prepared_asr_execution_shape {
+                Some(PreparedAsrExecutionShape::RetainedSequence { input_tokens })
+                    if self.prepared_sequence_input_tokens == Some(input_tokens)
+                        && self
+                            .prepared_lfm25_audio_asr_artifact_for_executor()?
+                            .is_some() => {}
+                Some(PreparedAsrExecutionShape::LongFormAtomic)
+                    if self.prepared_sequence_input_tokens.is_none()
+                        && self.prepared_asr_encoder_artifact.is_none() => {}
+                _ => {
+                    return Err(Error::InvalidInput(format!(
+                        "LFM2.5 Audio ASR request {} is missing a consistent exact media execution shape",
+                        self.id
+                    )));
+                }
+            }
+        }
         match (&ready.model, self.task_type) {
             (PreparedIncrementalModel::Asr(_), TaskType::ASR) if ready.qwen_tts.is_none() => Ok(()),
+            (PreparedIncrementalModel::Lfm25AudioAsr(_), TaskType::ASR)
+                if ready.qwen_tts.is_none() =>
+            {
+                Ok(())
+            }
             (PreparedIncrementalModel::QwenTts(_), TaskType::TTS)
                 if ready.model_variant.family() == ModelFamily::Qwen3Tts
                     && ready.qwen_tts.as_ref().is_some_and(|prepared| {
@@ -3154,7 +3277,8 @@ impl EngineCoreRequest {
             .as_ref()
             .and_then(|ready| match &ready.model {
                 PreparedIncrementalModel::Asr(model) => Some(model.model_arc()),
-                PreparedIncrementalModel::QwenTts(_) => None,
+                PreparedIncrementalModel::Lfm25AudioAsr(_)
+                | PreparedIncrementalModel::QwenTts(_) => None,
             }))
     }
 
@@ -3165,7 +3289,21 @@ impl EngineCoreRequest {
             .as_ref()
             .and_then(|ready| match &ready.model {
                 PreparedIncrementalModel::Asr(model) => Some(model.clone()),
-                PreparedIncrementalModel::QwenTts(_) => None,
+                PreparedIncrementalModel::Lfm25AudioAsr(_)
+                | PreparedIncrementalModel::QwenTts(_) => None,
+            }))
+    }
+
+    pub(crate) fn prepared_lfm25_audio_asr_model_lease_for_executor(
+        &self,
+    ) -> Result<Option<Lfm25AudioModelLease>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| match &ready.model {
+                PreparedIncrementalModel::Lfm25AudioAsr(model) => Some(model.clone()),
+                PreparedIncrementalModel::Asr(_) | PreparedIncrementalModel::QwenTts(_) => None,
             }))
     }
 
@@ -3178,7 +3316,9 @@ impl EngineCoreRequest {
             .as_ref()
             .and_then(|ready| match &ready.model {
                 PreparedIncrementalModel::QwenTts(model) => Some(model.model_arc()),
-                PreparedIncrementalModel::Asr(_) => None,
+                PreparedIncrementalModel::Asr(_) | PreparedIncrementalModel::Lfm25AudioAsr(_) => {
+                    None
+                }
             }))
     }
 
@@ -3191,7 +3331,9 @@ impl EngineCoreRequest {
             .as_ref()
             .and_then(|ready| match &ready.model {
                 PreparedIncrementalModel::QwenTts(model) => Some(model.clone()),
-                PreparedIncrementalModel::Asr(_) => None,
+                PreparedIncrementalModel::Asr(_) | PreparedIncrementalModel::Lfm25AudioAsr(_) => {
+                    None
+                }
             }))
     }
 
@@ -3617,7 +3759,8 @@ impl EngineCoreRequest {
             .as_ref()
             .and_then(|ready| match &ready.model {
                 PreparedIncrementalModel::Asr(model) => Some(model),
-                PreparedIncrementalModel::QwenTts(_) => None,
+                PreparedIncrementalModel::Lfm25AudioAsr(_)
+                | PreparedIncrementalModel::QwenTts(_) => None,
             })
             .filter(|_| self.uses_asr_retained_sequence())
             .map(|model| Self::continuous_asr_stage_cost(Some(&binding), model))
@@ -3632,7 +3775,10 @@ impl EngineCoreRequest {
                     prepared.prefill_tokens,
                     prepared.max_frames,
                 )),
-                (PreparedIncrementalModel::Asr(_), _) => None,
+                (
+                    PreparedIncrementalModel::Asr(_) | PreparedIncrementalModel::Lfm25AudioAsr(_),
+                    _,
+                ) => None,
                 _ => None,
             })
             .map(|(model, prefill_tokens, max_frames)| {
