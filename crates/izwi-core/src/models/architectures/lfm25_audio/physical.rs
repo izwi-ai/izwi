@@ -469,7 +469,10 @@ fn validate_retained_stage_graph(
     for stage in stages {
         stage.validate()?;
         let valid_batch = match (mode, stage.selector) {
-            (Lfm25AudioRetainedMode::Asr, StageWorkSelector::SequenceDecode) => {
+            (
+                Lfm25AudioRetainedMode::Asr | Lfm25AudioRetainedMode::Tts,
+                StageWorkSelector::SequenceDecode,
+            ) => {
                 matches!(
                     stage.batch_mode,
                     NativeBatchMode::None | NativeBatchMode::Continuous
@@ -945,7 +948,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_contract_rejects_unimplemented_native_batching_and_atomic_routes() {
+    fn retained_tts_accepts_continuous_decode_but_rejects_atomic_routes() {
         let prefill = retained_stage(1, StageWorkSelector::SequencePrefill, 0);
         let mut decode = retained_stage(2, StageWorkSelector::SequenceDecode, 0);
         decode.batch_mode = NativeBatchMode::Continuous;
@@ -960,7 +963,7 @@ mod tests {
             Lfm25AudioRetainedMode::Tts,
             &[&stages],
         )
-        .is_err());
+        .is_ok());
 
         let atomic = stage();
         let stages = [atomic, prefill];

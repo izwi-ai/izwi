@@ -23,6 +23,7 @@ pub(crate) enum Lfm25AudioRetainedMode {
 enum Lfm25AudioRetainedSubphase {
     Main,
     DepthformerFrame,
+    TtsFrame,
 }
 
 pub(crate) struct Lfm25AudioRetainedState {
@@ -100,6 +101,18 @@ impl Lfm25AudioRetainedState {
         )
     }
 
+    pub(crate) fn begin_tts_frame_quantum(
+        &mut self,
+        main: &PhysicalPagedKvCache,
+        depthformer: &PhysicalPagedKvCache,
+    ) -> Result<Lfm25AudioRetainedCheckpoint> {
+        self.begin_quantum(
+            Lfm25AudioRetainedSubphase::TtsFrame,
+            main,
+            Some(depthformer),
+        )
+    }
+
     fn begin_quantum(
         &mut self,
         subphase: Lfm25AudioRetainedSubphase,
@@ -137,9 +150,18 @@ impl Lfm25AudioRetainedState {
         checkpoint: &Lfm25AudioRetainedCheckpoint,
     ) -> Result<()> {
         self.authenticate(checkpoint, main, depthformer)?;
+        let expected_main = match checkpoint.subphase {
+            Lfm25AudioRetainedSubphase::Main | Lfm25AudioRetainedSubphase::DepthformerFrame => {
+                main.context_len()
+            }
+            Lfm25AudioRetainedSubphase::TtsFrame => {
+                checkpoint.main_position.checked_add(1).ok_or_else(|| {
+                    Error::InferenceError("LFM2.5 Audio main clock overflowed".into())
+                })?
+            }
+        };
         if main.context_len() != self.shortconv.cursor() as usize
-            || (checkpoint.subphase == Lfm25AudioRetainedSubphase::DepthformerFrame
-                && main.context_len() != checkpoint.main_position)
+            || main.context_len() != expected_main
         {
             return Err(Error::InferenceError(
                 "LFM2.5 Audio main KV and ShortConv clocks diverged".into(),
@@ -158,9 +180,8 @@ impl Lfm25AudioRetainedState {
             depthformer.map(PhysicalPagedKvCache::context_len),
             false,
         )?;
-        if checkpoint.subphase == Lfm25AudioRetainedSubphase::Main {
-            self.main_position = main.context_len();
-        } else if let Some(depthformer) = depthformer {
+        self.main_position = main.context_len();
+        if let Some(depthformer) = depthformer {
             self.depthformer_step = depthformer.context_len();
         }
         finish_quantum_authority(&mut self.active_quantum, checkpoint.quantum_nonce)?;
@@ -396,21 +417,25 @@ fn validate_subphase_binding(
 ) -> Result<()> {
     match (mode, subphase, cache_step) {
         (_, Lfm25AudioRetainedSubphase::Main, None) => Ok(()),
-        (Lfm25AudioRetainedMode::Asr, Lfm25AudioRetainedSubphase::DepthformerFrame, _) => Err(
-            Error::InvalidInput("LFM2.5 Audio ASR state cannot enter a Depthformer frame".into()),
-        ),
-        (Lfm25AudioRetainedMode::Tts, Lfm25AudioRetainedSubphase::DepthformerFrame, Some(step))
-            if step > max_steps =>
-        {
-            Err(Error::InferenceError(
-                "LFM2.5 Audio Depthformer clock exceeded its bound".into(),
-            ))
-        }
-        (Lfm25AudioRetainedMode::Tts, Lfm25AudioRetainedSubphase::DepthformerFrame, Some(step))
-            if !require_exact_step || step == expected_step =>
-        {
-            Ok(())
-        }
+        (
+            Lfm25AudioRetainedMode::Asr,
+            Lfm25AudioRetainedSubphase::DepthformerFrame | Lfm25AudioRetainedSubphase::TtsFrame,
+            _,
+        ) => Err(Error::InvalidInput(
+            "LFM2.5 Audio ASR state cannot enter a Depthformer frame".into(),
+        )),
+        (
+            Lfm25AudioRetainedMode::Tts,
+            Lfm25AudioRetainedSubphase::DepthformerFrame | Lfm25AudioRetainedSubphase::TtsFrame,
+            Some(step),
+        ) if step > max_steps => Err(Error::InferenceError(
+            "LFM2.5 Audio Depthformer clock exceeded its bound".into(),
+        )),
+        (
+            Lfm25AudioRetainedMode::Tts,
+            Lfm25AudioRetainedSubphase::DepthformerFrame | Lfm25AudioRetainedSubphase::TtsFrame,
+            Some(step),
+        ) if !require_exact_step || step == expected_step => Ok(()),
         (_, Lfm25AudioRetainedSubphase::Main, Some(_)) => Err(Error::InvalidInput(
             "LFM2.5 Audio main-only quantum cannot bind Depthformer KV".into(),
         )),
@@ -489,6 +514,37 @@ mod tests {
     #[test]
     fn retained_modes_keep_depthformer_authority_explicit() {
         assert_ne!(Lfm25AudioRetainedMode::Asr, Lfm25AudioRetainedMode::Tts);
+    }
+
+    #[test]
+    fn tts_frame_subphase_has_an_independent_bounded_codebook_clock() {
+        assert!(validate_subphase_binding(
+            Lfm25AudioRetainedMode::Tts,
+            Lfm25AudioRetainedSubphase::TtsFrame,
+            0,
+            8,
+            Some(0),
+            true,
+        )
+        .is_ok());
+        assert!(validate_subphase_binding(
+            Lfm25AudioRetainedMode::Tts,
+            Lfm25AudioRetainedSubphase::TtsFrame,
+            0,
+            8,
+            Some(8),
+            false,
+        )
+        .is_ok());
+        assert!(validate_subphase_binding(
+            Lfm25AudioRetainedMode::Asr,
+            Lfm25AudioRetainedSubphase::TtsFrame,
+            0,
+            8,
+            Some(0),
+            true,
+        )
+        .is_err());
     }
 
     #[test]

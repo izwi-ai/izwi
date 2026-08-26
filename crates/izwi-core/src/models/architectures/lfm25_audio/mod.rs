@@ -12,6 +12,7 @@ mod preprocessor;
 mod sampling;
 pub(crate) mod state;
 mod tokenizer;
+pub(crate) mod tts_retained;
 
 pub const LFM25_AUDIO_BUILT_IN_SPEAKERS: [&str; 4] =
     ["US Female", "US Male", "UK Female", "UK Male"];

@@ -5,11 +5,16 @@ use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{Embedding, Module};
 use candle_transformers::models::with_tracing::QMatMul;
 
+use crate::backends::kv::{
+    submit_ordered_after_write, KvSlotMap, KvWriteArgs, KvWriteCompletionCollector,
+    PagedKvDecodeArgs,
+};
 use crate::error::{Error, Result};
 use crate::kernels::{
     try_fused_qk_rms_norm, try_fused_rms_norm, try_fused_rope_pair_bshd,
     try_fused_silu_mul_with_status,
 };
+use crate::kv::KvDecodeBatchMetadata;
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
 use crate::models::shared::telemetry::record_rope_kernel;
 use crate::models::shared::weights::gguf::GgufLoader;
@@ -61,6 +66,10 @@ pub struct Lfm25SampledAudioFrame {
 impl Lfm25SampledAudioFrame {
     pub fn embedding(&self) -> &Tensor {
         &self.embedding
+    }
+
+    pub(crate) fn tokens(&self) -> Result<Vec<u32>> {
+        self.samples.iter().map(CodebookSample::to_token).collect()
     }
 }
 
@@ -240,6 +249,111 @@ impl Lfm25AudioHead {
 
         let embedding = self.embed_sampled_audio_frame(&samples, hidden.device())?;
         Ok((Lfm25SampledAudioFrame { samples, embedding }, profile))
+    }
+
+    pub(crate) fn sample_audio_frame_retained(
+        &self,
+        hidden: &Tensor,
+        config: &Lfm25SamplingConfig,
+        rng: &mut SimpleRng,
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<Lfm25SampledAudioFrame> {
+        self.sample_audio_frame_retained_batch(
+            hidden,
+            std::slice::from_ref(config),
+            &mut [rng],
+            &mut [cache],
+        )?
+        .pop()
+        .ok_or_else(|| Error::InferenceError("LFM2.5 Audio scalar frame is absent".into()))
+    }
+
+    pub(crate) fn sample_audio_frame_retained_batch(
+        &self,
+        hidden: &Tensor,
+        configs: &[Lfm25SamplingConfig],
+        rngs: &mut [&mut SimpleRng],
+        caches: &mut [&mut PhysicalPagedKvCache],
+    ) -> Result<Vec<Lfm25SampledAudioFrame>> {
+        let (batch, seq_len, _) = hidden.dims3()?;
+        if batch == 0
+            || seq_len != 1
+            || configs.len() != batch
+            || rngs.len() != batch
+            || caches.len() != batch
+        {
+            return Err(Error::InvalidInput(
+                "LFM2.5 Audio retained frame rows do not match".into(),
+            ));
+        }
+        if batch == 1 {
+            let depth_input = self
+                .depth_linear
+                .forward(hidden)?
+                .reshape((1, 1, self.codebooks, self.depthformer_dim))?
+                .squeeze(0)?
+                .squeeze(0)?;
+            let mut next_embed =
+                Tensor::zeros(self.depthformer_dim, hidden.dtype(), hidden.device())?;
+            let mut samples = Vec::with_capacity(self.codebooks);
+            for codebook_idx in 0..self.codebooks {
+                let cur = depth_input
+                    .i(codebook_idx)?
+                    .broadcast_add(&next_embed)?
+                    .unsqueeze(0)?
+                    .unsqueeze(0)?;
+                let out = self.depthformer.forward_physical(&cur, caches[0])?;
+                let sample =
+                    self.depth_embeddings[codebook_idx].sample(&out, &configs[0], rngs[0])?;
+                next_embed =
+                    self.depth_embeddings[codebook_idx].embed_sample(&sample, hidden.device())?;
+                samples.push(sample);
+            }
+            let embedding = self.embed_sampled_audio_frame(&samples, hidden.device())?;
+            return Ok(vec![Lfm25SampledAudioFrame { samples, embedding }]);
+        }
+
+        let depth_input = self.depth_linear.forward(hidden)?.reshape((
+            batch,
+            self.codebooks,
+            self.depthformer_dim,
+        ))?;
+        let mut next_embed = Tensor::zeros(
+            (batch, self.depthformer_dim),
+            hidden.dtype(),
+            hidden.device(),
+        )?;
+        let mut rows = (0..batch)
+            .map(|_| Vec::with_capacity(self.codebooks))
+            .collect::<Vec<Vec<CodebookSample>>>();
+        for codebook_idx in 0..self.codebooks {
+            let cur = depth_input
+                .narrow(1, codebook_idx, 1)?
+                .squeeze(1)?
+                .broadcast_add(&next_embed)?
+                .unsqueeze(1)?;
+            let out = self.depthformer.forward_physical_batch(&cur, caches)?;
+            let mut embeds = Vec::with_capacity(batch);
+            for row in 0..batch {
+                let row_out = out.narrow(0, row, 1)?;
+                let sample = self.depth_embeddings[codebook_idx].sample(
+                    &row_out,
+                    &configs[row],
+                    rngs[row],
+                )?;
+                embeds.push(
+                    self.depth_embeddings[codebook_idx].embed_sample(&sample, hidden.device())?,
+                );
+                rows[row].push(sample);
+            }
+            next_embed = Tensor::stack(&embeds.iter().collect::<Vec<_>>(), 0)?;
+        }
+        rows.into_iter()
+            .map(|samples| {
+                let embedding = self.embed_sampled_audio_frame(&samples, hidden.device())?;
+                Ok(Lfm25SampledAudioFrame { samples, embedding })
+            })
+            .collect()
     }
 
     pub fn first_tokens_with_profile(
@@ -449,6 +563,84 @@ impl Depthformer {
         cache.commit_prepared(prepared)?;
         Ok(hidden)
     }
+
+    fn forward_physical_batch(
+        &self,
+        x: &Tensor,
+        caches: &mut [&mut PhysicalPagedKvCache],
+    ) -> Result<Tensor> {
+        let (batch, seq_len, hidden) = x.dims3()?;
+        if batch <= 1 || seq_len != 1 || hidden != self.dim || caches.len() != batch {
+            return Err(Error::InvalidInput(
+                "Depthformer batch input does not match its physical rows".into(),
+            ));
+        }
+        let head_dim = self.dim / DEPTHFORMER_HEADS;
+        for cache in caches.iter() {
+            cache.validate_model(self.layers.len(), DEPTHFORMER_KV_HEADS, head_dim)?;
+            if cache.context_len() >= cache.capacity_tokens() {
+                return Err(Error::InvalidInput(
+                    "Depthformer batch row exceeded its invocation capacity".into(),
+                ));
+            }
+        }
+        let first = &*caches[0];
+        if caches
+            .iter()
+            .any(|cache| !Arc::ptr_eq(cache.arena(), first.arena()))
+        {
+            return Err(Error::InvalidInput(
+                "Depthformer batch rows do not share one physical arena".into(),
+            ));
+        }
+        let positions = caches
+            .iter()
+            .map(|cache| cache.context_len())
+            .collect::<Vec<_>>();
+        let slots = caches
+            .iter()
+            .enumerate()
+            .map(|(row, cache)| {
+                cache
+                    .slots_for_append(positions[row], 1)
+                    .map(|slots| slots[0])
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let lowered = first.arena().lower_slots(&slots)?;
+        let mut completions =
+            KvWriteCompletionCollector::new(first.arena().config(), lowered.logical_slots())?;
+        let execution = (|| -> Result<Tensor> {
+            let mut hidden = x.clone();
+            for (physical_layer, layer) in self.layers.iter().enumerate() {
+                let cache_refs = caches.iter().map(|cache| &**cache).collect::<Vec<_>>();
+                hidden = layer.forward_physical_batch(
+                    &hidden,
+                    &positions,
+                    physical_layer,
+                    &cache_refs,
+                    lowered.as_ref(),
+                    &mut completions,
+                )?;
+            }
+            Ok(hidden)
+        })();
+        let hidden = match execution {
+            Ok(hidden) => hidden,
+            Err(error) => {
+                return match completions.drain() {
+                    Ok(()) => Err(error),
+                    Err(drain) => Err(Error::InferenceError(format!(
+                        "Depthformer batch failed: {error}; fence drain failed: {drain}"
+                    ))),
+                }
+            }
+        };
+        let completion = Arc::new(completions.seal()?);
+        for (row, cache) in caches.iter_mut().enumerate() {
+            cache.commit_shared_completion(positions[row], 1, completion.clone())?;
+        }
+        Ok(hidden)
+    }
 }
 
 struct DepthformerBlock {
@@ -502,6 +694,28 @@ impl DepthformerBlock {
             physical_layer,
             cache,
             prepared,
+        )?;
+        let hidden = hidden.broadcast_add(x)?;
+        let ffn = self.mlp.forward(&self.ffn_norm.forward(&hidden)?)?;
+        hidden.broadcast_add(&ffn).map_err(Error::from)
+    }
+
+    fn forward_physical_batch(
+        &self,
+        x: &Tensor,
+        positions: &[usize],
+        physical_layer: usize,
+        caches: &[&PhysicalPagedKvCache],
+        slots: &dyn KvSlotMap,
+        completions: &mut KvWriteCompletionCollector,
+    ) -> Result<Tensor> {
+        let hidden = self.attn.forward_physical_batch(
+            &self.attn_norm.forward(x)?,
+            positions,
+            physical_layer,
+            caches,
+            slots,
+            completions,
         )?;
         let hidden = hidden.broadcast_add(x)?;
         let ffn = self.mlp.forward(&self.ffn_norm.forward(&hidden)?)?;
@@ -735,6 +949,130 @@ impl DepthAttention {
         )?;
         let out = out.reshape((batch, seq_len, hidden_size))?;
         self.o_proj.forward(&out)
+    }
+
+    fn forward_physical_batch(
+        &self,
+        hidden: &Tensor,
+        positions: &[usize],
+        physical_layer: usize,
+        caches: &[&PhysicalPagedKvCache],
+        slots: &dyn KvSlotMap,
+        completions: &mut KvWriteCompletionCollector,
+    ) -> Result<Tensor> {
+        let (batch, seq_len, hidden_size) = hidden.dims3()?;
+        if batch <= 1 || seq_len != 1 || positions.len() != batch || caches.len() != batch {
+            return Err(Error::InvalidInput(
+                "Depthformer attention batch dimensions do not match".into(),
+            ));
+        }
+        let first = caches[0];
+        if slots.arena_id() != first.arena().id()
+            || slots.len() != batch
+            || caches
+                .iter()
+                .any(|cache| !Arc::ptr_eq(cache.arena(), first.arena()))
+        {
+            return Err(Error::InvalidInput(
+                "Depthformer attention rows do not share physical authority".into(),
+            ));
+        }
+        let head_dim = hidden_size / DEPTHFORMER_HEADS;
+        let kv_hidden = DEPTHFORMER_KV_HEADS * head_dim;
+        let (q_hidden, k_hidden, v_hidden) = match &self.qkv {
+            DepthQkvProjection::Packed(qkv_proj) => {
+                let qkv = qkv_proj.forward(hidden)?;
+                let expected = hidden_size + 2 * kv_hidden;
+                if qkv.dim(2)? != expected {
+                    return Err(Error::ModelLoadError(
+                        "Packed depthformer batch qkv width is invalid".into(),
+                    ));
+                }
+                (
+                    qkv.i((.., .., ..hidden_size))?.contiguous()?,
+                    qkv.i((.., .., hidden_size..hidden_size + kv_hidden))?
+                        .contiguous()?,
+                    qkv.i((.., .., hidden_size + kv_hidden..))?.contiguous()?,
+                )
+            }
+            DepthQkvProjection::Separate {
+                q_proj,
+                k_proj,
+                v_proj,
+            } => (
+                q_proj.forward(hidden)?,
+                k_proj.forward(hidden)?,
+                v_proj.forward(hidden)?,
+            ),
+        };
+        let q = q_hidden
+            .reshape((batch, 1, DEPTHFORMER_HEADS, head_dim))?
+            .contiguous()?;
+        let k = k_hidden
+            .reshape((batch, 1, DEPTHFORMER_KV_HEADS, head_dim))?
+            .contiguous()?;
+        let values = v_hidden
+            .reshape((batch, DEPTHFORMER_KV_HEADS, head_dim))?
+            .contiguous()?;
+        let (q, k) = if q.device().is_metal() || q.device().is_cuda() {
+            match try_fused_qk_rms_norm(&q, &k, &self.qk_norm_weight, self.q_norm.eps()) {
+                Some(pair) => pair,
+                None => (self.q_norm.forward(&q)?, self.k_norm.forward(&k)?),
+            }
+        } else {
+            (self.q_norm.forward(&q)?, self.k_norm.forward(&k)?)
+        };
+        let mut queries = Vec::with_capacity(batch);
+        let mut keys = Vec::with_capacity(batch);
+        for row in 0..batch {
+            let q = q.narrow(0, row, 1)?;
+            let k = k.narrow(0, row, 1)?;
+            let (q, k) = if let Some((q, k)) =
+                try_apply_rotary_emb_pair_bshd(&q, &k, &self.cos_sin, positions[row])?
+            {
+                (q.transpose(1, 2)?, k.transpose(1, 2)?)
+            } else {
+                let q = q.transpose(1, 2)?.contiguous()?;
+                let k = k.transpose(1, 2)?.contiguous()?;
+                (
+                    apply_rotary_emb(&q, &self.cos, &self.sin, positions[row])?,
+                    apply_rotary_emb(&k, &self.cos, &self.sin, positions[row])?,
+                )
+            };
+            queries.push(q.reshape((DEPTHFORMER_HEADS, head_dim))?);
+            keys.push(k.reshape((DEPTHFORMER_KV_HEADS, head_dim))?);
+        }
+        let queries = Tensor::stack(&queries.iter().collect::<Vec<_>>(), 0)?.contiguous()?;
+        let keys = Tensor::stack(&keys.iter().collect::<Vec<_>>(), 0)?.contiguous()?;
+        let metadata = KvDecodeBatchMetadata {
+            sequences: caches
+                .iter()
+                .enumerate()
+                .map(|(row, cache)| cache.sequence_table(positions[row] + 1))
+                .collect::<Result<Vec<_>>>()?,
+        };
+        let binding = first.layer_binding(physical_layer)?;
+        let completion = first.arena().write_slots(
+            binding,
+            KvWriteArgs {
+                keys: &keys,
+                values: &values,
+                slots,
+            },
+        )?;
+        let (out, completion) = submit_ordered_after_write(completion, || {
+            first.arena().paged_decode(
+                binding,
+                PagedKvDecodeArgs {
+                    queries: &queries,
+                    batch: &metadata,
+                    softmax_scale: 1.0 / (head_dim as f32).sqrt(),
+                    softcap: None,
+                },
+            )
+        })?;
+        completions.collect(completion)?;
+        self.o_proj.forward(&out.reshape((batch, 1, hidden_size))?)
     }
 }
 

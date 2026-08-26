@@ -39,6 +39,10 @@ use super::sampling::{
 };
 use super::state::{Lfm25AudioRetainedCheckpoint, Lfm25AudioRetainedMode, Lfm25AudioRetainedState};
 use super::tokenizer::{Lfm25SpecialTokenIds, Lfm25TextTokenizer};
+use super::tts_retained::{
+    Lfm25AudioPreparedTtsArtifact, Lfm25AudioTtsDecodeStep, Lfm25AudioTtsPrefillStep,
+    Lfm25AudioTtsQuantumCheckpoint, Lfm25AudioTtsRetainedState,
+};
 use super::LFM25_AUDIO_DEFAULT_INTERLEAVED_SYSTEM_PROMPT;
 use crate::models::architectures::lfm2::backbone::QuantizedLfm2Backbone;
 
@@ -172,6 +176,28 @@ pub(crate) struct Lfm25AudioAsrStepResourceEnvelope {
     pub(crate) device_workspace_bytes: u64,
     pub(crate) unified_workspace_bytes: u64,
     pub(crate) workspace_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Lfm25AudioTtsStageCeiling {
+    pub(crate) backend: BackendKind,
+    pub(crate) max_prompt_tokens: usize,
+    pub(crate) max_codebooks: usize,
+    pub(crate) max_materialized_tensor_elements: u64,
+    pub(crate) max_retained_resident_bytes: u64,
+    pub(crate) max_workspace_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Lfm25AudioTtsStepResourceEnvelope {
+    pub(crate) backend: BackendKind,
+    pub(crate) work_units: u64,
+    pub(crate) materialized_tensor_elements: u64,
+    pub(crate) host_workspace_bytes: u64,
+    pub(crate) device_workspace_bytes: u64,
+    pub(crate) unified_workspace_bytes: u64,
+    pub(crate) workspace_bytes: u64,
+    pub(crate) depthformer_steps: usize,
 }
 
 const LFM25_AUDIO_MAX_SOURCE_SAMPLE_RATE: u32 = 192_000;
@@ -407,6 +433,118 @@ impl Lfm25AudioModel {
             requested_max_new_tokens,
             self.main_config.context_length,
         )
+    }
+
+    pub(crate) fn prepare_lfm25_audio_tts_artifact(
+        &self,
+        messages: &[ChatMessage],
+    ) -> Result<Arc<Lfm25AudioPreparedTtsArtifact>> {
+        let prompt_ids = self.build_chat_prompt(messages)?;
+        let prompt_embeddings = self.with_main_backbone(|backbone| {
+            embed_token_ids(backbone, &self.device.device, &prompt_ids)
+        })?;
+        let prompt_tokens = prompt_embeddings.dim(1)?;
+        if prompt_tokens == 0 || prompt_tokens >= self.main_config.context_length {
+            return Err(Error::InvalidInput(
+                "LFM2.5 Audio TTS prompt leaves no generation capacity".into(),
+            ));
+        }
+        let materialized_tensor_elements = u64::try_from(prompt_embeddings.elem_count())
+            .map_err(|_| Error::InvalidInput("LFM2.5 Audio TTS prompt exceeds u64".into()))?;
+        let retained_resident_bytes = materialized_tensor_elements
+            .checked_mul(
+                u64::try_from(prompt_embeddings.dtype().size_in_bytes()).map_err(|_| {
+                    Error::InvalidInput("LFM2.5 Audio TTS dtype size exceeds u64".into())
+                })?,
+            )
+            .ok_or_else(|| {
+                Error::InvalidInput("LFM2.5 Audio TTS prompt bytes overflowed".into())
+            })?;
+        Ok(Arc::new(Lfm25AudioPreparedTtsArtifact {
+            model_load_nonce: self.model_load_nonce,
+            prompt_embeddings,
+            prompt_tokens,
+            source_messages: Arc::from(messages.to_vec()),
+            materialized_tensor_elements,
+            retained_resident_bytes,
+        }))
+    }
+
+    pub(crate) fn new_retained_tts_state(
+        &self,
+        artifact: Arc<Lfm25AudioPreparedTtsArtifact>,
+        requested_max_new_tokens: usize,
+        generation: Lfm25AudioGenerationConfig,
+    ) -> Result<Lfm25AudioTtsRetainedState> {
+        Lfm25AudioTtsRetainedState::new(
+            artifact,
+            self.new_retained_state(Lfm25AudioRetainedMode::Tts)?,
+            self.model_load_nonce,
+            generation,
+            self.tokenizer.specials().clone(),
+            self.tokenizer.vocab_size(),
+            self.decoder_config.codebooks,
+            requested_max_new_tokens,
+            self.main_config.context_length,
+        )
+    }
+
+    pub(crate) fn retained_tts_prefill_step(
+        &self,
+        state: &mut Lfm25AudioTtsRetainedState,
+        main: &mut PhysicalPagedKvCache,
+        checkpoint: &Lfm25AudioTtsQuantumCheckpoint,
+        max_tokens: usize,
+    ) -> Result<Lfm25AudioTtsPrefillStep> {
+        self.with_main_backbone(|backbone| {
+            state.prefill_step(backbone, main, checkpoint, max_tokens)
+        })
+    }
+
+    pub(crate) fn retained_tts_decode_step(
+        &self,
+        state: &mut Lfm25AudioTtsRetainedState,
+        main: &mut PhysicalPagedKvCache,
+        depthformer: Option<&mut PhysicalPagedKvCache>,
+        checkpoint: &Lfm25AudioTtsQuantumCheckpoint,
+    ) -> Result<Lfm25AudioTtsDecodeStep> {
+        self.with_main_backbone(|backbone| {
+            state.decode_step(
+                backbone,
+                &self.tokenizer,
+                &self.audio_head,
+                main,
+                depthformer,
+                checkpoint,
+            )
+        })
+    }
+
+    pub(crate) fn retained_tts_audio_decode_batch(
+        &self,
+        states: &mut [&mut Lfm25AudioTtsRetainedState],
+        mains: &mut [&mut PhysicalPagedKvCache],
+        depthformers: &mut [&mut PhysicalPagedKvCache],
+        checkpoints: &[&Lfm25AudioTtsQuantumCheckpoint],
+    ) -> Result<Vec<Lfm25AudioTtsDecodeStep>> {
+        self.with_main_backbone(|backbone| {
+            Lfm25AudioTtsRetainedState::decode_audio_batch(
+                backbone,
+                &self.audio_head,
+                states,
+                mains,
+                depthformers,
+                checkpoints,
+            )
+        })
+    }
+
+    pub(crate) fn detokenize_retained_tts_state(
+        &self,
+        state: &Lfm25AudioTtsRetainedState,
+    ) -> Result<Vec<f32>> {
+        self.detokenizer
+            .decode(state.audio_codes(), &self.device.device)
     }
 
     pub(crate) fn retained_asr_prefill_step(
@@ -949,6 +1087,126 @@ impl Lfm25AudioModel {
             device_workspace_bytes,
             unified_workspace_bytes,
             workspace_bytes: tensor_workspace,
+        })
+    }
+
+    pub(crate) fn tts_stage_ceiling(&self) -> Result<Lfm25AudioTtsStageCeiling> {
+        let max_prompt_tokens = self.main_config.context_length.saturating_sub(1);
+        let materialized = u64::try_from(max_prompt_tokens)
+            .ok()
+            .and_then(|tokens| {
+                tokens.checked_mul(u64::try_from(self.main_config.embedding_length).ok()?)
+            })
+            .ok_or_else(|| Error::InvalidInput("LFM2.5 Audio TTS ceiling overflowed".into()))?;
+        let retained_resident_bytes = materialized.checked_mul(4).ok_or_else(|| {
+            Error::InvalidInput("LFM2.5 Audio TTS retained bytes overflowed".into())
+        })?;
+        let max_workspace_bytes = self
+            .tts_decode_resource_envelope(self.main_config.context_length - 1, true)?
+            .workspace_bytes
+            .max(
+                self.tts_prefill_resource_envelope(0, max_prompt_tokens, max_prompt_tokens)?
+                    .workspace_bytes,
+            );
+        Ok(Lfm25AudioTtsStageCeiling {
+            backend: BackendKind::from(self.device.kind),
+            max_prompt_tokens,
+            max_codebooks: self.decoder_config.codebooks,
+            max_materialized_tensor_elements: materialized,
+            max_retained_resident_bytes: retained_resident_bytes,
+            max_workspace_bytes,
+        })
+    }
+
+    pub(crate) fn tts_prefill_resource_envelope(
+        &self,
+        start: usize,
+        tokens: usize,
+        prompt_tokens: usize,
+    ) -> Result<Lfm25AudioTtsStepResourceEnvelope> {
+        let end = start
+            .checked_add(tokens)
+            .ok_or_else(|| Error::InvalidInput("LFM2.5 Audio TTS prefill overflowed".into()))?;
+        if tokens == 0 || end > prompt_tokens || prompt_tokens >= self.main_config.context_length {
+            return Err(Error::InvalidInput(
+                "LFM2.5 Audio TTS prefill is outside its prompt".into(),
+            ));
+        }
+        self.tts_step_resource_envelope(tokens, end, end == prompt_tokens, false)
+    }
+
+    pub(crate) fn tts_decode_resource_envelope(
+        &self,
+        position: usize,
+        include_depthformer: bool,
+    ) -> Result<Lfm25AudioTtsStepResourceEnvelope> {
+        let visible = position
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidInput("LFM2.5 Audio TTS position overflowed".into()))?;
+        if visible > self.main_config.context_length {
+            return Err(Error::InvalidInput(
+                "LFM2.5 Audio TTS decode exceeds model context".into(),
+            ));
+        }
+        self.tts_step_resource_envelope(1, visible, !include_depthformer, include_depthformer)
+    }
+
+    fn tts_step_resource_envelope(
+        &self,
+        query_tokens: usize,
+        visible_tokens: usize,
+        include_logits: bool,
+        include_depthformer: bool,
+    ) -> Result<Lfm25AudioTtsStepResourceEnvelope> {
+        let main = checked_asr_main_step_workspace(
+            query_tokens,
+            visible_tokens,
+            self.tokenizer.vocab_size(),
+            include_logits,
+            &self.main_config,
+        )?;
+        let depth = if include_depthformer {
+            checked_depthformer_frame_workspace(&self.decoder_config)?
+        } else {
+            0
+        };
+        let workspace_bytes = main
+            .checked_add(depth)
+            .ok_or_else(|| Error::InvalidInput("LFM2.5 Audio TTS workspace overflowed".into()))?;
+        let backend = BackendKind::from(self.device.kind);
+        let (host_workspace_bytes, device_workspace_bytes, unified_workspace_bytes) =
+            map_asr_workspace_domains(backend, 0, workspace_bytes)?;
+        let depthformer_steps = if include_depthformer {
+            self.decoder_config.codebooks
+        } else {
+            0
+        };
+        let work_units = u64::try_from(query_tokens)
+            .ok()
+            .and_then(|main| main.checked_add(u64::try_from(depthformer_steps).ok()?))
+            .ok_or_else(|| Error::InvalidInput("LFM2.5 Audio TTS work exceeds u64".into()))?;
+        let materialized_tensor_elements = u64::try_from(query_tokens)
+            .ok()
+            .and_then(|tokens| {
+                tokens.checked_mul(u64::try_from(self.main_config.embedding_length).ok()?)
+            })
+            .and_then(|main| {
+                main.checked_add(
+                    u64::try_from(depthformer_steps)
+                        .ok()?
+                        .checked_mul(u64::try_from(self.decoder_config.depthformer_dim).ok()?)?,
+                )
+            })
+            .ok_or_else(|| Error::InvalidInput("LFM2.5 Audio TTS elements overflowed".into()))?;
+        Ok(Lfm25AudioTtsStepResourceEnvelope {
+            backend,
+            work_units,
+            materialized_tensor_elements,
+            host_workspace_bytes,
+            device_workspace_bytes,
+            unified_workspace_bytes,
+            workspace_bytes,
+            depthformer_steps,
         })
     }
 
@@ -2472,6 +2730,33 @@ fn checked_asr_main_step_workspace(
         elements = add(elements, mul(q, u(vocab_size)?)?)?;
     }
     mul(elements, 4)
+}
+
+fn checked_depthformer_frame_workspace(config: &Lfm25AudioDecoderConfig) -> Result<u64> {
+    let u = |value: usize| {
+        u64::try_from(value).map_err(|_| {
+            Error::InvalidInput("LFM2.5 Audio Depthformer geometry exceeds u64".into())
+        })
+    };
+    let dim = u(config.depthformer_dim)?;
+    let codebooks = u(config.codebooks)?;
+    let layers = u(config.depthformer_layers)?;
+    // One codebook step owns projected QKV/residual/FFN planes while its
+    // invocation cache keeps every preceding codebook K/V row live. This is a
+    // conservative per-frame peak, not a throughput claim.
+    let step_planes = dim
+        .checked_mul(16)
+        .and_then(|value| value.checked_mul(layers))
+        .ok_or_else(|| Error::InvalidInput("LFM2.5 Audio Depthformer step overflowed".into()))?;
+    let cache_planes = codebooks
+        .checked_mul(dim)
+        .and_then(|value| value.checked_mul(2))
+        .and_then(|value| value.checked_mul(layers))
+        .ok_or_else(|| Error::InvalidInput("LFM2.5 Audio Depthformer cache overflowed".into()))?;
+    step_planes
+        .checked_add(cache_planes)
+        .and_then(|value| value.checked_mul(4))
+        .ok_or_else(|| Error::InvalidInput("LFM2.5 Audio Depthformer bytes overflowed".into()))
 }
 
 fn validate_prepared_asr_identity(expected: u64, actual: u64) -> Result<()> {
