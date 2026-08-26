@@ -39,6 +39,7 @@ const LFM25_AUDIO_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(
 const LFM25_AUDIO_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(24);
 const VIBEVOICE_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(26);
 const FISH_S2_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(27);
+const VOXTRAL_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(28);
 const PARAKEET_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(28);
 pub(crate) const VOXTRAL_REALTIME_ADAPTER_ABI: AdapterAbiRevision =
     AdapterAbiRevision::new(crate::models::architectures::voxtral::VOXTRAL_REALTIME_EXECUTION_ABI);
@@ -903,6 +904,11 @@ fn is_fish_s2_physical_tts(metadata: AdapterMetadata) -> bool {
         && metadata.model_variant.family() == crate::catalog::ModelFamily::FishS2Tts
 }
 
+fn is_voxtral_physical_tts(metadata: AdapterMetadata) -> bool {
+    metadata.capability == CapabilityKind::Tts
+        && metadata.model_variant.family() == crate::catalog::ModelFamily::VoxtralTts
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PhysicalQwenTtsAdapterFactory;
 
@@ -1085,6 +1091,34 @@ struct VibeVoicePhysicalTtsAdapterFactory;
 
 #[derive(Debug, Clone, Copy)]
 struct FishS2PhysicalTtsAdapterFactory;
+
+#[derive(Debug, Clone, Copy)]
+struct VoxtralPhysicalTtsAdapterFactory;
+
+impl LoadedExecutionAdapterFactory for VoxtralPhysicalTtsAdapterFactory {
+    fn id(&self) -> &'static str {
+        "builtin.voxtral_tts.physical_sequence"
+    }
+    fn batch_mode(&self) -> NativeBatchMode {
+        NativeBatchMode::Continuous
+    }
+    fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
+        is_voxtral_physical_tts(metadata)
+    }
+    fn create(
+        &self,
+        context: LoadedAdapterFactoryContext,
+        metadata: AdapterMetadata,
+    ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
+        Ok(Arc::new(VoxtralTtsExecutionAdapter::new(
+            context.execution_group_id,
+            context.model_instance_id,
+            metadata,
+            context.backend_kind,
+            context.max_tensor_batch_size,
+        )))
+    }
+}
 
 impl LoadedExecutionAdapterFactory for FishS2PhysicalTtsAdapterFactory {
     fn id(&self) -> &'static str {
@@ -1329,6 +1363,7 @@ impl LoadedExecutionAdapterFactory for ScalarExecutionAdapterFactory {
             && !is_lfm25_audio_physical_tts(metadata)
             && !is_vibevoice_physical_tts(metadata)
             && !is_fish_s2_physical_tts(metadata)
+            && !is_voxtral_physical_tts(metadata)
     }
 
     fn create(
@@ -1361,6 +1396,7 @@ pub(super) fn built_in_loaded_adapter_factories() -> Vec<Arc<dyn LoadedExecution
         Arc::new(Lfm25AudioPhysicalTtsAdapterFactory),
         Arc::new(VibeVoicePhysicalTtsAdapterFactory),
         Arc::new(FishS2PhysicalTtsAdapterFactory),
+        Arc::new(VoxtralPhysicalTtsAdapterFactory),
         Arc::new(ScalarExecutionAdapterFactory),
     ]
 }
@@ -2336,6 +2372,127 @@ impl LoadedExecutionAdapter for ContinuousAsrExecutionAdapter {
             adapter_abi_revision: self.adapter_abi_revision(),
             metadata,
             execution_profile,
+            stages: Arc::from([preparation, prefill, decode]),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct VoxtralTtsExecutionAdapter {
+    execution_group_id: ExecutionGroupId,
+    model_instance_id: ModelInstanceId,
+    adapter_instance_id: AdapterInstanceId,
+    metadata: AdapterMetadata,
+    backend_kind: BackendKind,
+    max_batch_size: usize,
+}
+
+impl VoxtralTtsExecutionAdapter {
+    fn new(
+        execution_group_id: ExecutionGroupId,
+        model_instance_id: ModelInstanceId,
+        metadata: AdapterMetadata,
+        backend_kind: BackendKind,
+        max_batch_size: usize,
+    ) -> Self {
+        Self {
+            execution_group_id,
+            model_instance_id,
+            adapter_instance_id: AdapterInstanceId::new(
+                NEXT_ADAPTER_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+            ),
+            metadata,
+            backend_kind,
+            max_batch_size: max_batch_size.max(1),
+        }
+    }
+}
+
+impl LoadedExecutionAdapter for VoxtralTtsExecutionAdapter {
+    fn metadata(&self) -> AdapterMetadata {
+        self.metadata
+    }
+    fn adapter_instance_id(&self) -> AdapterInstanceId {
+        self.adapter_instance_id
+    }
+    fn adapter_abi_revision(&self) -> AdapterAbiRevision {
+        VOXTRAL_TTS_ADAPTER_ABI
+    }
+
+    fn contract(&self, _streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
+        let mut profile = scalar_execution_profile(self.metadata, self.backend_kind, false);
+        profile.mode = ExecutionMode::Sequence;
+        profile.prefill = PrefillMode::Incremental;
+        profile.incremental_decode = true;
+        profile.prefill_batch = NativeBatchMode::Static;
+        profile.decode_batch = NativeBatchMode::Continuous;
+        profile.cache_mode = CacheMode::ExternalPaged;
+        profile.cache_namespace = Some(format!(
+            "{}:tts:{}:voxtral-state-v2",
+            self.metadata.model_variant,
+            self.backend_kind.as_str()
+        ));
+        profile.kv_dtype = "state_v2_resolved".into();
+        profile.cancellation = CancellationGranularity::SequenceStep;
+        profile.concurrency = ConcurrencyClass::Batchable;
+        profile.recompute_safe = true;
+        profile.cache_release_safe = true;
+        profile.max_batch_size = self.max_batch_size;
+        profile.resolved_from_loaded_model = true;
+
+        let mut preparation = StageDescriptor::from_execution_profile(
+            StageId::new(0),
+            "tts.prepare.voxtral",
+            &profile,
+            NativeBatchMode::None,
+        );
+        preparation.selector = StageWorkSelector::PreSequencePreparation;
+        preparation.progress = StageProgressKind::Atomic;
+        preparation.max_batch_size = 1;
+        preparation.concurrency = ConcurrencyClass::Exclusive;
+        preparation.shape_policy = StageShapePolicy::Exact;
+        preparation.max_work_units = 16_384;
+        preparation.max_workspace_bytes = 512 * 1024 * 1024;
+
+        let mut prefill = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            "tts.prefill.voxtral.tensor_static",
+            &profile,
+            NativeBatchMode::Static,
+        );
+        prefill.selector = StageWorkSelector::SequencePrefill;
+        prefill.progress = StageProgressKind::Iterative;
+        prefill.shape_policy = StageShapePolicy::Ragged;
+        prefill.max_padding_basis_points = 0;
+        prefill.max_work_units = 16_384_u64.saturating_mul(self.max_batch_size as u64);
+        prefill.max_workspace_bytes = 512_u64
+            .saturating_mul(1024 * 1024)
+            .saturating_mul(self.max_batch_size as u64);
+
+        let mut decode = StageDescriptor::from_execution_profile(
+            StageId::new(2),
+            "tts.decode.voxtral.tensor_continuous",
+            &profile,
+            NativeBatchMode::Continuous,
+        );
+        decode.selector = StageWorkSelector::SequenceDecode;
+        decode.progress = StageProgressKind::Iterative;
+        decode.shape_policy = StageShapePolicy::Ragged;
+        decode.max_work_units = 64_u64.saturating_mul(self.max_batch_size as u64);
+        decode.max_workspace_bytes = 512_u64
+            .saturating_mul(1024 * 1024)
+            .saturating_mul(self.max_batch_size as u64);
+        for stage in [&mut preparation, &mut prefill, &mut decode] {
+            stage.output_visibility = OutputVisibility::AfterQuantumCommit;
+            stage.validate()?;
+        }
+        Ok(LoadedExecutionContract {
+            execution_group_id: self.execution_group_id,
+            model_instance_id: self.model_instance_id,
+            adapter_instance_id: self.adapter_instance_id,
+            adapter_abi_revision: self.adapter_abi_revision(),
+            metadata: self.metadata,
+            execution_profile: profile,
             stages: Arc::from([preparation, prefill, decode]),
         })
     }
@@ -6849,5 +7006,42 @@ mod tests {
         assert_eq!(contract.stages[1].shape_policy, StageShapePolicy::Exact);
         assert_eq!(contract.stages[1].concurrency, ConcurrencyClass::Exclusive);
         assert_eq!(contract.stages[1].max_batch_size, 1);
+    }
+
+    #[test]
+    fn voxtral_tts_factory_publishes_retained_batched_graph_on_all_backends() {
+        let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(8, 1).unwrap();
+        let metadata = *registry
+            .require(CapabilityKind::Tts, ModelVariant::Voxtral4BTts2603)
+            .unwrap();
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            let adapter = VoxtralTtsExecutionAdapter::new(
+                ExecutionGroupId::new(91),
+                ModelInstanceId::new(92),
+                metadata,
+                backend,
+                8,
+            );
+            let contract = adapter.contract(StreamingRequirements::NONE).unwrap();
+            assert_eq!(contract.adapter_abi_revision, VOXTRAL_TTS_ADAPTER_ABI);
+            assert_eq!(
+                contract.execution_profile.cache_mode,
+                CacheMode::ExternalPaged
+            );
+            assert_eq!(
+                contract.execution_profile.prefill_batch,
+                NativeBatchMode::Static
+            );
+            assert_eq!(
+                contract.execution_profile.decode_batch,
+                NativeBatchMode::Continuous
+            );
+            assert_eq!(contract.stages[1].shape_policy, StageShapePolicy::Ragged);
+            assert_eq!(contract.stages[1].max_padding_basis_points, 0);
+            assert!(contract
+                .stages
+                .iter()
+                .all(|stage| { stage.output_visibility == OutputVisibility::AfterQuantumCommit }));
+        }
     }
 }
