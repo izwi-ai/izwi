@@ -2636,7 +2636,7 @@ struct Predictor {
 }
 
 #[derive(Clone)]
-struct PredictorState {
+pub(super) struct PredictorState {
     h0: Option<Tensor>,
     c0: Option<Tensor>,
     h1: Option<Tensor>,
@@ -2674,11 +2674,41 @@ impl Predictor {
     }
 
     fn step(&self, label: usize, state: &mut PredictorState, device: &Device) -> Result<Tensor> {
-        let x = if label == self.blank_idx {
-            Tensor::zeros((1, PRED_HIDDEN), self.embed.dtype(), device)?
-        } else {
-            self.embed.i((label, ..))?.unsqueeze(0)?
-        };
+        self.step_batch(std::slice::from_ref(&label), state, device)
+    }
+
+    fn step_batch(
+        &self,
+        labels: &[usize],
+        state: &mut PredictorState,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let batch = labels.len();
+        if batch == 0 {
+            return Err(Error::InvalidInput(
+                "Nemotron predictor batch cannot be empty".into(),
+            ));
+        }
+        let rows = labels
+            .iter()
+            .map(|&label| {
+                if label == self.blank_idx {
+                    Tensor::zeros((1, PRED_HIDDEN), self.embed.dtype(), device).map_err(Error::from)
+                } else if label < self.blank_idx {
+                    self.embed
+                        .i((label, ..))
+                        .and_then(|row| row.unsqueeze(0))
+                        .map_err(Error::from)
+                } else {
+                    Err(Error::InvalidInput(format!(
+                        "Nemotron predictor label {label} exceeds blank index {}",
+                        self.blank_idx
+                    )))
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let refs = rows.iter().collect::<Vec<_>>();
+        let x = Tensor::cat(&refs, 0)?;
 
         let h0 = state
             .h0
@@ -2688,9 +2718,15 @@ impl Predictor {
             .c0
             .as_ref()
             .ok_or_else(|| Error::InferenceError("Nemotron predictor c0 is not hydrated".into()))?;
+        if [h0.dim(0)?, c0.dim(0)?]
+            .into_iter()
+            .any(|width| width != batch)
+        {
+            return Err(Error::InvalidInput(
+                "Nemotron predictor labels and recurrent state disagree".into(),
+            ));
+        }
         let (h0, c0) = self.lstm_l0.step(&x, h0, c0)?;
-        state.h0 = Some(h0);
-        state.c0 = Some(c0);
 
         let h1 = state
             .h1
@@ -2700,9 +2736,17 @@ impl Predictor {
             .c1
             .as_ref()
             .ok_or_else(|| Error::InferenceError("Nemotron predictor c1 is not hydrated".into()))?;
-        let (h1, c1) = self
-            .lstm_l1
-            .step(state.h0.as_ref().expect("assigned above"), h1, c1)?;
+        if [h1.dim(0)?, c1.dim(0)?]
+            .into_iter()
+            .any(|width| width != batch)
+        {
+            return Err(Error::InvalidInput(
+                "Nemotron predictor labels and recurrent state disagree".into(),
+            ));
+        }
+        let (h1, c1) = self.lstm_l1.step(&h0, h1, c1)?;
+        state.h0 = Some(h0);
+        state.c0 = Some(c0);
         state.h1 = Some(h1);
         state.c1 = Some(c1);
 
@@ -2945,6 +2989,24 @@ impl Joint {
         let f = self.project_encoder(f)?;
         let g = self.project_predictor(g)?;
         self.joint_from_projections(&f, &g)
+    }
+
+    fn joint_batch_rows(&self, encoded_rows: &Tensor, predictor_rows: &Tensor) -> Result<Tensor> {
+        let (batch, _) = encoded_rows
+            .dims2()
+            .map_err(|_| Error::InvalidInput("Nemotron joint encoder rows must be [B,D]".into()))?;
+        let (predictor_batch, steps, _) = predictor_rows.dims3().map_err(|_| {
+            Error::InvalidInput("Nemotron joint predictor rows must be [B,1,D]".into())
+        })?;
+        if batch == 0 || predictor_batch != batch || steps != 1 {
+            return Err(Error::InvalidInput(
+                "Nemotron joint batch geometry is incompatible".into(),
+            ));
+        }
+        self.joint_after_projection(&encoded_rows.unsqueeze(1)?, predictor_rows)?
+            .squeeze(2)?
+            .squeeze(1)
+            .map_err(Error::from)
     }
 
     fn project_encoder(&self, f: &Tensor) -> Result<Tensor> {
