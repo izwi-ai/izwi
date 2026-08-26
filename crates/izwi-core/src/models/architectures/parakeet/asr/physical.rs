@@ -14,7 +14,7 @@ use crate::models::shared::state::typed_invocation_descriptor;
 use super::PRED_HIDDEN;
 
 pub(crate) const PARAKEET_PREDICTOR_STATE_DOMAIN: StateDomainId = StateDomainId::new(1);
-const PARAKEET_PREDICTOR_STATE_GROUP: StateGroupId = StateGroupId::new(1);
+pub(crate) const PARAKEET_PREDICTOR_STATE_GROUP: StateGroupId = StateGroupId::new(1);
 
 #[derive(Debug, Clone)]
 pub(crate) struct ParakeetPhysicalStateSpec {

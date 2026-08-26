@@ -14,7 +14,10 @@ use candle_nn::{
     ModuleT, VarBuilder,
 };
 
-use crate::backends::state::{InvocationTensorComponentValue, InvocationTensorUpdateV2};
+use crate::backends::state::{
+    InvocationTensorComponentValue, InvocationTensorUpdateV2, PhysicalStateTransactionId,
+    StateComponentValue, TensorStateArena,
+};
 use crate::backends::DeviceProfile;
 use crate::engine::{InvocationTensorLease, StageDescriptor};
 use crate::error::{Error, Result};
@@ -77,6 +80,10 @@ impl ParakeetPreparedEncoderArtifact {
             Error::Overloaded("Parakeet encoder artifact storage accounting overflowed".into())
         })?;
         Ok(accounting.bytes())
+    }
+
+    pub(crate) const fn encoded_len(&self) -> usize {
+        self.encoded_len
     }
 }
 
@@ -223,6 +230,11 @@ impl ParakeetAsrModel {
         if audio.is_empty() {
             return Err(Error::InvalidInput("Empty audio input".into()));
         }
+        if sample_rate == 0 {
+            return Err(Error::InvalidInput(
+                "Parakeet sample rate must be greater than zero".into(),
+            ));
+        }
         let mono = if sample_rate == SAMPLE_RATE {
             audio.to_vec()
         } else {
@@ -266,6 +278,114 @@ impl ParakeetAsrModel {
             counters: ParakeetDecodeCounters::default(),
             finished: false,
         })
+    }
+
+    pub(crate) fn hydrate_retained_decode_physical_state(
+        &self,
+        state: &mut ParakeetRetainedDecodeState,
+        arena: &TensorStateArena,
+        transaction: PhysicalStateTransactionId,
+    ) -> Result<()> {
+        let snapshot = arena
+            .read_transaction_base(transaction, physical::PARAKEET_PREDICTOR_STATE_DOMAIN)?
+            .ok_or_else(|| {
+                Error::InferenceError(
+                    "Parakeet retained predictor has no committed physical snapshot".into(),
+                )
+            })?;
+        if snapshot.components.len() != 5
+            || snapshot
+                .components
+                .iter()
+                .enumerate()
+                .any(|(index, value)| {
+                    value.component != StateComponentId::new((index + 1) as u32)
+                        || value.tensor.is_none()
+                })
+        {
+            return Err(Error::InferenceError(
+                "Parakeet retained predictor snapshot has non-canonical components".into(),
+            ));
+        }
+        let tensor = |index: usize| {
+            snapshot.components[index].tensor.clone().ok_or_else(|| {
+                Error::InferenceError("Parakeet retained predictor snapshot lost a tensor".into())
+            })
+        };
+        state.predictor = ParakeetPredictorBatchState {
+            h0: tensor(0)?,
+            c0: tensor(1)?,
+            h1: tensor(2)?,
+            c1: tensor(3)?,
+        };
+        state.predictor_out = tensor(4)?;
+        Ok(())
+    }
+
+    pub(crate) fn stage_retained_decode_physical_state(
+        &self,
+        state: &ParakeetRetainedDecodeState,
+        arena: &TensorStateArena,
+        transaction: PhysicalStateTransactionId,
+        target_cursor: u64,
+    ) -> Result<()> {
+        let expected_cursor = arena
+            .read_transaction_base(transaction, physical::PARAKEET_PREDICTOR_STATE_DOMAIN)?
+            .map_or(0, |snapshot| snapshot.cursor);
+        if target_cursor <= expected_cursor {
+            return Err(Error::InferenceError(format!(
+                "Parakeet retained predictor cursor did not advance: {expected_cursor} -> {target_cursor}"
+            )));
+        }
+        let tensors = [
+            state.predictor.h0.clone(),
+            state.predictor.c0.clone(),
+            state.predictor.h1.clone(),
+            state.predictor.c1.clone(),
+            state.predictor_out.clone(),
+        ];
+        let values = tensors
+            .into_iter()
+            .enumerate()
+            .map(|(index, tensor)| StateComponentValue {
+                component: StateComponentId::new((index + 1) as u32),
+                tensor: Some(tensor),
+            })
+            .collect();
+        arena.stage_replace(
+            transaction,
+            physical::PARAKEET_PREDICTOR_STATE_DOMAIN,
+            expected_cursor,
+            target_cursor,
+            values,
+        )
+    }
+
+    pub(crate) fn retained_decode_output(
+        &self,
+        artifact: &ParakeetPreparedEncoderArtifact,
+        state: &ParakeetRetainedDecodeState,
+    ) -> ParakeetAsrTranscriptionOutput {
+        ParakeetAsrTranscriptionOutput {
+            text: state.assembled.clone(),
+            language: artifact.language.clone(),
+            diagnostics: Some(serde_json::json!({
+                "input_samples": artifact.input_samples,
+                "input_sample_rate": artifact.input_sample_rate,
+                "resampled_samples": artifact.resampled_samples,
+                "feature_frames": artifact.feature_frames,
+                "encoded_frames": artifact.encoded_len,
+                "tdt_joint_steps": state.counters.tdt_joint_steps,
+                "tdt_emitted_tokens": state.counters.tdt_emitted_tokens,
+                "tdt_blank_steps": state.counters.tdt_blank_steps,
+                "host_argmax_reads": state.counters.host_argmax_reads,
+                "device_argmax_scalar_reads": state.counters.device_argmax_scalar_reads,
+            })),
+        }
+    }
+
+    pub(crate) const fn retained_decode_finished(state: &ParakeetRetainedDecodeState) -> bool {
+        state.finished
     }
 
     pub(crate) fn retained_decode_step_batch(
