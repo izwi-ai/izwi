@@ -14,6 +14,7 @@ use crate::model::ModelVariant;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::chat::{ChatMessage, ChatRole};
 
+use super::asr_retained::Lfm25AudioAsrRetainedState;
 use super::audio_output::{Lfm25AudioHead, Lfm25SampledAudioFrame};
 use super::bundle::{Lfm25AudioBundle, Lfm25AudioBundleInfo};
 use super::config::{
@@ -80,6 +81,34 @@ pub(crate) struct Lfm25AudioPreparedAsrArtifact {
     pub(crate) retained_resident_bytes: u64,
     pub(crate) retained_host_bytes: u64,
     preparation_timings: Lfm25AsrPreparationTimings,
+}
+
+impl Lfm25AudioPreparedAsrArtifact {
+    pub(crate) const fn model_load_nonce(&self) -> u64 {
+        self.model_load_nonce
+    }
+
+    pub(crate) fn hidden_size(&self) -> Result<usize> {
+        self.prompt_embeddings.dim(2).map_err(Error::from)
+    }
+
+    pub(crate) fn prompt_slice(&self, start: usize, tokens: usize) -> Result<Tensor> {
+        let end = start.checked_add(tokens).ok_or_else(|| {
+            Error::InvalidInput("LFM2.5 Audio retained ASR prefill range overflowed".into())
+        })?;
+        if tokens == 0 || end > self.prompt_tokens {
+            return Err(Error::InvalidInput(
+                "LFM2.5 Audio retained ASR prefill range is outside the prompt".into(),
+            ));
+        }
+        self.prompt_embeddings
+            .narrow(1, start, tokens)
+            .map_err(Error::from)
+    }
+
+    pub(crate) fn device(&self) -> &candle_core::Device {
+        self.prompt_embeddings.device()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -333,6 +362,28 @@ impl Lfm25AudioModel {
             backbone.new_shortconv_state(),
             self.decoder_config.codebooks,
         ))
+    }
+
+    pub(crate) fn new_retained_asr_state(
+        &self,
+        artifact: Arc<Lfm25AudioPreparedAsrArtifact>,
+        requested_max_new_tokens: usize,
+    ) -> Result<Lfm25AudioAsrRetainedState> {
+        validate_prepared_asr_identity(self.model_load_nonce, artifact.model_load_nonce())?;
+        validate_prepared_asr_prompt_shape(
+            artifact.prompt_embeddings.dims(),
+            artifact.prompt_tokens,
+            self.main_config.embedding_length,
+        )?;
+        Lfm25AudioAsrRetainedState::new(
+            artifact,
+            self.new_retained_state(Lfm25AudioRetainedMode::Asr)?,
+            self.model_load_nonce,
+            self.tokenizer.vocab_size(),
+            self.tokenizer.specials().clone(),
+            requested_max_new_tokens,
+            self.main_config.context_length,
+        )
     }
 
     pub(crate) fn begin_retained_main_quantum(
@@ -1840,7 +1891,7 @@ fn last_hidden_state(hidden_states: &Tensor) -> Result<Tensor> {
         .map_err(Error::from)
 }
 
-fn text_delta(previous: &str, current: &str) -> String {
+pub(super) fn text_delta(previous: &str, current: &str) -> String {
     if let Some(delta) = current.strip_prefix(previous) {
         return delta.to_string();
     }
@@ -1897,7 +1948,7 @@ fn append_asr_text_token(
     })
 }
 
-fn is_asr_stop_token(next: u32, specials: &Lfm25SpecialTokenIds) -> bool {
+pub(super) fn is_asr_stop_token(next: u32, specials: &Lfm25SpecialTokenIds) -> bool {
     next == specials.im_end
         || next == specials.eos
         || specials.eos_alt == Some(next)
@@ -1966,7 +2017,7 @@ fn has_suffix_repeat(ids: &[u32], span: usize, repeats: usize) -> bool {
     })
 }
 
-fn has_token_repetition_loop(ids: &[u32]) -> bool {
+pub(super) fn has_token_repetition_loop(ids: &[u32]) -> bool {
     if ids.len() < 48 {
         return false;
     }
@@ -1982,7 +2033,7 @@ struct NormalizedTextWord {
     end: usize,
 }
 
-fn trim_repeated_phrase_tail(input: &str) -> Option<String> {
+pub(super) fn trim_repeated_phrase_tail(input: &str) -> Option<String> {
     let words = normalized_text_words(input);
     const MIN_REPEAT_COUNT: usize = 4;
     const MIN_PHRASE_WORDS: usize = 2;

@@ -1,5 +1,6 @@
 //! Native LFM2.5 Audio GGUF architecture support.
 
+pub(crate) mod asr_retained;
 mod audio_output;
 mod bundle;
 mod config;

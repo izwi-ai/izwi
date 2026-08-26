@@ -205,6 +205,19 @@ impl Lfm25AudioRetainedState {
         }
     }
 
+    pub(crate) fn authenticate_main_quantum(
+        &self,
+        main: &PhysicalPagedKvCache,
+        checkpoint: &Lfm25AudioRetainedCheckpoint,
+    ) -> Result<()> {
+        if checkpoint.subphase != Lfm25AudioRetainedSubphase::Main {
+            return Err(Error::InferenceError(
+                "LFM2.5 Audio ASR received a non-main retained checkpoint".into(),
+            ));
+        }
+        self.authenticate(checkpoint, main, None)
+    }
+
     /// Depthformer is a codebook-local clock. Reset it before opening the
     /// frame quantum; rollback then returns to that zero-step frame boundary.
     pub(crate) fn reset_depthformer_frame(
