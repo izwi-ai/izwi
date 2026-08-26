@@ -297,6 +297,8 @@ struct ChatBenchSample {
 #[derive(Debug, Clone)]
 struct TtsBenchSample {
     total_ms: f64,
+    first_audio_ms: Option<f64>,
+    inter_frame_ms: Vec<f64>,
     generation_time_ms: Option<f64>,
     audio_duration_secs: Option<f64>,
     rtf: Option<f64>,
@@ -330,6 +332,8 @@ struct AsrBenchResponse {
 #[derive(Debug, Clone)]
 struct AsrBenchSample {
     total_ms: f64,
+    first_transcript_ms: Option<f64>,
+    inter_transcript_ms: Vec<f64>,
     response: AsrBenchResponse,
 }
 
@@ -562,6 +566,7 @@ struct BenchmarkRunConfig {
     iterations: Option<u32>,
     concurrent: Option<u32>,
     warmup: bool,
+    stream: bool,
     prompt: Option<String>,
     system: Option<String>,
     max_tokens: Option<usize>,
@@ -579,6 +584,10 @@ struct BenchmarkRunConfig {
 struct BenchmarkSummary {
     latency_ms: Option<Stats>,
     ttft_ms: Option<Stats>,
+    first_audio_ms: Option<Stats>,
+    inter_frame_ms: Option<Stats>,
+    first_transcript_ms: Option<Stats>,
+    inter_transcript_ms: Option<Stats>,
     end_to_end_ms: Option<Stats>,
     completion_tps: Option<Stats>,
     tokens_per_second: Option<Stats>,
@@ -611,6 +620,10 @@ struct BenchmarkSample {
     index: usize,
     latency_ms: Option<f64>,
     ttft_ms: Option<f64>,
+    first_audio_ms: Option<f64>,
+    inter_frame_ms: Option<f64>,
+    first_transcript_ms: Option<f64>,
+    inter_transcript_ms: Option<f64>,
     end_to_end_ms: Option<f64>,
     completion_tps: Option<f64>,
     tokens_per_second: Option<f64>,
@@ -685,6 +698,7 @@ struct BenchmarkManifestCase {
     iterations: Option<u32>,
     concurrent: Option<u32>,
     warmup: Option<bool>,
+    stream: Option<bool>,
     prompt: Option<String>,
     system: Option<String>,
     max_tokens: Option<usize>,
@@ -706,6 +720,7 @@ struct BenchmarkManifestMatrix {
     iterations: Option<Vec<u32>>,
     concurrent: Option<Vec<u32>>,
     warmup: Option<Vec<bool>>,
+    stream: Option<Vec<bool>>,
     prompt: Option<Vec<String>>,
     system: Option<Vec<String>>,
     max_tokens: Option<Vec<usize>>,
@@ -732,6 +747,7 @@ enum MatrixValue {
     Iterations(u32),
     Concurrent(u32),
     Warmup(bool),
+    Stream(bool),
     Prompt(String),
     System(String),
     MaxTokens(usize),
@@ -881,6 +897,7 @@ pub async fn execute(
             reference_text_file,
             concurrent,
             warmup,
+            stream,
         } => bench_tts(
             server,
             &model,
@@ -893,6 +910,7 @@ pub async fn execute(
             reference_text_file.as_deref(),
             concurrent,
             warmup,
+            stream,
             &options,
             theme,
         )
@@ -906,6 +924,7 @@ pub async fn execute(
             max_tokens,
             concurrent,
             warmup,
+            stream,
         } => bench_asr(
             server,
             &model,
@@ -915,6 +934,7 @@ pub async fn execute(
             max_tokens,
             concurrent,
             warmup,
+            stream,
             &options,
             theme,
         )
@@ -1093,6 +1113,7 @@ impl MatrixValue {
             MatrixValue::Iterations(value) => case.iterations = Some(*value),
             MatrixValue::Concurrent(value) => case.concurrent = Some(*value),
             MatrixValue::Warmup(value) => case.warmup = Some(*value),
+            MatrixValue::Stream(value) => case.stream = Some(*value),
             MatrixValue::Prompt(value) => case.prompt = Some(value.clone()),
             MatrixValue::System(value) => case.system = Some(value.clone()),
             MatrixValue::MaxTokens(value) => case.max_tokens = Some(*value),
@@ -1126,6 +1147,7 @@ impl MatrixValue {
             MatrixValue::MaxTokens(value) => value.to_string(),
             MatrixValue::DurationSecs(value) => value.to_string(),
             MatrixValue::Warmup(value) => value.to_string(),
+            MatrixValue::Stream(value) => value.to_string(),
         }
     }
 }
@@ -1147,6 +1169,7 @@ impl BenchmarkManifestMatrix {
             MatrixValue::Concurrent,
         )?;
         add_matrix_dimension(&mut dimensions, "warmup", &self.warmup, MatrixValue::Warmup)?;
+        add_matrix_dimension(&mut dimensions, "stream", &self.stream, MatrixValue::Stream)?;
         add_matrix_dimension(&mut dimensions, "prompt", &self.prompt, MatrixValue::Prompt)?;
         add_matrix_dimension(&mut dimensions, "system", &self.system, MatrixValue::System)?;
         add_matrix_dimension(
@@ -1571,6 +1594,7 @@ async fn bench_manifest(
                     reference_text_file.as_deref(),
                     case.concurrent.unwrap_or(1),
                     case.warmup.unwrap_or(false),
+                    case.stream.unwrap_or(false),
                     options,
                     theme,
                 )
@@ -1595,6 +1619,7 @@ async fn bench_manifest(
                     case.max_tokens,
                     case.concurrent.unwrap_or(1),
                     case.warmup.unwrap_or(false),
+                    case.stream.unwrap_or(false),
                     options,
                     theme,
                 )
@@ -1908,6 +1933,10 @@ async fn bench_chat(
             index: index + 1,
             latency_ms: Some(sample.total_ms),
             ttft_ms: Some(sample.ttft_ms),
+            first_audio_ms: None,
+            inter_frame_ms: None,
+            first_transcript_ms: None,
+            inter_transcript_ms: None,
             end_to_end_ms: Some(sample.total_ms),
             completion_tps: Some(if sample.total_ms > 0.0 {
                 sample.completion_tokens as f64 * 1000.0 / sample.total_ms
@@ -1942,6 +1971,7 @@ async fn bench_chat(
             iterations: Some(iterations),
             concurrent: Some(concurrent),
             warmup,
+            stream: false,
             prompt: Some(prompt.to_string()),
             system: system.as_deref().map(|value| value.to_string()),
             max_tokens: Some(max_tokens),
@@ -1957,6 +1987,10 @@ async fn bench_chat(
         summary: BenchmarkSummary {
             latency_ms: None,
             ttft_ms: stats(&ttft_ms),
+            first_audio_ms: None,
+            inter_frame_ms: None,
+            first_transcript_ms: None,
+            inter_transcript_ms: None,
             end_to_end_ms: stats(&total_ms),
             completion_tps: stats(&completion_tps),
             tokens_per_second: None,
@@ -1993,6 +2027,7 @@ async fn bench_tts(
     reference_text_file: Option<&Path>,
     concurrent: u32,
     warmup: bool,
+    stream_output: bool,
     options: &BenchOptions,
     theme: &Theme,
 ) -> Result<BenchmarkReport> {
@@ -2026,7 +2061,7 @@ async fn bench_tts(
         if options.interactive() {
             theme.info("Running warmup iteration...");
         }
-        let _ = run_tts_request(server, model, text, &reference).await?;
+        let _ = run_tts_request(server, model, text, &reference, stream_output).await?;
     }
 
     let pb = progress_bar(options.interactive(), iterations as u64);
@@ -2052,12 +2087,18 @@ async fn bench_tts(
             let server = server.to_string();
             async move {
                 let start = Instant::now();
-                let result = run_tts_request(&server, &model, text.as_str(), reference.as_ref())
-                    .await
-                    .map(|mut sample| {
-                        sample.total_ms = start.elapsed().as_secs_f64() * 1000.0;
-                        sample
-                    });
+                let result = run_tts_request(
+                    &server,
+                    &model,
+                    text.as_str(),
+                    reference.as_ref(),
+                    stream_output,
+                )
+                .await
+                .map(|mut sample| {
+                    sample.total_ms = start.elapsed().as_secs_f64() * 1000.0;
+                    sample
+                });
                 progress.inc(1);
                 result
             }
@@ -2082,6 +2123,14 @@ async fn bench_tts(
         .filter_map(|sample| sample.audio_duration_secs)
         .collect();
     let rtf: Vec<f64> = samples.iter().filter_map(|sample| sample.rtf).collect();
+    let first_audio_ms: Vec<f64> = samples
+        .iter()
+        .filter_map(|sample| sample.first_audio_ms)
+        .collect();
+    let inter_frame_ms: Vec<f64> = samples
+        .iter()
+        .flat_map(|sample| sample.inter_frame_ms.iter().copied())
+        .collect();
     let tokens_per_second: Vec<f64> = samples
         .iter()
         .filter_map(
@@ -2149,6 +2198,22 @@ async fn bench_tts(
                 percentile(&tokens_per_second, 0.95)
             );
         }
+        if !first_audio_ms.is_empty() {
+            println!(
+                "  First audio (avg/p50/p95):       {:.2} / {:.2} / {:.2} ms",
+                first_audio_ms.iter().sum::<f64>() / first_audio_ms.len() as f64,
+                percentile(&first_audio_ms, 0.5),
+                percentile(&first_audio_ms, 0.95)
+            );
+        }
+        if !inter_frame_ms.is_empty() {
+            println!(
+                "  Inter-chunk (avg/p50/p95):       {:.2} / {:.2} / {:.2} ms",
+                inter_frame_ms.iter().sum::<f64>() / inter_frame_ms.len() as f64,
+                percentile(&inter_frame_ms, 0.5),
+                percentile(&inter_frame_ms, 0.95)
+            );
+        }
         print_tts_stage_timing_summary(&tts_stage_samples);
     }
     let metrics_after = fetch_runtime_metrics(server).await;
@@ -2167,6 +2232,10 @@ async fn bench_tts(
             index: index + 1,
             latency_ms: Some(sample.total_ms),
             ttft_ms: None,
+            first_audio_ms: sample.first_audio_ms,
+            inter_frame_ms: stats(&sample.inter_frame_ms).map(|stats| stats.avg),
+            first_transcript_ms: None,
+            inter_transcript_ms: None,
             end_to_end_ms: Some(sample.total_ms),
             completion_tps: None,
             tokens_per_second: match (sample.tokens_generated, sample.generation_time_ms) {
@@ -2200,6 +2269,7 @@ async fn bench_tts(
             iterations: Some(iterations),
             concurrent: Some(concurrent),
             warmup,
+            stream: stream_output,
             prompt: None,
             system: None,
             max_tokens: None,
@@ -2215,6 +2285,10 @@ async fn bench_tts(
         summary: BenchmarkSummary {
             latency_ms: stats(&times),
             ttft_ms: None,
+            first_audio_ms: stats(&first_audio_ms),
+            inter_frame_ms: stats(&inter_frame_ms),
+            first_transcript_ms: None,
+            inter_transcript_ms: None,
             end_to_end_ms: stats(&times),
             completion_tps: None,
             tokens_per_second: stats(&tokens_per_second),
@@ -2248,6 +2322,7 @@ async fn bench_asr(
     max_tokens: Option<usize>,
     concurrent: u32,
     warmup: bool,
+    stream_output: bool,
     options: &BenchOptions,
     theme: &Theme,
 ) -> Result<BenchmarkReport> {
@@ -2301,7 +2376,15 @@ async fn bench_asr(
         if options.interactive() {
             theme.info("Running warmup iteration...");
         }
-        let _ = run_asr_request(server, model, &audio_base64, language, max_tokens).await?;
+        let _ = run_asr_request(
+            server,
+            model,
+            &audio_base64,
+            language,
+            max_tokens,
+            stream_output,
+        )
+        .await?;
     }
 
     let pb = progress_bar(options.interactive(), iterations as u64);
@@ -2333,11 +2416,12 @@ async fn bench_asr(
                     audio_base64.as_str(),
                     language.as_deref().map(|value| value.as_str()),
                     max_tokens,
+                    stream_output,
                 )
                 .await
-                .map(|response| AsrBenchSample {
-                    total_ms: start.elapsed().as_secs_f64() * 1000.0,
-                    response,
+                .map(|mut sample| {
+                    sample.total_ms = start.elapsed().as_secs_f64() * 1000.0;
+                    sample
                 });
                 progress.inc(1);
                 result
@@ -2364,6 +2448,14 @@ async fn bench_asr(
     let rtf: Vec<f64> = samples
         .iter()
         .filter_map(|sample| sample.response.rtf)
+        .collect();
+    let first_transcript_ms: Vec<f64> = samples
+        .iter()
+        .filter_map(|sample| sample.first_transcript_ms)
+        .collect();
+    let inter_transcript_ms: Vec<f64> = samples
+        .iter()
+        .flat_map(|sample| sample.inter_transcript_ms.iter().copied())
         .collect();
     let mut stage_samples = Vec::new();
     let mut decode_profile_samples = Vec::new();
@@ -2415,6 +2507,22 @@ async fn bench_asr(
                 percentile(&rtf, 0.95)
             );
         }
+        if !first_transcript_ms.is_empty() {
+            println!(
+                "  First transcript (avg/p50/p95): {:.2} / {:.2} / {:.2} ms",
+                first_transcript_ms.iter().sum::<f64>() / first_transcript_ms.len() as f64,
+                percentile(&first_transcript_ms, 0.5),
+                percentile(&first_transcript_ms, 0.95)
+            );
+        }
+        if !inter_transcript_ms.is_empty() {
+            println!(
+                "  Inter-delta (avg/p50/p95):      {:.2} / {:.2} / {:.2} ms",
+                inter_transcript_ms.iter().sum::<f64>() / inter_transcript_ms.len() as f64,
+                percentile(&inter_transcript_ms, 0.5),
+                percentile(&inter_transcript_ms, 0.95)
+            );
+        }
         print_asr_stage_timing_summary(&stage_samples);
         print_asr_decode_profile_summary(&decode_profile_samples);
     }
@@ -2441,6 +2549,10 @@ async fn bench_asr(
             index: index + 1,
             latency_ms: Some(sample.total_ms),
             ttft_ms: None,
+            first_audio_ms: None,
+            inter_frame_ms: None,
+            first_transcript_ms: sample.first_transcript_ms,
+            inter_transcript_ms: stats(&sample.inter_transcript_ms).map(|stats| stats.avg),
             end_to_end_ms: Some(sample.total_ms),
             completion_tps: None,
             tokens_per_second: None,
@@ -2475,6 +2587,7 @@ async fn bench_asr(
             iterations: Some(iterations),
             concurrent: Some(concurrent),
             warmup,
+            stream: stream_output,
             prompt: None,
             system: None,
             max_tokens,
@@ -2490,6 +2603,10 @@ async fn bench_asr(
         summary: BenchmarkSummary {
             latency_ms: stats(&times),
             ttft_ms: None,
+            first_audio_ms: None,
+            inter_frame_ms: None,
+            first_transcript_ms: stats(&first_transcript_ms),
+            inter_transcript_ms: stats(&inter_transcript_ms),
             end_to_end_ms: stats(&times),
             completion_tps: None,
             tokens_per_second: None,
@@ -2597,6 +2714,7 @@ async fn bench_throughput(
             iterations: None,
             concurrent: Some(concurrent),
             warmup: false,
+            stream: false,
             prompt: None,
             system: None,
             max_tokens: None,
@@ -2612,6 +2730,10 @@ async fn bench_throughput(
         summary: BenchmarkSummary {
             latency_ms: None,
             ttft_ms: None,
+            first_audio_ms: None,
+            inter_frame_ms: None,
+            first_transcript_ms: None,
+            inter_transcript_ms: None,
             end_to_end_ms: None,
             completion_tps: None,
             tokens_per_second: None,
@@ -2736,9 +2858,15 @@ async fn run_tts_request(
     model: &str,
     text: &str,
     reference: &TtsBenchReference,
+    stream_output: bool,
 ) -> Result<TtsBenchSample> {
     let client = http::client(Some(std::time::Duration::from_secs(300)))?;
-    let request_body = build_tts_bench_request_body(model, text, reference);
+    let mut request_body = build_tts_bench_request_body(model, text, reference);
+    if stream_output {
+        request_body["stream"] = serde_json::Value::Bool(true);
+        request_body["stream_format"] = serde_json::Value::String("sse".to_string());
+    }
+    let started = Instant::now();
 
     let response = client
         .post(format!("{}/v1/audio/speech", server))
@@ -2756,14 +2884,116 @@ async fn run_tts_request(
         });
     }
 
+    if stream_output {
+        return consume_tts_benchmark_stream(response, started).await;
+    }
+
+    let generation_time_ms = header_f64(&response, "x-generation-time-ms");
+    let audio_duration_secs = header_f64(&response, "x-audio-duration-secs");
+    let rtf = header_f64(&response, "x-rtf");
+    let tokens_generated = header_u64(&response, "x-tokens-generated");
+    let diagnostics = header_json(&response, "x-izwi-tts-diagnostics");
+    response
+        .bytes()
+        .await
+        .map_err(|error| CliError::ConnectionError(error.to_string()))?;
     Ok(TtsBenchSample {
-        total_ms: 0.0,
-        generation_time_ms: header_f64(&response, "x-generation-time-ms"),
-        audio_duration_secs: header_f64(&response, "x-audio-duration-secs"),
-        rtf: header_f64(&response, "x-rtf"),
-        tokens_generated: header_u64(&response, "x-tokens-generated"),
-        diagnostics: header_json(&response, "x-izwi-tts-diagnostics"),
+        total_ms: started.elapsed().as_secs_f64() * 1000.0,
+        first_audio_ms: None,
+        inter_frame_ms: Vec::new(),
+        generation_time_ms,
+        audio_duration_secs,
+        rtf,
+        tokens_generated,
+        diagnostics,
     })
+}
+
+async fn consume_tts_benchmark_stream(
+    response: reqwest::Response,
+    started: Instant,
+) -> Result<TtsBenchSample> {
+    let mut bytes = response.bytes_stream();
+    let mut buffer = Vec::new();
+    let mut timing = TtsStreamTimingState::default();
+    while let Some(chunk) = bytes.next().await {
+        buffer.extend_from_slice(
+            &chunk.map_err(|error| CliError::ConnectionError(error.to_string()))?,
+        );
+        while let Some(boundary) = buffer.windows(2).position(|window| window == b"\n\n") {
+            let event = buffer.drain(..boundary).collect::<Vec<_>>();
+            buffer.drain(..2);
+            let event = String::from_utf8(event).map_err(|error| {
+                CliError::Other(format!("Invalid UTF-8 in TTS stream: {error}"))
+            })?;
+            for line in event.lines() {
+                let Some(payload) = line.trim_end_matches('\r').strip_prefix("data: ") else {
+                    continue;
+                };
+                let value: serde_json::Value = serde_json::from_str(payload).map_err(|error| {
+                    CliError::Other(format!("Invalid TTS stream payload: {error}"))
+                })?;
+                let now = started.elapsed().as_secs_f64() * 1000.0;
+                if let Some(sample) = handle_tts_benchmark_stream_event(&value, now, &mut timing)? {
+                    return Ok(sample);
+                }
+            }
+        }
+    }
+    Err(CliError::Other(
+        "TTS benchmark stream ended before audio.done".to_string(),
+    ))
+}
+
+#[derive(Default)]
+struct TtsStreamTimingState {
+    first_audio_ms: Option<f64>,
+    last_audio_ms: Option<f64>,
+    inter_frame_ms: Vec<f64>,
+}
+
+fn handle_tts_benchmark_stream_event(
+    value: &serde_json::Value,
+    now_ms: f64,
+    timing: &mut TtsStreamTimingState,
+) -> Result<Option<TtsBenchSample>> {
+    match value.get("event").and_then(|event| event.as_str()) {
+        Some("audio.chunk") => {
+            if timing.first_audio_ms.is_none() {
+                timing.first_audio_ms = Some(now_ms);
+            }
+            if let Some(previous) = timing.last_audio_ms.replace(now_ms) {
+                timing.inter_frame_ms.push(now_ms - previous);
+            }
+            Ok(None)
+        }
+        Some("audio.done") => Ok(Some(TtsBenchSample {
+            total_ms: now_ms,
+            first_audio_ms: timing.first_audio_ms,
+            inter_frame_ms: std::mem::take(&mut timing.inter_frame_ms),
+            generation_time_ms: value
+                .get("generation_time_ms")
+                .and_then(|value| value.as_f64()),
+            audio_duration_secs: value
+                .get("audio_duration_secs")
+                .and_then(|value| value.as_f64()),
+            rtf: value.get("rtf").and_then(|value| value.as_f64()),
+            tokens_generated: value
+                .get("tokens_generated")
+                .and_then(|value| value.as_u64()),
+            diagnostics: None,
+        })),
+        Some("audio.failed") => {
+            let error = value
+                .get("error")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown streaming synthesis failure");
+            Err(CliError::Other(format!(
+                "TTS benchmark stream failed: {error}"
+            )))
+        }
+        _ => Ok(None),
+    }
 }
 
 fn build_tts_bench_request_body(
@@ -2797,7 +3027,8 @@ async fn run_asr_request(
     audio_base64: &str,
     language: Option<&str>,
     max_tokens: Option<usize>,
-) -> Result<AsrBenchResponse> {
+    stream_output: bool,
+) -> Result<AsrBenchSample> {
     let client = http::client(Some(std::time::Duration::from_secs(300)))?;
     let mut request_body = serde_json::json!({
         "model": model,
@@ -2810,6 +3041,10 @@ async fn run_asr_request(
     if let Some(max_tokens) = max_tokens {
         request_body["max_tokens"] = serde_json::json!(max_tokens);
     }
+    if stream_output {
+        request_body["stream"] = serde_json::Value::Bool(true);
+    }
+    let started = Instant::now();
 
     let response = client
         .post(format!("{}/v1/audio/transcriptions", server))
@@ -2827,10 +3062,118 @@ async fn run_asr_request(
         });
     }
 
-    response
+    if stream_output {
+        return consume_asr_benchmark_stream(response, started).await;
+    }
+    let response = response
         .json::<AsrBenchResponse>()
         .await
-        .map_err(|e| CliError::Other(format!("Failed to parse ASR benchmark response: {e}")))
+        .map_err(|e| CliError::Other(format!("Failed to parse ASR benchmark response: {e}")))?;
+    Ok(AsrBenchSample {
+        total_ms: started.elapsed().as_secs_f64() * 1000.0,
+        first_transcript_ms: None,
+        inter_transcript_ms: Vec::new(),
+        response,
+    })
+}
+
+async fn consume_asr_benchmark_stream(
+    response: reqwest::Response,
+    started: Instant,
+) -> Result<AsrBenchSample> {
+    let mut bytes = response.bytes_stream();
+    let mut buffer = Vec::new();
+    let mut timing = AsrStreamTimingState::default();
+    while let Some(chunk) = bytes.next().await {
+        buffer.extend_from_slice(
+            &chunk.map_err(|error| CliError::ConnectionError(error.to_string()))?,
+        );
+        while let Some(boundary) = buffer.windows(2).position(|window| window == b"\n\n") {
+            let event = buffer.drain(..boundary).collect::<Vec<_>>();
+            buffer.drain(..2);
+            let event = String::from_utf8(event).map_err(|error| {
+                CliError::Other(format!("Invalid UTF-8 in ASR stream: {error}"))
+            })?;
+            for line in event.lines() {
+                let Some(payload) = line.trim_end_matches('\r').strip_prefix("data: ") else {
+                    continue;
+                };
+                let value: serde_json::Value = serde_json::from_str(payload).map_err(|error| {
+                    CliError::Other(format!("Invalid ASR stream payload: {error}"))
+                })?;
+                let now = started.elapsed().as_secs_f64() * 1000.0;
+                if let Some(sample) = handle_asr_benchmark_stream_event(&value, now, &mut timing)? {
+                    return Ok(sample);
+                }
+            }
+        }
+    }
+    Err(CliError::Other(
+        "ASR benchmark stream ended before transcript.text.done".to_string(),
+    ))
+}
+
+#[derive(Default)]
+struct AsrStreamTimingState {
+    first_transcript_ms: Option<f64>,
+    last_transcript_ms: Option<f64>,
+    inter_transcript_ms: Vec<f64>,
+    transcript: String,
+}
+
+fn handle_asr_benchmark_stream_event(
+    value: &serde_json::Value,
+    now_ms: f64,
+    timing: &mut AsrStreamTimingState,
+) -> Result<Option<AsrBenchSample>> {
+    match value.get("type").and_then(|kind| kind.as_str()) {
+        Some("transcript.text.delta") => {
+            let delta = value
+                .get("delta")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            if !delta.is_empty() {
+                timing.transcript.push_str(delta);
+                if timing.first_transcript_ms.is_none() {
+                    timing.first_transcript_ms = Some(now_ms);
+                }
+                if let Some(previous) = timing.last_transcript_ms.replace(now_ms) {
+                    timing.inter_transcript_ms.push(now_ms - previous);
+                }
+            }
+            Ok(None)
+        }
+        Some("transcript.text.done") => {
+            if let Some(text) = value.get("text").and_then(|value| value.as_str()) {
+                timing.transcript = text.to_string();
+            }
+            Ok(Some(AsrBenchSample {
+                total_ms: now_ms,
+                first_transcript_ms: timing.first_transcript_ms,
+                inter_transcript_ms: std::mem::take(&mut timing.inter_transcript_ms),
+                response: AsrBenchResponse {
+                    text: Some(std::mem::take(&mut timing.transcript)),
+                    duration: value
+                        .get("audio_duration_secs")
+                        .and_then(|value| value.as_f64()),
+                    processing_time_ms: None,
+                    rtf: None,
+                    izwi_asr_diagnostics: None,
+                },
+            }))
+        }
+        Some("error") => {
+            let error = value
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown streaming transcription failure");
+            Err(CliError::Other(format!(
+                "ASR benchmark stream failed: {error}"
+            )))
+        }
+        _ => Ok(None),
+    }
 }
 
 async fn run_chat_request(
@@ -5148,6 +5491,66 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn audio_stream_benchmarks_record_first_output_and_inter_event_latency() {
+        let mut tts_timing = TtsStreamTimingState::default();
+        assert!(handle_tts_benchmark_stream_event(
+            &serde_json::json!({"event": "audio.chunk", "sequence": 0}),
+            10.0,
+            &mut tts_timing,
+        )
+        .expect("first TTS event")
+        .is_none());
+        assert!(handle_tts_benchmark_stream_event(
+            &serde_json::json!({"event": "audio.chunk", "sequence": 1}),
+            15.0,
+            &mut tts_timing,
+        )
+        .expect("second TTS event")
+        .is_none());
+        let tts = handle_tts_benchmark_stream_event(
+            &serde_json::json!({
+                "event": "audio.done",
+                "tokens_generated": 2,
+                "generation_time_ms": 10.0,
+                "audio_duration_secs": 0.02,
+                "rtf": 0.5,
+            }),
+            20.0,
+            &mut tts_timing,
+        )
+        .expect("terminal TTS event")
+        .expect("TTS sample");
+        assert!(tts.first_audio_ms.is_some());
+        assert_eq!(tts.inter_frame_ms, vec![5.0]);
+        assert_eq!(tts.tokens_generated, Some(2));
+
+        let mut asr_timing = AsrStreamTimingState::default();
+        for (now, delta) in [(7.0, "hello "), (11.0, "world")] {
+            assert!(handle_asr_benchmark_stream_event(
+                &serde_json::json!({"type": "transcript.text.delta", "delta": delta}),
+                now,
+                &mut asr_timing,
+            )
+            .expect("ASR delta")
+            .is_none());
+        }
+        let asr = handle_asr_benchmark_stream_event(
+            &serde_json::json!({
+                "type": "transcript.text.done",
+                "text": "hello world",
+                "audio_duration_secs": 1.0,
+            }),
+            13.0,
+            &mut asr_timing,
+        )
+        .expect("terminal ASR event")
+        .expect("ASR sample");
+        assert!(asr.first_transcript_ms.is_some());
+        assert_eq!(asr.inter_transcript_ms, vec![4.0]);
+        assert_eq!(asr.response.text.as_deref(), Some("hello world"));
+    }
+
+    #[test]
     fn chat_stream_event_records_first_delta_and_terminal_usage() {
         let started = Instant::now();
         let mut first_delta_at = None;
@@ -5598,6 +6001,10 @@ mod tests {
             index: 1,
             latency_ms: Some(123.0),
             ttft_ms: None,
+            first_audio_ms: None,
+            inter_frame_ms: None,
+            first_transcript_ms: None,
+            inter_transcript_ms: None,
             end_to_end_ms: Some(123.0),
             completion_tps: None,
             tokens_per_second: None,
@@ -5629,6 +6036,8 @@ mod tests {
     fn tts_quality_gates_flag_empty_clipped_and_silent_audio() {
         let sample = TtsBenchSample {
             total_ms: 100.0,
+            first_audio_ms: None,
+            inter_frame_ms: Vec::new(),
             generation_time_ms: Some(90.0),
             audio_duration_secs: Some(0.0),
             rtf: None,
@@ -6239,6 +6648,10 @@ concurrent = [1, 2]
                 "{name}"
             );
             assert!(cases.iter().all(|case| case.model.is_some()), "{name}");
+            assert!(
+                cases.iter().all(|case| case.stream == Some(true)),
+                "{name} must collect first-output and inter-event streaming latency"
+            );
             for concurrency in [1, 2, 4, 8] {
                 assert_eq!(
                     cases

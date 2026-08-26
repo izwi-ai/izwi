@@ -578,6 +578,10 @@ pub enum BenchCommands {
         /// Enable warmup iteration
         #[arg(long)]
         warmup: bool,
+
+        /// Use SSE streaming and measure first-audio/inter-chunk latency
+        #[arg(long)]
+        stream: bool,
     },
 
     /// Benchmark ASR inference
@@ -609,6 +613,10 @@ pub enum BenchCommands {
         /// Enable warmup iteration
         #[arg(long)]
         warmup: bool,
+
+        /// Use SSE streaming and measure first-transcript/inter-delta latency
+        #[arg(long)]
+        stream: bool,
     },
 
     /// Benchmark system throughput

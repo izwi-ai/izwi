@@ -9,6 +9,7 @@ command = "asr"
 file = "../../data/test.wav"
 iterations = 8
 warmup = true
+stream = true
 
 [benchmarks.matrix]
 model = [
@@ -28,6 +29,7 @@ name = "tts-cuda-concurrency"
 command = "tts"
 iterations = 8
 warmup = true
+stream = true
 text = "Continuous audio batching should remain responsive and clear."
 
 [benchmarks.matrix]
@@ -46,10 +48,10 @@ command = "tts"
 model = "VibeVoice-1.5B"
 iterations = 8
 warmup = true
+stream = true
 text = "Continuous audio batching should remain responsive and clear."
 reference_audio = "../../data/fox.wav"
 reference_text_file = "../../data/fox.md"
 
 [benchmarks.matrix]
 concurrent = [1, 2, 4, 8]
-
