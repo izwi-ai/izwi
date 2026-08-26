@@ -141,10 +141,18 @@ const fn fixed(axis: ShapeAxis, value: u64) -> ShapeDimension {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::state::{
+        negotiate_state_plan, PhysicalStateSequenceId, PhysicalStateTransactionId,
+        StateBackendPlanRequest, StateComponentValue, TensorStateArena, TensorStateCapacity,
+        TensorStateSelection,
+    };
+    use crate::backends::BackendKind;
     use crate::engine::{
         ExecutionMode, ExecutionProfile, NativeBatchMode, StageId, StageWorkSelector,
     };
     use crate::model::ModelVariant;
+    use candle_core::{DType, Device, Tensor};
+    use std::sync::Arc;
 
     fn stage(id: u32, selector: StageWorkSelector) -> StageDescriptor {
         let mut profile = ExecutionProfile::fail_closed(
@@ -189,5 +197,96 @@ mod tests {
         let error = parakeet_physical_state_spec(&[&retained, &atomic])
             .expect_err("mixed Parakeet state lifetimes must fail closed");
         assert!(error.to_string().contains("must be published separately"));
+    }
+
+    #[test]
+    fn retained_tensor_abort_preserves_committed_predictor_state() {
+        let contract = parakeet_retained_contract(parakeet_invocation_contract().unwrap()).unwrap();
+        let plan = negotiate_state_plan(
+            &contract,
+            &StateBackendPlanRequest {
+                backend: BackendKind::Cpu,
+                device_ordinal: None,
+                page_tokens_hint: None,
+                storage_dtype_hint: None,
+            },
+        )
+        .unwrap();
+        let capacity = TensorStateCapacity::for_plan(&plan, 1, 1).unwrap();
+        let arena =
+            TensorStateArena::new_with_contract(Arc::new(plan), &contract, capacity, Device::Cpu)
+                .unwrap();
+        let sequence = PhysicalStateSequenceId::new(1).unwrap();
+        arena.register(sequence).unwrap();
+        let values = |fill: f32| {
+            (0_u32..5)
+                .map(|index| StateComponentValue {
+                    component: StateComponentId::new(index + 1),
+                    tensor: Some(
+                        Tensor::full(
+                            fill,
+                            if index < 4 {
+                                vec![1, PRED_HIDDEN]
+                            } else {
+                                vec![1, 1, PRED_HIDDEN]
+                            },
+                            &Device::Cpu,
+                        )
+                        .unwrap()
+                        .to_dtype(DType::F32)
+                        .unwrap(),
+                    ),
+                })
+                .collect::<Vec<_>>()
+        };
+        let selection = |expected_cursor, target_cursor| TensorStateSelection {
+            group: PARAKEET_PREDICTOR_STATE_GROUP,
+            clock: StateClock::DecoderTokens,
+            expected_cursor,
+            target_cursor,
+        };
+
+        let first = PhysicalStateTransactionId::new(1).unwrap();
+        arena
+            .begin_selected(first, sequence, &[selection(0, 1)])
+            .unwrap();
+        arena
+            .stage_replace(first, PARAKEET_PREDICTOR_STATE_DOMAIN, 0, 1, values(0.0))
+            .unwrap();
+        let completion = arena.seal_selected_completion(first).unwrap();
+        arena.commit_selected(first, &completion).unwrap();
+        assert_eq!(
+            arena
+                .read(sequence, PARAKEET_PREDICTOR_STATE_DOMAIN)
+                .unwrap()
+                .unwrap()
+                .cursor,
+            1
+        );
+
+        let rollback = PhysicalStateTransactionId::new(2).unwrap();
+        arena
+            .begin_selected(rollback, sequence, &[selection(1, 2)])
+            .unwrap();
+        arena
+            .stage_replace(rollback, PARAKEET_PREDICTOR_STATE_DOMAIN, 1, 2, values(1.0))
+            .unwrap();
+        arena.abort(rollback).unwrap();
+        let after = arena
+            .read(sequence, PARAKEET_PREDICTOR_STATE_DOMAIN)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.cursor, 1);
+        assert_eq!(
+            after.components[0]
+                .tensor
+                .as_ref()
+                .unwrap()
+                .sum_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap(),
+            0.0
+        );
     }
 }
