@@ -1344,6 +1344,7 @@ struct NemotronPreprocessor {
     normalize: FeatureNormalize,
 }
 
+#[derive(Clone)]
 pub(super) struct NemotronStreamingFeatureState {
     preemphasized: Vec<f32>,
     last_raw_sample: Option<f32>,
@@ -1359,6 +1360,7 @@ pub(super) struct NemotronStreamingFeatureChunk {
     pub is_final: bool,
 }
 
+#[derive(Clone)]
 pub(super) struct NemotronStreamingPreEncodeState {
     features: Option<Tensor>,
     /// Global feature-frame index represented by tensor column zero. The
@@ -1377,6 +1379,7 @@ pub(super) struct NemotronStreamingEncodedChunk {
     pub is_final: bool,
 }
 
+#[derive(Clone)]
 pub(super) struct NemotronStreamingEncoderState {
     pending_pre_encoded: Option<Tensor>,
     pending_start_frame: usize,
@@ -1598,6 +1601,7 @@ pub(super) struct NemotronRnntStreamStep {
     pub stats: NemotronDecodeStats,
 }
 
+#[derive(Clone)]
 struct ConformerLayerStreamState {
     attn_cache: Option<Tensor>,
     conv_cache: Option<Tensor>,

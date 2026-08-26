@@ -466,6 +466,7 @@ pub enum NemotronStreamingCacheStatus {
     PhysicalStateV2,
 }
 
+#[derive(Clone)]
 pub struct NemotronStreamingState {
     profile: NemotronStreamingProfile,
     prompt: NemotronPromptCondition,
@@ -488,6 +489,19 @@ pub struct NemotronStreamingState {
     rnnt_state: Option<NemotronRnntStreamState>,
     assembled_text: String,
     emitted_tokens: usize,
+}
+
+pub(crate) enum NemotronRealtimeBatchInput<'a> {
+    Push {
+        samples: &'a [f32],
+        sample_rate: u32,
+    },
+    Finish,
+}
+
+pub(crate) struct NemotronRealtimeBatchRow<'a> {
+    pub(crate) state: &'a mut NemotronStreamingState,
+    pub(crate) input: NemotronRealtimeBatchInput<'a>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2002,38 +2016,121 @@ impl NemotronAsrModel {
         if samples.is_empty() {
             return Ok(Vec::new());
         }
-        if state.input_finished {
-            return Err(Error::InvalidInput(
-                "Cannot push audio into a finalized Nemotron streaming state".to_string(),
-            ));
-        }
-        let (next_resampler, samples) = state.resampler.resample_chunk(
-            samples,
-            sample_rate,
-            state.sample_rate,
-            state.max_samples,
-        )?;
-        state.push_samples(&samples)?;
-        state.resampler = next_resampler;
-        self.decode_ready_stream_chunks(state)
+        self.run_realtime_batch(&mut [NemotronRealtimeBatchRow {
+            state,
+            input: NemotronRealtimeBatchInput::Push {
+                samples,
+                sample_rate,
+            },
+        }])
+        .map(|mut rows| rows.pop().unwrap_or_default())
     }
 
     pub fn finish_stream(
         &self,
         state: &mut NemotronStreamingState,
     ) -> Result<Vec<NemotronRealtimeStreamEvent>> {
-        let (next_resampler, tail) = state.resampler.finish()?;
-        if !tail.is_empty() {
-            state.push_samples(&tail)?;
+        self.run_realtime_batch(&mut [NemotronRealtimeBatchRow {
+            state,
+            input: NemotronRealtimeBatchInput::Finish,
+        }])
+        .map(|mut rows| rows.pop().unwrap_or_default())
+    }
+
+    pub(crate) fn run_realtime_batch(
+        &self,
+        rows: &mut [NemotronRealtimeBatchRow<'_>],
+    ) -> Result<Vec<Vec<NemotronRealtimeStreamEvent>>> {
+        if rows.is_empty() {
+            return Err(Error::InvalidInput(
+                "Nemotron realtime cohort cannot be empty".into(),
+            ));
         }
-        state.resampler = next_resampler;
-        state.finish_input();
-        let mut batch = NemotronRealtimeEventBatch::new(state);
-        self.decode_ready_stream_chunks_into(state, &mut batch)?;
-        if !state.final_event_emitted {
-            batch.mark_final();
+        let checkpoints = rows.iter().map(|row| row.state.clone()).collect::<Vec<_>>();
+        let result = self.run_realtime_batch_inner(rows);
+        if result.is_err() {
+            for (row, checkpoint) in rows.iter_mut().zip(checkpoints) {
+                *row.state = checkpoint;
+            }
         }
-        Ok(batch.into_events(state))
+        result
+    }
+
+    fn run_realtime_batch_inner(
+        &self,
+        rows: &mut [NemotronRealtimeBatchRow<'_>],
+    ) -> Result<Vec<Vec<NemotronRealtimeStreamEvent>>> {
+        let finishing = rows
+            .iter()
+            .map(|row| matches!(row.input, NemotronRealtimeBatchInput::Finish))
+            .collect::<Vec<_>>();
+        let mut event_batches = rows
+            .iter()
+            .map(|row| NemotronRealtimeEventBatch::new(row.state))
+            .collect::<Vec<_>>();
+        for row in rows.iter_mut() {
+            match &row.input {
+                NemotronRealtimeBatchInput::Push {
+                    samples,
+                    sample_rate,
+                } => {
+                    if samples.is_empty() {
+                        continue;
+                    }
+                    if row.state.input_finished {
+                        return Err(Error::InvalidInput(
+                            "Cannot push audio into a finalized Nemotron streaming state".into(),
+                        ));
+                    }
+                    let (next_resampler, samples) = row.state.resampler.resample_chunk(
+                        samples,
+                        *sample_rate,
+                        row.state.sample_rate,
+                        row.state.max_samples,
+                    )?;
+                    row.state.push_samples(&samples)?;
+                    row.state.resampler = next_resampler;
+                }
+                NemotronRealtimeBatchInput::Finish => {
+                    let (next_resampler, tail) = row.state.resampler.finish()?;
+                    if !tail.is_empty() {
+                        row.state.push_samples(&tail)?;
+                    }
+                    row.state.resampler = next_resampler;
+                    row.state.finish_input();
+                }
+            }
+        }
+
+        loop {
+            let mut consumed_chunk = false;
+            for row in rows.iter_mut() {
+                let Some(chunk) = row.state.next_ready_chunk() else {
+                    continue;
+                };
+                let chunk_samples =
+                    row.state.samples[chunk.start_sample..chunk.end_sample].to_vec();
+                row.state.feature_state.push_samples(&chunk_samples)?;
+                if chunk.is_final {
+                    row.state.feature_state.finish_input();
+                }
+                row.state.mark_chunk_consumed(&chunk)?;
+                consumed_chunk = true;
+            }
+            self.drain_streaming_cohort(rows, &mut event_batches)?;
+            if !consumed_chunk {
+                break;
+            }
+        }
+
+        let mut outputs = Vec::with_capacity(rows.len());
+        for ((row, mut batch), finishing) in rows.iter_mut().zip(event_batches).zip(finishing) {
+            if finishing && !row.state.final_event_emitted {
+                batch.mark_final();
+            }
+            outputs.push(batch.into_events(row.state));
+        }
+        Ok(outputs)
     }
 
     pub fn start_decode_with_prompt(
@@ -2175,6 +2272,101 @@ impl NemotronAsrModel {
                 state.emitted_tokens = decoded.stats.emitted_tokens;
                 batch.record_decoded_text(state, text, encoder_chunk.is_final)?;
                 progressed = true;
+            }
+
+            if !progressed {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn drain_streaming_cohort(
+        &self,
+        rows: &mut [NemotronRealtimeBatchRow<'_>],
+        event_batches: &mut [NemotronRealtimeEventBatch],
+    ) -> Result<()> {
+        if rows.len() != event_batches.len() {
+            return Err(Error::InferenceError(
+                "Nemotron realtime event cohort geometry mismatch".into(),
+            ));
+        }
+        loop {
+            let mut progressed = false;
+            let mut encoded_chunks = (0..rows.len()).map(|_| None).collect::<Vec<_>>();
+            for (index, row) in rows.iter_mut().enumerate() {
+                let state = &mut row.state;
+                if let Some(feature_chunk) = self
+                    .network
+                    .compute_streaming_features(&mut state.feature_state)?
+                {
+                    state.pre_encode_state.push_features(feature_chunk)?;
+                    progressed = true;
+                } else if state.input_finished {
+                    state.pre_encode_state.finish_input();
+                }
+
+                if let Some(pre_encoded) = self
+                    .network
+                    .pre_encode_streaming_chunk(&mut state.pre_encode_state)?
+                {
+                    state.encoder_state.push_pre_encoded(pre_encoded)?;
+                    progressed = true;
+                } else if state.input_finished {
+                    state.encoder_state.finish_input();
+                }
+
+                let prompt_id = self.network.prompt_id(&state.prompt.target_lang)?;
+                if let Some(encoded) = self
+                    .network
+                    .encode_streaming_chunk(&mut state.encoder_state, prompt_id)?
+                {
+                    encoded_chunks[index] = Some(encoded);
+                    progressed = true;
+                }
+            }
+
+            if encoded_chunks.iter().any(Option::is_some) {
+                let mut rnnt_states = Vec::new();
+                let mut encoded = Vec::new();
+                let mut encoded_lens = Vec::new();
+                for (row, chunk) in rows.iter_mut().zip(encoded_chunks.iter()) {
+                    let Some(chunk) = chunk.as_ref() else {
+                        continue;
+                    };
+                    rnnt_states.push(row.state.rnnt_state.as_mut().ok_or_else(|| {
+                        Error::InferenceError(
+                            "Nemotron realtime cohort row has no RNNT state".into(),
+                        )
+                    })?);
+                    encoded.push(&chunk.encoded);
+                    encoded_lens.push(chunk.frames);
+                }
+                self.network.decode_rnnt_streaming_cohort(
+                    &mut rnnt_states,
+                    &encoded,
+                    &encoded_lens,
+                )?;
+                drop(rnnt_states);
+
+                for ((row, batch), chunk) in rows
+                    .iter_mut()
+                    .zip(event_batches.iter_mut())
+                    .zip(encoded_chunks.iter())
+                {
+                    let Some(chunk) = chunk.as_ref() else {
+                        continue;
+                    };
+                    let rnnt_state = row.state.rnnt_state.as_ref().ok_or_else(|| {
+                        Error::InferenceError("Nemotron realtime cohort row lost RNNT state".into())
+                    })?;
+                    row.state.emitted_tokens = rnnt_state.token_ids().len();
+                    batch.record_decoded_text(
+                        row.state,
+                        self.decoder.decode(rnnt_state.token_ids()),
+                        chunk.is_final,
+                    )?;
+                }
             }
 
             if !progressed {
