@@ -15,6 +15,7 @@ dry_run=0
 require_optimized_kernel_evidence=0
 require_continuous_batch_evidence=0
 require_resumable_prefill_evidence=0
+require_audio_streaming_evidence=0
 certificate_written=0
 started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
@@ -35,6 +36,8 @@ Options:
                         Require every case to prove run-local multi-row continuous batching
   --require-resumable-prefill-evidence
                         Require every case to prove a prompt ran as multiple resumable spans
+  --require-audio-streaming-evidence
+                        Require ASR/TTS c1/c2/c4/c8 streaming first/inter-output metrics
   --dry-run             Print the benchmark command without probing hardware/server
   -h, --help            Show this help
 
@@ -83,6 +86,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --require-resumable-prefill-evidence)
             require_resumable_prefill_evidence=1
+            shift
+            ;;
+        --require-audio-streaming-evidence)
+            require_audio_streaming_evidence=1
             shift
             ;;
         --dry-run)
@@ -164,6 +171,7 @@ write_status_certificate() {
         --argjson require_optimized "${require_optimized_kernel_evidence}" \
         --argjson require_continuous "${require_continuous_batch_evidence}" \
         --argjson require_resumable_prefill "${require_resumable_prefill_evidence}" \
+        --argjson require_audio_streaming "${require_audio_streaming_evidence}" \
         '{
             schema: "izwi.model-evidence.v2",
             status: $status,
@@ -179,7 +187,8 @@ write_status_certificate() {
             requirements: {
                 optimized_kernel: ($require_optimized == 1),
                 continuous_batch: ($require_continuous == 1),
-                resumable_prefill: ($require_resumable_prefill == 1)
+                resumable_prefill: ($require_resumable_prefill == 1),
+                audio_streaming: ($require_audio_streaming == 1)
             },
             backend: $backend,
             device: null,
@@ -283,7 +292,8 @@ if ! jq -e \
     --arg backend "${backend}" \
     --argjson require_optimized "${require_optimized_kernel_evidence}" \
     --argjson require_continuous "${require_continuous_batch_evidence}" \
-    --argjson require_resumable_prefill "${require_resumable_prefill_evidence}" '
+    --argjson require_resumable_prefill "${require_resumable_prefill_evidence}" \
+    --argjson require_audio_streaming "${require_audio_streaming_evidence}" '
     .schema_version == 1 and
     (.reports | length) > 0 and
     ([.reports[].name] | all(type == "string") and length == (unique | length)) and
@@ -362,6 +372,28 @@ if ! jq -e \
         $quanta > $requests and
         $tokens > $quanta
     ] | all(. == true))) and
+    (($require_audio_streaming == 0) or (
+        ([.reports[].report |
+            .command == "asr" or .command == "tts"
+        ] | all(. == true)) and
+        ([.reports[].report |
+            .config.stream == true and
+            (if .command == "tts" then
+                .summary.first_audio_ms.count == (.samples | length) and
+                .summary.inter_frame_ms.count > 0
+             else
+                .summary.first_transcript_ms.count == (.samples | length) and
+                .summary.inter_transcript_ms.count > 0
+             end)
+        ] | all(. == true)) and
+        ([.reports[].report | {
+            command: .command,
+            model: .config.model,
+            concurrent: .config.concurrent
+        }] | sort_by(.command, .model, .concurrent) |
+            group_by(.command, .model) |
+            all(map(.concurrent) == [1, 2, 4, 8]))
+    )) and
     (($require_optimized == 0) or ([.reports[] |
         .report.telemetry as $telemetry |
         (((($telemetry.after.kernel_path.fused_attention_success_total // 0) -
@@ -397,6 +429,7 @@ jq -n \
     --argjson require_optimized "${require_optimized_kernel_evidence}" \
     --argjson require_continuous "${require_continuous_batch_evidence}" \
     --argjson require_resumable_prefill "${require_resumable_prefill_evidence}" \
+    --argjson require_audio_streaming "${require_audio_streaming_evidence}" \
     --slurpfile health "${health_path}" \
     --slurpfile report "${report_path}" \
     '{
@@ -415,7 +448,8 @@ jq -n \
         requirements: {
             optimized_kernel: ($require_optimized == 1),
             continuous_batch: ($require_continuous == 1),
-            resumable_prefill: ($require_resumable_prefill == 1)
+            resumable_prefill: ($require_resumable_prefill == 1),
+            audio_streaming: ($require_audio_streaming == 1)
         },
         device: {
             build_git_sha: $health[0].runtime.build_git_sha,
@@ -477,6 +511,12 @@ jq -n \
                 model: .report.config.model,
                 samples: (.report.samples | length),
                 quality_failed: .report.summary.quality_gates.failed,
+                streaming_latency: {
+                    first_audio_ms: .report.summary.first_audio_ms,
+                    inter_frame_ms: .report.summary.inter_frame_ms,
+                    first_transcript_ms: .report.summary.first_transcript_ms,
+                    inter_transcript_ms: .report.summary.inter_transcript_ms
+                },
                 telemetry_delta_available: .report.telemetry.delta_available,
                 backend_kind: $runtime.backend_kind,
                 actual_device_kind: $runtime.actual_device_kind,

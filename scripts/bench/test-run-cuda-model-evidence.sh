@@ -14,15 +14,18 @@ grep -q -- '--allow-unsupported' <<<"${help}"
 grep -q -- '--require-optimized-kernel-evidence' <<<"${help}"
 grep -q -- '--require-continuous-batch-evidence' <<<"${help}"
 grep -q -- '--require-resumable-prefill-evidence' <<<"${help}"
+grep -q -- '--require-audio-streaming-evidence' <<<"${help}"
 grep -q 'selected backend health' <<<"${help}"
 
 dry_output=$(${runner} --manifest "${manifest}" --output "${tmp_dir}/dry" --dry-run \
-    --require-continuous-batch-evidence --require-resumable-prefill-evidence)
+    --require-continuous-batch-evidence --require-resumable-prefill-evidence \
+    --require-audio-streaming-evidence)
 grep -q 'IZWI_BENCH_QUALITY_MODE=strict' <<<"${dry_output}"
 grep -q -- '--artifact-dir' <<<"${dry_output}"
 jq -e '.schema == "izwi.model-evidence.v2" and .backend == "cuda" and .status == "unsupported" and
        .reason == "dry_run" and .requirements.continuous_batch == true and
        .requirements.resumable_prefill == true and
+       .requirements.audio_streaming == true and
        (.run.worktree_clean | type == "boolean")' \
     "${tmp_dir}/dry/certificate.json" >/dev/null
 [[ ! -e "${tmp_dir}/dry/benchmark" ]]
