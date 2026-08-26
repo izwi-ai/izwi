@@ -400,12 +400,15 @@ fn loaded_execution_contracts(
             .collect::<Vec<_>>();
         requirements.extend(long_form);
     }
-    // VibeVoice TTS retains its public/direct atomic route as a separately
-    // authenticated invocation graph while normal requests use the retained
-    // sequence graph. The internal long-form bit is only a graph-enumeration
-    // discriminator here; request routing never labels TTS as ASR.
+    // VibeVoice and Fish S2 TTS retain their public/direct atomic routes as
+    // separately authenticated invocation graphs while normal requests use
+    // retained sequence graphs. The internal long-form bit is only a graph-
+    // enumeration discriminator here; request routing never labels TTS as ASR.
     if metadata.capability == CapabilityKind::Tts
-        && metadata.model_variant.family() == crate::catalog::ModelFamily::VibeVoiceTts
+        && matches!(
+            metadata.model_variant.family(),
+            crate::catalog::ModelFamily::VibeVoiceTts | crate::catalog::ModelFamily::FishS2Tts
+        )
     {
         let atomic = requirements
             .iter()
@@ -6662,6 +6665,28 @@ mod tests {
             contract.stages[1].max_workspace_bytes,
             CONTINUOUS_CHAT_MAX_BATCH_WORKSPACE_BYTES
         );
+    }
+
+    #[test]
+    fn fish_s2_loaded_contracts_enumerate_retained_and_atomic_state_graphs() {
+        let registry = RuntimeAdapterRegistry::built_in();
+        let metadata = *registry
+            .require(CapabilityKind::Tts, ModelVariant::FishAudioS2Pro)
+            .unwrap();
+        let adapter = FishS2TtsExecutionAdapter::new(
+            ExecutionGroupId::new(1),
+            ModelInstanceId::new(2),
+            metadata,
+            BackendKind::Cpu,
+        );
+
+        let contracts = loaded_execution_contracts(&adapter).unwrap();
+        assert!(contracts
+            .iter()
+            .any(|contract| contract.execution_profile.mode == ExecutionMode::Sequence));
+        assert!(contracts
+            .iter()
+            .any(|contract| contract.execution_profile.mode == ExecutionMode::Atomic));
     }
 
     #[test]

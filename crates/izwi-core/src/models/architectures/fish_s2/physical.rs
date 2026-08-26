@@ -520,6 +520,34 @@ mod tests {
     }
 
     #[test]
+    fn retained_and_atomic_graphs_publish_both_state_lifetimes() {
+        let retained = [
+            retained_stage(1, StageWorkSelector::SequencePrefill),
+            retained_stage(2, StageWorkSelector::SequenceDecode),
+        ];
+        let atomic = stage();
+        let spec = fish_s2_physical_state_spec(
+            &current_config(),
+            DType::F16,
+            &[&retained, std::slice::from_ref(&atomic)],
+        )
+        .expect("mixed physical state");
+
+        assert!(spec.retained.is_some());
+        let InvocationWorkspaceSet::Bounded { profiles } = &spec.descriptor.invocation else {
+            panic!("atomic compatibility graph must publish invocation pages");
+        };
+        assert_eq!(profiles.len(), 2);
+        assert!(profiles.iter().any(|profile| {
+            profile
+                .stages
+                .iter()
+                .flat_map(|workspace| &workspace.domains)
+                .any(|domain| matches!(domain, InvocationWorkspaceDomain::State { .. }))
+        }));
+    }
+
+    #[test]
     fn dual_ar_contract_has_distinct_slow_and_fast_clocks_and_geometry() {
         let config = current_config();
         let contract = fish_s2_invocation_contract(&config, StateDType::F16, 64).expect("contract");
