@@ -11,7 +11,7 @@ use crate::models::architectures::fish_s2::contracts::semantic_code_from_token_i
 use crate::models::architectures::qwen3::core::build_rope_cache;
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
 use crate::models::shared::sampling::{
-    bounded_cuda_sampling_candidates, device_candidates_cover_top_p, sample_device_candidates,
+    bounded_device_sampling_candidates, device_candidates_cover_top_p, sample_device_candidates,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -445,7 +445,7 @@ fn sample_logits(row: &Tensor, sampler: &mut FishS2Sampler) -> Result<u32> {
             .map_err(Error::from);
     }
 
-    if let Some(candidates) = bounded_cuda_sampling_candidates(
+    if let Some(candidates) = bounded_device_sampling_candidates(
         row,
         row.dim(0)?,
         0,

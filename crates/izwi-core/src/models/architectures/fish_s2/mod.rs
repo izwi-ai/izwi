@@ -14,7 +14,7 @@ use crate::engine::StageDescriptor;
 use crate::error::{Error, Result};
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::sampling::{
-    bounded_cuda_sampling_candidates, device_candidates_cover_top_p, sample_device_candidates,
+    bounded_device_sampling_candidates, device_candidates_cover_top_p, sample_device_candidates,
 };
 
 pub mod artifacts;
@@ -492,7 +492,7 @@ fn sample_semantic_token(
         &first_frame_mask
     };
 
-    if let Some(candidates) = bounded_cuda_sampling_candidates(
+    if let Some(candidates) = bounded_device_sampling_candidates(
         &row,
         row.dim(0)?,
         0,
@@ -513,7 +513,7 @@ fn sample_semantic_token(
                         .copied()
                         .unwrap_or(false)
                 {
-                    let retry = bounded_cuda_sampling_candidates(
+                    let retry = bounded_device_sampling_candidates(
                         &row,
                         row.dim(0)?,
                         0,
