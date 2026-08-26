@@ -181,12 +181,15 @@ pub use types::{
 
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
+use crate::models::architectures::lfm25_audio::model::Lfm25AudioPreparedAsrArtifact;
 use crate::models::architectures::qwen3::asr::{Qwen3AsrAudioBatchRow, Qwen3AsrPreparedAudio};
 use crate::models::architectures::vibevoice::asr::{
     VibeVoiceAsrPreparationDecision, VibeVoiceAsrPreparedArtifact,
 };
 use crate::models::architectures::whisper::asr::WhisperAudioBatchRow;
-use crate::models::registry::{ChatModelLease, ModelRegistry, NativeChatPreparedPrompt};
+use crate::models::registry::{
+    ChatModelLease, Lfm25AudioModelLease, ModelRegistry, NativeChatPreparedPrompt,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
@@ -1216,6 +1219,110 @@ impl Engine {
         })?;
 
         match request.task_type {
+            TaskType::ASR if variant.family() == crate::catalog::ModelFamily::Lfm25Audio => {
+                let model = registry
+                    .get_lfm25_audio_lease(variant)
+                    .await
+                    .ok_or_else(|| {
+                        Error::ModelNotFound(format!(
+                            "LFM2.5 Audio ASR model {variant} is not loaded"
+                        ))
+                    })?;
+                if request.prepared_asr_execution_shape().is_none() {
+                    let model_for_preparation = model.clone();
+                    let request_id = request.id.clone();
+                    let deadline = request.deadline;
+                    let context_limit = registry
+                        .effective_context(variant)
+                        .unwrap_or(self.config.max_seq_len);
+                    let acquire_permit = self
+                        .direct_request_preparation_permits
+                        .clone()
+                        .acquire_owned();
+                    let permit = match deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline.into(), acquire_permit)
+                            .await
+                            .map_err(|_| Error::Timeout(request_id.clone()))?,
+                        None => acquire_permit.await,
+                    }
+                    .map_err(|_| {
+                        Error::InferenceError(
+                            "Direct LFM2.5 Audio ASR preparation queue is unavailable".into(),
+                        )
+                    })?;
+                    let worker = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        let request = request;
+                        let (samples, sample_rate) =
+                            executor::decode_request_audio_with_rate(&request)?;
+                        if model_for_preparation.asr_requires_long_form(&samples, sample_rate) {
+                            return Self::finalize_direct_lfm25_audio_asr_preparation(
+                                request,
+                                variant,
+                                model_for_preparation,
+                                samples,
+                                sample_rate,
+                                context_limit,
+                                None,
+                                None,
+                            );
+                        }
+
+                        let envelope = model_for_preparation
+                            .lfm25_audio_asr_preparation_resource_envelope(
+                                samples.len(),
+                                sample_rate,
+                            )?;
+                        let artifact = model_for_preparation
+                            .prepare_lfm25_audio_asr_artifact(&samples, sample_rate)?;
+                        let geometry = envelope.geometry;
+                        if artifact.source_samples != geometry.source_samples
+                            || artifact.source_sample_rate != geometry.source_sample_rate
+                            || artifact.resampled_samples != geometry.resampled_samples
+                            || artifact.effective_feature_frames
+                                != geometry.effective_feature_frames
+                            || artifact.audio_tokens != geometry.encoder_frames
+                            || artifact.prompt_tokens != geometry.prompt_tokens
+                            || artifact.materialized_tensor_elements
+                                != geometry.materialized_tensor_elements
+                            || artifact.retained_resident_bytes != geometry.retained_resident_bytes
+                            || artifact.retained_resident_bytes
+                                > envelope.max_retained_resident_bytes
+                            || artifact.materialized_tensor_elements
+                                > envelope.max_materialized_tensor_elements
+                        {
+                            return Err(Error::InferenceError(
+                                "Direct LFM2.5 Audio ASR artifact disagrees with its admitted preparation envelope"
+                                    .into(),
+                            ));
+                        }
+                        let prompt_tokens = artifact.prompt_tokens;
+                        Self::finalize_direct_lfm25_audio_asr_preparation(
+                            request,
+                            variant,
+                            model_for_preparation,
+                            samples,
+                            sample_rate,
+                            context_limit,
+                            Some(prompt_tokens),
+                            Some(artifact),
+                        )
+                    });
+                    request = match deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline.into(), worker)
+                            .await
+                            .map_err(|_| Error::Timeout(request_id.clone()))?,
+                        None => worker.await,
+                    }
+                    .map_err(|error| {
+                        Error::InferenceError(format!(
+                            "LFM2.5 Audio ASR request {request_id} preparation worker failed: {error}"
+                        ))
+                    })??;
+                } else {
+                    request.install_lfm25_audio_asr_execution_model(variant, model)?;
+                }
+            }
             TaskType::ASR if variant.family() != crate::catalog::ModelFamily::Voxtral => {
                 let model = registry.get_asr_lease(variant).await.ok_or_else(|| {
                     Error::ModelNotFound(format!("ASR model {variant} is not loaded"))
@@ -1653,6 +1760,53 @@ impl Engine {
             TaskType::ASR | TaskType::TTS | TaskType::Chat | TaskType::SpeechToSpeech => {}
         }
         Ok(request)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_direct_lfm25_audio_asr_preparation(
+        mut request: EngineCoreRequest,
+        variant: ModelVariant,
+        model: Lfm25AudioModelLease,
+        samples: Vec<f32>,
+        sample_rate: u32,
+        context_limit: usize,
+        input_tokens: Option<usize>,
+        artifact: Option<Arc<Lfm25AudioPreparedAsrArtifact>>,
+    ) -> Result<EngineCoreRequest> {
+        Self::validate_direct_lfm25_audio_asr_preparation_pair(input_tokens, artifact.as_deref())?;
+
+        request.install_prepared_asr_audio(variant, samples, sample_rate)?;
+        match (input_tokens, artifact) {
+            (None, None) => {
+                request.install_prepared_asr_long_form_atomic()?;
+                request.install_lfm25_audio_asr_execution_model(variant, model)?;
+            }
+            (Some(input_tokens), Some(artifact)) => {
+                request.install_prepared_sequence_input_tokens(input_tokens, context_limit)?;
+                request.install_lfm25_audio_asr_execution_model(variant, model)?;
+                request.install_prepared_lfm25_audio_asr_artifact(variant, artifact)?;
+            }
+            _ => unreachable!("route/artifact pair was validated above"),
+        }
+        Ok(request)
+    }
+
+    fn validate_direct_lfm25_audio_asr_preparation_pair(
+        input_tokens: Option<usize>,
+        artifact: Option<&Lfm25AudioPreparedAsrArtifact>,
+    ) -> Result<()> {
+        match (input_tokens, artifact) {
+            (None, None) => Ok(()),
+            (Some(input_tokens), Some(artifact)) if input_tokens == artifact.prompt_tokens => {
+                Ok(())
+            }
+            (Some(_), Some(_)) => Err(Error::InferenceError(
+                "Direct LFM2.5 Audio ASR prompt shape disagrees with its prepared artifact".into(),
+            )),
+            _ => Err(Error::InferenceError(
+                "Direct LFM2.5 Audio ASR route and prepared artifact disagree".into(),
+            )),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2717,6 +2871,17 @@ mod tests {
         assert_eq!(request.num_prompt_tokens(), 37);
         assert!(request.uses_asr_retained_sequence());
         assert!(request.install_prepared_asr_long_form_atomic().is_err());
+    }
+
+    #[test]
+    fn direct_lfm25_audio_asr_route_requires_a_complete_normal_or_long_form_pair() {
+        Engine::validate_direct_lfm25_audio_asr_preparation_pair(None, None)
+            .expect("long-form route has neither prompt tokens nor a retained artifact");
+        let error = Engine::validate_direct_lfm25_audio_asr_preparation_pair(Some(32), None)
+            .expect_err("normal route cannot omit its retained artifact");
+        assert!(error
+            .to_string()
+            .contains("route and prepared artifact disagree"));
     }
 
     #[test]
