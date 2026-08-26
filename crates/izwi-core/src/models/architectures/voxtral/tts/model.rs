@@ -444,12 +444,13 @@ impl VoxtralTtsModel {
         states: &mut [&mut VoxtralTtsRetainedState],
         caches: &mut [&mut PhysicalPagedKvCache],
         checkpoints: &[&VoxtralTtsQuantumCheckpoint],
-        max_tokens: usize,
+        max_tokens: &[usize],
     ) -> Result<VoxtralTtsPrefillBatch> {
         if states.is_empty()
             || states.len() != caches.len()
             || states.len() != checkpoints.len()
-            || max_tokens == 0
+            || max_tokens.len() != states.len()
+            || max_tokens.iter().any(|tokens| *tokens == 0)
         {
             return Err(Error::InvalidInput(
                 "Voxtral TTS retained prefill batch widths are invalid".into(),
@@ -467,6 +468,7 @@ impl VoxtralTtsModel {
             Error::InferenceError("Voxtral TTS retained prefill requires loaded weights".into())
         })?;
         let mut consumed = vec![0usize; states.len()];
+        let mut lm_launch_widths = Vec::new();
         let mut max_lm_launch_width = 0usize;
         let mut scalar_lm_launches = 0usize;
         loop {
@@ -474,7 +476,7 @@ impl VoxtralTtsModel {
                 .iter()
                 .enumerate()
                 .filter_map(|(row, state)| {
-                    (consumed[row] < max_tokens
+                    (consumed[row] < max_tokens[row]
                         && state.prefill_cursor < state.artifact.prompt_tokens)
                         .then_some(row)
                 })
@@ -511,6 +513,7 @@ impl VoxtralTtsModel {
                 )?;
             max_lm_launch_width = max_lm_launch_width.max(active.len());
             scalar_lm_launches += usize::from(active.len() == 1);
+            lm_launch_widths.push(active.len());
             for (wave_row, &state_row) in active.iter().enumerate() {
                 let state = &mut states[state_row];
                 state.prefill_cursor += 1;
@@ -537,6 +540,7 @@ impl VoxtralTtsModel {
             .collect();
         Ok(VoxtralTtsPrefillBatch {
             steps,
+            lm_launch_widths,
             max_lm_launch_width,
             scalar_lm_launches,
         })

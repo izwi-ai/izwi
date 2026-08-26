@@ -316,6 +316,11 @@ pub enum WorkUnit {
         /// is an authenticated explicit selection of no auxiliary group.
         auxiliary_state: Option<Arc<[ClockedStateSpan]>>,
     },
+    /// A model-authenticated terminal sequence stage that does not append KV.
+    /// TTS codecs use this after acoustic decode has committed its final frame.
+    SequenceFinalize {
+        max_output_steps: usize,
+    },
     /// One input-driven realtime quantum. `input` is the exact absolute input
     /// interval accepted by this push; output is bounded independently because
     /// a realtime model may emit zero or more events for one input chunk.
@@ -452,6 +457,7 @@ pub enum StageWorkSelector {
     PreSequencePreparation,
     SequencePrefill,
     SequenceDecode,
+    SequenceFinalize,
     RealtimePush,
     RealtimeFinish,
     RealtimePreparation,
@@ -481,6 +487,7 @@ impl StageWorkSelector {
                     ..
                 },
             )
+            | (Self::SequenceFinalize, WorkUnit::SequenceFinalize { .. })
             | (Self::RealtimePush, WorkUnit::RealtimePush { .. })
             | (Self::RealtimeFinish, WorkUnit::RealtimeFinish { .. })
             | (Self::RealtimePreparation, WorkUnit::RealtimePreparation { .. })
@@ -2429,6 +2436,8 @@ pub enum TerminalOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum YieldReason {
     QuantumExhausted,
+    /// Decoder state is durably ready for a distinct terminal sequence stage.
+    AwaitingFinalization,
     Backpressure,
     AwaitingInput,
     Preempted,
@@ -2752,6 +2761,22 @@ impl ExecutionReport {
                     return Err(Error::InferenceError(
                         "executor reported progress without consuming or producing work"
                             .to_string(),
+                    ));
+                }
+            }
+            WorkUnit::SequenceFinalize { max_output_steps } => {
+                if self.input_consumed != 0 || self.output_produced > max_output_steps {
+                    return Err(Error::InferenceError(
+                        "sequence finalization reported progress beyond its terminal quantum"
+                            .into(),
+                    ));
+                }
+                if !matches!(
+                    self.disposition,
+                    ExecutionDisposition::Finished(_) | ExecutionDisposition::Failed(_)
+                ) {
+                    return Err(Error::InferenceError(
+                        "sequence finalization must finish or fail in one transaction".into(),
                     ));
                 }
             }
@@ -4664,5 +4689,30 @@ mod tests {
         assert!(capabilities.cancellable_between_steps);
         assert!(!capabilities.physical_cache);
         assert_eq!(capabilities.max_batch_size, 4);
+    }
+
+    #[test]
+    fn sequence_finalize_accepts_only_one_terminal_cache_free_transaction() {
+        let plan = plan_for(
+            SessionKey::new("tts-finalize".to_string(), 1),
+            WorkUnit::SequenceFinalize {
+                max_output_steps: 1,
+            },
+        );
+        let completed = report_for(
+            &plan,
+            ExecutionDisposition::Finished(FinishReason::Completed),
+        );
+        assert!(completed.validate_against(&plan).is_ok());
+
+        let yielded = report_for(
+            &plan,
+            ExecutionDisposition::Yielded(YieldReason::QuantumExhausted),
+        );
+        assert!(yielded.validate_against(&plan).is_err());
+
+        let mut consumed_input = completed;
+        consumed_input.input_consumed = 1;
+        assert!(consumed_input.validate_against(&plan).is_err());
     }
 }

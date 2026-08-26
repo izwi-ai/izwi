@@ -50,6 +50,9 @@ pub(crate) struct VoxtralTtsPrefillStep {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VoxtralTtsPrefillBatch {
     pub(crate) steps: Vec<VoxtralTtsPrefillStep>,
+    /// One entry for every physical LM wave. Unequal prompt spans can shrink a
+    /// cohort over time, so a single maximum is not truthful call telemetry.
+    pub(crate) lm_launch_widths: Vec<usize>,
     pub(crate) max_lm_launch_width: usize,
     pub(crate) scalar_lm_launches: usize,
 }
@@ -100,6 +103,10 @@ struct VoxtralTtsHostCheckpoint {
 
 pub(crate) struct VoxtralTtsQuantumCheckpoint {
     cache: PhysicalPagedKvCheckpoint,
+    host: VoxtralTtsHostCheckpoint,
+}
+
+pub(crate) struct VoxtralTtsCodecCheckpoint {
     host: VoxtralTtsHostCheckpoint,
 }
 
@@ -182,6 +189,33 @@ impl VoxtralTtsRetainedState {
         Ok(())
     }
 
+    pub(crate) fn begin_codec_quantum(&self) -> Result<VoxtralTtsCodecCheckpoint> {
+        if self.phase != VoxtralTtsRetainedPhase::Codec || self.frames.is_empty() {
+            return Err(Error::InvalidInput(
+                "Voxtral TTS codec quantum requires committed acoustic frames".into(),
+            ));
+        }
+        Ok(VoxtralTtsCodecCheckpoint {
+            host: self.host_checkpoint(),
+        })
+    }
+
+    pub(crate) fn commit_codec_quantum(
+        &self,
+        _checkpoint: &VoxtralTtsCodecCheckpoint,
+    ) -> Result<()> {
+        if self.phase != VoxtralTtsRetainedPhase::Finished {
+            return Err(Error::InferenceError(
+                "Voxtral TTS codec quantum did not reach its terminal state".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn rollback_codec_quantum(&mut self, checkpoint: &VoxtralTtsCodecCheckpoint) {
+        self.restore_host(&checkpoint.host);
+    }
+
     fn host_checkpoint(&self) -> VoxtralTtsHostCheckpoint {
         VoxtralTtsHostCheckpoint {
             prefill_cursor: self.prefill_cursor,
@@ -204,8 +238,16 @@ impl VoxtralTtsRetainedState {
         self.artifact.prompt_tokens
     }
 
+    pub(crate) fn prefill_cursor(&self) -> usize {
+        self.prefill_cursor
+    }
+
     pub(crate) fn finished(&self) -> bool {
         self.phase == VoxtralTtsRetainedPhase::Finished
+    }
+
+    pub(crate) fn codec_ready(&self) -> bool {
+        self.phase == VoxtralTtsRetainedPhase::Codec
     }
 }
 
@@ -331,5 +373,19 @@ mod tests {
         right.params.cfg_alpha = 1.2;
         right.frames.push(vec![1, 2]);
         assert!(validate_acoustic_cohort(&[&mut left, &mut right]).is_err());
+    }
+
+    #[test]
+    fn codec_checkpoint_rolls_back_terminal_host_mutation_without_kv() {
+        let mut state = decode_state(1.2, 1);
+        state.phase = VoxtralTtsRetainedPhase::Codec;
+        let checkpoint = state.begin_codec_quantum().unwrap();
+        state.phase = VoxtralTtsRetainedPhase::Finished;
+        state.frames.clear();
+        assert!(state.commit_codec_quantum(&checkpoint).is_ok());
+
+        state.rollback_codec_quantum(&checkpoint);
+        assert!(state.codec_ready());
+        assert_eq!(state.frames, vec![vec![1, 2]]);
     }
 }

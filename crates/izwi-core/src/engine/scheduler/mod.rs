@@ -564,6 +564,10 @@ struct RunningRequest {
     prefill_complete: bool,
     /// Whether a prefill quantum has been scheduled but not yet committed.
     prefill_in_flight: bool,
+    /// A committed decoder quantum requested a distinct terminal model stage.
+    finalize_pending: bool,
+    /// The exact finalization quantum has been planned but not yet committed.
+    finalize_in_flight: bool,
     /// Scheduler-visible incremental-prefill quanta committed for this request.
     incremental_prefill_quanta_committed: usize,
     /// Priority of this request
@@ -726,6 +730,8 @@ impl Scheduler {
                 num_tokens_generated: 0,
                 prefill_complete: true,
                 prefill_in_flight: false,
+                finalize_pending: false,
+                finalize_in_flight: false,
                 incremental_prefill_quanta_committed: 0,
                 priority: request.priority,
                 workload_class: request.workload_class,
@@ -1014,11 +1020,65 @@ impl Scheduler {
             result.total_tokens = result.total_tokens.saturating_add(1);
         }
 
+        // Finalization is a distinct, cache-free model stage. Schedule it
+        // ahead of ordinary decode so a completed acoustic row cannot consume
+        // another decoder quantum or be stranded by its output-token ceiling.
+        let mut finalize_candidates = self
+            .running
+            .iter()
+            .filter(|(id, running)| {
+                running.finalize_pending
+                    && !running.finalize_in_flight
+                    && !self.realtime_sessions.contains_key(*id)
+            })
+            .filter_map(|(id, running)| {
+                let metadata = self.requests.get(id)?;
+                if metadata
+                    .retry_not_before
+                    .is_some_and(|not_before| not_before > scheduling_now)
+                {
+                    return None;
+                }
+                Some((
+                    id.clone(),
+                    running.sequence_id,
+                    running.priority,
+                    running.num_tokens_processed,
+                ))
+            })
+            .collect::<Vec<_>>();
+        finalize_candidates
+            .sort_by(|left, right| right.2.cmp(&left.2).then_with(|| left.1.cmp(&right.1)));
+        for (request_id, sequence_id, _priority, num_computed_tokens) in finalize_candidates {
+            if remaining_batch == 0 || remaining_decode_budget == 0 {
+                break;
+            }
+            let plan_id = self.next_plan_id;
+            self.next_plan_id = self.next_plan_id.saturating_add(1);
+            if let Some(running) = self.running.get_mut(&request_id) {
+                running.finalize_in_flight = true;
+            }
+            result.decode_requests.push(ScheduledRequest {
+                plan_id,
+                request_id,
+                sequence_id,
+                num_tokens: 1,
+                is_prefill: false,
+                num_computed_tokens,
+                work: WorkUnit::SequenceFinalize {
+                    max_output_steps: 1,
+                },
+            });
+            remaining_decode_budget = remaining_decode_budget.saturating_sub(1);
+            remaining_batch -= 1;
+            result.total_tokens = result.total_tokens.saturating_add(1);
+        }
+
         // Phase 1: schedule decode requests (already running prefill-complete requests).
         let mut decode_candidates: Vec<_> = self
             .running
             .iter()
-            .filter(|(_, r)| r.prefill_complete)
+            .filter(|(_, r)| r.prefill_complete && !r.finalize_pending)
             .filter(|(id, _)| !self.realtime_sessions.contains_key(*id))
             .filter_map(|(id, r)| {
                 let metadata = self.requests.get(id)?;
@@ -1422,6 +1482,8 @@ impl Scheduler {
                 // complete prompt was actually consumed.
                 prefill_complete: false,
                 prefill_in_flight: true,
+                finalize_pending: false,
+                finalize_in_flight: false,
                 incremental_prefill_quanta_committed: 0,
                 priority: metadata.priority,
                 workload_class: metadata.workload_class,
@@ -1526,6 +1588,29 @@ impl Scheduler {
             }
         }
         self.update_dynamic_budget();
+    }
+
+    /// Move one committed retained sequence onto its load-sealed finalization
+    /// stage. This is deliberately independent of generated-token capacity:
+    /// the final decoder frame may consume the request's last output token.
+    pub fn request_sequence_finalize(
+        &mut self,
+        request_id: &RequestId,
+    ) -> crate::error::Result<()> {
+        let running = self.running.get_mut(request_id).ok_or_else(|| {
+            crate::error::Error::InferenceError(
+                "cannot finalize a request that is not running".into(),
+            )
+        })?;
+        if !running.prefill_complete || running.prefill_in_flight {
+            return Err(crate::error::Error::InferenceError(
+                "cannot finalize a sequence before committed prefill".into(),
+            ));
+        }
+        running.finalize_pending = true;
+        running.finalize_in_flight = false;
+        running.paused = false;
+        Ok(())
     }
 
     pub(crate) fn prepare_realtime_stage_outcome(
@@ -1841,6 +1926,7 @@ impl Scheduler {
         }
 
         running.prefill_in_flight = false;
+        running.finalize_in_flight = false;
         running.prefill_complete = running.num_tokens_processed >= metadata.total_prompt_tokens;
         true
     }
@@ -1917,6 +2003,8 @@ impl Scheduler {
         running.num_tokens_generated = 0;
         running.prefill_complete = false;
         running.prefill_in_flight = false;
+        running.finalize_pending = false;
+        running.finalize_in_flight = false;
         running.first_token_emitted = false;
         running.paused = true;
         true
@@ -3257,6 +3345,9 @@ mod tests {
         let scheduled = scheduler.schedule();
         let session = scheduled.prefill_requests[0].session_key();
         scheduler.update_after_step(&request_id, 4, 2, 1.0);
+        scheduler
+            .request_sequence_finalize(&request_id)
+            .expect("committed decode can request finalization");
         let metadata_before = scheduler.requests[&request_id].clone();
 
         assert!(scheduler.restart_request_for_recompute(&session));
@@ -3293,6 +3384,7 @@ mod tests {
         assert_eq!(running.num_tokens_generated, 0);
         assert!(!running.prefill_complete);
         assert!(!running.prefill_in_flight);
+        assert!(!running.finalize_pending);
         assert!(!running.first_token_emitted);
         assert!(running.paused);
 
@@ -4562,5 +4654,48 @@ mod tests {
         assert!(!config.enable_adaptive_batching);
         assert!(!config.enable_power_adaptive);
         assert!(!config.enable_decode_quanta);
+    }
+
+    #[test]
+    fn committed_sequence_finalization_is_scheduled_as_a_distinct_cache_free_stage() {
+        let mut scheduler = small_scheduler();
+        let request = build_request(TaskType::TTS, "tts-finalize", Priority::Normal);
+        assert!(scheduler.add_request(&request));
+        let prefill = scheduler.schedule();
+        assert_eq!(prefill.prefill_requests.len(), 1);
+        scheduler.update_after_step(&request.id, request.num_prompt_tokens(), 0, 1.0);
+        scheduler
+            .request_sequence_finalize(&request.id)
+            .expect("committed sequence can finalize");
+
+        let scheduled = scheduler.schedule();
+        assert_eq!(scheduled.decode_requests.len(), 1);
+        let row = &scheduled.decode_requests[0];
+        assert_eq!(row.request_id, request.id);
+        assert_eq!(row.num_tokens, 1);
+        assert!(matches!(
+            row.work,
+            WorkUnit::SequenceFinalize {
+                max_output_steps: 1
+            }
+        ));
+        assert!(scheduler.schedule().decode_requests.is_empty());
+
+        let session = row.session_key();
+        assert!(scheduler.release_execution_quantum_for_retry(&session));
+        let retry = scheduler.schedule();
+        assert_eq!(retry.decode_requests.len(), 1);
+        assert!(matches!(
+            retry.decode_requests[0].work,
+            WorkUnit::SequenceFinalize { .. }
+        ));
+    }
+
+    #[test]
+    fn sequence_finalization_cannot_bypass_uncommitted_prefill() {
+        let mut scheduler = small_scheduler();
+        let request = build_request(TaskType::TTS, "tts-finalize-early", Priority::Normal);
+        assert!(scheduler.add_request(&request));
+        assert!(scheduler.request_sequence_finalize(&request.id).is_err());
     }
 }

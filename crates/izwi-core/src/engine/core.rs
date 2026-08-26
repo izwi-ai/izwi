@@ -853,6 +853,7 @@ impl EngineCore {
         let work_kind = match &work {
             WorkUnit::PreSequencePreparation { kind } => kind.clone(),
             WorkUnit::SequenceStep { phase, .. } => format!("{phase:?}").to_ascii_lowercase(),
+            WorkUnit::SequenceFinalize { .. } => "sequence_finalize".to_string(),
             WorkUnit::RealtimePush { .. } => "realtime_push".to_string(),
             WorkUnit::RealtimeFinish { .. } => "realtime_finish".to_string(),
             WorkUnit::RealtimePreparation { mode, .. } => {
@@ -933,6 +934,7 @@ impl EngineCore {
                 phase: super::SequencePhase::Decode,
                 ..
             } => ExecutionState::Decoding,
+            WorkUnit::SequenceFinalize { .. } => ExecutionState::Decoding,
             WorkUnit::RealtimePush { .. } => ExecutionState::RealtimeRunning,
             WorkUnit::RealtimeFinish { .. } => ExecutionState::RealtimeFinishing,
             WorkUnit::RealtimePreparation {
@@ -1952,6 +1954,38 @@ impl EngineCore {
                         result.output.tokens_generated,
                         step_time_ms,
                     );
+                    if matches!(
+                        result.disposition,
+                        ExecutionDisposition::Yielded(super::YieldReason::AwaitingFinalization)
+                    ) {
+                        if let Err(error) = self
+                            .scheduler
+                            .request_sequence_finalize(&plan.session.request_id)
+                        {
+                            warn!(
+                                request_id = %plan.session.request_id,
+                                error = %error,
+                                "Committed sequence could not enter finalization"
+                            );
+                            return Some(CommittedExecutorOutput {
+                                session: plan.session,
+                                output: ExecutorOutput::error(
+                                    result.output.request_id,
+                                    format!("sequence finalization transition failed: {error}"),
+                                ),
+                                disposition: ExecutionDisposition::Failed(
+                                    ExecutionFailure::invalid_output(
+                                        "sequence finalization transition failed",
+                                    ),
+                                ),
+                                provenance: OutcomeProvenance::failure(
+                                    FailureOrigin::StateCommit,
+                                    result.provenance.dispatch_state,
+                                ),
+                                staged_stream_outputs: Vec::new(),
+                            });
+                        }
+                    }
                 }
             }
             ExecutionDisposition::Failed(_) => {}
@@ -2027,6 +2061,13 @@ impl EngineCore {
                 })?;
                 input.max(output).max(1)
             }
+            WorkUnit::SequenceFinalize { max_output_steps } => u64::try_from(*max_output_steps)
+                .map_err(|_| {
+                    Error::Overloaded(
+                        "sequence finalization output bound exceeds work accounting".into(),
+                    )
+                })?
+                .max(1),
             WorkUnit::RealtimePush {
                 input,
                 max_output_steps,

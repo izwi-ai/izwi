@@ -5144,7 +5144,7 @@ impl RuntimeService {
                 .params
                 .max_tokens
                 .max(1)
-                .min(context_limit.saturating_sub(1)),
+                .min(context_limit.saturating_sub(1).max(1)),
             ..Default::default()
         };
         let retained_request_bytes = u64::try_from(retained_engine_request_input_bytes(&request)?)
@@ -5205,13 +5205,11 @@ impl RuntimeService {
                     ));
                 }
                 let artifact = model_for_preparation.prepare_retained_artifact(&text, &voice)?;
-                let retained = retained_request_bytes
-                    .checked_add(artifact.retained_resident_bytes)
-                    .ok_or_else(|| {
-                        Error::Overloaded("Voxtral TTS retained bytes overflow".into())
-                    })?;
                 Ok(vec![Ok(PreparationArtifact {
-                    retained: JobResourceObservation::host(retained),
+                    retained: JobResourceObservation {
+                        host_bytes: retained_request_bytes,
+                        accelerator_bytes: artifact.retained_resident_bytes,
+                    },
                     value: artifact,
                 })])
             })

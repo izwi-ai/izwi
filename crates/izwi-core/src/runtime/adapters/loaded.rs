@@ -2544,7 +2544,20 @@ impl LoadedExecutionAdapter for VoxtralTtsExecutionAdapter {
         decode.max_workspace_bytes = 512_u64
             .saturating_mul(1024 * 1024)
             .saturating_mul(self.max_batch_size as u64);
-        for stage in [&mut preparation, &mut prefill, &mut decode] {
+        let mut finalize = StageDescriptor::from_execution_profile(
+            StageId::new(3),
+            "tts.codec.voxtral.scalar",
+            &profile,
+            NativeBatchMode::None,
+        );
+        finalize.selector = StageWorkSelector::SequenceFinalize;
+        finalize.progress = StageProgressKind::Atomic;
+        finalize.shape_policy = StageShapePolicy::Exact;
+        finalize.max_batch_size = 1;
+        finalize.concurrency = ConcurrencyClass::Exclusive;
+        finalize.max_work_units = 1;
+        finalize.max_workspace_bytes = 512 * 1024 * 1024;
+        for stage in [&mut preparation, &mut prefill, &mut decode, &mut finalize] {
             stage.output_visibility = OutputVisibility::AfterQuantumCommit;
             stage.validate()?;
         }
@@ -2555,7 +2568,7 @@ impl LoadedExecutionAdapter for VoxtralTtsExecutionAdapter {
             adapter_abi_revision: self.adapter_abi_revision(),
             metadata: self.metadata,
             execution_profile: profile,
-            stages: Arc::from([preparation, prefill, decode]),
+            stages: Arc::from([preparation, prefill, decode, finalize]),
         })
     }
 }
@@ -7172,6 +7185,13 @@ mod tests {
             );
             assert_eq!(contract.stages[1].shape_policy, StageShapePolicy::Ragged);
             assert_eq!(contract.stages[1].max_padding_basis_points, 0);
+            assert_eq!(contract.stages.len(), 4);
+            assert_eq!(
+                contract.stages[3].selector,
+                StageWorkSelector::SequenceFinalize
+            );
+            assert_eq!(contract.stages[3].batch_mode, NativeBatchMode::None);
+            assert_eq!(contract.stages[3].max_batch_size, 1);
             assert!(contract
                 .stages
                 .iter()

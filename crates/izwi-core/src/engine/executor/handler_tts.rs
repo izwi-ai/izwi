@@ -16,11 +16,58 @@ use super::super::types::AudioOutput;
 use super::super::SessionKey;
 use super::state::{
     ActiveFishS2TtsDecode, ActiveLfm25TtsDecode, ActiveQwenTtsDecode, ActiveVibeVoiceTtsDecode,
-    QwenTtsPhysicalState,
+    ActiveVoxtralTtsDecode, QwenTtsPhysicalState,
 };
 use super::{
     ExecutorOutput, ExecutorPhaseTiming, ExecutorStateLease, ModelSessionResult, NativeExecutor,
 };
+
+struct ContinuousVoxtralTtsRow<'a> {
+    index: usize,
+    lease: Option<ExecutorStateLease<'a, ActiveVoxtralTtsDecode>>,
+    cache: crate::models::shared::attention::physical::PhysicalPagedKvCache,
+    checkpoint:
+        Option<crate::models::architectures::voxtral::tts::retained::VoxtralTtsQuantumCheckpoint>,
+    prior_frames: usize,
+    prior_stream_sequence: usize,
+}
+
+impl ContinuousVoxtralTtsRow<'_> {
+    fn rollback(&mut self) -> Result<()> {
+        let checkpoint = self.checkpoint.take().ok_or_else(|| {
+            Error::InferenceError("Voxtral TTS row has no rollback checkpoint".into())
+        })?;
+        let lease = self.lease.as_mut().expect("armed Voxtral TTS lease");
+        let active = lease.require_state_mut()?;
+        active
+            .state
+            .rollback_quantum(&mut self.cache, &checkpoint)?;
+        active.last_frames_generated = self.prior_frames;
+        active.stream_sequence = self.prior_stream_sequence;
+        lease.mark_clean();
+        Ok(())
+    }
+}
+
+struct ContinuousVoxtralTtsBatch<'a> {
+    rows: Vec<ContinuousVoxtralTtsRow<'a>>,
+    armed: bool,
+}
+
+impl Drop for ContinuousVoxtralTtsBatch<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        for row in &mut self.rows {
+            if row.checkpoint.is_some() {
+                if let Err(error) = row.rollback() {
+                    tracing::error!(%error, "Voxtral TTS rollback failed; state remains fenced");
+                }
+            }
+        }
+    }
+}
 
 struct ContinuousLfm25TtsRow<'a> {
     index: usize,
@@ -270,6 +317,24 @@ fn retained_tts_batch_model_call(
         }),
         rows => Some(crate::engine::metrics::EngineModelCall::NativeTensor { mode, rows }),
     }
+}
+
+fn validate_voxtral_tts_prefill_step(
+    row: usize,
+    scheduled: &ScheduledRequest,
+    step: &crate::models::architectures::voxtral::tts::retained::VoxtralTtsPrefillStep,
+) -> Result<()> {
+    let expected_cursor = scheduled
+        .num_computed_tokens
+        .checked_add(scheduled.num_tokens)
+        .ok_or_else(|| Error::InferenceError("Voxtral TTS prefill cursor overflowed".into()))?;
+    if step.consumed_tokens != scheduled.num_tokens || step.prefill_cursor != expected_cursor {
+        return Err(Error::InferenceError(format!(
+            "Voxtral TTS prefill row {row} drifted: consumed {}, cursor {}, expected {} tokens ending at {expected_cursor}",
+            step.consumed_tokens, step.prefill_cursor, scheduled.num_tokens,
+        )));
+    }
+    Ok(())
 }
 
 fn accepted_tts_talker_tokens(
@@ -641,6 +706,551 @@ impl NativeExecutor {
             error: None,
         })
         .with_managed_cache_completions(completions))
+    }
+
+    pub(super) fn voxtral_tts_request_with_managed_cache(
+        &self,
+        request: &EngineCoreRequest,
+        scheduled: &ScheduledRequest,
+        mut retained: Option<super::RetainedRowManagedState>,
+    ) -> Result<ModelSessionResult> {
+        let variant = Self::resolve_variant(request)?;
+        if variant.family() != ModelFamily::VoxtralTts {
+            return Err(Error::InvalidInput("foreign Voxtral TTS request".into()));
+        }
+        let model = request
+            .prepared_voxtral_tts_model_lease_for_executor()?
+            .ok_or_else(|| Error::InferenceError("Voxtral TTS lost model residency".into()))?;
+        let mut retained = retained.take().ok_or_else(|| {
+            Error::InferenceError("Voxtral TTS lost retained physical state".into())
+        })?;
+        let mut cache = retained.take_only_paged()?;
+        retained.ensure_all_paged_consumed()?;
+        let mut lease = ExecutorStateLease::checkout(
+            &self.voxtral_tts_decode_states,
+            scheduled.session_key(),
+            variant,
+            "Voxtral TTS decode",
+        )?;
+        if lease.state().is_some_and(|active| {
+            active.variant != variant || !Arc::ptr_eq(&active.model.model_arc(), &model.model_arc())
+        }) {
+            lease.discard_state();
+        }
+        let fresh = lease.state().is_none();
+        if fresh {
+            if !scheduled.is_prefill || scheduled.num_computed_tokens != 0 {
+                return Err(Error::InferenceError(
+                    "Voxtral TTS lost initial state".into(),
+                ));
+            }
+            let artifact = request
+                .prepared_voxtral_tts_artifact_for_executor()?
+                .ok_or_else(|| Error::InferenceError("Voxtral TTS lost prompt".into()))?;
+            let params = request
+                .voxtral_tts_generation_params_for_executor()?
+                .ok_or_else(|| Error::InferenceError("Voxtral TTS lost geometry".into()))?;
+            let state = model.new_retained_state(artifact, params)?;
+            lease.install_state(ActiveVoxtralTtsDecode {
+                variant,
+                model: model.clone(),
+                state,
+                last_frames_generated: 0,
+                stream_sequence: 0,
+            })?;
+        }
+        let prior_stream_sequence = lease.require_state_mut()?.stream_sequence;
+        if scheduled.is_prefill {
+            let state = &lease.require_state_mut()?.state;
+            let (start, _) = resumable_tts_prefill_span(scheduled, state.prompt_tokens())?;
+            if state.prefill_cursor() != start {
+                return Err(Error::InferenceError(
+                    "Voxtral TTS scheduler and retained prefill cursors diverged".into(),
+                ));
+            }
+        }
+        let checkpoint = lease.require_state_mut()?.state.begin_quantum(&cache)?;
+        lease.mark_dirty();
+        let result = (|| -> Result<_> {
+            let active = lease.require_state_mut()?;
+            if scheduled.is_prefill {
+                let step = model.retained_prefill_step(
+                    &mut active.state,
+                    &mut cache,
+                    &checkpoint,
+                    scheduled.num_tokens,
+                )?;
+                if step.consumed_tokens != scheduled.num_tokens {
+                    return Err(Error::InferenceError("Voxtral TTS prefill drifted".into()));
+                }
+                Ok((false, 0usize))
+            } else {
+                let step =
+                    model.retained_decode_step(&mut active.state, &mut cache, &checkpoint)?;
+                Ok((step.finished, step.frames_generated))
+            }
+        })();
+        let (codec_ready, frames) = match result {
+            Ok(value) if !request.is_cancelled() => value,
+            result => {
+                let _ = request.take_staged_stream_outputs();
+                lease
+                    .require_state_mut()?
+                    .state
+                    .rollback_quantum(&mut cache, &checkpoint)?;
+                lease.require_state_mut()?.stream_sequence = prior_stream_sequence;
+                lease.mark_clean();
+                if fresh {
+                    lease.discard_state();
+                }
+                return result.and_then(|_| Err(Error::Cancelled(request.id.clone())));
+            }
+        };
+        let completions = cache.take_completed_writes();
+        lease
+            .require_state_mut()?
+            .state
+            .commit_quantum(&cache, &checkpoint)?;
+        let active = lease.require_state_mut()?;
+        let generated = frames.saturating_sub(active.last_frames_generated);
+        active.last_frames_generated = frames;
+        let audio = AudioOutput::new(
+            Vec::new(),
+            u32::try_from(model.codec_config.sample_rate)
+                .map_err(|_| Error::InferenceError("Voxtral TTS sample rate exceeds u32".into()))?,
+        );
+        lease.mark_clean();
+        lease.restore()?;
+        let output = ExecutorOutput {
+            request_id: request.id.clone(),
+            audio: Some(audio),
+            text: None,
+            input_transcription: None,
+            tokens_processed: scheduled.num_tokens,
+            tokens_generated: generated,
+            finished: false,
+            phase_timing_override: None,
+            asr_diagnostics: None,
+            error: None,
+        };
+        let result = if codec_ready {
+            ModelSessionResult::yielded(output, crate::engine::YieldReason::AwaitingFinalization)
+        } else {
+            ModelSessionResult::sequence(output)
+        };
+        Ok(result.with_managed_cache_completions(completions))
+    }
+
+    pub(super) fn voxtral_tts_batch_with_managed(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+        mut managed: Vec<Option<super::RetainedRowManagedState>>,
+    ) -> Result<Vec<ModelSessionResult>> {
+        if requests.len() != scheduled.len() || managed.len() != scheduled.len() {
+            return Err(Error::InvalidInput(
+                "Voxtral TTS batch rows do not match".into(),
+            ));
+        }
+        let mut outputs = (0..scheduled.len()).map(|_| None).collect::<Vec<_>>();
+        let live = requests
+            .iter()
+            .enumerate()
+            .filter_map(|(index, request)| {
+                if request.is_cancelled() {
+                    outputs[index] = Some(ModelSessionResult::cancelled_before_dispatch(
+                        ExecutorOutput::cancelled(request.id.clone()),
+                    ));
+                    None
+                } else {
+                    Some(index)
+                }
+            })
+            .collect::<Vec<_>>();
+        if live.is_empty() {
+            return outputs
+                .into_iter()
+                .map(|output| {
+                    output.ok_or_else(|| {
+                        Error::InferenceError("Voxtral TTS cancelled row lost output".into())
+                    })
+                })
+                .collect();
+        }
+        let is_prefill = scheduled[live[0]].is_prefill;
+        if live
+            .iter()
+            .any(|index| scheduled[*index].is_prefill != is_prefill)
+        {
+            return Err(Error::InvalidInput("Voxtral TTS batch mixed phases".into()));
+        }
+        let model = requests[live[0]]
+            .prepared_voxtral_tts_model_lease_for_executor()?
+            .ok_or_else(|| Error::InferenceError("Voxtral TTS batch lost model".into()))?;
+        let model_arc = model.model_arc();
+        let mut rows = Vec::with_capacity(live.len());
+        for index in live.iter().copied() {
+            let request = requests[index];
+            let variant = Self::resolve_variant(request)?;
+            let row_model = request
+                .prepared_voxtral_tts_model_lease_for_executor()?
+                .ok_or_else(|| Error::InferenceError("Voxtral TTS row lost model".into()))?;
+            if variant.family() != ModelFamily::VoxtralTts
+                || !Arc::ptr_eq(&model_arc, &row_model.model_arc())
+            {
+                return Err(Error::InvalidInput(
+                    "Voxtral TTS batch crossed identity".into(),
+                ));
+            }
+            let mut retained = managed[index].take().ok_or_else(|| {
+                Error::InferenceError("Voxtral TTS batch lost physical state".into())
+            })?;
+            let cache = retained.take_only_paged()?;
+            retained.ensure_all_paged_consumed()?;
+            let mut lease = ExecutorStateLease::checkout(
+                &self.voxtral_tts_decode_states,
+                scheduled[index].session_key(),
+                variant,
+                "batched Voxtral TTS",
+            )?;
+            if lease.state().is_some_and(|active| {
+                active.variant != variant || !Arc::ptr_eq(&active.model.model_arc(), &model_arc)
+            }) {
+                lease.discard_state();
+            }
+            if lease.state().is_none() {
+                if !is_prefill || scheduled[index].num_computed_tokens != 0 {
+                    return Err(Error::InferenceError("Voxtral TTS batch lost state".into()));
+                }
+                let artifact = request
+                    .prepared_voxtral_tts_artifact_for_executor()?
+                    .ok_or_else(|| Error::InferenceError("Voxtral TTS row lost prompt".into()))?;
+                let params = request
+                    .voxtral_tts_generation_params_for_executor()?
+                    .ok_or_else(|| Error::InferenceError("Voxtral TTS row lost geometry".into()))?;
+                lease.install_state(ActiveVoxtralTtsDecode {
+                    variant,
+                    model: model.clone(),
+                    state: model.new_retained_state(artifact, params)?,
+                    last_frames_generated: 0,
+                    stream_sequence: 0,
+                })?;
+            }
+            let active = lease.require_state_mut()?;
+            if is_prefill {
+                let (start, _) =
+                    resumable_tts_prefill_span(&scheduled[index], active.state.prompt_tokens())?;
+                if active.state.prefill_cursor() != start {
+                    return Err(Error::InferenceError(
+                        "Voxtral TTS batch scheduler and retained prefill cursors diverged".into(),
+                    ));
+                }
+            }
+            let prior_frames = active.last_frames_generated;
+            let prior_stream_sequence = active.stream_sequence;
+            let checkpoint = active.state.begin_quantum(&cache)?;
+            lease.mark_dirty();
+            rows.push(ContinuousVoxtralTtsRow {
+                index,
+                lease: Some(lease),
+                cache,
+                checkpoint: Some(checkpoint),
+                prior_frames,
+                prior_stream_sequence,
+            });
+        }
+        let mut batch = ContinuousVoxtralTtsBatch { rows, armed: true };
+        for row in &mut batch.rows {
+            if requests[row.index].is_cancelled() {
+                row.rollback()?;
+                outputs[row.index] = Some(ModelSessionResult::cancelled(
+                    ExecutorOutput::cancelled(requests[row.index].id.clone()),
+                ));
+            }
+        }
+        let call_rows = batch
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(row, state)| state.checkpoint.is_some().then_some(row))
+            .collect::<Vec<_>>();
+        let mut state_refs = Vec::new();
+        let mut cache_refs = Vec::new();
+        let mut checkpoint_refs = Vec::new();
+        let mut spans = Vec::new();
+        for (row_index, row) in batch.rows.iter_mut().enumerate() {
+            if !call_rows.contains(&row_index) {
+                continue;
+            }
+            state_refs.push(
+                &mut row
+                    .lease
+                    .as_mut()
+                    .expect("armed Voxtral lease")
+                    .require_state_mut()?
+                    .state,
+            );
+            cache_refs.push(&mut row.cache);
+            checkpoint_refs.push(row.checkpoint.as_ref().expect("armed Voxtral checkpoint"));
+            spans.push(scheduled[row.index].num_tokens);
+        }
+        let prefill_result = is_prefill
+            .then(|| {
+                Self::run_blocking(|| {
+                    model.retained_prefill_batch(
+                        &mut state_refs,
+                        &mut cache_refs,
+                        &checkpoint_refs,
+                        &spans,
+                    )
+                })
+            })
+            .transpose()?;
+        let decode_result = (!is_prefill)
+            .then(|| {
+                Self::run_blocking(|| {
+                    model.retained_decode_batch(&mut state_refs, &mut cache_refs, &checkpoint_refs)
+                })
+            })
+            .transpose()?;
+        drop((state_refs, cache_refs, checkpoint_refs));
+        let (steps, launch_widths) = if let Some(result) = prefill_result {
+            if result.steps.len() != call_rows.len() {
+                return Err(Error::InferenceError(
+                    "Voxtral TTS prefill returned the wrong number of rows".into(),
+                ));
+            }
+            for (step, &call_row) in result.steps.iter().zip(&call_rows) {
+                let index = batch.rows[call_row].index;
+                validate_voxtral_tts_prefill_step(index, &scheduled[index], step)?;
+            }
+            (
+                result
+                    .steps
+                    .into_iter()
+                    .map(|step| (false, step.prefill_cursor))
+                    .collect::<Vec<_>>(),
+                result.lm_launch_widths,
+            )
+        } else if let Some(result) = decode_result {
+            (
+                result
+                    .steps
+                    .into_iter()
+                    .map(|step| (step.finished, step.frames_generated))
+                    .collect(),
+                vec![result.acoustic_launch_width, result.lm_launch_width],
+            )
+        } else {
+            unreachable!("Voxtral TTS cohort has one physical phase")
+        };
+        if steps.len() != call_rows.len() {
+            return Err(Error::InferenceError(
+                "Voxtral TTS batch returned wrong width".into(),
+            ));
+        }
+        let mode = if is_prefill {
+            crate::engine::NativeBatchMode::Static
+        } else {
+            crate::engine::NativeBatchMode::Continuous
+        };
+        for width in launch_widths {
+            if let Some(call) = retained_tts_batch_model_call(mode, width) {
+                crate::engine::metrics::record_engine_model_call(call);
+            }
+        }
+        for row in &mut batch.rows {
+            let index = row.index;
+            if row.checkpoint.is_none() {
+                continue;
+            }
+            if requests[index].is_cancelled() {
+                row.rollback()?;
+                outputs[index] = Some(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                    requests[index].id.clone(),
+                )));
+            }
+        }
+        // Cancellation is checked again immediately before the all-row commit
+        // validation. Codec work is deliberately absent here: terminal rows
+        // yield onto the scheduler-visible SequenceFinalize stage.
+        for row in &mut batch.rows {
+            let index = row.index;
+            if row.checkpoint.is_some() && requests[index].is_cancelled() {
+                let _ = requests[index].take_staged_stream_outputs();
+                row.rollback()?;
+                outputs[index] = Some(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                    requests[index].id.clone(),
+                )));
+            }
+        }
+
+        // Validate every host/KV commit before consuming any checkpoint.
+        for row in &mut batch.rows {
+            let Some(checkpoint) = row.checkpoint.as_ref() else {
+                continue;
+            };
+            row.lease
+                .as_mut()
+                .expect("armed Voxtral lease")
+                .require_state_mut()?
+                .state
+                .commit_quantum(&row.cache, checkpoint)?;
+        }
+
+        let sample_rate = u32::try_from(model.codec_config.sample_rate)
+            .map_err(|_| Error::InferenceError("Voxtral sample rate exceeds u32".into()))?;
+        for (call_row, (codec_ready, progress)) in call_rows.into_iter().zip(steps) {
+            let row = &mut batch.rows[call_row];
+            let index = row.index;
+            if row.checkpoint.is_none() {
+                continue;
+            }
+            let completions = row.cache.take_completed_writes();
+            let lease = row.lease.as_mut().expect("armed Voxtral lease");
+            let active = lease.require_state_mut()?;
+            let generated = if is_prefill {
+                0
+            } else {
+                progress.saturating_sub(active.last_frames_generated)
+            };
+            if !is_prefill {
+                active.last_frames_generated = progress;
+            }
+            row.checkpoint = None;
+            lease.mark_clean();
+            let lease = row.lease.take().expect("armed Voxtral lease");
+            lease.restore()?;
+            let output = ExecutorOutput {
+                request_id: requests[index].id.clone(),
+                audio: Some(AudioOutput::new(Vec::new(), sample_rate)),
+                text: None,
+                input_transcription: None,
+                tokens_processed: scheduled[index].num_tokens,
+                tokens_generated: generated,
+                finished: false,
+                phase_timing_override: None,
+                asr_diagnostics: None,
+                error: None,
+            };
+            let result = if codec_ready {
+                ModelSessionResult::yielded(
+                    output,
+                    crate::engine::YieldReason::AwaitingFinalization,
+                )
+            } else {
+                ModelSessionResult::sequence(output)
+            };
+            outputs[index] = Some(result.with_managed_cache_completions(completions));
+        }
+        batch.armed = false;
+        outputs
+            .into_iter()
+            .map(|output| {
+                output.ok_or_else(|| Error::InferenceError("Voxtral TTS row lost output".into()))
+            })
+            .collect()
+    }
+
+    pub(super) fn voxtral_tts_finalize_request(
+        &self,
+        request: &EngineCoreRequest,
+        scheduled: &ScheduledRequest,
+    ) -> Result<ModelSessionResult> {
+        if !matches!(
+            scheduled.work,
+            crate::engine::WorkUnit::SequenceFinalize {
+                max_output_steps: 1
+            }
+        ) || scheduled.is_prefill
+        {
+            return Err(Error::InvalidInput(
+                "Voxtral TTS codec requires an exact sequence-finalize quantum".into(),
+            ));
+        }
+        let variant = Self::resolve_variant(request)?;
+        if variant.family() != ModelFamily::VoxtralTts {
+            return Err(Error::InvalidInput(
+                "foreign Voxtral TTS codec request".into(),
+            ));
+        }
+        let model = request
+            .prepared_voxtral_tts_model_lease_for_executor()?
+            .ok_or_else(|| {
+                Error::InferenceError("Voxtral TTS codec lost model residency".into())
+            })?;
+        let mut lease = ExecutorStateLease::checkout(
+            &self.voxtral_tts_decode_states,
+            scheduled.session_key(),
+            variant,
+            "Voxtral TTS codec",
+        )?;
+        let active = lease.require_state_mut()?;
+        if active.variant != variant
+            || !Arc::ptr_eq(&active.model.model_arc(), &model.model_arc())
+            || !active.state.codec_ready()
+        {
+            return Err(Error::InferenceError(
+                "Voxtral TTS codec state crossed its model or phase fence".into(),
+            ));
+        }
+        let prior_stream_sequence = active.stream_sequence;
+        let checkpoint = active.state.begin_codec_quantum()?;
+        lease.mark_dirty();
+        let result = (|| -> Result<AudioOutput> {
+            let active = lease.require_state_mut()?;
+            let output = model.retained_codec_finalize(&mut active.state)?;
+            let sample_rate = u32::try_from(output.sample_rate)
+                .map_err(|_| Error::InferenceError("Voxtral sample rate exceeds u32".into()))?;
+            if let Some(tx) = Self::stream_sender(request) {
+                Self::stream_audio_with_policy(
+                    &tx,
+                    request.stream_policy,
+                    &request.id,
+                    &mut active.stream_sequence,
+                    output.samples.clone(),
+                    sample_rate,
+                    false,
+                )?;
+                Self::stream_final_marker_with_policy(
+                    &tx,
+                    request.stream_policy,
+                    &request.id,
+                    &mut active.stream_sequence,
+                )?;
+            }
+            if request.is_cancelled() {
+                return Err(Error::Cancelled(request.id.clone()));
+            }
+            active.state.commit_codec_quantum(&checkpoint)?;
+            Ok(AudioOutput::new(output.samples, sample_rate))
+        })();
+        let audio = match result {
+            Ok(audio) => audio,
+            Err(error) => {
+                let _ = request.take_staged_stream_outputs();
+                let active = lease.require_state_mut()?;
+                active.state.rollback_codec_quantum(&checkpoint);
+                active.stream_sequence = prior_stream_sequence;
+                lease.mark_clean();
+                lease.restore()?;
+                return Err(error);
+            }
+        };
+        lease.mark_clean();
+        lease.release()?;
+        Ok(ModelSessionResult::sequence(ExecutorOutput {
+            request_id: request.id.clone(),
+            audio: Some(audio),
+            text: None,
+            input_transcription: None,
+            tokens_processed: 0,
+            tokens_generated: 0,
+            finished: true,
+            phase_timing_override: None,
+            asr_diagnostics: None,
+            error: None,
+        }))
     }
 
     pub(super) fn fish_s2_tts_request_with_managed_cache(
@@ -2399,6 +3009,17 @@ impl NativeExecutor {
         if ordered_requests.first().is_some_and(|request| {
             request
                 .model_variant
+                .is_some_and(|variant| variant.family() == ModelFamily::VoxtralTts)
+        }) {
+            return self.voxtral_tts_batch_with_managed(
+                &ordered_requests,
+                scheduled,
+                managed_caches,
+            );
+        }
+        if ordered_requests.first().is_some_and(|request| {
+            request
+                .model_variant
                 .is_some_and(|variant| variant.family() == ModelFamily::VibeVoiceTts)
         }) {
             return self.vibevoice_tts_decode_batch_with_managed(
@@ -2816,6 +3437,47 @@ mod tests {
                 rows: 3
             })
         ));
+    }
+
+    #[test]
+    fn voxtral_prefill_telemetry_preserves_unequal_wave_widths() {
+        let calls = [3, 2, 1]
+            .into_iter()
+            .map(|width| {
+                retained_tts_batch_model_call(crate::engine::NativeBatchMode::Static, width)
+                    .expect("positive launch width")
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            calls[0],
+            crate::engine::metrics::EngineModelCall::NativeTensor { rows: 3, .. }
+        ));
+        assert!(matches!(
+            calls[1],
+            crate::engine::metrics::EngineModelCall::NativeTensor { rows: 2, .. }
+        ));
+        assert!(matches!(
+            calls[2],
+            crate::engine::metrics::EngineModelCall::ScalarRows { rows: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn voxtral_prefill_step_rejects_consumption_or_cursor_drift() {
+        let scheduled = scheduled(true, 3);
+        let valid = crate::models::architectures::voxtral::tts::retained::VoxtralTtsPrefillStep {
+            consumed_tokens: 3,
+            prefill_cursor: 3,
+            prompt_tokens: 8,
+            complete: false,
+        };
+        validate_voxtral_tts_prefill_step(0, &scheduled, &valid).unwrap();
+        let mut drifted = valid.clone();
+        drifted.prefill_cursor = 2;
+        assert!(validate_voxtral_tts_prefill_step(0, &scheduled, &drifted).is_err());
+        drifted.prefill_cursor = 3;
+        drifted.consumed_tokens = 2;
+        assert!(validate_voxtral_tts_prefill_step(0, &scheduled, &drifted).is_err());
     }
 
     #[test]
