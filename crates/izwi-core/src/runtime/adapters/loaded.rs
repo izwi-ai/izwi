@@ -1050,7 +1050,7 @@ impl LoadedExecutionAdapterFactory for Lfm25AudioPhysicalTtsAdapterFactory {
     }
 
     fn batch_mode(&self) -> NativeBatchMode {
-        NativeBatchMode::None
+        NativeBatchMode::Continuous
     }
 
     fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
@@ -1067,6 +1067,7 @@ impl LoadedExecutionAdapterFactory for Lfm25AudioPhysicalTtsAdapterFactory {
             context.model_instance_id,
             metadata,
             context.backend_kind,
+            context.max_tensor_batch_size,
         )))
     }
 }
@@ -2152,6 +2153,7 @@ struct Lfm25AudioTtsExecutionAdapter {
     adapter_instance_id: AdapterInstanceId,
     metadata: AdapterMetadata,
     backend_kind: BackendKind,
+    max_batch_size: usize,
     ceiling: OnceLock<crate::models::architectures::lfm25_audio::model::Lfm25AudioTtsStageCeiling>,
 }
 
@@ -2161,6 +2163,7 @@ impl Lfm25AudioTtsExecutionAdapter {
         model_instance_id: ModelInstanceId,
         metadata: AdapterMetadata,
         backend_kind: BackendKind,
+        max_batch_size: usize,
     ) -> Self {
         Self {
             execution_group_id,
@@ -2170,6 +2173,7 @@ impl Lfm25AudioTtsExecutionAdapter {
             ),
             metadata,
             backend_kind,
+            max_batch_size: max_batch_size.max(1),
             ceiling: OnceLock::new(),
         }
     }
@@ -2237,7 +2241,7 @@ impl LoadedExecutionAdapter for Lfm25AudioTtsExecutionAdapter {
         profile.prefill = PrefillMode::Incremental;
         profile.incremental_decode = true;
         profile.prefill_batch = NativeBatchMode::None;
-        profile.decode_batch = NativeBatchMode::None;
+        profile.decode_batch = NativeBatchMode::Continuous;
         profile.cache_mode = CacheMode::ExternalPaged;
         profile.cache_namespace = Some(format!(
             "{}:tts:{}:state-v2",
@@ -2246,10 +2250,10 @@ impl LoadedExecutionAdapter for Lfm25AudioTtsExecutionAdapter {
         ));
         profile.kv_dtype = "state_v2_resolved".into();
         profile.cancellation = CancellationGranularity::SequenceStep;
-        profile.concurrency = ConcurrencyClass::Exclusive;
+        profile.concurrency = ConcurrencyClass::Batchable;
         profile.recompute_safe = true;
         profile.cache_release_safe = true;
-        profile.max_batch_size = 1;
+        profile.max_batch_size = self.max_batch_size;
         profile.resolved_from_loaded_model = true;
         let mut preparation = StageDescriptor::from_execution_profile(
             StageId::new(0),
@@ -2258,6 +2262,8 @@ impl LoadedExecutionAdapter for Lfm25AudioTtsExecutionAdapter {
             NativeBatchMode::None,
         );
         preparation.selector = StageWorkSelector::PreSequencePreparation;
+        preparation.max_batch_size = 1;
+        preparation.concurrency = ConcurrencyClass::Exclusive;
         preparation.progress = StageProgressKind::Atomic;
         preparation.shape_policy = StageShapePolicy::Exact;
         preparation.max_work_units = u64::try_from(ceiling.max_prompt_tokens)
@@ -2271,6 +2277,8 @@ impl LoadedExecutionAdapter for Lfm25AudioTtsExecutionAdapter {
             NativeBatchMode::None,
         );
         prefill.selector = StageWorkSelector::SequencePrefill;
+        prefill.max_batch_size = 1;
+        prefill.concurrency = ConcurrencyClass::Exclusive;
         prefill.shape_policy = StageShapePolicy::Exact;
         prefill.max_work_units = u64::try_from(ceiling.max_prompt_tokens)
             .map_err(|_| Error::Overloaded("LFM2.5 Audio TTS prompt ceiling exceeds u64".into()))?;
@@ -2278,17 +2286,24 @@ impl LoadedExecutionAdapter for Lfm25AudioTtsExecutionAdapter {
         prefill.output_visibility = OutputVisibility::AfterQuantumCommit;
         let mut decode = StageDescriptor::from_execution_profile(
             StageId::new(2),
-            "tts.decode.lfm25_audio.scalar",
+            "tts.decode.lfm25_audio.tensor_continuous",
             &profile,
-            NativeBatchMode::None,
+            NativeBatchMode::Continuous,
         );
         decode.selector = StageWorkSelector::SequenceDecode;
         decode.shape_policy = StageShapePolicy::Exact;
-        decode.max_work_units =
-            u64::try_from(ceiling.max_codebooks.saturating_add(1)).map_err(|_| {
-                Error::Overloaded("LFM2.5 Audio TTS codebook ceiling exceeds u64".into())
-            })?;
-        decode.max_workspace_bytes = ceiling.max_workspace_bytes;
+        decode.max_work_units = u64::try_from(ceiling.max_codebooks.saturating_add(1))
+            .map_err(|_| Error::Overloaded("LFM2.5 Audio TTS codebook ceiling exceeds u64".into()))?
+            .checked_mul(u64::try_from(self.max_batch_size).map_err(|_| {
+                Error::Overloaded("LFM2.5 Audio TTS batch ceiling exceeds u64".into())
+            })?)
+            .ok_or_else(|| Error::Overloaded("LFM2.5 Audio TTS batch work overflow".into()))?;
+        decode.max_workspace_bytes = ceiling
+            .max_workspace_bytes
+            .checked_mul(u64::try_from(self.max_batch_size).map_err(|_| {
+                Error::Overloaded("LFM2.5 Audio TTS batch ceiling exceeds u64".into())
+            })?)
+            .ok_or_else(|| Error::Overloaded("LFM2.5 Audio TTS batch workspace overflow".into()))?;
         decode.output_visibility = OutputVisibility::AfterQuantumCommit;
         preparation.validate()?;
         prefill.validate()?;
@@ -5644,7 +5659,7 @@ mod tests {
     }
 
     #[test]
-    fn lfm25_audio_tts_factory_publishes_sealed_scalar_sequence_graph() {
+    fn lfm25_audio_tts_factory_publishes_sealed_continuous_decode_graph() {
         let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(8, 1).unwrap();
         let scalar = ScalarExecutionAdapterFactory;
         let factory = Lfm25AudioPhysicalTtsAdapterFactory;
@@ -5659,6 +5674,7 @@ mod tests {
                 ModelInstanceId::new(74),
                 metadata,
                 backend,
+                8,
             );
             assert!(adapter.contract(StreamingRequirements::NONE).is_err());
             adapter.install_test_preparation_seal(backend, 1).unwrap();
@@ -5667,16 +5683,25 @@ mod tests {
             assert_eq!(contract.execution_profile.mode, ExecutionMode::Sequence);
             assert_eq!(
                 contract.execution_profile.decode_batch,
-                NativeBatchMode::None
+                NativeBatchMode::Continuous
             );
             assert_eq!(contract.stages.len(), 3);
             assert_eq!(contract.stages[0].name, "tts.prepare.lfm25_audio");
             assert_eq!(contract.stages[1].name, "tts.prefill.lfm25_audio.scalar");
-            assert_eq!(contract.stages[2].name, "tts.decode.lfm25_audio.scalar");
-            assert!(contract.stages.iter().all(|stage| {
-                stage.output_visibility == OutputVisibility::AfterQuantumCommit
-                    && stage.max_batch_size == 1
-            }));
+            assert_eq!(
+                contract.stages[2].name,
+                "tts.decode.lfm25_audio.tensor_continuous"
+            );
+            assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::None);
+            assert_eq!(contract.stages[1].batch_mode, NativeBatchMode::None);
+            assert_eq!(contract.stages[2].batch_mode, NativeBatchMode::Continuous);
+            assert_eq!(contract.stages[0].max_batch_size, 1);
+            assert_eq!(contract.stages[1].max_batch_size, 1);
+            assert_eq!(contract.stages[2].max_batch_size, 8);
+            assert!(contract
+                .stages
+                .iter()
+                .all(|stage| { stage.output_visibility == OutputVisibility::AfterQuantumCommit }));
         }
     }
 

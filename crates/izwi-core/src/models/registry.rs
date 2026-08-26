@@ -3085,6 +3085,20 @@ impl NativeAudioChatModel {
         }
     }
 
+    pub(crate) fn lfm25_audio_tts_audio_decode_batch(
+        &self,
+        states: &mut [&mut Lfm25AudioTtsRetainedState],
+        mains: &mut [&mut PhysicalPagedKvCache],
+        depthformers: &mut [&mut PhysicalPagedKvCache],
+        checkpoints: &[&Lfm25AudioTtsQuantumCheckpoint],
+    ) -> Result<Vec<Lfm25AudioTtsDecodeStep>> {
+        match self {
+            Self::Lfm25Audio(model) => {
+                model.retained_tts_audio_decode_batch(states, mains, depthformers, checkpoints)
+            }
+        }
+    }
+
     pub(crate) fn detokenize_lfm25_audio_retained_tts_state(
         &self,
         state: &Lfm25AudioTtsRetainedState,

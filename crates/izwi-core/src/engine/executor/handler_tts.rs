@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::catalog::ModelFamily;
+use crate::engine::InvocationPagedKvLease;
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::tts::{
     PhysicalTtsManagedQuantumCheckpoint, PhysicalTtsPrefillManagedCheckpoint, SpeakerReference,
@@ -17,6 +18,92 @@ use super::state::{ActiveLfm25TtsDecode, ActiveQwenTtsDecode, QwenTtsPhysicalSta
 use super::{
     ExecutorOutput, ExecutorPhaseTiming, ExecutorStateLease, ModelSessionResult, NativeExecutor,
 };
+
+struct ContinuousLfm25TtsRow<'a> {
+    index: usize,
+    session: SessionKey,
+    lease: Option<ExecutorStateLease<'a, ActiveLfm25TtsDecode>>,
+    main: crate::models::shared::attention::physical::PhysicalPagedKvCache,
+    depth: Option<InvocationPagedKvLease>,
+    checkpoint: Option<
+        crate::models::architectures::lfm25_audio::tts_retained::Lfm25AudioTtsQuantumCheckpoint,
+    >,
+    prior_tokens: usize,
+    prior_stream_sequence: usize,
+}
+
+impl<'a> ContinuousLfm25TtsRow<'a> {
+    fn lease_mut(&mut self) -> Result<&mut ExecutorStateLease<'a, ActiveLfm25TtsDecode>> {
+        self.lease.as_mut().ok_or_else(|| {
+            Error::InferenceError("LFM2.5 Audio TTS cohort state lease is absent".into())
+        })
+    }
+
+    fn rollback(&mut self) -> Result<()> {
+        let checkpoint = self.checkpoint.take().ok_or_else(|| {
+            Error::InferenceError("LFM2.5 Audio TTS cohort checkpoint is absent".into())
+        })?;
+        let depth = self.depth.as_mut().ok_or_else(|| {
+            Error::InferenceError("LFM2.5 Audio TTS cohort depth lease is absent".into())
+        })?;
+        let lease = self.lease.as_mut().ok_or_else(|| {
+            Error::InferenceError("LFM2.5 Audio TTS cohort state lease is absent".into())
+        })?;
+        let active = lease.require_state_mut()?;
+        active
+            .state
+            .rollback_quantum(&mut self.main, Some(depth.cache_mut()), &checkpoint)?;
+        active.last_tokens_generated = self.prior_tokens;
+        active.stream_sequence = self.prior_stream_sequence;
+        lease.mark_clean();
+        Ok(())
+    }
+}
+
+struct ContinuousLfm25TtsBatch<'a> {
+    rows: Vec<ContinuousLfm25TtsRow<'a>>,
+    armed: bool,
+}
+
+impl<'a> ContinuousLfm25TtsBatch<'a> {
+    fn new(rows: Vec<ContinuousLfm25TtsRow<'a>>) -> Self {
+        Self { rows, armed: true }
+    }
+
+    fn rollback_row(&mut self, row: usize) -> Result<()> {
+        self.rows
+            .get_mut(row)
+            .ok_or_else(|| {
+                Error::InferenceError("continuous LFM TTS rollback row is out of range".into())
+            })?
+            .rollback()
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ContinuousLfm25TtsBatch<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        for row in &mut self.rows {
+            if row.checkpoint.is_none() {
+                continue;
+            }
+            if let Err(error) = row.rollback() {
+                tracing::error!(
+                    request_id = %row.session.request_id,
+                    epoch = row.session.epoch,
+                    %error,
+                    "continuous LFM2.5 TTS rollback failed; state fenced until cleanup"
+                );
+            }
+        }
+    }
+}
 
 fn validate_qwen_tts_physical_bindings(
     has_managed_runtime: bool,
@@ -1038,6 +1125,272 @@ impl NativeExecutor {
         }
     }
 
+    fn lfm25_audio_tts_decode_batch_with_managed(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+        mut managed: Vec<Option<super::RetainedRowManagedState>>,
+    ) -> Result<Vec<ModelSessionResult>> {
+        let mut outputs = (0..scheduled.len()).map(|_| None).collect::<Vec<_>>();
+        let mut audio_indices = Vec::new();
+        for index in 0..scheduled.len() {
+            if requests[index].is_cancelled() {
+                outputs[index] = Some(ModelSessionResult::cancelled_before_dispatch(
+                    ExecutorOutput::cancelled(requests[index].id.clone()),
+                ));
+                continue;
+            }
+            let variant = Self::resolve_variant(requests[index])?;
+            let lease = ExecutorStateLease::checkout(
+                &self.lfm25_tts_decode_states,
+                scheduled[index].session_key(),
+                variant,
+                "continuous LFM2.5 Audio TTS inspect",
+            )?;
+            let audio = lease
+                .state()
+                .ok_or_else(|| Error::InferenceError("continuous LFM TTS row has no state".into()))?
+                .state
+                .decode_needs_depthformer();
+            lease.restore()?;
+            if audio {
+                audio_indices.push(index);
+            } else {
+                outputs[index] = Some(self.lfm25_audio_tts_request_with_managed_cache(
+                    requests[index],
+                    &scheduled[index],
+                    managed[index].take(),
+                )?);
+            }
+        }
+        if audio_indices.is_empty() {
+            return outputs
+                .into_iter()
+                .map(|output| {
+                    output.ok_or_else(|| {
+                        Error::InferenceError("LFM TTS row produced no output".into())
+                    })
+                })
+                .collect();
+        }
+        let model = requests[audio_indices[0]]
+            .prepared_lfm25_audio_tts_model_lease_for_executor()?
+            .ok_or_else(|| Error::InferenceError("continuous LFM TTS lost model".into()))?;
+        let model_arc = model.model_arc();
+        let mut rows = Vec::with_capacity(audio_indices.len());
+        for index in audio_indices.iter().copied() {
+            let row_model = requests[index]
+                .prepared_lfm25_audio_tts_model_lease_for_executor()?
+                .ok_or_else(|| Error::InferenceError("continuous LFM TTS row lost model".into()))?;
+            if !Arc::ptr_eq(&model_arc, &row_model.model_arc()) {
+                return Err(Error::InferenceError(
+                    "continuous LFM TTS crossed model identity".into(),
+                ));
+            }
+            let mut retained = managed[index].take().ok_or_else(|| {
+                Error::InferenceError("continuous LFM TTS lost managed state".into())
+            })?;
+            let tensor = retained.tensor_state.clone().ok_or_else(|| {
+                Error::InferenceError("continuous LFM TTS lost ShortConv reservation".into())
+            })?;
+            let arena = requests[index]
+                .managed_cache_runtime()
+                .and_then(|runtime| runtime.tensor_state())
+                .ok_or_else(|| {
+                    Error::InferenceError("continuous LFM TTS lost ShortConv arena".into())
+                })?;
+            let main = retained.take_only_paged()?;
+            retained.ensure_all_paged_consumed()?;
+            let mut lease = ExecutorStateLease::checkout(
+                &self.lfm25_tts_decode_states,
+                scheduled[index].session_key(),
+                Self::resolve_variant(requests[index])?,
+                "continuous LFM2.5 Audio TTS decode",
+            )?;
+            let active = lease.require_state_mut()?;
+            active.state.bind_tensor_sequence(tensor.sequence)?;
+            active.state.restore_shortconv(arena)?;
+            let prior_tokens = active.last_tokens_generated;
+            let prior_stream_sequence = active.stream_sequence;
+            let mut depth =
+                super::invocation_paged_lease_for_row(requests[index], &scheduled[index])?;
+            let checkpoint = active
+                .state
+                .reset_and_begin_quantum(&main, Some(depth.cache_mut()))?;
+            lease.mark_dirty();
+            rows.push(ContinuousLfm25TtsRow {
+                index,
+                session: scheduled[index].session_key(),
+                lease: Some(lease),
+                main,
+                depth: Some(depth),
+                checkpoint: Some(checkpoint),
+                prior_tokens,
+                prior_stream_sequence,
+            });
+        }
+        let mut batch = ContinuousLfm25TtsBatch::new(rows);
+        let native = (|| {
+            let mut states = Vec::with_capacity(batch.rows.len());
+            let mut mains = Vec::with_capacity(batch.rows.len());
+            let mut depths = Vec::with_capacity(batch.rows.len());
+            let mut checkpoints = Vec::with_capacity(batch.rows.len());
+            for row in &mut batch.rows {
+                let ContinuousLfm25TtsRow {
+                    lease,
+                    main,
+                    depth,
+                    checkpoint,
+                    ..
+                } = row;
+                states.push(
+                    &mut lease
+                        .as_mut()
+                        .ok_or_else(|| {
+                            Error::InferenceError("continuous LFM TTS state lease is absent".into())
+                        })?
+                        .require_state_mut()?
+                        .state,
+                );
+                mains.push(main);
+                depths.push(
+                    depth
+                        .as_mut()
+                        .expect("armed LFM TTS depth lease")
+                        .cache_mut(),
+                );
+                checkpoints.push(checkpoint.as_ref().expect("armed LFM TTS checkpoint"));
+            }
+            Self::run_blocking(|| {
+                model.lfm25_audio_tts_audio_decode_batch(
+                    &mut states,
+                    &mut mains,
+                    &mut depths,
+                    &checkpoints,
+                )
+            })
+        })();
+        let steps = match native {
+            Ok(steps) if steps.len() == batch.rows.len() => steps,
+            Ok(_) => {
+                return Err(Error::InferenceError(
+                    "LFM TTS native cohort returned wrong width".into(),
+                ))
+            }
+            Err(error) => return Err(error),
+        };
+        crate::engine::metrics::record_engine_model_call(
+            crate::engine::metrics::EngineModelCall::NativeTensor {
+                mode: crate::engine::NativeBatchMode::Continuous,
+                rows: batch.rows.len(),
+            },
+        );
+        for row_index in 0..batch.rows.len() {
+            let index = batch.rows[row_index].index;
+            let arena = requests[index]
+                .managed_cache_runtime()
+                .and_then(|runtime| runtime.tensor_state())
+                .ok_or_else(|| {
+                    Error::InferenceError("continuous LFM TTS lost ShortConv arena".into())
+                })?;
+            batch.rows[row_index]
+                .lease_mut()?
+                .require_state_mut()?
+                .state
+                .stage_shortconv(arena, scheduled[index].plan_id)?;
+        }
+        for row_index in 0..batch.rows.len() {
+            let index = batch.rows[row_index].index;
+            if requests[index].is_cancelled() {
+                batch.rollback_row(row_index)?;
+                outputs[index] = Some(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                    requests[index].id.clone(),
+                )));
+            }
+        }
+        for (row_index, step) in steps.into_iter().enumerate() {
+            let row = &mut batch.rows[row_index];
+            let index = row.index;
+            if requests[index].is_cancelled() {
+                row.lease
+                    .take()
+                    .expect("armed LFM TTS state lease")
+                    .release()?;
+                continue;
+            }
+            let completions = row.main.take_completed_writes();
+            let checkpoint = row.checkpoint.take().expect("armed LFM TTS checkpoint");
+            {
+                let ContinuousLfm25TtsRow {
+                    lease, main, depth, ..
+                } = row;
+                lease
+                    .as_mut()
+                    .expect("armed LFM TTS state lease")
+                    .require_state_mut()?
+                    .state
+                    .commit_quantum(
+                        main,
+                        Some(depth.as_ref().expect("armed LFM TTS depth lease").cache()),
+                        &checkpoint,
+                    )?;
+            }
+            let _ = row
+                .depth
+                .take()
+                .expect("armed LFM TTS depth lease")
+                .release()?;
+            let active = row.lease_mut()?.require_state_mut()?;
+            let generated = step
+                .tokens_generated
+                .saturating_sub(active.last_tokens_generated);
+            active.last_tokens_generated = step.tokens_generated;
+            let samples = if step.finished {
+                model.detokenize_lfm25_audio_retained_tts_state(&active.state)?
+            } else {
+                Vec::new()
+            };
+            let sample_rate = model.lfm25_audio_tts_output_sample_rate();
+            let text = step.text;
+            row.lease_mut()?.mark_clean();
+            if step.finished {
+                row.lease
+                    .take()
+                    .expect("armed LFM TTS state lease")
+                    .release()?;
+            } else {
+                row.lease
+                    .take()
+                    .expect("armed LFM TTS state lease")
+                    .restore()?;
+            }
+            outputs[index] = Some(
+                ModelSessionResult::sequence(ExecutorOutput {
+                    request_id: requests[index].id.clone(),
+                    audio: Some(AudioOutput::new(samples, sample_rate)),
+                    text: Some(text),
+                    input_transcription: None,
+                    tokens_processed: 1,
+                    tokens_generated: generated,
+                    finished: step.finished,
+                    phase_timing_override: None,
+                    asr_diagnostics: None,
+                    error: None,
+                })
+                .with_managed_cache_completions(completions),
+            );
+        }
+        batch.disarm();
+        outputs
+            .into_iter()
+            .map(|output| {
+                output.ok_or_else(|| {
+                    Error::InferenceError("continuous LFM TTS row produced no output".into())
+                })
+            })
+            .collect()
+    }
+
     pub(super) fn tts_decode_batch_with_managed(
         &self,
         requests: &[&EngineCoreRequest],
@@ -1065,6 +1418,17 @@ impl NativeExecutor {
                     })
             })
             .collect::<Result<Vec<_>>>()?;
+        if ordered_requests.first().is_some_and(|request| {
+            request
+                .model_variant
+                .is_some_and(|variant| variant.family() == ModelFamily::Lfm25Audio)
+        }) {
+            return self.lfm25_audio_tts_decode_batch_with_managed(
+                &ordered_requests,
+                scheduled,
+                managed_caches,
+            );
+        }
         let live_indices = ordered_requests
             .iter()
             .enumerate()
