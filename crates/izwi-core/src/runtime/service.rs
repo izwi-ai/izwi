@@ -644,6 +644,23 @@ fn host_input_observation(input_bytes: usize) -> Result<JobResourceObservation> 
     ))
 }
 
+fn retained_lfm25_audio_tts_artifact_host_bytes(messages: &[ChatMessage]) -> Result<u64> {
+    let mut bytes = 0usize;
+    add_chat_messages_allocations(&mut bytes, messages, messages.len())?;
+    u64::try_from(bytes)
+        .map_err(|_| Error::Overloaded("LFM2.5 Audio TTS retained prompt exceeds u64".into()))
+}
+
+fn lfm25_audio_tts_preparation_workspace(backend: BackendKind, bytes: u64) -> ResourceVector {
+    let mut workspace = ResourceVector::zero();
+    match backend {
+        BackendKind::Cpu => workspace.host_bytes = ResourceAmount::Known(bytes),
+        BackendKind::Metal => workspace.unified_bytes = ResourceAmount::Known(bytes),
+        BackendKind::Cuda => workspace.device_bytes = ResourceAmount::Known(bytes),
+    }
+    workspace
+}
+
 fn asr_encoder_retained_resources(
     backend: BackendKind,
     host_bytes: u64,
@@ -4474,14 +4491,229 @@ impl RuntimeService {
             .await
     }
 
+    async fn prepare_lfm25_audio_tts_for_binding(
+        &self,
+        request: EngineCoreRequest,
+        job: JobLease,
+        residency_lease: Option<&ModelResidencyLease>,
+    ) -> Result<(EngineCoreRequest, JobLease)> {
+        if request.task_type != TaskType::TTS
+            || request
+                .model_variant
+                .is_none_or(|variant| variant.family() != ModelFamily::Lfm25Audio)
+            || request
+                .prepared_lfm25_audio_tts_artifact_for_executor()?
+                .is_some()
+        {
+            return Ok((request, job));
+        }
+        let variant = request
+            .model_variant
+            .expect("validated LFM2.5 Audio TTS variant");
+        let model = self
+            .model_registry
+            .get_lfm25_audio_lease(variant)
+            .await
+            .ok_or_else(|| {
+                Error::ModelNotFound(format!("LFM2.5 Audio model {variant} is not loaded"))
+            })?;
+        let residency = residency_lease.ok_or_else(|| {
+            Error::InferenceError("LFM2.5 Audio TTS preparation requires model residency".into())
+        })?;
+        let loaded_bundle = self
+            .model_lifecycle
+            .try_get_ready_bundle(residency.variant());
+        let preparation_contract = loaded_contract_for_residency(
+            residency,
+            loaded_bundle.as_deref(),
+            CapabilityKind::Tts,
+            false,
+            self.coordinator.execution_group_id(),
+            self.backend_router.context().backend_kind,
+            Some(ExecutionTargetKind::TokenEngine),
+        )?;
+        let context_limit = self
+            .model_registry
+            .effective_context(variant)
+            .ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "LFM2.5 Audio model {variant} has no effective context"
+                ))
+            })?;
+        let ceiling = model.lfm25_audio_tts_stage_ceiling()?;
+        let backend = self.backend_router.context().backend_kind;
+        if ceiling.backend != backend {
+            return Err(Error::InferenceError(
+                "LFM2.5 Audio TTS preparation ceiling used the wrong backend domain".into(),
+            ));
+        }
+        let retained_request_host_bytes =
+            u64::try_from(retained_engine_request_input_bytes(&request)?).map_err(|_| {
+                Error::Overloaded("LFM2.5 Audio TTS retained input exceeds u64".into())
+            })?;
+        job.record_materialized_usage(JobResourceObservation::host(retained_request_host_bytes))?;
+        let bridge = self.coordinator.bridge_preparation_admission(job)?;
+        let preparation_resources = asr_encoder_retained_resources(
+            backend,
+            retained_request_host_bytes,
+            ceiling.max_retained_resident_bytes,
+        )?;
+        let preparation_spec = JobSpec {
+            request_id: request.id.clone(),
+            lane: CoordinatorLane::Atomic,
+            priority: request.priority,
+            workload_class: request.workload_class,
+            deadline: request.deadline,
+            resources: preparation_resources,
+        };
+        let preparation_job = match self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                preparation_spec,
+                JobResourceObservation::host(retained_request_host_bytes),
+            )
+            .await
+        {
+            Ok(job) => job,
+            Err(failure) => {
+                drop(request);
+                let error = failure.error;
+                drop(failure.bridge);
+                return Err(error);
+            }
+        };
+        let messages = request.lfm25_audio_tts_messages_for_preparation()?;
+        let work = WorkUnit::PreSequencePreparation {
+            kind: "tts.prepare.lfm25_audio".into(),
+        };
+        let workspace = lfm25_audio_tts_preparation_workspace(backend, ceiling.max_workspace_bytes);
+        let cost = crate::engine::WorkCost::with_workspace(
+            u64::try_from(ceiling.max_prompt_tokens).map_err(|_| {
+                Error::Overloaded("LFM2.5 Audio TTS prompt ceiling exceeds u64".into())
+            })?,
+            ceiling.max_materialized_tensor_elements,
+            workspace,
+        );
+        let cancellation = PreparationCancellation::default();
+        let row = self.coordinator.seal_preparation_row(
+            preparation_job,
+            &preparation_contract,
+            &work,
+            cost,
+            ceiling.max_materialized_tensor_elements,
+            cancellation.clone(),
+        )?;
+        let model_for_preparation = model.clone();
+        let mut cancellation_guard = PreparationCancellationGuard {
+            cancellation,
+            armed: true,
+        };
+        let mut outcomes = self
+            .coordinator
+            .run_loaded_native_preparation_batch(
+                vec![row],
+                preparation_contract,
+                work,
+                move |live| {
+                    if live != [0] {
+                        return Err(Error::InferenceError(
+                            "LFM2.5 Audio TTS preparation received a non-scalar live set".into(),
+                        ));
+                    }
+                    let artifact =
+                        model_for_preparation.prepare_lfm25_audio_tts_artifact(&messages)?;
+                    let artifact_host_bytes = retained_lfm25_audio_tts_artifact_host_bytes(
+                        artifact.source_messages.as_ref(),
+                    )?;
+                    let retained_host_bytes = retained_request_host_bytes
+                        .checked_add(artifact_host_bytes)
+                        .ok_or_else(|| {
+                            Error::Overloaded(
+                                "LFM2.5 Audio TTS retained host accounting overflow".into(),
+                            )
+                        })?;
+                    Ok(vec![Ok(PreparationArtifact {
+                        retained: JobResourceObservation {
+                            host_bytes: retained_host_bytes,
+                            accelerator_bytes: artifact.retained_resident_bytes,
+                        },
+                        value: artifact,
+                    })])
+                },
+            )
+            .await?;
+        cancellation_guard.armed = false;
+        let outcome = outcomes.pop().ok_or_else(|| {
+            Error::InferenceError("LFM2.5 Audio TTS preparation returned no outcome".into())
+        })?;
+        let (artifact, bridge) = match outcome {
+            PreparationRowOutcome::Committed { artifact, bridge } => (artifact.value, bridge),
+            PreparationRowOutcome::Cancelled => return Err(Error::Cancelled(request.id.clone())),
+            PreparationRowOutcome::TimedOut => return Err(Error::Timeout(request.id.clone())),
+            PreparationRowOutcome::Failed(error) => return Err(error),
+        };
+        if artifact.prompt_tokens == 0
+            || artifact.prompt_tokens > ceiling.max_prompt_tokens
+            || artifact.materialized_tensor_elements > ceiling.max_materialized_tensor_elements
+            || artifact.retained_resident_bytes > ceiling.max_retained_resident_bytes
+        {
+            drop(artifact);
+            drop(request);
+            drop(bridge);
+            return Err(Error::InferenceError(
+                "LFM2.5 Audio TTS artifact exceeded its admitted preparation ceiling".into(),
+            ));
+        }
+        let artifact_host_bytes =
+            retained_lfm25_audio_tts_artifact_host_bytes(artifact.source_messages.as_ref())?;
+        let retained_host_bytes = retained_request_host_bytes
+            .checked_add(artifact_host_bytes)
+            .ok_or_else(|| {
+                Error::Overloaded("LFM2.5 Audio TTS retained host accounting overflow".into())
+            })?;
+        let accelerator_bytes = artifact.retained_resident_bytes;
+        let mut prepared = request;
+        prepared.install_lfm25_audio_tts_execution_model(
+            variant,
+            model,
+            artifact,
+            context_limit,
+        )?;
+        let (execution, _) = self.coordinator_job_for_request(&prepared)?;
+        match self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                execution,
+                JobResourceObservation {
+                    host_bytes: retained_host_bytes,
+                    accelerator_bytes,
+                },
+            )
+            .await
+        {
+            Ok(job) => Ok((prepared, job)),
+            Err(failure) => {
+                drop(prepared);
+                let error = failure.error;
+                drop(failure.bridge);
+                Err(error)
+            }
+        }
+    }
+
     async fn run_request_after_admission(
         &self,
         request: EngineCoreRequest,
         job: JobLease,
         residency_lease: Option<ModelResidencyLease>,
     ) -> Result<EngineOutput> {
-        let (mut request, job) = self
+        let (request, job) = self
             .prepare_asr_shape_for_binding(request, job, residency_lease.as_ref())
+            .await?;
+        let (mut request, job) = self
+            .prepare_lfm25_audio_tts_for_binding(request, job, residency_lease.as_ref())
             .await?;
         let loaded_bundle = residency_lease
             .as_ref()
@@ -4764,8 +4996,11 @@ impl RuntimeService {
         F: FnMut(StreamingOutput) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
-        let (mut request, job) = self
+        let (request, job) = self
             .prepare_asr_shape_for_binding(request, job, residency_lease.as_ref())
+            .await?;
+        let (mut request, job) = self
+            .prepare_lfm25_audio_tts_for_binding(request, job, residency_lease.as_ref())
             .await?;
         let loaded_bundle = residency_lease
             .as_ref()
@@ -7324,6 +7559,39 @@ mod tests {
         assert_eq!(metal.unified_bytes, ResourceAmount::Known(1_000));
         assert_eq!(cuda.host_bytes, ResourceAmount::Known(300));
         assert_eq!(cuda.device_bytes, ResourceAmount::Known(700));
+        assert!(cpu.is_fully_known());
+        assert!(metal.is_fully_known());
+        assert!(cuda.is_fully_known());
+    }
+
+    #[test]
+    fn lfm25_audio_tts_preparation_charges_prompt_and_backend_workspace_exactly() {
+        let messages = vec![
+            ChatMessage {
+                role: crate::models::shared::chat::ChatRole::System,
+                content: String::from("system"),
+            },
+            ChatMessage {
+                role: crate::models::shared::chat::ChatRole::User,
+                content: String::from("speak this"),
+            },
+        ];
+        let expected_host = messages.len() * std::mem::size_of::<ChatMessage>()
+            + messages
+                .iter()
+                .map(|message| message.content.capacity())
+                .sum::<usize>();
+        assert_eq!(
+            retained_lfm25_audio_tts_artifact_host_bytes(&messages).unwrap(),
+            expected_host as u64
+        );
+
+        let cpu = lfm25_audio_tts_preparation_workspace(BackendKind::Cpu, 17);
+        let metal = lfm25_audio_tts_preparation_workspace(BackendKind::Metal, 17);
+        let cuda = lfm25_audio_tts_preparation_workspace(BackendKind::Cuda, 17);
+        assert_eq!(cpu.host_bytes, ResourceAmount::Known(17));
+        assert_eq!(metal.unified_bytes, ResourceAmount::Known(17));
+        assert_eq!(cuda.device_bytes, ResourceAmount::Known(17));
         assert!(cpu.is_fully_known());
         assert!(metal.is_fully_known());
         assert!(cuda.is_fully_known());
