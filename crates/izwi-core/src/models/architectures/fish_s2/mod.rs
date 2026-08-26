@@ -40,7 +40,8 @@ pub use contracts::{
 pub use dac::{FishS2DacConfig, FishS2DacDecoder};
 pub use fast::{FishS2FastConfig, FishS2FastDecoder, FishS2GeneratedFrame, FishS2Sampler};
 pub(crate) use physical::{
-    FishS2PhysicalStateSpec, FISH_S2_FAST_STATE_DOMAIN, FISH_S2_SLOW_STATE_DOMAIN,
+    FishS2PhysicalStateSpec, FISH_S2_FAST_STATE_DOMAIN, FISH_S2_FAST_STATE_GROUP,
+    FISH_S2_SLOW_STATE_DOMAIN, FISH_S2_SLOW_STATE_GROUP,
 };
 #[allow(unused_imports)]
 pub(crate) use retained::{
@@ -51,6 +52,11 @@ pub use tokenizer::{
     FishS2ConditioningPrompt, FishS2PromptTokenizer, FishS2SpecialTokens, FishS2VqCodes,
 };
 pub use weights::{FishS2TensorSpec, FishS2WeightIndex, FishS2Weights};
+
+pub(crate) const FISH_S2_TTS_PREPARATION_STAGE: &str = "tts.prepare.fish_s2";
+pub(crate) const FISH_S2_TTS_PREFILL_STAGE: &str = "tts.prefill.fish_s2";
+pub(crate) const FISH_S2_TTS_DECODE_STAGE: &str = "tts.decode.fish_s2";
+pub(crate) const FISH_S2_TTS_LEGACY_STAGE: &str = "tts.scalar";
 
 pub struct FishS2TtsModel {
     model_identity: u64,

@@ -21,8 +21,8 @@ use super::FishS2Config;
 
 pub(crate) const FISH_S2_SLOW_STATE_DOMAIN: StateDomainId = StateDomainId::new(1);
 pub(crate) const FISH_S2_FAST_STATE_DOMAIN: StateDomainId = StateDomainId::new(2);
-const FISH_S2_SLOW_STATE_GROUP: StateGroupId = StateGroupId::new(1);
-const FISH_S2_FAST_STATE_GROUP: StateGroupId = StateGroupId::new(2);
+pub(crate) const FISH_S2_SLOW_STATE_GROUP: StateGroupId = StateGroupId::new(1);
+pub(crate) const FISH_S2_FAST_STATE_GROUP: StateGroupId = StateGroupId::new(2);
 
 #[derive(Debug, Clone)]
 pub(crate) struct FishS2PhysicalStateSpec {

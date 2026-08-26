@@ -38,6 +38,7 @@ const GRANITE_SPEECH_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::n
 const LFM25_AUDIO_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(23);
 const LFM25_AUDIO_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(24);
 const VIBEVOICE_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(26);
+const FISH_S2_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(27);
 pub(crate) const VOXTRAL_REALTIME_ADAPTER_ABI: AdapterAbiRevision =
     AdapterAbiRevision::new(crate::models::architectures::voxtral::VOXTRAL_REALTIME_EXECUTION_ABI);
 // Architecture ceiling: 8,192 codec frames, 1,920 output samples/frame,
@@ -891,6 +892,11 @@ fn is_vibevoice_physical_tts(metadata: AdapterMetadata) -> bool {
         && metadata.model_variant.family() == crate::catalog::ModelFamily::VibeVoiceTts
 }
 
+fn is_fish_s2_physical_tts(metadata: AdapterMetadata) -> bool {
+    metadata.capability == CapabilityKind::Tts
+        && metadata.model_variant.family() == crate::catalog::ModelFamily::FishS2Tts
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PhysicalQwenTtsAdapterFactory;
 
@@ -1067,6 +1073,36 @@ struct Lfm25AudioPhysicalTtsAdapterFactory;
 
 #[derive(Debug, Clone, Copy)]
 struct VibeVoicePhysicalTtsAdapterFactory;
+
+#[derive(Debug, Clone, Copy)]
+struct FishS2PhysicalTtsAdapterFactory;
+
+impl LoadedExecutionAdapterFactory for FishS2PhysicalTtsAdapterFactory {
+    fn id(&self) -> &'static str {
+        "builtin.fish_s2_tts.physical_sequence"
+    }
+
+    fn batch_mode(&self) -> NativeBatchMode {
+        NativeBatchMode::Continuous
+    }
+
+    fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
+        is_fish_s2_physical_tts(metadata)
+    }
+
+    fn create(
+        &self,
+        context: LoadedAdapterFactoryContext,
+        metadata: AdapterMetadata,
+    ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
+        Ok(Arc::new(FishS2TtsExecutionAdapter::new(
+            context.execution_group_id,
+            context.model_instance_id,
+            metadata,
+            context.backend_kind,
+        )))
+    }
+}
 
 impl LoadedExecutionAdapterFactory for VibeVoicePhysicalTtsAdapterFactory {
     fn id(&self) -> &'static str {
@@ -1254,6 +1290,7 @@ impl LoadedExecutionAdapterFactory for ScalarExecutionAdapterFactory {
             && !is_lfm25_audio_physical_asr(metadata)
             && !is_lfm25_audio_physical_tts(metadata)
             && !is_vibevoice_physical_tts(metadata)
+            && !is_fish_s2_physical_tts(metadata)
     }
 
     fn create(
@@ -1284,6 +1321,7 @@ pub(super) fn built_in_loaded_adapter_factories() -> Vec<Arc<dyn LoadedExecution
         Arc::new(Lfm25AudioPhysicalAsrAdapterFactory),
         Arc::new(Lfm25AudioPhysicalTtsAdapterFactory),
         Arc::new(VibeVoicePhysicalTtsAdapterFactory),
+        Arc::new(FishS2PhysicalTtsAdapterFactory),
         Arc::new(ScalarExecutionAdapterFactory),
     ]
 }
@@ -2265,6 +2303,160 @@ impl LoadedExecutionAdapter for ContinuousAsrExecutionAdapter {
 }
 
 #[derive(Debug)]
+struct FishS2TtsExecutionAdapter {
+    execution_group_id: ExecutionGroupId,
+    model_instance_id: ModelInstanceId,
+    adapter_instance_id: AdapterInstanceId,
+    metadata: AdapterMetadata,
+    backend_kind: BackendKind,
+}
+
+impl FishS2TtsExecutionAdapter {
+    fn new(
+        execution_group_id: ExecutionGroupId,
+        model_instance_id: ModelInstanceId,
+        metadata: AdapterMetadata,
+        backend_kind: BackendKind,
+    ) -> Self {
+        Self {
+            execution_group_id,
+            model_instance_id,
+            adapter_instance_id: AdapterInstanceId::new(
+                NEXT_ADAPTER_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+            ),
+            metadata,
+            backend_kind,
+        }
+    }
+}
+
+impl LoadedExecutionAdapter for FishS2TtsExecutionAdapter {
+    fn metadata(&self) -> AdapterMetadata {
+        self.metadata
+    }
+
+    fn adapter_instance_id(&self) -> AdapterInstanceId {
+        self.adapter_instance_id
+    }
+
+    fn adapter_abi_revision(&self) -> AdapterAbiRevision {
+        FISH_S2_TTS_ADAPTER_ABI
+    }
+
+    fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
+        use crate::models::architectures::fish_s2::{
+            FISH_S2_FAST_STATE_GROUP, FISH_S2_SLOW_STATE_GROUP, FISH_S2_TTS_DECODE_STAGE,
+            FISH_S2_TTS_LEGACY_STAGE, FISH_S2_TTS_PREFILL_STAGE, FISH_S2_TTS_PREPARATION_STAGE,
+        };
+        if streaming.asr_long_form {
+            let mut profile = scalar_execution_profile(self.metadata, self.backend_kind, false);
+            profile.mode = ExecutionMode::Atomic;
+            profile.cache_mode = CacheMode::None;
+            profile.cache_namespace = None;
+            profile.kv_dtype = "none".into();
+            profile.max_batch_size = 1;
+            profile.resolved_from_loaded_model = true;
+            let mut stage = StageDescriptor::from_execution_profile(
+                StageId::new(0),
+                FISH_S2_TTS_LEGACY_STAGE,
+                &profile,
+                NativeBatchMode::None,
+            );
+            stage.selector = StageWorkSelector::Atomic;
+            stage.shape_policy = StageShapePolicy::Exact;
+            stage.validate()?;
+            return Ok(LoadedExecutionContract {
+                execution_group_id: self.execution_group_id,
+                model_instance_id: self.model_instance_id,
+                adapter_instance_id: self.adapter_instance_id,
+                adapter_abi_revision: self.adapter_abi_revision(),
+                metadata: self.metadata,
+                execution_profile: profile,
+                stages: Arc::from([stage]),
+            });
+        }
+
+        let mut profile = scalar_execution_profile(self.metadata, self.backend_kind, false);
+        profile.mode = ExecutionMode::Sequence;
+        profile.prefill = PrefillMode::Incremental;
+        profile.incremental_decode = true;
+        // The current slow and fast physical kernels accept B=1. The sequence
+        // scheduler may interleave users, but must not publish a native batch.
+        profile.decode_batch = NativeBatchMode::None;
+        profile.cache_mode = CacheMode::ExternalPaged;
+        profile.cache_namespace = Some(format!(
+            "{}:tts:{}:fish-s2-state-v2",
+            self.metadata.model_variant,
+            self.backend_kind.as_str()
+        ));
+        profile.kv_dtype = "state_v2_resolved".into();
+        profile.cancellation = CancellationGranularity::SequenceStep;
+        profile.concurrency = ConcurrencyClass::Batchable;
+        profile.recompute_safe = true;
+        profile.cache_release_safe = true;
+        profile.max_batch_size = 1;
+        profile.resolved_from_loaded_model = true;
+
+        let mut preparation = StageDescriptor::from_execution_profile(
+            StageId::new(0),
+            FISH_S2_TTS_PREPARATION_STAGE,
+            &profile,
+            NativeBatchMode::None,
+        );
+        preparation.selector = StageWorkSelector::PreSequencePreparation;
+        preparation.progress = StageProgressKind::Atomic;
+        preparation.concurrency = ConcurrencyClass::Exclusive;
+        preparation.shape_policy = StageShapePolicy::Exact;
+        preparation.max_work_units = 16_384;
+        preparation.max_workspace_bytes = 512 * 1024 * 1024;
+
+        let mut prefill = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            FISH_S2_TTS_PREFILL_STAGE,
+            &profile,
+            NativeBatchMode::None,
+        );
+        prefill.selector = StageWorkSelector::SequencePrefill;
+        prefill.concurrency = ConcurrencyClass::Exclusive;
+        prefill.shape_policy = StageShapePolicy::Exact;
+        prefill.max_work_units = 16_384;
+        prefill.max_workspace_bytes = 512 * 1024 * 1024;
+        prefill.retained_state_selections = Some(vec![ClockedStateSelection::new(
+            FISH_S2_SLOW_STATE_GROUP,
+            StateClock::DecoderTokens,
+        )?]);
+
+        let mut decode = StageDescriptor::from_execution_profile(
+            StageId::new(2),
+            FISH_S2_TTS_DECODE_STAGE,
+            &profile,
+            NativeBatchMode::None,
+        );
+        decode.selector = StageWorkSelector::SequenceDecode;
+        decode.concurrency = ConcurrencyClass::Exclusive;
+        decode.shape_policy = StageShapePolicy::Exact;
+        decode.max_work_units = 1;
+        decode.max_workspace_bytes = 512 * 1024 * 1024;
+        decode.retained_state_selections = Some(vec![
+            ClockedStateSelection::new(FISH_S2_SLOW_STATE_GROUP, StateClock::DecoderTokens)?,
+            ClockedStateSelection::new(FISH_S2_FAST_STATE_GROUP, StateClock::CodebookSteps)?,
+        ]);
+        preparation.validate()?;
+        prefill.validate()?;
+        decode.validate()?;
+        Ok(LoadedExecutionContract {
+            execution_group_id: self.execution_group_id,
+            model_instance_id: self.model_instance_id,
+            adapter_instance_id: self.adapter_instance_id,
+            adapter_abi_revision: self.adapter_abi_revision(),
+            metadata: self.metadata,
+            execution_profile: profile,
+            stages: Arc::from([preparation, prefill, decode]),
+        })
+    }
+}
+
+#[derive(Debug)]
 struct VibeVoiceTtsExecutionAdapter {
     execution_group_id: ExecutionGroupId,
     model_instance_id: ModelInstanceId,
@@ -2770,7 +2962,7 @@ impl LoadedExecutionAdapter for Lfm25AudioAsrExecutionAdapter {
         profile.mode = ExecutionMode::Sequence;
         profile.prefill = PrefillMode::Incremental;
         profile.incremental_decode = true;
-        profile.prefill_batch = NativeBatchMode::None;
+        profile.prefill_batch = NativeBatchMode::Static;
         profile.decode_batch = NativeBatchMode::Continuous;
         profile.cache_mode = CacheMode::ExternalPaged;
         profile.cache_namespace = Some(format!(
@@ -2805,16 +2997,30 @@ impl LoadedExecutionAdapter for Lfm25AudioAsrExecutionAdapter {
 
         let mut prefill = StageDescriptor::from_execution_profile(
             StageId::new(1),
-            "asr.prefill.lfm25_audio.scalar",
+            "asr.prefill.lfm25_audio.tensor_static",
             &profile,
-            NativeBatchMode::None,
+            NativeBatchMode::Static,
         );
         prefill.selector = StageWorkSelector::SequencePrefill;
         prefill.progress = StageProgressKind::Iterative;
-        prefill.max_batch_size = 1;
-        prefill.concurrency = ConcurrencyClass::Exclusive;
-        prefill.shape_policy = StageShapePolicy::Exact;
-        prefill.max_workspace_bytes = seal.max_workspace_bytes;
+        prefill.max_batch_size = self.max_batch_size;
+        prefill.concurrency = ConcurrencyClass::Batchable;
+        prefill.shape_policy = StageShapePolicy::Ragged;
+        prefill.max_padding_basis_points = 0;
+        prefill.max_work_units = u64::try_from(seal.max_prompt_tokens)
+            .map_err(|_| Error::Overloaded("LFM2.5 Audio ASR prompt ceiling exceeds u64".into()))?
+            .checked_mul(u64::try_from(self.max_batch_size).map_err(|_| {
+                Error::Overloaded("LFM2.5 Audio ASR batch ceiling exceeds u64".into())
+            })?)
+            .ok_or_else(|| Error::Overloaded("LFM2.5 Audio ASR prefill work overflow".into()))?;
+        prefill.max_workspace_bytes = seal
+            .max_workspace_bytes
+            .checked_mul(u64::try_from(self.max_batch_size).map_err(|_| {
+                Error::Overloaded("LFM2.5 Audio ASR batch ceiling exceeds u64".into())
+            })?)
+            .ok_or_else(|| {
+                Error::Overloaded("LFM2.5 Audio ASR prefill workspace overflow".into())
+            })?;
         prefill.output_visibility = OutputVisibility::AfterQuantumCommit;
 
         let mut decode = StageDescriptor::from_execution_profile(
@@ -6056,7 +6262,7 @@ mod tests {
             assert_eq!(contract.execution_profile.prefill, PrefillMode::Incremental);
             assert_eq!(
                 contract.execution_profile.prefill_batch,
-                NativeBatchMode::None
+                NativeBatchMode::Static
             );
             assert_eq!(
                 contract.execution_profile.decode_batch,
@@ -6075,12 +6281,13 @@ mod tests {
             assert_eq!(preparation.max_workspace_bytes, 96 * 1024 * 1024);
 
             let prefill = &contract.stages[1];
-            assert_eq!(prefill.name, "asr.prefill.lfm25_audio.scalar");
+            assert_eq!(prefill.name, "asr.prefill.lfm25_audio.tensor_static");
             assert_eq!(prefill.progress, StageProgressKind::Iterative);
-            assert_eq!(prefill.batch_mode, NativeBatchMode::None);
-            assert_eq!(prefill.max_batch_size, 1);
-            assert_eq!(prefill.concurrency, ConcurrencyClass::Exclusive);
-            assert_eq!(prefill.shape_policy, StageShapePolicy::Exact);
+            assert_eq!(prefill.batch_mode, NativeBatchMode::Static);
+            assert_eq!(prefill.max_batch_size, 8);
+            assert_eq!(prefill.concurrency, ConcurrencyClass::Batchable);
+            assert_eq!(prefill.shape_policy, StageShapePolicy::Ragged);
+            assert_eq!(prefill.max_padding_basis_points, 0);
 
             let decode = &contract.stages[2];
             assert_eq!(decode.name, "asr.decode.lfm25_audio.continuous");
