@@ -16,9 +16,11 @@ use crate::models::architectures::vibevoice::tts::VibeVoiceTtsRetainedState;
 use crate::models::architectures::voxtral::realtime::{
     VoxtralRealtimeCheckpoint, VoxtralRealtimeState,
 };
+use crate::models::architectures::voxtral::tts::retained::VoxtralTtsRetainedState;
 use crate::models::registry::{
     AsrModelLease, FishS2TtsModelLease, Lfm25AudioModelLease, NativeAsrDecodeState, NativeAsrModel,
     NativeChatDecodeState, QwenTtsModelLease, VibeVoiceTtsModelLease, VoxtralModelLease,
+    VoxtralTtsModelLease,
 };
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 
@@ -74,6 +76,14 @@ pub(super) struct ActiveFishS2TtsDecode {
     pub(super) variant: ModelVariant,
     pub(super) model: FishS2TtsModelLease,
     pub(super) state: FishS2RetainedState,
+    pub(super) last_frames_generated: usize,
+    pub(super) stream_sequence: usize,
+}
+
+pub(super) struct ActiveVoxtralTtsDecode {
+    pub(super) variant: ModelVariant,
+    pub(super) model: VoxtralTtsModelLease,
+    pub(super) state: VoxtralTtsRetainedState,
     pub(super) last_frames_generated: usize,
     pub(super) stream_sequence: usize,
 }
