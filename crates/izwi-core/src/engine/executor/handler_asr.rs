@@ -7,7 +7,9 @@ use crate::models::architectures::lfm25_audio::asr_retained::{
 use crate::models::architectures::nemotron::asr::{
     NemotronRealtimeBatchInput, NemotronRealtimeDecodeBatchRow,
 };
-use crate::models::architectures::parakeet::asr::ParakeetRetainedDecodeBatchRow;
+use crate::models::architectures::parakeet::asr::{
+    ParakeetRetainedDecodeBatchRow, ParakeetRetainedDecodeState,
+};
 use crate::models::architectures::vibevoice::asr::VibeVoiceAsrRetainedTokenizerQuantum;
 use crate::models::architectures::vibevoice::asr::{
     VibeVoiceAsrPreparedTokenizerSpan, VibeVoiceAsrRetainedPrefillBatchRow,
@@ -60,6 +62,16 @@ fn retained_asr_batch_model_call(
 }
 
 fn late_cancelled_lfm_asr_prefill_rows(cancelled: &[bool], armed: &[bool]) -> Vec<usize> {
+    cancelled
+        .iter()
+        .zip(armed)
+        .enumerate()
+        .filter_map(|(row, (cancelled, armed))| (*cancelled && *armed).then_some(row))
+        .collect()
+}
+
+fn late_cancelled_parakeet_rows(cancelled: &[bool], armed: &[bool]) -> Vec<usize> {
+    debug_assert_eq!(cancelled.len(), armed.len());
     cancelled
         .iter()
         .zip(armed)
@@ -477,6 +489,135 @@ impl Drop for ContinuousLfm25AsrStateBatch<'_> {
                     "continuous LFM2.5 ASR rollback failed; state fenced until cleanup"
                 ),
             }
+        }
+        self.rows.clear();
+    }
+}
+
+fn rollback_parakeet_host_state<T>(state: &mut T, checkpoint: &mut Option<T>) -> bool {
+    let Some(checkpoint) = checkpoint.take() else {
+        return false;
+    };
+    *state = checkpoint;
+    true
+}
+
+struct ContinuousParakeetAsrRow<'a> {
+    index: usize,
+    session: SessionKey,
+    arena: Arc<crate::backends::state::TensorStateArena>,
+    target: u64,
+    lease: ExecutorStateLease<'a, ActiveParakeetAsrDecode>,
+    checkpoint: Option<ParakeetRetainedDecodeState>,
+}
+
+struct ContinuousParakeetAsrStateBatch<'a> {
+    rows: Vec<ContinuousParakeetAsrRow<'a>>,
+    armed: bool,
+}
+
+impl<'a> ContinuousParakeetAsrStateBatch<'a> {
+    fn new(rows: Vec<ContinuousParakeetAsrRow<'a>>) -> Self {
+        Self { rows, armed: true }
+    }
+
+    fn rollback_row(&mut self, row: usize) -> Result<usize> {
+        let row = self.rows.get_mut(row).ok_or_else(|| {
+            Error::InferenceError("continuous Parakeet ASR rollback row is out of range".into())
+        })?;
+        let active = row.lease.require_state_mut()?;
+        if !rollback_parakeet_host_state(&mut active.state, &mut row.checkpoint) {
+            return Err(Error::InferenceError(
+                "continuous Parakeet ASR row has no armed checkpoint".into(),
+            ));
+        }
+        row.lease.mark_clean();
+        Ok(row.index)
+    }
+
+    fn validate_publication(&self) -> Result<()> {
+        for row in &self.rows {
+            row.lease.validate_defer()?;
+        }
+        Ok(())
+    }
+
+    fn commit(mut self) -> Result<Vec<(usize, ExecutorStateLease<'a, ActiveParakeetAsrDecode>)>> {
+        for row in &mut self.rows {
+            row.checkpoint.take();
+            row.lease.mark_clean();
+        }
+        self.armed = false;
+        Ok(std::mem::take(&mut self.rows)
+            .into_iter()
+            .map(|row| (row.index, row.lease))
+            .collect())
+    }
+}
+
+impl Drop for ContinuousParakeetAsrStateBatch<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        for row in &mut self.rows {
+            let rollback = row
+                .lease
+                .require_state_mut()
+                .map(|active| rollback_parakeet_host_state(&mut active.state, &mut row.checkpoint));
+            match rollback {
+                Ok(true) => row.lease.mark_clean(),
+                Ok(false) => {}
+                Err(error) => tracing::error!(
+                    request_id = %row.session.request_id,
+                    epoch = row.session.epoch,
+                    %error,
+                    "continuous Parakeet ASR rollback failed; state fenced until cleanup"
+                ),
+            }
+        }
+        self.rows.clear();
+    }
+}
+
+struct ParakeetPrefillHostBatch<'a> {
+    rows: Vec<(usize, ExecutorStateLease<'a, ActiveParakeetAsrDecode>)>,
+    armed: bool,
+}
+
+impl<'a> ParakeetPrefillHostBatch<'a> {
+    fn new() -> Self {
+        Self {
+            rows: Vec::new(),
+            armed: true,
+        }
+    }
+
+    fn push(&mut self, index: usize, lease: ExecutorStateLease<'a, ActiveParakeetAsrDecode>) {
+        self.rows.push((index, lease));
+    }
+
+    fn validate_publication(&self) -> Result<()> {
+        for (_, lease) in &self.rows {
+            lease.validate_defer()?;
+        }
+        Ok(())
+    }
+
+    fn commit(mut self) -> Vec<(usize, ExecutorStateLease<'a, ActiveParakeetAsrDecode>)> {
+        self.armed = false;
+        std::mem::take(&mut self.rows)
+    }
+}
+
+impl Drop for ParakeetPrefillHostBatch<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        for (_, lease) in &mut self.rows {
+            lease.discard_state();
+            lease.mark_clean();
         }
         self.rows.clear();
     }
@@ -5653,35 +5794,44 @@ impl NativeExecutor {
         {
             crate::engine::metrics::record_engine_model_call(call);
         }
+        let mut cancelled = vec![false; requests.len()];
+        for row in &rows {
+            cancelled[row.0] = requests[row.0].is_cancelled();
+        }
+        for (row, state) in rows.iter().zip(&states) {
+            let (index, _, _, _, arena, target, _, _, _) = row;
+            if cancelled[*index] {
+                continue;
+            }
+            model.stage_retained_decode_physical_state(
+                state,
+                arena.as_ref(),
+                PhysicalStateTransactionId::new(scheduled[*index].plan_id)?,
+                *target,
+            )?;
+        }
+        // No host state is installed until every live tensor transaction has
+        // staged successfully. Cancellation during peer staging is observed at
+        // this last pre-publication barrier.
+        for row in &rows {
+            cancelled[row.0] |= requests[row.0].is_cancelled();
+        }
+
+        let mut host = ParakeetPrefillHostBatch::new();
+        let mut continuing = vec![false; requests.len()];
         for (
-            (
-                index,
-                variant,
-                row_model,
-                artifact,
-                arena,
-                target,
-                sample_count,
-                sample_rate,
-                mut lease,
-            ),
+            (index, variant, row_model, artifact, _, _, sample_count, sample_rate, mut lease),
             state,
         ) in rows.into_iter().zip(states)
         {
             let request = requests[index];
-            if request.is_cancelled() {
+            if cancelled[index] {
                 lease.release()?;
                 outputs[index] = Some(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
                     request.id.clone(),
                 )));
                 continue;
             }
-            model.stage_retained_decode_physical_state(
-                &state,
-                arena.as_ref(),
-                PhysicalStateTransactionId::new(scheduled[index].plan_id)?,
-                target,
-            )?;
             lease.install_state(ActiveParakeetAsrDecode {
                 variant,
                 model: row_model,
@@ -5692,7 +5842,8 @@ impl NativeExecutor {
                 input_sample_rate: sample_rate,
                 input_sample_count: sample_count,
             })?;
-            lease.restore()?;
+            continuing[index] = true;
+            host.push(index, lease);
             outputs[index] = Some(ModelSessionResult::sequence(ExecutorOutput {
                 request_id: request.id.clone(),
                 audio: Some(AudioOutput::new(Vec::new(), sample_rate)),
@@ -5705,6 +5856,31 @@ impl NativeExecutor {
                 asr_diagnostics: None,
                 error: None,
             }));
+        }
+        let host_cancelled = host
+            .rows
+            .iter()
+            .map(|(index, _)| requests[*index].is_cancelled())
+            .collect::<Vec<_>>();
+        let host_armed = host
+            .rows
+            .iter()
+            .map(|(_, lease)| lease.state().is_some())
+            .collect::<Vec<_>>();
+        for row in late_cancelled_parakeet_rows(&host_cancelled, &host_armed) {
+            let index = host.rows[row].0;
+            continuing[index] = false;
+            outputs[index] = Some(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                requests[index].id.clone(),
+            )));
+        }
+        host.validate_publication()?;
+        for (index, lease) in host.commit() {
+            if continuing[index] {
+                lease.restore()?;
+            } else {
+                lease.release()?;
+            }
         }
         outputs
             .into_iter()
@@ -5819,12 +5995,21 @@ impl NativeExecutor {
                     .ok_or_else(|| Error::Overloaded("Parakeet decode cursor overflow".into()))?,
             )
             .map_err(|_| Error::Overloaded("Parakeet decode cursor exceeds u64".into()))?;
-            rows.push((index, arena, target, checkpoint, lease));
+            rows.push(ContinuousParakeetAsrRow {
+                index,
+                session: scheduled[index].session_key(),
+                arena,
+                target,
+                lease,
+                checkpoint: Some(checkpoint),
+            });
         }
-        let mut batch = rows
+        let mut active_states = ContinuousParakeetAsrStateBatch::new(rows);
+        let mut batch = active_states
+            .rows
             .iter_mut()
-            .map(|(_, _, _, _, lease)| {
-                let active = lease.require_state_mut()?;
+            .map(|row| {
+                let active = row.lease.require_state_mut()?;
                 Ok(ParakeetRetainedDecodeBatchRow {
                     artifact: active.artifact.as_ref(),
                     state: &mut active.state,
@@ -5833,18 +6018,8 @@ impl NativeExecutor {
             .collect::<Result<Vec<_>>>()?;
         let steps = Self::run_blocking(|| model.retained_decode_step_batch(&mut batch));
         drop(batch);
-        let steps = match steps {
-            Ok(steps) => steps,
-            Err(error) => {
-                for (_, _, _, checkpoint, mut lease) in rows.into_iter() {
-                    lease.require_state_mut()?.state = checkpoint;
-                    lease.mark_clean();
-                    lease.restore()?;
-                }
-                return Err(error);
-            }
-        };
-        if steps.len() != rows.len() {
+        let steps = steps?;
+        if steps.len() != active_states.rows.len() {
             return Err(Error::InferenceError(
                 "Parakeet native decode returned the wrong row count".into(),
             ));
@@ -5854,76 +6029,122 @@ impl NativeExecutor {
         {
             crate::engine::metrics::record_engine_model_call(call);
         }
-        for ((index, arena, target, checkpoint, mut lease), step) in rows.into_iter().zip(steps) {
-            let request = requests[index];
-            if request.is_cancelled() {
-                lease.require_state_mut()?.state = checkpoint;
-                lease.mark_clean();
-                lease.release()?;
-                outputs[index] = Some(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
-                    request.id.clone(),
-                )));
-                continue;
-            }
-            let active = lease.require_state_mut()?;
-            model.stage_retained_decode_physical_state(
-                &active.state,
-                arena.as_ref(),
-                PhysicalStateTransactionId::new(scheduled[index].plan_id)?,
-                target,
-            )?;
-            let generated = step
-                .tokens_generated
-                .saturating_sub(active.last_tokens_generated);
-            active.last_tokens_generated = step.tokens_generated;
-            if let Some(tx) = Self::stream_sender(request) {
-                if !step.delta.is_empty() {
-                    Self::stream_text_with_policy(
-                        &tx,
-                        request.stream_policy,
-                        &request.id,
-                        &mut active.stream_sequence,
-                        step.delta.clone(),
-                    )?;
+        let mut steps = steps.into_iter().map(Some).collect::<Vec<_>>();
+        let mut continuing = vec![false; requests.len()];
+        let sealing = (|| -> Result<()> {
+            for row in 0..active_states.rows.len() {
+                let index = active_states.rows[row].index;
+                let request = requests[index];
+                if request.is_cancelled() {
+                    let index = active_states.rollback_row(row)?;
+                    outputs[index] = Some(ModelSessionResult::cancelled(
+                        ExecutorOutput::cancelled(request.id.clone()),
+                    ));
+                    continue;
                 }
-                if step.finished {
-                    Self::stream_final_marker_with_policy(
-                        &tx,
-                        request.stream_policy,
-                        &request.id,
-                        &mut active.stream_sequence,
-                    )?;
+                let step = steps[row].take().ok_or_else(|| {
+                    Error::InferenceError("Parakeet decode lost a native batch row".into())
+                })?;
+                let active_row = &mut active_states.rows[row];
+                let active = active_row.lease.require_state_mut()?;
+                model.stage_retained_decode_physical_state(
+                    &active.state,
+                    active_row.arena.as_ref(),
+                    PhysicalStateTransactionId::new(scheduled[index].plan_id)?,
+                    active_row.target,
+                )?;
+                let generated = step
+                    .tokens_generated
+                    .saturating_sub(active.last_tokens_generated);
+                active.last_tokens_generated = step.tokens_generated;
+                if let Some(tx) = Self::stream_sender(request) {
+                    if !step.delta.is_empty() {
+                        Self::stream_text_with_policy(
+                            &tx,
+                            request.stream_policy,
+                            &request.id,
+                            &mut active.stream_sequence,
+                            step.delta.clone(),
+                        )?;
+                    }
+                    if step.finished {
+                        Self::stream_final_marker_with_policy(
+                            &tx,
+                            request.stream_policy,
+                            &request.id,
+                            &mut active.stream_sequence,
+                        )?;
+                    }
                 }
+                let diagnostics = step
+                    .finished
+                    .then(|| {
+                        model
+                            .retained_decode_output(active.artifact.as_ref(), &active.state)
+                            .diagnostics
+                    })
+                    .flatten();
+                let sample_rate = active.input_sample_rate;
+                let sample_count = active.input_sample_count;
+                continuing[index] = !step.finished;
+                outputs[index] = Some(ModelSessionResult::sequence(ExecutorOutput {
+                    request_id: request.id.clone(),
+                    audio: Some(AudioOutput::new(Vec::new(), sample_rate)),
+                    text: Some(step.text),
+                    input_transcription: None,
+                    tokens_processed: scheduled[index].num_tokens,
+                    tokens_generated: generated,
+                    finished: step.finished,
+                    phase_timing_override: None,
+                    asr_diagnostics: diagnostics,
+                    error: None,
+                }));
+                let _ = sample_count;
             }
-            let diagnostics = step
-                .finished
-                .then(|| {
-                    model
-                        .retained_decode_output(active.artifact.as_ref(), &active.state)
-                        .diagnostics
-                })
-                .flatten();
-            let sample_rate = active.input_sample_rate;
-            let sample_count = active.input_sample_count;
-            lease.mark_clean();
-            if step.finished {
-                lease.release()?;
-            } else {
+            Ok(())
+        })();
+        if let Err(error) = sealing {
+            for row in &active_states.rows {
+                let _ = requests[row.index].take_staged_stream_outputs();
+            }
+            return Err(error);
+        }
+        // A peer row may finish its native call or stream staging after an
+        // earlier row was cancelled. Recheck every armed checkpoint before any
+        // host state is made visible; cancellation restores only that row while
+        // an error still rolls the complete cohort back through the guard.
+        let host_cancelled = active_states
+            .rows
+            .iter()
+            .map(|row| requests[row.index].is_cancelled())
+            .collect::<Vec<_>>();
+        let host_armed = active_states
+            .rows
+            .iter()
+            .map(|row| row.checkpoint.is_some())
+            .collect::<Vec<_>>();
+        for row in late_cancelled_parakeet_rows(&host_cancelled, &host_armed) {
+            let index = active_states.rows[row].index;
+            let _ = requests[index].take_staged_stream_outputs()?;
+            let index = active_states.rollback_row(row)?;
+            continuing[index] = false;
+            outputs[index] = Some(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                requests[index].id.clone(),
+            )));
+        }
+        if let Err(error) = active_states.validate_publication() {
+            for row in &active_states.rows {
+                let _ = requests[row.index].take_staged_stream_outputs();
+            }
+            return Err(error);
+        }
+        let committed = active_states.commit()?;
+        for (index, lease) in committed {
+            if continuing[index] {
                 lease.restore()?;
+            } else {
+                lease.release()?;
             }
-            outputs[index] = Some(ModelSessionResult::sequence(ExecutorOutput {
-                request_id: request.id.clone(),
-                audio: Some(AudioOutput::new(Vec::new(), sample_rate)),
-                text: Some(step.text),
-                input_transcription: None,
-                tokens_processed: scheduled[index].num_tokens,
-                tokens_generated: generated,
-                finished: step.finished,
-                phase_timing_override: None,
-                asr_diagnostics: diagnostics,
-                error: None,
-            }));
-            let _ = sample_count;
         }
         outputs
             .into_iter()
@@ -7690,6 +7911,52 @@ mod tests {
             ),
             vec![0, 3]
         );
+    }
+
+    #[test]
+    fn parakeet_mixed_cancellation_selects_only_armed_rows() {
+        assert_eq!(
+            super::late_cancelled_parakeet_rows(
+                &[false, true, true, false, true],
+                &[true, true, false, true, true],
+            ),
+            vec![1, 4]
+        );
+    }
+
+    #[test]
+    fn parakeet_host_rollback_restores_cancelled_then_aborts_remaining_cohort() {
+        let mut states = [10_u32, 20, 30];
+        let mut checkpoints = [Some(1_u32), Some(2), Some(3)];
+        let cancelled = [false, true, false];
+        let armed = checkpoints.map(|checkpoint| checkpoint.is_some());
+
+        for row in super::late_cancelled_parakeet_rows(&cancelled, &armed) {
+            assert!(super::rollback_parakeet_host_state(
+                &mut states[row],
+                &mut checkpoints[row],
+            ));
+        }
+        assert_eq!(states, [10, 2, 30]);
+
+        for (state, checkpoint) in states.iter_mut().zip(&mut checkpoints) {
+            super::rollback_parakeet_host_state(state, checkpoint);
+        }
+        assert_eq!(states, [1, 2, 3]);
+        assert_eq!(checkpoints, [None, None, None]);
+    }
+
+    #[test]
+    fn parakeet_committed_host_state_is_not_rolled_back_during_cleanup() {
+        let mut state = 9_u32;
+        let mut checkpoint = Some(4_u32);
+        checkpoint.take();
+
+        assert!(!super::rollback_parakeet_host_state(
+            &mut state,
+            &mut checkpoint,
+        ));
+        assert_eq!(state, 9);
     }
 
     #[test]
