@@ -15,6 +15,7 @@ grep -q -- '--require-optimized-kernel-evidence' <<<"${help}"
 grep -q -- '--require-continuous-batch-evidence' <<<"${help}"
 grep -q -- '--require-resumable-prefill-evidence' <<<"${help}"
 grep -q -- '--require-audio-streaming-evidence' <<<"${help}"
+grep -q -- '--audio-runtime-evidence' <<<"${help}"
 grep -q 'selected backend health' <<<"${help}"
 
 dry_output=$(${runner} --manifest "${manifest}" --output "${tmp_dir}/dry" --dry-run \

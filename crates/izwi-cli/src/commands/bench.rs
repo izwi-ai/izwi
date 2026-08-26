@@ -6630,6 +6630,24 @@ concurrent = [1, 2]
     fn backend_audio_performance_manifests_cover_all_asr_and_tts_families_at_c1_to_c8() {
         let manifest_root =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/manifests");
+        let expected_models: BTreeSet<_> = [
+            ("Granite-Speech-4.1-2B-Plus", "asr"),
+            ("Kokoro-82M", "tts"),
+            ("LFM2.5-Audio-1.5B-GGUF", "asr"),
+            ("LFM2.5-Audio-1.5B-GGUF", "tts"),
+            ("Nemotron-3.5-ASR-Streaming-0.6B", "asr"),
+            ("Parakeet-TDT-0.6B-v3", "asr"),
+            ("Qwen3-ASR-0.6B-GGUF", "asr"),
+            ("Qwen3-TTS-12Hz-0.6B-Base", "tts"),
+            ("VibeVoice-1.5B", "tts"),
+            ("VibeVoice-ASR", "asr"),
+            ("Voxtral-4B-TTS-2603", "tts"),
+            ("Voxtral-Mini-4B-Realtime-2602", "asr"),
+            ("Whisper-Large-v3-Turbo", "asr"),
+            ("FishAudio-S2-Pro", "tts"),
+        ]
+        .into_iter()
+        .collect();
         for name in [
             "cpu-audio-concurrency.toml",
             "metal-audio-concurrency.toml",
@@ -6649,6 +6667,10 @@ concurrent = [1, 2]
             );
             assert!(cases.iter().all(|case| case.model.is_some()), "{name}");
             assert!(
+                cases.iter().all(|case| case.iterations == Some(8)),
+                "{name} must collect eight streaming samples per concurrency cell"
+            );
+            assert!(
                 cases.iter().all(|case| case.stream == Some(true)),
                 "{name} must collect first-output and inter-event streaming latency"
             );
@@ -6662,6 +6684,11 @@ concurrent = [1, 2]
                     "{name} c{concurrency}"
                 );
             }
+            let actual_models: BTreeSet<_> = cases
+                .iter()
+                .map(|case| (case.model.as_deref().expect("model"), case.command.as_str()))
+                .collect();
+            assert_eq!(actual_models, expected_models, "{name} family coverage");
         }
     }
 

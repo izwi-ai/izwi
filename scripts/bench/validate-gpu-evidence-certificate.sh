@@ -14,6 +14,7 @@ Options:
   --expected-git-sha SHA              Required 40-character source SHA
   --require-continuous-batch-evidence Require certified multi-row continuous batching
   --require-resumable-prefill-evidence Require certified multi-span resumable prefill
+  --require-audio-streaming-evidence Require retained streaming and runtime stress evidence
   -h, --help                          Show this help
 
 The validator accepts izwi.gpu-kv-evidence.v1 for Metal/CUDA KV matrices,
@@ -28,6 +29,7 @@ backend=
 expected_git_sha=
 require_continuous=0
 require_resumable_prefill=0
+require_audio_streaming=0
 
 while (($#)); do
   case "$1" in
@@ -49,6 +51,10 @@ while (($#)); do
       ;;
     --require-resumable-prefill-evidence)
       require_resumable_prefill=1
+      shift
+      ;;
+    --require-audio-streaming-evidence)
+      require_audio_streaming=1
       shift
       ;;
     -h|--help)
@@ -84,8 +90,8 @@ case "$schema" in
       echo "error: GPU KV evidence cannot certify a CPU runtime" >&2
       exit 1
     fi
-    if ((require_continuous || require_resumable_prefill)); then
-      echo "error: KV-only evidence cannot certify model batching or resumable prefill" >&2
+    if ((require_continuous || require_resumable_prefill || require_audio_streaming)); then
+      echo "error: KV-only evidence cannot certify model batching, resumable prefill, or audio streaming" >&2
       exit 1
     fi
     if ! jq -e \
@@ -182,6 +188,10 @@ case "$schema" in
       echo "error: legacy CUDA model evidence cannot certify another runtime" >&2
       exit 1
     fi
+    if ((require_audio_streaming)) && [[ "$schema" != izwi.model-evidence.v2 ]]; then
+      echo "error: legacy CUDA model evidence cannot certify complete audio runtime evidence" >&2
+      exit 1
+    fi
     if ! jq -e \
       --arg schema "$schema" \
       --arg backend "$backend" \
@@ -236,6 +246,54 @@ case "$schema" in
       ' "$certificate" >/dev/null; then
       echo "error: model certificate failed exact-SHA, runtime, batching, or prefill validation" >&2
       exit 1
+    fi
+    if ((require_audio_streaming)); then
+      if ! jq -e '
+        .requirements.audio_streaming == true and
+        (.audio_runtime_evidence_sha256 | test("^[0-9a-f]{64}$")) and
+        (.artifacts.audio_runtime_evidence | type == "string" and length > 0) and
+        (.artifacts.report | type == "string" and length > 0) and
+        all(.cases[];
+          (.command == "asr" or .command == "tts") and
+          .quality_failed == 0 and .telemetry_delta_available == true and
+          .samples > 0 and
+          (if .command == "tts" then
+             .streaming_latency.first_audio_ms.count == .samples and
+             .streaming_latency.inter_frame_ms.count == .samples
+           else
+             .streaming_latency.first_transcript_ms.count == .samples and
+             .streaming_latency.inter_transcript_ms.count == .samples
+           end)) and
+        ([.cases[] | {command, model, concurrent}] |
+          sort_by(.command, .model, .concurrent) |
+          group_by(.command, .model) |
+          all(map(.concurrent) == [1, 2, 4, 8]))
+      ' "$certificate" >/dev/null; then
+        echo "error: model certificate lacks complete retained audio evidence" >&2
+        exit 1
+      fi
+      certificate_dir=$(cd "$(dirname "$certificate")" && pwd)
+      audio_path=$(jq -r '.artifacts.audio_runtime_evidence' "$certificate")
+      report_path=$(jq -r '.artifacts.report' "$certificate")
+      [[ "$audio_path" = /* ]] || audio_path="$certificate_dir/$audio_path"
+      [[ "$report_path" = /* ]] || report_path="$certificate_dir/$report_path"
+      if [[ ! -s "$audio_path" || ! -s "$report_path" ]]; then
+        echo "error: retained audio runtime evidence or benchmark report is missing" >&2
+        exit 1
+      fi
+      if command -v sha256sum >/dev/null 2>&1; then
+        actual_audio_sha256=$(sha256sum "$audio_path" | awk '{print $1}')
+      else
+        actual_audio_sha256=$(shasum -a 256 "$audio_path" | awk '{print $1}')
+      fi
+      expected_audio_sha256=$(jq -r '.audio_runtime_evidence_sha256' "$certificate")
+      if [[ "$actual_audio_sha256" != "$expected_audio_sha256" ]]; then
+        echo "error: retained audio runtime evidence SHA-256 does not match the certificate" >&2
+        exit 1
+      fi
+      "$(dirname "$0")/validate-audio-runtime-evidence.sh" \
+        --evidence "$audio_path" --report "$report_path" --backend "$backend" \
+        --expected-git-sha "$expected_git_sha" >/dev/null
     fi
     ;;
   *)

@@ -16,6 +16,7 @@ require_optimized_kernel_evidence=0
 require_continuous_batch_evidence=0
 require_resumable_prefill_evidence=0
 require_audio_streaming_evidence=0
+audio_runtime_evidence=""
 certificate_written=0
 started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
@@ -37,7 +38,9 @@ Options:
   --require-resumable-prefill-evidence
                         Require every case to prove a prompt ran as multiple resumable spans
   --require-audio-streaming-evidence
-                        Require ASR/TTS c1/c2/c4/c8 streaming first/inter-output metrics
+                        Require the complete ASR/TTS streaming and runtime stress gates
+  --audio-runtime-evidence PATH
+                        Exact-SHA/device stress artifact required by the audio gate
   --dry-run             Print the benchmark command without probing hardware/server
   -h, --help            Show this help
 
@@ -91,6 +94,10 @@ while [[ $# -gt 0 ]]; do
         --require-audio-streaming-evidence)
             require_audio_streaming_evidence=1
             shift
+            ;;
+        --audio-runtime-evidence)
+            audio_runtime_evidence="${2:-}"
+            shift 2
             ;;
         --dry-run)
             dry_run=1
@@ -288,6 +295,29 @@ report_path="${benchmark_dir}/report.json"
 metadata_path="${benchmark_dir}/metadata.json"
 observability_path="${benchmark_dir}/observability.json"
 
+audio_runtime_hash=""
+audio_runtime_copy="${output_dir}/audio-runtime-evidence.json"
+if [[ "${require_audio_streaming_evidence}" -eq 1 ]]; then
+    if [[ -z "${audio_runtime_evidence}" || ! -s "${audio_runtime_evidence}" ]]; then
+        fail "Audio certification requires --audio-runtime-evidence from the exact-SHA/device stress run"
+    fi
+    if ! "${repo_root}/scripts/bench/validate-audio-runtime-evidence.sh" \
+        --evidence "${audio_runtime_evidence}" \
+        --report "${report_path}" \
+        --backend "${backend}" \
+        --expected-git-sha "${git_sha}" >>"${runner_log}"; then
+        fail "Audio runtime stress evidence failed validation"
+    fi
+    if [[ "${audio_runtime_evidence}" != "${audio_runtime_copy}" ]]; then
+        cp "${audio_runtime_evidence}" "${audio_runtime_copy}"
+    fi
+    if command -v sha256sum >/dev/null 2>&1; then
+        audio_runtime_hash=$(sha256sum "${audio_runtime_copy}" | awk '{print $1}')
+    else
+        audio_runtime_hash=$(shasum -a 256 "${audio_runtime_copy}" | awk '{print $1}')
+    fi
+fi
+
 if ! jq -e \
     --arg backend "${backend}" \
     --argjson require_optimized "${require_optimized_kernel_evidence}" \
@@ -378,12 +408,24 @@ if ! jq -e \
         ] | all(. == true)) and
         ([.reports[].report |
             .config.stream == true and
+            (.samples | length) == .config.iterations and
+            ([.samples[].quality_gates[] | .status != "fail"] | all(. == true)) and
             (if .command == "tts" then
                 .summary.first_audio_ms.count == (.samples | length) and
-                .summary.inter_frame_ms.count > 0
+                .summary.inter_frame_ms.count == (.samples | length) and
+                ([.samples[] |
+                    (.first_audio_ms | type == "number" and . >= 0) and
+                    (.inter_frame_ms | type == "number" and . >= 0) and
+                    (.end_to_end_ms | type == "number" and . >= .first_audio_ms)
+                ] | all(. == true))
              else
                 .summary.first_transcript_ms.count == (.samples | length) and
-                .summary.inter_transcript_ms.count > 0
+                .summary.inter_transcript_ms.count == (.samples | length) and
+                ([.samples[] |
+                    (.first_transcript_ms | type == "number" and . >= 0) and
+                    (.inter_transcript_ms | type == "number" and . >= 0) and
+                    (.end_to_end_ms | type == "number" and . >= .first_transcript_ms)
+                ] | all(. == true))
              end)
         ] | all(. == true)) and
         ([.reports[].report | {
@@ -430,6 +472,7 @@ jq -n \
     --argjson require_continuous "${require_continuous_batch_evidence}" \
     --argjson require_resumable_prefill "${require_resumable_prefill_evidence}" \
     --argjson require_audio_streaming "${require_audio_streaming_evidence}" \
+    --arg audio_runtime_sha256 "${audio_runtime_hash}" \
     --slurpfile health "${health_path}" \
     --slurpfile report "${report_path}" \
     '{
@@ -451,6 +494,7 @@ jq -n \
             resumable_prefill: ($require_resumable_prefill == 1),
             audio_streaming: ($require_audio_streaming == 1)
         },
+        audio_runtime_evidence_sha256: (if $audio_runtime_sha256 == "" then null else $audio_runtime_sha256 end),
         device: {
             build_git_sha: $health[0].runtime.build_git_sha,
             requested_backend: $health[0].runtime.requested_backend,
@@ -509,6 +553,7 @@ jq -n \
                 name: .name,
                 command: .report.command,
                 model: .report.config.model,
+                concurrent: .report.config.concurrent,
                 samples: (.report.samples | length),
                 quality_failed: .report.summary.quality_gates.failed,
                 streaming_latency: {
@@ -571,6 +616,7 @@ jq -n \
             observability: "benchmark/observability.json",
             manifest: "benchmark/manifest.toml",
             health: "health.json",
+            audio_runtime_evidence: (if $audio_runtime_sha256 == "" then null else "audio-runtime-evidence.json" end),
             runner_log: "runner.log"
         }
     }' >"${certificate_path}"

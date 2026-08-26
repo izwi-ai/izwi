@@ -125,14 +125,46 @@ scripts/bench/run-model-evidence.sh --backend metal \
   --manifest benchmarks/manifests/metal-audio-concurrency.toml \
   --server http://127.0.0.1:8080 \
   --output target/metal-audio-evidence \
+  --audio-runtime-evidence target/metal-audio-runtime-stress.json \
   --require-audio-streaming-evidence
 ```
 
-The gate rejects a missing concurrency cell, non-streaming case, missing first
-output, or a route that never produces an inter-output sample. A locally
-passing CPU report does not certify Metal or CUDA; accelerator certificates
-remain bound to the exact selected device, runtime backend, clean Git SHA, and
-captured telemetry.
+The gate rejects a missing concurrency cell, a missing per-request first or
+inter-output sample, any sample-level quality failure, or an incomplete run.
+Successful benchmark traffic cannot prove destructive lifecycle properties,
+so the gate also requires an externally produced `izwi.audio-runtime-evidence.v1`
+stress artifact. Validate one independently with:
+
+```bash
+scripts/bench/validate-audio-runtime-evidence.sh \
+  --evidence target/metal-audio-runtime-stress.json \
+  --report target/metal-audio-evidence/benchmark/report.json \
+  --backend metal --expected-git-sha "$(git rev-parse HEAD)"
+
+scripts/bench/validate-gpu-evidence-certificate.sh \
+  --certificate target/metal-audio-evidence/certificate.json \
+  --backend metal --expected-git-sha "$(git rev-parse HEAD)" \
+  --require-audio-streaming-evidence
+```
+
+The stress artifact must cover exactly the report's ASR/TTS models and prove,
+per model, c1/c2/c4/c8 execution, scalar/width-one completion without an
+unexpected backend fallback, output parity, bounded non-starving service,
+mixed cancellation with no post-cancel publication, cache-pressure rejection
+and recovery, unload/drain to zero active retained sessions, and a measured
+memory plateau of at least three samples. It is intentionally external: the
+runner does not synthesize cancellation, unload, pressure, or memory claims
+from successful requests. The validator binds it to the clean Git SHA, selected
+backend, and non-empty device/runtime identities, then retains its SHA-256 in
+the model certificate.
+The complete machine-readable field contract is exercised by
+`scripts/bench/test-validate-audio-runtime-evidence.sh`; producers should use
+that passing fixture as the minimal schema example.
+
+A locally passing CPU report and stress artifact do not certify Metal or CUDA.
+Accelerator certificates remain bound to their own exact selected device,
+runtime backend, clean Git SHA, and captured telemetry. Until those external
+runs exist, their result is unavailable, not passing or failing.
 
 Continuous batching uses CPU, Metal, and CUDA concurrent manifests covering
 Qwen3, Qwen3.5, Qwen3.8, LFM2, and Gemma. The

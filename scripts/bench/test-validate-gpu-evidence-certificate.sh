@@ -12,6 +12,7 @@ help=$($validator --help)
 grep -q 'Unsupported, skipped' <<<"$help"
 grep -q -- '--require-continuous-batch-evidence' <<<"$help"
 grep -q -- '--require-resumable-prefill-evidence' <<<"$help"
+grep -q -- '--require-audio-streaming-evidence' <<<"$help"
 
 jq -cn --arg git_sha "$git_sha" '
   [
@@ -134,6 +135,58 @@ jq -n --arg git_sha "$git_sha" '
 $validator --certificate "$tmp_dir/model-certificate.json" --backend cuda \
   --expected-git-sha "$git_sha" --require-continuous-batch-evidence \
   --require-resumable-prefill-evidence >/dev/null
+
+jq -n '{reports: [{report: {command: "asr", config: {model: "audio-model"}}}]}' \
+  >"$tmp_dir/audio-report.json"
+jq -n --arg git_sha "$git_sha" '{
+  schema: "izwi.audio-runtime-evidence.v1", status: "passed",
+  git_sha: $git_sha, backend: "cuda",
+  device: {selected_backend: "cuda", identity: "test-gpu", runtime_id: "run-1"},
+  models: [{
+    model: "audio-model", task: "asr", concurrency: [1, 2, 4, 8],
+    correctness: {samples_compared: 8, mismatches: 0},
+    fairness: {requests: 8, completed: 8, starved: 0, max_queue_wait_ms: 10},
+    cancellation: {cancelled_requests: 1, post_cancel_outputs: 0, live_peers_completed: 1, retained_sessions_after: 0},
+    cache_pressure: {pressure_events: 1, rejections: 1, recovered_requests: 1, retained_bytes_after: 0},
+    unload_drain: {attempts: 1, completed: 1, active_requests_after: 0, retained_sessions_after: 0},
+    fallback: {c1_requests: 1, c1_completed: 1, unexpected_backend_fallbacks: 0},
+    memory: {samples: 3, plateau: true, growth_bytes: 0, tolerance_bytes: 1024}
+  }]
+}' >"$tmp_dir/audio-runtime.json"
+if command -v sha256sum >/dev/null 2>&1; then
+  audio_sha256=$(sha256sum "$tmp_dir/audio-runtime.json" | awk '{print $1}')
+else
+  audio_sha256=$(shasum -a 256 "$tmp_dir/audio-runtime.json" | awk '{print $1}')
+fi
+jq --arg audio_sha256 "$audio_sha256" \
+  --arg audio "$tmp_dir/audio-runtime.json" --arg report "$tmp_dir/audio-report.json" '
+  .requirements.audio_streaming = true |
+  .audio_runtime_evidence_sha256 = $audio_sha256 |
+  .artifacts = {audio_runtime_evidence: $audio, report: $report} |
+  .cases = ([1, 2, 4, 8] | map({
+    name: ("audio-c" + tostring), command: "asr", model: "audio-model",
+    concurrent: ., samples: 1, quality_failed: 0,
+    telemetry_delta_available: true, backend_kind: "cuda",
+    actual_device_kind: "cuda",
+    streaming_latency: {
+      first_audio_ms: null, inter_frame_ms: null,
+      first_transcript_ms: {count: 1}, inter_transcript_ms: {count: 1}
+    }
+  }))
+' "$tmp_dir/model-certificate.json" >"$tmp_dir/audio-certificate.json"
+$validator --certificate "$tmp_dir/audio-certificate.json" --backend cuda \
+  --expected-git-sha "$git_sha" --require-audio-streaming-evidence >/dev/null
+
+jq '.models[0].memory.growth_bytes = 1' "$tmp_dir/audio-runtime.json" \
+  >"$tmp_dir/audio-runtime-mutated.json"
+jq --arg audio "$tmp_dir/audio-runtime-mutated.json" \
+  '.artifacts.audio_runtime_evidence = $audio' "$tmp_dir/audio-certificate.json" \
+  >"$tmp_dir/audio-certificate-bad-digest.json"
+if $validator --certificate "$tmp_dir/audio-certificate-bad-digest.json" --backend cuda \
+  --expected-git-sha "$git_sha" --require-audio-streaming-evidence >/dev/null 2>&1; then
+  echo 'validator accepted mutated audio runtime evidence with a stale digest' >&2
+  exit 1
+fi
 
 for portable_backend in cpu metal; do
   jq --arg backend "$portable_backend" '
