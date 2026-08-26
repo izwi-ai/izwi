@@ -4145,6 +4145,27 @@ pub struct VibeVoiceTtsModelLease {
     inner: TrackedModelLease<VibeVoiceTtsModel>,
 }
 
+/// A loaded Fish S2 TTS handle that fences unload for the exact model
+/// instance retained by an admitted incremental request.
+#[derive(Clone)]
+pub struct FishS2TtsModelLease {
+    inner: TrackedModelLease<FishS2TtsModel>,
+}
+
+impl FishS2TtsModelLease {
+    pub(crate) fn model_arc(&self) -> Arc<FishS2TtsModel> {
+        self.inner.model.clone()
+    }
+}
+
+impl Deref for FishS2TtsModelLease {
+    type Target = FishS2TtsModel;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
 impl VibeVoiceTtsModelLease {
     pub(crate) fn model_arc(&self) -> Arc<VibeVoiceTtsModel> {
         self.inner.model.clone()
@@ -5181,7 +5202,7 @@ pub struct ModelRegistry {
     voxtral_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<VoxtralTtsModel>>>>>>,
     vibevoice_tts_models:
         Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<VibeVoiceTtsModel>>>>>,
-    fish_s2_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<FishS2TtsModel>>>>>>,
+    fish_s2_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<FishS2TtsModel>>>>>,
     qwen_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<Qwen3TtsModel>>>>>,
     kokoro_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<KokoroTtsModel>>>>>>,
     effective_contexts: Arc<std::sync::RwLock<HashMap<ModelVariant, usize>>>,
@@ -5485,8 +5506,8 @@ impl ModelRegistry {
 
         {
             let guard = self.diarization_models.read().await;
-            for (variant, cell) in guard.iter() {
-                let Some(model) = cell.get() else {
+            for (variant, entry) in guard.iter() {
+                let Some(model) = entry.get() else {
                     continue;
                 };
                 diagnostics.push(loaded_model_diagnostics_entry(
@@ -5596,8 +5617,8 @@ impl ModelRegistry {
 
         {
             let guard = self.fish_s2_tts_models.read().await;
-            for (variant, cell) in guard.iter() {
-                let Some(model) = cell.get() else {
+            for (variant, entry) in guard.iter() {
+                let Some(model) = entry.model.get() else {
                     continue;
                 };
                 diagnostics.push(loaded_model_diagnostics_entry(
@@ -6138,12 +6159,18 @@ impl ModelRegistry {
             Error::InvalidInput(format!("Unsupported Fish S2 TTS model variant: {variant}"))
         })?;
 
-        let cell = {
+        let (entry, loading_guard) = {
             let mut guard = self.fish_s2_tts_models.write().await;
-            guard
+            let entry = guard
                 .entry(variant)
-                .or_insert_with(|| Arc::new(OnceCell::new()))
-                .clone()
+                .or_insert_with(|| Arc::new(TrackedModelEntry::default()))
+                .clone();
+            let loading_guard = entry.uses.acquire().ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "Fish S2 TTS model {variant} exceeded its active-use accounting capacity"
+                ))
+            })?;
+            (entry, loading_guard)
         };
 
         info!(
@@ -6151,7 +6178,8 @@ impl ModelRegistry {
             registration.name
         );
 
-        let model = cell
+        entry
+            .model
             .get_or_try_init({
                 let model_dir = model_dir.to_path_buf();
                 let device = self.device.clone();
@@ -6164,8 +6192,19 @@ impl ModelRegistry {
                 }
             })
             .await?;
-
-        Ok(model.clone())
+        let model = {
+            let guard = self.fish_s2_tts_models.read().await;
+            guard
+                .get(&variant)
+                .filter(|current| Arc::ptr_eq(current, &entry))
+                .and_then(|current| current.model.get().cloned())
+        };
+        drop(loading_guard);
+        model.ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "Fish S2 TTS model {variant} load was superseded before publication"
+            ))
+        })
     }
 
     pub async fn load_kokoro(
@@ -6462,12 +6501,51 @@ impl ModelRegistry {
 
     pub async fn get_fish_s2_tts(&self, variant: ModelVariant) -> Option<Arc<FishS2TtsModel>> {
         let guard = self.fish_s2_tts_models.read().await;
-        guard.get(&variant).and_then(|cell| cell.get().cloned())
+        guard.get(&variant).and_then(|entry| entry.ready_model())
     }
 
     pub fn try_get_fish_s2_tts(&self, variant: ModelVariant) -> Option<Arc<FishS2TtsModel>> {
         let guard = self.fish_s2_tts_models.try_read().ok()?;
-        guard.get(&variant).and_then(|cell| cell.get().cloned())
+        guard.get(&variant).and_then(|entry| entry.ready_model())
+    }
+
+    pub async fn get_fish_s2_tts_lease(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<FishS2TtsModelLease> {
+        let guard = self.fish_s2_tts_models.read().await;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire_ready())
+            .map(|inner| FishS2TtsModelLease { inner })
+    }
+
+    pub fn try_get_fish_s2_tts_lease(&self, variant: ModelVariant) -> Option<FishS2TtsModelLease> {
+        let guard = self.fish_s2_tts_models.try_read().ok()?;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire_ready())
+            .map(|inner| FishS2TtsModelLease { inner })
+    }
+
+    pub(crate) async fn get_loading_fish_s2_tts(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<Arc<FishS2TtsModel>> {
+        let guard = self.fish_s2_tts_models.read().await;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.model.get().cloned())
+    }
+
+    pub(crate) async fn publish_fish_s2_tts_ready(&self, variant: ModelVariant) -> Result<()> {
+        let guard = self.fish_s2_tts_models.read().await;
+        let entry = guard.get(&variant).ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "cannot publish missing Fish S2 TTS model {variant} as ready"
+            ))
+        })?;
+        entry.publish_ready()
     }
 
     pub async fn get_qwen_tts(&self, variant: ModelVariant) -> Option<Arc<Qwen3TtsModel>> {
@@ -6584,8 +6662,17 @@ impl ModelRegistry {
     }
 
     pub async fn unload_fish_s2_tts(&self, variant: ModelVariant) {
-        let mut guard = self.fish_s2_tts_models.write().await;
-        guard.remove(&variant);
+        let entry = {
+            let mut guard = self.fish_s2_tts_models.write().await;
+            let entry = guard.remove(&variant);
+            if let Some(entry) = &entry {
+                entry.reset_ready();
+            }
+            entry
+        };
+        if let Some(entry) = entry {
+            entry.uses.wait_until_idle().await;
+        }
     }
 
     pub async fn unload_qwen_tts(&self, variant: ModelVariant) {
