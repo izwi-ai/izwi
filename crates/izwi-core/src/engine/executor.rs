@@ -75,8 +75,8 @@ use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::ModelRegistry;
 use crate::runtime::{PhysicalExecutionAdmission, PhysicalExecutionLease};
 use state::{
-    ActiveAsrDecode, ActiveChatDecode, ActiveQwenTtsDecode, ActiveVoxtralRealtime,
-    PendingVoxtralRealtimeQuantum, PreparedVoxtralRealtimeQuantum,
+    ActiveAsrDecode, ActiveChatDecode, ActiveLfm25AsrDecode, ActiveQwenTtsDecode,
+    ActiveVoxtralRealtime, PendingVoxtralRealtimeQuantum, PreparedVoxtralRealtimeQuantum,
 };
 
 const QWEN38_TARGET_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(1);
@@ -2393,6 +2393,7 @@ pub struct NativeExecutor {
     loaded_tts_model: Option<Arc<Qwen3TtsModel>>,
     chat_decode_states: ExecutorStateStore<ActiveChatDecode>,
     asr_decode_states: ExecutorStateStore<ActiveAsrDecode>,
+    lfm25_asr_decode_states: ExecutorStateStore<ActiveLfm25AsrDecode>,
     voxtral_realtime: Arc<VoxtralRealtimeStateCoordinator>,
     qwen_tts_decode_states: ExecutorStateStore<ActiveQwenTtsDecode>,
 }
@@ -2469,6 +2470,7 @@ impl NativeExecutor {
             loaded_tts_model: None,
             chat_decode_states: Mutex::new(HashMap::new()),
             asr_decode_states: Mutex::new(HashMap::new()),
+            lfm25_asr_decode_states: Mutex::new(HashMap::new()),
             voxtral_realtime,
             qwen_tts_decode_states: Mutex::new(HashMap::new()),
         }
@@ -3112,6 +3114,9 @@ impl ModelExecutor for NativeExecutor {
             .asr_decode_states
             .lock()
             .map_err(|_| Error::InferenceError("ASR decode state mutex poisoned".to_string()))?;
+        let mut lfm25_asr = self.lfm25_asr_decode_states.lock().map_err(|_| {
+            Error::InferenceError("LFM2.5 Audio ASR decode state mutex poisoned".to_string())
+        })?;
         if self.voxtral_realtime.abort_matching(|_| true).is_err() {
             return Err(Error::InferenceError(
                 "failed to abort pending Voxtral realtime state during shutdown".to_string(),
@@ -3130,9 +3135,10 @@ impl ModelExecutor for NativeExecutor {
         })?;
         chat.clear();
         asr.clear();
+        lfm25_asr.clear();
         voxtral.clear();
         tts.clear();
-        drop((chat, asr, voxtral, tts));
+        drop((chat, asr, lfm25_asr, voxtral, tts));
         self.initialized = false;
         self.loaded_tts_model = None;
         Ok(())
@@ -3146,9 +3152,10 @@ impl ModelExecutor for NativeExecutor {
         {
             return CacheReleaseReport::unconfirmed();
         }
-        let (Ok(mut chat), Ok(mut asr), Ok(mut voxtral), Ok(mut tts)) = (
+        let (Ok(mut chat), Ok(mut asr), Ok(mut lfm25_asr), Ok(mut voxtral), Ok(mut tts)) = (
             self.chat_decode_states.lock(),
             self.asr_decode_states.lock(),
+            self.lfm25_asr_decode_states.lock(),
             self.voxtral_realtime.states.lock(),
             self.qwen_tts_decode_states.lock(),
         ) else {
@@ -3157,9 +3164,15 @@ impl ModelExecutor for NativeExecutor {
 
         let chat = cleanup_request_states_locked(&mut chat, request_id);
         let asr = cleanup_request_states_locked(&mut asr, request_id);
+        let lfm25_asr = cleanup_request_states_locked(&mut lfm25_asr, request_id);
         let voxtral = cleanup_request_states_locked(&mut voxtral, request_id);
         let tts = cleanup_request_states_locked(&mut tts, request_id);
-        cleanup_report(chat.combine(asr).combine(voxtral).combine(tts))
+        cleanup_report(
+            chat.combine(asr)
+                .combine(lfm25_asr)
+                .combine(voxtral)
+                .combine(tts),
+        )
     }
 
     fn cleanup_session(&self, session: &SessionKey) -> CacheReleaseReport {
@@ -3170,9 +3183,10 @@ impl ModelExecutor for NativeExecutor {
         {
             return CacheReleaseReport::unconfirmed();
         }
-        let (Ok(mut chat), Ok(mut asr), Ok(mut voxtral), Ok(mut tts)) = (
+        let (Ok(mut chat), Ok(mut asr), Ok(mut lfm25_asr), Ok(mut voxtral), Ok(mut tts)) = (
             self.chat_decode_states.lock(),
             self.asr_decode_states.lock(),
+            self.lfm25_asr_decode_states.lock(),
             self.voxtral_realtime.states.lock(),
             self.qwen_tts_decode_states.lock(),
         ) else {
@@ -3181,9 +3195,15 @@ impl ModelExecutor for NativeExecutor {
 
         let chat = cleanup_session_state_locked(&mut chat, session);
         let asr = cleanup_session_state_locked(&mut asr, session);
+        let lfm25_asr = cleanup_session_state_locked(&mut lfm25_asr, session);
         let voxtral = cleanup_session_state_locked(&mut voxtral, session);
         let tts = cleanup_session_state_locked(&mut tts, session);
-        cleanup_report(chat.combine(asr).combine(voxtral).combine(tts))
+        cleanup_report(
+            chat.combine(asr)
+                .combine(lfm25_asr)
+                .combine(voxtral)
+                .combine(tts),
+        )
     }
 
     fn purge_model_cache(&self, variant: ModelVariant) -> CacheReleaseReport {
@@ -4158,12 +4178,18 @@ mod tests {
                 variant: ModelVariant::Qwen3Asr06BGguf,
             },
         );
+        executor.lfm25_asr_decode_states.lock().unwrap().insert(
+            session.clone(),
+            ExecutorStateSlot::InFlight {
+                variant: ModelVariant::Lfm25Audio15BGguf,
+            },
+        );
 
         let report = executor.cleanup_session(&session);
         assert_eq!(report.outcome, CacheReleaseOutcome::BusyInFlight);
         assert!(!report.confirmed);
         assert_eq!(report.released_sessions, 0);
-        assert_eq!(report.busy_sessions, 3);
+        assert_eq!(report.busy_sessions, 4);
     }
 
     fn qwen38_test_arena(generation: u32) -> KvArenaId {

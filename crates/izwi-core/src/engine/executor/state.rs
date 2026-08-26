@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::model::ModelVariant;
+use crate::models::architectures::lfm25_audio::asr_retained::Lfm25AudioAsrRetainedState;
 use crate::models::architectures::qwen3::tts::{
     PhysicalTtsDecodeState, PhysicalTtsPrefillState, Qwen3TtsModel,
 };
@@ -9,8 +10,8 @@ use crate::models::architectures::voxtral::realtime::{
     VoxtralRealtimeCheckpoint, VoxtralRealtimeState,
 };
 use crate::models::registry::{
-    AsrModelLease, NativeAsrDecodeState, NativeAsrModel, NativeChatDecodeState, QwenTtsModelLease,
-    VoxtralModelLease,
+    AsrModelLease, Lfm25AudioModelLease, NativeAsrDecodeState, NativeAsrModel,
+    NativeChatDecodeState, QwenTtsModelLease, VoxtralModelLease,
 };
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 
@@ -30,6 +31,16 @@ pub(super) struct ActiveAsrDecode {
     pub(super) model: Arc<NativeAsrModel>,
     pub(super) _model_lease: AsrModelLease,
     pub(super) state: NativeAsrDecodeState,
+    pub(super) last_tokens_generated: usize,
+    pub(super) stream_sequence: usize,
+    pub(super) input_sample_rate: u32,
+    pub(super) input_sample_count: usize,
+}
+
+pub(super) struct ActiveLfm25AsrDecode {
+    pub(super) variant: ModelVariant,
+    pub(super) model: Lfm25AudioModelLease,
+    pub(super) state: Lfm25AudioAsrRetainedState,
     pub(super) last_tokens_generated: usize,
     pub(super) stream_sequence: usize,
     pub(super) input_sample_rate: u32,
