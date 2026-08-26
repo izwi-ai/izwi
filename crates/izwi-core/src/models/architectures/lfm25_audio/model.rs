@@ -21,6 +21,7 @@ use super::config::{
     parse_main_backbone_config, Lfm25AudioDecoderConfig, Lfm25AudioEncoderConfig,
     Lfm2BackboneConfig,
 };
+use super::conformer::subsampled_len_3x;
 use super::conformer::Lfm25AudioEncoder;
 use super::detokenizer::Lfm25AudioDetokenizer;
 use super::physical::{
@@ -70,13 +71,66 @@ pub(crate) struct Lfm25AudioPreparedAsrArtifact {
     pub(crate) source_samples: usize,
     pub(crate) source_sample_rate: u32,
     pub(crate) resampled_samples: usize,
-    pub(crate) feature_frames: usize,
+    pub(crate) mel_frames: usize,
+    pub(crate) effective_feature_frames: usize,
     pub(crate) audio_tokens: usize,
     pub(crate) prompt_tokens: usize,
+    /// Retained mixed-prompt tensor elements only.
     pub(crate) materialized_tensor_elements: u64,
+    pub(crate) retained_resident_bytes: u64,
     pub(crate) retained_host_bytes: u64,
     preparation_timings: Lfm25AsrPreparationTimings,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Lfm25AudioAsrPreparationGeometry {
+    pub(crate) source_samples: usize,
+    pub(crate) source_sample_rate: u32,
+    pub(crate) resampled_samples: usize,
+    pub(crate) padded_samples: usize,
+    pub(crate) total_mel_frames: usize,
+    pub(crate) effective_feature_frames: usize,
+    pub(crate) encoder_frames: usize,
+    pub(crate) prompt_tokens: usize,
+    /// Useful unpadded feature input plus the retained mixed prompt.
+    pub(crate) preparation_useful_tensor_elements: u64,
+    /// Retained mixed-prompt tensor elements only.
+    pub(crate) materialized_tensor_elements: u64,
+    pub(crate) retained_resident_bytes: u64,
+    pub(crate) host_workspace_bytes: u64,
+    pub(crate) device_workspace_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Lfm25AudioAsrPreparationResourceEnvelope {
+    pub(crate) backend: BackendKind,
+    pub(crate) geometry: Lfm25AudioAsrPreparationGeometry,
+    pub(crate) max_work_units: u64,
+    pub(crate) max_materialized_tensor_elements: u64,
+    pub(crate) max_retained_resident_bytes: u64,
+    pub(crate) max_host_workspace_bytes: u64,
+    pub(crate) max_device_workspace_bytes: u64,
+    pub(crate) max_unified_workspace_bytes: u64,
+    pub(crate) max_workspace_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Lfm25AudioAsrPreparationStageCeiling {
+    pub(crate) backend: BackendKind,
+    pub(crate) max_source_samples: usize,
+    pub(crate) max_source_sample_rate: u32,
+    pub(crate) max_resampled_samples: usize,
+    pub(crate) max_prompt_tokens: usize,
+    pub(crate) max_work_units: u64,
+    pub(crate) max_materialized_tensor_elements: u64,
+    pub(crate) max_retained_resident_bytes: u64,
+    pub(crate) max_host_workspace_bytes: u64,
+    pub(crate) max_device_workspace_bytes: u64,
+    pub(crate) max_unified_workspace_bytes: u64,
+    pub(crate) max_workspace_bytes: u64,
+}
+
+const LFM25_AUDIO_MAX_SOURCE_SAMPLE_RATE: u32 = 192_000;
 
 #[derive(Debug, Clone, Copy, Default)]
 struct Lfm25AsrPreparationTimings {
@@ -383,6 +437,8 @@ impl Lfm25AudioModel {
                 "LFM2.5 Audio sample rate must be non-zero".to_string(),
             ));
         }
+        let ceiling = self.asr_preparation_stage_ceiling()?;
+        let envelope = self.asr_preparation_resource_envelope(audio.len(), sample_rate)?;
 
         let total_started = Instant::now();
         let resample_started = Instant::now();
@@ -393,7 +449,7 @@ impl Lfm25AudioModel {
                 audio,
                 sample_rate,
                 super::config::LFM25_AUDIO_INPUT_SAMPLE_RATE,
-            )
+            )?
         };
         let resample_ms = elapsed_ms(resample_started);
 
@@ -443,6 +499,28 @@ impl Lfm25AudioModel {
                     .to_string(),
             ));
         }
+        let retained_resident_bytes = materialized_tensor_elements
+            .checked_mul(
+                u64::try_from(prompt_embeddings.dtype().size_in_bytes()).map_err(|_| {
+                    Error::InvalidInput("LFM2.5 Audio prompt dtype size exceeds u64".to_string())
+                })?,
+            )
+            .ok_or_else(|| {
+                Error::InvalidInput("LFM2.5 Audio retained tensor bytes overflowed u64".to_string())
+            })?;
+        if mono_16khz.len() != envelope.geometry.resampled_samples
+            || feature_frames != envelope.geometry.effective_feature_frames
+            || prompt_tokens != envelope.geometry.prompt_tokens
+            || audio_tokens != envelope.geometry.encoder_frames
+            || materialized_tensor_elements != envelope.geometry.materialized_tensor_elements
+            || retained_resident_bytes > envelope.max_retained_resident_bytes
+            || envelope.max_workspace_bytes > ceiling.max_workspace_bytes
+        {
+            return Err(Error::InferenceError(
+                "Prepared LFM2.5 Audio artifact exceeded its authenticated preparation seal"
+                    .to_string(),
+            ));
+        }
 
         Ok(Arc::new(Lfm25AudioPreparedAsrArtifact {
             model_load_nonce: self.model_load_nonce,
@@ -452,10 +530,12 @@ impl Lfm25AudioModel {
             source_samples: audio.len(),
             source_sample_rate: sample_rate,
             resampled_samples: mono_16khz.len(),
-            feature_frames,
+            mel_frames: envelope.geometry.total_mel_frames,
+            effective_feature_frames: feature_frames,
             audio_tokens,
             prompt_tokens,
             materialized_tensor_elements,
+            retained_resident_bytes,
             retained_host_bytes: prepared_asr_retained_host_bytes(),
             preparation_timings: Lfm25AsrPreparationTimings {
                 resample_ms,
@@ -467,6 +547,222 @@ impl Lfm25AudioModel {
                 total_ms: elapsed_ms(total_started),
             },
         }))
+    }
+
+    pub(crate) fn asr_preparation_geometry(
+        &self,
+        source_samples: usize,
+        source_sample_rate: u32,
+    ) -> Result<Lfm25AudioAsrPreparationGeometry> {
+        if source_samples == 0 || source_sample_rate == 0 {
+            return Err(Error::InvalidInput(
+                "LFM2.5 Audio preparation requires non-empty audio and a non-zero sample rate"
+                    .to_string(),
+            ));
+        }
+        if source_sample_rate > LFM25_AUDIO_MAX_SOURCE_SAMPLE_RATE {
+            return Err(Error::InvalidInput(format!(
+                "LFM2.5 Audio source sample rate {source_sample_rate} exceeds the sealed maximum {LFM25_AUDIO_MAX_SOURCE_SAMPLE_RATE}"
+            )));
+        }
+        let resampled_samples = checked_resampled_len(
+            source_samples,
+            source_sample_rate,
+            super::config::LFM25_AUDIO_INPUT_SAMPLE_RATE,
+        )?;
+        let padded_samples = resampled_samples
+            .checked_add(super::config::LFM25_AUDIO_INPUT_N_FFT)
+            .ok_or_else(|| Error::InvalidInput("LFM2.5 Audio padding overflowed usize".into()))?;
+        let padded_feature_frames = resampled_samples
+            .checked_div(super::config::LFM25_AUDIO_INPUT_HOP_LENGTH)
+            .and_then(|frames| frames.checked_add(1))
+            .ok_or_else(|| Error::InvalidInput("LFM2.5 Audio frame count overflowed".into()))?;
+        let effective_frames = super::preprocessor::effective_frame_count(resampled_samples);
+        let encoder_frames = subsampled_len_3x(effective_frames);
+        let (prefix, suffix) = self.build_asr_prompt_segments()?;
+        let prompt_tokens = checked_asr_prompt_tokens(
+            prefix.len(),
+            encoder_frames,
+            suffix.len(),
+            self.main_config.context_length,
+        )?;
+        let materialized_tensor_elements =
+            checked_asr_prompt_tensor_elements(prompt_tokens, self.main_config.embedding_length)?;
+        let preparation_useful_tensor_elements = u64::try_from(padded_feature_frames)
+            .ok()
+            .and_then(|frames| {
+                frames.checked_mul(u64::try_from(self.encoder_config.num_mel_bins).ok()?)
+            })
+            .and_then(|features| features.checked_add(materialized_tensor_elements))
+            .ok_or_else(|| {
+                Error::InvalidInput(
+                    "LFM2.5 Audio useful preparation elements overflowed u64".into(),
+                )
+            })?;
+        let retained_resident_bytes =
+            materialized_tensor_elements.checked_mul(4).ok_or_else(|| {
+                Error::InvalidInput("LFM2.5 Audio retained resident bytes overflowed".into())
+            })?;
+        let (host_workspace_bytes, device_workspace_bytes) = checked_asr_preparation_workspace(
+            resampled_samples,
+            padded_samples,
+            padded_feature_frames,
+            encoder_frames,
+            prompt_tokens,
+            &self.encoder_config,
+            self.main_config.embedding_length,
+        )?;
+        Ok(Lfm25AudioAsrPreparationGeometry {
+            source_samples,
+            source_sample_rate,
+            resampled_samples,
+            padded_samples,
+            total_mel_frames: padded_feature_frames,
+            effective_feature_frames: effective_frames,
+            encoder_frames,
+            prompt_tokens,
+            preparation_useful_tensor_elements,
+            materialized_tensor_elements,
+            retained_resident_bytes,
+            host_workspace_bytes,
+            device_workspace_bytes,
+        })
+    }
+
+    pub(crate) fn asr_preparation_resource_envelope(
+        &self,
+        source_samples: usize,
+        source_sample_rate: u32,
+    ) -> Result<Lfm25AudioAsrPreparationResourceEnvelope> {
+        let backend = BackendKind::from(self.device.kind);
+        let geometry = self.asr_preparation_geometry(source_samples, source_sample_rate)?;
+        let (max_host_workspace_bytes, max_device_workspace_bytes, max_unified_workspace_bytes) =
+            map_asr_workspace_domains(
+                backend,
+                geometry.host_workspace_bytes,
+                geometry.device_workspace_bytes,
+            )?;
+        let max_workspace_bytes = geometry
+            .host_workspace_bytes
+            .checked_add(geometry.device_workspace_bytes)
+            .ok_or_else(|| Error::InvalidInput("LFM2.5 Audio workspace bytes overflowed".into()))?;
+        Ok(Lfm25AudioAsrPreparationResourceEnvelope {
+            backend,
+            geometry,
+            max_work_units: u64::try_from(geometry.encoder_frames)
+                .map_err(|_| Error::InvalidInput("LFM2.5 Audio work units exceed u64".into()))?,
+            max_materialized_tensor_elements: geometry.preparation_useful_tensor_elements,
+            max_retained_resident_bytes: geometry.retained_resident_bytes,
+            max_host_workspace_bytes,
+            max_device_workspace_bytes,
+            max_unified_workspace_bytes,
+            max_workspace_bytes,
+        })
+    }
+
+    pub(crate) fn asr_preparation_stage_ceiling(
+        &self,
+    ) -> Result<Lfm25AudioAsrPreparationStageCeiling> {
+        let (prefix, suffix) = self.build_asr_prompt_segments()?;
+        let fixed_tokens = prefix
+            .len()
+            .checked_add(suffix.len())
+            .ok_or_else(|| Error::InvalidInput("LFM2.5 Audio fixed prompt overflowed".into()))?;
+        let max_prompt_tokens =
+            self.main_config
+                .context_length
+                .checked_sub(1)
+                .ok_or_else(|| {
+                    Error::ModelLoadError(
+                        "LFM2.5 Audio context leaves no ASR prompt capacity".into(),
+                    )
+                })?;
+        let max_encoder_frames = max_prompt_tokens.checked_sub(fixed_tokens).ok_or_else(|| {
+            Error::ModelLoadError("LFM2.5 Audio fixed ASR prompt exceeds model context".into())
+        })?;
+        if max_encoder_frames == 0 {
+            return Err(Error::ModelLoadError(
+                "LFM2.5 Audio context leaves no audio-token capacity".into(),
+            ));
+        }
+        let max_effective_frames = max_encoder_frames.checked_mul(8).ok_or_else(|| {
+            Error::ModelLoadError("LFM2.5 Audio maximum feature frames overflowed".into())
+        })?;
+        let max_resampled_samples = max_effective_frames
+            .checked_add(1)
+            .and_then(|frames| frames.checked_mul(super::config::LFM25_AUDIO_INPUT_HOP_LENGTH))
+            .and_then(|samples| samples.checked_sub(1))
+            .ok_or_else(|| {
+                Error::ModelLoadError("LFM2.5 Audio maximum resampled samples overflowed".into())
+            })?;
+        let max_source_samples = max_resampled_samples
+            .checked_mul(LFM25_AUDIO_MAX_SOURCE_SAMPLE_RATE as usize)
+            .and_then(|samples| {
+                samples.checked_div(super::config::LFM25_AUDIO_INPUT_SAMPLE_RATE as usize)
+            })
+            .ok_or_else(|| {
+                Error::ModelLoadError("LFM2.5 Audio maximum source samples overflowed".into())
+            })?;
+        let padded_samples = max_resampled_samples
+            .checked_add(super::config::LFM25_AUDIO_INPUT_N_FFT)
+            .ok_or_else(|| {
+                Error::ModelLoadError("LFM2.5 Audio maximum padding overflowed".into())
+            })?;
+        let total_mel_frames = max_resampled_samples
+            .checked_div(super::config::LFM25_AUDIO_INPUT_HOP_LENGTH)
+            .and_then(|frames| frames.checked_add(1))
+            .ok_or_else(|| {
+                Error::ModelLoadError("LFM2.5 Audio maximum mel frames overflowed".into())
+            })?;
+        let (logical_host, logical_device) = checked_asr_preparation_workspace(
+            max_resampled_samples,
+            padded_samples,
+            total_mel_frames,
+            max_encoder_frames,
+            max_prompt_tokens,
+            &self.encoder_config,
+            self.main_config.embedding_length,
+        )?;
+        let backend = BackendKind::from(self.device.kind);
+        let (max_host_workspace_bytes, max_device_workspace_bytes, max_unified_workspace_bytes) =
+            map_asr_workspace_domains(backend, logical_host, logical_device)?;
+        let max_workspace_bytes = logical_host.checked_add(logical_device).ok_or_else(|| {
+            Error::ModelLoadError("LFM2.5 Audio maximum workspace overflowed".into())
+        })?;
+        let max_materialized_tensor_elements = checked_asr_prompt_tensor_elements(
+            max_prompt_tokens,
+            self.main_config.embedding_length,
+        )?;
+        let max_retained_resident_bytes = max_materialized_tensor_elements
+            .checked_mul(4)
+            .ok_or_else(|| {
+                Error::ModelLoadError("LFM2.5 Audio resident ceiling overflowed".into())
+            })?;
+        let max_materialized_tensor_elements = u64::try_from(total_mel_frames)
+            .ok()
+            .and_then(|frames| {
+                frames.checked_mul(u64::try_from(self.encoder_config.num_mel_bins).ok()?)
+            })
+            .and_then(|features| features.checked_add(max_materialized_tensor_elements))
+            .ok_or_else(|| {
+                Error::ModelLoadError("LFM2.5 Audio useful preparation ceiling overflowed".into())
+            })?;
+        Ok(Lfm25AudioAsrPreparationStageCeiling {
+            backend,
+            max_source_samples,
+            max_source_sample_rate: LFM25_AUDIO_MAX_SOURCE_SAMPLE_RATE,
+            max_resampled_samples,
+            max_prompt_tokens,
+            max_work_units: u64::try_from(max_encoder_frames).map_err(|_| {
+                Error::ModelLoadError("LFM2.5 Audio maximum work units exceed u64".into())
+            })?,
+            max_materialized_tensor_elements,
+            max_retained_resident_bytes,
+            max_host_workspace_bytes,
+            max_device_workspace_bytes,
+            max_unified_workspace_bytes,
+            max_workspace_bytes,
+        })
     }
 
     pub(crate) fn transcribe_prepared_asr_with_callback_physical(
@@ -691,9 +987,11 @@ impl Lfm25AudioModel {
                 "input_samples": prepared.source_samples,
                 "input_sample_rate": prepared.source_sample_rate,
                 "resampled_samples": prepared.resampled_samples,
-                "feature_frames": prepared.feature_frames,
+                "mel_frames": prepared.mel_frames,
+                "feature_frames": prepared.effective_feature_frames,
                 "audio_tokens": prepared.audio_tokens,
                 "materialized_tensor_elements": prepared.materialized_tensor_elements,
+                "retained_resident_bytes": prepared.retained_resident_bytes,
                 "retained_host_bytes": prepared.retained_host_bytes
             },
             "decode": {
@@ -1320,7 +1618,7 @@ impl Lfm25AudioModel {
                 audio,
                 sample_rate,
                 super::config::LFM25_AUDIO_INPUT_SAMPLE_RATE,
-            )
+            )?
         };
 
         let (features, feature_frames) = self
@@ -1804,6 +2102,146 @@ fn validate_prepared_asr_prompt_shape(
     Ok(())
 }
 
+fn checked_asr_preparation_workspace(
+    resampled_samples: usize,
+    padded_samples: usize,
+    feature_frames: usize,
+    encoder_frames: usize,
+    prompt_tokens: usize,
+    encoder: &Lfm25AudioEncoderConfig,
+    main_hidden: usize,
+) -> Result<(u64, u64)> {
+    // This deliberately sums conservative logical allocations rather than
+    // claiming an allocator-observed peak. In particular, four N×N attention
+    // planes overbound the score, relative N×(2N-1), rel-shift, and mask
+    // materializations for every Conformer block on every backend.
+    let u = |value: usize, label: &str| {
+        u64::try_from(value).map_err(|_| {
+            Error::InvalidInput(format!("LFM2.5 Audio {label} exceeds u64 during sealing"))
+        })
+    };
+    let mul = |left: u64, right: u64, label: &str| {
+        left.checked_mul(right).ok_or_else(|| {
+            Error::InvalidInput(format!("LFM2.5 Audio {label} overflowed during sealing"))
+        })
+    };
+    let add = |left: u64, right: u64, label: &str| {
+        left.checked_add(right).ok_or_else(|| {
+            Error::InvalidInput(format!("LFM2.5 Audio {label} overflowed during sealing"))
+        })
+    };
+    let f32_bytes = 4u64;
+    let mel = u(encoder.num_mel_bins, "mel bins")?;
+    let frames = u(feature_frames, "feature frames")?;
+    let encoded = u(encoder_frames, "encoder frames")?;
+    let hidden = u(encoder.embedding_length, "encoder hidden size")?;
+    let ffn = u(encoder.feed_forward_length, "encoder FFN size")?;
+    let heads = u(encoder.attention_head_count, "encoder attention heads")?;
+
+    // Host frontend peak includes the resampled waveform, reflected padding,
+    // row-major log-mel, transposed tensor upload buffer, and complex FFT frame.
+    let host_elements = add(
+        add(
+            u(resampled_samples, "resampled samples")?,
+            u(padded_samples, "padded samples")?,
+            "host waveforms",
+        )?,
+        add(
+            mul(mul(frames, mel, "log-mel elements")?, 2, "dual mel buffers")?,
+            mul(
+                u(super::config::LFM25_AUDIO_INPUT_N_FFT, "FFT width")?,
+                2,
+                "complex FFT frame",
+            )?,
+            "host feature scratch",
+        )?,
+        "host frontend peak",
+    )?;
+
+    let feature_elements = mul(frames, mel, "feature tensor")?;
+    let conv_elements = mul(
+        mul(frames, mel, "conv spatial elements")?,
+        u(encoder.subsampling_channels, "subsampling channels")?,
+        "conv activation",
+    )?;
+    let encoded_elements = mul(encoded, hidden, "encoder hidden")?;
+    let ffn_elements = mul(encoded, ffn, "encoder FFN")?;
+    let attention_elements = mul(
+        mul(heads, encoded, "attention rows")?,
+        encoded,
+        "attention scores",
+    )?;
+    let positional_elements = mul(
+        encoded
+            .checked_mul(2)
+            .and_then(|v| v.checked_sub(1))
+            .ok_or_else(|| {
+                Error::InvalidInput("LFM2.5 Audio positional width overflowed".into())
+            })?,
+        hidden,
+        "relative positional embedding",
+    )?;
+    let per_layer = add(
+        mul(encoded_elements, 12, "Conformer hidden intermediates")?,
+        add(
+            mul(ffn_elements, 4, "Conformer FFN intermediates")?,
+            mul(attention_elements, 4, "Conformer attention intermediates")?,
+            "Conformer layer scratch",
+        )?,
+        "Conformer layer total",
+    )?;
+    let all_layers = mul(
+        per_layer,
+        u(encoder.block_count, "encoder block count")?,
+        "Conformer blocks",
+    )?;
+    let adapter_elements = mul(
+        encoded,
+        u(
+            encoder.projection_dim.max(encoder.embedding_length),
+            "adapter width",
+        )?,
+        "adapter activation",
+    )?;
+    let prompt_elements = mul(
+        u(prompt_tokens, "prompt tokens")?,
+        u(main_hidden, "main hidden")?,
+        "full prompt",
+    )?;
+    let device_elements = [
+        feature_elements,
+        conv_elements,
+        encoded_elements,
+        positional_elements,
+        all_layers,
+        mul(adapter_elements, 3, "adapter intermediates")?,
+        mul(prompt_elements, 3, "mixed prompt construction")?,
+    ]
+    .into_iter()
+    .try_fold(0u64, |total, value| {
+        add(total, value, "device preparation peak")
+    })?;
+    Ok((
+        mul(host_elements, f32_bytes, "host workspace bytes")?,
+        mul(device_elements, f32_bytes, "device workspace bytes")?,
+    ))
+}
+
+fn map_asr_workspace_domains(
+    backend: BackendKind,
+    host_frontend_bytes: u64,
+    tensor_bytes: u64,
+) -> Result<(u64, u64, u64)> {
+    let unified = host_frontend_bytes
+        .checked_add(tensor_bytes)
+        .ok_or_else(|| Error::InvalidInput("LFM2.5 Audio workspace domain overflowed".into()))?;
+    Ok(match backend {
+        BackendKind::Cpu => (unified, 0, 0),
+        BackendKind::Metal => (0, 0, unified),
+        BackendKind::Cuda => (host_frontend_bytes, tensor_bytes, 0),
+    })
+}
+
 fn validate_prepared_asr_identity(expected: u64, actual: u64) -> Result<()> {
     if expected != actual {
         return Err(Error::InvalidInput(
@@ -1813,13 +2251,30 @@ fn validate_prepared_asr_identity(expected: u64, actual: u64) -> Result<()> {
     Ok(())
 }
 
-fn resample_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
+fn checked_resampled_len(input_len: usize, src_rate: u32, dst_rate: u32) -> Result<usize> {
+    if src_rate == 0 || dst_rate == 0 {
+        return Err(Error::InvalidInput(
+            "LFM2.5 Audio resampling rates must be non-zero".into(),
+        ));
+    }
+    if input_len < 2 || src_rate == dst_rate {
+        return Ok(input_len);
+    }
+    let numerator = (input_len as u128)
+        .checked_mul(dst_rate as u128)
+        .and_then(|value| value.checked_add((src_rate / 2) as u128))
+        .ok_or_else(|| Error::InvalidInput("LFM2.5 Audio resampled length overflowed".into()))?;
+    usize::try_from((numerator / src_rate as u128).max(1))
+        .map_err(|_| Error::InvalidInput("LFM2.5 Audio resampled length exceeds usize".into()))
+}
+
+fn resample_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Result<Vec<f32>> {
     if src_rate == dst_rate || audio.len() < 2 {
-        return audio.to_vec();
+        return Ok(audio.to_vec());
     }
 
     let ratio = dst_rate as f64 / src_rate as f64;
-    let out_len = ((audio.len() as f64) * ratio).round().max(1.0) as usize;
+    let out_len = checked_resampled_len(audio.len(), src_rate, dst_rate)?;
     let mut out = Vec::with_capacity(out_len);
 
     for idx in 0..out_len {
@@ -1835,7 +2290,7 @@ fn resample_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
         out.push(left_sample + (right_sample - left_sample) * frac);
     }
 
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1938,6 +2393,48 @@ mod tests {
         assert!(validate_prepared_asr_prompt_shape(&[2, 12, 8], 12, 8).is_err());
         assert!(validate_prepared_asr_prompt_shape(&[1, 11, 8], 12, 8).is_err());
         assert!(validate_prepared_asr_prompt_shape(&[1, 12, 7], 12, 8).is_err());
+    }
+
+    #[test]
+    fn asr_preparation_geometry_uses_exact_checked_resample_rounding() {
+        assert_eq!(
+            checked_resampled_len(48_000, 48_000, 16_000).unwrap(),
+            16_000
+        );
+        assert_eq!(checked_resampled_len(3, 2, 1).unwrap(), 2);
+        assert!(checked_resampled_len(16, 0, 16_000).is_err());
+    }
+
+    #[test]
+    fn asr_preparation_workspace_maps_backend_domains_without_double_counting() {
+        assert_eq!(
+            map_asr_workspace_domains(BackendKind::Cpu, 11, 29).unwrap(),
+            (40, 0, 0)
+        );
+        assert_eq!(
+            map_asr_workspace_domains(BackendKind::Metal, 11, 29).unwrap(),
+            (0, 0, 40)
+        );
+        assert_eq!(
+            map_asr_workspace_domains(BackendKind::Cuda, 11, 29).unwrap(),
+            (11, 29, 0)
+        );
+        assert!(map_asr_workspace_domains(BackendKind::Cpu, u64::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn four_attention_planes_bound_dense_relative_attention_materialization() {
+        for frames in [1u64, 2, 17, 511] {
+            let dense_and_relative = frames
+                .checked_mul(frames)
+                .and_then(|dense| {
+                    frames
+                        .checked_mul(frames * 2 - 1)
+                        .and_then(|relative| dense.checked_add(relative))
+                })
+                .unwrap();
+            assert!(dense_and_relative <= 4 * frames * frames);
+        }
     }
 
     #[test]
