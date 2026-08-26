@@ -494,6 +494,47 @@ impl NativeExecutor {
         )
     }
 
+    pub(super) fn execute_static_lfm25_tts_prefill_requests_with_rows(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+        rows: Option<&[ReadyQuantum]>,
+    ) -> Result<Vec<ExecutorStepResult>> {
+        let ordered_requests = scheduled
+            .iter()
+            .map(|scheduled| {
+                Self::find_request(requests, scheduled).ok_or_else(|| {
+                    Error::InferenceError(
+                        "static LFM2.5 TTS prefill row has no request snapshot".into(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let managed = scheduled
+            .iter()
+            .zip(&ordered_requests)
+            .map(|(scheduled, request)| {
+                let reservation = rows
+                    .and_then(|rows| rows.iter().find(|row| row.plan_id == scheduled.plan_id))
+                    .and_then(|row| row.managed_cache.as_ref());
+                reservation
+                    .map(|reservation| {
+                        super::retained_row_managed_state_for_row(request, scheduled, reservation)
+                    })
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let outputs =
+            self.lfm25_audio_tts_prefill_batch_with_managed(&ordered_requests, scheduled, managed)?;
+        self.finish_scheduled_execution(
+            requests,
+            scheduled,
+            outputs,
+            BatchDispatch::new(BatchDispatchKind::TensorStatic, scheduled.len()),
+            rows,
+        )
+    }
+
     pub(super) fn finish_scheduled_execution(
         &self,
         requests: &[&EngineCoreRequest],

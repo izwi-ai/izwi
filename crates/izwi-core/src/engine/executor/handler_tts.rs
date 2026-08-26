@@ -206,6 +206,20 @@ fn continuous_tts_model_call(
     }
 }
 
+fn retained_tts_batch_model_call(
+    mode: crate::engine::NativeBatchMode,
+    live_kernel_rows: usize,
+) -> Option<crate::engine::metrics::EngineModelCall> {
+    match live_kernel_rows {
+        0 => None,
+        1 => Some(crate::engine::metrics::EngineModelCall::ScalarRows {
+            envelope: mode,
+            rows: 1,
+        }),
+        rows => Some(crate::engine::metrics::EngineModelCall::NativeTensor { mode, rows }),
+    }
+}
+
 fn accepted_tts_talker_tokens(
     start_cursor: usize,
     end_cursor: usize,
@@ -1124,6 +1138,295 @@ impl NativeExecutor {
         }
     }
 
+    pub(super) fn lfm25_audio_tts_prefill_batch_with_managed(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+        mut managed: Vec<Option<super::RetainedRowManagedState>>,
+    ) -> Result<Vec<ModelSessionResult>> {
+        if requests.len() != scheduled.len() || managed.len() != scheduled.len() {
+            return Err(Error::InvalidInput(
+                "LFM2.5 Audio TTS prefill batch rows do not match".into(),
+            ));
+        }
+        let mut outputs = (0..scheduled.len()).map(|_| None).collect::<Vec<_>>();
+        let live = requests
+            .iter()
+            .enumerate()
+            .filter_map(|(index, request)| {
+                if request.is_cancelled() {
+                    outputs[index] = Some(ModelSessionResult::cancelled_before_dispatch(
+                        ExecutorOutput::cancelled(request.id.clone()),
+                    ));
+                    None
+                } else {
+                    Some(index)
+                }
+            })
+            .collect::<Vec<_>>();
+        if live.is_empty() {
+            return outputs
+                .into_iter()
+                .map(|output| {
+                    output
+                        .ok_or_else(|| Error::InferenceError("LFM TTS prefill lost output".into()))
+                })
+                .collect();
+        }
+        let model = requests[live[0]]
+            .prepared_lfm25_audio_tts_model_lease_for_executor()?
+            .ok_or_else(|| Error::InferenceError("LFM TTS prefill lost model".into()))?;
+        let model_arc = model.model_arc();
+        let mut rows = Vec::with_capacity(live.len());
+        for index in live.iter().copied() {
+            if !scheduled[index].is_prefill {
+                return Err(Error::InvalidInput(
+                    "LFM TTS prefill batch contains a decode row".into(),
+                ));
+            }
+            let variant = Self::resolve_variant(requests[index])?;
+            let row_model = requests[index]
+                .prepared_lfm25_audio_tts_model_lease_for_executor()?
+                .ok_or_else(|| Error::InferenceError("LFM TTS prefill row lost model".into()))?;
+            if !Arc::ptr_eq(&model_arc, &row_model.model_arc()) {
+                return Err(Error::InferenceError(
+                    "LFM TTS prefill crossed model identity".into(),
+                ));
+            }
+            let mut retained = managed[index].take().ok_or_else(|| {
+                Error::InferenceError("LFM TTS prefill lost retained state".into())
+            })?;
+            let tensor = retained.tensor_state.clone().ok_or_else(|| {
+                Error::InferenceError("LFM TTS prefill lost ShortConv reservation".into())
+            })?;
+            let arena = requests[index]
+                .managed_cache_runtime()
+                .and_then(|runtime| runtime.tensor_state())
+                .ok_or_else(|| {
+                    Error::InferenceError("LFM TTS prefill lost ShortConv arena".into())
+                })?;
+            let main = retained.take_only_paged()?;
+            retained.ensure_all_paged_consumed()?;
+            let mut lease = ExecutorStateLease::checkout(
+                &self.lfm25_tts_decode_states,
+                scheduled[index].session_key(),
+                variant,
+                "batched LFM2.5 Audio TTS prefill",
+            )?;
+            if lease.state().is_some_and(|active| {
+                active.variant != variant || !Arc::ptr_eq(&active.model.model_arc(), &model_arc)
+            }) {
+                lease.discard_state();
+            }
+            if lease.state().is_none() {
+                if scheduled[index].num_computed_tokens != 0 {
+                    return Err(Error::InferenceError(
+                        "LFM TTS prefill lost state after initial quantum".into(),
+                    ));
+                }
+                let artifact = requests[index]
+                    .prepared_lfm25_audio_tts_artifact_for_executor()?
+                    .ok_or_else(|| Error::InferenceError("LFM TTS prefill lost prompt".into()))?;
+                if artifact.prompt_tokens != requests[index].num_prompt_tokens() {
+                    return Err(Error::InferenceError(
+                        "LFM TTS prefill prompt differs from admission".into(),
+                    ));
+                }
+                let state = model.new_lfm25_audio_retained_tts_state(
+                    artifact,
+                    requests[index].params.max_tokens.max(1),
+                    requests[index].lfm25_audio_tts_generation_config(),
+                )?;
+                lease.install_state(ActiveLfm25TtsDecode {
+                    variant,
+                    model: model.clone(),
+                    state,
+                    last_tokens_generated: 0,
+                    stream_sequence: 0,
+                })?;
+            }
+            let active = lease.require_state_mut()?;
+            active.state.bind_tensor_sequence(tensor.sequence)?;
+            active.state.restore_shortconv(arena)?;
+            if active.state.prefill_cursor() != scheduled[index].num_computed_tokens {
+                return Err(Error::InferenceError(
+                    "LFM TTS prefill cursor differs from admission".into(),
+                ));
+            }
+            let prior_tokens = active.last_tokens_generated;
+            let prior_stream_sequence = active.stream_sequence;
+            let checkpoint = active.state.reset_and_begin_quantum(&main, None)?;
+            lease.mark_dirty();
+            rows.push(ContinuousLfm25TtsRow {
+                index,
+                session: scheduled[index].session_key(),
+                lease: Some(lease),
+                main,
+                depth: None,
+                checkpoint: Some(checkpoint),
+                prior_tokens,
+                prior_stream_sequence,
+            });
+        }
+        let mut batch = ContinuousLfm25TtsBatch::new(rows);
+        for row in 0..batch.rows.len() {
+            let index = batch.rows[row].index;
+            if requests[index].is_cancelled() {
+                batch.rollback_row(row)?;
+                outputs[index] = Some(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                    requests[index].id.clone(),
+                )));
+            }
+        }
+        let call_rows = batch
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(row, state)| state.checkpoint.is_some().then_some(row))
+            .collect::<Vec<_>>();
+        let native = if call_rows.is_empty() {
+            None
+        } else {
+            let mut states = Vec::with_capacity(call_rows.len());
+            let mut mains = Vec::with_capacity(call_rows.len());
+            let mut checkpoints = Vec::with_capacity(call_rows.len());
+            let mut spans = Vec::with_capacity(call_rows.len());
+            for (row_index, row) in batch.rows.iter_mut().enumerate() {
+                if !call_rows.contains(&row_index) {
+                    continue;
+                }
+                let ContinuousLfm25TtsRow {
+                    lease,
+                    main,
+                    checkpoint,
+                    ..
+                } = row;
+                states.push(
+                    &mut lease
+                        .as_mut()
+                        .expect("armed LFM TTS prefill state lease")
+                        .require_state_mut()?
+                        .state,
+                );
+                mains.push(main);
+                checkpoints.push(
+                    checkpoint
+                        .as_ref()
+                        .expect("armed LFM TTS prefill checkpoint"),
+                );
+                spans.push(scheduled[row.index].num_tokens);
+            }
+            Some(Self::run_blocking(|| {
+                model.lfm25_audio_tts_prefill_batch(&mut states, &mut mains, &checkpoints, &spans)
+            })?)
+        };
+        if let Some(native) = native {
+            if native.steps.len() != call_rows.len() {
+                return Err(Error::InferenceError(
+                    "LFM TTS prefill returned wrong row count".into(),
+                ));
+            }
+            for width in native.launch_widths {
+                if let Some(call) =
+                    retained_tts_batch_model_call(crate::engine::NativeBatchMode::Static, width)
+                {
+                    crate::engine::metrics::record_engine_model_call(call);
+                }
+            }
+            for (row, step) in call_rows.iter().copied().zip(native.steps) {
+                let index = batch.rows[row].index;
+                let expected_end = scheduled[index]
+                    .num_computed_tokens
+                    .checked_add(scheduled[index].num_tokens)
+                    .ok_or_else(|| Error::InvalidInput("LFM TTS prefill span overflowed".into()))?;
+                if step.consumed_tokens != scheduled[index].num_tokens
+                    || step.prefill_cursor != expected_end
+                {
+                    return Err(Error::InferenceError(
+                        "LFM TTS prefill progress differs from admission".into(),
+                    ));
+                }
+            }
+        }
+        for row in 0..batch.rows.len() {
+            let index = batch.rows[row].index;
+            if batch.rows[row].checkpoint.is_none() {
+                continue;
+            }
+            let arena = requests[index]
+                .managed_cache_runtime()
+                .and_then(|runtime| runtime.tensor_state())
+                .ok_or_else(|| {
+                    Error::InferenceError("LFM TTS prefill lost ShortConv arena".into())
+                })?;
+            batch.rows[row]
+                .lease_mut()?
+                .require_state_mut()?
+                .state
+                .stage_shortconv(arena, scheduled[index].plan_id)?;
+            if requests[index].is_cancelled() {
+                batch.rollback_row(row)?;
+                outputs[index] = Some(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                    requests[index].id.clone(),
+                )));
+            }
+        }
+        for row in &mut batch.rows {
+            let index = row.index;
+            if row.checkpoint.is_none() {
+                row.lease
+                    .take()
+                    .expect("rolled back LFM TTS prefill lease")
+                    .release()?;
+                continue;
+            }
+            let completions = row.main.take_completed_writes();
+            let checkpoint = row
+                .checkpoint
+                .take()
+                .expect("armed LFM TTS prefill checkpoint");
+            {
+                let ContinuousLfm25TtsRow { lease, main, .. } = row;
+                lease
+                    .as_mut()
+                    .expect("armed LFM TTS prefill lease")
+                    .require_state_mut()?
+                    .state
+                    .commit_quantum(main, None, &checkpoint)?;
+            }
+            row.lease_mut()?.mark_clean();
+            row.lease
+                .take()
+                .expect("committed LFM TTS prefill lease")
+                .restore()?;
+            outputs[index] = Some(
+                ModelSessionResult::sequence(ExecutorOutput {
+                    request_id: requests[index].id.clone(),
+                    audio: Some(AudioOutput::new(
+                        Vec::new(),
+                        model.lfm25_audio_tts_output_sample_rate(),
+                    )),
+                    text: Some(String::new()),
+                    input_transcription: None,
+                    tokens_processed: scheduled[index].num_tokens,
+                    tokens_generated: 0,
+                    finished: false,
+                    phase_timing_override: None,
+                    asr_diagnostics: None,
+                    error: None,
+                })
+                .with_managed_cache_completions(completions),
+            );
+        }
+        batch.disarm();
+        outputs
+            .into_iter()
+            .map(|output| {
+                output.ok_or_else(|| Error::InferenceError("LFM TTS prefill lost output".into()))
+            })
+            .collect()
+    }
+
     fn lfm25_audio_tts_decode_batch_with_managed(
         &self,
         requests: &[&EngineCoreRequest],
@@ -1879,6 +2182,20 @@ mod tests {
         assert!(matches!(
             continuous_tts_model_call(2, true),
             Some(crate::engine::metrics::EngineModelCall::NativeTensor { rows: 2, .. })
+        ));
+        assert!(matches!(
+            retained_tts_batch_model_call(crate::engine::NativeBatchMode::Static, 1),
+            Some(crate::engine::metrics::EngineModelCall::ScalarRows {
+                envelope: crate::engine::NativeBatchMode::Static,
+                rows: 1
+            })
+        ));
+        assert!(matches!(
+            retained_tts_batch_model_call(crate::engine::NativeBatchMode::Static, 3),
+            Some(crate::engine::metrics::EngineModelCall::NativeTensor {
+                mode: crate::engine::NativeBatchMode::Static,
+                rows: 3
+            })
         ));
     }
 
