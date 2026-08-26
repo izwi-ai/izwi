@@ -63,6 +63,9 @@ use crate::models::architectures::qwen3::asr::{
 use crate::models::architectures::vibevoice::asr::{
     VibeVoiceAsrPreparationDecision, VibeVoiceAsrPreparedArtifact, VibeVoiceAsrPreparedGeometry,
 };
+use crate::models::architectures::vibevoice::tts::{
+    vibevoice_tts_auto_max_frames_for_text, VibeVoiceSpeakerReference, VibeVoiceTtsGenerationParams,
+};
 use crate::models::architectures::whisper::asr::{
     WhisperAudioBatchRow, WhisperPreparedWindow, WhisperWindowPreparationGeometry,
 };
@@ -73,6 +76,7 @@ use crate::runtime::adapters::{
     LoadedModelBundle, RuntimeAdapterRegistry, StreamingRequirements,
 };
 use crate::runtime::asr::RealtimeAsrSessionPolicy;
+use crate::runtime::audio_io::decode_reference_audio_base64;
 use crate::runtime::broker::{
     InferenceBroker, InferenceBrokerObservation, InferenceBrokerSnapshot,
 };
@@ -4491,6 +4495,206 @@ impl RuntimeService {
             .await
     }
 
+    async fn prepare_vibevoice_tts_for_binding(
+        &self,
+        request: EngineCoreRequest,
+        job: JobLease,
+        residency_lease: Option<&ModelResidencyLease>,
+    ) -> Result<(EngineCoreRequest, JobLease)> {
+        if request.task_type != TaskType::TTS
+            || request
+                .model_variant
+                .is_none_or(|variant| variant.family() != ModelFamily::VibeVoiceTts)
+            || request
+                .prepared_vibevoice_tts_artifact_for_executor()?
+                .is_some()
+        {
+            return Ok((request, job));
+        }
+        let variant = request
+            .model_variant
+            .expect("validated VibeVoice TTS variant");
+        let model = self
+            .model_registry
+            .get_vibevoice_tts_lease(variant)
+            .await
+            .ok_or_else(|| {
+                Error::ModelNotFound(format!("VibeVoice TTS model {variant} is not loaded"))
+            })?;
+        let residency = residency_lease.ok_or_else(|| {
+            Error::InferenceError("VibeVoice TTS preparation requires model residency".into())
+        })?;
+        let loaded_bundle = self
+            .model_lifecycle
+            .try_get_ready_bundle(residency.variant());
+        let contract = loaded_contract_for_residency(
+            residency,
+            loaded_bundle.as_deref(),
+            CapabilityKind::Tts,
+            false,
+            self.coordinator.execution_group_id(),
+            self.backend_router.context().backend_kind,
+            Some(ExecutionTargetKind::TokenEngine),
+        )?;
+        let context_limit = self
+            .model_registry
+            .effective_context(variant)
+            .ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "VibeVoice TTS model {variant} has no effective context"
+                ))
+            })?;
+        let text = request
+            .tts_text_for_execution()
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| Error::InvalidInput("VibeVoice TTS request is missing text".into()))?
+            .trim()
+            .to_string();
+        let reference_audio = request.tts_reference_audio_for_execution().ok_or_else(|| {
+            Error::InvalidInput("VibeVoice TTS requires reference_audio and reference_text".into())
+        })?;
+        let reference_text = request
+            .tts_reference_text_for_execution()
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| {
+                Error::InvalidInput(
+                    "VibeVoice TTS requires reference_audio and reference_text".into(),
+                )
+            })?;
+        let (audio_samples, sample_rate) = decode_reference_audio_base64(reference_audio)?;
+        let reference = VibeVoiceSpeakerReference {
+            audio_samples,
+            sample_rate,
+            text: reference_text.to_string(),
+        };
+        let requested_speaker = request.tts_speaker_for_execution().map(str::to_string);
+        let auto_frame_budget = request.params.max_tokens == 0;
+        let params = VibeVoiceTtsGenerationParams {
+            cfg_scale: 1.5,
+            diffusion_steps: model.default_diffusion_steps().max(1),
+            max_frames: if auto_frame_budget {
+                vibevoice_tts_auto_max_frames_for_text(&text)
+            } else {
+                request
+                    .params
+                    .max_tokens
+                    .clamp(1, ModelVariant::VIBEVOICE_TTS_MAX_OUTPUT_FRAMES)
+            },
+            auto_frame_budget,
+        };
+        let retained_request_bytes = u64::try_from(retained_engine_request_input_bytes(&request)?)
+            .map_err(|_| Error::Overloaded("VibeVoice TTS retained request exceeds u64".into()))?;
+        job.record_materialized_usage(JobResourceObservation::host(retained_request_bytes))?;
+        let bridge = self.coordinator.bridge_preparation_admission(job)?;
+        let preparation_spec = JobSpec {
+            request_id: request.id.clone(),
+            lane: CoordinatorLane::Atomic,
+            priority: request.priority,
+            workload_class: request.workload_class,
+            deadline: request.deadline,
+            resources: asr_encoder_retained_resources(
+                self.backend_router.context().backend_kind,
+                retained_request_bytes,
+                512 * 1024 * 1024,
+            )?,
+        };
+        let preparation_job = match self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                preparation_spec,
+                JobResourceObservation::host(retained_request_bytes),
+            )
+            .await
+        {
+            Ok(job) => job,
+            Err(failure) => return Err(failure.error),
+        };
+        let work = WorkUnit::PreSequencePreparation {
+            kind: "tts.prepare.vibevoice".into(),
+        };
+        let cost = crate::engine::WorkCost::with_workspace(
+            u64::try_from(context_limit)
+                .map_err(|_| Error::Overloaded("VibeVoice context exceeds u64".into()))?,
+            u64::try_from(context_limit).unwrap_or(u64::MAX),
+            lfm25_audio_tts_preparation_workspace(
+                self.backend_router.context().backend_kind,
+                512 * 1024 * 1024,
+            ),
+        );
+        let cancellation = PreparationCancellation::default();
+        let row = self.coordinator.seal_preparation_row(
+            preparation_job,
+            &contract,
+            &work,
+            cost,
+            u64::try_from(context_limit).unwrap_or(u64::MAX),
+            cancellation.clone(),
+        )?;
+        let model_for_preparation = model.clone();
+        let mut cancellation_guard = PreparationCancellationGuard {
+            cancellation,
+            armed: true,
+        };
+        let mut outcomes = self
+            .coordinator
+            .run_loaded_native_preparation_batch(vec![row], contract, work, move |live| {
+                if live != [0] {
+                    return Err(Error::InferenceError(
+                        "VibeVoice TTS preparation must remain scalar".into(),
+                    ));
+                }
+                let artifact = model_for_preparation.prepare_retained_artifact(
+                    &text,
+                    &reference,
+                    requested_speaker.as_deref(),
+                )?;
+                let accelerator_bytes = artifact.retained_tensor_bytes()?;
+                Ok(vec![Ok(PreparationArtifact {
+                    retained: JobResourceObservation {
+                        host_bytes: retained_request_bytes,
+                        accelerator_bytes,
+                    },
+                    value: artifact,
+                })])
+            })
+            .await?;
+        cancellation_guard.armed = false;
+        let (artifact, bridge) = match outcomes.pop().ok_or_else(|| {
+            Error::InferenceError("VibeVoice TTS preparation returned no outcome".into())
+        })? {
+            PreparationRowOutcome::Committed { artifact, bridge } => (artifact, bridge),
+            PreparationRowOutcome::Cancelled => return Err(Error::Cancelled(request.id.clone())),
+            PreparationRowOutcome::TimedOut => return Err(Error::Timeout(request.id.clone())),
+            PreparationRowOutcome::Failed(error) => return Err(error),
+        };
+        let accelerator_bytes = artifact.retained.accelerator_bytes;
+        let mut prepared = request;
+        prepared.install_vibevoice_tts_execution_model(
+            variant,
+            model,
+            artifact.value,
+            params,
+            context_limit,
+        )?;
+        let (execution, _) = self.coordinator_job_for_request(&prepared)?;
+        match self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                execution,
+                JobResourceObservation {
+                    host_bytes: retained_request_bytes,
+                    accelerator_bytes,
+                },
+            )
+            .await
+        {
+            Ok(job) => Ok((prepared, job)),
+            Err(failure) => Err(failure.error),
+        }
+    }
+
     async fn prepare_lfm25_audio_tts_for_binding(
         &self,
         request: EngineCoreRequest,
@@ -4711,6 +4915,9 @@ impl RuntimeService {
     ) -> Result<EngineOutput> {
         let (request, job) = self
             .prepare_asr_shape_for_binding(request, job, residency_lease.as_ref())
+            .await?;
+        let (request, job) = self
+            .prepare_vibevoice_tts_for_binding(request, job, residency_lease.as_ref())
             .await?;
         let (mut request, job) = self
             .prepare_lfm25_audio_tts_for_binding(request, job, residency_lease.as_ref())

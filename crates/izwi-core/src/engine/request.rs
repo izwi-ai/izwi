@@ -1398,6 +1398,17 @@ impl EngineCoreRequest {
         self.selected_tts_reference().0.map(String::as_str)
     }
 
+    pub(crate) fn tts_text_for_execution(&self) -> Option<&str> {
+        self.text.as_deref()
+    }
+
+    pub(crate) fn tts_speaker_for_execution(&self) -> Option<&str> {
+        self.params
+            .speaker
+            .as_deref()
+            .or(self.params.voice.as_deref())
+    }
+
     pub(crate) fn tts_reference_text_for_execution(&self) -> Option<&str> {
         self.selected_tts_reference().1.map(String::as_str)
     }
