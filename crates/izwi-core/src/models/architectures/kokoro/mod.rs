@@ -26,6 +26,7 @@ use tracing::info;
 
 use crate::backends::DeviceProfile;
 use crate::error::{Error, Result};
+use crate::models::shared::memory::accounting::TensorStorageAccounting;
 
 use self::phonemizer::EspeakPhonemizer;
 use self::prosody::{
@@ -422,6 +423,37 @@ pub struct KokoroPreparedRequest {
     pub token_ids: Vec<u32>,
     pub ref_style: Tensor,
     pub speed: f32,
+}
+
+impl KokoroPreparedRequest {
+    pub(crate) fn retained_tensor_bytes(&self) -> Result<u64> {
+        let mut accounting = TensorStorageAccounting::default();
+        accounting.add_tensor(&self.ref_style).ok_or_else(|| {
+            Error::Overloaded("Kokoro prepared style accounting overflowed".into())
+        })?;
+        Ok(accounting.bytes())
+    }
+
+    pub(crate) fn retained_host_bytes(&self) -> Result<u64> {
+        let string_bytes = [
+            self.source_text.capacity(),
+            self.requested_speaker.as_ref().map_or(0, String::capacity),
+            self.requested_language.as_ref().map_or(0, String::capacity),
+            self.phonemes.capacity(),
+        ]
+        .into_iter()
+        .try_fold(0usize, |bytes, capacity| bytes.checked_add(capacity))
+        .ok_or_else(|| Error::Overloaded("Kokoro prepared host bytes overflowed".into()))?;
+        let token_bytes = self
+            .token_ids
+            .capacity()
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| Error::Overloaded("Kokoro prepared host bytes overflowed".into()))?;
+        string_bytes
+            .checked_add(token_bytes)
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| Error::Overloaded("Kokoro prepared host bytes overflowed".into()))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1177,6 +1209,13 @@ mod tests {
                 .expect("style"),
             speed: 1.0,
         }
+    }
+
+    #[test]
+    fn prepared_request_accounts_host_and_tensor_ownership_separately() {
+        let prepared = prepared_with_width(7);
+        assert_eq!(prepared.retained_tensor_bytes().unwrap(), 256 * 4);
+        assert!(prepared.retained_host_bytes().unwrap() >= 7 * (2 + 4));
     }
 
     #[test]
