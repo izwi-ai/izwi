@@ -54,6 +54,11 @@ const CONSERVATIVE_NEMOTRON_DECODER_TOKEN_BYTES: usize = 256;
 const REALTIME_HOST_FIXED_OVERHEAD_BYTES: u64 = 64 * 1024;
 const REALTIME_PEAK_TEXT_COPIES: u64 = 4;
 pub(crate) const NEMOTRON_REALTIME_STAGE_WORKSPACE_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const NEMOTRON_REALTIME_ENCODER_STAGE: &str = "asr.realtime.encoder";
+pub(crate) const NEMOTRON_REALTIME_RNNT_STAGE: &str = "asr.realtime.rnnt";
+pub(crate) const NEMOTRON_REALTIME_FALLBACK_STAGE: &str = "asr.realtime.scalar_fallback";
+pub(crate) const NEMOTRON_ENCODER_STATE_GROUP: StateGroupId = StateGroupId::new(1);
+pub(crate) const NEMOTRON_RNNT_STATE_GROUP: StateGroupId = StateGroupId::new(2);
 const NEMOTRON_FEATURE_HISTORY_DOMAIN: StateDomainId = StateDomainId::new(1);
 const NEMOTRON_PENDING_ENCODER_DOMAIN: StateDomainId = StateDomainId::new(2);
 const NEMOTRON_ATTENTION_HISTORY_DOMAIN: StateDomainId = StateDomainId::new(3);
@@ -1175,11 +1180,23 @@ fn nemotron_realtime_state_contract(
     ];
     let contract = InferenceStateContract {
         abi: CURRENT_INFERENCE_STATE_ABI,
-        groups: vec![StateGroupSpec {
-            id: StateGroupId::new(1),
-            domains: domains.iter().map(StateDomainSpec::id).collect(),
-            prefix_shareable: false,
-        }],
+        groups: vec![
+            StateGroupSpec {
+                id: NEMOTRON_ENCODER_STATE_GROUP,
+                domains: vec![
+                    NEMOTRON_FEATURE_HISTORY_DOMAIN,
+                    NEMOTRON_PENDING_ENCODER_DOMAIN,
+                    NEMOTRON_ATTENTION_HISTORY_DOMAIN,
+                    NEMOTRON_CONVOLUTION_HISTORY_DOMAIN,
+                ],
+                prefix_shareable: false,
+            },
+            StateGroupSpec {
+                id: NEMOTRON_RNNT_STATE_GROUP,
+                domains: vec![NEMOTRON_RNNT_STATE_DOMAIN],
+                prefix_shareable: false,
+            },
+        ],
         domains,
     };
     contract.validate()?;
@@ -3380,6 +3397,11 @@ mod tests {
             nemotron_realtime_state_contract(16_000 * 300, shape, 56, StateDType::F16).unwrap();
 
         assert_eq!(contract.domains.len(), 5);
+        assert_eq!(contract.groups.len(), 2);
+        assert_eq!(contract.groups[0].id, NEMOTRON_ENCODER_STATE_GROUP);
+        assert_eq!(contract.groups[0].domains.len(), 4);
+        assert_eq!(contract.groups[1].id, NEMOTRON_RNNT_STATE_GROUP);
+        assert_eq!(contract.groups[1].domains, vec![NEMOTRON_RNNT_STATE_DOMAIN]);
         assert!(matches!(contract.domains[0], StateDomainSpec::Append(_)));
         assert!(matches!(contract.domains[1], StateDomainSpec::Append(_)));
         assert!(matches!(contract.domains[2], StateDomainSpec::Ring(_)));

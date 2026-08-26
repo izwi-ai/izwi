@@ -29,7 +29,7 @@ use super::{
 const SCALAR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(11);
 const STATIC_TENSOR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(12);
 const CONTINUOUS_TENSOR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(13);
-const NEMOTRON_REALTIME_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(14);
+const NEMOTRON_REALTIME_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(25);
 const CONTINUOUS_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(15);
 const CONTINUOUS_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(16);
 const WHISPER_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(17);
@@ -942,7 +942,7 @@ impl LoadedExecutionAdapterFactory for NemotronRealtimeAdapterFactory {
     }
 
     fn batch_mode(&self) -> NativeBatchMode {
-        NativeBatchMode::None
+        NativeBatchMode::Continuous
     }
 
     fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
@@ -959,6 +959,7 @@ impl LoadedExecutionAdapterFactory for NemotronRealtimeAdapterFactory {
             context.model_instance_id,
             metadata,
             context.backend_kind,
+            context.max_tensor_batch_size,
         )))
     }
 }
@@ -1590,6 +1591,7 @@ struct NemotronRealtimeExecutionAdapter {
     adapter_instance_id: AdapterInstanceId,
     metadata: AdapterMetadata,
     backend_kind: BackendKind,
+    max_batch_size: usize,
 }
 
 impl NemotronRealtimeExecutionAdapter {
@@ -1598,6 +1600,7 @@ impl NemotronRealtimeExecutionAdapter {
         model_instance_id: ModelInstanceId,
         metadata: AdapterMetadata,
         backend_kind: BackendKind,
+        max_batch_size: usize,
     ) -> Self {
         Self {
             execution_group_id,
@@ -1607,6 +1610,7 @@ impl NemotronRealtimeExecutionAdapter {
             ),
             metadata,
             backend_kind,
+            max_batch_size: max_batch_size.max(1),
         }
     }
 }
@@ -1628,33 +1632,97 @@ impl LoadedExecutionAdapter for NemotronRealtimeExecutionAdapter {
         let metadata = self.metadata();
         let mut execution_profile =
             scalar_execution_profile(metadata, self.backend_kind, streaming.model_native);
-        execution_profile.mode = ExecutionMode::Atomic;
-        execution_profile.prefill = PrefillMode::Full;
-        execution_profile.incremental_decode = false;
+        execution_profile.mode = ExecutionMode::Realtime;
+        execution_profile.prefill = PrefillMode::None;
+        execution_profile.incremental_decode = true;
         execution_profile.prefill_batch = NativeBatchMode::None;
-        execution_profile.decode_batch = NativeBatchMode::None;
+        execution_profile.decode_batch = NativeBatchMode::Continuous;
         execution_profile.cache_mode = CacheMode::None;
         execution_profile.cache_namespace = None;
         execution_profile.kv_dtype = "none".into();
         execution_profile.cancellation = CancellationGranularity::RealtimeChunk;
-        execution_profile.concurrency = ConcurrencyClass::Exclusive;
+        execution_profile.concurrency = ConcurrencyClass::Batchable;
         execution_profile.recompute_safe = false;
         execution_profile.cache_release_safe = true;
         execution_profile.prefix_reuse_safe = false;
-        execution_profile.max_batch_size = 1;
+        execution_profile.max_batch_size = self.max_batch_size;
         execution_profile.resolved_from_loaded_model = true;
 
-        let mut stage = StageDescriptor::from_execution_profile(
-            StageId::new(1),
-            "asr.realtime.physical_tensor",
+        let workspace =
+            crate::models::architectures::nemotron::asr::NEMOTRON_REALTIME_STAGE_WORKSPACE_BYTES;
+        let width = u64::try_from(self.max_batch_size)
+            .map_err(|_| Error::Overloaded("Nemotron realtime batch width exceeds u64".into()))?;
+        let batch_workspace = workspace.checked_mul(width).ok_or_else(|| {
+            Error::Overloaded("Nemotron realtime batch workspace overflowed".into())
+        })?;
+        let max_samples = u64::try_from(
+            crate::models::architectures::nemotron::asr::NemotronAsrModel::conservative_realtime_stream_resource_reservation(None, None, None)?.max_samples,
+        )
+        .map_err(|_| Error::Overloaded("Nemotron realtime sample ceiling exceeds u64".into()))?;
+
+        let mut fallback = StageDescriptor::from_execution_profile(
+            StageId::new(0),
+            crate::models::architectures::nemotron::asr::NEMOTRON_REALTIME_FALLBACK_STAGE,
             &execution_profile,
             NativeBatchMode::None,
         );
-        stage.selector = StageWorkSelector::Atomic;
-        stage.max_workspace_bytes =
-            crate::models::architectures::nemotron::asr::NEMOTRON_REALTIME_STAGE_WORKSPACE_BYTES;
-        stage.output_visibility = OutputVisibility::AfterQuantumCommit;
-        stage.validate()?;
+        fallback.selector = StageWorkSelector::Atomic;
+        fallback.max_batch_size = 1;
+        fallback.max_work_units = max_samples;
+        fallback.max_workspace_bytes = workspace;
+        fallback.concurrency = ConcurrencyClass::Exclusive;
+        fallback.shape_policy = StageShapePolicy::Exact;
+        fallback.retained_state_selections = Some(vec![
+            ClockedStateSelection::new(
+                crate::models::architectures::nemotron::asr::NEMOTRON_ENCODER_STATE_GROUP,
+                StateClock::AudioFrames,
+            )?,
+            ClockedStateSelection::new(
+                crate::models::architectures::nemotron::asr::NEMOTRON_RNNT_STATE_GROUP,
+                StateClock::DecoderTokens,
+            )?,
+        ]);
+        fallback.output_visibility = OutputVisibility::AfterQuantumCommit;
+
+        let mut encoder = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            crate::models::architectures::nemotron::asr::NEMOTRON_REALTIME_ENCODER_STAGE,
+            &execution_profile,
+            NativeBatchMode::None,
+        );
+        encoder.selector = StageWorkSelector::RealtimePreparation;
+        encoder.max_batch_size = 1;
+        encoder.max_work_units = max_samples;
+        encoder.max_workspace_bytes = workspace;
+        encoder.concurrency = ConcurrencyClass::Exclusive;
+        encoder.shape_policy = StageShapePolicy::Exact;
+        encoder.retained_state_selections = Some(vec![ClockedStateSelection::new(
+            crate::models::architectures::nemotron::asr::NEMOTRON_ENCODER_STATE_GROUP,
+            StateClock::AudioFrames,
+        )?]);
+
+        let mut rnnt = StageDescriptor::from_execution_profile(
+            StageId::new(2),
+            crate::models::architectures::nemotron::asr::NEMOTRON_REALTIME_RNNT_STAGE,
+            &execution_profile,
+            NativeBatchMode::Continuous,
+        );
+        rnnt.selector = StageWorkSelector::RealtimeDecodeContinuation;
+        rnnt.progress = StageProgressKind::Iterative;
+        rnnt.membership_safe_point = MembershipSafePoint::QuantumBoundary;
+        rnnt.max_batch_size = self.max_batch_size;
+        rnnt.max_work_units = width;
+        rnnt.workspace_per_row_bytes = workspace;
+        rnnt.max_workspace_bytes = batch_workspace;
+        rnnt.shape_policy = StageShapePolicy::Ragged;
+        rnnt.retained_state_selections = Some(vec![ClockedStateSelection::new(
+            crate::models::architectures::nemotron::asr::NEMOTRON_RNNT_STATE_GROUP,
+            StateClock::DecoderTokens,
+        )?]);
+
+        fallback.validate()?;
+        encoder.validate()?;
+        rnnt.validate()?;
 
         Ok(LoadedExecutionContract {
             execution_group_id: self.execution_group_id,
@@ -1663,7 +1731,7 @@ impl LoadedExecutionAdapter for NemotronRealtimeExecutionAdapter {
             adapter_abi_revision: self.adapter_abi_revision(),
             metadata,
             execution_profile,
-            stages: Arc::from([stage]),
+            stages: Arc::from([fallback, encoder, rnnt]),
         })
     }
 }
@@ -4280,9 +4348,9 @@ mod tests {
     }
 
     #[test]
-    fn nemotron_realtime_factory_authors_atomic_physical_tensor_workspace() {
+    fn nemotron_realtime_factory_authors_split_retained_stages() {
         let draft = LoadedModelBundleDraft::build(
-            &RuntimeAdapterRegistry::built_in(),
+            &RuntimeAdapterRegistry::built_in_with_execution_limits(4, 4).unwrap(),
             ExecutionGroupId::new(3),
             ModelInstanceId::new(15),
             ModelVariant::Nemotron35AsrStreaming06B,
@@ -4296,13 +4364,33 @@ mod tests {
         assert!(!contracts.is_empty());
         for contract in contracts {
             assert_eq!(contract.adapter_abi_revision, NEMOTRON_REALTIME_ADAPTER_ABI);
-            assert_eq!(contract.execution_profile.mode, ExecutionMode::Atomic);
+            assert_eq!(contract.execution_profile.mode, ExecutionMode::Realtime);
             assert_eq!(contract.execution_profile.cache_mode, CacheMode::None);
-            assert_eq!(contract.stages.len(), 1);
+            assert_eq!(
+                contract.execution_profile.decode_batch,
+                NativeBatchMode::Continuous
+            );
+            assert_eq!(contract.execution_profile.max_batch_size, 4);
+            assert_eq!(contract.stages.len(), 3);
             assert_eq!(contract.stages[0].selector, StageWorkSelector::Atomic);
+            assert_eq!(
+                contract.stages[1].selector,
+                StageWorkSelector::RealtimePreparation
+            );
+            assert_eq!(contract.stages[1].batch_mode, NativeBatchMode::None);
+            assert_eq!(
+                contract.stages[2].selector,
+                StageWorkSelector::RealtimeDecodeContinuation
+            );
+            assert_eq!(contract.stages[2].batch_mode, NativeBatchMode::Continuous);
+            assert_eq!(contract.stages[2].max_batch_size, 4);
             assert_eq!(
                 contract.stages[0].max_workspace_bytes,
                 crate::models::architectures::nemotron::asr::NEMOTRON_REALTIME_STAGE_WORKSPACE_BYTES
+            );
+            assert_eq!(
+                contract.stages[2].max_workspace_bytes,
+                4 * crate::models::architectures::nemotron::asr::NEMOTRON_REALTIME_STAGE_WORKSPACE_BYTES
             );
         }
     }
