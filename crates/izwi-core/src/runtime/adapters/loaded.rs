@@ -35,6 +35,7 @@ const CONTINUOUS_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1
 const WHISPER_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(17);
 const VIBEVOICE_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(19);
 const GRANITE_SPEECH_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(22);
+const LFM25_AUDIO_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(23);
 pub(crate) const VOXTRAL_REALTIME_ADAPTER_ABI: AdapterAbiRevision =
     AdapterAbiRevision::new(crate::models::architectures::voxtral::VOXTRAL_REALTIME_EXECUTION_ABI);
 // Architecture ceiling: 8,192 codec frames, 1,920 output samples/frame,
@@ -245,6 +246,15 @@ pub(crate) trait LoadedExecutionAdapter: fmt::Debug + Send + Sync {
         ))
     }
 
+    fn seal_lfm25_audio_asr_preparation(
+        &self,
+        _model: &crate::models::registry::NativeAudioChatModel,
+    ) -> Result<()> {
+        Err(Error::ModelLoadError(
+            "loaded adapter does not own LFM2.5 Audio ASR preparation".into(),
+        ))
+    }
+
     fn seal_voxtral_realtime_preparation(
         &self,
         _model: &crate::models::architectures::voxtral::realtime::VoxtralRealtimeModel,
@@ -366,6 +376,7 @@ fn loaded_execution_contracts(
                 | crate::catalog::ModelFamily::WhisperAsr
                 | crate::catalog::ModelFamily::VibeVoiceAsr
                 | crate::catalog::ModelFamily::GraniteSpeechAsr
+                | crate::catalog::ModelFamily::Lfm25Audio
         )
     {
         let long_form = requirements
@@ -840,6 +851,11 @@ fn is_granite_speech_physical_asr(metadata: AdapterMetadata) -> bool {
         && metadata.model_variant.family() == crate::catalog::ModelFamily::GraniteSpeechAsr
 }
 
+fn is_lfm25_audio_physical_asr(metadata: AdapterMetadata) -> bool {
+    metadata.capability == CapabilityKind::Asr
+        && metadata.model_variant.family() == crate::catalog::ModelFamily::Lfm25Audio
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PhysicalQwenTtsAdapterFactory;
 
@@ -1007,6 +1023,37 @@ struct VibeVoicePhysicalAsrAdapterFactory;
 #[derive(Debug, Clone, Copy)]
 struct GraniteSpeechPhysicalAsrAdapterFactory;
 
+#[derive(Debug, Clone, Copy)]
+struct Lfm25AudioPhysicalAsrAdapterFactory;
+
+impl LoadedExecutionAdapterFactory for Lfm25AudioPhysicalAsrAdapterFactory {
+    fn id(&self) -> &'static str {
+        "builtin.lfm25_audio_asr.physical_sequence"
+    }
+
+    fn batch_mode(&self) -> NativeBatchMode {
+        NativeBatchMode::Continuous
+    }
+
+    fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
+        is_lfm25_audio_physical_asr(metadata)
+    }
+
+    fn create(
+        &self,
+        context: LoadedAdapterFactoryContext,
+        metadata: AdapterMetadata,
+    ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
+        Ok(Arc::new(Lfm25AudioAsrExecutionAdapter::new(
+            context.execution_group_id,
+            context.model_instance_id,
+            metadata,
+            context.backend_kind,
+            context.max_tensor_batch_size,
+        )))
+    }
+}
+
 impl LoadedExecutionAdapterFactory for GraniteSpeechPhysicalAsrAdapterFactory {
     fn id(&self) -> &'static str {
         "builtin.granite_speech_asr.physical_sequence"
@@ -1109,6 +1156,7 @@ impl LoadedExecutionAdapterFactory for ScalarExecutionAdapterFactory {
             && !is_whisper_physical_asr(metadata)
             && !is_vibevoice_physical_asr(metadata)
             && !is_granite_speech_physical_asr(metadata)
+            && !is_lfm25_audio_physical_asr(metadata)
     }
 
     fn create(
@@ -1136,6 +1184,7 @@ pub(super) fn built_in_loaded_adapter_factories() -> Vec<Arc<dyn LoadedExecution
         Arc::new(WhisperPhysicalAsrAdapterFactory),
         Arc::new(VibeVoicePhysicalAsrAdapterFactory),
         Arc::new(GraniteSpeechPhysicalAsrAdapterFactory),
+        Arc::new(Lfm25AudioPhysicalAsrAdapterFactory),
         Arc::new(ScalarExecutionAdapterFactory),
     ]
 }
@@ -2044,6 +2093,252 @@ impl LoadedExecutionAdapter for ContinuousAsrExecutionAdapter {
             adapter_abi_revision: self.adapter_abi_revision(),
             metadata,
             execution_profile,
+            stages: Arc::from([preparation, prefill, decode]),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct Lfm25AudioAsrExecutionAdapter {
+    execution_group_id: ExecutionGroupId,
+    model_instance_id: ModelInstanceId,
+    adapter_instance_id: AdapterInstanceId,
+    metadata: AdapterMetadata,
+    backend_kind: BackendKind,
+    max_batch_size: usize,
+    preparation: OnceLock<
+        crate::models::architectures::lfm25_audio::model::Lfm25AudioAsrPreparationStageCeiling,
+    >,
+}
+
+impl Lfm25AudioAsrExecutionAdapter {
+    fn new(
+        execution_group_id: ExecutionGroupId,
+        model_instance_id: ModelInstanceId,
+        metadata: AdapterMetadata,
+        backend_kind: BackendKind,
+        max_batch_size: usize,
+    ) -> Self {
+        Self {
+            execution_group_id,
+            model_instance_id,
+            adapter_instance_id: AdapterInstanceId::new(
+                NEXT_ADAPTER_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+            ),
+            metadata,
+            backend_kind,
+            max_batch_size: max_batch_size.max(1),
+            preparation: OnceLock::new(),
+        }
+    }
+
+    fn install_preparation_seal(
+        &self,
+        seal: crate::models::architectures::lfm25_audio::model::Lfm25AudioAsrPreparationStageCeiling,
+    ) -> Result<()> {
+        if let Some(existing) = self.preparation.get() {
+            return if *existing == seal {
+                Ok(())
+            } else {
+                Err(Error::ModelLoadError(
+                    "LFM2.5 Audio ASR preparation was resealed with different geometry".into(),
+                ))
+            };
+        }
+        self.preparation.set(seal).map_err(|_| {
+            Error::ModelLoadError("LFM2.5 Audio ASR preparation seal raced publication".into())
+        })
+    }
+}
+
+impl LoadedExecutionAdapter for Lfm25AudioAsrExecutionAdapter {
+    fn metadata(&self) -> AdapterMetadata {
+        self.metadata
+    }
+
+    fn adapter_instance_id(&self) -> AdapterInstanceId {
+        self.adapter_instance_id
+    }
+
+    fn adapter_abi_revision(&self) -> AdapterAbiRevision {
+        LFM25_AUDIO_ASR_ADAPTER_ABI
+    }
+
+    fn seal_lfm25_audio_asr_preparation(
+        &self,
+        model: &crate::models::registry::NativeAudioChatModel,
+    ) -> Result<()> {
+        self.install_preparation_seal(model.lfm25_audio_asr_preparation_stage_ceiling()?)
+    }
+
+    #[cfg(test)]
+    fn install_test_preparation_seal(
+        &self,
+        backend: BackendKind,
+        _max_batch_size: usize,
+    ) -> Result<()> {
+        self.install_preparation_seal(
+            crate::models::architectures::lfm25_audio::model::Lfm25AudioAsrPreparationStageCeiling {
+                backend,
+                max_source_samples: 16_000 * 30,
+                max_source_sample_rate: 48_000,
+                max_resampled_samples: 16_000 * 30,
+                max_prompt_tokens: 4_096,
+                max_work_units: 1_024,
+                max_materialized_tensor_elements: 4_096 * 2_048,
+                max_retained_resident_bytes: 4_096 * 2_048 * 4,
+                max_host_workspace_bytes: 32 * 1024 * 1024,
+                max_device_workspace_bytes: 64 * 1024 * 1024,
+                max_unified_workspace_bytes: 0,
+                max_workspace_bytes: 96 * 1024 * 1024,
+            },
+        )
+    }
+
+    fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
+        let metadata = self.metadata();
+        if streaming.model_native && metadata.streaming_mode == StreamingMode::None {
+            return Err(Error::InvalidInput(format!(
+                "Model {} has no streaming ASR contract",
+                metadata.model_variant
+            )));
+        }
+        if streaming.asr_long_form {
+            let mut profile = scalar_execution_profile(metadata, self.backend_kind, false);
+            profile.mode = ExecutionMode::Atomic;
+            profile.prefill = PrefillMode::None;
+            profile.incremental_decode = false;
+            profile.prefill_batch = NativeBatchMode::None;
+            profile.decode_batch = NativeBatchMode::None;
+            profile.cache_mode = CacheMode::None;
+            profile.cache_namespace = None;
+            profile.kv_dtype = "none".into();
+            profile.cancellation = CancellationGranularity::OperationBoundary;
+            profile.concurrency = ConcurrencyClass::Exclusive;
+            profile.recompute_safe = false;
+            profile.cache_release_safe = false;
+            profile.prefix_reuse_safe = false;
+            profile.max_batch_size = 1;
+            profile.resolved_from_loaded_model = true;
+
+            let mut stage = StageDescriptor::from_execution_profile(
+                StageId::new(3),
+                "asr.long_form.lfm25_audio.atomic",
+                &profile,
+                NativeBatchMode::None,
+            );
+            stage.selector = StageWorkSelector::Atomic;
+            stage.shape_policy = StageShapePolicy::Exact;
+            stage.output_visibility = OutputVisibility::AfterQuantumCommit;
+            stage.validate()?;
+            return Ok(LoadedExecutionContract {
+                execution_group_id: self.execution_group_id,
+                model_instance_id: self.model_instance_id,
+                adapter_instance_id: self.adapter_instance_id(),
+                adapter_abi_revision: self.adapter_abi_revision(),
+                metadata,
+                execution_profile: profile,
+                stages: Arc::from([stage]),
+            });
+        }
+
+        let seal = self.preparation.get().ok_or_else(|| {
+            Error::ModelLoadError(
+                "LFM2.5 Audio ASR normal graph is unavailable before preparation is sealed".into(),
+            )
+        })?;
+        if seal.backend != self.backend_kind
+            || seal.max_source_samples == 0
+            || seal.max_source_sample_rate == 0
+            || seal.max_resampled_samples == 0
+            || seal.max_prompt_tokens == 0
+            || seal.max_work_units == 0
+            || seal.max_materialized_tensor_elements == 0
+            || seal.max_retained_resident_bytes == 0
+            || seal.max_workspace_bytes == 0
+        {
+            return Err(Error::ModelLoadError(
+                "LFM2.5 Audio ASR preparation seal does not match its loaded adapter".into(),
+            ));
+        }
+
+        let mut profile = scalar_execution_profile(metadata, self.backend_kind, false);
+        profile.mode = ExecutionMode::Sequence;
+        profile.prefill = PrefillMode::Incremental;
+        profile.incremental_decode = true;
+        profile.prefill_batch = NativeBatchMode::None;
+        profile.decode_batch = NativeBatchMode::Continuous;
+        profile.cache_mode = CacheMode::ExternalPaged;
+        profile.cache_namespace = Some(format!(
+            "{}:{}:state-v2",
+            metadata.model_variant,
+            self.backend_kind.as_str()
+        ));
+        profile.kv_dtype = "state_v2_resolved".into();
+        profile.cancellation = CancellationGranularity::SequenceStep;
+        profile.concurrency = ConcurrencyClass::Batchable;
+        profile.recompute_safe = true;
+        profile.cache_release_safe = true;
+        profile.prefix_reuse_safe = false;
+        profile.max_batch_size = self.max_batch_size;
+        profile.resolved_from_loaded_model = true;
+
+        let mut preparation = StageDescriptor::from_execution_profile(
+            StageId::new(0),
+            "asr.encoder.lfm25_audio",
+            &profile,
+            NativeBatchMode::None,
+        );
+        preparation.selector = StageWorkSelector::PreSequencePreparation;
+        preparation.progress = StageProgressKind::Atomic;
+        preparation.membership_safe_point = MembershipSafePoint::OperationBoundary;
+        preparation.max_batch_size = 1;
+        preparation.max_work_units = seal.max_work_units;
+        preparation.max_workspace_bytes = seal.max_workspace_bytes;
+        preparation.concurrency = ConcurrencyClass::Exclusive;
+        preparation.shape_policy = StageShapePolicy::Exact;
+        preparation.output_visibility = OutputVisibility::AfterQuantumCommit;
+
+        let mut prefill = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            "asr.prefill.lfm25_audio.scalar",
+            &profile,
+            NativeBatchMode::None,
+        );
+        prefill.selector = StageWorkSelector::SequencePrefill;
+        prefill.progress = StageProgressKind::Iterative;
+        prefill.max_batch_size = 1;
+        prefill.concurrency = ConcurrencyClass::Exclusive;
+        prefill.shape_policy = StageShapePolicy::Exact;
+        prefill.max_workspace_bytes = seal.max_workspace_bytes;
+        prefill.output_visibility = OutputVisibility::AfterQuantumCommit;
+
+        let mut decode = StageDescriptor::from_execution_profile(
+            StageId::new(2),
+            "asr.decode.lfm25_audio.continuous",
+            &profile,
+            NativeBatchMode::Continuous,
+        );
+        decode.selector = StageWorkSelector::SequenceDecode;
+        decode.progress = StageProgressKind::Iterative;
+        decode.shape_policy = StageShapePolicy::Ragged;
+        decode.concurrency = ConcurrencyClass::Batchable;
+        decode.max_work_units = u64::try_from(self.max_batch_size).map_err(|_| {
+            Error::Overloaded("LFM2.5 Audio ASR batch width exceeds work accounting".into())
+        })?;
+        decode.max_workspace_bytes = CONTINUOUS_ASR_MAX_BATCH_WORKSPACE_BYTES;
+        decode.output_visibility = OutputVisibility::AfterQuantumCommit;
+
+        preparation.validate()?;
+        prefill.validate()?;
+        decode.validate()?;
+        Ok(LoadedExecutionContract {
+            execution_group_id: self.execution_group_id,
+            model_instance_id: self.model_instance_id,
+            adapter_instance_id: self.adapter_instance_id(),
+            adapter_abi_revision: self.adapter_abi_revision(),
+            metadata,
+            execution_profile: profile,
             stages: Arc::from([preparation, prefill, decode]),
         })
     }
@@ -3215,6 +3510,16 @@ impl LoadedModelBundleDraft {
             )
         })?;
         execution.seal_granite_speech_asr_preparation(model)
+    }
+
+    pub(crate) fn seal_lfm25_audio_asr_preparation(
+        &self,
+        model: &crate::models::registry::NativeAudioChatModel,
+    ) -> Result<()> {
+        let execution = self.capabilities.get(&CapabilityKind::Asr).ok_or_else(|| {
+            Error::ModelLoadError("LFM2.5 Audio loaded bundle has no ASR capability to seal".into())
+        })?;
+        execution.seal_lfm25_audio_asr_preparation(model)
     }
 
     pub(crate) fn seal_voxtral_realtime_preparation(
@@ -5113,6 +5418,88 @@ mod tests {
             contract.stages[1].max_work_units,
             CONTINUOUS_CHAT_MAX_DECODE_QUANTUM
         );
+    }
+
+    #[test]
+    fn lfm25_audio_asr_factory_publishes_sealed_retained_graph_and_atomic_long_form() {
+        let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(8, 1).unwrap();
+        let scalar = ScalarExecutionAdapterFactory;
+        let factory = Lfm25AudioPhysicalAsrAdapterFactory;
+
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            let metadata = *registry
+                .require(CapabilityKind::Asr, ModelVariant::Lfm25Audio15BGguf)
+                .unwrap();
+            assert!(factory.supports(metadata, backend));
+            assert!(!scalar.supports(metadata, backend));
+
+            let adapter = Lfm25AudioAsrExecutionAdapter::new(
+                ExecutionGroupId::new(71),
+                ModelInstanceId::new(72),
+                metadata,
+                backend,
+                8,
+            );
+            let missing = adapter.contract(StreamingRequirements::NONE).unwrap_err();
+            assert!(missing.to_string().contains("preparation is sealed"));
+
+            let long = adapter
+                .contract(StreamingRequirements::NONE.with_asr_long_form(true))
+                .unwrap();
+            assert_eq!(long.stages.len(), 1);
+            assert_eq!(long.stages[0].name, "asr.long_form.lfm25_audio.atomic");
+            assert_eq!(long.stages[0].progress, StageProgressKind::Atomic);
+            assert_eq!(long.stages[0].shape_policy, StageShapePolicy::Exact);
+            assert_eq!(
+                long.stages[0].output_visibility,
+                OutputVisibility::AfterQuantumCommit
+            );
+
+            adapter.install_test_preparation_seal(backend, 8).unwrap();
+            let contract = adapter.contract(StreamingRequirements::NONE).unwrap();
+            assert_eq!(contract.adapter_abi_revision, LFM25_AUDIO_ASR_ADAPTER_ABI);
+            assert_eq!(contract.execution_profile.mode, ExecutionMode::Sequence);
+            assert_eq!(contract.execution_profile.prefill, PrefillMode::Incremental);
+            assert_eq!(
+                contract.execution_profile.prefill_batch,
+                NativeBatchMode::None
+            );
+            assert_eq!(
+                contract.execution_profile.decode_batch,
+                NativeBatchMode::Continuous
+            );
+            assert_eq!(contract.stages.len(), 3);
+
+            let preparation = &contract.stages[0];
+            assert_eq!(preparation.name, "asr.encoder.lfm25_audio");
+            assert_eq!(preparation.progress, StageProgressKind::Atomic);
+            assert_eq!(preparation.batch_mode, NativeBatchMode::None);
+            assert_eq!(preparation.max_batch_size, 1);
+            assert_eq!(preparation.concurrency, ConcurrencyClass::Exclusive);
+            assert_eq!(preparation.shape_policy, StageShapePolicy::Exact);
+            assert_eq!(preparation.max_work_units, 1_024);
+            assert_eq!(preparation.max_workspace_bytes, 96 * 1024 * 1024);
+
+            let prefill = &contract.stages[1];
+            assert_eq!(prefill.name, "asr.prefill.lfm25_audio.scalar");
+            assert_eq!(prefill.progress, StageProgressKind::Iterative);
+            assert_eq!(prefill.batch_mode, NativeBatchMode::None);
+            assert_eq!(prefill.max_batch_size, 1);
+            assert_eq!(prefill.concurrency, ConcurrencyClass::Exclusive);
+            assert_eq!(prefill.shape_policy, StageShapePolicy::Exact);
+
+            let decode = &contract.stages[2];
+            assert_eq!(decode.name, "asr.decode.lfm25_audio.continuous");
+            assert_eq!(decode.progress, StageProgressKind::Iterative);
+            assert_eq!(decode.batch_mode, NativeBatchMode::Continuous);
+            assert_eq!(decode.max_batch_size, 8);
+            assert_eq!(decode.concurrency, ConcurrencyClass::Batchable);
+            assert_eq!(decode.shape_policy, StageShapePolicy::Ragged);
+            assert!(contract
+                .stages
+                .iter()
+                .all(|stage| stage.output_visibility == OutputVisibility::AfterQuantumCommit));
+        }
     }
 
     #[test]
