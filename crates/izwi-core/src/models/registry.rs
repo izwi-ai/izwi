@@ -39,10 +39,20 @@ use crate::models::architectures::lfm2::chat::{
     ChatDecodeState as Lfm2ChatDecodeState, Lfm2ChatDecodeCheckpoint, Lfm2ChatModel,
 };
 use crate::models::architectures::lfm25_audio::{
-    physical::{
-        Lfm25AudioPhysicalStateSpec, Lfm25AudioStateMode, LFM25_DEPTHFORMER_STATE_DOMAIN,
-        LFM25_MAIN_ATTENTION_STATE_DOMAIN, LFM25_MAIN_SHORTCONV_STATE_DOMAIN,
+    asr_retained::{
+        Lfm25AudioAsrDecodeStep, Lfm25AudioAsrPrefillStep, Lfm25AudioAsrQuantumCheckpoint,
+        Lfm25AudioAsrRetainedState,
     },
+    model::{
+        Lfm25AudioAsrPreparationResourceEnvelope, Lfm25AudioAsrPreparationStageCeiling,
+        Lfm25AudioAsrStepResourceEnvelope, Lfm25AudioPreparedAsrArtifact,
+    },
+    physical::{
+        Lfm25AudioPhysicalStateSpec, Lfm25AudioRetainedStateSpec, Lfm25AudioStateMode,
+        LFM25_DEPTHFORMER_STATE_DOMAIN, LFM25_MAIN_ATTENTION_STATE_DOMAIN,
+        LFM25_MAIN_SHORTCONV_STATE_DOMAIN,
+    },
+    state::Lfm25AudioRetainedMode,
     Lfm25AudioGenerationConfig, Lfm25AudioModel, Lfm25AudioStreamConfig,
 };
 use crate::models::architectures::nemotron::asr::{
@@ -2899,6 +2909,17 @@ fn lfm25_audio_asr_long_form_config() -> AsrLongFormConfig {
     cfg
 }
 
+fn lfm25_audio_asr_requires_long_form(audio: &[f32], sample_rate: u32) -> bool {
+    plan_audio_chunks(
+        audio,
+        sample_rate,
+        &lfm25_audio_asr_long_form_config(),
+        None,
+    )
+    .len()
+        > 1
+}
+
 fn lfm25_audio_asr_single_pass_max_new_tokens(max_tokens: Option<usize>) -> usize {
     max_tokens
         .or_else(|| env_positive_usize("IZWI_LFM25_ASR_MAX_NEW_TOKENS"))
@@ -2956,6 +2977,132 @@ fn env_positive_usize(key: &str) -> Option<usize> {
 }
 
 impl NativeAudioChatModel {
+    pub(crate) fn retained_asr_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<Lfm25AudioRetainedStateSpec> {
+        match self {
+            Self::Lfm25Audio(model) => {
+                model.retained_state_spec(Lfm25AudioRetainedMode::Asr, stage_graphs)
+            }
+        }
+    }
+
+    pub(crate) fn asr_requires_long_form(&self, audio: &[f32], sample_rate: u32) -> bool {
+        lfm25_audio_asr_requires_long_form(audio, sample_rate)
+    }
+
+    pub(crate) fn prepare_lfm25_audio_asr_artifact(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+    ) -> Result<Arc<Lfm25AudioPreparedAsrArtifact>> {
+        match self {
+            Self::Lfm25Audio(model) => model.prepare_asr_artifact(audio, sample_rate),
+        }
+    }
+
+    pub(crate) fn lfm25_audio_asr_preparation_stage_ceiling(
+        &self,
+    ) -> Result<Lfm25AudioAsrPreparationStageCeiling> {
+        match self {
+            Self::Lfm25Audio(model) => model.asr_preparation_stage_ceiling(),
+        }
+    }
+
+    pub(crate) fn lfm25_audio_asr_preparation_resource_envelope(
+        &self,
+        source_samples: usize,
+        source_sample_rate: u32,
+    ) -> Result<Lfm25AudioAsrPreparationResourceEnvelope> {
+        match self {
+            Self::Lfm25Audio(model) => {
+                model.asr_preparation_resource_envelope(source_samples, source_sample_rate)
+            }
+        }
+    }
+
+    pub(crate) fn new_lfm25_audio_retained_asr_state(
+        &self,
+        artifact: Arc<Lfm25AudioPreparedAsrArtifact>,
+        requested_max_new_tokens: usize,
+    ) -> Result<Lfm25AudioAsrRetainedState> {
+        match self {
+            Self::Lfm25Audio(model) => {
+                model.new_retained_asr_state(artifact, requested_max_new_tokens)
+            }
+        }
+    }
+
+    pub(crate) fn lfm25_audio_asr_prefill_resource_envelope(
+        &self,
+        start: usize,
+        tokens: usize,
+        prompt_tokens: usize,
+    ) -> Result<Lfm25AudioAsrStepResourceEnvelope> {
+        match self {
+            Self::Lfm25Audio(model) => {
+                model.asr_prefill_resource_envelope(start, tokens, prompt_tokens)
+            }
+        }
+    }
+
+    pub(crate) fn lfm25_audio_asr_decode_resource_envelope(
+        &self,
+        position: usize,
+    ) -> Result<Lfm25AudioAsrStepResourceEnvelope> {
+        match self {
+            Self::Lfm25Audio(model) => model.asr_decode_resource_envelope(position),
+        }
+    }
+
+    pub(crate) fn lfm25_audio_asr_prefill_step(
+        &self,
+        state: &mut Lfm25AudioAsrRetainedState,
+        cache: &mut PhysicalPagedKvCache,
+        checkpoint: &Lfm25AudioAsrQuantumCheckpoint,
+        max_tokens: usize,
+    ) -> Result<Lfm25AudioAsrPrefillStep> {
+        match self {
+            Self::Lfm25Audio(model) => {
+                model.retained_asr_prefill_step(state, cache, checkpoint, max_tokens)
+            }
+        }
+    }
+
+    pub(crate) fn lfm25_audio_asr_decode_step(
+        &self,
+        state: &mut Lfm25AudioAsrRetainedState,
+        cache: &mut PhysicalPagedKvCache,
+        checkpoint: &Lfm25AudioAsrQuantumCheckpoint,
+    ) -> Result<Lfm25AudioAsrDecodeStep> {
+        match self {
+            Self::Lfm25Audio(model) => model.retained_asr_decode_step(state, cache, checkpoint),
+        }
+    }
+
+    pub(crate) fn lfm25_audio_asr_decode_will_append(
+        &self,
+        state: &Lfm25AudioAsrRetainedState,
+    ) -> Result<bool> {
+        match self {
+            Self::Lfm25Audio(model) => model.retained_asr_decode_will_append(state),
+        }
+    }
+
+    pub(crate) fn lfm25_audio_asr_decode_append_batch(
+        &self,
+        states: &mut [&mut Lfm25AudioAsrRetainedState],
+        caches: &mut [&mut PhysicalPagedKvCache],
+        checkpoints: &[&Lfm25AudioAsrQuantumCheckpoint],
+    ) -> Result<Vec<Lfm25AudioAsrDecodeStep>> {
+        match self {
+            Self::Lfm25Audio(model) => {
+                model.retained_asr_decode_append_batch(states, caches, checkpoints)
+            }
+        }
+    }
+
     pub(crate) fn physical_state_spec(
         &self,
         mode: Lfm25AudioStateMode,
@@ -6474,6 +6621,31 @@ mod tests {
         if let Some(previous) = previous {
             std::env::set_var("IZWI_LFM25_ASR_CHUNK_MAX_NEW_TOKENS", previous);
         }
+    }
+
+    #[test]
+    fn lfm_audio_asr_route_decision_uses_the_authoritative_chunk_planner() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let cfg = lfm25_audio_asr_long_form_config();
+        let sample_rate = 100_u32;
+        let one_chunk_samples = (cfg.hard_max_chunk_secs * sample_rate as f32)
+            .floor()
+            .max(1.0) as usize;
+        let multi_chunk_samples = one_chunk_samples
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(1))
+            .expect("test audio length");
+
+        let one_chunk = vec![0.0; one_chunk_samples];
+        assert_eq!(
+            lfm25_audio_asr_requires_long_form(&one_chunk, sample_rate),
+            plan_audio_chunks(&one_chunk, sample_rate, &cfg, None).len() > 1
+        );
+        let multi_chunk = vec![0.0; multi_chunk_samples];
+        assert!(lfm25_audio_asr_requires_long_form(
+            &multi_chunk,
+            sample_rate
+        ));
     }
 
     #[test]

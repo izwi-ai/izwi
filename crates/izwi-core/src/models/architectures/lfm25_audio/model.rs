@@ -29,7 +29,8 @@ use super::conformer::subsampled_len_3x;
 use super::conformer::Lfm25AudioEncoder;
 use super::detokenizer::Lfm25AudioDetokenizer;
 use super::physical::{
-    lfm25_audio_physical_state_spec, Lfm25AudioPhysicalStateSpec, Lfm25AudioStateMode,
+    lfm25_audio_physical_state_spec, lfm25_audio_retained_state_spec, Lfm25AudioPhysicalStateSpec,
+    Lfm25AudioRetainedStateSpec, Lfm25AudioStateMode,
 };
 use super::preprocessor::Lfm25AudioPreprocessor;
 use super::sampling::{
@@ -361,6 +362,14 @@ impl Lfm25AudioModel {
         stage_graphs: &[&[StageDescriptor]],
     ) -> Result<Lfm25AudioPhysicalStateSpec> {
         lfm25_audio_physical_state_spec(&self.main_config, &self.decoder_config, mode, stage_graphs)
+    }
+
+    pub(crate) fn retained_state_spec(
+        &self,
+        mode: Lfm25AudioRetainedMode,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<Lfm25AudioRetainedStateSpec> {
+        lfm25_audio_retained_state_spec(&self.main_config, &self.decoder_config, mode, stage_graphs)
     }
 
     pub(crate) fn new_retained_state(
