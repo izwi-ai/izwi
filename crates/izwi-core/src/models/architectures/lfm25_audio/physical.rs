@@ -296,6 +296,13 @@ pub(crate) fn lfm25_audio_retained_state_spec(
                 mode == Lfm25AudioRetainedMode::Asr && stage.selector == StageWorkSelector::Atomic;
             let owns_depthformer = mode == Lfm25AudioRetainedMode::Tts
                 && stage.selector == StageWorkSelector::SequenceDecode;
+            let lease_scope = if owns_main_invocation || owns_depthformer {
+                InvocationLeaseScope::PerRow
+            } else if stage.max_batch_size > 1 {
+                InvocationLeaseScope::PerStageBatch
+            } else {
+                InvocationLeaseScope::PerRow
+            };
             let mut groups = Vec::new();
             let mut domains = Vec::new();
             if owns_main_invocation {
@@ -369,6 +376,23 @@ pub(crate) fn lfm25_audio_retained_state_spec(
                 });
             }
             if stage.max_workspace_bytes > 0 {
+                let scratch_bytes = match lease_scope {
+                    InvocationLeaseScope::PerStageBatch => stage.max_workspace_bytes,
+                    InvocationLeaseScope::PerRow => {
+                        let width = u64::try_from(stage.max_batch_size).map_err(|_| {
+                            Error::ModelLoadError(
+                                "LFM2.5 Audio retained batch width exceeds u64".into(),
+                            )
+                        })?;
+                        if stage.max_workspace_bytes % width != 0 {
+                            return Err(Error::ModelLoadError(
+                                "LFM2.5 Audio per-row invocation scratch is not evenly partitioned"
+                                    .into(),
+                            ));
+                        }
+                        stage.max_workspace_bytes / width
+                    }
+                };
                 let scratch_id = LFM25_DEPTHFORMER_STATE_DOMAIN
                     .get()
                     .checked_add(u32::try_from(index + 1).map_err(|_| {
@@ -387,7 +411,7 @@ pub(crate) fn lfm25_audio_retained_state_spec(
                     alignment_bytes: 64,
                     zero_on_release: false,
                     formula: WorkspaceFormula {
-                        fixed_bytes: stage.max_workspace_bytes,
+                        fixed_bytes: scratch_bytes,
                         dimensions: vec![],
                         terms: vec![],
                     },
@@ -396,11 +420,7 @@ pub(crate) fn lfm25_audio_retained_state_spec(
             has_invocation_workspace |= !domains.is_empty();
             invocation_stages.push(InvocationStageWorkspace {
                 stage: stage.id,
-                lease_scope: if stage.max_batch_size > 1 {
-                    InvocationLeaseScope::PerStageBatch
-                } else {
-                    InvocationLeaseScope::PerRow
-                },
+                lease_scope,
                 groups,
                 domains,
             });
@@ -468,17 +488,23 @@ fn validate_retained_stage_graph(
     let mut decodes = 0usize;
     for stage in stages {
         stage.validate()?;
-        let valid_batch = match (mode, stage.selector) {
-            (
-                Lfm25AudioRetainedMode::Asr | Lfm25AudioRetainedMode::Tts,
-                StageWorkSelector::SequenceDecode,
-            ) => {
+        let valid_batch = match stage.selector {
+            StageWorkSelector::PreSequencePreparation => {
+                stage.batch_mode == NativeBatchMode::None && stage.max_batch_size == 1
+            }
+            StageWorkSelector::SequencePrefill => {
+                matches!(
+                    stage.batch_mode,
+                    NativeBatchMode::None | NativeBatchMode::Static
+                ) && stage.max_batch_size > 0
+            }
+            StageWorkSelector::SequenceDecode => {
                 matches!(
                     stage.batch_mode,
                     NativeBatchMode::None | NativeBatchMode::Continuous
                 ) && stage.max_batch_size > 0
             }
-            _ => stage.batch_mode == NativeBatchMode::None && stage.max_batch_size == 1,
+            _ => false,
         };
         if !valid_batch {
             return Err(Error::ModelLoadError(
@@ -497,8 +523,7 @@ fn validate_retained_stage_graph(
         }
         match stage.selector {
             StageWorkSelector::PreSequencePreparation
-                if mode == Lfm25AudioRetainedMode::Asr
-                    && stage.progress == StageProgressKind::Atomic =>
+                if stage.progress == StageProgressKind::Atomic =>
             {
                 preparations += 1;
             }
@@ -518,11 +543,7 @@ fn validate_retained_stage_graph(
             }
         }
     }
-    let preparation_valid = match mode {
-        Lfm25AudioRetainedMode::Asr => preparations == 1,
-        Lfm25AudioRetainedMode::Tts => preparations == 0,
-    };
-    if !preparation_valid || prefills != 1 || decodes != 1 {
+    if preparations != 1 || prefills != 1 || decodes != 1 {
         return Err(Error::ModelLoadError(
             "LFM2.5 Audio retained graph has the wrong preparation/prefill/decode topology".into(),
         ));
@@ -841,7 +862,10 @@ mod tests {
     #[test]
     fn retained_asr_contract_coexists_with_continuous_normal_and_atomic_long_form() {
         let preparation = retained_stage(0, StageWorkSelector::PreSequencePreparation, 128);
-        let prefill = retained_stage(1, StageWorkSelector::SequencePrefill, 64);
+        let mut prefill = retained_stage(1, StageWorkSelector::SequencePrefill, 64);
+        prefill.batch_mode = NativeBatchMode::Static;
+        prefill.concurrency = ConcurrencyClass::Batchable;
+        prefill.max_batch_size = 4;
         let mut decode = retained_stage(2, StageWorkSelector::SequenceDecode, 32);
         decode.batch_mode = NativeBatchMode::Continuous;
         decode.concurrency = ConcurrencyClass::Batchable;
@@ -905,9 +929,10 @@ mod tests {
 
     #[test]
     fn retained_tts_keeps_depthformer_on_decode_invocation_only() {
+        let preparation = retained_stage(0, StageWorkSelector::PreSequencePreparation, 32);
         let prefill = retained_stage(1, StageWorkSelector::SequencePrefill, 0);
         let decode = retained_stage(2, StageWorkSelector::SequenceDecode, 64);
-        let stages = [prefill, decode];
+        let stages = [preparation, prefill, decode];
         let spec = lfm25_audio_retained_state_spec(
             &main_config(),
             &decoder_config(),
@@ -940,15 +965,54 @@ mod tests {
         let InvocationWorkspaceSet::Bounded { profiles } = &spec.descriptor.invocation else {
             panic!("TTS decode invocation state must be bounded");
         };
-        assert!(profiles[0].stages[0].domains.is_empty());
+        assert!(profiles[0].stages[1].domains.is_empty());
         assert!(matches!(
-            profiles[0].stages[1].domains[0],
+            profiles[0].stages[2].domains[0],
             InvocationWorkspaceDomain::State { .. }
         ));
     }
 
     #[test]
+    fn retained_tts_accepts_static_prefill_and_partitions_decode_per_row() {
+        let preparation = retained_stage(0, StageWorkSelector::PreSequencePreparation, 32);
+        let mut prefill = retained_stage(1, StageWorkSelector::SequencePrefill, 256);
+        prefill.batch_mode = NativeBatchMode::Static;
+        prefill.concurrency = ConcurrencyClass::Batchable;
+        prefill.max_batch_size = 4;
+        let mut decode = retained_stage(2, StageWorkSelector::SequenceDecode, 256);
+        decode.batch_mode = NativeBatchMode::Continuous;
+        decode.concurrency = ConcurrencyClass::Batchable;
+        decode.max_batch_size = 4;
+        decode.membership_safe_point = MembershipSafePoint::QuantumBoundary;
+        decode.shape_policy = StageShapePolicy::Ragged;
+        let stages = [preparation, prefill, decode];
+
+        let spec = lfm25_audio_retained_state_spec(
+            &main_config(),
+            &decoder_config(),
+            Lfm25AudioRetainedMode::Tts,
+            &[&stages],
+        )
+        .expect("production TTS batch geometry");
+        let InvocationWorkspaceSet::Bounded { profiles } = &spec.descriptor.invocation else {
+            panic!("TTS invocation workspace must be bounded");
+        };
+        let decode = &profiles[0].stages[2];
+        assert_eq!(decode.lease_scope, InvocationLeaseScope::PerRow);
+        let scratch = decode
+            .domains
+            .iter()
+            .find_map(|domain| match domain {
+                InvocationWorkspaceDomain::Scratch { formula, .. } => Some(formula),
+                InvocationWorkspaceDomain::State { .. } => None,
+            })
+            .expect("decode scratch");
+        assert_eq!(scratch.fixed_bytes, 64);
+    }
+
+    #[test]
     fn retained_tts_accepts_continuous_decode_but_rejects_atomic_routes() {
+        let preparation = retained_stage(0, StageWorkSelector::PreSequencePreparation, 0);
         let prefill = retained_stage(1, StageWorkSelector::SequencePrefill, 0);
         let mut decode = retained_stage(2, StageWorkSelector::SequenceDecode, 0);
         decode.batch_mode = NativeBatchMode::Continuous;
@@ -956,7 +1020,7 @@ mod tests {
         decode.max_batch_size = 2;
         decode.membership_safe_point = MembershipSafePoint::QuantumBoundary;
         decode.shape_policy = StageShapePolicy::Ragged;
-        let stages = [prefill.clone(), decode];
+        let stages = [preparation, prefill.clone(), decode];
         assert!(lfm25_audio_retained_state_spec(
             &main_config(),
             &decoder_config(),
