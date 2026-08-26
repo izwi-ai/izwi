@@ -1706,6 +1706,65 @@ impl Engine {
                 }
                 request.install_asr_execution_model(variant, model)?;
             }
+            TaskType::TTS if variant.family() == crate::catalog::ModelFamily::Lfm25Audio => {
+                let model = registry
+                    .get_lfm25_audio_lease(variant)
+                    .await
+                    .ok_or_else(|| {
+                        Error::ModelNotFound(format!(
+                            "LFM2.5 Audio TTS model {variant} is not loaded"
+                        ))
+                    })?;
+                if request
+                    .prepared_lfm25_audio_tts_artifact_for_executor()?
+                    .is_none()
+                {
+                    let request_id = request.id.clone();
+                    let deadline = request.deadline;
+                    let context_limit = registry
+                        .effective_context(variant)
+                        .unwrap_or(self.config.max_seq_len);
+                    let acquire_permit = self
+                        .direct_request_preparation_permits
+                        .clone()
+                        .acquire_owned();
+                    let permit = match deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline.into(), acquire_permit)
+                            .await
+                            .map_err(|_| Error::Timeout(request_id.clone()))?,
+                        None => acquire_permit.await,
+                    }
+                    .map_err(|_| {
+                        Error::InferenceError(
+                            "Direct LFM2.5 Audio TTS preparation queue is unavailable".into(),
+                        )
+                    })?;
+                    let worker = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        let mut request = request;
+                        let messages = request.lfm25_audio_tts_messages_for_preparation()?;
+                        let artifact = model.prepare_lfm25_audio_tts_artifact(&messages)?;
+                        request.install_lfm25_audio_tts_execution_model(
+                            variant,
+                            model,
+                            artifact,
+                            context_limit,
+                        )?;
+                        Ok::<_, Error>(request)
+                    });
+                    request = match deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline.into(), worker)
+                            .await
+                            .map_err(|_| Error::Timeout(request_id.clone()))?,
+                        None => worker.await,
+                    }
+                    .map_err(|error| {
+                        Error::InferenceError(format!(
+                            "LFM2.5 Audio TTS request {request_id} preparation worker failed: {error}"
+                        ))
+                    })??;
+                }
+            }
             TaskType::TTS if variant.family() == crate::catalog::ModelFamily::Qwen3Tts => {
                 let model = registry.get_qwen_tts_lease(variant).await.ok_or_else(|| {
                     Error::ModelNotFound(format!("Qwen TTS model {variant} is not loaded"))

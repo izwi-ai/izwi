@@ -23,7 +23,10 @@ use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::granite_speech::asr::GraniteSpeechPreparedPromptArtifact;
-use crate::models::architectures::lfm25_audio::model::Lfm25AudioPreparedAsrArtifact;
+use crate::models::architectures::lfm25_audio::{
+    lfm25_audio_tts_system_prompt, model::Lfm25AudioPreparedAsrArtifact,
+    tts_retained::Lfm25AudioPreparedTtsArtifact, Lfm25AudioGenerationConfig,
+};
 use crate::models::architectures::qwen3::asr::Qwen3AsrPreparedAudio;
 use crate::models::architectures::qwen3::tts::{
     Qwen3TtsModel, SpeakerReference, TtsGenerationParams, TtsSessionCacheRequest,
@@ -34,7 +37,7 @@ use crate::models::registry::{
     AsrModelLease, ChatModelLease, Lfm25AudioModelLease, NativeAsrModel, NativeChatModel,
     NativeChatPreparedPrompt, QwenTtsModelLease,
 };
-use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRequestConfig};
+use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRequestConfig, ChatRole};
 use crate::runtime::audio_io::{
     validate_base64_audio_retained_size, validate_base64_audio_source_input,
     MAX_AUDIO_SOURCE_BYTES, MAX_REFERENCE_SOURCE_BYTES,
@@ -343,6 +346,7 @@ enum PreparedChatModel {
 enum PreparedIncrementalModel {
     Asr(AsrModelLease),
     Lfm25AudioAsr(Lfm25AudioModelLease),
+    Lfm25AudioTts(Lfm25AudioModelLease),
     QwenTts(QwenTtsModelLease),
 }
 
@@ -351,6 +355,7 @@ impl fmt::Debug for PreparedIncrementalModel {
         match self {
             Self::Asr(model) => write!(formatter, "Asr({:p})", &**model),
             Self::Lfm25AudioAsr(model) => write!(formatter, "Lfm25AudioAsr({:p})", &**model),
+            Self::Lfm25AudioTts(model) => write!(formatter, "Lfm25AudioTts({:p})", &**model),
             Self::QwenTts(model) => write!(formatter, "QwenTts({:p})", &**model),
         }
     }
@@ -361,6 +366,7 @@ pub(super) struct IncrementalModelExecutionReady {
     model_variant: ModelVariant,
     model: PreparedIncrementalModel,
     qwen_tts: Option<PreparedQwenTtsInput>,
+    lfm25_audio_tts: Option<Arc<Lfm25AudioPreparedTtsArtifact>>,
 }
 
 #[derive(Debug, Clone)]
@@ -2341,6 +2347,7 @@ impl EngineCoreRequest {
             model_variant,
             model: PreparedIncrementalModel::Asr(model),
             qwen_tts: None,
+            lfm25_audio_tts: None,
         });
         if let Some((stage_id, cost)) = prepared_continuous_cost {
             self.install_prepared_stage_cost(stage_id, cost)?;
@@ -2367,6 +2374,7 @@ impl EngineCoreRequest {
             model_variant,
             model: PreparedIncrementalModel::Lfm25AudioAsr(model),
             qwen_tts: None,
+            lfm25_audio_tts: None,
         });
         Ok(())
     }
@@ -3093,6 +3101,90 @@ impl EngineCoreRequest {
         self.prepared_asr_execution_shape == Some(PreparedAsrExecutionShape::LongFormAtomic)
     }
 
+    pub(crate) fn lfm25_audio_tts_messages_for_preparation(&self) -> Result<Vec<ChatMessage>> {
+        let text = self
+            .text
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| {
+                Error::InvalidInput("LFM2.5 Audio TTS request is missing text".into())
+            })?;
+        let speaker = self
+            .params
+            .speaker
+            .as_deref()
+            .or(self.params.voice.as_deref());
+        Ok(vec![
+            ChatMessage {
+                role: ChatRole::System,
+                content: lfm25_audio_tts_system_prompt(speaker).to_string(),
+            },
+            ChatMessage {
+                role: ChatRole::User,
+                content: text.trim().to_string(),
+            },
+        ])
+    }
+
+    pub(crate) fn install_lfm25_audio_tts_execution_model(
+        &mut self,
+        model_variant: ModelVariant,
+        model: Lfm25AudioModelLease,
+        artifact: Arc<Lfm25AudioPreparedTtsArtifact>,
+        max_sequence_tokens: usize,
+    ) -> Result<()> {
+        if model_variant.family() != ModelFamily::Lfm25Audio
+            || self.task_type != TaskType::TTS
+            || self.model_variant != Some(model_variant)
+        {
+            return Err(Error::InvalidInput(format!(
+                "LFM2.5 Audio TTS request {} model preparation does not match its routed task/model",
+                self.id
+            )));
+        }
+        let expected = self.lfm25_audio_tts_messages_for_preparation()?;
+        if artifact.source_messages.len() != expected.len()
+            || artifact
+                .source_messages
+                .iter()
+                .zip(&expected)
+                .any(|(actual, expected)| {
+                    actual.role != expected.role || actual.content != expected.content
+                })
+            || artifact.prompt_tokens == 0
+            || artifact.prompt_tokens >= max_sequence_tokens
+        {
+            return Err(Error::InvalidInput(format!(
+                "LFM2.5 Audio TTS request {} prepared prompt does not match its exact input/context",
+                self.id
+            )));
+        }
+        let available = max_sequence_tokens - artifact.prompt_tokens;
+        self.params.max_tokens = if self.params.max_tokens == 0 {
+            1_024.min(available)
+        } else {
+            self.params.max_tokens.min(available)
+        };
+        if self.params.max_tokens == 0 {
+            return Err(Error::InvalidInput(
+                "LFM2.5 Audio TTS request leaves no output capacity".into(),
+            ));
+        }
+        self.prepared_stage_costs.clear();
+        self.prepared_sequence_input_tokens = Some(artifact.prompt_tokens);
+        self.incremental_model_execution_ready = Some(IncrementalModelExecutionReady {
+            model_variant,
+            model: PreparedIncrementalModel::Lfm25AudioTts(model),
+            qwen_tts: None,
+            lfm25_audio_tts: Some(artifact),
+        });
+        Ok(())
+    }
+
+    pub(crate) fn lfm25_audio_tts_generation_config(&self) -> Lfm25AudioGenerationConfig {
+        Lfm25AudioGenerationConfig::default()
+    }
+
     pub(crate) fn install_qwen_tts_execution_model(
         &mut self,
         model_variant: ModelVariant,
@@ -3181,6 +3273,7 @@ impl EngineCoreRequest {
                 prefill_tokens: layout.prefill_tokens,
                 max_frames: layout.max_frames,
             }),
+            lfm25_audio_tts: None,
         });
         if let Some((stage_id, cost)) = prepared_continuous_cost {
             self.install_prepared_stage_cost(stage_id, cost)?;
@@ -3310,10 +3403,40 @@ impl EngineCoreRequest {
                 }
             }
         }
+        if matches!(&ready.model, PreparedIncrementalModel::Lfm25AudioTts(_)) {
+            let expected = self.lfm25_audio_tts_messages_for_preparation()?;
+            let prepared = ready.lfm25_audio_tts.as_ref().ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "LFM2.5 Audio TTS request {} is missing its prepared prompt",
+                    self.id
+                ))
+            })?;
+            if ready.model_variant.family() != ModelFamily::Lfm25Audio
+                || self.prepared_sequence_input_tokens != Some(prepared.prompt_tokens)
+                || prepared.source_messages.len() != expected.len()
+                || prepared
+                    .source_messages
+                    .iter()
+                    .zip(&expected)
+                    .any(|(actual, expected)| {
+                        actual.role != expected.role || actual.content != expected.content
+                    })
+            {
+                return Err(Error::InvalidInput(format!(
+                    "LFM2.5 Audio TTS request {} changed after preparation",
+                    self.id
+                )));
+            }
+        }
         match (&ready.model, self.task_type) {
             (PreparedIncrementalModel::Asr(_), TaskType::ASR) if ready.qwen_tts.is_none() => Ok(()),
             (PreparedIncrementalModel::Lfm25AudioAsr(_), TaskType::ASR)
                 if ready.qwen_tts.is_none() =>
+            {
+                Ok(())
+            }
+            (PreparedIncrementalModel::Lfm25AudioTts(_), TaskType::TTS)
+                if ready.qwen_tts.is_none() && ready.lfm25_audio_tts.is_some() =>
             {
                 Ok(())
             }
@@ -3341,6 +3464,7 @@ impl EngineCoreRequest {
             .and_then(|ready| match &ready.model {
                 PreparedIncrementalModel::Asr(model) => Some(model.model_arc()),
                 PreparedIncrementalModel::Lfm25AudioAsr(_)
+                | PreparedIncrementalModel::Lfm25AudioTts(_)
                 | PreparedIncrementalModel::QwenTts(_) => None,
             }))
     }
@@ -3353,6 +3477,7 @@ impl EngineCoreRequest {
             .and_then(|ready| match &ready.model {
                 PreparedIncrementalModel::Asr(model) => Some(model.clone()),
                 PreparedIncrementalModel::Lfm25AudioAsr(_)
+                | PreparedIncrementalModel::Lfm25AudioTts(_)
                 | PreparedIncrementalModel::QwenTts(_) => None,
             }))
     }
@@ -3366,8 +3491,33 @@ impl EngineCoreRequest {
             .as_ref()
             .and_then(|ready| match &ready.model {
                 PreparedIncrementalModel::Lfm25AudioAsr(model) => Some(model.clone()),
-                PreparedIncrementalModel::Asr(_) | PreparedIncrementalModel::QwenTts(_) => None,
+                PreparedIncrementalModel::Asr(_)
+                | PreparedIncrementalModel::Lfm25AudioTts(_)
+                | PreparedIncrementalModel::QwenTts(_) => None,
             }))
+    }
+
+    pub(crate) fn prepared_lfm25_audio_tts_model_lease_for_executor(
+        &self,
+    ) -> Result<Option<Lfm25AudioModelLease>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| match &ready.model {
+                PreparedIncrementalModel::Lfm25AudioTts(model) => Some(model.clone()),
+                _ => None,
+            }))
+    }
+
+    pub(crate) fn prepared_lfm25_audio_tts_artifact_for_executor(
+        &self,
+    ) -> Result<Option<Arc<Lfm25AudioPreparedTtsArtifact>>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| ready.lfm25_audio_tts.clone()))
     }
 
     pub(crate) fn prepared_qwen_tts_model_for_executor(
@@ -3379,9 +3529,9 @@ impl EngineCoreRequest {
             .as_ref()
             .and_then(|ready| match &ready.model {
                 PreparedIncrementalModel::QwenTts(model) => Some(model.model_arc()),
-                PreparedIncrementalModel::Asr(_) | PreparedIncrementalModel::Lfm25AudioAsr(_) => {
-                    None
-                }
+                PreparedIncrementalModel::Asr(_)
+                | PreparedIncrementalModel::Lfm25AudioAsr(_)
+                | PreparedIncrementalModel::Lfm25AudioTts(_) => None,
             }))
     }
 
@@ -3394,9 +3544,9 @@ impl EngineCoreRequest {
             .as_ref()
             .and_then(|ready| match &ready.model {
                 PreparedIncrementalModel::QwenTts(model) => Some(model.clone()),
-                PreparedIncrementalModel::Asr(_) | PreparedIncrementalModel::Lfm25AudioAsr(_) => {
-                    None
-                }
+                PreparedIncrementalModel::Asr(_)
+                | PreparedIncrementalModel::Lfm25AudioAsr(_)
+                | PreparedIncrementalModel::Lfm25AudioTts(_) => None,
             }))
     }
 
@@ -3823,6 +3973,7 @@ impl EngineCoreRequest {
             .and_then(|ready| match &ready.model {
                 PreparedIncrementalModel::Asr(model) => Some(model),
                 PreparedIncrementalModel::Lfm25AudioAsr(_)
+                | PreparedIncrementalModel::Lfm25AudioTts(_)
                 | PreparedIncrementalModel::QwenTts(_) => None,
             })
             .filter(|_| self.uses_asr_retained_sequence())
