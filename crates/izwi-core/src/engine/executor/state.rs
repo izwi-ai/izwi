@@ -7,12 +7,13 @@ use crate::models::architectures::lfm25_audio::tts_retained::Lfm25AudioTtsRetain
 use crate::models::architectures::qwen3::tts::{
     PhysicalTtsDecodeState, PhysicalTtsPrefillState, Qwen3TtsModel,
 };
+use crate::models::architectures::vibevoice::tts::VibeVoiceTtsRetainedState;
 use crate::models::architectures::voxtral::realtime::{
     VoxtralRealtimeCheckpoint, VoxtralRealtimeState,
 };
 use crate::models::registry::{
     AsrModelLease, Lfm25AudioModelLease, NativeAsrDecodeState, NativeAsrModel,
-    NativeChatDecodeState, QwenTtsModelLease, VoxtralModelLease,
+    NativeChatDecodeState, QwenTtsModelLease, VibeVoiceTtsModelLease, VoxtralModelLease,
 };
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 
@@ -53,6 +54,14 @@ pub(super) struct ActiveLfm25TtsDecode {
     pub(super) model: Lfm25AudioModelLease,
     pub(super) state: Lfm25AudioTtsRetainedState,
     pub(super) last_tokens_generated: usize,
+    pub(super) stream_sequence: usize,
+}
+
+pub(super) struct ActiveVibeVoiceTtsDecode {
+    pub(super) variant: ModelVariant,
+    pub(super) model: VibeVoiceTtsModelLease,
+    pub(super) state: VibeVoiceTtsRetainedState,
+    pub(super) last_frames_generated: usize,
     pub(super) stream_sequence: usize,
 }
 
