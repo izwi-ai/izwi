@@ -1242,6 +1242,9 @@ pub(super) struct NemotronStreamingFeatureChunk {
 
 pub(super) struct NemotronStreamingPreEncodeState {
     features: Option<Tensor>,
+    /// Global feature-frame index represented by tensor column zero. The
+    /// retained tensor is compacted after every committed subsampling step.
+    feature_base_frame: usize,
     feature_frames: usize,
     emitted_encoded_frames: usize,
     input_finished: bool,
@@ -1358,6 +1361,7 @@ impl NemotronStreamingPreEncodeState {
     pub(super) fn new() -> Self {
         Self {
             features: None,
+            feature_base_frame: 0,
             feature_frames: 0,
             emitted_encoded_frames: 0,
             input_finished: false,
@@ -1393,6 +1397,7 @@ impl NemotronStreamingPreEncodeState {
         self.features = Some(if let Some(existing) = self.features.as_ref() {
             Tensor::cat(&[existing, &chunk.features], 2)?
         } else {
+            self.feature_base_frame = chunk.start_frame;
             chunk.features
         });
         self.feature_frames = self.feature_frames.saturating_add(chunk.frames);
@@ -1410,6 +1415,14 @@ impl NemotronStreamingPreEncodeState {
 
     pub(super) fn install_retained_tensor(&mut self, tensor: Option<Tensor>) {
         self.features = tensor;
+    }
+
+    #[cfg(test)]
+    fn retained_feature_frames(&self) -> usize {
+        self.features
+            .as_ref()
+            .and_then(|features| features.dim(2).ok())
+            .unwrap_or(0)
     }
 }
 
@@ -1990,23 +2003,70 @@ impl ConvSubsamplingDw {
             return Ok(None);
         }
 
-        let (encoded, encoded_len) = self.forward(features, state.feature_frames)?;
-        let stable_frames = stable_frames.min(encoded_len);
+        let local_feature_frames = features.dim(2)?;
+        if state.feature_base_frame % SUBSAMPLING_FACTOR != 0
+            || state.feature_base_frame.checked_add(local_feature_frames)
+                != Some(state.feature_frames)
+        {
+            return Err(Error::InferenceError(
+                "Nemotron retained subsampling window lost global stride alignment".into(),
+            ));
+        }
+        let encoded_base_frame = state.feature_base_frame / SUBSAMPLING_FACTOR;
+        let (encoded, local_encoded_len) = self.forward(features, local_feature_frames)?;
+        let available_encoded_end = encoded_base_frame
+            .checked_add(local_encoded_len)
+            .ok_or_else(|| Error::InferenceError("Nemotron encoded cursor overflowed".into()))?;
+        let stable_frames = stable_frames.min(available_encoded_end);
         if stable_frames <= state.emitted_encoded_frames {
             return Ok(None);
         }
 
         let start_frame = state.emitted_encoded_frames;
         let frames = stable_frames - start_frame;
-        let encoded = encoded.narrow(1, start_frame, frames)?.contiguous()?;
+        let local_start = start_frame.checked_sub(encoded_base_frame).ok_or_else(|| {
+            Error::InferenceError("Nemotron subsampling window discarded live output".into())
+        })?;
+        let encoded = encoded.narrow(1, local_start, frames)?.contiguous()?;
+
+        // One preceding stride cell (8 input frames for the current three
+        // stride-2 convolutions) is sufficient to reproduce the next global
+        // output exactly, including its seven-frame left receptive field.
+        // Build the compacted tensor before publishing cursor mutations so a
+        // failed allocation leaves the retained state unchanged.
+        let (next_features, next_base_frame) = if state.input_finished {
+            (None, state.feature_frames)
+        } else {
+            let next_base_frame = stable_frames
+                .saturating_sub(1)
+                .checked_mul(SUBSAMPLING_FACTOR)
+                .ok_or_else(|| {
+                    Error::InferenceError("Nemotron subsampling carry cursor overflowed".into())
+                })?;
+            let discard = next_base_frame
+                .checked_sub(state.feature_base_frame)
+                .ok_or_else(|| {
+                    Error::InferenceError("Nemotron subsampling carry moved backwards".into())
+                })?;
+            let keep = local_feature_frames.checked_sub(discard).ok_or_else(|| {
+                Error::InferenceError("Nemotron subsampling carry exceeded its window".into())
+            })?;
+            (
+                Some(features.narrow(2, discard, keep)?.contiguous()?),
+                next_base_frame,
+            )
+        };
         state.emitted_encoded_frames = stable_frames;
+        state.features = next_features;
+        state.feature_base_frame = next_base_frame;
 
         Ok(Some(NemotronStreamingEncodedChunk {
             encoded,
             start_frame,
             frames,
             total_stable_frames: stable_frames,
-            is_final: state.input_finished && stable_frames == encoded_len,
+            is_final: state.input_finished
+                && stable_frames == subsampled_len_3x(state.feature_frames),
         }))
     }
 
@@ -3789,6 +3849,61 @@ mod tests {
             .push_features(feature_chunk(&features, 1, 1, false))
             .unwrap_err();
         assert!(err.to_string().contains("expected start frame 0"));
+    }
+
+    #[test]
+    fn streaming_pre_encode_retained_window_plateaus_across_long_streams() {
+        let subsampling = zero_subsampling();
+        let device = Device::Cpu;
+        let feature_frames = 8 * 64;
+        let features = Tensor::zeros((1, N_MELS, feature_frames), DType::F32, &device).unwrap();
+        let mut state = NemotronStreamingPreEncodeState::new();
+
+        for start in (0..feature_frames).step_by(8) {
+            state
+                .push_features(feature_chunk(&features, start, 8, false))
+                .unwrap();
+            let chunk = subsampling
+                .forward_streaming_chunk(&mut state)
+                .unwrap()
+                .expect("each stride-sized input must stabilize one output");
+            assert_eq!(chunk.frames, 1);
+            assert_eq!(state.retained_feature_frames(), 8);
+        }
+        assert_eq!(state.feature_frames, feature_frames);
+        assert_eq!(state.emitted_encoded_frames, feature_frames / 8);
+    }
+
+    #[test]
+    fn streaming_pre_encode_failure_does_not_publish_partial_cursor_state() {
+        let subsampling = zero_subsampling();
+        let features = Tensor::zeros((1, N_MELS, 8), DType::F32, &Device::Cpu).unwrap();
+        let mut state = NemotronStreamingPreEncodeState::new();
+        state
+            .push_features(feature_chunk(&features, 0, 8, false))
+            .unwrap();
+        state.feature_base_frame = 1;
+
+        let before_emitted = state.emitted_encoded_frames;
+        let before_frames = state.retained_feature_frames();
+        let error = match subsampling.forward_streaming_chunk(&mut state) {
+            Ok(_) => panic!("misaligned retained window must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("stride alignment"));
+        assert_eq!(state.emitted_encoded_frames, before_emitted);
+        assert_eq!(state.retained_feature_frames(), before_frames);
+        assert_eq!(state.feature_base_frame, 1);
+    }
+
+    #[test]
+    fn new_stream_resets_bounded_subsampling_carry() {
+        let state = NemotronStreamingPreEncodeState::new();
+        assert_eq!(state.feature_base_frame, 0);
+        assert_eq!(state.feature_frames, 0);
+        assert_eq!(state.emitted_encoded_frames, 0);
+        assert_eq!(state.retained_feature_frames(), 0);
+        assert!(!state.input_finished);
     }
 
     #[test]
