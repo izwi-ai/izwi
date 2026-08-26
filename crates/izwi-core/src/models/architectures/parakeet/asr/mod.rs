@@ -110,6 +110,46 @@ impl ParakeetDecoder {
 }
 
 impl ParakeetAsrModel {
+    pub(crate) fn new_predictor_batch_state(
+        &self,
+        batch: usize,
+    ) -> Result<ParakeetPredictorBatchState> {
+        if batch == 0 {
+            return Err(Error::InvalidInput(
+                "Parakeet predictor batch must contain at least one row".into(),
+            ));
+        }
+        self.network
+            .predictor
+            .initial_state(batch, self.network.predictor.embed.device())
+    }
+
+    /// Execute one native recurrent predictor step for independent request
+    /// rows. This is a real B-wide LSTM call; callers retain scalar fallback
+    /// by passing one label and one-row state.
+    pub(crate) fn predictor_step_batch(
+        &self,
+        labels: &[usize],
+        state: &mut ParakeetPredictorBatchState,
+    ) -> Result<Tensor> {
+        self.network
+            .predictor
+            .step_batch(labels, state, self.network.predictor.embed.device())
+    }
+
+    /// Run the joint network across independent rows without padding a time
+    /// dimension. `encoded_rows` is `[B,Denc]` and `predictor_rows` is
+    /// `[B,1,Dpred]`; the result is `[B,V+durations]`.
+    pub(crate) fn joint_batch_rows(
+        &self,
+        encoded_rows: &Tensor,
+        predictor_rows: &Tensor,
+    ) -> Result<Tensor> {
+        self.network
+            .joint
+            .joint_batch_rows(encoded_rows, predictor_rows)
+    }
+
     pub(crate) fn physical_state_spec(
         &self,
         stage_graphs: &[&[StageDescriptor]],
@@ -1161,7 +1201,7 @@ struct Predictor {
 }
 
 #[derive(Clone)]
-struct PredictorState {
+pub(crate) struct ParakeetPredictorBatchState {
     h0: Tensor,
     c0: Tensor,
     h1: Tensor,
@@ -1185,9 +1225,9 @@ impl Predictor {
         })
     }
 
-    fn initial_state(&self, batch: usize, device: &Device) -> Result<PredictorState> {
+    fn initial_state(&self, batch: usize, device: &Device) -> Result<ParakeetPredictorBatchState> {
         let zeros = |dim| Tensor::zeros((batch, dim), DType::F32, device).map_err(Error::from);
-        Ok(PredictorState {
+        Ok(ParakeetPredictorBatchState {
             h0: zeros(PRED_HIDDEN)?,
             c0: zeros(PRED_HIDDEN)?,
             h1: zeros(PRED_HIDDEN)?,
@@ -1195,18 +1235,62 @@ impl Predictor {
         })
     }
 
-    fn step(&self, label: usize, state: &mut PredictorState, device: &Device) -> Result<Tensor> {
-        let x = if label == self.blank_idx {
-            Tensor::zeros((1, PRED_HIDDEN), DType::F32, device)?
-        } else {
-            self.embed.i((label, ..))?.unsqueeze(0)?
-        };
+    fn step(
+        &self,
+        label: usize,
+        state: &mut ParakeetPredictorBatchState,
+        device: &Device,
+    ) -> Result<Tensor> {
+        self.step_batch(std::slice::from_ref(&label), state, device)
+    }
+
+    fn step_batch(
+        &self,
+        labels: &[usize],
+        state: &mut ParakeetPredictorBatchState,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let batch = labels.len();
+        if batch == 0
+            || [
+                state.h0.dim(0),
+                state.c0.dim(0),
+                state.h1.dim(0),
+                state.c1.dim(0),
+            ]
+            .into_iter()
+            .any(|value| value.ok() != Some(batch))
+        {
+            return Err(Error::InvalidInput(
+                "Parakeet predictor labels and recurrent batch state disagree".into(),
+            ));
+        }
+        let rows = labels
+            .iter()
+            .map(|&label| {
+                if label == self.blank_idx {
+                    Tensor::zeros((1, PRED_HIDDEN), DType::F32, device).map_err(Error::from)
+                } else if label < self.blank_idx {
+                    self.embed
+                        .i((label, ..))
+                        .and_then(|row| row.unsqueeze(0))
+                        .map_err(Error::from)
+                } else {
+                    Err(Error::InvalidInput(format!(
+                        "Parakeet predictor label {label} exceeds blank index {}",
+                        self.blank_idx
+                    )))
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let refs = rows.iter().collect::<Vec<_>>();
+        let x = Tensor::cat(&refs, 0)?;
 
         let (h0, c0) = self.lstm_l0.step(&x, &state.h0, &state.c0)?;
+        let (h1, c1) = self.lstm_l1.step(&h0, &state.h1, &state.c1)?;
+        // Publish all four recurrent tensors only after both layers succeed.
         state.h0 = h0;
         state.c0 = c0;
-
-        let (h1, c1) = self.lstm_l1.step(&state.h0, &state.h1, &state.c1)?;
         state.h1 = h1;
         state.c1 = c1;
 
@@ -1249,7 +1333,7 @@ impl Predictor {
                 "Parakeet physical predictor snapshot has non-canonical components".into(),
             ));
         }
-        let mut state = PredictorState {
+        let mut state = ParakeetPredictorBatchState {
             h0: snapshot.components[0].tensor.clone(),
             c0: snapshot.components[1].tensor.clone(),
             h1: snapshot.components[2].tensor.clone(),
@@ -1264,7 +1348,7 @@ impl Predictor {
 fn commit_parakeet_predictor_state(
     lease: &mut InvocationTensorLease,
     expected_cursor: u64,
-    state: &PredictorState,
+    state: &ParakeetPredictorBatchState,
     output: &Tensor,
 ) -> Result<()> {
     let target_cursor = expected_cursor
@@ -1459,6 +1543,24 @@ impl Joint {
             .forward(&inp)
             .map_err(|e| Error::InferenceError(e.to_string()))
     }
+
+    fn joint_batch_rows(&self, encoded_rows: &Tensor, predictor_rows: &Tensor) -> Result<Tensor> {
+        let (batch, _) = encoded_rows.dims2().map_err(|_| {
+            Error::InvalidInput("Parakeet batched joint encoder rows must be [B,D]".into())
+        })?;
+        let (predictor_batch, predictor_steps, _) = predictor_rows.dims3().map_err(|_| {
+            Error::InvalidInput("Parakeet batched joint predictor rows must be [B,1,D]".into())
+        })?;
+        if batch == 0 || predictor_batch != batch || predictor_steps != 1 {
+            return Err(Error::InvalidInput(
+                "Parakeet batched joint rows have incompatible batch geometry".into(),
+            ));
+        }
+        self.joint_after_projection(&encoded_rows.unsqueeze(1)?, predictor_rows)?
+            .squeeze(2)?
+            .squeeze(1)
+            .map_err(Error::from)
+    }
 }
 
 fn build_rel_positional_embedding(len: usize, d_model: usize, device: &Device) -> Result<Tensor> {
@@ -1537,8 +1639,27 @@ fn resample_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
 
 #[cfg(test)]
 mod tests {
-    use super::argmax_1d;
+    use super::{argmax_1d, Joint, LstmCell, Predictor, PRED_HIDDEN};
     use candle_core::{DType, Device, Tensor};
+    use candle_nn::Linear;
+
+    fn zero_lstm(device: &Device) -> LstmCell {
+        LstmCell {
+            w_ih: Tensor::zeros((PRED_HIDDEN * 4, PRED_HIDDEN), DType::F32, device).unwrap(),
+            w_hh: Tensor::zeros((PRED_HIDDEN * 4, PRED_HIDDEN), DType::F32, device).unwrap(),
+            b_ih: Tensor::zeros(PRED_HIDDEN * 4, DType::F32, device).unwrap(),
+            b_hh: Tensor::zeros(PRED_HIDDEN * 4, DType::F32, device).unwrap(),
+        }
+    }
+
+    fn zero_predictor(device: &Device) -> Predictor {
+        Predictor {
+            embed: Tensor::zeros((3, PRED_HIDDEN), DType::F32, device).unwrap(),
+            lstm_l0: zero_lstm(device),
+            lstm_l1: zero_lstm(device),
+            blank_idx: 2,
+        }
+    }
 
     #[test]
     fn parakeet_argmax_selects_half_logits_on_device() {
@@ -1558,5 +1679,109 @@ mod tests {
         let err = argmax_1d(&logits).expect_err("empty logits should be rejected");
 
         assert!(format!("{err}").contains("Parakeet argmax received empty logits"));
+    }
+
+    #[test]
+    fn predictor_native_batch_matches_independent_scalar_rows() {
+        let device = Device::Cpu;
+        let predictor = zero_predictor(&device);
+        let labels = [0usize, predictor.blank_idx];
+        let mut batch_state = predictor.initial_state(labels.len(), &device).unwrap();
+        let batch = predictor
+            .step_batch(&labels, &mut batch_state, &device)
+            .unwrap();
+
+        let mut scalar_outputs = Vec::new();
+        let mut scalar_states = Vec::new();
+        for label in labels {
+            let mut state = predictor.initial_state(1, &device).unwrap();
+            scalar_outputs.push(predictor.step(label, &mut state, &device).unwrap());
+            scalar_states.push(state);
+        }
+        let output_refs = scalar_outputs.iter().collect::<Vec<_>>();
+        let expected = Tensor::cat(&output_refs, 0).unwrap();
+        assert_eq!(
+            batch.to_vec3::<f32>().unwrap(),
+            expected.to_vec3::<f32>().unwrap()
+        );
+        for (batched, scalar_component) in [
+            (
+                &batch_state.h0,
+                scalar_states
+                    .iter()
+                    .map(|state| &state.h0)
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                &batch_state.c0,
+                scalar_states
+                    .iter()
+                    .map(|state| &state.c0)
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                &batch_state.h1,
+                scalar_states
+                    .iter()
+                    .map(|state| &state.h1)
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                &batch_state.c1,
+                scalar_states
+                    .iter()
+                    .map(|state| &state.c1)
+                    .collect::<Vec<_>>(),
+            ),
+        ] {
+            let expected = Tensor::cat(&scalar_component, 0).unwrap();
+            assert_eq!(
+                batched.to_vec2::<f32>().unwrap(),
+                expected.to_vec2::<f32>().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn joint_native_batch_matches_independent_scalar_rows() {
+        let device = Device::Cpu;
+        let enc_hidden = 3usize;
+        let output_dim = 5usize;
+        let joint = Joint {
+            pred: Linear::new(
+                Tensor::zeros((PRED_HIDDEN, PRED_HIDDEN), DType::F32, &device).unwrap(),
+                None,
+            ),
+            enc: Linear::new(
+                Tensor::zeros((PRED_HIDDEN, enc_hidden), DType::F32, &device).unwrap(),
+                None,
+            ),
+            out: Linear::new(
+                Tensor::zeros((output_dim, PRED_HIDDEN), DType::F32, &device).unwrap(),
+                Some(Tensor::arange(0f32, output_dim as f32, &device).unwrap()),
+            ),
+            num_classes_with_blank: 3,
+            num_durations: 2,
+        };
+        let encoded = Tensor::zeros((2, enc_hidden), DType::F32, &device).unwrap();
+        let predictor = Tensor::zeros((2, 1, PRED_HIDDEN), DType::F32, &device).unwrap();
+        let batch = joint.joint_batch_rows(&encoded, &predictor).unwrap();
+        let mut scalar = Vec::new();
+        for row in 0..2 {
+            scalar.push(
+                joint
+                    .joint_batch_rows(
+                        &encoded.narrow(0, row, 1).unwrap(),
+                        &predictor.narrow(0, row, 1).unwrap(),
+                    )
+                    .unwrap(),
+            );
+        }
+        let refs = scalar.iter().collect::<Vec<_>>();
+        let expected = Tensor::cat(&refs, 0).unwrap();
+        assert_eq!(
+            batch.to_vec2::<f32>().unwrap(),
+            expected.to_vec2::<f32>().unwrap()
+        );
     }
 }
