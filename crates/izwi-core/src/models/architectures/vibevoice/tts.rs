@@ -921,6 +921,33 @@ impl VibeVoiceTtsModel {
         Ok(steps)
     }
 
+    pub(crate) fn retained_decode_batch_eligible(
+        &self,
+        state: &VibeVoiceTtsRetainedState,
+    ) -> Result<bool> {
+        self.validate_retained_state(state)?;
+        if state.active_quantum.is_some()
+            || state.staged_step.is_some()
+            || state.finished
+            || state.positive_position
+                != state.artifact.input_ids.len() + state.scaled_latents.len()
+            || state.negative_position != 1 + state.scaled_latents.len()
+            || state.scaled_latents.len() >= state.params.max_frames.max(1)
+        {
+            return Ok(false);
+        }
+        if state.scaled_latents.len() < MIN_FRAMES_BEFORE_STOP {
+            return Ok(true);
+        }
+        Ok(next_tts_control_token_from_hidden(
+            &self.language_model,
+            state.last_hidden.as_ref().ok_or_else(|| {
+                Error::InferenceError("VibeVoice retained TTS has no positive hidden".into())
+            })?,
+            self.tokenizer.specials(),
+        )? == self.tokenizer.specials().speech_pad)
+    }
+
     pub(crate) fn finalize_retained_state(
         &self,
         state: &VibeVoiceTtsRetainedState,

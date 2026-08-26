@@ -2614,7 +2614,10 @@ fn loaded_native_batch_support(request: &EngineCoreRequest) -> NativeBatchSuppor
                 .prepared_qwen_tts_model_for_executor()
                 .is_ok_and(|model| {
                     model.is_some_and(|model| model.supports_continuous_decode_batch())
-                }),
+                })
+                || request
+                    .prepared_vibevoice_tts_model_lease_for_executor()
+                    .is_ok_and(|model| model.is_some()),
         ),
         TaskType::SpeechToSpeech => (false, false),
     };

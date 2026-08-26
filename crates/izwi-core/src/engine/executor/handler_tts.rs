@@ -34,6 +34,55 @@ struct ContinuousLfm25TtsRow<'a> {
     prior_stream_sequence: usize,
 }
 
+struct ContinuousVibeVoiceTtsRow<'a> {
+    index: usize,
+    session: SessionKey,
+    lease: Option<ExecutorStateLease<'a, ActiveVibeVoiceTtsDecode>>,
+    checkpoint:
+        Option<crate::models::architectures::vibevoice::tts::VibeVoiceTtsRetainedCheckpoint>,
+    prior_frames: usize,
+    prior_stream_sequence: usize,
+}
+
+impl ContinuousVibeVoiceTtsRow<'_> {
+    fn rollback(&mut self) -> Result<()> {
+        let checkpoint = self.checkpoint.as_mut().ok_or_else(|| {
+            Error::InferenceError("VibeVoice TTS cohort checkpoint is absent".into())
+        })?;
+        let lease = self
+            .lease
+            .as_mut()
+            .ok_or_else(|| Error::InferenceError("VibeVoice TTS cohort lease is absent".into()))?;
+        let active = lease.require_state_mut()?;
+        active.state.rollback_managed_quantum(checkpoint)?;
+        active.last_frames_generated = self.prior_frames;
+        active.stream_sequence = self.prior_stream_sequence;
+        self.checkpoint = None;
+        lease.mark_clean();
+        Ok(())
+    }
+}
+
+struct ContinuousVibeVoiceTtsBatch<'a> {
+    rows: Vec<ContinuousVibeVoiceTtsRow<'a>>,
+    armed: bool,
+}
+
+impl Drop for ContinuousVibeVoiceTtsBatch<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        for row in &mut self.rows {
+            if row.checkpoint.is_some() {
+                if let Err(error) = row.rollback() {
+                    tracing::error!(request_id = %row.session.request_id, %error, "VibeVoice TTS cohort rollback failed");
+                }
+            }
+        }
+    }
+}
+
 impl<'a> ContinuousLfm25TtsRow<'a> {
     fn lease_mut(&mut self) -> Result<&mut ExecutorStateLease<'a, ActiveLfm25TtsDecode>> {
         self.lease.as_mut().ok_or_else(|| {
@@ -1909,6 +1958,240 @@ impl NativeExecutor {
             .collect()
     }
 
+    fn vibevoice_tts_decode_batch_with_managed(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+        mut managed: Vec<Option<super::RetainedRowManagedState>>,
+    ) -> Result<Vec<ModelSessionResult>> {
+        let mut outputs = (0..scheduled.len()).map(|_| None).collect::<Vec<_>>();
+        let mut native_indices = Vec::new();
+        let mut scalar_rows = 0usize;
+        let first_live = requests.iter().position(|request| !request.is_cancelled());
+        let Some(first_live) = first_live else {
+            return requests
+                .iter()
+                .map(|request| {
+                    Ok(ModelSessionResult::cancelled_before_dispatch(
+                        ExecutorOutput::cancelled(request.id.clone()),
+                    ))
+                })
+                .collect();
+        };
+        let model = requests[first_live]
+            .prepared_vibevoice_tts_model_lease_for_executor()?
+            .ok_or_else(|| Error::InferenceError("VibeVoice TTS cohort lost model".into()))?;
+        let model_arc = model.model_arc();
+        let cohort_params = requests[first_live]
+            .vibevoice_tts_generation_params_for_executor()?
+            .ok_or_else(|| Error::InferenceError("VibeVoice TTS cohort lost parameters".into()))?;
+        for index in 0..scheduled.len() {
+            if requests[index].is_cancelled() {
+                outputs[index] = Some(ModelSessionResult::cancelled_before_dispatch(
+                    ExecutorOutput::cancelled(requests[index].id.clone()),
+                ));
+                continue;
+            }
+            let row_model = requests[index]
+                .prepared_vibevoice_tts_model_lease_for_executor()?
+                .ok_or_else(|| Error::InferenceError("VibeVoice TTS row lost model".into()))?;
+            let row_params = requests[index]
+                .vibevoice_tts_generation_params_for_executor()?
+                .ok_or_else(|| Error::InferenceError("VibeVoice TTS row lost parameters".into()))?;
+            if !Arc::ptr_eq(&model_arc, &row_model.model_arc()) || row_params != cohort_params {
+                scalar_rows += 1;
+                outputs[index] = Some(self.vibevoice_tts_request_with_managed_cache(
+                    requests[index],
+                    &scheduled[index],
+                    managed[index].take(),
+                )?);
+                continue;
+            }
+            let inspect = ExecutorStateLease::checkout(
+                &self.vibevoice_tts_decode_states,
+                scheduled[index].session_key(),
+                Self::resolve_variant(requests[index])?,
+                "VibeVoice TTS cohort inspect",
+            )?;
+            let eligible = inspect
+                .state()
+                .map(|active| model.retained_decode_batch_eligible(&active.state))
+                .transpose()?
+                .unwrap_or(false);
+            inspect.restore()?;
+            if eligible {
+                native_indices.push(index);
+            } else {
+                scalar_rows += 1;
+                outputs[index] = Some(self.vibevoice_tts_request_with_managed_cache(
+                    requests[index],
+                    &scheduled[index],
+                    managed[index].take(),
+                )?);
+            }
+        }
+        if native_indices.len() == 1 {
+            let index = native_indices.pop().unwrap();
+            scalar_rows += 1;
+            outputs[index] = Some(self.vibevoice_tts_request_with_managed_cache(
+                requests[index],
+                &scheduled[index],
+                managed[index].take(),
+            )?);
+        } else if !native_indices.is_empty() {
+            let mut rows = Vec::with_capacity(native_indices.len());
+            let mut quanta = Vec::with_capacity(native_indices.len());
+            for index in native_indices.iter().copied() {
+                let mut retained = managed[index].take().ok_or_else(|| {
+                    Error::InferenceError("VibeVoice TTS cohort lost retained state".into())
+                })?;
+                let positive = retained
+                    .take_paged_domain(crate::kv::CacheDomainId::new(1), true)?
+                    .expect("required positive cache");
+                let negative = retained
+                    .take_paged_domain(crate::kv::CacheDomainId::new(2), true)?
+                    .expect("required negative cache");
+                retained.ensure_all_paged_consumed()?;
+                let _tensor = retained.tensor_state.clone().ok_or_else(|| {
+                    Error::InferenceError("VibeVoice TTS cohort lost tokenizer reservation".into())
+                })?;
+                let arena = requests[index]
+                    .managed_cache_runtime()
+                    .and_then(|runtime| runtime.tensor_state())
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::InferenceError("VibeVoice TTS cohort lost tokenizer arena".into())
+                    })?;
+                quanta.push(
+                    crate::models::architectures::vibevoice::tts::VibeVoiceTtsTokenizerQuantum {
+                        arena,
+                        transaction: crate::backends::state::PhysicalStateTransactionId::new(
+                            scheduled[index].plan_id,
+                        )?,
+                    },
+                );
+                let mut lease = ExecutorStateLease::checkout(
+                    &self.vibevoice_tts_decode_states,
+                    scheduled[index].session_key(),
+                    Self::resolve_variant(requests[index])?,
+                    "VibeVoice TTS cohort decode",
+                )?;
+                let active = lease.require_state_mut()?;
+                let prior_frames = active.last_frames_generated;
+                let prior_stream_sequence = active.stream_sequence;
+                let checkpoint = active.state.begin_managed_quantum(positive, negative)?;
+                lease.mark_dirty();
+                rows.push(ContinuousVibeVoiceTtsRow {
+                    index,
+                    session: scheduled[index].session_key(),
+                    lease: Some(lease),
+                    checkpoint: Some(checkpoint),
+                    prior_frames,
+                    prior_stream_sequence,
+                });
+            }
+            let mut batch = ContinuousVibeVoiceTtsBatch { rows, armed: true };
+            let steps = {
+                let mut states = batch
+                    .rows
+                    .iter_mut()
+                    .map(|row| {
+                        &mut row
+                            .lease
+                            .as_mut()
+                            .expect("armed VibeVoice lease")
+                            .require_state_mut()
+                            .expect("checked VibeVoice state")
+                            .state
+                    })
+                    .collect::<Vec<_>>();
+                Self::run_blocking(|| model.retained_decode_step_batch(&mut states, &quanta))?
+            };
+            crate::engine::metrics::record_engine_model_call(
+                crate::engine::metrics::EngineModelCall::NativeTensor {
+                    mode: crate::engine::NativeBatchMode::Continuous,
+                    rows: batch.rows.len(),
+                },
+            );
+            for (row_index, step) in steps.into_iter().enumerate() {
+                let row = &mut batch.rows[row_index];
+                let index = row.index;
+                if requests[index].is_cancelled() {
+                    row.rollback()?;
+                    row.lease
+                        .take()
+                        .expect("rolled back VibeVoice lease")
+                        .release()?;
+                    outputs[index] = Some(ModelSessionResult::cancelled(
+                        ExecutorOutput::cancelled(requests[index].id.clone()),
+                    ));
+                    continue;
+                }
+                let checkpoint = row.checkpoint.as_mut().expect("armed VibeVoice checkpoint");
+                let active = row
+                    .lease
+                    .as_mut()
+                    .expect("armed VibeVoice lease")
+                    .require_state_mut()?;
+                let completions = active.state.take_managed_write_completions();
+                active.state.commit_managed_quantum(checkpoint)?;
+                row.checkpoint = None;
+                let generated = step
+                    .frames_generated
+                    .saturating_sub(active.last_frames_generated);
+                active.last_frames_generated = step.frames_generated;
+                let _ = active.state.take_staged_step();
+                let (samples, sample_rate) = if step.finished {
+                    let output = model.finalize_retained_state(&active.state)?;
+                    (output.samples, output.sample_rate)
+                } else {
+                    (Vec::new(), 24_000)
+                };
+                row.lease
+                    .as_mut()
+                    .expect("armed VibeVoice lease")
+                    .mark_clean();
+                if step.finished {
+                    row.lease.take().expect("armed VibeVoice lease").release()?;
+                } else {
+                    row.lease.take().expect("armed VibeVoice lease").restore()?;
+                }
+                outputs[index] = Some(
+                    ModelSessionResult::sequence(ExecutorOutput {
+                        request_id: requests[index].id.clone(),
+                        audio: Some(AudioOutput::new(samples, sample_rate)),
+                        text: None,
+                        input_transcription: None,
+                        tokens_processed: 1,
+                        tokens_generated: generated,
+                        finished: step.finished,
+                        phase_timing_override: None,
+                        asr_diagnostics: None,
+                        error: None,
+                    })
+                    .with_managed_cache_completions(completions),
+                );
+            }
+            batch.armed = false;
+        }
+        if scalar_rows > 0 {
+            crate::engine::metrics::record_engine_model_call(
+                crate::engine::metrics::EngineModelCall::ScalarRows {
+                    envelope: crate::engine::NativeBatchMode::Continuous,
+                    rows: scalar_rows,
+                },
+            );
+        }
+        outputs
+            .into_iter()
+            .map(|output| {
+                output.ok_or_else(|| {
+                    Error::InferenceError("VibeVoice TTS row produced no output".into())
+                })
+            })
+            .collect()
+    }
+
     pub(super) fn tts_decode_batch_with_managed(
         &self,
         requests: &[&EngineCoreRequest],
@@ -1942,6 +2225,17 @@ impl NativeExecutor {
                 .is_some_and(|variant| variant.family() == ModelFamily::Lfm25Audio)
         }) {
             return self.lfm25_audio_tts_decode_batch_with_managed(
+                &ordered_requests,
+                scheduled,
+                managed_caches,
+            );
+        }
+        if ordered_requests.first().is_some_and(|request| {
+            request
+                .model_variant
+                .is_some_and(|variant| variant.family() == ModelFamily::VibeVoiceTts)
+        }) {
+            return self.vibevoice_tts_decode_batch_with_managed(
                 &ordered_requests,
                 scheduled,
                 managed_caches,
