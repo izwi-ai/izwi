@@ -4152,6 +4152,27 @@ pub struct FishS2TtsModelLease {
     inner: TrackedModelLease<FishS2TtsModel>,
 }
 
+/// A loaded Voxtral TTS handle that fences unload for the exact model
+/// instance retained by an admitted incremental request.
+#[derive(Clone)]
+pub struct VoxtralTtsModelLease {
+    inner: TrackedModelLease<VoxtralTtsModel>,
+}
+
+impl VoxtralTtsModelLease {
+    pub(crate) fn model_arc(&self) -> Arc<VoxtralTtsModel> {
+        self.inner.model.clone()
+    }
+}
+
+impl Deref for VoxtralTtsModelLease {
+    type Target = VoxtralTtsModel;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
 impl FishS2TtsModelLease {
     pub(crate) fn model_arc(&self) -> Arc<FishS2TtsModel> {
         self.inner.model.clone()
@@ -5199,7 +5220,7 @@ pub struct ModelRegistry {
     chat_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<NativeChatModel>>>>>,
     voxtral_models:
         Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<VoxtralRealtimeModel>>>>>,
-    voxtral_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<VoxtralTtsModel>>>>>>,
+    voxtral_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<VoxtralTtsModel>>>>>,
     vibevoice_tts_models:
         Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<VibeVoiceTtsModel>>>>>,
     fish_s2_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<FishS2TtsModel>>>>>,
@@ -5575,8 +5596,8 @@ impl ModelRegistry {
 
         {
             let guard = self.voxtral_tts_models.read().await;
-            for (variant, cell) in guard.iter() {
-                if cell.get().is_some() {
+            for (variant, entry) in guard.iter() {
+                if entry.ready_model().is_some() {
                     diagnostics.push(loaded_model_diagnostics_entry(
                         &self.device,
                         *variant,
@@ -6061,12 +6082,18 @@ impl ModelRegistry {
             Error::InvalidInput(format!("Unsupported Voxtral TTS model variant: {variant}"))
         })?;
 
-        let cell = {
+        let (entry, loading_guard) = {
             let mut guard = self.voxtral_tts_models.write().await;
-            guard
+            let entry = guard
                 .entry(variant)
-                .or_insert_with(|| Arc::new(OnceCell::new()))
-                .clone()
+                .or_insert_with(|| Arc::new(TrackedModelEntry::default()))
+                .clone();
+            let loading_guard = entry.uses.acquire().ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "Voxtral TTS model {variant} exceeded its active-use accounting capacity"
+                ))
+            })?;
+            (entry, loading_guard)
         };
 
         info!(
@@ -6074,7 +6101,8 @@ impl ModelRegistry {
             registration.name
         );
 
-        let model = cell
+        entry
+            .model
             .get_or_try_init({
                 let model_dir = model_dir.to_path_buf();
                 let device = self.device.clone();
@@ -6087,8 +6115,19 @@ impl ModelRegistry {
                 }
             })
             .await?;
-
-        Ok(model.clone())
+        let model = {
+            let guard = self.voxtral_tts_models.read().await;
+            guard
+                .get(&variant)
+                .filter(|current| Arc::ptr_eq(current, &entry))
+                .and_then(|current| current.model.get().cloned())
+        };
+        drop(loading_guard);
+        model.ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "Voxtral TTS model {variant} load was superseded before publication"
+            ))
+        })
     }
 
     pub async fn load_vibevoice_tts(
@@ -6439,12 +6478,51 @@ impl ModelRegistry {
 
     pub async fn get_voxtral_tts(&self, variant: ModelVariant) -> Option<Arc<VoxtralTtsModel>> {
         let guard = self.voxtral_tts_models.read().await;
-        guard.get(&variant).and_then(|cell| cell.get().cloned())
+        guard.get(&variant).and_then(|entry| entry.ready_model())
     }
 
     pub fn try_get_voxtral_tts(&self, variant: ModelVariant) -> Option<Arc<VoxtralTtsModel>> {
         let guard = self.voxtral_tts_models.try_read().ok()?;
-        guard.get(&variant).and_then(|cell| cell.get().cloned())
+        guard.get(&variant).and_then(|entry| entry.ready_model())
+    }
+
+    pub async fn get_voxtral_tts_lease(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<VoxtralTtsModelLease> {
+        let guard = self.voxtral_tts_models.read().await;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire_ready())
+            .map(|inner| VoxtralTtsModelLease { inner })
+    }
+
+    pub fn try_get_voxtral_tts_lease(&self, variant: ModelVariant) -> Option<VoxtralTtsModelLease> {
+        let guard = self.voxtral_tts_models.try_read().ok()?;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire_ready())
+            .map(|inner| VoxtralTtsModelLease { inner })
+    }
+
+    pub(crate) async fn get_loading_voxtral_tts(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<Arc<VoxtralTtsModel>> {
+        let guard = self.voxtral_tts_models.read().await;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.model.get().cloned())
+    }
+
+    pub(crate) async fn publish_voxtral_tts_ready(&self, variant: ModelVariant) -> Result<()> {
+        let guard = self.voxtral_tts_models.read().await;
+        let entry = guard.get(&variant).ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "cannot publish missing Voxtral TTS model {variant} as ready"
+            ))
+        })?;
+        entry.publish_ready()
     }
 
     pub async fn get_vibevoice_tts(&self, variant: ModelVariant) -> Option<Arc<VibeVoiceTtsModel>> {
@@ -6643,8 +6721,17 @@ impl ModelRegistry {
     }
 
     pub async fn unload_voxtral_tts(&self, variant: ModelVariant) {
-        let mut guard = self.voxtral_tts_models.write().await;
-        guard.remove(&variant);
+        let entry = {
+            let mut guard = self.voxtral_tts_models.write().await;
+            let entry = guard.remove(&variant);
+            if let Some(entry) = &entry {
+                entry.reset_ready();
+            }
+            entry
+        };
+        if let Some(entry) = entry {
+            entry.uses.wait_until_idle().await;
+        }
     }
 
     pub async fn unload_vibevoice_tts(&self, variant: ModelVariant) {

@@ -2095,7 +2095,7 @@ impl ModelLifecycleController {
                 }
                 let model = self
                     .model_registry
-                    .get_voxtral_tts(variant)
+                    .get_loading_voxtral_tts(variant)
                     .await
                     .ok_or_else(|| {
                         Error::ModelLoadError(format!(
@@ -2155,6 +2155,11 @@ impl ModelLifecycleController {
             if variant.family() == crate::catalog::ModelFamily::FishS2Tts {
                 self.model_registry
                     .publish_fish_s2_tts_ready(variant)
+                    .await?;
+            }
+            if variant.family() == crate::catalog::ModelFamily::VoxtralTts {
+                self.model_registry
+                    .publish_voxtral_tts_ready(variant)
                     .await?;
             }
             self.touch_model_usage(variant).await;
