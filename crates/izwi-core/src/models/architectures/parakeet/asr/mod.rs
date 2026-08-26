@@ -23,6 +23,7 @@ use crate::kv::v2::{
     StateComponentId, StateUpdateKind,
 };
 use crate::model::ModelVariant;
+use crate::models::shared::memory::accounting::TensorStorageAccounting;
 use crate::models::shared::weights::mlx;
 use crate::tokenizer::Tokenizer;
 
@@ -48,6 +49,62 @@ pub struct ParakeetAsrTranscriptionOutput {
     pub text: String,
     pub language: Option<String>,
     pub diagnostics: Option<serde_json::Value>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ParakeetPreparedEncoderArtifact {
+    encoded: Tensor,
+    encoded_len: usize,
+    input_samples: usize,
+    input_sample_rate: u32,
+    resampled_samples: usize,
+    feature_frames: usize,
+    language: Option<String>,
+}
+
+impl ParakeetPreparedEncoderArtifact {
+    pub(crate) fn decode_budget(&self, max_symbols: usize) -> Result<usize> {
+        self.encoded_len
+            .checked_mul(max_symbols)
+            .and_then(|value| value.checked_mul(8))
+            .map(|value| value.max(1))
+            .ok_or_else(|| Error::Overloaded("Parakeet retained decode budget overflowed".into()))
+    }
+
+    pub(crate) fn resident_tensor_bytes(&self) -> Result<u64> {
+        let mut accounting = TensorStorageAccounting::default();
+        accounting.add_tensor(&self.encoded).ok_or_else(|| {
+            Error::Overloaded("Parakeet encoder artifact storage accounting overflowed".into())
+        })?;
+        Ok(accounting.bytes())
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ParakeetRetainedDecodeState {
+    predictor: ParakeetPredictorBatchState,
+    predictor_out: Tensor,
+    t: usize,
+    last_emit_t: usize,
+    emit_count_at_t: usize,
+    guard_steps: usize,
+    token_ids: Vec<usize>,
+    assembled: String,
+    counters: ParakeetDecodeCounters,
+    finished: bool,
+}
+
+pub(crate) struct ParakeetRetainedDecodeBatchRow<'a> {
+    pub(crate) artifact: &'a ParakeetPreparedEncoderArtifact,
+    pub(crate) state: &'a mut ParakeetRetainedDecodeState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParakeetRetainedDecodeStep {
+    pub(crate) delta: String,
+    pub(crate) text: String,
+    pub(crate) tokens_generated: usize,
+    pub(crate) finished: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -155,6 +212,193 @@ impl ParakeetAsrModel {
         stage_graphs: &[&[StageDescriptor]],
     ) -> Result<ParakeetPhysicalStateSpec> {
         physical::parakeet_physical_state_spec(stage_graphs)
+    }
+
+    pub(crate) fn prepare_retained_encoder(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+    ) -> Result<ParakeetPreparedEncoderArtifact> {
+        if audio.is_empty() {
+            return Err(Error::InvalidInput("Empty audio input".into()));
+        }
+        let mono = if sample_rate == SAMPLE_RATE {
+            audio.to_vec()
+        } else {
+            resample_linear(audio, sample_rate, SAMPLE_RATE)
+        };
+        let (features, feature_frames, _) = self
+            .preprocessor
+            .compute_features_with_upload_timing(&mono)?;
+        let mut timings = ParakeetTimings::default();
+        let (encoded, encoded_len) =
+            self.network
+                .encode_with_timings(&features, feature_frames, &mut timings)?;
+        if encoded_len == 0 {
+            return Err(Error::InferenceError(
+                "Parakeet encoder produced no decodable frames".into(),
+            ));
+        }
+        Ok(ParakeetPreparedEncoderArtifact {
+            encoded,
+            encoded_len,
+            input_samples: audio.len(),
+            input_sample_rate: sample_rate,
+            resampled_samples: mono.len(),
+            feature_frames,
+            language: language.map(ToOwned::to_owned),
+        })
+    }
+
+    pub(crate) fn start_retained_decode(&self) -> Result<ParakeetRetainedDecodeState> {
+        let mut predictor = self.new_predictor_batch_state(1)?;
+        let predictor_out = self.predictor_step_batch(&[self.blank_idx], &mut predictor)?;
+        Ok(ParakeetRetainedDecodeState {
+            predictor,
+            predictor_out,
+            t: 0,
+            last_emit_t: usize::MAX,
+            emit_count_at_t: 0,
+            guard_steps: 0,
+            token_ids: Vec::new(),
+            assembled: String::new(),
+            counters: ParakeetDecodeCounters::default(),
+            finished: false,
+        })
+    }
+
+    pub(crate) fn retained_decode_step_batch(
+        &self,
+        rows: &mut [ParakeetRetainedDecodeBatchRow<'_>],
+    ) -> Result<Vec<ParakeetRetainedDecodeStep>> {
+        if rows.is_empty() || rows.iter().any(|row| row.state.finished) {
+            return Err(Error::InvalidInput(
+                "Parakeet retained cohort requires live rows".into(),
+            ));
+        }
+        let checkpoints = rows.iter().map(|row| row.state.clone()).collect::<Vec<_>>();
+        let result = (|| {
+            let encoded_rows = rows
+                .iter()
+                .map(|row| {
+                    if row.state.t >= row.artifact.encoded_len {
+                        return Err(Error::InferenceError(
+                            "Parakeet retained cursor exceeded encoder artifact".into(),
+                        ));
+                    }
+                    row.artifact
+                        .encoded
+                        .i((0, row.state.t, ..))?
+                        .unsqueeze(0)
+                        .map_err(Error::from)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let encoded_refs = encoded_rows.iter().collect::<Vec<_>>();
+            let encoded = Tensor::cat(&encoded_refs, 0)?;
+            let predictor_rows = rows
+                .iter()
+                .map(|row| &row.state.predictor_out)
+                .collect::<Vec<_>>();
+            let predictor = Tensor::cat(&predictor_rows, 0)?;
+            let logits = self
+                .joint_batch_rows(&encoded, &predictor)?
+                .to_vec2::<f32>()?;
+            let mut emitted = Vec::new();
+            for (index, (row, logits)) in rows.iter_mut().zip(&logits).enumerate() {
+                let token_end = self.blank_idx + 1;
+                if logits.len() < token_end + self.num_durations {
+                    return Err(Error::InferenceError(
+                        "Parakeet retained joint output has invalid geometry".into(),
+                    ));
+                }
+                let label = argmax_slice(&logits[..token_end])?;
+                let duration =
+                    argmax_slice(&logits[token_end..])?.min(self.num_durations.saturating_sub(1));
+                let mut jump = duration;
+                if label == self.blank_idx && jump == 0 {
+                    jump = 1;
+                }
+                let t_cur = row.state.t;
+                row.state.t = row.state.t.saturating_add(jump);
+                row.state.guard_steps = row.state.guard_steps.saturating_add(1);
+                row.state.counters.tdt_joint_steps =
+                    row.state.counters.tdt_joint_steps.saturating_add(1);
+                row.state.counters.device_argmax_scalar_reads = row
+                    .state
+                    .counters
+                    .device_argmax_scalar_reads
+                    .saturating_add(2);
+                if label == self.blank_idx {
+                    row.state.counters.tdt_blank_steps =
+                        row.state.counters.tdt_blank_steps.saturating_add(1);
+                    continue;
+                }
+                if t_cur == row.state.last_emit_t {
+                    row.state.emit_count_at_t = row.state.emit_count_at_t.saturating_add(1);
+                } else {
+                    row.state.last_emit_t = t_cur;
+                    row.state.emit_count_at_t = 1;
+                }
+                if row.state.emit_count_at_t > self.max_symbols {
+                    row.state.t = t_cur.saturating_add(1);
+                    continue;
+                }
+                row.state.token_ids.push(label);
+                emitted.push((index, label));
+            }
+            if !emitted.is_empty() {
+                let refs = emitted
+                    .iter()
+                    .map(|(index, _)| &rows[*index].state.predictor)
+                    .collect::<Vec<_>>();
+                let mut cohort = ParakeetPredictorBatchState::gather_rows(&refs)?;
+                let labels = emitted.iter().map(|(_, label)| *label).collect::<Vec<_>>();
+                let outputs = self.predictor_step_batch(&labels, &mut cohort)?;
+                let mut scattered = emitted
+                    .iter()
+                    .map(|(index, _)| rows[*index].state.predictor.clone())
+                    .collect::<Vec<_>>();
+                let mut targets = scattered.iter_mut().collect::<Vec<_>>();
+                cohort.scatter_rows(&mut targets)?;
+                drop(targets);
+                for ((cohort_index, (row_index, _)), predictor) in
+                    emitted.iter().enumerate().zip(scattered)
+                {
+                    rows[*row_index].state.predictor = predictor;
+                    rows[*row_index].state.predictor_out =
+                        outputs.narrow(0, cohort_index, 1)?.contiguous()?;
+                }
+            }
+            let mut steps = Vec::with_capacity(rows.len());
+            for row in rows.iter_mut() {
+                let previous = row.state.assembled.clone();
+                row.state.assembled = self.decoder.decode(&row.state.token_ids);
+                let delta = text_delta(&previous, &row.state.assembled);
+                let guard_limit = row
+                    .artifact
+                    .encoded_len
+                    .saturating_mul(self.max_symbols)
+                    .saturating_mul(8)
+                    .max(512);
+                row.state.finished =
+                    row.state.t >= row.artifact.encoded_len || row.state.guard_steps >= guard_limit;
+                row.state.counters.tdt_emitted_tokens = row.state.token_ids.len();
+                steps.push(ParakeetRetainedDecodeStep {
+                    delta,
+                    text: row.state.assembled.clone(),
+                    tokens_generated: row.state.token_ids.len(),
+                    finished: row.state.finished,
+                });
+            }
+            Ok(steps)
+        })();
+        if result.is_err() {
+            for (row, checkpoint) in rows.iter_mut().zip(checkpoints) {
+                *row.state = checkpoint;
+            }
+        }
+        result
     }
 
     pub fn load(
@@ -1663,6 +1907,30 @@ fn argmax_1d(x: &Tensor) -> Result<usize> {
     let idx = idx.to_dtype(DType::U32)?.to_scalar::<u32>()?;
     usize::try_from(idx)
         .map_err(|_| Error::InferenceError(format!("Parakeet argmax index exceeds usize: {idx}")))
+}
+
+fn argmax_slice(values: &[f32]) -> Result<usize> {
+    let mut values = values.iter().copied().enumerate();
+    let (mut best_index, mut best_value) = values.next().ok_or_else(|| {
+        Error::InferenceError("Parakeet argmax received empty logits".to_string())
+    })?;
+    if !best_value.is_finite() {
+        return Err(Error::InferenceError(
+            "Parakeet argmax received non-finite logits".to_string(),
+        ));
+    }
+    for (index, value) in values {
+        if !value.is_finite() {
+            return Err(Error::InferenceError(
+                "Parakeet argmax received non-finite logits".to_string(),
+            ));
+        }
+        if value > best_value {
+            best_index = index;
+            best_value = value;
+        }
+    }
+    Ok(best_index)
 }
 
 fn resample_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
