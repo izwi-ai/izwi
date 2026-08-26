@@ -2727,8 +2727,15 @@ impl ModelExecutor for NativeExecutor {
                             .and_then(|registry| registry.try_get_qwen_tts(variant))
                     })
                     .is_some()
+                    || request
+                        .prepared_vibevoice_tts_model_lease_for_executor()
+                        .is_ok_and(|model| model.is_some())
                     || (self.config.model_registry.is_none() && self.loaded_tts_model.is_some());
-                loaded.then_some(variant.family() == crate::catalog::ModelFamily::Qwen3Tts)
+                loaded.then_some(matches!(
+                    variant.family(),
+                    crate::catalog::ModelFamily::Qwen3Tts
+                        | crate::catalog::ModelFamily::VibeVoiceTts
+                ))
             }
             super::types::TaskType::SpeechToSpeech => self
                 .config
@@ -2760,7 +2767,11 @@ impl ModelExecutor for NativeExecutor {
                     variant.family() == crate::catalog::ModelFamily::Qwen3Asr
                 }
                 super::types::TaskType::TTS => {
-                    variant.family() == crate::catalog::ModelFamily::Qwen3Tts
+                    matches!(
+                        variant.family(),
+                        crate::catalog::ModelFamily::Qwen3Tts
+                            | crate::catalog::ModelFamily::VibeVoiceTts
+                    )
                 }
                 super::types::TaskType::SpeechToSpeech => false,
             });
@@ -2778,7 +2789,14 @@ impl ModelExecutor for NativeExecutor {
                 .prepared_qwen_tts_model_for_executor()
                 .ok()
                 .flatten()
-                .map(|model| model.supports_resumable_prefill()),
+                .map(|model| model.supports_resumable_prefill())
+                .or_else(|| {
+                    request
+                        .prepared_vibevoice_tts_model_lease_for_executor()
+                        .ok()
+                        .flatten()
+                        .map(|_| true)
+                }),
             super::types::TaskType::SpeechToSpeech => None,
         };
 

@@ -268,8 +268,8 @@ pub(crate) struct VibeVoiceTtsRetainedCheckpoint {
 }
 
 struct VibeVoiceTtsRetainedCheckpointPayload {
-    positive_cache: PhysicalPagedKvCache,
-    negative_cache: PhysicalPagedKvCache,
+    positive_cache: Option<PhysicalPagedKvCache>,
+    negative_cache: Option<PhysicalPagedKvCache>,
     positive_position: usize,
     negative_position: usize,
     last_hidden: Option<Tensor>,
@@ -605,6 +605,38 @@ impl VibeVoiceTtsModel {
             staged_step: None,
             managed_completions_drained: true,
         })
+    }
+
+    pub(crate) fn new_retained_state_in_quantum(
+        &self,
+        artifact: Arc<VibeVoiceTtsPreparedArtifact>,
+        params: VibeVoiceTtsGenerationParams,
+        positive_cache: PhysicalPagedKvCache,
+        negative_cache: PhysicalPagedKvCache,
+    ) -> Result<(VibeVoiceTtsRetainedState, VibeVoiceTtsRetainedCheckpoint)> {
+        let mut state =
+            self.new_retained_state(artifact, params, positive_cache, negative_cache)?;
+        state.active_quantum = Some(1);
+        state.next_quantum = 2;
+        let checkpoint = VibeVoiceTtsRetainedCheckpoint {
+            state_id: state.state_id,
+            quantum: 1,
+            payload: Some(VibeVoiceTtsRetainedCheckpointPayload {
+                positive_cache: None,
+                negative_cache: None,
+                positive_position: 0,
+                negative_position: 0,
+                last_hidden: None,
+                negative_last_hidden: None,
+                acoustic_clock: 0,
+                semantic_clock: 0,
+                scaled_latents: Vec::new(),
+                finished: false,
+                staged_step: None,
+                managed_completions_drained: true,
+            }),
+        };
+        Ok((state, checkpoint))
     }
 
     pub(crate) fn retained_prefill_step(
@@ -1601,8 +1633,8 @@ impl VibeVoiceTtsRetainedState {
             state_id: self.state_id,
             quantum,
             payload: Some(VibeVoiceTtsRetainedCheckpointPayload {
-                positive_cache: std::mem::replace(&mut self.positive_cache, positive_cache),
-                negative_cache: std::mem::replace(&mut self.negative_cache, negative_cache),
+                positive_cache: Some(std::mem::replace(&mut self.positive_cache, positive_cache)),
+                negative_cache: Some(std::mem::replace(&mut self.negative_cache, negative_cache)),
                 positive_position: self.positive_position,
                 negative_position: self.negative_position,
                 last_hidden: self.last_hidden.clone(),
@@ -1640,8 +1672,16 @@ impl VibeVoiceTtsRetainedState {
         let payload = checkpoint.payload.take().ok_or_else(|| {
             Error::InferenceError("VibeVoice TTS checkpoint was already consumed".into())
         })?;
-        self.positive_cache = payload.positive_cache;
-        self.negative_cache = payload.negative_cache;
+        self.positive_cache = payload.positive_cache.ok_or_else(|| {
+            Error::InferenceError(
+                "initial VibeVoice TTS quantum must be discarded on rollback".into(),
+            )
+        })?;
+        self.negative_cache = payload.negative_cache.ok_or_else(|| {
+            Error::InferenceError(
+                "initial VibeVoice TTS quantum must be discarded on rollback".into(),
+            )
+        })?;
         self.positive_position = payload.positive_position;
         self.negative_position = payload.negative_position;
         self.last_hidden = payload.last_hidden;

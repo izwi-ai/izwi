@@ -14,7 +14,9 @@ use super::super::request::EngineCoreRequest;
 use super::super::scheduler::ScheduledRequest;
 use super::super::types::AudioOutput;
 use super::super::SessionKey;
-use super::state::{ActiveLfm25TtsDecode, ActiveQwenTtsDecode, QwenTtsPhysicalState};
+use super::state::{
+    ActiveLfm25TtsDecode, ActiveQwenTtsDecode, ActiveVibeVoiceTtsDecode, QwenTtsPhysicalState,
+};
 use super::{
     ExecutorOutput, ExecutorPhaseTiming, ExecutorStateLease, ModelSessionResult, NativeExecutor,
 };
@@ -432,6 +434,163 @@ impl NativeExecutor {
             text: ref_text.to_string(),
             sample_rate,
         }))
+    }
+
+    pub(super) fn vibevoice_tts_request_with_managed_cache(
+        &self,
+        request: &EngineCoreRequest,
+        scheduled: &ScheduledRequest,
+        retained: Option<super::RetainedRowManagedState>,
+    ) -> Result<ModelSessionResult> {
+        let variant = Self::resolve_variant(request)?;
+        let model = request
+            .prepared_vibevoice_tts_model_lease_for_executor()?
+            .ok_or_else(|| Error::InferenceError("VibeVoice TTS lost model residency".into()))?;
+        let mut retained = retained.ok_or_else(|| {
+            Error::InferenceError("VibeVoice TTS lost retained physical state".into())
+        })?;
+        let positive = retained
+            .take_paged_domain(crate::kv::CacheDomainId::new(1), true)?
+            .expect("required VibeVoice positive cache");
+        let negative = retained
+            .take_paged_domain(crate::kv::CacheDomainId::new(2), true)?
+            .expect("required VibeVoice negative cache");
+        retained.ensure_all_paged_consumed()?;
+        let _tensor = retained.tensor_state.clone().ok_or_else(|| {
+            Error::InferenceError("VibeVoice TTS lost tokenizer reservation".into())
+        })?;
+        let arena = request
+            .managed_cache_runtime()
+            .and_then(|runtime| runtime.tensor_state())
+            .cloned()
+            .ok_or_else(|| Error::InferenceError("VibeVoice TTS lost tokenizer arena".into()))?;
+        let mut lease = ExecutorStateLease::checkout(
+            &self.vibevoice_tts_decode_states,
+            scheduled.session_key(),
+            variant,
+            "VibeVoice TTS decode",
+        )?;
+        if lease.state().is_some_and(|active| {
+            active.variant != variant || !Arc::ptr_eq(&active.model.model_arc(), &model.model_arc())
+        }) {
+            lease.discard_state();
+        }
+        let fresh = lease.state().is_none();
+        let mut checkpoint = if fresh {
+            let artifact = request
+                .prepared_vibevoice_tts_artifact_for_executor()?
+                .ok_or_else(|| Error::InferenceError("VibeVoice TTS lost prompt".into()))?;
+            let params = request
+                .vibevoice_tts_generation_params_for_executor()?
+                .ok_or_else(|| Error::InferenceError("VibeVoice TTS lost geometry".into()))?;
+            let (state, checkpoint) =
+                model.new_retained_state_in_quantum(artifact, params, positive, negative)?;
+            lease.install_state(ActiveVibeVoiceTtsDecode {
+                variant,
+                model: model.clone(),
+                state,
+                last_frames_generated: 0,
+                stream_sequence: 0,
+            })?;
+            checkpoint
+        } else {
+            lease
+                .require_state_mut()?
+                .state
+                .begin_managed_quantum(positive, negative)?
+        };
+        lease.mark_dirty();
+        let result = (|| {
+            let active = lease.require_state_mut()?;
+            let step = if scheduled.is_prefill {
+                let step = model.retained_prefill_step(&mut active.state, scheduled.num_tokens)?;
+                if step.consumed_positive_tokens != scheduled.num_tokens {
+                    return Err(Error::InferenceError(
+                        "VibeVoice TTS prefill progress differs from scheduler".into(),
+                    ));
+                }
+                None
+            } else {
+                let transaction =
+                    crate::backends::state::PhysicalStateTransactionId::new(scheduled.plan_id)?;
+                Some(model.retained_decode_step(
+                    &mut active.state,
+                    &crate::models::architectures::vibevoice::tts::VibeVoiceTtsTokenizerQuantum {
+                        arena: arena.clone(),
+                        transaction,
+                    },
+                )?)
+            };
+            if request.is_cancelled() {
+                return Err(Error::Cancelled(request.id.clone()));
+            }
+            Ok::<_, Error>(step)
+        })();
+        let step = match result {
+            Ok(step) if !request.is_cancelled() => step,
+            result => {
+                if fresh {
+                    let _ = lease
+                        .require_state_mut()?
+                        .state
+                        .take_managed_write_completions();
+                    lease.discard_state();
+                } else {
+                    lease
+                        .require_state_mut()?
+                        .state
+                        .rollback_managed_quantum(&mut checkpoint)?;
+                }
+                lease.mark_clean();
+                return result.and_then(|_| Err(Error::Cancelled(request.id.clone())));
+            }
+        };
+        let completions = lease
+            .require_state_mut()?
+            .state
+            .take_managed_write_completions();
+        lease
+            .require_state_mut()?
+            .state
+            .commit_managed_quantum(&mut checkpoint)?;
+        let active = lease.require_state_mut()?;
+        let generated = step
+            .as_ref()
+            .map(|step| {
+                step.frames_generated
+                    .saturating_sub(active.last_frames_generated)
+            })
+            .unwrap_or(0);
+        if let Some(step) = &step {
+            active.last_frames_generated = step.frames_generated;
+            let _ = active.state.take_staged_step();
+        }
+        let finished = step.as_ref().is_some_and(|step| step.finished);
+        let (samples, sample_rate) = if finished {
+            let output = model.finalize_retained_state(&active.state)?;
+            (output.samples, output.sample_rate)
+        } else {
+            (Vec::new(), 24_000)
+        };
+        lease.mark_clean();
+        if finished {
+            lease.release()?;
+        } else {
+            lease.restore()?;
+        }
+        Ok(ModelSessionResult::sequence(ExecutorOutput {
+            request_id: request.id.clone(),
+            audio: Some(AudioOutput::new(samples, sample_rate)),
+            text: None,
+            input_transcription: None,
+            tokens_processed: scheduled.num_tokens,
+            tokens_generated: generated,
+            finished,
+            phase_timing_override: None,
+            asr_diagnostics: None,
+            error: None,
+        })
+        .with_managed_cache_completions(completions))
     }
 
     pub(super) fn lfm25_audio_tts_request_with_managed_cache(
