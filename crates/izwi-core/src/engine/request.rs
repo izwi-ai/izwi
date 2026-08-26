@@ -28,6 +28,7 @@ use crate::models::architectures::lfm25_audio::{
     lfm25_audio_tts_system_prompt, model::Lfm25AudioPreparedAsrArtifact,
     tts_retained::Lfm25AudioPreparedTtsArtifact, Lfm25AudioGenerationConfig,
 };
+use crate::models::architectures::parakeet::asr::ParakeetPreparedEncoderArtifact;
 use crate::models::architectures::qwen3::asr::Qwen3AsrPreparedAudio;
 use crate::models::architectures::qwen3::tts::{
     Qwen3TtsModel, SpeakerReference, TtsGenerationParams, TtsSessionCacheRequest,
@@ -925,6 +926,7 @@ enum PreparedAsrEncoderArtifactValue {
     VibeVoice(Arc<VibeVoiceAsrPreparedArtifact>),
     GraniteSpeech(Arc<GraniteSpeechPreparedPromptArtifact>),
     Lfm25Audio(Arc<Lfm25AudioPreparedAsrArtifact>),
+    Parakeet(Arc<ParakeetPreparedEncoderArtifact>),
 }
 
 impl fmt::Debug for PreparedAsrEncoderArtifact {
@@ -946,6 +948,7 @@ impl PreparedAsrEncoderArtifactValue {
             Self::VibeVoice(_) => "vibevoice",
             Self::GraniteSpeech(_) => "granite_speech",
             Self::Lfm25Audio(_) => "lfm25_audio",
+            Self::Parakeet(_) => "parakeet",
         }
     }
 
@@ -962,13 +965,18 @@ impl PreparedAsrEncoderArtifactValue {
             Self::Lfm25Audio(value) => {
                 Ok((value.retained_host_bytes, value.retained_resident_bytes))
             }
+            Self::Parakeet(value) => Ok((0, value.resident_tensor_bytes()?)),
         }
     }
 
     fn clocked_state_projections(&self) -> &[ClockedStateProjection] {
         match self {
             Self::VibeVoice(value) => value.tokenizer_state_projections(),
-            Self::Qwen3(_) | Self::Whisper(_) | Self::GraniteSpeech(_) | Self::Lfm25Audio(_) => &[],
+            Self::Qwen3(_)
+            | Self::Whisper(_)
+            | Self::GraniteSpeech(_)
+            | Self::Lfm25Audio(_)
+            | Self::Parakeet(_) => &[],
         }
     }
 }
@@ -2759,7 +2767,8 @@ impl EngineCoreRequest {
             PreparedAsrEncoderArtifactValue::Whisper(_)
             | PreparedAsrEncoderArtifactValue::VibeVoice(_)
             | PreparedAsrEncoderArtifactValue::GraniteSpeech(_)
-            | PreparedAsrEncoderArtifactValue::Lfm25Audio(_) => Err(Error::InvalidInput(
+            | PreparedAsrEncoderArtifactValue::Lfm25Audio(_)
+            | PreparedAsrEncoderArtifactValue::Parakeet(_) => Err(Error::InvalidInput(
                 "foreign encoder artifact was requested through the Qwen3 accessor".into(),
             )),
         }
@@ -2816,7 +2825,8 @@ impl EngineCoreRequest {
             PreparedAsrEncoderArtifactValue::Qwen3(_)
             | PreparedAsrEncoderArtifactValue::VibeVoice(_)
             | PreparedAsrEncoderArtifactValue::GraniteSpeech(_)
-            | PreparedAsrEncoderArtifactValue::Lfm25Audio(_) => Err(Error::InvalidInput(
+            | PreparedAsrEncoderArtifactValue::Lfm25Audio(_)
+            | PreparedAsrEncoderArtifactValue::Parakeet(_) => Err(Error::InvalidInput(
                 "foreign encoder artifact was requested through the Whisper accessor".into(),
             )),
         }
@@ -2873,7 +2883,8 @@ impl EngineCoreRequest {
             PreparedAsrEncoderArtifactValue::Qwen3(_)
             | PreparedAsrEncoderArtifactValue::Whisper(_)
             | PreparedAsrEncoderArtifactValue::GraniteSpeech(_)
-            | PreparedAsrEncoderArtifactValue::Lfm25Audio(_) => Err(Error::InvalidInput(
+            | PreparedAsrEncoderArtifactValue::Lfm25Audio(_)
+            | PreparedAsrEncoderArtifactValue::Parakeet(_) => Err(Error::InvalidInput(
                 "foreign encoder artifact was requested through the VibeVoice accessor".into(),
             )),
         }
@@ -2930,7 +2941,8 @@ impl EngineCoreRequest {
             PreparedAsrEncoderArtifactValue::Qwen3(_)
             | PreparedAsrEncoderArtifactValue::Whisper(_)
             | PreparedAsrEncoderArtifactValue::VibeVoice(_)
-            | PreparedAsrEncoderArtifactValue::Lfm25Audio(_) => Err(Error::InvalidInput(
+            | PreparedAsrEncoderArtifactValue::Lfm25Audio(_)
+            | PreparedAsrEncoderArtifactValue::Parakeet(_) => Err(Error::InvalidInput(
                 "foreign encoder artifact was requested through the Granite Speech accessor".into(),
             )),
         }
@@ -3007,8 +3019,63 @@ impl EngineCoreRequest {
             PreparedAsrEncoderArtifactValue::Qwen3(_)
             | PreparedAsrEncoderArtifactValue::Whisper(_)
             | PreparedAsrEncoderArtifactValue::VibeVoice(_)
-            | PreparedAsrEncoderArtifactValue::GraniteSpeech(_) => Err(Error::InvalidInput(
+            | PreparedAsrEncoderArtifactValue::GraniteSpeech(_)
+            | PreparedAsrEncoderArtifactValue::Parakeet(_) => Err(Error::InvalidInput(
                 "foreign encoder artifact was requested through the LFM2.5 Audio accessor".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn install_prepared_parakeet_artifact(
+        &mut self,
+        model_variant: ModelVariant,
+        artifact: Arc<ParakeetPreparedEncoderArtifact>,
+    ) -> Result<()> {
+        if model_variant.family() != ModelFamily::ParakeetAsr
+            || self.task_type != TaskType::ASR
+            || self.model_variant != Some(model_variant)
+            || self.uses_asr_long_form_atomic()
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} Parakeet artifact does not match its normal routed model",
+                self.id
+            )));
+        }
+        let source_fingerprint = self.asr_execution_source_fingerprint(model_variant)?;
+        if self.prepared_asr_encoder_artifact.is_some() {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} already owns an encoder artifact",
+                self.id
+            )));
+        }
+        self.prepared_asr_encoder_artifact = Some(PreparedAsrEncoderArtifact {
+            model_variant,
+            artifact: PreparedAsrEncoderArtifactValue::Parakeet(artifact),
+            source_fingerprint,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn prepared_parakeet_artifact_for_executor(
+        &self,
+    ) -> Result<Option<Arc<ParakeetPreparedEncoderArtifact>>> {
+        let Some(prepared) = self.prepared_asr_encoder_artifact.as_ref() else {
+            return Ok(None);
+        };
+        if self.model_variant != Some(prepared.model_variant)
+            || self.asr_execution_source_fingerprint(prepared.model_variant)?
+                != prepared.source_fingerprint
+            || self.uses_asr_long_form_atomic()
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} changed after Parakeet preparation",
+                self.id
+            )));
+        }
+        match &prepared.artifact {
+            PreparedAsrEncoderArtifactValue::Parakeet(value) => Ok(Some(value.clone())),
+            _ => Err(Error::InvalidInput(
+                "foreign encoder artifact was requested through the Parakeet accessor".into(),
             )),
         }
     }
@@ -3512,6 +3579,7 @@ impl EngineCoreRequest {
                     | ModelFamily::WhisperAsr
                     | ModelFamily::VibeVoiceAsr
                     | ModelFamily::GraniteSpeechAsr
+                    | ModelFamily::ParakeetAsr
             )
         {
             if self.prepared_asr_audio_for_executor()?.is_none() {
@@ -3536,6 +3604,9 @@ impl EngineCoreRequest {
                             ModelFamily::GraniteSpeechAsr => self
                                 .prepared_granite_speech_artifact_for_executor()?
                                 .is_some(),
+                            ModelFamily::ParakeetAsr => {
+                                self.prepared_parakeet_artifact_for_executor()?.is_some()
+                            }
                             _ => false,
                         } => {}
                 Some(PreparedAsrExecutionShape::LongFormAtomic)
