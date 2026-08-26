@@ -182,7 +182,7 @@ const fn family_inference_state_policy(family: ModelFamily) -> FamilyInferenceSt
         },
         Lfm25Audio => FamilyInferenceStatePolicy {
             tts: Invocation,
-            asr: Invocation,
+            asr: RetainedAndInvocation,
             ..FamilyInferenceStatePolicy::STATELESS
         },
         SortformerDiarization | Qwen3ForcedAligner | Tokenizer => {
@@ -405,7 +405,9 @@ fn tts_streaming_mode(model_variant: ModelVariant) -> StreamingMode {
 }
 
 fn asr_execution_target(model_variant: ModelVariant) -> ExecutionTargetKind {
-    if model_variant.is_audio_chat() {
+    if model_variant.is_audio_chat()
+        && model_variant.family() != crate::catalog::ModelFamily::Lfm25Audio
+    {
         ExecutionTargetKind::DirectModel
     } else {
         ExecutionTargetKind::TokenEngine
@@ -496,6 +498,7 @@ impl ModelCapabilityAdapter for AsrCapabilityAdapter {
                         | ModelFamily::WhisperAsr
                         | ModelFamily::VibeVoiceAsr
                         | ModelFamily::GraniteSpeechAsr
+                        | ModelFamily::Lfm25Audio
                 ) {
                     SequenceExecutionMode::Always
                 } else {
@@ -920,7 +923,7 @@ mod tests {
                 .require(CapabilityKind::Asr, ModelVariant::Lfm25Audio15BGguf)
                 .expect("lfm audio asr adapter")
                 .execution_target,
-            ExecutionTargetKind::DirectModel
+            ExecutionTargetKind::TokenEngine
         );
         assert_eq!(
             registry
@@ -936,8 +939,15 @@ mod tests {
                 .execution_target,
             ExecutionTargetKind::TokenEngine
         );
+        let asr = registry
+            .require(CapabilityKind::Asr, ModelVariant::Lfm25Audio15BGguf)
+            .expect("lfm audio asr capability");
+        assert_eq!(asr.sequence_execution, SequenceExecutionMode::Always);
+        assert_eq!(
+            asr.state_requirement,
+            InferenceStateRequirement::RetainedAndInvocation
+        );
         for capability in [
-            CapabilityKind::Asr,
             CapabilityKind::Tts,
             CapabilityKind::AudioChat,
             CapabilityKind::SpeechToSpeech,
