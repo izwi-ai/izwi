@@ -4815,6 +4815,76 @@ mod tests {
     }
 
     #[test]
+    fn nemotron_realtime_purge_fences_in_flight_state_then_confirms_drain() {
+        let variant = ModelVariant::Nemotron35AsrStreaming06B;
+        let ready = SessionKey::new("nemotron-ready".to_string(), 1);
+        let busy = SessionKey::new("nemotron-busy".to_string(), 1);
+        let mut states = HashMap::from([
+            (
+                ready.clone(),
+                ExecutorStateSlot::Ready {
+                    variant,
+                    state: variant,
+                },
+            ),
+            (busy.clone(), ExecutorStateSlot::InFlight { variant }),
+        ]);
+
+        let first = cleanup_model_states_locked(&mut states, variant, |owner| *owner);
+        assert_eq!(first.released, 1);
+        assert_eq!(first.busy, 1);
+        assert!(!states.contains_key(&ready));
+        assert!(states.contains_key(&busy));
+        assert_eq!(
+            cleanup_report(first).outcome,
+            CacheReleaseOutcome::BusyInFlight
+        );
+
+        states.insert(
+            busy,
+            ExecutorStateSlot::Ready {
+                variant,
+                state: variant,
+            },
+        );
+        let drained = cleanup_model_states_locked(&mut states, variant, |owner| *owner);
+        assert_eq!(
+            cleanup_report(drained).outcome,
+            CacheReleaseOutcome::Confirmed
+        );
+        assert!(states.is_empty());
+    }
+
+    #[test]
+    fn nemotron_cancelled_quantum_restores_then_releases_its_state_slot() {
+        let variant = ModelVariant::Nemotron35AsrStreaming06B;
+        let session = SessionKey::new("nemotron-cancelled".to_string(), 2);
+        let store = Mutex::new(HashMap::from([(
+            session.clone(),
+            ExecutorStateSlot::Ready {
+                variant,
+                state: 7usize,
+            },
+        )]));
+        let checkpoint = 7usize;
+        let mut lease = ExecutorStateLease::checkout(
+            &store,
+            session.clone(),
+            variant,
+            "Nemotron cancellation fixture",
+        )
+        .unwrap();
+        *lease.require_state_mut().unwrap() = 99;
+        lease.mark_dirty();
+
+        *lease.require_state_mut().unwrap() = checkpoint;
+        lease.mark_clean();
+        lease.release().unwrap();
+
+        assert!(!store.lock().unwrap().contains_key(&session));
+    }
+
+    #[test]
     fn executor_state_lease_explicitly_restores_or_releases() {
         let session = SessionKey::new("explicit-transition".to_string(), 2);
         let variant = ModelVariant::Qwen306B;
