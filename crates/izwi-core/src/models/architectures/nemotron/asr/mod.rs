@@ -509,6 +509,18 @@ pub(crate) struct NemotronRealtimeBatchRow<'a> {
     pub(crate) input: NemotronRealtimeBatchInput<'a>,
 }
 
+#[derive(Clone)]
+pub(crate) struct NemotronRealtimePreparedChunk {
+    encoded: Tensor,
+    pub(crate) frames: usize,
+    pub(crate) is_final: bool,
+}
+
+pub(crate) struct NemotronRealtimeDecodeBatchRow<'a> {
+    pub(crate) state: &'a mut NemotronStreamingState,
+    pub(crate) chunk: &'a NemotronRealtimePreparedChunk,
+}
+
 #[derive(Clone, Debug, Default)]
 struct NemotronStreamingResampler {
     source_rate: Option<u32>,
@@ -1016,11 +1028,11 @@ fn state_dtype(dtype: DType) -> Result<StateDType> {
     }
 }
 
-fn state_header(id: StateDomainId) -> StateDomainHeader {
+fn state_header(id: StateDomainId, clock: StateClock) -> StateDomainHeader {
     StateDomainHeader {
         id,
         scope: StateScope::Retained,
-        clock: StateClock::Custom("realtime_operation_revision".into()),
+        clock,
         placement: PlacementPolicy::BackendLocal,
         prefix: PrefixPolicy::Disabled,
         checkpoint: CheckpointPolicy::Transactional,
@@ -1150,31 +1162,43 @@ fn nemotron_realtime_state_contract(
     ];
     let domains = vec![
         StateDomainSpec::Append(AppendStateDomainSpec {
-            header: state_header(NEMOTRON_FEATURE_HISTORY_DOMAIN),
+            header: state_header(
+                NEMOTRON_FEATURE_HISTORY_DOMAIN,
+                StateClock::Custom("realtime_operation_revision".into()),
+            ),
             components_per_step: vec![feature],
             max_steps: u64::try_from(feature_frames)
                 .map_err(|_| realtime_reservation_overflow())?,
         }),
         StateDomainSpec::Append(AppendStateDomainSpec {
-            header: state_header(NEMOTRON_PENDING_ENCODER_DOMAIN),
+            header: state_header(
+                NEMOTRON_PENDING_ENCODER_DOMAIN,
+                StateClock::Custom("realtime_operation_revision".into()),
+            ),
             components_per_step: vec![encoder],
             max_steps: u64::try_from(encoded_frames)
                 .map_err(|_| realtime_reservation_overflow())?,
         }),
         StateDomainSpec::Ring(RingStateDomainSpec {
-            header: state_header(NEMOTRON_ATTENTION_HISTORY_DOMAIN),
+            header: state_header(
+                NEMOTRON_ATTENTION_HISTORY_DOMAIN,
+                StateClock::Custom("realtime_operation_revision".into()),
+            ),
             components_per_step: attention,
             capacity_steps: u64::try_from(left_context_frames)
                 .map_err(|_| realtime_reservation_overflow())?,
         }),
         StateDomainSpec::Ring(RingStateDomainSpec {
-            header: state_header(NEMOTRON_CONVOLUTION_HISTORY_DOMAIN),
+            header: state_header(
+                NEMOTRON_CONVOLUTION_HISTORY_DOMAIN,
+                StateClock::Custom("realtime_operation_revision".into()),
+            ),
             components_per_step: convolution,
             capacity_steps: u64::try_from(shape.conv_kernel_size - 1)
                 .map_err(|_| realtime_reservation_overflow())?,
         }),
         StateDomainSpec::Tensor(TensorStateDomainSpec {
-            header: state_header(NEMOTRON_RNNT_STATE_DOMAIN),
+            header: state_header(NEMOTRON_RNNT_STATE_DOMAIN, StateClock::DecoderTokens),
             components: rnnt,
         }),
     ];
@@ -1586,6 +1610,16 @@ impl NemotronAsrModel {
         runtime: &RetainedTensorStateRuntimeV2,
         transaction: PhysicalStateTransactionId,
     ) -> Result<()> {
+        self.hydrate_realtime_encoder_physical_state(state, runtime, transaction)?;
+        self.hydrate_realtime_rnnt_physical_state(state, runtime, transaction)
+    }
+
+    pub(crate) fn hydrate_realtime_encoder_physical_state(
+        &self,
+        state: &mut NemotronStreamingState,
+        runtime: &RetainedTensorStateRuntimeV2,
+        transaction: PhysicalStateTransactionId,
+    ) -> Result<()> {
         let feature =
             physical_components(runtime, transaction, NEMOTRON_FEATURE_HISTORY_DOMAIN, 1)?;
         let pending =
@@ -1602,8 +1636,6 @@ impl NemotronAsrModel {
             NEMOTRON_CONVOLUTION_HISTORY_DOMAIN,
             self.network.realtime_state_shape().encoder_layers,
         )?;
-        let rnnt = physical_components(runtime, transaction, NEMOTRON_RNNT_STATE_DOMAIN, 6)?;
-
         state
             .pre_encode_state
             .install_retained_tensor(feature.into_iter().next().flatten());
@@ -1612,6 +1644,16 @@ impl NemotronAsrModel {
             attention,
             convolution,
         )?;
+        Ok(())
+    }
+
+    pub(crate) fn hydrate_realtime_rnnt_physical_state(
+        &self,
+        state: &mut NemotronStreamingState,
+        runtime: &RetainedTensorStateRuntimeV2,
+        transaction: PhysicalStateTransactionId,
+    ) -> Result<()> {
+        let rnnt = physical_components(runtime, transaction, NEMOTRON_RNNT_STATE_DOMAIN, 6)?;
         let rnnt_state = state.rnnt_state.as_mut().ok_or_else(|| {
             Error::InferenceError("Nemotron realtime state has no RNNT control state".into())
         })?;
@@ -1628,15 +1670,19 @@ impl NemotronAsrModel {
         transaction: PhysicalStateTransactionId,
         target_cursor: u64,
     ) -> Result<()> {
+        self.stage_realtime_encoder_physical_state(state, runtime, transaction, target_cursor)?;
+        self.stage_realtime_rnnt_physical_state(state, runtime, transaction, target_cursor)
+    }
+
+    pub(crate) fn stage_realtime_encoder_physical_state(
+        &self,
+        state: &mut NemotronStreamingState,
+        runtime: &RetainedTensorStateRuntimeV2,
+        transaction: PhysicalStateTransactionId,
+        target_cursor: u64,
+    ) -> Result<()> {
         let feature = vec![state.pre_encode_state.retained_tensor()];
         let (pending, attention, convolution) = state.encoder_state.retained_tensors();
-        let rnnt_state = state.rnnt_state.as_ref().ok_or_else(|| {
-            Error::InferenceError("Nemotron realtime state has no RNNT control state".into())
-        })?;
-        let rnnt = rnnt_state
-            .retained_tensors()
-            .into_iter()
-            .collect::<Vec<_>>();
 
         stage_physical_components(
             runtime,
@@ -1666,6 +1712,23 @@ impl NemotronAsrModel {
             target_cursor,
             convolution,
         )?;
+        self.clear_realtime_encoder_tensor_handles(state)
+    }
+
+    pub(crate) fn stage_realtime_rnnt_physical_state(
+        &self,
+        state: &mut NemotronStreamingState,
+        runtime: &RetainedTensorStateRuntimeV2,
+        transaction: PhysicalStateTransactionId,
+        target_cursor: u64,
+    ) -> Result<()> {
+        let rnnt_state = state.rnnt_state.as_ref().ok_or_else(|| {
+            Error::InferenceError("Nemotron realtime state has no RNNT control state".into())
+        })?;
+        let rnnt = rnnt_state
+            .retained_tensors()
+            .into_iter()
+            .collect::<Vec<_>>();
         stage_physical_components(
             runtime,
             transaction,
@@ -1673,8 +1736,7 @@ impl NemotronAsrModel {
             target_cursor,
             rnnt,
         )?;
-
-        self.clear_realtime_tensor_handles(state)
+        self.clear_realtime_rnnt_tensor_handles(state)
     }
 
     pub(crate) fn clear_realtime_tensor_handles(
@@ -1684,6 +1746,14 @@ impl NemotronAsrModel {
         // The committed arena or active transaction owns the retained
         // handles. Between operations the native state keeps only
         // host/control metadata.
+        self.clear_realtime_encoder_tensor_handles(state)?;
+        self.clear_realtime_rnnt_tensor_handles(state)
+    }
+
+    fn clear_realtime_encoder_tensor_handles(
+        &self,
+        state: &mut NemotronStreamingState,
+    ) -> Result<()> {
         state.pre_encode_state.install_retained_tensor(None);
         let layers = self.network.realtime_state_shape().encoder_layers;
         state.encoder_state.install_retained_tensors(
@@ -1691,6 +1761,10 @@ impl NemotronAsrModel {
             vec![None; layers],
             vec![None; layers],
         )?;
+        Ok(())
+    }
+
+    fn clear_realtime_rnnt_tensor_handles(&self, state: &mut NemotronStreamingState) -> Result<()> {
         state
             .rnnt_state
             .as_mut()
@@ -2052,6 +2126,176 @@ impl NemotronAsrModel {
             input: NemotronRealtimeBatchInput::Finish,
         }])
         .map(|mut rows| rows.pop().unwrap_or_default())
+    }
+
+    pub(crate) fn prepare_realtime_input(
+        &self,
+        state: &mut NemotronStreamingState,
+        input: NemotronRealtimeBatchInput<'_>,
+    ) -> Result<Vec<NemotronRealtimePreparedChunk>> {
+        let checkpoint = state.clone();
+        let result = self.prepare_realtime_input_inner(state, input);
+        if result.is_err() {
+            *state = checkpoint;
+        }
+        result
+    }
+
+    fn prepare_realtime_input_inner(
+        &self,
+        state: &mut NemotronStreamingState,
+        input: NemotronRealtimeBatchInput<'_>,
+    ) -> Result<Vec<NemotronRealtimePreparedChunk>> {
+        match input {
+            NemotronRealtimeBatchInput::Push {
+                samples,
+                sample_rate,
+            } => {
+                if state.input_finished {
+                    return Err(Error::InvalidInput(
+                        "Cannot push audio into a finalized Nemotron streaming state".into(),
+                    ));
+                }
+                let (next_resampler, samples) = state.resampler.resample_chunk(
+                    samples,
+                    sample_rate,
+                    state.sample_rate,
+                    state.max_samples,
+                )?;
+                state.push_samples(&samples)?;
+                state.resampler = next_resampler;
+            }
+            NemotronRealtimeBatchInput::Finish => {
+                let (next_resampler, tail) = state.resampler.finish()?;
+                if !tail.is_empty() {
+                    state.push_samples(&tail)?;
+                }
+                state.resampler = next_resampler;
+                state.finish_input();
+            }
+        }
+
+        let mut prepared = Vec::new();
+        loop {
+            let Some(chunk) = state.next_ready_chunk() else {
+                break;
+            };
+            let chunk_samples = state.samples[chunk.start_sample..chunk.end_sample].to_vec();
+            state.feature_state.push_samples(&chunk_samples)?;
+            if chunk.is_final {
+                state.feature_state.finish_input();
+            }
+            state.mark_chunk_consumed(&chunk)?;
+            self.drain_streaming_encoder(state, &mut prepared)?;
+        }
+        self.drain_streaming_encoder(state, &mut prepared)?;
+        Ok(prepared)
+    }
+
+    fn drain_streaming_encoder(
+        &self,
+        state: &mut NemotronStreamingState,
+        prepared: &mut Vec<NemotronRealtimePreparedChunk>,
+    ) -> Result<()> {
+        loop {
+            let mut progressed = false;
+            if let Some(feature_chunk) = self
+                .network
+                .compute_streaming_features(&mut state.feature_state)?
+            {
+                state.pre_encode_state.push_features(feature_chunk)?;
+                progressed = true;
+            } else if state.input_finished {
+                state.pre_encode_state.finish_input();
+            }
+            if let Some(pre_encoded) = self
+                .network
+                .pre_encode_streaming_chunk(&mut state.pre_encode_state)?
+            {
+                state.encoder_state.push_pre_encoded(pre_encoded)?;
+                progressed = true;
+            } else if state.input_finished {
+                state.encoder_state.finish_input();
+            }
+            let prompt_id = self.network.prompt_id(&state.prompt.target_lang)?;
+            if let Some(chunk) = self
+                .network
+                .encode_streaming_chunk(&mut state.encoder_state, prompt_id)?
+            {
+                prepared.push(NemotronRealtimePreparedChunk {
+                    encoded: chunk.encoded,
+                    frames: chunk.frames,
+                    is_final: chunk.is_final,
+                });
+                progressed = true;
+            }
+            if !progressed {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn decode_realtime_prepared_batch(
+        &self,
+        rows: &mut [NemotronRealtimeDecodeBatchRow<'_>],
+    ) -> Result<Vec<Vec<NemotronRealtimeStreamEvent>>> {
+        if rows.is_empty() {
+            return Err(Error::InvalidInput(
+                "Nemotron RNNT prepared cohort cannot be empty".into(),
+            ));
+        }
+        let checkpoints = rows.iter().map(|row| row.state.clone()).collect::<Vec<_>>();
+        let result = (|| {
+            let mut event_batches = rows
+                .iter()
+                .map(|row| NemotronRealtimeEventBatch::new(row.state))
+                .collect::<Vec<_>>();
+            let encoded = rows
+                .iter()
+                .map(|row| row.chunk.encoded.clone())
+                .collect::<Vec<_>>();
+            let encoded_refs = encoded.iter().collect::<Vec<_>>();
+            let encoded_lens = rows.iter().map(|row| row.chunk.frames).collect::<Vec<_>>();
+            let mut rnnt_states = rows
+                .iter_mut()
+                .map(|row| {
+                    row.state.rnnt_state.as_mut().ok_or_else(|| {
+                        Error::InferenceError(
+                            "Nemotron prepared cohort row has no RNNT state".into(),
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            self.network.decode_rnnt_streaming_cohort(
+                &mut rnnt_states,
+                &encoded_refs,
+                &encoded_lens,
+            )?;
+            drop(rnnt_states);
+            let mut outputs = Vec::with_capacity(rows.len());
+            for (row, mut batch) in rows.iter_mut().zip(event_batches.drain(..)) {
+                let (tokens, text) = {
+                    let rnnt = row.state.rnnt_state.as_ref().ok_or_else(|| {
+                        Error::InferenceError("Nemotron prepared row lost RNNT state".into())
+                    })?;
+                    (
+                        rnnt.token_ids().len(),
+                        self.decoder.decode(rnnt.token_ids()),
+                    )
+                };
+                row.state.emitted_tokens = tokens;
+                batch.record_decoded_text(row.state, text, row.chunk.is_final)?;
+                outputs.push(batch.into_events(row.state));
+            }
+            Ok(outputs)
+        })();
+        if result.is_err() {
+            for (row, checkpoint) in rows.iter_mut().zip(checkpoints) {
+                *row.state = checkpoint;
+            }
+        }
+        result
     }
 
     pub(crate) fn run_realtime_batch(
