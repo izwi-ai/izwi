@@ -46,6 +46,7 @@ use crate::models::architectures::lfm25_audio::{
     model::{
         Lfm25AudioAsrPreparationResourceEnvelope, Lfm25AudioAsrPreparationStageCeiling,
         Lfm25AudioAsrStepResourceEnvelope, Lfm25AudioPreparedAsrArtifact,
+        Lfm25AudioTtsStageCeiling, Lfm25AudioTtsStepResourceEnvelope,
     },
     physical::{
         Lfm25AudioPhysicalStateSpec, Lfm25AudioRetainedStateSpec, Lfm25AudioStateMode,
@@ -53,6 +54,10 @@ use crate::models::architectures::lfm25_audio::{
         LFM25_MAIN_SHORTCONV_STATE_DOMAIN,
     },
     state::Lfm25AudioRetainedMode,
+    tts_retained::{
+        Lfm25AudioPreparedTtsArtifact, Lfm25AudioTtsDecodeStep, Lfm25AudioTtsPrefillStep,
+        Lfm25AudioTtsQuantumCheckpoint, Lfm25AudioTtsRetainedState,
+    },
     Lfm25AudioGenerationConfig, Lfm25AudioModel, Lfm25AudioStreamConfig,
 };
 use crate::models::architectures::nemotron::asr::{
@@ -2996,6 +3001,96 @@ impl NativeAudioChatModel {
             Self::Lfm25Audio(model) => {
                 model.retained_state_spec(Lfm25AudioRetainedMode::Tts, stage_graphs)
             }
+        }
+    }
+
+    pub(crate) fn prepare_lfm25_audio_tts_artifact(
+        &self,
+        messages: &[ChatMessage],
+    ) -> Result<Arc<Lfm25AudioPreparedTtsArtifact>> {
+        match self {
+            Self::Lfm25Audio(model) => model.prepare_lfm25_audio_tts_artifact(messages),
+        }
+    }
+
+    pub(crate) fn lfm25_audio_tts_stage_ceiling(&self) -> Result<Lfm25AudioTtsStageCeiling> {
+        match self {
+            Self::Lfm25Audio(model) => model.tts_stage_ceiling(),
+        }
+    }
+
+    pub(crate) fn lfm25_audio_tts_prefill_resource_envelope(
+        &self,
+        start: usize,
+        tokens: usize,
+        prompt_tokens: usize,
+    ) -> Result<Lfm25AudioTtsStepResourceEnvelope> {
+        match self {
+            Self::Lfm25Audio(model) => {
+                model.tts_prefill_resource_envelope(start, tokens, prompt_tokens)
+            }
+        }
+    }
+
+    pub(crate) fn lfm25_audio_tts_decode_resource_envelope(
+        &self,
+        position: usize,
+        include_depthformer: bool,
+    ) -> Result<Lfm25AudioTtsStepResourceEnvelope> {
+        match self {
+            Self::Lfm25Audio(model) => {
+                model.tts_decode_resource_envelope(position, include_depthformer)
+            }
+        }
+    }
+
+    pub(crate) fn new_lfm25_audio_retained_tts_state(
+        &self,
+        artifact: Arc<Lfm25AudioPreparedTtsArtifact>,
+        requested_max_new_tokens: usize,
+        generation: Lfm25AudioGenerationConfig,
+    ) -> Result<Lfm25AudioTtsRetainedState> {
+        match self {
+            Self::Lfm25Audio(model) => {
+                model.new_retained_tts_state(artifact, requested_max_new_tokens, generation)
+            }
+        }
+    }
+
+    pub(crate) fn lfm25_audio_tts_prefill_step(
+        &self,
+        state: &mut Lfm25AudioTtsRetainedState,
+        main: &mut PhysicalPagedKvCache,
+        checkpoint: &Lfm25AudioTtsQuantumCheckpoint,
+        max_tokens: usize,
+    ) -> Result<Lfm25AudioTtsPrefillStep> {
+        match self {
+            Self::Lfm25Audio(model) => {
+                model.retained_tts_prefill_step(state, main, checkpoint, max_tokens)
+            }
+        }
+    }
+
+    pub(crate) fn lfm25_audio_tts_decode_step(
+        &self,
+        state: &mut Lfm25AudioTtsRetainedState,
+        main: &mut PhysicalPagedKvCache,
+        depthformer: Option<&mut PhysicalPagedKvCache>,
+        checkpoint: &Lfm25AudioTtsQuantumCheckpoint,
+    ) -> Result<Lfm25AudioTtsDecodeStep> {
+        match self {
+            Self::Lfm25Audio(model) => {
+                model.retained_tts_decode_step(state, main, depthformer, checkpoint)
+            }
+        }
+    }
+
+    pub(crate) fn detokenize_lfm25_audio_retained_tts_state(
+        &self,
+        state: &Lfm25AudioTtsRetainedState,
+    ) -> Result<Vec<f32>> {
+        match self {
+            Self::Lfm25Audio(model) => model.detokenize_retained_tts_state(state),
         }
     }
 
