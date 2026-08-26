@@ -137,3 +137,57 @@ const fn fixed(axis: ShapeAxis, value: u64) -> ShapeDimension {
         extent: ShapeExtent::Fixed { value },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::{
+        ExecutionMode, ExecutionProfile, NativeBatchMode, StageId, StageWorkSelector,
+    };
+    use crate::model::ModelVariant;
+
+    fn stage(id: u32, selector: StageWorkSelector) -> StageDescriptor {
+        let mut profile = ExecutionProfile::fail_closed(
+            crate::backends::BackendKind::Cpu,
+            Some(ModelVariant::ParakeetTdt06BV3),
+            ExecutionMode::Sequence,
+        );
+        profile.resolved_from_loaded_model = true;
+        let mut stage = StageDescriptor::from_execution_profile(
+            StageId::new(id),
+            "parakeet.test",
+            &profile,
+            NativeBatchMode::None,
+        );
+        stage.selector = selector;
+        stage
+    }
+
+    #[test]
+    fn retained_contract_is_tensor_only_and_decoder_clocked() {
+        let stages = vec![
+            stage(1, StageWorkSelector::SequencePrefill),
+            stage(2, StageWorkSelector::SequenceDecode),
+        ];
+        let spec = parakeet_physical_state_spec(&[&stages]).unwrap();
+        let retained = spec.retained.expect("retained Parakeet contract");
+        assert_eq!(retained.domains.len(), 1);
+        let StateDomainSpec::Tensor(domain) = &retained.domains[0] else {
+            panic!("Parakeet recurrent state must never publish paged KV")
+        };
+        assert_eq!(domain.header.id, PARAKEET_PREDICTOR_STATE_DOMAIN);
+        assert_eq!(domain.header.scope, StateScope::Retained);
+        assert_eq!(domain.header.clock, StateClock::DecoderTokens);
+        assert_eq!(domain.header.checkpoint, CheckpointPolicy::Transactional);
+        assert_eq!(domain.components.len(), 5);
+    }
+
+    #[test]
+    fn retained_and_atomic_graphs_cannot_share_physical_publication() {
+        let retained = vec![stage(1, StageWorkSelector::SequenceDecode)];
+        let atomic = vec![stage(2, StageWorkSelector::Atomic)];
+        let error = parakeet_physical_state_spec(&[&retained, &atomic])
+            .expect_err("mixed Parakeet state lifetimes must fail closed");
+        assert!(error.to_string().contains("must be published separately"));
+    }
+}
