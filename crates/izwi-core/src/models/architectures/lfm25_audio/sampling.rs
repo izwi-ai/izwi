@@ -4,7 +4,7 @@ use candle_core::{DType, IndexOp, Tensor, D};
 
 use crate::error::{Error, Result};
 use crate::models::shared::sampling::{
-    bounded_cuda_sampling_candidates, device_candidates_cover_top_p, sample_device_candidates,
+    bounded_device_sampling_candidates, device_candidates_cover_top_p, sample_device_candidates,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -78,7 +78,7 @@ pub fn sample_from_logits(
         return greedy_from_logits_row(&logits, vocab_limit);
     }
 
-    if let Some(candidates) = bounded_cuda_sampling_candidates(
+    if let Some(candidates) = bounded_device_sampling_candidates(
         &logits,
         vocab_limit,
         config.top_k,
