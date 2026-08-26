@@ -159,6 +159,17 @@ pub(crate) struct Lfm25AudioAsrPreparationStageCeiling {
     pub(crate) max_workspace_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Lfm25AudioAsrStepResourceEnvelope {
+    pub(crate) backend: BackendKind,
+    pub(crate) work_units: u64,
+    pub(crate) materialized_tensor_elements: u64,
+    pub(crate) host_workspace_bytes: u64,
+    pub(crate) device_workspace_bytes: u64,
+    pub(crate) unified_workspace_bytes: u64,
+    pub(crate) workspace_bytes: u64,
+}
+
 const LFM25_AUDIO_MAX_SOURCE_SAMPLE_RATE: u32 = 192_000;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -813,6 +824,72 @@ impl Lfm25AudioModel {
             max_device_workspace_bytes,
             max_unified_workspace_bytes,
             max_workspace_bytes,
+        })
+    }
+
+    pub(crate) fn asr_prefill_resource_envelope(
+        &self,
+        start: usize,
+        tokens: usize,
+        prompt_tokens: usize,
+    ) -> Result<Lfm25AudioAsrStepResourceEnvelope> {
+        let end = start
+            .checked_add(tokens)
+            .ok_or_else(|| Error::InvalidInput("LFM2.5 Audio prefill span overflowed".into()))?;
+        if tokens == 0 || end > prompt_tokens || prompt_tokens >= self.main_config.context_length {
+            return Err(Error::InvalidInput(
+                "LFM2.5 Audio prefill span is outside its sealed prompt".into(),
+            ));
+        }
+        self.asr_main_step_resource_envelope(tokens, end, end == prompt_tokens)
+    }
+
+    pub(crate) fn asr_decode_resource_envelope(
+        &self,
+        position: usize,
+    ) -> Result<Lfm25AudioAsrStepResourceEnvelope> {
+        let visible = position
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidInput("LFM2.5 Audio decode position overflowed".into()))?;
+        if visible > self.main_config.context_length {
+            return Err(Error::InvalidInput(
+                "LFM2.5 Audio decode position exceeds model context".into(),
+            ));
+        }
+        self.asr_main_step_resource_envelope(1, visible, true)
+    }
+
+    fn asr_main_step_resource_envelope(
+        &self,
+        query_tokens: usize,
+        visible_tokens: usize,
+        include_logits: bool,
+    ) -> Result<Lfm25AudioAsrStepResourceEnvelope> {
+        let tensor_workspace = checked_asr_main_step_workspace(
+            query_tokens,
+            visible_tokens,
+            self.tokenizer.vocab_size(),
+            include_logits,
+            &self.main_config,
+        )?;
+        let backend = BackendKind::from(self.device.kind);
+        let (host_workspace_bytes, device_workspace_bytes, unified_workspace_bytes) =
+            map_asr_workspace_domains(backend, 0, tensor_workspace)?;
+        let materialized_tensor_elements = u64::try_from(query_tokens)
+            .ok()
+            .and_then(|tokens| {
+                tokens.checked_mul(u64::try_from(self.main_config.embedding_length).ok()?)
+            })
+            .ok_or_else(|| Error::InvalidInput("LFM2.5 Audio step elements overflowed".into()))?;
+        Ok(Lfm25AudioAsrStepResourceEnvelope {
+            backend,
+            work_units: u64::try_from(query_tokens)
+                .map_err(|_| Error::InvalidInput("LFM2.5 Audio step work exceeds u64".into()))?,
+            materialized_tensor_elements,
+            host_workspace_bytes,
+            device_workspace_bytes,
+            unified_workspace_bytes,
+            workspace_bytes: tensor_workspace,
         })
     }
 
@@ -2293,6 +2370,51 @@ fn map_asr_workspace_domains(
     })
 }
 
+fn checked_asr_main_step_workspace(
+    query_tokens: usize,
+    visible_tokens: usize,
+    vocab_size: usize,
+    include_logits: bool,
+    config: &Lfm2BackboneConfig,
+) -> Result<u64> {
+    let u = |value: usize| {
+        u64::try_from(value)
+            .map_err(|_| Error::InvalidInput("LFM2.5 Audio step geometry exceeds u64".into()))
+    };
+    let mul = |left: u64, right: u64| {
+        left.checked_mul(right)
+            .ok_or_else(|| Error::InvalidInput("LFM2.5 Audio step workspace overflowed".into()))
+    };
+    let add = |left: u64, right: u64| {
+        left.checked_add(right)
+            .ok_or_else(|| Error::InvalidInput("LFM2.5 Audio step workspace overflowed".into()))
+    };
+    let q = u(query_tokens)?;
+    let visible = u(visible_tokens)?;
+    let hidden = u(config.embedding_length)?;
+    let ffn = u(config
+        .feed_forward_length
+        .unwrap_or(config.embedding_length))?;
+    let heads = u(config.attention_head_count)?;
+    let layers = u(config.block_count)?;
+    let ring = u(config.shortconv_l_cache)?;
+
+    // Conservative logical ceiling. Every model block is priced as if it
+    // simultaneously owns residual/norm/QKV/output tensors, both FFN arms,
+    // dense attention through the full visible prefix, and a cloned ShortConv
+    // ring. Actual mixed attention/ShortConv layouts allocate a strict subset.
+    let hidden_planes = mul(mul(q, hidden)?, 12)?;
+    let ffn_planes = mul(mul(q, ffn)?, 4)?;
+    let attention_planes = mul(mul(mul(heads, q)?, visible)?, 4)?;
+    let ring_clone = mul(mul(ring, hidden)?, layers)?;
+    let per_layer = add(add(hidden_planes, ffn_planes)?, attention_planes)?;
+    let mut elements = add(mul(per_layer, layers)?, ring_clone)?;
+    if include_logits {
+        elements = add(elements, mul(q, u(vocab_size)?)?)?;
+    }
+    mul(elements, 4)
+}
+
 fn validate_prepared_asr_identity(expected: u64, actual: u64) -> Result<()> {
     if expected != actual {
         return Err(Error::InvalidInput(
@@ -2471,6 +2593,31 @@ mod tests {
             (11, 29, 0)
         );
         assert!(map_asr_workspace_domains(BackendKind::Cpu, u64::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn main_step_workspace_prices_logits_context_and_shortconv_clones() {
+        let config = Lfm2BackboneConfig {
+            architecture: "lfm2".into(),
+            block_count: 4,
+            context_length: 128,
+            embedding_length: 16,
+            embedding_length_out: None,
+            feed_forward_length: Some(32),
+            attention_head_count: 4,
+            attention_head_count_kv: vec![2; 4],
+            attention_layer_norm_rms_epsilon: 1e-5,
+            attention_sliding_window: Some(32),
+            rope_freq_base: 10_000.0,
+            shortconv_l_cache: 3,
+        };
+        let without_logits = checked_asr_main_step_workspace(2, 11, 101, false, &config).unwrap();
+        let with_logits = checked_asr_main_step_workspace(2, 11, 101, true, &config).unwrap();
+        assert_eq!(with_logits - without_logits, 2 * 101 * 4);
+        assert!(
+            checked_asr_main_step_workspace(2, 12, 101, false, &config).unwrap() > without_logits
+        );
+        assert!(checked_asr_main_step_workspace(usize::MAX, 2, 3, true, &config).is_err());
     }
 
     #[test]
