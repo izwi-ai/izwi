@@ -1,6 +1,7 @@
 //! Fish Audio S2 Pro TTS architecture boundary.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use candle_core::{DType, IndexOp, Tensor};
@@ -24,6 +25,7 @@ pub mod contracts;
 pub mod dac;
 pub mod fast;
 mod physical;
+mod retained;
 pub mod slow;
 pub mod tokenizer;
 pub mod weights;
@@ -40,6 +42,10 @@ pub use fast::{FishS2FastConfig, FishS2FastDecoder, FishS2GeneratedFrame, FishS2
 pub(crate) use physical::{
     FishS2PhysicalStateSpec, FISH_S2_FAST_STATE_DOMAIN, FISH_S2_SLOW_STATE_DOMAIN,
 };
+#[allow(unused_imports)]
+pub(crate) use retained::{
+    FishS2PreparedArtifact, FishS2RetainedCheckpoint, FishS2RetainedState, FishS2RetainedStep,
+};
 pub use slow::{FishS2SlowConfig, FishS2SlowOutput, FishS2SlowTransformer};
 pub use tokenizer::{
     FishS2ConditioningPrompt, FishS2PromptTokenizer, FishS2SpecialTokens, FishS2VqCodes,
@@ -47,6 +53,7 @@ pub use tokenizer::{
 pub use weights::{FishS2TensorSpec, FishS2WeightIndex, FishS2Weights};
 
 pub struct FishS2TtsModel {
+    model_identity: u64,
     variant: ModelVariant,
     config: FishS2Config,
     artifacts: FishS2ArtifactManifest,
@@ -70,7 +77,7 @@ pub struct FishS2Reference {
     pub text: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FishS2GenerationParams {
     pub max_frames: usize,
     pub temperature: f32,
@@ -121,6 +128,7 @@ const FISH_S2_DTYPE_ENV: &str = "IZWI_FISH_S2_DTYPE";
 const RAS_WIN_SIZE: usize = 10;
 const RAS_HIGH_TEMP: f32 = 1.0;
 const RAS_HIGH_TOP_P: f32 = 0.9;
+static NEXT_FISH_S2_MODEL_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
 impl FishS2TtsModel {
     pub fn load_metadata(model_dir: &Path, variant: ModelVariant) -> Result<Self> {
@@ -133,6 +141,7 @@ impl FishS2TtsModel {
         let artifacts = FishS2ArtifactManifest::load(model_dir)?;
         let codec = FishS2CodecArtifact::load(model_dir)?;
         Ok(Self {
+            model_identity: next_fish_s2_model_identity()?,
             variant,
             config,
             artifacts,
@@ -237,6 +246,14 @@ impl FishS2TtsModel {
             fast_cache,
         )
     }
+}
+
+fn next_fish_s2_model_identity() -> Result<u64> {
+    NEXT_FISH_S2_MODEL_IDENTITY
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .map_err(|_| Error::ModelLoadError("Fish S2 model identity space exhausted".into()))
 }
 
 impl FishS2NativeRuntime {
@@ -448,6 +465,7 @@ impl Default for FishS2GenerationParams {
     }
 }
 
+#[derive(Clone)]
 struct FishS2SemanticSampler {
     temperature: f32,
     top_p: f32,

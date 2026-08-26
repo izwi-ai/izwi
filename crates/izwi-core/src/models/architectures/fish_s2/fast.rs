@@ -37,7 +37,7 @@ pub struct FishS2GeneratedFrame {
     pub codebooks: Vec<u32>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FishS2Sampler {
     pub temperature: f32,
     pub top_p: f32,
@@ -424,7 +424,7 @@ impl FishS2FastMlp {
     }
 }
 
-fn sample_logits(row: &Tensor, sampler: &mut FishS2Sampler) -> Result<u32> {
+pub(crate) fn sample_logits(row: &Tensor, sampler: &mut FishS2Sampler) -> Result<u32> {
     if row.dims1()? == 0 {
         return Err(Error::InferenceError(
             "Fish S2 fast sampler received empty logits".to_string(),
