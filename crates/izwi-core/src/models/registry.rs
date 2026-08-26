@@ -55,8 +55,9 @@ use crate::models::architectures::lfm25_audio::{
     },
     state::Lfm25AudioRetainedMode,
     tts_retained::{
-        Lfm25AudioPreparedTtsArtifact, Lfm25AudioTtsDecodeStep, Lfm25AudioTtsPrefillBatch,
-        Lfm25AudioTtsPrefillStep, Lfm25AudioTtsQuantumCheckpoint, Lfm25AudioTtsRetainedState,
+        Lfm25AudioPreparedTtsArtifact, Lfm25AudioTtsDecodeBatch, Lfm25AudioTtsDecodeStep,
+        Lfm25AudioTtsPrefillBatch, Lfm25AudioTtsPrefillStep, Lfm25AudioTtsQuantumCheckpoint,
+        Lfm25AudioTtsRetainedState,
     },
     Lfm25AudioGenerationConfig, Lfm25AudioModel, Lfm25AudioStreamConfig,
 };
@@ -3105,10 +3106,23 @@ impl NativeAudioChatModel {
         mains: &mut [&mut PhysicalPagedKvCache],
         depthformers: &mut [&mut PhysicalPagedKvCache],
         checkpoints: &[&Lfm25AudioTtsQuantumCheckpoint],
-    ) -> Result<Vec<Lfm25AudioTtsDecodeStep>> {
+    ) -> Result<Lfm25AudioTtsDecodeBatch> {
         match self {
             Self::Lfm25Audio(model) => {
                 model.retained_tts_audio_decode_batch(states, mains, depthformers, checkpoints)
+            }
+        }
+    }
+
+    pub(crate) fn lfm25_audio_tts_text_decode_batch(
+        &self,
+        states: &mut [&mut Lfm25AudioTtsRetainedState],
+        mains: &mut [&mut PhysicalPagedKvCache],
+        checkpoints: &[&Lfm25AudioTtsQuantumCheckpoint],
+    ) -> Result<Lfm25AudioTtsDecodeBatch> {
+        match self {
+            Self::Lfm25Audio(model) => {
+                model.retained_tts_text_decode_batch(states, mains, checkpoints)
             }
         }
     }

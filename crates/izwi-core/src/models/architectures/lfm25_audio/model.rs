@@ -15,8 +15,8 @@ use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::chat::{ChatMessage, ChatRole};
 
 use super::asr_retained::{
-    Lfm25AudioAsrDecodeStep, Lfm25AudioAsrPrefillStep, Lfm25AudioAsrQuantumCheckpoint,
-    Lfm25AudioAsrRetainedState,
+    Lfm25AudioAsrDecodeStep, Lfm25AudioAsrPrefillBatch, Lfm25AudioAsrPrefillStep,
+    Lfm25AudioAsrQuantumCheckpoint, Lfm25AudioAsrRetainedState,
 };
 use super::audio_output::{Lfm25AudioHead, Lfm25SampledAudioFrame};
 use super::bundle::{Lfm25AudioBundle, Lfm25AudioBundleInfo};
@@ -40,8 +40,9 @@ use super::sampling::{
 use super::state::{Lfm25AudioRetainedCheckpoint, Lfm25AudioRetainedMode, Lfm25AudioRetainedState};
 use super::tokenizer::{Lfm25SpecialTokenIds, Lfm25TextTokenizer};
 use super::tts_retained::{
-    Lfm25AudioPreparedTtsArtifact, Lfm25AudioTtsDecodeStep, Lfm25AudioTtsPrefillStep,
-    Lfm25AudioTtsQuantumCheckpoint, Lfm25AudioTtsRetainedState,
+    Lfm25AudioPreparedTtsArtifact, Lfm25AudioTtsDecodeBatch, Lfm25AudioTtsDecodeStep,
+    Lfm25AudioTtsPrefillBatch, Lfm25AudioTtsPrefillStep, Lfm25AudioTtsQuantumCheckpoint,
+    Lfm25AudioTtsRetainedState,
 };
 use super::LFM25_AUDIO_DEFAULT_INTERLEAVED_SYSTEM_PROMPT;
 use crate::models::architectures::lfm2::backbone::QuantizedLfm2Backbone;
@@ -501,6 +502,24 @@ impl Lfm25AudioModel {
         })
     }
 
+    pub(crate) fn retained_tts_prefill_batch(
+        &self,
+        states: &mut [&mut Lfm25AudioTtsRetainedState],
+        mains: &mut [&mut PhysicalPagedKvCache],
+        checkpoints: &[&Lfm25AudioTtsQuantumCheckpoint],
+        max_tokens: &[usize],
+    ) -> Result<Lfm25AudioTtsPrefillBatch> {
+        self.with_main_backbone(|backbone| {
+            Lfm25AudioTtsRetainedState::prefill_batch(
+                backbone,
+                states,
+                mains,
+                checkpoints,
+                max_tokens,
+            )
+        })
+    }
+
     pub(crate) fn retained_tts_decode_step(
         &self,
         state: &mut Lfm25AudioTtsRetainedState,
@@ -526,7 +545,7 @@ impl Lfm25AudioModel {
         mains: &mut [&mut PhysicalPagedKvCache],
         depthformers: &mut [&mut PhysicalPagedKvCache],
         checkpoints: &[&Lfm25AudioTtsQuantumCheckpoint],
-    ) -> Result<Vec<Lfm25AudioTtsDecodeStep>> {
+    ) -> Result<Lfm25AudioTtsDecodeBatch> {
         self.with_main_backbone(|backbone| {
             Lfm25AudioTtsRetainedState::decode_audio_batch(
                 backbone,
@@ -534,6 +553,23 @@ impl Lfm25AudioModel {
                 states,
                 mains,
                 depthformers,
+                checkpoints,
+            )
+        })
+    }
+
+    pub(crate) fn retained_tts_text_decode_batch(
+        &self,
+        states: &mut [&mut Lfm25AudioTtsRetainedState],
+        mains: &mut [&mut PhysicalPagedKvCache],
+        checkpoints: &[&Lfm25AudioTtsQuantumCheckpoint],
+    ) -> Result<Lfm25AudioTtsDecodeBatch> {
+        self.with_main_backbone(|backbone| {
+            Lfm25AudioTtsRetainedState::decode_text_batch(
+                backbone,
+                &self.tokenizer,
+                states,
+                mains,
                 checkpoints,
             )
         })
@@ -556,6 +592,24 @@ impl Lfm25AudioModel {
     ) -> Result<Lfm25AudioAsrPrefillStep> {
         self.with_main_backbone(|backbone| {
             state.prefill_step(backbone, cache, checkpoint, max_tokens)
+        })
+    }
+
+    pub(crate) fn retained_asr_prefill_batch(
+        &self,
+        states: &mut [&mut Lfm25AudioAsrRetainedState],
+        caches: &mut [&mut PhysicalPagedKvCache],
+        checkpoints: &[&Lfm25AudioAsrQuantumCheckpoint],
+        max_tokens: &[usize],
+    ) -> Result<Lfm25AudioAsrPrefillBatch> {
+        self.with_main_backbone(|backbone| {
+            Lfm25AudioAsrRetainedState::prefill_batch(
+                backbone,
+                states,
+                caches,
+                checkpoints,
+                max_tokens,
+            )
         })
     }
 

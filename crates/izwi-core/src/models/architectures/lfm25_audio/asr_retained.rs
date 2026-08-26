@@ -34,6 +34,12 @@ pub(crate) struct Lfm25AudioAsrPrefillStep {
     pub(crate) pending_token: Option<u32>,
 }
 
+#[derive(Debug)]
+pub(crate) struct Lfm25AudioAsrPrefillBatch {
+    pub(crate) steps: Vec<Lfm25AudioAsrPrefillStep>,
+    pub(crate) launch_widths: Vec<usize>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Lfm25AudioAsrDecodeStep {
     /// Token appended to main KV in this quantum. A terminal stop decision is
@@ -84,6 +90,97 @@ pub(crate) struct Lfm25AudioAsrRetainedState {
 }
 
 impl Lfm25AudioAsrRetainedState {
+    pub(crate) fn prefill_batch(
+        backbone: &QuantizedLfm2Backbone,
+        states: &mut [&mut Self],
+        caches: &mut [&mut PhysicalPagedKvCache],
+        checkpoints: &[&Lfm25AudioAsrQuantumCheckpoint],
+        max_tokens: &[usize],
+    ) -> Result<Lfm25AudioAsrPrefillBatch> {
+        let batch = states.len();
+        if batch == 0
+            || caches.len() != batch
+            || checkpoints.len() != batch
+            || max_tokens.len() != batch
+        {
+            return Err(Error::InvalidInput(
+                "LFM2.5 Audio ASR prefill batch rows do not match".into(),
+            ));
+        }
+        let mut positions = Vec::with_capacity(batch);
+        let mut consumed = Vec::with_capacity(batch);
+        let mut inputs = Vec::with_capacity(batch);
+        for row in 0..batch {
+            states[row].authenticate_step(caches[row], checkpoints[row])?;
+            if states[row].finished
+                || states[row].pending_token.is_some()
+                || states[row].prefill_cursor >= states[row].artifact.prompt_tokens
+                || max_tokens[row] == 0
+                || backbone.hidden_size() != states[row].artifact.hidden_size()?
+            {
+                return Err(Error::InvalidInput(
+                    "LFM2.5 Audio ASR prefill batch contains an invalid row".into(),
+                ));
+            }
+            let span = max_tokens[row]
+                .min(states[row].artifact.prompt_tokens - states[row].prefill_cursor);
+            positions.push(states[row].prefill_cursor);
+            consumed.push(span);
+            inputs.push(
+                states[row]
+                    .artifact
+                    .prompt_slice(states[row].prefill_cursor, span)?,
+            );
+        }
+        let mut shortconv = states
+            .iter_mut()
+            .map(|state| &mut state.retained.shortconv)
+            .collect::<Vec<_>>();
+        let output =
+            backbone.forward_embeds_retained_batch(&inputs, &positions, &mut shortconv, caches)?;
+        drop(shortconv);
+        let completing = (0..batch)
+            .filter(|row| positions[*row] + consumed[*row] == states[*row].artifact.prompt_tokens)
+            .collect::<Vec<_>>();
+        let logits = if completing.is_empty() {
+            None
+        } else {
+            let hidden = Tensor::cat(
+                &completing
+                    .iter()
+                    .map(|row| output.last_hidden[*row].clone())
+                    .collect::<Vec<_>>(),
+                0,
+            )?;
+            Some(backbone.project_last_hidden(&hidden)?)
+        };
+        let mut pending = vec![None; batch];
+        if let Some(logits) = logits.as_ref() {
+            for (logit_row, row) in completing.iter().copied().enumerate() {
+                pending[row] = Some(greedy_from_logits(
+                    &logits.i(logit_row)?,
+                    states[row].vocab_limit,
+                )?);
+            }
+        }
+        let mut steps = Vec::with_capacity(batch);
+        for row in 0..batch {
+            states[row].prefill_cursor += consumed[row];
+            states[row].pending_token = pending[row];
+            steps.push(Lfm25AudioAsrPrefillStep {
+                consumed_tokens: consumed[row],
+                prefill_cursor: states[row].prefill_cursor,
+                prompt_tokens: states[row].artifact.prompt_tokens,
+                complete: states[row].prefill_cursor == states[row].artifact.prompt_tokens,
+                pending_token: pending[row],
+            });
+        }
+        Ok(Lfm25AudioAsrPrefillBatch {
+            steps,
+            launch_widths: output.launch_widths,
+        })
+    }
+
     pub(crate) fn decode_will_append(&self, tokenizer: &Lfm25TextTokenizer) -> Result<bool> {
         if self.finished || self.prefill_cursor != self.artifact.prompt_tokens {
             return Ok(false);

@@ -34,6 +34,12 @@ pub(crate) struct Lfm25AudioTtsPrefillStep {
     pub(crate) complete: bool,
 }
 
+#[derive(Debug)]
+pub(crate) struct Lfm25AudioTtsPrefillBatch {
+    pub(crate) steps: Vec<Lfm25AudioTtsPrefillStep>,
+    pub(crate) launch_widths: Vec<usize>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Lfm25AudioTtsDecodeStep {
     pub(crate) delta: String,
@@ -42,6 +48,13 @@ pub(crate) struct Lfm25AudioTtsDecodeStep {
     pub(crate) tokens_generated: usize,
     pub(crate) finished: bool,
     pub(crate) in_audio: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct Lfm25AudioTtsDecodeBatch {
+    pub(crate) steps: Vec<Lfm25AudioTtsDecodeStep>,
+    pub(crate) main_launch_widths: Vec<usize>,
+    pub(crate) depthformer_width: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -84,6 +97,94 @@ pub(crate) struct Lfm25AudioTtsRetainedState {
 }
 
 impl Lfm25AudioTtsRetainedState {
+    pub(crate) fn prefill_batch(
+        backbone: &QuantizedLfm2Backbone,
+        states: &mut [&mut Self],
+        mains: &mut [&mut PhysicalPagedKvCache],
+        checkpoints: &[&Lfm25AudioTtsQuantumCheckpoint],
+        max_tokens: &[usize],
+    ) -> Result<Lfm25AudioTtsPrefillBatch> {
+        let batch = states.len();
+        if batch == 0
+            || mains.len() != batch
+            || checkpoints.len() != batch
+            || max_tokens.len() != batch
+        {
+            return Err(Error::InvalidInput(
+                "LFM2.5 Audio TTS prefill batch rows do not match".into(),
+            ));
+        }
+        let mut positions = Vec::with_capacity(batch);
+        let mut consumed = Vec::with_capacity(batch);
+        let mut inputs = Vec::with_capacity(batch);
+        for row in 0..batch {
+            states[row].authenticate_host(checkpoints[row])?;
+            if checkpoints[row].has_depthformer
+                || states[row].finished
+                || states[row].prefill_cursor >= states[row].artifact.prompt_tokens
+                || max_tokens[row] == 0
+            {
+                return Err(Error::InvalidInput(
+                    "LFM2.5 Audio TTS prefill batch contains an invalid row".into(),
+                ));
+            }
+            let span = max_tokens[row]
+                .min(states[row].artifact.prompt_tokens - states[row].prefill_cursor);
+            positions.push(states[row].prefill_cursor);
+            consumed.push(span);
+            inputs.push(states[row].artifact.prompt_embeddings.narrow(
+                1,
+                states[row].prefill_cursor,
+                span,
+            )?);
+        }
+        let mut shortconv = states
+            .iter_mut()
+            .map(|state| &mut state.retained.shortconv)
+            .collect::<Vec<_>>();
+        let output =
+            backbone.forward_embeds_retained_batch(&inputs, &positions, &mut shortconv, mains)?;
+        drop(shortconv);
+        let completing = (0..batch)
+            .filter(|row| positions[*row] + consumed[*row] == states[*row].artifact.prompt_tokens)
+            .collect::<Vec<_>>();
+        let logits = if completing.is_empty() {
+            None
+        } else {
+            let hidden = Tensor::cat(
+                &completing
+                    .iter()
+                    .map(|row| output.last_hidden[*row].clone())
+                    .collect::<Vec<_>>(),
+                0,
+            )?;
+            Some(backbone.project_last_hidden(&hidden)?)
+        };
+        let mut steps = Vec::with_capacity(batch);
+        for row in 0..batch {
+            states[row].prefill_cursor += consumed[row];
+            if let Some(logit_row) = completing.iter().position(|complete| *complete == row) {
+                states[row].last_hidden = Some(output.last_hidden[row].clone());
+                states[row].logits = Some(
+                    logits
+                        .as_ref()
+                        .expect("completing rows have logits")
+                        .narrow(0, logit_row, 1)?,
+                );
+            }
+            steps.push(Lfm25AudioTtsPrefillStep {
+                consumed_tokens: consumed[row],
+                prefill_cursor: states[row].prefill_cursor,
+                prompt_tokens: states[row].artifact.prompt_tokens,
+                complete: states[row].prefill_cursor == states[row].artifact.prompt_tokens,
+            });
+        }
+        Ok(Lfm25AudioTtsPrefillBatch {
+            steps,
+            launch_widths: output.launch_widths,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         artifact: Arc<Lfm25AudioPreparedTtsArtifact>,
@@ -289,7 +390,7 @@ impl Lfm25AudioTtsRetainedState {
         mains: &mut [&mut PhysicalPagedKvCache],
         depths: &mut [&mut PhysicalPagedKvCache],
         checkpoints: &[&Lfm25AudioTtsQuantumCheckpoint],
-    ) -> Result<Vec<Lfm25AudioTtsDecodeStep>> {
+    ) -> Result<Lfm25AudioTtsDecodeBatch> {
         let batch = states.len();
         if batch == 0 || mains.len() != batch || depths.len() != batch || checkpoints.len() != batch
         {
@@ -313,9 +414,14 @@ impl Lfm25AudioTtsRetainedState {
                 &mut states[0].rng,
                 depths[0],
             )?;
-            return Ok(vec![
-                states[0].finish_audio_frame(backbone, audio_head, mains[0], frame)?
-            ]);
+            return Self::finish_audio_frames_batch(
+                backbone,
+                audio_head,
+                states,
+                mains,
+                vec![frame],
+                1,
+            );
         }
         for row in 0..batch {
             states[row].authenticate_host(checkpoints[row])?;
@@ -347,13 +453,220 @@ impl Lfm25AudioTtsRetainedState {
         let frames =
             audio_head.sample_audio_frame_retained_batch(&hidden, &configs, &mut rngs, depths)?;
         drop(rngs);
-        frames
-            .into_iter()
-            .enumerate()
-            .map(|(row, frame)| {
-                states[row].finish_audio_frame(backbone, audio_head, mains[row], frame)
-            })
-            .collect()
+        Self::finish_audio_frames_batch(backbone, audio_head, states, mains, frames, batch)
+    }
+
+    pub(crate) fn decode_text_batch(
+        backbone: &QuantizedLfm2Backbone,
+        tokenizer: &Lfm25TextTokenizer,
+        states: &mut [&mut Self],
+        mains: &mut [&mut PhysicalPagedKvCache],
+        checkpoints: &[&Lfm25AudioTtsQuantumCheckpoint],
+    ) -> Result<Lfm25AudioTtsDecodeBatch> {
+        let batch = states.len();
+        if batch == 0 || mains.len() != batch || checkpoints.len() != batch {
+            return Err(Error::InvalidInput(
+                "LFM2.5 Audio TTS text batch rows do not match".into(),
+            ));
+        }
+        let mut rngs = states
+            .iter()
+            .map(|state| state.rng.clone())
+            .collect::<Vec<_>>();
+        let mut tokens = Vec::with_capacity(batch);
+        let mut next_visible = Vec::with_capacity(batch);
+        let mut deltas = Vec::with_capacity(batch);
+        let mut append_rows = Vec::new();
+        for row in 0..batch {
+            states[row].authenticate_host(checkpoints[row])?;
+            if states[row].finished || states[row].in_audio || checkpoints[row].has_depthformer {
+                return Err(Error::InvalidInput(
+                    "LFM2.5 Audio TTS text batch contains a non-text row".into(),
+                ));
+            }
+            let logits = states[row].logits.as_ref().ok_or_else(|| {
+                Error::InferenceError("LFM2.5 Audio TTS text row has no logits".into())
+            })?;
+            let next = sample_from_logits(
+                logits,
+                states[row].vocab_limit,
+                &states[row].generation.text,
+                &mut rngs[row],
+            )?;
+            tokens.push(next);
+            if next == states[row].specials.im_end
+                || next == states[row].specials.eos
+                || states[row].specials.eos_alt == Some(next)
+            {
+                next_visible.push(states[row].visible_text_ids.clone());
+                deltas.push(String::new());
+                continue;
+            }
+            let mut ids = states[row].visible_text_ids.clone();
+            if next != states[row].specials.audio_start && next != states[row].specials.text_end {
+                ids.push(next);
+            }
+            let visible = tokenizer.decode_text(&ids)?;
+            deltas.push(text_delta(&states[row].visible_text, &visible));
+            next_visible.push(ids);
+            append_rows.push(row);
+        }
+        let mut launch_widths = Vec::new();
+        let mut appended_hidden = Vec::new();
+        let mut appended_logits = None;
+        if !append_rows.is_empty() {
+            let input = Tensor::from_slice(
+                &append_rows
+                    .iter()
+                    .map(|row| tokens[*row])
+                    .collect::<Vec<_>>(),
+                (append_rows.len(), 1),
+                states[0].artifact.prompt_embeddings.device(),
+            )?;
+            let embeds = backbone.embed_tokens(&input)?;
+            let row_embeds = (0..append_rows.len())
+                .map(|row| embeds.narrow(0, row, 1))
+                .collect::<candle_core::Result<Vec<_>>>()?;
+            let positions = append_rows
+                .iter()
+                .map(|row| states[*row].retained.main_position())
+                .collect::<Vec<_>>();
+            let mut shortconv = states
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(row, state)| {
+                    append_rows
+                        .contains(&row)
+                        .then_some(&mut state.retained.shortconv)
+                })
+                .collect::<Vec<_>>();
+            let mut append_mains = mains
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(row, main)| append_rows.contains(&row).then_some(&mut **main))
+                .collect::<Vec<_>>();
+            let output = backbone.forward_embeds_retained_batch(
+                &row_embeds,
+                &positions,
+                &mut shortconv,
+                &mut append_mains,
+            )?;
+            appended_logits =
+                Some(backbone.project_last_hidden(&Tensor::cat(&output.last_hidden, 0)?)?);
+            appended_hidden = output.last_hidden;
+            launch_widths = output.launch_widths;
+        }
+        let mut steps = Vec::with_capacity(batch);
+        for row in 0..batch {
+            states[row].rng = rngs[row].clone();
+            states[row].tokens_generated += 1;
+            let Some(appended_row) = append_rows.iter().position(|append| *append == row) else {
+                states[row].finished = true;
+                steps.push(states[row].outcome(String::new(), None));
+                continue;
+            };
+            states[row].visible_text_ids = std::mem::take(&mut next_visible[row]);
+            states[row].visible_text = tokenizer.decode_text(&states[row].visible_text_ids)?;
+            if tokens[row] == states[row].specials.audio_start {
+                states[row].in_audio = true;
+            }
+            states[row].last_hidden = Some(appended_hidden[appended_row].clone());
+            states[row].logits = Some(
+                appended_logits
+                    .as_ref()
+                    .expect("appended rows have logits")
+                    .narrow(0, appended_row, 1)?,
+            );
+            if has_token_repetition_loop(&states[row].visible_text_ids)
+                || states[row].tokens_generated >= states[row].max_new_tokens
+            {
+                states[row].finished = true;
+            }
+            steps.push(states[row].outcome(std::mem::take(&mut deltas[row]), None));
+        }
+        Ok(Lfm25AudioTtsDecodeBatch {
+            steps,
+            main_launch_widths: launch_widths,
+            depthformer_width: None,
+        })
+    }
+
+    fn finish_audio_frames_batch(
+        backbone: &QuantizedLfm2Backbone,
+        audio_head: &Lfm25AudioHead,
+        states: &mut [&mut Self],
+        mains: &mut [&mut PhysicalPagedKvCache],
+        frames: Vec<Lfm25SampledAudioFrame>,
+        depthformer_width: usize,
+    ) -> Result<Lfm25AudioTtsDecodeBatch> {
+        let batch = states.len();
+        if frames.len() != batch || mains.len() != batch {
+            return Err(Error::InvalidInput(
+                "LFM2.5 Audio TTS sampled frame rows do not match".into(),
+            ));
+        }
+        let mut tokens = Vec::with_capacity(batch);
+        let mut is_end = Vec::with_capacity(batch);
+        let mut inputs = Vec::with_capacity(batch);
+        let mut positions = Vec::with_capacity(batch);
+        for (row, frame) in frames.iter().enumerate() {
+            let row_tokens = frame.tokens()?;
+            let row_is_end = row_tokens.first().copied() == Some(audio_head.audio_end_token_id());
+            tokens.push(row_tokens);
+            is_end.push(row_is_end);
+            inputs.push(frame.embedding().clone());
+            positions.push(states[row].retained.main_position());
+        }
+        let mut shortconv = states
+            .iter_mut()
+            .map(|state| &mut state.retained.shortconv)
+            .collect::<Vec<_>>();
+        let output =
+            backbone.forward_embeds_retained_batch(&inputs, &positions, &mut shortconv, mains)?;
+        drop(shortconv);
+        let ending = (0..batch).filter(|row| is_end[*row]).collect::<Vec<_>>();
+        let ending_logits = if ending.is_empty() {
+            None
+        } else {
+            let hidden = Tensor::cat(
+                &ending
+                    .iter()
+                    .map(|row| output.last_hidden[*row].clone())
+                    .collect::<Vec<_>>(),
+                0,
+            )?;
+            Some(backbone.project_last_hidden(&hidden)?)
+        };
+        let mut steps = Vec::with_capacity(batch);
+        for row in 0..batch {
+            states[row].tokens_generated += 1;
+            if !is_end[row] {
+                for (codebook, token) in tokens[row].iter().copied().enumerate() {
+                    states[row].audio_codes[codebook].push(token);
+                }
+            }
+            states[row].last_hidden = Some(output.last_hidden[row].clone());
+            if let Some(logit_row) = ending.iter().position(|ending_row| *ending_row == row) {
+                states[row].in_audio = false;
+                states[row].logits = Some(
+                    ending_logits
+                        .as_ref()
+                        .expect("ending rows have logits")
+                        .narrow(0, logit_row, 1)?,
+                );
+            }
+            if states[row].tokens_generated >= states[row].max_new_tokens {
+                states[row].finished = true;
+            }
+            steps.push(
+                states[row].outcome(String::new(), (!is_end[row]).then(|| tokens[row].clone())),
+            );
+        }
+        Ok(Lfm25AudioTtsDecodeBatch {
+            steps,
+            main_launch_widths: output.launch_widths,
+            depthformer_width: Some(depthformer_width),
+        })
     }
 
     fn finish_text_token(

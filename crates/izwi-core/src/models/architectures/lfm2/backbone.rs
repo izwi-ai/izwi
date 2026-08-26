@@ -40,6 +40,30 @@ pub(crate) struct Lfm2ShortConvRuntimeState {
     components: Vec<(crate::kv::v2::StateComponentId, Option<Tensor>)>,
 }
 
+#[derive(Debug)]
+pub(crate) struct Lfm2RetainedEmbeddingBatchOutput {
+    pub(crate) last_hidden: Vec<Tensor>,
+    pub(crate) launch_widths: Vec<usize>,
+}
+
+fn retained_ragged_launch_rows(spans: &[usize]) -> Result<Vec<Vec<usize>>> {
+    if spans.is_empty() || spans.contains(&0) {
+        return Err(Error::InvalidInput(
+            "LFM2 retained ragged spans must be non-empty".into(),
+        ));
+    }
+    let max_span = spans.iter().copied().max().expect("non-empty spans");
+    Ok((0..max_span)
+        .map(|offset| {
+            spans
+                .iter()
+                .enumerate()
+                .filter_map(|(row, span)| (offset < *span).then_some(row))
+                .collect::<Vec<_>>()
+        })
+        .collect())
+}
+
 impl Lfm2ShortConvRuntimeState {
     pub(crate) fn new(model: &QuantizedLfm2Backbone) -> Self {
         Self {
@@ -1208,10 +1232,38 @@ impl QuantizedLfm2Backbone {
         caches: &mut [&mut PhysicalPagedKvCache],
     ) -> Result<Tensor> {
         let batch = token_ids.len();
-        if batch == 0 || positions.len() != batch || states.len() != batch || caches.len() != batch
+        if batch == 0 {
+            return Err(Error::InvalidInput(
+                "LFM2 retained decode batch is empty".into(),
+            ));
+        }
+        let input = Tensor::from_slice(
+            token_ids,
+            (batch, 1),
+            self.token_embeddings.embeddings().device(),
+        )?;
+        let embeds = self.embed_tokens(&input)?;
+        let hidden = self.forward_embeds_retained_step_batch(&embeds, positions, states, caches)?;
+        self.project_last_hidden(&hidden)
+    }
+
+    fn forward_embeds_retained_step_batch(
+        &self,
+        input_embeds: &Tensor,
+        positions: &[usize],
+        states: &mut [&mut Lfm2ShortConvRuntimeState],
+        caches: &mut [&mut PhysicalPagedKvCache],
+    ) -> Result<Tensor> {
+        let (batch, seq_len, hidden_size) = input_embeds.dims3()?;
+        if batch == 0
+            || seq_len != 1
+            || hidden_size != self.cfg.embedding_length
+            || positions.len() != batch
+            || states.len() != batch
+            || caches.len() != batch
         {
             return Err(Error::InvalidInput(
-                "LFM2 retained decode batch rows do not match".into(),
+                "LFM2 retained embedding batch rows do not match".into(),
             ));
         }
         for row in 0..batch {
@@ -1219,7 +1271,7 @@ impl QuantizedLfm2Backbone {
                 || states[row].cursor() != positions[row] as u64
             {
                 return Err(Error::InvalidInput(
-                    "LFM2 retained decode row cursors do not match".into(),
+                    "LFM2 retained embedding row cursors do not match".into(),
                 ));
             }
         }
@@ -1241,12 +1293,7 @@ impl QuantizedLfm2Backbone {
             .map(|state| (**state).clone())
             .collect::<Vec<_>>();
         let execution = (|| -> Result<Tensor> {
-            let input = Tensor::from_slice(
-                token_ids,
-                (batch, 1),
-                self.token_embeddings.embeddings().device(),
-            )?;
-            let mut hidden_states = self.embed_tokens(&input)?;
+            let mut hidden_states = input_embeds.clone();
             for layer in &self.layers {
                 let residual = hidden_states.clone();
                 let hidden = layer.operator_norm.forward(&hidden_states)?;
@@ -1271,11 +1318,10 @@ impl QuantizedLfm2Backbone {
                 let hidden = layer.ffn_norm.forward(&hidden_states)?;
                 hidden_states = (&layer.mlp.forward(&hidden)? + &residual)?;
             }
-            let hidden = self.norm.forward(&hidden_states)?;
-            self.project_last_hidden(&hidden)
+            self.norm.forward(&hidden_states).map_err(Error::from)
         })();
-        let logits = match execution {
-            Ok(logits) => logits,
+        let hidden = match execution {
+            Ok(hidden) => hidden,
             Err(error) => {
                 return match completions.drain() {
                     Ok(()) => Err(error),
@@ -1293,7 +1339,89 @@ impl QuantizedLfm2Backbone {
             cache.commit_shared_completion(positions[row], 1, completion.clone())?;
             **states.get_mut(row).expect("state row exists") = working[row].clone();
         }
-        Ok(logits)
+        Ok(hidden)
+    }
+
+    pub(crate) fn forward_embeds_retained_batch(
+        &self,
+        input_embeds: &[Tensor],
+        positions: &[usize],
+        states: &mut [&mut Lfm2ShortConvRuntimeState],
+        caches: &mut [&mut PhysicalPagedKvCache],
+    ) -> Result<Lfm2RetainedEmbeddingBatchOutput> {
+        let batch = input_embeds.len();
+        if batch == 0 || positions.len() != batch || states.len() != batch || caches.len() != batch
+        {
+            return Err(Error::InvalidInput(
+                "LFM2 retained ragged embedding rows do not match".into(),
+            ));
+        }
+        let mut spans = Vec::with_capacity(batch);
+        for row in 0..batch {
+            let (embed_batch, span, hidden) = input_embeds[row].dims3()?;
+            if embed_batch != 1
+                || span == 0
+                || hidden != self.cfg.embedding_length
+                || caches[row].context_len() != positions[row]
+                || states[row].cursor() != positions[row] as u64
+            {
+                return Err(Error::InvalidInput(
+                    "LFM2 retained ragged embedding geometry is invalid".into(),
+                ));
+            }
+            spans.push(span);
+        }
+        let waves = retained_ragged_launch_rows(&spans)?;
+        let mut last_hidden = (0..batch).map(|_| None).collect::<Vec<_>>();
+        let mut launch_widths = Vec::with_capacity(waves.len());
+        for (offset, active) in waves.into_iter().enumerate() {
+            let embeds = Tensor::cat(
+                &active
+                    .iter()
+                    .map(|row| input_embeds[*row].narrow(1, offset, 1))
+                    .collect::<candle_core::Result<Vec<_>>>()?,
+                0,
+            )?;
+            let wave_positions = active
+                .iter()
+                .map(|row| positions[*row] + offset)
+                .collect::<Vec<_>>();
+            let mut wave_states = states
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(row, state)| active.contains(&row).then_some(&mut **state))
+                .collect::<Vec<_>>();
+            let mut wave_caches = caches
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(row, cache)| active.contains(&row).then_some(&mut **cache))
+                .collect::<Vec<_>>();
+            let hidden = self.forward_embeds_retained_step_batch(
+                &embeds,
+                &wave_positions,
+                &mut wave_states,
+                &mut wave_caches,
+            )?;
+            for (wave_row, row) in active.iter().copied().enumerate() {
+                if offset + 1 == spans[row] {
+                    last_hidden[row] = Some(hidden.narrow(0, wave_row, 1)?);
+                }
+            }
+            launch_widths.push(active.len());
+        }
+        Ok(Lfm2RetainedEmbeddingBatchOutput {
+            last_hidden: last_hidden
+                .into_iter()
+                .map(|hidden| {
+                    hidden.ok_or_else(|| {
+                        Error::InferenceError(
+                            "LFM2 retained ragged batch lost a terminal hidden row".into(),
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            launch_widths,
+        })
     }
 
     /// Advance the retained B1 backbone from caller-supplied embeddings.
@@ -1807,4 +1935,13 @@ mod tests {
         assert_eq!(rows[0].cursor, 3);
         assert_eq!(rows[1].cursor, 2);
     }
+}
+#[test]
+fn retained_ragged_launches_drop_shorter_rows_without_padding() {
+    assert_eq!(
+        retained_ragged_launch_rows(&[3, 1, 2]).unwrap(),
+        vec![vec![0, 1, 2], vec![0, 2], vec![0]]
+    );
+    assert!(retained_ragged_launch_rows(&[]).is_err());
+    assert!(retained_ragged_launch_rows(&[1, 0]).is_err());
 }

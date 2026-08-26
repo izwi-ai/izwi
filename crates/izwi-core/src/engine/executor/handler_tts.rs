@@ -43,16 +43,15 @@ impl<'a> ContinuousLfm25TtsRow<'a> {
         let checkpoint = self.checkpoint.take().ok_or_else(|| {
             Error::InferenceError("LFM2.5 Audio TTS cohort checkpoint is absent".into())
         })?;
-        let depth = self.depth.as_mut().ok_or_else(|| {
-            Error::InferenceError("LFM2.5 Audio TTS cohort depth lease is absent".into())
-        })?;
         let lease = self.lease.as_mut().ok_or_else(|| {
             Error::InferenceError("LFM2.5 Audio TTS cohort state lease is absent".into())
         })?;
         let active = lease.require_state_mut()?;
-        active
-            .state
-            .rollback_quantum(&mut self.main, Some(depth.cache_mut()), &checkpoint)?;
+        active.state.rollback_quantum(
+            &mut self.main,
+            self.depth.as_mut().map(|depth| depth.cache_mut()),
+            &checkpoint,
+        )?;
         active.last_tokens_generated = self.prior_tokens;
         active.stream_sequence = self.prior_stream_sequence;
         lease.mark_clean();
@@ -1132,7 +1131,8 @@ impl NativeExecutor {
         mut managed: Vec<Option<super::RetainedRowManagedState>>,
     ) -> Result<Vec<ModelSessionResult>> {
         let mut outputs = (0..scheduled.len()).map(|_| None).collect::<Vec<_>>();
-        let mut audio_indices = Vec::new();
+        let mut live_indices = Vec::new();
+        let mut audio_by_index = vec![false; scheduled.len()];
         for index in 0..scheduled.len() {
             if requests[index].is_cancelled() {
                 outputs[index] = Some(ModelSessionResult::cancelled_before_dispatch(
@@ -1153,17 +1153,10 @@ impl NativeExecutor {
                 .state
                 .decode_needs_depthformer();
             lease.restore()?;
-            if audio {
-                audio_indices.push(index);
-            } else {
-                outputs[index] = Some(self.lfm25_audio_tts_request_with_managed_cache(
-                    requests[index],
-                    &scheduled[index],
-                    managed[index].take(),
-                )?);
-            }
+            audio_by_index[index] = audio;
+            live_indices.push(index);
         }
-        if audio_indices.is_empty() {
+        if live_indices.is_empty() {
             return outputs
                 .into_iter()
                 .map(|output| {
@@ -1173,12 +1166,12 @@ impl NativeExecutor {
                 })
                 .collect();
         }
-        let model = requests[audio_indices[0]]
+        let model = requests[live_indices[0]]
             .prepared_lfm25_audio_tts_model_lease_for_executor()?
             .ok_or_else(|| Error::InferenceError("continuous LFM TTS lost model".into()))?;
         let model_arc = model.model_arc();
-        let mut rows = Vec::with_capacity(audio_indices.len());
-        for index in audio_indices.iter().copied() {
+        let mut rows = Vec::with_capacity(live_indices.len());
+        for index in live_indices.iter().copied() {
             let row_model = requests[index]
                 .prepared_lfm25_audio_tts_model_lease_for_executor()?
                 .ok_or_else(|| Error::InferenceError("continuous LFM TTS row lost model".into()))?;
@@ -1212,79 +1205,145 @@ impl NativeExecutor {
             active.state.restore_shortconv(arena)?;
             let prior_tokens = active.last_tokens_generated;
             let prior_stream_sequence = active.stream_sequence;
-            let mut depth =
-                super::invocation_paged_lease_for_row(requests[index], &scheduled[index])?;
+            let mut depth = audio_by_index[index]
+                .then(|| super::invocation_paged_lease_for_row(requests[index], &scheduled[index]))
+                .transpose()?;
             let checkpoint = active
                 .state
-                .reset_and_begin_quantum(&main, Some(depth.cache_mut()))?;
+                .reset_and_begin_quantum(&main, depth.as_mut().map(|depth| depth.cache_mut()))?;
             lease.mark_dirty();
             rows.push(ContinuousLfm25TtsRow {
                 index,
                 session: scheduled[index].session_key(),
                 lease: Some(lease),
                 main,
-                depth: Some(depth),
+                depth,
                 checkpoint: Some(checkpoint),
                 prior_tokens,
                 prior_stream_sequence,
             });
         }
         let mut batch = ContinuousLfm25TtsBatch::new(rows);
-        let native = (|| {
-            let mut states = Vec::with_capacity(batch.rows.len());
-            let mut mains = Vec::with_capacity(batch.rows.len());
-            let mut depths = Vec::with_capacity(batch.rows.len());
-            let mut checkpoints = Vec::with_capacity(batch.rows.len());
-            for row in &mut batch.rows {
-                let ContinuousLfm25TtsRow {
-                    lease,
-                    main,
-                    depth,
-                    checkpoint,
-                    ..
-                } = row;
-                states.push(
-                    &mut lease
-                        .as_mut()
-                        .ok_or_else(|| {
-                            Error::InferenceError("continuous LFM TTS state lease is absent".into())
-                        })?
-                        .require_state_mut()?
-                        .state,
-                );
-                mains.push(main);
-                depths.push(
-                    depth
-                        .as_mut()
-                        .expect("armed LFM TTS depth lease")
-                        .cache_mut(),
-                );
-                checkpoints.push(checkpoint.as_ref().expect("armed LFM TTS checkpoint"));
-            }
-            Self::run_blocking(|| {
-                model.lfm25_audio_tts_audio_decode_batch(
-                    &mut states,
-                    &mut mains,
-                    &mut depths,
-                    &checkpoints,
-                )
-            })
-        })();
-        let steps = match native {
-            Ok(steps) if steps.len() == batch.rows.len() => steps,
-            Ok(_) => {
+        let mut steps = (0..batch.rows.len()).map(|_| None).collect::<Vec<_>>();
+        let mut launch_widths = Vec::new();
+        let audio_rows = batch
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(row, state)| state.depth.is_some().then_some(row))
+            .collect::<Vec<_>>();
+        if !audio_rows.is_empty() {
+            let native = (|| {
+                let mut states = Vec::with_capacity(audio_rows.len());
+                let mut mains = Vec::with_capacity(audio_rows.len());
+                let mut depths = Vec::with_capacity(audio_rows.len());
+                let mut checkpoints = Vec::with_capacity(audio_rows.len());
+                for (row_index, row) in batch.rows.iter_mut().enumerate() {
+                    if !audio_rows.contains(&row_index) {
+                        continue;
+                    }
+                    let ContinuousLfm25TtsRow {
+                        lease,
+                        main,
+                        depth,
+                        checkpoint,
+                        ..
+                    } = row;
+                    states.push(
+                        &mut lease
+                            .as_mut()
+                            .ok_or_else(|| {
+                                Error::InferenceError(
+                                    "continuous LFM TTS state lease is absent".into(),
+                                )
+                            })?
+                            .require_state_mut()?
+                            .state,
+                    );
+                    mains.push(main);
+                    depths.push(
+                        depth
+                            .as_mut()
+                            .expect("armed LFM TTS depth lease")
+                            .cache_mut(),
+                    );
+                    checkpoints.push(checkpoint.as_ref().expect("armed LFM TTS checkpoint"));
+                }
+                Self::run_blocking(|| {
+                    model.lfm25_audio_tts_audio_decode_batch(
+                        &mut states,
+                        &mut mains,
+                        &mut depths,
+                        &checkpoints,
+                    )
+                })
+            })()?;
+            if native.steps.len() != audio_rows.len() {
                 return Err(Error::InferenceError(
-                    "LFM TTS native cohort returned wrong width".into(),
-                ))
+                    "LFM TTS audio cohort returned wrong width".into(),
+                ));
             }
-            Err(error) => return Err(error),
-        };
-        crate::engine::metrics::record_engine_model_call(
-            crate::engine::metrics::EngineModelCall::NativeTensor {
-                mode: crate::engine::NativeBatchMode::Continuous,
-                rows: batch.rows.len(),
-            },
-        );
+            launch_widths.extend(native.depthformer_width);
+            launch_widths.extend(native.main_launch_widths);
+            for (row, step) in audio_rows.iter().copied().zip(native.steps) {
+                steps[row] = Some(step);
+            }
+        }
+        let text_rows = batch
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(row, state)| state.depth.is_none().then_some(row))
+            .collect::<Vec<_>>();
+        if !text_rows.is_empty() {
+            let native = (|| {
+                let mut states = Vec::with_capacity(text_rows.len());
+                let mut mains = Vec::with_capacity(text_rows.len());
+                let mut checkpoints = Vec::with_capacity(text_rows.len());
+                for (row_index, row) in batch.rows.iter_mut().enumerate() {
+                    if !text_rows.contains(&row_index) {
+                        continue;
+                    }
+                    let ContinuousLfm25TtsRow {
+                        lease,
+                        main,
+                        depth: _,
+                        checkpoint,
+                        ..
+                    } = row;
+                    states.push(
+                        &mut lease
+                            .as_mut()
+                            .ok_or_else(|| {
+                                Error::InferenceError(
+                                    "continuous LFM TTS state lease is absent".into(),
+                                )
+                            })?
+                            .require_state_mut()?
+                            .state,
+                    );
+                    mains.push(main);
+                    checkpoints.push(checkpoint.as_ref().expect("armed LFM TTS checkpoint"));
+                }
+                Self::run_blocking(|| {
+                    model.lfm25_audio_tts_text_decode_batch(&mut states, &mut mains, &checkpoints)
+                })
+            })()?;
+            if native.steps.len() != text_rows.len() {
+                return Err(Error::InferenceError(
+                    "LFM TTS text cohort returned wrong width".into(),
+                ));
+            }
+            launch_widths.extend(native.main_launch_widths);
+            for (row, step) in text_rows.iter().copied().zip(native.steps) {
+                steps[row] = Some(step);
+            }
+        }
+        for width in launch_widths {
+            if let Some(call) = continuous_tts_model_call(width, true) {
+                crate::engine::metrics::record_engine_model_call(call);
+            }
+        }
         for row_index in 0..batch.rows.len() {
             let index = batch.rows[row_index].index;
             let arena = requests[index]
@@ -1309,6 +1368,9 @@ impl NativeExecutor {
             }
         }
         for (row_index, step) in steps.into_iter().enumerate() {
+            let step = step.ok_or_else(|| {
+                Error::InferenceError("LFM TTS cohort lost a decode result".into())
+            })?;
             let row = &mut batch.rows[row_index];
             let index = row.index;
             if requests[index].is_cancelled() {
@@ -1329,17 +1391,11 @@ impl NativeExecutor {
                     .expect("armed LFM TTS state lease")
                     .require_state_mut()?
                     .state
-                    .commit_quantum(
-                        main,
-                        Some(depth.as_ref().expect("armed LFM TTS depth lease").cache()),
-                        &checkpoint,
-                    )?;
+                    .commit_quantum(main, depth.as_ref().map(|depth| depth.cache()), &checkpoint)?;
             }
-            let _ = row
-                .depth
-                .take()
-                .expect("armed LFM TTS depth lease")
-                .release()?;
+            if let Some(depth) = row.depth.take() {
+                let _ = depth.release()?;
+            }
             let active = row.lease_mut()?.require_state_mut()?;
             let generated = step
                 .tokens_generated
