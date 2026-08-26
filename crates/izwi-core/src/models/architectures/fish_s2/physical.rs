@@ -27,6 +27,9 @@ const FISH_S2_FAST_STATE_GROUP: StateGroupId = StateGroupId::new(2);
 #[derive(Debug, Clone)]
 pub(crate) struct FishS2PhysicalStateSpec {
     pub(crate) descriptor: CapabilityStateDescriptorV2,
+    /// Transactional slow/fast state for staged sequence graphs. Atomic
+    /// compatibility graphs continue to use invocation-owned copies.
+    pub(crate) retained: Option<InferenceStateContract>,
     pub(crate) invocation: InferenceStateContract,
 }
 
@@ -49,6 +52,7 @@ pub(crate) fn fish_s2_physical_state_spec(
     let fast_capacity = u64::try_from(config.num_codebooks)
         .map_err(|_| Error::ModelLoadError("Fish S2 codebook count exceeds u64".into()))?;
     let invocation = fish_s2_invocation_contract(config, state_dtype, page_tokens)?;
+    let retained = fish_s2_retained_contract(invocation.clone())?;
     let max_domain_id = invocation
         .domains
         .iter()
@@ -57,42 +61,48 @@ pub(crate) fn fish_s2_physical_state_spec(
         .ok_or_else(|| Error::ModelLoadError("Fish S2 invocation contract is empty".into()))?;
 
     let mut profiles = Vec::with_capacity(stage_graphs.len());
+    let mut has_invocation_workspace = false;
     for stages in stage_graphs {
         let mut ordered = stages.iter().collect::<Vec<_>>();
         ordered.sort_unstable_by_key(|stage| stage.id);
         let mut invocation_stages = Vec::with_capacity(ordered.len());
         for (index, stage) in ordered.into_iter().enumerate() {
-            let mut domains = invocation
-                .domains
-                .iter()
-                .cloned()
-                .map(|state| {
-                    let max_tokens = match state.id() {
-                        FISH_S2_SLOW_STATE_DOMAIN => slow_capacity,
-                        FISH_S2_FAST_STATE_DOMAIN => fast_capacity,
-                        _ => {
-                            return Err(Error::ModelLoadError(
-                                "Fish S2 invocation contract has an unknown domain".into(),
-                            ))
-                        }
-                    };
-                    let capacity = if state.id() == FISH_S2_SLOW_STATE_DOMAIN {
-                        InvocationStateCapacity::decoder_context(max_tokens)?
-                    } else {
-                        InvocationStateCapacity::PagedTokens { max_tokens }
-                    };
-                    Ok(InvocationWorkspaceDomain::State {
-                        placement: state.header().placement,
-                        formula: WorkspaceFormula {
-                            fixed_bytes: fish_s2_paged_invocation_bytes(&state, max_tokens)?,
-                            dimensions: vec![],
-                            terms: vec![],
-                        },
-                        state,
-                        capacity,
+            let uses_invocation_state = stage.selector == crate::engine::StageWorkSelector::Atomic;
+            let mut domains = if uses_invocation_state {
+                invocation
+                    .domains
+                    .iter()
+                    .cloned()
+                    .map(|state| {
+                        let max_tokens = match state.id() {
+                            FISH_S2_SLOW_STATE_DOMAIN => slow_capacity,
+                            FISH_S2_FAST_STATE_DOMAIN => fast_capacity,
+                            _ => {
+                                return Err(Error::ModelLoadError(
+                                    "Fish S2 invocation contract has an unknown domain".into(),
+                                ))
+                            }
+                        };
+                        let capacity = if state.id() == FISH_S2_SLOW_STATE_DOMAIN {
+                            InvocationStateCapacity::decoder_context(max_tokens)?
+                        } else {
+                            InvocationStateCapacity::PagedTokens { max_tokens }
+                        };
+                        Ok(InvocationWorkspaceDomain::State {
+                            placement: state.header().placement,
+                            formula: WorkspaceFormula {
+                                fixed_bytes: fish_s2_paged_invocation_bytes(&state, max_tokens)?,
+                                dimensions: vec![],
+                                terms: vec![],
+                            },
+                            state,
+                            capacity,
+                        })
                     })
-                })
-                .collect::<Result<Vec<_>>>()?;
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                Vec::new()
+            };
             if stage.max_workspace_bytes > 0 {
                 let scratch_id = max_domain_id
                     .checked_add(u32::try_from(index + 1).map_err(|_| {
@@ -113,10 +123,15 @@ pub(crate) fn fish_s2_physical_state_spec(
                     },
                 });
             }
+            has_invocation_workspace |= !domains.is_empty();
             invocation_stages.push(InvocationStageWorkspace {
                 stage: stage.id,
                 lease_scope: InvocationLeaseScope::PerRow,
-                groups: invocation.groups.clone(),
+                groups: if uses_invocation_state {
+                    invocation.groups.clone()
+                } else {
+                    Vec::new()
+                },
                 domains,
             });
         }
@@ -128,18 +143,61 @@ pub(crate) fn fish_s2_physical_state_spec(
     profiles.sort_unstable_by_key(|profile| profile.stage_graph_fingerprint);
     profiles.dedup();
 
+    let uses_retained = stage_graphs.iter().any(|stages| {
+        stages.iter().any(|stage| {
+            matches!(
+                stage.selector,
+                crate::engine::StageWorkSelector::SequencePrefill
+                    | crate::engine::StageWorkSelector::SequenceDecode
+            )
+        })
+    });
+    let invocation_workspace = if has_invocation_workspace {
+        InvocationWorkspaceSet::Bounded { profiles }
+    } else {
+        InvocationWorkspaceSet::None {
+            stage_graph_fingerprints: profiles
+                .into_iter()
+                .map(|profile| profile.stage_graph_fingerprint)
+                .collect(),
+        }
+    };
     let descriptor = CapabilityStateDescriptorV2 {
         abi: CURRENT_INFERENCE_STATE_ABI,
-        retained: RetainedStateCapability::Stateless,
-        invocation: InvocationWorkspaceSet::Bounded { profiles },
+        retained: if uses_retained {
+            RetainedStateCapability::Managed {
+                contract: retained.clone(),
+            }
+        } else {
+            RetainedStateCapability::Stateless
+        },
+        invocation: invocation_workspace,
     };
     for stages in stage_graphs {
         descriptor.validate_against_stages(stages)?;
     }
     Ok(FishS2PhysicalStateSpec {
         descriptor,
+        retained: uses_retained.then_some(retained),
         invocation,
     })
+}
+
+fn fish_s2_retained_contract(
+    mut contract: InferenceStateContract,
+) -> Result<InferenceStateContract> {
+    for domain in &mut contract.domains {
+        let StateDomainSpec::PagedAttention(domain) = domain else {
+            return Err(Error::ModelLoadError(
+                "Fish S2 retained state must be paged attention".into(),
+            ));
+        };
+        domain.header.scope = StateScope::Retained;
+        domain.header.prefix = PrefixPolicy::Disabled;
+        domain.header.checkpoint = CheckpointPolicy::Transactional;
+    }
+    contract.validate()?;
+    Ok(contract)
 }
 
 fn fish_s2_invocation_contract(
@@ -364,8 +422,9 @@ mod tests {
 
     use super::*;
     use crate::engine::{
-        ConcurrencyClass, ExecutionDomain, MembershipSafePoint, NativeBatchMode, OutputVisibility,
-        StageId, StageProgressKind, StageShapePolicy, StageWorkSelector,
+        ClockedStateSelection, ConcurrencyClass, ExecutionDomain, MembershipSafePoint,
+        NativeBatchMode, OutputVisibility, StageId, StageProgressKind, StageShapePolicy,
+        StageWorkSelector,
     };
     use crate::models::architectures::fish_s2::config::current_config;
 
@@ -392,6 +451,72 @@ mod tests {
             output_visibility: OutputVisibility::AfterQuantumCommit,
             retained_state_selections: None,
         }
+    }
+
+    fn retained_stage(id: u32, selector: StageWorkSelector) -> StageDescriptor {
+        let mut stage = stage();
+        stage.id = StageId::new(id);
+        stage.name = format!("fish_s2.retained.{id}");
+        stage.selector = selector;
+        stage.progress = StageProgressKind::Iterative;
+        stage.concurrency = ConcurrencyClass::Exclusive;
+        stage.shape_policy = StageShapePolicy::Exact;
+        stage.retained_state_selections = Some(vec![ClockedStateSelection::new(
+            FISH_S2_FAST_STATE_GROUP,
+            StateClock::CodebookSteps,
+        )
+        .expect("fast state selection")]);
+        stage
+    }
+
+    #[test]
+    fn staged_graph_publishes_transactional_slow_and_fast_retained_domains() {
+        let config = current_config();
+        let stages = [
+            retained_stage(1, StageWorkSelector::SequencePrefill),
+            retained_stage(2, StageWorkSelector::SequenceDecode),
+        ];
+        let spec = fish_s2_physical_state_spec(&config, DType::F16, &[&stages])
+            .expect("retained physical state");
+        let retained = spec.retained.as_ref().expect("retained contract");
+        assert_eq!(retained.domains.len(), 2);
+        assert_eq!(retained.groups.len(), 2);
+        for domain in &retained.domains {
+            assert_eq!(domain.header().scope, StateScope::Retained);
+            assert_eq!(domain.header().checkpoint, CheckpointPolicy::Transactional);
+        }
+        let StateDomainSpec::PagedAttention(slow) = &retained.domains[0] else {
+            panic!("slow retained domain must be paged attention");
+        };
+        let StateDomainSpec::PagedAttention(fast) = &retained.domains[1] else {
+            panic!("fast retained domain must be paged attention");
+        };
+        assert_eq!(slow.header.clock, StateClock::DecoderTokens);
+        assert_eq!(fast.header.clock, StateClock::CodebookSteps);
+
+        let InvocationWorkspaceSet::None {
+            stage_graph_fingerprints,
+        } = &spec.descriptor.invocation
+        else {
+            panic!("staged graph must not duplicate retained pages as invocation state");
+        };
+        assert_eq!(stage_graph_fingerprints.len(), 1);
+    }
+
+    #[test]
+    fn atomic_graph_preserves_invocation_owned_slow_and_fast_pages() {
+        let execution = stage();
+        let spec = fish_s2_physical_state_spec(
+            &current_config(),
+            DType::F16,
+            &[std::slice::from_ref(&execution)],
+        )
+        .expect("atomic physical state");
+        assert!(spec.retained.is_none());
+        assert!(matches!(
+            spec.descriptor.retained,
+            RetainedStateCapability::Stateless
+        ));
     }
 
     #[test]
