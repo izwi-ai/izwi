@@ -13,6 +13,7 @@ enum CertifiedTopology {
     RetainedPagedRing,
     RetainedPagedRotatingAndInvocationScratch,
     RetainedPagedTensorAndInvocationPaged,
+    RetainedPagedPagedTensorAndInvocationPagedPagedTensor,
     RetainedPagedAndInvocationPagedTensor,
     RetainedPagedAndInvocationPaged,
     RetainedPagedRingAndInvocationPagedRing,
@@ -42,6 +43,9 @@ impl CertifiedTopology {
             | Self::RetainedPagedStaticAndInvocationPagedStatic
             | Self::RetainedPagedRotatingAndInvocationScratch
             | Self::RetainedAppendRingTensor => InferenceStateRequirement::RetainedAndInvocation,
+            Self::RetainedPagedPagedTensorAndInvocationPagedPagedTensor => {
+                InferenceStateRequirement::RetainedAndInvocation
+            }
             Self::InvocationPaged
             | Self::InvocationPagedPaged
             | Self::InvocationPagedRing
@@ -82,7 +86,7 @@ fn certified_topology(
         (Qwen3Tts, Tts | StreamingTts) => RetainedPagedTensorAndInvocationPaged,
         (KokoroTts, Tts | StreamingTts) => Stateless,
         (VoxtralTts, Tts) => InvocationPaged,
-        (VibeVoiceTts, Tts) => InvocationPagedTensor,
+        (VibeVoiceTts, Tts) => RetainedPagedPagedTensorAndInvocationPagedPagedTensor,
         (FishS2Tts, Tts) => InvocationPagedPaged,
 
         // Qwen ASR commits decoder pages and immutable prepared inputs under

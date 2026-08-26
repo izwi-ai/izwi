@@ -374,7 +374,11 @@ fn retained_state_expectation(
             Capability::Tts | Capability::StreamingTts => Stateless,
             _ => unexpected_capability(variant, capability),
         },
-        ModelFamily::VibeVoiceTts | ModelFamily::FishS2Tts => match capability {
+        ModelFamily::VibeVoiceTts => match capability {
+            Capability::Tts => Managed,
+            _ => unexpected_capability(variant, capability),
+        },
+        ModelFamily::FishS2Tts => match capability {
             Capability::Tts => Stateless,
             _ => unexpected_capability(variant, capability),
         },

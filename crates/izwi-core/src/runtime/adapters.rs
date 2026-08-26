@@ -152,7 +152,11 @@ const fn family_inference_state_policy(family: ModelFamily) -> FamilyInferenceSt
             ..FamilyInferenceStatePolicy::STATELESS
         },
         KokoroTts => FamilyInferenceStatePolicy::STATELESS,
-        VoxtralTts | VibeVoiceTts | FishS2Tts => FamilyInferenceStatePolicy {
+        VibeVoiceTts => FamilyInferenceStatePolicy {
+            tts: RetainedAndInvocation,
+            ..FamilyInferenceStatePolicy::STATELESS
+        },
+        VoxtralTts | FishS2Tts => FamilyInferenceStatePolicy {
             tts: Invocation,
             ..FamilyInferenceStatePolicy::STATELESS
         },
@@ -374,9 +378,7 @@ fn tts_execution_target(model_variant: ModelVariant) -> ExecutionTargetKind {
         || model_variant.is_lfm25_audio_gguf()
         || matches!(
             model_variant.family(),
-            crate::catalog::ModelFamily::VoxtralTts
-                | crate::catalog::ModelFamily::VibeVoiceTts
-                | crate::catalog::ModelFamily::FishS2Tts
+            crate::catalog::ModelFamily::VoxtralTts | crate::catalog::ModelFamily::FishS2Tts
         )
     {
         ExecutionTargetKind::DirectModel
@@ -1069,18 +1071,18 @@ mod tests {
     }
 
     #[test]
-    fn built_in_registry_marks_vibevoice_tts_as_direct_tts_with_final_only_streaming() {
+    fn built_in_registry_marks_vibevoice_tts_as_retained_token_engine() {
         let registry = RuntimeAdapterRegistry::built_in();
         let variant = ModelVariant::VibeVoice15BTts;
 
         let adapter = registry
             .require(CapabilityKind::Tts, variant)
             .expect("vibevoice tts adapter");
-        assert_eq!(adapter.execution_target, ExecutionTargetKind::DirectModel);
+        assert_eq!(adapter.execution_target, ExecutionTargetKind::TokenEngine);
         assert_eq!(adapter.streaming_mode, StreamingMode::FinalOnly);
         assert_eq!(
             adapter.state_requirement,
-            InferenceStateRequirement::Invocation
+            InferenceStateRequirement::RetainedAndInvocation
         );
         assert!(registry
             .require(CapabilityKind::StreamingTts, variant)

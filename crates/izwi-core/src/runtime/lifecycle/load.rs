@@ -1976,14 +1976,47 @@ impl ModelLifecycleController {
                     .map(|contract| contract.stages.as_ref())
                     .collect::<Vec<_>>();
                 let physical_spec = model.physical_state_spec(&stage_graphs)?;
+                let retained_contract = physical_spec.retained.as_ref().ok_or_else(|| {
+                    Error::ModelLoadError(
+                        "VibeVoice TTS normal graph did not publish retained state".into(),
+                    )
+                })?;
+                let retained = self
+                    .core_engine
+                    .load_managed_model_state(
+                        model_instance_id,
+                        retained_contract,
+                        physical_spec.retained_max_tokens,
+                    )
+                    .await?;
+                self.model_registry.publish_effective_context(
+                    variant,
+                    retained.logical_token_reach(),
+                )?;
+                crate::runtime::rollout::validate_managed_state_plan_eligibility(
+                    variant,
+                    CapabilityKind::Tts,
+                    retained.state_plan_v2(),
+                )?;
+                let retained_uses = contracts
+                    .iter()
+                    .map(|contract| {
+                        let graph = stage_graph_fingerprint(&contract.stages)?;
+                        let retained_use = match contract.execution_profile.cache_mode {
+                            CacheMode::ExternalPaged => RetainedStateUseV2::ExternalPaged,
+                            CacheMode::None => RetainedStateUseV2::Inactive,
+                        };
+                        Ok((graph, retained_use))
+                    })
+                    .collect::<Result<HashMap<_, _>>>()?;
                 let publication = self
                     .load_invocation_workspace_publication(
                         model_instance_id,
                         &contracts,
                         physical_spec.descriptor,
                         &physical_spec.invocation,
-                        None,
-                        HashMap::new(),
+                        Some(retained.into()),
+                        retained_uses,
                     )
                     .await?;
                 state_publications.insert(CapabilityKind::Tts, publication);
