@@ -156,8 +156,12 @@ const fn family_inference_state_policy(family: ModelFamily) -> FamilyInferenceSt
             tts: RetainedAndInvocation,
             ..FamilyInferenceStatePolicy::STATELESS
         },
-        VoxtralTts | FishS2Tts => FamilyInferenceStatePolicy {
+        VoxtralTts => FamilyInferenceStatePolicy {
             tts: Invocation,
+            ..FamilyInferenceStatePolicy::STATELESS
+        },
+        FishS2Tts => FamilyInferenceStatePolicy {
+            tts: RetainedAndInvocation,
             ..FamilyInferenceStatePolicy::STATELESS
         },
         ParakeetAsr => FamilyInferenceStatePolicy {
@@ -382,7 +386,7 @@ fn tts_execution_target(model_variant: ModelVariant) -> ExecutionTargetKind {
         || model_variant.is_lfm25_audio_gguf()
         || matches!(
             model_variant.family(),
-            crate::catalog::ModelFamily::VoxtralTts | crate::catalog::ModelFamily::FishS2Tts
+            crate::catalog::ModelFamily::VoxtralTts
         )
     {
         ExecutionTargetKind::DirectModel
@@ -1094,18 +1098,18 @@ mod tests {
     }
 
     #[test]
-    fn built_in_registry_marks_fish_s2_as_direct_final_only_tts() {
+    fn built_in_registry_marks_fish_s2_as_retained_final_only_tts() {
         let registry = RuntimeAdapterRegistry::built_in();
         let variant = ModelVariant::FishAudioS2Pro;
 
         let adapter = registry
             .require(CapabilityKind::Tts, variant)
             .expect("Fish S2 TTS adapter");
-        assert_eq!(adapter.execution_target, ExecutionTargetKind::DirectModel);
+        assert_eq!(adapter.execution_target, ExecutionTargetKind::TokenEngine);
         assert_eq!(adapter.streaming_mode, StreamingMode::FinalOnly);
         assert_eq!(
             adapter.state_requirement,
-            InferenceStateRequirement::Invocation
+            InferenceStateRequirement::RetainedAndInvocation
         );
     }
 
