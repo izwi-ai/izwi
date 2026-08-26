@@ -47,6 +47,9 @@ pub(crate) struct Lfm25AudioRetainedStateSpec {
     pub(crate) descriptor: CapabilityStateDescriptorV2,
     pub(crate) retained: InferenceStateContract,
     pub(crate) retained_max_tokens: usize,
+    /// ASR preserves its long-form compatibility graph as invocation-owned
+    /// main paged + ShortConv state alongside the normal managed sequence.
+    pub(crate) main_invocation: Option<InferenceStateContract>,
     /// TTS resets this invocation cache for every emitted frame. ASR has no
     /// Depthformer and therefore no invocation state contract here.
     pub(crate) depthformer_invocation: Option<InferenceStateContract>,
@@ -236,6 +239,20 @@ pub(crate) fn lfm25_audio_retained_state_spec(
     }
     let retained = lfm2_managed_cache_contract(main_config)?;
     let retained_max_tokens = main_config.context_length;
+    let main_invocation = (mode == Lfm25AudioRetainedMode::Asr)
+        .then(|| {
+            let layout = Lfm2StateLayout::from_config(main_config)?;
+            lfm2_main_invocation_contract(
+                main_config,
+                &layout,
+                Lfm2StateIds {
+                    attention: LFM25_MAIN_ATTENTION_STATE_DOMAIN,
+                    shortconv: LFM25_MAIN_SHORTCONV_STATE_DOMAIN,
+                    main_group: LFM25_MAIN_STATE_GROUP,
+                },
+            )
+        })
+        .transpose()?;
     let depthformer_invocation = if mode == Lfm25AudioRetainedMode::Tts {
         let domain = depthformer_domain(decoder_config)?;
         let contract = InferenceStateContract {
@@ -275,10 +292,60 @@ pub(crate) fn lfm25_audio_retained_state_spec(
         ordered.sort_unstable_by_key(|stage| stage.id);
         let mut invocation_stages = Vec::with_capacity(ordered.len());
         for (index, stage) in ordered.into_iter().enumerate() {
+            let owns_main_invocation =
+                mode == Lfm25AudioRetainedMode::Asr && stage.selector == StageWorkSelector::Atomic;
             let owns_depthformer = mode == Lfm25AudioRetainedMode::Tts
                 && stage.selector == StageWorkSelector::SequenceDecode;
             let mut groups = Vec::new();
             let mut domains = Vec::new();
+            if owns_main_invocation {
+                let contract = main_invocation
+                    .as_ref()
+                    .expect("ASR retained topology has main invocation state");
+                groups = contract.groups.clone();
+                for state in &contract.domains {
+                    let (fixed_bytes, capacity) = match state {
+                        StateDomainSpec::PagedAttention(_) => {
+                            let max_tokens =
+                                u64::try_from(main_config.context_length).map_err(|_| {
+                                    Error::ModelLoadError(
+                                        "LFM2.5 Audio main context exceeds u64".into(),
+                                    )
+                                })?;
+                            (
+                                paged_f32_invocation_bytes(state, max_tokens)?,
+                                InvocationStateCapacity::AxisBoundPagedTokens {
+                                    binding: StateCapacityBinding::new(
+                                        StateCapacityAxis::DecoderContext,
+                                        1,
+                                        max_tokens,
+                                    )?,
+                                },
+                            )
+                        }
+                        StateDomainSpec::Ring(_) => (
+                            ring_f32_invocation_bytes(state)?,
+                            InvocationStateCapacity::SemanticBounded,
+                        ),
+                        _ => {
+                            return Err(Error::ModelLoadError(
+                                "LFM2.5 Audio main invocation contract contains unsupported state"
+                                    .into(),
+                            ));
+                        }
+                    };
+                    domains.push(InvocationWorkspaceDomain::State {
+                        placement: state.header().placement,
+                        formula: WorkspaceFormula {
+                            fixed_bytes,
+                            dimensions: vec![],
+                            terms: vec![],
+                        },
+                        state: state.clone(),
+                        capacity,
+                    });
+                }
+            }
             if owns_depthformer {
                 let contract = depthformer_invocation
                     .as_ref()
@@ -329,7 +396,11 @@ pub(crate) fn lfm25_audio_retained_state_spec(
             has_invocation_workspace |= !domains.is_empty();
             invocation_stages.push(InvocationStageWorkspace {
                 stage: stage.id,
-                lease_scope: InvocationLeaseScope::PerRow,
+                lease_scope: if stage.max_batch_size > 1 {
+                    InvocationLeaseScope::PerStageBatch
+                } else {
+                    InvocationLeaseScope::PerRow
+                },
                 groups,
                 domains,
             });
@@ -365,6 +436,7 @@ pub(crate) fn lfm25_audio_retained_state_spec(
         descriptor,
         retained,
         retained_max_tokens,
+        main_invocation,
         depthformer_invocation,
     })
 }
@@ -373,15 +445,41 @@ fn validate_retained_stage_graph(
     mode: Lfm25AudioRetainedMode,
     stages: &[StageDescriptor],
 ) -> Result<()> {
+    if mode == Lfm25AudioRetainedMode::Asr
+        && stages.len() == 1
+        && stages[0].selector == StageWorkSelector::Atomic
+    {
+        let stage = &stages[0];
+        stage.validate()?;
+        if stage.progress != StageProgressKind::Atomic
+            || stage.batch_mode != NativeBatchMode::None
+            || stage.max_batch_size != 1
+            || stage.output_visibility != OutputVisibility::AfterQuantumCommit
+            || stage.retained_state_selections.is_some()
+        {
+            return Err(Error::ModelLoadError(
+                "LFM2.5 Audio long-form ASR requires one scalar atomic invocation stage".into(),
+            ));
+        }
+        return Ok(());
+    }
     let mut preparations = 0usize;
     let mut prefills = 0usize;
     let mut decodes = 0usize;
     for stage in stages {
         stage.validate()?;
-        if stage.batch_mode != NativeBatchMode::None || stage.max_batch_size != 1 {
+        let valid_batch = match (mode, stage.selector) {
+            (Lfm25AudioRetainedMode::Asr, StageWorkSelector::SequenceDecode) => {
+                matches!(
+                    stage.batch_mode,
+                    NativeBatchMode::None | NativeBatchMode::Continuous
+                ) && stage.max_batch_size > 0
+            }
+            _ => stage.batch_mode == NativeBatchMode::None && stage.max_batch_size == 1,
+        };
+        if !valid_batch {
             return Err(Error::ModelLoadError(
-                "LFM2.5 Audio retained handlers are dormant and cannot advertise native batching"
-                    .into(),
+                "LFM2.5 Audio retained stage has incompatible native batch geometry".into(),
             ));
         }
         if stage.output_visibility != OutputVisibility::AfterQuantumCommit {
@@ -718,6 +816,7 @@ mod tests {
         .expect("retained ASR contract");
 
         assert_eq!(spec.retained_max_tokens, 17);
+        assert!(spec.main_invocation.is_some());
         assert!(spec.depthformer_invocation.is_none());
         assert!(spec.retained.domains.iter().all(|domain| {
             domain.header().scope == crate::kv::v2::StateScope::Retained
@@ -737,6 +836,71 @@ mod tests {
     }
 
     #[test]
+    fn retained_asr_contract_coexists_with_continuous_normal_and_atomic_long_form() {
+        let preparation = retained_stage(0, StageWorkSelector::PreSequencePreparation, 128);
+        let prefill = retained_stage(1, StageWorkSelector::SequencePrefill, 64);
+        let mut decode = retained_stage(2, StageWorkSelector::SequenceDecode, 32);
+        decode.batch_mode = NativeBatchMode::Continuous;
+        decode.concurrency = ConcurrencyClass::Batchable;
+        decode.max_batch_size = 4;
+        decode.membership_safe_point = MembershipSafePoint::QuantumBoundary;
+        decode.shape_policy = StageShapePolicy::Ragged;
+        let normal = [preparation, prefill, decode];
+        let mut long_form = stage();
+        long_form.name = "asr.long_form.lfm25_audio.atomic".into();
+        let long_form = [long_form];
+
+        let spec = lfm25_audio_retained_state_spec(
+            &main_config(),
+            &decoder_config(),
+            Lfm25AudioRetainedMode::Asr,
+            &[&normal, &long_form],
+        )
+        .expect("normal and long-form ASR graphs must coexist");
+
+        let main = spec
+            .main_invocation
+            .as_ref()
+            .expect("long form owns main invocation state");
+        assert_eq!(main.domains.len(), 2);
+        assert_eq!(main.groups.len(), 1);
+        let InvocationWorkspaceSet::Bounded { profiles } = &spec.descriptor.invocation else {
+            panic!("combined ASR graphs require bounded invocation profiles");
+        };
+        let atomic = profiles
+            .iter()
+            .find(|profile| {
+                profile.stage_graph_fingerprint == stage_graph_fingerprint(&long_form).unwrap()
+            })
+            .and_then(|profile| profile.stages.first())
+            .expect("atomic profile");
+        assert!(atomic
+            .domains
+            .iter()
+            .any(|domain| { domain.id() == LFM25_MAIN_ATTENTION_STATE_DOMAIN }));
+        assert!(atomic
+            .domains
+            .iter()
+            .any(|domain| { domain.id() == LFM25_MAIN_SHORTCONV_STATE_DOMAIN }));
+        let normal_decode = profiles
+            .iter()
+            .find(|profile| {
+                profile.stage_graph_fingerprint == stage_graph_fingerprint(&normal).unwrap()
+            })
+            .and_then(|profile| {
+                profile
+                    .stages
+                    .iter()
+                    .find(|stage| stage.stage == normal[2].id)
+            })
+            .expect("normal decode profile");
+        assert!(normal_decode
+            .domains
+            .iter()
+            .all(|domain| { matches!(domain, InvocationWorkspaceDomain::Scratch { .. }) }));
+    }
+
+    #[test]
     fn retained_tts_keeps_depthformer_on_decode_invocation_only() {
         let prefill = retained_stage(1, StageWorkSelector::SequencePrefill, 0);
         let decode = retained_stage(2, StageWorkSelector::SequenceDecode, 64);
@@ -750,6 +914,7 @@ mod tests {
         .expect("retained TTS contract");
 
         assert_eq!(spec.retained.domains.len(), 2);
+        assert!(spec.main_invocation.is_none());
         assert!(spec
             .retained
             .domains
