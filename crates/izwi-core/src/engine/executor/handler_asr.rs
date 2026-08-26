@@ -5368,12 +5368,12 @@ impl NativeExecutor {
                 ));
             }
             steps.extend(append_rows.into_iter().zip(native_steps));
-            crate::engine::metrics::record_engine_model_call(
-                crate::engine::metrics::EngineModelCall::NativeTensor {
-                    mode: crate::engine::NativeBatchMode::Continuous,
-                    rows: native_width,
-                },
-            );
+            if let Some(call) = retained_asr_batch_model_call(
+                crate::engine::NativeBatchMode::Continuous,
+                native_width,
+            ) {
+                crate::engine::metrics::record_engine_model_call(call);
+            }
         }
         if scalar_rows > 0 {
             crate::engine::metrics::record_engine_model_call(
@@ -7227,6 +7227,20 @@ mod tests {
             Some(crate::engine::metrics::EngineModelCall::NativeTensor {
                 mode: crate::engine::NativeBatchMode::Static,
                 rows: 3
+            })
+        ));
+        assert!(matches!(
+            super::retained_asr_batch_model_call(crate::engine::NativeBatchMode::Continuous, 1),
+            Some(crate::engine::metrics::EngineModelCall::ScalarRows {
+                envelope: crate::engine::NativeBatchMode::Continuous,
+                rows: 1
+            })
+        ));
+        assert!(matches!(
+            super::retained_asr_batch_model_call(crate::engine::NativeBatchMode::Continuous, 2),
+            Some(crate::engine::metrics::EngineModelCall::NativeTensor {
+                mode: crate::engine::NativeBatchMode::Continuous,
+                rows: 2
             })
         ));
     }
