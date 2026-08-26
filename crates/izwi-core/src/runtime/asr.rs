@@ -421,6 +421,11 @@ impl RuntimeAsrRealtimeState {
         model: &NativeAsrModel,
         operation: impl FnOnce(&mut NativeAsrRealtimeState) -> Result<T>,
     ) -> Result<T> {
+        let checkpoint = match &self.native {
+            NativeAsrRealtimeState::Nemotron(state) => {
+                NativeAsrRealtimeState::Nemotron(state.clone())
+            }
+        };
         let transaction = self.physical.begin()?;
         let result = (|| {
             model.hydrate_realtime_physical_state(
@@ -442,6 +447,7 @@ impl RuntimeAsrRealtimeState {
             Ok(output)
         })();
         if result.is_err() {
+            self.native = checkpoint;
             if let Err(error) = model.clear_realtime_tensor_handles(&mut self.native) {
                 tracing::error!(
                     error = %error,
