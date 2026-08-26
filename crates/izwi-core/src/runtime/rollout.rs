@@ -89,6 +89,7 @@ pub(crate) fn validate_managed_state_plan_eligibility(
                 ModelFamily::Qwen3Tts,
                 CapabilityKind::Tts | CapabilityKind::StreamingTts
             )
+            | (ModelFamily::VibeVoiceTts, CapabilityKind::Tts)
     );
     if !route_validated {
         return Err(Error::ModelLoadError(format!(
@@ -196,6 +197,15 @@ mod tests {
             validate_managed_state_plan_eligibility(
                 ModelVariant::Lfm25Audio15BGguf,
                 CapabilityKind::Asr,
+                &plan,
+            )
+            .unwrap(),
+            KvProviderEligibility::PortableRouteValidated
+        );
+        assert_eq!(
+            validate_managed_state_plan_eligibility(
+                ModelVariant::VibeVoice15BTts,
+                CapabilityKind::Tts,
                 &plan,
             )
             .unwrap(),

@@ -2853,6 +2853,7 @@ impl LoadedExecutionAdapter for VibeVoiceTtsExecutionAdapter {
         );
         preparation.selector = StageWorkSelector::PreSequencePreparation;
         preparation.progress = StageProgressKind::Atomic;
+        preparation.membership_safe_point = MembershipSafePoint::OperationBoundary;
         preparation.max_batch_size = 1;
         preparation.concurrency = ConcurrencyClass::Exclusive;
         preparation.shape_policy = StageShapePolicy::Exact;
@@ -6546,6 +6547,34 @@ mod tests {
         assert_eq!(
             streaming_capability.execution_profile.cache_mode,
             CacheMode::ExternalPaged
+        );
+    }
+
+    #[test]
+    fn vibevoice_tts_preparation_uses_the_authenticated_operation_boundary() {
+        let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(2, 1).unwrap();
+        let draft = LoadedModelBundleDraft::build(
+            &registry,
+            ExecutionGroupId::new(1),
+            ModelInstanceId::new(2),
+            ModelVariant::VibeVoice15BTts,
+            BackendKind::Cpu,
+        )
+        .unwrap();
+        let contract = draft
+            .capabilities
+            .get(&CapabilityKind::Tts)
+            .unwrap()
+            .contract(StreamingRequirements::NONE)
+            .unwrap();
+
+        assert_eq!(
+            contract.stages[0].selector,
+            StageWorkSelector::PreSequencePreparation
+        );
+        assert_eq!(
+            contract.stages[0].membership_safe_point,
+            MembershipSafePoint::OperationBoundary
         );
     }
 
