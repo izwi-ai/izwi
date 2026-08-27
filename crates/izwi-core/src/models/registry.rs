@@ -2248,6 +2248,7 @@ impl NativeAsrModel {
     pub fn supports_continuous_decode_batch(&self) -> bool {
         match self {
             Self::Qwen3(model) => model.supports_continuous_decode_batch(),
+            Self::Parakeet(_) => true,
             Self::VibeVoice(model) => model.supports_continuous_decode_batch(),
             Self::GraniteSpeech(model) => model.supports_continuous_decode_batch(),
             _ => false,
@@ -2255,7 +2256,7 @@ impl NativeAsrModel {
     }
 
     pub fn supports_static_prefill_batch(&self) -> bool {
-        matches!(self, Self::VibeVoice(_))
+        matches!(self, Self::Parakeet(_) | Self::VibeVoice(_))
     }
 
     pub fn continuous_decode_is_tensor_batched(&self) -> bool {
@@ -2266,6 +2267,9 @@ impl NativeAsrModel {
     pub fn continuous_decode_batch_workspace_per_row_bytes(&self) -> Result<u64> {
         match self {
             Self::Qwen3(model) => model.continuous_decode_batch_workspace_per_row_bytes(),
+            Self::Parakeet(_) => Ok(
+                crate::models::architectures::parakeet::asr::PARAKEET_RETAINED_WORKSPACE_PER_ROW_BYTES,
+            ),
             Self::VibeVoice(model) => model.continuous_decode_workspace_per_row_bytes(),
             Self::GraniteSpeech(model) => model.continuous_decode_workspace_per_row_bytes(),
             _ => Err(Error::InvalidInput(

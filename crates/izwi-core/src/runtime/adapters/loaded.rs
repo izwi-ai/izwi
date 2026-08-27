@@ -799,8 +799,13 @@ fn validate_retained_state_use(
     };
     if !valid {
         return Err(Error::ModelLoadError(
-            "retained-state use does not match its physical backing and exact execution profile"
-                .to_string(),
+            format!(
+                "retained-state use {retained_state_use:?} does not match its physical backing (tensor_only={}) and exact execution profile (cache_mode={:?}, namespace={}, kv_dtype={})",
+                retained.is_tensor_only(),
+                profile.cache_mode,
+                profile.cache_namespace.is_some(),
+                profile.kv_dtype,
+            ),
         ));
     }
     Ok(())
@@ -3160,7 +3165,8 @@ impl LoadedExecutionAdapter for ParakeetAsrExecutionAdapter {
         profile.incremental_decode = true;
         profile.prefill_batch = NativeBatchMode::Static;
         profile.decode_batch = NativeBatchMode::Continuous;
-        // Parakeet retains recurrent tensors, not attention pages.
+        // Parakeet's rollback-safe recurrent state is retained by the exact
+        // executor session; it has no attention pages or managed KV runtime.
         profile.cache_mode = CacheMode::None;
         profile.cache_namespace = None;
         profile.kv_dtype = "none".into();

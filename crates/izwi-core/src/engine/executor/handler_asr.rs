@@ -505,8 +505,6 @@ fn rollback_parakeet_host_state<T>(state: &mut T, checkpoint: &mut Option<T>) ->
 struct ContinuousParakeetAsrRow<'a> {
     index: usize,
     session: SessionKey,
-    arena: Arc<crate::backends::state::TensorStateArena>,
-    target: u64,
     lease: ExecutorStateLease<'a, ActiveParakeetAsrDecode>,
     checkpoint: Option<ParakeetRetainedDecodeState>,
 }
@@ -5678,7 +5676,7 @@ impl NativeExecutor {
         &self,
         requests: &[&EngineCoreRequest],
         scheduled: &[ScheduledRequest],
-        mut managed: Vec<Option<super::RetainedRowManagedState>>,
+        managed: Vec<Option<super::RetainedRowManagedState>>,
     ) -> Result<Vec<ModelSessionResult>> {
         if requests.len() != scheduled.len() || managed.len() != scheduled.len() {
             return Err(Error::InvalidInput(
@@ -5737,20 +5735,11 @@ impl NativeExecutor {
                     "Parakeet prefill batch crossed its loaded sequence identity".into(),
                 ));
             }
-            let mut retained = managed[index].take().ok_or_else(|| {
-                Error::InferenceError("Parakeet prefill lost retained tensor state".into())
-            })?;
-            retained.ensure_all_paged_consumed()?;
-            drop(retained.tensor_state.take().ok_or_else(|| {
-                Error::InferenceError("Parakeet prefill lost tensor reservation".into())
-            })?);
-            let arena = request
-                .managed_cache_runtime()
-                .and_then(|runtime| runtime.tensor_state())
-                .cloned()
-                .ok_or_else(|| {
-                    Error::InferenceError("Parakeet prefill lost tensor arena".into())
-                })?;
+            if managed[index].is_some() {
+                return Err(Error::InferenceError(
+                    "cacheless Parakeet prefill received managed state".into(),
+                ));
+            }
             let artifact = request
                 .prepared_parakeet_artifact_for_executor()?
                 .ok_or_else(|| {
@@ -5771,20 +5760,11 @@ impl NativeExecutor {
                     "Parakeet initial prefill found an existing session state".into(),
                 ));
             }
-            let target = u64::try_from(
-                scheduled[index]
-                    .num_computed_tokens
-                    .checked_add(scheduled[index].num_tokens)
-                    .ok_or_else(|| Error::Overloaded("Parakeet prefill cursor overflow".into()))?,
-            )
-            .map_err(|_| Error::Overloaded("Parakeet prefill cursor exceeds u64".into()))?;
             rows.push((
                 index,
                 variant,
                 row_model,
                 artifact,
-                arena,
-                target,
                 samples.len(),
                 sample_rate,
                 lease,
@@ -5805,31 +5785,14 @@ impl NativeExecutor {
         for row in &rows {
             cancelled[row.0] = requests[row.0].is_cancelled();
         }
-        for (row, state) in rows.iter().zip(&states) {
-            let (index, _, _, _, arena, target, _, _, _) = row;
-            if cancelled[*index] {
-                continue;
-            }
-            model.stage_retained_decode_physical_state(
-                state,
-                arena.as_ref(),
-                PhysicalStateTransactionId::new(scheduled[*index].plan_id)?,
-                *target,
-            )?;
-        }
-        // No host state is installed until every live tensor transaction has
-        // staged successfully. Cancellation during peer staging is observed at
-        // this last pre-publication barrier.
         for row in &rows {
             cancelled[row.0] |= requests[row.0].is_cancelled();
         }
 
         let mut host = ParakeetPrefillHostBatch::new();
         let mut continuing = vec![false; requests.len()];
-        for (
-            (index, variant, row_model, artifact, _, _, sample_count, sample_rate, mut lease),
-            state,
-        ) in rows.into_iter().zip(states)
+        for ((index, variant, row_model, artifact, sample_count, sample_rate, mut lease), state) in
+            rows.into_iter().zip(states)
         {
             let request = requests[index];
             if cancelled[index] {
@@ -5901,7 +5864,7 @@ impl NativeExecutor {
         &self,
         requests: &[&EngineCoreRequest],
         scheduled: &[ScheduledRequest],
-        mut managed: Vec<Option<super::RetainedRowManagedState>>,
+        managed: Vec<Option<super::RetainedRowManagedState>>,
     ) -> Result<Vec<ModelSessionResult>> {
         let mut outputs = (0..requests.len()).map(|_| None).collect::<Vec<_>>();
         let live = requests
@@ -5954,18 +5917,11 @@ impl NativeExecutor {
                     "Parakeet decode batch crossed its loaded sequence identity".into(),
                 ));
             }
-            let mut retained = managed[index].take().ok_or_else(|| {
-                Error::InferenceError("Parakeet decode lost retained tensor state".into())
-            })?;
-            retained.ensure_all_paged_consumed()?;
-            drop(retained.tensor_state.take().ok_or_else(|| {
-                Error::InferenceError("Parakeet decode lost tensor reservation".into())
-            })?);
-            let arena = request
-                .managed_cache_runtime()
-                .and_then(|runtime| runtime.tensor_state())
-                .cloned()
-                .ok_or_else(|| Error::InferenceError("Parakeet decode lost tensor arena".into()))?;
+            if managed[index].is_some() {
+                return Err(Error::InferenceError(
+                    "cacheless Parakeet decode received managed state".into(),
+                ));
+            }
             let mut lease = ExecutorStateLease::checkout(
                 &self.parakeet_asr_decode_states,
                 scheduled[index].session_key(),
@@ -5989,24 +5945,10 @@ impl NativeExecutor {
                 ));
             }
             let checkpoint = active.state.clone();
-            model.hydrate_retained_decode_physical_state(
-                &mut active.state,
-                arena.as_ref(),
-                PhysicalStateTransactionId::new(scheduled[index].plan_id)?,
-            )?;
             lease.mark_dirty();
-            let target = u64::try_from(
-                scheduled[index]
-                    .num_computed_tokens
-                    .checked_add(scheduled[index].num_tokens)
-                    .ok_or_else(|| Error::Overloaded("Parakeet decode cursor overflow".into()))?,
-            )
-            .map_err(|_| Error::Overloaded("Parakeet decode cursor exceeds u64".into()))?;
             rows.push(ContinuousParakeetAsrRow {
                 index,
                 session: scheduled[index].session_key(),
-                arena,
-                target,
                 lease,
                 checkpoint: Some(checkpoint),
             });
@@ -6052,14 +5994,7 @@ impl NativeExecutor {
                 let step = steps[row].take().ok_or_else(|| {
                     Error::InferenceError("Parakeet decode lost a native batch row".into())
                 })?;
-                let active_row = &mut active_states.rows[row];
-                let active = active_row.lease.require_state_mut()?;
-                model.stage_retained_decode_physical_state(
-                    &active.state,
-                    active_row.arena.as_ref(),
-                    PhysicalStateTransactionId::new(scheduled[index].plan_id)?,
-                    active_row.target,
-                )?;
+                let active = active_states.rows[row].lease.require_state_mut()?;
                 let generated = step
                     .tokens_generated
                     .saturating_sub(active.last_tokens_generated);

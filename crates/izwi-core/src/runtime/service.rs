@@ -4631,10 +4631,11 @@ impl RuntimeService {
             u64::try_from(samples.len())
                 .map_err(|_| Error::Overloaded("Parakeet sample work exceeds u64".into()))?,
             materialized_elements,
-            ResourceVector {
-                device_bytes: ResourceAmount::Known(workspace_bytes),
-                ..ResourceVector::zero()
-            },
+            retained_artifact_resources(
+                self.backend_router.context().backend_kind,
+                0,
+                workspace_bytes,
+            )?,
         );
         let cancellation = PreparationCancellation::default();
         let row = self.coordinator.seal_preparation_row(

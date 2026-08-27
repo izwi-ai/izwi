@@ -1646,6 +1646,15 @@ impl ModelLifecycleController {
                                 self.realtime_asr_sequence_capacity,
                             )
                             .await?;
+                        let effective_context = self.config.portable_context_ceiling();
+                        self.model_registry.publish_effective_context(
+                            variant,
+                            u64::try_from(effective_context).map_err(|_| {
+                                Error::ModelLoadError(
+                                    "Parakeet effective context exceeds u64".into(),
+                                )
+                            })?,
+                        )?;
                         let retained_uses = contracts
                             .iter()
                             .map(|contract| {
@@ -1658,7 +1667,7 @@ impl ModelLifecycleController {
                                             .into(),
                                     ));
                                 }
-                                Ok((graph, RetainedStateUseV2::ExternalTensor))
+                                Ok((graph, RetainedStateUseV2::Inactive))
                             })
                             .collect::<Result<HashMap<_, _>>>()?;
                         if physical_spec.invocation.is_some() {

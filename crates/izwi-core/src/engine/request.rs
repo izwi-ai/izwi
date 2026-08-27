@@ -2447,6 +2447,24 @@ impl EngineCoreRequest {
         }) else {
             return Ok(None);
         };
+        if matches!(model, NativeAsrModel::Parakeet(_)) {
+            let cost = WorkCost::new(
+                1,
+                1,
+                crate::models::architectures::parakeet::asr::PARAKEET_RETAINED_WORKSPACE_PER_ROW_BYTES,
+            );
+            if !cost
+                .workspace
+                .workspace_bytes()
+                .is_ok_and(|bytes| bytes <= stage.max_workspace_bytes)
+            {
+                return Err(Error::Overloaded(
+                    "Parakeet retained decode workspace exceeds its loaded adapter budget"
+                        .to_string(),
+                ));
+            }
+            return Ok(Some((stage.id, cost)));
+        }
         if !model.supports_continuous_decode_batch() {
             return Err(Error::InvalidInput(
                 "loaded adapter selected continuous decode for an incompatible ASR model"
