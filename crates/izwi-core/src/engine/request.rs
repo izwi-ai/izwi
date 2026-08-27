@@ -2472,12 +2472,7 @@ impl EngineCoreRequest {
             ));
         }
         let accelerator_bytes = model.continuous_decode_batch_workspace_per_row_bytes()?;
-        let host_bytes = u64::try_from(
-            std::mem::size_of::<u32>() + 4 * std::mem::size_of::<usize>(),
-        )
-        .map_err(|_| {
-            Error::Overloaded("continuous ASR host workspace estimate overflow".to_string())
-        })?;
+        let host_bytes = super::continuous_asr_host_workspace_per_row_bytes()?;
         let cost = WorkCost::with_workspace(
             1,
             1,
@@ -2487,10 +2482,8 @@ impl EngineCoreRequest {
                 ..ResourceVector::zero()
             },
         );
-        if !cost
-            .workspace
-            .workspace_bytes()
-            .is_ok_and(|bytes| bytes <= stage.max_workspace_bytes)
+        if super::continuous_asr_workspace_per_row_bytes(accelerator_bytes)?
+            > stage.max_workspace_bytes
         {
             return Err(Error::Overloaded(
                 "continuous ASR decode workspace exceeds its loaded adapter budget".to_string(),

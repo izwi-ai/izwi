@@ -911,6 +911,17 @@ impl Default for WorkCost {
     }
 }
 
+pub(crate) fn continuous_asr_host_workspace_per_row_bytes() -> Result<u64> {
+    u64::try_from(std::mem::size_of::<u32>() + 4 * std::mem::size_of::<usize>())
+        .map_err(|_| Error::Overloaded("continuous ASR host workspace estimate overflow".into()))
+}
+
+pub(crate) fn continuous_asr_workspace_per_row_bytes(accelerator_bytes: u64) -> Result<u64> {
+    accelerator_bytes
+        .checked_add(continuous_asr_host_workspace_per_row_bytes()?)
+        .ok_or_else(|| Error::Overloaded("continuous ASR workspace estimate overflow".into()))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BatchBudget {
     pub max_rows: usize,

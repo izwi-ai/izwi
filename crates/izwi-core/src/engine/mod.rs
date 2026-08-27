@@ -76,7 +76,10 @@ pub(crate) use config::resolve_backend_model_context;
 pub(crate) use config::tts_explicit_output_limit;
 pub use config::EngineCoreConfig;
 pub use core::EngineCore;
-pub(crate) use execution::ClockedStateProjection;
+pub(crate) use execution::{
+    continuous_asr_host_workspace_per_row_bytes, continuous_asr_workspace_per_row_bytes,
+    ClockedStateProjection,
+};
 pub use execution::{
     AdapterAbiRevision, AdapterBindingKey, AdapterInstanceId, BatchBudget, BatchDispatch,
     BatchDispatchKind, BatchId, BatchKey, BatchLaneKey, CacheMode, CancellationGranularity,

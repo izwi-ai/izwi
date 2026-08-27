@@ -1063,16 +1063,10 @@ impl GraniteSpeechAsrModel {
             ));
         }
         let max_new_tokens = options.max_new_tokens.max(1);
-        let required = artifact
-            .prompt_tokens
-            .checked_add(max_new_tokens)
-            .ok_or_else(|| Error::InvalidInput("Granite Speech context length overflow".into()))?;
-        if required > cache.capacity_tokens() {
-            return Err(Error::InvalidInput(format!(
-                "Granite Speech prompt and decode require {required} KV tokens, but retained cache capacity is {}",
-                cache.capacity_tokens()
-            )));
-        }
+        // This cache view contains only the pages reserved for the current
+        // scheduler quantum. Later resumable-prefill and decode quanta replace
+        // it with larger transactional views, so the request-wide context was
+        // already bounded against the model runtime during shape preparation.
         let special = self.prompt_tokenizer.special_tokens();
         let mut stop_tokens = BTreeSet::from([special.eos_token_id, special.pad_token_id]);
         stop_tokens.extend(options.stop_token_ids);

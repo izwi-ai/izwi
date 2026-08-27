@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::backends::BackendKind;
-use crate::engine::ManagedKvModelRuntime;
+use crate::engine::{continuous_asr_workspace_per_row_bytes, ManagedKvModelRuntime};
 use crate::engine::{
     AdapterAbiRevision, AdapterInstanceId, CacheMode, CancellationGranularity,
     ClockedStateSelection, ConcurrencyClass, ExecutionAdapterBinding, ExecutionGroupId,
@@ -3819,9 +3819,10 @@ impl LoadedExecutionAdapter for GraniteSpeechAsrExecutionAdapter {
         decode.max_work_units = u64::try_from(decode.max_batch_size).map_err(|_| {
             Error::Overloaded("Granite Speech ASR batch width exceeds work accounting".into())
         })?;
-        decode.workspace_per_row_bytes = seal.decode_workspace_per_row_bytes;
-        decode.max_workspace_bytes = seal
-            .decode_workspace_per_row_bytes
+        let decode_workspace_per_row =
+            continuous_asr_workspace_per_row_bytes(seal.decode_workspace_per_row_bytes)?;
+        decode.workspace_per_row_bytes = decode_workspace_per_row;
+        decode.max_workspace_bytes = decode_workspace_per_row
             .checked_mul(u64::try_from(self.max_batch_size).map_err(|_| {
                 Error::Overloaded("Granite Speech ASR batch width exceeds u64".into())
             })?)
@@ -4038,8 +4039,9 @@ impl LoadedExecutionAdapter for VibeVoiceAsrExecutionAdapter {
                 "VibeVoice ASR execution seal does not match its loaded adapter".into(),
             ));
         }
-        let decode_workspace = seal
-            .decode_workspace_per_row_bytes
+        let decode_workspace_per_row =
+            continuous_asr_workspace_per_row_bytes(seal.decode_workspace_per_row_bytes)?;
+        let decode_workspace = decode_workspace_per_row
             .checked_mul(
                 u64::try_from(self.max_batch_size).map_err(|_| {
                     Error::Overloaded("VibeVoice ASR batch width exceeds u64".into())
@@ -4132,6 +4134,7 @@ impl LoadedExecutionAdapter for VibeVoiceAsrExecutionAdapter {
             Error::Overloaded("VibeVoice ASR batch width exceeds work accounting".into())
         })?;
         decode.max_workspace_bytes = decode_workspace;
+        decode.workspace_per_row_bytes = decode_workspace_per_row;
         decode.retained_state_selections = Some(vec![]);
         preparation.validate()?;
         prefill.validate()?;
@@ -7046,8 +7049,9 @@ mod tests {
         assert_eq!(normal.stages[2].concurrency, ConcurrencyClass::Batchable);
         assert_eq!(normal.stages[2].shape_policy, StageShapePolicy::Ragged);
         assert_eq!(normal.stages[2].max_work_units, 8);
-        assert_eq!(normal.stages[2].max_workspace_bytes, 8 * 8_192);
-        assert_eq!(normal.stages[2].workspace_per_row_bytes, 8_192);
+        let decode_workspace = continuous_asr_workspace_per_row_bytes(8_192).unwrap();
+        assert_eq!(normal.stages[2].max_workspace_bytes, 8 * decode_workspace);
+        assert_eq!(normal.stages[2].workspace_per_row_bytes, decode_workspace);
         assert!(normal.stages[0].max_work_units > 0);
         assert!(normal.stages[0].max_workspace_bytes > 0);
 
@@ -7097,8 +7101,9 @@ mod tests {
             );
             assert_eq!(contract.stages[1].concurrency, ConcurrencyClass::Exclusive);
             assert_eq!(contract.stages[2].concurrency, ConcurrencyClass::Batchable);
-            assert_eq!(contract.stages[2].workspace_per_row_bytes, 8_192);
-            assert_eq!(contract.stages[2].max_workspace_bytes, 8 * 8_192);
+            let decode_workspace = continuous_asr_workspace_per_row_bytes(8_192).unwrap();
+            assert_eq!(contract.stages[2].workspace_per_row_bytes, decode_workspace);
+            assert_eq!(contract.stages[2].max_workspace_bytes, 8 * decode_workspace);
         }
     }
 
@@ -7250,7 +7255,9 @@ mod tests {
         assert_eq!(normal.stages[2].batch_mode, NativeBatchMode::Continuous);
         assert_eq!(normal.stages[2].shape_policy, StageShapePolicy::Ragged);
         assert_eq!(normal.stages[2].max_batch_size, 4);
-        assert_eq!(normal.stages[2].max_workspace_bytes, 4 * 8_192);
+        let decode_workspace = continuous_asr_workspace_per_row_bytes(8_192).unwrap();
+        assert_eq!(normal.stages[2].workspace_per_row_bytes, decode_workspace);
+        assert_eq!(normal.stages[2].max_workspace_bytes, 4 * decode_workspace);
 
         let legacy = adapter
             .contract(StreamingRequirements::NONE.with_asr_long_form(true))
