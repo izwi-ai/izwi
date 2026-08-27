@@ -2,7 +2,7 @@ use crate::backends::state::PhysicalStateTransactionId;
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::models::architectures::lfm25_audio::asr_retained::{
-    Lfm25AudioAsrDecodeStep, Lfm25AudioAsrQuantumCheckpoint,
+    Lfm25AudioAsrDecodeStep, Lfm25AudioAsrQuantumCheckpoint, Lfm25AudioAsrStopReason,
 };
 use crate::models::architectures::nemotron::asr::{
     NemotronRealtimeBatchInput, NemotronRealtimeDecodeBatchRow,
@@ -3722,8 +3722,10 @@ impl NativeExecutor {
                     delta: String::new(),
                     text: active.state.text().to_string(),
                     tokens_generated: active.last_tokens_generated,
-                    finished: false,
-                    stop_reason: None,
+                    finished: prefill.finished,
+                    stop_reason: prefill
+                        .finished
+                        .then_some(Lfm25AudioAsrStopReason::StopToken),
                     pending_token: prefill.pending_token,
                 }
             } else {
@@ -5227,7 +5229,7 @@ impl NativeExecutor {
                     || step.prefill_cursor != expected_end
                     || step.prompt_tokens != requests[index].num_prompt_tokens()
                     || step.complete != (expected_end == step.prompt_tokens)
-                    || step.pending_token.is_some() != step.complete
+                    || step.pending_token.is_some() != (step.complete && !step.finished)
                 {
                     return Err(Error::InferenceError(
                         "LFM ASR prefill progress differs from admission".into(),
@@ -5275,7 +5277,12 @@ impl NativeExecutor {
             })?;
             let sample_rate = active.input_sample_rate;
             let sample_count = active.input_sample_count;
-            lease.restore()?;
+            let finished = active.state.finished();
+            if finished {
+                lease.release()?;
+            } else {
+                lease.restore()?;
+            }
             outputs[index] = Some(
                 ModelSessionResult::sequence(ExecutorOutput {
                     request_id: requests[index].id.clone(),
@@ -5292,7 +5299,7 @@ impl NativeExecutor {
                     input_transcription: None,
                     tokens_processed: scheduled[index].num_tokens,
                     tokens_generated: 0,
-                    finished: false,
+                    finished,
                     phase_timing_override: None,
                     asr_diagnostics: None,
                     error: None,

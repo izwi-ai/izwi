@@ -2956,6 +2956,13 @@ fn loaded_native_batch_support(request: &EngineCoreRequest) -> NativeBatchSuppor
                     model.supports_continuous_decode_batch(),
                 )
             })
+            .or_else(|| {
+                request
+                    .prepared_lfm25_audio_asr_model_lease_for_executor()
+                    .ok()
+                    .flatten()
+                    .map(|_| (true, true))
+            })
             .unwrap_or((false, false)),
         TaskType::TTS => (
             false,
@@ -3066,7 +3073,14 @@ impl ModelExecutor for NativeExecutor {
                         .as_ref()
                         .and_then(|registry| registry.try_get_asr(variant))
                 })
-                .map(|model| model.supports_incremental_decode()),
+                .map(|model| model.supports_incremental_decode())
+                .or_else(|| {
+                    request
+                        .prepared_lfm25_audio_asr_model_lease_for_executor()
+                        .ok()
+                        .flatten()
+                        .map(|_| request.uses_asr_retained_sequence())
+                }),
             super::types::TaskType::TTS => {
                 let loaded = request
                     .prepared_qwen_tts_model_for_executor()
@@ -3121,6 +3135,8 @@ impl ModelExecutor for NativeExecutor {
                 }
                 super::types::TaskType::ASR => {
                     variant.family() == crate::catalog::ModelFamily::Qwen3Asr
+                        || (variant.family() == crate::catalog::ModelFamily::Lfm25Audio
+                            && request.uses_asr_retained_sequence())
                 }
                 super::types::TaskType::TTS => {
                     matches!(
@@ -3141,7 +3157,14 @@ impl ModelExecutor for NativeExecutor {
                 .prepared_asr_model_for_executor()
                 .ok()
                 .flatten()
-                .map(|model| model.supports_resumable_prefill()),
+                .map(|model| model.supports_resumable_prefill())
+                .or_else(|| {
+                    request
+                        .prepared_lfm25_audio_asr_model_lease_for_executor()
+                        .ok()
+                        .flatten()
+                        .map(|_| true)
+                }),
             super::types::TaskType::TTS => request
                 .prepared_qwen_tts_model_for_executor()
                 .ok()
@@ -5964,6 +5987,42 @@ mod tests {
         let mut long = EngineCoreRequest::asr_bytes(vec![1, 2, 3]);
         long.model_variant = Some(ModelVariant::Qwen3Asr06BGguf);
         long.install_prepared_asr_audio(ModelVariant::Qwen3Asr06BGguf, vec![0.0; 160], 16_000)
+            .unwrap();
+        long.install_prepared_asr_long_form_atomic().unwrap();
+        let long_profile = executor.execution_profile(&long).unwrap();
+        assert_eq!(long_profile.mode, ExecutionMode::Atomic);
+        assert_eq!(long_profile.prefill, PrefillMode::None);
+        assert!(!long_profile.incremental_decode);
+        assert_eq!(long_profile.cache_mode, CacheMode::None);
+        assert_eq!(long_profile.decode_batch, NativeBatchMode::None);
+        assert_eq!(long_profile.concurrency, ConcurrencyClass::Exclusive);
+        assert_eq!(long_profile.max_batch_size, 1);
+    }
+
+    #[test]
+    fn lfm25_audio_asr_raw_profile_uses_the_exact_prepared_execution_route() {
+        let executor = NativeExecutor::new(WorkerConfig {
+            backend: BackendKind::Cpu,
+            request_parallelism: 4,
+            enable_chunked_prefill: true,
+            ..Default::default()
+        });
+        let variant = ModelVariant::Lfm25Audio15BGguf;
+        let mut normal = EngineCoreRequest::asr_bytes(vec![1, 2, 3]);
+        normal.model_variant = Some(variant);
+        normal
+            .install_prepared_asr_audio(variant, vec![0.0; 160], 16_000)
+            .unwrap();
+        normal
+            .install_prepared_sequence_input_tokens(32, 4096)
+            .unwrap();
+        let normal_profile = executor.execution_profile(&normal).unwrap();
+        assert_eq!(normal_profile.mode, ExecutionMode::Sequence);
+        assert!(normal_profile.incremental_decode);
+
+        let mut long = EngineCoreRequest::asr_bytes(vec![1, 2, 3]);
+        long.model_variant = Some(variant);
+        long.install_prepared_asr_audio(variant, vec![0.0; 160], 16_000)
             .unwrap();
         long.install_prepared_asr_long_form_atomic().unwrap();
         let long_profile = executor.execution_profile(&long).unwrap();

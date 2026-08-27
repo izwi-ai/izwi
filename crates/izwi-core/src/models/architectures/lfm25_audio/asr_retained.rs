@@ -32,6 +32,7 @@ pub(crate) struct Lfm25AudioAsrPrefillStep {
     pub(crate) prompt_tokens: usize,
     pub(crate) complete: bool,
     pub(crate) pending_token: Option<u32>,
+    pub(crate) finished: bool,
 }
 
 #[derive(Debug)]
@@ -42,8 +43,9 @@ pub(crate) struct Lfm25AudioAsrPrefillBatch {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Lfm25AudioAsrDecodeStep {
-    /// Token appended to main KV in this quantum. A terminal stop decision is
-    /// a valid zero-append quantum and therefore carries `None`.
+    /// Token appended to main KV in this quantum. `None` is retained only as
+    /// a defensive signal; sequence transactions must finish on a prior
+    /// authenticated append.
     pub(crate) cache_append_token: Option<u32>,
     pub(crate) visible_token: Option<u32>,
     pub(crate) delta: String,
@@ -166,13 +168,18 @@ impl Lfm25AudioAsrRetainedState {
         let mut steps = Vec::with_capacity(batch);
         for row in 0..batch {
             states[row].prefill_cursor += consumed[row];
-            states[row].pending_token = pending[row];
+            let terminal_stop =
+                pending[row].is_some_and(|token| is_stop_token(token, &states[row].specials));
+            states[row].pending_token = (!terminal_stop).then_some(pending[row]).flatten();
+            states[row].finished = terminal_stop;
+            states[row].stop_reason = terminal_stop.then_some(Lfm25AudioAsrStopReason::StopToken);
             steps.push(Lfm25AudioAsrPrefillStep {
                 consumed_tokens: consumed[row],
                 prefill_cursor: states[row].prefill_cursor,
                 prompt_tokens: states[row].artifact.prompt_tokens,
                 complete: states[row].prefill_cursor == states[row].artifact.prompt_tokens,
-                pending_token: pending[row],
+                pending_token: states[row].pending_token,
+                finished: states[row].finished,
             });
         }
         Ok(Lfm25AudioAsrPrefillBatch {
@@ -181,7 +188,7 @@ impl Lfm25AudioAsrRetainedState {
         })
     }
 
-    pub(crate) fn decode_will_append(&self, tokenizer: &Lfm25TextTokenizer) -> Result<bool> {
+    pub(crate) fn decode_will_append(&self, _tokenizer: &Lfm25TextTokenizer) -> Result<bool> {
         if self.finished || self.prefill_cursor != self.artifact.prompt_tokens {
             return Ok(false);
         }
@@ -191,10 +198,7 @@ impl Lfm25AudioAsrRetainedState {
         if is_stop_token(token, &self.specials) {
             return Ok(false);
         }
-        let mut ids = self.generated_ids.clone();
-        ids.push(token);
-        let decoded = tokenizer.decode_text(&ids)?;
-        Ok(!has_token_repetition_loop(&ids) && trim_repeated_phrase_tail(&decoded).is_none())
+        Ok(!is_stop_token(token, &self.specials))
     }
 
     pub(crate) fn decode_append_batch(
@@ -222,11 +226,25 @@ impl Lfm25AudioAsrRetainedState {
             let token = states[row].pending_token.expect("append row has a token");
             let mut ids = states[row].generated_ids.clone();
             ids.push(token);
-            let assembled = tokenizer.decode_text(&ids)?;
+            let mut assembled = tokenizer.decode_text(&ids)?;
+            let token_repetition = has_token_repetition_loop(&ids);
+            let text_repetition = if let Some(trimmed) = trim_repeated_phrase_tail(&assembled) {
+                assembled = trimmed;
+                true
+            } else {
+                false
+            };
             let delta = text_delta(&states[row].assembled, &assembled);
+            let repetition_stop = if text_repetition {
+                Some(Lfm25AudioAsrStopReason::TextRepetition)
+            } else if token_repetition {
+                Some(Lfm25AudioAsrStopReason::TokenRepetition)
+            } else {
+                None
+            };
             tokens.push(token);
             positions.push(states[row].main_position()?);
-            next_host.push((ids, assembled, delta));
+            next_host.push((ids, assembled, delta, repetition_stop));
         }
         let mut shortconv = states
             .iter_mut()
@@ -250,26 +268,38 @@ impl Lfm25AudioAsrRetainedState {
         let mut post_kernel = Vec::with_capacity(states.len());
         for (row, state) in states.iter().enumerate() {
             let reached_budget = next_host[row].0.len() >= state.max_new_tokens;
-            let next_pending = if reached_budget {
+            let repetition_stop = next_host[row].3;
+            let sampled = if reached_budget || repetition_stop.is_some() {
                 None
             } else {
                 Some(greedy_from_logits(&logits.i(row)?, state.vocab_limit)?)
             };
+            let terminal_stop = sampled.is_some_and(|token| is_stop_token(token, &state.specials));
+            let next_pending = (!terminal_stop).then_some(sampled).flatten();
             let appended_count = state.decode_tokens_appended.checked_add(1).ok_or_else(|| {
                 Error::InferenceError("LFM2.5 Audio ASR decode cursor overflowed".into())
             })?;
-            post_kernel.push((reached_budget, next_pending, appended_count));
+            let stop_reason = if reached_budget {
+                Some(Lfm25AudioAsrStopReason::MaxTokens)
+            } else {
+                repetition_stop.or(terminal_stop.then_some(Lfm25AudioAsrStopReason::StopToken))
+            };
+            post_kernel.push((stop_reason, next_pending, appended_count));
         }
         let mut outcomes = Vec::with_capacity(states.len());
         for (row, state) in states.iter_mut().enumerate() {
-            let (ids, assembled, delta) = std::mem::take(&mut next_host[row]);
-            let (reached_budget, next_pending, appended_count) = post_kernel[row];
+            let (ids, assembled, delta, repetition_stop) = std::mem::take(&mut next_host[row]);
+            let (stop_reason, next_pending, appended_count) = post_kernel[row];
             state.decode_tokens_appended = appended_count;
             state.pending_token = next_pending;
             state.generated_ids = ids;
             state.assembled = assembled;
-            state.finished = reached_budget;
-            state.stop_reason = reached_budget.then_some(Lfm25AudioAsrStopReason::MaxTokens);
+            state.token_repetition_loop |=
+                repetition_stop == Some(Lfm25AudioAsrStopReason::TokenRepetition);
+            state.text_repetition_loop |=
+                repetition_stop == Some(Lfm25AudioAsrStopReason::TextRepetition);
+            state.finished = stop_reason.is_some();
+            state.stop_reason = stop_reason;
             outcomes.push(state.decode_outcome(Some(tokens[row]), Some(tokens[row]), delta));
         }
         Ok(outcomes)
@@ -434,13 +464,17 @@ impl Lfm25AudioAsrRetainedState {
             None
         };
         self.prefill_cursor = next_cursor;
-        self.pending_token = pending_token;
+        let terminal_stop = pending_token.is_some_and(|token| is_stop_token(token, &self.specials));
+        self.pending_token = (!terminal_stop).then_some(pending_token).flatten();
+        self.finished = terminal_stop;
+        self.stop_reason = terminal_stop.then_some(Lfm25AudioAsrStopReason::StopToken);
         Ok(Lfm25AudioAsrPrefillStep {
             consumed_tokens: consumed,
             prefill_cursor: next_cursor,
             prompt_tokens: self.artifact.prompt_tokens,
             complete: next_cursor == self.artifact.prompt_tokens,
-            pending_token,
+            pending_token: self.pending_token,
+            finished: self.finished,
         })
     }
 
@@ -484,16 +518,6 @@ impl Lfm25AudioAsrRetainedState {
         } else {
             None
         };
-        if let Some(stop_reason) = repetition_stop {
-            self.pending_token = None;
-            self.generated_ids = generated_ids;
-            self.assembled = assembled;
-            self.token_repetition_loop |= token_repetition_loop;
-            self.text_repetition_loop |= text_repetition_loop;
-            self.finished = true;
-            self.stop_reason = Some(stop_reason);
-            return Ok(self.decode_outcome(None, Some(appended), delta));
-        }
         let position = self
             .artifact
             .prompt_tokens
@@ -508,16 +532,18 @@ impl Lfm25AudioAsrRetainedState {
             Error::InferenceError("LFM2.5 Audio ASR decode cursor overflowed".into())
         })?;
         let reached_budget = generated_ids.len() >= self.max_new_tokens;
+        let sampled = if reached_budget || repetition_stop.is_some() {
+            None
+        } else {
+            Some(greedy_from_logits(&logits, self.vocab_limit)?)
+        };
+        let terminal_stop = sampled.is_some_and(|token| is_stop_token(token, &self.specials));
         let stop_reason = if reached_budget {
             Some(Lfm25AudioAsrStopReason::MaxTokens)
         } else {
-            None
+            repetition_stop.or(terminal_stop.then_some(Lfm25AudioAsrStopReason::StopToken))
         };
-        let next_pending = if stop_reason.is_none() {
-            Some(greedy_from_logits(&logits, self.vocab_limit)?)
-        } else {
-            None
-        };
+        let next_pending = (!terminal_stop).then_some(sampled).flatten();
 
         self.decode_tokens_appended = next_appended;
         self.pending_token = next_pending;
@@ -633,21 +659,11 @@ impl Lfm25AudioAsrRetainedState {
 fn valid_commit_progress(
     checkpoint_cursor: usize,
     current_cursor: usize,
-    finished: bool,
-    stop_reason: Option<Lfm25AudioAsrStopReason>,
-    pending_was_stop: bool,
+    _finished: bool,
+    _stop_reason: Option<Lfm25AudioAsrStopReason>,
+    _pending_was_stop: bool,
 ) -> bool {
     current_cursor > checkpoint_cursor
-        || (current_cursor == checkpoint_cursor
-            && finished
-            && match stop_reason {
-                Some(Lfm25AudioAsrStopReason::StopToken) => pending_was_stop,
-                Some(
-                    Lfm25AudioAsrStopReason::TokenRepetition
-                    | Lfm25AudioAsrStopReason::TextRepetition,
-                ) => !pending_was_stop,
-                _ => false,
-            })
 }
 
 #[cfg(test)]
@@ -681,9 +697,9 @@ mod tests {
     }
 
     #[test]
-    fn terminal_stop_is_the_only_valid_zero_append_decode_quantum() {
+    fn retained_sequence_commit_always_requires_an_authenticated_append() {
         assert!(valid_commit_progress(9, 10, false, None, false));
-        assert!(valid_commit_progress(
+        assert!(!valid_commit_progress(
             9,
             9,
             true,
@@ -697,7 +713,7 @@ mod tests {
             Some(Lfm25AudioAsrStopReason::MaxTokens),
             false
         ));
-        assert!(valid_commit_progress(
+        assert!(!valid_commit_progress(
             9,
             9,
             true,
