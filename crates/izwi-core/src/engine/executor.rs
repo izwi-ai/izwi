@@ -3119,7 +3119,7 @@ impl ModelExecutor for NativeExecutor {
         let asr_long_form =
             request.task_type == super::types::TaskType::ASR && request.uses_asr_long_form_atomic();
         let implementation_incremental = !asr_long_form
-            && loaded_incremental.unwrap_or_else(|| match request.task_type {
+            && (loaded_incremental.unwrap_or_else(|| match request.task_type {
                 super::types::TaskType::Chat => {
                     matches!(
                         variant.family(),
@@ -3133,11 +3133,7 @@ impl ModelExecutor for NativeExecutor {
                             | ModelVariant::Qwen317B4Bit
                     )
                 }
-                super::types::TaskType::ASR => {
-                    variant.family() == crate::catalog::ModelFamily::Qwen3Asr
-                        || (variant.family() == crate::catalog::ModelFamily::Lfm25Audio
-                            && request.uses_asr_retained_sequence())
-                }
+                super::types::TaskType::ASR => request.uses_asr_retained_sequence(),
                 super::types::TaskType::TTS => {
                     matches!(
                         variant.family(),
@@ -3147,7 +3143,8 @@ impl ModelExecutor for NativeExecutor {
                     )
                 }
                 super::types::TaskType::SpeechToSpeech => false,
-            });
+            }) || (request.task_type == super::types::TaskType::ASR
+                && request.uses_asr_retained_sequence()));
         let resumable_prefill_proof = match request.task_type {
             super::types::TaskType::Chat => request
                 .prepared_chat_model_for_executor()
@@ -6033,6 +6030,29 @@ mod tests {
         assert_eq!(long_profile.decode_batch, NativeBatchMode::None);
         assert_eq!(long_profile.concurrency, ConcurrencyClass::Exclusive);
         assert_eq!(long_profile.max_batch_size, 1);
+    }
+
+    #[test]
+    fn retained_whisper_route_stays_sequence_without_an_executor_local_model() {
+        let executor = NativeExecutor::new(WorkerConfig {
+            backend: BackendKind::Cpu,
+            request_parallelism: 4,
+            enable_chunked_prefill: true,
+            ..Default::default()
+        });
+        let variant = ModelVariant::WhisperLargeV3Turbo;
+        let mut request = EngineCoreRequest::asr_bytes(vec![1, 2, 3]);
+        request.model_variant = Some(variant);
+        request
+            .install_prepared_asr_audio(variant, vec![0.0; 160], 16_000)
+            .unwrap();
+        request
+            .install_prepared_sequence_input_tokens(32, 4096)
+            .unwrap();
+
+        let profile = executor.execution_profile(&request).unwrap();
+        assert_eq!(profile.mode, ExecutionMode::Sequence);
+        assert!(profile.incremental_decode);
     }
 
     #[test]

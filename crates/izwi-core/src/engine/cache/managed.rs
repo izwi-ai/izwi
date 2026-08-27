@@ -1225,8 +1225,15 @@ impl ManagedKvCacheManager {
             WorkUnit::SequenceStep {
                 input,
                 auxiliary_state,
+                phase,
                 ..
-            } => (Some(*input), auxiliary_state.as_ref(), None, false, false),
+            } => (
+                Some(*input),
+                auxiliary_state.as_ref(),
+                None,
+                *phase == crate::engine::SequencePhase::Decode,
+                false,
+            ),
             WorkUnit::RealtimePush {
                 max_cache_append, ..
             }

@@ -883,6 +883,20 @@ impl NativeExecutor {
                             ))
                         } else if result.output.tokens_processed == scheduled.num_tokens {
                             reservation.completed_write_receipt(&result.managed_cache_completions)
+                        } else if result.output.tokens_processed == 0
+                            && matches!(
+                                scheduled.work,
+                                crate::engine::WorkUnit::SequenceStep {
+                                    phase: crate::engine::SequencePhase::Decode,
+                                    ..
+                                }
+                            )
+                            && !result.output.finished
+                        {
+                            Err(Error::InferenceError(
+                                "unfinished sequence decode returned zero managed-cache progress"
+                                    .into(),
+                            ))
                         } else {
                             reservation
                                 .domains

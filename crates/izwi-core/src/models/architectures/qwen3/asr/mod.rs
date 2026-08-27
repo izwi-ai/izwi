@@ -2209,15 +2209,10 @@ impl Qwen3AsrModel {
             if row.dtype() != self.text_dtype {
                 row = row.to_dtype(self.text_dtype)?;
             }
-            // A multi-row narrow view can otherwise retain the entire padded
-            // batch allocation. Compact it so per-request residency is
-            // isolated and exactly observable by the scheduler. B1 already
-            // owns an exact, unpadded backing allocation.
-            exact_rows.push(if rows.len() == 1 {
-                row
-            } else {
-                deep_copy_tensor_storage(&row)?
-            });
+            // Isolate every retained row in exact-sized persistent storage.
+            // Metal pool bins can otherwise make even B1 backing larger than
+            // the logical artifact admitted by the scheduler.
+            exact_rows.push(deep_copy_tensor_storage(&row)?);
         }
         let encode_ms = elapsed_ms(encode_started);
         let frontend_total_ms = elapsed_ms(batch_started);
@@ -4032,6 +4027,9 @@ fn normalized_language_name(language: &str) -> String {
     if lang.eq_ignore_ascii_case("auto") {
         return "Auto".to_string();
     }
+    if matches!(lang.to_ascii_lowercase().as_str(), "en" | "eng") {
+        return "English".to_string();
+    }
 
     let mut out = String::with_capacity(lang.len());
     let mut new_word = true;
@@ -4070,6 +4068,9 @@ fn parse_asr_output(raw: &str, user_language: Option<&str>) -> (Option<String>, 
             if let Some((_, text)) = split_language_prefixed_output(rest) {
                 return (Some(language), text);
             }
+        }
+        if let Some(text) = strip_forced_language_echo(trimmed, &language) {
+            return (Some(language), text.to_string());
         }
         return (Some(language), trimmed.to_string());
     }
@@ -4112,6 +4113,26 @@ fn parse_asr_output(raw: &str, user_language: Option<&str>) -> (Option<String>, 
     }
 
     (None, trimmed.to_string())
+}
+
+fn strip_forced_language_echo<'a>(text: &'a str, language: &str) -> Option<&'a str> {
+    let mut split_idx = None;
+    let mut prev_is_lower = false;
+    for (idx, ch) in text.char_indices() {
+        if prev_is_lower && ch.is_ascii_uppercase() {
+            split_idx = Some(idx);
+            break;
+        }
+        prev_is_lower = ch.is_lowercase();
+    }
+    let split_idx = split_idx?;
+    let prefix = text[..split_idx]
+        .chars()
+        .map(|ch| if ch == '\u{261}' { 'g' } else { ch })
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let language = language.to_ascii_lowercase();
+    (prefix.chars().count() >= 3 && language.ends_with(&prefix)).then_some(text[split_idx..].trim())
 }
 
 fn split_language_prefixed_output(rest: &str) -> Option<(Option<String>, String)> {
@@ -5560,6 +5581,10 @@ mod tests {
             forced_language_name(Some("english")),
             Some("English".to_string())
         );
+        assert_eq!(
+            forced_language_name(Some("en")),
+            Some("English".to_string())
+        );
     }
 
     #[test]
@@ -5583,6 +5608,13 @@ mod tests {
     fn parse_asr_output_respects_forced_language_and_strips_prefix() {
         let (language, text) =
             parse_asr_output("language EnglishThe quick brown fox.", Some("english"));
+        assert_eq!(language.as_deref(), Some("English"));
+        assert_eq!(text, "The quick brown fox.");
+    }
+
+    #[test]
+    fn parse_asr_output_strips_partial_confusable_forced_language_echo() {
+        let (language, text) = parse_asr_output("ɡlishThe quick brown fox.", Some("english"));
         assert_eq!(language.as_deref(), Some("English"));
         assert_eq!(text, "The quick brown fox.");
     }

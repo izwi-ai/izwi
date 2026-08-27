@@ -7,11 +7,51 @@ use candle_core::{CpuStorage, Storage, Tensor};
 /// Materialize a tensor in independent Candle-managed storage.
 ///
 /// `contiguous` alone may preserve an already-contiguous narrow view, while an
-/// identity affine always produces a new output. Keeping this allocation in
-/// Candle's normal pool is essential: application-created Metal private
-/// buffers bypass Candle's pooled reclamation and residency-set lifecycle.
+/// identity affine always produces a new output. Metal retained artifacts use
+/// an exact-sized persistent buffer so logical admission bytes and resident
+/// backing bytes remain identical instead of depending on pool reuse history.
 pub(crate) fn deep_copy_tensor_storage(tensor: &Tensor) -> candle_core::Result<Tensor> {
-    tensor.contiguous()?.affine(1.0, 0.0)
+    let contiguous = tensor.contiguous()?;
+    #[cfg(feature = "metal")]
+    {
+        let (storage, layout) = contiguous.storage_and_layout();
+        if let Storage::Metal(source) = &*storage {
+            let dtype = contiguous.dtype();
+            let element_count = contiguous.elem_count();
+            let byte_count = element_count
+                .checked_mul(dtype.size_in_bytes())
+                .ok_or_else(|| {
+                    candle_core::Error::Msg("persistent Metal tensor size overflowed".into())
+                })?;
+            let source_offset = layout
+                .start_offset()
+                .checked_mul(dtype.size_in_bytes())
+                .ok_or_else(|| {
+                    candle_core::Error::Msg("persistent Metal tensor offset overflowed".into())
+                })?;
+            let device = contiguous.device().as_metal_device()?.clone();
+            let buffer = device.new_private_buffer(
+                element_count,
+                dtype,
+                "izwi retained tensor compact copy",
+            )?;
+            {
+                let mut blit = device.blit_command_encoder()?;
+                blit.set_label("izwi retained tensor compact copy");
+                blit.copy_from_buffer(source.buffer(), source_offset, &buffer, 0, byte_count);
+            }
+            let shape = contiguous.shape().clone();
+            drop(storage);
+            let storage = candle_core::MetalStorage::new(buffer, device, element_count, dtype);
+            return Ok(Tensor::from_storage(
+                Storage::Metal(storage),
+                shape,
+                candle_core::op::BackpropOp::none(),
+                false,
+            ));
+        }
+    }
+    contiguous.affine(1.0, 0.0)
 }
 
 /// Accumulates the backing allocations retained by a set of Candle tensors.
@@ -178,7 +218,7 @@ mod tests {
 
     #[cfg(feature = "metal")]
     #[test]
-    fn persistent_metal_copy_uses_accounted_pooled_backing() {
+    fn persistent_metal_copy_uses_exact_sized_backing() {
         let Ok(Ok(device)) = std::panic::catch_unwind(|| Device::new_metal(0)) else {
             return;
         };
@@ -187,7 +227,7 @@ mod tests {
         let mut accounting = TensorStorageAccounting::default();
         accounting.add_tensor(&compact).unwrap();
 
-        assert!(accounting.bytes() >= 3 * std::mem::size_of::<f32>() as u64);
+        assert_eq!(accounting.bytes(), 3 * std::mem::size_of::<f32>() as u64);
         assert_eq!(compact.to_vec1::<f32>().unwrap(), vec![0.0; 3]);
     }
 
@@ -204,7 +244,7 @@ mod tests {
         let mut accounting = TensorStorageAccounting::default();
         accounting.add_tensor(&compact).unwrap();
 
-        assert!(accounting.bytes() >= 12 * std::mem::size_of::<f32>() as u64);
+        assert_eq!(accounting.bytes(), 12 * std::mem::size_of::<f32>() as u64);
         assert_eq!(
             compact.to_vec2::<f32>().unwrap(),
             vec![

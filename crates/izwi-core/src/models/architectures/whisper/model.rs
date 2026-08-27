@@ -16,6 +16,7 @@ use crate::error::{Error, Result};
 use crate::kv::v2::{DomainStepIntent, StateUpdateKind};
 use crate::models::shared::attention::flash::try_fused_self_attention;
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
+use crate::models::shared::memory::accounting::deep_copy_tensor_storage;
 
 use super::physical::WHISPER_CROSS_STATE_DOMAIN;
 
@@ -331,7 +332,12 @@ impl ResidualAttentionBlock {
         let (cross_attn, _) = self.cross_attn.as_ref().ok_or_else(|| {
             Error::InvalidInput("Whisper decoder layer has no cross-attention projection".into())
         })?;
-        cross_attn.project_cross_attention_memory(model_layer, audio_features)
+        let projected = cross_attn.project_cross_attention_memory(model_layer, audio_features)?;
+        Ok(StaticAttentionLayerValue {
+            model_layer: projected.model_layer,
+            keys: deep_copy_tensor_storage(&projected.keys)?,
+            values: deep_copy_tensor_storage(&projected.values)?,
+        })
     }
 
     fn forward_decoder_physical(

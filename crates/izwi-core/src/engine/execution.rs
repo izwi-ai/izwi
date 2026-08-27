@@ -837,7 +837,9 @@ impl ExecutionAdapterBinding {
             .iter()
             .filter(|stage| stage.selector == StageWorkSelector::Any);
         let stage = fallback.next().ok_or_else(|| {
-            Error::InvalidInput("execution adapter has no stage for scheduled work".to_string())
+            Error::InvalidInput(format!(
+                "execution adapter has no stage for scheduled work: {work:?}"
+            ))
         })?;
         if fallback.next().is_some() {
             return Err(Error::InvalidInput(
@@ -1480,7 +1482,10 @@ impl ManagedCacheReservation {
         }
         let unchanged_prefix_work = matches!(
             &row.work,
-            WorkUnit::RealtimePush { .. }
+            WorkUnit::SequenceStep {
+                phase: SequencePhase::Decode,
+                ..
+            } | WorkUnit::RealtimePush { .. }
                 | WorkUnit::RealtimeFinish { .. }
                 | WorkUnit::RealtimePreparation { .. }
                 | WorkUnit::RealtimeCompletion { .. }
@@ -1629,7 +1634,7 @@ impl ManagedCacheReservation {
         if unchanged_prefix {
             if !self.allow_unchanged_prefix {
                 return Err(Error::InferenceError(
-                    "unchanged managed-cache prefix is authorized only for realtime work".into(),
+                    "unchanged managed-cache prefix lacks terminal or realtime authority".into(),
                 ));
             }
             if !completions.is_empty() {
@@ -2021,7 +2026,8 @@ impl ManagedCacheReceipt {
             if unchanged {
                 if !self.reservation.allow_unchanged_prefix {
                     return Err(Error::InferenceError(
-                        "unchanged managed-cache receipt lacks realtime authority".into(),
+                        "unchanged managed-cache receipt lacks terminal or realtime authority"
+                            .into(),
                     ));
                 }
                 if !blocks.is_empty() {
