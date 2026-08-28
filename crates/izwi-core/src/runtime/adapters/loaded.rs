@@ -6514,6 +6514,7 @@ mod tests {
             physical.stages[0].selector,
             StageWorkSelector::SequencePrefill
         );
+        assert_eq!(physical.stages[0].batch_mode, NativeBatchMode::None);
         assert_eq!(physical.stages[0].max_batch_size, 1);
         assert_eq!(physical.stages[0].concurrency, ConcurrencyClass::Exclusive);
         assert_eq!(

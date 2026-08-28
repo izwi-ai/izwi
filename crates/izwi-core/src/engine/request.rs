@@ -2650,6 +2650,35 @@ impl EngineCoreRequest {
         Ok(Some((stage.id, WorkCost::new(1, tensor_elements, 0))))
     }
 
+    fn native_prepared_stage(
+        binding: Option<&super::ExecutionAdapterBinding>,
+        selector: super::StageWorkSelector,
+    ) -> Option<&super::StageDescriptor> {
+        binding.and_then(|binding| {
+            binding.stages.iter().find(|stage| {
+                stage.selector == selector && stage.batch_mode != super::NativeBatchMode::None
+            })
+        })
+    }
+
+    fn fit_qwen_tts_layout_to_loaded_context(
+        mut layout: crate::models::architectures::qwen3::tts::Qwen3TtsPhysicalSessionLayout,
+        max_sequence_tokens: usize,
+        request_id: &str,
+    ) -> Result<crate::models::architectures::qwen3::tts::Qwen3TtsPhysicalSessionLayout> {
+        let output_capacity = max_sequence_tokens
+            .checked_sub(layout.prefill_tokens)
+            .filter(|capacity| *capacity > 0)
+            .ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "Qwen TTS request {request_id} exact prefill has {} tokens and leaves no output capacity in the configured {max_sequence_tokens}-token context",
+                    layout.prefill_tokens
+                ))
+            })?;
+        layout.max_frames = layout.max_frames.min(output_capacity);
+        Ok(layout)
+    }
+
     fn resumable_tts_prefill_stage_cost(
         binding: Option<&super::ExecutionAdapterBinding>,
         model: &Qwen3TtsModel,
@@ -2657,12 +2686,9 @@ impl EngineCoreRequest {
         max_frames: usize,
         has_reference: bool,
     ) -> Result<Option<(StageId, WorkCost)>> {
-        let Some(stage) = binding.and_then(|binding| {
-            binding
-                .stages
-                .iter()
-                .find(|stage| stage.selector == super::StageWorkSelector::SequencePrefill)
-        }) else {
+        let Some(stage) =
+            Self::native_prepared_stage(binding, super::StageWorkSelector::SequencePrefill)
+        else {
             return Ok(None);
         };
         let (host_bytes, accelerator_bytes) =
@@ -3636,6 +3662,8 @@ impl EngineCoreRequest {
             uses_preset_speaker: speaker.is_some(),
             max_frames: params.max_frames,
         })?;
+        let layout =
+            Self::fit_qwen_tts_layout_to_loaded_context(layout, max_sequence_tokens, &self.id)?;
         let prepared_continuous_cost = Self::continuous_tts_stage_cost(
             self.execution_adapter_binding.as_ref(),
             &model_arc,
@@ -3649,10 +3677,10 @@ impl EngineCoreRequest {
             layout.max_frames,
             reference.is_some(),
         )?;
-        if layout.prefill_tokens == 0 || layout.prefill_tokens >= max_sequence_tokens {
+        if layout.prefill_tokens == 0 {
             return Err(Error::InvalidInput(format!(
-                "Qwen TTS request {} exact prefill has {} tokens and leaves no output capacity in the configured {max_sequence_tokens}-token context",
-                self.id, layout.prefill_tokens
+                "Qwen TTS request {} exact prefill is empty",
+                self.id
             )));
         }
         self.params.max_tokens = layout.max_frames;
@@ -5674,6 +5702,64 @@ mod tests {
         let mut mismatched = binding;
         mismatched.adapter_instance_id = super::super::AdapterInstanceId::new(3);
         assert!(request.bind_execution_adapter(mismatched).is_err());
+    }
+
+    #[test]
+    fn qwen_scalar_prefill_is_not_a_native_prepared_cost_stage() {
+        let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
+        let profile = super::super::ExecutionProfile::fail_closed(
+            crate::backends::BackendKind::Metal,
+            Some(variant),
+            super::super::ExecutionMode::Sequence,
+        );
+        let mut stage = super::super::StageDescriptor::from_execution_profile(
+            super::super::StageId::new(1),
+            "tts.prefill.physical",
+            &profile,
+            super::super::NativeBatchMode::None,
+        );
+        stage.selector = super::super::StageWorkSelector::SequencePrefill;
+        let binding = super::super::ExecutionAdapterBinding {
+            execution_group_id: super::super::ExecutionGroupId::new(1),
+            model_instance_id: super::super::ModelInstanceId::new(2),
+            adapter_instance_id: super::super::AdapterInstanceId::new(3),
+            adapter_abi_revision: super::super::AdapterAbiRevision::new(1),
+            model_variant: variant,
+            capability_id: "tts".to_string(),
+            stages: std::sync::Arc::from([stage]),
+        };
+
+        assert!(EngineCoreRequest::native_prepared_stage(
+            Some(&binding),
+            super::super::StageWorkSelector::SequencePrefill,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn qwen_tts_output_budget_fits_the_loaded_context_before_admission() {
+        let fitted = EngineCoreRequest::fit_qwen_tts_layout_to_loaded_context(
+            crate::models::architectures::qwen3::tts::Qwen3TtsPhysicalSessionLayout {
+                prefill_tokens: 9,
+                max_frames: ModelVariant::QWEN3_TTS_MAX_OUTPUT_FRAMES,
+            },
+            1_024,
+            "request-1",
+        )
+        .expect("output budget should fit");
+
+        assert_eq!(fitted.prefill_tokens, 9);
+        assert_eq!(fitted.max_frames, 1_015);
+        assert_eq!(fitted.prefill_tokens + fitted.max_frames, 1_024);
+        assert!(EngineCoreRequest::fit_qwen_tts_layout_to_loaded_context(
+            crate::models::architectures::qwen3::tts::Qwen3TtsPhysicalSessionLayout {
+                prefill_tokens: 1_024,
+                max_frames: 1,
+            },
+            1_024,
+            "request-2",
+        )
+        .is_err());
     }
 
     #[test]
