@@ -74,6 +74,7 @@ struct ContinuousLfm25TtsRow<'a> {
     session: SessionKey,
     lease: Option<ExecutorStateLease<'a, ActiveLfm25TtsDecode>>,
     main: crate::models::shared::attention::physical::PhysicalPagedKvCache,
+    main_start: usize,
     depth: Option<InvocationPagedKvLease>,
     checkpoint: Option<
         crate::models::architectures::lfm25_audio::tts_retained::Lfm25AudioTtsQuantumCheckpoint,
@@ -1617,6 +1618,7 @@ impl NativeExecutor {
             .and_then(|runtime| runtime.tensor_state())
             .ok_or_else(|| Error::InferenceError("LFM2.5 Audio TTS lost ShortConv arena".into()))?;
         let mut main = retained.take_only_paged()?;
+        let main_start = main.context_len();
         retained.ensure_all_paged_consumed()?;
         let mut lease = ExecutorStateLease::checkout(
             &self.lfm25_tts_decode_states,
@@ -1772,6 +1774,9 @@ impl NativeExecutor {
         } else {
             lease.restore()?;
         }
+        let main_append = main.context_len().checked_sub(main_start).ok_or_else(|| {
+            Error::InferenceError("LFM2.5 Audio TTS main cache cursor regressed".into())
+        })?;
         Ok(ModelSessionResult::sequence(ExecutorOutput {
             request_id: request.id.clone(),
             audio: Some(AudioOutput {
@@ -1788,7 +1793,8 @@ impl NativeExecutor {
             asr_diagnostics: None,
             error: None,
         })
-        .with_managed_cache_completions(completions))
+        .with_managed_cache_completions(completions)
+        .with_managed_cache_append(main_append))
     }
 
     pub(super) fn qwen_tts_request(
@@ -2364,6 +2370,7 @@ impl NativeExecutor {
                     Error::InferenceError("LFM TTS prefill lost ShortConv arena".into())
                 })?;
             let main = retained.take_only_paged()?;
+            let main_start = main.context_len();
             retained.ensure_all_paged_consumed()?;
             let mut lease = ExecutorStateLease::checkout(
                 &self.lfm25_tts_decode_states,
@@ -2420,6 +2427,7 @@ impl NativeExecutor {
                 session: scheduled[index].session_key(),
                 lease: Some(lease),
                 main,
+                main_start,
                 depth: None,
                 checkpoint: Some(checkpoint),
                 prior_tokens,
@@ -2539,6 +2547,13 @@ impl NativeExecutor {
                 continue;
             }
             let completions = row.main.take_completed_writes();
+            let main_append = row
+                .main
+                .context_len()
+                .checked_sub(row.main_start)
+                .ok_or_else(|| {
+                    Error::InferenceError("continuous LFM TTS main cache cursor regressed".into())
+                })?;
             let checkpoint = row
                 .checkpoint
                 .take()
@@ -2573,7 +2588,8 @@ impl NativeExecutor {
                     asr_diagnostics: None,
                     error: None,
                 })
-                .with_managed_cache_completions(completions),
+                .with_managed_cache_completions(completions)
+                .with_managed_cache_append(main_append),
             );
         }
         batch.disarm();
@@ -2654,6 +2670,7 @@ impl NativeExecutor {
                     Error::InferenceError("continuous LFM TTS lost ShortConv arena".into())
                 })?;
             let main = retained.take_only_paged()?;
+            let main_start = main.context_len();
             retained.ensure_all_paged_consumed()?;
             let mut lease = ExecutorStateLease::checkout(
                 &self.lfm25_tts_decode_states,
@@ -2678,6 +2695,7 @@ impl NativeExecutor {
                 session: scheduled[index].session_key(),
                 lease: Some(lease),
                 main,
+                main_start,
                 depth,
                 checkpoint: Some(checkpoint),
                 prior_tokens,
@@ -2842,6 +2860,13 @@ impl NativeExecutor {
                 continue;
             }
             let completions = row.main.take_completed_writes();
+            let main_append = row
+                .main
+                .context_len()
+                .checked_sub(row.main_start)
+                .ok_or_else(|| {
+                    Error::InferenceError("continuous LFM TTS main cache cursor regressed".into())
+                })?;
             let checkpoint = row.checkpoint.take().expect("armed LFM TTS checkpoint");
             {
                 let ContinuousLfm25TtsRow {
@@ -2894,7 +2919,8 @@ impl NativeExecutor {
                     asr_diagnostics: None,
                     error: None,
                 })
-                .with_managed_cache_completions(completions),
+                .with_managed_cache_completions(completions)
+                .with_managed_cache_append(main_append),
             );
         }
         batch.disarm();

@@ -382,12 +382,10 @@ pub(crate) fn scalar_execution_profile(
 }
 
 fn tts_execution_target(model_variant: ModelVariant) -> ExecutionTargetKind {
-    if model_variant.is_lfm25_audio_gguf()
-        || matches!(
-            model_variant.family(),
-            crate::catalog::ModelFamily::VoxtralTts
-        )
-    {
+    if matches!(
+        model_variant.family(),
+        crate::catalog::ModelFamily::VoxtralTts
+    ) {
         ExecutionTargetKind::DirectModel
     } else {
         ExecutionTargetKind::TokenEngine
@@ -759,7 +757,7 @@ mod tests {
             .require(CapabilityKind::Tts, ModelVariant::Lfm25Audio15BGguf)
             .expect("lfm audio tts adapter");
         assert_eq!(lfm.streaming_mode, StreamingMode::FinalOnly);
-        assert_eq!(lfm.execution_target, ExecutionTargetKind::DirectModel);
+        assert_eq!(lfm.execution_target, ExecutionTargetKind::TokenEngine);
     }
 
     #[test]

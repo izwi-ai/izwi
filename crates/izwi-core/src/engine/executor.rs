@@ -2934,6 +2934,14 @@ impl NativeBatchSupport {
     }
 }
 
+fn tts_native_batch_implementation_support(
+    qwen_decode: bool,
+    vibevoice_decode: bool,
+    lfm25_audio: bool,
+) -> (bool, bool) {
+    (lfm25_audio, qwen_decode || vibevoice_decode || lfm25_audio)
+}
+
 /// Intersect a load-sealed stage declaration with an implemented model call.
 /// Merely publishing `NativeBatchMode` in catalog or request data is not
 /// sufficient. Each audio family remains `NONE` until its exact loaded model
@@ -2964,17 +2972,22 @@ fn loaded_native_batch_support(request: &EngineCoreRequest) -> NativeBatchSuppor
                     .map(|_| (true, true))
             })
             .unwrap_or((false, false)),
-        TaskType::TTS => (
-            false,
-            request
-                .prepared_qwen_tts_model_for_executor()
-                .is_ok_and(|model| {
-                    model.is_some_and(|model| model.supports_continuous_decode_batch())
-                })
-                || request
+        TaskType::TTS => {
+            let lfm25_audio = request
+                .prepared_lfm25_audio_tts_model_lease_for_executor()
+                .is_ok_and(|model| model.is_some());
+            tts_native_batch_implementation_support(
+                request
+                    .prepared_qwen_tts_model_for_executor()
+                    .is_ok_and(|model| {
+                        model.is_some_and(|model| model.supports_continuous_decode_batch())
+                    }),
+                request
                     .prepared_vibevoice_tts_model_lease_for_executor()
                     .is_ok_and(|model| model.is_some()),
-        ),
+                lfm25_audio,
+            )
+        }
         TaskType::SpeechToSpeech => (false, false),
     };
     if !prefill_supported && !decode_supported {
@@ -3099,10 +3112,14 @@ impl ModelExecutor for NativeExecutor {
                     || request
                         .prepared_fish_s2_tts_model_lease_for_executor()
                         .is_ok_and(|model| model.is_some())
+                    || request
+                        .prepared_lfm25_audio_tts_model_lease_for_executor()
+                        .is_ok_and(|model| model.is_some())
                     || (self.config.model_registry.is_none() && self.loaded_tts_model.is_some());
                 loaded.then_some(matches!(
                     variant.family(),
                     crate::catalog::ModelFamily::Qwen3Tts
+                        | crate::catalog::ModelFamily::Lfm25Audio
                         | crate::catalog::ModelFamily::VibeVoiceTts
                         | crate::catalog::ModelFamily::FishS2Tts
                 ))
@@ -3138,6 +3155,7 @@ impl ModelExecutor for NativeExecutor {
                     matches!(
                         variant.family(),
                         crate::catalog::ModelFamily::Qwen3Tts
+                            | crate::catalog::ModelFamily::Lfm25Audio
                             | crate::catalog::ModelFamily::VibeVoiceTts
                             | crate::catalog::ModelFamily::FishS2Tts
                     )
@@ -3177,6 +3195,13 @@ impl ModelExecutor for NativeExecutor {
                 .or_else(|| {
                     request
                         .prepared_fish_s2_tts_model_lease_for_executor()
+                        .ok()
+                        .flatten()
+                        .map(|_| true)
+                })
+                .or_else(|| {
+                    request
+                        .prepared_lfm25_audio_tts_model_lease_for_executor()
                         .ok()
                         .flatten()
                         .map(|_| true)
@@ -6030,6 +6055,32 @@ mod tests {
         assert_eq!(long_profile.decode_batch, NativeBatchMode::None);
         assert_eq!(long_profile.concurrency, ConcurrencyClass::Exclusive);
         assert_eq!(long_profile.max_batch_size, 1);
+    }
+
+    #[test]
+    fn lfm25_audio_tts_raw_profile_uses_the_sequence_execution_route() {
+        let executor = NativeExecutor::new(WorkerConfig {
+            backend: BackendKind::Cpu,
+            request_parallelism: 4,
+            enable_chunked_prefill: true,
+            ..Default::default()
+        });
+        let mut request = EngineCoreRequest::tts("The quick brown fox jumps over the lazy dog");
+        request.model_variant = Some(ModelVariant::Lfm25Audio15BGguf);
+
+        let profile = executor.execution_profile(&request).unwrap();
+
+        assert_eq!(profile.mode, ExecutionMode::Sequence);
+        assert!(profile.incremental_decode);
+        assert_eq!(profile.prefill, PrefillMode::Full);
+    }
+
+    #[test]
+    fn lfm25_audio_tts_implements_static_prefill_and_continuous_decode() {
+        assert_eq!(
+            tts_native_batch_implementation_support(false, false, true),
+            (true, true)
+        );
     }
 
     #[test]
