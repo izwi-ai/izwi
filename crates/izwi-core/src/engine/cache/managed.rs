@@ -1217,6 +1217,7 @@ impl ManagedKvCacheManager {
     ) -> Result<Option<ManagedCacheReservation>> {
         let (
             sequence_input,
+            sequence_phase,
             auxiliary_state,
             realtime_cache_append,
             allow_unchanged_prefix,
@@ -1229,6 +1230,7 @@ impl ManagedKvCacheManager {
                 ..
             } => (
                 Some(*input),
+                Some(*phase),
                 auxiliary_state.as_ref(),
                 None,
                 *phase == crate::engine::SequencePhase::Decode,
@@ -1239,18 +1241,18 @@ impl ManagedKvCacheManager {
             }
             | WorkUnit::RealtimeFinish {
                 max_cache_append, ..
-            } => (None, None, Some(*max_cache_append), true, false),
+            } => (None, None, None, Some(*max_cache_append), true, false),
             WorkUnit::RealtimePreparation {
                 auxiliary_state, ..
-            } => (None, auxiliary_state.as_ref(), Some(0), true, false),
-            WorkUnit::RealtimeCompletion { .. } => (None, None, Some(0), true, false),
+            } => (None, None, auxiliary_state.as_ref(), Some(0), true, false),
+            WorkUnit::RealtimeCompletion { .. } => (None, None, None, Some(0), true, false),
             WorkUnit::RealtimePromptPrefill { cache_append, .. } => {
                 if *cache_append == 0 {
                     return Err(Error::InvalidInput(
                         "realtime prompt prefill requires a positive exact cache append".into(),
                     ));
                 }
-                (None, None, Some(*cache_append), false, true)
+                (None, None, None, Some(*cache_append), false, true)
             }
             WorkUnit::RealtimeDecodeContinuation {
                 max_cache_append,
@@ -1262,7 +1264,7 @@ impl ManagedKvCacheManager {
                         "realtime decode continuation requires exactly one cache append".into(),
                     ));
                 }
-                (None, auxiliary_state.as_ref(), Some(1), false, true)
+                (None, None, auxiliary_state.as_ref(), Some(1), false, true)
             }
             _ => return Ok(None),
         };
@@ -1372,6 +1374,12 @@ impl ManagedKvCacheManager {
         let mut domains = Vec::with_capacity(runtime.plan.groups.len());
         let mut pending_prefixes = Vec::new();
         for group in &runtime.plan.groups {
+            let domain_sequence_input = match (sequence_input, sequence_phase, request) {
+                (Some(input), Some(phase), Some(request)) => {
+                    Some(request.project_paged_state_input(group.domain, phase, input)?)
+                }
+                (input, _, _) => input,
+            };
             let coordinator = state
                 .coordinators
                 .get_mut(&group.arena)
@@ -1379,7 +1387,7 @@ impl ManagedKvCacheManager {
             let snapshot = coordinator
                 .snapshot(session, group.domain)
                 .map_err(coordinator_error)?;
-            let target_committed_tokens = match (sequence_input, realtime_cache_append) {
+            let target_committed_tokens = match (domain_sequence_input, realtime_cache_append) {
                 (Some(input), None) => u32::try_from(input.end).map_err(|_| {
                     Error::InvalidInput("managed KV token position exceeds u32".to_string())
                 })?,
@@ -1401,7 +1409,7 @@ impl ManagedKvCacheManager {
                     "scheduled KV target regressed behind the committed cache table".to_string(),
                 ));
             }
-            if sequence_input.is_some_and(|input| input.is_empty()) {
+            if domain_sequence_input.is_some_and(|input| input.is_empty()) {
                 if target_committed_tokens != snapshot.committed_tokens {
                     abort_domains(state, txn_id, &domains);
                     return Err(Error::InferenceError(
@@ -1411,12 +1419,13 @@ impl ManagedKvCacheManager {
                 continue;
             }
             let prefix_eligible = snapshot.committed_tokens == 0
-                && sequence_input.is_some_and(|input| input.start == 0)
+                && domain_sequence_input.is_some_and(|input| input.start == 0)
                 // Prefix reuse is bounded by this transaction's committed
                 // target below, so the first scheduler-visible chunk does not
                 // need to cover the entire logical prompt.
                 && request.is_some_and(|request| {
-                    sequence_input.is_some_and(|input| input.end <= request.prompt_tokens.len())
+                    domain_sequence_input
+                        .is_some_and(|input| input.end <= request.prompt_tokens.len())
                 })
                 && target_committed_tokens > 1
                 && prefix_enabled_for_domain(&state.contract, group.domain);
@@ -1454,7 +1463,7 @@ impl ManagedKvCacheManager {
             let target_window_start = sliding_window
                 .map(|window| {
                     target_committed_tokens.saturating_sub(window).min(
-                        sequence_input
+                        domain_sequence_input
                             .map(|input| u32::try_from(input.start).unwrap_or(u32::MAX))
                             .unwrap_or(snapshot.committed_tokens),
                     )

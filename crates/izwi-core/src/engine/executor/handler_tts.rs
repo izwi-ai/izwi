@@ -746,14 +746,33 @@ impl NativeExecutor {
             .take_paged_domain(crate::kv::CacheDomainId::new(2), true)?
             .expect("required VibeVoice negative cache");
         retained.ensure_all_paged_consumed()?;
-        let _tensor = retained.tensor_state.clone().ok_or_else(|| {
-            Error::InferenceError("VibeVoice TTS lost tokenizer reservation".into())
-        })?;
-        let arena = request
-            .managed_cache_runtime()
-            .and_then(|runtime| runtime.tensor_state())
-            .cloned()
-            .ok_or_else(|| Error::InferenceError("VibeVoice TTS lost tokenizer arena".into()))?;
+        let tokenizer_quantum = if scheduled.is_prefill {
+            if retained.tensor_state.is_some() {
+                return Err(Error::InferenceError(
+                    "VibeVoice TTS prefill unexpectedly reserved tokenizer state".into(),
+                ));
+            }
+            None
+        } else {
+            retained.tensor_state.clone().ok_or_else(|| {
+                Error::InferenceError("VibeVoice TTS lost tokenizer reservation".into())
+            })?;
+            let arena = request
+                .managed_cache_runtime()
+                .and_then(|runtime| runtime.tensor_state())
+                .cloned()
+                .ok_or_else(|| {
+                    Error::InferenceError("VibeVoice TTS lost tokenizer arena".into())
+                })?;
+            Some(
+                crate::models::architectures::vibevoice::tts::VibeVoiceTtsTokenizerQuantum {
+                    arena,
+                    transaction: crate::backends::state::PhysicalStateTransactionId::new(
+                        scheduled.plan_id,
+                    )?,
+                },
+            )
+        };
         let mut lease = ExecutorStateLease::checkout(
             &self.vibevoice_tts_decode_states,
             scheduled.session_key(),
@@ -801,15 +820,14 @@ impl NativeExecutor {
                 }
                 None
             } else {
-                let transaction =
-                    crate::backends::state::PhysicalStateTransactionId::new(scheduled.plan_id)?;
-                Some(model.retained_decode_step(
-                    &mut active.state,
-                    &crate::models::architectures::vibevoice::tts::VibeVoiceTtsTokenizerQuantum {
-                        arena: arena.clone(),
-                        transaction,
-                    },
-                )?)
+                Some(
+                    model.retained_decode_step(
+                        &mut active.state,
+                        tokenizer_quantum
+                            .as_ref()
+                            .expect("decode requires a tokenizer quantum"),
+                    )?,
+                )
             };
             if request.is_cancelled() {
                 return Err(Error::Cancelled(request.id.clone()));
@@ -839,6 +857,10 @@ impl NativeExecutor {
             .require_state_mut()?
             .state
             .take_managed_write_completions();
+        let clocked_state_completion = tokenizer_quantum
+            .as_ref()
+            .map(|quantum| quantum.arena.seal_selected_completion(quantum.transaction))
+            .transpose()?;
         lease
             .require_state_mut()?
             .state
@@ -868,7 +890,7 @@ impl NativeExecutor {
         } else {
             lease.restore()?;
         }
-        Ok(ModelSessionResult::sequence(ExecutorOutput {
+        let result = ModelSessionResult::sequence(ExecutorOutput {
             request_id: request.id.clone(),
             audio: Some(AudioOutput::new(samples, sample_rate)),
             text: None,
@@ -880,7 +902,11 @@ impl NativeExecutor {
             asr_diagnostics: None,
             error: None,
         })
-        .with_managed_cache_completions(completions))
+        .with_managed_cache_completions(completions);
+        Ok(match clocked_state_completion {
+            Some(completion) => result.with_clocked_state_completion(completion),
+            None => result,
+        })
     }
 
     pub(super) fn voxtral_tts_request_with_managed_cache(

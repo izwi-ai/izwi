@@ -3186,6 +3186,48 @@ impl EngineCoreRequest {
         let Some(authorized) = stage.retained_state_selections.as_deref() else {
             return Ok(None);
         };
+        if self
+            .incremental_model_execution_ready
+            .as_ref()
+            .is_some_and(|ready| {
+                matches!(ready.model, PreparedIncrementalModel::VibeVoiceTts(_))
+                    && ready.vibevoice_tts.is_some()
+            })
+        {
+            if authorized.is_empty() {
+                return Ok(Some(Arc::from([])));
+            }
+            let selection = super::ClockedStateSelection::new(
+                crate::models::architectures::vibevoice::VIBEVOICE_TTS_TOKENIZER_GROUP,
+                crate::kv::v2::StateClock::CodecFrames,
+            )?;
+            if authorized != [selection.clone()] {
+                return Err(Error::InvalidInput(format!(
+                    "stage {} does not authorize the VibeVoice TTS tokenizer clock",
+                    stage.name
+                )));
+            }
+            let prompt_tokens = self.prepared_sequence_input_tokens.ok_or_else(|| {
+                Error::InferenceError(
+                    "prepared VibeVoice TTS request lost its prompt boundary".into(),
+                )
+            })?;
+            let start = input.start.checked_sub(prompt_tokens).ok_or_else(|| {
+                Error::InvalidInput(
+                    "VibeVoice TTS tokenizer state cannot advance during prompt prefill".into(),
+                )
+            })?;
+            let end = input.end.checked_sub(prompt_tokens).ok_or_else(|| {
+                Error::InvalidInput(
+                    "VibeVoice TTS tokenizer state crossed its prompt boundary".into(),
+                )
+            })?;
+            return Ok(Some(Arc::from([ClockedStateSpan::new(
+                selection.group(),
+                selection.clock().clone(),
+                InputRange::new(start, end)?,
+            )?])));
+        }
         let projections = if let Some(prepared) = self.prepared_asr_encoder_artifact.as_ref() {
             if self.model_variant != Some(prepared.model_variant)
                 || self.asr_execution_source_fingerprint(prepared.model_variant)?
@@ -3244,6 +3286,58 @@ impl EngineCoreRequest {
         }
 
         Ok(Some(Arc::from(spans)))
+    }
+
+    pub(crate) fn project_paged_state_input(
+        &self,
+        domain: crate::kv::CacheDomainId,
+        phase: super::SequencePhase,
+        input: InputRange,
+    ) -> Result<InputRange> {
+        let is_vibevoice_tts =
+            self.incremental_model_execution_ready
+                .as_ref()
+                .is_some_and(|ready| {
+                    matches!(ready.model, PreparedIncrementalModel::VibeVoiceTts(_))
+                        && ready.vibevoice_tts.is_some()
+                });
+        if !is_vibevoice_tts
+            || domain != crate::models::architectures::vibevoice::VIBEVOICE_TTS_NEGATIVE_DOMAIN
+        {
+            return Ok(input);
+        }
+        match phase {
+            super::SequencePhase::Prefill if input.start == 0 => InputRange::new(0, 1),
+            super::SequencePhase::Prefill => Err(Error::InferenceError(
+                "VibeVoice TTS requires its exact prompt prefill in one quantum".into(),
+            )),
+            super::SequencePhase::Decode => {
+                let prompt_tokens = self.prepared_sequence_input_tokens.ok_or_else(|| {
+                    Error::InferenceError(
+                        "prepared VibeVoice TTS request lost its prompt boundary".into(),
+                    )
+                })?;
+                let start = input
+                    .start
+                    .checked_sub(prompt_tokens)
+                    .and_then(|frames| frames.checked_add(1))
+                    .ok_or_else(|| {
+                        Error::InvalidInput(
+                            "VibeVoice TTS negative cache start crossed its prompt boundary".into(),
+                        )
+                    })?;
+                let end = input
+                    .end
+                    .checked_sub(prompt_tokens)
+                    .and_then(|frames| frames.checked_add(1))
+                    .ok_or_else(|| {
+                        Error::InvalidInput(
+                            "VibeVoice TTS negative cache end crossed its prompt boundary".into(),
+                        )
+                    })?;
+                InputRange::new(start, end)
+            }
+        }
     }
 
     pub(crate) fn install_prepared_sequence_input_tokens(

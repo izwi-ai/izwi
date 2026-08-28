@@ -657,8 +657,19 @@ fn authenticate_vibevoice_asr_graph(stages: &[StageDescriptor]) -> Result<VibeVo
             && decode.physical_launch_policy == PhysicalLaunchPolicy::ExecutionGroupExclusive
             && decode.membership_safe_point == MembershipSafePoint::QuantumBoundary
             && decode.output_visibility == OutputVisibility::AfterQuantumCommit
-            && decode.max_batch_size > 1
-            && decode.retained_state_selections.as_deref() == Some(&[]);
+            && ((is_asr
+                && decode.max_batch_size > 1
+                && decode.retained_state_selections.as_deref() == Some(&[]))
+                || (is_tts
+                    && decode.max_batch_size > 0
+                    && decode.retained_state_selections.as_deref()
+                        == Some(
+                            [ClockedStateSelection::new(
+                                VIBEVOICE_TTS_TOKENIZER_GROUP,
+                                StateClock::CodecFrames,
+                            )?]
+                            .as_slice(),
+                        )));
         if valid {
             return Ok(VibeVoiceAsrGraphKind::Normal);
         }
@@ -1534,6 +1545,11 @@ mod tests {
         normal[1].name = VIBEVOICE_TTS_PREFILL_STAGE.into();
         normal[1].retained_state_selections = Some(vec![]);
         normal[2].name = VIBEVOICE_TTS_DECODE_STAGE.into();
+        normal[2].retained_state_selections = Some(vec![ClockedStateSelection::new(
+            VIBEVOICE_TTS_TOKENIZER_GROUP,
+            StateClock::CodecFrames,
+        )
+        .unwrap()]);
         let mut legacy = asr_legacy_stage();
         legacy.name = VIBEVOICE_TTS_LEGACY_STAGE.into();
         let spec = vibevoice_physical_state_spec(
@@ -1549,5 +1565,40 @@ mod tests {
             domain.scope() == StateScope::Retained
                 && domain.header().checkpoint == CheckpointPolicy::Transactional
         }));
+    }
+
+    #[test]
+    fn tts_dual_graph_accepts_a_resource_constrained_width_one_decode_limit() {
+        let tokenizer = [
+            tokenizer_domain(3, 3, StateClock::CodecFrames, &[(2, 3)]),
+            tokenizer_domain(4, 3, StateClock::CodecFrames, &[(4, 5)]),
+        ];
+        let invocation = vibevoice_invocation_contract_from_state(
+            state_contract(2, DType::F16),
+            DType::F16,
+            &tokenizer,
+        )
+        .unwrap();
+        let mut normal = asr_normal_stages();
+        normal[0].name = VIBEVOICE_TTS_PREPARATION_STAGE.into();
+        normal[1].name = VIBEVOICE_TTS_PREFILL_STAGE.into();
+        normal[1].retained_state_selections = Some(vec![]);
+        normal[2].name = VIBEVOICE_TTS_DECODE_STAGE.into();
+        normal[2].retained_state_selections = Some(vec![ClockedStateSelection::new(
+            VIBEVOICE_TTS_TOKENIZER_GROUP,
+            StateClock::CodecFrames,
+        )
+        .unwrap()]);
+        normal[2].max_batch_size = 1;
+        normal[2].max_work_units = 1;
+        let mut legacy = asr_legacy_stage();
+        legacy.name = VIBEVOICE_TTS_LEGACY_STAGE.into();
+
+        vibevoice_physical_state_spec(
+            &[normal.as_slice(), std::slice::from_ref(&legacy)],
+            invocation,
+            8192,
+        )
+        .unwrap();
     }
 }

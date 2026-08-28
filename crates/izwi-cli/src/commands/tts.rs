@@ -10,6 +10,9 @@ use serde_json::{json, Value};
 use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
+use std::time::Duration;
+
+const TTS_REQUEST_TIMEOUT: Duration = Duration::from_secs(900);
 
 pub struct TtsArgs {
     pub text: String,
@@ -82,7 +85,10 @@ pub async fn execute(args: TtsArgs, server: &str, theme: &Theme) -> Result<()> {
         allow_format_fallback,
     })?;
 
-    let client = http::client(Some(std::time::Duration::from_secs(300)))?;
+    // Dense diffusion TTS can legitimately exceed five minutes on
+    // resource-constrained local Metal devices. Keep a finite client fence,
+    // but leave enough room for the server's own configured request deadline.
+    let client = http::client(Some(TTS_REQUEST_TIMEOUT))?;
 
     let start_time = std::time::Instant::now();
 

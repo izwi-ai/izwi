@@ -2955,9 +2955,7 @@ impl ExecutionReport {
 
 fn validate_plan_clocked_state(plan: &ExecutionPlan) -> Result<()> {
     let WorkUnit::SequenceStep {
-        phase,
-        auxiliary_state,
-        ..
+        auxiliary_state, ..
     } = &plan.work
     else {
         return Ok(());
@@ -2968,11 +2966,6 @@ fn validate_plan_clocked_state(plan: &ExecutionPlan) -> Result<()> {
         .and_then(|stage| stage.retained_state_selections.as_deref());
     match (policy, auxiliary_state.as_deref()) {
         (None, None) => return Ok(()),
-        (Some(_), Some(spans)) if *phase == SequencePhase::Decode && !spans.is_empty() => {
-            return Err(Error::InferenceError(
-                "sequence decode cannot advance auxiliary retained-state clocks".into(),
-            ));
-        }
         (Some(selections), Some(spans)) => {
             let mut previous_group = None;
             for span in spans {

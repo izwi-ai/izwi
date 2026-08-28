@@ -732,26 +732,6 @@ impl VibeVoiceTtsModel {
             state.staged_step = Some(step.clone());
             return Ok(step);
         }
-        if state.scaled_latents.len() >= MIN_FRAMES_BEFORE_STOP {
-            let predicted = next_tts_control_token_from_hidden(
-                &self.language_model,
-                state.last_hidden.as_ref().ok_or_else(|| {
-                    Error::InferenceError("VibeVoice retained TTS has no positive hidden".into())
-                })?,
-                self.tokenizer.specials(),
-            )?;
-            if predicted == self.tokenizer.specials().speech_end
-                || predicted == self.tokenizer.specials().endoftext
-            {
-                state.finished = true;
-                let step = VibeVoiceTtsRetainedDecodeStep {
-                    frames_generated: state.scaled_latents.len(),
-                    finished: true,
-                };
-                state.staged_step = Some(step.clone());
-                return Ok(step);
-            }
-        }
         let plan = vibevoice_diffusion_plan(
             &self.prediction_head,
             VibeVoiceDiffusionScheduler::new(
@@ -805,6 +785,17 @@ impl VibeVoiceTtsModel {
         state.scaled_latents.push(latent_frame);
         state.managed_completions_drained = false;
         state.finished = state.scaled_latents.len() >= state.params.max_frames.max(1);
+        if !state.finished && state.scaled_latents.len() >= MIN_FRAMES_BEFORE_STOP {
+            let predicted = next_tts_control_token_from_hidden(
+                &self.language_model,
+                state.last_hidden.as_ref().ok_or_else(|| {
+                    Error::InferenceError("VibeVoice retained TTS has no positive hidden".into())
+                })?,
+                self.tokenizer.specials(),
+            )?;
+            state.finished = predicted == self.tokenizer.specials().speech_end
+                || predicted == self.tokenizer.specials().endoftext;
+        }
         let step = VibeVoiceTtsRetainedDecodeStep {
             frames_generated: state.scaled_latents.len(),
             finished: state.finished,

@@ -2899,7 +2899,10 @@ impl LoadedExecutionAdapter for VibeVoiceTtsExecutionAdapter {
             .workspace_per_row_bytes
             .checked_mul(decode.max_work_units)
             .ok_or_else(|| Error::Overloaded("VibeVoice TTS decode workspace overflow".into()))?;
-        decode.retained_state_selections = Some(vec![]);
+        decode.retained_state_selections = Some(vec![ClockedStateSelection::new(
+            crate::models::architectures::vibevoice::VIBEVOICE_TTS_TOKENIZER_GROUP,
+            StateClock::CodecFrames,
+        )?]);
         preparation.validate()?;
         prefill.validate()?;
         decode.validate()?;
@@ -6588,6 +6591,21 @@ mod tests {
         assert_eq!(
             contract.stages[0].membership_safe_point,
             MembershipSafePoint::OperationBoundary
+        );
+        assert_eq!(
+            contract.stages[1].retained_state_selections.as_deref(),
+            Some(&[][..])
+        );
+        assert_eq!(
+            contract.stages[2].retained_state_selections.as_deref(),
+            Some(
+                [ClockedStateSelection::new(
+                    crate::models::architectures::vibevoice::VIBEVOICE_TTS_TOKENIZER_GROUP,
+                    StateClock::CodecFrames,
+                )
+                .unwrap()]
+                .as_slice()
+            )
         );
     }
 

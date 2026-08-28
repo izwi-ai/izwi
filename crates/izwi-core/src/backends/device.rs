@@ -368,7 +368,9 @@ impl DeviceProfile {
                 reason: "CPU default dtype is F32".into(),
             },
             DeviceKind::Metal => DTypeSelection {
-                dtype: if request.model_family == Some(ModelFamily::VoxtralTts) {
+                dtype: if request.model_family == Some(ModelFamily::VibeVoiceTts) {
+                    DType::F16
+                } else if request.model_family == Some(ModelFamily::VoxtralTts) {
                     DType::F32
                 } else if request.model_family == Some(ModelFamily::Voxtral)
                     && request.checkpoint_dtype != Some(DType::F32)
@@ -377,7 +379,9 @@ impl DeviceProfile {
                 } else {
                     DType::F32
                 },
-                reason: if request.model_family == Some(ModelFamily::VoxtralTts) {
+                reason: if request.model_family == Some(ModelFamily::VibeVoiceTts) {
+                    "VibeVoice TTS Metal policy uses F16 to bound dense model residency".into()
+                } else if request.model_family == Some(ModelFamily::VoxtralTts) {
                     "Voxtral TTS Metal policy keeps F32 across LM, acoustic transformer, and codec until lower-precision kernels are proven".into()
                 } else if request.model_family == Some(ModelFamily::Voxtral)
                     && request.checkpoint_dtype != Some(DType::F32)
@@ -1202,7 +1206,7 @@ mod tests {
     }
 
     #[test]
-    fn cpu_and_metal_vibevoice_model_dtype_stays_f32() {
+    fn vibevoice_tts_uses_f16_on_metal_while_cpu_and_asr_stay_f32() {
         let cpu_profile = DeviceProfile {
             device: Device::Cpu,
             kind: DeviceKind::Cpu,
@@ -1221,22 +1225,18 @@ mod tests {
             memory_pool: None,
         };
 
-        for family in [ModelFamily::VibeVoiceTts, ModelFamily::VibeVoiceAsr] {
-            assert_eq!(cpu_profile.select_model_dtype(family, None), DType::F32);
-            assert_eq!(
-                cpu_profile
-                    .select_model_dtype_checked(family, Some("bf16"), "VibeVoice")
-                    .unwrap(),
-                DType::F32
-            );
-            assert_eq!(metal_profile.select_model_dtype(family, None), DType::F32);
-            assert_eq!(
-                metal_profile
-                    .select_model_dtype_checked(family, Some("f16"), "VibeVoice")
-                    .unwrap(),
-                DType::F32
-            );
-        }
+        assert_eq!(
+            cpu_profile.select_model_dtype(ModelFamily::VibeVoiceTts, None),
+            DType::F32
+        );
+        assert_eq!(
+            metal_profile.select_model_dtype(ModelFamily::VibeVoiceTts, None),
+            DType::F16
+        );
+        assert_eq!(
+            metal_profile.select_model_dtype(ModelFamily::VibeVoiceAsr, None),
+            DType::F32
+        );
     }
 
     #[test]
