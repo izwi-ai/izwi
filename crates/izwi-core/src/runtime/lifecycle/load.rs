@@ -107,6 +107,20 @@ fn uses_asr_model_registry(variant: ModelVariant) -> bool {
     )
 }
 
+fn kokoro_effective_context_tokens(
+    model_context_tokens: usize,
+    portable_context_tokens: usize,
+) -> Result<u64> {
+    let effective = model_context_tokens.min(portable_context_tokens);
+    if effective == 0 {
+        return Err(Error::ModelLoadError(
+            "Kokoro effective context must be greater than zero".into(),
+        ));
+    }
+    u64::try_from(effective)
+        .map_err(|_| Error::ModelLoadError("Kokoro effective context exceeds u64".into()))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ManagedChatCapacityPolicy {
     /// `None` delegates staged transaction width to the engine-wide
@@ -2232,6 +2246,23 @@ impl ModelLifecycleController {
                     .await?;
                 state_publications.insert(CapabilityKind::Tts, publication);
             }
+            if variant.family() == crate::catalog::ModelFamily::KokoroTts {
+                let model = self
+                    .model_registry
+                    .get_loading_kokoro(variant)
+                    .await
+                    .ok_or_else(|| {
+                        Error::ModelLoadError(format!(
+                            "loaded Kokoro TTS model {variant} is missing from the registry"
+                        ))
+                    })?;
+                let effective_context = kokoro_effective_context_tokens(
+                    model.config().context_length(),
+                    self.config.portable_context_ceiling(),
+                )?;
+                self.model_registry
+                    .publish_effective_context(variant, effective_context)?;
+            }
             self.bind_loaded_model_bundle_draft(
                 bundle_draft,
                 variant,
@@ -2408,9 +2439,10 @@ impl RuntimeService {
 mod tests {
     use super::{
         estimate_from_tensor_inventory, is_metal_command_buffer_oom,
-        loaded_asr_state_publication_route, managed_chat_capacity_policy, model_memory_estimate,
-        model_resource_plan, plan_invocation_allocations, qwen38_representation_memory_estimate,
-        qwen38_resource_plan, residency_budget_has_capacity, select_lru_eviction_candidate,
+        kokoro_effective_context_tokens, loaded_asr_state_publication_route,
+        managed_chat_capacity_policy, model_memory_estimate, model_resource_plan,
+        plan_invocation_allocations, qwen38_representation_memory_estimate, qwen38_resource_plan,
+        residency_budget_has_capacity, select_lru_eviction_candidate,
         validate_scratch_only_invocation_publication, LoadedAsrStatePublicationRoute,
         ModelMemoryEstimate, QWEN38_BF16_ELEMENTS, QWEN38_CUDA_DEVICE_CONVERSION_SCRATCH_BYTES,
         QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES, QWEN38_FP8_ELEMENTS,
@@ -3069,6 +3101,14 @@ mod tests {
         );
         assert_eq!(nemotron.load_peak_bytes, nemotron.resident_bytes);
         assert_eq!(kokoro.load_peak_bytes, kokoro.resident_bytes);
+    }
+
+    #[test]
+    fn kokoro_effective_context_respects_model_and_runtime_limits() {
+        assert_eq!(kokoro_effective_context_tokens(512, 1_024).unwrap(), 512);
+        assert_eq!(kokoro_effective_context_tokens(512, 256).unwrap(), 256);
+        assert!(kokoro_effective_context_tokens(0, 1_024).is_err());
+        assert!(kokoro_effective_context_tokens(512, 0).is_err());
     }
 
     #[test]

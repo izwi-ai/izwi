@@ -2947,6 +2947,10 @@ fn tts_native_batch_implementation_support(
 /// sufficient. Each audio family remains `NONE` until its exact loaded model
 /// and adapter both expose a real multi-row call at this boundary.
 fn loaded_native_batch_support(request: &EngineCoreRequest) -> NativeBatchSupport {
+    let kokoro_static = request.task_type == TaskType::TTS
+        && request
+            .prepared_kokoro_tts_model_lease_for_executor()
+            .is_ok_and(|model| model.is_some());
     let (prefill_supported, decode_supported) = match request.task_type {
         TaskType::Chat => (
             false,
@@ -2990,12 +2994,30 @@ fn loaded_native_batch_support(request: &EngineCoreRequest) -> NativeBatchSuppor
         }
         TaskType::SpeechToSpeech => (false, false),
     };
-    if !prefill_supported && !decode_supported {
-        return NativeBatchSupport::NONE;
-    }
     let Some(binding) = request.execution_adapter_binding() else {
         return NativeBatchSupport::NONE;
     };
+    if kokoro_static {
+        let atomic_work = WorkUnit::AtomicJob {
+            kind: "tts".to_string(),
+        };
+        let static_batch = binding.stage_for_work(&atomic_work).is_ok_and(|stage| {
+            stage.selector == StageWorkSelector::Atomic
+                && stage.batch_mode == NativeBatchMode::Static
+                && stage.concurrency == ConcurrencyClass::Batchable
+        });
+        return NativeBatchSupport {
+            prefill: if static_batch {
+                NativeBatchMode::Static
+            } else {
+                NativeBatchMode::None
+            },
+            decode: NativeBatchMode::None,
+        };
+    }
+    if !prefill_supported && !decode_supported {
+        return NativeBatchSupport::NONE;
+    }
     let decode_work = WorkUnit::SequenceStep {
         phase: SequencePhase::Decode,
         input: super::InputRange { start: 0, end: 1 },
@@ -3114,6 +3136,9 @@ impl ModelExecutor for NativeExecutor {
                         .is_ok_and(|model| model.is_some())
                     || request
                         .prepared_lfm25_audio_tts_model_lease_for_executor()
+                        .is_ok_and(|model| model.is_some())
+                    || request
+                        .prepared_kokoro_tts_model_lease_for_executor()
                         .is_ok_and(|model| model.is_some())
                     || (self.config.model_registry.is_none() && self.loaded_tts_model.is_some());
                 loaded.then_some(matches!(

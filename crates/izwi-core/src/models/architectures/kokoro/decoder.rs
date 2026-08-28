@@ -255,6 +255,20 @@ impl KokoroDecoder {
                 log_kokoro_profile("decoder.f0n_conv", t0.elapsed());
             }
 
+            let (_, _, asr_time) = asr.dims3().map_err(Error::from)?;
+            let (_, _, f0_time) = f0.dims3().map_err(Error::from)?;
+            let (_, _, n_time) = n.dims3().map_err(Error::from)?;
+            if f0_time != asr_time || n_time != asr_time {
+                return Err(Error::InferenceError(format!(
+                    "Kokoro decoder conditioning time mismatch: asr={:?}, f0_curve={:?}, n_curve={:?}, f0_conv={:?}, n_conv={:?}",
+                    asr.dims(),
+                    f0_curve.dims(),
+                    n_curve.dims(),
+                    f0.dims(),
+                    n.dims()
+                )));
+            }
+
             let t1 = Instant::now();
             let x = Tensor::cat(&[asr.clone(), f0.clone(), n.clone()], 1).map_err(Error::from)?;
             let mut x = self.encode.forward(&x, style)?;

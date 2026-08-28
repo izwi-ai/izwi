@@ -264,6 +264,12 @@ fn kokoro_duration_buckets(expanded_frames: &[usize]) -> Vec<Vec<usize>> {
     buckets.into_values().collect()
 }
 
+fn kokoro_decoder_conditioning_frames(expanded_frames: usize) -> Result<usize> {
+    expanded_frames.checked_mul(2).ok_or_else(|| {
+        Error::Overloaded("Kokoro decoder conditioning length overflowed".to_string())
+    })
+}
+
 fn select_trimmed_batch(tensor: &Tensor, rows: &[usize], frames: usize) -> Result<Tensor> {
     let selected = rows
         .iter()
@@ -779,11 +785,18 @@ impl KokoroTtsModel {
         let duration_buckets = kokoro_duration_buckets(&predecoder.prosody.expanded_frames);
         for duration_bucket in duration_buckets {
             let expanded_frames = predecoder.prosody.expanded_frames[duration_bucket[0]];
+            let conditioning_frames = kokoro_decoder_conditioning_frames(expanded_frames)?;
             let asr = select_trimmed_batch(&predecoder.asr, &duration_bucket, expanded_frames)?;
-            let f0 =
-                select_trimmed_batch_2d(&predecoder.prosody.f0, &duration_bucket, expanded_frames)?;
-            let n =
-                select_trimmed_batch_2d(&predecoder.prosody.n, &duration_bucket, expanded_frames)?;
+            let f0 = select_trimmed_batch_2d(
+                &predecoder.prosody.f0,
+                &duration_bucket,
+                conditioning_frames,
+            )?;
+            let n = select_trimmed_batch_2d(
+                &predecoder.prosody.n,
+                &duration_bucket,
+                conditioning_frames,
+            )?;
             let style_rows = duration_bucket
                 .iter()
                 .map(|&row| {
@@ -1239,6 +1252,15 @@ mod tests {
             kokoro_duration_buckets(&[11, 7, 11, 9, 7]),
             vec![vec![1, 4], vec![3], vec![0, 2]]
         );
+    }
+
+    #[test]
+    fn decoder_conditioning_preserves_the_double_rate_f0_and_noise_curves() {
+        assert_eq!(kokoro_decoder_conditioning_frames(88).unwrap(), 176);
+        assert!(matches!(
+            kokoro_decoder_conditioning_frames(usize::MAX),
+            Err(Error::Overloaded(message)) if message.contains("conditioning length")
+        ));
     }
 
     #[test]

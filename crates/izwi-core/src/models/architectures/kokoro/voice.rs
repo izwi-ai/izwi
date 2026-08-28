@@ -10,6 +10,12 @@ use crate::error::{Error, Result};
 
 pub(crate) const KOKORO_MODEL_MEMO_MAX_BYTES: u64 = (510 * 256 * std::mem::size_of::<f32>()) as u64;
 
+fn detached_style_row(pack: &Tensor, index: usize) -> Result<Tensor> {
+    pack.i((index, .., ..))?
+        .affine(1.0, 0.0)
+        .map_err(Error::from)
+}
+
 #[derive(Debug)]
 pub struct VoiceLibrary {
     voices_dir: PathBuf,
@@ -90,7 +96,7 @@ impl VoiceLibrary {
         let pack = self.load_pack(speaker)?;
         let clamped_len = phoneme_len.clamp(1, 510);
         let idx = clamped_len - 1;
-        pack.i((idx, .., ..)).map_err(Error::from)
+        detached_style_row(&pack, idx)
     }
 }
 
@@ -230,5 +236,22 @@ fn read_tensor_from_zip(path: &Path, info: &TensorInfo, member_path: &str) -> Re
         tensor.permute(perm).map_err(Error::from)
     } else {
         Ok(tensor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::shared::memory::accounting::TensorStorageAccounting;
+
+    #[test]
+    fn prepared_style_row_does_not_retain_the_full_voice_pack_storage() {
+        let pack = Tensor::zeros((510, 1, 256), DType::F32, &candle_core::Device::Cpu).unwrap();
+        let style = detached_style_row(&pack, 42).unwrap();
+        let mut accounting = TensorStorageAccounting::default();
+        accounting.add_tensor(&style).expect("style accounting");
+
+        assert_eq!(style.dims(), &[1, 256]);
+        assert_eq!(accounting.bytes(), 256 * std::mem::size_of::<f32>() as u64);
     }
 }
