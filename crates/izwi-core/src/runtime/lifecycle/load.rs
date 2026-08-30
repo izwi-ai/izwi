@@ -145,6 +145,32 @@ fn portable_invocation_context_intent(
     }
 }
 
+fn automatic_state_group_budget(available_bytes: u64, remaining_groups: u64) -> u64 {
+    available_bytes / remaining_groups.max(1)
+}
+
+fn portable_context_ceiling(
+    variant: ModelVariant,
+    preference: ContextLengthPreference,
+    maximum: u64,
+) -> u64 {
+    if preference.explicit_tokens().is_some() {
+        return maximum;
+    }
+    match variant {
+        ModelVariant::Lfm25Audio15BGguf => maximum.min(4_096),
+        _ => maximum,
+    }
+}
+
+fn portable_context_reserve_bytes(variant: ModelVariant, configured_reserve_bytes: u64) -> u64 {
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    let total_inference_bytes = (variant.memory_required_gb() as f64 * GIB as f64).ceil() as u64;
+    let resident_bytes = model_memory_estimate(variant).resident_bytes;
+    configured_reserve_bytes.saturating_add(total_inference_bytes.saturating_sub(resident_bytes))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ManagedChatCapacityPolicy {
     /// `None` delegates staged transaction width to the engine-wide
@@ -743,8 +769,10 @@ impl ModelLifecycleController {
         descriptor: &mut CapabilityStateDescriptorV2,
         invocation_contract: &InferenceStateContract,
         executions: &[LoadedExecutionContract],
+        remaining_automatic_state_groups: u64,
     ) -> Result<()> {
-        let safety_reserve_bytes = self.config.portable_context_reserve_bytes;
+        let safety_reserve_bytes =
+            portable_context_reserve_bytes(variant, self.config.portable_context_reserve_bytes);
         let backend = self.backend_router.context().backend_kind;
         if backend == BackendKind::Cuda {
             return Ok(());
@@ -769,6 +797,8 @@ impl ModelLifecycleController {
             return Ok(());
         };
         let budget = headroom_bytes.saturating_sub(safety_reserve_bytes);
+        let automatic_budget =
+            automatic_state_group_budget(budget, remaining_automatic_state_groups);
         let required = |tokens: Option<u64>| -> Result<u64> {
             let mut candidate = descriptor.clone();
             if let Some(tokens) = tokens {
@@ -803,6 +833,7 @@ impl ModelLifecycleController {
             }
             return Ok(());
         };
+        let maximum = portable_context_ceiling(variant, self.config.max_sequence_length, maximum);
         let intent = portable_invocation_context_intent(
             self.config.max_sequence_length,
             self.model_registry.effective_context(variant),
@@ -834,7 +865,7 @@ impl ModelLifecycleController {
             let (mut low, mut high) = (minimum, ceiling);
             while low < high {
                 let middle = low + (high - low).div_ceil(2);
-                if required(Some(middle))? <= budget {
+                if required(Some(middle))? <= automatic_budget {
                     low = middle;
                 } else {
                     high = middle - 1;
@@ -856,10 +887,32 @@ impl ModelLifecycleController {
         &self,
         model_instance_id: crate::engine::ModelInstanceId,
         executions: &[LoadedExecutionContract],
+        descriptor: CapabilityStateDescriptorV2,
+        invocation_contract: &InferenceStateContract,
+        retained: Option<RetainedStateRuntimeV2>,
+        retained_uses: HashMap<[u8; 32], RetainedStateUseV2>,
+    ) -> Result<LoadedStatePublication> {
+        self.load_invocation_workspace_publication_with_remaining_groups(
+            model_instance_id,
+            executions,
+            descriptor,
+            invocation_contract,
+            retained,
+            retained_uses,
+            1,
+        )
+        .await
+    }
+
+    async fn load_invocation_workspace_publication_with_remaining_groups(
+        &self,
+        model_instance_id: crate::engine::ModelInstanceId,
+        executions: &[LoadedExecutionContract],
         mut descriptor: CapabilityStateDescriptorV2,
         invocation_contract: &InferenceStateContract,
         retained: Option<RetainedStateRuntimeV2>,
         retained_uses: HashMap<[u8; 32], RetainedStateUseV2>,
+        remaining_automatic_state_groups: u64,
     ) -> Result<LoadedStatePublication> {
         let variant = self
             .resident_variant_for_instance(model_instance_id)
@@ -873,6 +926,7 @@ impl ModelLifecycleController {
             &mut descriptor,
             invocation_contract,
             executions,
+            remaining_automatic_state_groups,
         )?;
         validate_physical_publication_backing(
             &descriptor,
@@ -1895,6 +1949,13 @@ impl ModelLifecycleController {
                     CapabilityKind::AudioChat,
                     CapabilityKind::SpeechToSpeech,
                 ] {
+                    let remaining_automatic_state_groups = match capability {
+                        CapabilityKind::Asr => 5,
+                        CapabilityKind::Tts => 3,
+                        CapabilityKind::AudioChat => 2,
+                        CapabilityKind::SpeechToSpeech => 1,
+                        _ => unreachable!("LFM2.5 Audio capability list is closed above"),
+                    };
                     let contracts = bundle_draft.execution_contracts(capability)?;
                     let stage_graphs = contracts
                         .iter()
@@ -1902,12 +1963,26 @@ impl ModelLifecycleController {
                         .collect::<Vec<_>>();
                     if capability == CapabilityKind::Asr {
                         let physical_spec = model.retained_asr_state_spec(&stage_graphs)?;
+                        let retained_max_tokens = usize::try_from(portable_context_ceiling(
+                            variant,
+                            self.config.max_sequence_length,
+                            u64::try_from(physical_spec.retained_max_tokens).map_err(|_| {
+                                Error::ModelLoadError(
+                                    "LFM2.5 Audio retained context exceeds u64".into(),
+                                )
+                            })?,
+                        ))
+                        .map_err(|_| {
+                            Error::ModelLoadError(
+                                "LFM2.5 Audio retained context exceeds usize".into(),
+                            )
+                        })?;
                         let retained = self
                             .core_engine
                             .load_managed_model_state_with_portable_copies(
                                 model_instance_id,
                                 &physical_spec.retained,
-                                Some(physical_spec.retained_max_tokens),
+                                Some(retained_max_tokens),
                                 2,
                             )
                             .await?;
@@ -1948,13 +2023,14 @@ impl ModelLifecycleController {
                             )
                         })?;
                         let publication = self
-                            .load_invocation_workspace_publication(
+                            .load_invocation_workspace_publication_with_remaining_groups(
                                 model_instance_id,
                                 &contracts,
                                 physical_spec.descriptor,
                                 main_invocation,
                                 Some(retained.into()),
                                 retained_uses,
+                                remaining_automatic_state_groups,
                             )
                             .await?;
                         state_publications.insert(capability, publication);
@@ -1962,12 +2038,18 @@ impl ModelLifecycleController {
                     }
                     if capability == CapabilityKind::Tts {
                         let physical_spec = model.retained_tts_state_spec(&stage_graphs)?;
+                        let retained_max_tokens = self
+                            .model_registry
+                            .effective_context(variant)
+                            .map_or(physical_spec.retained_max_tokens, |tokens| {
+                                physical_spec.retained_max_tokens.min(tokens)
+                            });
                         let retained = self
                             .core_engine
                             .load_managed_model_state(
                                 model_instance_id,
                                 &physical_spec.retained,
-                                Some(physical_spec.retained_max_tokens),
+                                Some(retained_max_tokens),
                             )
                             .await?;
                         self.model_registry.publish_effective_context(
@@ -1997,13 +2079,14 @@ impl ModelLifecycleController {
                             },
                         )?;
                         let publication = self
-                            .load_invocation_workspace_publication(
+                            .load_invocation_workspace_publication_with_remaining_groups(
                                 model_instance_id,
                                 &contracts,
                                 physical_spec.descriptor,
                                 depthformer,
                                 Some(retained.into()),
                                 retained_uses,
+                                remaining_automatic_state_groups,
                             )
                             .await?;
                         state_publications.insert(capability, publication);
@@ -2016,13 +2099,14 @@ impl ModelLifecycleController {
                     };
                     let physical_spec = model.physical_state_spec(mode, &stage_graphs)?;
                     let publication = self
-                        .load_invocation_workspace_publication(
+                        .load_invocation_workspace_publication_with_remaining_groups(
                             model_instance_id,
                             &contracts,
                             physical_spec.descriptor,
                             &physical_spec.invocation,
                             None,
                             HashMap::new(),
+                            remaining_automatic_state_groups,
                         )
                         .await?;
                     state_publications.insert(capability, publication);
@@ -2053,12 +2137,18 @@ impl ModelLifecycleController {
                             "loaded model {variant} requires physical TTS state, but the {backend:?} build has no direct paged-attention runtime"
                         )));
                     }
+                    let retained_max_tokens = self
+                        .model_registry
+                        .effective_context(variant)
+                        .map_or(physical_spec.retained_max_tokens, |tokens| {
+                            physical_spec.retained_max_tokens.min(tokens)
+                        });
                     let retained = self
                         .core_engine
                         .load_managed_model_state(
                             model_instance_id,
                             &physical_spec.retained,
-                            Some(physical_spec.retained_max_tokens),
+                            Some(retained_max_tokens),
                         )
                         .await?;
                     self.model_registry.publish_effective_context(
@@ -2098,13 +2188,23 @@ impl ModelLifecycleController {
                         })
                         .collect::<Result<HashMap<_, _>>>()?;
                     let publication = self
-                        .load_invocation_workspace_publication(
+                        .load_invocation_workspace_publication_with_remaining_groups(
                             model_instance_id,
                             &contracts,
                             physical_spec.descriptor,
                             &physical_spec.predictor_contract,
                             Some(retained.into()),
                             retained_uses,
+                            if capability == CapabilityKind::Tts
+                                && self
+                                    .adapter_registry
+                                    .require(CapabilityKind::StreamingTts, variant)
+                                    .is_ok()
+                            {
+                                3
+                            } else {
+                                1
+                            },
                         )
                         .await?;
                     state_publications.insert(capability, publication);
@@ -2467,16 +2567,16 @@ impl RuntimeService {
 #[cfg(test)]
 mod tests {
     use super::{
-        estimate_from_tensor_inventory, is_metal_command_buffer_oom,
+        automatic_state_group_budget, estimate_from_tensor_inventory, is_metal_command_buffer_oom,
         kokoro_effective_context_tokens, loaded_asr_state_publication_route,
         managed_chat_capacity_policy, model_memory_estimate, model_resource_plan,
-        plan_invocation_allocations, portable_invocation_context_intent,
-        qwen38_representation_memory_estimate, qwen38_resource_plan, residency_budget_has_capacity,
-        select_lru_eviction_candidate, validate_scratch_only_invocation_publication,
-        LoadedAsrStatePublicationRoute, ModelMemoryEstimate, PortableInvocationContextIntent,
-        QWEN38_BF16_ELEMENTS, QWEN38_CUDA_DEVICE_CONVERSION_SCRATCH_BYTES,
-        QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES, QWEN38_FP8_ELEMENTS,
-        QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES, QWEN38_Q8_0_BLOCK_BYTES,
+        plan_invocation_allocations, portable_context_ceiling, portable_context_reserve_bytes,
+        portable_invocation_context_intent, qwen38_representation_memory_estimate,
+        qwen38_resource_plan, residency_budget_has_capacity, select_lru_eviction_candidate,
+        validate_scratch_only_invocation_publication, LoadedAsrStatePublicationRoute,
+        ModelMemoryEstimate, PortableInvocationContextIntent, QWEN38_BF16_ELEMENTS,
+        QWEN38_CUDA_DEVICE_CONVERSION_SCRATCH_BYTES, QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES,
+        QWEN38_FP8_ELEMENTS, QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES, QWEN38_Q8_0_BLOCK_BYTES,
         QWEN38_Q8_0_BLOCK_ELEMENTS,
     };
     use crate::backends::kv::managed_kv_backend_compiled;
@@ -3162,6 +3262,56 @@ mod tests {
     }
 
     #[test]
+    fn automatic_state_groups_share_remaining_headroom() {
+        assert_eq!(automatic_state_group_budget(5_000, 5), 1_000);
+        assert_eq!(automatic_state_group_budget(5_000, 2), 2_500);
+        assert_eq!(automatic_state_group_budget(5_000, 1), 5_000);
+        assert_eq!(automatic_state_group_budget(5_000, 0), 5_000);
+    }
+
+    #[test]
+    fn lfm25_audio_context_fit_preserves_request_workspace_and_safety_headroom() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+
+        assert_eq!(
+            portable_context_reserve_bytes(ModelVariant::Lfm25Audio15BGguf, GIB),
+            3 * GIB
+        );
+        assert_eq!(
+            portable_context_reserve_bytes(ModelVariant::Kokoro82M, GIB),
+            GIB
+        );
+    }
+
+    #[test]
+    fn lfm25_audio_automatic_context_uses_the_validated_portable_ceiling() {
+        assert_eq!(
+            portable_context_ceiling(
+                ModelVariant::Lfm25Audio15BGguf,
+                ContextLengthPreference::Auto,
+                128_000
+            ),
+            4_096
+        );
+        assert_eq!(
+            portable_context_ceiling(
+                ModelVariant::Lfm25Audio15BGguf,
+                ContextLengthPreference::explicit(8_192).unwrap(),
+                128_000
+            ),
+            128_000
+        );
+        assert_eq!(
+            portable_context_ceiling(
+                ModelVariant::Kokoro82M,
+                ContextLengthPreference::Auto,
+                128_000
+            ),
+            128_000
+        );
+    }
+
+    #[test]
     fn explicit_invocation_context_remains_mandatory_after_state_publication() {
         let explicit = ContextLengthPreference::explicit(32_768).unwrap();
         assert_eq!(
@@ -3172,18 +3322,17 @@ mod tests {
 
     #[test]
     fn lfm25_audio_cold_load_fits_with_separately_reserved_request_workspace() {
-        const MIB: u64 = 1024 * 1024;
-        const GIB: u64 = 1024 * MIB;
+        const GIB: u64 = 1024 * 1024 * 1024;
 
         let authority = vector_authority(ResourceVector {
-            unified_bytes: ResourceAmount::Known(4 * GIB),
+            unified_bytes: ResourceAmount::Known(5 * GIB),
             ..ResourceVector::zero()
         });
         let _request = authority
             .reserve(
                 ReservationOwner::new(ReservationClass::Request, "lfm-request"),
                 ResourceVector {
-                    unified_bytes: ResourceAmount::Known(512 * MIB),
+                    unified_bytes: ResourceAmount::Known(2 * GIB),
                     ..ResourceVector::zero()
                 },
             )
