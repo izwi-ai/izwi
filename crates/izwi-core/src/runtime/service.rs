@@ -4103,7 +4103,13 @@ impl RuntimeService {
                     sample_rate,
                     model_for_shape.max_audio_seconds_hint(),
                 );
-                let geometry = (!long_form)
+                // Granite's retained decoder is not quality-certified: the
+                // real model can collapse to tokenizer id 0 for every output
+                // step while its invocation-scoped physical route produces
+                // the expected transcript. Keep retained preparation behind
+                // the model's truthful capability declaration so production
+                // requests use the correctness-proven atomic route.
+                let geometry = (!long_form && model_for_shape.supports_resumable_prefill())
                     .then(|| {
                         model_for_shape.granite_speech_retained_preparation_geometry(
                             &samples,

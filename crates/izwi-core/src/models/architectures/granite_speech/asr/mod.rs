@@ -539,11 +539,11 @@ impl GraniteSpeechAsrModel {
     }
 
     pub(crate) const fn supports_resumable_prefill(&self) -> bool {
-        true
+        false
     }
 
     pub(crate) const fn supports_incremental_decode(&self) -> bool {
-        true
+        false
     }
 
     pub(crate) fn physical_state_spec(

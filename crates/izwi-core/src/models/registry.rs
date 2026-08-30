@@ -2233,7 +2233,11 @@ impl NativeAsrModel {
     }
 
     pub fn supports_incremental_decode(&self) -> bool {
-        matches!(self, Self::Qwen3(_) | Self::GraniteSpeech(_))
+        match self {
+            Self::Qwen3(_) => true,
+            Self::GraniteSpeech(model) => model.supports_incremental_decode(),
+            _ => false,
+        }
     }
 
     pub fn supports_resumable_prefill(&self) -> bool {
