@@ -2084,7 +2084,13 @@ fn resolve_generation_timeout_secs(
         .ok()
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|value| value.is_finite() && *value >= 1.0)
-        .unwrap_or(8.0);
+        .unwrap_or_else(|| {
+            if variant == ModelVariant::VibeVoice15BTts {
+                izwi_core::runtime_models::architectures::vibevoice::tts::VIBEVOICE_TTS_DEFAULT_TIMEOUT_RTF
+            } else {
+                8.0
+            }
+        });
     let timeout_padding_secs = std::env::var("IZWI_TTS_TIMEOUT_PADDING_SECS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -2351,7 +2357,7 @@ mod tests {
                 None,
                 1,
             ),
-            59
+            1_110
         );
     }
 

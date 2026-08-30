@@ -159,6 +159,7 @@ fn portable_context_ceiling(
     }
     match variant {
         ModelVariant::Lfm25Audio15BGguf => maximum.min(4_096),
+        ModelVariant::VibeVoice15BTts => maximum.min(1_024),
         _ => maximum,
     }
 }
@@ -2236,12 +2237,32 @@ impl ModelLifecycleController {
                         "VibeVoice TTS normal graph did not publish retained state".into(),
                     )
                 })?;
+                let retained_max_tokens = physical_spec
+                    .retained_max_tokens
+                    .map(|maximum| {
+                        let maximum = u64::try_from(maximum).map_err(|_| {
+                            Error::ModelLoadError(
+                                "VibeVoice retained context exceeds u64".into(),
+                            )
+                        })?;
+                        usize::try_from(portable_context_ceiling(
+                            variant,
+                            self.config.max_sequence_length,
+                            maximum,
+                        ))
+                        .map_err(|_| {
+                            Error::ModelLoadError(
+                                "VibeVoice retained context exceeds usize".into(),
+                            )
+                        })
+                    })
+                    .transpose()?;
                 let retained = self
                     .core_engine
                     .load_managed_model_state(
                         model_instance_id,
                         retained_contract,
-                        physical_spec.retained_max_tokens,
+                        retained_max_tokens,
                     )
                     .await?;
                 self.model_registry.publish_effective_context(
@@ -3284,7 +3305,7 @@ mod tests {
     }
 
     #[test]
-    fn lfm25_audio_automatic_context_uses_the_validated_portable_ceiling() {
+    fn portable_tts_automatic_context_uses_validated_model_ceilings() {
         assert_eq!(
             portable_context_ceiling(
                 ModelVariant::Lfm25Audio15BGguf,
@@ -3308,6 +3329,14 @@ mod tests {
                 128_000
             ),
             128_000
+        );
+        assert_eq!(
+            portable_context_ceiling(
+                ModelVariant::VibeVoice15BTts,
+                ContextLengthPreference::Auto,
+                65_536
+            ),
+            1_024
         );
     }
 
