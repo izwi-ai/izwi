@@ -160,6 +160,9 @@ fn portable_context_ceiling(
     match variant {
         ModelVariant::Lfm25Audio15BGguf => maximum.min(4_096),
         ModelVariant::VibeVoice15BTts => maximum.min(1_024),
+        ModelVariant::Qwen3Asr06BGguf
+        | ModelVariant::Qwen3Asr17BGguf
+        | ModelVariant::GraniteSpeech412BPlus => maximum.min(1_024),
         _ => maximum,
     }
 }
@@ -1408,12 +1411,27 @@ impl ModelLifecycleController {
                                     .into(),
                             )
                         })?;
-                        let retained_max_tokens =
-                            physical_spec.retained_max_tokens.ok_or_else(|| {
+                        let retained_max_tokens = physical_spec
+                            .retained_max_tokens
+                            .ok_or_else(|| {
                                 Error::ModelLoadError(
                                     "Granite Speech retained decoder has no context bound".into(),
                                 )
                             })?;
+                        let retained_max_tokens = usize::try_from(portable_context_ceiling(
+                            variant,
+                            self.config.max_sequence_length,
+                            u64::try_from(retained_max_tokens).map_err(|_| {
+                                Error::ModelLoadError(
+                                    "Granite Speech retained context exceeds u64".into(),
+                                )
+                            })?,
+                        ))
+                        .map_err(|_| {
+                            Error::ModelLoadError(
+                                "Granite Speech retained context exceeds usize".into(),
+                            )
+                        })?;
                         let retained = self
                             .core_engine
                             .load_managed_model_state_with_portable_copies(
@@ -1466,13 +1484,14 @@ impl ModelLifecycleController {
                         (None, HashMap::new())
                     };
                     let publication = self
-                        .load_invocation_workspace_publication(
+                        .load_invocation_workspace_publication_with_remaining_groups(
                             model_instance_id,
                             &contracts,
                             physical_spec.descriptor,
                             &physical_spec.invocation,
                             retained,
                             retained_uses,
+                            if capability == CapabilityKind::Asr { 2 } else { 1 },
                         )
                         .await?;
                     state_publications.insert(capability, publication);
@@ -1534,12 +1553,26 @@ impl ModelLifecycleController {
                             .map(|contract| contract.stages.as_ref())
                             .collect::<Vec<_>>();
                         let physical_spec = loaded.qwen3_physical_state_spec(&stage_graphs)?;
+                        let retained_max_tokens = usize::try_from(portable_context_ceiling(
+                            variant,
+                            self.config.max_sequence_length,
+                            u64::try_from(physical_spec.retained_max_tokens).map_err(|_| {
+                                Error::ModelLoadError(
+                                    "Qwen3 ASR retained context exceeds u64".into(),
+                                )
+                            })?,
+                        ))
+                        .map_err(|_| {
+                            Error::ModelLoadError(
+                                "Qwen3 ASR retained context exceeds usize".into(),
+                            )
+                        })?;
                         let physical = self
                             .core_engine
                             .load_managed_model_state_with_portable_copies(
                                 model_instance_id,
                                 &physical_spec.retained,
-                                Some(physical_spec.retained_max_tokens),
+                                Some(retained_max_tokens),
                                 2,
                             )
                             .await?;
@@ -3305,7 +3338,7 @@ mod tests {
     }
 
     #[test]
-    fn portable_tts_automatic_context_uses_validated_model_ceilings() {
+    fn portable_automatic_context_uses_validated_model_ceilings() {
         assert_eq!(
             portable_context_ceiling(
                 ModelVariant::Lfm25Audio15BGguf,
@@ -3338,6 +3371,24 @@ mod tests {
             ),
             1_024
         );
+        for variant in [
+            ModelVariant::Qwen3Asr06BGguf,
+            ModelVariant::Qwen3Asr17BGguf,
+            ModelVariant::GraniteSpeech412BPlus,
+        ] {
+            assert_eq!(
+                portable_context_ceiling(variant, ContextLengthPreference::Auto, 65_536),
+                1_024
+            );
+            assert_eq!(
+                portable_context_ceiling(
+                    variant,
+                    ContextLengthPreference::explicit(8_192).unwrap(),
+                    65_536
+                ),
+                65_536
+            );
+        }
     }
 
     #[test]
