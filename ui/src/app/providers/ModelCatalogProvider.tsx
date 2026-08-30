@@ -38,6 +38,10 @@ interface ModelCatalogContextValue {
 
 const ModelCatalogContext = createContext<ModelCatalogContextValue | null>(null);
 
+function modelActionError(err: unknown, fallback: string): string {
+  return err instanceof Error && err.message.trim() ? err.message : fallback;
+}
+
 interface ModelCatalogProviderProps {
   children: ReactNode;
 }
@@ -572,10 +576,11 @@ export function ModelCatalogProvider({
         });
       } catch (err) {
         console.error("Load failed:", err);
-        setError("Failed to load model. Please try again.");
+        const message = modelActionError(err, "Failed to load model. Please try again.");
+        setError(message);
         notify({
           title: "Model load failed",
-          description: `Izwi could not load ${getModelLabel(variant)}.`,
+          description: message,
           tone: "danger",
         });
       } finally {
@@ -601,10 +606,14 @@ export function ModelCatalogProvider({
         });
       } catch (err) {
         console.error("Unload failed:", err);
-        setError("Failed to unload model. Please try again.");
+        const message = modelActionError(
+          err,
+          "Failed to unload model. Please try again.",
+        );
+        setError(message);
         notify({
           title: "Model unload failed",
-          description: `Izwi could not unload ${getModelLabel(variant)}.`,
+          description: message,
           tone: "danger",
         });
       }

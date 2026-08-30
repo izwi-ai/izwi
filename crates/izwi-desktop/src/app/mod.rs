@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use std::process::Child;
 use std::sync::{Arc, Mutex};
 use url::Url;
 
@@ -14,7 +13,7 @@ pub mod updater;
 pub mod updater_contract;
 pub mod window;
 
-use self::server::{maybe_start_local_server, server_host_port, shutdown_child};
+use self::server::{maybe_start_local_server, server_host_port, ManagedServer};
 use self::window::WindowConfig;
 
 #[derive(Debug, Parser)]
@@ -53,8 +52,9 @@ pub fn run(args: DesktopArgs) -> Result<()> {
         height: args.height,
     };
 
-    let managed_server = Arc::new(Mutex::new(None::<Child>));
+    let managed_server = Arc::new(Mutex::new(None::<ManagedServer>));
     let setup_server_handle = Arc::clone(&managed_server);
+    let event_server_handle = Arc::clone(&managed_server);
 
     let mut builder = tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
@@ -87,6 +87,10 @@ pub fn run(args: DesktopArgs) -> Result<()> {
     let app = builder
         .setup(move |app| {
             if let Some(server_child) = maybe_start_local_server(app.handle(), &server_url)? {
+                eprintln!(
+                    "desktop-owned izwi-server logs: {}",
+                    server_child.log_path().display()
+                );
                 let mut child_slot = setup_server_handle
                     .lock()
                     .map_err(|_| anyhow::anyhow!("failed to acquire server startup lock"))?;
@@ -104,15 +108,14 @@ pub fn run(args: DesktopArgs) -> Result<()> {
         .build(tauri::generate_context!())
         .map_err(|e| anyhow::anyhow!("failed to build desktop app: {}", e))?;
 
-    let exit_code = app.run_return(|app_handle, event| {
+    let exit_code = app.run_return(move |app_handle, event| {
         window::handle_run_event(app_handle, &event);
+        if window::event_ends_desktop_session(app_handle, &event) {
+            stop_managed_server(&event_server_handle);
+        }
     });
 
-    if let Ok(mut child_slot) = managed_server.lock() {
-        if let Some(mut child) = child_slot.take() {
-            shutdown_child(&mut child);
-        }
-    }
+    stop_managed_server(&managed_server);
 
     if exit_code != 0 {
         return Err(anyhow::anyhow!(
@@ -122,6 +125,14 @@ pub fn run(args: DesktopArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn stop_managed_server(server: &Arc<Mutex<Option<ManagedServer>>>) {
+    if let Ok(mut server_slot) = server.lock() {
+        if let Some(mut server) = server_slot.take() {
+            server.shutdown();
+        }
+    }
 }
 
 fn resolve_aptabase_app_key() -> Option<String> {
