@@ -13,13 +13,15 @@
 #![cfg_attr(test, allow(clippy::await_holding_lock))]
 
 use clap::{Parser, ValueEnum};
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 use tokio::signal;
 use tokio::sync::oneshot;
 use tracing::{info, warn};
+
+const DESKTOP_OWNER_PIPE_ENV: &str = "IZWI_DESKTOP_OWNER_PIPE";
 
 mod api;
 mod app;
@@ -669,12 +671,17 @@ async fn shutdown_signal(
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
 
+    let desktop_owner_exit = desktop_owner_exit_signal();
+
     tokio::select! {
         _ = ctrl_c => {
             info!("Received Ctrl+C, shutting down...");
         },
         _ = terminate => {
             info!("Received SIGTERM, shutting down...");
+        },
+        _ = desktop_owner_exit => {
+            info!("Desktop owner pipe closed, shutting down...");
         },
     }
 
@@ -684,6 +691,32 @@ async fn shutdown_signal(
     let _ = shutdown_started.send(());
 
     drop(state);
+}
+
+async fn desktop_owner_exit_signal() {
+    if std::env::var_os(DESKTOP_OWNER_PIPE_ENV).as_deref() != Some(std::ffi::OsStr::new("1")) {
+        std::future::pending::<()>().await;
+        return;
+    }
+
+    if let Err(err) = tokio::task::spawn_blocking(|| {
+        let stdin = std::io::stdin();
+        wait_for_owner_pipe_close(stdin.lock())
+    })
+    .await
+    {
+        warn!("Desktop owner-pipe monitor failed: {err}");
+    }
+}
+
+fn wait_for_owner_pipe_close(mut reader: impl Read) {
+    let mut buffer = [0_u8; 1];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+    }
 }
 
 async fn await_http_server_shutdown<F>(
@@ -754,6 +787,11 @@ mod tests {
     use crate::test_support::env_lock;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn desktop_owner_pipe_monitor_returns_at_eof() {
+        wait_for_owner_pipe_close(std::io::Cursor::new(Vec::<u8>::new()));
+    }
 
     #[tokio::test]
     async fn worker_shutdown_failure_still_runs_runtime_cleanup() {

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -69,6 +69,14 @@ function renderCatalog() {
   );
 }
 
+function deferredPromise<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((nextResolve) => {
+    resolve = nextResolve;
+  });
+  return { promise, resolve };
+}
+
 describe("ModelCatalogProvider model action errors", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -113,5 +121,31 @@ describe("ModelCatalogProvider model action errors", () => {
     expect(
       screen.getAllByText("Model Qwen3.5-4B is serving active requests"),
     ).toHaveLength(2);
+  });
+
+  it("cancels an in-flight model load without reporting it as loaded", async () => {
+    const load = deferredPromise<{ status: string; message: string }>();
+    const unload = deferredPromise<{ status: string; message: string }>();
+    apiMocks.loadModel.mockReturnValue(load.promise);
+    apiMocks.unloadModel.mockReturnValue(unload.promise);
+    renderCatalog();
+    await screen.findByText("ready");
+
+    fireEvent.click(screen.getByRole("button", { name: "Load" }));
+    await waitFor(() => expect(apiMocks.loadModel).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole("button", { name: "Unload" }));
+    await waitFor(() => expect(apiMocks.unloadModel).toHaveBeenCalled());
+
+    await act(async () => {
+      load.resolve({ status: "loaded", message: "loaded" });
+      await load.promise;
+    });
+    expect(screen.queryByText("Model loaded")).not.toBeInTheDocument();
+
+    await act(async () => {
+      unload.resolve({ status: "unloaded", message: "unloaded" });
+      await unload.promise;
+    });
+    expect(await screen.findByText("Model load cancelled")).toBeInTheDocument();
   });
 });

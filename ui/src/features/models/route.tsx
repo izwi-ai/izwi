@@ -545,6 +545,16 @@ export function MyModelsPage({
                             </>
                           )}
 
+                          {isLoading && (
+                            <button
+                              onClick={() => onUnload(model.variant)}
+                              className="flex items-center gap-1 rounded-md border border-[var(--danger-border)] bg-[var(--danger-bg)] px-2.5 py-1.5 text-xs font-medium text-[var(--danger-text)] transition-colors hover:bg-[var(--danger-bg-hover)]"
+                            >
+                              <X className="h-3.5 w-3.5" />
+                              Cancel load
+                            </button>
+                          )}
+
                           {isReady && (
                             <>
                               <button

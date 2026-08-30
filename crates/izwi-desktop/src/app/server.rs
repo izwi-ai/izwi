@@ -11,6 +11,7 @@ use tauri::Manager;
 use url::Url;
 
 const SERVER_LOG_FILE: &str = "izwi-server.log";
+const DESKTOP_OWNER_PIPE_ENV: &str = "IZWI_DESKTOP_OWNER_PIPE";
 
 pub struct ManagedServer {
     child: Option<Child>,
@@ -96,7 +97,8 @@ pub fn maybe_start_local_server<R: tauri::Runtime>(
 
     cmd.env("IZWI_HOST", bind_host)
         .env("IZWI_PORT", port.to_string())
-        .stdin(Stdio::null());
+        .env(DESKTOP_OWNER_PIPE_ENV, "1")
+        .stdin(Stdio::piped());
 
     let mut child = cmd.spawn().with_context(|| {
         format!(
