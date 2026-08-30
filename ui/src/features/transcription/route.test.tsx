@@ -1305,6 +1305,85 @@ describe("TranscriptionPage detail route", () => {
     expect(screen.getByText("Hello world")).toBeInTheDocument();
   });
 
+  it("reconciles a streamed failure with the persisted record", async () => {
+    const createdRecord = {
+      id: "txr-stream-failed-1",
+      created_at: 1,
+      model_id: "Qwen3-ASR-0.6B",
+      aligner_model_id: null,
+      language: "English",
+      processing_status: "pending" as const,
+      processing_error: null,
+      duration_secs: 3.6,
+      processing_time_ms: 0,
+      rtf: null,
+      audio_mime_type: "audio/wav",
+      audio_filename: "fox.wav",
+      transcription: "",
+      segments: [],
+      words: [],
+      summary_status: "not_requested" as const,
+      summary_model_id: null,
+      summary_text: null,
+      summary_error: null,
+      summary_updated_at: null,
+    };
+    let streamCallbacks:
+      | {
+          onError?: (message: string) => void;
+          onDone?: () => void;
+        }
+      | undefined;
+
+    apiMocks.createTranscriptionRecordStream.mockImplementationOnce(
+      (_request, callbacks) => {
+        streamCallbacks = callbacks;
+        callbacks.onCreated?.(createdRecord);
+        return new AbortController();
+      },
+    );
+    apiMocks.getTranscriptionRecord.mockResolvedValue({
+      ...createdRecord,
+      processing_status: "processing",
+    });
+
+    renderRoute("/transcription");
+    await waitFor(() =>
+      expect(apiMocks.listTranscriptionRecords).toHaveBeenCalled(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /New transcript/i }));
+    const fileInput = document.querySelector(
+      'input[type="file"]',
+    ) as HTMLInputElement;
+    fireEvent.change(fileInput, {
+      target: {
+        files: [new File(["audio"], "fox.wav", { type: "audio/wav" })],
+      },
+    });
+    expect(
+      await screen.findByRole("heading", { name: "Transcription Record" }),
+    ).toBeInTheDocument();
+
+    apiMocks.getTranscriptionRecord.mockResolvedValue({
+      ...createdRecord,
+      processing_status: "failed",
+      processing_error: "Metal command buffer ran out of memory",
+    });
+    await act(async () => {
+      streamCallbacks?.onError?.("Metal command buffer ran out of memory");
+      streamCallbacks?.onDone?.();
+    });
+
+    expect(
+      await screen.findByText("Metal command buffer ran out of memory"),
+    ).toBeInTheDocument();
+    await waitFor(() =>
+      expect(apiMocks.getTranscriptionRecord).toHaveBeenCalledWith(
+        "txr-stream-failed-1",
+      ),
+    );
+  });
+
   it("keeps progress delivered in the same stream batch as the created event", async () => {
     const createdRecord = {
       id: "txr-early-progress-1",
