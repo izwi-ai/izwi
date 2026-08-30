@@ -19,6 +19,7 @@ export type {
   ASRStreamCallbacks,
   ASRTranscribeRequest,
   ASRTranscribeResponse,
+  CancelSpeechHistoryRecordResponse,
   DiarizationRecord,
   DiarizationRecordCreateRequest,
   DiarizationProcessingStatus,

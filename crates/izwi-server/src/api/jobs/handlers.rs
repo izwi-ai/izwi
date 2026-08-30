@@ -2,6 +2,7 @@ use axum::{
     extract::{Path, State},
     Extension, Json,
 };
+use izwi_core::{parse_tts_model_variant, ModelVariant};
 use izwi_hooks::{
     AuditCategory, AuditEvent, AuditOutcome, EnterpriseAction, HookMetadata, ResourceDescriptor,
     ResourceKind,
@@ -135,6 +136,41 @@ pub async fn retry_job(
     .await;
 
     Ok(Json(load_job_trace(&state, &job_id).await?))
+}
+
+pub(crate) async fn cancel_active_tts_jobs_for_model(
+    state: &AppState,
+    variant: ModelVariant,
+) -> Result<usize, ApiError> {
+    let jobs = state
+        .batch_runtime_store
+        .list_active_jobs_by_kind(RuntimeJobKind::TtsSpeech)
+        .await
+        .map_err(map_store_error)?;
+    let mut cancelled = 0usize;
+
+    for job in jobs.into_iter().filter(|job| {
+        job.model_id
+            .as_deref()
+            .and_then(|model_id| parse_tts_model_variant(model_id).ok())
+            == Some(variant)
+    }) {
+        let Some(cancelled_job) = state
+            .batch_runtime_store
+            .cancel_job(
+                &job.id,
+                Some("Cancelled because the model is being unloaded".to_string()),
+            )
+            .await
+            .map_err(map_store_error)?
+        else {
+            continue;
+        };
+        update_route_projection_for_cancel(state, &cancelled_job).await?;
+        cancelled = cancelled.saturating_add(1);
+    }
+
+    Ok(cancelled)
 }
 
 async fn load_job_trace(

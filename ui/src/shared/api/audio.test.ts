@@ -638,6 +638,28 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
     );
   });
 
+  it("posts text-to-speech cancellation to the record cancel route", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({ id: "tts-1", cancelled: true, record: { id: "tts-1" } }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new AudioApiClient(new ApiHttpClient("http://localhost/v1"));
+    const result = await client.cancelTextToSpeechRecord("tts-1");
+
+    expect(result.cancelled).toBe(true);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost/v1/text-to-speech/tts-1/cancel",
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
+
   it("posts diarization reruns to the canonical reruns resource", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify(updatedRecord), {

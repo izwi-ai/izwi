@@ -6,6 +6,7 @@ import {
   Copy,
   Download,
   Loader2,
+  OctagonX,
   Trash2,
 } from "lucide-react";
 
@@ -32,7 +33,9 @@ interface TextToSpeechRecordDetailProps {
   error?: string | null;
   deleteError?: string | null;
   deletePending?: boolean;
+  cancelPending?: boolean;
   onBack?: () => void;
+  onCancel?: () => Promise<void> | void;
   onDelete?: () => Promise<void> | void;
 }
 
@@ -44,7 +47,9 @@ export function TextToSpeechRecordDetail({
   error = null,
   deleteError = null,
   deletePending = false,
+  cancelPending = false,
   onBack,
+  onCancel,
   onDelete,
 }: TextToSpeechRecordDetailProps) {
   const [copied, setCopied] = useState(false);
@@ -59,6 +64,7 @@ export function TextToSpeechRecordDetail({
     [record?.processing_error, record?.processing_status],
   );
   const hasAudio = Boolean(audioUrl) && processingStatus === "ready";
+  const canCancel = processingStatus === "pending" || processingStatus === "processing";
   const statusMessage = useMemo(() => {
     switch (processingStatus) {
       case "pending":
@@ -129,6 +135,23 @@ export function TextToSpeechRecordDetail({
         </div>
 
         <div className="flex flex-wrap items-center justify-end gap-2">
+          {onCancel && canCancel ? (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-9 gap-2 border-[var(--status-warning-border)] text-[var(--status-warning-text)]"
+              onClick={() => void onCancel()}
+              disabled={cancelPending}
+            >
+              {cancelPending ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <OctagonX className="h-4 w-4" />
+              )}
+              Cancel generation
+            </Button>
+          ) : null}
           <Button
             type="button"
             variant="outline"

@@ -43,6 +43,7 @@ use crate::speech_history_store::{
 };
 use crate::state::AppState;
 use izwi_core::audio::{inspect_audio_bytes, AudioEncoder, AudioFormat};
+use izwi_core::catalog::ModelFamily;
 use izwi_core::runtime_models::architectures::vibevoice::tts::vibevoice_tts_auto_max_frames_for_text;
 use izwi_core::runtime_models::architectures::voxtral::tts::voxtral_tts_auto_max_frames_for_text;
 use izwi_core::{
@@ -73,6 +74,13 @@ pub struct SpeechHistoryRecordListResponse {
 pub struct DeleteSpeechHistoryRecordResponse {
     pub id: String,
     pub deleted: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CancelSpeechHistoryRecordResponse {
+    pub id: String,
+    pub cancelled: bool,
+    pub record: SpeechHistoryRecord,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -267,6 +275,26 @@ pub async fn delete_text_to_speech_record(
     delete_record(state, SpeechRouteKind::TextToSpeech, record_id).await
 }
 
+pub async fn cancel_text_to_speech_record(
+    State(state): State<AppState>,
+    Path(record_id): Path<String>,
+) -> Result<Json<CancelSpeechHistoryRecordResponse>, ApiError> {
+    let record = cancel_speech_history_job(
+        &state,
+        SpeechRouteKind::TextToSpeech,
+        &record_id,
+        "Cancelled by speech history request",
+    )
+    .await?
+    .ok_or_else(|| ApiError::bad_request("Speech history job is not cancellable"))?;
+
+    Ok(Json(CancelSpeechHistoryRecordResponse {
+        id: record_id,
+        cancelled: true,
+        record,
+    }))
+}
+
 pub async fn delete_voice_design_record(
     State(state): State<AppState>,
     Path(record_id): Path<String>,
@@ -370,6 +398,13 @@ async fn delete_record(
     route_kind: SpeechRouteKind,
     record_id: String,
 ) -> Result<Json<DeleteSpeechHistoryRecordResponse>, ApiError> {
+    let _ = cancel_speech_history_job(
+        &state,
+        route_kind,
+        &record_id,
+        "Cancelled because the speech history record was deleted",
+    )
+    .await?;
     let deleted = state
         .speech_history_store
         .delete_record(route_kind, record_id.clone())
@@ -384,6 +419,44 @@ async fn delete_record(
         id: record_id,
         deleted: true,
     }))
+}
+
+async fn cancel_speech_history_job(
+    state: &AppState,
+    route_kind: SpeechRouteKind,
+    record_id: &str,
+    reason: &str,
+) -> Result<Option<SpeechHistoryRecord>, ApiError> {
+    let Some(job) = state
+        .batch_runtime_store
+        .get_active_job_for_route_record(
+            RuntimeJobKind::TtsSpeech,
+            route_kind.as_db_value(),
+            record_id,
+        )
+        .await
+        .map_err(map_store_error)?
+    else {
+        return Ok(None);
+    };
+
+    state
+        .batch_runtime_store
+        .cancel_job(&job.id, Some(reason.to_string()))
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::bad_request("Speech history job is no longer cancellable"))?;
+
+    state
+        .speech_history_store
+        .update_processing_status(
+            route_kind,
+            record_id.to_string(),
+            SpeechHistoryProcessingStatus::Failed,
+            Some(reason.to_string()),
+        )
+        .await
+        .map_err(map_store_error)
 }
 
 async fn create_record(
@@ -1771,10 +1844,12 @@ fn build_generation_request(
     if let Some(speed) = req.speed {
         generation_config.options.speed = speed;
     }
-    if let Some(max_tokens) = req.max_output_tokens.or(req.max_tokens) {
+    if let Some(max_tokens) = resolve_speech_history_output_frames(
+        variant,
+        &text,
+        req.max_output_tokens.or(req.max_tokens),
+    ) {
         generation_config.options.max_tokens = max_tokens;
-    } else if variant == ModelVariant::Voxtral4BTts2603 {
-        generation_config.options.max_tokens = 0;
     }
     if let Some(top_k) = req.top_k {
         generation_config.options.top_k = top_k;
@@ -1793,6 +1868,51 @@ fn build_generation_request(
         reference_text: req.reference_text,
         voice_description: req.voice_description,
     }
+}
+
+fn resolve_speech_history_output_frames(
+    variant: ModelVariant,
+    text: &str,
+    requested_frames: Option<usize>,
+) -> Option<usize> {
+    let model_max_frames = variant.tts_max_output_frames_hint()?;
+    match requested_frames {
+        Some(value) if value > 0 => Some(value.clamp(1, model_max_frames)),
+        Some(0) | None if variant == ModelVariant::Voxtral4BTts2603 => {
+            Some(voxtral_tts_auto_max_frames_for_text(text).min(model_max_frames))
+        }
+        Some(0) | None if variant == ModelVariant::VibeVoice15BTts => {
+            Some(vibevoice_tts_auto_max_frames_for_text(text).min(model_max_frames))
+        }
+        Some(0) | None if variant.family() == ModelFamily::Qwen3Tts => {
+            Some(qwen_tts_auto_max_frames_for_text(text))
+        }
+        Some(0) | None => Some(model_max_frames),
+        Some(_) => unreachable!("positive requested frames handled above"),
+    }
+}
+
+fn qwen_tts_auto_max_frames_for_text(text: &str) -> usize {
+    const MIN_AUDIO_SECS: f32 = 4.0;
+    const MAX_AUDIO_SECS_PER_REQUEST: f32 = 120.0;
+    const WORDS_PER_SECOND: f32 = 2.5;
+    const CHARS_PER_WORD: usize = 5;
+    const END_PADDING_SECS: f32 = 2.0;
+
+    let word_count = text.split_whitespace().count();
+    let char_word_equivalent = text
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .count()
+        .div_ceil(CHARS_PER_WORD);
+    let estimated_words = word_count.max(char_word_equivalent).max(1);
+    let estimated_secs = ((estimated_words as f32) / WORDS_PER_SECOND + END_PADDING_SECS)
+        .clamp(MIN_AUDIO_SECS, MAX_AUDIO_SECS_PER_REQUEST);
+    let frames = (estimated_secs * ModelVariant::QWEN3_TTS_FRAME_RATE_HZ).ceil() as usize;
+    frames.clamp(
+        (MIN_AUDIO_SECS * ModelVariant::QWEN3_TTS_FRAME_RATE_HZ) as usize,
+        (MAX_AUDIO_SECS_PER_REQUEST * ModelVariant::QWEN3_TTS_FRAME_RATE_HZ) as usize,
+    )
 }
 
 fn normalize_for_model_capabilities(
@@ -1954,16 +2074,8 @@ fn resolve_generation_timeout_secs(
         return default_timeout_secs.max(1);
     };
 
-    let effective_frames = match requested_frames {
-        Some(0) | None if variant == ModelVariant::Voxtral4BTts2603 => {
-            voxtral_tts_auto_max_frames_for_text(text)
-        }
-        Some(0) | None if variant == ModelVariant::VibeVoice15BTts => {
-            vibevoice_tts_auto_max_frames_for_text(text)
-        }
-        Some(0) | None => model_max_frames,
-        Some(value) => value.clamp(1, model_max_frames),
-    };
+    let effective_frames = resolve_speech_history_output_frames(variant, text, requested_frames)
+        .unwrap_or(model_max_frames);
 
     let speed = requested_speed.unwrap_or(1.0).clamp(0.25, 4.0) as f64;
     let estimated_audio_secs = ((effective_frames as f64) / (frame_rate_hz as f64)) / speed;
@@ -2193,7 +2305,10 @@ mod tests {
             ModelVariant::Voxtral4BTts2603,
         );
 
-        assert_eq!(generation.config.options.max_tokens, 0);
+        assert_eq!(
+            generation.config.options.max_tokens,
+            voxtral_tts_auto_max_frames_for_text(&generation.text)
+        );
         assert_eq!(
             resolve_generation_timeout_secs(
                 1,
@@ -2223,7 +2338,10 @@ mod tests {
             ModelVariant::VibeVoice15BTts,
         );
 
-        assert_eq!(generation.config.options.max_tokens, 0);
+        assert_eq!(
+            generation.config.options.max_tokens,
+            vibevoice_tts_auto_max_frames_for_text(&generation.text)
+        );
         assert_eq!(
             resolve_generation_timeout_secs(
                 1,
@@ -2234,6 +2352,38 @@ mod tests {
                 1,
             ),
             59
+        );
+    }
+
+    #[test]
+    fn qwen_history_auto_budget_is_text_sized_and_never_uses_family_maximum() {
+        let text = "A short desktop speech-history request";
+        let expected = qwen_tts_auto_max_frames_for_text(text);
+        assert!(expected < ModelVariant::QWEN3_TTS_MAX_OUTPUT_FRAMES);
+
+        for requested in [None, Some(0)] {
+            let mut req = base_request();
+            req.max_output_tokens = requested;
+            let generation = build_generation_request(
+                req,
+                "test-correlation".to_string(),
+                text.to_string(),
+                false,
+                ModelVariant::Qwen3Tts12Hz17BBase,
+            );
+            assert_eq!(generation.config.options.max_tokens, expected);
+        }
+    }
+
+    #[test]
+    fn speech_history_output_budget_clamps_explicit_requests_to_model_limit() {
+        assert_eq!(
+            resolve_speech_history_output_frames(
+                ModelVariant::Qwen3Tts12Hz06BCustomVoice,
+                "Hello",
+                Some(usize::MAX),
+            ),
+            Some(ModelVariant::QWEN3_TTS_MAX_OUTPUT_FRAMES)
         );
     }
 

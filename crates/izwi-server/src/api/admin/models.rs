@@ -10,6 +10,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::pin::Pin;
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{info, warn};
 use utoipa::ToSchema;
@@ -459,11 +460,20 @@ pub async fn unload_model(
     let variant = parse_variant(&variant)?;
     info!("Unloading model: {}", variant);
 
-    state.runtime.unload_model(variant).await?;
+    let cancelled_jobs =
+        crate::api::jobs::cancel_active_tts_jobs_for_model(&state, variant).await?;
+    unload_after_speech_job_cancellation(&state, variant, cancelled_jobs).await?;
 
     Ok(Json(DownloadResponse {
         status: "unloaded",
-        message: format!("Model {} unloaded successfully", variant),
+        message: if cancelled_jobs == 0 {
+            format!("Model {} unloaded successfully", variant)
+        } else {
+            format!(
+                "Model {} unloaded successfully after cancelling {} speech job(s)",
+                variant, cancelled_jobs
+            )
+        },
     }))
 }
 
@@ -475,8 +485,11 @@ pub async fn delete_model(
     let variant = parse_variant(&variant)?;
     info!("Deleting model: {}", variant);
 
-    // First unload via runtime path so registry/executor/cache cleanup runs.
-    state.runtime.unload_model(variant).await?;
+    // First cancel durable speech work, then unload through the runtime path so
+    // registry/executor/cache cleanup cannot race a batch retry that reloads it.
+    let cancelled_jobs =
+        crate::api::jobs::cancel_active_tts_jobs_for_model(&state, variant).await?;
+    unload_after_speech_job_cancellation(&state, variant, cancelled_jobs).await?;
 
     // Delete the model files
     state.runtime.model_manager().delete_model(variant).await?;
@@ -485,6 +498,30 @@ pub async fn delete_model(
         status: "deleted",
         message: format!("Model {} deleted successfully", variant),
     }))
+}
+
+async fn unload_after_speech_job_cancellation(
+    state: &AppState,
+    variant: ModelVariant,
+    cancelled_jobs: usize,
+) -> Result<(), ApiError> {
+    const CANCEL_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
+    const CANCEL_SETTLE_POLL: Duration = Duration::from_millis(50);
+
+    let deadline = Instant::now() + CANCEL_SETTLE_TIMEOUT;
+    loop {
+        match state.runtime.unload_model(variant).await {
+            Ok(()) => return Ok(()),
+            Err(izwi_core::Error::InferenceError(message))
+                if cancelled_jobs > 0
+                    && message.contains("active inference lease")
+                    && Instant::now() < deadline =>
+            {
+                tokio::time::sleep(CANCEL_SETTLE_POLL).await;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
 }
 
 /// Stream download progress as SSE

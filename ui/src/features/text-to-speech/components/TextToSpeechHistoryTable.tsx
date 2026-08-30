@@ -6,6 +6,7 @@ import {
   ExternalLink,
   Loader2,
   MoreVertical,
+  OctagonX,
   Trash2,
 } from "lucide-react";
 
@@ -43,6 +44,7 @@ interface TextToSpeechHistoryTableProps {
     onLoadMore: () => void;
   };
   onOpenRecord: (recordId: string) => void;
+  onCancelRecord?: (recordId: string) => Promise<void>;
   onDeleteRecord?: (recordId: string) => Promise<void>;
   onRefresh?: () => void;
 }
@@ -61,6 +63,7 @@ export function TextToSpeechHistoryTable({
   error = null,
   loadMore,
   onOpenRecord,
+  onCancelRecord,
   onDeleteRecord,
   onRefresh,
 }: TextToSpeechHistoryTableProps) {
@@ -186,6 +189,30 @@ export function TextToSpeechHistoryTable({
     }
   }
 
+  async function handleCancel(record: SpeechHistoryRecordSummary): Promise<void> {
+    if (!onCancelRecord || busyRecordId || deletePending) {
+      return;
+    }
+
+    setBusyRecordId(record.id);
+    try {
+      await onCancelRecord(record.id);
+      notify({
+        title: "Generation cancelled",
+        description: "The speech job was stopped and its model can now be unloaded.",
+        tone: "success",
+      });
+    } catch (err) {
+      notify({
+        title: "Could not cancel generation",
+        description: err instanceof Error ? err.message : "Failed to cancel generation.",
+        tone: "warning",
+      });
+    } finally {
+      setBusyRecordId(null);
+    }
+  }
+
   const activeBusyRecordId = busyRecordId;
 
   if (loading) {
@@ -258,6 +285,8 @@ export function TextToSpeechHistoryTable({
                   record.processing_error,
                 );
                 const canDownload = processingStatus === "ready";
+                const canCancel =
+                  processingStatus === "pending" || processingStatus === "processing";
 
                 return (
                   <tr
@@ -340,6 +369,15 @@ export function TextToSpeechHistoryTable({
                             <Download className="mr-2 h-4 w-4" />
                             Download
                           </DropdownMenuItem>
+                          {canCancel ? (
+                            <DropdownMenuItem
+                              disabled={isBusy || deletePending || !onCancelRecord}
+                              onSelect={() => void handleCancel(record)}
+                            >
+                              <OctagonX className="mr-2 h-4 w-4" />
+                              Cancel generation
+                            </DropdownMenuItem>
+                          ) : null}
                           <DropdownMenuSeparator />
                           <DropdownMenuItem
                             disabled={!onDeleteRecord || deletePending}

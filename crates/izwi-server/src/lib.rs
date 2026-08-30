@@ -181,7 +181,30 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
         enterprise_hooks,
         persistence,
     )?;
-    let mut startup_warnings = preload_configured_models(&state).await;
+    let mut startup_warnings = Vec::new();
+    if let Err(err) = state
+        .batch_runtime_store
+        .reconcile_inconsistent_states()
+        .await
+    {
+        startup_warnings.push(format!(
+            "Failed to reconcile durable runtime jobs during startup: {err}"
+        ));
+    }
+    match state
+        .speech_history_store
+        .reconcile_stale_processing_records()
+        .await
+    {
+        Ok(reconciled) if reconciled > 0 => {
+            info!(reconciled, "Reconciled stale speech history records");
+        }
+        Ok(_) => {}
+        Err(err) => startup_warnings.push(format!(
+            "Failed to reconcile speech history records during startup: {err}"
+        )),
+    }
+    startup_warnings.extend(preload_configured_models(&state).await);
     startup_warnings.extend(warmup_preloaded_asr_models(&state).await);
     if !startup_warnings.is_empty() {
         state
