@@ -9,6 +9,7 @@ use tracing::info;
 
 use crate::backends::kv::managed_kv_backend_compiled;
 use crate::backends::BackendKind;
+use crate::config::ContextLengthPreference;
 use crate::engine::{
     AdapterInstanceId, CacheMode, ReservationClass, ReservationOwner, ResourceAmount,
     ResourceLease, ResourceVector,
@@ -119,6 +120,29 @@ fn kokoro_effective_context_tokens(
     }
     u64::try_from(effective)
         .map_err(|_| Error::ModelLoadError("Kokoro effective context exceeds u64".into()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PortableInvocationContextIntent {
+    Automatic { ceiling: u64 },
+    Explicit { selected: u64 },
+}
+
+fn portable_invocation_context_intent(
+    preference: ContextLengthPreference,
+    published_context: Option<usize>,
+    maximum: u64,
+) -> PortableInvocationContextIntent {
+    match preference.explicit_tokens() {
+        Some(tokens) => PortableInvocationContextIntent::Explicit {
+            selected: maximum.min(tokens as u64),
+        },
+        None => PortableInvocationContextIntent::Automatic {
+            ceiling: published_context
+                .and_then(|tokens| u64::try_from(tokens).ok())
+                .map_or(maximum, |tokens| maximum.min(tokens)),
+        },
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -779,19 +803,12 @@ impl ModelLifecycleController {
             }
             return Ok(());
         };
-        if let Some(selected) = self.model_registry.effective_context(variant) {
-            let selected = maximum.min(selected as u64);
-            let bytes = required(Some(selected))?;
-            if bytes > budget {
-                return Err(Error::ModelLoadError(format!(
-                    "aggregate portable state does not fit the selected context: context={selected}, invocation_state_bytes={bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}"
-                )));
-            }
-            descriptor.resolve_capacity_axis(StateCapacityAxis::DecoderContext, selected)?;
-            return Ok(());
-        }
-        let selected = if let Some(explicit) = self.config.max_sequence_length.explicit_tokens() {
-            let selected = maximum.min(explicit as u64);
+        let intent = portable_invocation_context_intent(
+            self.config.max_sequence_length,
+            self.model_registry.effective_context(variant),
+            maximum,
+        );
+        let selected = if let PortableInvocationContextIntent::Explicit { selected } = intent {
             let bytes = required(Some(selected))?;
             if bytes > budget {
                 return Err(Error::ModelLoadError(format!(
@@ -800,13 +817,21 @@ impl ModelLifecycleController {
             }
             selected
         } else {
+            let PortableInvocationContextIntent::Automatic { ceiling } = intent else {
+                unreachable!("portable invocation context intent was matched above")
+            };
+            if ceiling < minimum {
+                return Err(Error::ModelLoadError(format!(
+                    "published automatic context is below the invocation minimum: context={ceiling}, minimum={minimum}"
+                )));
+            }
             let minimum_bytes = required(Some(minimum))?;
             if minimum_bytes > budget {
                 return Err(Error::ModelLoadError(format!(
                     "portable invocation context minimum does not fit: context={minimum}, state_bytes={minimum_bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}"
                 )));
             }
-            let (mut low, mut high) = (minimum, maximum);
+            let (mut low, mut high) = (minimum, ceiling);
             while low < high {
                 let middle = low + (high - low).div_ceil(2);
                 if required(Some(middle))? <= budget {
@@ -1945,6 +1970,10 @@ impl ModelLifecycleController {
                                 Some(physical_spec.retained_max_tokens),
                             )
                             .await?;
+                        self.model_registry.publish_effective_context(
+                            variant,
+                            retained.logical_token_reach(),
+                        )?;
                         crate::runtime::rollout::validate_managed_state_plan_eligibility(
                             variant,
                             CapabilityKind::Tts,
@@ -2441,17 +2470,18 @@ mod tests {
         estimate_from_tensor_inventory, is_metal_command_buffer_oom,
         kokoro_effective_context_tokens, loaded_asr_state_publication_route,
         managed_chat_capacity_policy, model_memory_estimate, model_resource_plan,
-        plan_invocation_allocations, qwen38_representation_memory_estimate, qwen38_resource_plan,
-        residency_budget_has_capacity, select_lru_eviction_candidate,
-        validate_scratch_only_invocation_publication, LoadedAsrStatePublicationRoute,
-        ModelMemoryEstimate, QWEN38_BF16_ELEMENTS, QWEN38_CUDA_DEVICE_CONVERSION_SCRATCH_BYTES,
+        plan_invocation_allocations, portable_invocation_context_intent,
+        qwen38_representation_memory_estimate, qwen38_resource_plan, residency_budget_has_capacity,
+        select_lru_eviction_candidate, validate_scratch_only_invocation_publication,
+        LoadedAsrStatePublicationRoute, ModelMemoryEstimate, PortableInvocationContextIntent,
+        QWEN38_BF16_ELEMENTS, QWEN38_CUDA_DEVICE_CONVERSION_SCRATCH_BYTES,
         QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES, QWEN38_FP8_ELEMENTS,
         QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES, QWEN38_Q8_0_BLOCK_BYTES,
         QWEN38_Q8_0_BLOCK_ELEMENTS,
     };
     use crate::backends::kv::managed_kv_backend_compiled;
     use crate::backends::{BackendKind, BackendPreference};
-    use crate::config::EngineConfig;
+    use crate::config::{ContextLengthPreference, EngineConfig};
     use crate::engine::{
         AdapterAbiRevision, AdapterInstanceId, CapacitySource, ConcurrencyClass, ExecutionGroupId,
         ExecutionMode, ExecutionProfile, ModelInstanceId, NativeBatchMode,
@@ -3109,6 +3139,35 @@ mod tests {
         assert_eq!(kokoro_effective_context_tokens(512, 256).unwrap(), 256);
         assert!(kokoro_effective_context_tokens(0, 1_024).is_err());
         assert!(kokoro_effective_context_tokens(512, 0).is_err());
+    }
+
+    #[test]
+    fn automatic_invocation_context_treats_published_reach_as_a_ceiling() {
+        assert_eq!(
+            portable_invocation_context_intent(
+                ContextLengthPreference::Auto,
+                Some(128_000),
+                131_072
+            ),
+            PortableInvocationContextIntent::Automatic { ceiling: 128_000 }
+        );
+        assert_eq!(
+            portable_invocation_context_intent(
+                ContextLengthPreference::Auto,
+                Some(196_608),
+                65_536
+            ),
+            PortableInvocationContextIntent::Automatic { ceiling: 65_536 }
+        );
+    }
+
+    #[test]
+    fn explicit_invocation_context_remains_mandatory_after_state_publication() {
+        let explicit = ContextLengthPreference::explicit(32_768).unwrap();
+        assert_eq!(
+            portable_invocation_context_intent(explicit, Some(8_192), 65_536),
+            PortableInvocationContextIntent::Explicit { selected: 32_768 }
+        );
     }
 
     #[test]

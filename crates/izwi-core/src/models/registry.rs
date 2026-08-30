@@ -5473,7 +5473,9 @@ impl ModelRegistry {
         self.effective_contexts
             .write()
             .unwrap_or_else(|poison| poison.into_inner())
-            .insert(variant, tokens);
+            .entry(variant)
+            .and_modify(|current| *current = (*current).min(tokens))
+            .or_insert(tokens);
         Ok(())
     }
 
@@ -6900,6 +6902,20 @@ mod tests {
         assert_eq!(diagnostics.default_compute_dtype, "f32");
         assert_eq!(diagnostics.supports_incremental_decode, Some(true));
         assert!(diagnostics.default_dtype_reason.contains("CPU"));
+    }
+
+    #[test]
+    fn effective_context_only_narrows_within_a_loaded_generation() {
+        let registry = ModelRegistry::new(PathBuf::new(), DeviceProfile::cpu());
+        let variant = ModelVariant::Lfm25Audio15BGguf;
+
+        registry
+            .publish_effective_context(variant, 128_000)
+            .unwrap();
+        registry.publish_effective_context(variant, 65_536).unwrap();
+        registry.publish_effective_context(variant, 96_000).unwrap();
+
+        assert_eq!(registry.effective_context(variant), Some(65_536));
     }
 
     #[test]
