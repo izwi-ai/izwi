@@ -62,7 +62,7 @@ poll_record() {
     curl -fsS "${record_url}" >"${output_path}"
     status="$(jq -r '.processing_status // .status // empty' "${output_path}")"
     case "${status}" in
-      completed) return 0 ;;
+      ready|completed) return 0 ;;
       failed|cancelled|expired)
         jq . "${output_path}" >&2
         return 1
