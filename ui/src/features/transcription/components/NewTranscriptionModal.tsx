@@ -22,6 +22,7 @@ import {
 } from "@/shared/audioUpload";
 import type { UploadProgressInfo } from "@/shared/api/audio";
 import { isAbortError } from "@/shared/api/http";
+import { AUDIO_FILE_ACCEPT } from "@/shared/audioFileAccept";
 import {
   Select,
   SelectContent,
@@ -647,7 +648,7 @@ export function NewTranscriptionModal({
               <input
                 ref={fileInputRef}
                 type="file"
-                accept="audio/*"
+                accept={AUDIO_FILE_ACCEPT}
                 className="hidden"
                 onChange={(event) => void handleFileUpload(event)}
               />
