@@ -785,7 +785,7 @@ mod tests {
     fn qwen_auto_timeout_expands_for_long_form() {
         let req = SpeechRequest {
             model: "Qwen3-TTS-12Hz-0.6B-CustomVoice".to_string(),
-            input: "hello".to_string(),
+            input: "hello ".repeat(100),
             voice: Some("Aiden".to_string()),
             response_format: Some("wav".to_string()),
             allow_format_fallback: None,
