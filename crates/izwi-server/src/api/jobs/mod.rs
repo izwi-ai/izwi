@@ -2,7 +2,7 @@
 
 mod handlers;
 
-pub(crate) use handlers::cancel_active_tts_jobs_for_model;
+pub(crate) use handlers::cancel_active_audio_jobs_for_model;
 
 use axum::{routing::get, Router};
 

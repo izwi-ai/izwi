@@ -2,7 +2,7 @@ use axum::{
     extract::{Path, State},
     Extension, Json,
 };
-use izwi_core::{parse_tts_model_variant, ModelVariant};
+use izwi_core::{parse_model_variant, ModelVariant};
 use izwi_hooks::{
     AuditCategory, AuditEvent, AuditOutcome, EnterpriseAction, HookMetadata, ResourceDescriptor,
     ResourceKind,
@@ -138,39 +138,48 @@ pub async fn retry_job(
     Ok(Json(load_job_trace(&state, &job_id).await?))
 }
 
-pub(crate) async fn cancel_active_tts_jobs_for_model(
+pub(crate) async fn cancel_active_audio_jobs_for_model(
     state: &AppState,
     variant: ModelVariant,
 ) -> Result<usize, ApiError> {
-    let jobs = state
-        .batch_runtime_store
-        .list_active_jobs_by_kind(RuntimeJobKind::TtsSpeech)
-        .await
-        .map_err(map_store_error)?;
     let mut cancelled = 0usize;
 
-    for job in jobs.into_iter().filter(|job| {
-        job.model_id
-            .as_deref()
-            .and_then(|model_id| parse_tts_model_variant(model_id).ok())
-            == Some(variant)
-    }) {
-        let Some(cancelled_job) = state
+    for job_kind in [RuntimeJobKind::AsrTranscription, RuntimeJobKind::TtsSpeech] {
+        let jobs = state
             .batch_runtime_store
-            .cancel_job(
-                &job.id,
-                Some("Cancelled because the model is being unloaded".to_string()),
-            )
+            .list_active_jobs_by_kind(job_kind)
             .await
-            .map_err(map_store_error)?
-        else {
-            continue;
-        };
-        update_route_projection_for_cancel(state, &cancelled_job).await?;
-        cancelled = cancelled.saturating_add(1);
+            .map_err(map_store_error)?;
+
+        for job in jobs
+            .into_iter()
+            .filter(|job| runtime_job_targets_variant(job, variant))
+        {
+            let Some(cancelled_job) = state
+                .batch_runtime_store
+                .cancel_job(
+                    &job.id,
+                    Some("Cancelled because the model is being unloaded".to_string()),
+                )
+                .await
+                .map_err(map_store_error)?
+            else {
+                continue;
+            };
+            update_route_projection_for_cancel(state, &cancelled_job).await?;
+            cancelled = cancelled.saturating_add(1);
+        }
     }
 
     Ok(cancelled)
+}
+
+fn runtime_job_targets_variant(job: &RuntimeJob, variant: ModelVariant) -> bool {
+    model_id_targets_variant(job.model_id.as_deref(), variant)
+}
+
+fn model_id_targets_variant(model_id: Option<&str>, variant: ModelVariant) -> bool {
+    model_id.and_then(|model_id| parse_model_variant(model_id).ok()) == Some(variant)
 }
 
 async fn load_job_trace(
@@ -376,4 +385,29 @@ fn warn_if_projection_missing(updated: bool, job: &RuntimeJob) {
 
 fn map_store_error(err: anyhow::Error) -> ApiError {
     ApiError::internal(format!("Batch runtime storage error: {err}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unload_target_matching_accepts_asr_and_tts_model_ids() {
+        assert!(model_id_targets_variant(
+            Some("Qwen3-ASR-0.6B-GGUF"),
+            ModelVariant::Qwen3Asr06BGguf,
+        ));
+        assert!(model_id_targets_variant(
+            Some("Kokoro-82M"),
+            ModelVariant::Kokoro82M,
+        ));
+        assert!(!model_id_targets_variant(
+            Some("Kokoro-82M"),
+            ModelVariant::Qwen3Asr06BGguf,
+        ));
+        assert!(!model_id_targets_variant(
+            None,
+            ModelVariant::Qwen3Asr06BGguf,
+        ));
+    }
 }

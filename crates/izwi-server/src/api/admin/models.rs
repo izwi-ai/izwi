@@ -461,8 +461,8 @@ pub async fn unload_model(
     info!("Unloading model: {}", variant);
 
     let cancelled_jobs =
-        crate::api::jobs::cancel_active_tts_jobs_for_model(&state, variant).await?;
-    unload_after_speech_job_cancellation(&state, variant, cancelled_jobs).await?;
+        crate::api::jobs::cancel_active_audio_jobs_for_model(&state, variant).await?;
+    unload_after_audio_job_cancellation(&state, variant, cancelled_jobs).await?;
 
     Ok(Json(DownloadResponse {
         status: "unloaded",
@@ -470,7 +470,7 @@ pub async fn unload_model(
             format!("Model {} unloaded successfully", variant)
         } else {
             format!(
-                "Model {} unloaded successfully after cancelling {} speech job(s)",
+                "Model {} unloaded successfully after cancelling {} audio job(s)",
                 variant, cancelled_jobs
             )
         },
@@ -488,8 +488,8 @@ pub async fn delete_model(
     // First cancel durable speech work, then unload through the runtime path so
     // registry/executor/cache cleanup cannot race a batch retry that reloads it.
     let cancelled_jobs =
-        crate::api::jobs::cancel_active_tts_jobs_for_model(&state, variant).await?;
-    unload_after_speech_job_cancellation(&state, variant, cancelled_jobs).await?;
+        crate::api::jobs::cancel_active_audio_jobs_for_model(&state, variant).await?;
+    unload_after_audio_job_cancellation(&state, variant, cancelled_jobs).await?;
 
     // Delete the model files
     state.runtime.model_manager().delete_model(variant).await?;
@@ -500,7 +500,7 @@ pub async fn delete_model(
     }))
 }
 
-async fn unload_after_speech_job_cancellation(
+async fn unload_after_audio_job_cancellation(
     state: &AppState,
     variant: ModelVariant,
     cancelled_jobs: usize,
