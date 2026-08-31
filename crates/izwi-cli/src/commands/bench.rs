@@ -578,6 +578,7 @@ struct BenchmarkRunConfig {
     reference_text: Option<String>,
     language: Option<String>,
     duration_secs: Option<u64>,
+    request_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -898,6 +899,8 @@ pub async fn execute(
             concurrent,
             warmup,
             stream,
+            max_output_tokens,
+            timeout_secs,
         } => bench_tts(
             server,
             &model,
@@ -911,6 +914,8 @@ pub async fn execute(
             concurrent,
             warmup,
             stream,
+            max_output_tokens,
+            timeout_secs,
             &options,
             theme,
         )
@@ -1595,6 +1600,8 @@ async fn bench_manifest(
                     case.concurrent.unwrap_or(1),
                     case.warmup.unwrap_or(false),
                     case.stream.unwrap_or(false),
+                    case.max_tokens,
+                    900,
                     options,
                     theme,
                 )
@@ -1983,6 +1990,7 @@ async fn bench_chat(
             reference_text: None,
             language: None,
             duration_secs: None,
+            request_timeout_secs: None,
         },
         summary: BenchmarkSummary {
             latency_ms: None,
@@ -2028,6 +2036,8 @@ async fn bench_tts(
     concurrent: u32,
     warmup: bool,
     stream_output: bool,
+    max_output_tokens: Option<usize>,
+    timeout_secs: u64,
     options: &BenchOptions,
     theme: &Theme,
 ) -> Result<BenchmarkReport> {
@@ -2039,6 +2049,11 @@ async fn bench_tts(
     if concurrent == 0 {
         return Err(CliError::InvalidInput(
             "Concurrent requests must be greater than 0".to_string(),
+        ));
+    }
+    if timeout_secs == 0 {
+        return Err(CliError::InvalidInput(
+            "TTS benchmark timeout must be greater than 0 seconds".to_string(),
         ));
     }
 
@@ -2061,7 +2076,16 @@ async fn bench_tts(
         if options.interactive() {
             theme.info("Running warmup iteration...");
         }
-        let _ = run_tts_request(server, model, text, &reference, stream_output).await?;
+        let _ = run_tts_request(
+            server,
+            model,
+            text,
+            &reference,
+            stream_output,
+            max_output_tokens,
+            timeout_secs,
+        )
+        .await?;
     }
 
     let pb = progress_bar(options.interactive(), iterations as u64);
@@ -2093,6 +2117,8 @@ async fn bench_tts(
                     text.as_str(),
                     reference.as_ref(),
                     stream_output,
+                    max_output_tokens,
+                    timeout_secs,
                 )
                 .await
                 .map(|mut sample| {
@@ -2272,7 +2298,7 @@ async fn bench_tts(
             stream: stream_output,
             prompt: None,
             system: None,
-            max_tokens: None,
+            max_tokens: max_output_tokens,
             text: Some(text.as_ref().clone()),
             speaker: reference.speaker.clone(),
             file: None,
@@ -2281,6 +2307,7 @@ async fn bench_tts(
             reference_text: reference.reference_text.clone(),
             language: None,
             duration_secs: None,
+            request_timeout_secs: Some(timeout_secs),
         },
         summary: BenchmarkSummary {
             latency_ms: stats(&times),
@@ -2599,6 +2626,7 @@ async fn bench_asr(
             reference_text: None,
             language: language.as_deref().map(|value| value.to_string()),
             duration_secs: None,
+            request_timeout_secs: None,
         },
         summary: BenchmarkSummary {
             latency_ms: stats(&times),
@@ -2726,6 +2754,7 @@ async fn bench_throughput(
             reference_text: None,
             language: None,
             duration_secs: Some(duration),
+            request_timeout_secs: None,
         },
         summary: BenchmarkSummary {
             latency_ms: None,
@@ -2859,9 +2888,11 @@ async fn run_tts_request(
     text: &str,
     reference: &TtsBenchReference,
     stream_output: bool,
+    max_output_tokens: Option<usize>,
+    timeout_secs: u64,
 ) -> Result<TtsBenchSample> {
-    let client = http::client(Some(std::time::Duration::from_secs(300)))?;
-    let mut request_body = build_tts_bench_request_body(model, text, reference);
+    let client = http::client(Some(std::time::Duration::from_secs(timeout_secs)))?;
+    let mut request_body = build_tts_bench_request_body(model, text, reference, max_output_tokens);
     if stream_output {
         request_body["stream"] = serde_json::Value::Bool(true);
         request_body["stream_format"] = serde_json::Value::String("sse".to_string());
@@ -3000,6 +3031,7 @@ fn build_tts_bench_request_body(
     model: &str,
     text: &str,
     reference: &TtsBenchReference,
+    max_output_tokens: Option<usize>,
 ) -> serde_json::Value {
     let mut request_body = serde_json::json!({
         "model": model,
@@ -3017,6 +3049,9 @@ fn build_tts_bench_request_body(
     }
     if let Some(reference_text) = reference.reference_text.as_deref() {
         request_body["reference_text"] = serde_json::Value::String(reference_text.to_string());
+    }
+    if let Some(max_output_tokens) = max_output_tokens {
+        request_body["max_output_tokens"] = serde_json::Value::from(max_output_tokens);
     }
     request_body
 }
@@ -6163,8 +6198,12 @@ mod tests {
 
     #[test]
     fn tts_bench_request_omits_voice_without_speaker() {
-        let body =
-            build_tts_bench_request_body("Kokoro-82M", "hello", &TtsBenchReference::default());
+        let body = build_tts_bench_request_body(
+            "Kokoro-82M",
+            "hello",
+            &TtsBenchReference::default(),
+            None,
+        );
 
         assert!(body.get("voice").is_none());
     }
@@ -6175,11 +6214,12 @@ mod tests {
             speaker: Some("af_bella".to_string()),
             ..TtsBenchReference::default()
         };
-        let body = build_tts_bench_request_body("Kokoro-82M", "hello", &reference);
+        let body = build_tts_bench_request_body("Kokoro-82M", "hello", &reference, Some(256));
 
         assert_eq!(body["voice"], "af_bella");
         assert_eq!(body["model"], "Kokoro-82M");
         assert_eq!(body["input"], "hello");
+        assert_eq!(body["max_output_tokens"], 256);
     }
 
     #[test]

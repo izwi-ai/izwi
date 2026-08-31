@@ -582,6 +582,14 @@ pub enum BenchCommands {
         /// Use SSE streaming and measure first-audio/inter-chunk latency
         #[arg(long)]
         stream: bool,
+
+        /// Explicit maximum generated audio frames
+        #[arg(long)]
+        max_output_tokens: Option<usize>,
+
+        /// Per-request client timeout in seconds
+        #[arg(long, default_value = "900")]
+        timeout_secs: u64,
     },
 
     /// Benchmark ASR inference

@@ -19,6 +19,9 @@ use crate::api::pagination::{encode_cursor, CursorPagination, CursorPaginationQu
 use crate::api::request_context::RequestContext;
 use crate::api::saved_voices::resolve_saved_voice_reference;
 use crate::api::tts_long_form::{expand_generation_requests_for_long_form, generate_long_form_tts};
+#[cfg(test)]
+use crate::api::tts_policy::qwen_tts_auto_max_frames_for_text;
+use crate::api::tts_policy::resolve_tts_output_frames;
 use crate::batch_runtime::{
     store::{
         sha256_hex, NewIdempotencyRecord, NewJobStage, NewJobStageDispatch, NewMediaAsset,
@@ -43,8 +46,9 @@ use crate::speech_history_store::{
 };
 use crate::state::AppState;
 use izwi_core::audio::{inspect_audio_bytes, AudioEncoder, AudioFormat};
-use izwi_core::catalog::ModelFamily;
+#[cfg(test)]
 use izwi_core::runtime_models::architectures::vibevoice::tts::vibevoice_tts_auto_max_frames_for_text;
+#[cfg(test)]
 use izwi_core::runtime_models::architectures::voxtral::tts::voxtral_tts_auto_max_frames_for_text;
 use izwi_core::{
     parse_tts_model_variant, AudioChunk, GenerationConfig, GenerationRequest, ModelVariant,
@@ -1875,44 +1879,7 @@ fn resolve_speech_history_output_frames(
     text: &str,
     requested_frames: Option<usize>,
 ) -> Option<usize> {
-    let model_max_frames = variant.tts_max_output_frames_hint()?;
-    match requested_frames {
-        Some(value) if value > 0 => Some(value.clamp(1, model_max_frames)),
-        Some(0) | None if variant == ModelVariant::Voxtral4BTts2603 => {
-            Some(voxtral_tts_auto_max_frames_for_text(text).min(model_max_frames))
-        }
-        Some(0) | None if variant == ModelVariant::VibeVoice15BTts => {
-            Some(vibevoice_tts_auto_max_frames_for_text(text).min(model_max_frames))
-        }
-        Some(0) | None if variant.family() == ModelFamily::Qwen3Tts => {
-            Some(qwen_tts_auto_max_frames_for_text(text))
-        }
-        Some(0) | None => Some(model_max_frames),
-        Some(_) => unreachable!("positive requested frames handled above"),
-    }
-}
-
-fn qwen_tts_auto_max_frames_for_text(text: &str) -> usize {
-    const MIN_AUDIO_SECS: f32 = 4.0;
-    const MAX_AUDIO_SECS_PER_REQUEST: f32 = 120.0;
-    const WORDS_PER_SECOND: f32 = 2.5;
-    const CHARS_PER_WORD: usize = 5;
-    const END_PADDING_SECS: f32 = 2.0;
-
-    let word_count = text.split_whitespace().count();
-    let char_word_equivalent = text
-        .chars()
-        .filter(|ch| !ch.is_whitespace())
-        .count()
-        .div_ceil(CHARS_PER_WORD);
-    let estimated_words = word_count.max(char_word_equivalent).max(1);
-    let estimated_secs = ((estimated_words as f32) / WORDS_PER_SECOND + END_PADDING_SECS)
-        .clamp(MIN_AUDIO_SECS, MAX_AUDIO_SECS_PER_REQUEST);
-    let frames = (estimated_secs * ModelVariant::QWEN3_TTS_FRAME_RATE_HZ).ceil() as usize;
-    frames.clamp(
-        (MIN_AUDIO_SECS * ModelVariant::QWEN3_TTS_FRAME_RATE_HZ) as usize,
-        (MAX_AUDIO_SECS_PER_REQUEST * ModelVariant::QWEN3_TTS_FRAME_RATE_HZ) as usize,
-    )
+    resolve_tts_output_frames(variant, text, requested_frames)
 }
 
 fn normalize_for_model_capabilities(

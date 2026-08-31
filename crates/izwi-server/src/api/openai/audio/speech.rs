@@ -16,11 +16,10 @@ use tracing::info;
 
 use crate::api::request_context::RequestContext;
 use crate::api::saved_voices::resolve_saved_voice_reference;
+use crate::api::tts_policy::resolve_tts_output_frames;
 use crate::error::ApiError;
 use crate::state::AppState;
 use izwi_core::audio::{AudioEncoder, AudioFormat};
-use izwi_core::runtime_models::architectures::vibevoice::tts::vibevoice_tts_auto_max_frames_for_text;
-use izwi_core::runtime_models::architectures::voxtral::tts::voxtral_tts_auto_max_frames_for_text;
 use izwi_core::{
     parse_tts_model_variant, AudioChunk, GenerationConfig, GenerationRequest, ModelVariant,
     WorkloadClass,
@@ -233,23 +232,11 @@ fn resolve_speech_timeout_secs(
         return default_timeout_secs.max(1);
     };
 
-    // `0`/omitted means auto for TTS. Voxtral uses a text-sized default
-    // budget because every native frame is expensive and audio is emitted only
-    // after the final codec pass; other TTS models keep the historical max.
+    // `0`/omitted means the same model-aware automatic frame budget used by
+    // the first-party product route.
     let requested_frames = req.max_output_tokens.or(req.max_tokens);
-    let effective_frames = match requested_frames {
-        Some(0) | None if variant == ModelVariant::Voxtral4BTts2603 => {
-            voxtral_tts_auto_max_frames_for_text(&req.input)
-        }
-        Some(0) | None if variant == ModelVariant::VibeVoice15BTts => {
-            vibevoice_tts_auto_max_frames_for_text(&req.input)
-        }
-        Some(0) | None if variant == ModelVariant::FishAudioS2Pro => {
-            fish_s2_tts_auto_max_frames_for_text(&req.input)
-        }
-        Some(0) | None => model_max_frames,
-        Some(value) => value.clamp(1, model_max_frames),
-    };
+    let effective_frames = resolve_tts_output_frames(variant, &req.input, requested_frames)
+        .unwrap_or(model_max_frames);
 
     // Estimate output duration from codec frame budget and requested speed.
     let speed = req.speed.unwrap_or(1.0).clamp(0.25, 4.0) as f64;
@@ -282,16 +269,6 @@ fn resolve_speech_timeout_secs(
         .min(timeout_max_secs.max(1));
 
     default_timeout_secs.max(suggested_secs).max(1)
-}
-
-fn fish_s2_tts_auto_max_frames_for_text(text: &str) -> usize {
-    // S2 Pro advertises roughly 21.5 codec tokens/sec. Keep the first API
-    // budget conservative until native generation and long-form chunking have
-    // real-model parity evidence.
-    let word_count = text.split_whitespace().count().max(1);
-    let estimated_secs = ((word_count as f32) / 2.6).clamp(4.0, 120.0);
-    let frames = (estimated_secs * ModelVariant::FISH_S2_PRO_FRAME_RATE_HZ).ceil() as usize;
-    frames.clamp(96, ModelVariant::FISH_S2_PRO_MAX_OUTPUT_FRAMES)
 }
 
 fn normalize_speech_request(mut req: SpeechRequest) -> SpeechRequest {
@@ -685,15 +662,12 @@ fn build_generation_request(
     if let Some(speed) = req.speed {
         gen_config.options.speed = speed;
     }
-    if let Some(max_tokens) = req.max_output_tokens.or(req.max_tokens) {
-        gen_config.options.max_tokens = max_tokens;
-    } else if matches!(
+    if let Some(max_tokens) = resolve_tts_output_frames(
         variant,
-        ModelVariant::Voxtral4BTts2603
-            | ModelVariant::VibeVoice15BTts
-            | ModelVariant::FishAudioS2Pro
+        &req.input,
+        req.max_output_tokens.or(req.max_tokens),
     ) {
-        gen_config.options.max_tokens = 0;
+        gen_config.options.max_tokens = max_tokens;
     }
     if let Some(top_k) = req.top_k {
         gen_config.options.top_k = top_k;
@@ -918,7 +892,11 @@ mod tests {
             false,
             ModelVariant::Voxtral4BTts2603,
         );
-        assert_eq!(generation.config.options.max_tokens, 0);
+        assert_eq!(
+            generation.config.options.max_tokens,
+            resolve_tts_output_frames(ModelVariant::Voxtral4BTts2603, &req.input, None)
+                .expect("Voxtral frame hint")
+        );
     }
 
     #[test]
@@ -952,7 +930,11 @@ mod tests {
             false,
             ModelVariant::VibeVoice15BTts,
         );
-        assert_eq!(generation.config.options.max_tokens, 0);
+        assert_eq!(
+            generation.config.options.max_tokens,
+            resolve_tts_output_frames(ModelVariant::VibeVoice15BTts, &req.input, None)
+                .expect("VibeVoice frame hint")
+        );
     }
 
     #[test]
@@ -986,7 +968,46 @@ mod tests {
             false,
             ModelVariant::FishAudioS2Pro,
         );
-        assert_eq!(generation.config.options.max_tokens, 0);
+        assert_eq!(
+            generation.config.options.max_tokens,
+            resolve_tts_output_frames(ModelVariant::FishAudioS2Pro, &req.input, None)
+                .expect("Fish frame hint")
+        );
+    }
+
+    #[test]
+    fn qwen_tts_omitted_max_tokens_uses_shared_text_sized_budget() {
+        let req = SpeechRequest {
+            model: "Qwen3-TTS-12Hz-0.6B-CustomVoice".to_string(),
+            input: "The quick brown fox jumps over the lazy dog.".to_string(),
+            voice: Some("Aiden".to_string()),
+            response_format: Some("wav".to_string()),
+            allow_format_fallback: None,
+            speed: None,
+            language: None,
+            temperature: None,
+            max_tokens: None,
+            max_output_tokens: None,
+            top_k: None,
+            stream: Some(false),
+            stream_format: None,
+            instructions: None,
+            reference_audio: None,
+            reference_text: None,
+            saved_voice_id: None,
+        };
+
+        let generation = build_generation_request(
+            &req,
+            "test-correlation".to_string(),
+            false,
+            ModelVariant::Qwen3Tts12Hz06BCustomVoice,
+        );
+        assert_eq!(
+            generation.config.options.max_tokens,
+            resolve_tts_output_frames(ModelVariant::Qwen3Tts12Hz06BCustomVoice, &req.input, None,)
+                .expect("Qwen frame hint")
+        );
     }
 
     #[test]
