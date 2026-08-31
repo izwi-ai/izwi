@@ -555,7 +555,11 @@ impl ModelVariant {
                     "GGUF text model uses Candle quantized weights on the selected device",
                 )
             }
-            _ if self.is_qwen_asr_gguf() || self.is_lfm25_audio_gguf() => {
+            _ if self.is_qwen_asr_gguf() => CudaQuantizationInfo::new(
+                CudaQuantizationSupportLevel::CandleQuantizedGeneric,
+                "Qwen3-ASR uses quantized GGUF QMatMul text projections while the audio tower and bridge remain dense",
+            ),
+            _ if self.is_lfm25_audio_gguf() => {
                 CudaQuantizationInfo::new(
                     CudaQuantizationSupportLevel::DenseDequantizedFallback,
                     "GGUF speech/audio bundle is loaded through dense VarBuilder paths",
@@ -814,8 +818,12 @@ mod tests {
         );
         assert_eq!(
             ModelVariant::Qwen3Asr06BGguf.cuda_quantization().level,
-            CudaQuantizationSupportLevel::DenseDequantizedFallback
+            CudaQuantizationSupportLevel::CandleQuantizedGeneric
         );
+        assert!(ModelVariant::Qwen3Asr06BGguf
+            .cuda_quantization()
+            .reason
+            .contains("QMatMul"));
         assert_eq!(
             ModelVariant::Qwen3Tts12Hz06BBase4Bit
                 .cuda_quantization()
