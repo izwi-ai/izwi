@@ -3809,13 +3809,13 @@ mod tests {
         let models_dir =
             std::env::temp_dir().join(format!("izwi-runtime-residency-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&models_dir).unwrap();
-        let mut runtime = RuntimeService::new(EngineConfig {
+        let runtime = RuntimeService::new(EngineConfig {
             models_dir: models_dir.clone(),
             backend: BackendPreference::Cpu,
+            max_loaded_models: Some(1),
             ..EngineConfig::default()
         })
         .unwrap();
-        runtime.max_loaded_models = Some(1);
         runtime
             .model_manager
             .mark_loaded(ModelVariant::GraniteSpeech412BPlus)

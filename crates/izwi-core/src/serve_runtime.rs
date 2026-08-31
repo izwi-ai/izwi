@@ -10,6 +10,7 @@ use crate::config::{
 pub const ENV_HOST: &str = "IZWI_HOST";
 pub const ENV_PORT: &str = "IZWI_PORT";
 pub const ENV_MODELS_DIR: &str = "IZWI_MODELS_DIR";
+pub const ENV_MAX_LOADED_MODELS: &str = "IZWI_MAX_LOADED_MODELS";
 pub const ENV_BACKEND: &str = "IZWI_BACKEND";
 pub const ENV_MAX_BATCH_SIZE: &str = "IZWI_MAX_BATCH_SIZE";
 pub const ENV_PHYSICAL_EXECUTION_MODE: &str = "IZWI_PHYSICAL_EXECUTION_MODE";
@@ -40,6 +41,7 @@ pub struct ServeRuntimeConfig {
     pub host: String,
     pub port: u16,
     pub models_dir: PathBuf,
+    pub max_loaded_models: usize,
     pub backend: BackendPreference,
     pub max_batch_size: BatchSizePreference,
     pub physical_execution_mode: PhysicalExecutionMode,
@@ -69,6 +71,7 @@ impl Default for ServeRuntimeConfig {
             host: default_host(),
             port: default_port(),
             models_dir: default_models_dir(),
+            max_loaded_models: 1,
             backend: default_backend(),
             max_batch_size: default_max_batch_size(),
             physical_execution_mode: PhysicalExecutionMode::Serial,
@@ -115,6 +118,9 @@ impl ServeRuntimeConfig {
         }
         if let Some(models_dir) = overrides.models_dir.as_ref() {
             self.models_dir = models_dir.clone();
+        }
+        if let Some(max_loaded_models) = overrides.max_loaded_models {
+            self.max_loaded_models = max_loaded_models.max(1);
         }
         if let Some(backend) = overrides.backend {
             self.backend = backend;
@@ -186,6 +192,7 @@ impl ServeRuntimeConfig {
     pub fn engine_config(&self) -> EngineConfig {
         EngineConfig {
             models_dir: self.models_dir.clone(),
+            max_loaded_models: Some(self.max_loaded_models.max(1)),
             max_batch_size: self.max_batch_size,
             physical_execution_mode: self.physical_execution_mode,
             max_physical_in_flight: self.max_physical_in_flight,
@@ -211,6 +218,7 @@ pub struct ServeRuntimeConfigOverrides {
     pub host: Option<String>,
     pub port: Option<u16>,
     pub models_dir: Option<PathBuf>,
+    pub max_loaded_models: Option<usize>,
     pub backend: Option<BackendPreference>,
     pub max_batch_size: Option<BatchSizePreference>,
     pub physical_execution_mode: Option<PhysicalExecutionMode>,
@@ -240,6 +248,7 @@ impl ServeRuntimeConfigOverrides {
             host: read_env_string(ENV_HOST, &[]),
             port: read_env_u16(ENV_PORT, &[]),
             models_dir: read_env_path(ENV_MODELS_DIR, &[]),
+            max_loaded_models: read_env_usize(ENV_MAX_LOADED_MODELS, &[]),
             backend: read_env_backend(ENV_BACKEND, &[]),
             max_batch_size: read_env_batch_size(ENV_MAX_BATCH_SIZE, &[]),
             physical_execution_mode: read_env_physical_execution_mode(
@@ -449,6 +458,7 @@ mod tests {
         ENV_HOST,
         ENV_PORT,
         ENV_MODELS_DIR,
+        ENV_MAX_LOADED_MODELS,
         ENV_BACKEND,
         ENV_MAX_BATCH_SIZE,
         ENV_PHYSICAL_EXECUTION_MODE,
@@ -491,6 +501,26 @@ mod tests {
 
         assert_eq!(overrides.max_concurrent_requests, Some(77));
         assert_eq!(overrides.request_timeout_secs, Some(555));
+        clear_env();
+    }
+
+    #[test]
+    fn server_profile_defaults_to_one_resident_model_and_allows_override() {
+        let _guard = crate::env_test_lock().lock().expect("env lock poisoned");
+        clear_env();
+
+        let defaults = ServeRuntimeConfig::default();
+        assert_eq!(defaults.max_loaded_models, 1);
+        assert_eq!(defaults.engine_config().max_loaded_models, Some(1));
+
+        std::env::set_var(ENV_MAX_LOADED_MODELS, "3");
+        let resolved = ServeRuntimeConfig::from_sources(
+            &ServeRuntimeConfigOverrides::default(),
+            &ServeRuntimeConfigOverrides::from_env(),
+            &ServeRuntimeConfigOverrides::default(),
+        );
+        assert_eq!(resolved.max_loaded_models, 3);
+        assert_eq!(resolved.engine_config().max_loaded_models, Some(3));
         clear_env();
     }
 

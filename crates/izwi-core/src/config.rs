@@ -589,6 +589,12 @@ pub struct EngineConfig {
     #[serde(default = "default_models_dir")]
     pub models_dir: PathBuf,
 
+    /// Maximum simultaneously resident model variants. `None` leaves model
+    /// residency unbounded for embedded runtimes; server profiles resolve an
+    /// explicit value.
+    #[serde(default)]
+    pub max_loaded_models: Option<usize>,
+
     /// Automatic or explicitly fixed physical tensor batch width.
     #[serde(default)]
     pub max_batch_size: BatchSizePreference,
@@ -675,6 +681,7 @@ impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             models_dir: default_models_dir(),
+            max_loaded_models: None,
             max_batch_size: BatchSizePreference::Auto,
             physical_execution_mode: PhysicalExecutionMode::Serial,
             max_physical_in_flight: PhysicalInFlightLimit::default(),

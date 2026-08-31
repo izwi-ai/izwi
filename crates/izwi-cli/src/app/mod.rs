@@ -28,6 +28,7 @@ pub async fn run(cli: Cli, theme: Theme) -> Result<()> {
             physical_execution_mode,
             max_physical_in_flight,
             max_scheduler_batch_size,
+            max_loaded_models,
             max_retained_sequences,
             max_staged_transactions,
             max_queued_requests,
@@ -52,6 +53,7 @@ pub async fn run(cli: Cli, theme: Theme) -> Result<()> {
                 physical_execution_mode,
                 max_physical_in_flight,
                 max_scheduler_batch_size,
+                max_loaded_models,
                 max_retained_sequences,
                 max_staged_transactions,
                 max_queued_requests,
@@ -233,6 +235,7 @@ fn build_serve_args(
     physical_execution_mode: Option<izwi_core::PhysicalExecutionMode>,
     max_physical_in_flight: Option<izwi_core::PhysicalInFlightLimit>,
     max_scheduler_batch_size: Option<usize>,
+    max_loaded_models: Option<usize>,
     max_retained_sequences: Option<usize>,
     max_staged_transactions: Option<usize>,
     max_queued_requests: Option<usize>,
@@ -256,6 +259,7 @@ fn build_serve_args(
         physical_execution_mode,
         max_physical_in_flight,
         max_scheduler_batch_size,
+        max_loaded_models,
         max_retained_sequences,
         max_staged_transactions,
         max_queued_requests,
@@ -303,6 +307,7 @@ mod tests {
         std::env::remove_var(izwi_core::serve_runtime::ENV_HOST);
         std::env::remove_var(izwi_core::serve_runtime::ENV_PORT);
         std::env::remove_var(izwi_core::serve_runtime::ENV_MODELS_DIR);
+        std::env::remove_var(izwi_core::serve_runtime::ENV_MAX_LOADED_MODELS);
         std::env::remove_var(izwi_core::serve_runtime::ENV_BACKEND);
         std::env::remove_var(izwi_core::serve_runtime::ENV_MAX_BATCH_SIZE);
         std::env::remove_var(izwi_core::serve_runtime::ENV_PHYSICAL_EXECUTION_MODE);
@@ -368,6 +373,7 @@ mod tests {
             Some(izwi_core::PhysicalExecutionMode::Serial),
             Some(izwi_core::PhysicalInFlightLimit::new(2).unwrap()),
             None,
+            Some(1),
             None,
             None,
             None,
@@ -391,6 +397,7 @@ mod tests {
             izwi_core::PhysicalExecutionMode::Serial
         );
         assert_eq!(args.runtime.max_physical_in_flight.get(), 2);
+        assert_eq!(args.runtime.max_loaded_models, 1);
         assert_eq!(args.runtime.request_timeout_secs, 600);
         assert_eq!(args.runtime.backend, BackendPreference::Cuda);
         assert!(args.runtime.cors_enabled);
@@ -410,6 +417,7 @@ mod tests {
         let args = build_serve_args(
             None,
             ServeMode::Server,
+            None,
             None,
             None,
             None,

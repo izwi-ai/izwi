@@ -115,6 +115,10 @@ pub enum Commands {
         #[arg(long)]
         max_scheduler_batch_size: Option<usize>,
 
+        /// Maximum simultaneously resident model variants
+        #[arg(long)]
+        max_loaded_models: Option<usize>,
+
         /// Maximum retained sequence/session rows
         #[arg(long)]
         max_retained_sequences: Option<usize>,

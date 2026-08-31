@@ -12,6 +12,7 @@
 // the stricter lint enabled.
 #![cfg_attr(test, allow(clippy::await_holding_lock))]
 
+use anyhow::Context;
 use clap::{Parser, ValueEnum};
 use std::io::{Cursor, Read};
 use std::path::Path;
@@ -152,6 +153,12 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
     );
 
     let serve_config = resolve_serve_runtime_config(&args);
+    let effective_runtime_config = serde_json::to_string(&serve_config)
+        .context("failed to serialize effective server runtime configuration")?;
+    info!(
+        build_git_sha = option_env!("IZWI_BUILD_GIT_SHA").unwrap_or("unknown"),
+        effective_runtime_config, "Resolved effective server runtime configuration"
+    );
     let config = serve_config.engine_config();
     info!("Models directory: {:?}", config.models_dir);
 

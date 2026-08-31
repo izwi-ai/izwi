@@ -67,6 +67,8 @@ pub struct RuntimeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_scheduler_batch_size: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_loaded_models: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enable_prefix_caching: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed_prefix_cache_salt: Option<String>,
@@ -99,6 +101,7 @@ impl RuntimeConfig {
             && self.physical_execution_mode.is_none()
             && self.max_physical_in_flight.is_none()
             && self.max_scheduler_batch_size.is_none()
+            && self.max_loaded_models.is_none()
             && self.enable_prefix_caching.is_none()
             && self.managed_prefix_cache_salt.is_none()
             && self.max_prefix_cache_pages.is_none()
@@ -187,6 +190,7 @@ impl Config {
                 physical_execution_mode: Some(defaults.physical_execution_mode),
                 max_physical_in_flight: Some(defaults.max_physical_in_flight),
                 max_scheduler_batch_size: Some(defaults.max_scheduler_batch_size),
+                max_loaded_models: Some(defaults.max_loaded_models),
                 enable_prefix_caching: Some(defaults.enable_prefix_caching),
                 managed_prefix_cache_salt: defaults.managed_prefix_cache_salt.clone(),
                 max_prefix_cache_pages: Some(defaults.max_prefix_cache_pages),
@@ -225,6 +229,7 @@ impl Config {
             physical_execution_mode: self.runtime.physical_execution_mode,
             max_physical_in_flight: self.runtime.max_physical_in_flight,
             max_scheduler_batch_size: self.runtime.max_scheduler_batch_size,
+            max_loaded_models: self.runtime.max_loaded_models,
             enable_prefix_caching: self.runtime.enable_prefix_caching,
             managed_prefix_cache_salt: self.runtime.managed_prefix_cache_salt.clone(),
             max_prefix_cache_pages: self.runtime.max_prefix_cache_pages,
@@ -275,6 +280,9 @@ impl Config {
             }
             "runtime.max_scheduler_batch_size" => {
                 self.runtime.max_scheduler_batch_size = Some(parse_usize(value)?)
+            }
+            "runtime.max_loaded_models" => {
+                self.runtime.max_loaded_models = Some(parse_usize(value)?)
             }
             "runtime.enable_prefix_caching" => {
                 self.runtime.enable_prefix_caching = Some(parse_bool(value)?)
@@ -360,6 +368,10 @@ impl Config {
             "runtime.max_scheduler_batch_size" => self
                 .runtime
                 .max_scheduler_batch_size
+                .map(|value| toml::Value::Integer(value as i64)),
+            "runtime.max_loaded_models" => self
+                .runtime
+                .max_loaded_models
                 .map(|value| toml::Value::Integer(value as i64)),
             "runtime.enable_prefix_caching" => {
                 self.runtime.enable_prefix_caching.map(toml::Value::Boolean)
@@ -545,6 +557,7 @@ mod tests {
                 physical_execution_mode: Some(PhysicalExecutionMode::Shadow),
                 max_physical_in_flight: Some(PhysicalInFlightLimit::new(4).unwrap()),
                 max_scheduler_batch_size: Some(9),
+                max_loaded_models: Some(1),
                 enable_prefix_caching: Some(true),
                 managed_prefix_cache_salt: Some("tenant-a".to_string()),
                 max_prefix_cache_pages: Some(64),
@@ -586,6 +599,7 @@ mod tests {
             Some(4)
         );
         assert_eq!(overrides.max_scheduler_batch_size, Some(9));
+        assert_eq!(overrides.max_loaded_models, Some(1));
         assert_eq!(overrides.enable_prefix_caching, Some(true));
         assert_eq!(
             overrides.managed_prefix_cache_salt.as_deref(),
@@ -632,6 +646,9 @@ mod tests {
             .set_value("runtime.max_scheduler_batch_size", "13")
             .expect("scheduler capacity should parse");
         config
+            .set_value("runtime.max_loaded_models", "2")
+            .expect("model residency limit should parse");
+        config
             .set_value(
                 "server.cors_origins",
                 "http://localhost:3000,https://example.com",
@@ -667,6 +684,7 @@ mod tests {
             Some(toml::Value::Integer(3))
         );
         assert_eq!(config.runtime.max_scheduler_batch_size, Some(13));
+        assert_eq!(config.runtime.max_loaded_models, Some(2));
         assert_eq!(
             config.server.cors_origins,
             Some(vec![

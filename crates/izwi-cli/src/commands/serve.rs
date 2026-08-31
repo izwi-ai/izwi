@@ -201,6 +201,10 @@ fn set_server_env(args: &ServeArgs) {
         args.runtime.max_scheduler_batch_size.to_string(),
     );
     std::env::set_var(
+        "IZWI_MAX_LOADED_MODELS",
+        args.runtime.max_loaded_models.to_string(),
+    );
+    std::env::set_var(
         "IZWI_MAX_RETAINED_SEQUENCES",
         args.runtime.max_retained_sequences.to_string(),
     );
@@ -615,6 +619,7 @@ mod tests {
         std::env::remove_var("IZWI_BACKEND");
         std::env::remove_var("IZWI_NUM_THREADS");
         std::env::remove_var("IZWI_MODELS_DIR");
+        std::env::remove_var("IZWI_MAX_LOADED_MODELS");
         std::env::remove_var("IZWI_CORS");
         std::env::remove_var("IZWI_CORS_ORIGINS");
         std::env::remove_var("IZWI_NO_UI");
@@ -628,6 +633,7 @@ mod tests {
                 host: "0.0.0.0".to_string(),
                 port: 8080,
                 models_dir: PathBuf::from("/tmp/models"),
+                max_loaded_models: 1,
                 max_batch_size: izwi_core::BatchSizePreference::Auto,
                 physical_execution_mode: izwi_core::PhysicalExecutionMode::Shadow,
                 max_physical_in_flight: izwi_core::PhysicalInFlightLimit::new(3).unwrap(),

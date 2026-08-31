@@ -2441,6 +2441,10 @@ impl RuntimeService {
             realtime_asr_sequence_capacity,
         ));
 
+        let max_loaded_models = config
+            .max_loaded_models
+            .or_else(|| positive_usize_env("IZWI_MAX_LOADED_MODELS"));
+
         Ok(Self {
             config,
             cache_policy,
@@ -2466,7 +2470,7 @@ impl RuntimeService {
             step_driver_wakeup: Arc::new(Notify::new()),
             step_driver_started: AtomicBool::new(false),
             loaded_tts_variant,
-            max_loaded_models: positive_usize_env("IZWI_MAX_LOADED_MODELS"),
+            max_loaded_models,
             model_lifecycle,
             device,
         })
