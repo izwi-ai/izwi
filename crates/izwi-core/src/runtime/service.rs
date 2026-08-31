@@ -3150,6 +3150,12 @@ impl RuntimeService {
             None => self.load_model_for_inference(variant).await?,
         };
         let registry = self.model_registry.clone();
+        // Input preparation can temporarily retain both the caller-provided
+        // payload and a job-owned copy. Restore the pending claim before that
+        // temporary representation is moved into or replaced by the canonical
+        // request. The final retained request is observed below, so shrinking
+        // and growing representations follow one ordered transition.
+        job.prepare_materialized_release(JobResourceObservation::default())?;
         let (residency_lease, mut request) = self
             .coordinator
             .run_host_blocking_stage(&job, move || {
@@ -3168,6 +3174,11 @@ impl RuntimeService {
         request.priority = effective_context.priority;
         request.admission_ms = effective_context.admission_ms;
         request.deadline = effective_context.deadline;
+        let retained_request_host_bytes =
+            u64::try_from(retained_engine_request_input_bytes(&request)?).map_err(|_| {
+                Error::Overloaded("prepared engine request retained input exceeds u64".into())
+            })?;
+        job.record_materialized_usage(JobResourceObservation::host(retained_request_host_bytes))?;
         Ok(AdmittedEngineRequest {
             request,
             job,

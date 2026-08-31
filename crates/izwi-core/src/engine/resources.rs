@@ -1824,6 +1824,28 @@ mod tests {
     }
 
     #[test]
+    fn ordered_release_allows_smaller_replacement_materialization() {
+        let provider = Arc::new(LiveProvider {
+            capacity: 200,
+            available: AtomicU64::new(100),
+        });
+        let authority = Arc::new(ResourceAuthority::new(provider));
+        let lease = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Pipeline, "replace-materialization"),
+                slots(100),
+            )
+            .unwrap();
+
+        lease.record_materialized_usage(slots(100)).unwrap();
+        lease.prepare_materialized_release(slots(0)).unwrap();
+        lease.record_materialized_usage(slots(50)).unwrap();
+
+        assert_eq!(authority.snapshot().reserved, slots(100));
+        assert_eq!(authority.snapshot().reservations, 1);
+    }
+
+    #[test]
     fn ordered_materialized_release_cannot_double_spend_external_headroom() {
         use std::sync::Barrier;
 
