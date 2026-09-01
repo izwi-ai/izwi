@@ -3962,13 +3962,15 @@ mod tests {
                 writable_blocks: written_blocks.clone(),
             }],
             clocked_state: None,
-            allow_unchanged_prefix: false,
+            allow_unchanged_prefix: true,
         };
-        assert!(reservation
+        let mut unauthorized = reservation.clone();
+        unauthorized.allow_unchanged_prefix = false;
+        assert!(unauthorized
             .completed_write_receipt_for_prefix(&[], 4)
-            .expect_err("ordinary sequence work cannot authenticate a zero KV append")
+            .expect_err("a reservation without authority cannot authenticate a zero KV append")
             .to_string()
-            .contains("only for realtime"));
+            .contains("lacks terminal or realtime authority"));
         let batch = PhysicalBatch {
             batch_id: BatchId::new(99),
             lane: lane.clone(),

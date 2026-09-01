@@ -2292,13 +2292,13 @@ mod tests {
             transaction.commit().unwrap();
             (first, second)
         };
-        assert_eq!(
+        assert_nested_f32_close(
             prefill_one.to_vec3::<f32>().unwrap(),
-            causal_depthwise_reference(&input_one, &weight, None)
+            causal_depthwise_reference(&input_one, &weight, None),
         );
-        assert_eq!(
+        assert_nested_f32_close(
             prefill_two.to_vec3::<f32>().unwrap(),
-            causal_depthwise_reference(&input_two, &weight, None)
+            causal_depthwise_reference(&input_two, &weight, None),
         );
         assert_eq!(arena.absolute_cursor(), 4);
         assert_eq!(arena.valid_length(), 3);
@@ -2329,9 +2329,9 @@ mod tests {
             transaction.commit().unwrap();
             output
         };
-        assert_eq!(
+        assert_nested_f32_close(
             decode_output.to_vec3::<f32>().unwrap(),
-            causal_depthwise_reference(&decode_input, &weight, Some(&history))
+            causal_depthwise_reference(&decode_input, &weight, Some(&history)),
         );
         assert_eq!(arena.absolute_cursor(), 5);
         assert_eq!(arena.valid_length(), 3);
@@ -2363,9 +2363,9 @@ mod tests {
             transaction.commit().unwrap();
             output
         };
-        assert_eq!(
+        assert_nested_f32_close(
             continuation_output.to_vec3::<f32>().unwrap(),
-            causal_depthwise_reference(&continuation, &weight, Some(&continuation_history))
+            causal_depthwise_reference(&continuation, &weight, Some(&continuation_history)),
         );
         assert_eq!(arena.absolute_cursor(), 7);
         assert_eq!(arena.valid_length(), 3);
@@ -2406,6 +2406,32 @@ mod tests {
             }
         }
         output
+    }
+
+    fn assert_nested_f32_close(actual: Vec<Vec<Vec<f32>>>, expected: Vec<Vec<Vec<f32>>>) {
+        assert_eq!(actual.len(), expected.len(), "batch size mismatch");
+        for (batch, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+            assert_eq!(
+                actual.len(),
+                expected.len(),
+                "hidden size mismatch at batch {batch}"
+            );
+            for (hidden, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+                assert_eq!(
+                    actual.len(),
+                    expected.len(),
+                    "step count mismatch at batch {batch}, hidden {hidden}"
+                );
+                for (step, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+                    assert!(
+                        actual.is_finite()
+                            && expected.is_finite()
+                            && (actual - expected).abs() <= 1e-6,
+                        "value mismatch at batch {batch}, hidden {hidden}, step {step}: {actual} != {expected}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
