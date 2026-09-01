@@ -869,6 +869,11 @@ impl Attention {
         let v = v
             .reshape((seq_len, self.num_kv_heads, self.head_dim))?
             .contiguous()?;
+        let compute_dtype = x.dtype();
+        let state_dtype = cache.arena().config().dtype;
+        let q = q.to_dtype(state_dtype)?;
+        let k = k.to_dtype(state_dtype)?;
+        let v = v.to_dtype(state_dtype)?;
         let out = cache.write_and_attend(
             layer_idx,
             prepared,
@@ -877,7 +882,9 @@ impl Attention {
             &v,
             1.0 / (self.head_dim as f32).sqrt(),
         )?;
-        let out = out.reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
+        let out =
+            out.to_dtype(compute_dtype)?
+                .reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
         self.o_proj.forward(&out).map_err(Error::from)
     }
 
@@ -960,6 +967,11 @@ impl Attention {
             ));
         }
         let binding = first.layer_binding(layer_idx)?;
+        let compute_dtype = x.dtype();
+        let state_dtype = first.arena().config().dtype;
+        let queries = queries.to_dtype(state_dtype)?;
+        let keys = keys.to_dtype(state_dtype)?;
+        let values = values.to_dtype(state_dtype)?;
         let completion = first.arena().write_slots(
             binding,
             KvWriteArgs {
@@ -994,7 +1006,11 @@ impl Attention {
         })?;
         completions.collect(completion)?;
         self.o_proj
-            .forward(&out.reshape((batch_size, sequence_len, self.num_heads * self.head_dim))?)
+            .forward(&out.to_dtype(compute_dtype)?.reshape((
+                batch_size,
+                sequence_len,
+                self.num_heads * self.head_dim,
+            ))?)
             .map_err(Error::from)
     }
 }
@@ -1199,6 +1215,13 @@ mod tests {
     }
 
     fn test_arena(instance: u64) -> (Arc<dyn KvArena>, Vec<KvLayerBinding>) {
+        test_arena_with_dtype(instance, DType::F32)
+    }
+
+    fn test_arena_with_dtype(
+        instance: u64,
+        dtype: DType,
+    ) -> (Arc<dyn KvArena>, Vec<KvLayerBinding>) {
         let binding = KvLayerBinding {
             model_layer: 0,
             physical_layer: 0,
@@ -1214,7 +1237,7 @@ mod tests {
             page_tokens: 2,
             capacity_pages: 24,
             growth: None,
-            dtype: DType::F32,
+            dtype,
             layers: vec![KvLayerConfig {
                 binding,
                 num_kv_heads: 1,
@@ -1272,6 +1295,25 @@ mod tests {
         assert_eq!(code_predictor_physical_context_tokens(0), 2);
         assert_eq!(code_predictor_physical_context_tokens(1), 2);
         assert_eq!(code_predictor_physical_context_tokens(15), 16);
+    }
+
+    #[test]
+    fn f32_predictor_compute_runs_against_f16_physical_kv() {
+        let device = Device::Cpu;
+        let model = tiny_predictor(&device);
+        let (arena, bindings) = test_arena_with_dtype(710, DType::F16);
+        let mut cache = test_cache(arena, &bindings, 0, 0);
+
+        let codes = model
+            .generate_acoustic_codes_physical(
+                &frame_input(3, &device),
+                &frame_input(7, &device),
+                &mut cache,
+            )
+            .unwrap();
+
+        assert_eq!(codes.len(), 3);
+        assert_eq!(cache.context_len(), 4);
     }
 
     #[test]

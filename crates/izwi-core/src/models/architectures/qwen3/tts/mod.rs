@@ -962,6 +962,10 @@ pub struct Qwen3TtsModel {
     code_predictor_dtype: DType,
     /// Data type used by the speech tokenizer decoder.
     speech_tokenizer_dtype: DType,
+    /// Storage dtype used by managed talker KV pages.
+    talker_state_dtype: DType,
+    /// Storage dtype used by invocation-scoped predictor KV pages.
+    predictor_state_dtype: DType,
     /// Tokenizer for text and codec tokens
     tokenizer: TtsTokenizer,
     /// Special token IDs
@@ -988,8 +992,8 @@ impl Qwen3TtsModel {
     pub(crate) fn managed_inference_state_contract(&self) -> Result<InferenceStateContract> {
         qwen3_tts_inference_state_contract(
             &self.config,
-            self.dtype,
-            self.code_predictor_dtype,
+            self.talker_state_dtype,
+            self.predictor_state_dtype,
             self.kv_page_size,
         )
     }
@@ -1359,6 +1363,27 @@ fn select_qwen3_tts_dtypes(
     }
 }
 
+fn select_qwen3_tts_state_dtypes(
+    device: &DeviceProfile,
+    compute: Qwen3TtsDTypePlan,
+    kv_cache_dtype: &str,
+) -> Result<(DType, DType)> {
+    if !device.kind.is_metal() || compute.talker != DType::F32 {
+        return Ok((compute.talker, compute.code_predictor));
+    }
+    let storage = match kv_cache_dtype.trim().to_ascii_lowercase().as_str() {
+        "float16" | "fp16" | "f16" => DType::F16,
+        "bfloat16" | "bf16" => DType::BF16,
+        "float32" | "fp32" | "f32" => DType::F32,
+        value => {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3 TTS managed state does not support KV dtype `{value}`"
+            )))
+        }
+    };
+    Ok((storage, storage))
+}
+
 fn qwen_tts_uses_device_sampling(device: &DeviceProfile) -> bool {
     device.kind.is_cuda() || device.kind.is_metal()
 }
@@ -1532,6 +1557,8 @@ impl Qwen3TtsModel {
             is_custom_voice_model,
             is_voice_clone_model,
         )?;
+        let (talker_state_dtype, predictor_state_dtype) =
+            select_qwen3_tts_state_dtypes(&device, dtype_plan, kv_cache_dtype)?;
 
         // Load tokenizer
         let specials = TtsSpecialTokens::from_configs(&config, &config.talker_config);
@@ -1589,8 +1616,13 @@ impl Qwen3TtsModel {
         )?;
 
         info!(
-            "Qwen3-TTS model loaded successfully on {:?} (talker {:?}, predictor {:?}, speech tokenizer {:?})",
-            device.kind, dtype_plan.talker, dtype_plan.code_predictor, dtype_plan.speech_tokenizer
+            "Qwen3-TTS model loaded successfully on {:?} (talker {:?}, predictor {:?}, speech tokenizer {:?}, talker state {:?}, predictor state {:?})",
+            device.kind,
+            dtype_plan.talker,
+            dtype_plan.code_predictor,
+            dtype_plan.speech_tokenizer,
+            talker_state_dtype,
+            predictor_state_dtype,
         );
         let kv_quantization = KvCacheQuantization::from_dtype_hint(kv_cache_dtype);
 
@@ -1599,6 +1631,8 @@ impl Qwen3TtsModel {
             dtype: dtype_plan.talker,
             code_predictor_dtype: dtype_plan.code_predictor,
             speech_tokenizer_dtype: dtype_plan.speech_tokenizer,
+            talker_state_dtype,
+            predictor_state_dtype,
             tokenizer,
             specials,
             talker,
@@ -5081,6 +5115,28 @@ mod tests {
                 code_predictor: DType::F16,
                 speech_tokenizer: DType::F16,
             }
+        );
+    }
+
+    #[test]
+    fn metal_f32_compute_uses_configured_dense_kv_storage() {
+        let metal = dtype_test_profile(DeviceKind::Metal, false, false);
+        let compute = select_qwen3_tts_dtypes(&metal, None, true, false).unwrap();
+        assert_eq!(compute.talker, DType::F32);
+        assert_eq!(
+            select_qwen3_tts_state_dtypes(&metal, compute, "float16").unwrap(),
+            (DType::F16, DType::F16)
+        );
+        assert_eq!(
+            select_qwen3_tts_state_dtypes(&metal, compute, "float32").unwrap(),
+            (DType::F32, DType::F32)
+        );
+
+        let cpu = dtype_test_profile(DeviceKind::Cpu, false, false);
+        let cpu_compute = select_qwen3_tts_dtypes(&cpu, None, true, false).unwrap();
+        assert_eq!(
+            select_qwen3_tts_state_dtypes(&cpu, cpu_compute, "float16").unwrap(),
+            (DType::F32, DType::F32)
         );
     }
 
