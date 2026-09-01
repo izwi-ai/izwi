@@ -92,3 +92,8 @@ config = "0.14"
 # optimized. Scope it to Candle 0.11.0's exact transitive gemm-f16 version.
 [profile.dev.package."gemm-f16:0.19.0"]
 opt-level = 1
+
+[patch.crates-io]
+# Candle 0.11 unconditionally creates a macOS 15-only residency-set class.
+# Keep the existing no-residency fallback available on supported macOS 12-14.
+candle-metal-kernels = { path = "third_party/candle-metal-kernels-0.11.0" }

@@ -5640,6 +5640,18 @@ mod tests {
         }
     }
 
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    fn metal_test_device() -> Option<Device> {
+        static DEVICE: std::sync::OnceLock<Option<Device>> = std::sync::OnceLock::new();
+        DEVICE
+            .get_or_init(|| {
+                std::panic::catch_unwind(|| Device::new_metal(0))
+                    .ok()
+                    .and_then(Result::ok)
+            })
+            .clone()
+    }
+
     #[test]
     fn test_l2_norm_matches_reference() {
         let device = Device::Cpu;
@@ -5686,7 +5698,7 @@ mod tests {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     #[test]
     fn metal_silu_mul_kernel_matches_reference_if_available() {
-        let Ok(device) = Device::new_metal(0) else {
+        let Some(device) = metal_test_device() else {
             return;
         };
         for dtype in [DType::F32, DType::F16] {
@@ -5731,7 +5743,7 @@ mod tests {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     #[test]
     fn metal_one_pass_paged_attention_softcap_matches_reference_if_available() {
-        let Ok(device) = Device::new_metal(0) else {
+        let Some(device) = metal_test_device() else {
             return;
         };
         let cpu = Device::Cpu;
@@ -5798,7 +5810,7 @@ mod tests {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     #[test]
     fn metal_split_paged_attention_matches_online_reference_if_available() {
-        let Ok(device) = Device::new_metal(0) else {
+        let Some(device) = metal_test_device() else {
             return;
         };
         let cpu = Device::Cpu;
@@ -5928,7 +5940,7 @@ mod tests {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     #[test]
     fn metal_packed_varlen_prefill_matches_ragged_reference_if_available() {
-        let Ok(device) = Device::new_metal(0) else {
+        let Some(device) = metal_test_device() else {
             return;
         };
         let cpu = Device::Cpu;
@@ -6053,7 +6065,7 @@ mod tests {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     #[test]
     fn metal_split_packed_prefill_matches_asymmetric_gqa_reference_if_available() {
-        let Ok(device) = Device::new_metal(0) else {
+        let Some(device) = metal_test_device() else {
             return;
         };
         let cpu = Device::Cpu;
@@ -6283,7 +6295,7 @@ mod tests {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     #[test]
     fn metal_qwen35_causal_conv_sequence_matches_cpu_reference_if_available() {
-        let Ok(Ok(device)) = std::panic::catch_unwind(|| Device::new_metal(0)) else {
+        let Some(device) = metal_test_device() else {
             return;
         };
         let seq_len = 2;
@@ -6327,7 +6339,7 @@ mod tests {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     #[test]
     fn metal_qwen35_gated_delta_matches_cpu_reference_for_both_layouts_if_available() {
-        let Ok(Ok(device)) = std::panic::catch_unwind(|| Device::new_metal(0)) else {
+        let Some(device) = metal_test_device() else {
             return;
         };
         // Cross several tile boundaries so the test also verifies that each
@@ -6414,7 +6426,7 @@ mod tests {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     #[test]
     fn metal_qwen35_gated_delta_rejects_invalid_dtype_and_head_layout_if_available() {
-        let Ok(Ok(device)) = std::panic::catch_unwind(|| Device::new_metal(0)) else {
+        let Some(device) = metal_test_device() else {
             return;
         };
         let query = Tensor::zeros((1, 2, 16, 2), DType::F32, &device).unwrap();
@@ -6456,7 +6468,7 @@ mod tests {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     #[test]
     fn metal_lfm_shortconv_decode3_matches_reference_if_available() {
-        let Ok(device) = Device::new_metal(0) else {
+        let Some(device) = metal_test_device() else {
             return;
         };
         let cache = Tensor::from_vec(
@@ -6497,7 +6509,7 @@ mod tests {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     #[test]
     fn metal_lfm_shortconv_update3_matches_reference_if_available() {
-        let Ok(device) = Device::new_metal(0) else {
+        let Some(device) = metal_test_device() else {
             return;
         };
         let cache = Tensor::from_vec(
@@ -6525,7 +6537,7 @@ mod tests {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     #[test]
     fn metal_lfm_shortconv_sequence3_matches_reference_if_available() {
-        let Ok(device) = Device::new_metal(0) else {
+        let Some(device) = metal_test_device() else {
             return;
         };
         let bx = Tensor::from_vec(
@@ -6572,7 +6584,7 @@ mod tests {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     #[test]
     fn metal_lfm_shortconv_consumes_wrapped_physical_ring() {
-        let Ok(Ok(device)) = std::panic::catch_unwind(|| Device::new_metal(0)) else {
+        let Some(device) = metal_test_device() else {
             return;
         };
         let ring = Tensor::from_vec(
@@ -6608,7 +6620,7 @@ mod tests {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     #[test]
     fn metal_rms_norm_kernel_matches_reference_if_available() {
-        let Ok(device) = Device::new_metal(0) else {
+        let Some(device) = metal_test_device() else {
             return;
         };
         for dtype in [DType::F32, DType::F16] {
@@ -6659,7 +6671,7 @@ mod tests {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     #[test]
     fn metal_rope_pair_bshd_kernel_matches_reference_if_available() {
-        let Ok(device) = Device::new_metal(0) else {
+        let Some(device) = metal_test_device() else {
             return;
         };
         for dtype in [DType::F32, DType::F16] {
@@ -6767,7 +6779,7 @@ mod tests {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     #[test]
     fn metal_decode_gqa_attention_kernel_matches_reference_if_available() {
-        let Ok(device) = Device::new_metal(0) else {
+        let Some(device) = metal_test_device() else {
             return;
         };
         for dtype in [DType::F32, DType::F16] {
@@ -6895,7 +6907,7 @@ mod tests {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     #[test]
     fn metal_qk_rms_norm_kernel_matches_reference_if_available() {
-        let Ok(device) = Device::new_metal(0) else {
+        let Some(device) = metal_test_device() else {
             return;
         };
         for dtype in [DType::F32, DType::F16] {
