@@ -1326,15 +1326,14 @@ fn select_qwen3_tts_dtypes(
         });
     }
 
-    let legacy_dtype = if device.kind.is_metal() {
-        // Dense 1.7B variants exceed practical Apple unified-memory capacity
-        // when CustomVoice/Base metadata forces the historical F32 path.
-        DType::F16
-    } else if is_custom_voice_model || is_voice_clone_model {
-        // Voice-clone and CustomVoice generation were historically kept in
-        // F32 by default. Preserve that outside CUDA, and keep the decoder at
-        // F32 for CUDA unless the user explicitly overrides the dtype.
+    let legacy_dtype = if is_custom_voice_model || is_voice_clone_model {
+        // CustomVoice and Base/voice-clone checkpoints require F32 for
+        // intelligible audio. In particular, selecting F16 for every Metal
+        // component produces structurally valid but corrupted speech.
         DType::F32
+    } else if device.kind.is_metal() {
+        // VoiceDesign remains safe at F16 and benefits from lower residency.
+        DType::F16
     } else {
         device.select_model_dtype(ModelFamily::Qwen3Tts, None)
     };
@@ -5048,11 +5047,11 @@ mod tests {
     }
 
     #[test]
-    fn metal_qwen_tts_uses_f16_for_every_dense_variant() {
+    fn qwen_tts_default_dtype_policy_preserves_correctness_sensitive_modes() {
         let cpu = dtype_test_profile(DeviceKind::Cpu, false, false);
-        let cpu_plan = select_qwen3_tts_dtypes(&cpu, None, true, false).unwrap();
+        let cpu_custom = select_qwen3_tts_dtypes(&cpu, None, true, false).unwrap();
         assert_eq!(
-            cpu_plan,
+            cpu_custom,
             Qwen3TtsDTypePlan {
                 talker: DType::F32,
                 code_predictor: DType::F32,
@@ -5062,14 +5061,27 @@ mod tests {
 
         let metal = dtype_test_profile(DeviceKind::Metal, false, false);
         let metal_custom = select_qwen3_tts_dtypes(&metal, None, true, false).unwrap();
-        assert_eq!(metal_custom.talker, DType::F16);
-        assert_eq!(metal_custom.code_predictor, DType::F16);
-        assert_eq!(metal_custom.speech_tokenizer, DType::F16);
+        assert_eq!(
+            metal_custom,
+            Qwen3TtsDTypePlan {
+                talker: DType::F32,
+                code_predictor: DType::F32,
+                speech_tokenizer: DType::F32,
+            }
+        );
+
+        let metal_base = select_qwen3_tts_dtypes(&metal, None, false, true).unwrap();
+        assert_eq!(metal_base, metal_custom);
 
         let metal_voice_design = select_qwen3_tts_dtypes(&metal, None, false, false).unwrap();
-        assert_eq!(metal_voice_design.talker, DType::F16);
-        assert_eq!(metal_voice_design.code_predictor, DType::F16);
-        assert_eq!(metal_voice_design.speech_tokenizer, DType::F16);
+        assert_eq!(
+            metal_voice_design,
+            Qwen3TtsDTypePlan {
+                talker: DType::F16,
+                code_predictor: DType::F16,
+                speech_tokenizer: DType::F16,
+            }
+        );
     }
 
     #[test]
