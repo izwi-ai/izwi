@@ -685,11 +685,10 @@ impl Lfm2ChatModel {
             let delta = self.tokenizer.decode_token_piece(next)?.to_string();
             state.generated_ids.push(next);
             state.assembled.push_str(&delta);
-            if should_check_repetition_loop(state.generated_ids.len())
-                && has_token_repetition_loop(&state.generated_ids)
+            if (should_check_repetition_loop(state.generated_ids.len())
+                && has_token_repetition_loop(&state.generated_ids))
+                || state.generated_ids.len() >= state.max_new_tokens
             {
-                state.finished = true;
-            } else if state.generated_ids.len() >= state.max_new_tokens {
                 state.finished = true;
             } else {
                 state.pending_token = Some(next);

@@ -3712,9 +3712,11 @@ mod tests {
             );
         }
 
-        let mut shadow = EngineCoreConfig::default();
-        shadow.physical_execution_mode = crate::config::PhysicalExecutionMode::Shadow;
-        shadow.max_physical_in_flight = crate::config::PhysicalInFlightLimit::new(4).unwrap();
+        let mut shadow = EngineCoreConfig {
+            physical_execution_mode: crate::config::PhysicalExecutionMode::Shadow,
+            max_physical_in_flight: crate::config::PhysicalInFlightLimit::new(4).unwrap(),
+            ..EngineCoreConfig::default()
+        };
         assert_eq!(
             Engine::physical_execution_telemetry_policy(&shadow, None),
             (EnginePhysicalExecutionMode::Shadow, 1)

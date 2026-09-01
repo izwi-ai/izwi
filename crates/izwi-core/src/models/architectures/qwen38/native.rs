@@ -1444,7 +1444,9 @@ fn decode_u16_float_le(data: &[u8], name: &str, decode: impl Fn(u16) -> f32) -> 
         )));
     }
     Ok(data
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|bytes| decode(u16::from_le_bytes([bytes[0], bytes[1]])))
         .collect())
 }
@@ -1457,7 +1459,9 @@ fn decode_f32_le(data: &[u8], name: &str) -> Result<Vec<f32>> {
         )));
     }
     Ok(data
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
         .collect())
 }

@@ -4788,8 +4788,7 @@ mod tests {
                 incompatible.source_identity,
                 incompatible.layers.clone(),
             )
-            .err()
-            .expect("incompatible layer width must fail installation");
+            .expect_err("incompatible layer width must fail installation");
         assert!(!error.to_string().is_empty());
         drop(owner);
         assert_cross_sequence_released_for_reuse(runtime.as_ref());

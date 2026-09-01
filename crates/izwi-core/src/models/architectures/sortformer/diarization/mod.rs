@@ -1723,7 +1723,7 @@ fn compress_spkcache(
         .into_iter()
         .take(cfg.spkcache_len)
         .collect::<Vec<_>>();
-    selected.sort_by(|a, b| a.flat_index.cmp(&b.flat_index));
+    selected.sort_by_key(|a| a.flat_index);
 
     let mut spkcache = Vec::with_capacity(cfg.spkcache_len);
     let mut spkcache_preds = Vec::with_capacity(cfg.spkcache_len);

@@ -2193,7 +2193,7 @@ mod tests {
         let scalar_refs = scalar_states.iter().collect::<Vec<_>>();
         let gathered = super::ParakeetPredictorBatchState::gather_rows(&scalar_refs).unwrap();
         assert_eq!(gathered.h0.dims(), batch_state.h0.dims());
-        let mut scattered = vec![
+        let mut scattered = [
             predictor.initial_state(1, &device).unwrap(),
             predictor.initial_state(1, &device).unwrap(),
         ];

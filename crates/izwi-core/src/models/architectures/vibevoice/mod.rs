@@ -535,9 +535,11 @@ fn vibevoice_asr_physical_state_spec(
             invocation_stages.push(InvocationStageWorkspace {
                 stage: stage.id,
                 lease_scope: InvocationLeaseScope::PerRow,
-                groups: owns_legacy_state
-                    .then(|| invocation.groups.clone())
-                    .unwrap_or_default(),
+                groups: if owns_legacy_state {
+                    invocation.groups.clone()
+                } else {
+                    Default::default()
+                },
                 domains,
             });
         }

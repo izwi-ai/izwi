@@ -1970,11 +1970,7 @@ fn strip_think_sections(input: &str) -> String {
     let open_tag = "<think>";
     let close_tag = "</think>";
 
-    loop {
-        let Some(start) = out.find(open_tag) else {
-            break;
-        };
-
+    while let Some(start) = out.find(open_tag) {
         if let Some(end_rel) = out[start + open_tag.len()..].find(close_tag) {
             let end = start + open_tag.len() + end_rel;
             let mut next = String::with_capacity(out.len());

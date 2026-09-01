@@ -654,7 +654,7 @@ impl Gemma3ChatModel {
             pending_token: None,
             prefill_progress: 0,
             generated_ids: Vec::new(),
-            sampler: ChatSampler::new(config.clone(), &prompt_ids),
+            sampler: ChatSampler::new(config.clone(), prompt_ids),
             assembled: String::new(),
             stagnant_steps: 0,
             max_new_tokens: max_new_tokens.max(1),
@@ -936,11 +936,7 @@ fn strip_think_blocks(input: &str) -> String {
     let open = "<think>";
     let close = "</think>";
 
-    loop {
-        let Some(start) = output.find(open) else {
-            break;
-        };
-
+    while let Some(start) = output.find(open) {
         let search_from = start + open.len();
         if let Some(end_rel) = output[search_from..].find(close) {
             let end = search_from + end_rel + close.len();

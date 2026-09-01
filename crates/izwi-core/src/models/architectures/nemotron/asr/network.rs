@@ -2368,7 +2368,7 @@ impl ConvSubsamplingDw {
         }
 
         let local_feature_frames = features.dim(2)?;
-        if state.feature_base_frame % SUBSAMPLING_FACTOR != 0
+        if !state.feature_base_frame.is_multiple_of(SUBSAMPLING_FACTOR)
             || state.feature_base_frame.checked_add(local_feature_frames)
                 != Some(state.feature_frames)
         {

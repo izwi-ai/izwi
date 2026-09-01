@@ -1377,7 +1377,7 @@ impl RuntimeService {
                 (
                     RuntimeRealtimeEngineModel::Nemotron {
                         _lease: lease,
-                        reservation: reservation.clone(),
+                        reservation,
                     },
                     max_samples,
                     reservation.host_bytes(),

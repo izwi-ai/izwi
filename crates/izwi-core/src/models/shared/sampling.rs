@@ -948,7 +948,7 @@ mod tests {
             .unwrap();
         let after_candidates = crate::models::shared::telemetry::snapshot();
         let packed_elements = DEVICE_SAMPLING_CANDIDATE_LIMIT * 2 + 1;
-        assert!(after_candidates.host_read_ops_total >= before_candidates.host_read_ops_total + 1);
+        assert!(after_candidates.host_read_ops_total > before_candidates.host_read_ops_total);
         assert!(
             after_candidates.host_read_bytes_total
                 >= before_candidates.host_read_bytes_total + (packed_elements * 4) as u64
@@ -966,7 +966,7 @@ mod tests {
             .sample(&logits, width)
             .unwrap();
         let after_fallback = crate::models::shared::telemetry::snapshot();
-        assert!(after_fallback.host_read_ops_total >= before_fallback.host_read_ops_total + 1);
+        assert!(after_fallback.host_read_ops_total > before_fallback.host_read_ops_total);
         assert!(
             after_fallback.host_read_bytes_total
                 >= before_fallback.host_read_bytes_total + (width * 4) as u64

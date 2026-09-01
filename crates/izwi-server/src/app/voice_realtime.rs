@@ -1346,7 +1346,7 @@ fn parse_binary_message(data: &[u8]) -> Result<BinaryMessageKind, String> {
 
 fn pcm16_bytes_to_i16(bytes: &[u8]) -> Vec<i16> {
     let mut out = Vec::with_capacity(bytes.len() / 2);
-    for chunk in bytes.chunks_exact(2) {
+    for chunk in bytes.as_chunks::<2>().0 {
         out.push(i16::from_le_bytes([chunk[0], chunk[1]]));
     }
     out
@@ -3268,10 +3268,7 @@ fn strip_think_tags(input: &str) -> String {
     let close_tag = "</think>";
     let mut out = input.to_string();
 
-    loop {
-        let Some(start) = out.find(open_tag) else {
-            break;
-        };
+    while let Some(start) = out.find(open_tag) {
         if let Some(end_rel) = out[start + open_tag.len()..].find(close_tag) {
             let end = start + open_tag.len() + end_rel;
             let mut next = String::with_capacity(out.len());

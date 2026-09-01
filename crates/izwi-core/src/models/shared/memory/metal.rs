@@ -203,7 +203,7 @@ impl MetalMemoryPool {
     pub fn release(&self, tensor: Tensor) {
         // Check if tensor is on the same device by comparing device types
         let tensor_device_type = format!("{:?}", tensor.device());
-        let pool_device_type = format!("{:?}", &self.device);
+        let pool_device_type = format!("{:?}", self.device);
         if tensor_device_type != pool_device_type {
             // Can't pool tensors from different devices
             return;

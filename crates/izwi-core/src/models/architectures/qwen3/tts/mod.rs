@@ -4914,33 +4914,36 @@ mod tests {
         ];
         let initial_rng = [state_a.rng.state, state_b.rng.state];
 
-        let mut states = [&mut state_a, &mut state_b];
-        let mut predictors = [&mut predictor_a, &mut predictor_b];
-        let failed: Result<Vec<u32>> =
-            run_tts_decode_batch_transaction(&mut states, &mut predictors, |states, predictors| {
-                for row in 0..states.len() {
-                    simulate_batch_model_progress(
-                        &talker,
-                        states[row],
-                        predictors[row],
-                        u32::try_from(row + 1).unwrap(),
-                    )?;
-                }
-                // Row zero has already produced audio when row one's codec
-                // fails. The public Vec-returning call cannot expose row zero,
-                // so the complete physical batch must become retryable.
-                simulate_batch_codec_finalization(states[0], 1);
-                Err(Error::InferenceError(
-                    "injected second-row codec failure".into(),
-                ))
-            });
-        let failure = failed.unwrap_err().to_string();
+        let failure = {
+            let mut states = [&mut state_a, &mut state_b];
+            let mut predictors = [&mut predictor_a, &mut predictor_b];
+            let failed: Result<Vec<u32>> = run_tts_decode_batch_transaction(
+                &mut states,
+                &mut predictors,
+                |states, predictors| {
+                    for row in 0..states.len() {
+                        simulate_batch_model_progress(
+                            &talker,
+                            states[row],
+                            predictors[row],
+                            u32::try_from(row + 1).unwrap(),
+                        )?;
+                    }
+                    // Row zero has already produced audio when row one's codec
+                    // fails. The public Vec-returning call cannot expose row zero,
+                    // so the complete physical batch must become retryable.
+                    simulate_batch_codec_finalization(states[0], 1);
+                    Err(Error::InferenceError(
+                        "injected second-row codec failure".into(),
+                    ))
+                },
+            );
+            failed.unwrap_err().to_string()
+        };
         assert!(
             failure.contains("injected second-row codec failure"),
             "unexpected failure: {failure}"
         );
-        drop(states);
-        drop(predictors);
 
         for (row, state) in [&mut state_a, &mut state_b].into_iter().enumerate() {
             assert_eq!(state.talker_cache.context_len(), 0);
@@ -4970,9 +4973,9 @@ mod tests {
         assert!(predictor_a.take_completed_writes().is_empty());
         assert!(predictor_b.take_completed_writes().is_empty());
 
-        let mut states = [&mut state_a, &mut state_b];
-        let mut predictors = [&mut predictor_a, &mut predictor_b];
-        let outputs =
+        let outputs = {
+            let mut states = [&mut state_a, &mut state_b];
+            let mut predictors = [&mut predictor_a, &mut predictor_b];
             run_tts_decode_batch_transaction(&mut states, &mut predictors, |states, predictors| {
                 for row in 0..states.len() {
                     let token = u32::try_from(row + 1).unwrap();
@@ -4981,10 +4984,9 @@ mod tests {
                 }
                 Ok(vec![10, 20])
             })
-            .unwrap();
+            .unwrap()
+        };
         assert_eq!(outputs, vec![10, 20]);
-        drop(states);
-        drop(predictors);
 
         for state in [&state_a, &state_b] {
             assert_eq!(state.talker_cache.context_len(), 1);

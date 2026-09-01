@@ -224,7 +224,7 @@ fn read_tensor_from_zip(path: &Path, info: &TensorInfo, member_path: &str) -> Re
     let mut raw = vec![0u8; byte_len];
     reader.read_exact(&mut raw)?;
     let mut data = Vec::with_capacity(elem_count);
-    for chunk in raw.chunks_exact(4) {
+    for chunk in raw.as_chunks::<4>().0 {
         data.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
 

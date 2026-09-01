@@ -863,11 +863,7 @@ impl VibeVoiceTtsModel {
         )?;
         let latents = self.sample_speech_latent_cross_request_batch(states, &plan)?;
         let mut steps = Vec::with_capacity(states.len());
-        for ((state, quantum), latent) in states
-            .iter_mut()
-            .zip(tokenizer_quanta)
-            .zip(latents.into_iter())
-        {
+        for ((state, quantum), latent) in states.iter_mut().zip(tokenizer_quanta).zip(latents) {
             let latent_frame = latent.unsqueeze(1)?;
             let feedback = self.generated_speech_embed_retained(
                 &latent_frame,
@@ -1103,10 +1099,8 @@ impl VibeVoiceTtsModel {
             profile.negative_prefill_ms = elapsed_ms(started);
             (prefill_hidden, negative_hidden)
         };
-        let mut pos = prompt.input_ids.len();
         let mut last_hidden = last_sequence_hidden(&prefill_hidden, "VibeVoice TTS prefill")?;
 
-        let mut negative_pos = 1usize;
         let mut negative_last_hidden =
             last_sequence_hidden(&negative_hidden, "VibeVoice TTS negative prefill")?;
 
@@ -1125,7 +1119,9 @@ impl VibeVoiceTtsModel {
         )?;
         profile.diffusion_steps = diffusion_plan.steps.len();
         let mut scaled_latents = Vec::with_capacity(max_frames);
-        for frame_idx in 0..max_frames {
+        for ((pos, negative_pos), frame_idx) in
+            (prompt.input_ids.len()..).zip(1usize..).zip(0..max_frames)
+        {
             if frame_idx >= MIN_FRAMES_BEFORE_STOP {
                 let started = Instant::now();
                 let predicted_id = next_tts_control_token_from_hidden(
@@ -1197,9 +1193,7 @@ impl VibeVoiceTtsModel {
                 profile.negative_decode_ms += elapsed_ms(started);
                 (hidden, negative_hidden)
             };
-            pos += 1;
             last_hidden = last_sequence_hidden(&hidden, "VibeVoice TTS generated frame")?;
-            negative_pos += 1;
             negative_last_hidden =
                 last_sequence_hidden(&negative_hidden, "VibeVoice TTS negative frame")?;
         }

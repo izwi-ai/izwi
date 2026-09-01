@@ -6341,11 +6341,7 @@ impl NativeExecutor {
         };
         crate::engine::metrics::record_engine_model_call(model_call);
 
-        for (row, cancelled) in call_rows
-            .iter()
-            .copied()
-            .zip(cancelled_after_model.into_iter())
-        {
+        for (row, cancelled) in call_rows.iter().copied().zip(cancelled_after_model) {
             if !cancelled {
                 continue;
             }
@@ -6386,7 +6382,7 @@ impl NativeExecutor {
         }
 
         let mut continuing = vec![false; scheduled.len()];
-        for (row, step) in call_rows.iter().copied().zip(steps.into_iter()) {
+        for (row, step) in call_rows.iter().copied().zip(steps) {
             let index = active_states.rows[row].0;
             if outputs[index].is_some() {
                 continue;
@@ -6942,14 +6938,14 @@ impl NativeExecutor {
                     })
                 })?;
 
-                let chunk_plan = Self::asr_chunk_plan(&samples, sample_rate, None, false, false);
+                let chunk_plan = Self::asr_chunk_plan(samples, sample_rate, None, false, false);
                 if chunk_plan.requires_chunk_path() {
                     let chunked = Self::transcribe_with_chunk_plan_with_details(
                         &request.id,
                         stream_tx.as_ref(),
                         stream_policy,
                         &mut sequence,
-                        &samples,
+                        samples,
                         sample_rate,
                         &chunk_plan.chunks,
                         &chunk_plan.config,
@@ -6995,7 +6991,7 @@ impl NativeExecutor {
                         };
                         let text = with_single_invocation_cache(request, scheduled, |cache| {
                             model.transcribe_with_callback_physical(
-                                &samples,
+                                samples,
                                 sample_rate,
                                 language,
                                 &mut emit,
@@ -7015,7 +7011,7 @@ impl NativeExecutor {
                     }
                 }
                 let details = with_single_invocation_cache(request, scheduled, |cache| {
-                    model.transcribe_with_details_physical(&samples, sample_rate, language, cache)
+                    model.transcribe_with_details_physical(samples, sample_rate, language, cache)
                 })?;
                 return Ok((details.text, details.diagnostics));
             }
@@ -7023,7 +7019,7 @@ impl NativeExecutor {
             let (model, _model_lease) = self.asr_model_for_request(request, variant)?;
 
             let chunk_plan = Self::asr_chunk_plan(
-                &samples,
+                samples,
                 sample_rate,
                 model.max_audio_seconds_hint(),
                 request.streaming && !model.supports_incremental_decode(),
@@ -7035,7 +7031,7 @@ impl NativeExecutor {
                     stream_tx.as_ref(),
                     stream_policy,
                     &mut sequence,
-                    &samples,
+                    samples,
                     sample_rate,
                     &chunk_plan.chunks,
                     &chunk_plan.config,
@@ -7197,7 +7193,7 @@ impl NativeExecutor {
                             with_vibevoice_invocation_state(request, scheduled, |leases| {
                                 model
                                     .transcribe_vibevoice_with_callback_and_prompt_and_options_physical(
-                                        &samples,
+                                        samples,
                                         sample_rate,
                                         language,
                                         asr_prompt,
@@ -7211,7 +7207,7 @@ impl NativeExecutor {
                             with_single_invocation_cache(request, scheduled, |cache| {
                                 model
                                     .transcribe_granite_speech_with_callback_and_prompt_and_options_physical(
-                                        &samples,
+                                        samples,
                                         sample_rate,
                                         language,
                                         asr_prompt,
@@ -7226,7 +7222,7 @@ impl NativeExecutor {
                             scheduled,
                             |self_kv, cross_kv| {
                                 model.transcribe_whisper_with_callback_and_prompt_physical(
-                                    &samples,
+                                    samples,
                                     sample_rate,
                                     language,
                                     asr_prompt,
@@ -7239,7 +7235,7 @@ impl NativeExecutor {
                         ModelFamily::ParakeetAsr => {
                             with_single_invocation_tensor(request, scheduled, |state| {
                                 model.transcribe_parakeet_with_callback_physical(
-                                    &samples,
+                                    samples,
                                     sample_rate,
                                     language,
                                     state,
@@ -7252,7 +7248,7 @@ impl NativeExecutor {
                             scheduled,
                             |predictor, acoustic| {
                                 model.transcribe_nemotron_with_callback_and_prompt_physical(
-                                    &samples,
+                                    samples,
                                     sample_rate,
                                     language,
                                     asr_prompt,
@@ -7263,7 +7259,7 @@ impl NativeExecutor {
                             },
                         )?,
                         _ => model.transcribe_with_callback_and_prompt_and_options(
-                            &samples,
+                            samples,
                             sample_rate,
                             language,
                             asr_prompt,
@@ -7287,7 +7283,7 @@ impl NativeExecutor {
                 ModelFamily::Qwen3Asr => {
                     with_single_invocation_cache(request, scheduled, |cache| {
                         model.transcribe_qwen3_with_details_and_prompt_physical(
-                            &samples,
+                            samples,
                             sample_rate,
                             language,
                             asr_prompt,
@@ -7298,7 +7294,7 @@ impl NativeExecutor {
                 ModelFamily::VibeVoiceAsr => {
                     with_vibevoice_invocation_state(request, scheduled, |leases| {
                         model.transcribe_vibevoice_with_details_and_prompt_and_options_physical(
-                            &samples,
+                            samples,
                             sample_rate,
                             language,
                             asr_prompt,
@@ -7311,7 +7307,7 @@ impl NativeExecutor {
                     with_single_invocation_cache(request, scheduled, |cache| {
                         model
                             .transcribe_granite_speech_with_details_and_prompt_and_options_physical(
-                                &samples,
+                                samples,
                                 sample_rate,
                                 language,
                                 asr_prompt,
@@ -7323,7 +7319,7 @@ impl NativeExecutor {
                 ModelFamily::WhisperAsr => {
                     with_whisper_invocation_state(request, scheduled, |self_kv, cross_kv| {
                         model.transcribe_whisper_with_details_and_prompt_physical(
-                            &samples,
+                            samples,
                             sample_rate,
                             language,
                             asr_prompt,
@@ -7335,7 +7331,7 @@ impl NativeExecutor {
                 ModelFamily::ParakeetAsr => {
                     with_single_invocation_tensor(request, scheduled, |state| {
                         model.transcribe_parakeet_with_details_physical(
-                            &samples,
+                            samples,
                             sample_rate,
                             language,
                             state,
@@ -7345,7 +7341,7 @@ impl NativeExecutor {
                 ModelFamily::NemotronAsr => {
                     with_nemotron_offline_state(request, scheduled, |predictor, acoustic| {
                         model.transcribe_nemotron_with_details_and_prompt_physical(
-                            &samples,
+                            samples,
                             sample_rate,
                             language,
                             asr_prompt,
@@ -7355,7 +7351,7 @@ impl NativeExecutor {
                     })?
                 }
                 _ => model.transcribe_with_details_and_prompt_and_options(
-                    &samples,
+                    samples,
                     sample_rate,
                     language,
                     asr_prompt,

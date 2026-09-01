@@ -196,7 +196,7 @@ impl Lfm25AudioRetainedState {
     pub(crate) fn rollback_quantum(
         &mut self,
         main: &mut PhysicalPagedKvCache,
-        mut depthformer: Option<&mut PhysicalPagedKvCache>,
+        depthformer: Option<&mut PhysicalPagedKvCache>,
         checkpoint: &Lfm25AudioRetainedCheckpoint,
     ) -> Result<()> {
         self.authenticate(checkpoint, main, depthformer.as_deref())?;
@@ -204,10 +204,7 @@ impl Lfm25AudioRetainedState {
         if let Err(error) = main.restore_logical_checkpoint(checkpoint.main_kv.clone()) {
             failures.push(format!("main KV: {error}"));
         }
-        if let (Some(cache), Some(saved)) = (
-            depthformer.as_deref_mut(),
-            checkpoint.depthformer_kv.as_ref(),
-        ) {
+        if let (Some(cache), Some(saved)) = (depthformer, checkpoint.depthformer_kv.as_ref()) {
             if let Err(error) = cache.restore_logical_checkpoint(saved.clone()) {
                 failures.push(format!("Depthformer KV: {error}"));
             }

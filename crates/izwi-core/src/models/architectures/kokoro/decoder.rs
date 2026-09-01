@@ -691,7 +691,7 @@ impl KokoroIstftGenerator {
         let n_bins = self.cfg.gen_istft_n_fft / 2 + 1;
         let frames = spectra
             .first()
-            .map(|(mag, _)| if n_bins == 0 { 0 } else { mag.len() / n_bins })
+            .map(|(mag, _)| mag.len().checked_div(n_bins).unwrap_or(0))
             .unwrap_or(0);
         let mut har = vec![0.0f32; batch * n_bins * 2 * frames];
         for (batch_index, (mag, phase)) in spectra.iter().enumerate() {

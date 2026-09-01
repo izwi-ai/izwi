@@ -433,7 +433,7 @@ impl Qwen3ChatModel {
             pending_token: None,
             prefill_progress: 0,
             generated_ids: Vec::new(),
-            sampler: ChatSampler::new(config.clone(), &prompt_ids),
+            sampler: ChatSampler::new(config.clone(), prompt_ids),
             assembled: String::new(),
             max_new_tokens: max_new_tokens.max(1),
             finished: false,
@@ -731,11 +731,7 @@ fn strip_think_blocks(input: &str) -> String {
         }
     }
 
-    loop {
-        let Some(start) = output.find(open) else {
-            break;
-        };
-
+    while let Some(start) = output.find(open) {
         let search_from = start + open.len();
         if let Some(end_rel) = output[search_from..].find(close) {
             let end = search_from + end_rel + close.len();

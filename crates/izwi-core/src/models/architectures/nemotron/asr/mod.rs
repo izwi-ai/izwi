@@ -2280,10 +2280,7 @@ impl NemotronAsrModel {
         }
 
         let mut prepared = Vec::new();
-        loop {
-            let Some(chunk) = state.next_ready_chunk() else {
-                break;
-            };
+        while let Some(chunk) = state.next_ready_chunk() {
             let chunk_samples = state.samples[chunk.start_sample..chunk.end_sample].to_vec();
             state.feature_state.push_samples(&chunk_samples)?;
             if chunk.is_final {

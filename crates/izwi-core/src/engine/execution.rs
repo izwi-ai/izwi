@@ -185,7 +185,7 @@ impl ClockedStateProjection {
                 "clocked retained-state projection ranges cannot be empty".into(),
             ));
         }
-        if auxiliary.len() % primary.len() != 0 {
+        if !auxiliary.len().is_multiple_of(primary.len()) {
             return Err(Error::InvalidInput(
                 "clocked retained-state projection has no exact integral scale".into(),
             ));
@@ -1536,8 +1536,8 @@ impl ManagedCacheReservation {
                     "clocked-state sequence spans have no physical reservation".into(),
                 ));
             }
-            (Some(spans), None) if spans.is_empty() => {}
-            (Some(spans), Some(_)) if spans.is_empty() => {
+            (Some([]), None) => {}
+            (Some([]), Some(_)) => {
                 return Err(Error::InvalidInput(
                     "explicit empty clocked-state work cannot reserve a tensor transaction".into(),
                 ));

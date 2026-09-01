@@ -768,6 +768,8 @@ impl InferenceCoordinator {
 
     /// Compete fairly for a fresh job permit, then atomically exchange the
     /// bridge's retained resource authorization into the resolved admission.
+    // Failure returns the bridge so its retained authorization remains recoverable.
+    #[allow(clippy::result_large_err)]
     pub(crate) async fn admit_observed_from_preparation(
         self: &Arc<Self>,
         mut bridge: PreparationAdmissionBridge,

@@ -277,7 +277,7 @@ fn list_local_media_files(
 
     let mut paths = Vec::new();
     collect_media_paths(media_root, media_root, &mut paths)?;
-    paths.sort_by(|left, right| right.modified_at.cmp(&left.modified_at));
+    paths.sort_by_key(|path| std::cmp::Reverse(path.modified_at));
     paths.truncate(limit);
     Ok(paths)
 }

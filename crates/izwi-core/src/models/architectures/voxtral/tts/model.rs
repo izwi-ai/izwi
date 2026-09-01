@@ -450,7 +450,7 @@ impl VoxtralTtsModel {
             || states.len() != caches.len()
             || states.len() != checkpoints.len()
             || max_tokens.len() != states.len()
-            || max_tokens.iter().any(|tokens| *tokens == 0)
+            || max_tokens.contains(&0)
         {
             return Err(Error::InvalidInput(
                 "Voxtral TTS retained prefill batch widths are invalid".into(),
@@ -830,7 +830,6 @@ impl VoxtralTtsPipeline {
                 Error::InferenceError(format!("Voxtral TTS LM prefill failed: {err}"))
             })?;
         let lm_prefill_duration = lm_prefill_start.elapsed();
-        let mut pos = prompt.input_ids.len();
         let mut last_hidden = last_sequence_hidden(&prefill_hidden, "Voxtral TTS LM prefill")?;
         let mut frames = Vec::new();
         let mut acoustic_duration = Duration::ZERO;
@@ -838,7 +837,7 @@ impl VoxtralTtsPipeline {
         let mut tensor_feedback_frames = 0usize;
         let mut host_feedback_frames = 0usize;
 
-        for frame_idx in 0..max_frames {
+        for (pos, frame_idx) in (prompt.input_ids.len()..).zip(0..max_frames) {
             let acoustic_start = Instant::now();
             let generated = self
                 .acoustic_transformer
@@ -896,7 +895,6 @@ impl VoxtralTtsPipeline {
                     Error::InferenceError(format!("Voxtral TTS LM decode failed: {err}"))
                 })?;
             lm_decode_duration += lm_decode_start.elapsed();
-            pos += 1;
             last_hidden = last_sequence_hidden(&hidden, "Voxtral TTS LM decode")?;
         }
 

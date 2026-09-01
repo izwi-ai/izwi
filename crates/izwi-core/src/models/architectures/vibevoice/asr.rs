@@ -1638,7 +1638,6 @@ impl VibeVoiceAsrModel {
             None,
         )?;
         let prefill_ms = elapsed_ms(prefill_started);
-        let mut pos = prompt.input_ids.len();
         let mut next = argmax_last_logits(&logits, cuda_device_argmax)?;
         let mut generated = Vec::new();
         let mut assembled = String::new();
@@ -1654,7 +1653,7 @@ impl VibeVoiceAsrModel {
         let mut stop_sequence = None::<String>;
         let decode_started = Instant::now();
 
-        for _ in 0..max_new_tokens {
+        for pos in (prompt.input_ids.len()..).take(max_new_tokens) {
             if stop_tokens.contains(&next) {
                 stop_reason = Some(if built_in_stop_tokens.contains(&next) {
                     "model_stop_token"
@@ -1682,7 +1681,6 @@ impl VibeVoiceAsrModel {
             let logits = self
                 .language_model
                 .forward_managed(&token, pos, physical_cache)?;
-            pos += 1;
             next = argmax_last_logits(&logits, cuda_device_argmax)?;
         }
         let decode_ms = elapsed_ms(decode_started);

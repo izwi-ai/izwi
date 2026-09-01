@@ -546,7 +546,7 @@ fn decode_wav_pcm16_mono_with_metadata(
 
     let mut samples = Vec::with_capacity(frame_count);
     if channels == 1 {
-        for bytes in data[..frame_count * block_align].chunks_exact(2) {
+        for bytes in data[..frame_count * block_align].as_chunks::<2>().0 {
             let sample = i16::from_le_bytes([bytes[0], bytes[1]]) as f32 / 32767.0;
             samples.push(sample.clamp(-1.0, 1.0));
         }

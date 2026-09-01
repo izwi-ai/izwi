@@ -2587,7 +2587,7 @@ mod tests {
     #[test]
     fn mtp_policy_is_enabled_at_depth_one_by_default() {
         let policy = Qwen38MtpPolicy::resolve(None, None).unwrap();
-        assert!(DEFAULT_MTP_ENABLED);
+        const { assert!(DEFAULT_MTP_ENABLED) };
         assert_eq!(
             policy,
             Qwen38MtpPolicy::Enabled {

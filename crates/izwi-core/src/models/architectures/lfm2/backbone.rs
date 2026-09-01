@@ -1318,7 +1318,7 @@ impl QuantizedLfm2Backbone {
                 let hidden = layer.ffn_norm.forward(&hidden_states)?;
                 hidden_states = (&layer.mlp.forward(&hidden)? + &residual)?;
             }
-            self.norm.forward(&hidden_states).map_err(Error::from)
+            self.norm.forward(&hidden_states)
         })();
         let hidden = match execution {
             Ok(hidden) => hidden,

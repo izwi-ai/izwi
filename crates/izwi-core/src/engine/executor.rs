@@ -2030,6 +2030,8 @@ impl VoxtralRealtimeStateCoordinator {
         }
     }
 
+    // Returning the pending quantum preserves ownership when registration fails.
+    #[allow(clippy::result_large_err)]
     fn register(
         &self,
         plan_id: PlanId,
@@ -2348,6 +2350,8 @@ impl NemotronRealtimeStateCoordinator {
         }
     }
 
+    // Returning the pending quantum preserves ownership when registration fails.
+    #[allow(clippy::result_large_err)]
     fn register(
         &self,
         plan_id: PlanId,

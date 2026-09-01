@@ -29,7 +29,7 @@ pub(crate) fn exact_stage_scratch_domain(
         InvocationLeaseScope::PerRow => u64::try_from(stage.max_batch_size)
             .map_err(|_| model_load("invocation scratch row count exceeds u64"))?,
     };
-    if slots == 0 || stage.max_workspace_bytes % slots != 0 {
+    if slots == 0 || !stage.max_workspace_bytes.is_multiple_of(slots) {
         return Err(model_load(
             "invocation scratch ceiling cannot be partitioned across its lease slots",
         ));
