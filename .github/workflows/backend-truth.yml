@@ -172,9 +172,21 @@ jobs:
           retention-days: 90
 
   cargo-metal:
-    name: Cargo Validation (Metal)
-    runs-on: macos-14
+    name: Cargo Validation (${{ matrix.contract }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            contract: macOS 12-14 CPU fallback
+            command: cargo-metal-fallback
+          - os: macos-15
+            contract: macOS 15+ Metal
+            command: cargo-metal
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
 
     steps:
       - name: Checkout
@@ -190,7 +202,7 @@ jobs:
             . -> target
 
       - name: Run Metal backend validation
-        run: scripts/ci/check-backend-truth.sh cargo-metal
+        run: scripts/ci/check-backend-truth.sh ${{ matrix.command }}
 
   docker-cpu:
     name: Docker Build (CPU)

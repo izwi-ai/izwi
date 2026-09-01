@@ -8,8 +8,10 @@
 use candle_core::{DType, Device};
 use std::any::Any;
 use std::borrow::Cow;
+use std::collections::HashMap;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use tracing::{debug, info, warn};
 
 use super::types::{BackendKind, BackendPreference};
@@ -575,6 +577,24 @@ impl DeviceProfile {
 pub struct DeviceSelector;
 
 static METAL_PROBE_PANICKED: AtomicBool = AtomicBool::new(false);
+static METAL_DEVICES: OnceLock<Mutex<HashMap<usize, Option<Device>>>> = OnceLock::new();
+
+/// Whether this process may initialize Candle's Metal backend safely.
+///
+/// Candle 0.11 constructs a residency-set descriptor introduced in macOS 15.
+/// Calling into that path on older releases panics before Candle can return an
+/// error, so Izwi deliberately keeps those systems on the CPU backend.
+pub fn metal_runtime_supported() -> bool {
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    {
+        objc2::available!(macos = 15.0)
+    }
+
+    #[cfg(not(all(feature = "metal", target_os = "macos")))]
+    {
+        false
+    }
+}
 
 fn panic_payload_to_string(payload: &(dyn Any + Send)) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {
@@ -586,25 +606,53 @@ fn panic_payload_to_string(payload: &(dyn Any + Send)) -> String {
     "unknown panic payload".to_string()
 }
 
+fn probe_metal_device_for_runtime<F>(runtime_supported: bool, probe: F) -> Option<Device>
+where
+    F: FnOnce() -> candle_core::Result<Device>,
+{
+    if !runtime_supported || METAL_PROBE_PANICKED.load(Ordering::Relaxed) {
+        return None;
+    }
+
+    match catch_unwind(AssertUnwindSafe(probe)) {
+        Ok(Ok(device)) if device.is_metal() => Some(device),
+        Ok(Ok(_)) | Ok(Err(_)) => None,
+        Err(payload) => {
+            METAL_PROBE_PANICKED.store(true, Ordering::Relaxed);
+            warn!(
+                "Metal probe panicked; disabling Metal for this process: {}",
+                panic_payload_to_string(payload.as_ref())
+            );
+            None
+        }
+    }
+}
+
+/// Returns a Metal device only when the current runtime satisfies Izwi's
+/// macOS 15+ Metal contract and Candle initializes it without error. Candle's
+/// default-device registry is not safe to initialize concurrently, so devices
+/// are constructed once per ordinal and the shared handle is cloned thereafter.
+pub fn metal_device_if_available(ordinal: usize) -> Option<Device> {
+    if !metal_runtime_supported() {
+        return None;
+    }
+
+    let devices = METAL_DEVICES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut devices = devices
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(device) = devices.get(&ordinal) {
+        return device.clone();
+    }
+
+    let device = probe_metal_device_for_runtime(true, || Device::new_metal(ordinal));
+    devices.insert(ordinal, device.clone());
+    device
+}
+
 impl DeviceSelector {
     fn try_metal() -> Option<DeviceProfile> {
-        if METAL_PROBE_PANICKED.load(Ordering::Relaxed) {
-            return None;
-        }
-
-        let device = match std::panic::catch_unwind(|| Device::metal_if_available(0)) {
-            Ok(Ok(device)) => device,
-            Ok(Err(_)) => return None,
-            Err(payload) => {
-                METAL_PROBE_PANICKED.store(true, Ordering::Relaxed);
-                warn!(
-                    "Metal probe panicked; disabling Metal for this process: {}",
-                    panic_payload_to_string(payload.as_ref())
-                );
-                return None;
-            }
-        };
-        if device.is_metal() {
+        if let Some(device) = metal_device_if_available(0) {
             // Initialize memory pool for Metal
             let memory_pool = metal_pool_for_device(&device);
 
@@ -827,6 +875,32 @@ fn detect_cuda_capabilities(_ordinal: usize) -> CudaProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsupported_metal_runtime_never_invokes_candle_probe() {
+        let invoked = AtomicBool::new(false);
+        let device = probe_metal_device_for_runtime(false, || {
+            invoked.store(true, Ordering::Relaxed);
+            Ok(Device::Cpu)
+        });
+
+        assert!(device.is_none());
+        assert!(!invoked.load(Ordering::Relaxed));
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn pre_macos15_auto_and_explicit_metal_preferences_fall_back_to_cpu() {
+        if metal_runtime_supported() {
+            return;
+        }
+
+        for preference in [BackendPreference::Auto, BackendPreference::Metal] {
+            let profile = DeviceSelector::detect_for_preference(preference).unwrap();
+            assert_eq!(profile.kind, DeviceKind::Cpu);
+            assert!(profile.device.is_cpu());
+        }
+    }
 
     #[test]
     fn cuda_ordinal_parser_is_deterministic() {

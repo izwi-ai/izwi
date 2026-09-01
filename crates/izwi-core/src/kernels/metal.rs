@@ -5644,11 +5644,7 @@ mod tests {
     fn metal_test_device() -> Option<Device> {
         static DEVICE: std::sync::OnceLock<Option<Device>> = std::sync::OnceLock::new();
         DEVICE
-            .get_or_init(|| {
-                std::panic::catch_unwind(|| Device::new_metal(0))
-                    .ok()
-                    .and_then(Result::ok)
-            })
+            .get_or_init(|| crate::backends::metal_device_if_available(0))
             .clone()
     }
 

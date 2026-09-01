@@ -101,6 +101,8 @@ izwi serve
 
 ### Custom runtime settings
 
+The Metal example requires Apple Silicon with macOS 15+.
+
 ```bash
 izwi serve \
   --host 127.0.0.1 \

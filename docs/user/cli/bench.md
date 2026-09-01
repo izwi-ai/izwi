@@ -111,7 +111,8 @@ izwi bench asr --model Whisper-Large-v3-Turbo --file test.wav --language en --it
 ### Whisper ASR Performance Protocol
 
 For CPU and Metal regressions, start a warmed server for the backend under
-test, then run the smoke guardrail before recording a benchmark:
+test, then run the smoke guardrail before recording a benchmark. Metal runs
+require Apple Silicon with macOS 15+:
 
 ```bash
 IZWI_BACKEND=metal \

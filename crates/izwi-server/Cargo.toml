@@ -17,6 +17,7 @@ cudnn-base = ["cuda-base", "izwi-core/cudnn"]
 cuda = ["cuda-base", "izwi-core/flash-attn"]
 cudnn = ["cuda", "izwi-core/cudnn"]
 flash-attn = ["cuda"]
+metal = ["izwi-core/metal"]
 db-mysql = ["sea-orm/sqlx-mysql"]
 db-postgres = ["sea-orm/sqlx-postgres"]
 
@@ -64,7 +65,7 @@ sea-orm = { version = "=2.0.0-rc.38", default-features = false, features = [
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-izwi-core = { path = "../izwi-core", default-features = false, features = ["metal", "accelerate"] }
+izwi-core = { path = "../izwi-core", default-features = false, features = ["accelerate"] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 izwi-core = { path = "../izwi-core", default-features = false }

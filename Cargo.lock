@@ -775,6 +775,8 @@ dependencies = [
 [[package]]
 name = "candle-metal-kernels"
 version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "242e83c6acf639bb273c929d73c67a882bb4dd08a140f121096e19ba2f213d3e"
 dependencies = [
  "block2 0.6.2",
  "half",
@@ -3721,6 +3723,7 @@ dependencies = [
  "izwi-asr-toolkit",
  "izwi-vad",
  "memmap2",
+ "objc2 0.6.3",
  "objc2-metal 0.3.2",
  "rand 0.8.5",
  "rand_chacha 0.3.1",

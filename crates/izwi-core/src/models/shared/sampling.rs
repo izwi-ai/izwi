@@ -1001,7 +1001,7 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn metal_bounded_candidates_match_cpu_semantics_if_available() {
-        let Ok(Ok(metal)) = std::panic::catch_unwind(|| Device::new_metal(0)) else {
+        let Some(metal) = crate::backends::metal_device_if_available(0) else {
             return;
         };
         let width = 257;

@@ -83,9 +83,8 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn linear_forward_last_dim_handles_voxtral_mlp_shape_on_metal() {
-        let device = match std::panic::catch_unwind(|| Device::new_metal(0)) {
-            Ok(Ok(device)) => device,
-            _ => return,
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            return;
         };
         let linear = Linear::new(
             Tensor::zeros((9_216, 3_072), DType::F32, &device).unwrap(),

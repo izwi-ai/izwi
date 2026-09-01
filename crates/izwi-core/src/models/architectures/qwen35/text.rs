@@ -2437,7 +2437,7 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn owned_recurrent_states_do_not_alias_on_metal() {
-        let Ok(Ok(device)) = std::panic::catch_unwind(|| Device::new_metal(0)) else {
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
             return;
         };
         let first = owned_zero_tensor(&[1, 2, 4, 4], DType::F32, &device)

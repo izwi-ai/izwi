@@ -505,16 +505,13 @@ fn create_metal_runtime(
     options: &Options,
     config: KvArenaConfig,
 ) -> Result<Option<Runtime>, String> {
-    let device = match Device::new_metal(0) {
-        Ok(device) => device,
-        Err(error) => {
-            emit_status(
-                options,
-                "unsupported",
-                &format!("Metal device unavailable: {error}"),
-            );
-            return Ok(None);
-        }
+    let Some(device) = izwi_core::backends::metal_device_if_available(0) else {
+        emit_status(
+            options,
+            "unsupported",
+            "Metal requires macOS 15 or later and an available Metal device",
+        );
+        return Ok(None);
     };
     let arena = Arc::new(
         CandleAcceleratorKvArena::new_mutation_only(config, device.clone())

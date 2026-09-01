@@ -28,6 +28,8 @@ cargo build -p izwi-cli
 
 ### Install script (macOS/Linux)
 
+The script selects Metal on Apple Silicon with macOS 15+ and CPU on macOS 12-14.
+
 ```bash
 ./scripts/install-cli.sh
 ```
@@ -69,6 +71,8 @@ izwi tts "hello from izwi cli" \
 ## Common commands
 
 ### Server
+
+Metal backend examples require Apple Silicon with macOS 15+.
 
 ```bash
 izwi serve

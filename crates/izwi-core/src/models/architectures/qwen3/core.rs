@@ -4737,9 +4737,8 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn dense_decode_attention_matches_manual_gqa_on_metal_decode_window() {
-        let device = match std::panic::catch_unwind(|| Device::new_metal(0)) {
-            Ok(Ok(device)) => device,
-            _ => return,
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            return;
         };
         let num_heads = 2usize;
         let num_kv_heads = 1usize;

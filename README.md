@@ -47,7 +47,8 @@ Download the latest build from
 
 Runtime support depends on the artifact:
 
-- macOS Apple Silicon release builds use Metal.
+- macOS Apple Silicon release builds use Metal on macOS 15+ and fall back to
+  CPU on macOS 12-14.
 - Linux and Windows release builds are CPU-only.
 - CUDA is supported through the Docker CUDA profile or source builds on
   compatible NVIDIA hosts.

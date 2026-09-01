@@ -73,7 +73,8 @@ For each OS runner, the workflow builds:
 
 GitHub Releases currently publish:
 
-1. macOS assets as the Metal-capable path for Apple Silicon hosts.
+1. macOS assets as the Metal-capable path on Apple Silicon with macOS 15+;
+   those same assets fall back to CPU on macOS 12-14.
 2. Linux and Windows assets as CPU-only native artifacts with CPU-safe public entrypoints.
 
 Linux and Windows public binary names must remain unchanged:

@@ -2214,7 +2214,7 @@ fn validate_config(config: &KvArenaConfig, backend: BackendKind, device: &Device
             ));
         }
         // Candle exposes Metal's registry id as its DeviceLocation rather than
-        // the selector ordinal accepted by Device::new_metal. Require the
+        // the selector ordinal accepted by Candle's Metal constructor. Require the
         // resolved ordinal to be explicit, but do not compare unlike ids.
         DeviceLocation::Metal { .. } if config.id.device_ordinal.is_none() => {
             return Err(Error::InferenceError(
@@ -2774,7 +2774,7 @@ mod tests {
     fn batched_row_mutations_preserve_order_dtypes_and_parallel_copy_semantics() -> Result<()> {
         let mut devices = vec![Device::Cpu];
         #[cfg(feature = "metal")]
-        if let Ok(Ok(device)) = std::panic::catch_unwind(|| Device::new_metal(0)) {
+        if let Some(device) = crate::backends::metal_device_if_available(0) {
             devices.push(device);
         }
         #[cfg(feature = "cuda")]
@@ -2848,7 +2848,7 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn prefill_lowering_is_compact_and_cache_key_tracks_generations() -> Result<()> {
-        let Ok(Ok(device)) = std::panic::catch_unwind(|| Device::new_metal(0)) else {
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
             return Ok(());
         };
         let binding = KvLayerBinding {
@@ -2975,7 +2975,7 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn clean_page_tracking_elides_only_proven_redundant_zeroes() -> Result<()> {
-        let Ok(Ok(device)) = std::panic::catch_unwind(|| Device::new_metal(0)) else {
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
             return Ok(());
         };
         let binding = KvLayerBinding {
@@ -3043,9 +3043,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn metal_paged_decode_and_prefill_match_cpu_for_ragged_shuffled_mha_gqa_mqa() -> Result<()> {
-        // Candle 0.11 panics inside Device::new_metal when Metal reports an
-        // empty device list, so feature-only CI must guard both failure modes.
-        let Ok(Ok(device)) = std::panic::catch_unwind(|| Device::new_metal(0)) else {
+        // Feature-only CI must tolerate an unavailable or unsupported Metal
+        // runtime without entering Candle's device constructor.
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
             return Ok(());
         };
         for dtype in [DType::F32, DType::F16] {

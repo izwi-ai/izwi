@@ -22,8 +22,9 @@ pub use cuda_runtime::{
     CudaRuntimeDiagnostics,
 };
 pub use device::{
-    parse_dtype_name, DTypeSelection, DTypeSelectionError, DTypeSelectionPolicy,
-    DTypeSelectionRequest, DeviceCapabilities, DeviceKind, DeviceProfile, DeviceSelector,
+    metal_device_if_available, metal_runtime_supported, parse_dtype_name, DTypeSelection,
+    DTypeSelectionError, DTypeSelectionPolicy, DTypeSelectionRequest, DeviceCapabilities,
+    DeviceKind, DeviceProfile, DeviceSelector,
 };
 pub use model_io::{
     auto_gguf_mmap_for_backend, backend_kind_for_device, gguf_mmap_enabled,

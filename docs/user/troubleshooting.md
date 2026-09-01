@@ -291,13 +291,16 @@ uname -m  # Should show "arm64"
 
 **Check macOS version:**
 ```bash
-sw_vers  # Should be 12.0+
+sw_vers  # Should be 15.0+ for Metal
 ```
 
 **Enable Metal:**
 ```bash
 izwi serve --backend metal
 ```
+
+Metal requires macOS 15 or later. On macOS 12-14, Izwi keeps running on CPU
+and an explicit Metal request reports a CPU fallback.
 
 ### CUDA not detected (Linux/Windows)
 

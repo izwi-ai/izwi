@@ -41,7 +41,7 @@ pub fn fused_kernels_available_for_device(device: &Device) -> bool {
 }
 
 fn metal_fused_kernels_available() -> bool {
-    cfg!(target_os = "macos")
+    crate::backends::metal_runtime_supported()
 }
 
 /// Whether to use fused kernels (can be disabled via environment).

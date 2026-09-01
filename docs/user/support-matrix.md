@@ -21,13 +21,15 @@ If another page says something different, this page should win.
 
 | Surface | OS / Hardware | Backend status | Support level | Notes |
 |---------|----------------|----------------|---------------|-------|
-| **Desktop app from GitHub Releases** | macOS on Apple Silicon | `metal` | Stable | Desktop and terminal binaries bundled in the macOS release can use Metal acceleration. |
+| **Desktop app from GitHub Releases** | Apple Silicon, macOS 15+ | `metal` | Stable | The release selects Metal automatically when the runtime is eligible. |
+| **Desktop app from GitHub Releases** | macOS 12-14 | `cpu` | Stable | The same release remains launchable and deliberately avoids Candle's Metal constructor. |
 | **Desktop app from GitHub Releases** | Linux x86_64 | `cpu` | Stable | Native Linux installers are CPU-only and do not bundle CUDA runtime libraries. |
 | **Desktop app from GitHub Releases** | Windows x86_64 | `cpu` | Stable | Native Windows installers are CPU-only and do not bundle CUDA runtime DLLs. |
 | **Terminal bundle from GitHub Releases** | Linux x86_64 | `cpu` | Stable | Linux terminal tarballs contain the public CPU-only CLI, server, and desktop shell binaries. |
-| **Terminal bundle from GitHub Releases** | macOS Apple Silicon | `metal` | Stable | Metal is compiled into the macOS build path. |
+| **Terminal bundle from GitHub Releases** | Apple Silicon, macOS 15+ | `metal` | Stable | Metal is compiled into the macOS bundle and runtime-gated. |
+| **Terminal bundle from GitHub Releases** | macOS 12-14 | `cpu` | Stable | Metal requests fall back to CPU before device construction. |
 | **Terminal bundle from GitHub Releases** | Windows x86_64 | `cpu` | Stable | Windows terminal zips contain the public CPU-only CLI, server, and desktop shell binaries. |
-| **Source build** | macOS Apple Silicon with `--features metal` | `metal` | Stable | Recommended GPU path on macOS. |
+| **Source build** | Apple Silicon, macOS 15+ with `--features metal` | `metal` | Stable | Recommended GPU path on supported macOS runtimes. |
 | **Source build** | Linux x86_64 with `--features cuda` and CUDA toolkit installed | `cuda` | Supported | Useful for development, custom builds, and debugging outside Docker. Requires a compatible NVIDIA driver/toolkit environment. |
 | **Source build** | Windows with `--features cuda` and CUDA toolkit installed | `cuda` | Preview | Useful for development and custom validation. Native Windows release artifacts remain CPU-only. |
 | **Docker `production` target** | Linux x86_64 | `cpu` | Stable | CPU-only container image. |
@@ -86,7 +88,7 @@ and realtime route families. Detailed preview behavior is documented in the
 - Release installers do not replace the host NVIDIA driver. CUDA acceleration requires a compatible NVIDIA driver and CUDA-capable GPU.
 - Source builds still require the CUDA toolkit and remain useful for development or fallback validation.
 - The Docker CUDA image/profile is the CUDA distribution path for NVIDIA Linux hosts and may require `CUDA_COMPUTE_CAP` when built on a machine without `nvidia-smi`.
-- On macOS, the recommended GPU path is Metal, not CUDA.
+- On macOS 15+, the recommended GPU path is Metal, not CUDA. macOS 12-14 are CPU-only.
 
 ### Qwen3.8 CUDA weight residency
 
@@ -236,7 +238,8 @@ For configuration, counters, benchmarks, and rollback, see
 
 Use the following expectations when validating a host:
 
-- **macOS Apple Silicon:** build or install a Metal-capable binary and run with `--backend metal` or `IZWI_BACKEND=metal`.
+- **Apple Silicon, macOS 15+:** build or install a Metal-capable binary and run with `--backend metal` or `IZWI_BACKEND=metal`.
+- **macOS 12-14:** run with `--backend cpu`; `auto` and explicit `metal` requests fall back to CPU.
 - **Linux/Windows GitHub Release:** run `izwi serve --backend cpu`, then `izwi status --detailed`.
 - **Docker CUDA on NVIDIA Linux hosts:** run `docker compose --profile cuda up`, then confirm the container selects CUDA through `/v1/health` or `izwi status --detailed` from a matching client environment. Eligible Candle FlashAttention, Qwen3/Qwen3.5 RoPE, and Gemma RMSNorm CUDA routes activate automatically; their environment variables remain explicit rollback switches. Qwen3.8 is an independently gated family and must report its own execution path and evidence.
 - **Linux/Windows source build for CUDA:** build with `cargo build --release --features cuda`, then run with `--backend cuda` or `IZWI_BACKEND=cuda`. The `cuda` wrapper includes Candle FlashAttention, while `cudnn` additionally enables matching Candle/cuDNN convolution paths.

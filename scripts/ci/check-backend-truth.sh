@@ -9,7 +9,9 @@ Usage: scripts/ci/check-backend-truth.sh <command>
 Commands:
   hygiene       Run repository format, Clippy, all-target, diff, and shell gates
   cargo-cpu     Run CPU-focused cargo checks and core scheduler regressions
-  cargo-metal   Run Metal-focused cargo checks and core scheduler regressions on macOS
+  cargo-metal   Require macOS 15+ and run Metal-focused validation
+  cargo-metal-fallback
+                Require macOS 12-14 and prove Metal-enabled code falls back to CPU
   cargo-cuda-compile
                 Compile/link CUDA harnesses without executing CUDA-linked binaries
   cargo-cuda    Compatibility alias for cargo-cuda-compile
@@ -371,17 +373,44 @@ run_cargo_metal() {
         echo "Metal checks require macOS." >&2
         exit 1
     fi
+    if [[ "$(sw_vers -productVersion | cut -d. -f1)" -lt 15 ]]; then
+        echo "Metal acceleration validation requires macOS 15 or later." >&2
+        exit 1
+    fi
 
     cargo check --locked -p izwi-core --features metal
     cargo check --locked -p izwi-cli --features metal
-    cargo check --locked -p izwi-server
+    cargo check --locked -p izwi-server --features metal
     cargo test --locked -p izwi-core --features metal --lib --tests
-    cargo test --locked -p izwi-server --lib
+    cargo test --locked -p izwi-server --features metal --lib
     scripts/bench/run_kv_cache_matrix.sh --lane metal --iterations 1 --warmup 0 --require-device
+}
+
+run_cargo_metal_fallback() {
+    require_command cargo
+
+    if [[ "$(uname -s)" != "Darwin" ]]; then
+        echo "macOS fallback checks require macOS." >&2
+        exit 1
+    fi
+    if [[ "$(sw_vers -productVersion | cut -d. -f1)" -ge 15 ]]; then
+        echo "The legacy CPU fallback lane requires macOS 12-14." >&2
+        exit 1
+    fi
+
+    cargo check --locked -p izwi-core --features metal
+    cargo check --locked -p izwi-cli
+    cargo check --locked -p izwi-server
+    cargo test --locked -p izwi-core --features metal \
+        pre_macos15_auto_and_explicit_metal_preferences_fall_back_to_cpu --lib
+    cargo test --locked -p izwi-core --features metal \
+        unsupported_metal_runtime_never_invokes_candle_probe --lib
+    cargo test --locked -p izwi-server --lib
 }
 
 run_hygiene() {
     require_command cargo
+    require_command rg
 
     # Tauri validates bundle resources from platform overlays during build-script
     # execution, even though Clippy/check do not create an application bundle.
@@ -391,6 +420,16 @@ run_hygiene() {
     local tauri_check_config='{"bundle":{"resources":null,"linux":{"deb":{"files":{}}}}}'
 
     git diff --check
+    local unguarded_metal_constructors
+    unguarded_metal_constructors="$(
+        rg -n 'Device::(new_metal|metal_if_available)' crates --glob '*.rs' \
+            | grep -v '^crates/izwi-core/src/backends/device.rs:' || true
+    )"
+    if [[ -n "${unguarded_metal_constructors}" ]]; then
+        echo "Metal device construction must use izwi_core::backends::metal_device_if_available:" >&2
+        printf '%s\n' "${unguarded_metal_constructors}" >&2
+        exit 1
+    fi
     # The repository still has a documented, pre-existing workspace rustfmt
     # backlog. Gate the production KV surface touched by this rollout without
     # rewriting or silently grandfathering new drift in those files.
@@ -410,6 +449,7 @@ run_hygiene() {
         cargo check --locked --workspace --all-targets
     bash -n scripts/ci/*.sh scripts/bench/*.sh
     scripts/bench/test-run-kv-cache-matrix.sh
+    scripts/test-install-cli-backend-selection.sh
     scripts/bench/test-run-cuda-model-evidence.sh
     scripts/bench/test-run-cuda-model-load-evidence.sh
 }
@@ -531,6 +571,9 @@ main() {
             ;;
         cargo-metal)
             run_cargo_metal
+            ;;
+        cargo-metal-fallback)
+            run_cargo_metal_fallback
             ;;
         cargo-cuda-compile)
             run_cargo_cuda_compile

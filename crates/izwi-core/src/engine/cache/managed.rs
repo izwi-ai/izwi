@@ -3467,7 +3467,7 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn managed_metal_runtime_allocates_on_the_exact_worker_device() -> Result<()> {
-        let Ok(Ok(device)) = std::panic::catch_unwind(|| Device::new_metal(0)) else {
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
             return Ok(());
         };
         let expected_location = device.location();

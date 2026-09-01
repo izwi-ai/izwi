@@ -84,7 +84,7 @@ metal = ["izwi-core/metal"]
 playback = [] # rodio
 
 [target.'cfg(target_os = "macos")'.dependencies]
-izwi-core = { path = "../izwi-core", default-features = false, features = ["metal", "accelerate"] }
+izwi-core = { path = "../izwi-core", default-features = false, features = ["accelerate"] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 izwi-core = { path = "../izwi-core", default-features = false }

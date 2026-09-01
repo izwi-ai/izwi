@@ -28,7 +28,7 @@ jobs:
             asset_suffix: windows-x86_64
             bundle_kind: nsis
             bundle_ext: exe
-          - os: macos-latest
+          - os: macos-15
             asset_suffix: macos
             bundle_kind: dmg
             bundle_ext: dmg
@@ -116,11 +116,36 @@ jobs:
       - name: Build UI dist (required by izwi-desktop compile-time Tauri config)
         run: npm --prefix ui run build
 
-      - name: Build CLI, server, and desktop binaries
+      - name: Build CLI and server binaries (Linux/Windows)
+        if: runner.os != 'macOS'
         run: |
           # izwi-desktop bundles izwi/izwi-server as resources, so build those first.
           cargo build --release --bin izwi --bin izwi-server
+
+      - name: Build CLI and server binaries (macOS 15+ Metal, macOS 12 deployment)
+        if: runner.os == 'macOS'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
+        run: |
+          cargo build --release -p izwi-cli --features metal
+          cargo build --release -p izwi-server --features metal
+
+      - name: Build desktop binary
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
+        run: |
           cargo build --release --bin izwi-desktop
+
+      - name: Verify macOS binary deployment floor
+        if: runner.os == 'macOS'
+        run: |
+          for binary in target/release/izwi target/release/izwi-server target/release/izwi-desktop; do
+            minos="$(otool -l "$binary" | awk '/LC_BUILD_VERSION/ { found=1; next } found && /minos/ { print $2; exit }')"
+            if [[ "$minos" != "12.0" ]]; then
+              echo "::error::$binary has deployment floor '$minos', expected 12.0."
+              exit 1
+            fi
+          done
 
       - name: Package terminal binaries (Linux/macOS)
         if: runner.os != 'Windows'
@@ -171,6 +196,7 @@ jobs:
         if: runner.os == 'macOS' && env.APPLE_SIGNING_IDENTITY == ''
         env:
           CI: "true"
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
         run: |
           env -u APPLE_SIGNING_IDENTITY \
             -u APPLE_CERTIFICATE \
@@ -186,6 +212,7 @@ jobs:
         if: runner.os == 'macOS' && env.APPLE_SIGNING_IDENTITY != ''
         env:
           CI: "true"
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -196,6 +223,20 @@ jobs:
           cargo tauri build \
             --bundles app,${{ matrix.bundle_kind }} \
             --config crates/izwi-desktop/tauri.macos.conf.json
+
+      - name: Verify macOS bundle deployment floor
+        if: runner.os == 'macOS'
+        run: |
+          app_path="$(find target crates/izwi-desktop/target -type d -path '*/release/bundle/macos/*.app' | head -n 1)"
+          if [[ -z "$app_path" ]]; then
+            echo "::error::Could not find the built macOS app bundle."
+            exit 1
+          fi
+          minos="$(plutil -extract LSMinimumSystemVersion raw -o - "$app_path/Contents/Info.plist")"
+          if [[ "$minos" != "12.0" ]]; then
+            echo "::error::$app_path has LSMinimumSystemVersion '$minos', expected 12.0."
+            exit 1
+          fi
 
       - name: Collect updater artifacts (Linux)
         if: runner.os == 'Linux'
@@ -363,7 +404,7 @@ jobs:
           cat > release-support.md <<'EOF'
           ## Runtime Support
 
-          - macOS native artifacts are Metal-capable on Apple Silicon.
+          - macOS native artifacts use Metal on Apple Silicon with macOS 15 or later and fall back to CPU on macOS 12-14.
           - Linux and Windows native artifacts are CPU-only and intentionally do not bundle CUDA runtime libraries.
           - NVIDIA CUDA is supported through the Docker `production-cuda` target / `docker compose --profile cuda` and through source builds with `--features cuda`.
           - Native artifacts are checked for CUDA runtime payloads and per-file size before release publication.

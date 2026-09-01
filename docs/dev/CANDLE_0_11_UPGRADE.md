@@ -21,7 +21,7 @@ Apple Silicon stable Rust caveat:
 - The workspace keeps using crates.io Candle and handles this with
   `.cargo/config.toml`, disabling the CPU `fp16` target feature only for
   `aarch64-apple-darwin`. This routes Candle through its stable fallback while
-  leaving Metal acceleration available.
+  leaving Metal acceleration available on macOS 15+.
 - Disabling `fp16` exposes a `gemm-f16 0.19.0` debug-codegen bug where its
   unoptimized inline assembly is emitted outside the required `fullfp16`
   target-feature context. The root `Cargo.toml` therefore uses `opt-level = 1`
@@ -31,6 +31,10 @@ Apple Silicon stable Rust caveat:
   the Cargo config or profile override as an upstream Candle/toolchain
   compatibility decision, and verify Linux Docker/CI paths against the
   crates.io dependency.
+- Published `candle-metal-kernels 0.11.0` constructs a macOS-15-only residency
+  descriptor. Izwi keeps the official crates.io package and gates every Metal
+  device probe with a runtime availability check: macOS 12-14 select CPU before
+  entering Candle, while macOS 15+ retains Metal acceleration.
 
 ## Metal API Migration
 
