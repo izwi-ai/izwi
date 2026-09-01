@@ -9,5 +9,8 @@ use crate::state::AppState;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/onboarding", get(handlers::get_onboarding_state))
-        .route("/onboarding/complete", axum::routing::post(handlers::complete_onboarding))
+        .route(
+            "/onboarding/complete",
+            axum::routing::post(handlers::complete_onboarding),
+        )
 }

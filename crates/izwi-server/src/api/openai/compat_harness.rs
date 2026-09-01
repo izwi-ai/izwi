@@ -3,10 +3,10 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
-    Router,
-    body::{Body, to_bytes},
+    body::{to_bytes, Body},
     http::{Method, Request, StatusCode},
     response::Response,
+    Router,
 };
 use base64::Engine as _;
 use izwi_core::audio::{AudioEncoder, AudioFormat};
@@ -298,14 +298,12 @@ async fn transcriptions_unknown_model_returns_openai_error_envelope() {
             .and_then(|value| value.as_str()),
         Some("invalid_request_error")
     );
-    assert!(
-        payload
-            .get("error")
-            .and_then(|error| error.get("message"))
-            .and_then(|value| value.as_str())
-            .unwrap_or_default()
-            .contains("Unsupported transcription model")
-    );
+    assert!(payload
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .contains("Unsupported transcription model"));
 }
 
 #[tokio::test]
@@ -334,12 +332,10 @@ async fn speech_unknown_model_returns_openai_error_envelope() {
             .and_then(|value| value.as_str()),
         Some("invalid_request_error")
     );
-    assert!(
-        payload
-            .get("error")
-            .and_then(|error| error.get("message"))
-            .and_then(|value| value.as_str())
-            .unwrap_or_default()
-            .contains("Unsupported TTS model")
-    );
+    assert!(payload
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .contains("Unsupported TTS model"));
 }

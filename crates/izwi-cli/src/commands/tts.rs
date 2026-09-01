@@ -1,15 +1,18 @@
-use crate::AudioFormat;
 use crate::error::{CliError, Result};
 use crate::http;
 use crate::style::Theme;
-use base64::Engine;
+use crate::AudioFormat;
 use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::header::HeaderMap;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
+use std::time::Duration;
+
+const TTS_REQUEST_TIMEOUT: Duration = Duration::from_secs(900);
 
 pub struct TtsArgs {
     pub text: String,
@@ -53,7 +56,7 @@ pub async fn execute(args: TtsArgs, server: &str, theme: &Theme) -> Result<()> {
         let mut buffer = String::new();
         std::io::stdin()
             .read_to_string(&mut buffer)
-            .map_err(|e| CliError::Io(e))?;
+            .map_err(CliError::Io)?;
         buffer
     } else {
         text
@@ -82,7 +85,10 @@ pub async fn execute(args: TtsArgs, server: &str, theme: &Theme) -> Result<()> {
         allow_format_fallback,
     })?;
 
-    let client = http::client(Some(std::time::Duration::from_secs(300)))?;
+    // Dense diffusion TTS can legitimately exceed five minutes on
+    // resource-constrained local Metal devices. Keep a finite client fence,
+    // but leave enough room for the server's own configured request deadline.
+    let client = http::client(Some(TTS_REQUEST_TIMEOUT))?;
 
     let start_time = std::time::Instant::now();
 
@@ -223,11 +229,11 @@ async fn handle_output(
 
     let mut file = tokio::fs::File::create(&output_path)
         .await
-        .map_err(|e| CliError::Io(e))?;
+        .map_err(CliError::Io)?;
 
     tokio::io::AsyncWriteExt::write_all(&mut file, &audio_data)
         .await
-        .map_err(|e| CliError::Io(e))?;
+        .map_err(CliError::Io)?;
 
     theme.success(&format!("Audio saved to: {}", output_path.display()));
 

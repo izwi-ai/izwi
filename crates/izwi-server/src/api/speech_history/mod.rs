@@ -17,6 +17,7 @@ pub fn router() -> Router<AppState> {
     const CANONICAL_TTS_COLLECTION: &str = "/text-to-speech";
     const CANONICAL_TTS_MEMBER: &str = "/text-to-speech/{record_id}";
     const CANONICAL_TTS_AUDIO: &str = "/text-to-speech/{record_id}/audio";
+    const CANONICAL_TTS_CANCEL: &str = "/text-to-speech/{record_id}/cancel";
     const CANONICAL_VOICE_DESIGN_COLLECTION: &str = "/voice-designs";
     const CANONICAL_VOICE_DESIGN_MEMBER: &str = "/voice-designs/{record_id}";
     const CANONICAL_VOICE_DESIGN_AUDIO: &str = "/voice-designs/{record_id}/audio";
@@ -38,6 +39,10 @@ pub fn router() -> Router<AppState> {
         .route(
             CANONICAL_TTS_AUDIO,
             get(handlers::get_text_to_speech_record_audio),
+        )
+        .route(
+            CANONICAL_TTS_CANCEL,
+            axum::routing::post(handlers::cancel_text_to_speech_record),
         )
         .route(
             CANONICAL_VOICE_DESIGN_COLLECTION,

@@ -9,24 +9,58 @@
 
 use candle_core::{DType, Tensor};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::models::shared::telemetry::{
     record_fused_attention_attempt, record_fused_attention_fallback,
     record_fused_attention_masked_attempt, record_fused_attention_masked_fallback,
     record_fused_attention_masked_success, record_fused_attention_success, AttentionFallbackReason,
 };
 
-/// Runtime opt-in for fused attention paths.
+/// Runtime policy for CUDA FlashAttention.
+///
+/// `Auto` retains the historical opportunistic behavior. `Force` is intended
+/// for external CUDA certification and fails instead of silently using the
+/// portable attention graph. The shipping default is capability-gated `Auto`;
+/// `Off` remains the explicit rollback mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlashAttentionMode {
+    Off,
+    Auto,
+    Force,
+}
+
+impl FlashAttentionMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Auto => "auto",
+            Self::Force => "force",
+        }
+    }
+
+    const fn requested(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
+fn parse_flash_attention_mode(value: Option<&str>) -> FlashAttentionMode {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("force") => FlashAttentionMode::Force,
+        Some("auto" | "1" | "true" | "yes" | "on") => FlashAttentionMode::Auto,
+        None => FlashAttentionMode::Auto,
+        Some("off" | "0" | "false" | "no") => FlashAttentionMode::Off,
+        Some(_) => FlashAttentionMode::Off,
+    }
+}
+
+pub fn flash_attention_mode() -> FlashAttentionMode {
+    let value = std::env::var("IZWI_USE_FLASH_ATTENTION").ok();
+    parse_flash_attention_mode(value.as_deref())
+}
+
+/// Compatibility predicate for model diagnostics and existing call sites.
 pub fn flash_attention_requested() -> bool {
-    std::env::var("IZWI_USE_FLASH_ATTENTION")
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
+    flash_attention_mode().requested()
 }
 
 /// Whether the build includes CUDA FlashAttention2 support.
@@ -66,26 +100,35 @@ pub const fn cuda_flash_attention_capabilities() -> CudaFlashAttentionCapabiliti
 pub const fn cuda_flash_attention_head_dim_supported(head_dim: usize) -> bool {
     head_dim > 0
         && head_dim <= CUDA_FLASH_ATTENTION_MAX_HEAD_DIM
-        && head_dim % CUDA_FLASH_ATTENTION_HEAD_DIM_MULTIPLE == 0
+        && head_dim.is_multiple_of(CUDA_FLASH_ATTENTION_HEAD_DIM_MULTIPLE)
 }
 
-#[derive(Debug, Clone, Copy)]
+pub const fn cuda_flash_attention_compute_capability_supported(
+    compute_capability: Option<(u32, u32)>,
+) -> bool {
+    matches!(compute_capability, Some((major, _)) if major >= 8)
+}
+
+fn observed_cuda_compute_capability(device: &candle_core::Device) -> Option<(u32, u32)> {
+    #[cfg(feature = "cuda")]
+    if let candle_core::Device::Cuda(device) = device {
+        return device
+            .cuda_stream()
+            .context()
+            .compute_capability()
+            .ok()
+            .map(|(major, minor)| (major.max(0) as u32, minor.max(0) as u32));
+    }
+    let _ = device;
+    None
+}
+
+#[derive(Debug, Clone, Copy, Default)]
 pub struct CudaFlashAttentionOptions<'a> {
     pub window_size_left: Option<usize>,
     pub window_size_right: Option<usize>,
     pub alibi_slopes: Option<&'a Tensor>,
     pub softcap: Option<f32>,
-}
-
-impl Default for CudaFlashAttentionOptions<'_> {
-    fn default() -> Self {
-        Self {
-            window_size_left: None,
-            window_size_right: None,
-            alibi_slopes: None,
-            softcap: None,
-        }
-    }
 }
 
 fn cuda_flash_attention_window(
@@ -96,13 +139,25 @@ fn cuda_flash_attention_window(
         options.window_size_left,
         options
             .window_size_right
-            .or_else(|| if causal { Some(0) } else { None }),
+            .or(if causal { Some(0) } else { None }),
     )
 }
 
 /// Runtime check used by models that wire Candle's `use_flash_attn` flag.
 pub fn should_enable_flash_attention_v2(device: &candle_core::Device) -> bool {
-    flash_attention_requested() && device.is_cuda() && flash_attention_compiled()
+    flash_attention_requested()
+        && device.is_cuda()
+        && flash_attention_compiled()
+        && cuda_flash_attention_compute_capability_supported(observed_cuda_compute_capability(
+            device,
+        ))
+}
+
+fn forced_cuda_flash_attention_error(reason: AttentionFallbackReason) -> Error {
+    Error::ConfigError(format!(
+        "forced CUDA FlashAttention is unavailable: {}",
+        reason.as_label()
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +174,7 @@ fn should_try_cuda_flash_attention(
     q_dtype: DType,
     k_dtype: DType,
     v_dtype: DType,
+    compute_capability: Option<(u32, u32)>,
 ) -> CudaFlashAttentionDecision {
     if !requested {
         return CudaFlashAttentionDecision::Skip(AttentionFallbackReason::FlashNotRequested);
@@ -134,6 +190,11 @@ fn should_try_cuda_flash_attention(
     }
     if q_dtype != k_dtype || k_dtype != v_dtype {
         return CudaFlashAttentionDecision::Skip(AttentionFallbackReason::FlashDTypeMismatch);
+    }
+    if !cuda_flash_attention_compute_capability_supported(compute_capability) {
+        return CudaFlashAttentionDecision::Skip(
+            AttentionFallbackReason::FlashComputeCapabilityUnsupported,
+        );
     }
     if !cuda_flash_attention_head_dim_supported(head_dim) {
         return CudaFlashAttentionDecision::Skip(AttentionFallbackReason::UnsupportedBackend);
@@ -259,20 +320,23 @@ fn try_fused_self_attention_with_options_and_scale(
     let mut fallback_reason = AttentionFallbackReason::UnsupportedBackend;
 
     if q.device().is_cuda() {
+        let mode = flash_attention_mode();
         let cuda_decision = should_try_cuda_flash_attention(
-            flash_attention_requested(),
+            mode.requested(),
             flash_attention_compiled(),
             masked,
             head_dim,
             q.dtype(),
             k.dtype(),
             v.dtype(),
+            observed_cuda_compute_capability(q.device()),
         );
 
         match cuda_decision {
             CudaFlashAttentionDecision::Try => {
                 #[cfg(feature = "flash-attn")]
                 {
+                    record_flash_layout_copies();
                     let q = q.transpose(1, 2)?.contiguous()?;
                     let k = k.transpose(1, 2)?.contiguous()?;
                     let v = v.transpose(1, 2)?.contiguous()?;
@@ -297,6 +361,14 @@ fn try_fused_self_attention_with_options_and_scale(
             CudaFlashAttentionDecision::Skip(reason) => {
                 fallback_reason = reason;
             }
+        }
+
+        if mode == FlashAttentionMode::Force {
+            record_fused_attention_fallback(fallback_reason);
+            if masked {
+                record_fused_attention_masked_fallback();
+            }
+            return Err(forced_cuda_flash_attention_error(fallback_reason));
         }
     }
 
@@ -340,6 +412,13 @@ fn try_fused_self_attention_with_options_and_scale(
     Ok(None)
 }
 
+#[cfg(feature = "flash-attn")]
+fn record_flash_layout_copies() {
+    for _ in 0..3 {
+        crate::models::shared::telemetry::record_layout_copy();
+    }
+}
+
 /// Try CUDA FlashAttention varlen for packed independent attention spans.
 ///
 /// Input/output layout: `[1, heads, total_seq, head_dim]`. The cumulative
@@ -359,20 +438,25 @@ pub fn try_fused_varlen_self_attention(
     }
 
     record_fused_attention_attempt();
+    let mode = flash_attention_mode();
     let mut fallback_reason = AttentionFallbackReason::UnsupportedBackend;
     if cu_seqlens.len() < 2 || max_seqlen == 0 {
         record_fused_attention_fallback(fallback_reason);
+        if mode == FlashAttentionMode::Force {
+            return Err(forced_cuda_flash_attention_error(fallback_reason));
+        }
         return Ok(None);
     }
 
     let cuda_decision = should_try_cuda_flash_attention(
-        flash_attention_requested(),
+        mode.requested(),
         flash_attention_compiled(),
         false,
         head_dim,
         q.dtype(),
         k.dtype(),
         v.dtype(),
+        observed_cuda_compute_capability(q.device()),
     );
 
     match cuda_decision {
@@ -382,6 +466,7 @@ pub fn try_fused_varlen_self_attention(
                 let device = q.device();
                 let scale = 1.0f32 / (head_dim as f32).sqrt();
                 let flash_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    record_flash_layout_copies();
                     let q = q.squeeze(0)?.transpose(0, 1)?.contiguous()?;
                     let k = k.squeeze(0)?.transpose(0, 1)?.contiguous()?;
                     let v = v.squeeze(0)?.transpose(0, 1)?.contiguous()?;
@@ -409,6 +494,9 @@ pub fn try_fused_varlen_self_attention(
     }
 
     record_fused_attention_fallback(fallback_reason);
+    if mode == FlashAttentionMode::Force {
+        return Err(forced_cuda_flash_attention_error(fallback_reason));
+    }
     Ok(None)
 }
 
@@ -586,7 +674,7 @@ fn metal_sdpa_shape_supported(
     if v_heads != kv_heads {
         return false;
     }
-    if q_heads % kv_heads != 0 {
+    if !q_heads.is_multiple_of(kv_heads) {
         return false;
     }
     if q_seq > k_seq {
@@ -671,15 +759,38 @@ fn dtype_supported_for_flash(dtype: DType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        cuda_flash_attention_capabilities, cuda_flash_attention_head_dim_supported,
-        cuda_flash_attention_window, metal_sdpa_mask_shape_supported, metal_sdpa_shape_supported,
+        cuda_flash_attention_capabilities, cuda_flash_attention_compute_capability_supported,
+        cuda_flash_attention_head_dim_supported, cuda_flash_attention_window,
+        metal_sdpa_mask_shape_supported, metal_sdpa_shape_supported, parse_flash_attention_mode,
         should_try_cuda_flash_attention, should_try_metal_sdpa, should_use_metal_sdpa_f16_cast,
-        CudaFlashAttentionDecision, CudaFlashAttentionOptions, MetalSdpaDecision,
-        CUDA_FLASH_ATTENTION_HEAD_DIM_MULTIPLE, CUDA_FLASH_ATTENTION_MAX_HEAD_DIM,
+        CudaFlashAttentionDecision, CudaFlashAttentionOptions, FlashAttentionMode,
+        MetalSdpaDecision, CUDA_FLASH_ATTENTION_HEAD_DIM_MULTIPLE,
+        CUDA_FLASH_ATTENTION_MAX_HEAD_DIM,
     };
     use crate::models::shared::telemetry::AttentionFallbackReason;
     use candle_core::DType;
     use candle_core::{Device, Tensor};
+
+    #[test]
+    fn flash_attention_mode_defaults_to_auto_with_explicit_rollback() {
+        assert_eq!(parse_flash_attention_mode(None), FlashAttentionMode::Auto);
+        for value in ["off", "0", "false", "no", "invalid"] {
+            assert_eq!(
+                parse_flash_attention_mode(Some(value)),
+                FlashAttentionMode::Off
+            );
+        }
+        for value in ["auto", "1", "true", "yes", "on", " AUTO "] {
+            assert_eq!(
+                parse_flash_attention_mode(Some(value)),
+                FlashAttentionMode::Auto
+            );
+        }
+        assert_eq!(
+            parse_flash_attention_mode(Some(" force ")),
+            FlashAttentionMode::Force
+        );
+    }
 
     #[test]
     fn metal_sdpa_shape_gate_accepts_supported_shapes() {
@@ -739,7 +850,8 @@ mod tests {
                 128,
                 DType::F16,
                 DType::F16,
-                DType::F16
+                DType::F16,
+                Some((8, 0))
             ),
             CudaFlashAttentionDecision::Skip(AttentionFallbackReason::FlashNotRequested)
         );
@@ -751,7 +863,8 @@ mod tests {
                 128,
                 DType::F16,
                 DType::F16,
-                DType::F16
+                DType::F16,
+                Some((8, 0))
             ),
             CudaFlashAttentionDecision::Skip(AttentionFallbackReason::FlashNotCompiled)
         );
@@ -763,7 +876,8 @@ mod tests {
                 128,
                 DType::F16,
                 DType::F16,
-                DType::F16
+                DType::F16,
+                Some((8, 0))
             ),
             CudaFlashAttentionDecision::Skip(AttentionFallbackReason::FlashMaskUnsupported)
         );
@@ -775,7 +889,8 @@ mod tests {
                 128,
                 DType::F32,
                 DType::F32,
-                DType::F32
+                DType::F32,
+                Some((8, 0))
             ),
             CudaFlashAttentionDecision::Skip(AttentionFallbackReason::FlashDTypeUnsupported)
         );
@@ -787,7 +902,8 @@ mod tests {
                 128,
                 DType::F16,
                 DType::BF16,
-                DType::F16
+                DType::F16,
+                Some((8, 0))
             ),
             CudaFlashAttentionDecision::Skip(AttentionFallbackReason::FlashDTypeMismatch)
         );
@@ -799,7 +915,8 @@ mod tests {
                 128,
                 DType::F16,
                 DType::F16,
-                DType::F16
+                DType::F16,
+                Some((8, 0))
             ),
             CudaFlashAttentionDecision::Try
         );
@@ -836,7 +953,8 @@ mod tests {
                 CUDA_FLASH_ATTENTION_MAX_HEAD_DIM,
                 DType::BF16,
                 DType::BF16,
-                DType::BF16
+                DType::BF16,
+                Some((8, 0))
             ),
             CudaFlashAttentionDecision::Try
         );
@@ -848,9 +966,40 @@ mod tests {
                 CUDA_FLASH_ATTENTION_MAX_HEAD_DIM + CUDA_FLASH_ATTENTION_HEAD_DIM_MULTIPLE,
                 DType::F16,
                 DType::F16,
-                DType::F16
+                DType::F16,
+                Some((8, 0))
             ),
             CudaFlashAttentionDecision::Skip(AttentionFallbackReason::UnsupportedBackend)
+        );
+    }
+
+    #[test]
+    fn cuda_flash_attention_requires_observed_sm80_or_newer() {
+        assert!(!cuda_flash_attention_compute_capability_supported(None));
+        assert!(!cuda_flash_attention_compute_capability_supported(Some((
+            7, 5
+        ))));
+        assert!(cuda_flash_attention_compute_capability_supported(Some((
+            8, 0
+        ))));
+        assert!(cuda_flash_attention_compute_capability_supported(Some((
+            9, 0
+        ))));
+
+        assert_eq!(
+            should_try_cuda_flash_attention(
+                true,
+                true,
+                false,
+                128,
+                DType::F16,
+                DType::F16,
+                DType::F16,
+                None,
+            ),
+            CudaFlashAttentionDecision::Skip(
+                AttentionFallbackReason::FlashComputeCapabilityUnsupported
+            )
         );
     }
 

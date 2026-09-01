@@ -5,6 +5,7 @@ on:
     paths:
       - ".github/workflows/backend-truth.yml"
       - ".github/workflows/cuda-flash-attn.yml"
+      - ".github/workflows/cuda-model-evidence.yml"
       - ".github/workflows/release.yml"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -21,6 +22,7 @@ on:
     paths:
       - ".github/workflows/backend-truth.yml"
       - ".github/workflows/cuda-flash-attn.yml"
+      - ".github/workflows/cuda-model-evidence.yml"
       - ".github/workflows/release.yml"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -40,6 +42,37 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  hygiene:
+    name: Repository Hygiene
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Linux dependencies for Tauri
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            ripgrep
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run repository hygiene gates
+        run: scripts/ci/check-backend-truth.sh hygiene
+
   cargo-cpu:
     name: Cargo Validation (CPU)
     runs-on: ubuntu-latest
@@ -69,12 +102,15 @@ jobs:
         run: scripts/ci/check-backend-truth.sh cargo-cpu
 
   cargo-cuda:
-    name: Cargo Validation (CUDA)
+    name: CUDA Compile (Driverless)
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
       CUDA_COMPUTE_CAP: "80"
-      IZWI_CUDA_FEATURES: "cuda,cudnn"
+      # Keep the required PR build on Candle's base CUDA path; the normal
+      # product `cuda` feature includes paged FlashAttention and is exercised
+      # by the longer CUDA workflow.
+      IZWI_CUDA_FEATURES: "cuda-base,cudnn-base"
     container:
       image: nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
 
@@ -100,13 +136,58 @@ jobs:
             --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Run CUDA backend validation
-        run: scripts/ci/check-backend-truth.sh cargo-cuda
+      - name: Compile CUDA harnesses without execution
+        run: scripts/ci/check-backend-truth.sh cargo-cuda-compile
+
+  cuda-device-certification:
+    name: CUDA Device Numerical Certification
+    if: github.event_name != 'pull_request'
+    runs-on: [self-hosted, linux, x64, nvidia]
+    environment: cuda-certification
+    concurrency:
+      group: cuda-device-certification
+      cancel-in-progress: false
+    timeout-minutes: 180
+    env:
+      CUDA_COMPUTE_CAP: "80"
+      IZWI_KV_CERT_ITERATIONS: "30"
+      IZWI_KV_CERT_WARMUP: "5"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run required native and FlashAttention device certification
+        run: scripts/ci/check-backend-truth.sh cargo-cuda-device
+
+      - name: Retain numerical certification records
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kv-cache-cuda-certification-${{ github.sha }}
+          path: target/kv-cache-cuda-certification.jsonl
+          if-no-files-found: error
+          retention-days: 90
 
   cargo-metal:
-    name: Cargo Validation (Metal)
-    runs-on: macos-14
+    name: Cargo Validation (${{ matrix.contract }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            contract: macOS 12-14 CPU fallback
+            command: cargo-metal-fallback
+          - os: macos-15
+            contract: macOS 15+ Metal
+            command: cargo-metal
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
 
     steps:
       - name: Checkout
@@ -122,7 +203,7 @@ jobs:
             . -> target
 
       - name: Run Metal backend validation
-        run: scripts/ci/check-backend-truth.sh cargo-metal
+        run: scripts/ci/check-backend-truth.sh ${{ matrix.command }}
 
   docker-cpu:
     name: Docker Build (CPU)
@@ -145,7 +226,7 @@ jobs:
     env:
       DOCKER_BUILDKIT: "1"
       CUDA_COMPUTE_CAP: "80"
-      IZWI_CUDA_FEATURES: "cuda,cudnn"
+      IZWI_CUDA_FEATURES: "cuda-base,cudnn-base"
 
     steps:
       - name: Checkout

@@ -691,13 +691,16 @@ impl BatchWorkerRunner {
         };
         tokio::pin!(deadline_wait);
         let renewal_interval = Duration::from_millis(
-            u64::try_from(
-                (self.config.lease_duration.as_millis() / 3)
-                    .max(1)
-                    .min(30_000),
-            )
-            .unwrap_or(30_000),
+            u64::try_from((self.config.lease_duration.as_millis() / 3).clamp(1, 30_000))
+                .unwrap_or(30_000),
         );
+        let mut renewal_tick = tokio::time::interval(renewal_interval);
+        renewal_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        renewal_tick.tick().await;
+        let cancellation_poll_interval = self.config.poll_interval.max(Duration::from_millis(10));
+        let mut cancellation_tick = tokio::time::interval(cancellation_poll_interval);
+        cancellation_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        cancellation_tick.tick().await;
         let execution_result = loop {
             tokio::select! {
                 result = &mut execution => {
@@ -715,7 +718,7 @@ impl BatchWorkerRunner {
                         StageCancellationReason::ExecutionDeadline,
                     );
                 },
-                _ = tokio::time::sleep(renewal_interval) => {
+                _ = renewal_tick.tick() => {
                     let renewed = self.store.renew_stage_lease(
                         &lease,
                         self.config.lease_duration.as_millis() as u64,
@@ -730,6 +733,14 @@ impl BatchWorkerRunner {
                         "running",
                         Some((claimed.job.id.clone(), claimed.stage.id.clone())),
                     ).await?;
+                },
+                _ = cancellation_tick.tick() => {
+                    if !self.store.stage_lease_is_active(&lease).await? {
+                        cancellation.cancel(StageCancellationReason::LeaseLost);
+                        break StageExecutionResolution::Cancelled(
+                            StageCancellationReason::LeaseLost,
+                        );
+                    }
                 }
             }
         };
@@ -1517,8 +1528,11 @@ mod tests {
             .await
             .expect("cancel")
             .expect("cancelled job");
-        release.notify_one();
-        assert!(run.await.expect("runner join").expect("run once"));
+        assert!(tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("cancelled execution should stop without executor cooperation")
+            .expect("runner join")
+            .expect("run once"));
 
         let stage = store
             .get_stage(&stage_id)

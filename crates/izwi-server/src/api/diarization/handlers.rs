@@ -768,10 +768,12 @@ async fn generate_diarization_summary(
         parse_chat_model_variant(Some(DEFAULT_DIARIZATION_SUMMARY_MODEL)).map_err(|err| {
             format!("Invalid summary model '{DEFAULT_DIARIZATION_SUMMARY_MODEL}': {err}")
         })?;
-    let mut params = GenerationParams::default();
-    params.max_tokens = DEFAULT_DIARIZATION_SUMMARY_MAX_TOKENS;
-    params.temperature = 0.2;
-    params.top_p = 0.9;
+    let params = GenerationParams {
+        max_tokens: DEFAULT_DIARIZATION_SUMMARY_MAX_TOKENS,
+        temperature: 0.2,
+        top_p: 0.9,
+        ..Default::default()
+    };
 
     let generation = runtime
         .chat_generate_with_runtime_context(
@@ -867,11 +869,7 @@ fn strip_think_sections(input: &str) -> String {
     let open_tag = "<think>";
     let close_tag = "</think>";
 
-    loop {
-        let Some(start) = out.find(open_tag) else {
-            break;
-        };
-
+    while let Some(start) = out.find(open_tag) {
         if let Some(end_rel) = out[start + open_tag.len()..].find(close_tag) {
             let end = start + open_tag.len() + end_rel;
             let mut next = String::with_capacity(out.len());
@@ -1161,6 +1159,10 @@ fn audio_response(audio: StoredDiarizationAudio) -> Response {
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
+fn map_store_error(err: anyhow::Error) -> ApiError {
+    ApiError::internal(format!("Diarization storage error: {err}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1361,8 +1363,4 @@ mod tests {
         let error = update.error.expect("error should be populated");
         assert_eq!(error.len(), 320);
     }
-}
-
-fn map_store_error(err: anyhow::Error) -> ApiError {
-    ApiError::internal(format!("Diarization storage error: {err}"))
 }

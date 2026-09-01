@@ -21,13 +21,15 @@ If another page says something different, this page should win.
 
 | Surface | OS / Hardware | Backend status | Support level | Notes |
 |---------|----------------|----------------|---------------|-------|
-| **Desktop app from GitHub Releases** | macOS on Apple Silicon | `metal` | Stable | Desktop and terminal binaries bundled in the macOS release can use Metal acceleration. |
+| **Desktop app from GitHub Releases** | Apple Silicon, macOS 15+ | `metal` | Stable | The release selects Metal automatically when the runtime is eligible. |
+| **Desktop app from GitHub Releases** | macOS 12-14 | `cpu` | Stable | The same release remains launchable and deliberately avoids Candle's Metal constructor. |
 | **Desktop app from GitHub Releases** | Linux x86_64 | `cpu` | Stable | Native Linux installers are CPU-only and do not bundle CUDA runtime libraries. |
 | **Desktop app from GitHub Releases** | Windows x86_64 | `cpu` | Stable | Native Windows installers are CPU-only and do not bundle CUDA runtime DLLs. |
 | **Terminal bundle from GitHub Releases** | Linux x86_64 | `cpu` | Stable | Linux terminal tarballs contain the public CPU-only CLI, server, and desktop shell binaries. |
-| **Terminal bundle from GitHub Releases** | macOS Apple Silicon | `metal` | Stable | Metal is compiled into the macOS build path. |
+| **Terminal bundle from GitHub Releases** | Apple Silicon, macOS 15+ | `metal` | Stable | Metal is compiled into the macOS bundle and runtime-gated. |
+| **Terminal bundle from GitHub Releases** | macOS 12-14 | `cpu` | Stable | Metal requests fall back to CPU before device construction. |
 | **Terminal bundle from GitHub Releases** | Windows x86_64 | `cpu` | Stable | Windows terminal zips contain the public CPU-only CLI, server, and desktop shell binaries. |
-| **Source build** | macOS Apple Silicon with `--features metal` | `metal` | Stable | Recommended GPU path on macOS. |
+| **Source build** | Apple Silicon, macOS 15+ with `--features metal` | `metal` | Stable | Recommended GPU path on supported macOS runtimes. |
 | **Source build** | Linux x86_64 with `--features cuda` and CUDA toolkit installed | `cuda` | Supported | Useful for development, custom builds, and debugging outside Docker. Requires a compatible NVIDIA driver/toolkit environment. |
 | **Source build** | Windows with `--features cuda` and CUDA toolkit installed | `cuda` | Preview | Useful for development and custom validation. Native Windows release artifacts remain CPU-only. |
 | **Docker `production` target** | Linux x86_64 | `cpu` | Stable | CPU-only container image. |
@@ -86,7 +88,149 @@ and realtime route families. Detailed preview behavior is documented in the
 - Release installers do not replace the host NVIDIA driver. CUDA acceleration requires a compatible NVIDIA driver and CUDA-capable GPU.
 - Source builds still require the CUDA toolkit and remain useful for development or fallback validation.
 - The Docker CUDA image/profile is the CUDA distribution path for NVIDIA Linux hosts and may require `CUDA_COMPUTE_CAP` when built on a machine without `nvidia-smi`.
-- On macOS, the recommended GPU path is Metal, not CUDA.
+- On macOS 15+, the recommended GPU path is Metal, not CUDA. macOS 12-14 are CPU-only.
+
+### Qwen3.8 CUDA weight residency
+
+`Qwen3.8-27B-FP8` keeps its official block-scaled FP8 checkpoint as the source
+artifact, but the current CUDA path does not execute native FP8 matrix
+multiplication. It applies each projection's `weight_scale_inv`, requantizes
+the projection to resident Candle Q8_0 weights, and retains source-dense tensors
+as BF16. Runtime diagnostics identify this as
+`resident_representation: q8_0_requantized_projections_with_dense_bf16` and
+`fp8_execution_mode: q8_0_compressed_fallback`.
+
+This compressed fallback is designed to fit 40/48 GB-class CUDA devices with a
+resource-fitted context, subject to actual free VRAM and allocator headroom. It
+must not be described as native FP8 execution or as CUDA-certified until the
+corresponding NVIDIA evidence is retained. The earlier fully expanded BF16
+weight plan required an 80 GB-class device; CPU and Metal continue to use their
+expanded F32 and F16 representations respectively.
+
+### Qwen3.8 multi-token prediction defaults
+
+Native Qwen3.8 MTP is enabled by default with one draft token on CPU, Metal,
+and CUDA. No environment variables are required for that default. Set
+`IZWI_QWEN38_MTP=0` and restart or reload the model to disable MTP. The
+`IZWI_QWEN38_MTP_DRAFT_TOKENS` setting controls proposal depth rather than
+enablement; its default is `1`, and supported explicit values are `1` through
+`3`.
+
+---
+
+## Managed Inference-State Support
+
+This matrix describes ownership and provider classification in the current
+source tree. It is narrower than general model availability: a model can be
+available while a particular cache provider or hardware cell remains
+uncertified.
+
+| Backend | ABI-v2 physical state | Paged provider class | Current boundary |
+|---|---|---|---|
+| **CPU** | Supported | Portable | Dense F32/F16/BF16 KV policy; direct paged write, prefill, decode, zero, and copy. |
+| **Metal** | Supported when built with `metal` | Portable | Direct native Metal operations are intentionally classified Portable until a separately measured optimized cell is promoted. CPU and Metal share one unified-memory authority. |
+| **CUDA (`cuda-base`)** | Supported when built with CUDA | Portable | Native direct-page provider. CUDA compilation and device execution are separate release gates. |
+| **CUDA (`cuda` / `flash-attn`)** | Supported when built with CUDA and FlashAttention | Portable, or Optimized-eligible per resolved cell | Optimized eligibility requires F16/BF16, full attention, page size divisible by 32, zero first-page offsets, and equal K/V head dimensions divisible by 8 and no larger than 512. Runtime and performance certification require retained NVIDIA evidence. Ineligible cells remain Portable. |
+
+The runtime fails model loading when a required ABI-v2 operation set or exact
+model/capability route is incomplete. Source/build eligibility never upgrades
+a route to runtime-validated or performance-certified evidence. The runtime
+does not silently switch back to a model-owned cache.
+
+### State topology by model family
+
+The load path currently publishes ABI-v2 state as follows:
+
+| Model family / route | ABI-v2 topology | Provider-promotion status |
+|---|---|---|
+| **Qwen3 chat** | Retained paged KV | Portable route validated; eligible CUDA cells remain unverified until NVIDIA evidence is retained |
+| **Qwen3.5 chat** | Composite retained paged/ring state | Portable route validated; eligible CUDA paged cells remain unverified until NVIDIA evidence is retained |
+| **Qwen3.8 chat (`Qwen38Chat`)** | Composite retained paged/tensor state under an independent family contract | Separate conformance and backend evidence required; Qwen3.5 results do not certify this family |
+| **Gemma 3 chat** | Retained paged KV with model-declared attention semantics | Portable route validated; eligible CUDA cells remain unverified until NVIDIA evidence is retained |
+| **Qwen3 ASR** | Retained paged state plus bounded invocation workspace | Portable route validated; eligible CUDA cells remain unverified until NVIDIA evidence is retained |
+| **Qwen3 TTS** | Retained paged predictor state plus bounded invocation state/workspace | Portable route validated; eligible CUDA cells remain unverified until NVIDIA evidence is retained |
+| **LFM2 chat** | Retained paged attention plus transactional ShortConv ring state | Portable route validated; eligible accelerator cells remain unverified until hardware evidence is retained |
+| **LFM2.5 Audio** | Bounded invocation-scoped paged/ring/composite state | ABI-v2 physical ownership; no Optimized attestation |
+| **Whisper, Parakeet, VibeVoice ASR, Granite Speech, Voxtral ASR** | Bounded invocation-scoped physical state; Granite publishes both ASR routes | ABI-v2 physical ownership; no Optimized attestation |
+| **Nemotron ASR** | Offline bounded invocation state and retained realtime tensor state | ABI-v2 physical ownership; no Optimized attestation |
+| **VibeVoice, Fish S2, Voxtral TTS** | Bounded invocation-scoped physical state | ABI-v2 physical ownership; no Optimized attestation |
+| **Sortformer diarization** | Bounded invocation-scoped physical state | ABI-v2 physical ownership; no Optimized attestation |
+| **Stateless/catalog-only routes** | No retained mutable state, or no loaded state publication | No cache provider applies |
+
+“ABI-v2 physical ownership” is not a claim of complete model-quality or
+hardware performance certification. The exact model revision, capability,
+backend, dtype, page geometry, attention semantics, and build feature cell must
+pass its release lane.
+
+### CUDA context policy
+
+CUDA uses the native context reported by the loaded chat checkpoint. CPU and
+Metal retain the configured sequence limit (4,096 tokens by default). The
+current native CUDA ceilings are:
+
+| Model | CUDA ceiling | Source |
+|---|---:|---|
+| Qwen3 chat | 40,960 tokens | [Official Qwen3 config](https://huggingface.co/Qwen/Qwen3-4B/blob/main/config.json) |
+| Qwen3.5 chat | 262,144 tokens | [Official Qwen3.5 config](https://huggingface.co/Qwen/Qwen3.5-4B/blob/main/config.json) |
+| Qwen3.8 chat | 262,144 logical tokens; effective context is resource-fitted | [Pinned official Qwen3.8 config](https://huggingface.co/Qwen/Qwen3.8-27B-FP8/blob/017b9c7af6b5689d5dd426a76e0bc077eb5ca20a/config.json) |
+| LFM2.5 chat | 128,000 tokens | [Official LFM2.5 config](https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct/blob/main/config.json) |
+| Gemma 3 1B / 4B | 32,768 / 131,072 tokens | [Google Gemma 3 model card](https://ai.google.dev/gemma/docs/core/model_card_3) |
+
+Optional YaRN extensions are not included: the local adapters do not implement
+their scaling parameters. Qwen3.8 fits its effective context to remaining
+resources without changing the 262,144-token logical maximum. Other CUDA chat
+routes reserve their selected paged KV capacity before publishing a model as
+ready. Explicit context requests still fail when the requested state cannot
+fit; the runtime does not overcommit VRAM.
+
+For audio generation, automatic output budgets remain bounded. Explicit CUDA
+requests can use the 32,768-token LFM2.5 Audio and Fish S2 contexts; Voxtral TTS
+accepts the upstream deployment ceiling of 2,048 output frames. CPU and Metal
+retain their existing limits. VibeVoice ASR uses its documented 60-minute
+single-pass window on CUDA by default; `IZWI_VIBEVOICE_ASR_CUDA_MAX_AUDIO_SECS`
+can lower that window but cannot raise it above 60 minutes. See the
+[LFM2.5 Audio model card](https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B),
+[Fish S2 config](https://huggingface.co/fishaudio/s2-pro/blob/main/config.json),
+[Voxtral deployment](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/deploy/voxtral_tts.yaml),
+and [VibeVoice ASR model card](https://huggingface.co/microsoft/VibeVoice-ASR).
+
+Qwen3 ASR accepts up to 1,200 seconds per CUDA transcription chunk, while the
+forced-aligner route accepts up to 180 seconds and rejects longer inputs
+explicitly. CPU and Metal retain the checkpoint preprocessor window. Neither
+CUDA route silently truncates audio at the portable preprocessor limit.
+
+Voxtral Realtime CUDA offline decoding uses the loaded model position range
+(131,072 tokens in the current checkpoint) instead of the portable 1,024-frame
+service limit. Its physical paged cache rotates the 8,192-token attention
+window with one spare page; inputs beyond the loaded position range fail
+explicitly instead of silently dropping the tail.
+
+Architectural processing windows are not expanded. Whisper still processes
+30-second encoder windows, Kokoro still uses at most 510 phonemes per model
+chunk, and streaming ASR/diarization families retain their bounded working
+buffers while the runtime orchestrates longer inputs.
+
+### Cache policy support
+
+| Policy | Status | Notes |
+|---|---|---|
+| Dense `float16`, `bfloat16`, `float32` KV | Supported by configuration boundary | Backend/model negotiation can still reject an exact incompatible cell. |
+| `int8` / `q4` KV | Unsupported | Parsed for migration diagnostics, then rejected before model readiness. |
+| CUDA FP8 E4M3 KV | Experimental, blocked | Kernel experiments exist, but scaled storage, scale-aware mutation/accounting, and NVIDIA evidence are incomplete. Arena and direct dispatch both fail closed to dense KV. |
+| Prefix reuse | Opt-in | Disabled by default; requires a non-empty isolation namespace and an independently bounded page budget. |
+| Optimized-provider demotion | Supported | Set `IZWI_KV_DISABLE_OPTIMIZED_PROVIDER=1`; this can only demote to the validated Portable route. |
+| Tiered/offloaded or distributed KV | Not supported | No production ownership or eviction contract is published for these modes. |
+
+Eligible CUDA routes automatically use resident block-table metadata,
+admission-grown physical backing, device/shape-keyed attention selection,
+bounded sampling readback, VRAM-tiered continuous batches, and stable one-pass
+decode graph buckets. Graph keys include exact K/V and metadata tensor
+identities, geometry, dtype, scale, and softcap. Partitioned decode, FP8
+storage, unobserved/pre-Ampere devices, and any capture/replay failure retain
+eager native decode. CPU and Metal do not enter this policy.
+
+For configuration, counters, benchmarks, and rollback, see
+[KV Cache Operations](/kv-cache-operations).
 
 ---
 
@@ -94,10 +238,11 @@ and realtime route families. Detailed preview behavior is documented in the
 
 Use the following expectations when validating a host:
 
-- **macOS Apple Silicon:** build or install a Metal-capable binary and run with `--backend metal` or `IZWI_BACKEND=metal`.
+- **Apple Silicon, macOS 15+:** build or install a Metal-capable binary and run with `--backend metal` or `IZWI_BACKEND=metal`.
+- **macOS 12-14:** run with `--backend cpu`; `auto` and explicit `metal` requests fall back to CPU.
 - **Linux/Windows GitHub Release:** run `izwi serve --backend cpu`, then `izwi status --detailed`.
-- **Docker CUDA on NVIDIA Linux hosts:** run `docker compose --profile cuda up`, then confirm the container selects CUDA through `/v1/health` or `izwi status --detailed` from a matching client environment.
-- **Linux/Windows source build for CUDA:** build with `cargo build --release --features cuda`, then run with `--backend cuda` or `IZWI_BACKEND=cuda`. Whisper CUDA experiments can additionally enable Candle-backed features such as `flash-attn` or `cudnn` when the matching NVIDIA libraries are installed.
+- **Docker CUDA on NVIDIA Linux hosts:** run `docker compose --profile cuda up`, then confirm the container selects CUDA through `/v1/health` or `izwi status --detailed` from a matching client environment. Eligible Candle FlashAttention, Qwen3/Qwen3.5 RoPE, and Gemma RMSNorm CUDA routes activate automatically; their environment variables remain explicit rollback switches. Qwen3.8 is an independently gated family and must report its own execution path and evidence.
+- **Linux/Windows source build for CUDA:** build with `cargo build --release --features cuda`, then run with `--backend cuda` or `IZWI_BACKEND=cuda`. The `cuda` wrapper includes Candle FlashAttention, while `cudnn` additionally enables matching Candle/cuDNN convolution paths.
 
 ---
 

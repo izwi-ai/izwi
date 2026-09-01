@@ -8,8 +8,10 @@
 use candle_core::{DType, Device};
 use std::any::Any;
 use std::borrow::Cow;
+use std::collections::HashMap;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use tracing::{debug, info, warn};
 
 use super::types::{BackendKind, BackendPreference};
@@ -65,6 +67,10 @@ pub struct DeviceCapabilities {
     pub recommended_batch_size: usize,
     /// Available memory in bytes (if detectable)
     pub available_memory_bytes: Option<usize>,
+    /// Total physical memory for the selected CUDA device.
+    pub cuda_total_memory_bytes: Option<usize>,
+    /// Ordinal used to select the CUDA device.
+    pub cuda_device_ordinal: Option<usize>,
     /// CUDA compute capability for NVIDIA devices
     pub cuda_compute_capability: Option<(u32, u32)>,
     /// CUDA device name when reported by the runtime
@@ -81,24 +87,21 @@ impl Default for DeviceCapabilities {
             has_unified_memory: false,
             recommended_batch_size: 1,
             available_memory_bytes: None,
+            cuda_total_memory_bytes: None,
+            cuda_device_ordinal: None,
             cuda_compute_capability: None,
             cuda_device_name: None,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DTypeSelectionPolicy {
+    #[default]
     Default,
     PreferF32,
     PreferF16,
     PreferBf16,
-}
-
-impl Default for DTypeSelectionPolicy {
-    fn default() -> Self {
-        Self::Default
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -367,7 +370,9 @@ impl DeviceProfile {
                 reason: "CPU default dtype is F32".into(),
             },
             DeviceKind::Metal => DTypeSelection {
-                dtype: if request.model_family == Some(ModelFamily::VoxtralTts) {
+                dtype: if request.model_family == Some(ModelFamily::VibeVoiceTts) {
+                    DType::F16
+                } else if request.model_family == Some(ModelFamily::VoxtralTts) {
                     DType::F32
                 } else if request.model_family == Some(ModelFamily::Voxtral)
                     && request.checkpoint_dtype != Some(DType::F32)
@@ -376,7 +381,9 @@ impl DeviceProfile {
                 } else {
                     DType::F32
                 },
-                reason: if request.model_family == Some(ModelFamily::VoxtralTts) {
+                reason: if request.model_family == Some(ModelFamily::VibeVoiceTts) {
+                    "VibeVoice TTS Metal policy uses F16 to bound dense model residency".into()
+                } else if request.model_family == Some(ModelFamily::VoxtralTts) {
                     "Voxtral TTS Metal policy keeps F32 across LM, acoustic transformer, and codec until lower-precision kernels are proven".into()
                 } else if request.model_family == Some(ModelFamily::Voxtral)
                     && request.checkpoint_dtype != Some(DType::F32)
@@ -570,6 +577,24 @@ impl DeviceProfile {
 pub struct DeviceSelector;
 
 static METAL_PROBE_PANICKED: AtomicBool = AtomicBool::new(false);
+static METAL_DEVICES: OnceLock<Mutex<HashMap<usize, Option<Device>>>> = OnceLock::new();
+
+/// Whether this process may initialize Candle's Metal backend safely.
+///
+/// Candle 0.11 constructs a residency-set descriptor introduced in macOS 15.
+/// Calling into that path on older releases panics before Candle can return an
+/// error, so Izwi deliberately keeps those systems on the CPU backend.
+pub fn metal_runtime_supported() -> bool {
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    {
+        objc2::available!(macos = 15.0)
+    }
+
+    #[cfg(not(all(feature = "metal", target_os = "macos")))]
+    {
+        false
+    }
+}
 
 fn panic_payload_to_string(payload: &(dyn Any + Send)) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {
@@ -581,25 +606,53 @@ fn panic_payload_to_string(payload: &(dyn Any + Send)) -> String {
     "unknown panic payload".to_string()
 }
 
+fn probe_metal_device_for_runtime<F>(runtime_supported: bool, probe: F) -> Option<Device>
+where
+    F: FnOnce() -> candle_core::Result<Device>,
+{
+    if !runtime_supported || METAL_PROBE_PANICKED.load(Ordering::Relaxed) {
+        return None;
+    }
+
+    match catch_unwind(AssertUnwindSafe(probe)) {
+        Ok(Ok(device)) if device.is_metal() => Some(device),
+        Ok(Ok(_)) | Ok(Err(_)) => None,
+        Err(payload) => {
+            METAL_PROBE_PANICKED.store(true, Ordering::Relaxed);
+            warn!(
+                "Metal probe panicked; disabling Metal for this process: {}",
+                panic_payload_to_string(payload.as_ref())
+            );
+            None
+        }
+    }
+}
+
+/// Returns a Metal device only when the current runtime satisfies Izwi's
+/// macOS 15+ Metal contract and Candle initializes it without error. Candle's
+/// default-device registry is not safe to initialize concurrently, so devices
+/// are constructed once per ordinal and the shared handle is cloned thereafter.
+pub fn metal_device_if_available(ordinal: usize) -> Option<Device> {
+    if !metal_runtime_supported() {
+        return None;
+    }
+
+    let devices = METAL_DEVICES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut devices = devices
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(device) = devices.get(&ordinal) {
+        return device.clone();
+    }
+
+    let device = probe_metal_device_for_runtime(true, || Device::new_metal(ordinal));
+    devices.insert(ordinal, device.clone());
+    device
+}
+
 impl DeviceSelector {
     fn try_metal() -> Option<DeviceProfile> {
-        if METAL_PROBE_PANICKED.load(Ordering::Relaxed) {
-            return None;
-        }
-
-        let device = match std::panic::catch_unwind(|| Device::metal_if_available(0)) {
-            Ok(Ok(device)) => device,
-            Ok(Err(_)) => return None,
-            Err(payload) => {
-                METAL_PROBE_PANICKED.store(true, Ordering::Relaxed);
-                warn!(
-                    "Metal probe panicked; disabling Metal for this process: {}",
-                    panic_payload_to_string(payload.as_ref())
-                );
-                return None;
-            }
-        };
-        if device.is_metal() {
+        if let Some(device) = metal_device_if_available(0) {
             // Initialize memory pool for Metal
             let memory_pool = metal_pool_for_device(&device);
 
@@ -618,6 +671,8 @@ impl DeviceSelector {
                     has_unified_memory: true, // Apple Silicon has unified memory
                     recommended_batch_size: 4, // Conservative for unified memory
                     available_memory_bytes: None, // Could be detected via system APIs
+                    cuda_total_memory_bytes: None,
+                    cuda_device_ordinal: None,
                     cuda_compute_capability: None,
                     cuda_device_name: None,
                 },
@@ -629,17 +684,18 @@ impl DeviceSelector {
     }
 
     fn try_cuda() -> Option<DeviceProfile> {
-        let device = std::panic::catch_unwind(|| Device::cuda_if_available(0))
+        let ordinal = configured_cuda_ordinal();
+        let device = std::panic::catch_unwind(|| Device::cuda_if_available(ordinal))
             .ok()?
             .ok()?;
         if device.is_cuda() {
-            let cuda_capabilities = Self::detect_cuda_capabilities(0);
+            let cuda_capabilities = Self::detect_cuda_capabilities(ordinal);
             let supports_bf16 = cuda_capabilities
                 .compute_capability
                 .is_some_and(cuda_compute_capability_supports_bf16);
             let supports_f16 = cuda_capabilities
                 .compute_capability
-                .map_or(true, cuda_compute_capability_supports_f16);
+                .is_none_or(cuda_compute_capability_supports_f16);
             let supports_int8_tensor_cores = cuda_capabilities
                 .compute_capability
                 .is_some_and(cuda_compute_capability_supports_int8_tensor_cores);
@@ -654,7 +710,9 @@ impl DeviceSelector {
                     supports_int8_tensor_cores,
                     has_unified_memory: false,
                     recommended_batch_size: 8, // CUDA can handle larger batches
-                    available_memory_bytes: cuda_capabilities.total_memory_bytes,
+                    available_memory_bytes: cuda_capabilities.free_memory_bytes,
+                    cuda_total_memory_bytes: cuda_capabilities.total_memory_bytes,
+                    cuda_device_ordinal: Some(ordinal),
                     cuda_compute_capability: cuda_capabilities.compute_capability,
                     cuda_device_name: cuda_capabilities.device_name,
                 },
@@ -727,6 +785,7 @@ impl DeviceSelector {
 #[derive(Debug, Clone, Default)]
 struct CudaProbe {
     compute_capability: Option<(u32, u32)>,
+    free_memory_bytes: Option<usize>,
     total_memory_bytes: Option<usize>,
     device_name: Option<String>,
 }
@@ -741,6 +800,26 @@ pub fn parse_dtype_name(raw: &str) -> Option<DType> {
         "float16" | "f16" | "fp16" | "half" => Some(DType::F16),
         "float32" | "float" | "f32" | "fp32" => Some(DType::F32),
         _ => None,
+    }
+}
+
+fn parse_cuda_ordinal(raw: Option<&str>) -> Option<usize> {
+    raw.map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .and_then(|raw| raw.parse::<usize>().ok())
+}
+
+fn configured_cuda_ordinal() -> usize {
+    let raw = std::env::var("IZWI_CUDA_DEVICE_ORDINAL").ok();
+    match raw.as_deref() {
+        None => 0,
+        Some(value) => match parse_cuda_ordinal(Some(value)) {
+            Some(ordinal) => ordinal,
+            None => {
+                warn!("Ignoring invalid IZWI_CUDA_DEVICE_ORDINAL={value:?}; using CUDA device 0");
+                0
+            }
+        },
     }
 }
 
@@ -766,11 +845,17 @@ fn detect_cuda_capabilities(ordinal: usize) -> CudaProbe {
                 .compute_capability()
                 .ok()
                 .map(|(major, minor)| (major.max(0) as u32, minor.max(0) as u32));
-            let total_memory_bytes = unsafe { result::device::total_mem(context.cu_device()).ok() };
+            let (free_memory_bytes, total_memory_bytes) = result::mem_get_info()
+                .map(|(free, total)| (Some(free), Some(total)))
+                .unwrap_or_else(|_| {
+                    let total = unsafe { result::device::total_mem(context.cu_device()).ok() };
+                    (None, total)
+                });
             let device_name = context.name().ok().map(|name| name.trim().to_string());
 
             CudaProbe {
                 compute_capability,
+                free_memory_bytes,
                 total_memory_bytes,
                 device_name: device_name.filter(|name| !name.is_empty()),
             }
@@ -790,6 +875,41 @@ fn detect_cuda_capabilities(_ordinal: usize) -> CudaProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsupported_metal_runtime_never_invokes_candle_probe() {
+        let invoked = AtomicBool::new(false);
+        let device = probe_metal_device_for_runtime(false, || {
+            invoked.store(true, Ordering::Relaxed);
+            Ok(Device::Cpu)
+        });
+
+        assert!(device.is_none());
+        assert!(!invoked.load(Ordering::Relaxed));
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn pre_macos15_auto_and_explicit_metal_preferences_fall_back_to_cpu() {
+        if metal_runtime_supported() {
+            return;
+        }
+
+        for preference in [BackendPreference::Auto, BackendPreference::Metal] {
+            let profile = DeviceSelector::detect_for_preference(preference).unwrap();
+            assert_eq!(profile.kind, DeviceKind::Cpu);
+            assert!(profile.device.is_cpu());
+        }
+    }
+
+    #[test]
+    fn cuda_ordinal_parser_is_deterministic() {
+        assert_eq!(parse_cuda_ordinal(None), None);
+        assert_eq!(parse_cuda_ordinal(Some("")), None);
+        assert_eq!(parse_cuda_ordinal(Some(" 2 ")), Some(2));
+        assert_eq!(parse_cuda_ordinal(Some("-1")), None);
+        assert_eq!(parse_cuda_ordinal(Some("gpu0")), None);
+    }
 
     #[test]
     fn test_detect_with_cpu_preference_returns_cpu() {
@@ -1160,7 +1280,7 @@ mod tests {
     }
 
     #[test]
-    fn cpu_and_metal_vibevoice_model_dtype_stays_f32() {
+    fn vibevoice_tts_uses_f16_on_metal_while_cpu_and_asr_stay_f32() {
         let cpu_profile = DeviceProfile {
             device: Device::Cpu,
             kind: DeviceKind::Cpu,
@@ -1179,22 +1299,18 @@ mod tests {
             memory_pool: None,
         };
 
-        for family in [ModelFamily::VibeVoiceTts, ModelFamily::VibeVoiceAsr] {
-            assert_eq!(cpu_profile.select_model_dtype(family, None), DType::F32);
-            assert_eq!(
-                cpu_profile
-                    .select_model_dtype_checked(family, Some("bf16"), "VibeVoice")
-                    .unwrap(),
-                DType::F32
-            );
-            assert_eq!(metal_profile.select_model_dtype(family, None), DType::F32);
-            assert_eq!(
-                metal_profile
-                    .select_model_dtype_checked(family, Some("f16"), "VibeVoice")
-                    .unwrap(),
-                DType::F32
-            );
-        }
+        assert_eq!(
+            cpu_profile.select_model_dtype(ModelFamily::VibeVoiceTts, None),
+            DType::F32
+        );
+        assert_eq!(
+            metal_profile.select_model_dtype(ModelFamily::VibeVoiceTts, None),
+            DType::F16
+        );
+        assert_eq!(
+            metal_profile.select_model_dtype(ModelFamily::VibeVoiceAsr, None),
+            DType::F32
+        );
     }
 
     #[test]

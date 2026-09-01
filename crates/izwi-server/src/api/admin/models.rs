@@ -10,6 +10,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::pin::Pin;
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{info, warn};
 use utoipa::ToSchema;
@@ -18,7 +19,8 @@ use crate::error::ApiError;
 use crate::state::AppState;
 use izwi_core::model::download::DownloadState;
 use izwi_core::{
-    parse_model_variant, ModelInfo, ModelStatus, ModelVariant, SpeechModelCapabilities,
+    parse_model_variant, ChatModelCapabilities, ChatReasoningEffort, ModelInfo, ModelStatus,
+    ModelVariant, SpeechModelCapabilities,
 };
 
 /// Response for model list
@@ -41,9 +43,11 @@ pub struct AdminModelInfo {
     pub modalities: Vec<String>,
     pub route_capabilities: AdminModelRouteCapabilities,
     pub batch_capabilities: AdminModelBatchCapabilities,
+    pub chat_capabilities: Option<AdminChatModelCapabilities>,
     pub speech_capabilities: Option<AdminSpeechModelCapabilities>,
     pub cuda_support: serde_json::Value,
     pub cuda_quantization: serde_json::Value,
+    pub cuda_operators: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_diagnostics: Option<serde_json::Value>,
 }
@@ -57,6 +61,15 @@ pub struct AdminSpeechModelCapabilities {
     pub supports_streaming: bool,
     pub supports_speed_control: bool,
     pub supports_auto_long_form: bool,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AdminChatModelCapabilities {
+    pub supports_thinking: bool,
+    pub default_thinking_enabled: bool,
+    pub reasoning_efforts: Vec<String>,
+    pub default_reasoning_effort: Option<String>,
+    pub supports_preserve_thinking: bool,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -136,6 +149,7 @@ impl AdminModelInfo {
             modalities: model_modalities(variant),
             route_capabilities: AdminModelRouteCapabilities::from_variant(variant),
             batch_capabilities: AdminModelBatchCapabilities::from_variant(variant),
+            chat_capabilities: info.chat_capabilities.map(AdminChatModelCapabilities::from),
             speech_capabilities: info
                 .speech_capabilities
                 .map(AdminSpeechModelCapabilities::from),
@@ -143,8 +157,38 @@ impl AdminModelInfo {
                 .unwrap_or(serde_json::Value::Null),
             cuda_quantization: serde_json::to_value(info.cuda_quantization)
                 .unwrap_or(serde_json::Value::Null),
+            cuda_operators: serde_json::to_value(variant.cuda_operator_capabilities())
+                .unwrap_or(serde_json::Value::Null),
             runtime_diagnostics,
         }
+    }
+}
+
+impl From<ChatModelCapabilities> for AdminChatModelCapabilities {
+    fn from(capabilities: ChatModelCapabilities) -> Self {
+        Self {
+            supports_thinking: capabilities.supports_thinking,
+            default_thinking_enabled: capabilities.default_thinking_enabled,
+            reasoning_efforts: capabilities
+                .reasoning_efforts
+                .into_iter()
+                .map(reasoning_effort_as_str)
+                .map(str::to_string)
+                .collect(),
+            default_reasoning_effort: capabilities
+                .default_reasoning_effort
+                .map(reasoning_effort_as_str)
+                .map(str::to_string),
+            supports_preserve_thinking: capabilities.supports_preserve_thinking,
+        }
+    }
+}
+
+const fn reasoning_effort_as_str(effort: ChatReasoningEffort) -> &'static str {
+    match effort {
+        ChatReasoningEffort::Xhigh => "xhigh",
+        ChatReasoningEffort::Medium => "medium",
+        ChatReasoningEffort::Low => "low",
     }
 }
 
@@ -416,11 +460,20 @@ pub async fn unload_model(
     let variant = parse_variant(&variant)?;
     info!("Unloading model: {}", variant);
 
-    state.runtime.unload_model(variant).await?;
+    let cancelled_jobs =
+        crate::api::jobs::cancel_active_audio_jobs_for_model(&state, variant).await?;
+    unload_after_audio_job_cancellation(&state, variant, cancelled_jobs).await?;
 
     Ok(Json(DownloadResponse {
         status: "unloaded",
-        message: format!("Model {} unloaded successfully", variant),
+        message: if cancelled_jobs == 0 {
+            format!("Model {} unloaded successfully", variant)
+        } else {
+            format!(
+                "Model {} unloaded successfully after cancelling {} audio job(s)",
+                variant, cancelled_jobs
+            )
+        },
     }))
 }
 
@@ -432,8 +485,11 @@ pub async fn delete_model(
     let variant = parse_variant(&variant)?;
     info!("Deleting model: {}", variant);
 
-    // First unload via runtime path so registry/executor/cache cleanup runs.
-    state.runtime.unload_model(variant).await?;
+    // First cancel durable speech work, then unload through the runtime path so
+    // registry/executor/cache cleanup cannot race a batch retry that reloads it.
+    let cancelled_jobs =
+        crate::api::jobs::cancel_active_audio_jobs_for_model(&state, variant).await?;
+    unload_after_audio_job_cancellation(&state, variant, cancelled_jobs).await?;
 
     // Delete the model files
     state.runtime.model_manager().delete_model(variant).await?;
@@ -442,6 +498,30 @@ pub async fn delete_model(
         status: "deleted",
         message: format!("Model {} deleted successfully", variant),
     }))
+}
+
+async fn unload_after_audio_job_cancellation(
+    state: &AppState,
+    variant: ModelVariant,
+    cancelled_jobs: usize,
+) -> Result<(), ApiError> {
+    const CANCEL_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
+    const CANCEL_SETTLE_POLL: Duration = Duration::from_millis(50);
+
+    let deadline = Instant::now() + CANCEL_SETTLE_TIMEOUT;
+    loop {
+        match state.runtime.unload_model(variant).await {
+            Ok(()) => return Ok(()),
+            Err(izwi_core::Error::InferenceError(message))
+                if cancelled_jobs > 0
+                    && message.contains("active inference lease")
+                    && Instant::now() < deadline =>
+            {
+                tokio::time::sleep(CANCEL_SETTLE_POLL).await;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
 }
 
 /// Stream download progress as SSE
@@ -779,37 +859,72 @@ mod tests {
     use izwi_core::LoadedModelDiagnostics;
 
     #[test]
-    fn admin_model_runtime_diagnostics_preserve_actual_and_policy_values() {
+    fn admin_model_runtime_diagnostics_preserve_qwen38_family_and_policy_values() {
         let diagnostics = LoadedModelDiagnostics {
-            variant_id: ModelVariant::Qwen306BGguf.dir_name().to_string(),
-            variant: ModelVariant::Qwen306BGguf.to_string(),
-            family: "qwen3_chat",
+            variant_id: ModelVariant::Qwen3827BFp8.dir_name().to_string(),
+            variant: ModelVariant::Qwen3827BFp8.to_string(),
+            family: "qwen38_chat",
             task: "chat",
             handle_kind: "native_chat",
-            loaded_model_kind: "qwen3_chat",
+            loaded_model_kind: "qwen38_chat",
             backend_kind: "cuda".to_string(),
             device_kind: "Cuda".to_string(),
             actual_device_kind: Some("cuda".to_string()),
             actual_compute_dtype: Some("f16".to_string()),
             default_compute_dtype: "bf16".to_string(),
             default_dtype_reason: "CUDA policy prefers BF16".to_string(),
+            effective_context_tokens: None,
             supports_incremental_decode: Some(true),
             supports_realtime_stream_decode: None,
-            family_diagnostics: None,
+            family_diagnostics: Some(serde_json::json!({
+                "checkpoint_format": "safetensors_block_fp8",
+                "resident_representation": "q8_0_requantized_projections_with_dense_bf16",
+                "fp8_execution_mode": "q8_0_compressed_fallback",
+                "fallback_reason": "native FP8 execution is not runtime-certified",
+            })),
         };
         let model = AdminModelInfo::from_model_info(
-            ModelInfo::new(ModelVariant::Qwen306BGguf),
+            ModelInfo::new(ModelVariant::Qwen3827BFp8),
             Some(serde_json::to_value(diagnostics).expect("serialize runtime diagnostics")),
         );
 
         let value = serde_json::to_value(model).expect("serialize admin model");
+        assert_eq!(value["variant"], "Qwen3.8-27B-FP8");
+        assert_eq!(value["chat_capabilities"]["supports_thinking"], true);
         assert_eq!(
-            value["runtime_diagnostics"]["actual_compute_dtype"],
-            "f16"
+            value["chat_capabilities"]["default_reasoning_effort"],
+            "xhigh"
         );
+        assert_eq!(
+            value["chat_capabilities"]["reasoning_efforts"],
+            serde_json::json!(["xhigh", "medium", "low"])
+        );
+        assert_eq!(
+            value["chat_capabilities"]["supports_preserve_thinking"],
+            true
+        );
+        assert_eq!(value["runtime_diagnostics"]["family"], "qwen38_chat");
+        assert_eq!(
+            value["runtime_diagnostics"]["loaded_model_kind"],
+            "qwen38_chat"
+        );
+        assert_eq!(value["runtime_diagnostics"]["actual_compute_dtype"], "f16");
         assert_eq!(
             value["runtime_diagnostics"]["default_compute_dtype"],
             "bf16"
+        );
+        assert_eq!(
+            value["runtime_diagnostics"]["family_diagnostics"]["resident_representation"],
+            "q8_0_requantized_projections_with_dense_bf16"
+        );
+        assert_eq!(
+            value["runtime_diagnostics"]["family_diagnostics"]["fp8_execution_mode"],
+            "q8_0_compressed_fallback"
+        );
+        assert!(
+            value["runtime_diagnostics"]["family_diagnostics"]["fallback_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("not runtime-certified"))
         );
     }
 }

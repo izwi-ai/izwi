@@ -51,17 +51,13 @@ impl SpeechRouteKind {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum SpeechHistoryProcessingStatus {
     Pending,
     Processing,
+    #[default]
     Ready,
     Failed,
-}
-
-impl Default for SpeechHistoryProcessingStatus {
-    fn default() -> Self {
-        Self::Ready
-    }
 }
 
 impl SpeechHistoryProcessingStatus {
@@ -469,6 +465,41 @@ impl SpeechHistoryStore {
     ) -> anyhow::Result<Option<SpeechHistoryRecord>> {
         self.update_processing_status_inner(route_kind, record_id, None, status, processing_error)
             .await
+    }
+
+    /// Fail persisted speech projections that cannot be resumed after startup.
+    /// A pending/processing projection remains live only while a matching
+    /// durable TTS job is still in a non-terminal state.
+    pub async fn reconcile_stale_processing_records(&self) -> anyhow::Result<u64> {
+        let db = self.db.connection().await?;
+        let result = db
+            .execute_raw(raw::statement(
+                db,
+                r#"
+                UPDATE speech_history_records
+                SET
+                    processing_status = 'failed',
+                    processing_error = COALESCE(
+                        NULLIF(processing_error, ''),
+                        'Speech generation was interrupted before server restart'
+                    ),
+                    runtime_stage_id = NULL,
+                    runtime_attempt_token = NULL
+                WHERE processing_status IN ('pending', 'processing')
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM runtime_jobs j
+                      WHERE j.job_kind = 'tts_speech'
+                        AND j.route_record_kind = speech_history_records.route_kind
+                        AND j.route_record_id = speech_history_records.id
+                        AND j.status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing')
+                  )
+                "#,
+                Vec::new(),
+            )?)
+            .await
+            .context("Failed to reconcile stale speech history processing records")?;
+        Ok(result.rows_affected())
     }
 
     pub async fn update_processing_status_for_attempt(
@@ -1519,6 +1550,96 @@ mod tests {
         assert_eq!(
             unchanged.processing_status,
             SpeechHistoryProcessingStatus::Ready
+        );
+
+        clear_env();
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_fails_only_processing_records_without_active_jobs() {
+        let _guard = env_lock();
+        let (_temp, store) = setup_store();
+        let stale = store
+            .create_record(NewSpeechHistoryRecord {
+                processing_status: SpeechHistoryProcessingStatus::Processing,
+                audio_bytes: Vec::new(),
+                audio_filename: None,
+                ..ready_record()
+            })
+            .await
+            .expect("stale processing record");
+        let resumable = store
+            .create_record(NewSpeechHistoryRecord {
+                processing_status: SpeechHistoryProcessingStatus::Pending,
+                audio_bytes: Vec::new(),
+                audio_filename: None,
+                ..ready_record()
+            })
+            .await
+            .expect("resumable pending record");
+        let (runtime, _attempt) =
+            claim_projection_attempt(&store, SpeechRouteKind::TextToSpeech, resumable.id.as_str())
+                .await;
+
+        assert_eq!(
+            store
+                .reconcile_stale_processing_records()
+                .await
+                .expect("startup reconciliation"),
+            1
+        );
+        let stale = store
+            .get_record(SpeechRouteKind::TextToSpeech, stale.id)
+            .await
+            .expect("stale lookup")
+            .expect("stale record");
+        assert_eq!(
+            stale.processing_status,
+            SpeechHistoryProcessingStatus::Failed
+        );
+        assert!(stale
+            .processing_error
+            .as_deref()
+            .is_some_and(|message| message.contains("server restart")));
+        let resumable = store
+            .get_record(SpeechRouteKind::TextToSpeech, resumable.id.clone())
+            .await
+            .expect("resumable lookup")
+            .expect("resumable record");
+        assert_eq!(
+            resumable.processing_status,
+            SpeechHistoryProcessingStatus::Pending
+        );
+
+        let active_job = runtime
+            .get_active_job_for_route_record(
+                RuntimeJobKind::TtsSpeech,
+                SpeechRouteKind::TextToSpeech.as_db_value(),
+                &resumable.id,
+            )
+            .await
+            .expect("active job lookup")
+            .expect("active job");
+        runtime
+            .cancel_job(&active_job.id, Some("test cancellation".to_string()))
+            .await
+            .expect("cancel runtime job")
+            .expect("cancelled runtime job");
+        assert_eq!(
+            store
+                .reconcile_stale_processing_records()
+                .await
+                .expect("terminal reconciliation"),
+            1
+        );
+        let terminal = store
+            .get_record(SpeechRouteKind::TextToSpeech, resumable.id)
+            .await
+            .expect("terminal lookup")
+            .expect("terminal record");
+        assert_eq!(
+            terminal.processing_status,
+            SpeechHistoryProcessingStatus::Failed
         );
 
         clear_env();

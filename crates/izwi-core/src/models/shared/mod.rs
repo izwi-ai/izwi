@@ -7,5 +7,8 @@ pub mod attention;
 pub mod chat;
 pub mod config;
 pub mod memory;
+pub mod sampling;
+pub mod speculative_sampling;
+pub(crate) mod state;
 pub mod telemetry;
 pub mod weights;

@@ -127,12 +127,14 @@ impl Default for StageClaimFilter {
 
 impl StageClaimFilter {
     pub fn for_worker_queues(queue_names: &[String]) -> Self {
-        let mut filter = Self::default();
-        filter.queue_names = normalize_filter_values(queue_names);
-        if filter.queue_names.is_empty() {
-            filter.queue_names.push("batch".to_string());
+        let mut queue_names = normalize_filter_values(queue_names);
+        if queue_names.is_empty() {
+            queue_names.push("batch".to_string());
         }
-        filter
+        Self {
+            queue_names,
+            ..Default::default()
+        }
     }
 
     fn normalized(&self) -> Self {
@@ -630,6 +632,73 @@ impl BatchRuntimeStore {
             )?)
             .await
             .context("Failed to load runtime job")?;
+
+        row.as_ref().map(map_runtime_job).transpose()
+    }
+
+    pub async fn list_active_jobs_by_kind(
+        &self,
+        job_kind: RuntimeJobKind,
+    ) -> anyhow::Result<Vec<RuntimeJob>> {
+        let db = self.db.connection().await?;
+        let rows = db
+            .query_all_raw(raw::statement(
+                db,
+                r#"
+                SELECT id, created_at, updated_at, queued_at, started_at, finished_at,
+                       job_kind, status, priority, model_id, capability,
+                       route_record_kind, route_record_id, input_media_asset_id,
+                       input_text_asset_id, request_json, model_snapshot_json,
+                       progress_json, error_code, error_message, attempt_count,
+                       max_attempts, retry_policy_json, idempotency_key,
+                       correlation_id, cancellation_reason
+                FROM runtime_jobs
+                WHERE job_kind = ?1
+                  AND status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing')
+                ORDER BY created_at ASC, id ASC
+                "#,
+                vec![job_kind.as_db_value().into()],
+            )?)
+            .await
+            .context("Failed to list active runtime jobs by kind")?;
+
+        rows.iter().map(map_runtime_job).collect()
+    }
+
+    pub async fn get_active_job_for_route_record(
+        &self,
+        job_kind: RuntimeJobKind,
+        route_record_kind: &str,
+        route_record_id: &str,
+    ) -> anyhow::Result<Option<RuntimeJob>> {
+        let db = self.db.connection().await?;
+        let row = db
+            .query_one_raw(raw::statement(
+                db,
+                r#"
+                SELECT id, created_at, updated_at, queued_at, started_at, finished_at,
+                       job_kind, status, priority, model_id, capability,
+                       route_record_kind, route_record_id, input_media_asset_id,
+                       input_text_asset_id, request_json, model_snapshot_json,
+                       progress_json, error_code, error_message, attempt_count,
+                       max_attempts, retry_policy_json, idempotency_key,
+                       correlation_id, cancellation_reason
+                FROM runtime_jobs
+                WHERE job_kind = ?1
+                  AND route_record_kind = ?2
+                  AND route_record_id = ?3
+                  AND status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing')
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                "#,
+                vec![
+                    job_kind.as_db_value().into(),
+                    route_record_kind.into(),
+                    route_record_id.into(),
+                ],
+            )?)
+            .await
+            .context("Failed to load active runtime job for route record")?;
 
         row.as_ref().map(map_runtime_job).transpose()
     }
@@ -3311,6 +3380,73 @@ mod tests {
             heartbeat.registration.queue_classes,
             vec![QueueClass::Batch]
         );
+    }
+
+    #[tokio::test]
+    async fn active_job_indexes_exclude_terminal_jobs() {
+        let (store, _root) = build_store();
+        let job = store
+            .create_job(NewRuntimeJob {
+                job_kind: RuntimeJobKind::TtsSpeech,
+                status: RuntimeJobStatus::Queued,
+                priority: 0,
+                model_id: Some("Qwen3-TTS-12Hz-0.6B-CustomVoice".to_string()),
+                capability: Some("tts".to_string()),
+                route_record_kind: Some("text_to_speech".to_string()),
+                route_record_id: Some("speech-1".to_string()),
+                input_media_asset_id: None,
+                input_text_asset_id: None,
+                request_json: json!({}),
+                model_snapshot_json: json!({}),
+                retry_policy_json: json!({"max_attempts": 1}),
+                max_attempts: 1,
+                idempotency_key: None,
+                correlation_id: None,
+            })
+            .await
+            .expect("active job");
+
+        assert_eq!(
+            store
+                .get_active_job_for_route_record(
+                    RuntimeJobKind::TtsSpeech,
+                    "text_to_speech",
+                    "speech-1",
+                )
+                .await
+                .expect("route lookup")
+                .expect("active route job")
+                .id,
+            job.id
+        );
+        assert_eq!(
+            store
+                .list_active_jobs_by_kind(RuntimeJobKind::TtsSpeech)
+                .await
+                .expect("kind lookup")
+                .len(),
+            1
+        );
+
+        store
+            .cancel_job(&job.id, Some("test cancellation".to_string()))
+            .await
+            .expect("cancel")
+            .expect("cancelled job");
+        assert!(store
+            .get_active_job_for_route_record(
+                RuntimeJobKind::TtsSpeech,
+                "text_to_speech",
+                "speech-1",
+            )
+            .await
+            .expect("terminal route lookup")
+            .is_none());
+        assert!(store
+            .list_active_jobs_by_kind(RuntimeJobKind::TtsSpeech)
+            .await
+            .expect("terminal kind lookup")
+            .is_empty());
     }
 
     #[tokio::test]

@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { ModelInfo } from "@/api";
@@ -19,6 +19,25 @@ function buildModel(overrides: Partial<ModelInfo>): ModelInfo {
 }
 
 describe("MyModelsPage", () => {
+  it("allows a loading model to be cancelled", () => {
+    const onUnload = vi.fn();
+    render(
+      <MyModelsPage
+        models={[buildModel({ status: "loading" })]}
+        loading={false}
+        downloadProgress={{}}
+        onDownload={vi.fn()}
+        onLoad={vi.fn()}
+        onUnload={onUnload}
+        onDelete={vi.fn()}
+        onRefresh={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel load" }));
+    expect(onUnload).toHaveBeenCalledWith("Qwen3.5-0.8B");
+  });
+
   it("groups Qwen3.5 models under Qwen and uses Qwen3 model names without chat prefixes", () => {
     render(
       <MyModelsPage

@@ -17,7 +17,7 @@ mod kokoro;
 mod lifecycle;
 mod pipeline;
 mod request;
-mod rollout;
+pub(crate) mod rollout;
 mod routing;
 mod service;
 mod speech_to_speech;
@@ -34,14 +34,15 @@ pub use conformance::{
     ConformanceCapability, ConformanceExecutionClass,
 };
 pub use coordinator::{CoordinatorLane, CoordinatorSnapshot, InferenceCoordinator, JobSpec};
+pub(crate) use coordinator::{PhysicalExecutionAdmission, PhysicalExecutionLease};
 pub use service::RuntimeService;
 pub use telemetry::{
     runtime_trace_contracts, sanitized_replay_record, trace_contract_for_phase,
-    EngineKvCacheRuntimeSnapshot, EngineRuntimeTelemetrySnapshot,
-    InferenceBrokerRuntimeTelemetrySnapshot, PipelineRuntimeTelemetrySnapshot, ReplayRedaction,
-    RuntimeLatencyStats, RuntimeObservabilityTelemetrySnapshot, RuntimeObservationContext,
-    RuntimeReplayRecord, RuntimeStageObservation, RuntimeStageOutcome, RuntimeStageOutputCounters,
-    RuntimeStageTiming, RuntimeTelemetrySnapshot, RuntimeTraceContract, RuntimeTracePhase,
+    EngineRuntimeTelemetrySnapshot, InferenceBrokerRuntimeTelemetrySnapshot,
+    PipelineRuntimeTelemetrySnapshot, ReplayRedaction, RuntimeLatencyStats,
+    RuntimeObservabilityTelemetrySnapshot, RuntimeObservationContext, RuntimeReplayRecord,
+    RuntimeStageObservation, RuntimeStageOutcome, RuntimeStageOutputCounters, RuntimeStageTiming,
+    RuntimeTelemetrySnapshot, RuntimeTraceContract, RuntimeTracePhase,
     RuntimeWorkloadClassTelemetrySnapshot, VoiceRuntimeTelemetrySnapshot, RUNTIME_REPLAY_REDACTION,
     RUNTIME_TRACE_CONTRACTS, TRACE_CAPABILITY, TRACE_CORRELATION_ID, TRACE_ERROR_KIND,
     TRACE_EXECUTION_TARGET, TRACE_MODEL_VARIANT, TRACE_PIPELINE_KIND, TRACE_PIPELINE_STAGE,

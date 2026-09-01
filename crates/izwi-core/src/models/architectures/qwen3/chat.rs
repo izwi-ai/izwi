@@ -3,25 +3,31 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::Arc;
 
-use candle_core::quantized::gguf_file;
-use candle_core::{DType, IndexOp, Tensor, D};
+#[cfg(test)]
+use candle_core::D;
+use candle_core::{DType, IndexOp, Tensor};
 use candle_nn::VarBuilder;
-use candle_transformers::models::quantized_qwen3::ModelWeights as QuantizedQwen3Model;
 use serde::Deserialize;
 use serde_json::Value;
 use tracing::info;
 
+use crate::backends::kv::KvWriteBatchCompletion;
+use crate::backends::BackendKind;
 use crate::backends::DeviceProfile;
-use crate::backends::{open_gguf_reader, BackendKind};
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
+use crate::kv::v2::StateDomainId;
+use crate::kv::{InferenceStateCapability, InferenceStateContractProvider};
 use crate::model::ModelVariant;
-use crate::models::architectures::qwen3::core::{Qwen3Cache, Qwen3Config, Qwen3Model};
-use crate::models::shared::chat::{ChatMessage, ChatRole};
+use crate::models::architectures::qwen3::core::{Qwen3Config, Qwen3Model};
+use crate::models::shared::attention::paged::default_kv_page_size;
+use crate::models::shared::attention::physical::PhysicalPagedKvCache;
+use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
 use crate::models::shared::config::checkpoint_dtype_from_config_json;
-use crate::models::shared::memory::accounting::TensorStorageAccounting;
+use crate::models::shared::sampling::ChatSampler;
+use crate::models::shared::weights::gguf::GgufLoader;
 use crate::tokenizer::Tokenizer;
 
 #[derive(Debug, Clone)]
@@ -31,22 +37,103 @@ pub struct ChatGenerationOutput {
 }
 
 pub struct ChatDecodeState {
-    cache: Qwen3Cache,
-    embeds: Tensor,
+    cache: PhysicalPagedKvCache,
+    /// Model output that has not yet been sampled by the current executor
+    /// quantum. The first decode step consumes prefill output in the same
+    /// invocation; later quanta compute and consume their output locally.
+    unconsumed_output: Option<Tensor>,
     pos: usize,
+    /// Token already emitted to the caller but not yet appended to KV. The
+    /// next decode quantum consumes exactly this token, keeping physical KV
+    /// progress aligned with the scheduler's input range.
+    pending_token: Option<u32>,
+    /// Scheduler-visible prompt cursor. This stays logical even when a final
+    /// first span reuses an engine-owned physical prefix.
+    prefill_progress: usize,
     generated_ids: Vec<u32>,
+    sampler: ChatSampler,
     assembled: String,
     max_new_tokens: usize,
     finished: bool,
 }
 
+pub(crate) struct ChatDecodeCheckpoint {
+    cache: PhysicalPagedKvCache,
+    unconsumed_output: Option<Tensor>,
+    pos: usize,
+    pending_token: Option<u32>,
+    prefill_progress: usize,
+    generated_ids: Vec<u32>,
+    sampler: ChatSampler,
+    assembled: String,
+    finished: bool,
+}
+
 impl ChatDecodeState {
-    /// All Candle backing allocations retained by this incremental session.
-    pub fn session_cache_bytes(&self) -> Option<u64> {
-        let mut accounting = TensorStorageAccounting::default();
-        self.cache.account_storage(&mut accounting)?;
-        accounting.add_tensor(&self.embeds)?;
-        Some(accounting.bytes())
+    pub(crate) fn prefill_progress(&self) -> usize {
+        self.prefill_progress
+    }
+
+    pub fn uses_managed_kv(&self) -> bool {
+        true
+    }
+
+    pub(crate) fn take_managed_write_completions(&mut self) -> Vec<Arc<KvWriteBatchCompletion>> {
+        self.cache.take_completed_writes()
+    }
+
+    pub(crate) fn install_managed_reservation(
+        &mut self,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<()> {
+        let checkpoint = self.begin_managed_quantum(cache)?;
+        drop(checkpoint);
+        Ok(())
+    }
+
+    pub(crate) fn begin_managed_quantum(
+        &mut self,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<ChatDecodeCheckpoint> {
+        let current = &self.cache;
+        if current.arena().id() != cache.arena().id()
+            || current.arena().config().group != cache.arena().config().group
+        {
+            return Err(Error::InferenceError(
+                "a Qwen3 session cannot switch managed KV authority".to_string(),
+            ));
+        }
+        if cache.context_len() != self.pos {
+            return Err(Error::InferenceError(format!(
+                "managed Qwen3 reservation starts at {}, but decode state is at {}",
+                cache.context_len(),
+                self.pos
+            )));
+        }
+        let checkpoint = ChatDecodeCheckpoint {
+            cache: std::mem::replace(&mut self.cache, cache),
+            unconsumed_output: self.unconsumed_output.clone(),
+            pos: self.pos,
+            pending_token: self.pending_token,
+            prefill_progress: self.prefill_progress,
+            generated_ids: self.generated_ids.clone(),
+            sampler: self.sampler.clone(),
+            assembled: self.assembled.clone(),
+            finished: self.finished,
+        };
+        Ok(checkpoint)
+    }
+
+    pub(crate) fn rollback_managed_quantum(&mut self, checkpoint: ChatDecodeCheckpoint) {
+        self.cache = checkpoint.cache;
+        self.unconsumed_output = checkpoint.unconsumed_output;
+        self.pos = checkpoint.pos;
+        self.pending_token = checkpoint.pending_token;
+        self.prefill_progress = checkpoint.prefill_progress;
+        self.generated_ids = checkpoint.generated_ids;
+        self.sampler = checkpoint.sampler;
+        self.assembled = checkpoint.assembled;
+        self.finished = checkpoint.finished;
     }
 }
 
@@ -141,24 +228,40 @@ impl ChatTokenizer {
     }
 }
 
-enum Qwen3ChatBackend {
-    Native {
-        text_model: Qwen3Model,
-    },
-    Gguf {
-        text_model: Mutex<QuantizedQwen3Model>,
-        gguf_file: String,
-    },
-}
-
 pub struct Qwen3ChatModel {
     device: DeviceProfile,
-    compute_dtype: Option<DType>,
+    compute_dtype: DType,
     tokenizer: ChatTokenizer,
-    backend: Qwen3ChatBackend,
+    text_model: Qwen3Model,
+}
+
+impl InferenceStateContractProvider for Qwen3ChatModel {
+    fn inference_state_contract(&self) -> Result<InferenceStateCapability> {
+        if !self.text_model.supports_managed_kv_execution() {
+            return Err(Error::ModelLoadError(
+                "native Qwen3 attention geometry is unsupported by the physical runtime"
+                    .to_string(),
+            ));
+        }
+        Ok(InferenceStateCapability::Managed(
+            self.text_model.managed_inference_state_contract(
+                StateDomainId::new(1),
+                self.compute_dtype,
+                default_kv_page_size(),
+            )?,
+        ))
+    }
 }
 
 impl Qwen3ChatModel {
+    pub fn max_context_tokens(&self) -> Result<usize> {
+        self.text_model.context_length().ok_or_else(|| {
+            Error::ModelLoadError(
+                "Qwen3 checkpoint is missing a positive max_position_embeddings value".into(),
+            )
+        })
+    }
+
     pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
         if variant.is_qwen_chat_gguf() {
             return Self::load_gguf(model_dir, variant, device);
@@ -213,9 +316,9 @@ impl Qwen3ChatModel {
 
         Ok(Self {
             device,
-            compute_dtype: Some(dtype),
+            compute_dtype: dtype,
             tokenizer,
-            backend: Qwen3ChatBackend::Native { text_model },
+            text_model,
         })
     }
 
@@ -240,29 +343,28 @@ impl Qwen3ChatModel {
             )));
         }
 
-        let tokenizer = ChatTokenizer::load(model_dir, None)?;
-        let mut reader = open_gguf_reader(&gguf_path, BackendKind::from(device.kind))?;
-        let content = gguf_file::Content::read(&mut reader)
-            .map_err(|e| Error::ModelLoadError(format!("Failed to parse GGUF header: {e}")))?;
-        let text_model = QuantizedQwen3Model::from_gguf(content, &mut reader, &device.device)
-            .map_err(|e| {
-                Error::ModelLoadError(format!("Failed to load quantized Qwen3 GGUF model: {e}"))
-            })?;
+        let loader =
+            GgufLoader::from_path_with_backend(&gguf_path, BackendKind::from(device.kind))?;
+        let config = parse_qwen3_gguf_config(&loader)?;
+        let tokenizer = ChatTokenizer::load(model_dir, Some(config.vocab_size))?;
+        let dtype_override = std::env::var("IZWI_CHAT_DTYPE")
+            .ok()
+            .or_else(|| std::env::var("IZWI_QWEN_DTYPE").ok());
+        let dtype = select_qwen3_dense_dtype(&device, dtype_override.as_deref(), None)?;
+        let text_model = Qwen3Model::load_gguf_text(config, &loader, &device.device, dtype, "")?;
 
         info!(
-            "Loaded Qwen3 GGUF chat model on {:?} from {}",
+            "Loaded native physical Qwen3 GGUF chat model on {:?} with dtype {:?} from {}",
             device.kind,
+            dtype,
             gguf_path.display()
         );
 
         Ok(Self {
             device,
-            compute_dtype: None,
+            compute_dtype: dtype,
             tokenizer,
-            backend: Qwen3ChatBackend::Gguf {
-                text_model: Mutex::new(text_model),
-                gguf_file: gguf_name.to_string(),
-            },
+            text_model,
         })
     }
 
@@ -271,8 +373,7 @@ impl Qwen3ChatModel {
     }
 
     pub fn runtime_compute_dtype(&self) -> Option<String> {
-        self.compute_dtype
-            .map(|dtype| format!("{dtype:?}").to_ascii_lowercase())
+        Some(format!("{:?}", self.compute_dtype).to_ascii_lowercase())
     }
 
     pub fn generate(
@@ -286,82 +387,125 @@ impl Qwen3ChatModel {
 
     pub fn generate_with_callback(
         &self,
-        messages: &[ChatMessage],
-        max_new_tokens: usize,
-        on_delta: &mut dyn FnMut(&str),
+        _messages: &[ChatMessage],
+        _max_new_tokens: usize,
+        _on_delta: &mut dyn FnMut(&str),
     ) -> Result<ChatGenerationOutput> {
-        match &self.backend {
-            Qwen3ChatBackend::Native { .. } => {
-                let mut state = self.start_decode(messages, max_new_tokens)?;
-                loop {
-                    let step = self.decode_step(&mut state)?;
-                    if !step.delta.is_empty() {
-                        for ch in step.delta.chars() {
-                            let mut buf = [0u8; 4];
-                            on_delta(ch.encode_utf8(&mut buf));
-                        }
-                    }
-                    if step.finished {
-                        return Ok(ChatGenerationOutput {
-                            text: step.text,
-                            tokens_generated: step.tokens_generated,
-                        });
-                    }
-                }
-            }
-            Qwen3ChatBackend::Gguf { .. } => {
-                self.generate_with_callback_gguf(messages, max_new_tokens, on_delta)
-            }
-        }
+        Err(Error::InvalidInput(
+            "Qwen3 generation requires scheduler-owned physical state".to_string(),
+        ))
     }
 
-    pub fn start_decode(
+    /// Start a native safetensors session directly in authoritative physical
+    /// KV pages supplied by the engine. The prompt is written into the arena
+    /// during prefill; no model-owned prompt history survives this boundary.
+    pub fn start_decode_managed(
         &self,
         messages: &[ChatMessage],
         max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+        cache: PhysicalPagedKvCache,
     ) -> Result<ChatDecodeState> {
-        let text_model = match &self.backend {
-            Qwen3ChatBackend::Native { text_model } => text_model,
-            Qwen3ChatBackend::Gguf { gguf_file, .. } => {
-                return Err(Error::InvalidInput(format!(
-                    "Incremental chat decode is unavailable for GGUF model {}",
-                    gguf_file
-                )))
-            }
-        };
-
         let prompt_ids = self.build_prompt(messages)?;
-        let input_ids = Tensor::from_vec(
-            prompt_ids.clone(),
-            (1, prompt_ids.len()),
-            &self.device.device,
-        )?;
+        let mut state =
+            self.begin_resumable_prefill_managed(&prompt_ids, max_new_tokens, config, cache)?;
+        self.continue_resumable_prefill(&mut state, &prompt_ids, 0, prompt_ids.len())?;
+        Ok(state)
+    }
 
-        let mut cache = Qwen3Cache::new(text_model.num_layers());
-        let embeds = text_model.forward(&input_ids, 0, Some(&mut cache))?;
-        let pos = embeds.dim(1)?;
-
+    pub(crate) fn begin_resumable_prefill_managed(
+        &self,
+        prompt_ids: &[u32],
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<ChatDecodeState> {
+        if prompt_ids.is_empty() || cache.context_len() >= prompt_ids.len() {
+            return Err(Error::InvalidInput(
+                "Qwen3 resumable prefill requires at least one private prompt token".into(),
+            ));
+        }
+        let pos = cache.context_len();
         Ok(ChatDecodeState {
             cache,
-            embeds,
+            unconsumed_output: None,
             pos,
+            pending_token: None,
+            prefill_progress: 0,
             generated_ids: Vec::new(),
+            sampler: ChatSampler::new(config.clone(), prompt_ids),
             assembled: String::new(),
             max_new_tokens: max_new_tokens.max(1),
             finished: false,
         })
     }
 
-    pub fn decode_step(&self, state: &mut ChatDecodeState) -> Result<ChatDecodeStep> {
-        let text_model = match &self.backend {
-            Qwen3ChatBackend::Native { text_model } => text_model,
-            Qwen3ChatBackend::Gguf { gguf_file, .. } => {
-                return Err(Error::InvalidInput(format!(
-                    "Incremental chat decode is unavailable for GGUF model {}",
-                    gguf_file
-                )))
-            }
+    pub(crate) fn continue_resumable_prefill(
+        &self,
+        state: &mut ChatDecodeState,
+        prompt_ids: &[u32],
+        span_start: usize,
+        span_end: usize,
+    ) -> Result<bool> {
+        if state.prefill_progress != span_start
+            || span_start >= span_end
+            || span_end > prompt_ids.len()
+            || state.finished
+            || state.unconsumed_output.is_some()
+            || state.pending_token.is_some()
+            || !state.generated_ids.is_empty()
+        {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3 resumable prefill span [{span_start},{span_end}) is incompatible with cursor {} and prompt length {}",
+                state.prefill_progress,
+                prompt_ids.len()
+            )));
+        }
+        let physical_start = state.cache.context_len();
+        let first_span = span_start == 0;
+        if state.pos != physical_start
+            || (!first_span && physical_start != span_start)
+            || (first_span && physical_start >= span_end)
+        {
+            return Err(Error::InferenceError(format!(
+                "Qwen3 resumable prefill physical cursor {physical_start} is incompatible with logical span [{span_start},{span_end})"
+            )));
+        }
+        let input_ids = Tensor::from_slice(
+            &prompt_ids[physical_start..span_end],
+            (1, span_end - physical_start),
+            &self.device.device,
+        )?;
+        let complete = span_end == prompt_ids.len();
+        let output = if complete {
+            Some(
+                self.text_model
+                    .forward_managed(&input_ids, physical_start, &mut state.cache)?,
+            )
+        } else {
+            let embeds = self.text_model.embeddings(&input_ids)?;
+            self.text_model.forward_managed_hidden_with_embeds(
+                &embeds,
+                physical_start,
+                &mut state.cache,
+                None,
+            )?;
+            None
         };
+        if state.cache.context_len() != span_end {
+            return Err(Error::InferenceError(format!(
+                "Qwen3 resumable prefill committed physical cursor {} instead of {span_end}",
+                state.cache.context_len()
+            )));
+        }
+        state.pos = span_end;
+        state.prefill_progress = span_end;
+        state.unconsumed_output = output;
+        Ok(complete)
+    }
+
+    pub fn decode_step(&self, state: &mut ChatDecodeState) -> Result<ChatDecodeStep> {
+        let text_model = &self.text_model;
 
         if state.finished || state.generated_ids.len() >= state.max_new_tokens {
             state.finished = true;
@@ -373,12 +517,22 @@ impl Qwen3ChatModel {
             });
         }
 
-        let logits = state.embeds.i((0, state.embeds.dim(1)? - 1))?;
-        let next = argmax(&logits)?;
+        if let Some(pending) = state.pending_token.take() {
+            let next_tensor = Tensor::from_vec(vec![pending], (1, 1), &self.device.device)?;
+            state.unconsumed_output =
+                Some(text_model.forward_managed(&next_tensor, state.pos, &mut state.cache)?);
+            state.pos += 1;
+        }
+
+        let output = state.unconsumed_output.take().ok_or_else(|| {
+            Error::InferenceError("Qwen3 decode quantum has no unconsumed model output".into())
+        })?;
+        let next = state.sampler.sample(&output, self.tokenizer.vocab_size)?;
 
         if next == self.tokenizer.specials.im_end
             || next == self.tokenizer.specials.eos
             || self.tokenizer.specials.eos_alt == Some(next)
+            || state.sampler.is_configured_stop(next)
         {
             state.finished = true;
             return Ok(ChatDecodeStep {
@@ -390,13 +544,10 @@ impl Qwen3ChatModel {
         }
 
         state.generated_ids.push(next);
+        state.pending_token = Some(next);
         let decoded = self.tokenizer.decode_text(&state.generated_ids)?;
         let delta = text_delta(&state.assembled, &decoded);
         state.assembled = decoded;
-
-        let next_tensor = Tensor::from_vec(vec![next], (1, 1), &self.device.device)?;
-        state.embeds = text_model.forward(&next_tensor, state.pos, Some(&mut state.cache))?;
-        state.pos += 1;
 
         if state.generated_ids.len() >= state.max_new_tokens {
             state.finished = true;
@@ -417,34 +568,55 @@ impl Qwen3ChatModel {
         &self,
         states: &mut [&mut ChatDecodeState],
     ) -> Result<Vec<ChatDecodeStep>> {
-        let text_model = match &self.backend {
-            Qwen3ChatBackend::Native { text_model } => text_model,
-            Qwen3ChatBackend::Gguf { gguf_file, .. } => {
-                return Err(Error::InvalidInput(format!(
-                    "Continuous chat decode is unavailable for GGUF model {}",
-                    gguf_file
-                )))
-            }
-        };
+        let text_model = &self.text_model;
         if states.is_empty() {
             return Ok(Vec::new());
         }
+        if states.iter().any(|state| state.unconsumed_output.is_some()) {
+            return Err(Error::InferenceError(
+                "continuous Qwen3 decode crossed a quantum with unconsumed model output"
+                    .to_string(),
+            ));
+        }
 
-        let mut next_tokens = Vec::with_capacity(states.len());
-        let mut steps = Vec::with_capacity(states.len());
+        let pending_tokens = states
+            .iter_mut()
+            .map(|state| {
+                state.pending_token.take().ok_or_else(|| {
+                    Error::InferenceError(
+                        "continuous Qwen3 decode state has no scheduled input token".to_string(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let positions = states.iter().map(|state| state.pos).collect::<Vec<_>>();
+        let input_ids = Tensor::from_vec(pending_tokens, (states.len(), 1), &self.device.device)?;
+        let mut caches = states
+            .iter_mut()
+            .map(|state| &mut state.cache)
+            .collect::<Vec<_>>();
+        let next_logits =
+            text_model.forward_managed_decode_batch(&input_ids, &positions, &mut caches)?;
         for state in states.iter_mut() {
+            state.pos = state.pos.saturating_add(1);
+        }
+
+        let mut steps = Vec::with_capacity(states.len());
+        for (row, state) in states.iter_mut().enumerate() {
             if state.finished || state.generated_ids.len() >= state.max_new_tokens {
                 return Err(Error::InvalidInput(
                     "Continuous chat batch contains a terminal decode state".to_string(),
                 ));
             }
 
-            let logits = state.embeds.i((0, state.embeds.dim(1)? - 1))?;
-            let next = argmax(&logits)?;
-            next_tokens.push(next);
+            let row_output = next_logits.i(row)?.unsqueeze(0)?;
+            let next = state
+                .sampler
+                .sample(&row_output, self.tokenizer.vocab_size)?;
             if next == self.tokenizer.specials.im_end
                 || next == self.tokenizer.specials.eos
                 || self.tokenizer.specials.eos_alt == Some(next)
+                || state.sampler.is_configured_stop(next)
             {
                 state.finished = true;
                 steps.push(ChatDecodeStep {
@@ -457,6 +629,7 @@ impl Qwen3ChatModel {
             }
 
             state.generated_ids.push(next);
+            state.pending_token = Some(next);
             let decoded = self.tokenizer.decode_text(&state.generated_ids)?;
             let delta = text_delta(&state.assembled, &decoded);
             state.assembled = decoded;
@@ -471,142 +644,28 @@ impl Qwen3ChatModel {
             });
         }
 
-        let positions = states.iter().map(|state| state.pos).collect::<Vec<_>>();
-        let input_ids = Tensor::from_vec(next_tokens, (states.len(), 1), &self.device.device)?;
-        let mut caches = states
-            .iter_mut()
-            .map(|state| &mut state.cache)
-            .collect::<Vec<_>>();
-        let next_logits = text_model.forward_decode_batch(&input_ids, &positions, &mut caches)?;
-        drop(caches);
-
-        for (row_idx, state) in states.iter_mut().enumerate() {
-            // Stop rows participate in the tensor operation to preserve the
-            // physical batch width, but their terminal state is never reused.
-            if !steps[row_idx].finished || state.generated_ids.len() >= state.max_new_tokens {
-                state.embeds = next_logits.i(row_idx)?.unsqueeze(0)?;
-                state.pos = state.pos.saturating_add(1);
-            }
-        }
         Ok(steps)
     }
 
     pub fn supports_incremental_decode(&self) -> bool {
-        matches!(&self.backend, Qwen3ChatBackend::Native { .. })
+        true
     }
 
     pub fn supports_continuous_decode_batch(&self) -> bool {
-        matches!(&self.backend, Qwen3ChatBackend::Native { .. })
+        true
     }
 
     /// Additional per-row tensor materialization used only by the continuous
     /// path when ragged attention rows are concatenated back into one batch.
     pub fn continuous_decode_batch_workspace_per_row_bytes(&self) -> Result<u64> {
-        let Qwen3ChatBackend::Native { text_model } = &self.backend else {
-            return Err(Error::InvalidInput(
-                "continuous decode workspace is unavailable for GGUF chat models".to_string(),
-            ));
-        };
-        let dtype = self.compute_dtype.ok_or_else(|| {
-            Error::InvalidInput(
-                "continuous decode workspace requires a resolved model dtype".to_string(),
-            )
-        })?;
-        continuous_decode_collation_workspace_bytes(text_model.hidden_size(), dtype.size_in_bytes())
-    }
-
-    fn generate_with_callback_gguf(
-        &self,
-        messages: &[ChatMessage],
-        max_new_tokens: usize,
-        on_delta: &mut dyn FnMut(&str),
-    ) -> Result<ChatGenerationOutput> {
-        let prompt_ids = self.build_prompt(messages)?;
-        let mut model = match &self.backend {
-            Qwen3ChatBackend::Gguf { text_model, .. } => text_model.lock().map_err(|_| {
-                Error::InferenceError("Qwen3 GGUF model mutex poisoned".to_string())
-            })?,
-            Qwen3ChatBackend::Native { .. } => {
-                return Err(Error::InferenceError(
-                    "Internal error: GGUF generation called on safetensors backend".to_string(),
-                ))
-            }
-        };
-
-        model.clear_kv_cache();
-        let input_ids = Tensor::from_vec(
-            prompt_ids.clone(),
-            (1, prompt_ids.len()),
-            &self.device.device,
-        )?;
-        let mut logits = model
-            .forward(&input_ids, 0)
-            .map_err(|e| Error::InferenceError(format!("Qwen3 GGUF forward failed: {e}")))?;
-        let mut position = prompt_ids.len();
-
-        let mut generated_ids = Vec::new();
-        let mut assembled = String::new();
-        let max_new_tokens = max_new_tokens.max(1);
-
-        while generated_ids.len() < max_new_tokens {
-            let next = argmax(&logits)?;
-            if next == self.tokenizer.specials.im_end
-                || next == self.tokenizer.specials.eos
-                || self.tokenizer.specials.eos_alt == Some(next)
-            {
-                break;
-            }
-
-            generated_ids.push(next);
-            let decoded = self.tokenizer.decode_text(&generated_ids)?;
-            let delta = text_delta(&assembled, &decoded);
-            if !delta.is_empty() {
-                for ch in delta.chars() {
-                    let mut buf = [0u8; 4];
-                    on_delta(ch.encode_utf8(&mut buf));
-                }
-            }
-            assembled = decoded;
-
-            let next_tensor = Tensor::from_vec(vec![next], (1, 1), &self.device.device)?;
-            logits = model
-                .forward(&next_tensor, position)
-                .map_err(|e| Error::InferenceError(format!("Qwen3 GGUF decode failed: {e}")))?;
-            position += 1;
-        }
-
-        Ok(ChatGenerationOutput {
-            text: assembled.trim().to_string(),
-            tokens_generated: generated_ids.len(),
-        })
+        continuous_decode_collation_workspace_bytes(
+            self.text_model.hidden_size(),
+            self.compute_dtype.size_in_bytes(),
+        )
     }
 
     pub fn prompt_token_ids(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
         self.build_prompt(messages)
-    }
-
-    /// Model-derived authorization for all retained incremental decode tensors.
-    pub fn session_cache_reservation_bytes(
-        &self,
-        prompt_tokens: usize,
-        max_new_tokens: usize,
-    ) -> Result<u64> {
-        if prompt_tokens == 0 {
-            return Err(Error::InvalidInput(
-                "Qwen3 cache authorization requires exact precomputed prompt tokens".to_string(),
-            ));
-        }
-        let text_model = match &self.backend {
-            Qwen3ChatBackend::Native { text_model } => text_model,
-            Qwen3ChatBackend::Gguf { gguf_file, .. } => {
-                return Err(Error::InvalidInput(format!(
-                    "Incremental chat cache authorization is unavailable for GGUF model {gguf_file}"
-                )))
-            }
-        };
-        text_model
-            .session_cache_upper_bound_bytes(prompt_tokens, max_new_tokens)
-            .ok_or_else(|| Error::Overloaded("Qwen3 session cache bound overflow".to_string()))
     }
 
     fn build_prompt(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
@@ -665,18 +724,14 @@ fn strip_think_blocks(input: &str) -> String {
     let close = "</think>";
 
     if let Some(close_idx) = output.find(close) {
-        let has_open_before_close = output[..close_idx].find(open).is_some();
+        let has_open_before_close = output[..close_idx].contains(open);
         if !has_open_before_close {
             let start = close_idx + close.len();
             output = output[start..].to_string();
         }
     }
 
-    loop {
-        let Some(start) = output.find(open) else {
-            break;
-        };
-
+    while let Some(start) = output.find(open) {
         let search_from = start + open.len();
         if let Some(end_rel) = output[search_from..].find(close) {
             let end = search_from + end_rel + close.len();
@@ -698,6 +753,51 @@ fn parse_qwen3_config(config_str: &str) -> Result<Qwen3Config> {
     } else {
         serde_json::from_value(value).map_err(Error::from)
     }
+}
+
+fn parse_qwen3_gguf_config(loader: &GgufLoader) -> Result<Qwen3Config> {
+    let required_usize = |key: &str| {
+        loader
+            .get_metadata_u64(key)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| {
+                Error::ModelLoadError(format!("Missing or invalid GGUF metadata: {key}"))
+            })
+    };
+    let required_f64 = |key: &str| {
+        loader.get_metadata_f64(key).ok_or_else(|| {
+            Error::ModelLoadError(format!("Missing or invalid GGUF metadata: {key}"))
+        })
+    };
+    let vocab_size = loader
+        .get_metadata_array_len("tokenizer.ggml.tokens")
+        .ok_or_else(|| {
+            Error::ModelLoadError(
+                "Missing or invalid GGUF metadata: tokenizer.ggml.tokens".to_string(),
+            )
+        })?;
+
+    Ok(Qwen3Config {
+        hidden_size: required_usize("qwen3.embedding_length")?,
+        intermediate_size: required_usize("qwen3.feed_forward_length")?,
+        num_attention_heads: required_usize("qwen3.attention.head_count")?,
+        num_hidden_layers: required_usize("qwen3.block_count")?,
+        num_key_value_heads: required_usize("qwen3.attention.head_count_kv")?,
+        max_position_embeddings: Some(required_usize("qwen3.context_length")?),
+        head_dim: loader
+            .get_metadata_u64("qwen3.attention.key_length")
+            .and_then(|value| usize::try_from(value).ok()),
+        rms_norm_eps: required_f64("qwen3.attention.layer_norm_rms_epsilon")?,
+        rope_theta: required_f64("qwen3.rope.freq_base")?,
+        vocab_size,
+        lm_head_size: None,
+        tie_word_embeddings: !loader.has_tensor("output.weight"),
+        rope_scaling: None,
+        sliding_window: None,
+        use_sliding_window: false,
+        ada_rms_norm_t_cond: false,
+        ada_rms_norm_t_cond_dim: 0,
+    })
 }
 
 fn select_qwen3_dense_dtype(
@@ -731,6 +831,7 @@ fn continuous_decode_collation_workspace_bytes(
         })
 }
 
+#[cfg(test)]
 fn argmax(logits: &Tensor) -> Result<u32> {
     let logits = match logits.rank() {
         1 => logits.clone(),
@@ -760,6 +861,26 @@ fn argmax(logits: &Tensor) -> Result<u32> {
         .map_err(Error::from)
 }
 
+#[cfg(test)]
+fn argmax_last_sequence_output(output: &Tensor) -> Result<u32> {
+    let (batch, sequence, _width) = output.dims3()?;
+    if batch != 1 || sequence == 0 {
+        return Err(Error::InferenceError(format!(
+            "Qwen3 decode output expects [1,sequence,width], got {:?}",
+            output.dims()
+        )));
+    }
+    argmax(&output.i((0, sequence - 1))?)
+}
+
+#[cfg(test)]
+fn take_quantum_argmax(output: &mut Option<Tensor>) -> Result<u32> {
+    let output = output.take().ok_or_else(|| {
+        Error::InferenceError("Qwen3 decode quantum has no unconsumed model output".to_string())
+    })?;
+    argmax_last_sequence_output(&output)
+}
+
 fn text_delta(previous: &str, current: &str) -> String {
     if let Some(delta) = current.strip_prefix(previous) {
         return delta.to_string();
@@ -775,10 +896,11 @@ fn text_delta(previous: &str, current: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        continuous_decode_collation_workspace_bytes, select_qwen3_dense_dtype, strip_think_blocks,
+        argmax_last_sequence_output, continuous_decode_collation_workspace_bytes,
+        select_qwen3_dense_dtype, strip_think_blocks, take_quantum_argmax,
     };
     use crate::backends::{DeviceCapabilities, DeviceKind, DeviceProfile};
-    use candle_core::{DType, Device};
+    use candle_core::{DType, Device, IndexOp, Tensor};
 
     #[test]
     fn strip_think_blocks_handles_explicit_tags() {
@@ -802,6 +924,35 @@ mod tests {
             continuous_decode_collation_workspace_bytes(3_584, 4).unwrap(),
             14_336
         );
+    }
+
+    #[test]
+    fn sampling_consumes_quantum_output_without_changing_argmax() {
+        let output = Tensor::from_vec(vec![0.5f32, 7.0, 2.0], (1, 1, 3), &Device::Cpu).unwrap();
+        let expected = argmax_last_sequence_output(&output).unwrap();
+        let mut unconsumed = Some(output);
+
+        assert_eq!(take_quantum_argmax(&mut unconsumed).unwrap(), expected);
+        assert!(unconsumed.is_none());
+        assert!(take_quantum_argmax(&mut unconsumed).is_err());
+    }
+
+    #[test]
+    fn continuous_rows_are_sampled_from_batch_output_without_state_tensors() {
+        let batch = Tensor::from_vec(
+            vec![0.0f32, 4.0, 1.0, 9.0, 3.0, 2.0],
+            (2, 1, 3),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let sampled = (0..2)
+            .map(|row| {
+                let row_output = batch.i(row).unwrap().unsqueeze(0).unwrap();
+                argmax_last_sequence_output(&row_output).unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(sampled, vec![1, 0]);
     }
 
     #[test]

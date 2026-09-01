@@ -8,7 +8,11 @@ use rand::{Rng, SeedableRng};
 use crate::error::{Error, Result};
 use crate::models::architectures::fish_s2::config::FishS2Config;
 use crate::models::architectures::fish_s2::contracts::semantic_code_from_token_id;
-use crate::models::architectures::qwen3::core::{build_rope_cache, causal_mask, repeat_kv};
+use crate::models::architectures::qwen3::core::build_rope_cache;
+use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
+use crate::models::shared::sampling::{
+    bounded_device_sampling_candidates, device_candidates_cover_top_p, sample_device_candidates,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FishS2FastConfig {
@@ -33,22 +37,11 @@ pub struct FishS2GeneratedFrame {
     pub codebooks: Vec<u32>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FishS2Sampler {
     pub temperature: f32,
     pub top_p: f32,
     rng: StdRng,
-}
-
-#[derive(Debug, Default)]
-pub struct FishS2FastCache {
-    layers: Vec<FishS2FastLayerCache>,
-}
-
-#[derive(Debug, Default)]
-struct FishS2FastLayerCache {
-    key: Option<Tensor>,
-    value: Option<Tensor>,
 }
 
 pub struct FishS2FastDecoder {
@@ -135,24 +128,6 @@ impl FishS2Sampler {
     }
 }
 
-impl FishS2FastCache {
-    pub fn new(num_layers: usize) -> Self {
-        Self {
-            layers: (0..num_layers)
-                .map(|_| FishS2FastLayerCache::default())
-                .collect(),
-        }
-    }
-
-    pub fn current_len(&self) -> usize {
-        self.layers
-            .first()
-            .and_then(|layer| layer.key.as_ref())
-            .and_then(|key| key.dims().get(2).copied())
-            .unwrap_or(0)
-    }
-}
-
 impl FishS2FastDecoder {
     pub fn load(cfg: FishS2FastConfig, vb: VarBuilder) -> Result<Self> {
         let project_in = if cfg.input_hidden_size == cfg.hidden_size {
@@ -202,10 +177,6 @@ impl FishS2FastDecoder {
         &self.cfg
     }
 
-    pub fn new_cache(&self) -> FishS2FastCache {
-        FishS2FastCache::new(self.layers.len())
-    }
-
     pub fn project_slow_hidden(&self, hidden: &Tensor) -> Result<Tensor> {
         match &self.project_in {
             FishS2FastProjectIn::Identity => Ok(hidden.clone()),
@@ -228,14 +199,37 @@ impl FishS2FastDecoder {
         &self,
         x: &Tensor,
         input_pos: usize,
-        cache: &mut FishS2FastCache,
+        cache: &mut PhysicalPagedKvCache,
     ) -> Result<Tensor> {
+        let (batch_size, sequence_len, hidden_size) = x.dims3()?;
+        if batch_size != 1 || sequence_len != 1 || hidden_size != self.cfg.hidden_size {
+            return Err(Error::InvalidInput(format!(
+                "Fish S2 fast physical paging expects [1,1,{}], got {:?}",
+                self.cfg.hidden_size,
+                x.dims()
+            )));
+        }
+        if input_pos >= self.cfg.num_codebooks || input_pos >= cache.capacity_tokens() {
+            return Err(Error::InvalidInput(format!(
+                "Fish S2 fast codebook position {input_pos} exceeds model/cache capacity {}/{}",
+                self.cfg.num_codebooks,
+                cache.capacity_tokens()
+            )));
+        }
+        cache.validate_model(
+            self.cfg.num_hidden_layers,
+            self.cfg.num_key_value_heads,
+            self.cfg.head_dim,
+        )?;
+        let mut prepared = cache.prepare_append(input_pos, sequence_len)?;
         let mut hidden = x.clone();
         for (idx, layer) in self.layers.iter().enumerate() {
-            hidden = layer.forward(&hidden, input_pos, &mut cache.layers[idx])?;
+            hidden = layer.forward(&hidden, input_pos, cache, &mut prepared, idx)?;
         }
         let out = self.norm.forward(&hidden)?;
-        self.output.forward(&out).map_err(Error::from)
+        let logits = self.output.forward(&out)?;
+        cache.commit_prepared(prepared)?;
+        Ok(logits)
     }
 
     pub fn generate_frame(
@@ -243,17 +237,18 @@ impl FishS2FastDecoder {
         semantic_token_id: u32,
         slow_hidden: &Tensor,
         sampler: &mut FishS2Sampler,
+        cache: &mut PhysicalPagedKvCache,
     ) -> Result<FishS2GeneratedFrame> {
         let semantic_code =
             semantic_code_from_token_id_from_fast_config(&self.cfg, semantic_token_id)?;
-        let mut cache = self.new_cache();
+        cache.reset_invocation()?;
         let hidden = self.project_slow_hidden(slow_hidden)?;
-        let _ = self.forward_step(&hidden, 0, &mut cache)?;
+        let _ = self.forward_step(&hidden, 0, cache)?;
 
         let mut codebooks = vec![semantic_code];
         let mut current = self.codebook_embedding(semantic_code)?;
         for codebook_idx in 1..self.cfg.num_codebooks {
-            let logits = self.forward_step(&current, codebook_idx, &mut cache)?;
+            let logits = self.forward_step(&current, codebook_idx, cache)?;
             let row = logits.i((0, 0))?;
             let code = sample_logits(&row, sampler)?;
             codebooks.push(code);
@@ -294,10 +289,14 @@ impl FishS2FastLayer {
         &self,
         x: &Tensor,
         input_pos: usize,
-        cache: &mut FishS2FastLayerCache,
+        cache: &PhysicalPagedKvCache,
+        prepared: &mut PreparedPhysicalPagedStep,
+        layer_idx: usize,
     ) -> Result<Tensor> {
         let normed = self.input_layernorm.forward(x)?;
-        let attn = self.self_attn.forward(&normed, input_pos, cache)?;
+        let attn = self
+            .self_attn
+            .forward(&normed, input_pos, cache, prepared, layer_idx)?;
         let x = x.broadcast_add(&attn)?;
         let normed = self.post_attention_layernorm.forward(&x)?;
         let mlp = self.mlp.forward(&normed)?;
@@ -340,10 +339,17 @@ impl FishS2FastAttention {
         &self,
         x: &Tensor,
         input_pos: usize,
-        cache: &mut FishS2FastLayerCache,
+        cache: &PhysicalPagedKvCache,
+        prepared: &mut PreparedPhysicalPagedStep,
+        layer_idx: usize,
     ) -> Result<Tensor> {
         let bsz = x.dim(0)?;
         let seq_len = x.dim(1)?;
+        if bsz != 1 {
+            return Err(Error::InvalidInput(
+                "Fish S2 fast physical paged attention expects one sequence".into(),
+            ));
+        }
         let q_size = self.num_heads * self.head_dim;
         let kv_size = self.num_kv_heads * self.head_dim;
         let qkv = self.qkv_proj.forward(x)?;
@@ -379,36 +385,12 @@ impl FishS2FastAttention {
             x.device(),
             x.dtype(),
         )?;
-        let q = apply_rope(&q, &cos, &sin)?.transpose(1, 2)?;
-        let mut k = apply_rope(&k, &cos, &sin)?.transpose(1, 2)?;
-        let mut v = v.transpose(1, 2)?;
-
-        if let (Some(prev_k), Some(prev_v)) = (&cache.key, &cache.value) {
-            k = Tensor::cat(&[prev_k, &k], 2)?;
-            v = Tensor::cat(&[prev_v, &v], 2)?;
-        }
-        cache.key = Some(k.clone());
-        cache.value = Some(v.clone());
-
-        let total_len = k.dim(2)?;
-        let k = repeat_kv(&k, self.num_heads, self.num_kv_heads)?;
-        let v = repeat_kv(&v, self.num_heads, self.num_kv_heads)?;
-        let q = q.reshape((bsz * self.num_heads, seq_len, self.head_dim))?;
-        let k = k.reshape((bsz * self.num_heads, total_len, self.head_dim))?;
-        let v = v.reshape((bsz * self.num_heads, total_len, self.head_dim))?;
-
-        let mut att = q.matmul(&k.transpose(1, 2)?)?;
-        let scale =
-            Tensor::new((self.head_dim as f32).sqrt(), att.device())?.to_dtype(att.dtype())?;
-        att = att.broadcast_div(&scale)?;
-        let mask = causal_mask(seq_len, total_len, input_pos, att.device(), att.dtype())?;
-        att = att.broadcast_add(&mask)?;
-        let att = ops::softmax(&att, D::Minus1)?;
-        let out = att.matmul(&v)?;
-        let out = out.reshape((bsz, self.num_heads, seq_len, self.head_dim))?;
-        let out = out
-            .transpose(1, 2)?
-            .reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
+        let q = apply_rope(&q, &cos, &sin)?.squeeze(0)?;
+        let k = apply_rope(&k, &cos, &sin)?.squeeze(0)?;
+        let v = v.squeeze(0)?;
+        let scale = 1.0f32 / (self.head_dim as f32).sqrt();
+        let out = cache.write_and_attend(layer_idx, prepared, &q, &k, &v, scale)?;
+        let out = out.reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
         self.o_proj.forward(&out).map_err(Error::from)
     }
 }
@@ -442,16 +424,47 @@ impl FishS2FastMlp {
     }
 }
 
-fn sample_logits(row: &Tensor, sampler: &mut FishS2Sampler) -> Result<u32> {
-    let values = row.to_dtype(candle_core::DType::F32)?.to_vec1::<f32>()?;
-    if values.is_empty() {
+pub(crate) fn sample_logits(row: &Tensor, sampler: &mut FishS2Sampler) -> Result<u32> {
+    if row.dims1()? == 0 {
         return Err(Error::InferenceError(
             "Fish S2 fast sampler received empty logits".to_string(),
         ));
     }
     if sampler.temperature <= 1e-5 || sampler.top_p <= 0.0 {
-        return argmax_values(&values);
+        let idx = row.argmax(D::Minus1)?;
+        let idx = if idx.rank() == 0 {
+            idx
+        } else {
+            idx.squeeze(0)?
+        };
+        crate::models::shared::telemetry::record_dtype_cast();
+        crate::models::shared::telemetry::record_host_read(candle_core::DType::U32, 1);
+        return idx
+            .to_dtype(candle_core::DType::U32)?
+            .to_scalar::<u32>()
+            .map_err(Error::from);
     }
+
+    if let Some(candidates) = bounded_device_sampling_candidates(
+        row,
+        row.dim(0)?,
+        0,
+        sampler.temperature,
+        &[],
+        1.0,
+        0.0,
+        None,
+    )? {
+        if device_candidates_cover_top_p(&candidates, sampler.top_p) {
+            if let Some(sampled) =
+                sample_device_candidates(&candidates, sampler.top_p, sampler.rng.r#gen::<f32>())
+            {
+                return Ok(sampled);
+            }
+        }
+    }
+
+    let values = row.to_dtype(candle_core::DType::F32)?.to_vec1::<f32>()?;
 
     let temp = sampler.temperature.max(1e-5);
     let max = values
@@ -667,9 +680,22 @@ mod tests {
     #[test]
     fn sampler_argmax_is_deterministic_at_zero_temperature() {
         let device = Device::Cpu;
-        let row = Tensor::from_vec(vec![0.1f32, 2.0, 1.0], (3,), &device).unwrap();
+        let row = Tensor::from_vec(vec![0.1f32, 2.0, 1.0], (3,), &device)
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap();
         let mut sampler = FishS2Sampler::new(0.0, 1.0, 7);
         assert_eq!(sample_logits(&row, &mut sampler).unwrap(), 1);
+    }
+
+    #[test]
+    fn sampler_rejects_empty_greedy_logits_before_readback() {
+        let device = Device::Cpu;
+        let row = Tensor::from_vec(Vec::<f32>::new(), (0,), &device).unwrap();
+        let mut sampler = FishS2Sampler::new(0.0, 1.0, 7);
+        let err = sample_logits(&row, &mut sampler).expect_err("empty logits should fail");
+
+        assert!(format!("{err}").contains("Fish S2 fast sampler received empty logits"));
     }
 
     #[test]
@@ -678,13 +704,28 @@ mod tests {
         let decoder = tiny_decoder(&device);
         let slow_hidden = Tensor::full(0.5f32, (1, 1, 3), &device).unwrap();
         let mut sampler = FishS2Sampler::new(0.0, 1.0, 11);
+        let cfg = decoder.config();
+        let mut cache = super::super::physical::test_physical_cache(
+            202,
+            cfg.num_hidden_layers,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+            cfg.num_codebooks,
+        );
         let frame = decoder
-            .generate_frame(22, &slow_hidden, &mut sampler)
+            .generate_frame(22, &slow_hidden, &mut sampler, &mut cache)
             .expect("frame");
         assert_eq!(frame.semantic_token_id, 22);
         assert_eq!(frame.codebooks.len(), 3);
         assert_eq!(frame.codebooks[0], 2);
         assert!(frame.codebooks[1] < 8);
         assert!(frame.codebooks[2] < 8);
+        assert_eq!(cache.context_len(), cfg.num_codebooks);
+
+        let second = decoder
+            .generate_frame(23, &slow_hidden, &mut sampler, &mut cache)
+            .expect("second frame");
+        assert_eq!(second.codebooks.len(), 3);
+        assert_eq!(cache.context_len(), cfg.num_codebooks);
     }
 }

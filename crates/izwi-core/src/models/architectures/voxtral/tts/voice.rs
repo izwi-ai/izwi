@@ -203,7 +203,7 @@ pub fn validate_voice_embedding_shape(
             dims
         )));
     }
-    if dims.iter().any(|dim| *dim == 0) {
+    if dims.contains(&0) {
         return Err(Error::ModelLoadError(format!(
             "Voxtral voice embedding dimensions must be non-zero, got shape {:?}",
             dims

@@ -176,9 +176,8 @@ impl AsrTokenizer {
         }
 
         let id_for = |token: &str| token_to_id.get(token).copied();
-        let im_start = id_for("<|im_start|>").ok_or_else(|| {
-            Error::TokenizationError("Missing <|im_start|> token id".to_string())
-        })?;
+        let im_start = id_for("<|im_start|>")
+            .ok_or_else(|| Error::TokenizationError("Missing <|im_start|> token id".to_string()))?;
         let im_end = id_for("<|im_end|>")
             .ok_or_else(|| Error::TokenizationError("Missing <|im_end|> token id".to_string()))?;
         let audio_start = id_for("<|audio_start|>")

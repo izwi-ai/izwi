@@ -51,7 +51,7 @@ async fn show_config(path: &PathBuf, theme: &Theme) -> Result<()> {
 
     let content = tokio::fs::read_to_string(path)
         .await
-        .map_err(|e| CliError::Io(e))?;
+        .map_err(CliError::Io)?;
 
     println!("{}", style("Configuration:").bold());
     println!("  Path: {}", path.display());
@@ -98,11 +98,11 @@ async fn edit_config(path: &PathBuf, theme: &Theme) -> Result<()> {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
-                .map_err(|e| CliError::Io(e))?;
+                .map_err(CliError::Io)?;
         }
         tokio::fs::write(path, default_config_contents()?)
             .await
-            .map_err(|e| CliError::Io(e))?;
+            .map_err(CliError::Io)?;
     }
 
     // Open in default editor
@@ -137,9 +137,7 @@ async fn reset_config(path: &PathBuf, yes: bool, theme: &Theme) -> Result<()> {
     }
 
     if path.exists() {
-        tokio::fs::remove_file(path)
-            .await
-            .map_err(|e| CliError::Io(e))?;
+        tokio::fs::remove_file(path).await.map_err(CliError::Io)?;
     }
 
     theme.success("Configuration reset to defaults");

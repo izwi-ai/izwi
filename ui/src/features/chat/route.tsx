@@ -6,7 +6,6 @@ import type { ModelDownloadProgressMap } from "@/features/models/downloadProgres
 import {
   CHAT_PREFERRED_MODELS,
   getChatRouteModelLabel,
-  isThinkingChatModel,
   resolvePreferredRouteModel,
 } from "@/features/models/catalog/routeModelCatalog";
 import { RouteModelModal } from "@/features/models/components/RouteModelModal";
@@ -78,10 +77,9 @@ export function ChatPage({
             : null
         }
         supportsThinking={
-          resolvedSelectedModel
-            ? isThinkingChatModel(resolvedSelectedModel)
-            : false
+          selectedModelInfo?.chat_capabilities?.supports_thinking ?? false
         }
+        chatCapabilities={selectedModelInfo?.chat_capabilities ?? null}
         modelOptions={modelOptions}
         onSelectModel={handleModelSelect}
         onOpenModelManager={openModelManager}

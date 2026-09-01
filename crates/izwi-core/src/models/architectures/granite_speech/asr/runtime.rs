@@ -1,26 +1,33 @@
 //! Native Candle runtime for Granite Speech ASR.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use candle_core::{DType, Device, Tensor, D};
+use candle_core::{DType, Device, IndexOp, Tensor, D};
 use candle_nn::{
     batch_norm, conv1d, conv1d_no_bias, embedding, layer_norm, linear, linear_no_bias, ops,
     rotary_emb, BatchNorm, Conv1d, Conv1dConfig, Embedding, LayerNorm, Linear, Module, ModuleT,
     RmsNorm, VarBuilder,
 };
 
+use crate::backends::kv::{
+    submit_ordered_after_write, KvSlotMap, KvWriteArgs, KvWriteCompletionCollector,
+    PagedKvDecodeArgs,
+};
 use crate::backends::DeviceProfile;
 use crate::error::{Error, Result};
 use crate::kernels::{
     try_fused_decode_gqa_attention, try_fused_rms_norm, try_fused_rope_pair_bshd,
     try_fused_silu_mul_with_status,
 };
-use crate::models::architectures::qwen3::core::{causal_mask, repeat_kv, Qwen3Cache};
+use crate::kv::KvDecodeBatchMetadata;
+use crate::models::architectures::qwen3::core::{causal_mask, repeat_kv};
 use crate::models::shared::attention::flash::{
     try_fused_self_attention, try_fused_self_attention_scaled,
 };
-use crate::models::shared::attention::paged::default_kv_page_size;
+use crate::models::shared::attention::geometry::AttentionGeometry;
+use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
 use crate::models::shared::telemetry::{
     record_decode_attention_path, record_rope_kernel, record_rope_manual, DecodeAttentionPath,
 };
@@ -288,7 +295,7 @@ fn granite_rope_kernel_enabled(device: &Device, dtype: DType, head_dim: usize) -
     if !granite_rope_kernel_policy(device.is_metal(), device.is_cuda(), override_enabled) {
         return false;
     }
-    if head_dim == 0 || head_dim % 2 != 0 {
+    if head_dim == 0 || !head_dim.is_multiple_of(2) {
         return false;
     }
     matches!(dtype, DType::F16 | DType::BF16 | DType::F32)
@@ -301,7 +308,7 @@ fn granite_rope_bhtd_kernel_enabled(device: &Device, dtype: DType, head_dim: usi
     if !granite_rope_bhtd_kernel_policy(device.is_metal(), override_enabled) {
         return false;
     }
-    if head_dim == 0 || head_dim % 2 != 0 {
+    if head_dim == 0 || !head_dim.is_multiple_of(2) {
         return false;
     }
     matches!(dtype, DType::F16 | DType::BF16 | DType::F32)
@@ -314,7 +321,7 @@ fn granite_rope_pair_bshd_kernel_enabled(device: &Device, dtype: DType, head_dim
     if !granite_rope_pair_bshd_kernel_policy(device.is_metal(), override_enabled) {
         return false;
     }
-    if head_dim == 0 || head_dim % 2 != 0 {
+    if head_dim == 0 || !head_dim.is_multiple_of(2) {
         return false;
     }
     matches!(dtype, DType::F16 | DType::F32)
@@ -602,6 +609,31 @@ impl GraniteTextExecutionPlan {
     }
 }
 
+fn granite_text_attention_geometry(config: &GraniteTextConfig) -> Result<AttentionGeometry> {
+    for (name, value) in [
+        ("rope_theta", config.rope_theta),
+        (
+            "attention_multiplier",
+            f64::from(config.attention_multiplier),
+        ),
+    ] {
+        if !value.is_finite() || value <= 0.0 {
+            return Err(Error::ModelLoadError(format!(
+                "Granite Speech text attention geometry is invalid: {name} must be finite and positive, got {value}"
+            )));
+        }
+    }
+    let geometry = AttentionGeometry::from_hidden_size(
+        "Granite Speech text",
+        config.hidden_size,
+        config.num_attention_heads,
+        config.num_key_value_heads,
+        None,
+    )?;
+    geometry.validate_rotary_dim("Granite Speech text", geometry.key_head_dim())?;
+    Ok(geometry)
+}
+
 fn parse_env_bool(raw: &str) -> Option<bool> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
@@ -625,6 +657,9 @@ impl GraniteSpeechRuntime {
         device: &DeviceProfile,
         dtype: DType,
     ) -> Result<Self> {
+        // Reject malformed text geometry before mapping a potentially large
+        // checkpoint and before any head-dimension division occurs.
+        granite_text_attention_geometry(&config.text_config)?;
         let load_started = Instant::now();
         let mmap_started = Instant::now();
         let vb = unsafe {
@@ -687,6 +722,10 @@ impl GraniteSpeechRuntime {
         self.dtype
     }
 
+    pub(crate) fn kv_dtype(&self) -> DType {
+        self.text_model.kv_dtype()
+    }
+
     pub fn audio_embeddings(&self, features: &GraniteSpeechAudioFeatures) -> Result<Tensor> {
         self.audio_embeddings_with_stats(features)
             .map(|(embeddings, _stats)| embeddings)
@@ -735,6 +774,173 @@ impl GraniteSpeechRuntime {
         Ok((embeddings, stats))
     }
 
+    pub(crate) fn audio_embeddings_batch_with_stats(
+        &self,
+        features: &[GraniteSpeechAudioFeatures],
+    ) -> Result<Vec<(Tensor, GraniteSpeechAudioEmbeddingStats)>> {
+        if features.is_empty() {
+            return Err(Error::InvalidInput(
+                "Granite Speech audio embedding batch is empty".into(),
+            ));
+        }
+        if features.len() == 1 {
+            return self
+                .audio_embeddings_with_stats(&features[0])
+                .map(|output| vec![output]);
+        }
+        let dim = features[0].encoder_dim;
+        let max_frames = features
+            .iter()
+            .map(|row| row.encoder_frames)
+            .max()
+            .unwrap_or(0);
+        if dim == 0
+            || max_frames == 0
+            || features.iter().any(|row| {
+                row.encoder_frames == 0
+                    || row.encoder_dim != dim
+                    || row.input_features.len() != row.encoder_frames
+                    || row.input_features.iter().any(|frame| frame.len() != dim)
+            })
+        {
+            return Err(Error::InvalidInput(
+                "Granite Speech audio batch has inconsistent frame geometry".into(),
+            ));
+        }
+        let valid_lengths = features
+            .iter()
+            .map(|row| row.encoder_frames)
+            .collect::<Vec<_>>();
+        let mut flat = Vec::with_capacity(features.len() * max_frames * dim);
+        for row in features {
+            for frame in &row.input_features {
+                flat.extend_from_slice(frame);
+            }
+            flat.resize(flat.len() + (max_frames - row.encoder_frames) * dim, 0.0);
+        }
+        let upload_start = Instant::now();
+        let input = Tensor::from_vec(flat, (features.len(), max_frames, dim), &self.device)?
+            .to_dtype(self.dtype)?;
+        let upload = upload_start.elapsed();
+        let encoder_start = Instant::now();
+        let encoded = self.encoder.forward_valid_lengths(&input, &valid_lengths)?;
+        let encoder = encoder_start.elapsed();
+        let projector_start = Instant::now();
+        let embeddings = self
+            .projector
+            .forward_compact_valid_lengths(&encoded, &valid_lengths)?;
+        let projector = projector_start.elapsed();
+        embeddings
+            .into_iter()
+            .zip(features)
+            .map(|(embeddings, row)| {
+                let windows = self.projector.window_count_for_frames(row.encoder_frames);
+                Ok((
+                    embeddings,
+                    GraniteSpeechAudioEmbeddingStats {
+                        upload,
+                        encoder,
+                        projector,
+                        encoder_frames: row.encoder_frames,
+                        encoder_dim: row.encoder_dim,
+                        conformer_context_size: self.encoder.context_size(),
+                        conformer_blocks: self.encoder.block_count_for_frames(row.encoder_frames),
+                        conformer_pad_frames: self
+                            .encoder
+                            .pad_frames_for_frames(row.encoder_frames),
+                        conformer_layers: self.encoder.layer_count(),
+                        qformer_windows: windows,
+                        qformer_window_size: self.projector.window_size(),
+                        qformer_queries_per_window: self.projector.num_queries(),
+                        qformer_layers: self.projector.layer_count(),
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    pub(crate) fn prepare_prompt_embeddings(
+        &self,
+        prompt: &GraniteSpeechPrompt,
+        special_tokens: &GraniteSpeechSpecialTokens,
+        audio_embeds: &Tensor,
+    ) -> Result<(Tensor, usize, usize)> {
+        let audio_tokens = audio_embeds.dim(1)?;
+        let input_ids = expand_audio_tokens(
+            &prompt.input_ids,
+            &prompt.audio_token_positions,
+            audio_tokens,
+            special_tokens.audio_token_id,
+        )?;
+        let audio_start = prompt
+            .audio_token_positions
+            .first()
+            .copied()
+            .ok_or_else(|| Error::InvalidInput("Granite prompt has no audio token".into()))?;
+        let embeddings = self.text_model.prompt_embeddings_with_audio(
+            &input_ids,
+            audio_start,
+            audio_tokens,
+            audio_embeds,
+        )?;
+        Ok((embeddings, input_ids.len(), audio_tokens))
+    }
+
+    pub(crate) fn prefill_prepared_prompt_span(
+        &self,
+        embeddings: &Tensor,
+        span_start: usize,
+        span_end: usize,
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<Tensor> {
+        let prompt_tokens = embeddings.dim(1)?;
+        if span_start != cache.context_len() || span_start >= span_end || span_end > prompt_tokens {
+            return Err(Error::InvalidInput(format!(
+                "Granite Speech prefill span [{span_start},{span_end}) does not continue cache cursor {} within prompt length {prompt_tokens}",
+                cache.context_len()
+            )));
+        }
+        let span = embeddings.narrow(1, span_start, span_end - span_start)?;
+        self.text_model
+            .forward_with_embeds_profiled(&span, span_start, cache, None, None)
+    }
+
+    pub(crate) fn decode_token(
+        &self,
+        token: u32,
+        position: usize,
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<Tensor> {
+        let token = Tensor::from_vec(vec![token], (1, 1), &self.device)?;
+        self.text_model
+            .forward_profiled(&token, position, cache, None, None)
+    }
+
+    pub(crate) fn decode_tokens_batch(
+        &self,
+        tokens: &[u32],
+        positions: &[usize],
+        caches: &mut [&mut PhysicalPagedKvCache],
+    ) -> Result<Tensor> {
+        if tokens.is_empty() || tokens.len() != positions.len() || tokens.len() != caches.len() {
+            return Err(Error::InvalidInput(
+                "Granite Speech decode batch rows do not match".into(),
+            ));
+        }
+        let input = Tensor::from_vec(tokens.to_vec(), (tokens.len(), 1), &self.device)?;
+        if tokens.len() == 1 {
+            self.text_model
+                .forward_profiled(&input, positions[0], caches[0], None, None)
+        } else {
+            self.text_model
+                .forward_managed_decode_batch(&input, positions, caches)
+        }
+    }
+
+    pub(crate) fn greedy_token(&self, logits: &Tensor) -> Result<u32> {
+        argmax_last_logits(logits)
+    }
+
     pub fn generate(
         &self,
         prompt: &GraniteSpeechPrompt,
@@ -744,6 +950,7 @@ impl GraniteSpeechRuntime {
         extra_stop_token_ids: &[u32],
         stop_sequences: &[String],
         decode: &mut dyn FnMut(&[u32]) -> Result<String>,
+        cache: &mut PhysicalPagedKvCache,
         on_delta: &mut dyn FnMut(&str),
         emit_deltas: bool,
     ) -> Result<GraniteSpeechGeneration> {
@@ -760,19 +967,25 @@ impl GraniteSpeechRuntime {
             .copied()
             .ok_or_else(|| Error::InvalidInput("Granite prompt has no audio token".to_string()))?;
         let max_steps = max_new_tokens.max(1);
-        let dense_decode_initial_capacity =
-            granite_dense_decode_initial_capacity(&self.device, input_ids.len(), max_steps);
-
-        let mut cache = Qwen3Cache::with_page_size_and_dense_decode_initial_capacity(
-            self.text_model.num_layers(),
-            default_kv_page_size(),
-            &self.device,
-            dense_decode_initial_capacity,
-        );
-        let dense_decode_max_tokens = cache.dense_decode_max_tokens();
-        let dense_decode_cache_enabled = dense_decode_max_tokens > 0;
-        let dense_head_decode_enabled =
-            dense_decode_cache_enabled && granite_dense_head_decode_allowed(&self.device);
+        if cache.context_len() != 0 {
+            return Err(Error::InvalidInput(
+                "Granite Speech invocation cache must begin empty".into(),
+            ));
+        }
+        let required_tokens = input_ids
+            .len()
+            .checked_add(max_steps)
+            .ok_or_else(|| Error::InvalidInput("Granite Speech context length overflow".into()))?;
+        if required_tokens > cache.capacity_tokens() {
+            return Err(Error::InvalidInput(format!(
+                "Granite Speech prompt and decode require {required_tokens} KV tokens, but the invocation cache has capacity for {}",
+                cache.capacity_tokens()
+            )));
+        }
+        let dense_decode_initial_capacity = 0;
+        let dense_decode_max_tokens = 0;
+        let dense_decode_cache_enabled = false;
+        let dense_head_decode_enabled = false;
         let cuda_device_argmax = self.device.is_cuda();
         let mut profiler = GraniteSpeechDecodeProfiler::from_env(self.text_model.num_layers());
         let profiling = profiler.is_some();
@@ -785,7 +998,7 @@ impl GraniteSpeechRuntime {
             audio_start,
             audio_tokens,
             audio_embeds,
-            &mut cache,
+            cache,
             rope_cache.as_ref(),
         )?;
         let prefill = prefill_start.elapsed();
@@ -826,7 +1039,7 @@ impl GraniteSpeechRuntime {
                     logits = self.text_model.forward_profiled(
                         &token_tensor,
                         input_ids.len() + step,
-                        Some(&mut cache),
+                        cache,
                         rope_cache.as_ref(),
                         profiler.as_mut(),
                     )?;
@@ -845,7 +1058,7 @@ impl GraniteSpeechRuntime {
                     logits = self.text_model.forward_profiled(
                         &token_tensor,
                         input_ids.len() + step,
-                        Some(&mut cache),
+                        cache,
                         rope_cache.as_ref(),
                         profiler.as_mut(),
                     )?;
@@ -889,7 +1102,7 @@ impl GraniteSpeechRuntime {
                 let next_logits = self.text_model.forward_profiled(
                     &token_tensor,
                     input_ids.len() + step,
-                    Some(&mut cache),
+                    cache,
                     rope_cache.as_ref(),
                     profiler.as_mut(),
                 )?;
@@ -947,7 +1160,7 @@ impl GraniteSpeechRuntime {
                 let next_logits = self.text_model.forward_profiled(
                     &token_tensor,
                     input_ids.len() + step,
-                    Some(&mut cache),
+                    cache,
                     rope_cache.as_ref(),
                     profiler.as_mut(),
                 )?;
@@ -1190,6 +1403,39 @@ impl GraniteSpeechEncoder {
         }
     }
 
+    fn forward_valid_lengths(&self, input: &Tensor, valid_lengths: &[usize]) -> Result<Tensor> {
+        let (batch, sequence, _) = input.dims3()?;
+        validate_frame_lengths(batch, sequence, valid_lengths)?;
+        let mask = frame_valid_mask(valid_lengths, sequence, input.device(), input.dtype())?;
+        let mut x = self.input_linear.forward(input)?.broadcast_mul(&mask)?;
+        let mut exported = Vec::with_capacity(self.cat_hidden_layers.len() + 1);
+        if self.cat_hidden_layers.contains(&0) {
+            exported.push(x.clone());
+        }
+        let midpoint = self.layers.len() / 2;
+        for (idx, layer) in self.layers.iter().enumerate() {
+            x = layer.forward_valid_lengths(&x, valid_lengths, &mask)?;
+            let layer_idx = idx + 1;
+            if self.cat_hidden_layers.contains(&layer_idx) {
+                exported.push(x.clone());
+            }
+            if layer_idx == midpoint {
+                let mid = self.out.forward(&x)?;
+                let mid = ops::softmax_last_dim(&mid)?;
+                let mid = self.out_mid.forward(&mid)?.broadcast_mul(&mask)?;
+                x = x.broadcast_add(&mid)?.broadcast_mul(&mask)?;
+            }
+        }
+        x = x.broadcast_mul(&mask)?;
+        if exported.is_empty() {
+            Ok(x)
+        } else {
+            exported.push(x);
+            let refs = exported.iter().collect::<Vec<_>>();
+            Tensor::cat(&refs, 2).map_err(Error::from)
+        }
+    }
+
     fn context_size(&self) -> usize {
         self.layers
             .first()
@@ -1242,6 +1488,26 @@ impl GraniteConformerBlock {
         let ff2 = self.ff2.forward(&out)?;
         out = out.broadcast_add(&(ff2 * 0.5)?)?;
         self.post_norm.forward(&out).map_err(Error::from)
+    }
+
+    fn forward_valid_lengths(
+        &self,
+        x: &Tensor,
+        valid_lengths: &[usize],
+        mask: &Tensor,
+    ) -> Result<Tensor> {
+        let ff1 = self.ff1.forward(x)?.broadcast_mul(mask)?;
+        let mut out = x.broadcast_add(&(ff1 * 0.5)?)?.broadcast_mul(mask)?;
+        let attn = self.attn.forward_valid_lengths(&out, valid_lengths)?;
+        out = out.broadcast_add(&attn)?.broadcast_mul(mask)?;
+        let conv = self.conv.forward_valid_lengths(&out, mask)?;
+        out = out.broadcast_add(&conv)?.broadcast_mul(mask)?;
+        let ff2 = self.ff2.forward(&out)?.broadcast_mul(mask)?;
+        out = out.broadcast_add(&(ff2 * 0.5)?)?.broadcast_mul(mask)?;
+        self.post_norm
+            .forward(&out)?
+            .broadcast_mul(mask)
+            .map_err(Error::from)
     }
 
     fn context_size(&self) -> usize {
@@ -1375,6 +1641,75 @@ impl GraniteConformerAttention {
         self.to_out.forward(&out).map_err(Error::from)
     }
 
+    fn forward_valid_lengths(&self, x: &Tensor, valid_lengths: &[usize]) -> Result<Tensor> {
+        let (batch, seq_len, _) = x.dims3()?;
+        validate_frame_lengths(batch, seq_len, valid_lengths)?;
+        let input_mask = frame_valid_mask(valid_lengths, seq_len, x.device(), x.dtype())?;
+        let x = self.pre_norm.forward(x)?.broadcast_mul(&input_mask)?;
+        let nblocks = seq_len.div_ceil(self.context_size);
+        let padded_len = nblocks * self.context_size;
+        let padded = if padded_len > seq_len {
+            x.pad_with_zeros(1, 0, padded_len - seq_len)?
+        } else {
+            x
+        };
+        let q = self.to_q.forward(&padded)?;
+        let kv = self.to_kv.forward(&padded)?;
+        let k = kv.narrow(2, 0, self.num_heads * self.dim_head)?;
+        let v = kv.narrow(
+            2,
+            self.num_heads * self.dim_head,
+            self.num_heads * self.dim_head,
+        )?;
+        let q = encoder_attention_heads(
+            &q,
+            batch,
+            nblocks,
+            self.context_size,
+            self.num_heads,
+            self.dim_head,
+        )?;
+        let k = encoder_attention_heads(
+            &k,
+            batch,
+            nblocks,
+            self.context_size,
+            self.num_heads,
+            self.dim_head,
+        )?;
+        let v = encoder_attention_heads(
+            &v,
+            batch,
+            nblocks,
+            self.context_size,
+            self.num_heads,
+            self.dim_head,
+        )?;
+        let pos_bias = self.relative_position_bias(&q)?;
+        let mut scores = (encoder_attention_scores(&q, &k)?
+            * (1.0 / (self.dim_head as f64).sqrt()))?
+        .broadcast_add(&pos_bias)?;
+        let key_mask = encoder_valid_key_mask(
+            valid_lengths,
+            nblocks,
+            self.context_size,
+            scores.device(),
+            scores.dtype(),
+        )?;
+        scores = scores.broadcast_add(&key_mask)?;
+        let attention =
+            ops::softmax(&scores.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(q.dtype())?;
+        let out = encoder_attention_context(&attention, &v)?
+            .transpose(2, 3)?
+            .reshape((batch, padded_len, self.num_heads * self.dim_head))?
+            .narrow(1, 0, seq_len)?
+            .broadcast_mul(&input_mask)?;
+        self.to_out
+            .forward(&out)?
+            .broadcast_mul(&input_mask)
+            .map_err(Error::from)
+    }
+
     fn relative_position_bias(&self, q: &Tensor) -> Result<Tensor> {
         let out_dtype = q.dtype();
         let rel = self
@@ -1398,6 +1733,66 @@ impl GraniteConformerAttention {
             .to_dtype(out_dtype)
             .map_err(Error::from)
     }
+}
+
+fn validate_frame_lengths(batch: usize, sequence: usize, valid_lengths: &[usize]) -> Result<()> {
+    if batch == 0
+        || sequence == 0
+        || valid_lengths.len() != batch
+        || valid_lengths
+            .iter()
+            .any(|length| *length == 0 || *length > sequence)
+    {
+        return Err(Error::InvalidInput(
+            "Granite Speech valid frame lengths do not match the padded batch".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn frame_valid_mask(
+    valid_lengths: &[usize],
+    sequence: usize,
+    device: &Device,
+    dtype: DType,
+) -> Result<Tensor> {
+    let data = valid_lengths
+        .iter()
+        .flat_map(|length| (0..sequence).map(move |position| (position < *length) as u8 as f32))
+        .collect::<Vec<_>>();
+    Tensor::from_vec(data, (valid_lengths.len(), sequence, 1), device)?
+        .to_dtype(dtype)
+        .map_err(Error::from)
+}
+
+fn encoder_valid_key_mask(
+    valid_lengths: &[usize],
+    nblocks: usize,
+    context: usize,
+    device: &Device,
+    dtype: DType,
+) -> Result<Tensor> {
+    let mut data = Vec::with_capacity(valid_lengths.len() * nblocks * context * context);
+    for valid in valid_lengths {
+        for block in 0..nblocks {
+            for _query in 0..context {
+                for key in 0..context {
+                    data.push(if block * context + key < *valid {
+                        0.0
+                    } else {
+                        -1e4
+                    });
+                }
+            }
+        }
+    }
+    Tensor::from_vec(
+        data,
+        (valid_lengths.len(), nblocks, 1, context, context),
+        device,
+    )?
+    .to_dtype(dtype)
+    .map_err(Error::from)
 }
 
 fn encoder_attention_heads(
@@ -1497,8 +1892,10 @@ impl GraniteConformerConv {
     fn load(config: &GraniteSpeechEncoderConfig, vb: VarBuilder) -> Result<Self> {
         let hidden = config.hidden_dim;
         let inner = hidden * config.conv_expansion_factor;
-        let mut depth_cfg = Conv1dConfig::default();
-        depth_cfg.groups = inner;
+        let depth_cfg = Conv1dConfig {
+            groups: inner,
+            ..Default::default()
+        };
         Ok(Self {
             norm: layer_norm(hidden, 1e-5, vb.pp("norm"))?,
             up_conv: conv1d(
@@ -1538,6 +1935,25 @@ impl GraniteConformerConv {
         let x = self.batch_norm.forward_t(&x, false)?.silu()?;
         self.down_conv
             .forward(&x)?
+            .transpose(1, 2)?
+            .contiguous()
+            .map_err(Error::from)
+    }
+
+    fn forward_valid_lengths(&self, x: &Tensor, frame_mask: &Tensor) -> Result<Tensor> {
+        let x = self.norm.forward(x)?;
+        let x = x.transpose(1, 2)?.contiguous()?;
+        let channel_mask = frame_mask.transpose(1, 2)?.contiguous()?;
+        let x = self.up_conv.forward(&x)?;
+        let x = glu_channels(&x)?.broadcast_mul(&channel_mask)?;
+        let pad = self.depth_conv_weight_width() / 2;
+        let right = pad.saturating_sub((self.depth_conv_weight_width() + 1) % 2);
+        let x = x.pad_with_zeros(2, pad, right)?;
+        let x = self.depth_conv.forward(&x)?;
+        let x = self.batch_norm.forward_t(&x, false)?.silu()?;
+        self.down_conv
+            .forward(&x)?
+            .broadcast_mul(&channel_mask)?
             .transpose(1, 2)?
             .contiguous()
             .map_err(Error::from)
@@ -1603,6 +2019,51 @@ impl GraniteSpeechProjector {
         let output = self.qformer.forward(&query, &windows)?;
         let output = output.reshape((batch, nblocks * self.num_queries, output.dim(2)?))?;
         self.linear.forward(&output).map_err(Error::from)
+    }
+
+    fn forward_compact_valid_lengths(
+        &self,
+        hidden: &Tensor,
+        valid_lengths: &[usize],
+    ) -> Result<Vec<Tensor>> {
+        let (batch, sequence, dim) = hidden.dims3()?;
+        validate_frame_lengths(batch, sequence, valid_lengths)?;
+        let mut packed = Vec::new();
+        let mut row_windows = Vec::with_capacity(batch);
+        for (row, valid) in valid_lengths.iter().copied().enumerate() {
+            let windows = self.window_count_for_frames(valid);
+            let padded = windows * self.window_size;
+            let row = hidden.i(row)?.narrow(0, 0, valid)?;
+            let row = if padded > valid {
+                row.pad_with_zeros(0, 0, padded - valid)?
+            } else {
+                row
+            };
+            packed.push(row.reshape((windows, self.window_size, dim))?);
+            row_windows.push(windows);
+        }
+        let refs = packed.iter().collect::<Vec<_>>();
+        let windows = Tensor::cat(&refs, 0)?;
+        let total_windows = windows.dim(0)?;
+        let query =
+            self.query
+                .broadcast_as((total_windows, self.num_queries, self.query.dim(2)?))?;
+        let output = self.qformer.forward(&query, &windows)?;
+        let output = self.linear.forward(&output)?;
+        let output_dim = output.dim(2)?;
+        let mut offset = 0usize;
+        row_windows
+            .into_iter()
+            .map(|windows| {
+                let row = output.narrow(0, offset, windows)?.reshape((
+                    1,
+                    windows * self.num_queries,
+                    output_dim,
+                ))?;
+                offset += windows;
+                Ok(row)
+            })
+            .collect()
     }
 
     fn window_count_for_frames(&self, frames: usize) -> usize {
@@ -1673,7 +2134,8 @@ impl GraniteQFormerLayer {
     fn load(config: &GraniteSpeechConfig, idx: usize, vb: VarBuilder) -> Result<Self> {
         let hidden = config.projector_config.hidden_size;
         let intermediate = config.projector_config.intermediate_size;
-        let has_cross = idx % config.projector_config.cross_attention_frequency.max(1) == 0;
+        let has_cross =
+            idx.is_multiple_of(config.projector_config.cross_attention_frequency.max(1));
         Ok(Self {
             attention: GraniteQFormerAttention::load(config, false, vb.pp("attention"))?,
             crossattention: if has_cross {
@@ -1906,6 +2368,14 @@ impl GraniteLanguageModel {
         self.layers.len()
     }
 
+    fn kv_dtype(&self) -> DType {
+        if self.execution_plan.f16_attention_core {
+            DType::F16
+        } else {
+            self.embed_tokens.embeddings().dtype()
+        }
+    }
+
     fn residual_branches_prescaled(&self) -> bool {
         self.residual_branches_prescaled
     }
@@ -1969,20 +2439,11 @@ impl GraniteLanguageModel {
         self.embed_tokens.forward(&ids).map_err(Error::from)
     }
 
-    fn forward(
-        &self,
-        input_ids: &Tensor,
-        start_pos: usize,
-        cache: Option<&mut Qwen3Cache>,
-    ) -> Result<Tensor> {
-        self.forward_profiled(input_ids, start_pos, cache, None, None)
-    }
-
     fn forward_profiled(
         &self,
         input_ids: &Tensor,
         start_pos: usize,
-        cache: Option<&mut Qwen3Cache>,
+        cache: &mut PhysicalPagedKvCache,
         rope_cache: Option<&GraniteRopeCache>,
         mut profile: Option<&mut GraniteSpeechDecodeProfiler>,
     ) -> Result<Tensor> {
@@ -1995,22 +2456,148 @@ impl GraniteLanguageModel {
         self.forward_with_embeds_profiled(&embeds, start_pos, cache, rope_cache, profile)
     }
 
-    fn forward_prompt_with_audio(
+    fn forward_managed_decode_batch(
         &self,
-        input_ids: &[u32],
-        audio_start: usize,
-        audio_len: usize,
-        audio_embeds: &Tensor,
-        cache: &mut Qwen3Cache,
+        input_ids: &Tensor,
+        start_positions: &[usize],
+        caches: &mut [&mut PhysicalPagedKvCache],
     ) -> Result<Tensor> {
-        self.forward_prompt_with_audio_with_rope(
-            input_ids,
-            audio_start,
-            audio_len,
-            audio_embeds,
-            cache,
-            None,
-        )
+        let (batch_size, sequence_len) = input_ids.dims2()?;
+        if batch_size == 0
+            || sequence_len != 1
+            || start_positions.len() != batch_size
+            || caches.len() != batch_size
+        {
+            return Err(Error::InvalidInput(format!(
+                "Granite Speech managed decode expects matching [batch,1] rows, got {:?}",
+                input_ids.dims()
+            )));
+        }
+        for (row, cache) in caches.iter().enumerate() {
+            cache.validate_model(
+                self.cfg.num_hidden_layers,
+                self.cfg.num_key_value_heads,
+                self.cfg.hidden_size / self.cfg.num_attention_heads,
+            )?;
+            cache.slots_for_append(start_positions[row], 1)?;
+        }
+
+        let first = &*caches[0];
+        for cache in caches.iter().skip(1) {
+            if !Arc::ptr_eq(&cache.arena, &first.arena) {
+                return Err(Error::InvalidInput(
+                    "Granite Speech managed decode rows must share one physical arena".into(),
+                ));
+            }
+        }
+        for layer_idx in 0..self.cfg.num_hidden_layers {
+            let binding = first.layer_binding(layer_idx)?;
+            for cache in caches.iter().skip(1) {
+                if cache.layer_binding(layer_idx)? != binding {
+                    return Err(Error::InvalidInput(
+                        "Granite Speech managed decode rows must share every layer binding".into(),
+                    ));
+                }
+            }
+        }
+        let combined_slots = caches
+            .iter()
+            .enumerate()
+            .map(|(row, cache)| {
+                cache
+                    .slots_for_append(start_positions[row], 1)
+                    .map(|slots| slots[0])
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let lowered = first.arena.lower_slots(&combined_slots)?;
+        let metadata = KvDecodeBatchMetadata {
+            sequences: caches
+                .iter()
+                .enumerate()
+                .map(|(row, cache)| {
+                    let context_len = start_positions[row].checked_add(1).ok_or_else(|| {
+                        Error::InferenceError("Granite Speech decode position overflow".into())
+                    })?;
+                    cache.sequence_table(context_len)
+                })
+                .collect::<Result<Vec<_>>>()?,
+        };
+        let mut completions =
+            KvWriteCompletionCollector::new(first.arena.config(), lowered.logical_slots())?;
+        let checkpoints = caches
+            .iter()
+            .map(|cache| cache.logical_checkpoint())
+            .collect::<Vec<_>>();
+        let execution = (|| -> Result<Tensor> {
+            let embeds = self.embed_tokens.forward(input_ids)?;
+            let mut x = (embeds * self.cfg.embedding_multiplier as f64)?;
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                let cache_refs = caches
+                    .iter()
+                    .map(|cache| &**cache)
+                    .collect::<Vec<&PhysicalPagedKvCache>>();
+                x = layer.forward_managed_decode_batch(
+                    &x,
+                    start_positions,
+                    &cache_refs,
+                    lowered.as_ref(),
+                    &metadata,
+                    &mut completions,
+                    layer_idx,
+                )?;
+            }
+            let hidden = granite_rms_norm_forward(&self.norm, &x)?;
+            let hidden = last_hidden_for_logits(&hidden)?;
+            let logits = if hidden.dtype() == self.lm_head.weight().dtype() {
+                self.lm_head.forward(&hidden)?
+            } else {
+                self.lm_head
+                    .forward(&hidden.to_dtype(self.lm_head.weight().dtype())?)?
+            };
+            if granite_native_greedy_logits_enabled() {
+                Ok(logits)
+            } else {
+                (logits / self.cfg.logits_scaling as f64)
+                    .and_then(|tensor| tensor.to_dtype(DType::F32))
+                    .map_err(Error::from)
+            }
+        })();
+        let logits = match execution {
+            Ok(logits) => logits,
+            Err(error) => {
+                return match completions.drain() {
+                    Ok(()) => Err(error),
+                    Err(drain) => Err(Error::InferenceError(format!(
+                        "Granite Speech decode batch failed: {error}; write-fence drain also failed: {drain}"
+                    ))),
+                };
+            }
+        };
+        let completion = Arc::new(completions.seal()?);
+        for committed in 0..caches.len() {
+            if let Err(error) = caches[committed].commit_shared_completion(
+                start_positions[committed],
+                1,
+                completion.clone(),
+            ) {
+                let mut rollback_error = None;
+                for rollback_row in 0..committed {
+                    if let Err(rollback) = caches[rollback_row]
+                        .restore_logical_checkpoint(checkpoints[rollback_row].clone())
+                    {
+                        rollback_error.get_or_insert(rollback);
+                    }
+                }
+                return if let Some(rollback) = rollback_error {
+                    Err(Error::InferenceError(format!(
+                        "Granite Speech decode batch commit failed: {error}; rollback also failed: {rollback}"
+                    )))
+                } else {
+                    Err(error)
+                };
+            }
+        }
+        Ok(logits)
     }
 
     fn forward_prompt_with_audio_with_rope(
@@ -2019,8 +2606,20 @@ impl GraniteLanguageModel {
         audio_start: usize,
         audio_len: usize,
         audio_embeds: &Tensor,
-        cache: &mut Qwen3Cache,
+        cache: &mut PhysicalPagedKvCache,
         rope_cache: Option<&GraniteRopeCache>,
+    ) -> Result<Tensor> {
+        let merged =
+            self.prompt_embeddings_with_audio(input_ids, audio_start, audio_len, audio_embeds)?;
+        self.forward_with_embeds_profiled(&merged, 0, cache, rope_cache, None)
+    }
+
+    fn prompt_embeddings_with_audio(
+        &self,
+        input_ids: &[u32],
+        audio_start: usize,
+        audio_len: usize,
+        audio_embeds: &Tensor,
     ) -> Result<Tensor> {
         let mut llm_ids = input_ids.to_vec();
         for idx in audio_start..audio_start + audio_len {
@@ -2043,27 +2642,32 @@ impl GraniteLanguageModel {
             Tensor::zeros((1, 0, hidden), embeds.dtype(), embeds.device())?
         };
         let audio = audio_embeds.to_dtype(embeds.dtype())?;
-        let merged = Tensor::cat(&[before, audio, after], 1)?;
-        self.forward_with_embeds_profiled(&merged, 0, Some(cache), rope_cache, None)
-    }
-
-    fn forward_with_embeds(
-        &self,
-        embeds: &Tensor,
-        start_pos: usize,
-        cache: Option<&mut Qwen3Cache>,
-    ) -> Result<Tensor> {
-        self.forward_with_embeds_profiled(embeds, start_pos, cache, None, None)
+        Tensor::cat(&[before, audio, after], 1).map_err(Error::from)
     }
 
     fn forward_with_embeds_profiled(
         &self,
         embeds: &Tensor,
         start_pos: usize,
-        mut cache: Option<&mut Qwen3Cache>,
+        cache: &mut PhysicalPagedKvCache,
         rope_cache: Option<&GraniteRopeCache>,
         mut profile: Option<&mut GraniteSpeechDecodeProfiler>,
     ) -> Result<Tensor> {
+        let (batch, sequence_len, hidden_size) = embeds.dims3()?;
+        if batch != 1 || sequence_len == 0 || hidden_size != self.cfg.hidden_size {
+            return Err(Error::InvalidInput(format!(
+                "Granite Speech decoder embeddings must have shape [1,sequence,{}], got {:?}",
+                self.cfg.hidden_size,
+                embeds.dims()
+            )));
+        }
+        cache.validate_model(
+            self.cfg.num_hidden_layers,
+            self.cfg.num_key_value_heads,
+            self.cfg.hidden_size / self.cfg.num_attention_heads,
+        )?;
+        cache.slots_for_append(start_pos, sequence_len)?;
+        let mut prepared = cache.prepare_append(start_pos, sequence_len)?;
         let profiling = profile.is_some();
         let mut x = (embeds * self.cfg.embedding_multiplier as f64)?;
         let rope_start = profile_start(profiling);
@@ -2090,14 +2694,14 @@ impl GraniteLanguageModel {
             profile.profile.forward.rope_build += profile_elapsed(rope_start);
         }
         for (idx, layer) in self.layers.iter().enumerate() {
-            let cache_ref = cache.as_deref_mut();
             if let Some(profile) = profile.as_deref_mut() {
                 let layer_start = profile_start(profiling);
                 let mut layer_profile = GraniteSpeechLayerDecodeProfile::default();
                 x = layer.forward(
                     &x,
                     start_pos,
-                    cache_ref,
+                    cache,
+                    &mut prepared,
                     idx,
                     rope.as_ref(),
                     Some(&mut layer_profile),
@@ -2105,7 +2709,15 @@ impl GraniteLanguageModel {
                 layer_profile.total = profile_elapsed(layer_start);
                 profile.add_layer(idx, layer_profile);
             } else {
-                x = layer.forward(&x, start_pos, cache_ref, idx, rope.as_ref(), None)?;
+                x = layer.forward(
+                    &x,
+                    start_pos,
+                    cache,
+                    &mut prepared,
+                    idx,
+                    rope.as_ref(),
+                    None,
+                )?;
             }
         }
         let final_norm_start = profile_start(profiling);
@@ -2129,16 +2741,18 @@ impl GraniteLanguageModel {
             self.lm_head
                 .forward(&hidden.to_dtype(self.lm_head.weight().dtype())?)?
         };
-        if let Some(profile) = profile.as_deref_mut() {
+        if let Some(profile) = profile {
             profile.profile.forward.lm_head += profile_elapsed(lm_head_start);
         }
-        if granite_native_greedy_logits_enabled() {
-            Ok(logits)
+        let logits = if granite_native_greedy_logits_enabled() {
+            logits
         } else {
             (logits / self.cfg.logits_scaling as f64)
                 .and_then(|tensor| tensor.to_dtype(DType::F32))
-                .map_err(Error::from)
-        }
+                .map_err(Error::from)?
+        };
+        cache.commit_prepared(prepared)?;
+        Ok(logits)
     }
 }
 
@@ -2190,7 +2804,8 @@ impl GraniteDecoderLayer {
         &self,
         x: &Tensor,
         start_pos: usize,
-        cache: Option<&mut Qwen3Cache>,
+        cache: &PhysicalPagedKvCache,
+        prepared: &mut PreparedPhysicalPagedStep,
         layer_idx: usize,
         rope: Option<&GraniteRopeSlice>,
         mut profile: Option<&mut GraniteSpeechLayerDecodeProfile>,
@@ -2207,13 +2822,14 @@ impl GraniteDecoderLayer {
                 &normed,
                 start_pos,
                 cache,
+                prepared,
                 layer_idx,
                 rope,
                 Some(&mut profile.attention),
             )?
         } else {
             self.self_attn
-                .forward(&normed, start_pos, cache, layer_idx, rope, None)?
+                .forward(&normed, start_pos, cache, prepared, layer_idx, rope, None)?
         };
         let residual_start = profile_start(profiling);
         let attn = self.scale_residual_branch(attn)?;
@@ -2235,10 +2851,40 @@ impl GraniteDecoderLayer {
         let residual_start = profile_start(profiling);
         let mlp = self.scale_residual_branch(mlp)?;
         let out = residual.broadcast_add(&mlp)?;
-        if let Some(profile) = profile.as_deref_mut() {
+        if let Some(profile) = profile {
             profile.residual += profile_elapsed(residual_start);
         }
         Ok(out)
+    }
+
+    fn forward_managed_decode_batch(
+        &self,
+        x: &Tensor,
+        start_positions: &[usize],
+        caches: &[&PhysicalPagedKvCache],
+        slots: &dyn KvSlotMap,
+        metadata: &KvDecodeBatchMetadata,
+        completions: &mut KvWriteCompletionCollector,
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let residual = x;
+        let normed = granite_rms_norm_forward(&self.input_layernorm, x)?;
+        let attn = self.self_attn.forward_managed_decode_batch(
+            &normed,
+            start_positions,
+            caches,
+            slots,
+            metadata,
+            completions,
+            layer_idx,
+        )?;
+        let attn = self.scale_residual_branch(attn)?;
+        let x = residual.broadcast_add(&attn)?;
+        let residual = &x;
+        let normed = granite_rms_norm_forward(&self.post_attention_layernorm, &x)?;
+        let mlp = self.mlp.forward(&normed, None)?;
+        let mlp = self.scale_residual_branch(mlp)?;
+        residual.broadcast_add(&mlp).map_err(Error::from)
     }
 
     fn scale_residual_branch(&self, branch: Tensor) -> Result<Tensor> {
@@ -2439,12 +3085,9 @@ impl GraniteTextAttention {
         prescale_residual: bool,
         execution_plan: GraniteTextExecutionPlan,
     ) -> Result<Self> {
-        let head_dim = config.hidden_size / config.num_attention_heads;
-        let o_proj = linear_no_bias(
-            config.num_attention_heads * head_dim,
-            config.hidden_size,
-            vb.pp("o_proj"),
-        )?;
+        let geometry = granite_text_attention_geometry(config)?;
+        let head_dim = geometry.key_head_dim();
+        let o_proj = linear_no_bias(geometry.query_width(), config.hidden_size, vb.pp("o_proj"))?;
         let o_proj =
             maybe_prescale_residual_linear(o_proj, config.residual_multiplier, prescale_residual)?;
         let o_proj = if execution_plan.selective_f16_attention_output {
@@ -2471,13 +3114,19 @@ impl GraniteTextAttention {
         &self,
         x: &Tensor,
         start_pos: usize,
-        cache: Option<&mut Qwen3Cache>,
+        cache: &PhysicalPagedKvCache,
+        prepared: &mut PreparedPhysicalPagedStep,
         layer_idx: usize,
         rope: Option<&GraniteRopeSlice>,
         mut profile: Option<&mut GraniteSpeechAttentionDecodeProfile>,
     ) -> Result<Tensor> {
         let profiling = profile.is_some();
         let (batch, seq_len, _) = x.dims3()?;
+        if batch != 1 {
+            return Err(Error::InvalidInput(
+                "Granite Speech physical attention expects one sequence per invocation".into(),
+            ));
+        }
         let qkv_start = profile_start(profiling);
         let qkv_dtype = if self.f16_attention_core {
             DType::F16
@@ -2565,97 +3214,174 @@ impl GraniteTextAttention {
             profile.rope += profile_elapsed(rope_start);
         }
         let cache_start = profile_start(profiling);
-        let (k, v, total_len) = if let Some(cache) = cache {
-            cache.append(layer_idx, k.clone(), v.clone())?;
-            if granite_dense_head_decode_allowed(q.device()) && seq_len == 1 && start_pos > 0 {
-                if let Some((k_heads, v_heads)) = cache.dense_heads(layer_idx)? {
-                    if let Some(profile) = profile.as_deref_mut() {
-                        profile.cache += profile_elapsed(cache_start);
-                    }
-                    record_decode_attention_path(DecodeAttentionPath::Dense);
-                    let kernel_start = profile_start(profiling);
-                    let (out, dense_kernel) = dense_decode_attention_heads_scaled(
-                        &q,
-                        &k_heads,
-                        &v_heads,
-                        self.num_heads,
-                        self.num_kv_heads,
-                        self.head_dim,
-                        self.attention_multiplier,
-                    )?;
-                    if let Some(profile) = profile.as_deref_mut() {
-                        profile.kernel += profile_elapsed(kernel_start);
-                        profile.dense_head_calls += 1;
-                        match dense_kernel {
-                            GraniteDenseDecodeAttentionKernel::Fused => {
-                                profile.dense_head_fused += 1;
-                            }
-                            GraniteDenseDecodeAttentionKernel::Fallback => {
-                                profile.dense_head_fallback += 1;
-                            }
-                        }
-                    }
-                    let out = out.reshape((batch, seq_len, self.num_heads * self.head_dim))?;
-                    let output_start = profile_start(profiling);
-                    let out = self.output_projection(&out, x.dtype())?;
-                    if let Some(profile) = profile.as_deref_mut() {
-                        profile.output += profile_elapsed(output_start);
-                    }
-                    return Ok(out);
-                }
-            }
-            let (cached_k, cached_v) = cache.materialize(layer_idx)?;
-            let total_len = cached_k.dim(1)?;
-            (cached_k, cached_v, total_len)
-        } else {
-            let total_len = k.dim(1)?;
-            (k, v, total_len)
-        };
+        let queries = q
+            .reshape((seq_len, self.num_heads, self.head_dim))?
+            .contiguous()?;
+        let keys = k
+            .reshape((seq_len, self.num_kv_heads, self.head_dim))?
+            .contiguous()?;
+        let values = v
+            .reshape((seq_len, self.num_kv_heads, self.head_dim))?
+            .contiguous()?;
+        let out = cache.write_and_attend(
+            layer_idx,
+            prepared,
+            &queries,
+            &keys,
+            &values,
+            self.attention_multiplier,
+        )?;
         if let Some(profile) = profile.as_deref_mut() {
             profile.cache += profile_elapsed(cache_start);
-        }
-
-        let kernel_start = profile_start(profiling);
-        if let Some(profile) = profile.as_deref_mut() {
-            if seq_len == 1 {
-                profile.materialized_decode_calls += 1;
-            } else {
+            if seq_len > 1 {
                 profile.prefill_attention_calls += 1;
             }
         }
-        let out = if seq_len == 1 {
-            dense_decode_attention_scaled(
-                &q,
-                &k,
-                &v,
-                self.num_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                self.attention_multiplier,
-            )?
-        } else {
-            text_attention(
-                &q,
-                &k,
-                &v,
-                self.num_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                start_pos,
-                total_len,
-                self.attention_multiplier,
-            )?
-        };
-        if let Some(profile) = profile.as_deref_mut() {
-            profile.kernel += profile_elapsed(kernel_start);
-        }
+        record_decode_attention_path(DecodeAttentionPath::Paged);
         let out = out.reshape((batch, seq_len, self.num_heads * self.head_dim))?;
         let output_start = profile_start(profiling);
         let out = self.output_projection(&out, x.dtype())?;
-        if let Some(profile) = profile.as_deref_mut() {
+        if let Some(profile) = profile {
             profile.output += profile_elapsed(output_start);
         }
         Ok(out)
+    }
+
+    fn forward_managed_decode_batch(
+        &self,
+        x: &Tensor,
+        start_positions: &[usize],
+        caches: &[&PhysicalPagedKvCache],
+        slots: &dyn KvSlotMap,
+        metadata: &KvDecodeBatchMetadata,
+        completions: &mut KvWriteCompletionCollector,
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let (batch, sequence_len, _) = x.dims3()?;
+        if batch == 0
+            || sequence_len != 1
+            || start_positions.len() != batch
+            || caches.len() != batch
+            || metadata.sequences.len() != batch
+        {
+            return Err(Error::InvalidInput(
+                "Granite Speech managed decode batch dimensions do not match".into(),
+            ));
+        }
+        let first = caches[0];
+        let first_binding = first.layer_binding(layer_idx)?;
+        for cache in caches.iter().skip(1) {
+            if !Arc::ptr_eq(&cache.arena, &first.arena)
+                || cache.layer_binding(layer_idx)? != first_binding
+            {
+                return Err(Error::InvalidInput(
+                    "Granite Speech managed decode rows must share one arena and layer binding"
+                        .into(),
+                ));
+            }
+        }
+        if slots.arena_id() != first.arena.id() || slots.len() != batch {
+            return Err(Error::InvalidInput(
+                "Granite Speech managed decode received an incompatible slot map".into(),
+            ));
+        }
+
+        let qkv_dtype = if self.f16_attention_core {
+            DType::F16
+        } else {
+            x.dtype()
+        };
+        let (q, k, v) = self.qkv_proj.forward_to_dtype(x, qkv_dtype)?;
+        let q = q.reshape((batch, 1, self.num_heads, self.head_dim))?;
+        let k = k.reshape((batch, 1, self.num_kv_heads, self.head_dim))?;
+        let v = v.reshape((batch, 1, self.num_kv_heads, self.head_dim))?;
+        let mut query_rows = Vec::with_capacity(batch);
+        let mut key_rows = Vec::with_capacity(batch);
+        let mut value_rows = Vec::with_capacity(batch);
+        for (row, position) in start_positions.iter().copied().enumerate() {
+            let (q_row, k_row) = self.apply_decode_rope_pair(
+                &q.i(row)?.unsqueeze(0)?,
+                &k.i(row)?.unsqueeze(0)?,
+                position,
+            )?;
+            query_rows.push(q_row.reshape((self.num_heads, self.head_dim))?);
+            key_rows.push(k_row.reshape((self.num_kv_heads, self.head_dim))?);
+            value_rows.push(v.i(row)?.reshape((self.num_kv_heads, self.head_dim))?);
+        }
+        let query_refs = query_rows.iter().collect::<Vec<_>>();
+        let key_refs = key_rows.iter().collect::<Vec<_>>();
+        let value_refs = value_rows.iter().collect::<Vec<_>>();
+        let queries = Tensor::stack(&query_refs, 0)?.contiguous()?;
+        let keys = Tensor::stack(&key_refs, 0)?.contiguous()?;
+        let values = Tensor::stack(&value_refs, 0)?.contiguous()?;
+        let completion = first.arena.write_slots(
+            first_binding,
+            KvWriteArgs {
+                keys: &keys,
+                values: &values,
+                slots,
+            },
+        )?;
+        let (out, completion) = submit_ordered_after_write(completion, || {
+            first.arena.paged_decode(
+                first_binding,
+                PagedKvDecodeArgs {
+                    queries: &queries,
+                    batch: metadata,
+                    softmax_scale: self.attention_multiplier,
+                    softcap: None,
+                },
+            )
+        })?;
+        completions.collect(completion)?;
+        record_decode_attention_path(DecodeAttentionPath::Paged);
+        let out = out.reshape((batch, 1, self.num_heads * self.head_dim))?;
+        self.output_projection(&out, x.dtype())
+    }
+
+    fn apply_decode_rope_pair(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        position: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let (cos, sin) = build_rope_cache(
+            1,
+            self.head_dim,
+            position,
+            self.rope_theta,
+            q.device(),
+            q.dtype(),
+        )?;
+        let rope = GraniteRopeSlice::new(cos, sin)?;
+        if granite_rope_pair_bshd_kernel_enabled(q.device(), q.dtype(), self.head_dim) {
+            if let Some((q, k)) = try_fused_rope_pair_bshd(q, k, &rope.packed) {
+                record_rope_kernel();
+                record_rope_kernel();
+                return Ok((q, k));
+            }
+        }
+        if granite_rope_bhtd_kernel_enabled(q.device(), q.dtype(), self.head_dim) {
+            if let Some((q, k)) = try_apply_granite_rope_pair_bhtd(q, k, &rope.cos, &rope.sin)? {
+                record_rope_kernel();
+                record_rope_kernel();
+                return Ok((q, k));
+            }
+        } else if granite_rope_kernel_enabled(q.device(), q.dtype(), self.head_dim) {
+            let cos = rope.cos.unsqueeze(0)?.contiguous()?;
+            let sin = rope.sin.unsqueeze(0)?.contiguous()?;
+            if let Some((q, k)) = try_apply_granite_rope_pair_thd(q, k, &cos, &sin)? {
+                record_rope_kernel();
+                record_rope_kernel();
+                return Ok((q, k));
+            }
+        }
+        record_rope_manual();
+        record_rope_manual();
+        Ok((
+            apply_rotary_emb(q, &rope.cos, &rope.sin)?,
+            apply_rotary_emb(k, &rope.cos, &rope.sin)?,
+        ))
     }
 
     fn qkv_projection_fused(&self) -> bool {
@@ -2689,14 +3415,20 @@ fn granite_decode_gqa_kernel_enabled(device: &Device, dtype: DType, total_len: u
     let override_enabled = std::env::var("IZWI_GRANITE_DECODE_GQA_KERNEL")
         .ok()
         .and_then(|raw| parse_env_bool(&raw));
-    if !granite_decode_gqa_kernel_policy(device.is_metal(), override_enabled) {
+    if !granite_decode_gqa_kernel_policy(device.is_metal(), device.is_cuda(), override_enabled) {
         return false;
     }
-    total_len > 0 && total_len <= 2048 && matches!(dtype, DType::F16 | DType::F32)
+    total_len > 0
+        && total_len <= 2048
+        && (matches!(dtype, DType::F16 | DType::F32) || (device.is_cuda() && dtype == DType::BF16))
 }
 
-fn granite_decode_gqa_kernel_policy(is_metal: bool, override_enabled: Option<bool>) -> bool {
-    override_enabled.unwrap_or(is_metal)
+fn granite_decode_gqa_kernel_policy(
+    is_metal: bool,
+    is_cuda: bool,
+    override_enabled: Option<bool>,
+) -> bool {
+    override_enabled.unwrap_or(is_metal || is_cuda)
 }
 
 fn granite_qformer_fused_attention_allowed(device: &Device) -> bool {
@@ -3170,7 +3902,7 @@ impl GraniteTextMlp {
         }
         let down_start = profile_start(profiling);
         let out = down_proj.forward(&hidden)?;
-        if let Some(profile) = profile.as_deref_mut() {
+        if let Some(profile) = profile {
             profile.down += profile_elapsed(down_start);
         }
         Ok(out)
@@ -3204,7 +3936,13 @@ fn maybe_prescale_residual_linear(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::kv::{CpuKvArena, KvArena, KvArenaConfig, KvLayerConfig};
+    use crate::backends::BackendKind;
+    use crate::engine::ModelInstanceId;
+    use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
+    use candle_nn::VarMap;
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     #[test]
     fn granite_load_completion_synchronizes_cpu_device() {
@@ -3234,6 +3972,44 @@ mod tests {
             use_cache: true,
             vocab_size: 16,
         }
+    }
+
+    #[test]
+    fn granite_text_attention_geometry_is_checked_before_division() {
+        let geometry = granite_text_attention_geometry(&tiny_granite_text_config()).unwrap();
+        assert_eq!(geometry.query_width(), 4);
+        assert_eq!(geometry.key_width(), 2);
+        assert_eq!(geometry.kv_groups(), 2);
+
+        let mut zero_query = tiny_granite_text_config();
+        zero_query.num_attention_heads = 0;
+        assert!(granite_text_attention_geometry(&zero_query)
+            .unwrap_err()
+            .to_string()
+            .contains("head counts must be non-zero"));
+
+        let mut non_divisible_hidden = tiny_granite_text_config();
+        non_divisible_hidden.hidden_size = 5;
+        assert!(granite_text_attention_geometry(&non_divisible_hidden)
+            .unwrap_err()
+            .to_string()
+            .contains("hidden size 5 is not divisible"));
+
+        let mut non_divisible_heads = tiny_granite_text_config();
+        non_divisible_heads.num_attention_heads = 3;
+        non_divisible_heads.num_key_value_heads = 2;
+        non_divisible_heads.hidden_size = 6;
+        assert!(granite_text_attention_geometry(&non_divisible_heads)
+            .unwrap_err()
+            .to_string()
+            .contains("query heads must be divisible"));
+
+        let mut invalid_scale = tiny_granite_text_config();
+        invalid_scale.attention_multiplier = 0.0;
+        assert!(granite_text_attention_geometry(&invalid_scale)
+            .unwrap_err()
+            .to_string()
+            .contains("attention_multiplier must be finite and positive"));
     }
 
     fn tiny_granite_text_tensors(device: &Device) -> HashMap<String, Tensor> {
@@ -3283,6 +4059,391 @@ mod tests {
             Tensor::zeros((4, 8), DType::F32, device).unwrap(),
         );
         tensors
+    }
+
+    fn tiny_granite_language_model(device: &Device) -> GraniteLanguageModel {
+        let mut tensors = tiny_granite_text_tensors(device);
+        let values = |count: usize, offset: usize| {
+            (0..count)
+                .map(|index| (((index * 7 + offset) % 19) as f32 - 9.0) / 23.0)
+                .collect::<Vec<_>>()
+        };
+        tensors.insert(
+            "model.embed_tokens.weight".into(),
+            Tensor::from_vec(values(64, 1), (16, 4), device).unwrap(),
+        );
+        for (name, shape, offset) in [
+            ("model.layers.0.self_attn.q_proj.weight", (4, 4), 2),
+            ("model.layers.0.self_attn.k_proj.weight", (2, 4), 3),
+            ("model.layers.0.self_attn.v_proj.weight", (2, 4), 4),
+            ("model.layers.0.self_attn.o_proj.weight", (4, 4), 5),
+        ] {
+            tensors.insert(
+                name.into(),
+                Tensor::from_vec(values(shape.0 * shape.1, offset), shape, device).unwrap(),
+            );
+        }
+        for (name, shape, offset) in [
+            ("model.layers.0.mlp.gate_proj.weight", (8, 4), 6),
+            ("model.layers.0.mlp.up_proj.weight", (8, 4), 7),
+            ("model.layers.0.mlp.down_proj.weight", (4, 8), 8),
+        ] {
+            tensors.insert(
+                name.into(),
+                Tensor::from_vec(values(shape.0 * shape.1, offset), shape, device).unwrap(),
+            );
+        }
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, device);
+        GraniteLanguageModel::load_with_execution_plan(
+            &tiny_granite_text_config(),
+            vb,
+            GraniteTextExecutionPlan {
+                selective_f16_lm_head: false,
+                selective_f16_qkv: false,
+                f16_attention_core: false,
+                selective_f16_mlp: false,
+                selective_f16_attention_output: false,
+            },
+        )
+        .unwrap()
+    }
+
+    fn tiny_audio_config() -> GraniteSpeechConfig {
+        GraniteSpeechConfig {
+            architectures: vec![],
+            audio_token_index: 0,
+            downsample_rate: 1,
+            dtype: None,
+            encoder_config: GraniteSpeechEncoderConfig {
+                cat_hidden_layers: vec![],
+                context_size: 2,
+                conv_expansion_factor: 1,
+                conv_kernel_size: 3,
+                dim_head: 1,
+                dropout: 0.0,
+                feedforward_mult: 2,
+                hidden_dim: 2,
+                input_dim: 2,
+                max_pos_emb: 2,
+                model_type: None,
+                num_heads: 2,
+                num_layers: 1,
+                output_dim: 2,
+            },
+            has_lora_adapter: false,
+            projector_config: super::super::config::GraniteSpeechProjectorConfig {
+                attention_probs_dropout_prob: 0.0,
+                encoder_hidden_size: 2,
+                hidden_act: "gelu".into(),
+                hidden_dropout_prob: 0.0,
+                hidden_size: 2,
+                intermediate_size: 4,
+                layer_norm_eps: 1e-5,
+                max_position_embeddings: 16,
+                model_type: None,
+                num_attention_heads: 2,
+                num_hidden_layers: 1,
+                pad_token_id: Some(0),
+                use_qformer_text_input: false,
+                cross_attention_frequency: 1,
+                chunk_size_feed_forward: 0,
+            },
+            text_config: tiny_granite_text_config(),
+            window_size: 2,
+            model_type: None,
+        }
+    }
+
+    #[test]
+    fn unequal_length_audio_batch_matches_scalar_and_zeroes_invalid_frames() {
+        let device = Device::Cpu;
+        let config = tiny_audio_config();
+        let vars = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vars, DType::F32, &device);
+        let encoder = GraniteSpeechEncoder::load(&config.encoder_config, vb.pp("encoder")).unwrap();
+        let projector = GraniteSpeechProjector::load(&config, vb.pp("projector")).unwrap();
+        let row_a =
+            Tensor::from_vec(vec![0.1f32, -0.2, 0.3, 0.4, -0.5, 0.6], (1, 3, 2), &device).unwrap();
+        let row_b = Tensor::from_vec(
+            vec![0.7f32, -0.8, 0.9, 1.0, -1.1, 1.2, 1.3, -1.4, 1.5, 1.6],
+            (1, 5, 2),
+            &device,
+        )
+        .unwrap();
+        let scalar_a = encoder.forward(&row_a).unwrap();
+        let scalar_b = encoder.forward(&row_b).unwrap();
+        let padded_a = row_a.pad_with_zeros(1, 0, 2).unwrap();
+        let input = Tensor::cat(&[&padded_a, &row_b], 0).unwrap();
+        let batch = encoder.forward_valid_lengths(&input, &[3, 5]).unwrap();
+        assert_tensor_close(
+            &scalar_a,
+            &batch
+                .i(0)
+                .unwrap()
+                .narrow(0, 0, 3)
+                .unwrap()
+                .unsqueeze(0)
+                .unwrap(),
+        );
+        assert_tensor_close(&scalar_b, &batch.i(1).unwrap().unsqueeze(0).unwrap());
+        let invalid = batch
+            .i(0)
+            .unwrap()
+            .narrow(0, 3, 2)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert_eq!(invalid, 0.0);
+        let scalar_projected_a = projector.forward(&scalar_a).unwrap();
+        let scalar_projected_b = projector.forward(&scalar_b).unwrap();
+        let projected = projector
+            .forward_compact_valid_lengths(&batch, &[3, 5])
+            .unwrap();
+        assert_tensor_close(&scalar_projected_a, &projected[0]);
+        assert_tensor_close(&scalar_projected_b, &projected[1]);
+    }
+
+    #[test]
+    fn valid_length_audio_batch_rejects_invalid_rows_and_preserves_b1() {
+        let device = Device::Cpu;
+        let config = tiny_audio_config();
+        let vars = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vars, DType::F32, &device);
+        let encoder = GraniteSpeechEncoder::load(&config.encoder_config, vb.pp("encoder")).unwrap();
+        let input = Tensor::zeros((1, 3, 2), DType::F32, &device).unwrap();
+        assert_tensor_close(
+            &encoder.forward(&input).unwrap(),
+            &encoder.forward_valid_lengths(&input, &[3]).unwrap(),
+        );
+        assert!(encoder.forward_valid_lengths(&input, &[]).is_err());
+        assert!(encoder.forward_valid_lengths(&input, &[0]).is_err());
+        assert!(encoder.forward_valid_lengths(&input, &[4]).is_err());
+    }
+
+    fn tiny_granite_cache() -> PhysicalPagedKvCache {
+        let binding = KvLayerBinding {
+            model_layer: 0,
+            physical_layer: 0,
+        };
+        let arena: Arc<dyn KvArena> = Arc::new(
+            CpuKvArena::new(KvArenaConfig {
+                id: KvArenaId {
+                    model_instance: ModelInstanceId::new(141),
+                    backend: BackendKind::Cpu,
+                    device_ordinal: None,
+                    generation: 1,
+                },
+                group: KvGroupId::new(0),
+                page_tokens: 2,
+                capacity_pages: 8,
+                growth: None,
+                dtype: DType::F32,
+                layers: vec![KvLayerConfig {
+                    binding,
+                    num_kv_heads: 1,
+                    key_head_dim: 2,
+                    value_head_dim: 2,
+                }],
+            })
+            .unwrap(),
+        );
+        let blocks = (0..8)
+            .map(|index| CacheBlockRef {
+                arena: arena.id(),
+                group: arena.config().group,
+                index,
+                slot_generation: 1,
+            })
+            .collect();
+        PhysicalPagedKvCache::new(arena, vec![binding], blocks, 0).unwrap()
+    }
+
+    fn tiny_shared_granite_caches(count: usize) -> Vec<PhysicalPagedKvCache> {
+        let binding = KvLayerBinding {
+            model_layer: 0,
+            physical_layer: 0,
+        };
+        let pages_per_row = 8usize;
+        let arena: Arc<dyn KvArena> = Arc::new(
+            CpuKvArena::new(KvArenaConfig {
+                id: KvArenaId {
+                    model_instance: ModelInstanceId::new(142),
+                    backend: BackendKind::Cpu,
+                    device_ordinal: None,
+                    generation: 1,
+                },
+                group: KvGroupId::new(0),
+                page_tokens: 2,
+                capacity_pages: u32::try_from(count * pages_per_row).unwrap(),
+                growth: None,
+                dtype: DType::F32,
+                layers: vec![KvLayerConfig {
+                    binding,
+                    num_kv_heads: 1,
+                    key_head_dim: 2,
+                    value_head_dim: 2,
+                }],
+            })
+            .unwrap(),
+        );
+        (0..count)
+            .map(|row| {
+                let blocks = (row * pages_per_row..(row + 1) * pages_per_row)
+                    .map(|index| CacheBlockRef {
+                        arena: arena.id(),
+                        group: arena.config().group,
+                        index: index as u32,
+                        slot_generation: 1,
+                    })
+                    .collect();
+                PhysicalPagedKvCache::new(arena.clone(), vec![binding], blocks, 0).unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scalar_chunked_prefill_matches_full_prefill() {
+        let device = Device::Cpu;
+        let model = tiny_granite_language_model(&device);
+        let embeddings = Tensor::from_vec(
+            (0..20)
+                .map(|index| (index as f32 - 7.0) / 13.0)
+                .collect::<Vec<_>>(),
+            (1, 5, 4),
+            &device,
+        )
+        .unwrap();
+        let mut full = tiny_granite_cache();
+        let mut chunked = tiny_granite_cache();
+
+        let full_logits = model
+            .forward_with_embeds_profiled(&embeddings, 0, &mut full, None, None)
+            .unwrap();
+        model
+            .forward_with_embeds_profiled(
+                &embeddings.narrow(1, 0, 2).unwrap(),
+                0,
+                &mut chunked,
+                None,
+                None,
+            )
+            .unwrap();
+        let chunked_logits = model
+            .forward_with_embeds_profiled(
+                &embeddings.narrow(1, 2, 3).unwrap(),
+                2,
+                &mut chunked,
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert_tensor_close(&full_logits, &chunked_logits);
+        assert_eq!(full.context_len(), 5);
+        assert_eq!(chunked.context_len(), 5);
+    }
+
+    #[test]
+    fn ragged_native_decode_matches_scalar_at_unequal_positions() {
+        let device = Device::Cpu;
+        let model = tiny_granite_language_model(&device);
+        let mut caches = tiny_shared_granite_caches(4);
+        let mut scalar_a = caches.remove(0);
+        let mut scalar_b = caches.remove(0);
+        let mut batch_a = caches.remove(0);
+        let mut batch_b = caches.remove(0);
+        let prompt_a = Tensor::from_vec(vec![1u32, 2], (1, 2), &device).unwrap();
+        let prompt_b = Tensor::from_vec(vec![3u32, 4, 5], (1, 3), &device).unwrap();
+        for cache in [&mut scalar_a, &mut batch_a] {
+            model
+                .forward_profiled(&prompt_a, 0, cache, None, None)
+                .unwrap();
+            cache.take_completed_writes();
+        }
+        for cache in [&mut scalar_b, &mut batch_b] {
+            model
+                .forward_profiled(&prompt_b, 0, cache, None, None)
+                .unwrap();
+            cache.take_completed_writes();
+        }
+
+        let token_a = Tensor::from_vec(vec![6u32], (1, 1), &device).unwrap();
+        let token_b = Tensor::from_vec(vec![7u32], (1, 1), &device).unwrap();
+        let scalar_a_logits = model
+            .forward_profiled(&token_a, 2, &mut scalar_a, None, None)
+            .unwrap();
+        let scalar_b_logits = model
+            .forward_profiled(&token_b, 3, &mut scalar_b, None, None)
+            .unwrap();
+        let input = Tensor::from_vec(vec![6u32, 7], (2, 1), &device).unwrap();
+        let batch_logits = model
+            .forward_managed_decode_batch(&input, &[2, 3], &mut [&mut batch_a, &mut batch_b])
+            .unwrap();
+
+        assert_tensor_close(
+            &scalar_a_logits,
+            &batch_logits.i(0).unwrap().unsqueeze(0).unwrap(),
+        );
+        assert_tensor_close(
+            &scalar_b_logits,
+            &batch_logits.i(1).unwrap().unsqueeze(0).unwrap(),
+        );
+        assert_eq!(batch_a.context_len(), 3);
+        assert_eq!(batch_b.context_len(), 4);
+        assert_eq!(batch_a.take_completed_writes().len(), 1);
+        assert_eq!(batch_b.take_completed_writes().len(), 1);
+
+        scalar_a.take_completed_writes();
+        scalar_b.take_completed_writes();
+        let token_a = Tensor::from_vec(vec![8u32], (1, 1), &device).unwrap();
+        let token_b = Tensor::from_vec(vec![9u32], (1, 1), &device).unwrap();
+        let scalar_a_logits = model
+            .forward_profiled(&token_a, 3, &mut scalar_a, None, None)
+            .unwrap();
+        let scalar_b_logits = model
+            .forward_profiled(&token_b, 4, &mut scalar_b, None, None)
+            .unwrap();
+        let input = Tensor::from_vec(vec![8u32, 9], (2, 1), &device).unwrap();
+        let batch_logits = model
+            .forward_managed_decode_batch(&input, &[3, 4], &mut [&mut batch_a, &mut batch_b])
+            .unwrap();
+        assert_tensor_close(
+            &scalar_a_logits,
+            &batch_logits.i(0).unwrap().unsqueeze(0).unwrap(),
+        );
+        assert_tensor_close(
+            &scalar_b_logits,
+            &batch_logits.i(1).unwrap().unsqueeze(0).unwrap(),
+        );
+        assert_eq!(batch_a.context_len(), 4);
+        assert_eq!(batch_b.context_len(), 5);
+    }
+
+    #[test]
+    fn ragged_native_decode_rejects_mixed_arenas_before_advancing_rows() {
+        let device = Device::Cpu;
+        let model = tiny_granite_language_model(&device);
+        let mut cache_a = tiny_granite_cache();
+        let mut cache_b = tiny_granite_cache();
+        let prompt = Tensor::from_vec(vec![1u32, 2], (1, 2), &device).unwrap();
+        for cache in [&mut cache_a, &mut cache_b] {
+            model
+                .forward_profiled(&prompt, 0, cache, None, None)
+                .unwrap();
+            cache.take_completed_writes();
+        }
+        let input = Tensor::from_vec(vec![6u32, 7], (2, 1), &device).unwrap();
+        assert!(model
+            .forward_managed_decode_batch(&input, &[2, 2], &mut [&mut cache_a, &mut cache_b],)
+            .is_err());
+        assert_eq!(cache_a.context_len(), 2);
+        assert_eq!(cache_b.context_len(), 2);
+        assert!(cache_a.take_completed_writes().is_empty());
+        assert!(cache_b.take_completed_writes().is_empty());
     }
 
     #[test]
@@ -3823,11 +4984,12 @@ mod tests {
     }
 
     #[test]
-    fn granite_decode_gqa_kernel_defaults_to_metal_only() {
-        assert!(granite_decode_gqa_kernel_policy(true, None));
-        assert!(!granite_decode_gqa_kernel_policy(false, None));
-        assert!(granite_decode_gqa_kernel_policy(false, Some(true)));
-        assert!(!granite_decode_gqa_kernel_policy(true, Some(false)));
+    fn granite_decode_gqa_kernel_defaults_to_accelerators() {
+        assert!(granite_decode_gqa_kernel_policy(true, false, None));
+        assert!(granite_decode_gqa_kernel_policy(false, true, None));
+        assert!(!granite_decode_gqa_kernel_policy(false, false, None));
+        assert!(granite_decode_gqa_kernel_policy(false, false, Some(true)));
+        assert!(!granite_decode_gqa_kernel_policy(true, false, Some(false)));
     }
 
     #[test]

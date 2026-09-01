@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -192,19 +192,25 @@ impl IncrementalStreamDeliveryWorkers {
         self.senders.remove(session);
     }
 
-    /// Close every ordered lane at the physical commit barrier. Deliveries
-    /// that are immediately writable get a short scheduler grace to finish;
-    /// a row still blocked after that point fails independently so its public
-    /// timeout cannot hold peer terminal markers or completions hostage.
-    pub(crate) async fn finish(mut self) -> Vec<StreamDeliveryFailure> {
-        self.senders.clear();
-        drop(self.failure_tx);
+    /// Close and drain only the exact per-session lanes owned by one completed
+    /// physical dispatch. Other dispatches keep their ordered lanes live.
+    pub(crate) async fn finish_sessions(
+        &mut self,
+        sessions: &HashSet<SessionKey>,
+    ) -> Vec<StreamDeliveryFailure> {
+        for session in sessions {
+            self.senders.remove(session);
+        }
         let deadline = tokio::time::Instant::now() + INCREMENTAL_COMMIT_FLUSH_GRACE;
         loop {
-            let finished = self
-                .tasks
+            let finished = sessions
                 .iter()
-                .filter_map(|(session, task)| task.is_finished().then_some(session.clone()))
+                .filter(|session| {
+                    self.tasks
+                        .get(*session)
+                        .is_some_and(tokio::task::JoinHandle::is_finished)
+                })
+                .cloned()
                 .collect::<Vec<_>>();
             for session in finished {
                 let task = self
@@ -219,14 +225,27 @@ impl IncrementalStreamDeliveryWorkers {
                     Err(_) => {}
                 }
             }
-            if self.tasks.is_empty() || tokio::time::Instant::now() >= deadline {
+            if sessions
+                .iter()
+                .all(|session| !self.tasks.contains_key(session))
+                || tokio::time::Instant::now() >= deadline
+            {
                 break;
             }
             tokio::task::yield_now().await;
         }
 
-        let mut failures = Vec::with_capacity(self.tasks.len());
-        for (session, task) in self.tasks {
+        let timed_out = sessions
+            .iter()
+            .filter(|session| self.tasks.contains_key(*session))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut failures = Vec::with_capacity(timed_out.len());
+        for session in timed_out {
+            let task = self
+                .tasks
+                .remove(&session)
+                .expect("timed-out delivery task remained registered");
             task.abort();
             match task.await {
                 Ok(()) => {}
@@ -243,6 +262,15 @@ impl IncrementalStreamDeliveryWorkers {
             });
         }
         failures
+    }
+
+    /// Close every ordered lane at the physical commit barrier. Deliveries
+    /// that are immediately writable get a short scheduler grace to finish;
+    /// a row still blocked after that point fails independently so its public
+    /// timeout cannot hold peer terminal markers or completions hostage.
+    pub(crate) async fn finish(mut self) -> Vec<StreamDeliveryFailure> {
+        let sessions = self.tasks.keys().cloned().collect::<HashSet<_>>();
+        self.finish_sessions(&sessions).await
     }
 }
 

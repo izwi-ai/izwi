@@ -6,13 +6,14 @@
 //! - Non-blocking downloads with background task spawning
 //! - Real-time progress via channels
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeSet, HashMap};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use futures::StreamExt;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
@@ -24,6 +25,20 @@ use crate::error::{Error, Result};
 
 const HF_BASE_URL: &str = "https://huggingface.co";
 const CHUNK_SIZE: usize = 8192; // 8KB chunks for streaming
+pub const ARTIFACT_MANIFEST_FILE: &str = "izwi-artifact.json";
+
+const QWEN38_REQUIRED_METADATA_FILES: &[&str] = &[
+    "config.json",
+    "generation_config.json",
+    "chat_template.jinja",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "vocab.json",
+    "merges.txt",
+    "preprocessor_config.json",
+    "video_preprocessor_config.json",
+    "model.safetensors.index.json",
+];
 
 fn qwen_chat_gguf_filename(variant: ModelVariant) -> Option<&'static str> {
     match variant {
@@ -168,9 +183,122 @@ struct HfRepoTreeEntry {
     size: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SafetensorsIndex {
+    weight_map: HashMap<String, String>,
+}
+
+/// Reproducibility record written only after a revision-pinned bundle has
+/// been downloaded completely.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactManifest {
+    pub schema_version: u32,
+    pub variant: ModelVariant,
+    pub repo_id: String,
+    pub revision: String,
+    pub files: Vec<String>,
+}
+
+pub fn read_artifact_manifest(model_dir: &Path) -> Result<Option<ArtifactManifest>> {
+    let path = model_dir.join(ARTIFACT_MANIFEST_FILE);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(path)?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(Error::from)
+}
+
+fn indexed_safetensor_shards(index_bytes: &[u8]) -> Result<Vec<String>> {
+    let index: SafetensorsIndex = serde_json::from_slice(index_bytes).map_err(|error| {
+        Error::DownloadError(format!("Invalid model.safetensors.index.json: {error}"))
+    })?;
+    if index.weight_map.is_empty() {
+        return Err(Error::DownloadError(
+            "model.safetensors.index.json has an empty weight_map".to_string(),
+        ));
+    }
+
+    let mut shards = BTreeSet::new();
+    for shard in index.weight_map.values() {
+        validate_relative_safetensor_path(shard)?;
+        shards.insert(shard.clone());
+    }
+    Ok(shards.into_iter().collect())
+}
+
+fn validate_relative_safetensor_path(path: &str) -> Result<()> {
+    let invalid_segment = path
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..");
+    let parsed = Path::new(path);
+    let normal_components_only = parsed
+        .components()
+        .all(|component| matches!(component, Component::Normal(_)));
+    let is_safetensors = parsed.extension().is_some_and(|ext| ext == "safetensors");
+
+    if path.is_empty()
+        || path.contains('\\')
+        || path.contains(':')
+        || parsed.is_absolute()
+        || invalid_segment
+        || !normal_components_only
+        || !is_safetensors
+    {
+        return Err(Error::DownloadError(format!(
+            "Unsafe Safetensors shard path in model index: {path:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn qwen38_selected_files(index_bytes: &[u8]) -> Result<Vec<String>> {
+    let mut files = QWEN38_REQUIRED_METADATA_FILES
+        .iter()
+        .map(|file| (*file).to_string())
+        .collect::<Vec<_>>();
+    files.extend(indexed_safetensor_shards(index_bytes)?);
+    Ok(files)
+}
+
+fn qwen38_bundle_is_complete(model_dir: &Path) -> bool {
+    let index_bytes = match std::fs::read(model_dir.join("model.safetensors.index.json")) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    let mut selected_files = match qwen38_selected_files(&index_bytes) {
+        Ok(files) => files,
+        Err(_) => return false,
+    };
+    if !selected_files
+        .iter()
+        .all(|file| model_dir.join(file).is_file())
+    {
+        return false;
+    }
+
+    let manifest = match read_artifact_manifest(model_dir) {
+        Ok(Some(manifest)) => manifest,
+        _ => return false,
+    };
+    let mut recorded_files = manifest.files.clone();
+    recorded_files.sort();
+    recorded_files.dedup();
+    selected_files.sort();
+    selected_files.dedup();
+
+    manifest.schema_version == 1
+        && manifest.variant == ModelVariant::Qwen3827BFp8
+        && manifest.repo_id == ModelVariant::Qwen3827BFp8.repo_id()
+        && manifest.revision == ModelVariant::QWEN38_27B_FP8_ARTIFACT_REVISION
+        && recorded_files == selected_files
+}
+
 #[derive(Debug, Clone)]
 struct FileDownloadPlan {
     source_repo: String,
+    source_revision: String,
     source_file: String,
     local_file: String,
     expected_size: u64,
@@ -180,6 +308,7 @@ struct FileDownloadPlan {
 #[derive(Debug, Clone)]
 struct ModelFileSpec {
     source_repo: String,
+    source_revision: String,
     source_file: String,
     local_file: String,
 }
@@ -225,8 +354,6 @@ pub enum DownloadState {
     Downloaded,
     Error,
 }
-
-use serde::{Deserialize, Serialize};
 
 /// Active download tracking
 #[derive(Debug)]
@@ -331,19 +458,24 @@ impl ModelDownloader {
         latest.remove(&variant);
     }
 
-    async fn get_repo_tree_index(&self, repo_id: &str) -> Result<HashMap<String, u64>> {
-        if let Some(cached) = self.repo_tree_cache.read().await.get(repo_id).cloned() {
+    async fn get_repo_tree_index(
+        &self,
+        repo_id: &str,
+        revision: &str,
+    ) -> Result<HashMap<String, u64>> {
+        let cache_key = format!("{repo_id}@{revision}");
+        if let Some(cached) = self.repo_tree_cache.read().await.get(&cache_key).cloned() {
             return Ok(cached);
         }
 
         let url = format!(
-            "{}/api/models/{}/tree/main?recursive=1",
-            HF_BASE_URL, repo_id
+            "{}/api/models/{}/tree/{}?recursive=1",
+            HF_BASE_URL, repo_id, revision
         );
         let response = self
             .http_client
             .get(&url)
-            .header("User-Agent", "izwi/0.1.0-beta-17")
+            .header("User-Agent", "izwi/0.1.0-beta-18")
             .send()
             .await
             .map_err(|e| Error::HfHubError(format!("Repo tree request failed: {}", e)))?;
@@ -369,7 +501,7 @@ impl ModelDownloader {
         self.repo_tree_cache
             .write()
             .await
-            .insert(repo_id.to_string(), index.clone());
+            .insert(cache_key, index.clone());
 
         Ok(index)
     }
@@ -381,23 +513,58 @@ impl ModelDownloader {
         }
     }
 
+    async fn get_file_bytes(
+        &self,
+        repo_id: &str,
+        revision: &str,
+        filename: &str,
+    ) -> Result<Vec<u8>> {
+        let url = format!(
+            "{}/{}/resolve/{}/{}",
+            HF_BASE_URL, repo_id, revision, filename
+        );
+        let response = self
+            .http_client
+            .get(&url)
+            .header("User-Agent", "izwi/0.1.0-beta-18")
+            .send()
+            .await
+            .map_err(|error| Error::HfHubError(format!("HTTP request failed: {error}")))?;
+        if !response.status().is_success() {
+            return Err(Error::HfHubError(format!(
+                "HTTP {} for {}",
+                response.status(),
+                url
+            )));
+        }
+        response
+            .bytes()
+            .await
+            .map(|bytes| bytes.to_vec())
+            .map_err(|error| Error::HfHubError(format!("Response body failed: {error}")))
+    }
+
     /// Download a file with streaming and progress bar
     async fn download_file_streaming(
         &self,
         repo_id: &str,
+        revision: &str,
         filename: &str,
         dest: &Path,
         file_pb: Option<ProgressBar>,
         progress_tx: Option<broadcast::Sender<DownloadProgress>>,
         progress_template: Option<DownloadProgress>,
     ) -> Result<u64> {
-        let url = format!("{}/{}/resolve/main/{}", HF_BASE_URL, repo_id, filename);
+        let url = format!(
+            "{}/{}/resolve/{}/{}",
+            HF_BASE_URL, repo_id, revision, filename
+        );
         debug!("Downloading from URL: {}", url);
 
         let response = self
             .http_client
             .get(&url)
-            .header("User-Agent", "izwi/0.1.0")
+            .header("User-Agent", "izwi/0.1.0-beta-18")
             .send()
             .await
             .map_err(|e| Error::HfHubError(format!("HTTP request failed: {}", e)))?;
@@ -427,15 +594,28 @@ impl ModelDownloader {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        // Stream download to file
-        let mut file = tokio::fs::File::create(dest).await?;
+        // Publish only complete files. A process interruption or stream error
+        // may leave a `.part` file, but never a shard that readiness checks can
+        // mistake for a complete artifact.
+        let file_name = dest
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                Error::DownloadError(format!("Invalid download destination: {}", dest.display()))
+            })?;
+        let partial_dest = dest.with_file_name(format!(".{file_name}.part"));
+        if partial_dest.exists() {
+            tokio::fs::remove_file(&partial_dest).await?;
+        }
+        let mut file = tokio::fs::File::create(&partial_dest).await?;
         let mut downloaded = 0u64;
         let mut stream = response.bytes_stream();
         let mut last_progress_emit = Instant::now();
         let mut last_progress_bytes = 0u64;
 
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| Error::HfHubError(format!("Stream error: {}", e)))?;
+            let chunk =
+                chunk.map_err(|error| Error::HfHubError(format!("Stream error: {error}")))?;
             tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
             downloaded += chunk.len() as u64;
 
@@ -485,6 +665,11 @@ impl ModelDownloader {
 
         // Sync file to disk
         file.sync_all().await?;
+        drop(file);
+        if let Err(error) = tokio::fs::rename(&partial_dest, dest).await {
+            let _ = tokio::fs::remove_file(&partial_dest).await;
+            return Err(Error::from(error));
+        }
 
         debug!("Downloaded {} bytes to {:?}", downloaded, dest);
         Ok(downloaded)
@@ -495,11 +680,65 @@ impl ModelDownloader {
         self.models_dir.join(variant.dir_name())
     }
 
+    async fn write_pinned_artifact_manifest(
+        &self,
+        variant: ModelVariant,
+        model_dir: &Path,
+        plans: &[FileDownloadPlan],
+    ) -> Result<()> {
+        let Some(revision) = variant.artifact_revision() else {
+            return Ok(());
+        };
+        let mut files = plans
+            .iter()
+            .map(|plan| plan.local_file.clone())
+            .collect::<Vec<_>>();
+        files.sort();
+        files.dedup();
+        for plan in plans {
+            let metadata = tokio::fs::metadata(model_dir.join(&plan.local_file))
+                .await
+                .map_err(|error| {
+                    Error::DownloadError(format!(
+                        "Refusing to publish incomplete artifact manifest for {variant}: {}: {error}",
+                        plan.local_file
+                    ))
+                })?;
+            if !metadata.is_file()
+                || (plan.strict_size_check
+                    && plan.expected_size > 0
+                    && metadata.len() != plan.expected_size)
+            {
+                return Err(Error::DownloadError(format!(
+                    "Refusing to publish incomplete artifact manifest for {variant}: {}",
+                    plan.local_file
+                )));
+            }
+        }
+
+        let manifest = ArtifactManifest {
+            schema_version: 1,
+            variant,
+            repo_id: variant.repo_id().to_string(),
+            revision: revision.to_string(),
+            files,
+        };
+        let bytes = serde_json::to_vec_pretty(&manifest)?;
+        let destination = model_dir.join(ARTIFACT_MANIFEST_FILE);
+        let partial = model_dir.join(format!(".{ARTIFACT_MANIFEST_FILE}.part"));
+        tokio::fs::write(&partial, bytes).await?;
+        tokio::fs::rename(&partial, &destination).await?;
+        Ok(())
+    }
+
     /// Check if a model is already downloaded
     pub fn is_downloaded(&self, variant: ModelVariant) -> bool {
         let path = self.model_path(variant);
         if !path.exists() {
             return false;
+        }
+        if variant.is_qwen38_fp8() {
+            return qwen38_bundle_is_complete(&path);
         }
 
         let has_any_safetensors = || {
@@ -585,6 +824,7 @@ impl ModelDownloader {
                 .exists(),
             ModelFamily::Qwen3Chat
             | ModelFamily::Qwen35Chat
+            | ModelFamily::Qwen38Chat
             | ModelFamily::Lfm2Chat
             | ModelFamily::Gemma3Chat => {
                 if variant.is_qwen_chat_gguf() {
@@ -677,7 +917,7 @@ impl ModelDownloader {
                 .unwrap()
                 .progress_chars("##-"),
         );
-        overall_pb.set_message(format!("{}", variant.display_name()));
+        overall_pb.set_message(variant.display_name().to_string());
 
         let mut downloaded_bytes: u64 = 0;
 
@@ -687,11 +927,26 @@ impl ModelDownloader {
 
             // Skip if already downloaded
             if dest.exists() {
-                debug!("File already exists: {:?}", dest);
                 let file_size = tokio::fs::metadata(&dest).await?.len();
-                downloaded_bytes += file_size;
-                overall_pb.set_position(downloaded_bytes);
-                continue;
+                if plan.strict_size_check
+                    && plan.expected_size > 0
+                    && file_size != plan.expected_size
+                {
+                    warn!(
+                        "Existing file size mismatch for {} (expected {} bytes, found {}), re-downloading",
+                        file, plan.expected_size, file_size
+                    );
+                    tokio::fs::remove_file(&dest).await?;
+                } else {
+                    debug!("File already exists: {:?}", dest);
+                    downloaded_bytes += if plan.expected_size > 0 {
+                        plan.expected_size
+                    } else {
+                        file_size
+                    };
+                    overall_pb.set_position(downloaded_bytes);
+                    continue;
+                }
             }
 
             // Create file progress bar
@@ -711,6 +966,7 @@ impl ModelDownloader {
             match self
                 .download_file_streaming(
                     &plan.source_repo,
+                    &plan.source_revision,
                     &plan.source_file,
                     &dest,
                     Some(file_pb.clone()),
@@ -720,6 +976,17 @@ impl ModelDownloader {
                 .await
             {
                 Ok(bytes_downloaded) => {
+                    if plan.strict_size_check
+                        && plan.expected_size > 0
+                        && bytes_downloaded != plan.expected_size
+                    {
+                        let _ = tokio::fs::remove_file(&dest).await;
+                        file_pb.finish_with_message(format!("{} ✗", file));
+                        return Err(Error::DownloadError(format!(
+                            "Downloaded size mismatch for {file}: expected {} bytes, got {bytes_downloaded} bytes",
+                            plan.expected_size
+                        )));
+                    }
                     debug!(
                         "Downloaded: {}/{} -> {:?} ({} bytes)",
                         plan.source_repo, plan.source_file, dest, bytes_downloaded
@@ -731,12 +998,20 @@ impl ModelDownloader {
                 Err(e) => {
                     warn!("Failed to download {}: {}", file, e);
                     file_pb.finish_with_message(format!("{} ✗", file));
+                    if variant.is_qwen38_fp8() {
+                        return Err(Error::DownloadError(format!(
+                            "Failed to download required pinned artifact {file}: {e}"
+                        )));
+                    }
                     // Some files might be optional, continue
                 }
             }
 
             self.multi_progress.remove(&file_pb);
         }
+
+        self.write_pinned_artifact_manifest(variant, &local_dir, &file_plans)
+            .await?;
 
         overall_pb.finish_with_message(format!("{} ✓", variant.display_name()));
         self.multi_progress.remove(&overall_pb);
@@ -947,6 +1222,7 @@ impl ModelDownloader {
                 match self
                     .download_file_streaming(
                         &plan.source_repo,
+                        &plan.source_revision,
                         &plan.source_file,
                         &dest,
                         Some(file_pb.clone()),
@@ -1013,6 +1289,9 @@ impl ModelDownloader {
 
             self.multi_progress.remove(&file_pb);
         }
+
+        self.write_pinned_artifact_manifest(variant, &local_dir, &file_plans)
+            .await?;
 
         // Send final completion progress
         let progress = DownloadProgress {
@@ -1157,9 +1436,15 @@ impl ModelDownloader {
             ],
             ModelFamily::Qwen3Chat
             | ModelFamily::Qwen35Chat
+            | ModelFamily::Qwen38Chat
             | ModelFamily::Lfm2Chat
             | ModelFamily::Gemma3Chat => {
-                if variant.is_qwen_chat_gguf() {
+                if variant.is_qwen38_fp8() {
+                    return QWEN38_REQUIRED_METADATA_FILES
+                        .iter()
+                        .map(|file| (*file).to_string())
+                        .collect();
+                } else if variant.is_qwen_chat_gguf() {
                     let gguf_file =
                         qwen_chat_gguf_filename(variant).expect("checked by is_qwen_chat_gguf");
                     return vec![
@@ -1304,6 +1589,7 @@ impl ModelDownloader {
 
     fn get_model_file_specs(&self, variant: ModelVariant) -> Vec<ModelFileSpec> {
         let default_repo = variant.repo_id().to_string();
+        let default_revision = variant.artifact_revision().unwrap_or("main").to_string();
 
         if let Some(tokenizer_repo) = vibevoice_tokenizer_repo(variant) {
             return self
@@ -1317,6 +1603,11 @@ impl ModelDownloader {
                     };
 
                     ModelFileSpec {
+                        source_revision: if source_repo == default_repo {
+                            default_revision.clone()
+                        } else {
+                            "main".to_string()
+                        },
                         source_repo,
                         source_file: file.clone(),
                         local_file: file,
@@ -1347,6 +1638,11 @@ impl ModelDownloader {
                     };
 
                     ModelFileSpec {
+                        source_revision: if source_repo == default_repo {
+                            default_revision.clone()
+                        } else {
+                            "main".to_string()
+                        },
                         source_repo,
                         source_file: file.clone(),
                         local_file: file,
@@ -1373,6 +1669,11 @@ impl ModelDownloader {
                     };
 
                     ModelFileSpec {
+                        source_revision: if source_repo == default_repo {
+                            default_revision.clone()
+                        } else {
+                            "main".to_string()
+                        },
                         source_repo,
                         source_file: file.clone(),
                         local_file: file,
@@ -1387,6 +1688,7 @@ impl ModelDownloader {
                 .into_iter()
                 .map(|file| ModelFileSpec {
                     source_repo: default_repo.clone(),
+                    source_revision: default_revision.clone(),
                     source_file: file.clone(),
                     local_file: file,
                 })
@@ -1399,6 +1701,7 @@ impl ModelDownloader {
                 .into_iter()
                 .map(|file| ModelFileSpec {
                     source_repo: default_repo.clone(),
+                    source_revision: default_revision.clone(),
                     source_file: file.clone(),
                     local_file: file,
                 })
@@ -1409,6 +1712,7 @@ impl ModelDownloader {
             .into_iter()
             .map(|file| ModelFileSpec {
                 source_repo: default_repo.clone(),
+                source_revision: default_revision.clone(),
                 source_file: file.clone(),
                 local_file: file,
             })
@@ -1416,13 +1720,51 @@ impl ModelDownloader {
     }
 
     /// Get actual file size from HTTP HEAD request
-    async fn get_actual_file_size(&self, repo_id: &str, filename: &str) -> Result<u64> {
-        let url = format!("{}/{}/resolve/main/{}", HF_BASE_URL, repo_id, filename);
+    async fn get_qwen38_indexed_file_specs(&self) -> Result<Vec<ModelFileSpec>> {
+        let variant = ModelVariant::Qwen3827BFp8;
+        let repo_id = variant.repo_id();
+        let revision = variant
+            .artifact_revision()
+            .expect("Qwen3.8 artifact revision is catalog-pinned");
+        let local_index = self
+            .model_path(variant)
+            .join("model.safetensors.index.json");
+        let index_bytes = if local_index.is_file() {
+            tokio::fs::read(&local_index).await?
+        } else {
+            self.get_file_bytes(repo_id, revision, "model.safetensors.index.json")
+                .await?
+        };
+
+        qwen38_selected_files(&index_bytes).map(|files| {
+            files
+                .into_iter()
+                .map(|file| ModelFileSpec {
+                    source_repo: repo_id.to_string(),
+                    source_revision: revision.to_string(),
+                    source_file: file.clone(),
+                    local_file: file,
+                })
+                .collect()
+        })
+    }
+
+    /// Get actual file size from HTTP HEAD request
+    async fn get_actual_file_size(
+        &self,
+        repo_id: &str,
+        revision: &str,
+        filename: &str,
+    ) -> Result<u64> {
+        let url = format!(
+            "{}/{}/resolve/{}/{}",
+            HF_BASE_URL, repo_id, revision, filename
+        );
 
         let response = self
             .http_client
             .head(&url)
-            .header("User-Agent", "izwi/0.1.0")
+            .header("User-Agent", "izwi/0.1.0-beta-18")
             .send()
             .await
             .map_err(|e| Error::HfHubError(format!("HEAD request failed: {}", e)))?;
@@ -1450,18 +1792,27 @@ impl ModelDownloader {
         &self,
         variant: ModelVariant,
     ) -> Result<Vec<FileDownloadPlan>> {
-        let file_specs = self.get_model_file_specs(variant);
+        let file_specs = if variant.is_qwen38_fp8() {
+            self.get_qwen38_indexed_file_specs().await?
+        } else {
+            self.get_model_file_specs(variant)
+        };
         let local_dir = self.model_path(variant);
+        let require_exact_bundle = variant.is_qwen38_fp8();
 
-        let mut repo_tree_indexes: HashMap<String, HashMap<String, u64>> = HashMap::new();
+        let mut repo_tree_indexes: HashMap<(String, String), HashMap<String, u64>> = HashMap::new();
         let mut repo_tree_planning_available = true;
         for spec in &file_specs {
-            if repo_tree_indexes.contains_key(&spec.source_repo) {
+            let repo_key = (spec.source_repo.clone(), spec.source_revision.clone());
+            if repo_tree_indexes.contains_key(&repo_key) {
                 continue;
             }
-            match self.get_repo_tree_index(&spec.source_repo).await {
+            match self
+                .get_repo_tree_index(&spec.source_repo, &spec.source_revision)
+                .await
+            {
                 Ok(index) => {
-                    repo_tree_indexes.insert(spec.source_repo.clone(), index);
+                    repo_tree_indexes.insert(repo_key, index);
                 }
                 Err(err) => {
                     warn!(
@@ -1480,17 +1831,24 @@ impl ModelDownloader {
 
             for spec in &file_specs {
                 if let Some(size) = repo_tree_indexes
-                    .get(&spec.source_repo)
+                    .get(&(spec.source_repo.clone(), spec.source_revision.clone()))
                     .and_then(|index| index.get(&spec.source_file))
                 {
                     plans.push(FileDownloadPlan {
                         source_repo: spec.source_repo.clone(),
+                        source_revision: spec.source_revision.clone(),
                         source_file: spec.source_file.clone(),
                         local_file: spec.local_file.clone(),
                         expected_size: *size,
                         strict_size_check: *size > 0,
                     });
                 } else {
+                    if require_exact_bundle {
+                        return Err(Error::DownloadError(format!(
+                            "Required pinned artifact is absent from repository tree: {}@{}/{}",
+                            spec.source_repo, spec.source_revision, spec.source_file
+                        )));
+                    }
                     skipped += 1;
                     debug!(
                         "Skipping unavailable file for {}: {}/{} (not present in repo tree)",
@@ -1525,11 +1883,12 @@ impl ModelDownloader {
         for spec in &file_specs {
             let dest = local_dir.join(&spec.local_file);
             match self
-                .get_actual_file_size(&spec.source_repo, &spec.source_file)
+                .get_actual_file_size(&spec.source_repo, &spec.source_revision, &spec.source_file)
                 .await
             {
                 Ok(size) => plans.push(FileDownloadPlan {
                     source_repo: spec.source_repo.clone(),
+                    source_revision: spec.source_revision.clone(),
                     source_file: spec.source_file.clone(),
                     local_file: spec.local_file.clone(),
                     expected_size: size,
@@ -1537,11 +1896,24 @@ impl ModelDownloader {
                 }),
                 Err(e) => {
                     if Self::is_not_found_hf_error(&e) {
+                        if require_exact_bundle {
+                            return Err(Error::DownloadError(format!(
+                                "Required pinned artifact is unavailable: {}@{}/{}",
+                                spec.source_repo, spec.source_revision, spec.source_file
+                            )));
+                        }
                         debug!(
                             "Skipping unavailable file for {}: {}/{} (HEAD returned 404)",
                             variant, spec.source_repo, spec.source_file
                         );
                         continue;
+                    }
+
+                    if require_exact_bundle {
+                        return Err(Error::DownloadError(format!(
+                            "Could not determine exact size for required pinned artifact {}@{}/{}: {}",
+                            spec.source_repo, spec.source_revision, spec.source_file, e
+                        )));
                     }
 
                     // Fall back to local size if present (resume semantics), else estimate.
@@ -1558,6 +1930,7 @@ impl ModelDownloader {
 
                     plans.push(FileDownloadPlan {
                         source_repo: spec.source_repo.clone(),
+                        source_revision: spec.source_revision.clone(),
                         source_file: spec.source_file.clone(),
                         local_file: spec.local_file.clone(),
                         expected_size: fallback_size,
@@ -1821,6 +2194,128 @@ mod tests {
             std::env::temp_dir().join(format!("izwi-downloader-test-{}", Uuid::new_v4()));
         let downloader = ModelDownloader::new(temp_dir.clone()).expect("downloader");
         (downloader, temp_dir)
+    }
+
+    fn synthetic_qwen38_index() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "metadata": { "total_size": 3 },
+            "weight_map": {
+                "model.language_model.layers.0.weight": "layers-0.safetensors",
+                "model.language_model.layers.0.weight_scale_inv": "layers-0.safetensors",
+                "model.language_model.embed_tokens.weight": "outside.safetensors",
+                "mtp.layers.0.weight": "mtp.safetensors"
+            }
+        }))
+        .expect("synthetic index")
+    }
+
+    #[test]
+    fn qwen38_index_closure_is_validated_and_deduplicated() {
+        assert_eq!(
+            indexed_safetensor_shards(&synthetic_qwen38_index()).expect("valid index"),
+            vec![
+                "layers-0.safetensors".to_string(),
+                "mtp.safetensors".to_string(),
+                "outside.safetensors".to_string(),
+            ]
+        );
+
+        for unsafe_path in [
+            "../escape.safetensors",
+            "/absolute.safetensors",
+            "nested\\windows.safetensors",
+            "nested//empty.safetensors",
+            "./relative.safetensors",
+            "not-a-shard.bin",
+        ] {
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "weight_map": { "tensor": unsafe_path }
+            }))
+            .expect("index");
+            assert!(
+                indexed_safetensor_shards(&bytes).is_err(),
+                "unsafe path should fail: {unsafe_path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn qwen38_indexed_specs_use_pinned_revision_and_exact_index_closure() {
+        let (downloader, temp_dir) = test_downloader();
+        let model_dir = downloader.model_path(ModelVariant::Qwen3827BFp8);
+        std::fs::create_dir_all(&model_dir).expect("model dir");
+        std::fs::write(
+            model_dir.join("model.safetensors.index.json"),
+            synthetic_qwen38_index(),
+        )
+        .expect("index");
+
+        let specs = downloader
+            .get_qwen38_indexed_file_specs()
+            .await
+            .expect("indexed specs");
+        let files = specs
+            .iter()
+            .map(|spec| spec.local_file.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(files.contains("layers-0.safetensors"));
+        assert!(files.contains("outside.safetensors"));
+        assert!(files.contains("mtp.safetensors"));
+        assert!(files.contains("chat_template.jinja"));
+        assert!(files.contains("video_preprocessor_config.json"));
+        assert!(specs.iter().all(|spec| {
+            spec.source_repo == "Qwen/Qwen3.8-27B-FP8"
+                && spec.source_revision == ModelVariant::QWEN38_27B_FP8_ARTIFACT_REVISION
+        }));
+
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[test]
+    fn qwen38_is_downloaded_requires_index_closure_and_pinned_manifest() {
+        let (downloader, temp_dir) = test_downloader();
+        let variant = ModelVariant::Qwen3827BFp8;
+        let model_dir = downloader.model_path(variant);
+        std::fs::create_dir_all(&model_dir).expect("model dir");
+        let index = synthetic_qwen38_index();
+        for file in QWEN38_REQUIRED_METADATA_FILES {
+            let bytes = if *file == "model.safetensors.index.json" {
+                index.as_slice()
+            } else {
+                b"{}"
+            };
+            std::fs::write(model_dir.join(file), bytes).expect("metadata");
+        }
+        std::fs::write(model_dir.join("layers-0.safetensors"), [0u8]).expect("layer shard");
+        assert!(
+            !downloader.is_downloaded(variant),
+            "one shard must never make the 66-shard bundle ready"
+        );
+
+        std::fs::write(model_dir.join("outside.safetensors"), [0u8]).expect("outside shard");
+        std::fs::write(model_dir.join("mtp.safetensors"), [0u8]).expect("mtp shard");
+        assert!(
+            !downloader.is_downloaded(variant),
+            "a complete closure without provenance metadata is not reproducible"
+        );
+
+        let manifest = ArtifactManifest {
+            schema_version: 1,
+            variant,
+            repo_id: variant.repo_id().to_string(),
+            revision: ModelVariant::QWEN38_27B_FP8_ARTIFACT_REVISION.to_string(),
+            files: qwen38_selected_files(&index).expect("selected files"),
+        };
+        std::fs::write(
+            model_dir.join(ARTIFACT_MANIFEST_FILE),
+            serde_json::to_vec_pretty(&manifest).expect("manifest"),
+        )
+        .expect("write manifest");
+        assert!(downloader.is_downloaded(variant));
+
+        std::fs::remove_file(model_dir.join("outside.safetensors")).expect("remove shard");
+        assert!(!downloader.is_downloaded(variant));
+        std::fs::remove_dir_all(temp_dir).ok();
     }
 
     #[test]

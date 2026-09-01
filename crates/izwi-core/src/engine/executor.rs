@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
@@ -18,8 +19,6 @@ mod handler_audio_chat;
 mod handler_chat;
 #[path = "executor/handler_tts.rs"]
 mod handler_tts;
-#[path = "executor/prefix_cache.rs"]
-mod prefix_cache;
 #[path = "executor/state.rs"]
 mod state;
 #[path = "executor/streaming.rs"]
@@ -30,34 +29,845 @@ pub(crate) use streaming::{
     StreamDeliveryFailure, StreamDeliveryFailureKind,
 };
 
+pub(crate) fn decode_request_audio_with_rate(
+    request: &EngineCoreRequest,
+) -> Result<(Vec<f32>, u32)> {
+    audio::decode_request_audio_with_rate(request)
+}
+
+pub(crate) fn qwen3_asr_requires_long_form(
+    samples: &[f32],
+    sample_rate: u32,
+    model_max_chunk_secs: Option<f32>,
+) -> bool {
+    audio::qwen3_asr_requires_long_form(samples, sample_rate, model_max_chunk_secs)
+}
+
 use super::config::EngineCoreConfig;
 use super::execution::{
-    BatchDispatch, CacheMode, CancellationGranularity, ConcurrencyClass, DispatchState,
-    ExecutionCapabilities, ExecutionDisposition, ExecutionFailure, ExecutionMode, ExecutionProfile,
-    FailureKind, FailureOrigin, FailureScope, FinishReason, HealthImpact, NativeBatchMode,
-    OutcomeProvenance, PhysicalBatch, PlanId, PrefillMode, RetryDisposition, SessionKey,
-    YieldReason,
+    BatchDispatch, BatchId, BatchLaneKey, CacheMode, CancellationGranularity, ConcurrencyClass,
+    DispatchState, ExecutionCapabilities, ExecutionDisposition, ExecutionDomain, ExecutionFailure,
+    ExecutionMode, ExecutionProfile, FailureKind, FailureOrigin, FailureScope, FinishReason,
+    HealthImpact, ManagedSessionGeneration, NativeBatchMode, OutcomeProvenance, PhysicalBatch,
+    PhysicalLaunchPolicy, PlanId, PrefillMode, ReadyQuantum, RealtimeStageOutcome,
+    RetryDisposition, SequencePhase, SessionKey, StageId, StageProgressKind, StageWorkSelector,
+    WorkUnit, YieldReason,
+};
+use super::metrics::{
+    begin_engine_physical_dispatch, record_engine_physical_defer, record_engine_physical_fallback,
+    EnginePhysicalDeferReason, EnginePhysicalFallbackReason,
 };
 use super::output::StreamingOutput;
 use super::request::EngineCoreRequest;
-use super::resources::{
-    BatchWorkspaceLease, ReservationClass, ReservationOwner, ResourceAmount, ResourceAuthority,
-    ResourceLease, ResourceVector,
-};
+use super::resources::{BatchWorkspaceLease, ResourceAuthority, ResourceVector};
 use super::scheduler::ScheduledRequest;
-use super::types::AudioOutput;
+use super::types::{AudioOutput, TaskType};
 use crate::backends::{
     can_parallelize_requests, BackendContext, BackendKind, BackendPreference, BackendRouter,
     BackendSelectionSource,
 };
 use crate::error::{Error, Result};
+use crate::kv::{CacheDomainId, KvArenaId, KvGroupId, KvStorageDType, KvStorageFormat};
 use crate::model::ModelVariant;
-use crate::models::architectures::qwen3::tts::{Qwen3TtsModel, TtsSessionCacheRequest};
-use crate::models::architectures::qwen35::chat::Qwen35PrefixSnapshot;
+use crate::models::architectures::qwen3::tts::Qwen3TtsModel;
 use crate::models::registry::{AsrModelLease, NativeAsrModel, NativeChatModel, QwenTtsModelLease};
+use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::ModelRegistry;
-use prefix_cache::{configured_qwen35_prefix_cache_bytes, ExactPrefixCache};
-use state::{ActiveAsrDecode, ActiveChatDecode, ActiveQwenTtsDecode};
+use crate::runtime::{PhysicalExecutionAdmission, PhysicalExecutionLease};
+use state::{
+    ActiveAsrDecode, ActiveChatDecode, ActiveFishS2TtsDecode, ActiveLfm25AsrDecode,
+    ActiveLfm25TtsDecode, ActiveNemotronRealtime, ActiveParakeetAsrDecode, ActiveQwenTtsDecode,
+    ActiveVibeVoiceTtsDecode, ActiveVoxtralRealtime, ActiveVoxtralTtsDecode,
+    PendingNemotronRealtimeQuantum, PendingVoxtralRealtimeQuantum, PreparedNemotronRealtimeQuantum,
+    PreparedVoxtralRealtimeQuantum,
+};
+
+const QWEN38_TARGET_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(1);
+const QWEN38_MTP_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(4);
+// Cancellation signals are AtomicBools without a notification edge. Polling
+// at 40 Hz bounds cancelled FIFO residency without turning admission into a
+// hot loop.
+const PHYSICAL_ADMISSION_CANCELLATION_POLL: Duration = Duration::from_millis(25);
+
+/// Exact executor-private route for one load-sealed native model call.
+///
+/// The public stage contract already supplies the durable proof surface: the
+/// adapter ABI, opaque stage identity, selector, batch mode, shape policy, and
+/// exact batch lane. This projection prevents the executor from authorizing a
+/// native call from a capability string alone. Audio routes are represented
+/// now so later family adapters can add model calls without weakening the
+/// shared validation boundary; no current audio adapter publishes a native
+/// batch mode, so those variants remain unreachable until an exact opt-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NativeBatchRoute {
+    ChatContinuousDecode {
+        stage_id: StageId,
+    },
+    Audio {
+        task: TaskType,
+        stage: NativeAudioStage,
+        mode: NativeBatchMode,
+        stage_id: StageId,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NativeAudioStage {
+    PreSequencePreparation,
+    SequencePrefill,
+    SequenceDecode,
+    SequenceFinalize,
+    RealtimePush,
+    RealtimeFinish,
+    RealtimePreparation,
+    RealtimePromptPrefill,
+    RealtimeDecodeContinuation,
+    RealtimeCompletion,
+    Atomic,
+    Pipeline { ordinal: usize },
+}
+
+impl NativeBatchRoute {
+    fn capability_matches_task(task: TaskType, capability: &str) -> bool {
+        match task {
+            TaskType::Chat => capability == "chat",
+            TaskType::ASR => matches!(
+                capability,
+                "asr" | "realtime_asr" | "speaker_attributed_asr"
+            ),
+            TaskType::TTS => matches!(capability, "tts" | "streaming_tts"),
+            TaskType::SpeechToSpeech => {
+                matches!(capability, "audio_chat" | "speech_to_speech")
+            }
+        }
+    }
+
+    fn audio_stage(work: &WorkUnit) -> NativeAudioStage {
+        match work {
+            WorkUnit::PreSequencePreparation { .. } => NativeAudioStage::PreSequencePreparation,
+            WorkUnit::SequenceStep {
+                phase: SequencePhase::Prefill,
+                ..
+            } => NativeAudioStage::SequencePrefill,
+            WorkUnit::SequenceStep {
+                phase: SequencePhase::Decode,
+                ..
+            } => NativeAudioStage::SequenceDecode,
+            WorkUnit::SequenceFinalize { .. } => NativeAudioStage::SequenceFinalize,
+            WorkUnit::RealtimePush { .. } => NativeAudioStage::RealtimePush,
+            WorkUnit::RealtimeFinish { .. } => NativeAudioStage::RealtimeFinish,
+            WorkUnit::RealtimePreparation { .. } => NativeAudioStage::RealtimePreparation,
+            WorkUnit::RealtimePromptPrefill { .. } => NativeAudioStage::RealtimePromptPrefill,
+            WorkUnit::RealtimeDecodeContinuation { .. } => {
+                NativeAudioStage::RealtimeDecodeContinuation
+            }
+            WorkUnit::RealtimeCompletion { .. } => NativeAudioStage::RealtimeCompletion,
+            WorkUnit::AtomicJob { .. } => NativeAudioStage::Atomic,
+            WorkUnit::PipelineStage { ordinal, .. } => {
+                NativeAudioStage::Pipeline { ordinal: *ordinal }
+            }
+        }
+    }
+
+    fn resolve(execution: &PhysicalBatchExecution<'_>) -> Result<Self> {
+        if execution.batch.mode == NativeBatchMode::None {
+            return Err(Error::InvalidInput(
+                "scalar physical work has no native tensor route".to_string(),
+            ));
+        }
+        let first_scheduled = execution.scheduled.first().ok_or_else(|| {
+            Error::InvalidInput("native physical batch has no scheduled rows".to_string())
+        })?;
+        let first_request = execution
+            .requests
+            .iter()
+            .copied()
+            .find(|request| request.id == first_scheduled.request_id)
+            .ok_or_else(|| {
+                Error::InferenceError(
+                    "native physical batch has no request for its first row".to_string(),
+                )
+            })?;
+        let task = first_request.task_type;
+        let role = Self::audio_stage(&first_scheduled.work);
+
+        for scheduled in execution.scheduled {
+            let request = execution
+                .requests
+                .iter()
+                .copied()
+                .find(|request| request.id == scheduled.request_id)
+                .ok_or_else(|| {
+                    Error::InferenceError(format!(
+                        "native physical row {} has no request snapshot",
+                        scheduled.request_id
+                    ))
+                })?;
+            if request.task_type != task || Self::audio_stage(&scheduled.work) != role {
+                return Err(Error::InvalidInput(
+                    "native physical batch mixed task or stage roles".to_string(),
+                ));
+            }
+            let binding = request.execution_adapter_binding().ok_or_else(|| {
+                Error::InferenceError(
+                    "native physical row has no loaded adapter binding".to_string(),
+                )
+            })?;
+            if binding.execution_group_id != execution.batch.lane.execution_group
+                || binding.model_instance_id != execution.batch.lane.model_instance
+                || binding.adapter_instance_id != execution.batch.lane.adapter_instance
+                || binding.adapter_abi_revision != execution.batch.lane.adapter_abi
+                || binding.capability_id != execution.batch.lane.capability_id
+                || request.model_variant != Some(binding.model_variant)
+                || request.model_instance_id() != Some(binding.model_instance_id)
+                || !Self::capability_matches_task(task, &binding.capability_id)
+            {
+                return Err(Error::InvalidInput(
+                    "native physical row crossed its loaded adapter identity".to_string(),
+                ));
+            }
+            let stage = binding.stage_for_work(&scheduled.work)?;
+            if stage.selector == StageWorkSelector::Any
+                || stage.domain != ExecutionDomain::ExecutionGroup
+                || stage.concurrency != ConcurrencyClass::Batchable
+                || stage.batch_mode != execution.batch.mode
+                || stage.id != execution.batch.lane.stage_id
+                || stage.name != execution.batch.lane.kernel_mode
+            {
+                return Err(Error::InvalidInput(
+                    "native physical row has no exact load-sealed model-call stage".to_string(),
+                ));
+            }
+        }
+
+        match (task, role, execution.batch.mode) {
+            (TaskType::Chat, NativeAudioStage::SequenceDecode, NativeBatchMode::Continuous) => {
+                Ok(Self::ChatContinuousDecode {
+                    stage_id: execution.batch.lane.stage_id,
+                })
+            }
+            (TaskType::ASR | TaskType::TTS, stage, mode) => Ok(Self::Audio {
+                task,
+                stage,
+                mode,
+                stage_id: execution.batch.lane.stage_id,
+            }),
+            _ => Err(Error::InvalidInput(
+                "loaded stage has no compatible native executor route".to_string(),
+            )),
+        }
+    }
+}
+
+struct Qwen38ManagedCaches {
+    target: PhysicalPagedKvCache,
+    mtp: Option<PhysicalPagedKvCache>,
+}
+
+fn exact_managed_group_for_domain(
+    groups: &[(CacheDomainId, KvGroupId, KvArenaId)],
+    reservation: &super::ManagedCacheReservation,
+    domain_id: CacheDomainId,
+    required: bool,
+) -> Result<Option<KvGroupId>> {
+    let planned = groups
+        .iter()
+        .filter(|(domain, _, _)| *domain == domain_id)
+        .collect::<Vec<_>>();
+    let reserved = reservation
+        .domains
+        .iter()
+        .filter(|domain| domain.domain == domain_id)
+        .collect::<Vec<_>>();
+
+    if planned.is_empty() && reserved.is_empty() {
+        if required {
+            return Err(Error::InferenceError(format!(
+                "managed Qwen3.8 reservation omitted required domain {}",
+                domain_id.get()
+            )));
+        }
+        return Ok(None);
+    }
+    if planned.len() != 1 || reserved.len() != 1 {
+        return Err(Error::InferenceError(format!(
+            "managed Qwen3.8 domain {} must resolve exactly once in both the plan and reservation",
+            domain_id.get()
+        )));
+    }
+    let (_, group_id, arena) = *planned[0];
+    if reserved[0].arena != arena {
+        return Err(Error::InferenceError(format!(
+            "managed Qwen3.8 domain {} crossed its planned arena",
+            domain_id.get()
+        )));
+    }
+    Ok(Some(group_id))
+}
+
+fn qwen38_managed_group_ids(
+    groups: &[(CacheDomainId, KvGroupId, KvArenaId)],
+    reservation: &super::ManagedCacheReservation,
+) -> Result<(KvGroupId, Option<KvGroupId>)> {
+    let target =
+        exact_managed_group_for_domain(groups, reservation, QWEN38_TARGET_ATTENTION_DOMAIN, true)?
+            .ok_or_else(|| {
+                Error::InferenceError("managed Qwen3.8 target domain did not resolve".into())
+            })?;
+    let mtp =
+        exact_managed_group_for_domain(groups, reservation, QWEN38_MTP_ATTENTION_DOMAIN, false)?;
+    Ok((target, mtp))
+}
+
+fn qwen38_managed_caches_for_row(
+    request: &EngineCoreRequest,
+    scheduled: &ScheduledRequest,
+    reservation: &super::ManagedCacheReservation,
+) -> Result<Qwen38ManagedCaches> {
+    let runtime = request.managed_cache_runtime().ok_or_else(|| {
+        Error::InferenceError("managed Qwen3.8 row has no model runtime".to_string())
+    })?;
+    let groups = runtime
+        .plan()
+        .groups
+        .iter()
+        .map(|group| (group.domain, group.id, group.arena))
+        .collect::<Vec<_>>();
+    let (target_group, mtp_group) = qwen38_managed_group_ids(&groups, reservation)?;
+    let target = physical_paged_cache_for_row(
+        request,
+        scheduled,
+        reservation,
+        QWEN38_TARGET_ATTENTION_DOMAIN,
+        target_group,
+    )?;
+    let mtp = mtp_group
+        .map(|group| {
+            physical_paged_cache_for_row(
+                request,
+                scheduled,
+                reservation,
+                QWEN38_MTP_ATTENTION_DOMAIN,
+                group,
+            )
+        })
+        .transpose()?;
+    Ok(Qwen38ManagedCaches { target, mtp })
+}
+
+fn qwen3_managed_cache_for_row(
+    request: &EngineCoreRequest,
+    scheduled: &ScheduledRequest,
+    reservation: &super::ManagedCacheReservation,
+) -> Result<PhysicalPagedKvCache> {
+    let runtime = request.managed_cache_runtime().ok_or_else(|| {
+        Error::InferenceError("managed Qwen3 row has no model runtime".to_string())
+    })?;
+    let mut groups = runtime.plan().groups.iter().filter(|group| {
+        reservation
+            .domains
+            .iter()
+            .any(|domain| domain.domain == group.domain && domain.arena == group.arena)
+    });
+    let group = groups.next().ok_or_else(|| {
+        Error::InvalidInput("native Qwen3 reservation has no resolved paged-attention group".into())
+    })?;
+    if groups.next().is_some() {
+        return Err(Error::InvalidInput(
+            "native Qwen3 reservation resolves more than one paged-attention group".into(),
+        ));
+    }
+    physical_paged_cache_for_row(request, scheduled, reservation, group.domain, group.id)
+}
+
+struct RetainedPagedRowState {
+    domain: CacheDomainId,
+    group: KvGroupId,
+    cache: PhysicalPagedKvCache,
+}
+
+/// Complete scheduler-owned retained state projection for one native row.
+///
+/// Unlike the former chat-specific dense/hybrid enum, this preserves every
+/// paged domain/group identity plus the transactional tensor reservation.
+/// Audio adapters can therefore select their exact authored domains without
+/// teaching the shared engine about target, predictor, codec, or transducer
+/// conventions.
+pub(super) struct RetainedRowManagedState {
+    paged: Vec<RetainedPagedRowState>,
+    pub(super) tensor_state: Option<super::ManagedTensorStateReservation>,
+    session_generation: ManagedSessionGeneration,
+}
+
+impl RetainedRowManagedState {
+    pub(super) fn session_generation(&self) -> ManagedSessionGeneration {
+        self.session_generation
+    }
+
+    pub(super) fn take_paged_domain(
+        &mut self,
+        domain: CacheDomainId,
+        required: bool,
+    ) -> Result<Option<PhysicalPagedKvCache>> {
+        let matches = self
+            .paged
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| (row.domain == domain).then_some(index))
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            if required {
+                return Err(Error::InferenceError(format!(
+                    "retained row omitted required paged domain {}",
+                    domain.get()
+                )));
+            }
+            return Ok(None);
+        }
+        if matches.len() != 1 {
+            return Err(Error::InvalidInput(format!(
+                "retained row domain {} resolves more than one physical group",
+                domain.get()
+            )));
+        }
+        Ok(Some(self.paged.swap_remove(matches[0]).cache))
+    }
+
+    pub(super) fn take_only_paged(&mut self) -> Result<PhysicalPagedKvCache> {
+        if self.paged.len() != 1 {
+            return Err(Error::InvalidInput(format!(
+                "retained row expected one paged group, found {}",
+                self.paged.len()
+            )));
+        }
+        Ok(self.paged.pop().expect("length checked").cache)
+    }
+
+    pub(super) fn ensure_all_paged_consumed(&self) -> Result<()> {
+        if self.paged.is_empty() {
+            Ok(())
+        } else {
+            let identities = self
+                .paged
+                .iter()
+                .map(|row| format!("{}:{}", row.domain.get(), row.group.get()))
+                .collect::<Vec<_>>()
+                .join(",");
+            Err(Error::InvalidInput(format!(
+                "retained row left unexpected paged domains/groups: {identities}"
+            )))
+        }
+    }
+}
+
+fn retained_row_managed_state_for_row(
+    request: &EngineCoreRequest,
+    scheduled: &ScheduledRequest,
+    reservation: &super::ManagedCacheReservation,
+) -> Result<RetainedRowManagedState> {
+    if reservation.txn_id != scheduled.plan_id || reservation.session != scheduled.session_key() {
+        return Err(Error::InferenceError(
+            "retained row reservation crossed its scheduled row fence".to_string(),
+        ));
+    }
+    let runtime = request.managed_cache_runtime().ok_or_else(|| {
+        Error::InferenceError("retained native row has no physical model runtime".to_string())
+    })?;
+    if request.model_instance_id() != Some(runtime.plan().model_instance) {
+        return Err(Error::InferenceError(
+            "retained native row crossed its loaded model instance".to_string(),
+        ));
+    }
+
+    let mut paged = Vec::new();
+    let mut seen = HashSet::new();
+    for domain in &reservation.domains {
+        for table in &domain.provisional_groups {
+            let mut groups = runtime.plan().groups.iter().filter(|group| {
+                group.domain == domain.domain
+                    && group.id == table.group
+                    && group.arena == domain.arena
+            });
+            let group = groups.next().ok_or_else(|| {
+                Error::InferenceError(
+                    "retained row reservation references an unresolved paged group".to_string(),
+                )
+            })?;
+            if groups.next().is_some() || !seen.insert((group.domain, group.id, group.arena)) {
+                return Err(Error::InvalidInput(
+                    "retained row reservation repeats a paged domain/group".to_string(),
+                ));
+            }
+            paged.push(RetainedPagedRowState {
+                domain: group.domain,
+                group: group.id,
+                cache: physical_paged_cache_for_row(
+                    request,
+                    scheduled,
+                    reservation,
+                    group.domain,
+                    group.id,
+                )?,
+            });
+        }
+    }
+    if paged.is_empty() && reservation.clocked_state.is_none() {
+        return Err(Error::InvalidInput(
+            "retained native row has neither paged nor tensor state".to_string(),
+        ));
+    }
+    Ok(RetainedRowManagedState {
+        paged,
+        tensor_state: reservation.clocked_state.clone(),
+        session_generation: reservation.session_generation,
+    })
+}
+
+/// Resolve one exact scheduler-owned paged-attention view without assuming
+/// that the row reservation contains only one state domain or physical group.
+fn physical_paged_cache_for_row(
+    request: &EngineCoreRequest,
+    scheduled: &ScheduledRequest,
+    reservation: &super::ManagedCacheReservation,
+    domain_id: CacheDomainId,
+    group_id: KvGroupId,
+) -> Result<PhysicalPagedKvCache> {
+    if reservation.txn_id != scheduled.plan_id || reservation.session != scheduled.session_key() {
+        return Err(Error::InferenceError(
+            "managed-cache reservation crossed its scheduled row fence".to_string(),
+        ));
+    }
+    let runtime = request.managed_cache_runtime().ok_or_else(|| {
+        Error::InferenceError("managed-cache row has no physical model runtime".to_string())
+    })?;
+    let plan = runtime.plan();
+    if request.model_instance_id() != Some(plan.model_instance) {
+        return Err(Error::InferenceError(
+            "managed-cache runtime does not match the row's loaded model instance".into(),
+        ));
+    }
+
+    let mut groups = plan
+        .groups
+        .iter()
+        .filter(|group| group.domain == domain_id && group.id == group_id);
+    let group = groups.next().ok_or_else(|| {
+        Error::InferenceError("managed-cache row references an unresolved domain/group pair".into())
+    })?;
+    if groups.next().is_some() {
+        return Err(Error::InferenceError(
+            "managed-cache plan repeats a domain/group pair".into(),
+        ));
+    }
+    let layers = &group.layers;
+    if layers.is_empty() {
+        return Err(Error::InferenceError(
+            "managed-cache paged-attention group has no layer bindings".into(),
+        ));
+    }
+    if group.arena.model_instance != plan.model_instance
+        || group.arena.backend != plan.backend
+        || group.arena.device_ordinal != plan.device_ordinal
+    {
+        return Err(Error::InferenceError(
+            "managed-cache group crossed its resolved runtime identity".into(),
+        ));
+    }
+
+    let mut domains = reservation
+        .domains
+        .iter()
+        .filter(|domain| domain.domain == domain_id && domain.arena == group.arena);
+    let domain = domains.next().ok_or_else(|| {
+        Error::InferenceError(
+            "managed-cache reservation omitted the selected domain/group arena".into(),
+        )
+    })?;
+    if domains.next().is_some() {
+        return Err(Error::InvalidInput(
+            "managed-cache reservation repeats the selected domain/group arena".into(),
+        ));
+    }
+    if domain.execution_start_tokens < domain.expected_committed_tokens
+        || domain.target_committed_tokens < domain.execution_start_tokens
+        || domain.target_window_start > domain.execution_start_tokens
+    {
+        return Err(Error::InvalidInput(
+            "managed-cache domain has an invalid execution/window range".into(),
+        ));
+    }
+    if group.page_tokens == 0
+        || domain.first_page_offset >= group.page_tokens
+        || domain.first_page_offset != domain.target_window_start % group.page_tokens
+    {
+        return Err(Error::InvalidInput(
+            "managed-cache first-page offset does not match its logical window".to_string(),
+        ));
+    }
+
+    let mut tables = domain
+        .provisional_groups
+        .iter()
+        .filter(|table| table.group == group_id);
+    let table = tables.next().ok_or_else(|| {
+        Error::InferenceError("managed-cache reservation omitted its selected block table".into())
+    })?;
+    if tables.next().is_some() {
+        return Err(Error::InvalidInput(
+            "managed-cache reservation repeats its selected block table".into(),
+        ));
+    }
+
+    let arena = runtime.arena(group.arena).ok_or_else(|| {
+        Error::InferenceError("managed-cache physical arena is no longer live".to_string())
+    })?;
+    let config = arena.config();
+    if arena.id() != group.arena
+        || arena.backend_kind() != plan.backend
+        || config.id != group.arena
+        || config.group != group_id
+        || config.page_tokens != group.page_tokens
+        || config.capacity_pages != group.capacity_pages
+    {
+        return Err(Error::InferenceError(
+            "managed-cache arena geometry does not match its resolved group".into(),
+        ));
+    }
+    let storage_matches = matches!(
+        (group.storage, config.dtype),
+        (
+            KvStorageFormat::Dense {
+                dtype: KvStorageDType::F32
+            },
+            candle_core::DType::F32
+        ) | (
+            KvStorageFormat::Dense {
+                dtype: KvStorageDType::F16
+            },
+            candle_core::DType::F16
+        ) | (
+            KvStorageFormat::Dense {
+                dtype: KvStorageDType::Bf16
+            },
+            candle_core::DType::BF16
+        )
+    );
+    if !storage_matches
+        || config.layers.len() != layers.len()
+        || config
+            .layers
+            .iter()
+            .zip(layers)
+            .any(|(configured, resolved)| {
+                configured.binding != *resolved
+                    || configured.num_kv_heads == 0
+                    || configured.key_head_dim == 0
+                    || configured.value_head_dim == 0
+            })
+    {
+        return Err(Error::InferenceError(
+            "managed-cache arena layer or storage geometry is stale".into(),
+        ));
+    }
+    let element_bytes = match config.dtype {
+        candle_core::DType::F32 => 4_u64,
+        candle_core::DType::F16 | candle_core::DType::BF16 => 2_u64,
+        _ => {
+            return Err(Error::InferenceError(
+                "managed-cache arena uses unsupported paged storage".into(),
+            ));
+        }
+    };
+    let bytes_per_page = config.layers.iter().try_fold(0_u64, |total, layer| {
+        let per_token = u64::from(layer.num_kv_heads)
+            .checked_mul(u64::from(layer.key_head_dim) + u64::from(layer.value_head_dim))
+            .ok_or_else(|| Error::InferenceError("managed-cache layer geometry overflow".into()))?;
+        let bytes = u64::from(config.page_tokens)
+            .checked_mul(per_token)
+            .and_then(|elements| elements.checked_mul(element_bytes))
+            .ok_or_else(|| Error::InferenceError("managed-cache page geometry overflow".into()))?;
+        total
+            .checked_add(bytes)
+            .ok_or_else(|| Error::InferenceError("managed-cache page geometry overflow".into()))
+    })?;
+    if bytes_per_page != group.bytes_per_page {
+        return Err(Error::InferenceError(
+            "managed-cache arena byte geometry does not match its resolved group".into(),
+        ));
+    }
+
+    let visible_target = domain
+        .target_committed_tokens
+        .checked_sub(domain.target_window_start)
+        .ok_or_else(|| Error::InvalidInput("managed-cache window exceeds its target".into()))?;
+    let physical_target = visible_target
+        .checked_add(domain.first_page_offset)
+        .ok_or_else(|| Error::InvalidInput("managed-cache window geometry overflow".into()))?;
+    let required_pages = usize::try_from(physical_target.div_ceil(group.page_tokens))
+        .map_err(|_| Error::InvalidInput("managed-cache page count exceeds usize".into()))?;
+    if required_pages == 0 || table.blocks.len() != required_pages {
+        return Err(Error::InvalidInput(format!(
+            "managed-cache block table has {} pages, expected {required_pages}",
+            table.blocks.len()
+        )));
+    }
+    let mut unique_blocks = HashSet::with_capacity(table.blocks.len());
+    if table.blocks.iter().any(|block| {
+        block.arena != group.arena
+            || block.group != group_id
+            || block.index >= group.capacity_pages
+            || block.slot_generation == 0
+            || !unique_blocks.insert(*block)
+    }) {
+        return Err(Error::InvalidInput(
+            "managed-cache block table contains a foreign, stale, duplicate, or out-of-range page"
+                .into(),
+        ));
+    }
+
+    PhysicalPagedKvCache::new_windowed(
+        arena.clone(),
+        layers.clone(),
+        table.blocks.clone(),
+        usize::try_from(domain.target_window_start)
+            .map_err(|_| Error::InvalidInput("managed-cache window exceeds usize".into()))?,
+        usize::try_from(domain.execution_start_tokens)
+            .map_err(|_| Error::InvalidInput("managed-cache context exceeds usize".into()))?,
+    )
+}
+
+fn invocation_paged_stage_and_domains<'a>(
+    request: &'a EngineCoreRequest,
+    scheduled: &ScheduledRequest,
+) -> Result<(
+    &'a super::StageDescriptor,
+    Vec<crate::kv::v2::StateDomainId>,
+)> {
+    let binding = request.execution_adapter_binding().ok_or_else(|| {
+        Error::InferenceError("physical invocation row has no loaded adapter binding".to_string())
+    })?;
+    let stage = binding.stage_for_work(&scheduled.work)?;
+    let graph = crate::kv::v2::stage_graph_fingerprint(&binding.stages)?;
+    let descriptor = request.v2_state_descriptor().ok_or_else(|| {
+        Error::InferenceError("physical invocation row has no state descriptor".to_string())
+    })?;
+    let crate::kv::v2::InvocationWorkspaceSet::Bounded { profiles } = &descriptor.invocation else {
+        return Err(Error::InferenceError(
+            "physical invocation row has no bounded workspace profile".to_string(),
+        ));
+    };
+    let profile = profiles
+        .iter()
+        .find(|profile| profile.stage_graph_fingerprint == graph)
+        .ok_or_else(|| {
+            Error::InferenceError(
+                "physical invocation row has no workspace for its adapter graph".to_string(),
+            )
+        })?;
+    let workspace = profile
+        .stages
+        .iter()
+        .find(|workspace| workspace.stage == stage.id)
+        .ok_or_else(|| {
+            Error::InferenceError(
+                "physical invocation row has no workspace for its scheduled stage".to_string(),
+            )
+        })?;
+    let paged = workspace
+        .domains
+        .iter()
+        .filter_map(|domain| match domain {
+            crate::kv::v2::InvocationWorkspaceDomain::State {
+                state: crate::kv::v2::StateDomainSpec::PagedAttention(state),
+                capacity,
+                ..
+            } if capacity.paged_max_tokens().is_some() => Some(state.header.id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if paged.is_empty() {
+        return Err(Error::InferenceError(
+            "physical invocation stage has no paged workspace domain".to_string(),
+        ));
+    }
+    Ok((stage, paged))
+}
+
+/// Lease the one paged invocation domain authored for this exact scheduled
+/// stage. Models receive only the physical cache view and cannot select a pool
+/// by convention or by model-family-specific IDs.
+fn invocation_paged_lease_for_row(
+    request: &EngineCoreRequest,
+    scheduled: &ScheduledRequest,
+) -> Result<super::InvocationPagedKvLease> {
+    let (stage, domains) = invocation_paged_stage_and_domains(request, scheduled)?;
+    if domains.len() != 1 {
+        return Err(Error::InferenceError(
+            "physical invocation stage has multiple paged workspace domains".to_string(),
+        ));
+    }
+    request
+        .v2_state_runtime()
+        .ok_or_else(|| {
+            Error::InferenceError("physical invocation row has no sealed runtime".to_string())
+        })?
+        .lease_invocation_paged(stage.id, domains[0])
+}
+
+fn validate_atomic_scalar_invocation_stage(
+    stage: &super::StageDescriptor,
+    work: &WorkUnit,
+) -> Result<()> {
+    if !matches!(work, WorkUnit::AtomicJob { .. }) {
+        return Err(Error::InvalidInput(
+            "scalar invocation workspace requires an atomic scheduled row".to_string(),
+        ));
+    }
+    if stage.progress != StageProgressKind::Atomic || stage.batch_mode != NativeBatchMode::None {
+        return Err(Error::InvalidInput(
+            "atomic invocation workspace requires a scalar atomic execution stage".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Acquire one atomic scalar row's complete authored typed workspace in
+/// canonical domain order. This is the model-neutral path for mixed paged,
+/// recurrent, append, ring, and static state.
+pub(super) fn invocation_workspace_leases_for_atomic_scalar_row(
+    request: &EngineCoreRequest,
+    scheduled: &ScheduledRequest,
+) -> Result<crate::kv::v2::InvocationWorkspaceLeaseSetV2> {
+    let binding = request.execution_adapter_binding().ok_or_else(|| {
+        Error::InferenceError("physical invocation row has no loaded adapter binding".to_string())
+    })?;
+    let stage = binding.stage_for_work(&scheduled.work)?;
+    validate_atomic_scalar_invocation_stage(stage, &scheduled.work)?;
+    request
+        .v2_state_runtime()
+        .ok_or_else(|| {
+            Error::InferenceError("physical invocation row has no sealed runtime".to_string())
+        })?
+        .lease_complete_invocation_workspace_set(stage.id)
+}
+
+/// Acquire one atomic scalar row's complete authored paged-domain set in
+/// canonical identity order. Callers cannot omit a required domain. The
+/// returned set releases every already-acquired lease if a later domain fails,
+/// and explicit completion returns only authenticated writes.
+pub(super) fn invocation_paged_leases_for_atomic_scalar_row(
+    request: &EngineCoreRequest,
+    scheduled: &ScheduledRequest,
+) -> Result<crate::kv::v2::InvocationPagedLeaseSetV2> {
+    let (stage, _) = invocation_paged_stage_and_domains(request, scheduled)?;
+    validate_atomic_scalar_invocation_stage(stage, &scheduled.work)?;
+    request
+        .v2_state_runtime()
+        .ok_or_else(|| {
+            Error::InferenceError("physical invocation row has no sealed runtime".to_string())
+        })?
+        .lease_complete_invocation_paged_set(stage.id)
+}
 
 fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(msg) = payload.downcast_ref::<&str>() {
@@ -68,6 +878,9 @@ fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
     }
     "unknown panic payload".to_string()
 }
+
+/// Hard upper bound for scoped CPU row workers in one physical dispatch.
+const MAX_CPU_REQUEST_PARALLELISM: usize = 4;
 
 /// Configuration for the model executor.
 #[derive(Clone)]
@@ -90,16 +903,17 @@ pub struct WorkerConfig {
     pub kv_page_size: usize,
     /// Optional shared model registry for loaded runtime models.
     pub model_registry: Option<Arc<ModelRegistry>>,
-    /// Shared physical resource authority used for model-owned cache lifetime.
+    /// Shared physical resource authority used for bounded executor workspaces.
     pub resource_authority: Option<Arc<ResourceAuthority>>,
-    /// Bytes represented by one scheduler logical KV block for logical
-    /// scheduling metrics only. Model-owned physical cache authorization must
-    /// come from the loaded model adapter.
-    pub logical_kv_block_bytes: u64,
+    /// Shared physical-launch admission. Runtime services replace the local
+    /// fail-closed gate with their coordinator-owned handle.
+    pub(crate) physical_execution_admission: Option<PhysicalExecutionAdmission>,
     /// Maximum width of a model-native tensor batch on this backend.
     pub max_tensor_batch_size: usize,
     /// Exact model variants enabled for static tensor execution on this worker.
     pub static_tensor_batch_variants: Arc<HashSet<ModelVariant>>,
+    /// Opt-in scheduler-level chunked prefill for resumable-prefill models.
+    pub enable_chunked_prefill: bool,
 }
 
 impl std::fmt::Debug for WorkerConfig {
@@ -121,7 +935,13 @@ impl std::fmt::Debug for WorkerConfig {
                 "resource_authority",
                 &self.resource_authority.as_ref().map(|_| "<shared>"),
             )
-            .field("logical_kv_block_bytes", &self.logical_kv_block_bytes)
+            .field(
+                "physical_execution_admission",
+                &self
+                    .physical_execution_admission
+                    .as_ref()
+                    .map(PhysicalExecutionAdmission::capacity),
+            )
             .field("max_tensor_batch_size", &self.max_tensor_batch_size)
             .field(
                 "static_tensor_batch_variants",
@@ -153,9 +973,10 @@ impl Default for WorkerConfig {
             kv_page_size: 64,
             model_registry: None,
             resource_authority: None,
-            logical_kv_block_bytes: 0,
+            physical_execution_admission: Some(PhysicalExecutionAdmission::standalone(1)),
             max_tensor_batch_size: 1,
             static_tensor_batch_variants: Arc::new(HashSet::new()),
+            enable_chunked_prefill: false,
         }
     }
 }
@@ -166,6 +987,21 @@ impl From<&EngineCoreConfig> for WorkerConfig {
             BackendRouter::resolve_context_for_kind(config.backend, BackendSelectionSource::Config);
         let backend_kind = backend_context.backend_kind;
         let num_threads = config.num_threads.max(1);
+        let max_tensor_batch_size = config
+            .max_tensor_batch_size
+            .resolve(backend_kind)
+            .min(Self::tensor_batch_cap(backend_kind))
+            .max(1);
+        let request_parallelism = Self::request_parallelism_for(backend_kind, num_threads);
+        let physical_execution_capacity = Self::physical_execution_capacity(
+            config.physical_execution_mode,
+            backend_kind,
+            request_parallelism,
+            config
+                .resolved_physical_execution_capacity()
+                .physical_launch_limit
+                .get(),
+        );
         Self {
             models_dir: config.models_dir.clone(),
             backend: backend_kind,
@@ -173,26 +1009,40 @@ impl From<&EngineCoreConfig> for WorkerConfig {
             dtype: "float32".to_string(),
             kv_cache_dtype: config.kv_cache_dtype.clone(),
             num_threads,
-            request_parallelism: Self::request_parallelism_for(backend_kind, num_threads),
+            request_parallelism,
             kv_page_size: config.block_size.max(1),
             model_registry: None,
             resource_authority: None,
-            logical_kv_block_bytes: (config.kv_cache_memory_bytes() / config.max_blocks.max(1))
-                as u64,
-            max_tensor_batch_size: config
-                .max_batch_size
-                .min(Self::tensor_batch_cap(backend_kind))
-                .max(1),
+            physical_execution_admission: Some(PhysicalExecutionAdmission::standalone(
+                physical_execution_capacity,
+            )),
+            max_tensor_batch_size,
             static_tensor_batch_variants: Arc::new(HashSet::new()),
+            enable_chunked_prefill: config.enable_chunked_prefill,
         }
     }
 }
 
 impl WorkerConfig {
+    fn physical_execution_capacity(
+        mode: crate::config::PhysicalExecutionMode,
+        backend: BackendKind,
+        request_parallelism: usize,
+        configured_launch_limit: usize,
+    ) -> usize {
+        if mode == crate::config::PhysicalExecutionMode::Concurrent && backend == BackendKind::Cpu {
+            request_parallelism.max(configured_launch_limit).max(1)
+        } else {
+            1
+        }
+    }
+
     fn tensor_batch_cap(backend: BackendKind) -> usize {
         match backend {
             BackendKind::Cpu | BackendKind::Metal => 2,
-            BackendKind::Cuda => 8,
+            // Runtime CUDA defaults remain VRAM-tiered and resource-admitted;
+            // this is only the hard kernel/metadata width ceiling.
+            BackendKind::Cuda => 32,
         }
     }
 
@@ -203,9 +1053,17 @@ impl WorkerConfig {
             .filter(|value| *value > 0)
     }
 
+    fn available_cpu_capacity() -> usize {
+        std::thread::available_parallelism()
+            .map(|capacity| capacity.get())
+            .unwrap_or(1)
+            .max(1)
+    }
+
     fn resolve_request_parallelism(
         backend: BackendKind,
-        num_threads: usize,
+        configured_intra_op_threads: usize,
+        available_cpu_capacity: usize,
         override_value: Option<usize>,
     ) -> usize {
         // Candle's Metal path is intentionally serialized in dispatch. Do not
@@ -214,21 +1072,28 @@ impl WorkerConfig {
         if backend == BackendKind::Metal {
             return 1;
         }
-        let default_parallelism = match backend {
-            // CPU workloads already use `num_threads` for BLAS/Rayon/intra-op work, so
-            // keep inter-request fan-out conservative unless explicitly overridden.
-            BackendKind::Cpu => 1,
-            BackendKind::Metal => unreachable!("Metal is clamped above"),
-            BackendKind::Cuda => num_threads.max(1),
-        };
 
-        override_value.unwrap_or(default_parallelism).max(1)
+        if backend == BackendKind::Cpu {
+            let cpu_capacity = available_cpu_capacity.max(1);
+            let hard_cap = cpu_capacity.min(MAX_CPU_REQUEST_PARALLELISM);
+            let automatic = (cpu_capacity / configured_intra_op_threads.max(1)).max(1);
+            // Preserve the operator override as the selected value, then keep
+            // both automatic and explicit widths within the process-visible
+            // CPU allocation and the executor's conservative worker ceiling.
+            return override_value.unwrap_or(automatic).clamp(1, hard_cap);
+        }
+
+        // CUDA does not gain automatic scalar concurrency here. Preserve the
+        // existing explicit override contract without coupling it to host CPU
+        // capacity; accelerator launch policy is sealed independently.
+        override_value.unwrap_or(1).max(1)
     }
 
-    fn request_parallelism_for(backend: BackendKind, num_threads: usize) -> usize {
+    fn request_parallelism_for(backend: BackendKind, configured_intra_op_threads: usize) -> usize {
         Self::resolve_request_parallelism(
             backend,
-            num_threads,
+            configured_intra_op_threads,
+            Self::available_cpu_capacity(),
             Self::request_parallelism_override(),
         )
     }
@@ -341,6 +1206,18 @@ pub struct ModelSessionResult {
     pub safe_point: bool,
     pub provenance: OutcomeProvenance,
     pub staged_stream_outputs: Vec<StreamingOutput>,
+    /// Backend-sealed physical write batches produced by this safe point.
+    /// The executor reconciles these against the exact row reservation before
+    /// it can construct a managed-cache receipt.
+    pub(crate) managed_cache_completions: Vec<Arc<crate::backends::kv::KvWriteBatchCompletion>>,
+    /// Exact decoder-KV cursor advance, distinct from source samples consumed
+    /// and user-visible output events for realtime audio work.
+    pub(crate) managed_cache_append: Option<usize>,
+    /// The result is not authoritative unless Core resolves the exact
+    /// executor-owned post-model transaction registered for its plan/session.
+    pub(crate) pending_quantum_required: bool,
+    pub(crate) realtime_stage_outcome: Option<RealtimeStageOutcome>,
+    pub(crate) clocked_state_completion: Option<crate::backends::state::TensorStateBatchCompletion>,
 }
 
 impl ModelSessionResult {
@@ -373,6 +1250,11 @@ impl ModelSessionResult {
             safe_point: true,
             provenance,
             staged_stream_outputs: Vec::new(),
+            managed_cache_completions: Vec::new(),
+            managed_cache_append: None,
+            pending_quantum_required: false,
+            realtime_stage_outcome: None,
+            clocked_state_completion: None,
         }
     }
 
@@ -383,6 +1265,41 @@ impl ModelSessionResult {
             safe_point: true,
             provenance: OutcomeProvenance::produced_output(),
             staged_stream_outputs: Vec::new(),
+            managed_cache_completions: Vec::new(),
+            managed_cache_append: None,
+            pending_quantum_required: false,
+            realtime_stage_outcome: None,
+            clocked_state_completion: None,
+        }
+    }
+
+    /// Request a model-neutral restart of this exact retained sequence. The
+    /// model commits its semantic restart checkpoint (including pending retry
+    /// intent) but publishes no physical write completion; Core aborts the
+    /// scheduler reservation and advances the managed subgeneration.
+    pub fn restart_sequence(request_id: String, reason: super::SequenceRestartReason) -> Self {
+        Self {
+            output: ExecutorOutput {
+                request_id,
+                audio: None,
+                text: None,
+                input_transcription: None,
+                tokens_processed: 0,
+                tokens_generated: 0,
+                finished: false,
+                phase_timing_override: None,
+                asr_diagnostics: None,
+                error: None,
+            },
+            disposition: ExecutionDisposition::RestartSequence(reason),
+            safe_point: true,
+            provenance: OutcomeProvenance::started(),
+            staged_stream_outputs: Vec::new(),
+            managed_cache_completions: Vec::new(),
+            managed_cache_append: None,
+            pending_quantum_required: false,
+            realtime_stage_outcome: None,
+            clocked_state_completion: None,
         }
     }
 
@@ -394,6 +1311,11 @@ impl ModelSessionResult {
             safe_point: true,
             provenance: OutcomeProvenance::started(),
             staged_stream_outputs: Vec::new(),
+            managed_cache_completions: Vec::new(),
+            managed_cache_append: None,
+            pending_quantum_required: false,
+            realtime_stage_outcome: None,
+            clocked_state_completion: None,
         }
     }
 
@@ -405,6 +1327,11 @@ impl ModelSessionResult {
             safe_point: true,
             provenance: OutcomeProvenance::not_started(),
             staged_stream_outputs: Vec::new(),
+            managed_cache_completions: Vec::new(),
+            managed_cache_append: None,
+            pending_quantum_required: false,
+            realtime_stage_outcome: None,
+            clocked_state_completion: None,
         }
     }
 
@@ -430,11 +1357,47 @@ impl ModelSessionResult {
             safe_point: true,
             provenance,
             staged_stream_outputs: Vec::new(),
+            managed_cache_completions: Vec::new(),
+            managed_cache_append: None,
+            pending_quantum_required: false,
+            realtime_stage_outcome: None,
+            clocked_state_completion: None,
         }
     }
 
     fn with_staged_stream_outputs(mut self, outputs: Vec<StreamingOutput>) -> Self {
         self.staged_stream_outputs = outputs;
+        self
+    }
+
+    pub(crate) fn with_managed_cache_completions(
+        mut self,
+        completions: Vec<Arc<crate::backends::kv::KvWriteBatchCompletion>>,
+    ) -> Self {
+        self.managed_cache_completions = completions;
+        self
+    }
+
+    pub(crate) fn with_managed_cache_append(mut self, appended: usize) -> Self {
+        self.managed_cache_append = Some(appended);
+        self
+    }
+
+    pub(crate) fn requiring_pending_quantum(mut self) -> Self {
+        self.pending_quantum_required = true;
+        self
+    }
+
+    pub(crate) fn with_realtime_stage_outcome(mut self, outcome: RealtimeStageOutcome) -> Self {
+        self.realtime_stage_outcome = Some(outcome);
+        self
+    }
+
+    pub(crate) fn with_clocked_state_completion(
+        mut self,
+        completion: crate::backends::state::TensorStateBatchCompletion,
+    ) -> Self {
+        self.clocked_state_completion = Some(completion);
         self
     }
 }
@@ -448,11 +1411,18 @@ pub struct ExecutorStepResult {
     pub safe_point: bool,
     pub dispatch: BatchDispatch,
     pub provenance: OutcomeProvenance,
-    /// Physical model-owned cache retained after this safe point. Unknown is
-    /// reported explicitly when a backend/model cannot observe all storage.
+    /// Executor-owned resources retained after this safe point. Persistent
+    /// inference state is reported by its lifecycle-owned physical manager.
     pub observed_resources: ResourceVector,
     pub output: ExecutorOutput,
     pub staged_stream_outputs: Vec<StreamingOutput>,
+    /// Optional physical KV write acknowledgement for this exact row.
+    pub managed_cache: Option<super::ManagedCacheReceipt>,
+    pub(crate) managed_cache_completions: Vec<Arc<crate::backends::kv::KvWriteBatchCompletion>>,
+    pub(crate) managed_cache_append: Option<usize>,
+    pub(crate) pending_quantum_required: bool,
+    pub(crate) realtime_stage_outcome: Option<RealtimeStageOutcome>,
+    pub(crate) clocked_state_completion: Option<crate::backends::state::TensorStateBatchCompletion>,
 }
 
 impl ExecutorStepResult {
@@ -478,6 +1448,12 @@ impl ExecutorStepResult {
             observed_resources: ResourceVector::zero(),
             output: session_result.output,
             staged_stream_outputs: session_result.staged_stream_outputs,
+            managed_cache: None,
+            managed_cache_completions: session_result.managed_cache_completions,
+            managed_cache_append: session_result.managed_cache_append,
+            pending_quantum_required: session_result.pending_quantum_required,
+            realtime_stage_outcome: session_result.realtime_stage_outcome,
+            clocked_state_completion: session_result.clocked_state_completion,
         }
     }
 
@@ -493,6 +1469,11 @@ impl ExecutorStepResult {
 
     pub fn with_observed_resources(mut self, resources: ResourceVector) -> Self {
         self.observed_resources = resources;
+        self
+    }
+
+    pub fn with_managed_cache_receipt(mut self, receipt: super::ManagedCacheReceipt) -> Self {
+        self.managed_cache = Some(receipt);
         self
     }
 }
@@ -701,57 +1682,1155 @@ pub trait ModelExecutor: Send + Sync {
 /// tensor cache state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CacheReleaseReport {
+    pub outcome: CacheReleaseOutcome,
     pub confirmed: bool,
     pub released_sessions: usize,
+    pub busy_sessions: usize,
+}
+
+/// Typed executor cleanup result. `BusyInFlight` is deliberately distinct from
+/// a generic unconfirmed cleanup: the exact session is still owned by a model
+/// forward and must be retried after that forward reaches its RAII boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheReleaseOutcome {
+    Confirmed,
+    BusyInFlight,
+    Unconfirmed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingQuantumDecision {
+    Commit,
+    Abort,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingQuantumFinalizeStatus {
+    NotFound,
+    Finalized,
+}
+
+pub(crate) trait PendingQuantumFinalizer: Send + Sync {
+    fn contains(&self, plan_id: PlanId, session: &SessionKey) -> bool;
+
+    fn prepare(
+        &self,
+        plan_id: PlanId,
+        session: &SessionKey,
+        decision: PendingQuantumDecision,
+    ) -> Result<PendingQuantumFinalizeStatus>;
+
+    fn publish(
+        &self,
+        plan_id: PlanId,
+        session: &SessionKey,
+    ) -> Result<PendingQuantumFinalizeStatus>;
+
+    fn discard(&self, plan_id: PlanId, session: &SessionKey);
 }
 
 impl CacheReleaseReport {
     pub const fn confirmed(released_sessions: usize) -> Self {
         Self {
+            outcome: CacheReleaseOutcome::Confirmed,
             confirmed: true,
             released_sessions,
+            busy_sessions: 0,
+        }
+    }
+
+    pub const fn busy_in_flight(released_sessions: usize, busy_sessions: usize) -> Self {
+        Self {
+            outcome: CacheReleaseOutcome::BusyInFlight,
+            confirmed: false,
+            released_sessions,
+            busy_sessions,
         }
     }
 
     pub const fn unconfirmed() -> Self {
         Self {
+            outcome: CacheReleaseOutcome::Unconfirmed,
             confirmed: false,
             released_sessions: 0,
+            busy_sessions: 0,
         }
     }
 }
 
-#[derive(Debug, Default)]
-struct CacheResourceReservation {
-    reserved_bytes: u64,
-    observed_blocks: usize,
-    lease: Option<ResourceLease>,
+enum ExecutorStateSlot<T> {
+    Ready { variant: ModelVariant, state: T },
+    InFlight { variant: ModelVariant },
+    Poisoned { variant: ModelVariant },
+}
+
+type ExecutorStateStore<T> = Mutex<HashMap<SessionKey, ExecutorStateSlot<T>>>;
+
+/// Exclusive ownership of one executor session state while a physical forward
+/// is running. The `InFlight` marker stays visible in the map for cleanup for
+/// the complete lifetime of this lease.
+///
+/// Before model state is mutated, dropping the lease restores a previously
+/// ready state. Once `mark_dirty` is called, an uncommitted unwind drops the
+/// possibly-mutated state and leaves a `Poisoned` marker so cleanup cannot
+/// mistake the temporary absence for a successful release.
+struct ExecutorStateLease<'a, T> {
+    store: &'a ExecutorStateStore<T>,
+    session: SessionKey,
+    state: Option<T>,
+    label: &'static str,
+    requested_variant: ModelVariant,
+    marker_variant: ModelVariant,
+    dirty: bool,
+    armed: bool,
+}
+
+impl<'a, T> ExecutorStateLease<'a, T> {
+    fn checkout(
+        store: &'a ExecutorStateStore<T>,
+        session: SessionKey,
+        requested_variant: ModelVariant,
+        label: &'static str,
+    ) -> Result<Self> {
+        use std::collections::hash_map::Entry;
+
+        let state = {
+            let mut states = store
+                .lock()
+                .map_err(|_| Error::InferenceError(format!("{label} state mutex poisoned")))?;
+            match states.entry(session.clone()) {
+                Entry::Vacant(entry) => {
+                    entry.insert(ExecutorStateSlot::InFlight {
+                        variant: requested_variant,
+                    });
+                    (None, requested_variant)
+                }
+                Entry::Occupied(mut entry) => match entry.get() {
+                    ExecutorStateSlot::Ready { variant, .. } => {
+                        let marker_variant = *variant;
+                        let previous = entry.insert(ExecutorStateSlot::InFlight {
+                            variant: marker_variant,
+                        });
+                        let ExecutorStateSlot::Ready { state, .. } = previous else {
+                            unreachable!("ready executor state changed under one mutex guard")
+                        };
+                        (Some(state), marker_variant)
+                    }
+                    ExecutorStateSlot::InFlight { .. } => {
+                        return Err(Error::InferenceError(format!(
+                            "{label} session {}:{} is already in flight",
+                            session.request_id, session.epoch
+                        )))
+                    }
+                    ExecutorStateSlot::Poisoned { .. } => {
+                        return Err(Error::InferenceError(format!(
+                            "{label} session {}:{} is poisoned and requires cleanup",
+                            session.request_id, session.epoch
+                        )))
+                    }
+                },
+            }
+        };
+
+        Ok(Self {
+            store,
+            session,
+            state: state.0,
+            label,
+            requested_variant,
+            marker_variant: state.1,
+            dirty: false,
+            armed: true,
+        })
+    }
+
+    fn state(&self) -> Option<&T> {
+        self.state.as_ref()
+    }
+
+    fn state_mut(&mut self) -> Option<&mut T> {
+        self.state.as_mut()
+    }
+
+    fn require_state_mut(&mut self) -> Result<&mut T> {
+        self.state.as_mut().ok_or_else(|| {
+            Error::InferenceError(format!(
+                "{} session {}:{} has no checked-out state",
+                self.label, self.session.request_id, self.session.epoch
+            ))
+        })
+    }
+
+    fn discard_state(&mut self) {
+        self.state.take();
+        self.dirty = false;
+        if self.marker_variant != self.requested_variant {
+            let mut states = self
+                .store
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if matches!(
+                states.get(&self.session),
+                Some(ExecutorStateSlot::InFlight { variant }) if *variant == self.marker_variant
+            ) {
+                states.insert(
+                    self.session.clone(),
+                    ExecutorStateSlot::InFlight {
+                        variant: self.requested_variant,
+                    },
+                );
+                self.marker_variant = self.requested_variant;
+            }
+        }
+    }
+
+    fn install_state(&mut self, state: T) -> Result<()> {
+        if self.state.is_some() {
+            return Err(Error::InferenceError(format!(
+                "{} session {}:{} replaced an owned state without releasing it",
+                self.label, self.session.request_id, self.session.epoch
+            )));
+        }
+        self.state = Some(state);
+        Ok(())
+    }
+
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    fn mark_clean(&mut self) {
+        self.dirty = false;
+    }
+
+    fn restore(mut self) -> Result<()> {
+        let state = self.state.take().ok_or_else(|| {
+            Error::InferenceError(format!(
+                "{} session {}:{} cannot restore an empty state",
+                self.label, self.session.request_id, self.session.epoch
+            ))
+        })?;
+        let result = self.replace_in_flight(ExecutorStateSlot::Ready {
+            variant: self.marker_variant,
+            state,
+        });
+        if result.is_ok() {
+            self.armed = false;
+        }
+        result
+    }
+
+    fn release(mut self) -> Result<()> {
+        let mut states = self
+            .store
+            .lock()
+            .map_err(|_| Error::InferenceError(format!("{} state mutex poisoned", self.label)))?;
+        match states.get(&self.session) {
+            Some(ExecutorStateSlot::InFlight { variant }) if *variant == self.marker_variant => {
+                states.remove(&self.session);
+                self.armed = false;
+                Ok(())
+            }
+            _ => Err(self.transition_collision()),
+        }
+    }
+
+    /// Transfer the checked-out value to a post-execution transaction while
+    /// deliberately retaining the visible `InFlight` ownership marker.
+    fn defer(mut self) -> Result<T> {
+        {
+            let states = self.store.lock().map_err(|_| {
+                Error::InferenceError(format!("{} state mutex poisoned", self.label))
+            })?;
+            if !matches!(
+                states.get(&self.session),
+                Some(ExecutorStateSlot::InFlight { variant }) if *variant == self.marker_variant
+            ) {
+                return Err(self.transition_collision());
+            }
+        }
+        let state = self.state.take().ok_or_else(|| {
+            Error::InferenceError(format!(
+                "{} session {}:{} cannot defer an empty state",
+                self.label, self.session.request_id, self.session.epoch
+            ))
+        })?;
+        self.armed = false;
+        Ok(state)
+    }
+
+    /// Validate the only fallible ownership checks performed by `defer`.
+    /// Callers sealing a cohort can validate every row before transferring
+    /// any row out of its rollback-capable lease.
+    fn validate_defer(&self) -> Result<()> {
+        let states = self
+            .store
+            .lock()
+            .map_err(|_| Error::InferenceError(format!("{} state mutex poisoned", self.label)))?;
+        if !matches!(
+            states.get(&self.session),
+            Some(ExecutorStateSlot::InFlight { variant }) if *variant == self.marker_variant
+        ) {
+            return Err(self.transition_collision());
+        }
+        if self.state.is_none() {
+            return Err(Error::InferenceError(format!(
+                "{} session {}:{} cannot defer an empty state",
+                self.label, self.session.request_id, self.session.epoch
+            )));
+        }
+        Ok(())
+    }
+
+    /// Transfer a lease after an all-row `validate_defer` barrier. No shared
+    /// state is touched between the barrier and this synchronous conversion.
+    fn defer_validated(mut self) -> T {
+        let state = self
+            .state
+            .take()
+            .expect("validated executor state lease must retain its state");
+        self.armed = false;
+        state
+    }
+
+    fn replace_in_flight(&mut self, replacement: ExecutorStateSlot<T>) -> Result<()> {
+        let mut states = self
+            .store
+            .lock()
+            .map_err(|_| Error::InferenceError(format!("{} state mutex poisoned", self.label)))?;
+        match states.get(&self.session) {
+            Some(ExecutorStateSlot::InFlight { variant }) if *variant == self.marker_variant => {
+                states.insert(self.session.clone(), replacement);
+                Ok(())
+            }
+            _ => Err(self.transition_collision()),
+        }
+    }
+
+    fn transition_collision(&self) -> Error {
+        Error::InferenceError(format!(
+            "{} session {}:{} lost its in-flight ownership marker",
+            self.label, self.session.request_id, self.session.epoch
+        ))
+    }
+}
+
+struct VoxtralRealtimeStateCoordinator {
+    states: ExecutorStateStore<ActiveVoxtralRealtime>,
+    pending: Mutex<HashMap<PlanId, PendingVoxtralRealtimeQuantum>>,
+    prepared: Mutex<HashMap<PlanId, PreparedVoxtralRealtimeQuantum>>,
+}
+
+impl VoxtralRealtimeStateCoordinator {
+    fn new() -> Self {
+        Self {
+            states: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
+            prepared: Mutex::new(HashMap::new()),
+        }
+    }
+
+    // Returning the pending quantum preserves ownership when registration fails.
+    #[allow(clippy::result_large_err)]
+    fn register(
+        &self,
+        plan_id: PlanId,
+        pending: PendingVoxtralRealtimeQuantum,
+    ) -> std::result::Result<(), (Error, PendingVoxtralRealtimeQuantum)> {
+        let mut quanta = match self.pending.lock() {
+            Ok(quanta) => quanta,
+            Err(_) => {
+                return Err((
+                    Error::InferenceError("Voxtral pending-quantum mutex poisoned".to_string()),
+                    pending,
+                ));
+            }
+        };
+        if quanta.contains_key(&plan_id) {
+            return Err((
+                Error::InferenceError(format!(
+                    "Voxtral pending quantum already exists for plan {plan_id}"
+                )),
+                pending,
+            ));
+        }
+        quanta.insert(plan_id, pending);
+        Ok(())
+    }
+
+    fn register_batch(
+        &self,
+        rows: Vec<(PlanId, PendingVoxtralRealtimeQuantum)>,
+    ) -> std::result::Result<(), (Error, Vec<(PlanId, PendingVoxtralRealtimeQuantum)>)> {
+        let mut quanta = match self.pending.lock() {
+            Ok(quanta) => quanta,
+            Err(_) => {
+                return Err((
+                    Error::InferenceError("Voxtral pending-quantum mutex poisoned".to_string()),
+                    rows,
+                ));
+            }
+        };
+        let mut plan_ids = std::collections::HashSet::with_capacity(rows.len());
+        if rows
+            .iter()
+            .any(|(plan_id, _)| !plan_ids.insert(*plan_id) || quanta.contains_key(plan_id))
+        {
+            return Err((
+                Error::InferenceError(
+                    "Voxtral cohort contains a duplicate pending plan".to_string(),
+                ),
+                rows,
+            ));
+        }
+        quanta.extend(rows);
+        Ok(())
+    }
+
+    fn replace_in_flight(
+        &self,
+        session: &SessionKey,
+        replacement: Option<ActiveVoxtralRealtime>,
+    ) -> Result<()> {
+        // Publication follows a successful model prepare and managed-KV
+        // finalize. Recover the guard so mutex poisoning cannot strand a
+        // successfully committed authoritative transaction.
+        let mut states = self
+            .states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let marker_variant = match states.get(session) {
+            Some(ExecutorStateSlot::InFlight { variant }) => *variant,
+            _ => replacement
+                .as_ref()
+                .map(|active| active.variant)
+                .ok_or_else(|| {
+                    Error::InferenceError(format!(
+                        "Voxtral realtime session {}:{} lost its pending variant identity",
+                        session.request_id, session.epoch
+                    ))
+                })?,
+        };
+        if !matches!(
+            states.get(session),
+            Some(ExecutorStateSlot::InFlight { variant }) if *variant == marker_variant
+        ) {
+            states.insert(
+                session.clone(),
+                ExecutorStateSlot::Poisoned {
+                    variant: marker_variant,
+                },
+            );
+            return Err(Error::InferenceError(format!(
+                "Voxtral realtime session {}:{} lost its pending ownership marker",
+                session.request_id, session.epoch
+            )));
+        }
+        match replacement {
+            Some(active) => {
+                if active.variant != marker_variant {
+                    states.insert(
+                        session.clone(),
+                        ExecutorStateSlot::Poisoned {
+                            variant: marker_variant,
+                        },
+                    );
+                    return Err(Error::InferenceError(
+                        "Voxtral pending state crossed its retained model variant".into(),
+                    ));
+                }
+                states.insert(
+                    session.clone(),
+                    ExecutorStateSlot::Ready {
+                        variant: marker_variant,
+                        state: active,
+                    },
+                );
+            }
+            None => {
+                states.remove(session);
+            }
+        }
+        Ok(())
+    }
+
+    fn poison_in_flight(&self, session: &SessionKey) {
+        let mut states = self
+            .states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(variant) = states.get(session).and_then(|slot| match slot {
+            ExecutorStateSlot::InFlight { variant } => Some(*variant),
+            _ => None,
+        }) {
+            states.insert(session.clone(), ExecutorStateSlot::Poisoned { variant });
+        }
+    }
+
+    fn resolve_pending(
+        &self,
+        mut pending: PendingVoxtralRealtimeQuantum,
+        decision: PendingQuantumDecision,
+    ) -> Result<PreparedVoxtralRealtimeQuantum> {
+        let operation = match decision {
+            PendingQuantumDecision::Commit => pending.active.model.commit_realtime_quantum(
+                &mut pending.active.state,
+                &pending.cache,
+                &mut pending.checkpoint,
+            ),
+            PendingQuantumDecision::Abort => {
+                pending.active.last_tokens_generated = pending.prior_last_tokens_generated;
+                pending.active.stream_sequence = pending.prior_stream_sequence;
+                pending.active.input_sample_rate = pending.prior_input_sample_rate;
+                pending.active.model.rollback_realtime_quantum(
+                    &mut pending.active.state,
+                    &mut pending.cache,
+                    &mut pending.checkpoint,
+                )
+            }
+        };
+        if let Err(error) = operation {
+            self.poison_in_flight(&pending.session);
+            return Err(error);
+        }
+        if decision == PendingQuantumDecision::Commit {
+            pending.active.last_tokens_generated = pending.active.state.tokens_generated();
+        }
+        let replacement = if decision == PendingQuantumDecision::Commit && pending.finished {
+            None
+        } else {
+            Some(pending.active)
+        };
+        Ok(PreparedVoxtralRealtimeQuantum {
+            session: pending.session,
+            replacement,
+        })
+    }
+
+    fn abort_matching(
+        &self,
+        predicate: impl Fn(&PendingVoxtralRealtimeQuantum) -> bool,
+    ) -> Result<usize> {
+        let pending = {
+            let mut quanta = self
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let ids = quanta
+                .iter()
+                .filter_map(|(id, pending)| predicate(pending).then_some(*id))
+                .collect::<Vec<_>>();
+            ids.into_iter()
+                .filter_map(|id| quanta.remove(&id))
+                .collect::<Vec<_>>()
+        };
+        let count = pending.len();
+        let mut failure = None;
+        for quantum in pending {
+            let session = quantum.session.clone();
+            let result = self
+                .resolve_pending(quantum, PendingQuantumDecision::Abort)
+                .and_then(|prepared| self.replace_in_flight(&session, prepared.replacement));
+            if let Err(error) = result {
+                error!(error = %error, "Failed to abort a pending Voxtral realtime quantum");
+                failure.get_or_insert(error);
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(count),
+        }
+    }
+
+    fn has_prepared(&self) -> bool {
+        !self
+            .prepared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
+    }
+}
+
+impl PendingQuantumFinalizer for VoxtralRealtimeStateCoordinator {
+    fn contains(&self, plan_id: PlanId, session: &SessionKey) -> bool {
+        self.pending
+            .lock()
+            .ok()
+            .and_then(|pending| pending.get(&plan_id).map(|row| &row.session == session))
+            .unwrap_or(false)
+    }
+
+    fn prepare(
+        &self,
+        plan_id: PlanId,
+        session: &SessionKey,
+        decision: PendingQuantumDecision,
+    ) -> Result<PendingQuantumFinalizeStatus> {
+        let pending = {
+            let mut quanta = self.pending.lock().map_err(|_| {
+                Error::InferenceError("Voxtral pending-quantum mutex poisoned".to_string())
+            })?;
+            let Some(pending) = quanta.get(&plan_id) else {
+                return Ok(PendingQuantumFinalizeStatus::NotFound);
+            };
+            if &pending.session != session {
+                return Err(Error::InferenceError(format!(
+                    "pending quantum plan {plan_id} belongs to a different session"
+                )));
+            }
+            quanta
+                .remove(&plan_id)
+                .expect("pending quantum was present")
+        };
+        let prepared = self.resolve_pending(pending, decision)?;
+        let mut rows = self.prepared.lock().map_err(|_| {
+            self.poison_in_flight(session);
+            Error::InferenceError("Voxtral prepared-quantum mutex poisoned".to_string())
+        })?;
+        if rows.insert(plan_id, prepared).is_some() {
+            self.poison_in_flight(session);
+            return Err(Error::InferenceError(format!(
+                "Voxtral prepared quantum already exists for plan {plan_id}"
+            )));
+        }
+        Ok(PendingQuantumFinalizeStatus::Finalized)
+    }
+
+    fn publish(
+        &self,
+        plan_id: PlanId,
+        session: &SessionKey,
+    ) -> Result<PendingQuantumFinalizeStatus> {
+        let prepared = {
+            let mut rows = self
+                .prepared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(prepared) = rows.remove(&plan_id) else {
+                return Ok(PendingQuantumFinalizeStatus::NotFound);
+            };
+            prepared
+        };
+        if &prepared.session != session {
+            self.poison_in_flight(&prepared.session);
+            return Err(Error::InferenceError(format!(
+                "prepared quantum plan {plan_id} belongs to a different session"
+            )));
+        }
+        self.replace_in_flight(session, prepared.replacement)?;
+        Ok(PendingQuantumFinalizeStatus::Finalized)
+    }
+
+    fn discard(&self, plan_id: PlanId, session: &SessionKey) {
+        let prepared = self
+            .prepared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&plan_id);
+        if let Some(prepared) = prepared {
+            self.poison_in_flight(&prepared.session);
+        } else {
+            self.poison_in_flight(session);
+        }
+    }
+}
+
+struct NemotronRealtimeStateCoordinator {
+    states: ExecutorStateStore<ActiveNemotronRealtime>,
+    pending: Mutex<HashMap<PlanId, PendingNemotronRealtimeQuantum>>,
+    prepared: Mutex<HashMap<PlanId, PreparedNemotronRealtimeQuantum>>,
+}
+
+impl NemotronRealtimeStateCoordinator {
+    fn new() -> Self {
+        Self {
+            states: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
+            prepared: Mutex::new(HashMap::new()),
+        }
+    }
+
+    // Returning the pending quantum preserves ownership when registration fails.
+    #[allow(clippy::result_large_err)]
+    fn register(
+        &self,
+        plan_id: PlanId,
+        pending: PendingNemotronRealtimeQuantum,
+    ) -> std::result::Result<(), (Error, PendingNemotronRealtimeQuantum)> {
+        let mut rows = match self.pending.lock() {
+            Ok(rows) => rows,
+            Err(_) => {
+                return Err((
+                    Error::InferenceError("Nemotron pending state mutex poisoned".into()),
+                    pending,
+                ))
+            }
+        };
+        if rows.contains_key(&plan_id) {
+            return Err((
+                Error::InferenceError(format!(
+                    "Nemotron pending quantum already exists for plan {plan_id}"
+                )),
+                pending,
+            ));
+        }
+        rows.insert(plan_id, pending);
+        Ok(())
+    }
+
+    fn register_batch(
+        &self,
+        rows: Vec<(PlanId, PendingNemotronRealtimeQuantum)>,
+    ) -> std::result::Result<(), (Error, Vec<(PlanId, PendingNemotronRealtimeQuantum)>)> {
+        let mut pending = match self.pending.lock() {
+            Ok(pending) => pending,
+            Err(_) => {
+                return Err((
+                    Error::InferenceError("Nemotron pending state mutex poisoned".into()),
+                    rows,
+                ))
+            }
+        };
+        let mut ids = HashSet::with_capacity(rows.len());
+        if rows
+            .iter()
+            .any(|(id, _)| !ids.insert(*id) || pending.contains_key(id))
+        {
+            return Err((
+                Error::InferenceError("Nemotron cohort contains duplicate pending plans".into()),
+                rows,
+            ));
+        }
+        pending.extend(rows);
+        Ok(())
+    }
+
+    fn replace_in_flight(
+        &self,
+        session: &SessionKey,
+        replacement: Option<ActiveNemotronRealtime>,
+    ) -> Result<()> {
+        let mut states = self
+            .states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let variant = match states.get(session) {
+            Some(ExecutorStateSlot::InFlight { variant }) => *variant,
+            _ => {
+                return Err(Error::InferenceError(
+                    "Nemotron pending state lost its ownership marker".into(),
+                ))
+            }
+        };
+        match replacement {
+            Some(active) if active.variant == variant => {
+                states.insert(
+                    session.clone(),
+                    ExecutorStateSlot::Ready {
+                        variant,
+                        state: active,
+                    },
+                );
+            }
+            Some(_) => {
+                states.insert(session.clone(), ExecutorStateSlot::Poisoned { variant });
+                return Err(Error::InferenceError(
+                    "Nemotron pending state crossed model variants".into(),
+                ));
+            }
+            None => {
+                states.remove(session);
+            }
+        }
+        Ok(())
+    }
+
+    fn abort_matching(
+        &self,
+        predicate: impl Fn(&PendingNemotronRealtimeQuantum) -> bool,
+    ) -> Result<usize> {
+        let rows = {
+            let mut pending = self.pending.lock().map_err(|_| {
+                Error::InferenceError("Nemotron pending state mutex poisoned".into())
+            })?;
+            let ids = pending
+                .iter()
+                .filter_map(|(id, row)| predicate(row).then_some(*id))
+                .collect::<Vec<_>>();
+            ids.into_iter()
+                .filter_map(|id| pending.remove(&id))
+                .collect::<Vec<_>>()
+        };
+        let count = rows.len();
+        for row in rows {
+            self.replace_in_flight(&row.session, Some(row.checkpoint))?;
+        }
+        Ok(count)
+    }
+
+    fn has_prepared(&self) -> bool {
+        !self
+            .prepared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
+    }
+}
+
+impl PendingQuantumFinalizer for NemotronRealtimeStateCoordinator {
+    fn contains(&self, plan_id: PlanId, session: &SessionKey) -> bool {
+        self.pending
+            .lock()
+            .ok()
+            .and_then(|rows| rows.get(&plan_id).map(|row| &row.session == session))
+            .unwrap_or(false)
+    }
+
+    fn prepare(
+        &self,
+        plan_id: PlanId,
+        session: &SessionKey,
+        decision: PendingQuantumDecision,
+    ) -> Result<PendingQuantumFinalizeStatus> {
+        let row = {
+            let mut rows = self.pending.lock().map_err(|_| {
+                Error::InferenceError("Nemotron pending state mutex poisoned".into())
+            })?;
+            let Some(row) = rows.get(&plan_id) else {
+                return Ok(PendingQuantumFinalizeStatus::NotFound);
+            };
+            if &row.session != session {
+                return Err(Error::InferenceError(
+                    "Nemotron pending plan crossed sessions".into(),
+                ));
+            }
+            rows.remove(&plan_id).expect("pending row present")
+        };
+        let replacement = if decision == PendingQuantumDecision::Commit {
+            (!row.finished).then_some(row.active)
+        } else {
+            Some(row.checkpoint)
+        };
+        let prepared = PreparedNemotronRealtimeQuantum {
+            session: row.session,
+            replacement,
+        };
+        if self
+            .prepared
+            .lock()
+            .map_err(|_| Error::InferenceError("Nemotron prepared state mutex poisoned".into()))?
+            .insert(plan_id, prepared)
+            .is_some()
+        {
+            return Err(Error::InferenceError(
+                "duplicate Nemotron prepared quantum".into(),
+            ));
+        }
+        Ok(PendingQuantumFinalizeStatus::Finalized)
+    }
+
+    fn publish(
+        &self,
+        plan_id: PlanId,
+        session: &SessionKey,
+    ) -> Result<PendingQuantumFinalizeStatus> {
+        let Some(prepared) = self
+            .prepared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&plan_id)
+        else {
+            return Ok(PendingQuantumFinalizeStatus::NotFound);
+        };
+        if &prepared.session != session {
+            return Err(Error::InferenceError(
+                "Nemotron prepared plan crossed sessions".into(),
+            ));
+        }
+        self.replace_in_flight(session, prepared.replacement)?;
+        Ok(PendingQuantumFinalizeStatus::Finalized)
+    }
+
+    fn discard(&self, plan_id: PlanId, session: &SessionKey) {
+        let row = self
+            .prepared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&plan_id);
+        let mut states = self
+            .states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let target = row.as_ref().map_or(session, |row| &row.session);
+        if let Some(ExecutorStateSlot::InFlight { variant }) = states.get(target) {
+            let variant = *variant;
+            states.insert(target.clone(), ExecutorStateSlot::Poisoned { variant });
+        }
+    }
+}
+
+struct RealtimePendingQuantumFinalizer {
+    voxtral: Arc<VoxtralRealtimeStateCoordinator>,
+    nemotron: Arc<NemotronRealtimeStateCoordinator>,
+}
+
+impl PendingQuantumFinalizer for RealtimePendingQuantumFinalizer {
+    fn contains(&self, plan_id: PlanId, session: &SessionKey) -> bool {
+        self.voxtral.contains(plan_id, session) || self.nemotron.contains(plan_id, session)
+    }
+    fn prepare(
+        &self,
+        plan_id: PlanId,
+        session: &SessionKey,
+        decision: PendingQuantumDecision,
+    ) -> Result<PendingQuantumFinalizeStatus> {
+        if self.nemotron.contains(plan_id, session) {
+            self.nemotron.prepare(plan_id, session, decision)
+        } else {
+            self.voxtral.prepare(plan_id, session, decision)
+        }
+    }
+    fn publish(
+        &self,
+        plan_id: PlanId,
+        session: &SessionKey,
+    ) -> Result<PendingQuantumFinalizeStatus> {
+        if self
+            .nemotron
+            .prepared
+            .lock()
+            .ok()
+            .is_some_and(|rows| rows.contains_key(&plan_id))
+        {
+            self.nemotron.publish(plan_id, session)
+        } else {
+            self.voxtral.publish(plan_id, session)
+        }
+    }
+    fn discard(&self, plan_id: PlanId, session: &SessionKey) {
+        if self
+            .nemotron
+            .prepared
+            .lock()
+            .ok()
+            .is_some_and(|rows| rows.contains_key(&plan_id))
+        {
+            self.nemotron.discard(plan_id, session)
+        } else {
+            self.voxtral.discard(plan_id, session)
+        }
+    }
+}
+
+impl<T> Drop for ExecutorStateLease<'_, T> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        use std::collections::hash_map::Entry;
+        let mut states = self
+            .store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match states.entry(self.session.clone()) {
+            Entry::Occupied(mut entry)
+                if matches!(
+                    entry.get(),
+                    ExecutorStateSlot::InFlight { variant } if *variant == self.marker_variant
+                ) =>
+            {
+                if self.dirty {
+                    entry.insert(ExecutorStateSlot::Poisoned {
+                        variant: self.marker_variant,
+                    });
+                } else if let Some(state) = self.state.take() {
+                    entry.insert(ExecutorStateSlot::Ready {
+                        variant: self.marker_variant,
+                        state,
+                    });
+                } else {
+                    entry.remove();
+                }
+            }
+            Entry::Vacant(entry) => {
+                // A missing marker means another path observed ownership that
+                // was not actually released. Fence the session until cleanup.
+                entry.insert(ExecutorStateSlot::Poisoned {
+                    variant: self.marker_variant,
+                });
+                tracing::error!(
+                    request_id = %self.session.request_id,
+                    epoch = self.session.epoch,
+                    state = self.label,
+                    "executor state lease lost its in-flight marker"
+                );
+            }
+            Entry::Occupied(mut entry) => {
+                entry.insert(ExecutorStateSlot::Poisoned {
+                    variant: self.marker_variant,
+                });
+                tracing::error!(
+                    request_id = %self.session.request_id,
+                    epoch = self.session.epoch,
+                    state = self.label,
+                    "executor state lease collided with another visible state; session fenced until cleanup"
+                );
+            }
+        }
+    }
 }
 
 pub struct NativeExecutor {
     config: WorkerConfig,
     initialized: bool,
     loaded_tts_model: Option<Arc<Qwen3TtsModel>>,
-    chat_decode_states: Mutex<HashMap<SessionKey, ActiveChatDecode>>,
-    qwen35_prefix_cache: ExactPrefixCache<NativeChatModel, Qwen35PrefixSnapshot>,
-    asr_decode_states: Mutex<HashMap<SessionKey, ActiveAsrDecode>>,
-    qwen_tts_decode_states: Mutex<HashMap<SessionKey, ActiveQwenTtsDecode>>,
-    cache_resource_leases: Mutex<HashMap<SessionKey, CacheResourceReservation>>,
+    chat_decode_states: ExecutorStateStore<ActiveChatDecode>,
+    asr_decode_states: ExecutorStateStore<ActiveAsrDecode>,
+    parakeet_asr_decode_states: ExecutorStateStore<ActiveParakeetAsrDecode>,
+    lfm25_asr_decode_states: ExecutorStateStore<ActiveLfm25AsrDecode>,
+    lfm25_tts_decode_states: ExecutorStateStore<ActiveLfm25TtsDecode>,
+    vibevoice_tts_decode_states: ExecutorStateStore<ActiveVibeVoiceTtsDecode>,
+    fish_s2_tts_decode_states: ExecutorStateStore<ActiveFishS2TtsDecode>,
+    voxtral_tts_decode_states: ExecutorStateStore<ActiveVoxtralTtsDecode>,
+    voxtral_realtime: Arc<VoxtralRealtimeStateCoordinator>,
+    nemotron_realtime: Arc<NemotronRealtimeStateCoordinator>,
+    qwen_tts_decode_states: ExecutorStateStore<ActiveQwenTtsDecode>,
 }
 
 impl NativeExecutor {
+    fn execute_voxtral_realtime_batch_with_rows(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+        rows: &[ReadyQuantum],
+        mode: NativeBatchMode,
+    ) -> Result<Vec<ExecutorStepResult>> {
+        let ordered_requests = scheduled
+            .iter()
+            .map(|scheduled| {
+                requests
+                    .iter()
+                    .copied()
+                    .find(|request| request.id == scheduled.request_id)
+                    .ok_or_else(|| {
+                        Error::InferenceError(
+                            "Voxtral native batch lost its request snapshot".into(),
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let managed = scheduled
+            .iter()
+            .zip(&ordered_requests)
+            .map(|(scheduled, request)| {
+                let reservation = rows
+                    .iter()
+                    .find(|row| row.plan_id == scheduled.plan_id)
+                    .and_then(|row| row.managed_cache.as_ref())
+                    .ok_or_else(|| {
+                        Error::InferenceError(
+                            "Voxtral native batch lost its retained reservation".into(),
+                        )
+                    })?;
+                retained_row_managed_state_for_row(request, scheduled, reservation).map(Some)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let outputs =
+            self.voxtral_realtime_batch_with_managed(&ordered_requests, scheduled, managed)?;
+        self.finish_scheduled_execution(
+            requests,
+            scheduled,
+            outputs,
+            match mode {
+                NativeBatchMode::Static => {
+                    BatchDispatch::new(super::BatchDispatchKind::TensorStatic, scheduled.len())
+                }
+                NativeBatchMode::Continuous => {
+                    BatchDispatch::new(super::BatchDispatchKind::TensorContinuous, scheduled.len())
+                }
+                NativeBatchMode::None => BatchDispatch::serial(),
+            },
+            Some(rows),
+        )
+    }
+
+    fn execute_nemotron_realtime_batch_with_rows(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+        rows: &[ReadyQuantum],
+        mode: NativeBatchMode,
+    ) -> Result<Vec<ExecutorStepResult>> {
+        let ordered = scheduled
+            .iter()
+            .map(|row| {
+                requests
+                    .iter()
+                    .copied()
+                    .find(|request| request.id == row.request_id)
+                    .ok_or_else(|| {
+                        Error::InferenceError("Nemotron batch lost request snapshot".into())
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let managed = scheduled
+            .iter()
+            .zip(&ordered)
+            .map(|(scheduled, request)| {
+                let reservation = rows
+                    .iter()
+                    .find(|row| row.plan_id == scheduled.plan_id)
+                    .and_then(|row| row.managed_cache.as_ref())
+                    .ok_or_else(|| {
+                        Error::InferenceError("Nemotron batch lost retained reservation".into())
+                    })?;
+                retained_row_managed_state_for_row(request, scheduled, reservation)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let outputs = self.nemotron_realtime_batch_with_managed(&ordered, scheduled, managed)?;
+        self.finish_scheduled_execution(
+            requests,
+            scheduled,
+            outputs,
+            if mode == NativeBatchMode::Continuous {
+                BatchDispatch::new(super::BatchDispatchKind::TensorContinuous, scheduled.len())
+            } else {
+                BatchDispatch::serial()
+            },
+            Some(rows),
+        )
+    }
+
     /// Create a new native executor.
     pub fn new(config: WorkerConfig) -> Self {
-        let qwen35_prefix_cache = ExactPrefixCache::new(configured_qwen35_prefix_cache_bytes());
+        Self::with_realtime_coordinators(
+            config,
+            Arc::new(VoxtralRealtimeStateCoordinator::new()),
+            Arc::new(NemotronRealtimeStateCoordinator::new()),
+        )
+    }
+
+    fn with_realtime_coordinators(
+        config: WorkerConfig,
+        voxtral_realtime: Arc<VoxtralRealtimeStateCoordinator>,
+        nemotron_realtime: Arc<NemotronRealtimeStateCoordinator>,
+    ) -> Self {
         Self {
             config,
             initialized: false,
             loaded_tts_model: None,
             chat_decode_states: Mutex::new(HashMap::new()),
-            qwen35_prefix_cache,
             asr_decode_states: Mutex::new(HashMap::new()),
+            parakeet_asr_decode_states: Mutex::new(HashMap::new()),
+            lfm25_asr_decode_states: Mutex::new(HashMap::new()),
+            lfm25_tts_decode_states: Mutex::new(HashMap::new()),
+            vibevoice_tts_decode_states: Mutex::new(HashMap::new()),
+            fish_s2_tts_decode_states: Mutex::new(HashMap::new()),
+            voxtral_tts_decode_states: Mutex::new(HashMap::new()),
+            voxtral_realtime,
+            nemotron_realtime,
             qwen_tts_decode_states: Mutex::new(HashMap::new()),
-            cache_resource_leases: Mutex::new(HashMap::new()),
         }
     }
 
@@ -809,9 +2888,7 @@ impl NativeExecutor {
                 Err(payload) => {
                     let message = panic_payload_to_string(payload.as_ref());
                     error!("Model execution panicked: {message}");
-                    Err(Error::InferenceError(format!(
-                        "Model execution panicked: {message}"
-                    )))
+                    std::panic::resume_unwind(payload)
                 }
             }
         };
@@ -825,327 +2902,173 @@ impl NativeExecutor {
             _ => run_catching_panic(),
         }
     }
-
-    fn reserve_scheduled_cache(
-        &self,
-        requests: &[&EngineCoreRequest],
-        scheduled: &[ScheduledRequest],
-    ) -> Result<()> {
-        let Some(authority) = self.config.resource_authority.as_ref() else {
-            return Ok(());
-        };
-
-        for item in scheduled {
-            let Some(request) = requests
-                .iter()
-                .copied()
-                .find(|request| request.id == item.request_id)
-            else {
-                continue;
-            };
-            let Some(profile) = self.execution_profile(request) else {
-                continue;
-            };
-            if profile.cache_mode != CacheMode::OpaqueModelOwned
-                || !profile.resolved_from_loaded_model
-            {
-                continue;
-            }
-            let session = item.session_key();
-            self.reserve_exact_session_cache(authority, &session, || {
-                self.authorized_session_cache_bytes(request)
-            })?;
-        }
-        Ok(())
-    }
-
-    /// Restore every scheduled model-owned cache lease to a pending claim
-    /// before model code can replace, release, or fail while mutating its
-    /// physical decode state. Successful non-terminal execution reconciles the
-    /// new positive observation afterwards.
-    fn prepare_scheduled_cache(&self, scheduled: &[ScheduledRequest]) -> Result<()> {
-        if self.config.resource_authority.is_none() {
-            return Ok(());
-        }
-        let reservations = self.cache_resource_leases.lock().map_err(|_| {
-            Error::InferenceError("cache resource reservation mutex poisoned".to_string())
-        })?;
-        let zero = cache_resource_vector(self.config.backend, 0);
-        for item in scheduled {
-            let session = item.session_key();
-            let Some(reservation) = reservations.get(&session) else {
-                continue;
-            };
-            let lease = reservation.lease.as_ref().ok_or_else(|| {
-                Error::InferenceError("cache allocation has no physical resource lease".to_string())
-            })?;
-            lease.prepare_materialized_release(zero)?;
-        }
-        Ok(())
-    }
-
-    fn reserve_exact_session_cache(
-        &self,
-        authority: &Arc<ResourceAuthority>,
-        session: &SessionKey,
-        authorize: impl FnOnce() -> Result<u64>,
-    ) -> Result<()> {
-        let mut reservations = self.cache_resource_leases.lock().map_err(|_| {
-            Error::InferenceError("cache resource reservation mutex poisoned".to_string())
-        })?;
-        if reservations.contains_key(session) {
-            return Ok(());
-        }
-
-        // Authorization is pure, but it remains under the exact-session map
-        // lock so concurrent executor entry cannot repeat it or double-reserve.
-        // Later decode steps reuse this lease until exact-session cleanup.
-        let authorized_bytes = authorize()?;
-        let owner = ReservationOwner::new(
-            ReservationClass::Cache,
-            format!("{}:{}", session.request_id, session.epoch),
-        );
-        let resources = cache_resource_vector(self.config.backend, authorized_bytes);
-        let lease = match self.config.backend {
-            BackendKind::Cpu | BackendKind::Metal => authority.track_advisory(owner, resources)?,
-            BackendKind::Cuda => authority.reserve(owner, resources)?,
-        };
-        reservations.insert(
-            session.clone(),
-            CacheResourceReservation {
-                reserved_bytes: authorized_bytes,
-                observed_blocks: 0,
-                lease: Some(lease),
-            },
-        );
-        Ok(())
-    }
-
-    fn authorized_session_cache_bytes(&self, request: &EngineCoreRequest) -> Result<u64> {
-        let variant = request.model_variant.ok_or_else(|| {
-            Error::InvalidInput(format!(
-                "Request {} is missing model variant for cache authorization",
-                request.id
-            ))
-        })?;
-        match request.task_type {
-            super::types::TaskType::Chat => {
-                let prompt_tokens = request.prompt_tokens.len();
-                request
-                    .prepared_chat_model_for_executor()?
-                    .session_cache_reservation_bytes(
-                        prompt_tokens,
-                        request.params.max_tokens.max(1),
-                    )
-            }
-            super::types::TaskType::ASR => {
-                let (model, _model_lease) = self.asr_model_for_request(request, variant)?;
-                model.session_cache_reservation_bytes(
-                    request.asr_language_for_execution(),
-                    request.asr_prompt_for_execution(),
-                    request.params.max_tokens.max(1),
-                )
-            }
-            super::types::TaskType::TTS => {
-                let params = Self::to_tts_params(request);
-                let text = request
-                    .text
-                    .as_deref()
-                    .ok_or_else(|| Error::InvalidInput("TTS request missing text".to_string()))?;
-                let reference = Self::reference_from_request(request)?;
-                let (model, _model_lease) = self.qwen_model_for_request(request)?;
-                model.session_cache_reservation_bytes(TtsSessionCacheRequest {
-                    text,
-                    reference: reference.as_ref(),
-                    language: request.language.as_deref(),
-                    instruct: request.voice_description.as_deref(),
-                    uses_preset_speaker: !model.available_speakers().is_empty(),
-                    max_frames: params.max_frames,
-                })
-            }
-            super::types::TaskType::SpeechToSpeech => Err(Error::InvalidInput(
-                "Speech-to-speech does not expose model-owned session cache authorization"
-                    .to_string(),
-            )),
-        }
-    }
-
-    fn observed_session_cache_bytes(
-        &self,
-        request: &EngineCoreRequest,
-        scheduled: &ScheduledRequest,
-        output: &ExecutorOutput,
-    ) -> Option<u64> {
-        if output.finished || output.error.is_some() {
-            return Some(0);
-        }
-        let session = scheduled.session_key();
-        match request.task_type {
-            super::types::TaskType::Chat => self
-                .chat_decode_states
-                .lock()
-                .ok()?
-                .get(&session)?
-                .state
-                .session_cache_bytes(),
-            super::types::TaskType::ASR => self
-                .asr_decode_states
-                .lock()
-                .ok()?
-                .get(&session)?
-                .state
-                .session_cache_bytes(),
-            super::types::TaskType::TTS => self
-                .qwen_tts_decode_states
-                .lock()
-                .ok()?
-                .get(&session)?
-                .state
-                .session_cache_bytes(),
-            super::types::TaskType::SpeechToSpeech => None,
-        }
-    }
-
-    fn reconcile_scheduled_cache(
-        &self,
-        request: &EngineCoreRequest,
-        scheduled: &ScheduledRequest,
-        output: &ExecutorOutput,
-    ) -> Result<ResourceVector> {
-        // Every scheduled cache lease was restored to pending before dispatch.
-        // A terminal or failed operation must therefore remain pending until
-        // cleanup drops the exact physical state and its lease; never turn its
-        // zero observation into a post-operation materialization transition.
-        if output.finished || output.error.is_some() {
-            return Ok(cache_observation(0));
-        }
-        let Some(profile) = self.execution_profile(request) else {
-            return Ok(ResourceVector::zero());
-        };
-        if profile.cache_mode != CacheMode::OpaqueModelOwned || !profile.resolved_from_loaded_model
-        {
-            return Ok(ResourceVector::zero());
-        }
-        let observed_bytes = require_known_cache_bytes(
-            self.observed_session_cache_bytes(request, scheduled, output),
-            scheduled,
-        )?;
-        let observation = cache_observation(observed_bytes);
-        if self.config.resource_authority.is_none() {
-            return Ok(observation);
-        }
-
-        let session = scheduled.session_key();
-        let mut reservations = self.cache_resource_leases.lock().map_err(|_| {
-            Error::InferenceError("cache resource reservation mutex poisoned".to_string())
-        })?;
-        let reservation = reservations.get_mut(&session).ok_or_else(|| {
-            Error::InferenceError("cache allocation has no exact-session reservation".to_string())
-        })?;
-        if observed_bytes > 0 {
-            if observed_bytes > reservation.reserved_bytes {
-                if matches!(self.config.backend, BackendKind::Cpu | BackendKind::Metal) {
-                    // CPU and unified-memory Metal use advisory capacity. Candle
-                    // can reuse a larger pooled allocation than the requested
-                    // power-of-two bucket, so grow the tracked lease to the
-                    // exact observed backing rather than failing inference
-                    // after the allocation already exists.
-                    reservation
-                        .lease
-                        .as_mut()
-                        .ok_or_else(|| {
-                            Error::InferenceError(
-                                "cache allocation has no physical resource lease".to_string(),
-                            )
-                        })?
-                        .resize(cache_resource_vector(self.config.backend, observed_bytes))?;
-                    reservation.reserved_bytes = observed_bytes;
-                } else {
-                    return Err(Error::InferenceError(format!(
-                        "materialized session cache uses {observed_bytes} bytes, exceeding its {}-byte authorization for request {} epoch {}",
-                        reservation.reserved_bytes, session.request_id, session.epoch
-                    )));
-                }
-            }
-            reservation
-                .lease
-                .as_ref()
-                .ok_or_else(|| {
-                    Error::InferenceError(
-                        "cache allocation has no physical resource lease".to_string(),
-                    )
-                })?
-                .record_materialized_usage(cache_resource_vector(
-                    self.config.backend,
-                    observed_bytes,
-                ))?;
-        }
-        reservation.observed_blocks = scheduled.block_ids.len();
-        Ok(observation)
-    }
 }
 
-fn cache_resource_vector(backend: BackendKind, bytes: u64) -> ResourceVector {
-    let mut resources = ResourceVector::zero();
-    match backend {
-        BackendKind::Cpu => resources.host_bytes = ResourceAmount::Known(bytes),
-        BackendKind::Metal => resources.unified_bytes = ResourceAmount::Known(bytes),
-        BackendKind::Cuda => resources.device_bytes = ResourceAmount::Known(bytes),
-    }
-    resources
+fn is_isolated_continuous_model_quantum(scheduled: &[ScheduledRequest]) -> bool {
+    scheduled.len() == 1 && !scheduled[0].is_prefill && scheduled[0].num_tokens > 1
 }
 
-fn cache_observation(bytes: u64) -> ResourceVector {
-    ResourceVector {
-        kv_bytes: ResourceAmount::Known(bytes),
-        ..ResourceVector::zero()
-    }
-}
-
-fn cache_observation_after_release(report: CacheReleaseReport) -> ResourceVector {
-    if report.confirmed {
-        cache_observation(0)
-    } else {
-        unknown_cache_observation()
-    }
-}
-
-fn require_known_cache_bytes(observed: Option<u64>, scheduled: &ScheduledRequest) -> Result<u64> {
-    observed.ok_or_else(|| {
-        Error::InferenceError(format!(
-            "loaded model did not report cache bytes for session {}:{}",
-            scheduled.request_id, scheduled.sequence_id
-        ))
-    })
-}
-
-fn unknown_cache_observation() -> ResourceVector {
-    ResourceVector {
-        kv_bytes: ResourceAmount::Unknown,
-        ..ResourceVector::zero()
-    }
-}
-
-fn static_qwen_tts_batch_eligible(
-    request: &EngineCoreRequest,
-    loaded_has_speakers: bool,
-    rollout_enabled: bool,
-) -> bool {
-    matches!(request.task_type, super::types::TaskType::TTS)
-        && !request.streaming
-        && !request.has_tts_reference_for_execution()
-        && request
-            .model_variant
-            .and_then(|variant| variant.speech_capabilities())
-            .is_some_and(|capabilities| capabilities.supports_builtin_voices)
-        && loaded_has_speakers
-        && rollout_enabled
-        && request.execution_adapter_binding().is_some_and(|binding| {
-            binding.stages.iter().any(|stage| {
-                stage.batch_mode == NativeBatchMode::Static
-                    && request.prepared_stage_cost(stage.id).is_some()
-            })
+fn has_native_vibevoice_tokenizer_batch(scheduled: &[ScheduledRequest]) -> bool {
+    scheduled.len() > 1
+        && scheduled.iter().all(|scheduled| {
+            matches!(
+                &scheduled.work,
+                WorkUnit::SequenceStep {
+                    auxiliary_state: Some(spans),
+                    ..
+                } if !spans.is_empty()
+            )
         })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NativeBatchSupport {
+    prefill: NativeBatchMode,
+    decode: NativeBatchMode,
+}
+
+impl NativeBatchSupport {
+    const NONE: Self = Self {
+        prefill: NativeBatchMode::None,
+        decode: NativeBatchMode::None,
+    };
+
+    fn is_native(self) -> bool {
+        self.prefill != NativeBatchMode::None || self.decode != NativeBatchMode::None
+    }
+}
+
+fn tts_native_batch_implementation_support(
+    qwen_decode: bool,
+    vibevoice_decode: bool,
+    lfm25_audio: bool,
+) -> (bool, bool) {
+    (lfm25_audio, qwen_decode || vibevoice_decode || lfm25_audio)
+}
+
+/// Intersect a load-sealed stage declaration with an implemented model call.
+/// Merely publishing `NativeBatchMode` in catalog or request data is not
+/// sufficient. Each audio family remains `NONE` until its exact loaded model
+/// and adapter both expose a real multi-row call at this boundary.
+fn loaded_native_batch_support(request: &EngineCoreRequest) -> NativeBatchSupport {
+    let kokoro_static = request.task_type == TaskType::TTS
+        && request
+            .prepared_kokoro_tts_model_lease_for_executor()
+            .is_ok_and(|model| model.is_some());
+    let (prefill_supported, decode_supported) = match request.task_type {
+        TaskType::Chat => (
+            false,
+            request
+                .prepared_chat_model_for_executor()
+                .is_ok_and(|model| model.supports_continuous_decode_batch()),
+        ),
+        TaskType::ASR => request
+            .prepared_asr_model_for_executor()
+            .ok()
+            .flatten()
+            .map(|model| {
+                (
+                    model.supports_static_prefill_batch(),
+                    model.supports_continuous_decode_batch(),
+                )
+            })
+            .or_else(|| {
+                request
+                    .prepared_lfm25_audio_asr_model_lease_for_executor()
+                    .ok()
+                    .flatten()
+                    .map(|_| (true, true))
+            })
+            .unwrap_or((false, false)),
+        TaskType::TTS => {
+            let lfm25_audio = request
+                .prepared_lfm25_audio_tts_model_lease_for_executor()
+                .is_ok_and(|model| model.is_some());
+            tts_native_batch_implementation_support(
+                request
+                    .prepared_qwen_tts_model_for_executor()
+                    .is_ok_and(|model| {
+                        model.is_some_and(|model| model.supports_continuous_decode_batch())
+                    }),
+                request
+                    .prepared_vibevoice_tts_model_lease_for_executor()
+                    .is_ok_and(|model| model.is_some()),
+                lfm25_audio,
+            )
+        }
+        TaskType::SpeechToSpeech => (false, false),
+    };
+    let Some(binding) = request.execution_adapter_binding() else {
+        return NativeBatchSupport::NONE;
+    };
+    if kokoro_static {
+        let atomic_work = WorkUnit::AtomicJob {
+            kind: "tts".to_string(),
+        };
+        let static_batch = binding.stage_for_work(&atomic_work).is_ok_and(|stage| {
+            stage.selector == StageWorkSelector::Atomic
+                && stage.batch_mode == NativeBatchMode::Static
+                && stage.concurrency == ConcurrencyClass::Batchable
+        });
+        return NativeBatchSupport {
+            prefill: if static_batch {
+                NativeBatchMode::Static
+            } else {
+                NativeBatchMode::None
+            },
+            decode: NativeBatchMode::None,
+        };
+    }
+    if !prefill_supported && !decode_supported {
+        return NativeBatchSupport::NONE;
+    }
+    let decode_work = WorkUnit::SequenceStep {
+        phase: SequencePhase::Decode,
+        input: super::InputRange { start: 0, end: 1 },
+        max_output_steps: 1,
+        auxiliary_state: None,
+    };
+    let decode = decode_supported
+        && binding.stage_for_work(&decode_work).is_ok_and(|stage| {
+            stage.selector == StageWorkSelector::SequenceDecode
+                && stage.batch_mode == NativeBatchMode::Continuous
+                && stage.concurrency == ConcurrencyClass::Batchable
+        });
+    let prefill_work = WorkUnit::SequenceStep {
+        phase: SequencePhase::Prefill,
+        input: super::InputRange { start: 0, end: 1 },
+        max_output_steps: 1,
+        auxiliary_state: None,
+    };
+    let prefill = prefill_supported
+        && binding.stage_for_work(&prefill_work).is_ok_and(|stage| {
+            stage.selector == StageWorkSelector::SequencePrefill
+                && stage.batch_mode == NativeBatchMode::Static
+                && stage.concurrency == ConcurrencyClass::Batchable
+        });
+    NativeBatchSupport {
+        prefill: if prefill {
+            NativeBatchMode::Static
+        } else {
+            NativeBatchMode::None
+        },
+        decode: if decode {
+            NativeBatchMode::Continuous
+        } else {
+            NativeBatchMode::None
+        },
+    }
+}
+
+fn resolved_resumable_prefill_mode(
+    chunking_enabled: bool,
+    exact_model_proof: Option<bool>,
+) -> PrefillMode {
+    if chunking_enabled && exact_model_proof == Some(true) {
+        PrefillMode::Incremental
+    } else {
+        PrefillMode::Full
+    }
 }
 
 impl ModelExecutor for NativeExecutor {
@@ -1174,7 +3097,9 @@ impl ModelExecutor for NativeExecutor {
                     .map(|model| match model.as_ref() {
                         NativeChatModel::Qwen3(model) => model.supports_incremental_decode(),
                         NativeChatModel::Qwen35(model) => model.supports_incremental_decode(),
-                        NativeChatModel::Gemma3(_) | NativeChatModel::Lfm2(_) => false,
+                        NativeChatModel::Qwen38(model) => model.supports_incremental_decode(),
+                        NativeChatModel::Gemma3(model) => model.supports_incremental_decode(),
+                        NativeChatModel::Lfm2(_) => false,
                     })
             }
             super::types::TaskType::ASR => request
@@ -1187,7 +3112,14 @@ impl ModelExecutor for NativeExecutor {
                         .as_ref()
                         .and_then(|registry| registry.try_get_asr(variant))
                 })
-                .map(|model| model.supports_incremental_decode()),
+                .map(|model| model.supports_incremental_decode())
+                .or_else(|| {
+                    request
+                        .prepared_lfm25_audio_asr_model_lease_for_executor()
+                        .ok()
+                        .flatten()
+                        .map(|_| request.uses_asr_retained_sequence())
+                }),
             super::types::TaskType::TTS => {
                 let loaded = request
                     .prepared_qwen_tts_model_for_executor()
@@ -1200,8 +3132,26 @@ impl ModelExecutor for NativeExecutor {
                             .and_then(|registry| registry.try_get_qwen_tts(variant))
                     })
                     .is_some()
+                    || request
+                        .prepared_vibevoice_tts_model_lease_for_executor()
+                        .is_ok_and(|model| model.is_some())
+                    || request
+                        .prepared_fish_s2_tts_model_lease_for_executor()
+                        .is_ok_and(|model| model.is_some())
+                    || request
+                        .prepared_lfm25_audio_tts_model_lease_for_executor()
+                        .is_ok_and(|model| model.is_some())
+                    || request
+                        .prepared_kokoro_tts_model_lease_for_executor()
+                        .is_ok_and(|model| model.is_some())
                     || (self.config.model_registry.is_none() && self.loaded_tts_model.is_some());
-                loaded.then_some(variant.family() == crate::catalog::ModelFamily::Qwen3Tts)
+                loaded.then_some(matches!(
+                    variant.family(),
+                    crate::catalog::ModelFamily::Qwen3Tts
+                        | crate::catalog::ModelFamily::Lfm25Audio
+                        | crate::catalog::ModelFamily::VibeVoiceTts
+                        | crate::catalog::ModelFamily::FishS2Tts
+                ))
             }
             super::types::TaskType::SpeechToSpeech => self
                 .config
@@ -1210,91 +3160,121 @@ impl ModelExecutor for NativeExecutor {
                 .and_then(|registry| registry.try_get_audio_chat(variant))
                 .map(|_| false),
         };
-        let loaded_has_speakers = request
-            .prepared_qwen_tts_model_for_executor()
-            .ok()
-            .flatten()
-            .or_else(|| {
-                self.config
-                    .model_registry
-                    .as_ref()
-                    .and_then(|registry| registry.try_get_qwen_tts(variant))
-            })
-            .or_else(|| self.loaded_tts_model.clone())
-            .is_some_and(|model| !model.available_speakers().is_empty());
-        let static_tts_batch = static_qwen_tts_batch_eligible(
-            request,
-            loaded_has_speakers,
-            self.config.static_tensor_batch_variants.contains(&variant),
-        );
-        let continuous_chat_batch = matches!(request.task_type, super::types::TaskType::Chat)
-            && request
-                .prepared_chat_model_for_executor()
-                .ok()
-                .is_some_and(|model| model.supports_continuous_decode_batch())
-            && request.execution_adapter_binding().is_some_and(|binding| {
-                binding
-                    .stages
-                    .iter()
-                    .any(|stage| stage.batch_mode == NativeBatchMode::Continuous)
-            });
+        let native_batch_support = loaded_native_batch_support(request);
         profile.resolved_from_loaded_model = loaded_incremental.is_some();
-        let implementation_incremental =
-            loaded_incremental.unwrap_or_else(|| match request.task_type {
+        let asr_long_form =
+            request.task_type == super::types::TaskType::ASR && request.uses_asr_long_form_atomic();
+        let implementation_incremental = !asr_long_form
+            && (loaded_incremental.unwrap_or_else(|| match request.task_type {
                 super::types::TaskType::Chat => {
-                    matches!(variant.family(), crate::catalog::ModelFamily::Qwen35Chat)
-                        || matches!(
-                            variant,
-                            ModelVariant::Qwen306B
-                                | ModelVariant::Qwen306B4Bit
-                                | ModelVariant::Qwen317B
-                                | ModelVariant::Qwen317B4Bit
-                        )
+                    matches!(
+                        variant.family(),
+                        crate::catalog::ModelFamily::Qwen35Chat
+                            | crate::catalog::ModelFamily::Qwen38Chat
+                    ) || matches!(
+                        variant,
+                        ModelVariant::Qwen306B
+                            | ModelVariant::Qwen306B4Bit
+                            | ModelVariant::Qwen317B
+                            | ModelVariant::Qwen317B4Bit
+                    )
                 }
-                super::types::TaskType::ASR => {
-                    variant.family() == crate::catalog::ModelFamily::Qwen3Asr
-                }
+                super::types::TaskType::ASR => request.uses_asr_retained_sequence(),
                 super::types::TaskType::TTS => {
-                    variant.family() == crate::catalog::ModelFamily::Qwen3Tts
+                    matches!(
+                        variant.family(),
+                        crate::catalog::ModelFamily::Qwen3Tts
+                            | crate::catalog::ModelFamily::Lfm25Audio
+                            | crate::catalog::ModelFamily::VibeVoiceTts
+                            | crate::catalog::ModelFamily::FishS2Tts
+                    )
                 }
                 super::types::TaskType::SpeechToSpeech => false,
-            });
+            }) || (request.task_type == super::types::TaskType::ASR
+                && request.uses_asr_retained_sequence()));
+        let resumable_prefill_proof = match request.task_type {
+            super::types::TaskType::Chat => request
+                .prepared_chat_model_for_executor()
+                .ok()
+                .map(|model| model.supports_resumable_prefill()),
+            super::types::TaskType::ASR => request
+                .prepared_asr_model_for_executor()
+                .ok()
+                .flatten()
+                .map(|model| model.supports_resumable_prefill())
+                .or_else(|| {
+                    request
+                        .prepared_lfm25_audio_asr_model_lease_for_executor()
+                        .ok()
+                        .flatten()
+                        .map(|_| true)
+                }),
+            super::types::TaskType::TTS => request
+                .prepared_qwen_tts_model_for_executor()
+                .ok()
+                .flatten()
+                .map(|model| model.supports_resumable_prefill())
+                .or_else(|| {
+                    request
+                        .prepared_vibevoice_tts_model_lease_for_executor()
+                        .ok()
+                        .flatten()
+                        .map(|_| true)
+                })
+                .or_else(|| {
+                    request
+                        .prepared_fish_s2_tts_model_lease_for_executor()
+                        .ok()
+                        .flatten()
+                        .map(|_| true)
+                })
+                .or_else(|| {
+                    request
+                        .prepared_lfm25_audio_tts_model_lease_for_executor()
+                        .ok()
+                        .flatten()
+                        .map(|_| true)
+                }),
+            super::types::TaskType::SpeechToSpeech => None,
+        };
 
-        if implementation_incremental
-            && (!matches!(request.task_type, super::types::TaskType::ASR) || request.streaming)
-        {
+        if implementation_incremental {
             profile.mode = ExecutionMode::Sequence;
-            profile.prefill = PrefillMode::Full;
+            // Scheduler-level spans require a stronger capability than
+            // incremental decode: the exact loaded family must publish a
+            // resumable prefill safe point. Unsupported families remain full.
+            profile.prefill = resolved_resumable_prefill_mode(
+                self.config.enable_chunked_prefill,
+                resumable_prefill_proof,
+            );
             profile.incremental_decode = true;
-            profile.cache_mode = CacheMode::OpaqueModelOwned;
-            // These adapters keep all mutable decode state inside the exact
-            // SessionKey maps below. Removing the entry drops every tensor
-            // reference and a fresh prefill can reconstruct it from input.
             profile.recompute_safe = profile.resolved_from_loaded_model;
             profile.cache_release_safe = profile.resolved_from_loaded_model;
         }
-        if matches!(request.task_type, super::types::TaskType::ASR) {
+        if matches!(request.task_type, super::types::TaskType::ASR) && !implementation_incremental {
             // Long audio can switch to a full chunk-plan operation after media
             // decode, so cancellation is conservatively operation-boundary.
             profile.cancellation = CancellationGranularity::OperationBoundary;
         }
-
-        if static_tts_batch {
-            // Preset-speaker Qwen TTS owns a real model tensor-batch API. It is
-            // an atomic full-generation operation, not a continuous sequence.
+        if asr_long_form {
             profile.mode = ExecutionMode::Atomic;
             profile.prefill = PrefillMode::None;
             profile.incremental_decode = false;
+            profile.prefill_batch = NativeBatchMode::None;
+            profile.decode_batch = NativeBatchMode::None;
             profile.cache_mode = CacheMode::None;
+            profile.cache_namespace = None;
+            profile.kv_dtype = "none".to_string();
+            profile.concurrency = ConcurrencyClass::Exclusive;
+            profile.max_batch_size = 1;
             profile.recompute_safe = false;
             profile.cache_release_safe = false;
-            profile.prefill_batch = NativeBatchMode::Static;
-            profile.decode_batch = NativeBatchMode::None;
-            profile.concurrency = ConcurrencyClass::Batchable;
-            profile.max_batch_size = self.config.max_tensor_batch_size.max(1);
-        } else if continuous_chat_batch {
-            profile.prefill_batch = NativeBatchMode::None;
-            profile.decode_batch = NativeBatchMode::Continuous;
+            profile.prefix_reuse_safe = false;
+        }
+
+        if native_batch_support.is_native() {
+            profile.prefill_batch = native_batch_support.prefill;
+            profile.decode_batch = native_batch_support.decode;
             profile.concurrency = ConcurrencyClass::Batchable;
             profile.max_batch_size = self.config.max_tensor_batch_size.max(1);
         } else {
@@ -1311,6 +3291,28 @@ impl ModelExecutor for NativeExecutor {
                 ConcurrencyClass::Exclusive
             };
             profile.max_batch_size = request_parallel_width;
+        }
+        if request.managed_cache_runtime().is_some() {
+            profile.cache_mode = CacheMode::ExternalPaged;
+        }
+        if asr_long_form {
+            profile.prefill_batch = NativeBatchMode::None;
+            profile.decode_batch = NativeBatchMode::None;
+            profile.concurrency = ConcurrencyClass::Exclusive;
+            profile.max_batch_size = 1;
+            profile.cache_mode = CacheMode::None;
+            profile.cache_namespace = None;
+            profile.kv_dtype = "none".to_string();
+        }
+        if matches!(request.task_type, super::types::TaskType::Chat) {
+            profile.preferred_decode_tokens = request
+                .prepared_chat_model_for_executor()
+                .ok()
+                .and_then(|model| match model.as_ref() {
+                    NativeChatModel::Qwen38(model) => Some(model.preferred_decode_tokens()),
+                    _ => None,
+                })
+                .unwrap_or(1);
         }
         Some(profile)
     }
@@ -1331,75 +3333,290 @@ impl ModelExecutor for NativeExecutor {
                 FailureOrigin::ExecutorValidation,
             ));
         }
-        if execution.batch.mode == NativeBatchMode::Static {
-            if !execution.is_prefill()
-                || execution.batch.lane.capability_id != "tts"
-                || execution
-                    .requests
-                    .iter()
-                    .any(|request| request.task_type != super::types::TaskType::TTS)
-            {
-                return Err(PhysicalDispatchError::not_started(
-                    Error::InferenceError(
-                        "static tensor batch was routed to an incompatible native stage"
-                            .to_string(),
-                    ),
-                    width,
-                    FailureOrigin::ExecutorValidation,
-                ));
-            }
+        if execution.batch.mode != NativeBatchMode::None {
+            let route = NativeBatchRoute::resolve(&execution).map_err(|error| {
+                PhysicalDispatchError::not_started(error, width, FailureOrigin::ExecutorValidation)
+            })?;
             if execution.scheduled.len() > self.config.max_tensor_batch_size.max(1) {
                 return Err(PhysicalDispatchError::not_started(
                     Error::Overloaded(
-                        "static tensor batch exceeds the backend width cap".to_string(),
+                        "native tensor batch exceeds the backend width cap".to_string(),
                     ),
                     width,
                     FailureOrigin::ExecutorValidation,
                 ));
             }
-            return self
-                .execute_static_tts_requests(execution.requests, execution.scheduled)
-                .map_err(|error| {
-                    PhysicalDispatchError::started(error, expected_dispatch, FailureOrigin::Model)
+            if is_isolated_continuous_model_quantum(execution.scheduled) {
+                // An isolated model-preferred quantum is still planned through
+                // the continuous stage so it can yield back to shared
+                // membership afterwards, but its model work is scalar/MTP and
+                // must use the existing transactional scalar handler. This
+                // keeps tensor-batch telemetry truthful and preserves the
+                // shared handler's one-token-per-row invariant.
+                let result = self.execute_requests_with_rows(
+                    execution.requests,
+                    execution.scheduled,
+                    Some(&execution.batch.rows),
+                );
+                if result
+                    .as_ref()
+                    .is_ok_and(|outputs| outputs.iter().all(|output| output.output.error.is_none()))
+                {
+                    crate::engine::metrics::record_engine_model_call(
+                        crate::engine::metrics::EngineModelCall::ScalarRows {
+                            envelope: NativeBatchMode::Continuous,
+                            rows: 1,
+                        },
+                    );
+                }
+                return result.map_err(|error| {
+                    PhysicalDispatchError::started(
+                        error,
+                        BatchDispatch::serial(),
+                        FailureOrigin::Model,
+                    )
                 });
-        }
-        if execution.batch.mode == NativeBatchMode::Continuous {
-            if execution.is_prefill()
-                || execution.batch.lane.capability_id != "chat"
-                || execution
-                    .requests
-                    .iter()
-                    .any(|request| request.task_type != super::types::TaskType::Chat)
-            {
-                return Err(PhysicalDispatchError::not_started(
-                    Error::InferenceError(
-                        "continuous tensor batch was routed to an incompatible native stage"
-                            .to_string(),
-                    ),
-                    width,
-                    FailureOrigin::ExecutorValidation,
-                ));
             }
-            if execution.scheduled.len() > self.config.max_tensor_batch_size.max(1) {
-                return Err(PhysicalDispatchError::not_started(
-                    Error::Overloaded(
-                        "continuous tensor batch exceeds the backend width cap".to_string(),
+            let result = match route {
+                NativeBatchRoute::ChatContinuousDecode { .. } => self
+                    .execute_continuous_chat_requests_with_rows(
+                        execution.requests,
+                        execution.scheduled,
+                        Some(&execution.batch.rows),
                     ),
-                    width,
-                    FailureOrigin::ExecutorValidation,
-                ));
-            }
-            return self
-                .execute_continuous_chat_requests(execution.requests, execution.scheduled)
-                .map_err(|error| {
-                    PhysicalDispatchError::started(error, expected_dispatch, FailureOrigin::Model)
-                });
+                NativeBatchRoute::Audio {
+                    task: TaskType::ASR,
+                    stage: NativeAudioStage::RealtimePreparation,
+                    mode: NativeBatchMode::Static,
+                    ..
+                } if execution.requests.iter().all(|request| {
+                    request.model_variant.is_some_and(|variant| {
+                        variant.family() == crate::catalog::ModelFamily::Voxtral
+                    })
+                }) =>
+                {
+                    self.execute_voxtral_realtime_batch_with_rows(
+                        execution.requests,
+                        execution.scheduled,
+                        &execution.batch.rows,
+                        NativeBatchMode::Static,
+                    )
+                }
+                NativeBatchRoute::Audio {
+                    task: TaskType::ASR,
+                    stage: NativeAudioStage::RealtimeDecodeContinuation,
+                    mode: NativeBatchMode::Continuous,
+                    ..
+                } if execution.requests.iter().all(|request| {
+                    request.model_variant.is_some_and(|variant| {
+                        variant.family() == crate::catalog::ModelFamily::NemotronAsr
+                    })
+                }) =>
+                {
+                    self.execute_nemotron_realtime_batch_with_rows(
+                        execution.requests,
+                        execution.scheduled,
+                        &execution.batch.rows,
+                        NativeBatchMode::Continuous,
+                    )
+                }
+                NativeBatchRoute::Audio {
+                    task: TaskType::ASR,
+                    stage: NativeAudioStage::RealtimeDecodeContinuation,
+                    mode: NativeBatchMode::Continuous,
+                    ..
+                } if execution.requests.iter().all(|request| {
+                    request.model_variant.is_some_and(|variant| {
+                        variant.family() == crate::catalog::ModelFamily::Voxtral
+                    })
+                }) =>
+                {
+                    self.execute_voxtral_realtime_batch_with_rows(
+                        execution.requests,
+                        execution.scheduled,
+                        &execution.batch.rows,
+                        NativeBatchMode::Continuous,
+                    )
+                }
+                NativeBatchRoute::Audio {
+                    task: TaskType::ASR,
+                    stage: NativeAudioStage::SequencePrefill,
+                    mode: NativeBatchMode::Static,
+                    ..
+                } if execution.batch.lane.kernel_mode
+                    == crate::models::architectures::parakeet::asr::PARAKEET_RETAINED_PREFILL_STAGE
+                    && execution.requests.iter().all(|request| {
+                        request.model_variant.is_some_and(|variant| {
+                            variant.family() == crate::catalog::ModelFamily::ParakeetAsr
+                        })
+                    }) =>
+                {
+                    self.execute_static_parakeet_asr_prefill_requests_with_rows(
+                        execution.requests,
+                        execution.scheduled,
+                        Some(&execution.batch.rows),
+                    )
+                }
+                NativeBatchRoute::Audio {
+                    task: TaskType::ASR,
+                    stage: NativeAudioStage::SequencePrefill,
+                    mode: NativeBatchMode::Static,
+                    ..
+                } if execution.requests.iter().all(|request| {
+                    request.model_variant.is_some_and(|variant| {
+                        variant.family() == crate::catalog::ModelFamily::Lfm25Audio
+                    }) && !request.uses_asr_long_form_atomic()
+                }) =>
+                {
+                    self.execute_static_lfm25_asr_prefill_requests_with_rows(
+                        execution.requests,
+                        execution.scheduled,
+                        Some(&execution.batch.rows),
+                    )
+                }
+                NativeBatchRoute::Audio {
+                    task: TaskType::ASR,
+                    stage: NativeAudioStage::SequencePrefill,
+                    mode: NativeBatchMode::Static,
+                    ..
+                } if execution.batch.lane.kernel_mode
+                    == crate::models::architectures::vibevoice::VIBEVOICE_ASR_PREFILL_STAGE
+                    && has_native_vibevoice_tokenizer_batch(execution.scheduled)
+                    && execution.requests.iter().all(|request| {
+                        request.model_variant.is_some_and(|variant| {
+                            variant.family() == crate::catalog::ModelFamily::VibeVoiceAsr
+                        })
+                    }) =>
+                {
+                    self.execute_static_vibevoice_prefill_requests_with_rows(
+                        execution.requests,
+                        execution.scheduled,
+                        Some(&execution.batch.rows),
+                    )
+                }
+                NativeBatchRoute::Audio {
+                    task: TaskType::ASR,
+                    stage: NativeAudioStage::SequencePrefill,
+                    mode: NativeBatchMode::Static,
+                    ..
+                } if execution.batch.lane.kernel_mode
+                    == crate::models::architectures::vibevoice::VIBEVOICE_ASR_PREFILL_STAGE
+                    && execution.requests.iter().all(|request| {
+                        request.model_variant.is_some_and(|variant| {
+                            variant.family() == crate::catalog::ModelFamily::VibeVoiceAsr
+                        })
+                    }) =>
+                {
+                    let result = self.execute_requests_with_rows(
+                        execution.requests,
+                        execution.scheduled,
+                        Some(&execution.batch.rows),
+                    );
+                    if result.as_ref().is_ok_and(|outputs| {
+                        outputs.iter().all(|output| output.output.error.is_none())
+                    }) {
+                        crate::engine::metrics::record_engine_model_call(
+                            crate::engine::metrics::EngineModelCall::ScalarRows {
+                                envelope: NativeBatchMode::Static,
+                                rows: execution.scheduled.len(),
+                            },
+                        );
+                    }
+                    result
+                }
+                NativeBatchRoute::Audio {
+                    task: TaskType::ASR,
+                    stage: NativeAudioStage::SequenceDecode,
+                    mode: NativeBatchMode::Continuous,
+                    ..
+                } => self.execute_continuous_asr_requests_with_rows(
+                    execution.requests,
+                    execution.scheduled,
+                    Some(&execution.batch.rows),
+                ),
+                NativeBatchRoute::Audio {
+                    task: TaskType::TTS,
+                    stage: NativeAudioStage::Atomic,
+                    mode: NativeBatchMode::Static,
+                    ..
+                } if execution.requests.iter().all(|request| {
+                    request.model_variant.is_some_and(|variant| {
+                        variant.family() == crate::catalog::ModelFamily::KokoroTts
+                    })
+                }) =>
+                {
+                    self.execute_static_kokoro_tts_requests_with_rows(
+                        execution.requests,
+                        execution.scheduled,
+                        Some(&execution.batch.rows),
+                    )
+                }
+                NativeBatchRoute::Audio {
+                    task: TaskType::TTS,
+                    stage: NativeAudioStage::SequencePrefill,
+                    mode: NativeBatchMode::Static,
+                    ..
+                } if execution.requests.iter().all(|request| {
+                    request.model_variant.is_some_and(|variant| {
+                        variant.family() == crate::catalog::ModelFamily::VoxtralTts
+                    })
+                }) =>
+                {
+                    self.execute_static_voxtral_tts_prefill_requests_with_rows(
+                        execution.requests,
+                        execution.scheduled,
+                        Some(&execution.batch.rows),
+                    )
+                }
+                NativeBatchRoute::Audio {
+                    task: TaskType::TTS,
+                    stage: NativeAudioStage::SequencePrefill,
+                    mode: NativeBatchMode::Static,
+                    ..
+                } if execution.requests.iter().all(|request| {
+                    request.model_variant.is_some_and(|variant| {
+                        variant.family() == crate::catalog::ModelFamily::Lfm25Audio
+                    })
+                }) =>
+                {
+                    self.execute_static_lfm25_tts_prefill_requests_with_rows(
+                        execution.requests,
+                        execution.scheduled,
+                        Some(&execution.batch.rows),
+                    )
+                }
+                NativeBatchRoute::Audio {
+                    task: TaskType::TTS,
+                    stage: NativeAudioStage::SequenceDecode,
+                    mode: NativeBatchMode::Continuous,
+                    ..
+                } => self.execute_continuous_tts_requests_with_rows(
+                    execution.requests,
+                    execution.scheduled,
+                    Some(&execution.batch.rows),
+                ),
+                NativeBatchRoute::Audio { .. } => {
+                    // An exact audio stage without a registered family call
+                    // fails before model entry; catalog identity alone never
+                    // fabricates native tensor execution.
+                    return Err(PhysicalDispatchError::not_started(
+                        Error::InferenceError(
+                            "loaded audio stage has no registered native model call".to_string(),
+                        ),
+                        width,
+                        FailureOrigin::ExecutorValidation,
+                    ));
+                }
+            };
+            return result.map_err(|error| {
+                PhysicalDispatchError::started(error, expected_dispatch, FailureOrigin::Model)
+            });
         }
-        let result = if execution.is_prefill() {
-            self.execute_prefill(execution.requests, execution.scheduled)
-        } else {
-            self.execute_decode(execution.requests, execution.scheduled)
-        };
+        let result = self.execute_requests_with_rows(
+            execution.requests,
+            execution.scheduled,
+            Some(&execution.batch.rows),
+        );
         result.map_err(|error| {
             PhysicalDispatchError::started(error, expected_dispatch, FailureOrigin::Model)
         })
@@ -1463,91 +3680,253 @@ impl ModelExecutor for NativeExecutor {
             .asr_decode_states
             .lock()
             .map_err(|_| Error::InferenceError("ASR decode state mutex poisoned".to_string()))?;
+        let mut parakeet_asr = self.parakeet_asr_decode_states.lock().map_err(|_| {
+            Error::InferenceError("Parakeet ASR decode state mutex poisoned".to_string())
+        })?;
+        let mut lfm25_asr = self.lfm25_asr_decode_states.lock().map_err(|_| {
+            Error::InferenceError("LFM2.5 Audio ASR decode state mutex poisoned".to_string())
+        })?;
+        let mut lfm25_tts = self.lfm25_tts_decode_states.lock().map_err(|_| {
+            Error::InferenceError("LFM2.5 Audio TTS decode state mutex poisoned".to_string())
+        })?;
+        let mut vibevoice_tts = self.vibevoice_tts_decode_states.lock().map_err(|_| {
+            Error::InferenceError("VibeVoice TTS decode state mutex poisoned".to_string())
+        })?;
+        let mut fish_s2_tts = self.fish_s2_tts_decode_states.lock().map_err(|_| {
+            Error::InferenceError("Fish S2 TTS decode state mutex poisoned".to_string())
+        })?;
+        let mut voxtral_tts = self.voxtral_tts_decode_states.lock().map_err(|_| {
+            Error::InferenceError("Voxtral TTS decode state mutex poisoned".to_string())
+        })?;
+        if self.voxtral_realtime.abort_matching(|_| true).is_err() {
+            return Err(Error::InferenceError(
+                "failed to abort pending Voxtral realtime state during shutdown".to_string(),
+            ));
+        }
+        if self.voxtral_realtime.has_prepared() {
+            return Err(Error::InferenceError(
+                "cannot shut down with a prepared Voxtral realtime quantum".to_string(),
+            ));
+        }
+        if self.nemotron_realtime.abort_matching(|_| true).is_err()
+            || self.nemotron_realtime.has_prepared()
+        {
+            return Err(Error::InferenceError(
+                "cannot shut down with unresolved Nemotron realtime state".into(),
+            ));
+        }
+        let mut voxtral = self.voxtral_realtime.states.lock().map_err(|_| {
+            Error::InferenceError("Voxtral realtime state mutex poisoned".to_string())
+        })?;
+        let mut nemotron =
+            self.nemotron_realtime.states.lock().map_err(|_| {
+                Error::InferenceError("Nemotron realtime state mutex poisoned".into())
+            })?;
         let mut tts = self.qwen_tts_decode_states.lock().map_err(|_| {
             Error::InferenceError("Qwen TTS decode state mutex poisoned".to_string())
         })?;
-        let mut reservations = self.cache_resource_leases.lock().map_err(|_| {
-            Error::InferenceError("cache resource reservation mutex poisoned".to_string())
-        })?;
-        let zero = cache_resource_vector(self.config.backend, 0);
-        for reservation in reservations.values() {
-            let lease = reservation.lease.as_ref().ok_or_else(|| {
-                Error::InferenceError("cache allocation has no physical resource lease".to_string())
-            })?;
-            lease.prepare_materialized_release(zero)?;
-        }
         chat.clear();
-        self.qwen35_prefix_cache.clear();
         asr.clear();
+        parakeet_asr.clear();
+        lfm25_asr.clear();
+        lfm25_tts.clear();
+        vibevoice_tts.clear();
+        fish_s2_tts.clear();
+        voxtral_tts.clear();
+        voxtral.clear();
+        nemotron.clear();
         tts.clear();
-        reservations.clear();
-        drop((chat, asr, tts, reservations));
+        drop((
+            chat,
+            asr,
+            parakeet_asr,
+            lfm25_asr,
+            lfm25_tts,
+            vibevoice_tts,
+            fish_s2_tts,
+            voxtral_tts,
+            voxtral,
+            nemotron,
+            tts,
+        ));
         self.initialized = false;
         self.loaded_tts_model = None;
         Ok(())
     }
 
     fn cleanup_request(&self, request_id: &str) -> CacheReleaseReport {
-        let (Ok(mut chat), Ok(mut asr), Ok(mut tts), Ok(mut reservations)) = (
+        if self
+            .voxtral_realtime
+            .abort_matching(|pending| pending.session.request_id == request_id)
+            .is_err()
+        {
+            return CacheReleaseReport::unconfirmed();
+        }
+        if self
+            .nemotron_realtime
+            .abort_matching(|pending| pending.session.request_id == request_id)
+            .is_err()
+        {
+            return CacheReleaseReport::unconfirmed();
+        }
+        let (
+            Ok(mut chat),
+            Ok(mut asr),
+            Ok(mut parakeet_asr),
+            Ok(mut lfm25_asr),
+            Ok(mut lfm25_tts),
+            Ok(mut vibevoice_tts),
+            Ok(mut fish_s2_tts),
+            Ok(mut voxtral_tts),
+            Ok(mut voxtral),
+            Ok(mut nemotron),
+            Ok(mut tts),
+        ) = (
             self.chat_decode_states.lock(),
             self.asr_decode_states.lock(),
+            self.parakeet_asr_decode_states.lock(),
+            self.lfm25_asr_decode_states.lock(),
+            self.lfm25_tts_decode_states.lock(),
+            self.vibevoice_tts_decode_states.lock(),
+            self.fish_s2_tts_decode_states.lock(),
+            self.voxtral_tts_decode_states.lock(),
+            self.voxtral_realtime.states.lock(),
+            self.nemotron_realtime.states.lock(),
             self.qwen_tts_decode_states.lock(),
-            self.cache_resource_leases.lock(),
-        ) else {
+        )
+        else {
             return CacheReleaseReport::unconfirmed();
         };
-        let zero = cache_resource_vector(self.config.backend, 0);
-        for (session, reservation) in reservations.iter() {
-            if session.request_id != request_id {
-                continue;
-            }
-            let Some(lease) = reservation.lease.as_ref() else {
-                return CacheReleaseReport::unconfirmed();
-            };
-            if lease.prepare_materialized_release(zero).is_err() {
-                return CacheReleaseReport::unconfirmed();
-            }
-        }
 
-        let mut released = 0usize;
-        released = released.saturating_add(retain_other_sessions_locked(&mut chat, request_id));
-        released = released.saturating_add(retain_other_sessions_locked(&mut asr, request_id));
-        released = released.saturating_add(retain_other_sessions_locked(&mut tts, request_id));
-        released =
-            released.saturating_add(retain_other_sessions_locked(&mut reservations, request_id));
-        CacheReleaseReport::confirmed(released)
+        let chat = cleanup_request_states_locked(&mut chat, request_id);
+        let asr = cleanup_request_states_locked(&mut asr, request_id);
+        let parakeet_asr = cleanup_request_states_locked(&mut parakeet_asr, request_id);
+        let lfm25_asr = cleanup_request_states_locked(&mut lfm25_asr, request_id);
+        let lfm25_tts = cleanup_request_states_locked(&mut lfm25_tts, request_id);
+        let vibevoice_tts = cleanup_request_states_locked(&mut vibevoice_tts, request_id);
+        let fish_s2_tts = cleanup_request_states_locked(&mut fish_s2_tts, request_id);
+        let voxtral_tts = cleanup_request_states_locked(&mut voxtral_tts, request_id);
+        let voxtral = cleanup_request_states_locked(&mut voxtral, request_id);
+        let nemotron = cleanup_request_states_locked(&mut nemotron, request_id);
+        let tts = cleanup_request_states_locked(&mut tts, request_id);
+        cleanup_report(
+            chat.combine(asr)
+                .combine(parakeet_asr)
+                .combine(lfm25_asr)
+                .combine(lfm25_tts)
+                .combine(vibevoice_tts)
+                .combine(fish_s2_tts)
+                .combine(voxtral_tts)
+                .combine(voxtral)
+                .combine(nemotron)
+                .combine(tts),
+        )
     }
 
     fn cleanup_session(&self, session: &SessionKey) -> CacheReleaseReport {
-        let (Ok(mut chat), Ok(mut asr), Ok(mut tts), Ok(mut reservations)) = (
+        if self
+            .voxtral_realtime
+            .abort_matching(|pending| &pending.session == session)
+            .is_err()
+        {
+            return CacheReleaseReport::unconfirmed();
+        }
+        if self
+            .nemotron_realtime
+            .abort_matching(|pending| &pending.session == session)
+            .is_err()
+        {
+            return CacheReleaseReport::unconfirmed();
+        }
+        let (
+            Ok(mut chat),
+            Ok(mut asr),
+            Ok(mut parakeet_asr),
+            Ok(mut lfm25_asr),
+            Ok(mut lfm25_tts),
+            Ok(mut vibevoice_tts),
+            Ok(mut fish_s2_tts),
+            Ok(mut voxtral_tts),
+            Ok(mut voxtral),
+            Ok(mut nemotron),
+            Ok(mut tts),
+        ) = (
             self.chat_decode_states.lock(),
             self.asr_decode_states.lock(),
+            self.parakeet_asr_decode_states.lock(),
+            self.lfm25_asr_decode_states.lock(),
+            self.lfm25_tts_decode_states.lock(),
+            self.vibevoice_tts_decode_states.lock(),
+            self.fish_s2_tts_decode_states.lock(),
+            self.voxtral_tts_decode_states.lock(),
+            self.voxtral_realtime.states.lock(),
+            self.nemotron_realtime.states.lock(),
             self.qwen_tts_decode_states.lock(),
-            self.cache_resource_leases.lock(),
-        ) else {
+        )
+        else {
             return CacheReleaseReport::unconfirmed();
         };
-        if let Some(reservation) = reservations.get(session) {
-            let Some(lease) = reservation.lease.as_ref() else {
-                return CacheReleaseReport::unconfirmed();
-            };
-            if lease
-                .prepare_materialized_release(cache_resource_vector(self.config.backend, 0))
-                .is_err()
-            {
-                return CacheReleaseReport::unconfirmed();
-            }
-        }
 
-        let released = usize::from(chat.remove(session).is_some())
-            .saturating_add(usize::from(asr.remove(session).is_some()))
-            .saturating_add(usize::from(tts.remove(session).is_some()))
-            .saturating_add(usize::from(reservations.remove(session).is_some()));
-        CacheReleaseReport::confirmed(released)
+        let chat = cleanup_session_state_locked(&mut chat, session);
+        let asr = cleanup_session_state_locked(&mut asr, session);
+        let parakeet_asr = cleanup_session_state_locked(&mut parakeet_asr, session);
+        let lfm25_asr = cleanup_session_state_locked(&mut lfm25_asr, session);
+        let lfm25_tts = cleanup_session_state_locked(&mut lfm25_tts, session);
+        let vibevoice_tts = cleanup_session_state_locked(&mut vibevoice_tts, session);
+        let fish_s2_tts = cleanup_session_state_locked(&mut fish_s2_tts, session);
+        let voxtral_tts = cleanup_session_state_locked(&mut voxtral_tts, session);
+        let voxtral = cleanup_session_state_locked(&mut voxtral, session);
+        let nemotron = cleanup_session_state_locked(&mut nemotron, session);
+        let tts = cleanup_session_state_locked(&mut tts, session);
+        cleanup_report(
+            chat.combine(asr)
+                .combine(parakeet_asr)
+                .combine(lfm25_asr)
+                .combine(lfm25_tts)
+                .combine(vibevoice_tts)
+                .combine(fish_s2_tts)
+                .combine(voxtral_tts)
+                .combine(voxtral)
+                .combine(nemotron)
+                .combine(tts),
+        )
     }
 
     fn purge_model_cache(&self, variant: ModelVariant) -> CacheReleaseReport {
-        CacheReleaseReport::confirmed(self.qwen35_prefix_cache.purge_variant(variant))
+        if self
+            .voxtral_realtime
+            .abort_matching(|pending| pending.active.variant == variant)
+            .is_err()
+        {
+            return CacheReleaseReport::unconfirmed();
+        }
+        if self
+            .nemotron_realtime
+            .abort_matching(|pending| pending.active.variant == variant)
+            .is_err()
+        {
+            return CacheReleaseReport::unconfirmed();
+        }
+        let (Ok(mut states), Ok(mut nemotron), Ok(mut voxtral_tts)) = (
+            self.voxtral_realtime.states.lock(),
+            self.nemotron_realtime.states.lock(),
+            self.voxtral_tts_decode_states.lock(),
+        ) else {
+            return CacheReleaseReport::unconfirmed();
+        };
+        cleanup_report(
+            cleanup_model_states_locked(&mut states, variant, |active| active.variant)
+                .combine(cleanup_model_states_locked(
+                    &mut nemotron,
+                    variant,
+                    |active| active.variant,
+                ))
+                .combine(cleanup_model_states_locked(
+                    &mut voxtral_tts,
+                    variant,
+                    |active| active.variant,
+                )),
+        )
     }
 }
 
@@ -1562,11 +3941,28 @@ struct BatchWorkspaceContext {
 pub struct UnifiedExecutor {
     inner: Arc<RwLock<Box<dyn ModelExecutor>>>,
     batch_workspace: Option<BatchWorkspaceContext>,
+    physical_execution_admission: Option<PhysicalExecutionAdmission>,
+    pending_quantum_finalizer: Option<Arc<dyn PendingQuantumFinalizer>>,
+}
+
+/// Opaque proof that one exact physical envelope owns execution capacity.
+/// Consuming this token is the only runner path into the native executor.
+pub(super) struct AdmittedPhysicalExecution {
+    batch_id: BatchId,
+    lane: BatchLaneKey,
+    width: usize,
+    _lease: Option<PhysicalExecutionLease>,
+}
+
+pub(super) enum PhysicalExecutionAdmissionOutcome {
+    Admitted(AdmittedPhysicalExecution),
+    Cancelled,
 }
 
 impl UnifiedExecutor {
     /// Create a new unified executor with native backend.
     pub fn new_native(config: WorkerConfig) -> Self {
+        let physical_execution_admission = config.physical_execution_admission.clone();
         let batch_workspace =
             config
                 .resource_authority
@@ -1575,9 +3971,22 @@ impl UnifiedExecutor {
                     backend: config.backend,
                     authority: authority.clone(),
                 });
+        let voxtral_realtime = Arc::new(VoxtralRealtimeStateCoordinator::new());
+        let nemotron_realtime = Arc::new(NemotronRealtimeStateCoordinator::new());
         Self {
-            inner: Arc::new(RwLock::new(Box::new(NativeExecutor::new(config)))),
+            inner: Arc::new(RwLock::new(Box::new(
+                NativeExecutor::with_realtime_coordinators(
+                    config,
+                    voxtral_realtime.clone(),
+                    nemotron_realtime.clone(),
+                ),
+            ))),
             batch_workspace,
+            physical_execution_admission,
+            pending_quantum_finalizer: Some(Arc::new(RealtimePendingQuantumFinalizer {
+                voxtral: voxtral_realtime,
+                nemotron: nemotron_realtime,
+            })),
         }
     }
 
@@ -1586,46 +3995,334 @@ impl UnifiedExecutor {
         Self {
             inner: Arc::new(RwLock::new(executor)),
             batch_workspace: None,
+            physical_execution_admission: None,
+            pending_quantum_finalizer: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_pending_quantum_finalizer_for_test(
+        mut self,
+        finalizer: Arc<dyn PendingQuantumFinalizer>,
+    ) -> Self {
+        self.pending_quantum_finalizer = Some(finalizer);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test_with_physical_context(
+        executor: Box<dyn ModelExecutor>,
+        backend: BackendKind,
+        authority: Arc<ResourceAuthority>,
+        admission: PhysicalExecutionAdmission,
+    ) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(executor)),
+            batch_workspace: Some(BatchWorkspaceContext { backend, authority }),
+            physical_execution_admission: Some(admission),
+            pending_quantum_finalizer: None,
+        }
+    }
+
+    fn explicit_physical_launch_policy(
+        batch: &PhysicalBatch,
+        requests: &[&EngineCoreRequest],
+    ) -> PhysicalLaunchPolicy {
+        if requests.len() != batch.rows.len() {
+            record_engine_physical_fallback(EnginePhysicalFallbackReason::BatchIncompatible);
+            return PhysicalLaunchPolicy::ExecutionGroupExclusive;
+        }
+        let mut policy = None;
+        for (request, row) in requests.iter().zip(&batch.rows) {
+            let Some(binding) = request.execution_adapter_binding() else {
+                record_engine_physical_fallback(EnginePhysicalFallbackReason::UncertifiedProfile);
+                return PhysicalLaunchPolicy::ExecutionGroupExclusive;
+            };
+            if binding.execution_group_id != batch.lane.execution_group
+                || binding.model_instance_id != batch.lane.model_instance
+                || binding.adapter_instance_id != batch.lane.adapter_instance
+                || binding.adapter_abi_revision != batch.lane.adapter_abi
+                || binding.capability_id != batch.lane.capability_id
+            {
+                record_engine_physical_fallback(EnginePhysicalFallbackReason::AdapterUnsupported);
+                return PhysicalLaunchPolicy::ExecutionGroupExclusive;
+            }
+            let Ok(stage) = binding.stage_for_work(&row.work) else {
+                record_engine_physical_fallback(EnginePhysicalFallbackReason::AdapterUnsupported);
+                return PhysicalLaunchPolicy::ExecutionGroupExclusive;
+            };
+            if stage.id != batch.lane.stage_id || stage.batch_mode != batch.mode {
+                record_engine_physical_fallback(EnginePhysicalFallbackReason::BatchIncompatible);
+                return PhysicalLaunchPolicy::ExecutionGroupExclusive;
+            }
+            match policy {
+                None => policy = Some(stage.physical_launch_policy),
+                Some(active) if active == stage.physical_launch_policy => {}
+                Some(_) => {
+                    record_engine_physical_fallback(
+                        EnginePhysicalFallbackReason::BatchIncompatible,
+                    );
+                    return PhysicalLaunchPolicy::ExecutionGroupExclusive;
+                }
+            }
+        }
+        policy.unwrap_or_else(|| {
+            record_engine_physical_fallback(EnginePhysicalFallbackReason::UncertifiedProfile);
+            PhysicalLaunchPolicy::ExecutionGroupExclusive
+        })
     }
 
     pub(super) fn reserve_batch_workspace(
         &self,
         batch: &PhysicalBatch,
     ) -> Result<Option<BatchWorkspaceLease>> {
-        if batch.workspace.workspace_bytes()? == 0 {
+        let workspace_bytes = match batch.workspace.workspace_bytes() {
+            Ok(workspace_bytes) => workspace_bytes,
+            Err(error) => {
+                record_engine_physical_fallback(EnginePhysicalFallbackReason::BatchIncompatible);
+                return Err(error);
+            }
+        };
+        if workspace_bytes == 0 {
             return Ok(None);
         }
-        let context = self.batch_workspace.as_ref().ok_or_else(|| {
-            Error::Overloaded(
+        let Some(context) = self.batch_workspace.as_ref() else {
+            record_engine_physical_defer(EnginePhysicalDeferReason::WorkspaceCapacity);
+            return Err(Error::Overloaded(
                 "physical batch requires workspace but no resource authority is installed"
                     .to_string(),
-            )
-        })?;
+            ));
+        };
         if batch.lane.backend != context.backend {
+            record_engine_physical_fallback(EnginePhysicalFallbackReason::BatchIncompatible);
             return Err(Error::InvalidInput(
                 "physical batch workspace backend does not match its executor".to_string(),
             ));
         }
-        context
+        let reservation = context
             .authority
             .reserve_batch_workspace(batch.lane.execution_group, batch.batch_id, batch.workspace)
-            .map(Some)
+            .map(Some);
+        if let Err(error) = &reservation {
+            match error {
+                Error::Overloaded(_) => {
+                    record_engine_physical_defer(EnginePhysicalDeferReason::WorkspaceCapacity)
+                }
+                _ => {
+                    record_engine_physical_fallback(EnginePhysicalFallbackReason::BatchIncompatible)
+                }
+            }
+        }
+        reservation
     }
 
-    /// Execute one exact physical batch envelope.
+    /// Permanently fail physical admission after a panic crossed native/model
+    /// entry. Per-model recovery is not available, so both execution capacity
+    /// and the shared resource authority fail closed until runtime recreation.
+    pub(super) fn poison_physical_runtime(&self, reason: impl Into<String>) {
+        let reason = reason.into();
+        if let Some(admission) = &self.physical_execution_admission {
+            admission.poison(reason.clone());
+        }
+        if let Some(context) = &self.batch_workspace {
+            context.authority.poison(reason);
+        }
+    }
+
+    /// Acquire physical execution capacity for one validated batch envelope.
+    /// Workspace and stream state must not be acquired until this returns.
+    pub(super) async fn acquire_physical_execution(
+        &self,
+        batch: &PhysicalBatch,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+    ) -> std::result::Result<PhysicalExecutionAdmissionOutcome, PhysicalDispatchError> {
+        let width = batch.rows.len().max(1);
+        PhysicalBatchExecution {
+            batch,
+            requests,
+            scheduled,
+        }
+        .validate()
+        .map_err(|error| {
+            record_engine_physical_fallback(EnginePhysicalFallbackReason::BatchIncompatible);
+            PhysicalDispatchError::not_started(error, width, FailureOrigin::ExecutorValidation)
+        })?;
+        if !requests.is_empty() && requests.iter().all(|request| request.is_cancelled()) {
+            return Ok(PhysicalExecutionAdmissionOutcome::Cancelled);
+        }
+        let lease = if let Some(admission) = &self.physical_execution_admission {
+            let launch_policy = Self::explicit_physical_launch_policy(batch, requests);
+            let deadline = requests.iter().filter_map(|request| request.deadline).min();
+            let acquire = admission.acquire_dispatch(
+                batch.lane.execution_group,
+                batch.lane.model_instance,
+                launch_policy,
+                batch.mode,
+                width,
+                deadline,
+            );
+            tokio::pin!(acquire);
+            let acquired = loop {
+                tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep(PHYSICAL_ADMISSION_CANCELLATION_POLL) => {
+                        if !requests.is_empty()
+                            && requests.iter().all(|request| request.is_cancelled())
+                        {
+                            break None;
+                        }
+                    }
+                    acquired = &mut acquire => break Some(acquired),
+                }
+            };
+            let Some(acquired) = acquired else {
+                return Ok(PhysicalExecutionAdmissionOutcome::Cancelled);
+            };
+            match acquired {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    return Err(PhysicalDispatchError::not_started(
+                        error,
+                        width,
+                        FailureOrigin::DispatchCoordination,
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        Ok(PhysicalExecutionAdmissionOutcome::Admitted(
+            AdmittedPhysicalExecution {
+                batch_id: batch.batch_id,
+                lane: batch.lane.clone(),
+                width,
+                _lease: lease,
+            },
+        ))
+    }
+
+    /// Execute a batch whose exact physical capacity has already been admitted.
+    pub(super) async fn execute_admitted_physical_batch(
+        &self,
+        admitted: AdmittedPhysicalExecution,
+        batch: &PhysicalBatch,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+    ) -> PhysicalDispatchResult {
+        if admitted.batch_id != batch.batch_id
+            || admitted.lane != batch.lane
+            || admitted.width != batch.rows.len().max(1)
+        {
+            return Err(PhysicalDispatchError::not_started(
+                Error::InvalidInput(
+                    "physical execution admission does not match its batch envelope".to_string(),
+                ),
+                batch.rows.len().max(1),
+                FailureOrigin::ExecutorValidation,
+            ));
+        }
+        if let Some(deadline) = requests.iter().filter_map(|request| request.deadline).min() {
+            if deadline <= std::time::Instant::now() {
+                return Err(PhysicalDispatchError::not_started(
+                    Error::Timeout("physical batch device entry".to_string()),
+                    admitted.width,
+                    FailureOrigin::DispatchCoordination,
+                ));
+            }
+        }
+        if !requests.is_empty() && requests.iter().all(|request| request.is_cancelled()) {
+            let dispatch = BatchDispatch::not_dispatched(admitted.width);
+            return Ok(scheduled
+                .iter()
+                .map(|scheduled| {
+                    ExecutorStepResult::from_session(
+                        scheduled,
+                        ModelSessionResult::cancelled_before_dispatch(ExecutorOutput::cancelled(
+                            scheduled.request_id.clone(),
+                        )),
+                    )
+                    .with_dispatch(dispatch)
+                })
+                .collect());
+        }
+        if let Some(admission) = &self.physical_execution_admission {
+            if let Err(error) = admission.ensure_healthy() {
+                return Err(PhysicalDispatchError::not_started(
+                    error,
+                    admitted.width,
+                    FailureOrigin::DispatchCoordination,
+                ));
+            }
+        }
+        let _physical_dispatch = begin_engine_physical_dispatch();
+        let executor = self.inner.read().await;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            executor.execute_physical_batch(PhysicalBatchExecution {
+                batch,
+                requests,
+                scheduled,
+            })
+        }));
+        match result {
+            Ok(result) => {
+                drop(executor);
+                drop(admitted);
+                result
+            }
+            Err(payload) => {
+                let message = panic_payload_to_string(payload.as_ref());
+                error!(
+                    batch_id = batch.batch_id.get(),
+                    "Physical model execution panicked after entry: {message}"
+                );
+                record_engine_physical_fallback(EnginePhysicalFallbackReason::DispatchFailure);
+                self.poison_physical_runtime("physical model execution panicked after entry");
+                drop(executor);
+                drop(admitted);
+                Err(PhysicalDispatchError::started(
+                    Error::InferenceError(
+                        "physical model execution panicked; runtime must be recreated".to_string(),
+                    ),
+                    batch.expected_dispatch(),
+                    FailureOrigin::Panic,
+                ))
+            }
+        }
+    }
+
+    /// Compatibility boundary for callers that do not need to interpose
+    /// workspace admission between physical admission and device entry.
     pub async fn execute_physical_batch(
         &self,
         batch: &PhysicalBatch,
         requests: &[&EngineCoreRequest],
         scheduled: &[ScheduledRequest],
     ) -> PhysicalDispatchResult {
-        let executor = self.inner.read().await;
-        executor.execute_physical_batch(PhysicalBatchExecution {
-            batch,
-            requests,
-            scheduled,
-        })
+        let admitted = self
+            .acquire_physical_execution(batch, requests, scheduled)
+            .await?;
+        match admitted {
+            PhysicalExecutionAdmissionOutcome::Admitted(admitted) => {
+                self.execute_admitted_physical_batch(admitted, batch, requests, scheduled)
+                    .await
+            }
+            PhysicalExecutionAdmissionOutcome::Cancelled => {
+                let dispatch = BatchDispatch::not_dispatched(batch.rows.len().max(1));
+                Ok(scheduled
+                    .iter()
+                    .map(|scheduled| {
+                        ExecutorStepResult::from_session(
+                            scheduled,
+                            ModelSessionResult::cancelled_before_dispatch(
+                                ExecutorOutput::cancelled(scheduled.request_id.clone()),
+                            ),
+                        )
+                        .with_dispatch(dispatch)
+                    })
+                    .collect())
+            }
+        }
     }
 
     pub async fn execution_profile(&self, request: &EngineCoreRequest) -> Option<ExecutionProfile> {
@@ -1633,8 +4330,66 @@ impl UnifiedExecutor {
         executor.execution_profile(request)
     }
 
+    pub(crate) fn has_pending_quantum(&self, plan_id: PlanId, session: &SessionKey) -> bool {
+        self.pending_quantum_finalizer
+            .as_ref()
+            .is_some_and(|finalizer| finalizer.contains(plan_id, session))
+    }
+
+    pub(crate) fn finalize_pending_quantum(
+        &self,
+        plan_id: PlanId,
+        session: &SessionKey,
+        decision: PendingQuantumDecision,
+    ) -> Result<PendingQuantumFinalizeStatus> {
+        let Some(finalizer) = self.pending_quantum_finalizer.as_ref() else {
+            return Ok(PendingQuantumFinalizeStatus::NotFound);
+        };
+        let prepared = finalizer.prepare(plan_id, session, decision)?;
+        if prepared == PendingQuantumFinalizeStatus::NotFound {
+            return Ok(prepared);
+        }
+        finalizer.publish(plan_id, session)
+    }
+
+    pub(crate) fn prepare_pending_quantum(
+        &self,
+        plan_id: PlanId,
+        session: &SessionKey,
+        decision: PendingQuantumDecision,
+    ) -> Result<PendingQuantumFinalizeStatus> {
+        let Some(finalizer) = self.pending_quantum_finalizer.as_ref() else {
+            return Ok(PendingQuantumFinalizeStatus::NotFound);
+        };
+        finalizer.prepare(plan_id, session, decision)
+    }
+
+    pub(crate) fn publish_pending_quantum(
+        &self,
+        plan_id: PlanId,
+        session: &SessionKey,
+    ) -> Result<PendingQuantumFinalizeStatus> {
+        let Some(finalizer) = self.pending_quantum_finalizer.as_ref() else {
+            return Ok(PendingQuantumFinalizeStatus::NotFound);
+        };
+        finalizer.publish(plan_id, session)
+    }
+
+    pub(crate) fn discard_prepared_quantum(&self, plan_id: PlanId, session: &SessionKey) {
+        if let Some(finalizer) = self.pending_quantum_finalizer.as_ref() {
+            finalizer.discard(plan_id, session);
+        }
+    }
+
     /// Check if ready.
     pub async fn is_ready(&self) -> bool {
+        if self
+            .physical_execution_admission
+            .as_ref()
+            .is_some_and(|admission| admission.ensure_healthy().is_err())
+        {
+            return false;
+        }
         let executor = self.inner.read().await;
         executor.is_ready()
     }
@@ -1668,10 +4423,122 @@ impl UnifiedExecutor {
     }
 }
 
-fn retain_other_sessions_locked<T>(states: &mut HashMap<SessionKey, T>, request_id: &str) -> usize {
-    let before = states.len();
-    states.retain(|session, _| session.request_id != request_id);
-    before.saturating_sub(states.len())
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StateCleanupSummary {
+    released: usize,
+    busy: usize,
+    unknown: usize,
+}
+
+impl StateCleanupSummary {
+    fn combine(self, other: Self) -> Self {
+        Self {
+            released: self.released.saturating_add(other.released),
+            busy: self.busy.saturating_add(other.busy),
+            unknown: self.unknown.saturating_add(other.unknown),
+        }
+    }
+}
+
+fn cleanup_report(summary: StateCleanupSummary) -> CacheReleaseReport {
+    if summary.unknown > 0 {
+        CacheReleaseReport::unconfirmed()
+    } else if summary.busy > 0 {
+        CacheReleaseReport::busy_in_flight(summary.released, summary.busy)
+    } else {
+        CacheReleaseReport::confirmed(summary.released)
+    }
+}
+
+fn cleanup_model_states_locked<T>(
+    states: &mut HashMap<SessionKey, ExecutorStateSlot<T>>,
+    variant: ModelVariant,
+    model_variant: impl Fn(&T) -> ModelVariant,
+) -> StateCleanupSummary {
+    let busy = states
+        .values()
+        .filter(|state| {
+            matches!(state, ExecutorStateSlot::InFlight { variant: owner } if *owner == variant)
+        })
+        .count();
+    let unknown = states
+        .values()
+        .filter(|state| {
+            matches!(state, ExecutorStateSlot::Poisoned { variant: owner } if *owner == variant)
+                || matches!(
+                    state,
+                    ExecutorStateSlot::Ready {
+                        variant: owner,
+                        state: active,
+                    } if (*owner == variant || model_variant(active) == variant)
+                        && *owner != model_variant(active)
+                )
+        })
+        .count();
+    let sessions = states
+        .iter()
+        .filter_map(|(session, state)| match state {
+            ExecutorStateSlot::Ready {
+                variant: owner,
+                state: active,
+            } if *owner == variant && model_variant(active) == variant => Some(session.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let released = sessions.len();
+    for session in sessions {
+        states.remove(&session);
+    }
+    StateCleanupSummary {
+        released,
+        busy,
+        unknown,
+    }
+}
+
+fn cleanup_request_states_locked<T>(
+    states: &mut HashMap<SessionKey, ExecutorStateSlot<T>>,
+    request_id: &str,
+) -> StateCleanupSummary {
+    let mut summary = StateCleanupSummary::default();
+    states.retain(|session, slot| {
+        if session.request_id != request_id {
+            return true;
+        }
+        match slot {
+            ExecutorStateSlot::InFlight { .. } => {
+                summary.busy = summary.busy.saturating_add(1);
+                true
+            }
+            ExecutorStateSlot::Ready { .. } | ExecutorStateSlot::Poisoned { .. } => {
+                summary.released = summary.released.saturating_add(1);
+                false
+            }
+        }
+    });
+    summary
+}
+
+fn cleanup_session_state_locked<T>(
+    states: &mut HashMap<SessionKey, ExecutorStateSlot<T>>,
+    session: &SessionKey,
+) -> StateCleanupSummary {
+    match states.get(session) {
+        Some(ExecutorStateSlot::InFlight { .. }) => StateCleanupSummary {
+            released: 0,
+            busy: 1,
+            unknown: 0,
+        },
+        Some(ExecutorStateSlot::Ready { .. } | ExecutorStateSlot::Poisoned { .. }) => {
+            states.remove(session);
+            StateCleanupSummary {
+                released: 1,
+                busy: 0,
+                unknown: 0,
+            }
+        }
+        None => StateCleanupSummary::default(),
+    }
 }
 
 /// Decode base64-encoded audio to samples.
@@ -1688,10 +4555,55 @@ fn decode_audio_base64_with_rate(audio_b64: &str) -> Result<(Vec<f32>, u32)> {
 mod tests {
     use super::*;
     use crate::engine::request::StreamStagingBuffer;
-    use crate::engine::{CapacitySource, PhysicalCapacityProvider, PhysicalCapacitySnapshot};
+    use crate::engine::{
+        CapacitySource, ClockedStateSpan, ManagedCacheDomainReservation, ManagedCacheReservation,
+        PhysicalCapacityProvider, PhysicalCapacitySnapshot, ResourceAmount, StageShapePolicy,
+    };
+    use crate::kv::v2::{StateClock, StateGroupId};
     use crate::model::ModelVariant;
     use base64::Engine;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RecordingPendingFinalizer {
+        session: SessionKey,
+        calls: Mutex<Vec<(PlanId, PendingQuantumDecision)>>,
+        prepared: Mutex<bool>,
+    }
+
+    impl PendingQuantumFinalizer for RecordingPendingFinalizer {
+        fn contains(&self, plan_id: PlanId, session: &SessionKey) -> bool {
+            plan_id == 41 && session == &self.session
+        }
+
+        fn prepare(
+            &self,
+            plan_id: PlanId,
+            session: &SessionKey,
+            decision: PendingQuantumDecision,
+        ) -> Result<PendingQuantumFinalizeStatus> {
+            if !self.contains(plan_id, session) {
+                return Ok(PendingQuantumFinalizeStatus::NotFound);
+            }
+            self.calls.lock().unwrap().push((plan_id, decision));
+            *self.prepared.lock().unwrap() = true;
+            Ok(PendingQuantumFinalizeStatus::Finalized)
+        }
+
+        fn publish(
+            &self,
+            plan_id: PlanId,
+            session: &SessionKey,
+        ) -> Result<PendingQuantumFinalizeStatus> {
+            if plan_id != 41 || session != &self.session || !*self.prepared.lock().unwrap() {
+                return Ok(PendingQuantumFinalizeStatus::NotFound);
+            }
+            *self.prepared.lock().unwrap() = false;
+            Ok(PendingQuantumFinalizeStatus::Finalized)
+        }
+
+        fn discard(&self, _plan_id: PlanId, _session: &SessionKey) {
+            *self.prepared.lock().unwrap() = false;
+        }
+    }
 
     #[derive(Debug)]
     struct FixedCapacityProvider {
@@ -1708,112 +4620,886 @@ mod tests {
         }
     }
 
-    #[derive(Debug)]
-    struct MutableCacheCapacityProvider {
-        capacity: ResourceVector,
-        available: std::sync::Mutex<ResourceVector>,
+    struct PanickingPhysicalExecutor;
+
+    impl ModelExecutor for PanickingPhysicalExecutor {
+        fn execute_prefill(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            panic!("physical executor panic sentinel");
+        }
+
+        fn execute_decode(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            panic!("physical executor panic sentinel");
+        }
+
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        fn initialize(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&mut self) -> Result<()> {
+            Ok(())
+        }
     }
 
-    impl MutableCacheCapacityProvider {
-        fn new(capacity: ResourceVector, available: ResourceVector) -> Self {
-            Self {
-                capacity,
-                available: std::sync::Mutex::new(available),
+    #[test]
+    fn unified_pending_quantum_finalizer_is_exact_and_model_neutral() {
+        let session = SessionKey::new("pending-finalizer".to_string(), 9);
+        let finalizer = Arc::new(RecordingPendingFinalizer {
+            session: session.clone(),
+            calls: Mutex::new(Vec::new()),
+            prepared: Mutex::new(false),
+        });
+        let executor = UnifiedExecutor::new_for_test(Box::new(PanickingPhysicalExecutor))
+            .with_pending_quantum_finalizer_for_test(finalizer.clone());
+
+        assert!(executor.has_pending_quantum(41, &session));
+        assert!(!executor.has_pending_quantum(41, &SessionKey::new(session.request_id.clone(), 10)));
+        assert_eq!(
+            executor
+                .finalize_pending_quantum(41, &session, PendingQuantumDecision::Abort)
+                .unwrap(),
+            PendingQuantumFinalizeStatus::Finalized
+        );
+        assert_eq!(
+            finalizer.calls.lock().unwrap().as_slice(),
+            &[(41, PendingQuantumDecision::Abort)]
+        );
+    }
+
+    #[test]
+    fn executor_state_lease_keeps_in_flight_ownership_visible_to_cleanup() {
+        let session = SessionKey::new("visible-in-flight".to_string(), 7);
+        let variant = ModelVariant::Qwen306B;
+        let store = Mutex::new(HashMap::from([(
+            session.clone(),
+            ExecutorStateSlot::Ready {
+                variant,
+                state: "ready".to_string(),
+            },
+        )]));
+
+        let lease =
+            ExecutorStateLease::checkout(&store, session.clone(), variant, "test state").unwrap();
+        assert_eq!(lease.state().map(String::as_str), Some("ready"));
+
+        let summary = {
+            let mut states = store.lock().unwrap();
+            cleanup_session_state_locked(&mut states, &session)
+        };
+        assert_eq!(
+            summary,
+            StateCleanupSummary {
+                released: 0,
+                busy: 1,
+                unknown: 0,
             }
-        }
+        );
+        drop(lease);
 
-        fn set_available(&self, available: ResourceVector) {
-            *self
-                .available
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner()) = available;
-        }
+        let states = store.lock().unwrap();
+        assert!(matches!(
+            states.get(&session),
+            Some(ExecutorStateSlot::Ready { state, .. }) if state == "ready"
+        ));
     }
 
-    impl PhysicalCapacityProvider for MutableCacheCapacityProvider {
-        fn snapshot(&self) -> PhysicalCapacitySnapshot {
-            PhysicalCapacitySnapshot {
-                capacity: self.capacity,
-                available: *self
-                    .available
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner()),
-                source: CapacitySource::Test,
+    #[test]
+    fn dirty_executor_state_unwind_is_poisoned_until_cleanup() {
+        let session = SessionKey::new("poison-on-unwind".to_string(), 3);
+        let variant = ModelVariant::Qwen306B;
+        let store = Mutex::new(HashMap::from([(
+            session.clone(),
+            ExecutorStateSlot::Ready {
+                variant,
+                state: 41usize,
+            },
+        )]));
+
+        let mut lease =
+            ExecutorStateLease::checkout(&store, session.clone(), variant, "test state").unwrap();
+        lease.mark_dirty();
+        *lease.require_state_mut().unwrap() = 42;
+        drop(lease);
+
+        assert!(matches!(
+            store.lock().unwrap().get(&session),
+            Some(ExecutorStateSlot::Poisoned { variant: owner }) if *owner == variant
+        ));
+        assert!(
+            ExecutorStateLease::checkout(&store, session.clone(), variant, "test state").is_err()
+        );
+
+        let summary = {
+            let mut states = store.lock().unwrap();
+            cleanup_session_state_locked(&mut states, &session)
+        };
+        assert_eq!(
+            summary,
+            StateCleanupSummary {
+                released: 1,
+                busy: 0,
+                unknown: 0,
             }
-        }
+        );
+        assert!(!store.lock().unwrap().contains_key(&session));
     }
 
-    fn materialized_cache_fixture(
-        backend: BackendKind,
-        request_id: &str,
-    ) -> (
-        NativeExecutor,
-        Arc<ResourceAuthority>,
-        Arc<MutableCacheCapacityProvider>,
-        EngineCoreRequest,
-        ScheduledRequest,
-    ) {
-        let capacity = cache_resource_vector(backend, 200);
-        let live_headroom = cache_resource_vector(backend, 100);
-        let provider = Arc::new(MutableCacheCapacityProvider::new(capacity, live_headroom));
-        let authority = Arc::new(ResourceAuthority::new(provider.clone()));
-        let lease = authority
-            .reserve(
-                ReservationOwner::new(ReservationClass::Cache, format!("{request_id}:7")),
-                cache_resource_vector(backend, 100),
-            )
-            .unwrap();
-        provider.set_available(cache_resource_vector(backend, 0));
-        lease
-            .record_materialized_usage(cache_resource_vector(backend, 100))
-            .unwrap();
-
-        let mut config = WorkerConfig::default();
-        config.backend = backend;
-        config.resource_authority = Some(authority.clone());
-        let executor = NativeExecutor::new(config);
-        let session = SessionKey::new(request_id.to_string(), 7);
-        executor.cache_resource_leases.lock().unwrap().insert(
+    #[test]
+    fn model_purge_never_confirms_unknown_poisoned_ownership() {
+        let session = SessionKey::new("poisoned-model-purge".to_string(), 1);
+        let mut states = HashMap::<SessionKey, ExecutorStateSlot<ModelVariant>>::from([(
             session,
-            CacheResourceReservation {
-                reserved_bytes: 100,
-                observed_blocks: 1,
-                lease: Some(lease),
+            ExecutorStateSlot::Poisoned {
+                variant: ModelVariant::VoxtralMini4BRealtime2602,
+            },
+        )]);
+
+        let summary = cleanup_model_states_locked(
+            &mut states,
+            ModelVariant::VoxtralMini4BRealtime2602,
+            |variant| *variant,
+        );
+        assert_eq!(summary.unknown, 1);
+        assert_eq!(
+            cleanup_report(summary).outcome,
+            CacheReleaseOutcome::Unconfirmed
+        );
+    }
+
+    #[test]
+    fn model_purge_ignores_other_variant_markers() {
+        let requested = ModelVariant::VoxtralMini4BRealtime2602;
+        let other_busy = SessionKey::new("other-busy".to_string(), 1);
+        let other_poisoned = SessionKey::new("other-poisoned".to_string(), 1);
+        let requested_ready = SessionKey::new("requested-ready".to_string(), 1);
+        let mut states = HashMap::from([
+            (
+                other_busy,
+                ExecutorStateSlot::InFlight {
+                    variant: ModelVariant::Qwen306B,
+                },
+            ),
+            (
+                other_poisoned,
+                ExecutorStateSlot::Poisoned {
+                    variant: ModelVariant::Qwen3Asr06BGguf,
+                },
+            ),
+            (
+                requested_ready.clone(),
+                ExecutorStateSlot::Ready {
+                    variant: requested,
+                    state: requested,
+                },
+            ),
+        ]);
+
+        let summary = cleanup_model_states_locked(&mut states, requested, |variant| *variant);
+        assert_eq!(
+            summary,
+            StateCleanupSummary {
+                released: 1,
+                busy: 0,
+                unknown: 0,
+            }
+        );
+        assert!(!states.contains_key(&requested_ready));
+        assert_eq!(states.len(), 2);
+        assert_eq!(
+            cleanup_report(summary).outcome,
+            CacheReleaseOutcome::Confirmed
+        );
+    }
+
+    #[test]
+    fn model_purge_reports_only_requested_variant_busy_marker() {
+        let requested = ModelVariant::VoxtralMini4BRealtime2602;
+        let mut states = HashMap::<SessionKey, ExecutorStateSlot<ModelVariant>>::from([
+            (
+                SessionKey::new("requested-busy".to_string(), 1),
+                ExecutorStateSlot::InFlight { variant: requested },
+            ),
+            (
+                SessionKey::new("other-poisoned".to_string(), 1),
+                ExecutorStateSlot::Poisoned {
+                    variant: ModelVariant::Qwen306B,
+                },
+            ),
+        ]);
+
+        let summary = cleanup_model_states_locked(&mut states, requested, |variant| *variant);
+        assert_eq!(summary.busy, 1);
+        assert_eq!(summary.unknown, 0);
+        assert_eq!(
+            cleanup_report(summary).outcome,
+            CacheReleaseOutcome::BusyInFlight
+        );
+    }
+
+    #[test]
+    fn voxtral_tts_model_purge_drains_ready_state_and_fences_in_flight_state() {
+        let variant = ModelVariant::Voxtral4BTts2603;
+        let ready = SessionKey::new("voxtral-tts-ready".to_string(), 1);
+        let busy = SessionKey::new("voxtral-tts-busy".to_string(), 1);
+        let mut states = HashMap::from([
+            (
+                ready.clone(),
+                ExecutorStateSlot::Ready {
+                    variant,
+                    state: variant,
+                },
+            ),
+            (busy.clone(), ExecutorStateSlot::InFlight { variant }),
+        ]);
+
+        let first = cleanup_model_states_locked(&mut states, variant, |owner| *owner);
+        assert_eq!(first.released, 1);
+        assert_eq!(first.busy, 1);
+        assert!(!states.contains_key(&ready));
+        assert!(states.contains_key(&busy));
+        assert_eq!(
+            cleanup_report(first).outcome,
+            CacheReleaseOutcome::BusyInFlight
+        );
+
+        states.insert(
+            busy.clone(),
+            ExecutorStateSlot::Ready {
+                variant,
+                state: variant,
             },
         );
-        let mut request = EngineCoreRequest::tts("cache transition");
-        request.id = request_id.to_string();
-        let scheduled = ScheduledRequest {
-            plan_id: 7,
-            request_id: request_id.to_string(),
-            sequence_id: 7,
-            num_tokens: 1,
-            is_prefill: false,
-            block_ids: vec![1],
-            num_computed_tokens: 1,
-            work: crate::engine::WorkUnit::SequenceStep {
-                phase: crate::engine::SequencePhase::Decode,
-                input: crate::engine::InputRange { start: 0, end: 1 },
-                max_output_steps: 1,
+        let drained = cleanup_model_states_locked(&mut states, variant, |owner| *owner);
+        assert_eq!(
+            cleanup_report(drained).outcome,
+            CacheReleaseOutcome::Confirmed
+        );
+        assert!(states.is_empty());
+    }
+
+    #[test]
+    fn nemotron_realtime_purge_fences_in_flight_state_then_confirms_drain() {
+        let variant = ModelVariant::Nemotron35AsrStreaming06B;
+        let ready = SessionKey::new("nemotron-ready".to_string(), 1);
+        let busy = SessionKey::new("nemotron-busy".to_string(), 1);
+        let mut states = HashMap::from([
+            (
+                ready.clone(),
+                ExecutorStateSlot::Ready {
+                    variant,
+                    state: variant,
+                },
+            ),
+            (busy.clone(), ExecutorStateSlot::InFlight { variant }),
+        ]);
+
+        let first = cleanup_model_states_locked(&mut states, variant, |owner| *owner);
+        assert_eq!(first.released, 1);
+        assert_eq!(first.busy, 1);
+        assert!(!states.contains_key(&ready));
+        assert!(states.contains_key(&busy));
+        assert_eq!(
+            cleanup_report(first).outcome,
+            CacheReleaseOutcome::BusyInFlight
+        );
+
+        states.insert(
+            busy,
+            ExecutorStateSlot::Ready {
+                variant,
+                state: variant,
+            },
+        );
+        let drained = cleanup_model_states_locked(&mut states, variant, |owner| *owner);
+        assert_eq!(
+            cleanup_report(drained).outcome,
+            CacheReleaseOutcome::Confirmed
+        );
+        assert!(states.is_empty());
+    }
+
+    #[test]
+    fn nemotron_cancelled_quantum_restores_then_releases_its_state_slot() {
+        let variant = ModelVariant::Nemotron35AsrStreaming06B;
+        let session = SessionKey::new("nemotron-cancelled".to_string(), 2);
+        let store = Mutex::new(HashMap::from([(
+            session.clone(),
+            ExecutorStateSlot::Ready {
+                variant,
+                state: 7usize,
+            },
+        )]));
+        let checkpoint = 7usize;
+        let mut lease = ExecutorStateLease::checkout(
+            &store,
+            session.clone(),
+            variant,
+            "Nemotron cancellation fixture",
+        )
+        .unwrap();
+        *lease.require_state_mut().unwrap() = 99;
+        lease.mark_dirty();
+
+        *lease.require_state_mut().unwrap() = checkpoint;
+        lease.mark_clean();
+        lease.release().unwrap();
+
+        assert!(!store.lock().unwrap().contains_key(&session));
+    }
+
+    #[test]
+    fn executor_state_lease_explicitly_restores_or_releases() {
+        let session = SessionKey::new("explicit-transition".to_string(), 2);
+        let variant = ModelVariant::Qwen306B;
+        let store = Mutex::new(HashMap::new());
+
+        let mut lease =
+            ExecutorStateLease::checkout(&store, session.clone(), variant, "test state").unwrap();
+        lease.install_state(9usize).unwrap();
+        lease.mark_dirty();
+        lease.restore().unwrap();
+        assert!(matches!(
+            store.lock().unwrap().get(&session),
+            Some(ExecutorStateSlot::Ready { state: 9, .. })
+        ));
+
+        let lease =
+            ExecutorStateLease::checkout(&store, session.clone(), variant, "test state").unwrap();
+        lease.release().unwrap();
+        assert!(!store.lock().unwrap().contains_key(&session));
+    }
+
+    #[test]
+    fn native_cleanup_reports_busy_chat_tts_and_asr_sessions() {
+        let executor = NativeExecutor::new(WorkerConfig::default());
+        let session = SessionKey::new("all-modalities-in-flight".to_string(), 11);
+        executor.chat_decode_states.lock().unwrap().insert(
+            session.clone(),
+            ExecutorStateSlot::InFlight {
+                variant: ModelVariant::Qwen306B,
+            },
+        );
+        executor.qwen_tts_decode_states.lock().unwrap().insert(
+            session.clone(),
+            ExecutorStateSlot::InFlight {
+                variant: ModelVariant::Qwen3Tts12Hz06BBase,
+            },
+        );
+        executor.asr_decode_states.lock().unwrap().insert(
+            session.clone(),
+            ExecutorStateSlot::InFlight {
+                variant: ModelVariant::Qwen3Asr06BGguf,
+            },
+        );
+        executor.lfm25_asr_decode_states.lock().unwrap().insert(
+            session.clone(),
+            ExecutorStateSlot::InFlight {
+                variant: ModelVariant::Lfm25Audio15BGguf,
+            },
+        );
+
+        let report = executor.cleanup_session(&session);
+        assert_eq!(report.outcome, CacheReleaseOutcome::BusyInFlight);
+        assert!(!report.confirmed);
+        assert_eq!(report.released_sessions, 0);
+        assert_eq!(report.busy_sessions, 4);
+    }
+
+    fn qwen38_test_arena(generation: u32) -> KvArenaId {
+        KvArenaId {
+            model_instance: super::super::ModelInstanceId::new(38),
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            generation,
+        }
+    }
+
+    #[test]
+    fn only_multi_token_solo_decode_uses_the_scalar_continuous_route() {
+        let scheduled = |num_tokens: usize, is_prefill: bool| ScheduledRequest {
+            plan_id: 1,
+            request_id: "route".to_string(),
+            sequence_id: 1,
+            num_tokens,
+            is_prefill,
+            num_computed_tokens: 0,
+            work: WorkUnit::SequenceStep {
+                phase: if is_prefill {
+                    crate::engine::SequencePhase::Prefill
+                } else {
+                    crate::engine::SequencePhase::Decode
+                },
+                input: crate::engine::InputRange {
+                    start: 0,
+                    end: num_tokens,
+                },
+                max_output_steps: num_tokens,
+                auxiliary_state: None,
             },
         };
-        (executor, authority, provider, request, scheduled)
+
+        assert!(is_isolated_continuous_model_quantum(&[scheduled(4, false)]));
+        assert!(!is_isolated_continuous_model_quantum(&[scheduled(
+            1, false
+        )]));
+        assert!(!is_isolated_continuous_model_quantum(&[scheduled(4, true)]));
+        assert!(!is_isolated_continuous_model_quantum(&[
+            scheduled(1, false),
+            scheduled(1, false),
+        ]));
+    }
+
+    fn native_route_fixture(
+        task: TaskType,
+        capability: &str,
+        variant: ModelVariant,
+        selector: StageWorkSelector,
+        stage_name: &str,
+        mode: NativeBatchMode,
+        phase: SequencePhase,
+    ) -> (EngineCoreRequest, ScheduledRequest, PhysicalBatch) {
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, Some(variant), ExecutionMode::Sequence);
+        profile.max_batch_size = 4;
+        let mut stage = super::super::StageDescriptor::from_execution_profile(
+            StageId::new(7),
+            stage_name,
+            &profile,
+            mode,
+        );
+        stage.selector = selector;
+        stage.max_work_units = 4;
+        stage.validate().unwrap();
+        let binding = super::super::ExecutionAdapterBinding {
+            execution_group_id: super::super::ExecutionGroupId::new(1),
+            model_instance_id: super::super::ModelInstanceId::new(2),
+            adapter_instance_id: super::super::AdapterInstanceId::new(3),
+            adapter_abi_revision: super::super::AdapterAbiRevision::new(4),
+            model_variant: variant,
+            capability_id: capability.to_string(),
+            stages: Arc::from([stage.clone()]),
+        };
+        binding.validate().unwrap();
+
+        let mut request = match task {
+            TaskType::TTS => EngineCoreRequest::tts("native route"),
+            TaskType::ASR => EngineCoreRequest::asr(""),
+            TaskType::Chat => EngineCoreRequest::chat(Vec::new()),
+            TaskType::SpeechToSpeech => EngineCoreRequest::speech_to_speech(""),
+        };
+        request.id = "native-route".to_string();
+        request.model_variant = Some(variant);
+        request.bind_execution_adapter(binding).unwrap();
+        let scheduled = ScheduledRequest {
+            plan_id: 11,
+            request_id: request.id.clone(),
+            sequence_id: 11,
+            num_tokens: 1,
+            is_prefill: phase == SequencePhase::Prefill,
+            num_computed_tokens: if phase == SequencePhase::Decode { 1 } else { 0 },
+            work: WorkUnit::SequenceStep {
+                phase,
+                input: if phase == SequencePhase::Prefill {
+                    super::super::InputRange { start: 0, end: 1 }
+                } else {
+                    super::super::InputRange { start: 1, end: 2 }
+                },
+                max_output_steps: 1,
+                auxiliary_state: None,
+            },
+        };
+        let lane = BatchLaneKey {
+            execution_group: super::super::ExecutionGroupId::new(1),
+            model_instance: super::super::ModelInstanceId::new(2),
+            adapter_instance: super::super::AdapterInstanceId::new(3),
+            adapter_abi: super::super::AdapterAbiRevision::new(4),
+            capability_id: capability.to_string(),
+            stage_id: StageId::new(7),
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            compute_dtype: "f32".to_string(),
+            state_dtype: "f32".to_string(),
+            tensor_layout: format!("{:?}", stage.shape_policy).to_ascii_lowercase(),
+            quantization: "none".to_string(),
+            state_schema: "test".to_string(),
+            kernel_mode: stage_name.to_string(),
+            semantic_mode: format!("{phase:?}").to_ascii_lowercase(),
+            shape_bucket: if stage.shape_policy == StageShapePolicy::Padded {
+                "padded".to_string()
+            } else {
+                "ragged".to_string()
+            },
+        };
+        let batch = PhysicalBatch {
+            batch_id: BatchId::new(12),
+            lane: lane.clone(),
+            mode,
+            budget: super::super::BatchBudget {
+                max_rows: 4,
+                max_logical_units: 4,
+                max_tensor_elements: 4,
+                max_workspace_bytes: 0,
+                max_padding_basis_points: stage.max_padding_basis_points,
+                max_formation_delay: Duration::ZERO,
+            },
+            rows: vec![super::super::ReadyQuantum {
+                plan_id: scheduled.plan_id,
+                session: scheduled.session_key(),
+                lane,
+                work: scheduled.work.clone(),
+                cost: super::super::WorkCost::new(1, 1, 0),
+                managed_cache: None,
+            }],
+            materialized_tensor_elements: 1,
+            workspace: ResourceVector::zero(),
+        };
+        batch.validate().unwrap();
+        (request, scheduled, batch)
+    }
+
+    #[test]
+    fn native_route_uses_exact_loaded_audio_stage_identity() {
+        let (request, scheduled, batch) = native_route_fixture(
+            TaskType::TTS,
+            "tts",
+            ModelVariant::Qwen3Tts12Hz06BCustomVoice,
+            StageWorkSelector::SequenceDecode,
+            "tts.decode.tensor_continuous",
+            NativeBatchMode::Continuous,
+            SequencePhase::Decode,
+        );
+        let requests = [&request];
+        let scheduled = [scheduled];
+        let execution = PhysicalBatchExecution {
+            batch: &batch,
+            requests: &requests,
+            scheduled: &scheduled,
+        };
+        execution.validate().unwrap();
+        assert_eq!(
+            NativeBatchRoute::resolve(&execution).unwrap(),
+            NativeBatchRoute::Audio {
+                task: TaskType::TTS,
+                stage: NativeAudioStage::SequenceDecode,
+                mode: NativeBatchMode::Continuous,
+                stage_id: StageId::new(7),
+            }
+        );
+    }
+
+    #[test]
+    fn native_audio_stage_authenticates_realtime_push_and_finish_roles() {
+        assert_eq!(
+            NativeBatchRoute::audio_stage(&WorkUnit::RealtimePush {
+                operation_id: super::super::RealtimeOperationId::new(1),
+                input: super::super::InputRange::new(0, 160).unwrap(),
+                max_output_steps: 2,
+                max_cache_append: 4,
+            }),
+            NativeAudioStage::RealtimePush
+        );
+        assert_eq!(
+            NativeBatchRoute::audio_stage(&WorkUnit::RealtimeFinish {
+                operation_id: super::super::RealtimeOperationId::new(2),
+                max_output_steps: 4,
+                max_cache_append: 4,
+            }),
+            NativeAudioStage::RealtimeFinish
+        );
+    }
+
+    #[test]
+    fn native_route_authenticates_vibevoice_static_prefill() {
+        let (request, scheduled, batch) = native_route_fixture(
+            TaskType::ASR,
+            "asr",
+            ModelVariant::VibeVoiceAsr,
+            StageWorkSelector::SequencePrefill,
+            crate::models::architectures::vibevoice::VIBEVOICE_ASR_PREFILL_STAGE,
+            NativeBatchMode::Static,
+            SequencePhase::Prefill,
+        );
+        let requests = [&request];
+        let scheduled = [scheduled];
+        assert_eq!(
+            NativeBatchRoute::resolve(&PhysicalBatchExecution {
+                batch: &batch,
+                requests: &requests,
+                scheduled: &scheduled,
+            })
+            .unwrap(),
+            NativeBatchRoute::Audio {
+                task: TaskType::ASR,
+                stage: NativeAudioStage::SequencePrefill,
+                mode: NativeBatchMode::Static,
+                stage_id: StageId::new(7),
+            }
+        );
+    }
+
+    #[test]
+    fn vibevoice_static_prefill_requires_two_selected_audio_rows() {
+        let (_, mut scheduled, _) = native_route_fixture(
+            TaskType::ASR,
+            "asr",
+            ModelVariant::VibeVoiceAsr,
+            StageWorkSelector::SequencePrefill,
+            crate::models::architectures::vibevoice::VIBEVOICE_ASR_PREFILL_STAGE,
+            NativeBatchMode::Static,
+            SequencePhase::Prefill,
+        );
+        assert!(!has_native_vibevoice_tokenizer_batch(&[
+            scheduled.clone(),
+            scheduled.clone(),
+        ]));
+        let WorkUnit::SequenceStep {
+            auxiliary_state, ..
+        } = &mut scheduled.work
+        else {
+            unreachable!()
+        };
+        *auxiliary_state = Some(Arc::from([ClockedStateSpan::new(
+            StateGroupId::new(2),
+            StateClock::AudioSamples,
+            super::super::InputRange::new(0, 3_200).unwrap(),
+        )
+        .unwrap()]));
+        assert!(!has_native_vibevoice_tokenizer_batch(&[scheduled.clone()]));
+        assert!(has_native_vibevoice_tokenizer_batch(&[
+            scheduled.clone(),
+            scheduled,
+        ]));
+    }
+
+    #[test]
+    fn native_route_preserves_chat_decode_and_rejects_fallback_stage_proof() {
+        let (request, scheduled, batch) = native_route_fixture(
+            TaskType::Chat,
+            "chat",
+            ModelVariant::Qwen306B,
+            StageWorkSelector::SequenceDecode,
+            "chat.decode.tensor_continuous",
+            NativeBatchMode::Continuous,
+            SequencePhase::Decode,
+        );
+        let requests = [&request];
+        let scheduled = [scheduled];
+        let execution = PhysicalBatchExecution {
+            batch: &batch,
+            requests: &requests,
+            scheduled: &scheduled,
+        };
+        assert_eq!(
+            NativeBatchRoute::resolve(&execution).unwrap(),
+            NativeBatchRoute::ChatContinuousDecode {
+                stage_id: StageId::new(7)
+            }
+        );
+
+        let (request, scheduled, batch) = native_route_fixture(
+            TaskType::TTS,
+            "tts",
+            ModelVariant::Qwen3Tts12Hz06BCustomVoice,
+            StageWorkSelector::Any,
+            "tts.compatibility",
+            NativeBatchMode::Continuous,
+            SequencePhase::Decode,
+        );
+        let requests = [&request];
+        let scheduled = [scheduled];
+        assert!(NativeBatchRoute::resolve(&PhysicalBatchExecution {
+            batch: &batch,
+            requests: &requests,
+            scheduled: &scheduled,
+        })
+        .is_err());
+    }
+
+    fn qwen38_test_reservation(domains: &[(CacheDomainId, KvArenaId)]) -> ManagedCacheReservation {
+        ManagedCacheReservation {
+            txn_id: 1,
+            session: SessionKey::new("qwen38-domain-selection".into(), 1),
+            session_generation: crate::engine::ManagedSessionGeneration::INITIAL,
+            domains: domains
+                .iter()
+                .map(|(domain, arena)| ManagedCacheDomainReservation {
+                    arena: *arena,
+                    domain: *domain,
+                    expected_version: 0,
+                    expected_committed_tokens: 0,
+                    execution_start_tokens: 0,
+                    target_committed_tokens: 1,
+                    target_window_start: 0,
+                    first_page_offset: 0,
+                    provisional_groups: Vec::new(),
+                    writable_blocks: Vec::new(),
+                })
+                .collect(),
+            clocked_state: None,
+            allow_unchanged_prefix: false,
+        }
+    }
+
+    #[test]
+    fn qwen38_managed_group_selection_resolves_exact_target_and_optional_mtp() {
+        let target_arena = qwen38_test_arena(1);
+        let mtp_arena = qwen38_test_arena(2);
+        let target_group = KvGroupId::new(1);
+        let mtp_group = KvGroupId::new(1);
+        let dual_groups = [
+            (QWEN38_MTP_ATTENTION_DOMAIN, mtp_group, mtp_arena),
+            (QWEN38_TARGET_ATTENTION_DOMAIN, target_group, target_arena),
+        ];
+        let dual_reservation = qwen38_test_reservation(&[
+            (QWEN38_TARGET_ATTENTION_DOMAIN, target_arena),
+            (QWEN38_MTP_ATTENTION_DOMAIN, mtp_arena),
+        ]);
+        assert_eq!(
+            qwen38_managed_group_ids(&dual_groups, &dual_reservation).unwrap(),
+            (target_group, Some(mtp_group))
+        );
+
+        let target_groups = [(QWEN38_TARGET_ATTENTION_DOMAIN, target_group, target_arena)];
+        let target_reservation =
+            qwen38_test_reservation(&[(QWEN38_TARGET_ATTENTION_DOMAIN, target_arena)]);
+        assert_eq!(
+            qwen38_managed_group_ids(&target_groups, &target_reservation).unwrap(),
+            (target_group, None)
+        );
+    }
+
+    #[test]
+    fn qwen38_managed_group_selection_rejects_half_resolved_mtp_domain() {
+        let target_arena = qwen38_test_arena(1);
+        let mtp_arena = qwen38_test_arena(2);
+        let groups = [
+            (
+                QWEN38_TARGET_ATTENTION_DOMAIN,
+                KvGroupId::new(1),
+                target_arena,
+            ),
+            (QWEN38_MTP_ATTENTION_DOMAIN, KvGroupId::new(1), mtp_arena),
+        ];
+        let target_only =
+            qwen38_test_reservation(&[(QWEN38_TARGET_ATTENTION_DOMAIN, target_arena)]);
+        assert!(qwen38_managed_group_ids(&groups, &target_only).is_err());
+
+        let target_group_only = &groups[..1];
+        let reservation_with_mtp = qwen38_test_reservation(&[
+            (QWEN38_TARGET_ATTENTION_DOMAIN, target_arena),
+            (QWEN38_MTP_ATTENTION_DOMAIN, mtp_arena),
+        ]);
+        assert!(qwen38_managed_group_ids(target_group_only, &reservation_with_mtp).is_err());
+    }
+
+    #[test]
+    fn qwen38_managed_group_selection_rejects_missing_duplicate_or_foreign_target() {
+        let target_arena = qwen38_test_arena(1);
+        let foreign_arena = qwen38_test_arena(2);
+        let empty_reservation = qwen38_test_reservation(&[]);
+        assert!(qwen38_managed_group_ids(&[], &empty_reservation).is_err());
+
+        let target_reservation =
+            qwen38_test_reservation(&[(QWEN38_TARGET_ATTENTION_DOMAIN, target_arena)]);
+        assert!(qwen38_managed_group_ids(&[], &target_reservation).is_err());
+
+        let duplicate_groups = [
+            (
+                QWEN38_TARGET_ATTENTION_DOMAIN,
+                KvGroupId::new(1),
+                target_arena,
+            ),
+            (
+                QWEN38_TARGET_ATTENTION_DOMAIN,
+                KvGroupId::new(2),
+                target_arena,
+            ),
+        ];
+        assert!(qwen38_managed_group_ids(&duplicate_groups, &target_reservation).is_err());
+
+        let foreign_groups = [(
+            QWEN38_TARGET_ATTENTION_DOMAIN,
+            KvGroupId::new(1),
+            foreign_arena,
+        )];
+        assert!(qwen38_managed_group_ids(&foreign_groups, &target_reservation).is_err());
     }
 
     #[test]
     fn test_worker_config_default() {
         let config = WorkerConfig::default();
         assert_eq!(config.backend, config.backend_context.backend_kind);
+        assert_eq!(
+            config.request_parallelism,
+            WorkerConfig::resolve_request_parallelism(
+                config.backend,
+                config.num_threads,
+                WorkerConfig::available_cpu_capacity(),
+                WorkerConfig::request_parallelism_override(),
+            )
+        );
+    }
+
+    #[test]
+    fn atomic_invocation_leases_reject_non_atomic_or_tensor_stages() {
+        let profile = ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Atomic);
+        let scalar = super::super::StageDescriptor::from_execution_profile(
+            super::super::StageId::new(1),
+            "atomic.scalar",
+            &profile,
+            NativeBatchMode::None,
+        );
+        let atomic = WorkUnit::AtomicJob {
+            kind: "test".to_string(),
+        };
+        validate_atomic_scalar_invocation_stage(&scalar, &atomic).unwrap();
+
+        let sequence = WorkUnit::SequenceStep {
+            phase: super::super::SequencePhase::Decode,
+            input: super::super::InputRange { start: 0, end: 1 },
+            max_output_steps: 1,
+            auxiliary_state: None,
+        };
+        assert!(validate_atomic_scalar_invocation_stage(&scalar, &sequence).is_err());
+
+        let tensor = super::super::StageDescriptor::from_execution_profile(
+            super::super::StageId::new(1),
+            "atomic.tensor",
+            &profile,
+            NativeBatchMode::Static,
+        );
+        assert!(validate_atomic_scalar_invocation_stage(&tensor, &atomic).is_err());
     }
 
     #[test]
     fn test_worker_config_from_engine_config_uses_backend_context() {
-        let mut engine = EngineCoreConfig::default();
-        engine.backend = BackendKind::Cpu;
+        let engine = EngineCoreConfig {
+            backend: BackendKind::Cpu,
+            ..Default::default()
+        };
 
         let config = WorkerConfig::from(&engine);
         assert_eq!(config.backend, config.backend_context.backend_kind);
-        assert_eq!(config.request_parallelism, 1);
+        assert_eq!(
+            config.request_parallelism,
+            WorkerConfig::resolve_request_parallelism(
+                BackendKind::Cpu,
+                engine.num_threads,
+                WorkerConfig::available_cpu_capacity(),
+                WorkerConfig::request_parallelism_override(),
+            )
+        );
         assert_eq!(
             config.backend_context.source,
             BackendSelectionSource::Config
@@ -1821,34 +5507,139 @@ mod tests {
     }
 
     #[test]
-    fn test_request_parallelism_defaults_are_backend_aware() {
+    fn standalone_execution_capacity_obeys_physical_rollout_mode() {
+        let mut engine = EngineCoreConfig {
+            backend: BackendKind::Cpu,
+            max_physical_in_flight: crate::config::PhysicalInFlightLimit::new(4).unwrap(),
+            ..Default::default()
+        };
+
+        for mode in [
+            crate::config::PhysicalExecutionMode::Serial,
+            crate::config::PhysicalExecutionMode::Shadow,
+        ] {
+            engine.physical_execution_mode = mode;
+            let worker = WorkerConfig::from(&engine);
+            assert_eq!(
+                worker
+                    .physical_execution_admission
+                    .as_ref()
+                    .unwrap()
+                    .capacity(),
+                1
+            );
+        }
+
+        engine.physical_execution_mode = crate::config::PhysicalExecutionMode::Concurrent;
+        let worker = WorkerConfig::from(&engine);
         assert_eq!(
-            WorkerConfig::resolve_request_parallelism(BackendKind::Cpu, 8, None),
+            worker
+                .physical_execution_admission
+                .as_ref()
+                .unwrap()
+                .capacity(),
+            worker.request_parallelism.max(4)
+        );
+
+        assert_eq!(
+            WorkerConfig::physical_execution_capacity(
+                crate::config::PhysicalExecutionMode::Concurrent,
+                BackendKind::Cuda,
+                4,
+                4,
+            ),
+            1,
+            "CUDA remains device-serialized until a backend certificate exists"
+        );
+    }
+
+    #[test]
+    fn cpu_request_parallelism_uses_available_capacity_and_intra_op_threads() {
+        assert_eq!(
+            WorkerConfig::resolve_request_parallelism(BackendKind::Cpu, 8, 8, None),
             1
         );
         assert_eq!(
-            WorkerConfig::resolve_request_parallelism(BackendKind::Metal, 8, None),
+            WorkerConfig::resolve_request_parallelism(BackendKind::Cpu, 8, 16, None),
+            2
+        );
+        assert_eq!(
+            WorkerConfig::resolve_request_parallelism(BackendKind::Cpu, 8, 32, None),
+            MAX_CPU_REQUEST_PARALLELISM
+        );
+        assert_eq!(
+            WorkerConfig::resolve_request_parallelism(BackendKind::Cpu, 1, 128, None),
+            MAX_CPU_REQUEST_PARALLELISM
+        );
+        assert_eq!(
+            WorkerConfig::resolve_request_parallelism(BackendKind::Cpu, 64, 8, None),
             1
         );
         assert_eq!(
-            WorkerConfig::resolve_request_parallelism(BackendKind::Cuda, 8, None),
-            8
+            WorkerConfig::resolve_request_parallelism(BackendKind::Cpu, 0, 0, None),
+            1
         );
+    }
+
+    #[test]
+    fn request_parallelism_override_precedes_auto_with_backend_clamps() {
         assert_eq!(
-            WorkerConfig::resolve_request_parallelism(BackendKind::Cpu, 8, Some(3)),
+            WorkerConfig::resolve_request_parallelism(BackendKind::Cpu, 8, 32, Some(3)),
             3
         );
         assert_eq!(
-            WorkerConfig::resolve_request_parallelism(BackendKind::Metal, 8, Some(3)),
+            WorkerConfig::resolve_request_parallelism(BackendKind::Cpu, 8, 32, Some(usize::MAX)),
+            MAX_CPU_REQUEST_PARALLELISM
+        );
+        assert_eq!(
+            WorkerConfig::resolve_request_parallelism(BackendKind::Cpu, 1, 2, Some(3)),
+            2
+        );
+        assert_eq!(
+            WorkerConfig::resolve_request_parallelism(BackendKind::Metal, 1, 32, Some(3)),
             1
         );
+        assert_eq!(
+            WorkerConfig::resolve_request_parallelism(BackendKind::Cuda, 1, 32, None),
+            1
+        );
+        assert_eq!(
+            WorkerConfig::resolve_request_parallelism(BackendKind::Cuda, 1, 32, Some(4)),
+            4
+        );
+    }
+
+    #[test]
+    fn automatic_tensor_width_follows_resolved_backend_and_not_scheduler_rows() {
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            let engine = EngineCoreConfig {
+                backend,
+                max_batch_size: 19,
+                ..EngineCoreConfig::default()
+            };
+            let worker = WorkerConfig::from(&engine);
+            assert_eq!(
+                worker.max_tensor_batch_size,
+                engine.max_tensor_batch_size.resolve(worker.backend)
+            );
+            assert_eq!(
+                worker.request_parallelism,
+                WorkerConfig::resolve_request_parallelism(
+                    backend,
+                    engine.num_threads,
+                    WorkerConfig::available_cpu_capacity(),
+                    WorkerConfig::request_parallelism_override(),
+                )
+            );
+            assert_eq!(engine.max_batch_size, 19);
+        }
     }
 
     #[test]
     fn tensor_batch_caps_are_backend_conservative() {
         assert_eq!(WorkerConfig::tensor_batch_cap(BackendKind::Cpu), 2);
         assert_eq!(WorkerConfig::tensor_batch_cap(BackendKind::Metal), 2);
-        assert_eq!(WorkerConfig::tensor_batch_cap(BackendKind::Cuda), 8);
+        assert_eq!(WorkerConfig::tensor_batch_cap(BackendKind::Cuda), 32);
     }
 
     #[test]
@@ -1919,6 +5710,7 @@ mod tests {
                         kind: "test".to_string(),
                     },
                     cost: super::super::WorkCost::new(1, 1, 8),
+                    managed_cache: None,
                 }],
                 materialized_tensor_elements: 1,
                 workspace: expected_workspace,
@@ -1936,322 +5728,165 @@ mod tests {
     }
 
     #[test]
-    fn static_tts_batch_eligibility_is_fail_closed() {
-        let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
-        let mut request = EngineCoreRequest::tts("hello").with_model_variant(variant);
-        assert!(!static_qwen_tts_batch_eligible(&request, true, true));
+    fn uncertified_physical_policy_fallback_is_observed_in_production_derivation() {
+        let before = super::super::metrics::engine_physical_execution_metrics_snapshot();
+        let request = EngineCoreRequest::tts("uncertified physical policy");
+        let lane = super::super::BatchLaneKey {
+            execution_group: super::super::ExecutionGroupId::new(17),
+            model_instance: super::super::ModelInstanceId::new(18),
+            adapter_instance: super::super::AdapterInstanceId::new(19),
+            adapter_abi: super::super::AdapterAbiRevision::new(1),
+            capability_id: "test".to_string(),
+            stage_id: super::super::StageId::new(1),
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            compute_dtype: "f32".to_string(),
+            state_dtype: "f32".to_string(),
+            tensor_layout: "exact".to_string(),
+            quantization: "none".to_string(),
+            state_schema: "none".to_string(),
+            kernel_mode: "test".to_string(),
+            semantic_mode: "test".to_string(),
+            shape_bucket: "exact.1".to_string(),
+        };
+        let batch = PhysicalBatch {
+            batch_id: super::super::BatchId::new(20),
+            lane: lane.clone(),
+            mode: NativeBatchMode::None,
+            budget: super::super::BatchBudget::width_one(),
+            rows: vec![super::super::ReadyQuantum {
+                plan_id: 1,
+                session: SessionKey::new(request.id.clone(), 1),
+                lane,
+                work: super::super::WorkUnit::AtomicJob {
+                    kind: "test".to_string(),
+                },
+                cost: super::super::WorkCost::new(1, 1, 0),
+                managed_cache: None,
+            }],
+            materialized_tensor_elements: 1,
+            workspace: ResourceVector::zero(),
+        };
 
-        let model_instance = super::super::ModelInstanceId::new(1);
-        request.bind_model_instance(model_instance).unwrap();
-        let mut profile =
-            ExecutionProfile::fail_closed(BackendKind::Cpu, Some(variant), ExecutionMode::Atomic);
-        profile.max_batch_size = 2;
-        let stage = super::super::StageDescriptor::from_execution_profile(
-            super::super::StageId::new(1),
-            "tts.generate",
-            &profile,
-            NativeBatchMode::Static,
+        assert_eq!(
+            UnifiedExecutor::explicit_physical_launch_policy(&batch, &[&request]),
+            PhysicalLaunchPolicy::ExecutionGroupExclusive
         );
-        let stage_id = stage.id;
-        request
-            .bind_execution_adapter(super::super::ExecutionAdapterBinding {
-                execution_group_id: super::super::ExecutionGroupId::new(1),
-                model_instance_id: model_instance,
-                adapter_instance_id: super::super::AdapterInstanceId::new(1),
-                adapter_abi_revision: super::super::AdapterAbiRevision::new(1),
-                model_variant: variant,
-                capability_id: "tts".to_string(),
-                stages: Arc::from([stage]),
+        let after = super::super::metrics::engine_physical_execution_metrics_snapshot();
+        assert!(
+            after.fallbacks.uncertified_profile
+                >= before.fallbacks.uncertified_profile.saturating_add(1)
+        );
+    }
+
+    #[test]
+    fn test_run_blocking_propagates_panic_to_physical_boundary() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            NativeExecutor::run_blocking(|| -> Result<()> {
+                panic!("executor panic sentinel");
             })
-            .unwrap();
-        assert!(!static_qwen_tts_batch_eligible(&request, true, true));
-        request
-            .install_prepared_stage_cost(stage_id, super::super::WorkCost::new(1, 1, 0))
-            .unwrap();
-        assert!(static_qwen_tts_batch_eligible(&request, true, true));
-        assert!(!static_qwen_tts_batch_eligible(&request, true, false));
-        assert!(!static_qwen_tts_batch_eligible(&request, false, true));
+        }));
 
-        request.streaming = true;
-        assert!(!static_qwen_tts_batch_eligible(&request, true, true));
-        request.streaming = false;
-        request.reference_audio = Some("audio".to_string());
-        request.reference_text = Some("reference".to_string());
-        assert!(!static_qwen_tts_batch_eligible(&request, true, true));
-
-        let voice_design = EngineCoreRequest::tts("hello")
-            .with_model_variant(ModelVariant::Qwen3Tts12Hz17BVoiceDesign);
-        assert!(!static_qwen_tts_batch_eligible(&voice_design, true, true));
+        let payload = result.expect_err("model panic must cross the native boundary");
+        assert!(panic_payload_to_string(payload.as_ref()).contains("executor panic sentinel"));
     }
 
-    #[test]
-    fn exact_session_cleanup_releases_backend_cache_lease_once() {
-        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
-            let capacity = cache_resource_vector(backend, 4096);
-            let authority = Arc::new(ResourceAuthority::new(Arc::new(FixedCapacityProvider {
-                capacity,
-            })));
-            let lease = authority
-                .reserve(
-                    ReservationOwner::new(ReservationClass::Cache, "session:7"),
-                    cache_resource_vector(backend, 1024),
-                )
-                .expect("cache lease");
-            let executor = NativeExecutor::new(WorkerConfig::default());
-            let session = SessionKey::new("session".to_string(), 7);
-            executor
-                .cache_resource_leases
-                .lock()
-                .expect("cache lease map")
-                .insert(
-                    session.clone(),
-                    CacheResourceReservation {
-                        reserved_bytes: 1024,
-                        observed_blocks: 1,
-                        lease: Some(lease),
-                    },
-                );
-            assert_eq!(authority.snapshot().reservations, 1);
-
-            let stale = SessionKey::new("session".to_string(), 6);
-            let stale_report = executor.cleanup_session(&stale);
-            assert!(stale_report.confirmed);
-            assert_eq!(stale_report.released_sessions, 0);
-            assert_eq!(authority.snapshot().reservations, 1);
-
-            let report = executor.cleanup_session(&session);
-            assert!(report.confirmed);
-            assert_eq!(report.released_sessions, 1);
-            assert_eq!(authority.snapshot().reservations, 0);
-            assert_eq!(executor.cleanup_session(&session).released_sessions, 0);
-        }
-    }
-
-    #[test]
-    fn terminal_incremental_cache_stays_pending_until_exact_cleanup() {
-        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
-            let (executor, authority, provider, request, scheduled) =
-                materialized_cache_fixture(backend, "terminal-cache");
-            executor
-                .prepare_scheduled_cache(std::slice::from_ref(&scheduled))
-                .unwrap();
-
-            let observed = executor
-                .reconcile_scheduled_cache(
-                    &request,
-                    &scheduled,
-                    &ExecutorOutput::terminal(request.id.clone()),
-                )
-                .unwrap();
-            assert_eq!(observed, cache_observation(0));
-
-            // The model's terminal path has released its physical cache. The
-            // old lease still owns the same bytes as pending authorization, so
-            // another admission cannot spend that newly visible headroom.
-            provider.set_available(cache_resource_vector(backend, 100));
-            assert!(matches!(
-                authority.reserve(
-                    ReservationOwner::new(ReservationClass::Request, "terminal-racer"),
-                    cache_resource_vector(backend, 50),
-                ),
-                Err(Error::Overloaded(_))
-            ));
-
-            let report = executor.cleanup_session(&scheduled.session_key());
-            assert!(report.confirmed);
-            assert_eq!(authority.snapshot().reservations, 0);
-            let replacement = authority
-                .reserve(
-                    ReservationOwner::new(ReservationClass::Request, "terminal-replacement"),
-                    cache_resource_vector(backend, 50),
-                )
-                .unwrap();
-            drop(replacement);
-        }
-    }
-
-    #[test]
-    fn model_error_cache_cleanup_cannot_double_spend_materialized_release() {
-        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
-            let (executor, authority, provider, request, scheduled) =
-                materialized_cache_fixture(backend, "error-cache");
-            executor
-                .prepare_scheduled_cache(std::slice::from_ref(&scheduled))
-                .unwrap();
-
-            let observed = executor
-                .reconcile_scheduled_cache(
-                    &request,
-                    &scheduled,
-                    &ExecutorOutput::error(request.id.clone(), "model failed"),
-                )
-                .unwrap();
-            assert_eq!(observed, cache_observation(0));
-
-            provider.set_available(cache_resource_vector(backend, 100));
-            assert!(matches!(
-                authority.reserve(
-                    ReservationOwner::new(ReservationClass::Request, "error-racer"),
-                    cache_resource_vector(backend, 50),
-                ),
-                Err(Error::Overloaded(_))
-            ));
-
-            let report = executor.cleanup_request(&request.id);
-            assert!(report.confirmed);
-            assert_eq!(authority.snapshot().reservations, 0);
-        }
-    }
-
-    #[test]
-    fn cache_authorization_runs_once_per_exact_session_on_every_backend() {
-        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
-            let capacity = cache_resource_vector(backend, 4096);
-            let authority = Arc::new(ResourceAuthority::new(Arc::new(FixedCapacityProvider {
-                capacity,
-            })));
-            let mut config = WorkerConfig::default();
-            config.backend = backend;
-            let executor = NativeExecutor::new(config);
-            let session = SessionKey::new("session".to_string(), 7);
-            let authorizations = AtomicUsize::new(0);
-
-            executor
-                .reserve_exact_session_cache(&authority, &session, || {
-                    authorizations.fetch_add(1, Ordering::Relaxed);
-                    Ok(1024)
-                })
-                .unwrap();
-            executor
-                .reserve_exact_session_cache(&authority, &session, || {
-                    authorizations.fetch_add(1, Ordering::Relaxed);
-                    Err(Error::InferenceError(
-                        "existing exact session must not be reauthorized".to_string(),
-                    ))
-                })
-                .unwrap();
-
-            assert_eq!(authorizations.load(Ordering::Relaxed), 1);
-            assert_eq!(
-                authority.snapshot().reserved,
-                cache_resource_vector(backend, 1024)
-            );
-            assert_eq!(
-                executor
-                    .cache_resource_leases
-                    .lock()
-                    .unwrap()
-                    .get(&session)
-                    .unwrap()
-                    .reserved_bytes,
-                1024
-            );
-
-            let next_epoch = SessionKey::new("session".to_string(), 8);
-            executor
-                .reserve_exact_session_cache(&authority, &next_epoch, || {
-                    authorizations.fetch_add(1, Ordering::Relaxed);
-                    Ok(1024)
-                })
-                .unwrap();
-            assert_eq!(authorizations.load(Ordering::Relaxed), 2);
-        }
-    }
-
-    #[test]
-    fn cpu_and_metal_cache_authorization_is_advisory_while_cuda_is_guarded() {
-        for backend in [BackendKind::Cpu, BackendKind::Metal] {
-            let capacity = cache_resource_vector(backend, 8);
-            let authority = Arc::new(ResourceAuthority::new(Arc::new(FixedCapacityProvider {
-                capacity,
-            })));
-            let mut config = WorkerConfig::default();
-            config.backend = backend;
-            let executor = NativeExecutor::new(config);
-            let session = SessionKey::new(format!("{backend:?}"), 1);
-
-            executor
-                .reserve_exact_session_cache(&authority, &session, || Ok(16))
-                .expect("advisory unified-memory cache claim");
-            assert_eq!(
-                authority.snapshot().reserved,
-                cache_resource_vector(backend, 16)
-            );
-        }
-
-        let backend = BackendKind::Cuda;
-        let capacity = cache_resource_vector(backend, 8);
+    #[tokio::test]
+    async fn post_entry_panic_poisons_physical_runtime_and_releases_admission() {
         let authority = Arc::new(ResourceAuthority::new(Arc::new(FixedCapacityProvider {
-            capacity,
-        })));
-        let mut config = WorkerConfig::default();
-        config.backend = backend;
-        let executor = NativeExecutor::new(config);
-        let session = SessionKey::new("cuda".to_string(), 1);
-        assert!(matches!(
-            executor.reserve_exact_session_cache(&authority, &session, || Ok(16)),
-            Err(Error::Overloaded(_))
-        ));
-    }
-
-    #[test]
-    fn chat_cache_authorization_requires_private_exact_preparation() {
-        let executor = NativeExecutor::new(WorkerConfig::default());
-        let request =
-            EngineCoreRequest::chat(Vec::new()).with_model_variant(ModelVariant::Qwen306B);
-
-        let error = executor
-            .authorized_session_cache_bytes(&request)
-            .expect_err("public prompt fields must not authorize physical cache");
-        assert!(error
-            .to_string()
-            .contains("missing exact model prompt preparation"));
-    }
-
-    #[test]
-    fn model_owned_cache_observation_is_required() {
-        let scheduled = ScheduledRequest {
-            plan_id: 9,
-            request_id: "cache-contract".to_string(),
-            sequence_id: 42,
-            num_tokens: 1,
-            is_prefill: false,
-            block_ids: Vec::new(),
-            num_computed_tokens: 1,
-            work: crate::engine::WorkUnit::SequenceStep {
-                phase: crate::engine::SequencePhase::Decode,
-                input: crate::engine::InputRange { start: 0, end: 1 },
-                max_output_steps: 1,
+            capacity: ResourceVector {
+                host_bytes: ResourceAmount::Known(64),
+                ..ResourceVector::zero()
             },
+        })));
+        let admission = PhysicalExecutionAdmission::standalone(1);
+        let executor = UnifiedExecutor::new_for_test_with_physical_context(
+            Box::new(PanickingPhysicalExecutor),
+            BackendKind::Cpu,
+            authority.clone(),
+            admission.clone(),
+        );
+        let mut request = EngineCoreRequest::tts("panic containment");
+        request.id = "panic-containment".to_string();
+        let lane = super::super::BatchLaneKey {
+            execution_group: super::super::ExecutionGroupId::new(27),
+            model_instance: super::super::ModelInstanceId::new(28),
+            adapter_instance: super::super::AdapterInstanceId::new(29),
+            adapter_abi: super::super::AdapterAbiRevision::new(1),
+            capability_id: "panic-test".to_string(),
+            stage_id: super::super::StageId::new(1),
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            compute_dtype: "f32".to_string(),
+            state_dtype: "f32".to_string(),
+            tensor_layout: "exact".to_string(),
+            quantization: "none".to_string(),
+            state_schema: "none".to_string(),
+            kernel_mode: "test".to_string(),
+            semantic_mode: "test".to_string(),
+            shape_bucket: "exact.1".to_string(),
+        };
+        let work = super::super::WorkUnit::AtomicJob {
+            kind: "panic-test".to_string(),
+        };
+        let batch = PhysicalBatch {
+            batch_id: super::super::BatchId::new(30),
+            lane: lane.clone(),
+            mode: NativeBatchMode::None,
+            budget: super::super::BatchBudget::width_one(),
+            rows: vec![super::super::ReadyQuantum {
+                plan_id: 1,
+                session: SessionKey::new(request.id.clone(), 1),
+                lane: lane.clone(),
+                work: work.clone(),
+                cost: super::super::WorkCost::new(1, 1, 0),
+                managed_cache: None,
+            }],
+            materialized_tensor_elements: 1,
+            workspace: ResourceVector::zero(),
+        };
+        let scheduled = ScheduledRequest {
+            plan_id: 1,
+            request_id: request.id.clone(),
+            sequence_id: 1,
+            num_tokens: 1,
+            is_prefill: true,
+            num_computed_tokens: 0,
+            work,
         };
 
+        let failure = executor
+            .execute_physical_batch(&batch, &[&request], &[scheduled])
+            .await
+            .expect_err("physical panic must become a typed dispatch failure");
+        assert_eq!(failure.provenance.dispatch_state, DispatchState::Started);
         assert_eq!(
-            require_known_cache_bytes(Some(4_096), &scheduled).unwrap(),
-            4_096
+            failure.provenance.failure_origin,
+            Some(FailureOrigin::Panic)
         );
-        let error = require_known_cache_bytes(None, &scheduled).unwrap_err();
-        assert!(error.to_string().contains("cache-contract:42"));
-
+        assert_eq!(admission.active(), 0);
         assert_eq!(
-            cache_observation_after_release(CacheReleaseReport::confirmed(1)).kv_bytes,
-            ResourceAmount::Known(0)
+            admission.poison_reason().as_deref(),
+            Some("physical model execution panicked after entry")
         );
         assert_eq!(
-            cache_observation_after_release(CacheReleaseReport::unconfirmed()).kv_bytes,
-            ResourceAmount::Unknown
+            authority.poison_reason().as_deref(),
+            Some("physical model execution panicked after entry")
         );
-    }
-
-    #[test]
-    fn test_run_blocking_converts_panic_to_error() {
-        let result = NativeExecutor::run_blocking(|| -> Result<()> {
-            panic!("executor panic sentinel");
-        });
-
-        let Err(Error::InferenceError(message)) = result else {
-            panic!("expected inference error from panic");
-        };
-        assert!(message.contains("executor panic sentinel"));
+        assert!(!executor.is_ready().await);
+        assert!(matches!(
+            admission
+                .acquire_dispatch(
+                    lane.execution_group,
+                    lane.model_instance,
+                    PhysicalLaunchPolicy::ExecutionGroupExclusive,
+                    NativeBatchMode::None,
+                    1,
+                    None,
+                )
+                .await,
+            Err(Error::Overloaded(message)) if message.contains("poisoned")
+        ));
     }
 
     #[test]
@@ -2320,11 +5955,194 @@ mod tests {
     }
 
     #[test]
+    fn resumable_prefill_classification_is_opt_in_and_fail_closed() {
+        let mut request = EngineCoreRequest::chat(vec![crate::models::shared::chat::ChatMessage {
+            role: crate::models::shared::chat::ChatRole::User,
+            content: "chunk me".to_string(),
+        }]);
+        request.model_variant = Some(ModelVariant::Qwen3827BFp8);
+        request.streaming = true;
+
+        let default_executor = NativeExecutor::new(WorkerConfig::default());
+        assert_eq!(
+            default_executor
+                .execution_profile(&request)
+                .unwrap()
+                .prefill,
+            PrefillMode::Full
+        );
+
+        let chunking_executor = NativeExecutor::new(WorkerConfig {
+            enable_chunked_prefill: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            chunking_executor
+                .execution_profile(&request)
+                .unwrap()
+                .prefill,
+            PrefillMode::Full
+        );
+
+        // Sibling hybrid without a resumable prefill path stays full.
+        request.model_variant = Some(ModelVariant::Qwen3508BGguf);
+        assert_eq!(
+            chunking_executor
+                .execution_profile(&request)
+                .unwrap()
+                .prefill,
+            PrefillMode::Full
+        );
+    }
+
+    #[test]
+    fn resumable_prefill_mode_requires_exact_positive_model_proof() {
+        assert_eq!(
+            resolved_resumable_prefill_mode(true, Some(true)),
+            PrefillMode::Incremental
+        );
+        assert_eq!(
+            resolved_resumable_prefill_mode(false, Some(true)),
+            PrefillMode::Full
+        );
+        assert_eq!(
+            resolved_resumable_prefill_mode(true, Some(false)),
+            PrefillMode::Full
+        );
+        assert_eq!(
+            resolved_resumable_prefill_mode(true, None),
+            PrefillMode::Full
+        );
+    }
+
+    #[test]
+    fn qwen_asr_raw_profile_uses_the_exact_prepared_execution_route() {
+        let executor = NativeExecutor::new(WorkerConfig {
+            backend: BackendKind::Cpu,
+            request_parallelism: 4,
+            enable_chunked_prefill: true,
+            ..Default::default()
+        });
+        let mut normal = EngineCoreRequest::asr_bytes(vec![1, 2, 3]);
+        normal.model_variant = Some(ModelVariant::Qwen3Asr06BGguf);
+        normal
+            .install_prepared_asr_audio(ModelVariant::Qwen3Asr06BGguf, vec![0.0; 160], 16_000)
+            .unwrap();
+        normal
+            .install_prepared_sequence_input_tokens(32, 4096)
+            .unwrap();
+        let normal_profile = executor.execution_profile(&normal).unwrap();
+        assert_eq!(normal_profile.mode, ExecutionMode::Sequence);
+        assert!(normal_profile.incremental_decode);
+
+        let mut long = EngineCoreRequest::asr_bytes(vec![1, 2, 3]);
+        long.model_variant = Some(ModelVariant::Qwen3Asr06BGguf);
+        long.install_prepared_asr_audio(ModelVariant::Qwen3Asr06BGguf, vec![0.0; 160], 16_000)
+            .unwrap();
+        long.install_prepared_asr_long_form_atomic().unwrap();
+        let long_profile = executor.execution_profile(&long).unwrap();
+        assert_eq!(long_profile.mode, ExecutionMode::Atomic);
+        assert_eq!(long_profile.prefill, PrefillMode::None);
+        assert!(!long_profile.incremental_decode);
+        assert_eq!(long_profile.cache_mode, CacheMode::None);
+        assert_eq!(long_profile.decode_batch, NativeBatchMode::None);
+        assert_eq!(long_profile.concurrency, ConcurrencyClass::Exclusive);
+        assert_eq!(long_profile.max_batch_size, 1);
+    }
+
+    #[test]
+    fn lfm25_audio_asr_raw_profile_uses_the_exact_prepared_execution_route() {
+        let executor = NativeExecutor::new(WorkerConfig {
+            backend: BackendKind::Cpu,
+            request_parallelism: 4,
+            enable_chunked_prefill: true,
+            ..Default::default()
+        });
+        let variant = ModelVariant::Lfm25Audio15BGguf;
+        let mut normal = EngineCoreRequest::asr_bytes(vec![1, 2, 3]);
+        normal.model_variant = Some(variant);
+        normal
+            .install_prepared_asr_audio(variant, vec![0.0; 160], 16_000)
+            .unwrap();
+        normal
+            .install_prepared_sequence_input_tokens(32, 4096)
+            .unwrap();
+        let normal_profile = executor.execution_profile(&normal).unwrap();
+        assert_eq!(normal_profile.mode, ExecutionMode::Sequence);
+        assert!(normal_profile.incremental_decode);
+
+        let mut long = EngineCoreRequest::asr_bytes(vec![1, 2, 3]);
+        long.model_variant = Some(variant);
+        long.install_prepared_asr_audio(variant, vec![0.0; 160], 16_000)
+            .unwrap();
+        long.install_prepared_asr_long_form_atomic().unwrap();
+        let long_profile = executor.execution_profile(&long).unwrap();
+        assert_eq!(long_profile.mode, ExecutionMode::Atomic);
+        assert_eq!(long_profile.prefill, PrefillMode::None);
+        assert!(!long_profile.incremental_decode);
+        assert_eq!(long_profile.cache_mode, CacheMode::None);
+        assert_eq!(long_profile.decode_batch, NativeBatchMode::None);
+        assert_eq!(long_profile.concurrency, ConcurrencyClass::Exclusive);
+        assert_eq!(long_profile.max_batch_size, 1);
+    }
+
+    #[test]
+    fn lfm25_audio_tts_raw_profile_uses_the_sequence_execution_route() {
+        let executor = NativeExecutor::new(WorkerConfig {
+            backend: BackendKind::Cpu,
+            request_parallelism: 4,
+            enable_chunked_prefill: true,
+            ..Default::default()
+        });
+        let mut request = EngineCoreRequest::tts("The quick brown fox jumps over the lazy dog");
+        request.model_variant = Some(ModelVariant::Lfm25Audio15BGguf);
+
+        let profile = executor.execution_profile(&request).unwrap();
+
+        assert_eq!(profile.mode, ExecutionMode::Sequence);
+        assert!(profile.incremental_decode);
+        assert_eq!(profile.prefill, PrefillMode::Full);
+    }
+
+    #[test]
+    fn lfm25_audio_tts_implements_static_prefill_and_continuous_decode() {
+        assert_eq!(
+            tts_native_batch_implementation_support(false, false, true),
+            (true, true)
+        );
+    }
+
+    #[test]
+    fn retained_whisper_route_stays_sequence_without_an_executor_local_model() {
+        let executor = NativeExecutor::new(WorkerConfig {
+            backend: BackendKind::Cpu,
+            request_parallelism: 4,
+            enable_chunked_prefill: true,
+            ..Default::default()
+        });
+        let variant = ModelVariant::WhisperLargeV3Turbo;
+        let mut request = EngineCoreRequest::asr_bytes(vec![1, 2, 3]);
+        request.model_variant = Some(variant);
+        request
+            .install_prepared_asr_audio(variant, vec![0.0; 160], 16_000)
+            .unwrap();
+        request
+            .install_prepared_sequence_input_tokens(32, 4096)
+            .unwrap();
+
+        let profile = executor.execution_profile(&request).unwrap();
+        assert_eq!(profile.mode, ExecutionMode::Sequence);
+        assert!(profile.incremental_decode);
+    }
+
+    #[test]
     fn unloaded_models_cannot_claim_native_batch_capability() {
         for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
-            let mut config = WorkerConfig::default();
-            config.backend = backend;
-            config.request_parallelism = 4;
+            let config = WorkerConfig {
+                backend,
+                request_parallelism: 4,
+                ..Default::default()
+            };
             let executor = NativeExecutor::new(config);
             let mut request = EngineCoreRequest::tts("batch me");
             request.model_variant = Some(ModelVariant::Qwen3Tts12Hz06BCustomVoice);

@@ -1,0 +1,21 @@
+# Exact-SHA CUDA continuous-batching certification workload for every chat
+# runtime family. Models must be preprovisioned; the strict runner verifies
+# observed CUDA residency and run-local multi-row tensor batches.
+
+[[benchmarks]]
+name = "chat-continuous-c8"
+command = "chat"
+iterations = 8
+concurrent = 8
+warmup = true
+prompt = "In one sentence, explain why continuous batching improves inference responsiveness."
+max_tokens = 128
+
+[benchmarks.matrix]
+model = [
+  "Qwen3-0.6B-GGUF",
+  "Qwen3.5-0.8B",
+  "Qwen3.8-27B-FP8",
+  "LFM2.5-1.2B-Instruct-GGUF",
+  "Gemma-3-1b-it",
+]

@@ -4,28 +4,53 @@
 //! (used for audio-conditioned ASR).
 
 use candle_core::quantized::{ggml_file, GgmlDType, QMatMul, QTensor};
-use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
-use candle_nn::{kv_cache::Cache, ops, rotary_emb, Embedding, Linear, RmsNorm, VarBuilder};
+#[cfg(test)]
+use candle_core::D;
+use candle_core::{DType, Device, IndexOp, Module, Tensor};
+#[cfg(test)]
+use candle_nn::kv_cache::Cache;
+use candle_nn::{ops, rotary_emb, Embedding, Linear, RmsNorm, VarBuilder};
 use candle_transformers::utils::repeat_kv as candle_repeat_kv;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
+#[cfg(test)]
+use crate::backends::kv::KvArena;
+use crate::backends::kv::{
+    submit_ordered_after_write, KvSlotMap, KvWriteArgs, KvWriteCompletionCollector,
+    PagedKvDecodeArgs,
+};
 use crate::error::{Error, Result};
 use crate::kernels::{try_fused_qk_rms_norm, try_fused_silu_mul_with_status};
+use crate::kv::v2::{
+    AttentionMask, AttentionPattern, CheckpointPolicy, InferenceStateContract, KeyEncoding,
+    PageSizeConstraint, PagedAttentionDomainSpec, PagedAttentionLayerSpec, PlacementPolicy,
+    PrefixPolicy, StateClock, StateDType, StateDomainHeader, StateDomainId, StateDomainSpec,
+    StateGroupId, StateGroupSpec, StateScope, CURRENT_INFERENCE_STATE_ABI,
+};
+use crate::kv::KvDecodeBatchMetadata;
+#[cfg(test)]
+use crate::kv::{CacheBlockRef, KvLayerBinding};
+#[cfg(test)]
 use crate::models::shared::attention::batched::{
     batched_scaled_dot_product_attention, BatchedAttentionConfig, BatchedAttentionInput,
 };
 use crate::models::shared::attention::flash::try_fused_self_attention;
+use crate::models::shared::attention::geometry::AttentionGeometry;
+use crate::models::shared::attention::gqa::{compact_gqa_sdpa_bhsd, CompactGqaMask};
+#[cfg(test)]
 use crate::models::shared::attention::paged::{
     append_to_pages, default_kv_page_size, default_kv_quantization, materialize_pages,
     paged_decode_attention, KvCacheQuantization, KvPage,
 };
+use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
+#[cfg(test)]
 use crate::models::shared::memory::accounting::TensorStorageAccounting;
-use crate::models::shared::telemetry::{
-    record_decode_attention_path, record_rope_kernel, record_rope_manual, DecodeAttentionPath,
-};
+#[cfg(test)]
+use crate::models::shared::telemetry::{record_decode_attention_path, DecodeAttentionPath};
+use crate::models::shared::telemetry::{record_rope_kernel, record_rope_manual};
 use crate::models::shared::weights::gguf::GgufLoader;
 use crate::models::shared::weights::mlx;
 
@@ -51,6 +76,8 @@ pub struct Qwen3Config {
     pub num_hidden_layers: usize,
     pub num_key_value_heads: usize,
     #[serde(default)]
+    pub max_position_embeddings: Option<usize>,
+    #[serde(default)]
     pub head_dim: Option<usize>,
     pub rms_norm_eps: f64,
     pub rope_theta: f64,
@@ -72,13 +99,53 @@ pub struct Qwen3Config {
 }
 
 impl Qwen3Config {
+    pub(crate) fn attention_geometry(&self) -> Result<AttentionGeometry> {
+        if !self.rope_theta.is_finite() || self.rope_theta <= 0.0 {
+            return Err(Error::ModelLoadError(format!(
+                "Qwen3 attention geometry is invalid: rope_theta must be finite and positive, got {}",
+                self.rope_theta
+            )));
+        }
+        let geometry = AttentionGeometry::from_hidden_size(
+            "Qwen3",
+            self.hidden_size,
+            self.num_attention_heads,
+            self.num_key_value_heads,
+            self.head_dim,
+        )?;
+        geometry.validate_rotary_dim("Qwen3", geometry.key_head_dim())?;
+        Ok(geometry)
+    }
+
+    /// Compatibility accessor for callers that only inspect a parsed config.
+    /// Model construction uses [`Self::attention_geometry`] and returns a typed
+    /// error for invalid geometry rather than relying on this sentinel value.
     pub fn head_dim(&self) -> usize {
-        self.head_dim
-            .unwrap_or(self.hidden_size / self.num_attention_heads)
+        match self.head_dim {
+            Some(head_dim) => head_dim,
+            None if self.num_attention_heads != 0
+                && self.hidden_size.is_multiple_of(self.num_attention_heads) =>
+            {
+                self.hidden_size / self.num_attention_heads
+            }
+            None => 0,
+        }
     }
 
     pub fn kv_groups(&self) -> usize {
-        self.num_attention_heads / self.num_key_value_heads
+        if self.num_key_value_heads != 0
+            && self
+                .num_attention_heads
+                .is_multiple_of(self.num_key_value_heads)
+        {
+            self.num_attention_heads / self.num_key_value_heads
+        } else {
+            0
+        }
+    }
+
+    pub fn context_length(&self) -> Option<usize> {
+        self.max_position_embeddings.filter(|length| *length > 0)
     }
 
     pub fn sliding_window(&self) -> Option<usize> {
@@ -89,6 +156,95 @@ impl Qwen3Config {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct Qwen3DecoderCacheGeometry {
+    pub domain: StateDomainId,
+    pub clock: StateClock,
+    pub num_layers: usize,
+    pub num_query_heads: usize,
+    pub num_kv_heads: usize,
+    pub key_head_dim: usize,
+    pub value_head_dim: usize,
+    pub sliding_window: Option<usize>,
+    pub storage_dtype: DType,
+    pub preferred_page_tokens: usize,
+    pub prefix: PrefixPolicy,
+}
+
+pub(crate) fn qwen3_decoder_cache_domain(
+    geometry: Qwen3DecoderCacheGeometry,
+) -> Result<PagedAttentionDomainSpec> {
+    let num_layers = u32::try_from(geometry.num_layers)
+        .map_err(|_| Error::InvalidInput("Qwen3 layer count exceeds u32".into()))?;
+    let num_query_heads = u32::try_from(geometry.num_query_heads)
+        .map_err(|_| Error::InvalidInput("Qwen3 query head count exceeds u32".into()))?;
+    let num_kv_heads = u32::try_from(geometry.num_kv_heads)
+        .map_err(|_| Error::InvalidInput("Qwen3 KV head count exceeds u32".into()))?;
+    let key_head_dim = u32::try_from(geometry.key_head_dim)
+        .map_err(|_| Error::InvalidInput("Qwen3 key head dimension exceeds u32".into()))?;
+    let value_head_dim = u32::try_from(geometry.value_head_dim)
+        .map_err(|_| Error::InvalidInput("Qwen3 value head dimension exceeds u32".into()))?;
+    let preferred = u32::try_from(geometry.preferred_page_tokens.max(1))
+        .map_err(|_| Error::InvalidInput("Qwen3 page size exceeds u32".into()))?;
+    let max_page_tokens = preferred.max(256);
+    let attention = match geometry.sliding_window {
+        Some(window_tokens) => AttentionPattern::SlidingWindow {
+            window_tokens: u32::try_from(window_tokens)
+                .map_err(|_| Error::InvalidInput("Qwen3 sliding window exceeds u32".into()))?,
+        },
+        None => AttentionPattern::Full,
+    };
+    let storage_dtype = match geometry.storage_dtype {
+        DType::F32 => StateDType::F32,
+        DType::F16 => StateDType::F16,
+        DType::BF16 => StateDType::Bf16,
+        dtype => {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3 managed KV does not support {dtype:?} storage"
+            )))
+        }
+    };
+
+    let layers = (0..num_layers)
+        .map(|model_layer| PagedAttentionLayerSpec {
+            model_layer,
+            query_heads: num_query_heads,
+            kv_heads: num_kv_heads,
+            key_head_dim,
+            value_head_dim,
+            pattern: attention,
+            mask: AttentionMask::Causal,
+            key_encoding: KeyEncoding::Rotary {
+                rotary_dim: key_head_dim,
+            },
+            attention_logit_softcap: None,
+        })
+        .collect();
+    Ok(PagedAttentionDomainSpec {
+        header: StateDomainHeader {
+            id: geometry.domain,
+            scope: StateScope::Retained,
+            clock: geometry.clock,
+            placement: PlacementPolicy::BackendLocalWithHostOffload,
+            checkpoint: if matches!(geometry.prefix, PrefixPolicy::Disabled) {
+                CheckpointPolicy::Transactional
+            } else {
+                CheckpointPolicy::CopyOnWrite
+            },
+            prefix: geometry.prefix,
+        },
+        layers,
+        page_size: PageSizeConstraint {
+            min_tokens: 1,
+            preferred_tokens: preferred,
+            max_tokens: max_page_tokens,
+            multiple_of: 1,
+        },
+        accepted_dtypes: vec![storage_dtype],
+    })
+}
+
+#[cfg(test)]
 pub struct Qwen3Cache {
     k_pages: Vec<Vec<KvPage>>,
     v_pages: Vec<Vec<KvPage>>,
@@ -103,6 +259,7 @@ pub struct Qwen3Cache {
     quantization: KvCacheQuantization,
 }
 
+#[cfg(test)]
 struct Qwen3RopeCacheEntry {
     seq_len: usize,
     start_pos: usize,
@@ -114,6 +271,7 @@ struct Qwen3RopeCacheEntry {
     sin_half: Tensor,
 }
 
+#[cfg(test)]
 impl Qwen3Cache {
     pub fn paged_storage_bytes(&self) -> usize {
         self.k_pages
@@ -508,6 +666,7 @@ impl Qwen3Cache {
     }
 }
 
+#[cfg(test)]
 fn dense_cache_initial_capacity(
     append_tokens: usize,
     page_size: usize,
@@ -525,6 +684,7 @@ fn dense_cache_initial_capacity(
         .min(dense_decode_max_tokens.max(1))
 }
 
+#[cfg(test)]
 pub(crate) fn qwen3_dense_decode_max_tokens(
     device: &Device,
     page_size: usize,
@@ -541,6 +701,7 @@ pub(crate) fn qwen3_dense_decode_max_tokens(
         .saturating_mul(qwen3_dense_decode_max_pages())
 }
 
+#[cfg(test)]
 fn qwen3_use_dense_decode_attention_feature(device: &Device) -> bool {
     let override_enabled = std::env::var("IZWI_QWEN3_DENSE_DECODE_ATTENTION")
         .ok()
@@ -548,6 +709,7 @@ fn qwen3_use_dense_decode_attention_feature(device: &Device) -> bool {
     qwen3_use_dense_decode_attention_policy(device.is_metal(), device.is_cuda(), override_enabled)
 }
 
+#[cfg(test)]
 fn qwen3_use_dense_decode_attention_policy(
     is_metal: bool,
     is_cuda: bool,
@@ -559,6 +721,7 @@ fn qwen3_use_dense_decode_attention_policy(
     override_enabled.unwrap_or(true)
 }
 
+#[cfg(test)]
 fn qwen3_dense_decode_max_pages() -> usize {
     std::env::var("IZWI_QWEN3_DENSE_DECODE_MAX_PAGES")
         .ok()
@@ -590,11 +753,15 @@ fn qwen3_qk_rms_norm_fusion_enabled(device: &Device) -> bool {
     let override_enabled = std::env::var("IZWI_QWEN3_QK_RMS_NORM_FUSION")
         .ok()
         .and_then(|raw| parse_env_bool(&raw));
-    qwen3_qk_rms_norm_fusion_policy(device.is_metal(), override_enabled)
+    qwen3_qk_rms_norm_fusion_policy(device.is_metal(), device.is_cuda(), override_enabled)
 }
 
-fn qwen3_qk_rms_norm_fusion_policy(is_metal: bool, override_enabled: Option<bool>) -> bool {
-    override_enabled.unwrap_or(is_metal)
+fn qwen3_qk_rms_norm_fusion_policy(
+    is_metal: bool,
+    is_cuda: bool,
+    override_enabled: Option<bool>,
+) -> bool {
+    override_enabled.unwrap_or(is_metal || is_cuda)
 }
 
 fn qwen3_quantized_projection_grouping_enabled(device: &Device, cfg: &Qwen3Config) -> bool {
@@ -758,16 +925,20 @@ impl Qwen3Projection {
     }
 
     fn quantized(loader: &GgufLoader, device: &Device, name: &str) -> Result<Self> {
-        let weights = Arc::new(loader.load_qtensor(name, device)?);
+        let resolved = qwen3_gguf_tensor_name(loader, name).unwrap_or_else(|| name.to_string());
+        let weights = Arc::new(loader.load_qtensor(&resolved, device)?);
         QMatMul::from_arc(weights)
             .map(Self::Quantized)
             .map_err(Error::from)
     }
 
     fn packed_quantized(loader: &GgufLoader, device: &Device, names: &[&str]) -> Result<Self> {
-        packed_quantized_qmatmul(loader, device, names)
-            .map(Self::Quantized)
-            .map_err(Error::from)
+        let resolved = names
+            .iter()
+            .map(|name| qwen3_gguf_tensor_name(loader, name).unwrap_or_else(|| (*name).to_string()))
+            .collect::<Vec<_>>();
+        let resolved = resolved.iter().map(String::as_str).collect::<Vec<_>>();
+        packed_quantized_qmatmul(loader, device, &resolved).map(Self::Quantized)
     }
 
     fn tied_dense(weight: Tensor) -> Self {
@@ -1053,10 +1224,10 @@ impl Qwen3FusedQuantizedQkvProjection {
         device: &Device,
         prefix: &str,
     ) -> Result<Self> {
-        let head_dim = cfg.head_dim();
-        let q_out = cfg.num_attention_heads * head_dim;
-        let k_out = cfg.num_key_value_heads * head_dim;
-        let v_out = cfg.num_key_value_heads * head_dim;
+        let geometry = cfg.attention_geometry()?;
+        let q_out = geometry.query_width();
+        let k_out = geometry.key_width();
+        let v_out = geometry.value_width();
         let names = [
             format!("{prefix}.q_proj.weight"),
             format!("{prefix}.k_proj.weight"),
@@ -1339,11 +1510,47 @@ fn load_optional_rms_norm_from_gguf(
     name: &str,
     eps: f64,
 ) -> Result<Option<RmsNorm>> {
-    if !loader.has_tensor(name) {
+    let Some(name) = qwen3_gguf_tensor_name(loader, name) else {
         return Ok(None);
-    }
-    let weight = loader.load_tensor(name, dtype, device)?;
+    };
+    let weight = loader.load_tensor(&name, dtype, device)?;
     Ok(Some(RmsNorm::new(weight, eps)))
+}
+
+fn qwen3_gguf_tensor_name(loader: &GgufLoader, logical_name: &str) -> Option<String> {
+    if loader.has_tensor(logical_name) {
+        return Some(logical_name.to_string());
+    }
+
+    let canonical = qwen3_canonical_gguf_tensor_name(logical_name)?;
+    loader.has_tensor(&canonical).then_some(canonical)
+}
+
+fn qwen3_canonical_gguf_tensor_name(logical_name: &str) -> Option<String> {
+    match logical_name {
+        "model.embed_tokens.weight" => Some("token_embd.weight".to_string()),
+        "model.norm.weight" => Some("output_norm.weight".to_string()),
+        "lm_head.weight" => Some("output.weight".to_string()),
+        _ => {
+            let layer = logical_name.strip_prefix("model.layers.")?;
+            let (layer_index, suffix) = layer.split_once('.')?;
+            let suffix = match suffix {
+                "input_layernorm.weight" => "attn_norm.weight",
+                "post_attention_layernorm.weight" => "ffn_norm.weight",
+                "self_attn.q_proj.weight" => "attn_q.weight",
+                "self_attn.k_proj.weight" => "attn_k.weight",
+                "self_attn.v_proj.weight" => "attn_v.weight",
+                "self_attn.o_proj.weight" => "attn_output.weight",
+                "self_attn.q_norm.weight" => "attn_q_norm.weight",
+                "self_attn.k_norm.weight" => "attn_k_norm.weight",
+                "mlp.gate_proj.weight" => "ffn_gate.weight",
+                "mlp.up_proj.weight" => "ffn_up.weight",
+                "mlp.down_proj.weight" => "ffn_down.weight",
+                _ => return None,
+            };
+            Some(format!("blk.{layer_index}.{suffix}"))
+        }
+    }
 }
 
 fn qk_norm_weight(q_norm: &Option<RmsNorm>, k_norm: &Option<RmsNorm>) -> Result<Option<Tensor>> {
@@ -1374,27 +1581,16 @@ struct Qwen3Attention {
 
 impl Qwen3Attention {
     fn load(cfg: &Qwen3Config, vb: VarBuilder) -> Result<Self> {
-        let head_dim = cfg.head_dim();
-        let q_proj = Qwen3Projection::dense(
-            cfg.hidden_size,
-            cfg.num_attention_heads * head_dim,
-            vb.pp("q_proj"),
-        )?;
-        let k_proj = Qwen3Projection::dense(
-            cfg.hidden_size,
-            cfg.num_key_value_heads * head_dim,
-            vb.pp("k_proj"),
-        )?;
-        let v_proj = Qwen3Projection::dense(
-            cfg.hidden_size,
-            cfg.num_key_value_heads * head_dim,
-            vb.pp("v_proj"),
-        )?;
-        let o_proj = Qwen3Projection::dense(
-            cfg.num_attention_heads * head_dim,
-            cfg.hidden_size,
-            vb.pp("o_proj"),
-        )?;
+        let geometry = cfg.attention_geometry()?;
+        let head_dim = geometry.key_head_dim();
+        let q_proj =
+            Qwen3Projection::dense(cfg.hidden_size, geometry.query_width(), vb.pp("q_proj"))?;
+        let k_proj =
+            Qwen3Projection::dense(cfg.hidden_size, geometry.key_width(), vb.pp("k_proj"))?;
+        let v_proj =
+            Qwen3Projection::dense(cfg.hidden_size, geometry.value_width(), vb.pp("v_proj"))?;
+        let o_proj =
+            Qwen3Projection::dense(geometry.query_width(), cfg.hidden_size, vb.pp("o_proj"))?;
         let qkv_proj = Qwen3QkvProjection::new_dense(q_proj, k_proj, v_proj, vb.device())?;
 
         let q_norm = candle_nn::rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("q_norm")).ok();
@@ -1433,7 +1629,7 @@ impl Qwen3Attention {
         dtype: DType,
         prefix: &str,
     ) -> Result<Self> {
-        let head_dim = cfg.head_dim();
+        let head_dim = cfg.attention_geometry()?.key_head_dim();
         let qkv_proj = if qwen3_quantized_projection_grouping_enabled(device, cfg) {
             Qwen3QkvProjection::new_quantized_grouped(loader, cfg, device, prefix)?
         } else {
@@ -1534,7 +1730,6 @@ impl Qwen3Attention {
         k: Tensor,
         start_pos: usize,
         position_ids: Option<&Tensor>,
-        cache: Option<&mut Qwen3Cache>,
     ) -> Result<(Tensor, Tensor)> {
         let seq_len = q.dim(1)?;
         if k.dim(1)? != seq_len {
@@ -1567,17 +1762,6 @@ impl Qwen3Attention {
                     &self.rope_inv_freqs,
                 )?
             }
-        } else if let Some(cache) = cache {
-            cache.cached_rope_pair(
-                seq_len,
-                start_pos,
-                self.head_dim,
-                q.device(),
-                q.dtype(),
-                self.use_mrope,
-                self.mrope_section.as_deref().unwrap_or(&[]),
-                &self.rope_inv_freqs,
-            )?
         } else if self.use_mrope {
             let mut data = Vec::with_capacity(3 * seq_len);
             let base = start_pos as i64;
@@ -1628,18 +1812,72 @@ impl Qwen3Attention {
         if !self.rope_kernel_enabled {
             return false;
         }
-        if self.head_dim == 0 || self.head_dim % 2 != 0 {
+        if self.head_dim == 0 || !self.head_dim.is_multiple_of(2) {
             return false;
         }
         matches!(dtype, DType::F16 | DType::BF16 | DType::F32)
     }
 
+    fn forward_stateless(
+        &self,
+        x: &Tensor,
+        start_pos: usize,
+        position_ids: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let batch = x.dim(0)?;
+        let sequence = x.dim(1)?;
+        let (query, key, value) = self.qkv_proj.forward(x)?;
+        let query = query.reshape((batch, sequence, self.num_heads, self.head_dim))?;
+        let key = key.reshape((batch, sequence, self.num_kv_heads, self.head_dim))?;
+        let value = value.reshape((batch, sequence, self.num_kv_heads, self.head_dim))?;
+        let (query, key) = self.apply_qk_norm_pair(query, key, sequence)?;
+        let (query, key) = self.apply_rope_pair(query, key, start_pos, position_ids)?;
+
+        let query = query.transpose(1, 2)?;
+        let key_heads = key.transpose(1, 2)?;
+        let value_heads = value.transpose(1, 2)?;
+        if start_pos == 0 {
+            if let Some(output) = try_fused_self_attention(
+                &query,
+                &key_heads,
+                &value_heads,
+                None,
+                self.head_dim,
+                true,
+            )? {
+                return self
+                    .o_proj
+                    .forward(&output.transpose(1, 2)?.reshape((
+                        batch,
+                        sequence,
+                        self.num_heads * self.head_dim,
+                    ))?)
+                    .map_err(Error::from);
+            }
+        }
+
+        let mask = (sequence > 1)
+            .then(|| causal_mask(sequence, sequence, start_pos, query.device(), query.dtype()))
+            .transpose()?;
+        let output = compact_gqa_sdpa_bhsd(
+            &query,
+            &key_heads,
+            &value_heads,
+            mask.as_ref().map(CompactGqaMask::Additive),
+            1.0 / (self.head_dim as f64).sqrt(),
+        )?
+        .transpose(1, 2)?
+        .reshape((batch, sequence, self.num_heads * self.head_dim))?;
+        self.o_proj.forward(&output).map_err(Error::from)
+    }
+
+    #[cfg(test)]
     fn forward(
         &self,
         x: &Tensor,
         start_pos: usize,
         position_ids: Option<&Tensor>,
-        mut cache: Option<&mut Qwen3Cache>,
+        cache: Option<&mut Qwen3Cache>,
         layer_idx: usize,
     ) -> Result<Tensor> {
         let bsz = x.dim(0)?;
@@ -1653,7 +1891,7 @@ impl Qwen3Attention {
 
         (q, k) = self.apply_qk_norm_pair(q, k, seq_len)?;
 
-        (q, k) = self.apply_rope_pair(q, k, start_pos, position_ids, cache.as_deref_mut())?;
+        (q, k) = self.apply_rope_pair(q, k, start_pos, position_ids)?;
 
         let (k, v) = if let Some(cache) = cache {
             cache.append(layer_idx, k.clone(), v.clone())?;
@@ -1783,6 +2021,131 @@ impl Qwen3Attention {
         Ok(out)
     }
 
+    fn forward_managed(
+        &self,
+        x: &Tensor,
+        start_pos: usize,
+        position_ids: Option<&Tensor>,
+        cache: &PhysicalPagedKvCache,
+        prepared: &mut PreparedPhysicalPagedStep,
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let bsz = x.dim(0)?;
+        let seq_len = x.dim(1)?;
+        if bsz != 1 {
+            return Err(Error::InvalidInput(
+                "Qwen3 managed prefill expects one sequence per call".to_string(),
+            ));
+        }
+        let (q, k, v) = self.qkv_proj.forward(x)?;
+        let q = q.reshape((bsz, seq_len, self.num_heads, self.head_dim))?;
+        let k = k.reshape((bsz, seq_len, self.num_kv_heads, self.head_dim))?;
+        let v = v.reshape((bsz, seq_len, self.num_kv_heads, self.head_dim))?;
+        let (q, k) = self.apply_qk_norm_pair(q, k, seq_len)?;
+        let (q, k) = self.apply_rope_pair(q, k, start_pos, position_ids)?;
+
+        let queries = q
+            .reshape((seq_len, self.num_heads, self.head_dim))?
+            .contiguous()?;
+        let keys = k
+            .reshape((seq_len, self.num_kv_heads, self.head_dim))?
+            .contiguous()?;
+        let values = v
+            .reshape((seq_len, self.num_kv_heads, self.head_dim))?
+            .contiguous()?;
+        let out = cache.write_and_attend(
+            layer_idx,
+            prepared,
+            &queries,
+            &keys,
+            &values,
+            1.0 / (self.head_dim as f32).sqrt(),
+        )?;
+        let out = out.reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
+        self.o_proj.forward(&out).map_err(Error::from)
+    }
+
+    fn forward_managed_decode_batch(
+        &self,
+        x: &Tensor,
+        start_positions: &[usize],
+        caches: &[&PhysicalPagedKvCache],
+        slots: &dyn KvSlotMap,
+        metadata: &KvDecodeBatchMetadata,
+        completions: &mut KvWriteCompletionCollector,
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let bsz = x.dim(0)?;
+        if x.dim(1)? != 1 || bsz == 0 || start_positions.len() != bsz || caches.len() != bsz {
+            return Err(Error::InvalidInput(
+                "Qwen3 managed decode batch dimensions do not match".to_string(),
+            ));
+        }
+        let first = caches[0];
+        if caches.iter().any(|cache| {
+            !Arc::ptr_eq(&cache.arena, &first.arena)
+                || cache.layer_binding(layer_idx).ok() != first.layer_binding(layer_idx).ok()
+        }) {
+            return Err(Error::InvalidInput(
+                "Qwen3 managed decode rows must share one arena and layer binding".to_string(),
+            ));
+        }
+
+        let (q, k, v) = self.qkv_proj.forward(x)?;
+        let q = q.reshape((bsz, 1, self.num_heads, self.head_dim))?;
+        let k = k.reshape((bsz, 1, self.num_kv_heads, self.head_dim))?;
+        let v = v.reshape((bsz, 1, self.num_kv_heads, self.head_dim))?;
+        let (q, k) = self.apply_qk_norm_pair(q, k, 1)?;
+
+        let mut query_rows = Vec::with_capacity(bsz);
+        let mut key_rows = Vec::with_capacity(bsz);
+        let mut value_rows = Vec::with_capacity(bsz);
+        for row in 0..bsz {
+            let q_row = q.i(row)?.unsqueeze(0)?;
+            let k_row = k.i(row)?.unsqueeze(0)?;
+            let (q_row, k_row) = self.apply_rope_pair(q_row, k_row, start_positions[row], None)?;
+            query_rows.push(q_row.reshape((self.num_heads, self.head_dim))?);
+            key_rows.push(k_row.reshape((self.num_kv_heads, self.head_dim))?);
+            value_rows.push(v.i(row)?.reshape((self.num_kv_heads, self.head_dim))?);
+        }
+
+        let query_rows = query_rows.iter().collect::<Vec<_>>();
+        let key_rows = key_rows.iter().collect::<Vec<_>>();
+        let value_rows = value_rows.iter().collect::<Vec<_>>();
+        let queries = Tensor::stack(&query_rows, 0)?.contiguous()?;
+        let keys = Tensor::stack(&key_rows, 0)?.contiguous()?;
+        let values = Tensor::stack(&value_rows, 0)?.contiguous()?;
+        if slots.arena_id() != first.arena.id() || slots.len() != bsz {
+            return Err(Error::InvalidInput(
+                "Qwen3 managed decode received an incompatible prepared slot map".into(),
+            ));
+        }
+        let binding = first.layer_binding(layer_idx)?;
+        let completion = first.arena.write_slots(
+            binding,
+            KvWriteArgs {
+                keys: &keys,
+                values: &values,
+                slots,
+            },
+        )?;
+        let (out, completion) = submit_ordered_after_write(completion, || {
+            first.arena.paged_decode(
+                binding,
+                PagedKvDecodeArgs {
+                    queries: &queries,
+                    batch: metadata,
+                    softmax_scale: 1.0 / (self.head_dim as f32).sqrt(),
+                    softcap: None,
+                },
+            )
+        })?;
+        completions.collect(completion)?;
+        let out = out.reshape((bsz, 1, self.num_heads * self.head_dim))?;
+        self.o_proj.forward(&out).map_err(Error::from)
+    }
+
+    #[cfg(test)]
     fn forward_decode_batch(
         &self,
         x: &Tensor,
@@ -1820,7 +2183,7 @@ impl Qwen3Attention {
             let k_row = k.i(row_idx)?.unsqueeze(0)?;
             let v_row = v.i(row_idx)?.unsqueeze(0)?;
             let (q_row, k_row) =
-                self.apply_rope_pair(q_row, k_row, start_positions[row_idx], None, Some(cache))?;
+                self.apply_rope_pair(q_row, k_row, start_positions[row_idx], None)?;
             cache.append(layer_idx, k_row, v_row)?;
 
             let attention = if let Some((k_heads, v_heads)) = cache.dense_heads(layer_idx)? {
@@ -1961,14 +2324,23 @@ impl Qwen3Layer {
         prefix: &str,
     ) -> Result<Self> {
         let input_layernorm = RmsNorm::new(
-            loader.load_tensor(&format!("{prefix}.input_layernorm.weight"), dtype, device)?,
+            loader.load_tensor(
+                &qwen3_gguf_tensor_name(loader, &format!("{prefix}.input_layernorm.weight"))
+                    .unwrap_or_else(|| format!("{prefix}.input_layernorm.weight")),
+                dtype,
+                device,
+            )?,
             cfg.rms_norm_eps,
         );
         let self_attn =
             Qwen3Attention::load_gguf(loader, cfg, device, dtype, &format!("{prefix}.self_attn"))?;
         let post_attention_layernorm = RmsNorm::new(
             loader.load_tensor(
-                &format!("{prefix}.post_attention_layernorm.weight"),
+                &qwen3_gguf_tensor_name(
+                    loader,
+                    &format!("{prefix}.post_attention_layernorm.weight"),
+                )
+                .unwrap_or_else(|| format!("{prefix}.post_attention_layernorm.weight")),
                 dtype,
                 device,
             )?,
@@ -1989,6 +2361,25 @@ impl Qwen3Layer {
             .add(self.mlp.projection_diagnostics())
     }
 
+    fn forward_stateless(
+        &self,
+        input: &Tensor,
+        start_pos: usize,
+        position_ids: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let attention = self.self_attn.forward_stateless(
+            &self.input_layernorm.forward(input)?,
+            start_pos,
+            position_ids,
+        )?;
+        let hidden = input.broadcast_add(&attention)?;
+        let mlp = self
+            .mlp
+            .forward(&self.post_attention_layernorm.forward(&hidden)?)?;
+        hidden.broadcast_add(&mlp).map_err(Error::from)
+    }
+
+    #[cfg(test)]
     fn forward(
         &self,
         x: &Tensor,
@@ -2009,6 +2400,7 @@ impl Qwen3Layer {
         Ok(x)
     }
 
+    #[cfg(test)]
     fn forward_decode_batch(
         &self,
         x: &Tensor,
@@ -2022,6 +2414,56 @@ impl Qwen3Layer {
                 .forward_decode_batch(&normed, start_positions, caches, layer_idx)?;
         let x = x.broadcast_add(&attn_out)?;
 
+        let normed = self.post_attention_layernorm.forward(&x)?;
+        let mlp_out = self.mlp.forward(&normed)?;
+        x.broadcast_add(&mlp_out).map_err(Error::from)
+    }
+
+    fn forward_managed(
+        &self,
+        x: &Tensor,
+        start_pos: usize,
+        position_ids: Option<&Tensor>,
+        cache: &PhysicalPagedKvCache,
+        prepared: &mut PreparedPhysicalPagedStep,
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let normed = self.input_layernorm.forward(x)?;
+        let attn_out = self.self_attn.forward_managed(
+            &normed,
+            start_pos,
+            position_ids,
+            cache,
+            prepared,
+            layer_idx,
+        )?;
+        let x = x.broadcast_add(&attn_out)?;
+        let normed = self.post_attention_layernorm.forward(&x)?;
+        let mlp_out = self.mlp.forward(&normed)?;
+        x.broadcast_add(&mlp_out).map_err(Error::from)
+    }
+
+    fn forward_managed_decode_batch(
+        &self,
+        x: &Tensor,
+        start_positions: &[usize],
+        caches: &[&PhysicalPagedKvCache],
+        slots: &dyn KvSlotMap,
+        metadata: &KvDecodeBatchMetadata,
+        completions: &mut KvWriteCompletionCollector,
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let normed = self.input_layernorm.forward(x)?;
+        let attn_out = self.self_attn.forward_managed_decode_batch(
+            &normed,
+            start_positions,
+            caches,
+            slots,
+            metadata,
+            completions,
+            layer_idx,
+        )?;
+        let x = x.broadcast_add(&attn_out)?;
         let normed = self.post_attention_layernorm.forward(&x)?;
         let mlp_out = self.mlp.forward(&normed)?;
         x.broadcast_add(&mlp_out).map_err(Error::from)
@@ -2063,6 +2505,49 @@ impl Default for Qwen3WeightLayout {
 }
 
 impl Qwen3Model {
+    pub fn context_length(&self) -> Option<usize> {
+        self.cfg.context_length()
+    }
+
+    pub(crate) fn supports_managed_kv_execution(&self) -> bool {
+        self.cfg.sliding_window().is_none()
+    }
+
+    pub(crate) fn managed_inference_state_contract(
+        &self,
+        domain: StateDomainId,
+        storage_dtype: DType,
+        preferred_page_tokens: usize,
+    ) -> Result<InferenceStateContract> {
+        let attention = self.cfg.attention_geometry()?;
+        let cache_domain = qwen3_decoder_cache_domain(Qwen3DecoderCacheGeometry {
+            domain,
+            clock: StateClock::DecoderTokens,
+            num_layers: self.cfg.num_hidden_layers,
+            num_query_heads: self.cfg.num_attention_heads,
+            num_kv_heads: self.cfg.num_key_value_heads,
+            key_head_dim: attention.key_head_dim(),
+            value_head_dim: attention.value_head_dim(),
+            sliding_window: self.cfg.sliding_window(),
+            storage_dtype,
+            preferred_page_tokens,
+            prefix: PrefixPolicy::CommittedPages {
+                positions: crate::kv::v2::PositionSemantics::Absolute,
+            },
+        })?;
+        let contract = InferenceStateContract {
+            abi: CURRENT_INFERENCE_STATE_ABI,
+            domains: vec![StateDomainSpec::PagedAttention(cache_domain)],
+            groups: vec![StateGroupSpec {
+                id: StateGroupId::new(domain.get()),
+                domains: vec![domain],
+                prefix_shareable: true,
+            }],
+        };
+        contract.validate()?;
+        Ok(contract)
+    }
+
     pub fn load(cfg: Qwen3Config, vb: VarBuilder) -> Result<Self> {
         Self::load_with_layout(cfg, vb, Qwen3WeightLayout::STANDARD)
     }
@@ -2072,6 +2557,7 @@ impl Qwen3Model {
         vb: VarBuilder,
         layout: Qwen3WeightLayout,
     ) -> Result<Self> {
+        cfg.attention_geometry()?;
         let lm_head_size = cfg.lm_head_size.unwrap_or(cfg.vocab_size);
         let embed_tokens = mlx::load_embedding(
             cfg.vocab_size,
@@ -2142,18 +2628,17 @@ impl Qwen3Model {
         dtype: DType,
         prefix: &str,
     ) -> Result<Self> {
+        cfg.attention_geometry()?;
         let lm_head_size = cfg.lm_head_size.unwrap_or(cfg.vocab_size);
         let model_prefix = qwen3_join_prefix(prefix, "model");
+        let embed_name = qwen3_join_prefix(&model_prefix, "embed_tokens.weight");
+        let embed_name = qwen3_gguf_tensor_name(loader, &embed_name).unwrap_or(embed_name);
         let embed_tokens = Embedding::new(
-            loader.load_tensor(
-                &qwen3_join_prefix(&model_prefix, "embed_tokens.weight"),
-                dtype,
-                device,
-            )?,
+            loader.load_tensor(&embed_name, dtype, device)?,
             cfg.hidden_size,
         );
         let lm_head_name = qwen3_join_prefix(prefix, "lm_head.weight");
-        let lm_head = if loader.has_tensor(&lm_head_name) {
+        let lm_head = if qwen3_gguf_tensor_name(loader, &lm_head_name).is_some() {
             Qwen3Projection::quantized(loader, device, &lm_head_name)?
         } else {
             if lm_head_size != cfg.vocab_size {
@@ -2170,12 +2655,10 @@ impl Qwen3Model {
             let layer = Qwen3Layer::load_gguf(loader, &cfg, device, dtype, &layer_prefix)?;
             layers.push(layer);
         }
+        let norm_name = qwen3_join_prefix(&model_prefix, "norm.weight");
+        let norm_name = qwen3_gguf_tensor_name(loader, &norm_name).unwrap_or(norm_name);
         let norm = RmsNorm::new(
-            loader.load_tensor(
-                &qwen3_join_prefix(&model_prefix, "norm.weight"),
-                dtype,
-                device,
-            )?,
+            loader.load_tensor(&norm_name, dtype, device)?,
             cfg.rms_norm_eps,
         );
         let use_mrope = cfg
@@ -2213,20 +2696,6 @@ impl Qwen3Model {
         self.cfg.hidden_size
     }
 
-    /// Conservative retained-session allocation bound for a complete decode.
-    ///
-    /// Candle cache pages may use any supported compute dtype or KV
-    /// quantization, so the bound deliberately prices every element as F32.
-    /// Dense cache growth is rounded to the next power of two to cover backing
-    /// capacity rather than only the logical token count.
-    pub fn session_cache_upper_bound_bytes(
-        &self,
-        prompt_tokens: usize,
-        max_new_tokens: usize,
-    ) -> Option<u64> {
-        qwen3_session_cache_upper_bound_bytes(&self.cfg, prompt_tokens, max_new_tokens)
-    }
-
     pub fn projection_diagnostics(&self) -> Qwen3ProjectionDiagnostics {
         self.layers
             .iter()
@@ -2235,6 +2704,7 @@ impl Qwen3Model {
             })
     }
 
+    #[cfg(test)]
     pub fn forward(
         &self,
         input_ids: &Tensor,
@@ -2248,6 +2718,7 @@ impl Qwen3Model {
     /// Execute one token for a changing set of independently cached sessions.
     /// Dense projections and MLPs use one real batch dimension; attention
     /// remains ragged and writes back into each exact session cache.
+    #[cfg(test)]
     pub fn forward_decode_batch(
         &self,
         input_ids: &Tensor,
@@ -2275,22 +2746,251 @@ impl Qwen3Model {
         self.logits_from_hidden(&hidden)
     }
 
+    /// Execute native Qwen3 against backend-owned authoritative KV pages.
+    ///
+    /// Initial prefill writes each layer directly into the supplied arena and
+    /// advances the logical context only after every layer succeeds. Decode
+    /// consumes those same pages without constructing a `Qwen3Cache`.
+    pub fn forward_managed(
+        &self,
+        input_ids: &Tensor,
+        start_pos: usize,
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<Tensor> {
+        let (batch_size, sequence_len) = input_ids.dims2()?;
+        if batch_size != 1 || sequence_len == 0 {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3 managed forward expects [1,sequence], got {:?}",
+                input_ids.dims()
+            )));
+        }
+        let embeds = self.embeddings(input_ids)?;
+        self.forward_managed_with_embeds(&embeds, start_pos, cache, None)
+    }
+
+    /// Execute caller-provided embeddings against authoritative KV pages.
+    ///
+    /// Multimodal adapters use this entry point after replacing placeholder
+    /// token embeddings with modality features. The cache behavior is exactly
+    /// the same as [`Self::forward_managed`]: every layer writes the supplied
+    /// arena and the logical context advances only after the full pass succeeds.
+    pub fn forward_managed_with_embeds(
+        &self,
+        embeds: &Tensor,
+        start_pos: usize,
+        cache: &mut PhysicalPagedKvCache,
+        position_ids: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let (hidden, prepared) =
+            self.prepare_managed_hidden_with_embeds(embeds, start_pos, cache, position_ids)?;
+        let logits = self.logits_from_hidden(&hidden)?;
+        cache.commit_prepared(prepared)?;
+        Ok(logits)
+    }
+
+    /// Execute caller-provided embeddings against authoritative KV pages and
+    /// return the normalized decoder hidden states without applying `lm_head`.
+    ///
+    /// Diffusion-conditioned adapters consume these states directly. The
+    /// physical page transition remains atomic: the prepared write set is
+    /// committed only after all decoder layers and the final norm succeed.
+    pub fn forward_managed_hidden_with_embeds(
+        &self,
+        embeds: &Tensor,
+        start_pos: usize,
+        cache: &mut PhysicalPagedKvCache,
+        position_ids: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let (hidden, prepared) =
+            self.prepare_managed_hidden_with_embeds(embeds, start_pos, cache, position_ids)?;
+        cache.commit_prepared(prepared)?;
+        Ok(hidden)
+    }
+
+    /// Commit caller-provided embeddings to managed KV without retaining a
+    /// decoder output or projecting logits.
+    ///
+    /// Resumable multimodal prefill uses this for every non-final scheduler
+    /// span. Only the current span's transient layer tensor exists during the
+    /// call; processed spans are represented solely by their committed KV.
+    pub fn forward_managed_prefill_only_with_embeds(
+        &self,
+        embeds: &Tensor,
+        start_pos: usize,
+        cache: &mut PhysicalPagedKvCache,
+        position_ids: Option<&Tensor>,
+    ) -> Result<()> {
+        let (_last_layer, prepared) =
+            self.prepare_managed_layers_with_embeds(embeds, start_pos, cache, position_ids)?;
+        cache.commit_prepared(prepared)?;
+        Ok(())
+    }
+
+    fn prepare_managed_hidden_with_embeds(
+        &self,
+        embeds: &Tensor,
+        start_pos: usize,
+        cache: &PhysicalPagedKvCache,
+        position_ids: Option<&Tensor>,
+    ) -> Result<(Tensor, PreparedPhysicalPagedStep)> {
+        let (x, prepared) =
+            self.prepare_managed_layers_with_embeds(embeds, start_pos, cache, position_ids)?;
+        let hidden = self.norm.forward(&x)?;
+        Ok((hidden, prepared))
+    }
+
+    fn prepare_managed_layers_with_embeds(
+        &self,
+        embeds: &Tensor,
+        start_pos: usize,
+        cache: &PhysicalPagedKvCache,
+        position_ids: Option<&Tensor>,
+    ) -> Result<(Tensor, PreparedPhysicalPagedStep)> {
+        let (batch_size, sequence_len, hidden_size) = embeds.dims3()?;
+        if batch_size != 1 || sequence_len == 0 || hidden_size != self.cfg.hidden_size {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3 managed embeddings expect [1,sequence,{}], got {:?}",
+                self.cfg.hidden_size,
+                embeds.dims()
+            )));
+        }
+        if self.cfg.sliding_window().is_some() {
+            return Err(Error::InvalidInput(
+                "Qwen3 managed execution does not yet support sliding-window block tables"
+                    .to_string(),
+            ));
+        }
+        cache.validate_model(
+            self.cfg.num_hidden_layers,
+            self.cfg.num_key_value_heads,
+            self.cfg.attention_geometry()?.key_head_dim(),
+        )?;
+        cache.slots_for_append(start_pos, sequence_len)?;
+        let mut prepared = cache.prepare_append(start_pos, sequence_len)?;
+
+        let mut x = embeds.clone();
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            x = layer.forward_managed(
+                &x,
+                start_pos,
+                position_ids,
+                cache,
+                &mut prepared,
+                layer_idx,
+            )?;
+        }
+        Ok((x, prepared))
+    }
+
+    /// One direct paged-attention call per layer for a ragged batch of native
+    /// Qwen3 decode rows sharing the same physical arena.
+    pub fn forward_managed_decode_batch(
+        &self,
+        input_ids: &Tensor,
+        start_positions: &[usize],
+        caches: &mut [&mut PhysicalPagedKvCache],
+    ) -> Result<Tensor> {
+        let (batch_size, sequence_len) = input_ids.dims2()?;
+        if sequence_len != 1
+            || batch_size == 0
+            || start_positions.len() != batch_size
+            || caches.len() != batch_size
+        {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3 managed decode expects matching [batch,1] rows, got {:?}",
+                input_ids.dims()
+            )));
+        }
+        if self.cfg.sliding_window().is_some() {
+            return Err(Error::InvalidInput(
+                "Qwen3 managed execution does not yet support sliding-window block tables"
+                    .to_string(),
+            ));
+        }
+        for (row, cache) in caches.iter().enumerate() {
+            cache.validate_model(
+                self.cfg.num_hidden_layers,
+                self.cfg.num_key_value_heads,
+                self.cfg.attention_geometry()?.key_head_dim(),
+            )?;
+            cache.slots_for_append(start_positions[row], 1)?;
+        }
+
+        let first = &*caches[0];
+        let combined_slots = caches
+            .iter()
+            .enumerate()
+            .map(|(row, cache)| {
+                cache
+                    .slots_for_append(start_positions[row], 1)
+                    .map(|slots| slots[0])
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let lowered = first.arena.lower_slots(&combined_slots)?;
+        let metadata = KvDecodeBatchMetadata {
+            sequences: caches
+                .iter()
+                .enumerate()
+                .map(|(row, cache)| cache.sequence_table(start_positions[row] + 1))
+                .collect::<Result<Vec<_>>>()?,
+        };
+        let mut completions =
+            KvWriteCompletionCollector::new(first.arena.config(), lowered.logical_slots())?;
+        let mut x = self.embeddings(input_ids)?;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let cache_refs = caches
+                .iter()
+                .map(|cache| &**cache)
+                .collect::<Vec<&PhysicalPagedKvCache>>();
+            x = layer.forward_managed_decode_batch(
+                &x,
+                start_positions,
+                &cache_refs,
+                lowered.as_ref(),
+                &metadata,
+                &mut completions,
+                layer_idx,
+            )?;
+        }
+        let hidden = self.norm.forward(&x)?;
+        let logits = self.logits_from_hidden(&hidden)?;
+        let completion = Arc::new(completions.seal()?);
+        for (row, cache) in caches.iter_mut().enumerate() {
+            cache.commit_shared_completion(start_positions[row], 1, completion.clone())?;
+        }
+        Ok(logits)
+    }
+
     pub fn embeddings(&self, input_ids: &Tensor) -> Result<Tensor> {
         self.embed_tokens.forward(input_ids).map_err(Error::from)
     }
 
+    pub fn forward_stateless_with_embeds(
+        &self,
+        embeds: &Tensor,
+        start_pos: usize,
+        position_ids: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let mut hidden = embeds.clone();
+        for layer in &self.layers {
+            hidden = layer.forward_stateless(&hidden, start_pos, position_ids)?;
+        }
+        self.logits_from_hidden(&self.norm.forward(&hidden)?)
+    }
+
+    #[cfg(test)]
     pub fn forward_with_embeds(
         &self,
         embeds: &Tensor,
         start_pos: usize,
-        mut cache: Option<&mut Qwen3Cache>,
+        cache: Option<&mut Qwen3Cache>,
         position_ids: Option<&Tensor>,
     ) -> Result<Tensor> {
-        let hidden =
-            self.forward_hidden_with_embeds(embeds, start_pos, cache.as_deref_mut(), position_ids)?;
+        let hidden = self.forward_hidden_with_embeds(embeds, start_pos, cache, position_ids)?;
         self.logits_from_hidden(&hidden)
     }
 
+    #[cfg(test)]
     pub fn forward_hidden_with_embeds(
         &self,
         embeds: &Tensor,
@@ -2330,40 +3030,6 @@ impl Qwen3Model {
     pub fn uses_mrope(&self) -> bool {
         self.use_mrope
     }
-}
-
-fn qwen3_session_cache_upper_bound_bytes(
-    cfg: &Qwen3Config,
-    prompt_tokens: usize,
-    max_new_tokens: usize,
-) -> Option<u64> {
-    let prompt_tokens = prompt_tokens.max(1);
-    let total_tokens = prompt_tokens.checked_add(max_new_tokens.max(1))?;
-    let cache_capacity = total_tokens.checked_next_power_of_two()?;
-    let bytes_per_element = 4u64;
-    let as_u64 = |value: usize| u64::try_from(value).ok();
-
-    let kv_bytes = 2u64
-        .checked_mul(as_u64(cfg.num_hidden_layers)?)?
-        .checked_mul(as_u64(cache_capacity)?)?
-        .checked_mul(as_u64(cfg.num_key_value_heads)?)?
-        .checked_mul(as_u64(cfg.head_dim())?)?
-        .checked_mul(bytes_per_element)?;
-    // The session-local RoPE cache retains one pair for prefill and one small
-    // pair for each decode position. Pricing two full-width tensors for every
-    // token is intentionally conservative.
-    let rope_bytes = 2u64
-        .checked_mul(as_u64(total_tokens)?)?
-        .checked_mul(as_u64(cfg.head_dim())?)?
-        .checked_mul(bytes_per_element)?;
-    // Incremental state retains the model output tensor. Its widest point is
-    // prompt prefill, not the one-token decode path.
-    let output_width = cfg.lm_head_size.unwrap_or(cfg.vocab_size);
-    let output_bytes = as_u64(prompt_tokens)?
-        .checked_mul(as_u64(output_width)?)?
-        .checked_mul(bytes_per_element)?;
-
-    kv_bytes.checked_add(rope_bytes)?.checked_add(output_bytes)
 }
 
 fn dense_logits_for_tokens(
@@ -2437,20 +3103,27 @@ pub(crate) fn dense_decode_attention(
         return out.transpose(1, 2).map_err(Error::from);
     }
 
-    let k = k_heads.transpose(1, 2)?.contiguous()?;
-    let v = v_heads.transpose(1, 2)?.contiguous()?;
-    let k = repeat_kv(&k, num_heads, num_kv_heads)?;
-    let v = repeat_kv(&v, num_heads, num_kv_heads)?;
-    let k_heads = k.transpose(1, 2)?.contiguous()?;
-    let v_heads = v.transpose(1, 2)?.contiguous()?;
-    let k_heads_t = k_heads.transpose(2, 3)?.contiguous()?;
-    let mut att = q_heads.matmul(&k_heads_t)?;
-    att = (att / (head_dim as f64).sqrt())?;
-    let att = ops::softmax(&att, D::Minus1)?;
-    let out = att.matmul(&v_heads)?;
-    out.transpose(1, 2)?
-        .reshape((bsz, seq_len, num_heads, head_dim))
-        .map_err(Error::from)
+    if q_heads.dim(1)? != num_heads
+        || k_heads.dim(1)? != num_kv_heads
+        || v_heads.dim(1)? != num_kv_heads
+    {
+        return Err(Error::InvalidInput(format!(
+            "Qwen3 dense decode head geometry does not match config: q={:?}, k={:?}, v={:?}, expected query_heads={num_heads}, kv_heads={num_kv_heads}",
+            q_heads.dims(),
+            k_heads.dims(),
+            v_heads.dims()
+        )));
+    }
+    compact_gqa_sdpa_bhsd(
+        &q_heads,
+        k_heads,
+        v_heads,
+        None,
+        1.0 / (head_dim as f64).sqrt(),
+    )?
+    .transpose(1, 2)?
+    .reshape((bsz, seq_len, num_heads, head_dim))
+    .map_err(Error::from)
 }
 
 pub fn repeat_kv(x: &Tensor, num_heads: usize, num_kv_heads: usize) -> Result<Tensor> {
@@ -2673,14 +3346,174 @@ fn qwen3_env_bool(name: &str, default: bool) -> bool {
 }
 
 fn qwen3_rope_kernel_enabled(device: &Device) -> bool {
-    device.is_metal() && qwen3_env_bool("IZWI_QWEN3_ROPE_KERNEL", true)
+    let override_enabled = std::env::var("IZWI_QWEN3_ROPE_KERNEL")
+        .ok()
+        .and_then(|raw| parse_env_bool(&raw));
+    qwen3_rope_kernel_policy(device.is_metal(), device.is_cuda(), override_enabled)
+}
+
+fn qwen3_rope_kernel_policy(is_metal: bool, is_cuda: bool, override_enabled: Option<bool>) -> bool {
+    if is_metal {
+        return override_enabled.unwrap_or(true);
+    }
+    if is_cuda {
+        return override_enabled.unwrap_or(true);
+    }
+    false
+}
+
+#[cfg(test)]
+pub(crate) fn tiny_qwen3_model_for_test(device: &Device) -> Qwen3Model {
+    tests::tiny_qwen3_model(device)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::kv::{CpuKvArena, KvArenaConfig, KvLayerConfig};
+    use crate::backends::BackendKind;
+    use crate::engine::ModelInstanceId;
+    use crate::kv::{KvArenaId, KvGroupId};
     use candle_nn::rotary_emb;
     use std::collections::HashMap;
+
+    fn attention_config(
+        hidden_size: usize,
+        query_heads: usize,
+        kv_heads: usize,
+        head_dim: Option<usize>,
+    ) -> Qwen3Config {
+        Qwen3Config {
+            hidden_size,
+            intermediate_size: hidden_size.saturating_mul(2),
+            num_attention_heads: query_heads,
+            num_hidden_layers: 1,
+            num_key_value_heads: kv_heads,
+            max_position_embeddings: Some(128),
+            head_dim,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10_000.0,
+            vocab_size: 32,
+            lm_head_size: None,
+            tie_word_embeddings: false,
+            rope_scaling: None,
+            sliding_window: None,
+            use_sliding_window: false,
+            ada_rms_norm_t_cond: false,
+            ada_rms_norm_t_cond_dim: 0,
+        }
+    }
+
+    #[test]
+    fn qwen3_attention_geometry_accepts_explicit_gqa_width() {
+        let config = attention_config(3072, 32, 8, Some(128));
+        let geometry = config.attention_geometry().unwrap();
+        assert_eq!(geometry.query_width(), 4096);
+        assert_eq!(geometry.key_width(), 1024);
+        assert_eq!(geometry.kv_groups(), 4);
+    }
+
+    #[test]
+    fn qwen3_malformed_heads_return_errors_without_division_panics() {
+        let zero_query = attention_config(4096, 0, 8, Some(128));
+        assert_eq!(zero_query.head_dim(), 128);
+        assert!(zero_query
+            .attention_geometry()
+            .unwrap_err()
+            .to_string()
+            .contains("head counts must be non-zero"));
+
+        let inferred_zero_query = attention_config(4096, 0, 8, None);
+        assert_eq!(inferred_zero_query.head_dim(), 0);
+        assert!(inferred_zero_query.attention_geometry().is_err());
+
+        let zero_kv = attention_config(4096, 32, 0, Some(128));
+        assert_eq!(zero_kv.kv_groups(), 0);
+        assert!(zero_kv.attention_geometry().is_err());
+
+        let non_divisible = attention_config(1536, 12, 5, Some(128));
+        assert!(non_divisible
+            .attention_geometry()
+            .unwrap_err()
+            .to_string()
+            .contains("query heads must be divisible"));
+
+        let mut invalid_theta = attention_config(4096, 32, 8, Some(128));
+        invalid_theta.rope_theta = f64::NAN;
+        assert!(invalid_theta
+            .attention_geometry()
+            .unwrap_err()
+            .to_string()
+            .contains("rope_theta must be finite and positive"));
+    }
+
+    #[test]
+    fn canonical_qwen3_gguf_names_cover_the_native_decoder_graph() {
+        for (logical, canonical) in [
+            ("model.embed_tokens.weight", "token_embd.weight"),
+            ("model.norm.weight", "output_norm.weight"),
+            ("lm_head.weight", "output.weight"),
+            (
+                "model.layers.7.input_layernorm.weight",
+                "blk.7.attn_norm.weight",
+            ),
+            (
+                "model.layers.7.self_attn.q_proj.weight",
+                "blk.7.attn_q.weight",
+            ),
+            (
+                "model.layers.7.self_attn.k_norm.weight",
+                "blk.7.attn_k_norm.weight",
+            ),
+            (
+                "model.layers.7.self_attn.o_proj.weight",
+                "blk.7.attn_output.weight",
+            ),
+            (
+                "model.layers.7.post_attention_layernorm.weight",
+                "blk.7.ffn_norm.weight",
+            ),
+            (
+                "model.layers.7.mlp.gate_proj.weight",
+                "blk.7.ffn_gate.weight",
+            ),
+            (
+                "model.layers.7.mlp.down_proj.weight",
+                "blk.7.ffn_down.weight",
+            ),
+        ] {
+            assert_eq!(
+                qwen3_canonical_gguf_tensor_name(logical).as_deref(),
+                Some(canonical)
+            );
+        }
+        assert!(qwen3_canonical_gguf_tensor_name("model.layers.7.unknown.weight").is_none());
+    }
+
+    #[test]
+    fn cache_domain_is_derived_from_loaded_qwen3_geometry() {
+        let domain = qwen3_decoder_cache_domain(Qwen3DecoderCacheGeometry {
+            domain: StateDomainId::new(4),
+            clock: StateClock::DecoderTokens,
+            num_layers: 3,
+            num_query_heads: 12,
+            num_kv_heads: 4,
+            key_head_dim: 80,
+            value_head_dim: 64,
+            sliding_window: Some(1024),
+            storage_dtype: DType::BF16,
+            preferred_page_tokens: 32,
+            prefix: PrefixPolicy::Disabled,
+        })
+        .unwrap();
+        assert_eq!(domain.layers.len(), 3);
+        assert_eq!(domain.layers[2].query_heads, 12);
+        assert_eq!(domain.layers[2].kv_heads, 4);
+        assert_eq!(domain.layers[2].key_head_dim, 80);
+        assert_eq!(domain.layers[2].value_head_dim, 64);
+        assert_eq!(domain.accepted_dtypes, vec![StateDType::Bf16]);
+        assert_eq!(domain.page_size.preferred_tokens, 32);
+    }
 
     fn assert_tensor_close(lhs: &Tensor, rhs: &Tensor) {
         assert_eq!(lhs.dims(), rhs.dims());
@@ -2727,13 +3560,14 @@ mod tests {
         })
     }
 
-    fn tiny_qwen3_model(device: &Device) -> Qwen3Model {
+    pub(super) fn tiny_qwen3_model(device: &Device) -> Qwen3Model {
         let cfg = Qwen3Config {
             hidden_size: 4,
             intermediate_size: 8,
             num_attention_heads: 2,
             num_hidden_layers: 1,
             num_key_value_heads: 1,
+            max_position_embeddings: Some(32),
             head_dim: Some(2),
             rms_norm_eps: 1e-5,
             rope_theta: 10_000.0,
@@ -2799,32 +3633,48 @@ mod tests {
         Qwen3Cache::with_page_size_and_quantization(1, 2, KvCacheQuantization::None)
     }
 
-    #[test]
-    fn session_cache_bound_is_architecture_derived_and_monotonic() {
-        let cfg = Qwen3Config {
-            hidden_size: 1_024,
-            intermediate_size: 3_072,
-            num_attention_heads: 16,
-            num_hidden_layers: 12,
-            num_key_value_heads: 4,
-            head_dim: Some(64),
-            rms_norm_eps: 1e-6,
-            rope_theta: 10_000.0,
-            vocab_size: 32_000,
-            lm_head_size: None,
-            tie_word_embeddings: false,
-            rope_scaling: None,
-            sliding_window: None,
-            use_sliding_window: false,
-            ada_rms_norm_t_cond: false,
-            ada_rms_norm_t_cond_dim: 0,
+    fn test_managed_arena() -> (Arc<dyn KvArena>, Vec<KvLayerBinding>) {
+        let binding = KvLayerBinding {
+            model_layer: 0,
+            physical_layer: 0,
         };
+        let arena = CpuKvArena::new(KvArenaConfig {
+            id: KvArenaId {
+                model_instance: ModelInstanceId::new(93),
+                backend: BackendKind::Cpu,
+                device_ordinal: None,
+                generation: 1,
+            },
+            group: KvGroupId::new(0),
+            page_tokens: 2,
+            capacity_pages: 8,
+            growth: None,
+            dtype: DType::F32,
+            layers: vec![KvLayerConfig {
+                binding,
+                num_kv_heads: 1,
+                key_head_dim: 2,
+                value_head_dim: 2,
+            }],
+        })
+        .unwrap();
+        (Arc::new(arena), vec![binding])
+    }
 
-        let small = qwen3_session_cache_upper_bound_bytes(&cfg, 32, 16).unwrap();
-        let large = qwen3_session_cache_upper_bound_bytes(&cfg, 64, 32).unwrap();
-        assert!(small > 0);
-        assert!(large > small);
-        assert!(qwen3_session_cache_upper_bound_bytes(&cfg, usize::MAX, 1).is_none());
+    fn test_managed_cache(
+        arena: Arc<dyn KvArena>,
+        bindings: Vec<KvLayerBinding>,
+        first_page: u32,
+    ) -> PhysicalPagedKvCache {
+        let blocks = (first_page..first_page + 4)
+            .map(|index| CacheBlockRef {
+                arena: arena.id(),
+                group: arena.config().group,
+                index,
+                slot_generation: 1,
+            })
+            .collect();
+        PhysicalPagedKvCache::new(arena, bindings, blocks, 0).unwrap()
     }
 
     #[test]
@@ -2895,6 +3745,229 @@ mod tests {
 
         assert_tensor_close(&scalar_a, &batched.i(0).unwrap().unsqueeze(0).unwrap());
         assert_tensor_close(&scalar_b, &batched.i(1).unwrap().unsqueeze(0).unwrap());
+    }
+
+    #[test]
+    fn managed_qwen3_prefill_and_decode_match_model_owned_cache() {
+        let device = Device::Cpu;
+        let model = tiny_qwen3_model(&device);
+        let mut owned = test_cache();
+        let (arena, bindings) = test_managed_arena();
+        let mut managed = test_managed_cache(arena.clone(), bindings, 0);
+        let prompt = Tensor::from_vec(vec![0u32, 1, 2], (1, 3), &device).unwrap();
+
+        let owned_prefill = model.forward(&prompt, 0, Some(&mut owned)).unwrap();
+        let managed_prefill = model.forward_managed(&prompt, 0, &mut managed).unwrap();
+        assert_tensor_close(&owned_prefill, &managed_prefill);
+        assert_eq!(managed.context_len(), 3);
+        assert_eq!(arena.operation_stats().slot_write_dispatches, 1);
+        assert_eq!(arena.operation_stats().paged_prefill_dispatches, 1);
+        assert_eq!(arena.operation_stats().paged_decode_dispatches, 0);
+        assert_eq!(
+            arena.operation_stats().cpu_reference_attention_dispatches,
+            1
+        );
+        let prefill_completions = managed.take_completed_writes();
+        assert_eq!(prefill_completions.len(), 1);
+        assert_eq!(prefill_completions[0].slots_per_layer(), 3);
+
+        let token = Tensor::from_vec(vec![5u32], (1, 1), &device).unwrap();
+        let owned_decode = model.forward(&token, 3, Some(&mut owned)).unwrap();
+        let managed_decode = model.forward_managed(&token, 3, &mut managed).unwrap();
+        assert_tensor_close(&owned_decode, &managed_decode);
+        assert_eq!(managed.context_len(), 4);
+        assert_eq!(arena.operation_stats().slot_write_dispatches, 2);
+        assert_eq!(arena.operation_stats().paged_prefill_dispatches, 1);
+        assert_eq!(arena.operation_stats().paged_decode_dispatches, 1);
+        assert_eq!(
+            arena.operation_stats().cpu_reference_attention_dispatches,
+            2
+        );
+        let decode_completions = managed.take_completed_writes();
+        assert_eq!(decode_completions.len(), 1);
+        assert_eq!(decode_completions[0].slots_per_layer(), 1);
+    }
+
+    #[test]
+    fn managed_qwen3_chunked_prefill_matches_monolithic_final_logits() {
+        let device = Device::Cpu;
+        let model = tiny_qwen3_model(&device);
+        let (full_arena, full_bindings) = test_managed_arena();
+        let (chunk_arena, chunk_bindings) = test_managed_arena();
+        let mut full_cache = test_managed_cache(full_arena, full_bindings, 0);
+        let mut chunk_cache = test_managed_cache(chunk_arena, chunk_bindings, 0);
+        let full_prompt = Tensor::from_vec(vec![0u32, 1, 2, 3], (1, 4), &device).unwrap();
+        let first_chunk = Tensor::from_vec(vec![0u32, 1], (1, 2), &device).unwrap();
+        let final_chunk = Tensor::from_vec(vec![2u32, 3], (1, 2), &device).unwrap();
+
+        let full = model
+            .forward_managed(&full_prompt, 0, &mut full_cache)
+            .unwrap();
+        model
+            .forward_managed(&first_chunk, 0, &mut chunk_cache)
+            .unwrap();
+        let chunked = model
+            .forward_managed(&final_chunk, 2, &mut chunk_cache)
+            .unwrap();
+
+        assert_tensor_close(
+            &full.narrow(1, 3, 1).unwrap(),
+            &chunked.narrow(1, 1, 1).unwrap(),
+        );
+        assert_eq!(full_cache.context_len(), 4);
+        assert_eq!(chunk_cache.context_len(), 4);
+        assert_eq!(full_cache.take_completed_writes().len(), 1);
+        assert_eq!(chunk_cache.take_completed_writes().len(), 2);
+    }
+
+    #[test]
+    fn managed_qwen3_caller_embeddings_match_token_prefill() {
+        let device = Device::Cpu;
+        let model = tiny_qwen3_model(&device);
+        let (token_arena, token_bindings) = test_managed_arena();
+        let (embed_arena, embed_bindings) = test_managed_arena();
+        let mut token_cache = test_managed_cache(token_arena, token_bindings, 0);
+        let mut embed_cache = test_managed_cache(embed_arena, embed_bindings, 0);
+        let prompt = Tensor::from_vec(vec![0u32, 1, 2], (1, 3), &device).unwrap();
+        let embeds = model.embeddings(&prompt).unwrap();
+
+        let token_logits = model.forward_managed(&prompt, 0, &mut token_cache).unwrap();
+        let embed_logits = model
+            .forward_managed_with_embeds(&embeds, 0, &mut embed_cache, None)
+            .unwrap();
+
+        assert_tensor_close(&token_logits, &embed_logits);
+        assert_eq!(token_cache.context_len(), 3);
+        assert_eq!(embed_cache.context_len(), 3);
+    }
+
+    #[test]
+    fn managed_qwen3_decode_batches_ragged_rows_in_one_arena() {
+        let device = Device::Cpu;
+        let model = tiny_qwen3_model(&device);
+        let mut owned_a = test_cache();
+        let mut owned_b = test_cache();
+        let (arena, bindings) = test_managed_arena();
+        let mut managed_a = test_managed_cache(arena.clone(), bindings.clone(), 0);
+        let mut managed_b = test_managed_cache(arena.clone(), bindings, 4);
+        let prompt_a = Tensor::from_vec(vec![0u32, 1], (1, 2), &device).unwrap();
+        let prompt_b = Tensor::from_vec(vec![2u32, 3, 4], (1, 3), &device).unwrap();
+        model.forward(&prompt_a, 0, Some(&mut owned_a)).unwrap();
+        model.forward(&prompt_b, 0, Some(&mut owned_b)).unwrap();
+        model.forward_managed(&prompt_a, 0, &mut managed_a).unwrap();
+        model.forward_managed(&prompt_b, 0, &mut managed_b).unwrap();
+        assert_eq!(managed_a.take_completed_writes().len(), 1);
+        assert_eq!(managed_b.take_completed_writes().len(), 1);
+
+        let scalar_a = model
+            .forward(
+                &Tensor::from_vec(vec![5u32], (1, 1), &device).unwrap(),
+                2,
+                Some(&mut owned_a),
+            )
+            .unwrap();
+        let scalar_b = model
+            .forward(
+                &Tensor::from_vec(vec![6u32], (1, 1), &device).unwrap(),
+                3,
+                Some(&mut owned_b),
+            )
+            .unwrap();
+        let mut caches = [&mut managed_a, &mut managed_b];
+        let batched = model
+            .forward_managed_decode_batch(
+                &Tensor::from_vec(vec![5u32, 6], (2, 1), &device).unwrap(),
+                &[2, 3],
+                &mut caches,
+            )
+            .unwrap();
+
+        assert_tensor_close(&scalar_a, &batched.i(0).unwrap().unsqueeze(0).unwrap());
+        assert_tensor_close(&scalar_b, &batched.i(1).unwrap().unsqueeze(0).unwrap());
+        assert_eq!(managed_a.context_len(), 3);
+        assert_eq!(managed_b.context_len(), 4);
+        let completion_a = managed_a.take_completed_writes();
+        let completion_b = managed_b.take_completed_writes();
+        assert_eq!(completion_a.len(), 1);
+        assert_eq!(completion_b.len(), 1);
+        assert!(Arc::ptr_eq(&completion_a[0], &completion_b[0]));
+        assert_eq!(completion_a[0].slots_per_layer(), 2);
+        // Two prompt prefill calls plus one batched decode attention call per
+        // layer, not one arena operation per ragged decode row.
+        assert_eq!(arena.operation_stats().slot_write_dispatches, 3);
+        assert_eq!(arena.operation_stats().paged_prefill_dispatches, 2);
+        assert_eq!(arena.operation_stats().paged_decode_dispatches, 1);
+    }
+
+    #[test]
+    fn managed_hidden_forward_matches_owned_and_exposes_early_release_receipt() {
+        let device = Device::Cpu;
+        let model = tiny_qwen3_model(&device);
+        let input_ids = Tensor::from_vec(vec![0u32, 1, 2], (1, 3), &device).unwrap();
+        let embeds = model.embeddings(&input_ids).unwrap();
+        let mut owned = test_cache();
+        let owned_hidden = model
+            .forward_hidden_with_embeds(&embeds, 0, Some(&mut owned), None)
+            .unwrap();
+
+        let (arena, bindings) = test_managed_arena();
+        let mut managed = test_managed_cache(arena, bindings, 0);
+        let managed_hidden = model
+            .forward_managed_hidden_with_embeds(&embeds, 0, &mut managed, None)
+            .unwrap();
+
+        assert_tensor_close(&owned_hidden, &managed_hidden);
+        assert_eq!(managed.context_len(), 3);
+        let completions = managed.take_completed_writes();
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].slots_per_layer(), 3);
+        assert!(managed.take_completed_writes().is_empty());
+    }
+
+    #[test]
+    fn managed_full_page_prefix_reuse_matches_full_prefill_logits() {
+        let device = Device::Cpu;
+        let model = tiny_qwen3_model(&device);
+        let prompt = Tensor::from_vec(vec![0u32, 1, 2, 3, 4], (1, 5), &device).unwrap();
+        let mut owned = test_cache();
+        let full_logits = model.forward(&prompt, 0, Some(&mut owned)).unwrap();
+
+        let (arena, bindings) = test_managed_arena();
+        let mut publisher = test_managed_cache(arena.clone(), bindings.clone(), 0);
+        let prefix = Tensor::from_vec(vec![0u32, 1, 2, 3], (1, 4), &device).unwrap();
+        model.forward_managed(&prefix, 0, &mut publisher).unwrap();
+        assert_eq!(publisher.context_len(), 4);
+
+        let mut reused = PhysicalPagedKvCache::new(
+            arena,
+            bindings,
+            publisher.blocks.clone(),
+            publisher.context_len(),
+        )
+        .unwrap();
+        let suffix = Tensor::from_vec(vec![4u32], (1, 1), &device).unwrap();
+        let reused_logits = model.forward_managed(&suffix, 4, &mut reused).unwrap();
+        let expected_last = full_logits.i((.., 4..5, ..)).unwrap();
+        assert_tensor_close(&expected_last, &reused_logits);
+    }
+
+    #[test]
+    fn managed_multi_token_prefix_extension_matches_full_prefill_logits() {
+        let device = Device::Cpu;
+        let model = tiny_qwen3_model(&device);
+        let prompt = Tensor::from_vec(vec![0u32, 1, 2, 3, 4], (1, 5), &device).unwrap();
+        let mut owned = test_cache();
+        let full_logits = model.forward(&prompt, 0, Some(&mut owned)).unwrap();
+
+        let (arena, bindings) = test_managed_arena();
+        let mut managed = test_managed_cache(arena, bindings, 0);
+        let prefix = Tensor::from_vec(vec![0u32, 1], (1, 2), &device).unwrap();
+        model.forward_managed(&prefix, 0, &mut managed).unwrap();
+        let suffix = Tensor::from_vec(vec![2u32, 3, 4], (1, 3), &device).unwrap();
+        let suffix_logits = model.forward_managed(&suffix, 2, &mut managed).unwrap();
+
+        assert_tensor_close(&full_logits.i((.., 2.., ..)).unwrap(), &suffix_logits);
+        assert_eq!(managed.context_len(), 5);
     }
 
     #[test]
@@ -3112,11 +4185,12 @@ mod tests {
     }
 
     #[test]
-    fn qwen3_qk_rms_norm_fusion_defaults_to_metal_only() {
-        assert!(qwen3_qk_rms_norm_fusion_policy(true, None));
-        assert!(!qwen3_qk_rms_norm_fusion_policy(false, None));
-        assert!(qwen3_qk_rms_norm_fusion_policy(false, Some(true)));
-        assert!(!qwen3_qk_rms_norm_fusion_policy(true, Some(false)));
+    fn qwen3_qk_rms_norm_fusion_defaults_to_accelerators() {
+        assert!(qwen3_qk_rms_norm_fusion_policy(true, false, None));
+        assert!(qwen3_qk_rms_norm_fusion_policy(false, true, None));
+        assert!(!qwen3_qk_rms_norm_fusion_policy(false, false, None));
+        assert!(qwen3_qk_rms_norm_fusion_policy(false, false, Some(true)));
+        assert!(!qwen3_qk_rms_norm_fusion_policy(true, false, Some(false)));
     }
 
     #[test]
@@ -3190,6 +4264,15 @@ mod tests {
         for (lhs, rhs) in kernel_vals.iter().zip(manual_vals.iter()) {
             assert!((lhs - rhs).abs() < 1e-5);
         }
+    }
+
+    #[test]
+    fn qwen3_cuda_rope_kernel_defaults_on_with_explicit_rollback() {
+        assert!(qwen3_rope_kernel_policy(true, false, None));
+        assert!(qwen3_rope_kernel_policy(false, true, None));
+        assert!(qwen3_rope_kernel_policy(false, true, Some(true)));
+        assert!(!qwen3_rope_kernel_policy(true, false, Some(false)));
+        assert!(!qwen3_rope_kernel_policy(false, false, Some(true)));
     }
 
     #[test]
@@ -3654,9 +4737,8 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn dense_decode_attention_matches_manual_gqa_on_metal_decode_window() {
-        let device = match std::panic::catch_unwind(|| Device::new_metal(0)) {
-            Ok(Ok(device)) => device,
-            _ => return,
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            return;
         };
         let num_heads = 2usize;
         let num_kv_heads = 1usize;

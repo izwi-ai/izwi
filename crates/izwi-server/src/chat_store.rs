@@ -255,17 +255,20 @@ impl ChatStore {
             .await
             .context("Failed to start chat message transaction")?;
 
-        let thread_exists = chat_threads::Entity::find_by_id(thread_id.clone())
+        let thread = chat_threads::Entity::find_by_id(thread_id.clone())
             .one(&tx)
             .await
             .context("Failed to load chat thread")?
-            .is_some();
+            .ok_or_else(|| anyhow!("Thread not found"))?;
 
-        if !thread_exists {
-            return Err(anyhow!("Thread not found"));
+        let previous_timestamp = latest_thread_message_timestamp(&tx, &thread_id)
+            .await?
+            .unwrap_or(thread.updated_at)
+            .max(thread.updated_at);
+        let created_at = now_unix_millis_i64().max(previous_timestamp.saturating_add(1));
+        if created_at == i64::MAX {
+            return Err(anyhow!("Chat message timestamp space is exhausted"));
         }
-
-        let now = now_unix_millis_i64();
         let message_id = new_uuid();
         let tokens_i64 = opt_usize_to_i64(tokens_generated)?;
         let serialized_content_parts = content_parts
@@ -280,7 +283,7 @@ impl ChatStore {
             role: Set(role.clone()),
             content: Set(content.clone()),
             content_parts: Set(serialized_content_parts),
-            created_at: Set(now),
+            created_at: Set(created_at),
             tokens_generated: Set(tokens_i64),
             generation_time_ms: Set(generation_time_ms),
         })
@@ -289,7 +292,7 @@ impl ChatStore {
         .context("Failed to append chat message")?;
 
         chat_threads::Entity::update_many()
-            .col_expr(chat_threads::Column::UpdatedAt, Expr::value(now))
+            .col_expr(chat_threads::Column::UpdatedAt, Expr::value(created_at))
             .col_expr(chat_threads::Column::ModelId, Expr::value(model_id.clone()))
             .filter(chat_threads::Column::Id.eq(thread_id.clone()))
             .exec(&tx)
@@ -306,7 +309,7 @@ impl ChatStore {
             role,
             content,
             content_parts,
-            created_at: now as u64,
+            created_at: i64_to_u64(created_at),
             tokens_generated,
             generation_time_ms,
         })
@@ -681,6 +684,26 @@ mod tests {
                 .expect("user message should append");
             assert_eq!(user_message.content_parts, Some(content_parts.clone()));
 
+            // Force the predecessor ahead of wall clock so message ordering
+            // cannot accidentally rely on UUID tie-breaking or clock progress.
+            let forced_user_created_at = i64::try_from(user_message.created_at)
+                .expect("message timestamp should fit i64")
+                .saturating_add(60_000);
+            let db = store
+                .db
+                .connection()
+                .await
+                .expect("database should connect");
+            chat_messages::Entity::update_many()
+                .col_expr(
+                    chat_messages::Column::CreatedAt,
+                    Expr::value(forced_user_created_at),
+                )
+                .filter(chat_messages::Column::Id.eq(user_message.id.clone()))
+                .exec(db)
+                .await
+                .expect("message timestamp should update");
+
             let assistant_message = store
                 .append_message(
                     thread.id.clone(),
@@ -694,6 +717,10 @@ mod tests {
                 .await
                 .expect("assistant message should append");
             assert_eq!(assistant_message.tokens_generated, Some(42));
+            assert_eq!(
+                assistant_message.created_at,
+                i64_to_u64(forced_user_created_at.saturating_add(1))
+            );
 
             let messages = store
                 .list_messages(thread.id.clone())

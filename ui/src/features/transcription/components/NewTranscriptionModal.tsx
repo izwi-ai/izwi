@@ -22,6 +22,7 @@ import {
 } from "@/shared/audioUpload";
 import type { UploadProgressInfo } from "@/shared/api/audio";
 import { isAbortError } from "@/shared/api/http";
+import { AUDIO_FILE_ACCEPT } from "@/shared/audioFileAccept";
 import {
   Select,
   SelectContent,
@@ -60,8 +61,8 @@ interface NewTranscriptionModalProps {
   onStreamingDelta?: (delta: string) => void;
   onStreamingProgress?: (progress: TranscriptionProcessingProgress) => void;
   onStreamingFinal?: (record: TranscriptionRecord) => void;
-  onStreamingError?: (message: string) => void;
-  onStreamingDone?: () => void;
+  onStreamingError?: (message: string, recordId: string | null) => void;
+  onStreamingDone?: (recordId: string | null) => void;
 }
 
 interface SubmitAudioOptions {
@@ -294,12 +295,14 @@ export function NewTranscriptionModal({
           : streamingEnabled
             ? await new Promise<TranscriptionRecord>((resolve, reject) => {
               let settled = false;
+              let createdRecordId: string | null = null;
               let streamController: AbortController | null = null;
               const handleCreated = (createdRecord: TranscriptionRecord) => {
                 if (settled) {
                   return;
                 }
                 settled = true;
+                createdRecordId = createdRecord.id;
                 try {
                   streamingCreatedHandled = Promise.resolve(
                     onCreated(createdRecord),
@@ -333,7 +336,7 @@ export function NewTranscriptionModal({
                   onStreamingFinal?.(finalRecord);
                 },
                 onError: (message) => {
-                  onStreamingError?.(message);
+                  onStreamingError?.(message, createdRecordId);
                   if (settled) {
                     return;
                   }
@@ -341,7 +344,7 @@ export function NewTranscriptionModal({
                   reject(new Error(message));
                 },
                 onDone: () => {
-                  onStreamingDone?.();
+                  onStreamingDone?.(createdRecordId);
                   if (settled) {
                     return;
                   }
@@ -645,7 +648,7 @@ export function NewTranscriptionModal({
               <input
                 ref={fileInputRef}
                 type="file"
-                accept="audio/*"
+                accept={AUDIO_FILE_ACCEPT}
                 className="hidden"
                 onChange={(event) => void handleFileUpload(event)}
               />

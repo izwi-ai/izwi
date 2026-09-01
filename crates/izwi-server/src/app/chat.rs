@@ -10,8 +10,8 @@ use tokio::sync::{mpsc, oneshot};
 use crate::error::ApiError;
 use crate::state::AppState;
 use izwi_core::{
-    parse_chat_model_variant, ChatGeneration, ChatMessage, ChatRequestConfig, GenerationParams,
-    ModelVariant, WorkloadClass,
+    parse_chat_model_variant, ChatGeneration, ChatMediaInput, ChatMessage, ChatReasoningEffort,
+    ChatRequestConfig, ChatTemplateKwargs, GenerationParams, ModelVariant, WorkloadClass,
 };
 
 #[derive(Debug, Clone)]
@@ -22,6 +22,8 @@ pub struct ChatExecutionRequest {
     pub max_tokens: Option<usize>,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
+    pub top_k: Option<usize>,
+    pub repetition_penalty: Option<f32>,
     pub presence_penalty: Option<f32>,
     pub chat_config: ChatRequestConfig,
     pub correlation_id: Option<String>,
@@ -34,14 +36,35 @@ impl ChatExecutionRequest {
 
     fn resolved_generation_params(&self) -> GenerationParams {
         let max_new_tokens = self.resolved_max_new_tokens();
-        let mut params = GenerationParams::default();
-        params.max_tokens = max_new_tokens;
+        let mut params = if self.variant == ModelVariant::Qwen3827BFp8 {
+            let thinking = self.chat_config.enable_thinking.unwrap_or(true);
+            GenerationParams {
+                temperature: if thinking { 1.0 } else { 0.7 },
+                top_p: if thinking { 0.95 } else { 0.80 },
+                top_k: 20,
+                repetition_penalty: 1.0,
+                presence_penalty: if thinking { 0.0 } else { 1.5 },
+                max_tokens: max_new_tokens,
+                ..Default::default()
+            }
+        } else {
+            GenerationParams {
+                max_tokens: max_new_tokens,
+                ..Default::default()
+            }
+        };
 
         if let Some(temperature) = self.temperature {
             params.temperature = temperature;
         }
         if let Some(top_p) = self.top_p {
             params.top_p = top_p;
+        }
+        if let Some(top_k) = self.top_k {
+            params.top_k = top_k;
+        }
+        if let Some(repetition_penalty) = self.repetition_penalty {
+            params.repetition_penalty = repetition_penalty;
         }
         if let Some(presence_penalty) = self.presence_penalty {
             params.presence_penalty = presence_penalty;
@@ -52,6 +75,53 @@ impl ChatExecutionRequest {
     fn resolved_chat_config(&self) -> ChatRequestConfig {
         self.chat_config.clone()
     }
+}
+
+fn resolve_compatible_field<T>(
+    name: &str,
+    direct: Option<T>,
+    template: Option<T>,
+) -> Result<Option<T>, ApiError>
+where
+    T: Copy + PartialEq,
+{
+    match (direct, template) {
+        (Some(direct), Some(template)) if direct != template => Err(ApiError::bad_request(
+            format!("Conflicting `{name}` values in request and `chat_template_kwargs`"),
+        )),
+        (Some(value), _) | (_, Some(value)) => Ok(Some(value)),
+        (None, None) => Ok(None),
+    }
+}
+
+pub fn resolve_chat_request_config(
+    enable_thinking: Option<bool>,
+    reasoning_effort: Option<ChatReasoningEffort>,
+    preserve_thinking: Option<bool>,
+    chat_template_kwargs: Option<&ChatTemplateKwargs>,
+    tools: Vec<serde_json::Value>,
+    media_inputs: Vec<ChatMediaInput>,
+) -> Result<ChatRequestConfig, ApiError> {
+    let template = chat_template_kwargs.cloned().unwrap_or_default();
+    Ok(ChatRequestConfig {
+        enable_thinking: resolve_compatible_field(
+            "enable_thinking",
+            enable_thinking,
+            template.enable_thinking,
+        )?,
+        reasoning_effort: resolve_compatible_field(
+            "reasoning_effort",
+            reasoning_effort,
+            template.reasoning_effort,
+        )?,
+        preserve_thinking: resolve_compatible_field(
+            "preserve_thinking",
+            preserve_thinking,
+            template.preserve_thinking,
+        )?,
+        tools,
+        media_inputs,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -169,7 +239,12 @@ pub fn max_new_tokens(
 ) -> usize {
     let requested = max_completion_tokens.or(max_tokens);
 
-    requested.unwrap_or(4096).clamp(1, 4096)
+    // Preserve an omitted OpenAI output limit until the exact prompt has been
+    // tokenized. The engine first bounds this sentinel by its backend context
+    // capacity, then `enforce_chat_context_window` reduces it to the loaded
+    // model's exact remaining context. This matches production serving engines
+    // such as vLLM and avoids imposing an unrelated API-layer token ceiling.
+    requested.unwrap_or(usize::MAX).max(1)
 }
 
 pub fn parse_chat_model(model_id: &str) -> Result<ModelVariant, ApiError> {
@@ -398,6 +473,8 @@ mod tests {
             max_tokens: Some(32),
             temperature: Some(0.42),
             top_p: Some(0.73),
+            top_k: None,
+            repetition_penalty: None,
             presence_penalty: Some(0.25),
             chat_config: ChatRequestConfig::default(),
             correlation_id: None,
@@ -411,8 +488,106 @@ mod tests {
         assert_eq!(params.max_tokens, 32);
     }
 
+    fn qwen38_request(enable_thinking: Option<bool>) -> ChatExecutionRequest {
+        ChatExecutionRequest {
+            variant: ModelVariant::Qwen3827BFp8,
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "hello".to_string(),
+            }],
+            max_completion_tokens: None,
+            max_tokens: Some(32),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            repetition_penalty: None,
+            presence_penalty: None,
+            chat_config: ChatRequestConfig {
+                enable_thinking,
+                ..Default::default()
+            },
+            correlation_id: None,
+        }
+    }
+
     #[test]
-    fn chat_models_default_to_4096_max_tokens_when_request_omits_limits() {
+    fn qwen38_uses_thinking_sampling_profile_when_values_are_omitted() {
+        let params = qwen38_request(None).resolved_generation_params();
+        assert_eq!(params.temperature, 1.0);
+        assert_eq!(params.top_p, 0.95);
+        assert_eq!(params.top_k, 20);
+        assert_eq!(params.repetition_penalty, 1.0);
+        assert_eq!(params.presence_penalty, 0.0);
+    }
+
+    #[test]
+    fn qwen38_uses_non_thinking_sampling_profile_when_disabled() {
+        let params = qwen38_request(Some(false)).resolved_generation_params();
+        assert_eq!(params.temperature, 0.7);
+        assert_eq!(params.top_p, 0.80);
+        assert_eq!(params.top_k, 20);
+        assert_eq!(params.repetition_penalty, 1.0);
+        assert_eq!(params.presence_penalty, 1.5);
+    }
+
+    #[test]
+    fn qwen38_explicit_sampling_values_win_over_profile() {
+        let mut request = qwen38_request(Some(true));
+        request.temperature = Some(0.2);
+        request.top_p = Some(0.3);
+        request.top_k = Some(7);
+        request.repetition_penalty = Some(1.2);
+        request.presence_penalty = Some(-0.4);
+
+        let params = request.resolved_generation_params();
+        assert_eq!(params.temperature, 0.2);
+        assert_eq!(params.top_p, 0.3);
+        assert_eq!(params.top_k, 7);
+        assert_eq!(params.repetition_penalty, 1.2);
+        assert_eq!(params.presence_penalty, -0.4);
+    }
+
+    #[test]
+    fn chat_template_kwargs_conflicts_are_rejected() {
+        let err = resolve_chat_request_config(
+            Some(true),
+            None,
+            None,
+            Some(&ChatTemplateKwargs {
+                enable_thinking: Some(false),
+                ..Default::default()
+            }),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect_err("conflicting enable_thinking must fail");
+
+        assert!(err.message.contains("Conflicting `enable_thinking`"));
+    }
+
+    #[test]
+    fn compatible_chat_template_kwargs_resolve_reasoning_controls() {
+        let config = resolve_chat_request_config(
+            None,
+            Some(ChatReasoningEffort::Low),
+            Some(false),
+            Some(&ChatTemplateKwargs {
+                enable_thinking: Some(true),
+                reasoning_effort: Some(ChatReasoningEffort::Low),
+                preserve_thinking: Some(false),
+            }),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("matching fields should resolve");
+
+        assert_eq!(config.enable_thinking, Some(true));
+        assert_eq!(config.reasoning_effort, Some(ChatReasoningEffort::Low));
+        assert_eq!(config.preserve_thinking, Some(false));
+    }
+
+    #[test]
+    fn chat_models_leave_omitted_output_limits_for_exact_context_resolution() {
         for variant in [
             ModelVariant::Gemma34BIt,
             ModelVariant::Lfm2512BInstructGguf,
@@ -423,8 +598,22 @@ mod tests {
             ModelVariant::Qwen314BGguf,
             ModelVariant::Qwen352BGguf,
         ] {
-            assert_eq!(max_new_tokens(variant, None, None), 4096);
+            assert_eq!(max_new_tokens(variant, None, None), usize::MAX);
         }
+    }
+
+    #[test]
+    fn explicit_chat_output_limits_are_not_capped_at_4096() {
+        assert_eq!(
+            max_new_tokens(ModelVariant::Qwen3827BFp8, None, Some(32_768)),
+            32_768
+        );
+        assert_eq!(
+            max_new_tokens(ModelVariant::Qwen3827BFp8, Some(65_536), Some(32_768)),
+            65_536,
+            "max_completion_tokens must retain precedence over legacy max_tokens"
+        );
+        assert_eq!(max_new_tokens(ModelVariant::Qwen3827BFp8, Some(0), None), 1);
     }
 
     #[tokio::test]

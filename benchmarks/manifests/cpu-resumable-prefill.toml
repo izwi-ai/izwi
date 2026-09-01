@@ -1,0 +1,26 @@
+# Exact-SHA CPU scheduler-resumable prefill workload for every chat family.
+# Set the chunk threshold below this prompt's token count.
+
+[[benchmarks]]
+name = "chat-resumable-prefill"
+command = "chat"
+iterations = 2
+concurrent = 1
+warmup = true
+prompt = """
+Explain continuous batching, chunked prefill, paged attention, prefix reuse, request fairness,
+cancellation, transaction rollback, mixed prompt lengths, retained recurrent state, device
+synchronization, sampling readbacks, memory capacity, batch width, padding waste, time to first
+token, inter-token latency, aggregate throughput, and exact-SHA release evidence. Compare CPU,
+Metal, and CUDA execution while preserving numerical parity and responsive multi-user serving.
+"""
+max_tokens = 32
+
+[benchmarks.matrix]
+model = [
+  "Qwen3-0.6B-GGUF",
+  "Qwen3.5-0.8B",
+  "Qwen3.8-27B-FP8",
+  "LFM2.5-1.2B-Instruct-GGUF",
+  "Gemma-3-1b-it",
+]

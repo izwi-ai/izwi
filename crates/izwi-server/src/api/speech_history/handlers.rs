@@ -19,6 +19,9 @@ use crate::api::pagination::{encode_cursor, CursorPagination, CursorPaginationQu
 use crate::api::request_context::RequestContext;
 use crate::api::saved_voices::resolve_saved_voice_reference;
 use crate::api::tts_long_form::{expand_generation_requests_for_long_form, generate_long_form_tts};
+#[cfg(test)]
+use crate::api::tts_policy::qwen_tts_auto_max_frames_for_text;
+use crate::api::tts_policy::resolve_tts_output_frames;
 use crate::batch_runtime::{
     store::{
         sha256_hex, NewIdempotencyRecord, NewJobStage, NewJobStageDispatch, NewMediaAsset,
@@ -43,7 +46,9 @@ use crate::speech_history_store::{
 };
 use crate::state::AppState;
 use izwi_core::audio::{inspect_audio_bytes, AudioEncoder, AudioFormat};
+#[cfg(test)]
 use izwi_core::runtime_models::architectures::vibevoice::tts::vibevoice_tts_auto_max_frames_for_text;
+#[cfg(test)]
 use izwi_core::runtime_models::architectures::voxtral::tts::voxtral_tts_auto_max_frames_for_text;
 use izwi_core::{
     parse_tts_model_variant, AudioChunk, GenerationConfig, GenerationRequest, ModelVariant,
@@ -73,6 +78,13 @@ pub struct SpeechHistoryRecordListResponse {
 pub struct DeleteSpeechHistoryRecordResponse {
     pub id: String,
     pub deleted: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CancelSpeechHistoryRecordResponse {
+    pub id: String,
+    pub cancelled: bool,
+    pub record: SpeechHistoryRecord,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -267,6 +279,26 @@ pub async fn delete_text_to_speech_record(
     delete_record(state, SpeechRouteKind::TextToSpeech, record_id).await
 }
 
+pub async fn cancel_text_to_speech_record(
+    State(state): State<AppState>,
+    Path(record_id): Path<String>,
+) -> Result<Json<CancelSpeechHistoryRecordResponse>, ApiError> {
+    let record = cancel_speech_history_job(
+        &state,
+        SpeechRouteKind::TextToSpeech,
+        &record_id,
+        "Cancelled by speech history request",
+    )
+    .await?
+    .ok_or_else(|| ApiError::bad_request("Speech history job is not cancellable"))?;
+
+    Ok(Json(CancelSpeechHistoryRecordResponse {
+        id: record_id,
+        cancelled: true,
+        record,
+    }))
+}
+
 pub async fn delete_voice_design_record(
     State(state): State<AppState>,
     Path(record_id): Path<String>,
@@ -370,6 +402,13 @@ async fn delete_record(
     route_kind: SpeechRouteKind,
     record_id: String,
 ) -> Result<Json<DeleteSpeechHistoryRecordResponse>, ApiError> {
+    let _ = cancel_speech_history_job(
+        &state,
+        route_kind,
+        &record_id,
+        "Cancelled because the speech history record was deleted",
+    )
+    .await?;
     let deleted = state
         .speech_history_store
         .delete_record(route_kind, record_id.clone())
@@ -384,6 +423,44 @@ async fn delete_record(
         id: record_id,
         deleted: true,
     }))
+}
+
+async fn cancel_speech_history_job(
+    state: &AppState,
+    route_kind: SpeechRouteKind,
+    record_id: &str,
+    reason: &str,
+) -> Result<Option<SpeechHistoryRecord>, ApiError> {
+    let Some(job) = state
+        .batch_runtime_store
+        .get_active_job_for_route_record(
+            RuntimeJobKind::TtsSpeech,
+            route_kind.as_db_value(),
+            record_id,
+        )
+        .await
+        .map_err(map_store_error)?
+    else {
+        return Ok(None);
+    };
+
+    state
+        .batch_runtime_store
+        .cancel_job(&job.id, Some(reason.to_string()))
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::bad_request("Speech history job is no longer cancellable"))?;
+
+    state
+        .speech_history_store
+        .update_processing_status(
+            route_kind,
+            record_id.to_string(),
+            SpeechHistoryProcessingStatus::Failed,
+            Some(reason.to_string()),
+        )
+        .await
+        .map_err(map_store_error)
 }
 
 async fn create_record(
@@ -1771,10 +1848,12 @@ fn build_generation_request(
     if let Some(speed) = req.speed {
         generation_config.options.speed = speed;
     }
-    if let Some(max_tokens) = req.max_output_tokens.or(req.max_tokens) {
+    if let Some(max_tokens) = resolve_speech_history_output_frames(
+        variant,
+        &text,
+        req.max_output_tokens.or(req.max_tokens),
+    ) {
         generation_config.options.max_tokens = max_tokens;
-    } else if variant == ModelVariant::Voxtral4BTts2603 {
-        generation_config.options.max_tokens = 0;
     }
     if let Some(top_k) = req.top_k {
         generation_config.options.top_k = top_k;
@@ -1793,6 +1872,14 @@ fn build_generation_request(
         reference_text: req.reference_text,
         voice_description: req.voice_description,
     }
+}
+
+fn resolve_speech_history_output_frames(
+    variant: ModelVariant,
+    text: &str,
+    requested_frames: Option<usize>,
+) -> Option<usize> {
+    resolve_tts_output_frames(variant, text, requested_frames)
 }
 
 fn normalize_for_model_capabilities(
@@ -1954,16 +2041,8 @@ fn resolve_generation_timeout_secs(
         return default_timeout_secs.max(1);
     };
 
-    let effective_frames = match requested_frames {
-        Some(0) | None if variant == ModelVariant::Voxtral4BTts2603 => {
-            voxtral_tts_auto_max_frames_for_text(text)
-        }
-        Some(0) | None if variant == ModelVariant::VibeVoice15BTts => {
-            vibevoice_tts_auto_max_frames_for_text(text)
-        }
-        Some(0) | None => model_max_frames,
-        Some(value) => value.clamp(1, model_max_frames),
-    };
+    let effective_frames = resolve_speech_history_output_frames(variant, text, requested_frames)
+        .unwrap_or(model_max_frames);
 
     let speed = requested_speed.unwrap_or(1.0).clamp(0.25, 4.0) as f64;
     let estimated_audio_secs = ((effective_frames as f64) / (frame_rate_hz as f64)) / speed;
@@ -1972,7 +2051,13 @@ fn resolve_generation_timeout_secs(
         .ok()
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|value| value.is_finite() && *value >= 1.0)
-        .unwrap_or(8.0);
+        .unwrap_or_else(|| {
+            if variant == ModelVariant::VibeVoice15BTts {
+                izwi_core::runtime_models::architectures::vibevoice::tts::VIBEVOICE_TTS_DEFAULT_TIMEOUT_RTF
+            } else {
+                8.0
+            }
+        });
     let timeout_padding_secs = std::env::var("IZWI_TTS_TIMEOUT_PADDING_SECS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -2018,6 +2103,45 @@ fn stream_terminal_failure_message(message: Option<String>) -> String {
 
 fn to_stream_json(event: SpeechStreamEvent) -> String {
     serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn audio_response(audio: StoredSpeechAudio, as_attachment: bool) -> Response {
+    let mut response = Response::builder().status(StatusCode::OK);
+
+    if let Ok(content_type) = HeaderValue::from_str(audio.audio_mime_type.as_str()) {
+        response = response.header(header::CONTENT_TYPE, content_type);
+    }
+
+    let disposition = if as_attachment {
+        audio
+            .audio_filename
+            .as_deref()
+            .map(|filename| format!("attachment; filename=\"{}\"", filename.replace('"', "")))
+            .unwrap_or_else(|| "attachment".to_string())
+    } else if let Some(filename) = audio.audio_filename.as_deref() {
+        format!("inline; filename=\"{}\"", filename.replace('"', ""))
+    } else {
+        "inline".to_string()
+    };
+    if let Ok(value) = HeaderValue::from_str(disposition.as_str()) {
+        response = response.header(header::CONTENT_DISPOSITION, value);
+    }
+
+    response
+        .body(Body::from(audio.audio_bytes))
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+fn map_store_error(err: anyhow::Error) -> ApiError {
+    ApiError::internal(format!("Speech history storage error: {err}"))
+}
+
+fn map_media_ingest_error(err: MediaIngestError) -> ApiError {
+    if err.is_invalid_input() {
+        ApiError::bad_request(err.to_string())
+    } else {
+        ApiError::internal(format!("Speech reference media ingest error: {err}"))
+    }
 }
 
 #[cfg(test)]
@@ -2154,7 +2278,10 @@ mod tests {
             ModelVariant::Voxtral4BTts2603,
         );
 
-        assert_eq!(generation.config.options.max_tokens, 0);
+        assert_eq!(
+            generation.config.options.max_tokens,
+            voxtral_tts_auto_max_frames_for_text(&generation.text)
+        );
         assert_eq!(
             resolve_generation_timeout_secs(
                 1,
@@ -2184,7 +2311,10 @@ mod tests {
             ModelVariant::VibeVoice15BTts,
         );
 
-        assert_eq!(generation.config.options.max_tokens, 0);
+        assert_eq!(
+            generation.config.options.max_tokens,
+            vibevoice_tts_auto_max_frames_for_text(&generation.text)
+        );
         assert_eq!(
             resolve_generation_timeout_secs(
                 1,
@@ -2194,7 +2324,39 @@ mod tests {
                 None,
                 1,
             ),
-            59
+            1_110
+        );
+    }
+
+    #[test]
+    fn qwen_history_auto_budget_is_text_sized_and_never_uses_family_maximum() {
+        let text = "A short desktop speech-history request";
+        let expected = qwen_tts_auto_max_frames_for_text(text);
+        assert!(expected < ModelVariant::QWEN3_TTS_MAX_OUTPUT_FRAMES);
+
+        for requested in [None, Some(0)] {
+            let mut req = base_request();
+            req.max_output_tokens = requested;
+            let generation = build_generation_request(
+                req,
+                "test-correlation".to_string(),
+                text.to_string(),
+                false,
+                ModelVariant::Qwen3Tts12Hz17BBase,
+            );
+            assert_eq!(generation.config.options.max_tokens, expected);
+        }
+    }
+
+    #[test]
+    fn speech_history_output_budget_clamps_explicit_requests_to_model_limit() {
+        assert_eq!(
+            resolve_speech_history_output_frames(
+                ModelVariant::Qwen3Tts12Hz06BCustomVoice,
+                "Hello",
+                Some(usize::MAX),
+            ),
+            Some(ModelVariant::QWEN3_TTS_MAX_OUTPUT_FRAMES)
         );
     }
 
@@ -2290,44 +2452,5 @@ mod tests {
         .expect("request should normalize");
 
         assert_eq!(normalized.speed, None);
-    }
-}
-
-fn audio_response(audio: StoredSpeechAudio, as_attachment: bool) -> Response {
-    let mut response = Response::builder().status(StatusCode::OK);
-
-    if let Ok(content_type) = HeaderValue::from_str(audio.audio_mime_type.as_str()) {
-        response = response.header(header::CONTENT_TYPE, content_type);
-    }
-
-    let disposition = if as_attachment {
-        audio
-            .audio_filename
-            .as_deref()
-            .map(|filename| format!("attachment; filename=\"{}\"", filename.replace('"', "")))
-            .unwrap_or_else(|| "attachment".to_string())
-    } else if let Some(filename) = audio.audio_filename.as_deref() {
-        format!("inline; filename=\"{}\"", filename.replace('"', ""))
-    } else {
-        "inline".to_string()
-    };
-    if let Ok(value) = HeaderValue::from_str(disposition.as_str()) {
-        response = response.header(header::CONTENT_DISPOSITION, value);
-    }
-
-    response
-        .body(Body::from(audio.audio_bytes))
-        .unwrap_or_else(|_| Response::new(Body::empty()))
-}
-
-fn map_store_error(err: anyhow::Error) -> ApiError {
-    ApiError::internal(format!("Speech history storage error: {err}"))
-}
-
-fn map_media_ingest_error(err: MediaIngestError) -> ApiError {
-    if err.is_invalid_input() {
-        ApiError::bad_request(err.to_string())
-    } else {
-        ApiError::internal(format!("Speech reference media ingest error: {err}"))
     }
 }

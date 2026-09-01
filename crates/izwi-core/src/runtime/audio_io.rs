@@ -530,7 +530,7 @@ fn decode_wav_pcm16_mono_with_metadata(
     }
 
     let data = &wav_bytes[data_range];
-    if error_mode.is_strict() && data.len() % block_align != 0 {
+    if error_mode.is_strict() && !data.len().is_multiple_of(block_align) {
         return Err(Error::InferenceError(format!(
             "WAV PCM16 data length {} is not aligned to {block_align}-byte frames",
             data.len()
@@ -546,7 +546,7 @@ fn decode_wav_pcm16_mono_with_metadata(
 
     let mut samples = Vec::with_capacity(frame_count);
     if channels == 1 {
-        for bytes in data[..frame_count * block_align].chunks_exact(2) {
+        for bytes in data[..frame_count * block_align].as_chunks::<2>().0 {
             let sample = i16::from_le_bytes([bytes[0], bytes[1]]) as f32 / 32767.0;
             samples.push(sample.clamp(-1.0, 1.0));
         }

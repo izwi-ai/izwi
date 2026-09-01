@@ -1,29 +1,72 @@
-use std::mem::size_of;
 use std::sync::Arc;
 use std::time::Instant;
 
-use tracing::debug;
-
-use crate::engine::resources::{ReservationClass, ReservationOwner, ResourceLease};
 use crate::error::{Error, Result};
-use crate::models::architectures::qwen35::chat::{Qwen35PrefixSnapshot, Qwen35PreparedPrompt};
-use crate::models::registry::NativeChatModel;
+use crate::models::registry::{NativeChatDecodeCheckpoint, NativeChatDecodeStep, NativeChatModel};
+use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::chat::ChatGenerationConfig;
 use crate::models::shared::chat::ChatMessage;
 
 use super::super::request::EngineCoreRequest;
 use super::super::scheduler::ScheduledRequest;
 use super::super::types::AudioOutput;
-use super::prefix_cache::{ExactPrefixHandle, ExactPrefixScope};
+use super::super::SessionKey;
 use super::state::ActiveChatDecode;
-use super::{ExecutorOutput, ExecutorPhaseTiming, ModelSessionResult, NativeExecutor};
+use super::{
+    ExecutorOutput, ExecutorPhaseTiming, ExecutorStateLease, ModelSessionResult, NativeExecutor,
+};
 
 const FALLBACK_CHAT_STREAM_BATCH_PIECES: usize = 4;
 const FALLBACK_CHAT_STREAM_BATCH_BYTES: usize = 32;
 
-struct PendingPrefixAuthorization {
-    max_bytes: u64,
-    lease: ResourceLease,
+fn begins_resumable_prefill_state(scheduled: &ScheduledRequest, resumable_prefill: bool) -> bool {
+    scheduled.is_prefill && resumable_prefill && scheduled.num_computed_tokens == 0
+}
+
+fn finish_resumable_prefill_step(
+    prefill_complete: bool,
+    last_tokens_generated: usize,
+    publish_bootstrap: impl FnOnce() -> Result<NativeChatDecodeStep>,
+) -> Result<NativeChatDecodeStep> {
+    if prefill_complete {
+        // Publish the already-computed first token in the same transaction as
+        // the final prompt span. No additional prompt KV write is performed.
+        return publish_bootstrap();
+    }
+    Ok(NativeChatDecodeStep {
+        delta: String::new(),
+        text: String::new(),
+        tokens_generated: last_tokens_generated,
+        input_tokens_committed: 0,
+        finished: false,
+    })
+}
+
+fn resumable_prefill_span(
+    scheduled: &ScheduledRequest,
+    prompt_tokens: usize,
+) -> Result<(usize, usize)> {
+    let start = scheduled.num_computed_tokens;
+    let end = start.checked_add(scheduled.num_tokens).ok_or_else(|| {
+        Error::InvalidInput("resumable prefill span overflowed prompt accounting".into())
+    })?;
+    let crate::engine::WorkUnit::SequenceStep { phase, input, .. } = &scheduled.work else {
+        return Err(Error::InvalidInput(
+            "resumable prefill requires sequence-prefill work".into(),
+        ));
+    };
+    if *phase != crate::engine::SequencePhase::Prefill
+        || input.start != start
+        || input.end != end
+        || start >= end
+        || end > prompt_tokens
+    {
+        return Err(Error::InvalidInput(format!(
+            "resumable prefill work [{}, {}) disagrees with scheduler span [{start}, {end}) for {prompt_tokens} prompt tokens",
+            input.start, input.end
+        )));
+    }
+    Ok((start, end))
 }
 
 #[derive(Debug, Default)]
@@ -31,6 +74,65 @@ struct StreamDeltaBatch {
     emitted_first: bool,
     pending: String,
     pending_pieces: usize,
+}
+
+struct ContinuousChatStateBatch<'a> {
+    rows: Vec<(
+        usize,
+        SessionKey,
+        ExecutorStateLease<'a, ActiveChatDecode>,
+        Option<NativeChatDecodeCheckpoint>,
+    )>,
+    armed: bool,
+}
+
+impl<'a> ContinuousChatStateBatch<'a> {
+    fn new(rows: Vec<(usize, SessionKey, ExecutorStateLease<'a, ActiveChatDecode>)>) -> Self {
+        Self {
+            rows: rows
+                .into_iter()
+                .map(|(index, session, lease)| (index, session, lease, None))
+                .collect(),
+            armed: true,
+        }
+    }
+
+    fn commit(mut self) -> Vec<(usize, SessionKey, ExecutorStateLease<'a, ActiveChatDecode>)> {
+        self.armed = false;
+        std::mem::take(&mut self.rows)
+            .into_iter()
+            .map(|(index, session, lease, _)| (index, session, lease))
+            .collect()
+    }
+}
+
+impl Drop for ContinuousChatStateBatch<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        for (_, session, lease, checkpoint) in &mut self.rows {
+            if let Some(checkpoint) = checkpoint.take() {
+                match lease
+                    .require_state_mut()
+                    .and_then(|state| state.state.rollback_continuous_quantum(checkpoint))
+                {
+                    Ok(()) => lease.mark_clean(),
+                    Err(error) => {
+                        tracing::error!(
+                            request_id = %session.request_id,
+                            epoch = session.epoch,
+                            %error,
+                            "continuous chat rollback failed; state fenced until cleanup"
+                        );
+                    }
+                }
+            }
+        }
+        // Dropping each lease restores clean/rolled-back rows and poisons any
+        // row whose physical mutation could not be rolled back.
+        self.rows.clear();
+    }
 }
 
 impl StreamDeltaBatch {
@@ -96,7 +198,49 @@ impl NativeExecutor {
         request: &EngineCoreRequest,
         scheduled: &ScheduledRequest,
     ) -> Result<ModelSessionResult> {
-        let prepared_qwen35_prompt = request.prepared_qwen35_prompt_for_executor()?;
+        self.chat_request_with_managed_cache(request, scheduled, None, None, None)
+    }
+
+    pub(super) fn chat_request_with_managed_cache(
+        &self,
+        request: &EngineCoreRequest,
+        scheduled: &ScheduledRequest,
+        mut managed_cache: Option<PhysicalPagedKvCache>,
+        mut mtp_cache: Option<PhysicalPagedKvCache>,
+        tensor_reservation: Option<crate::engine::ManagedTensorStateReservation>,
+    ) -> Result<ModelSessionResult> {
+        if managed_cache.is_none() && mtp_cache.is_some() {
+            return Err(Error::InferenceError(
+                "managed Qwen3.8 MTP cache has no target-cache authority".into(),
+            ));
+        }
+        if request.managed_cache_runtime().is_some() != managed_cache.is_some() {
+            return Err(Error::InferenceError(
+                "managed Qwen3 execution requires its exact row reservation".to_string(),
+            ));
+        }
+        let model = request.prepared_chat_model_for_executor()?;
+        let resumable_prefill =
+            self.config.enable_chunked_prefill && model.supports_resumable_prefill();
+        if managed_cache.is_some()
+            && scheduled.is_prefill
+            && !resumable_prefill
+            && (scheduled.num_computed_tokens != 0
+                || scheduled.num_tokens != request.num_prompt_tokens())
+        {
+            return Err(Error::InvalidInput(
+                "managed Qwen3 chat requires one full-prompt prefill quantum".to_string(),
+            ));
+        }
+        let tensor_arena = request
+            .managed_cache_runtime()
+            .and_then(|runtime| runtime.tensor_state().cloned());
+        if tensor_arena.is_some() != tensor_reservation.is_some() {
+            return Err(Error::InferenceError(
+                "managed chat tensor state requires its exact row reservation".into(),
+            ));
+        }
+        let prepared_chat_prompt = request.prepared_chat_prompt_for_executor()?;
         let variant = Self::resolve_variant(request)?;
         let messages = Self::chat_messages(request)?;
         let max_new_tokens = request.params.max_tokens.max(1);
@@ -104,16 +248,11 @@ impl NativeExecutor {
         let stream_policy = request.stream_policy;
         let generation_config = Self::chat_generation_config(request);
         let session = scheduled.session_key();
-        let model = request.prepared_chat_model_for_executor()?;
-        let prefix_scope = ExactPrefixScope {
-            variant,
-            backend: self.config.backend,
-            activation_dtype: self.config.dtype.clone(),
-            kv_cache_dtype: self.config.kv_cache_dtype.clone(),
-        };
-        let prefix_cache_enabled =
-            self.qwen35_prefix_cache_enabled(prepared_qwen35_prompt, model.as_ref());
-
+        if mtp_cache.is_some() && !matches!(model.as_ref(), NativeChatModel::Qwen38(_)) {
+            return Err(Error::InferenceError(
+                "managed Qwen3.8 MTP cache was routed to another model family".into(),
+            ));
+        }
         // Fallback path for chat backends that do not expose incremental decode state.
         if !model.supports_incremental_decode() {
             let mut phase_timing_override: Option<ExecutorPhaseTiming> = None;
@@ -217,124 +356,202 @@ impl NativeExecutor {
             }));
         }
 
-        let mut active_state = {
-            let mut guard = self.chat_decode_states.lock().map_err(|_| {
-                Error::InferenceError("Chat decode state mutex poisoned".to_string())
-            })?;
-            // Prefill scheduling can happen after preemption; only recover state
-            // owned by this exact request incarnation.
-            guard.remove(&session)
-        };
-
-        if active_state
-            .as_ref()
+        // Prefill scheduling can happen after preemption; only recover state
+        // owned by this exact request incarnation. The in-flight marker remains
+        // visible to cleanup until this quantum is committed or released.
+        let mut state_lease = ExecutorStateLease::checkout(
+            &self.chat_decode_states,
+            session,
+            variant,
+            "chat decode",
+        )?;
+        if state_lease
+            .state()
             .map(|state| state.variant != variant)
             .unwrap_or(false)
         {
-            active_state = None;
+            state_lease.discard_state();
         }
 
-        let mut active_state = if let Some(state) = active_state {
-            state
+        if state_lease.state().is_some() {
+            match managed_cache.take() {
+                Some(cache) => {
+                    state_lease.mark_dirty();
+                    state_lease
+                        .require_state_mut()?
+                        .state
+                        .install_managed_reservations(cache, mtp_cache.take())?;
+                }
+                None if state_lease
+                    .state()
+                    .is_some_and(|state| state.state.uses_managed_kv()) =>
+                {
+                    return Err(Error::InferenceError(
+                        "managed chat session lost its physical cache authority".to_string(),
+                    ))
+                }
+                None => {}
+            }
+            if let (Some(arena), Some(reservation)) = (tensor_arena.as_ref(), tensor_reservation) {
+                state_lease.mark_dirty();
+                state_lease
+                    .require_state_mut()?
+                    .state
+                    .bind_hybrid_tensor_sequence(reservation.sequence)?;
+                state_lease
+                    .require_state_mut()?
+                    .state
+                    .restore_hybrid_tensor_state(arena)?;
+            }
         } else {
             if request.is_cancelled() {
+                state_lease.release()?;
                 return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
                     request.id.clone(),
                 )));
             }
-            let cached_prefix = prefix_cache_enabled
-                .then(|| {
-                    let prepared = prepared_qwen35_prompt
-                        .expect("enabled Qwen3.5 prefix cache requires prepared prompt");
-                    self.qwen35_prefix_cache.lookup(
-                        &model,
-                        &prefix_scope,
-                        prepared.prompt_ids(),
-                        prepared.prompt_positions(),
-                    )
-                })
-                .flatten();
-            let pending_prefix_authorization = prefix_cache_enabled
-                .then(|| {
-                    self.preauthorize_qwen35_prefix_snapshot(
-                        request,
-                        &prefix_scope,
-                        prepared_qwen35_prompt
-                            .expect("enabled Qwen3.5 prefix cache requires prepared prompt"),
-                    )
-                })
-                .flatten();
-            let capture_prefix_max_bytes = pending_prefix_authorization
-                .as_ref()
-                .map(|authorization| authorization.max_bytes);
-            let mut decode_state = Self::run_blocking(|| {
-                model.start_decode_state_with_prefix(
-                    messages,
-                    max_new_tokens,
-                    &generation_config,
-                    prepared_qwen35_prompt,
-                    cached_prefix.as_ref().map(|cached| cached.snapshot()),
-                    capture_prefix_max_bytes,
-                )
-            })?;
-            let reused_prefix_tokens = decode_state.reused_qwen35_prefix_tokens();
-            if reused_prefix_tokens > 0 {
-                debug!(
-                    model = %variant,
-                    reused_prefix_tokens,
-                    prompt_tokens = request.num_prompt_tokens(),
-                    "Qwen3.5 exact-prefix cache hit"
-                );
+            if scheduled.is_prefill && resumable_prefill && scheduled.num_computed_tokens > 0 {
+                return Err(Error::InferenceError(format!(
+                    "resumable prefill request {} lost its decode state before span continuation; retry requires a fresh prompt",
+                    request.id
+                )));
             }
-            let pending_prefix_snapshot = match (
-                decode_state.take_pending_qwen35_prefix_snapshot(),
-                pending_prefix_authorization,
-            ) {
-                (Some(snapshot), Some(authorization)) => {
-                    self.materialize_qwen35_prefix_snapshot(&prefix_scope, snapshot, authorization)
+            let mut decode_state = match managed_cache.take() {
+                Some(cache) if begins_resumable_prefill_state(scheduled, resumable_prefill) => {
+                    Self::run_blocking(|| {
+                        model.start_resumable_prefill_state_managed(
+                            messages,
+                            max_new_tokens,
+                            &generation_config,
+                            prepared_chat_prompt,
+                            &request.prompt_tokens,
+                            cache,
+                            mtp_cache.take(),
+                        )
+                    })?
                 }
-                _ => None,
+                Some(cache) if matches!(model.as_ref(), NativeChatModel::Qwen35(_)) => {
+                    Self::run_blocking(|| {
+                        model.start_qwen35_decode_state_managed(
+                            messages,
+                            max_new_tokens,
+                            &generation_config,
+                            prepared_chat_prompt.and_then(|prepared| prepared.as_qwen35()),
+                            cache,
+                        )
+                    })?
+                }
+                Some(cache) if matches!(model.as_ref(), NativeChatModel::Qwen38(_)) => {
+                    Self::run_blocking(|| {
+                        model.start_qwen38_decode_state_managed(
+                            messages,
+                            max_new_tokens,
+                            &generation_config,
+                            prepared_chat_prompt.and_then(|prepared| prepared.as_qwen38()),
+                            cache,
+                            mtp_cache.take(),
+                        )
+                    })?
+                }
+                Some(cache) if matches!(model.as_ref(), NativeChatModel::Gemma3(_)) => {
+                    Self::run_blocking(|| {
+                        model.start_gemma3_decode_state_managed(
+                            messages,
+                            max_new_tokens,
+                            &generation_config,
+                            cache,
+                        )
+                    })?
+                }
+                Some(cache) => Self::run_blocking(|| {
+                    model.start_qwen3_decode_state_managed(
+                        messages,
+                        max_new_tokens,
+                        &generation_config,
+                        cache,
+                    )
+                })?,
+                None => {
+                    return Err(Error::InferenceError(
+                        "incremental chat execution requires scheduler-owned physical state".into(),
+                    ))
+                }
             };
-            ActiveChatDecode {
+            if let Some(reservation) = tensor_reservation {
+                decode_state.bind_hybrid_tensor_sequence(reservation.sequence)?;
+            }
+            state_lease.install_state(ActiveChatDecode {
                 variant,
                 state: decode_state,
                 last_tokens_generated: 0,
                 stream_sequence: 0,
                 streamed_text: String::new(),
-                pending_prefix_snapshot,
-            }
-        };
+            })?;
+        }
 
-        let decode_iterations = if scheduled.is_prefill {
+        let input_budget = if scheduled.is_prefill {
             1
         } else {
             scheduled.num_tokens.max(1)
         };
         let mut total_tokens_generated = 0usize;
-        let mut decode_steps_ran = 0usize;
-        let mut final_text = String::new();
-        let mut finished = false;
-
-        for _ in 0..decode_iterations {
+        if request.is_cancelled() {
+            state_lease.release()?;
+            return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                request.id.clone(),
+            )));
+        }
+        let resumable_prefill_quantum = scheduled.is_prefill && resumable_prefill;
+        let resumable_span_tokens = resumable_prefill_quantum.then_some(scheduled.num_tokens);
+        let resumable_span = resumable_prefill_quantum
+            .then(|| resumable_prefill_span(scheduled, request.num_prompt_tokens()))
+            .transpose()?;
+        state_lease.mark_dirty();
+        let (step, final_text, finished, managed_cache_completions) = {
+            let active_state = state_lease.require_state_mut()?;
+            let step = if let Some((span_start, span_end)) = resumable_span {
+                let prefill_complete = Self::run_blocking(|| {
+                    model.continue_resumable_prefill(
+                        &mut active_state.state,
+                        messages,
+                        &generation_config,
+                        prepared_chat_prompt,
+                        &request.prompt_tokens,
+                        span_start,
+                        span_end,
+                        request.num_prompt_tokens(),
+                    )
+                })?;
+                finish_resumable_prefill_step(
+                    prefill_complete,
+                    active_state.last_tokens_generated,
+                    || Self::run_blocking(|| model.decode_quantum(&mut active_state.state, 1)),
+                )?
+            } else {
+                Self::run_blocking(|| model.decode_quantum(&mut active_state.state, input_budget))?
+            };
             if request.is_cancelled() {
                 return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
                     request.id.clone(),
                 )));
             }
-            let step = Self::run_blocking(|| model.decode_step(&mut active_state.state))?;
-            if request.is_cancelled() {
-                return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
-                    request.id.clone(),
-                )));
-            }
-            decode_steps_ran = decode_steps_ran.saturating_add(1);
 
             let step_tokens_generated = step
                 .tokens_generated
                 .saturating_sub(active_state.last_tokens_generated);
             active_state.last_tokens_generated = step.tokens_generated;
             total_tokens_generated = total_tokens_generated.saturating_add(step_tokens_generated);
-            final_text = step.text.clone();
+            let mut final_text = step.text.clone();
+            let finished = step.finished;
+
+            // Durable state must be fully staged before any externally visible
+            // token is emitted. A staging failure then remains an atomic row
+            // failure instead of leaking text from an uncommittable quantum.
+            if let Some(arena) = tensor_arena.as_ref() {
+                active_state
+                    .state
+                    .stage_hybrid_tensor_state(arena, scheduled.plan_id)?;
+            }
 
             if let Some(tx) = stream_tx.as_ref() {
                 if !step.delta.is_empty() {
@@ -358,28 +575,21 @@ impl NativeExecutor {
                         canonical_chat_terminal_text(&active_state.streamed_text, final_text);
                 }
             }
+            let managed_cache_completions = active_state.state.take_managed_write_completions();
+            (step, final_text, finished, managed_cache_completions)
+        };
 
-            if step.finished {
-                if let Some(snapshot) = active_state.pending_prefix_snapshot.take() {
-                    let _ = self
-                        .qwen35_prefix_cache
-                        .insert(&model, prefix_scope.clone(), snapshot);
-                }
-                finished = true;
-                break;
-            }
-        }
-
-        let tokens_processed = if scheduled.is_prefill {
+        let tokens_processed = if let Some(span_tokens) = resumable_span_tokens {
+            span_tokens
+        } else if scheduled.is_prefill {
             request.num_prompt_tokens()
         } else {
-            decode_steps_ran.max(1)
+            step.input_tokens_committed
         };
-        if !finished {
-            let mut guard = self.chat_decode_states.lock().map_err(|_| {
-                Error::InferenceError("Chat decode state mutex poisoned".to_string())
-            })?;
-            guard.insert(session, active_state);
+        if finished {
+            state_lease.release()?;
+        } else {
+            state_lease.restore()?;
         }
 
         Ok(ModelSessionResult::sequence(ExecutorOutput {
@@ -393,13 +603,27 @@ impl NativeExecutor {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
-        }))
+        })
+        .with_managed_cache_completions(managed_cache_completions))
     }
 
     pub(super) fn chat_decode_batch(
         &self,
         requests: &[&EngineCoreRequest],
         scheduled: &[ScheduledRequest],
+    ) -> Result<Vec<ModelSessionResult>> {
+        self.chat_decode_batch_with_managed(
+            requests,
+            scheduled,
+            (0..scheduled.len()).map(|_| None).collect(),
+        )
+    }
+
+    pub(super) fn chat_decode_batch_with_managed(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+        managed_caches: Vec<Option<super::RetainedRowManagedState>>,
     ) -> Result<Vec<ModelSessionResult>> {
         if scheduled.is_empty()
             || scheduled
@@ -408,6 +632,11 @@ impl NativeExecutor {
         {
             return Err(Error::InvalidInput(
                 "continuous chat execution requires one decode token per row".to_string(),
+            ));
+        }
+        if managed_caches.len() != scheduled.len() {
+            return Err(Error::InvalidInput(
+                "continuous chat managed-cache rows do not match batch width".to_string(),
             ));
         }
         let ordered_requests = scheduled
@@ -425,13 +654,40 @@ impl NativeExecutor {
                     })
             })
             .collect::<Result<Vec<_>>>()?;
-        let model = ordered_requests[0].prepared_chat_model_for_executor()?;
+        let live_indices = ordered_requests
+            .iter()
+            .enumerate()
+            .filter_map(|(index, request)| (!request.is_cancelled()).then_some(index))
+            .collect::<Vec<_>>();
+        let mut outputs = (0..scheduled.len())
+            .map(|_| None)
+            .collect::<Vec<Option<ModelSessionResult>>>();
+        for (index, request) in ordered_requests.iter().enumerate() {
+            if request.is_cancelled() {
+                outputs[index] = Some(ModelSessionResult::cancelled_before_dispatch(
+                    ExecutorOutput::cancelled(request.id.clone()),
+                ));
+            }
+        }
+        if live_indices.is_empty() {
+            return outputs
+                .into_iter()
+                .map(|output| {
+                    output.ok_or_else(|| {
+                        Error::InferenceError("cancelled chat row produced no result".into())
+                    })
+                })
+                .collect();
+        }
+
+        let model = ordered_requests[live_indices[0]].prepared_chat_model_for_executor()?;
         if !model.supports_continuous_decode_batch() {
             return Err(Error::InvalidInput(
                 "loaded chat model has no continuous tensor decode adapter".to_string(),
             ));
         }
-        for request in ordered_requests.iter().skip(1) {
+        for index in live_indices.iter().copied().skip(1) {
+            let request = ordered_requests[index];
             let row_model = request.prepared_chat_model_for_executor()?;
             if !Arc::ptr_eq(&model, &row_model) {
                 return Err(Error::InferenceError(
@@ -440,70 +696,153 @@ impl NativeExecutor {
             }
         }
 
-        let mut active_states = {
-            let mut guard = self.chat_decode_states.lock().map_err(|_| {
-                Error::InferenceError("Chat decode state mutex poisoned".to_string())
+        let mut checked_out_states = Vec::with_capacity(live_indices.len());
+        for index in live_indices.iter().copied() {
+            let request = ordered_requests[index];
+            let session = scheduled[index].session_key();
+            let expected_variant = Self::resolve_variant(request)?;
+            let lease = ExecutorStateLease::checkout(
+                &self.chat_decode_states,
+                session.clone(),
+                expected_variant,
+                "continuous chat decode",
+            )?;
+            let state = lease.state().ok_or_else(|| {
+                Error::InferenceError(format!(
+                    "continuous chat session {}:{} has no active decode state",
+                    session.request_id, session.epoch
+                ))
             })?;
-            for (request, scheduled) in ordered_requests.iter().zip(scheduled) {
-                let session = scheduled.session_key();
-                let expected_variant = Self::resolve_variant(request)?;
-                let state = guard.get(&session).ok_or_else(|| {
-                    Error::InferenceError(format!(
-                        "continuous chat session {}:{} has no active decode state",
-                        session.request_id, session.epoch
-                    ))
-                })?;
-                if state.variant != expected_variant {
-                    return Err(Error::InferenceError(
-                        "continuous chat state variant does not match its request".to_string(),
-                    ));
-                }
+            if state.variant != expected_variant {
+                return Err(Error::InferenceError(
+                    "continuous chat state variant does not match its request".to_string(),
+                ));
             }
-            scheduled
-                .iter()
-                .map(|scheduled| {
-                    guard
-                        .remove(&scheduled.session_key())
-                        .expect("continuous chat state was validated under the same lock")
-                })
-                .collect::<Vec<_>>()
-        };
+            checked_out_states.push((index, session, lease));
+        }
+        let mut active_states = ContinuousChatStateBatch::new(checked_out_states);
+        let mut managed_caches = managed_caches;
 
+        for (index, _, lease, checkpoint) in &mut active_states.rows {
+            let request = ordered_requests[*index];
+            let managed_cache = managed_caches[*index].take();
+            if request.managed_cache_runtime().is_some() != managed_cache.is_some() {
+                return Err(Error::InferenceError(
+                    "continuous managed Qwen3 row lost its reservation".to_string(),
+                ));
+            }
+            match managed_cache {
+                Some(mut views) => {
+                    let tensor_reservation = views.tensor_state.clone();
+                    let (cache, mtp_cache) = if request.model_variant.is_some_and(|variant| {
+                        variant.family() == crate::catalog::ModelFamily::Qwen38Chat
+                    }) {
+                        let target =
+                            views.take_paged_domain(super::QWEN38_TARGET_ATTENTION_DOMAIN, true)?;
+                        let mtp =
+                            views.take_paged_domain(super::QWEN38_MTP_ATTENTION_DOMAIN, false)?;
+                        views.ensure_all_paged_consumed()?;
+                        (
+                            target.ok_or_else(|| {
+                                Error::InferenceError(
+                                    "continuous Qwen3.8 row lost its target cache".into(),
+                                )
+                            })?,
+                            mtp,
+                        )
+                    } else {
+                        (views.take_only_paged()?, None)
+                    };
+                    let tensor_arena = request
+                        .managed_cache_runtime()
+                        .and_then(|runtime| runtime.tensor_state());
+                    if tensor_arena.is_some() != tensor_reservation.is_some() {
+                        return Err(Error::InferenceError(
+                            "continuous hybrid row lost its tensor-state reservation".into(),
+                        ));
+                    }
+                    lease.mark_dirty();
+                    let active_state = lease.require_state_mut()?;
+                    if let (Some(arena), Some(reservation)) = (tensor_arena, tensor_reservation) {
+                        active_state
+                            .state
+                            .bind_hybrid_tensor_sequence(reservation.sequence)?;
+                        active_state.state.restore_hybrid_tensor_state(arena)?;
+                    }
+                    *checkpoint = Some(
+                        active_state
+                            .state
+                            .begin_continuous_quantum(cache, mtp_cache)?,
+                    );
+                }
+                None if lease
+                    .state()
+                    .is_some_and(|state| state.state.uses_managed_kv()) =>
+                {
+                    return Err(Error::InferenceError(
+                        "continuous chat row lost its managed-cache reservation".to_string(),
+                    ))
+                }
+                None => {}
+            }
+        }
+
+        for (_, _, lease, _) in &mut active_states.rows {
+            lease.mark_dirty();
+        }
         let mut state_refs = active_states
+            .rows
             .iter_mut()
-            .map(|state| &mut state.state)
-            .collect::<Vec<_>>();
+            .map(|(_, _, lease, _)| lease.require_state_mut().map(|state| &mut state.state))
+            .collect::<Result<Vec<_>>>()?;
+        let live_width = state_refs.len();
         let steps = Self::run_blocking(|| model.decode_step_batch(&mut state_refs))?;
         drop(state_refs);
-        if steps.len() != active_states.len() {
+        if steps.len() != active_states.rows.len() {
             return Err(Error::InferenceError(
                 "continuous chat model returned the wrong number of rows".to_string(),
             ));
         }
-
-        let mut outputs = Vec::with_capacity(steps.len());
-        let mut continuing = Vec::new();
-        for (((request, scheduled), mut active_state), step) in ordered_requests
-            .into_iter()
-            .zip(scheduled)
-            .zip(active_states)
-            .zip(steps)
-        {
-            if request.is_cancelled() {
-                outputs.push(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
-                    request.id.clone(),
-                )));
-                continue;
+        let model_call = if model.continuous_decode_is_tensor_batched() {
+            crate::engine::metrics::EngineModelCall::NativeTensor {
+                mode: crate::engine::NativeBatchMode::Continuous,
+                rows: live_width,
             }
+        } else {
+            crate::engine::metrics::EngineModelCall::ScalarRows {
+                envelope: crate::engine::NativeBatchMode::Continuous,
+                rows: live_width,
+            }
+        };
+        crate::engine::metrics::record_engine_model_call(model_call);
 
+        for (index, _, lease, _) in &mut active_states.rows {
+            if let Some(arena) = ordered_requests[*index]
+                .managed_cache_runtime()
+                .and_then(|runtime| runtime.tensor_state())
+            {
+                let active_state = lease.require_state_mut()?;
+                active_state
+                    .state
+                    .stage_hybrid_tensor_state(arena, scheduled[*index].plan_id)?;
+            }
+        }
+
+        let mut continuing = vec![false; scheduled.len()];
+        for ((index, _, lease, _), step) in active_states.rows.iter_mut().zip(steps) {
+            let request = ordered_requests[*index];
+            let active_state = lease.require_state_mut()?;
             let step_tokens_generated = step
                 .tokens_generated
                 .saturating_sub(active_state.last_tokens_generated);
             active_state.last_tokens_generated = step.tokens_generated;
-            if let Some(tx) = Self::stream_sender(request).as_ref() {
+            let stream_result = (|| -> Result<()> {
+                let Some(tx) = Self::stream_sender(request) else {
+                    return Ok(());
+                };
                 if !step.delta.is_empty() {
                     Self::stream_text_with_policy(
-                        tx,
+                        &tx,
                         request.stream_policy,
                         &request.id,
                         &mut active_state.stream_sequence,
@@ -513,125 +852,69 @@ impl NativeExecutor {
                 }
                 if step.finished {
                     Self::stream_final_marker_with_policy(
-                        tx,
+                        &tx,
                         request.stream_policy,
                         &request.id,
                         &mut active_state.stream_sequence,
                     )?;
                 }
+                Ok(())
+            })();
+            if let Err(error) = stream_result {
+                outputs[*index] = Some(ModelSessionResult::sequence(ExecutorOutput::error(
+                    request.id.clone(),
+                    format!("continuous chat stream staging failed: {error}"),
+                )));
+                continue;
             }
 
-            outputs.push(ModelSessionResult::sequence(ExecutorOutput {
-                request_id: request.id.clone(),
-                audio: Some(AudioOutput::empty(24_000)),
-                text: Some(if step.finished {
-                    canonical_chat_terminal_text(&active_state.streamed_text, step.text)
-                } else {
-                    step.text
-                }),
-                input_transcription: None,
-                tokens_processed: 1,
-                tokens_generated: step_tokens_generated,
-                finished: step.finished,
-                phase_timing_override: None,
-                asr_diagnostics: None,
-                error: None,
-            }));
+            let managed_cache_completions = active_state.state.take_managed_write_completions();
+            outputs[*index] = Some(
+                ModelSessionResult::sequence(ExecutorOutput {
+                    request_id: request.id.clone(),
+                    audio: Some(AudioOutput::empty(24_000)),
+                    text: Some(if step.finished {
+                        canonical_chat_terminal_text(&active_state.streamed_text, step.text)
+                    } else {
+                        step.text
+                    }),
+                    input_transcription: None,
+                    tokens_processed: 1,
+                    tokens_generated: step_tokens_generated,
+                    finished: step.finished,
+                    phase_timing_override: None,
+                    asr_diagnostics: None,
+                    error: None,
+                })
+                .with_managed_cache_completions(managed_cache_completions),
+            );
             if !step.finished {
-                continuing.push((scheduled.session_key(), active_state));
+                continuing[*index] = true;
             }
         }
 
-        if !continuing.is_empty() {
-            let mut guard = self.chat_decode_states.lock().map_err(|_| {
-                Error::InferenceError("Chat decode state mutex poisoned".to_string())
-            })?;
-            for (session, state) in continuing {
-                if guard.insert(session, state).is_some() {
-                    return Err(Error::InferenceError(
-                        "continuous chat state collided during commit".to_string(),
-                    ));
-                }
+        let committed_states = active_states.commit();
+        for (index, _, lease) in committed_states {
+            let transition = if continuing[index] {
+                lease.restore()
+            } else {
+                lease.release()
+            };
+            if let Err(error) = transition {
+                outputs[index] = Some(ModelSessionResult::sequence(ExecutorOutput::error(
+                    ordered_requests[index].id.clone(),
+                    format!("continuous chat state transition failed: {error}"),
+                )));
             }
         }
-        Ok(outputs)
-    }
-
-    fn qwen35_prefix_cache_enabled(
-        &self,
-        prepared: Option<&Qwen35PreparedPrompt>,
-        model: &NativeChatModel,
-    ) -> bool {
-        self.config.resource_authority.is_some()
-            && self.qwen35_prefix_cache.max_retained_bytes() > 0
-            && matches!(model, NativeChatModel::Qwen35(_))
-            && prepared.is_some_and(Qwen35PreparedPrompt::supports_exact_prefix_reuse)
-    }
-
-    fn preauthorize_qwen35_prefix_snapshot(
-        &self,
-        request: &EngineCoreRequest,
-        scope: &ExactPrefixScope,
-        prepared: &Qwen35PreparedPrompt,
-    ) -> Option<PendingPrefixAuthorization> {
-        let state_bytes = self.authorized_session_cache_bytes(request).ok()?;
-        let metadata_per_token = size_of::<u32>().checked_add(size_of::<[usize; 3]>())?;
-        let metadata_bytes = prepared
-            .prompt_ids()
-            .len()
-            .checked_mul(metadata_per_token)?
-            .checked_add(size_of::<Qwen35PrefixSnapshot>())?;
-        let max_bytes = state_bytes.checked_add(u64::try_from(metadata_bytes).ok()?)?;
-        if max_bytes == 0 || max_bytes > self.qwen35_prefix_cache.max_retained_bytes() {
-            return None;
-        }
-        let Some(authority) = self.config.resource_authority.as_ref() else {
-            return None;
-        };
-        let resources = super::cache_resource_vector(scope.backend, max_bytes);
-        let owner = ReservationOwner::new(
-            ReservationClass::Cache,
-            format!("qwen35-prefix-pending:{}", scope.variant),
-        );
-        let lease = authority.reserve(owner, resources).ok()?;
-        Some(PendingPrefixAuthorization { max_bytes, lease })
-    }
-
-    fn materialize_qwen35_prefix_snapshot(
-        &self,
-        scope: &ExactPrefixScope,
-        snapshot: Qwen35PrefixSnapshot,
-        mut authorization: PendingPrefixAuthorization,
-    ) -> Option<Arc<ExactPrefixHandle<Qwen35PrefixSnapshot>>> {
-        let Some(bytes) = snapshot.retained_bytes() else {
-            drop(snapshot);
-            drop(authorization);
-            return None;
-        };
-        if bytes == 0 || bytes > authorization.max_bytes {
-            drop(snapshot);
-            drop(authorization);
-            return None;
-        }
-        let resources = super::cache_resource_vector(scope.backend, bytes);
-        if authorization
-            .lease
-            .record_materialized_usage(resources)
-            .is_err()
-        {
-            drop(snapshot);
-            drop(authorization);
-            return None;
-        }
-        // The copy is complete and its exact backing size is known. Relinquish
-        // unused preauthorization while keeping the materialized snapshot fully
-        // covered for its retained lifetime.
-        let _ = authorization.lease.resize(resources);
-        Some(ExactPrefixHandle::new(
-            scope.backend,
-            snapshot,
-            Some(authorization.lease),
-        ))
+        outputs
+            .into_iter()
+            .map(|output| {
+                output.ok_or_else(|| {
+                    Error::InferenceError("continuous chat row produced no result".into())
+                })
+            })
+            .collect()
     }
 }
 
@@ -641,6 +924,84 @@ mod tests {
     use crate::engine::{GenerationParams, InputRange, SequencePhase, WorkUnit};
     use crate::model::ModelVariant;
     use crate::models::shared::chat::{ChatMessage, ChatRole};
+
+    #[test]
+    fn final_first_span_still_bootstraps_resumable_prefill_state() {
+        let scheduled = ScheduledRequest {
+            plan_id: 1,
+            request_id: "short-resumable-prompt".to_string(),
+            sequence_id: 1,
+            num_tokens: 16,
+            is_prefill: true,
+            num_computed_tokens: 0,
+            work: WorkUnit::SequenceStep {
+                phase: SequencePhase::Prefill,
+                input: InputRange { start: 0, end: 16 },
+                max_output_steps: 16,
+                auxiliary_state: None,
+            },
+        };
+
+        assert!(begins_resumable_prefill_state(&scheduled, true));
+        assert!(!begins_resumable_prefill_state(&scheduled, false));
+        assert_eq!(resumable_prefill_span(&scheduled, 16).unwrap(), (0, 16));
+    }
+
+    #[test]
+    fn resumable_prefill_rejects_scheduler_work_cursor_mismatch() {
+        let scheduled = ScheduledRequest {
+            plan_id: 1,
+            request_id: "bad-resumable-span".to_string(),
+            sequence_id: 1,
+            num_tokens: 8,
+            is_prefill: true,
+            num_computed_tokens: 8,
+            work: WorkUnit::SequenceStep {
+                phase: SequencePhase::Prefill,
+                input: InputRange { start: 7, end: 16 },
+                max_output_steps: 8,
+                auxiliary_state: None,
+            },
+        };
+
+        assert!(resumable_prefill_span(&scheduled, 16).is_err());
+    }
+
+    #[test]
+    fn final_resumable_prefill_span_publishes_its_bootstrap_token() {
+        let published = std::cell::Cell::new(false);
+        let step = finish_resumable_prefill_step(true, 0, || {
+            published.set(true);
+            Ok(NativeChatDecodeStep {
+                delta: "token".to_string(),
+                text: "token".to_string(),
+                tokens_generated: 1,
+                input_tokens_committed: 0,
+                finished: false,
+            })
+        })
+        .unwrap();
+
+        assert!(published.get());
+        assert_eq!(step.delta, "token");
+        assert_eq!(step.tokens_generated, 1);
+        assert_eq!(step.input_tokens_committed, 0);
+    }
+
+    #[test]
+    fn incomplete_resumable_prefill_span_does_not_publish_a_token() {
+        let published = std::cell::Cell::new(false);
+        let step = finish_resumable_prefill_step(false, 3, || {
+            published.set(true);
+            unreachable!("an incomplete prefill cannot publish its bootstrap")
+        })
+        .unwrap();
+
+        assert!(!published.get());
+        assert_eq!(step.tokens_generated, 3);
+        assert!(step.delta.is_empty());
+        assert_eq!(step.input_tokens_committed, 0);
+    }
 
     #[test]
     fn chat_handler_rejects_unprepared_public_prompt_tokens() {
@@ -657,12 +1018,12 @@ mod tests {
             sequence_id: 1,
             num_tokens: 3,
             is_prefill: true,
-            block_ids: Vec::new(),
             num_computed_tokens: 0,
             work: WorkUnit::SequenceStep {
                 phase: SequencePhase::Prefill,
                 input: InputRange { start: 0, end: 3 },
                 max_output_steps: 1,
+                auxiliary_state: None,
             },
         };
 
@@ -674,7 +1035,7 @@ mod tests {
             .contains("missing exact model prompt preparation"));
 
         request
-            .install_chat_execution_preparation(ModelVariant::Qwen306B, vec![1, 2, 3], None)
+            .install_chat_execution_preparation(ModelVariant::Qwen306B, vec![1, 2, 3], None, 4096)
             .unwrap();
         request.prompt_tokens[0] = 99;
         let error = executor

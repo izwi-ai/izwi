@@ -121,7 +121,7 @@ impl AgentEngine {
             role: MemoryMessageRole::System,
             content: agent.system_prompt.clone(),
         });
-        model_messages.extend(history.into_iter());
+        model_messages.extend(history);
 
         if let Some(plan_summary) = &plan {
             model_messages.push(MemoryMessage {

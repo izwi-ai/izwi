@@ -181,6 +181,15 @@ impl PlannedAsrChunks {
     }
 }
 
+pub(super) fn qwen3_asr_requires_long_form(
+    samples: &[f32],
+    sample_rate: u32,
+    model_max_chunk_secs: Option<f32>,
+) -> bool {
+    NativeExecutor::asr_chunk_plan(samples, sample_rate, model_max_chunk_secs, false, false)
+        .requires_chunk_path()
+}
+
 fn samples_to_seconds(samples: usize, sample_rate: u32) -> f32 {
     if sample_rate > 0 {
         samples as f32 / sample_rate as f32
@@ -1566,7 +1575,10 @@ mod tests {
         assert_eq!(text_event.sequence, 3);
         assert_eq!(text_event.text.as_deref(), Some(long_delta.trim()));
 
-        let final_event = events.iter().find(|event| event.is_final).expect("final marker");
+        let final_event = events
+            .iter()
+            .find(|event| event.is_final)
+            .expect("final marker");
         assert_eq!(final_event.sequence, 5);
         assert!(final_event.is_final);
     }

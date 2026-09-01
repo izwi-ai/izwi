@@ -84,69 +84,107 @@ struct EngineRuntimeTelemetrySnapshot {
     #[serde(default)]
     scheduler_running_requests: u64,
     #[serde(default)]
-    kv_cache_hits_total: u64,
+    incremental_prefill_quanta_committed_total: u64,
     #[serde(default)]
-    kv_cache_misses_total: u64,
+    incremental_prefill_tokens_committed_total: u64,
     #[serde(default)]
-    kv_cache_evictions_total: u64,
-    #[serde(default)]
-    kv_cache_allocated_blocks: u64,
-    #[serde(default)]
-    kv_cache_prefix_reuse_blocks_total: u64,
+    multispan_prefill_requests_total: u64,
     #[serde(default)]
     stream_backpressure_total: u64,
     #[serde(default)]
-    kv_cache: EngineKvCacheRuntimeSnapshot,
+    tensor_batches_total: u64,
+    #[serde(default)]
+    tensor_static_batches_total: u64,
+    #[serde(default)]
+    tensor_continuous_batches_total: u64,
+    #[serde(default)]
+    tensor_continuous_multirow_batches_total: u64,
+    #[serde(default)]
+    request_parallel_batches_total: u64,
+    #[serde(default)]
+    physical_batch_rejections_total: u64,
+    #[serde(default)]
+    tensor_batch_max_width: u64,
+    #[serde(default)]
+    tensor_batch_rows_total: u64,
+    #[serde(default)]
+    tensor_batch_capacity_rows_total: u64,
+    #[serde(default)]
+    tensor_batch_useful_elements_total: u64,
+    #[serde(default)]
+    tensor_batch_materialized_elements_total: u64,
+    #[serde(default)]
+    batch_workspace_bytes_total: u64,
+    #[serde(default)]
+    tensor_batch_fill_ratio: f64,
+    #[serde(default)]
+    tensor_batch_padding_ratio: f64,
+    #[serde(default)]
+    model_tensor_batches_total: u64,
+    #[serde(default)]
+    model_tensor_batch_rows_total: u64,
+    #[serde(default)]
+    model_tensor_batch_max_width: u64,
+    #[serde(default)]
+    model_scalar_row_dispatches_total: u64,
+    #[serde(default)]
+    model_decode_calls_total: u64,
+    #[serde(default)]
+    model_tensor_multirow_calls_total: u64,
+    #[serde(default)]
+    continuous_envelope_scalar_fallbacks_total: u64,
+    #[serde(default)]
+    kv_cache: ManagedKvRuntimeSnapshot,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-struct EngineKvCacheRuntimeSnapshot {
-    #[serde(default)]
-    block_accounting: String,
+struct ManagedKvRuntimeSnapshot {
     #[serde(default)]
     memory_accounting: String,
     #[serde(default)]
-    total_blocks: u64,
+    totals: ManagedKvRuntimeTotalsSnapshot,
     #[serde(default)]
-    soft_max_blocks: u64,
+    counters: ManagedKvTelemetrySnapshot,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct ManagedKvRuntimeTotalsSnapshot {
     #[serde(default)]
-    allocated_blocks: u64,
+    models: u64,
     #[serde(default)]
-    free_blocks: u64,
+    arenas: u64,
     #[serde(default)]
-    block_size: u64,
+    registered_sessions: u64,
     #[serde(default)]
-    dtype_bytes: u64,
+    physical_bytes: u64,
     #[serde(default)]
-    block_memory_bytes: u64,
+    coordinator: ManagedKvCoordinatorSnapshot,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct ManagedKvCoordinatorSnapshot {
     #[serde(default)]
-    memory_used_bytes: u64,
+    capacity_pages: u64,
     #[serde(default)]
-    memory_capacity_bytes: u64,
+    allocated_pages: u64,
     #[serde(default)]
-    utilization_ratio: f64,
+    free_pages: u64,
     #[serde(default)]
-    gpu_resident_blocks: u64,
+    execution_pins: u64,
     #[serde(default)]
-    pinned_blocks: u64,
+    transfer_pins: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct ManagedKvTelemetrySnapshot {
     #[serde(default)]
-    shared_prefixes: u64,
+    prefix_hits: u64,
     #[serde(default)]
-    total_allocations: u64,
+    prefix_misses: u64,
     #[serde(default)]
-    total_frees: u64,
+    prefix_evictions: u64,
     #[serde(default)]
-    shared_prefix_hits: u64,
-    #[serde(default)]
-    shared_prefix_misses: u64,
-    #[serde(default)]
-    shared_prefix_blocks_reused: u64,
-    #[serde(default)]
-    persistent_prefix_evictions: u64,
-    #[serde(default)]
-    copy_on_write_splits: u64,
-    #[serde(default)]
-    last_churn_ratio: f64,
+    reused_tokens: u64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -184,6 +222,14 @@ struct RuntimeLatencyStats {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct KernelPathTelemetrySnapshot {
+    #[serde(default)]
+    host_read_ops_total: u64,
+    #[serde(default)]
+    host_read_bytes_total: u64,
+    #[serde(default)]
+    dtype_cast_ops_total: u64,
+    #[serde(default)]
+    layout_copy_ops_total: u64,
     prefill_token_mode_steps_total: u64,
     prefill_sequence_spans_total: u64,
     prefill_sequence_tokens_total: u64,
@@ -223,6 +269,8 @@ struct KernelPathTelemetrySnapshot {
     #[serde(default)]
     fused_attention_fallback_flash_dtype_mismatch_total: u64,
     #[serde(default)]
+    fused_attention_fallback_flash_compute_capability_unsupported_total: u64,
+    #[serde(default)]
     fused_attention_fallback_flash_runtime_error_total: u64,
     #[serde(default)]
     fused_attention_fallback_metal_sdpa_runtime_error_total: u64,
@@ -249,6 +297,8 @@ struct ChatBenchSample {
 #[derive(Debug, Clone)]
 struct TtsBenchSample {
     total_ms: f64,
+    first_audio_ms: Option<f64>,
+    inter_frame_ms: Vec<f64>,
     generation_time_ms: Option<f64>,
     audio_duration_secs: Option<f64>,
     rtf: Option<f64>,
@@ -282,6 +332,8 @@ struct AsrBenchResponse {
 #[derive(Debug, Clone)]
 struct AsrBenchSample {
     total_ms: f64,
+    first_transcript_ms: Option<f64>,
+    inter_transcript_ms: Vec<f64>,
     response: AsrBenchResponse,
 }
 
@@ -514,6 +566,7 @@ struct BenchmarkRunConfig {
     iterations: Option<u32>,
     concurrent: Option<u32>,
     warmup: bool,
+    stream: bool,
     prompt: Option<String>,
     system: Option<String>,
     max_tokens: Option<usize>,
@@ -525,12 +578,17 @@ struct BenchmarkRunConfig {
     reference_text: Option<String>,
     language: Option<String>,
     duration_secs: Option<u64>,
+    request_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
 struct BenchmarkSummary {
     latency_ms: Option<Stats>,
     ttft_ms: Option<Stats>,
+    first_audio_ms: Option<Stats>,
+    inter_frame_ms: Option<Stats>,
+    first_transcript_ms: Option<Stats>,
+    inter_transcript_ms: Option<Stats>,
     end_to_end_ms: Option<Stats>,
     completion_tps: Option<Stats>,
     tokens_per_second: Option<Stats>,
@@ -563,6 +621,10 @@ struct BenchmarkSample {
     index: usize,
     latency_ms: Option<f64>,
     ttft_ms: Option<f64>,
+    first_audio_ms: Option<f64>,
+    inter_frame_ms: Option<f64>,
+    first_transcript_ms: Option<f64>,
+    inter_transcript_ms: Option<f64>,
     end_to_end_ms: Option<f64>,
     completion_tps: Option<f64>,
     tokens_per_second: Option<f64>,
@@ -637,6 +699,7 @@ struct BenchmarkManifestCase {
     iterations: Option<u32>,
     concurrent: Option<u32>,
     warmup: Option<bool>,
+    stream: Option<bool>,
     prompt: Option<String>,
     system: Option<String>,
     max_tokens: Option<usize>,
@@ -658,6 +721,7 @@ struct BenchmarkManifestMatrix {
     iterations: Option<Vec<u32>>,
     concurrent: Option<Vec<u32>>,
     warmup: Option<Vec<bool>>,
+    stream: Option<Vec<bool>>,
     prompt: Option<Vec<String>>,
     system: Option<Vec<String>>,
     max_tokens: Option<Vec<usize>>,
@@ -684,6 +748,7 @@ enum MatrixValue {
     Iterations(u32),
     Concurrent(u32),
     Warmup(bool),
+    Stream(bool),
     Prompt(String),
     System(String),
     MaxTokens(usize),
@@ -833,6 +898,9 @@ pub async fn execute(
             reference_text_file,
             concurrent,
             warmup,
+            stream,
+            max_output_tokens,
+            timeout_secs,
         } => bench_tts(
             server,
             &model,
@@ -845,6 +913,9 @@ pub async fn execute(
             reference_text_file.as_deref(),
             concurrent,
             warmup,
+            stream,
+            max_output_tokens,
+            timeout_secs,
             &options,
             theme,
         )
@@ -858,6 +929,7 @@ pub async fn execute(
             max_tokens,
             concurrent,
             warmup,
+            stream,
         } => bench_asr(
             server,
             &model,
@@ -867,6 +939,7 @@ pub async fn execute(
             max_tokens,
             concurrent,
             warmup,
+            stream,
             &options,
             theme,
         )
@@ -1045,6 +1118,7 @@ impl MatrixValue {
             MatrixValue::Iterations(value) => case.iterations = Some(*value),
             MatrixValue::Concurrent(value) => case.concurrent = Some(*value),
             MatrixValue::Warmup(value) => case.warmup = Some(*value),
+            MatrixValue::Stream(value) => case.stream = Some(*value),
             MatrixValue::Prompt(value) => case.prompt = Some(value.clone()),
             MatrixValue::System(value) => case.system = Some(value.clone()),
             MatrixValue::MaxTokens(value) => case.max_tokens = Some(*value),
@@ -1078,6 +1152,7 @@ impl MatrixValue {
             MatrixValue::MaxTokens(value) => value.to_string(),
             MatrixValue::DurationSecs(value) => value.to_string(),
             MatrixValue::Warmup(value) => value.to_string(),
+            MatrixValue::Stream(value) => value.to_string(),
         }
     }
 }
@@ -1099,6 +1174,7 @@ impl BenchmarkManifestMatrix {
             MatrixValue::Concurrent,
         )?;
         add_matrix_dimension(&mut dimensions, "warmup", &self.warmup, MatrixValue::Warmup)?;
+        add_matrix_dimension(&mut dimensions, "stream", &self.stream, MatrixValue::Stream)?;
         add_matrix_dimension(&mut dimensions, "prompt", &self.prompt, MatrixValue::Prompt)?;
         add_matrix_dimension(&mut dimensions, "system", &self.system, MatrixValue::System)?;
         add_matrix_dimension(
@@ -1523,6 +1599,9 @@ async fn bench_manifest(
                     reference_text_file.as_deref(),
                     case.concurrent.unwrap_or(1),
                     case.warmup.unwrap_or(false),
+                    case.stream.unwrap_or(false),
+                    case.max_tokens,
+                    900,
                     options,
                     theme,
                 )
@@ -1547,6 +1626,7 @@ async fn bench_manifest(
                     case.max_tokens,
                     case.concurrent.unwrap_or(1),
                     case.warmup.unwrap_or(false),
+                    case.stream.unwrap_or(false),
                     options,
                     theme,
                 )
@@ -1731,7 +1811,6 @@ async fn bench_chat(
     }
     let started_at = Utc::now();
     let run_start = Instant::now();
-    let metrics_before = fetch_runtime_metrics(server).await;
 
     if warmup {
         if options.interactive() {
@@ -1739,6 +1818,10 @@ async fn bench_chat(
         }
         let _ = run_chat_request(server, model, prompt, system, max_tokens).await?;
     }
+    // Evidence deltas must describe measured iterations only. In particular,
+    // a single-user warmup must not supply MTP or tensor-batch counters for a
+    // later concurrent case.
+    let metrics_before = fetch_runtime_metrics(server).await;
 
     let pb = progress_bar(options.interactive(), iterations as u64);
     pb.set_style(
@@ -1857,6 +1940,10 @@ async fn bench_chat(
             index: index + 1,
             latency_ms: Some(sample.total_ms),
             ttft_ms: Some(sample.ttft_ms),
+            first_audio_ms: None,
+            inter_frame_ms: None,
+            first_transcript_ms: None,
+            inter_transcript_ms: None,
             end_to_end_ms: Some(sample.total_ms),
             completion_tps: Some(if sample.total_ms > 0.0 {
                 sample.completion_tokens as f64 * 1000.0 / sample.total_ms
@@ -1891,6 +1978,7 @@ async fn bench_chat(
             iterations: Some(iterations),
             concurrent: Some(concurrent),
             warmup,
+            stream: false,
             prompt: Some(prompt.to_string()),
             system: system.as_deref().map(|value| value.to_string()),
             max_tokens: Some(max_tokens),
@@ -1902,10 +1990,15 @@ async fn bench_chat(
             reference_text: None,
             language: None,
             duration_secs: None,
+            request_timeout_secs: None,
         },
         summary: BenchmarkSummary {
             latency_ms: None,
             ttft_ms: stats(&ttft_ms),
+            first_audio_ms: None,
+            inter_frame_ms: None,
+            first_transcript_ms: None,
+            inter_transcript_ms: None,
             end_to_end_ms: stats(&total_ms),
             completion_tps: stats(&completion_tps),
             tokens_per_second: None,
@@ -1942,6 +2035,9 @@ async fn bench_tts(
     reference_text_file: Option<&Path>,
     concurrent: u32,
     warmup: bool,
+    stream_output: bool,
+    max_output_tokens: Option<usize>,
+    timeout_secs: u64,
     options: &BenchOptions,
     theme: &Theme,
 ) -> Result<BenchmarkReport> {
@@ -1953,6 +2049,11 @@ async fn bench_tts(
     if concurrent == 0 {
         return Err(CliError::InvalidInput(
             "Concurrent requests must be greater than 0".to_string(),
+        ));
+    }
+    if timeout_secs == 0 {
+        return Err(CliError::InvalidInput(
+            "TTS benchmark timeout must be greater than 0 seconds".to_string(),
         ));
     }
 
@@ -1975,7 +2076,16 @@ async fn bench_tts(
         if options.interactive() {
             theme.info("Running warmup iteration...");
         }
-        let _ = run_tts_request(server, model, text, &reference).await?;
+        let _ = run_tts_request(
+            server,
+            model,
+            text,
+            &reference,
+            stream_output,
+            max_output_tokens,
+            timeout_secs,
+        )
+        .await?;
     }
 
     let pb = progress_bar(options.interactive(), iterations as u64);
@@ -2001,12 +2111,20 @@ async fn bench_tts(
             let server = server.to_string();
             async move {
                 let start = Instant::now();
-                let result = run_tts_request(&server, &model, text.as_str(), reference.as_ref())
-                    .await
-                    .map(|mut sample| {
-                        sample.total_ms = start.elapsed().as_secs_f64() * 1000.0;
-                        sample
-                    });
+                let result = run_tts_request(
+                    &server,
+                    &model,
+                    text.as_str(),
+                    reference.as_ref(),
+                    stream_output,
+                    max_output_tokens,
+                    timeout_secs,
+                )
+                .await
+                .map(|mut sample| {
+                    sample.total_ms = start.elapsed().as_secs_f64() * 1000.0;
+                    sample
+                });
                 progress.inc(1);
                 result
             }
@@ -2031,6 +2149,14 @@ async fn bench_tts(
         .filter_map(|sample| sample.audio_duration_secs)
         .collect();
     let rtf: Vec<f64> = samples.iter().filter_map(|sample| sample.rtf).collect();
+    let first_audio_ms: Vec<f64> = samples
+        .iter()
+        .filter_map(|sample| sample.first_audio_ms)
+        .collect();
+    let inter_frame_ms: Vec<f64> = samples
+        .iter()
+        .flat_map(|sample| sample.inter_frame_ms.iter().copied())
+        .collect();
     let tokens_per_second: Vec<f64> = samples
         .iter()
         .filter_map(
@@ -2098,6 +2224,22 @@ async fn bench_tts(
                 percentile(&tokens_per_second, 0.95)
             );
         }
+        if !first_audio_ms.is_empty() {
+            println!(
+                "  First audio (avg/p50/p95):       {:.2} / {:.2} / {:.2} ms",
+                first_audio_ms.iter().sum::<f64>() / first_audio_ms.len() as f64,
+                percentile(&first_audio_ms, 0.5),
+                percentile(&first_audio_ms, 0.95)
+            );
+        }
+        if !inter_frame_ms.is_empty() {
+            println!(
+                "  Inter-chunk (avg/p50/p95):       {:.2} / {:.2} / {:.2} ms",
+                inter_frame_ms.iter().sum::<f64>() / inter_frame_ms.len() as f64,
+                percentile(&inter_frame_ms, 0.5),
+                percentile(&inter_frame_ms, 0.95)
+            );
+        }
         print_tts_stage_timing_summary(&tts_stage_samples);
     }
     let metrics_after = fetch_runtime_metrics(server).await;
@@ -2116,6 +2258,10 @@ async fn bench_tts(
             index: index + 1,
             latency_ms: Some(sample.total_ms),
             ttft_ms: None,
+            first_audio_ms: sample.first_audio_ms,
+            inter_frame_ms: stats(&sample.inter_frame_ms).map(|stats| stats.avg),
+            first_transcript_ms: None,
+            inter_transcript_ms: None,
             end_to_end_ms: Some(sample.total_ms),
             completion_tps: None,
             tokens_per_second: match (sample.tokens_generated, sample.generation_time_ms) {
@@ -2149,9 +2295,10 @@ async fn bench_tts(
             iterations: Some(iterations),
             concurrent: Some(concurrent),
             warmup,
+            stream: stream_output,
             prompt: None,
             system: None,
-            max_tokens: None,
+            max_tokens: max_output_tokens,
             text: Some(text.as_ref().clone()),
             speaker: reference.speaker.clone(),
             file: None,
@@ -2160,10 +2307,15 @@ async fn bench_tts(
             reference_text: reference.reference_text.clone(),
             language: None,
             duration_secs: None,
+            request_timeout_secs: Some(timeout_secs),
         },
         summary: BenchmarkSummary {
             latency_ms: stats(&times),
             ttft_ms: None,
+            first_audio_ms: stats(&first_audio_ms),
+            inter_frame_ms: stats(&inter_frame_ms),
+            first_transcript_ms: None,
+            inter_transcript_ms: None,
             end_to_end_ms: stats(&times),
             completion_tps: None,
             tokens_per_second: stats(&tokens_per_second),
@@ -2197,6 +2349,7 @@ async fn bench_asr(
     max_tokens: Option<usize>,
     concurrent: u32,
     warmup: bool,
+    stream_output: bool,
     options: &BenchOptions,
     theme: &Theme,
 ) -> Result<BenchmarkReport> {
@@ -2250,7 +2403,15 @@ async fn bench_asr(
         if options.interactive() {
             theme.info("Running warmup iteration...");
         }
-        let _ = run_asr_request(server, model, &audio_base64, language, max_tokens).await?;
+        let _ = run_asr_request(
+            server,
+            model,
+            &audio_base64,
+            language,
+            max_tokens,
+            stream_output,
+        )
+        .await?;
     }
 
     let pb = progress_bar(options.interactive(), iterations as u64);
@@ -2282,11 +2443,12 @@ async fn bench_asr(
                     audio_base64.as_str(),
                     language.as_deref().map(|value| value.as_str()),
                     max_tokens,
+                    stream_output,
                 )
                 .await
-                .map(|response| AsrBenchSample {
-                    total_ms: start.elapsed().as_secs_f64() * 1000.0,
-                    response,
+                .map(|mut sample| {
+                    sample.total_ms = start.elapsed().as_secs_f64() * 1000.0;
+                    sample
                 });
                 progress.inc(1);
                 result
@@ -2313,6 +2475,14 @@ async fn bench_asr(
     let rtf: Vec<f64> = samples
         .iter()
         .filter_map(|sample| sample.response.rtf)
+        .collect();
+    let first_transcript_ms: Vec<f64> = samples
+        .iter()
+        .filter_map(|sample| sample.first_transcript_ms)
+        .collect();
+    let inter_transcript_ms: Vec<f64> = samples
+        .iter()
+        .flat_map(|sample| sample.inter_transcript_ms.iter().copied())
         .collect();
     let mut stage_samples = Vec::new();
     let mut decode_profile_samples = Vec::new();
@@ -2364,6 +2534,22 @@ async fn bench_asr(
                 percentile(&rtf, 0.95)
             );
         }
+        if !first_transcript_ms.is_empty() {
+            println!(
+                "  First transcript (avg/p50/p95): {:.2} / {:.2} / {:.2} ms",
+                first_transcript_ms.iter().sum::<f64>() / first_transcript_ms.len() as f64,
+                percentile(&first_transcript_ms, 0.5),
+                percentile(&first_transcript_ms, 0.95)
+            );
+        }
+        if !inter_transcript_ms.is_empty() {
+            println!(
+                "  Inter-delta (avg/p50/p95):      {:.2} / {:.2} / {:.2} ms",
+                inter_transcript_ms.iter().sum::<f64>() / inter_transcript_ms.len() as f64,
+                percentile(&inter_transcript_ms, 0.5),
+                percentile(&inter_transcript_ms, 0.95)
+            );
+        }
         print_asr_stage_timing_summary(&stage_samples);
         print_asr_decode_profile_summary(&decode_profile_samples);
     }
@@ -2390,6 +2576,10 @@ async fn bench_asr(
             index: index + 1,
             latency_ms: Some(sample.total_ms),
             ttft_ms: None,
+            first_audio_ms: None,
+            inter_frame_ms: None,
+            first_transcript_ms: sample.first_transcript_ms,
+            inter_transcript_ms: stats(&sample.inter_transcript_ms).map(|stats| stats.avg),
             end_to_end_ms: Some(sample.total_ms),
             completion_tps: None,
             tokens_per_second: None,
@@ -2424,6 +2614,7 @@ async fn bench_asr(
             iterations: Some(iterations),
             concurrent: Some(concurrent),
             warmup,
+            stream: stream_output,
             prompt: None,
             system: None,
             max_tokens,
@@ -2435,10 +2626,15 @@ async fn bench_asr(
             reference_text: None,
             language: language.as_deref().map(|value| value.to_string()),
             duration_secs: None,
+            request_timeout_secs: None,
         },
         summary: BenchmarkSummary {
             latency_ms: stats(&times),
             ttft_ms: None,
+            first_audio_ms: None,
+            inter_frame_ms: None,
+            first_transcript_ms: stats(&first_transcript_ms),
+            inter_transcript_ms: stats(&inter_transcript_ms),
             end_to_end_ms: stats(&times),
             completion_tps: None,
             tokens_per_second: None,
@@ -2546,6 +2742,7 @@ async fn bench_throughput(
             iterations: None,
             concurrent: Some(concurrent),
             warmup: false,
+            stream: false,
             prompt: None,
             system: None,
             max_tokens: None,
@@ -2557,10 +2754,15 @@ async fn bench_throughput(
             reference_text: None,
             language: None,
             duration_secs: Some(duration),
+            request_timeout_secs: None,
         },
         summary: BenchmarkSummary {
             latency_ms: None,
             ttft_ms: None,
+            first_audio_ms: None,
+            inter_frame_ms: None,
+            first_transcript_ms: None,
+            inter_transcript_ms: None,
             end_to_end_ms: None,
             completion_tps: None,
             tokens_per_second: None,
@@ -2685,9 +2887,17 @@ async fn run_tts_request(
     model: &str,
     text: &str,
     reference: &TtsBenchReference,
+    stream_output: bool,
+    max_output_tokens: Option<usize>,
+    timeout_secs: u64,
 ) -> Result<TtsBenchSample> {
-    let client = http::client(Some(std::time::Duration::from_secs(300)))?;
-    let request_body = build_tts_bench_request_body(model, text, reference);
+    let client = http::client(Some(std::time::Duration::from_secs(timeout_secs)))?;
+    let mut request_body = build_tts_bench_request_body(model, text, reference, max_output_tokens);
+    if stream_output {
+        request_body["stream"] = serde_json::Value::Bool(true);
+        request_body["stream_format"] = serde_json::Value::String("sse".to_string());
+    }
+    let started = Instant::now();
 
     let response = client
         .post(format!("{}/v1/audio/speech", server))
@@ -2705,20 +2915,123 @@ async fn run_tts_request(
         });
     }
 
+    if stream_output {
+        return consume_tts_benchmark_stream(response, started).await;
+    }
+
+    let generation_time_ms = header_f64(&response, "x-generation-time-ms");
+    let audio_duration_secs = header_f64(&response, "x-audio-duration-secs");
+    let rtf = header_f64(&response, "x-rtf");
+    let tokens_generated = header_u64(&response, "x-tokens-generated");
+    let diagnostics = header_json(&response, "x-izwi-tts-diagnostics");
+    response
+        .bytes()
+        .await
+        .map_err(|error| CliError::ConnectionError(error.to_string()))?;
     Ok(TtsBenchSample {
-        total_ms: 0.0,
-        generation_time_ms: header_f64(&response, "x-generation-time-ms"),
-        audio_duration_secs: header_f64(&response, "x-audio-duration-secs"),
-        rtf: header_f64(&response, "x-rtf"),
-        tokens_generated: header_u64(&response, "x-tokens-generated"),
-        diagnostics: header_json(&response, "x-izwi-tts-diagnostics"),
+        total_ms: started.elapsed().as_secs_f64() * 1000.0,
+        first_audio_ms: None,
+        inter_frame_ms: Vec::new(),
+        generation_time_ms,
+        audio_duration_secs,
+        rtf,
+        tokens_generated,
+        diagnostics,
     })
+}
+
+async fn consume_tts_benchmark_stream(
+    response: reqwest::Response,
+    started: Instant,
+) -> Result<TtsBenchSample> {
+    let mut bytes = response.bytes_stream();
+    let mut buffer = Vec::new();
+    let mut timing = TtsStreamTimingState::default();
+    while let Some(chunk) = bytes.next().await {
+        buffer.extend_from_slice(
+            &chunk.map_err(|error| CliError::ConnectionError(error.to_string()))?,
+        );
+        while let Some(boundary) = buffer.windows(2).position(|window| window == b"\n\n") {
+            let event = buffer.drain(..boundary).collect::<Vec<_>>();
+            buffer.drain(..2);
+            let event = String::from_utf8(event).map_err(|error| {
+                CliError::Other(format!("Invalid UTF-8 in TTS stream: {error}"))
+            })?;
+            for line in event.lines() {
+                let Some(payload) = line.trim_end_matches('\r').strip_prefix("data: ") else {
+                    continue;
+                };
+                let value: serde_json::Value = serde_json::from_str(payload).map_err(|error| {
+                    CliError::Other(format!("Invalid TTS stream payload: {error}"))
+                })?;
+                let now = started.elapsed().as_secs_f64() * 1000.0;
+                if let Some(sample) = handle_tts_benchmark_stream_event(&value, now, &mut timing)? {
+                    return Ok(sample);
+                }
+            }
+        }
+    }
+    Err(CliError::Other(
+        "TTS benchmark stream ended before audio.done".to_string(),
+    ))
+}
+
+#[derive(Default)]
+struct TtsStreamTimingState {
+    first_audio_ms: Option<f64>,
+    last_audio_ms: Option<f64>,
+    inter_frame_ms: Vec<f64>,
+}
+
+fn handle_tts_benchmark_stream_event(
+    value: &serde_json::Value,
+    now_ms: f64,
+    timing: &mut TtsStreamTimingState,
+) -> Result<Option<TtsBenchSample>> {
+    match value.get("event").and_then(|event| event.as_str()) {
+        Some("audio.chunk") => {
+            if timing.first_audio_ms.is_none() {
+                timing.first_audio_ms = Some(now_ms);
+            }
+            if let Some(previous) = timing.last_audio_ms.replace(now_ms) {
+                timing.inter_frame_ms.push(now_ms - previous);
+            }
+            Ok(None)
+        }
+        Some("audio.done") => Ok(Some(TtsBenchSample {
+            total_ms: now_ms,
+            first_audio_ms: timing.first_audio_ms,
+            inter_frame_ms: std::mem::take(&mut timing.inter_frame_ms),
+            generation_time_ms: value
+                .get("generation_time_ms")
+                .and_then(|value| value.as_f64()),
+            audio_duration_secs: value
+                .get("audio_duration_secs")
+                .and_then(|value| value.as_f64()),
+            rtf: value.get("rtf").and_then(|value| value.as_f64()),
+            tokens_generated: value
+                .get("tokens_generated")
+                .and_then(|value| value.as_u64()),
+            diagnostics: None,
+        })),
+        Some("audio.failed") => {
+            let error = value
+                .get("error")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown streaming synthesis failure");
+            Err(CliError::Other(format!(
+                "TTS benchmark stream failed: {error}"
+            )))
+        }
+        _ => Ok(None),
+    }
 }
 
 fn build_tts_bench_request_body(
     model: &str,
     text: &str,
     reference: &TtsBenchReference,
+    max_output_tokens: Option<usize>,
 ) -> serde_json::Value {
     let mut request_body = serde_json::json!({
         "model": model,
@@ -2737,6 +3050,9 @@ fn build_tts_bench_request_body(
     if let Some(reference_text) = reference.reference_text.as_deref() {
         request_body["reference_text"] = serde_json::Value::String(reference_text.to_string());
     }
+    if let Some(max_output_tokens) = max_output_tokens {
+        request_body["max_output_tokens"] = serde_json::Value::from(max_output_tokens);
+    }
     request_body
 }
 
@@ -2746,7 +3062,8 @@ async fn run_asr_request(
     audio_base64: &str,
     language: Option<&str>,
     max_tokens: Option<usize>,
-) -> Result<AsrBenchResponse> {
+    stream_output: bool,
+) -> Result<AsrBenchSample> {
     let client = http::client(Some(std::time::Duration::from_secs(300)))?;
     let mut request_body = serde_json::json!({
         "model": model,
@@ -2759,6 +3076,10 @@ async fn run_asr_request(
     if let Some(max_tokens) = max_tokens {
         request_body["max_tokens"] = serde_json::json!(max_tokens);
     }
+    if stream_output {
+        request_body["stream"] = serde_json::Value::Bool(true);
+    }
+    let started = Instant::now();
 
     let response = client
         .post(format!("{}/v1/audio/transcriptions", server))
@@ -2776,10 +3097,118 @@ async fn run_asr_request(
         });
     }
 
-    response
+    if stream_output {
+        return consume_asr_benchmark_stream(response, started).await;
+    }
+    let response = response
         .json::<AsrBenchResponse>()
         .await
-        .map_err(|e| CliError::Other(format!("Failed to parse ASR benchmark response: {e}")))
+        .map_err(|e| CliError::Other(format!("Failed to parse ASR benchmark response: {e}")))?;
+    Ok(AsrBenchSample {
+        total_ms: started.elapsed().as_secs_f64() * 1000.0,
+        first_transcript_ms: None,
+        inter_transcript_ms: Vec::new(),
+        response,
+    })
+}
+
+async fn consume_asr_benchmark_stream(
+    response: reqwest::Response,
+    started: Instant,
+) -> Result<AsrBenchSample> {
+    let mut bytes = response.bytes_stream();
+    let mut buffer = Vec::new();
+    let mut timing = AsrStreamTimingState::default();
+    while let Some(chunk) = bytes.next().await {
+        buffer.extend_from_slice(
+            &chunk.map_err(|error| CliError::ConnectionError(error.to_string()))?,
+        );
+        while let Some(boundary) = buffer.windows(2).position(|window| window == b"\n\n") {
+            let event = buffer.drain(..boundary).collect::<Vec<_>>();
+            buffer.drain(..2);
+            let event = String::from_utf8(event).map_err(|error| {
+                CliError::Other(format!("Invalid UTF-8 in ASR stream: {error}"))
+            })?;
+            for line in event.lines() {
+                let Some(payload) = line.trim_end_matches('\r').strip_prefix("data: ") else {
+                    continue;
+                };
+                let value: serde_json::Value = serde_json::from_str(payload).map_err(|error| {
+                    CliError::Other(format!("Invalid ASR stream payload: {error}"))
+                })?;
+                let now = started.elapsed().as_secs_f64() * 1000.0;
+                if let Some(sample) = handle_asr_benchmark_stream_event(&value, now, &mut timing)? {
+                    return Ok(sample);
+                }
+            }
+        }
+    }
+    Err(CliError::Other(
+        "ASR benchmark stream ended before transcript.text.done".to_string(),
+    ))
+}
+
+#[derive(Default)]
+struct AsrStreamTimingState {
+    first_transcript_ms: Option<f64>,
+    last_transcript_ms: Option<f64>,
+    inter_transcript_ms: Vec<f64>,
+    transcript: String,
+}
+
+fn handle_asr_benchmark_stream_event(
+    value: &serde_json::Value,
+    now_ms: f64,
+    timing: &mut AsrStreamTimingState,
+) -> Result<Option<AsrBenchSample>> {
+    match value.get("type").and_then(|kind| kind.as_str()) {
+        Some("transcript.text.delta") => {
+            let delta = value
+                .get("delta")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            if !delta.is_empty() {
+                timing.transcript.push_str(delta);
+                if timing.first_transcript_ms.is_none() {
+                    timing.first_transcript_ms = Some(now_ms);
+                }
+                if let Some(previous) = timing.last_transcript_ms.replace(now_ms) {
+                    timing.inter_transcript_ms.push(now_ms - previous);
+                }
+            }
+            Ok(None)
+        }
+        Some("transcript.text.done") => {
+            if let Some(text) = value.get("text").and_then(|value| value.as_str()) {
+                timing.transcript = text.to_string();
+            }
+            Ok(Some(AsrBenchSample {
+                total_ms: now_ms,
+                first_transcript_ms: timing.first_transcript_ms,
+                inter_transcript_ms: std::mem::take(&mut timing.inter_transcript_ms),
+                response: AsrBenchResponse {
+                    text: Some(std::mem::take(&mut timing.transcript)),
+                    duration: value
+                        .get("audio_duration_secs")
+                        .and_then(|value| value.as_f64()),
+                    processing_time_ms: None,
+                    rtf: None,
+                    izwi_asr_diagnostics: None,
+                },
+            }))
+        }
+        Some("error") => {
+            let error = value
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown streaming transcription failure");
+            Err(CliError::Other(format!(
+                "ASR benchmark stream failed: {error}"
+            )))
+        }
+        _ => Ok(None),
+    }
 }
 
 async fn run_chat_request(
@@ -2812,6 +3241,9 @@ async fn run_chat_request(
         "max_completion_tokens": max_tokens,
     });
 
+    // Client-observed TTFT includes request transmission, server admission,
+    // queueing, prefill, and response-header latency.
+    let started = Instant::now();
     let response = client
         .post(format!("{}/v1/chat/completions", server))
         .json(&request_body)
@@ -2828,7 +3260,6 @@ async fn run_chat_request(
         });
     }
 
-    let started = Instant::now();
     let mut first_delta_at: Option<f64> = None;
     let mut prompt_tokens = 0usize;
     let mut completion_tokens = 0usize;
@@ -4760,6 +5191,74 @@ fn print_runtime_delta(
     println!("  Active (current):     {}", after.requests_active);
     println!("  Worker restarts{}:    {}", counter_suffix, restart_delta);
     println!("  Worker panics{}:      {}", counter_suffix, panic_delta);
+    let batch_before = &before.engine;
+    let batch_after = &after.engine;
+    let tensor_batches_delta = batch_after
+        .tensor_batches_total
+        .saturating_sub(batch_before.tensor_batches_total);
+    let static_batches_delta = batch_after
+        .tensor_static_batches_total
+        .saturating_sub(batch_before.tensor_static_batches_total);
+    let continuous_batches_delta = batch_after
+        .tensor_continuous_batches_total
+        .saturating_sub(batch_before.tensor_continuous_batches_total);
+    let continuous_multirow_batches_delta = batch_after
+        .tensor_continuous_multirow_batches_total
+        .saturating_sub(batch_before.tensor_continuous_multirow_batches_total);
+    let request_parallel_batches_delta = batch_after
+        .request_parallel_batches_total
+        .saturating_sub(batch_before.request_parallel_batches_total);
+    let rejected_batches_delta = batch_after
+        .physical_batch_rejections_total
+        .saturating_sub(batch_before.physical_batch_rejections_total);
+    let batch_rows_delta = batch_after
+        .tensor_batch_rows_total
+        .saturating_sub(batch_before.tensor_batch_rows_total);
+    let batch_capacity_rows_delta = batch_after
+        .tensor_batch_capacity_rows_total
+        .saturating_sub(batch_before.tensor_batch_capacity_rows_total);
+    let useful_elements_delta = batch_after
+        .tensor_batch_useful_elements_total
+        .saturating_sub(batch_before.tensor_batch_useful_elements_total);
+    let materialized_elements_delta = batch_after
+        .tensor_batch_materialized_elements_total
+        .saturating_sub(batch_before.tensor_batch_materialized_elements_total);
+    let workspace_bytes_delta = batch_after
+        .batch_workspace_bytes_total
+        .saturating_sub(batch_before.batch_workspace_bytes_total);
+    let run_fill_ratio = if batch_capacity_rows_delta == 0 {
+        0.0
+    } else {
+        batch_rows_delta as f64 / batch_capacity_rows_delta as f64
+    };
+    let run_padding_ratio = if materialized_elements_delta == 0 {
+        0.0
+    } else {
+        1.0 - useful_elements_delta as f64 / materialized_elements_delta as f64
+    };
+    println!(
+        "  Batch dispatch{} (tensor/static/continuous/continuous-multirow/request-parallel/rejected): {} / {} / {} / {} / {} / {}",
+        counter_suffix,
+        tensor_batches_delta,
+        static_batches_delta,
+        continuous_batches_delta,
+        continuous_multirow_batches_delta,
+        request_parallel_batches_delta,
+        rejected_batches_delta
+    );
+    println!(
+        "  Tensor batch{} (rows/capacity/max-width/fill/padding): {} / {} / {} / {:.1}% / {:.1}%",
+        counter_suffix,
+        batch_rows_delta,
+        batch_capacity_rows_delta,
+        batch_after.tensor_batch_max_width,
+        run_fill_ratio * 100.0,
+        run_padding_ratio.max(0.0) * 100.0
+    );
+    println!(
+        "  Tensor elements{} (useful/materialized), workspace bytes: {} / {}, {}",
+        counter_suffix, useful_elements_delta, materialized_elements_delta, workspace_bytes_delta
+    );
     println!(
         "  Queue wait rolling(avg/p50/p95): {:.2} / {:.2} / {:.2} ms",
         after.queue_wait_ms_avg, after.queue_wait_ms_p50, after.queue_wait_ms_p95
@@ -4785,20 +5284,27 @@ fn print_runtime_delta(
         "  End-to-end rolling(avg/p50/p95): {:.2} / {:.2} / {:.2} ms",
         after.end_to_end_ms_avg, after.end_to_end_ms_p50, after.end_to_end_ms_p95
     );
-    if after.engine.kv_cache.total_blocks > 0 {
+    if after.engine.kv_cache.totals.coordinator.capacity_pages > 0 {
         let kv = &after.engine.kv_cache;
+        let coordinator = &kv.totals.coordinator;
+        let utilization = coordinator.allocated_pages as f64 / coordinator.capacity_pages as f64;
         println!(
-            "  KV cache logical blocks used/free/soft/total: {} / {} / {} / {} (util {:.1}%, churn {:.3})",
-            kv.allocated_blocks,
-            kv.free_blocks,
-            kv.soft_max_blocks,
-            kv.total_blocks,
-            kv.utilization_ratio * 100.0,
-            kv.last_churn_ratio
+            "  KV cache physical pages used/free/total: {} / {} / {} (util {:.1}%)",
+            coordinator.allocated_pages,
+            coordinator.free_pages,
+            coordinator.capacity_pages,
+            utilization * 100.0,
         );
         println!(
-            "  KV cache estimated memory used/capacity: {} / {} bytes ({})",
-            kv.memory_used_bytes, kv.memory_capacity_bytes, kv.memory_accounting
+            "  KV cache physical arena backing: {} bytes ({}, {} models, {} arenas)",
+            kv.totals.physical_bytes, kv.memory_accounting, kv.totals.models, kv.totals.arenas,
+        );
+        println!(
+            "  KV cache prefix hit/miss/eviction/reused tokens: {} / {} / {} / {}",
+            kv.counters.prefix_hits,
+            kv.counters.prefix_misses,
+            kv.counters.prefix_evictions,
+            kv.counters.reused_tokens,
         );
     }
     if !after.models.is_empty() {
@@ -5018,6 +5524,66 @@ fn loaded_model_runtime_summary(model: &LoadedModelTelemetrySnapshot) -> String 
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn audio_stream_benchmarks_record_first_output_and_inter_event_latency() {
+        let mut tts_timing = TtsStreamTimingState::default();
+        assert!(handle_tts_benchmark_stream_event(
+            &serde_json::json!({"event": "audio.chunk", "sequence": 0}),
+            10.0,
+            &mut tts_timing,
+        )
+        .expect("first TTS event")
+        .is_none());
+        assert!(handle_tts_benchmark_stream_event(
+            &serde_json::json!({"event": "audio.chunk", "sequence": 1}),
+            15.0,
+            &mut tts_timing,
+        )
+        .expect("second TTS event")
+        .is_none());
+        let tts = handle_tts_benchmark_stream_event(
+            &serde_json::json!({
+                "event": "audio.done",
+                "tokens_generated": 2,
+                "generation_time_ms": 10.0,
+                "audio_duration_secs": 0.02,
+                "rtf": 0.5,
+            }),
+            20.0,
+            &mut tts_timing,
+        )
+        .expect("terminal TTS event")
+        .expect("TTS sample");
+        assert!(tts.first_audio_ms.is_some());
+        assert_eq!(tts.inter_frame_ms, vec![5.0]);
+        assert_eq!(tts.tokens_generated, Some(2));
+
+        let mut asr_timing = AsrStreamTimingState::default();
+        for (now, delta) in [(7.0, "hello "), (11.0, "world")] {
+            assert!(handle_asr_benchmark_stream_event(
+                &serde_json::json!({"type": "transcript.text.delta", "delta": delta}),
+                now,
+                &mut asr_timing,
+            )
+            .expect("ASR delta")
+            .is_none());
+        }
+        let asr = handle_asr_benchmark_stream_event(
+            &serde_json::json!({
+                "type": "transcript.text.done",
+                "text": "hello world",
+                "audio_duration_secs": 1.0,
+            }),
+            13.0,
+            &mut asr_timing,
+        )
+        .expect("terminal ASR event")
+        .expect("ASR sample");
+        assert!(asr.first_transcript_ms.is_some());
+        assert_eq!(asr.inter_transcript_ms, vec![4.0]);
+        assert_eq!(asr.response.text.as_deref(), Some("hello world"));
+    }
 
     #[test]
     fn chat_stream_event_records_first_delta_and_terminal_usage() {
@@ -5470,6 +6036,10 @@ mod tests {
             index: 1,
             latency_ms: Some(123.0),
             ttft_ms: None,
+            first_audio_ms: None,
+            inter_frame_ms: None,
+            first_transcript_ms: None,
+            inter_transcript_ms: None,
             end_to_end_ms: Some(123.0),
             completion_tps: None,
             tokens_per_second: None,
@@ -5501,6 +6071,8 @@ mod tests {
     fn tts_quality_gates_flag_empty_clipped_and_silent_audio() {
         let sample = TtsBenchSample {
             total_ms: 100.0,
+            first_audio_ms: None,
+            inter_frame_ms: Vec::new(),
             generation_time_ms: Some(90.0),
             audio_duration_secs: Some(0.0),
             rtf: None,
@@ -5626,8 +6198,12 @@ mod tests {
 
     #[test]
     fn tts_bench_request_omits_voice_without_speaker() {
-        let body =
-            build_tts_bench_request_body("Kokoro-82M", "hello", &TtsBenchReference::default());
+        let body = build_tts_bench_request_body(
+            "Kokoro-82M",
+            "hello",
+            &TtsBenchReference::default(),
+            None,
+        );
 
         assert!(body.get("voice").is_none());
     }
@@ -5638,11 +6214,12 @@ mod tests {
             speaker: Some("af_bella".to_string()),
             ..TtsBenchReference::default()
         };
-        let body = build_tts_bench_request_body("Kokoro-82M", "hello", &reference);
+        let body = build_tts_bench_request_body("Kokoro-82M", "hello", &reference, Some(256));
 
         assert_eq!(body["voice"], "af_bella");
         assert_eq!(body["model"], "Kokoro-82M");
         assert_eq!(body["input"], "hello");
+        assert_eq!(body["max_output_tokens"], 256);
     }
 
     #[test]
@@ -5742,40 +6319,62 @@ mod tests {
         let engine: EngineRuntimeTelemetrySnapshot = serde_json::from_value(serde_json::json!({
             "scheduler_queue_depth": 1,
             "scheduler_running_requests": 2,
-            "kv_cache_hits_total": 3,
+            "tensor_batches_total": 7,
+            "tensor_static_batches_total": 2,
+            "tensor_continuous_batches_total": 5,
+            "tensor_continuous_multirow_batches_total": 4,
+            "request_parallel_batches_total": 3,
+            "physical_batch_rejections_total": 1,
+            "tensor_batch_max_width": 8,
+            "tensor_batch_rows_total": 29,
+            "tensor_batch_capacity_rows_total": 40,
+            "tensor_batch_useful_elements_total": 2048,
+            "tensor_batch_materialized_elements_total": 2304,
+            "batch_workspace_bytes_total": 4096,
+            "tensor_batch_fill_ratio": 0.725,
+            "tensor_batch_padding_ratio": 0.1111111111,
             "kv_cache": {
-                "block_accounting": "logical",
-                "memory_accounting": "estimated_from_config",
-                "total_blocks": 128,
-                "soft_max_blocks": 96,
-                "allocated_blocks": 48,
-                "free_blocks": 80,
-                "block_size": 16,
-                "dtype_bytes": 2,
-                "block_memory_bytes": 786432,
-                "utilization_ratio": 0.375,
-                "shared_prefixes": 4,
-                "shared_prefix_hits": 3,
-                "shared_prefix_misses": 2,
-                "shared_prefix_blocks_reused": 7,
-                "copy_on_write_splits": 5,
-                "last_churn_ratio": 1.25
+                "memory_accounting": "physical_arena_backing",
+                "totals": {
+                    "models": 2,
+                    "arenas": 4,
+                    "registered_sessions": 3,
+                    "physical_bytes": 100663296,
+                    "coordinator": {
+                        "capacity_pages": 128,
+                        "allocated_pages": 48,
+                        "free_pages": 80,
+                        "execution_pins": 2,
+                        "transfer_pins": 1
+                    }
+                },
+                "counters": {
+                    "prefix_hits": 3,
+                    "prefix_misses": 2,
+                    "prefix_evictions": 5,
+                    "reused_tokens": 112
+                }
             }
         }))
         .expect("engine telemetry should deserialize");
 
         assert_eq!(engine.scheduler_queue_depth, 1);
-        assert_eq!(engine.kv_cache.total_blocks, 128);
-        assert_eq!(engine.kv_cache.block_accounting, "logical");
-        assert_eq!(
-            engine.kv_cache.memory_accounting,
-            "estimated_from_config"
-        );
-        assert_eq!(engine.kv_cache.shared_prefix_misses, 2);
-        assert_eq!(engine.kv_cache.shared_prefix_blocks_reused, 7);
-        assert_eq!(engine.kv_cache.soft_max_blocks, 96);
-        assert_eq!(engine.kv_cache.copy_on_write_splits, 5);
-        assert_eq!(engine.kv_cache.last_churn_ratio, 1.25);
+        assert_eq!(engine.tensor_batches_total, 7);
+        assert_eq!(engine.tensor_continuous_batches_total, 5);
+        assert_eq!(engine.tensor_continuous_multirow_batches_total, 4);
+        assert_eq!(engine.tensor_batch_max_width, 8);
+        assert_eq!(engine.tensor_batch_rows_total, 29);
+        assert_eq!(engine.tensor_batch_capacity_rows_total, 40);
+        assert_eq!(engine.tensor_batch_useful_elements_total, 2048);
+        assert_eq!(engine.tensor_batch_materialized_elements_total, 2304);
+        assert_eq!(engine.batch_workspace_bytes_total, 4096);
+        assert!((engine.tensor_batch_fill_ratio - 0.725).abs() < f64::EPSILON);
+        assert_eq!(engine.kv_cache.memory_accounting, "physical_arena_backing");
+        assert_eq!(engine.kv_cache.totals.coordinator.capacity_pages, 128);
+        assert_eq!(engine.kv_cache.totals.coordinator.allocated_pages, 48);
+        assert_eq!(engine.kv_cache.totals.physical_bytes, 100663296);
+        assert_eq!(engine.kv_cache.counters.prefix_misses, 2);
+        assert_eq!(engine.kv_cache.counters.reused_tokens, 112);
     }
 
     #[test]
@@ -6028,6 +6627,109 @@ concurrent = [1, 2]
         assert_eq!(cases[0].concurrent, Some(1));
         assert_eq!(cases[3].model.as_deref(), Some("m2"));
         assert_eq!(cases[3].concurrent, Some(2));
+    }
+
+    #[test]
+    fn cuda_family_manifest_covers_every_benchmarkable_implementation() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../benchmarks/manifests/cuda-family-api.toml");
+        let text = std::fs::read_to_string(path).expect("CUDA family manifest");
+        let manifest: BenchmarkManifest = toml::from_str(&text).expect("valid CUDA manifest");
+        let cases = expand_manifest_cases(&manifest).expect("unique CUDA cases");
+        assert_eq!(cases.len(), 17);
+        assert!(cases.iter().all(|case| case.model.is_some()));
+        assert!(cases
+            .iter()
+            .all(|case| matches!(case.command.as_str(), "chat" | "tts" | "asr")));
+    }
+
+    #[test]
+    fn backend_chat_performance_manifests_cover_every_chat_family() {
+        let manifest_root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/manifests");
+        for name in [
+            "cpu-continuous-batching.toml",
+            "cpu-resumable-prefill.toml",
+            "metal-continuous-batching.toml",
+            "metal-resumable-prefill.toml",
+            "cuda-continuous-batching.toml",
+            "cuda-resumable-prefill.toml",
+        ] {
+            let text = std::fs::read_to_string(manifest_root.join(name))
+                .expect("chat performance manifest");
+            let manifest: BenchmarkManifest =
+                toml::from_str(&text).expect("valid chat performance manifest");
+            let cases = expand_manifest_cases(&manifest).expect("unique chat performance cases");
+            assert_eq!(cases.len(), 5, "{name}");
+            assert!(cases.iter().all(|case| case.command == "chat"), "{name}");
+            assert!(cases.iter().all(|case| case.model.is_some()), "{name}");
+        }
+    }
+
+    #[test]
+    fn backend_audio_performance_manifests_cover_all_asr_and_tts_families_at_c1_to_c8() {
+        let manifest_root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/manifests");
+        let expected_models: BTreeSet<_> = [
+            ("Granite-Speech-4.1-2B-Plus", "asr"),
+            ("Kokoro-82M", "tts"),
+            ("LFM2.5-Audio-1.5B-GGUF", "asr"),
+            ("LFM2.5-Audio-1.5B-GGUF", "tts"),
+            ("Nemotron-3.5-ASR-Streaming-0.6B", "asr"),
+            ("Parakeet-TDT-0.6B-v3", "asr"),
+            ("Qwen3-ASR-0.6B-GGUF", "asr"),
+            ("Qwen3-TTS-12Hz-0.6B-Base", "tts"),
+            ("VibeVoice-1.5B", "tts"),
+            ("VibeVoice-ASR", "asr"),
+            ("Voxtral-4B-TTS-2603", "tts"),
+            ("Voxtral-Mini-4B-Realtime-2602", "asr"),
+            ("Whisper-Large-v3-Turbo", "asr"),
+            ("FishAudio-S2-Pro", "tts"),
+        ]
+        .into_iter()
+        .collect();
+        for name in [
+            "cpu-audio-concurrency.toml",
+            "metal-audio-concurrency.toml",
+            "cuda-audio-concurrency.toml",
+        ] {
+            let text = std::fs::read_to_string(manifest_root.join(name))
+                .expect("audio performance manifest");
+            let manifest: BenchmarkManifest =
+                toml::from_str(&text).expect("valid audio performance manifest");
+            let cases = expand_manifest_cases(&manifest).expect("unique audio performance cases");
+            assert_eq!(cases.len(), 56, "{name}");
+            assert!(
+                cases
+                    .iter()
+                    .all(|case| matches!(case.command.as_str(), "asr" | "tts")),
+                "{name}"
+            );
+            assert!(cases.iter().all(|case| case.model.is_some()), "{name}");
+            assert!(
+                cases.iter().all(|case| case.iterations == Some(8)),
+                "{name} must collect eight streaming samples per concurrency cell"
+            );
+            assert!(
+                cases.iter().all(|case| case.stream == Some(true)),
+                "{name} must collect first-output and inter-event streaming latency"
+            );
+            for concurrency in [1, 2, 4, 8] {
+                assert_eq!(
+                    cases
+                        .iter()
+                        .filter(|case| case.concurrent == Some(concurrency))
+                        .count(),
+                    14,
+                    "{name} c{concurrency}"
+                );
+            }
+            let actual_models: BTreeSet<_> = cases
+                .iter()
+                .map(|case| (case.model.as_deref().expect("model"), case.command.as_str()))
+                .collect();
+            assert_eq!(actual_models, expected_models, "{name} family coverage");
+        }
     }
 
     #[test]

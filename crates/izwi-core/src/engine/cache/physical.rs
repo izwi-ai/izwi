@@ -1,0 +1,2309 @@
+//! Lifecycle-owned physical inference-state allocations beyond retained KV.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use candle_core::{DType, Device, DeviceLocation};
+use serde::Serialize;
+
+use crate::backends::kv::{KvArenaConfig, KvBackendRuntime, KvLayerConfig};
+use crate::backends::state::{
+    negotiate_state_plan, PhysicalStateSequenceId, PhysicalStateTransactionId,
+    StateBackendPlanRequest, StateBackendRegistry, StateComponentValue, StateDomainSnapshot,
+    TensorStateArena, TensorStateCapacity,
+};
+use crate::backends::BackendKind;
+use crate::error::{Error, Result};
+use crate::kv::v2::{
+    invocation_paged_workspace_backing_v2, InferenceStateContract, InvocationStateCapacity,
+    InvocationWorkspaceBackingV2, InvocationWorkspaceDomain, ResolvedStatePlan, StateDType,
+    StateDomainId, StateDomainSpec, StatePlanId, StateScope,
+};
+use crate::kv::{KvArenaId, KvGroupId, KvLayerBinding};
+
+use super::invocation::{InvocationPagedKvPoolHandle, InvocationPagedKvPoolOwner};
+use super::invocation_tensor::{InvocationStaticAttentionPoolOwner, InvocationTensorPoolOwner};
+use super::managed::{managed_backend_runtime, managed_device_ordinal};
+use super::retained_static_attention::RetainedStaticAttentionRuntimeV2;
+use crate::engine::{
+    AdapterInstanceId, ModelInstanceId, ReservationClass, ReservationOwner, ResourceAmount,
+    ResourceAuthority, ResourceLease, ResourceVector, StageId,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct InvocationPhysicalKey {
+    pub(crate) adapter_instance: AdapterInstanceId,
+    pub(crate) stage_graph: [u8; 32],
+    pub(crate) stage: StageId,
+    pub(crate) domain: StateDomainId,
+}
+
+struct OwnedInvocationPool {
+    owner: InvocationPagedKvPoolOwner,
+    resource_lease: Option<ResourceLease>,
+    resources: ResourceVector,
+}
+
+enum InvocationSlotPoolOwner {
+    Tensor(InvocationTensorPoolOwner),
+    StaticAttention(InvocationStaticAttentionPoolOwner),
+}
+
+impl InvocationSlotPoolOwner {
+    fn maximum_bytes(&self) -> u64 {
+        match self {
+            Self::Tensor(owner) => owner.maximum_bytes(),
+            Self::StaticAttention(owner) => owner.maximum_bytes(),
+        }
+    }
+
+    fn backing(&self) -> Arc<dyn InvocationWorkspaceBackingV2> {
+        match self {
+            Self::Tensor(owner) => owner.backing(),
+            Self::StaticAttention(owner) => owner.backing(),
+        }
+    }
+
+    fn close_and_drain(&self) -> Result<()> {
+        match self {
+            Self::Tensor(owner) => owner.close_and_drain(),
+            Self::StaticAttention(owner) => owner.close_and_drain(),
+        }
+    }
+}
+
+struct OwnedInvocationSlotPool {
+    owner: InvocationSlotPoolOwner,
+    resource_lease: Option<ResourceLease>,
+    resources: ResourceVector,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub(crate) struct RetainedTensorStateRuntimeIdV2 {
+    pub(crate) model_instance: ModelInstanceId,
+    pub(crate) allocation_generation: u32,
+    pub(crate) state_plan: StatePlanId,
+}
+
+/// Lifecycle-owned physical runtime for a retained contract containing only
+/// transactional tensor/append/ring/static-tensor domains.
+pub(crate) struct RetainedTensorStateRuntimeV2 {
+    id: RetainedTensorStateRuntimeIdV2,
+    state_plan: Arc<ResolvedStatePlan>,
+    arena: Arc<TensorStateArena>,
+    next_sequence: AtomicU64,
+    next_transaction: AtomicU64,
+}
+
+impl std::fmt::Debug for RetainedTensorStateRuntimeV2 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RetainedTensorStateRuntimeV2")
+            .field("id", &self.id)
+            .field("sequence_capacity", &self.sequence_capacity())
+            .field("maximum_bytes", &self.maximum_bytes())
+            .finish_non_exhaustive()
+    }
+}
+
+impl RetainedTensorStateRuntimeV2 {
+    pub(crate) const fn id(&self) -> RetainedTensorStateRuntimeIdV2 {
+        self.id
+    }
+
+    pub(crate) fn state_plan_v2(&self) -> &ResolvedStatePlan {
+        &self.state_plan
+    }
+
+    pub(crate) fn maximum_bytes(&self) -> u64 {
+        self.arena.capacity().authorized_bytes()
+    }
+
+    pub(crate) fn sequence_capacity(&self) -> u32 {
+        self.arena.capacity().sequence_capacity()
+    }
+
+    pub(crate) fn register_sequence(&self) -> Result<PhysicalStateSequenceId> {
+        let sequence = PhysicalStateSequenceId::new(next_identity(&self.next_sequence)?)?;
+        self.arena.register(sequence)?;
+        Ok(sequence)
+    }
+
+    pub(crate) fn begin_transaction(
+        &self,
+        sequence: PhysicalStateSequenceId,
+    ) -> Result<PhysicalStateTransactionId> {
+        let transaction = PhysicalStateTransactionId::new(next_identity(&self.next_transaction)?)?;
+        self.arena.begin(transaction, sequence)?;
+        Ok(transaction)
+    }
+
+    pub(crate) fn read(
+        &self,
+        sequence: PhysicalStateSequenceId,
+        domain: StateDomainId,
+    ) -> Result<Option<StateDomainSnapshot>> {
+        self.arena.read(sequence, domain)
+    }
+
+    pub(crate) fn read_transaction_base(
+        &self,
+        transaction: PhysicalStateTransactionId,
+        domain: StateDomainId,
+    ) -> Result<Option<StateDomainSnapshot>> {
+        self.arena.read_transaction_base(transaction, domain)
+    }
+
+    pub(crate) fn stage_replace(
+        &self,
+        transaction: PhysicalStateTransactionId,
+        domain: StateDomainId,
+        expected_cursor: u64,
+        target_cursor: u64,
+        components: Vec<StateComponentValue>,
+    ) -> Result<()> {
+        self.arena.stage_replace(
+            transaction,
+            domain,
+            expected_cursor,
+            target_cursor,
+            components,
+        )
+    }
+
+    pub(crate) fn commit_transaction(
+        &self,
+        transaction: PhysicalStateTransactionId,
+        expected_cursor: u64,
+    ) -> Result<()> {
+        self.arena.commit(transaction, expected_cursor)
+    }
+
+    pub(crate) fn abort_transaction(&self, transaction: PhysicalStateTransactionId) -> Result<()> {
+        self.arena.abort(transaction)
+    }
+
+    pub(crate) fn release_sequence(&self, sequence: PhysicalStateSequenceId) -> Result<()> {
+        self.arena.release(sequence)
+    }
+
+    fn close_and_validate_drained(&self) -> Result<()> {
+        self.arena.close_and_validate_drained()
+    }
+}
+
+struct OwnedRetainedTensorState {
+    runtime: Arc<RetainedTensorStateRuntimeV2>,
+    resource_lease: Option<ResourceLease>,
+    resources: ResourceVector,
+}
+
+struct OwnedRetainedStaticAttention {
+    runtime: Arc<RetainedStaticAttentionRuntimeV2>,
+    resource_lease: Option<ResourceLease>,
+    resources: ResourceVector,
+}
+
+#[derive(Default)]
+struct ModelPhysicalState {
+    invocation_paged: HashMap<InvocationPhysicalKey, OwnedInvocationPool>,
+    invocation_slots: HashMap<InvocationPhysicalKey, OwnedInvocationSlotPool>,
+    retained_tensor: Option<OwnedRetainedTensorState>,
+    retained_static_attention: Option<OwnedRetainedStaticAttention>,
+}
+
+/// Worker-local owner for capability-authored invocation state. Planning and
+/// allocation happen while the model is Loading; request admission receives
+/// weak generation handles only.
+pub(crate) struct PhysicalStateManager {
+    models: HashMap<ModelInstanceId, ModelPhysicalState>,
+    resource_authority: Option<Arc<ResourceAuthority>>,
+    next_allocation_generation: u32,
+    worker_backend: BackendKind,
+    worker_device: Device,
+    worker_device_location: DeviceLocation,
+    worker_device_ordinal: Option<u32>,
+    backend_runtime: Option<Arc<dyn KvBackendRuntime>>,
+    backend_unavailable: Option<String>,
+    #[cfg(test)]
+    retained_static_materialized_observation: Option<ResourceVector>,
+}
+
+impl PhysicalStateManager {
+    pub(crate) fn contains_model(&self, model_instance: ModelInstanceId) -> bool {
+        self.models.contains_key(&model_instance)
+    }
+
+    pub(crate) fn for_worker(
+        resource_authority: Option<Arc<ResourceAuthority>>,
+        backend: BackendKind,
+        device: Device,
+    ) -> Self {
+        let (backend_runtime, backend_unavailable) = managed_backend_runtime(backend, &device);
+        Self {
+            models: HashMap::new(),
+            resource_authority,
+            next_allocation_generation: 1,
+            worker_backend: backend,
+            worker_device: device.clone(),
+            worker_device_location: device.location(),
+            worker_device_ordinal: managed_device_ordinal(&device),
+            backend_runtime,
+            backend_unavailable,
+            #[cfg(test)]
+            retained_static_materialized_observation: None,
+        }
+    }
+
+    pub(crate) fn cpu(resource_authority: Option<Arc<ResourceAuthority>>) -> Self {
+        Self::for_worker(resource_authority, BackendKind::Cpu, Device::Cpu)
+    }
+
+    pub(crate) fn resolve_state_plan(
+        &self,
+        contract: &InferenceStateContract,
+        page_tokens_hint: Option<u32>,
+    ) -> Result<Arc<ResolvedStatePlan>> {
+        Ok(Arc::new(negotiate_state_plan(
+            contract,
+            &StateBackendPlanRequest {
+                backend: self.worker_backend,
+                device_ordinal: self.worker_device_ordinal,
+                page_tokens_hint,
+                storage_dtype_hint: None,
+            },
+        )?))
+    }
+
+    pub(crate) fn allocate_retained_tensor(
+        &mut self,
+        model_instance: ModelInstanceId,
+        contract: &InferenceStateContract,
+        sequence_capacity: u32,
+    ) -> Result<Arc<RetainedTensorStateRuntimeV2>> {
+        contract.validate()?;
+        if sequence_capacity == 0
+            || contract.domains.is_empty()
+            || contract
+                .domains
+                .iter()
+                .any(|domain| domain.scope() != StateScope::Retained)
+            || contract.domains.iter().any(|domain| {
+                !matches!(
+                    domain,
+                    StateDomainSpec::Tensor(_)
+                        | StateDomainSpec::Append(_)
+                        | StateDomainSpec::Ring(_)
+                        | StateDomainSpec::StaticTensor(_)
+                )
+            })
+        {
+            return Err(invalid(
+                "retained tensor allocation requires non-zero sequence capacity and retained tensor, append, ring, or static-tensor domains only",
+            ));
+        }
+        if let Some(existing) = self
+            .models
+            .get(&model_instance)
+            .and_then(|model| model.retained_tensor.as_ref())
+        {
+            if existing.runtime.state_plan_v2().contract_fingerprint != contract.fingerprint()?
+                || existing.runtime.sequence_capacity() != sequence_capacity
+            {
+                return Err(invalid(
+                    "one model generation requested incompatible retained tensor allocation",
+                ));
+            }
+            return Ok(existing.runtime.clone());
+        }
+        let state_plan = Arc::new(negotiate_state_plan(
+            contract,
+            &StateBackendPlanRequest {
+                backend: self.worker_backend,
+                device_ordinal: self.worker_device_ordinal,
+                page_tokens_hint: None,
+                storage_dtype_hint: None,
+            },
+        )?);
+        if !state_plan.paged_attention.is_empty() || state_plan.non_paged.is_empty() {
+            return Err(invalid(
+                "retained tensor allocation resolved an invalid physical domain set",
+            ));
+        }
+        let capacity =
+            TensorStateCapacity::for_plan(&state_plan, sequence_capacity, sequence_capacity)?;
+        let maximum_bytes = capacity.authorized_bytes();
+        let generation = self.next_allocation_generation;
+        if generation == 0 {
+            return Err(invalid("physical retained allocation generation exhausted"));
+        }
+        let next_generation = generation
+            .checked_add(1)
+            .ok_or_else(|| invalid("physical retained allocation generation overflow"))?;
+        let resources = arena_resources(self.worker_backend, maximum_bytes);
+        let resource_lease = self
+            .resource_authority
+            .as_ref()
+            .map(|authority| {
+                reserve_retained_tensor(authority, model_instance, self.worker_backend, resources)
+            })
+            .transpose()?;
+        let arena = Arc::new(TensorStateArena::new(
+            state_plan.clone(),
+            capacity,
+            self.worker_device.clone(),
+        )?);
+        let runtime = Arc::new(RetainedTensorStateRuntimeV2 {
+            id: RetainedTensorStateRuntimeIdV2 {
+                model_instance,
+                allocation_generation: generation,
+                state_plan: state_plan.id,
+            },
+            state_plan,
+            arena,
+            next_sequence: AtomicU64::new(1),
+            next_transaction: AtomicU64::new(1),
+        });
+        let model = self.models.entry(model_instance).or_default();
+        if model
+            .retained_tensor
+            .replace(OwnedRetainedTensorState {
+                runtime: runtime.clone(),
+                resource_lease,
+                resources,
+            })
+            .is_some()
+        {
+            return Err(invalid(
+                "one model generation allocated retained tensor state twice",
+            ));
+        }
+        self.next_allocation_generation = next_generation;
+        Ok(runtime)
+    }
+
+    pub(crate) fn allocate_retained_static_attention(
+        &mut self,
+        model_instance: ModelInstanceId,
+        contract: &InferenceStateContract,
+        domain: StateDomainId,
+        sequence_capacity: u32,
+    ) -> Result<Arc<RetainedStaticAttentionRuntimeV2>> {
+        let state_plan = Arc::new(negotiate_state_plan(
+            contract,
+            &StateBackendPlanRequest {
+                backend: self.worker_backend,
+                device_ordinal: self.worker_device_ordinal,
+                page_tokens_hint: None,
+                storage_dtype_hint: None,
+            },
+        )?);
+        self.allocate_retained_static_attention_with_plan(
+            model_instance,
+            contract,
+            state_plan,
+            domain,
+            sequence_capacity,
+        )
+    }
+
+    pub(crate) fn allocate_retained_static_attention_with_plan(
+        &mut self,
+        model_instance: ModelInstanceId,
+        contract: &InferenceStateContract,
+        state_plan: Arc<ResolvedStatePlan>,
+        domain: StateDomainId,
+        sequence_capacity: u32,
+    ) -> Result<Arc<RetainedStaticAttentionRuntimeV2>> {
+        contract.validate()?;
+        if state_plan.contract_fingerprint != contract.fingerprint()?
+            || state_plan.backend != self.worker_backend
+            || state_plan.device_ordinal != self.worker_device_ordinal
+        {
+            return Err(invalid(
+                "retained static-attention resolved plan does not match its contract/worker",
+            ));
+        }
+        let semantic = contract
+            .domains
+            .iter()
+            .find(|candidate| candidate.id() == domain)
+            .ok_or_else(|| invalid("selected retained static-attention domain is absent"))?;
+        if sequence_capacity == 0
+            || !matches!(semantic, StateDomainSpec::StaticAttention(_))
+            || semantic.scope() != StateScope::Retained
+        {
+            return Err(invalid(
+                "retained static-attention allocation requires a selected retained static-attention domain and non-zero sequence capacity",
+            ));
+        }
+        let semantic_group = contract
+            .groups
+            .iter()
+            .find(|group| group.domains.contains(&domain))
+            .ok_or_else(|| invalid("selected retained static-attention domain has no group"))?;
+        if let Some(existing) = self
+            .models
+            .get(&model_instance)
+            .and_then(|model| model.retained_static_attention.as_ref())
+        {
+            if existing.runtime.state_plan_v2().contract_fingerprint != contract.fingerprint()?
+                || existing.runtime.state_plan_v2().id != state_plan.id
+                || existing.runtime.id().domain != domain
+                || existing.runtime.sequence_capacity() != sequence_capacity
+            {
+                return Err(invalid(
+                    "one model generation requested incompatible retained static-attention allocation",
+                ));
+            }
+            return Ok(existing.runtime.clone());
+        }
+        let resolved = state_plan
+            .non_paged
+            .iter()
+            .find(|candidate| candidate.domain() == domain)
+            .ok_or_else(|| {
+                invalid("selected retained static-attention domain has no resolved backing")
+            })?;
+        if resolved.group() != semantic_group.id
+            || !matches!(
+                resolved,
+                crate::kv::v2::ResolvedNonPagedDomainPlan::StaticAttention(_)
+            )
+        {
+            return Err(invalid(
+                "selected retained static-attention domain/group resolved incompatibly",
+            ));
+        }
+        let per_sequence_bytes = resolved.maximum_bytes();
+        let maximum_bytes = per_sequence_bytes
+            .checked_mul(u64::from(sequence_capacity))
+            .ok_or_else(|| invalid("retained static-attention allocation byte overflow"))?;
+        let generation = self.next_allocation_generation;
+        if generation == 0 {
+            return Err(invalid(
+                "physical retained static-attention allocation generation exhausted",
+            ));
+        }
+        let next_generation = generation.checked_add(1).ok_or_else(|| {
+            invalid("physical retained static-attention allocation generation overflow")
+        })?;
+        let resources = arena_resources(self.worker_backend, maximum_bytes);
+        let resource_lease = self
+            .resource_authority
+            .as_ref()
+            .map(|authority| {
+                reserve_retained_static_attention(
+                    authority,
+                    model_instance,
+                    self.worker_backend,
+                    resources,
+                )
+            })
+            .transpose()?;
+        let runtime = Arc::new(RetainedStaticAttentionRuntimeV2::new(
+            model_instance,
+            generation,
+            contract,
+            state_plan,
+            domain,
+            sequence_capacity,
+            self.worker_device.clone(),
+        )?);
+        if runtime.maximum_bytes() != maximum_bytes {
+            return Err(Error::InferenceError(
+                "retained static-attention physical bytes disagree with admission".to_string(),
+            ));
+        }
+        if let Some(lease) = resource_lease.as_ref() {
+            #[cfg(test)]
+            let observed = self
+                .retained_static_materialized_observation
+                .unwrap_or(resources);
+            #[cfg(not(test))]
+            let observed = resources;
+            lease.record_materialized_usage(observed)?;
+        }
+        let model = self.models.entry(model_instance).or_default();
+        if model
+            .retained_static_attention
+            .replace(OwnedRetainedStaticAttention {
+                runtime: runtime.clone(),
+                resource_lease,
+                resources,
+            })
+            .is_some()
+        {
+            return Err(invalid(
+                "one model generation allocated retained static attention twice",
+            ));
+        }
+        self.next_allocation_generation = next_generation;
+        Ok(runtime)
+    }
+
+    pub(crate) fn allocate_invocation_workspace(
+        &mut self,
+        model_instance: ModelInstanceId,
+        key: InvocationPhysicalKey,
+        contract: &InferenceStateContract,
+        plan: Arc<ResolvedStatePlan>,
+        workspace_domain: &InvocationWorkspaceDomain,
+        slot_count: u32,
+    ) -> Result<Arc<dyn InvocationWorkspaceBackingV2>> {
+        validate_invocation_allocation(
+            self,
+            model_instance,
+            key,
+            contract,
+            plan.as_ref(),
+            workspace_domain,
+            slot_count,
+        )?;
+        match workspace_domain {
+            InvocationWorkspaceDomain::Scratch { .. } => Err(invalid(
+                "scratch invocation workspace is stage-owned and has no persistent allocator",
+            )),
+            InvocationWorkspaceDomain::State {
+                state: StateDomainSpec::PagedAttention(_),
+                ..
+            } => {
+                let pool = self.allocate_invocation_paged(
+                    model_instance,
+                    key,
+                    plan.as_ref(),
+                    workspace_domain,
+                    slot_count,
+                )?;
+                Ok(invocation_paged_workspace_backing_v2(pool))
+            }
+            InvocationWorkspaceDomain::State {
+                state: StateDomainSpec::StaticAttention(_),
+                ..
+            }
+            | InvocationWorkspaceDomain::State {
+                state:
+                    StateDomainSpec::Tensor(_)
+                    | StateDomainSpec::Append(_)
+                    | StateDomainSpec::Ring(_)
+                    | StateDomainSpec::StaticTensor(_),
+                ..
+            } => self.allocate_invocation_slot(
+                model_instance,
+                key,
+                contract,
+                plan,
+                workspace_domain,
+                slot_count,
+            ),
+        }
+    }
+
+    pub(crate) fn resolve_and_allocate_invocation_workspace(
+        &mut self,
+        model_instance: ModelInstanceId,
+        key: InvocationPhysicalKey,
+        contract: &InferenceStateContract,
+        workspace_domain: &InvocationWorkspaceDomain,
+        slot_count: u32,
+    ) -> Result<Arc<dyn InvocationWorkspaceBackingV2>> {
+        let plan = Arc::new(negotiate_state_plan(
+            contract,
+            &StateBackendPlanRequest {
+                backend: self.worker_backend,
+                device_ordinal: self.worker_device_ordinal,
+                page_tokens_hint: match workspace_domain {
+                    InvocationWorkspaceDomain::State {
+                        state: StateDomainSpec::PagedAttention(domain),
+                        ..
+                    } => Some(domain.page_size.preferred_tokens),
+                    _ => None,
+                },
+                storage_dtype_hint: None,
+            },
+        )?);
+        self.allocate_invocation_workspace(
+            model_instance,
+            key,
+            contract,
+            plan,
+            workspace_domain,
+            slot_count,
+        )
+    }
+
+    fn allocate_invocation_slot(
+        &mut self,
+        model_instance: ModelInstanceId,
+        key: InvocationPhysicalKey,
+        contract: &InferenceStateContract,
+        plan: Arc<ResolvedStatePlan>,
+        workspace_domain: &InvocationWorkspaceDomain,
+        slot_count: u32,
+    ) -> Result<Arc<dyn InvocationWorkspaceBackingV2>> {
+        let generation = self.next_allocation_generation;
+        if generation == 0 {
+            return Err(invalid(
+                "physical invocation allocation generation exhausted",
+            ));
+        }
+        let next_generation = generation
+            .checked_add(1)
+            .ok_or_else(|| invalid("physical invocation allocation generation overflow"))?;
+        let matches = plan
+            .non_paged
+            .iter()
+            .filter(|resolved| resolved.domain() == key.domain)
+            .collect::<Vec<_>>();
+        let [resolved] = matches.as_slice() else {
+            return Err(invalid(
+                "invocation tensor allocator requires one exact resolved non-paged domain",
+            ));
+        };
+        let maximum_bytes = resolved
+            .maximum_bytes()
+            .checked_mul(u64::from(slot_count))
+            .ok_or_else(|| invalid("invocation slot pool byte accounting overflow"))?;
+        let resources = arena_resources(self.worker_backend, maximum_bytes);
+        let resource_lease = self
+            .resource_authority
+            .as_ref()
+            .map(|authority| {
+                reserve_arena(
+                    authority,
+                    model_instance,
+                    key,
+                    self.worker_backend,
+                    resources,
+                )
+            })
+            .transpose()?;
+        let owner = match workspace_domain {
+            InvocationWorkspaceDomain::State {
+                state: StateDomainSpec::StaticAttention(_),
+                ..
+            } => InvocationSlotPoolOwner::StaticAttention(InvocationStaticAttentionPoolOwner::new(
+                contract,
+                plan,
+                workspace_domain.clone(),
+                self.worker_device.clone(),
+                model_instance,
+                slot_count,
+                generation,
+            )?),
+            InvocationWorkspaceDomain::State {
+                state:
+                    StateDomainSpec::Tensor(_)
+                    | StateDomainSpec::Append(_)
+                    | StateDomainSpec::Ring(_)
+                    | StateDomainSpec::StaticTensor(_),
+                ..
+            } => InvocationSlotPoolOwner::Tensor(InvocationTensorPoolOwner::new(
+                contract,
+                plan,
+                workspace_domain.clone(),
+                self.worker_device.clone(),
+                model_instance,
+                slot_count,
+                generation,
+            )?),
+            _ => {
+                return Err(invalid(
+                    "invocation slot allocator requires a non-paged physical state domain",
+                ));
+            }
+        };
+        if owner.maximum_bytes() != maximum_bytes {
+            return Err(Error::InferenceError(
+                "invocation slot allocation does not match its reserved byte bound".to_string(),
+            ));
+        }
+        if let Some(lease) = resource_lease.as_ref() {
+            lease.record_materialized_usage(resources)?;
+        }
+        let backing = owner.backing();
+        let replaced = self
+            .models
+            .entry(model_instance)
+            .or_default()
+            .invocation_slots
+            .insert(
+                key,
+                OwnedInvocationSlotPool {
+                    owner,
+                    resource_lease,
+                    resources,
+                },
+            );
+        if replaced.is_some() {
+            return Err(Error::InferenceError(
+                "physical invocation identity changed during exclusive allocation".to_string(),
+            ));
+        }
+        self.next_allocation_generation = next_generation;
+        Ok(backing)
+    }
+
+    fn allocate_invocation_paged(
+        &mut self,
+        model_instance: ModelInstanceId,
+        key: InvocationPhysicalKey,
+        plan: &ResolvedStatePlan,
+        workspace_domain: &InvocationWorkspaceDomain,
+        slot_count: u32,
+    ) -> Result<InvocationPagedKvPoolHandle> {
+        validate_key(key)?;
+        if plan.backend != self.worker_backend
+            || plan.device_ordinal != self.worker_device_ordinal
+            || key.domain != workspace_domain.id()
+            || slot_count == 0
+        {
+            return Err(invalid(
+                "invocation allocation does not match its worker, domain, or lease multiplicity",
+            ));
+        }
+        if self
+            .models
+            .get(&model_instance)
+            .is_some_and(|model| model.invocation_paged.contains_key(&key))
+        {
+            return Err(invalid(
+                "one physical invocation identity was allocated more than once",
+            ));
+        }
+        let runtime = self.backend_runtime.as_ref().ok_or_else(|| {
+            Error::ModelLoadError(self.backend_unavailable.clone().unwrap_or_else(|| {
+                format!(
+                    "physical paged state is unavailable for {:?}",
+                    self.worker_backend
+                )
+            }))
+        })?;
+        let resolved = plan
+            .paged_attention
+            .iter()
+            .find(|candidate| candidate.domain == key.domain)
+            .ok_or_else(|| invalid("invocation paged domain is absent from its resolved plan"))?;
+        let InvocationWorkspaceDomain::State {
+            state: StateDomainSpec::PagedAttention(semantic),
+            capacity,
+            ..
+        } = workspace_domain
+        else {
+            return Err(invalid(
+                "physical paged allocator requires a paged token-capacity domain",
+            ));
+        };
+        let max_tokens = capacity.paged_max_tokens().ok_or_else(|| {
+            invalid("physical paged allocator requires a paged token-capacity domain")
+        })?;
+        let pages_per_slot = pages_for_tokens(max_tokens, resolved.page_tokens)?;
+        let capacity_pages = pages_per_slot
+            .checked_mul(slot_count)
+            .ok_or_else(|| invalid("invocation paged arena capacity overflow"))?;
+        let physical_bytes = resolved
+            .bytes_per_page
+            .checked_mul(u64::from(capacity_pages))
+            .ok_or_else(|| invalid("invocation paged arena byte size overflow"))?;
+        let generation = self.next_allocation_generation;
+        if generation == 0 {
+            return Err(invalid(
+                "physical invocation allocation generation exhausted",
+            ));
+        }
+        let next_generation = generation
+            .checked_add(1)
+            .ok_or_else(|| invalid("physical invocation allocation generation overflow"))?;
+        let resources = arena_resources(self.worker_backend, physical_bytes);
+        let resource_lease = self
+            .resource_authority
+            .as_ref()
+            .map(|authority| {
+                reserve_arena(
+                    authority,
+                    model_instance,
+                    key,
+                    self.worker_backend,
+                    resources,
+                )
+            })
+            .transpose()?;
+        let arena_id = KvArenaId {
+            model_instance,
+            backend: self.worker_backend,
+            device_ordinal: self.worker_device_ordinal,
+            generation,
+        };
+        let config = invocation_arena_config(
+            arena_id,
+            resolved,
+            semantic,
+            capacity_pages,
+            resolved.storage.dtype(),
+        )?;
+        let arena = runtime.allocate_arena(config)?;
+        if arena.backend_kind() != self.worker_backend
+            || arena.device_location() != self.worker_device_location
+        {
+            let _ = arena.drain();
+            return Err(Error::ModelLoadError(
+                "invocation arena was allocated on a different worker device".to_string(),
+            ));
+        }
+        let owner = match InvocationPagedKvPoolOwner::new(
+            plan,
+            workspace_domain,
+            arena.clone(),
+            0,
+            pages_per_slot,
+            slot_count,
+            generation,
+        ) {
+            Ok(owner) => owner,
+            Err(error) => {
+                let _ = arena.drain();
+                return Err(error);
+            }
+        };
+        if let Some(lease) = resource_lease.as_ref() {
+            lease.record_materialized_usage(resources)?;
+        }
+        let handle = owner.handle();
+        self.models
+            .entry(model_instance)
+            .or_default()
+            .invocation_paged
+            .insert(
+                key,
+                OwnedInvocationPool {
+                    owner,
+                    resource_lease,
+                    resources,
+                },
+            );
+        self.next_allocation_generation = next_generation;
+        Ok(handle)
+    }
+
+    /// Close and fence every owner without removing its resource lease. A
+    /// composite owner uses this as the first half of a two-manager unload.
+    pub(crate) fn prepare_unload_model(&mut self, model_instance: ModelInstanceId) -> Result<bool> {
+        self.prepare_unload_model_with_static_runtime_owners(model_instance, 1)
+    }
+
+    pub(crate) fn prepare_unload_model_with_static_runtime_owners(
+        &mut self,
+        model_instance: ModelInstanceId,
+        expected_static_runtime_owners: usize,
+    ) -> Result<bool> {
+        if expected_static_runtime_owners == 0 {
+            return Err(invalid(
+                "physical unload expected zero retained static runtime owners",
+            ));
+        }
+        let Some(model) = self.models.get(&model_instance) else {
+            return Ok(false);
+        };
+        let mut drain_error = None;
+        for pool in model.invocation_paged.values() {
+            if let Err(error) = pool.owner.close_and_drain() {
+                drain_error.get_or_insert(error);
+            }
+        }
+        for pool in model.invocation_slots.values() {
+            if let Err(error) = pool.owner.close_and_drain() {
+                drain_error.get_or_insert(error);
+            }
+        }
+        if let Some(retained) = model.retained_tensor.as_ref() {
+            if let Err(error) = retained.runtime.close_and_validate_drained() {
+                drain_error.get_or_insert(error);
+            }
+        }
+        if let Some(retained) = model.retained_static_attention.as_ref() {
+            if let Err(error) = retained.runtime.close_and_validate_drained() {
+                drain_error.get_or_insert(error);
+            }
+            if Arc::strong_count(&retained.runtime) != expected_static_runtime_owners {
+                drain_error.get_or_insert_with(|| {
+                    Error::InferenceError(format!(
+                        "retained static-attention runtime has {} owners, expected {expected_static_runtime_owners}",
+                        Arc::strong_count(&retained.runtime)
+                    ))
+                });
+            }
+        }
+        if let Some(error) = drain_error {
+            return Err(error);
+        }
+        for pool in model.invocation_paged.values() {
+            if let Some(lease) = pool.resource_lease.as_ref() {
+                if lease.resources() != pool.resources {
+                    return Err(Error::InferenceError(
+                        "invocation state resource lease changed after allocation".to_string(),
+                    ));
+                }
+                lease.prepare_materialized_release(ResourceVector::zero())?;
+            }
+        }
+        for pool in model.invocation_slots.values() {
+            if let Some(lease) = pool.resource_lease.as_ref() {
+                if lease.resources() != pool.resources {
+                    return Err(Error::InferenceError(
+                        "invocation slot resource lease changed after allocation".to_string(),
+                    ));
+                }
+                lease.prepare_materialized_release(ResourceVector::zero())?;
+            }
+        }
+        if let Some(retained) = model.retained_tensor.as_ref() {
+            if let Some(lease) = retained.resource_lease.as_ref() {
+                if lease.resources() != retained.resources {
+                    return Err(Error::InferenceError(
+                        "retained tensor resource lease changed after allocation".to_string(),
+                    ));
+                }
+                lease.prepare_materialized_release(ResourceVector::zero())?;
+            }
+        }
+        if let Some(retained) = model.retained_static_attention.as_ref() {
+            if let Some(lease) = retained.resource_lease.as_ref() {
+                if lease.resources() != retained.resources {
+                    return Err(Error::InferenceError(
+                        "retained static-attention resource lease changed after allocation"
+                            .to_string(),
+                    ));
+                }
+                lease.prepare_materialized_release(ResourceVector::zero())?;
+            }
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn commit_prepared_unload_model(&mut self, model_instance: ModelInstanceId) -> bool {
+        let removed = self.models.remove(&model_instance);
+        removed.is_some()
+    }
+
+    /// Close every pool first so a failed active-lease drain cannot admit new
+    /// work. Removal and resource release occur only after all pools fence.
+    pub(crate) fn unload_model(&mut self, model_instance: ModelInstanceId) -> Result<bool> {
+        if !self.prepare_unload_model(model_instance)? {
+            return Ok(false);
+        }
+        Ok(self.commit_prepared_unload_model(model_instance))
+    }
+
+    #[cfg(test)]
+    fn model_count(&self) -> usize {
+        self.models.len()
+    }
+}
+
+fn next_identity(counter: &AtomicU64) -> Result<u64> {
+    counter
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            value.checked_add(1)
+        })
+        .map_err(|_| invalid("physical state identity space exhausted"))
+}
+
+fn validate_key(key: InvocationPhysicalKey) -> Result<()> {
+    if key.adapter_instance.get() == 0
+        || key.stage_graph.iter().all(|byte| *byte == 0)
+        || key.domain.get() == 0
+    {
+        return Err(invalid("physical invocation key is incomplete"));
+    }
+    Ok(())
+}
+
+fn validate_invocation_allocation(
+    manager: &PhysicalStateManager,
+    model_instance: ModelInstanceId,
+    key: InvocationPhysicalKey,
+    contract: &InferenceStateContract,
+    plan: &ResolvedStatePlan,
+    workspace_domain: &InvocationWorkspaceDomain,
+    slot_count: u32,
+) -> Result<()> {
+    validate_key(key)?;
+    contract.validate()?;
+    if model_instance.get() == 0
+        || slot_count == 0
+        || plan.backend != manager.worker_backend
+        || plan.device_ordinal != manager.worker_device_ordinal
+        || plan.contract_fingerprint != contract.fingerprint()?
+        || key.domain != workspace_domain.id()
+    {
+        return Err(invalid(
+            "invocation allocation does not match its model, worker, contract, domain, or lease multiplicity",
+        ));
+    }
+    plan.validate_against(
+        contract,
+        &StateBackendRegistry::new(manager.worker_backend, manager.worker_device_ordinal)?,
+    )?;
+    if manager.models.get(&model_instance).is_some_and(|model| {
+        model.invocation_paged.contains_key(&key) || model.invocation_slots.contains_key(&key)
+    }) {
+        return Err(invalid(
+            "one physical invocation identity was allocated more than once",
+        ));
+    }
+    let InvocationWorkspaceDomain::State {
+        state,
+        capacity,
+        placement,
+        ..
+    } = workspace_domain
+    else {
+        return Ok(());
+    };
+    let canonical = contract
+        .domains
+        .iter()
+        .find(|candidate| candidate.id() == state.id())
+        .ok_or_else(|| invalid("invocation workspace domain is absent from its contract"))?;
+    if canonical != state
+        || state.scope() != StateScope::Invocation
+        || state.header().placement != *placement
+    {
+        return Err(invalid(
+            "invocation workspace is not the canonical invocation-scoped contract domain",
+        ));
+    }
+    let capacity_matches = matches!(state, StateDomainSpec::PagedAttention(_))
+        && capacity.paged_max_tokens().is_some()
+        || matches!(
+            (state, capacity),
+            (
+                StateDomainSpec::StaticAttention(_)
+                    | StateDomainSpec::Tensor(_)
+                    | StateDomainSpec::Append(_)
+                    | StateDomainSpec::Ring(_)
+                    | StateDomainSpec::StaticTensor(_),
+                InvocationStateCapacity::SemanticBounded
+            )
+        );
+    if !capacity_matches {
+        return Err(invalid(
+            "invocation workspace capacity does not match its semantic domain",
+        ));
+    }
+    Ok(())
+}
+
+fn pages_for_tokens(max_tokens: u64, page_tokens: u32) -> Result<u32> {
+    if max_tokens == 0 || page_tokens == 0 {
+        return Err(invalid("paged invocation capacity must be non-zero"));
+    }
+    let pages = max_tokens
+        .checked_add(u64::from(page_tokens) - 1)
+        .and_then(|tokens| tokens.checked_div(u64::from(page_tokens)))
+        .ok_or_else(|| invalid("paged invocation capacity overflow"))?;
+    u32::try_from(pages).map_err(|_| invalid("paged invocation capacity exceeds u32"))
+}
+
+fn invocation_arena_config(
+    id: KvArenaId,
+    resolved: &crate::kv::v2::ResolvedPagedAttentionGroup,
+    semantic: &crate::kv::v2::PagedAttentionDomainSpec,
+    capacity_pages: u32,
+    dtype: StateDType,
+) -> Result<KvArenaConfig> {
+    let mut layers = Vec::with_capacity(resolved.layers.len());
+    for binding in &resolved.layers {
+        let layer = semantic
+            .layers
+            .iter()
+            .find(|layer| layer.model_layer == binding.model_layer)
+            .ok_or_else(|| invalid("resolved invocation layer lost its semantic geometry"))?;
+        layers.push(KvLayerConfig {
+            binding: KvLayerBinding {
+                model_layer: binding.model_layer,
+                physical_layer: binding.physical_layer,
+            },
+            num_kv_heads: layer.kv_heads,
+            key_head_dim: layer.key_head_dim,
+            value_head_dim: layer.value_head_dim,
+        });
+    }
+    Ok(KvArenaConfig {
+        id,
+        group: KvGroupId::new(resolved.group.get()),
+        page_tokens: resolved.page_tokens,
+        capacity_pages,
+        growth: None,
+        dtype: candle_dtype(dtype)?,
+        layers,
+    })
+}
+
+fn candle_dtype(dtype: StateDType) -> Result<DType> {
+    match dtype {
+        StateDType::F32 => Ok(DType::F32),
+        StateDType::F16 => Ok(DType::F16),
+        StateDType::Bf16 => Ok(DType::BF16),
+        StateDType::I64 => Ok(DType::I64),
+        StateDType::I8 | StateDType::Q4 => Err(invalid(
+            "dense invocation arenas cannot allocate quantized state",
+        )),
+    }
+}
+
+fn arena_resources(backend: BackendKind, bytes: u64) -> ResourceVector {
+    let mut resources = ResourceVector::zero();
+    match backend {
+        BackendKind::Cpu => resources.host_bytes = ResourceAmount::Known(bytes),
+        BackendKind::Metal => resources.unified_bytes = ResourceAmount::Known(bytes),
+        BackendKind::Cuda => resources.device_bytes = ResourceAmount::Known(bytes),
+    }
+    resources
+}
+
+fn reserve_arena(
+    authority: &Arc<ResourceAuthority>,
+    model_instance: ModelInstanceId,
+    key: InvocationPhysicalKey,
+    backend: BackendKind,
+    resources: ResourceVector,
+) -> Result<ResourceLease> {
+    let owner = ReservationOwner::new(
+        ReservationClass::Model,
+        format!(
+            "invocation-state:{}:{}:{}:{}:{backend:?}",
+            model_instance.get(),
+            key.adapter_instance.get(),
+            key.stage.get(),
+            key.domain.get()
+        ),
+    );
+    authority.reserve(owner, resources)
+}
+
+fn reserve_retained_tensor(
+    authority: &Arc<ResourceAuthority>,
+    model_instance: ModelInstanceId,
+    backend: BackendKind,
+    resources: ResourceVector,
+) -> Result<ResourceLease> {
+    let owner = ReservationOwner::new(
+        ReservationClass::Model,
+        format!("retained-tensor-state:{}:{backend:?}", model_instance.get()),
+    );
+    authority.reserve(owner, resources)
+}
+
+fn reserve_retained_static_attention(
+    authority: &Arc<ResourceAuthority>,
+    model_instance: ModelInstanceId,
+    backend: BackendKind,
+    resources: ResourceVector,
+) -> Result<ResourceLease> {
+    let owner = ReservationOwner::new(
+        ReservationClass::Model,
+        format!(
+            "retained-static-attention-state:{}:{backend:?}",
+            model_instance.get()
+        ),
+    );
+    authority.reserve(owner, resources)
+}
+
+fn invalid(message: impl Into<String>) -> Error {
+    Error::InvalidInput(message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backends::state::{negotiate_state_plan, StateBackendPlanRequest};
+    use crate::engine::{CapacitySource, PhysicalCapacityProvider, PhysicalCapacitySnapshot};
+    use crate::kv::v2::{
+        test_contract, BoundedShape, CheckpointPolicy, InvocationStateCapacity, PlacementPolicy,
+        PrefixPolicy, ShapeAxis, ShapeDimension, ShapeExtent, StateClock, StateComponentId,
+        StateDomainHeader, StateGroupId, StateGroupSpec, StaticAttentionDomainSpec,
+        StaticAttentionLayerSpec, TensorComponentSpec, TensorRole, TensorStateDomainSpec,
+        WorkspaceFormula, CURRENT_INFERENCE_STATE_ABI,
+    };
+    use candle_core::Tensor;
+
+    #[derive(Debug)]
+    struct TestCapacityProvider {
+        capacity: ResourceVector,
+    }
+
+    impl PhysicalCapacityProvider for TestCapacityProvider {
+        fn snapshot(&self) -> PhysicalCapacitySnapshot {
+            PhysicalCapacitySnapshot {
+                capacity: self.capacity,
+                available: self.capacity,
+                source: CapacitySource::Test,
+            }
+        }
+    }
+
+    fn paged_invocation_contract() -> InferenceStateContract {
+        let mut contract = test_contract();
+        let StateDomainSpec::PagedAttention(domain) = &mut contract.domains[0] else {
+            unreachable!()
+        };
+        domain.header.scope = StateScope::Invocation;
+        domain.header.prefix = PrefixPolicy::Disabled;
+        domain.header.checkpoint = CheckpointPolicy::None;
+        domain.accepted_dtypes = vec![StateDType::F32];
+        domain.layers[0].query_heads = 2;
+        domain.layers[0].kv_heads = 2;
+        domain.layers[0].key_head_dim = 4;
+        domain.layers[0].value_head_dim = 4;
+        domain.layers[0].key_encoding = crate::kv::v2::KeyEncoding::Rotary { rotary_dim: 4 };
+        contract.groups[0].prefix_shareable = false;
+        contract
+    }
+
+    fn invocation_plan() -> (ResolvedStatePlan, InvocationWorkspaceDomain) {
+        let contract = paged_invocation_contract();
+        let workspace = InvocationWorkspaceDomain::State {
+            state: contract.domains[0].clone(),
+            capacity: InvocationStateCapacity::PagedTokens { max_tokens: 17 },
+            placement: PlacementPolicy::BackendLocalWithHostOffload,
+            formula: WorkspaceFormula {
+                fixed_bytes: 1024 * 1024,
+                dimensions: vec![],
+                terms: vec![],
+            },
+        };
+        let plan = negotiate_state_plan(
+            &contract,
+            &StateBackendPlanRequest {
+                backend: BackendKind::Cpu,
+                device_ordinal: None,
+                page_tokens_hint: Some(16),
+                storage_dtype_hint: Some(StateDType::F32),
+            },
+        )
+        .unwrap();
+        (plan, workspace)
+    }
+
+    fn tensor_invocation_domain(id: u32, maximum_elements: u64) -> StateDomainSpec {
+        StateDomainSpec::Tensor(TensorStateDomainSpec {
+            header: StateDomainHeader {
+                id: StateDomainId::new(id),
+                scope: StateScope::Invocation,
+                clock: StateClock::DecoderTokens,
+                placement: PlacementPolicy::BackendLocal,
+                prefix: PrefixPolicy::Disabled,
+                checkpoint: CheckpointPolicy::None,
+            },
+            components: vec![TensorComponentSpec {
+                id: StateComponentId::new(1),
+                role: TensorRole::Control,
+                shape: BoundedShape {
+                    dimensions: vec![ShapeDimension {
+                        axis: ShapeAxis::Hidden,
+                        extent: ShapeExtent::RuntimeBounded {
+                            min: 1,
+                            max: maximum_elements,
+                        },
+                    }],
+                },
+                accepted_dtypes: vec![StateDType::F32],
+            }],
+        })
+    }
+
+    fn static_attention_invocation_domain(id: u32, max_memory_tokens: u64) -> StateDomainSpec {
+        StateDomainSpec::StaticAttention(StaticAttentionDomainSpec {
+            header: StateDomainHeader {
+                id: StateDomainId::new(id),
+                scope: StateScope::Invocation,
+                clock: StateClock::EncoderTokens,
+                placement: PlacementPolicy::BackendLocal,
+                prefix: PrefixPolicy::Disabled,
+                checkpoint: CheckpointPolicy::None,
+            },
+            layers: vec![StaticAttentionLayerSpec {
+                model_layer: 0,
+                query_heads: 4,
+                kv_heads: 2,
+                key_head_dim: 2,
+                value_head_dim: 2,
+                key_encoding: crate::kv::v2::KeyEncoding::Raw,
+            }],
+            max_memory_tokens,
+            accepted_dtypes: vec![StateDType::F32],
+        })
+    }
+
+    fn mixed_invocation_contract() -> InferenceStateContract {
+        let mut contract = paged_invocation_contract();
+        contract.domains.push(tensor_invocation_domain(2, 8));
+        contract.groups.push(StateGroupSpec {
+            id: StateGroupId::new(2),
+            domains: vec![StateDomainId::new(2)],
+            prefix_shareable: false,
+        });
+        contract
+    }
+
+    fn tensor_invocation_plan_and_workspace() -> (
+        InferenceStateContract,
+        Arc<ResolvedStatePlan>,
+        InvocationWorkspaceDomain,
+    ) {
+        let contract = InferenceStateContract {
+            abi: CURRENT_INFERENCE_STATE_ABI,
+            domains: vec![tensor_invocation_domain(1, 8)],
+            groups: vec![StateGroupSpec {
+                id: StateGroupId::new(1),
+                domains: vec![StateDomainId::new(1)],
+                prefix_shareable: false,
+            }],
+        };
+        let plan = Arc::new(
+            negotiate_state_plan(
+                &contract,
+                &StateBackendPlanRequest {
+                    backend: BackendKind::Cpu,
+                    device_ordinal: None,
+                    page_tokens_hint: None,
+                    storage_dtype_hint: Some(StateDType::F32),
+                },
+            )
+            .unwrap(),
+        );
+        let workspace = InvocationWorkspaceDomain::State {
+            state: contract.domains[0].clone(),
+            capacity: InvocationStateCapacity::SemanticBounded,
+            placement: PlacementPolicy::BackendLocal,
+            formula: WorkspaceFormula {
+                fixed_bytes: plan.non_paged[0].maximum_bytes(),
+                dimensions: vec![],
+                terms: vec![],
+            },
+        };
+        (contract, plan, workspace)
+    }
+
+    fn static_attention_plan_and_workspace() -> (
+        InferenceStateContract,
+        Arc<ResolvedStatePlan>,
+        InvocationWorkspaceDomain,
+    ) {
+        let contract = InferenceStateContract {
+            abi: CURRENT_INFERENCE_STATE_ABI,
+            domains: vec![static_attention_invocation_domain(1, 2)],
+            groups: vec![StateGroupSpec {
+                id: StateGroupId::new(1),
+                domains: vec![StateDomainId::new(1)],
+                prefix_shareable: false,
+            }],
+        };
+        let plan = Arc::new(
+            negotiate_state_plan(
+                &contract,
+                &StateBackendPlanRequest {
+                    backend: BackendKind::Cpu,
+                    device_ordinal: None,
+                    page_tokens_hint: None,
+                    storage_dtype_hint: Some(StateDType::F32),
+                },
+            )
+            .unwrap(),
+        );
+        let workspace = InvocationWorkspaceDomain::State {
+            state: contract.domains[0].clone(),
+            capacity: InvocationStateCapacity::SemanticBounded,
+            placement: PlacementPolicy::BackendLocal,
+            formula: WorkspaceFormula {
+                fixed_bytes: plan.non_paged[0].maximum_bytes(),
+                dimensions: vec![],
+                terms: vec![],
+            },
+        };
+        (contract, plan, workspace)
+    }
+
+    fn retained_static_attention_contract() -> InferenceStateContract {
+        let StateDomainSpec::StaticAttention(mut domain) = static_attention_invocation_domain(1, 2)
+        else {
+            unreachable!("static-attention helper returns its named domain")
+        };
+        domain.header.scope = StateScope::Retained;
+        InferenceStateContract {
+            abi: CURRENT_INFERENCE_STATE_ABI,
+            domains: vec![StateDomainSpec::StaticAttention(domain)],
+            groups: vec![StateGroupSpec {
+                id: StateGroupId::new(1),
+                domains: vec![StateDomainId::new(1)],
+                prefix_shareable: false,
+            }],
+        }
+    }
+
+    fn mixed_paged_and_retained_static_contract() -> InferenceStateContract {
+        let mut contract = paged_invocation_contract();
+        let StateDomainSpec::StaticAttention(mut static_attention) =
+            static_attention_invocation_domain(2, 2)
+        else {
+            unreachable!("static-attention helper returns its named domain")
+        };
+        static_attention.header.scope = StateScope::Retained;
+        contract
+            .domains
+            .push(StateDomainSpec::StaticAttention(static_attention));
+        contract.groups.push(StateGroupSpec {
+            id: StateGroupId::new(2),
+            domains: vec![StateDomainId::new(2)],
+            prefix_shareable: false,
+        });
+        contract
+    }
+
+    fn mixed_plan_and_workspaces() -> (
+        InferenceStateContract,
+        Arc<ResolvedStatePlan>,
+        InvocationWorkspaceDomain,
+        InvocationWorkspaceDomain,
+    ) {
+        let contract = mixed_invocation_contract();
+        let plan = Arc::new(
+            negotiate_state_plan(
+                &contract,
+                &StateBackendPlanRequest {
+                    backend: BackendKind::Cpu,
+                    device_ordinal: None,
+                    page_tokens_hint: Some(16),
+                    storage_dtype_hint: Some(StateDType::F32),
+                },
+            )
+            .unwrap(),
+        );
+        let paged = InvocationWorkspaceDomain::State {
+            state: contract.domains[0].clone(),
+            capacity: InvocationStateCapacity::PagedTokens { max_tokens: 17 },
+            placement: PlacementPolicy::BackendLocalWithHostOffload,
+            formula: WorkspaceFormula {
+                fixed_bytes: 1024 * 1024,
+                dimensions: vec![],
+                terms: vec![],
+            },
+        };
+        let tensor_bytes = plan
+            .non_paged
+            .iter()
+            .find(|resolved| resolved.domain() == StateDomainId::new(2))
+            .unwrap()
+            .maximum_bytes();
+        let tensor = InvocationWorkspaceDomain::State {
+            state: contract.domains[1].clone(),
+            capacity: InvocationStateCapacity::SemanticBounded,
+            placement: PlacementPolicy::BackendLocal,
+            formula: WorkspaceFormula {
+                fixed_bytes: tensor_bytes,
+                dimensions: vec![],
+                terms: vec![],
+            },
+        };
+        (contract, plan, paged, tensor)
+    }
+
+    fn mixed_three_plan_and_workspaces() -> (
+        InferenceStateContract,
+        Arc<ResolvedStatePlan>,
+        InvocationWorkspaceDomain,
+        InvocationWorkspaceDomain,
+        InvocationWorkspaceDomain,
+    ) {
+        let mut contract = mixed_invocation_contract();
+        contract
+            .domains
+            .push(static_attention_invocation_domain(3, 2));
+        contract.groups.push(StateGroupSpec {
+            id: StateGroupId::new(3),
+            domains: vec![StateDomainId::new(3)],
+            prefix_shareable: false,
+        });
+        let plan = Arc::new(
+            negotiate_state_plan(
+                &contract,
+                &StateBackendPlanRequest {
+                    backend: BackendKind::Cpu,
+                    device_ordinal: None,
+                    page_tokens_hint: Some(16),
+                    storage_dtype_hint: Some(StateDType::F32),
+                },
+            )
+            .unwrap(),
+        );
+        let workspace_for =
+            |index: usize, domain: StateDomainId| InvocationWorkspaceDomain::State {
+                state: contract.domains[index].clone(),
+                capacity: InvocationStateCapacity::SemanticBounded,
+                placement: PlacementPolicy::BackendLocal,
+                formula: WorkspaceFormula {
+                    fixed_bytes: plan
+                        .non_paged
+                        .iter()
+                        .find(|resolved| resolved.domain() == domain)
+                        .unwrap()
+                        .maximum_bytes(),
+                    dimensions: vec![],
+                    terms: vec![],
+                },
+            };
+        let paged = InvocationWorkspaceDomain::State {
+            state: contract.domains[0].clone(),
+            capacity: InvocationStateCapacity::PagedTokens { max_tokens: 17 },
+            placement: PlacementPolicy::BackendLocalWithHostOffload,
+            formula: WorkspaceFormula {
+                fixed_bytes: 1024 * 1024,
+                dimensions: vec![],
+                terms: vec![],
+            },
+        };
+        let tensor = workspace_for(1, StateDomainId::new(2));
+        let static_attention = workspace_for(2, StateDomainId::new(3));
+        (contract, plan, paged, tensor, static_attention)
+    }
+
+    fn key() -> InvocationPhysicalKey {
+        InvocationPhysicalKey {
+            adapter_instance: AdapterInstanceId::new(3),
+            stage_graph: [7; 32],
+            stage: StageId::new(2),
+            domain: StateDomainId::new(1),
+        }
+    }
+
+    #[test]
+    fn invocation_key_accepts_the_canonical_scalar_stage_zero() {
+        let (plan, domain) = invocation_plan();
+        let mut scalar = key();
+        scalar.stage = StageId::new(0);
+        let model = ModelInstanceId::new(40);
+        let mut manager = PhysicalStateManager::cpu(None);
+        manager
+            .allocate_invocation_paged(model, scalar, &plan, &domain, 1)
+            .unwrap();
+        assert!(manager.unload_model(model).unwrap());
+    }
+
+    fn retained_tensor_contract(maximum_elements: u64) -> InferenceStateContract {
+        InferenceStateContract {
+            abi: CURRENT_INFERENCE_STATE_ABI,
+            domains: vec![StateDomainSpec::Tensor(TensorStateDomainSpec {
+                header: StateDomainHeader {
+                    id: StateDomainId::new(1),
+                    scope: StateScope::Retained,
+                    clock: StateClock::DecoderTokens,
+                    placement: PlacementPolicy::BackendLocal,
+                    prefix: PrefixPolicy::Disabled,
+                    checkpoint: CheckpointPolicy::Transactional,
+                },
+                components: vec![TensorComponentSpec {
+                    id: StateComponentId::new(1),
+                    role: TensorRole::RecurrentHidden,
+                    shape: BoundedShape {
+                        dimensions: vec![ShapeDimension {
+                            axis: ShapeAxis::Hidden,
+                            extent: ShapeExtent::RuntimeBounded {
+                                min: 1,
+                                max: maximum_elements,
+                            },
+                        }],
+                    },
+                    accepted_dtypes: vec![StateDType::F32],
+                }],
+            })],
+            groups: vec![StateGroupSpec {
+                id: StateGroupId::new(1),
+                domains: vec![StateDomainId::new(1)],
+                prefix_shareable: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn allocator_uses_exact_page_rounding_and_slot_multiplicity() {
+        let (plan, domain) = invocation_plan();
+        let mut manager = PhysicalStateManager::cpu(None);
+        let handle = manager
+            .allocate_invocation_paged(ModelInstanceId::new(41), key(), &plan, &domain, 2)
+            .unwrap();
+        let first = handle.lease().unwrap();
+        let second = handle.lease().unwrap();
+        assert_eq!(first.slot().page_count, 2);
+        assert_eq!(second.slot().page_count, 2);
+        assert_ne!(first.slot().first_page, second.slot().first_page);
+        assert!(handle.lease().is_err());
+        drop(first);
+        drop(second);
+        assert!(manager.unload_model(ModelInstanceId::new(41)).unwrap());
+        assert!(handle.lease().is_err());
+    }
+
+    #[test]
+    fn unload_closes_against_new_leases_and_retries_after_release() {
+        let (plan, domain) = invocation_plan();
+        let model = ModelInstanceId::new(42);
+        let mut manager = PhysicalStateManager::cpu(None);
+        let handle = manager
+            .allocate_invocation_paged(model, key(), &plan, &domain, 1)
+            .unwrap();
+        assert!(manager
+            .allocate_invocation_paged(model, key(), &plan, &domain, 1)
+            .is_err());
+        let lease = handle.lease().unwrap();
+        assert!(manager.unload_model(model).is_err());
+        assert!(handle.lease().is_err());
+        drop(lease);
+        assert!(manager.unload_model(model).unwrap());
+        assert_eq!(manager.model_count(), 0);
+
+        let replacement = manager
+            .allocate_invocation_paged(model, key(), &plan, &domain, 1)
+            .unwrap();
+        assert_ne!(replacement.id(), handle.id());
+        assert!(handle.lease().is_err());
+        manager.unload_model(model).unwrap();
+    }
+
+    #[test]
+    fn unload_closes_every_physical_owner_before_reporting_backpressure() {
+        let (plan, domain) = invocation_plan();
+        let model = ModelInstanceId::new(45);
+        let mut manager = PhysicalStateManager::cpu(None);
+        let first = manager
+            .allocate_invocation_paged(model, key(), &plan, &domain, 1)
+            .unwrap();
+        let mut second_key = key();
+        second_key.adapter_instance = AdapterInstanceId::new(4);
+        let second = manager
+            .allocate_invocation_paged(model, second_key, &plan, &domain, 1)
+            .unwrap();
+        let retained = manager
+            .allocate_retained_tensor(model, &retained_tensor_contract(8), 1)
+            .unwrap();
+        let invocation_lease = first.lease().unwrap();
+        let sequence = retained.register_sequence().unwrap();
+
+        assert!(manager.unload_model(model).is_err());
+        assert!(first.lease().is_err());
+        assert!(second.lease().is_err());
+        assert!(retained.register_sequence().is_err());
+
+        drop(invocation_lease);
+        retained.release_sequence(sequence).unwrap();
+        assert!(manager.unload_model(model).unwrap());
+    }
+
+    #[test]
+    fn generic_allocator_publishes_mixed_paged_and_tensor_backings_with_exact_resources() {
+        let (contract, plan, paged, tensor) = mixed_plan_and_workspaces();
+        let model = ModelInstanceId::new(46);
+        let mut manager = PhysicalStateManager::cpu(None);
+        let paged_key = key();
+        let mut tensor_key = key();
+        tensor_key.domain = StateDomainId::new(2);
+        let expected_paged_bytes = plan.paged_attention[0].bytes_per_page * 2 * 2;
+        let expected_tensor_bytes = plan
+            .non_paged
+            .iter()
+            .find(|resolved| resolved.domain() == StateDomainId::new(2))
+            .unwrap()
+            .maximum_bytes()
+            * 3;
+
+        let paged_backing = manager
+            .allocate_invocation_workspace(model, paged_key, &contract, plan.clone(), &paged, 2)
+            .unwrap();
+        let tensor_backing = manager
+            .allocate_invocation_workspace(model, tensor_key, &contract, plan, &tensor, 3)
+            .unwrap();
+        let physical = manager.models.get(&model).unwrap();
+        let paged_owned = physical.invocation_paged.get(&paged_key).unwrap();
+        let tensor_owned = physical.invocation_slots.get(&tensor_key).unwrap();
+        assert_eq!(
+            paged_owned.resources,
+            arena_resources(BackendKind::Cpu, expected_paged_bytes)
+        );
+        assert_eq!(
+            tensor_owned.resources,
+            arena_resources(BackendKind::Cpu, expected_tensor_bytes)
+        );
+        assert_eq!(
+            tensor_owned.resources.host_bytes,
+            ResourceAmount::Known(tensor_owned.owner.maximum_bytes())
+        );
+        assert_ne!(paged_backing.identity(), tensor_backing.identity());
+
+        let runtime = crate::kv::v2::InvocationWorkspaceRuntimeV2::new(vec![
+            crate::kv::v2::InvocationWorkspaceBindingV2 {
+                key: crate::kv::v2::InvocationWorkspaceKeyV2 {
+                    stage_graph: paged_key.stage_graph,
+                    stage: paged_key.stage,
+                    domain: paged_key.domain,
+                },
+                backing: paged_backing,
+            },
+            crate::kv::v2::InvocationWorkspaceBindingV2 {
+                key: crate::kv::v2::InvocationWorkspaceKeyV2 {
+                    stage_graph: tensor_key.stage_graph,
+                    stage: tensor_key.stage,
+                    domain: tensor_key.domain,
+                },
+                backing: tensor_backing,
+            },
+        ])
+        .unwrap();
+        drop(runtime);
+        assert!(manager.unload_model(model).unwrap());
+    }
+
+    #[test]
+    fn mixed_paged_tensor_and_static_publication_closes_every_active_owner() {
+        let (contract, plan, paged, tensor, static_attention) = mixed_three_plan_and_workspaces();
+        let model = ModelInstanceId::new(52);
+        let paged_key = key();
+        let mut tensor_key = key();
+        tensor_key.domain = StateDomainId::new(2);
+        let mut static_key = key();
+        static_key.domain = StateDomainId::new(3);
+        let mut manager = PhysicalStateManager::cpu(None);
+        let paged_backing = manager
+            .allocate_invocation_workspace(model, paged_key, &contract, plan.clone(), &paged, 1)
+            .unwrap();
+        let tensor_backing = manager
+            .allocate_invocation_workspace(model, tensor_key, &contract, plan.clone(), &tensor, 1)
+            .unwrap();
+        let static_backing = manager
+            .allocate_invocation_workspace(
+                model,
+                static_key,
+                &contract,
+                plan.clone(),
+                &static_attention,
+                1,
+            )
+            .unwrap();
+        let physical = manager.models.get(&model).unwrap();
+        assert_eq!(physical.invocation_slots.len(), 2);
+        assert!(matches!(
+            &physical.invocation_slots[&tensor_key].owner,
+            InvocationSlotPoolOwner::Tensor(_)
+        ));
+        assert!(matches!(
+            &physical.invocation_slots[&static_key].owner,
+            InvocationSlotPoolOwner::StaticAttention(_)
+        ));
+        let expected_static_bytes = plan
+            .non_paged
+            .iter()
+            .find(|resolved| resolved.domain() == static_key.domain)
+            .unwrap()
+            .maximum_bytes();
+        assert_eq!(
+            physical.invocation_slots[&static_key].resources,
+            arena_resources(BackendKind::Cpu, expected_static_bytes)
+        );
+        let runtime = crate::kv::v2::InvocationWorkspaceRuntimeV2::new(vec![
+            crate::kv::v2::InvocationWorkspaceBindingV2 {
+                key: crate::kv::v2::InvocationWorkspaceKeyV2 {
+                    stage_graph: paged_key.stage_graph,
+                    stage: paged_key.stage,
+                    domain: paged_key.domain,
+                },
+                backing: paged_backing.clone(),
+            },
+            crate::kv::v2::InvocationWorkspaceBindingV2 {
+                key: crate::kv::v2::InvocationWorkspaceKeyV2 {
+                    stage_graph: tensor_key.stage_graph,
+                    stage: tensor_key.stage,
+                    domain: tensor_key.domain,
+                },
+                backing: tensor_backing.clone(),
+            },
+            crate::kv::v2::InvocationWorkspaceBindingV2 {
+                key: crate::kv::v2::InvocationWorkspaceKeyV2 {
+                    stage_graph: static_key.stage_graph,
+                    stage: static_key.stage,
+                    domain: static_key.domain,
+                },
+                backing: static_backing.clone(),
+            },
+        ])
+        .unwrap();
+        drop(runtime);
+        let paged_lease = paged_backing.lease().unwrap();
+        let tensor_lease = tensor_backing.lease().unwrap();
+        let static_lease = static_backing.lease().unwrap();
+        assert!(manager.unload_model(model).is_err());
+        assert!(paged_backing.lease().is_err());
+        assert!(tensor_backing.lease().is_err());
+        assert!(static_backing.lease().is_err());
+        drop((paged_lease, tensor_lease, static_lease));
+        assert!(manager.unload_model(model).unwrap());
+    }
+
+    #[test]
+    fn generic_allocator_rejects_duplicate_keys_across_physical_kinds() {
+        let (tensor_contract, tensor_plan, tensor) = tensor_invocation_plan_and_workspace();
+        let paged_contract = paged_invocation_contract();
+        let (paged_plan, paged) = invocation_plan();
+        let model = ModelInstanceId::new(47);
+        let physical_key = key();
+        let mut manager = PhysicalStateManager::cpu(None);
+        manager
+            .allocate_invocation_workspace(
+                model,
+                physical_key,
+                &tensor_contract,
+                tensor_plan,
+                &tensor,
+                1,
+            )
+            .unwrap();
+        let generation = manager.next_allocation_generation;
+        assert!(manager
+            .allocate_invocation_workspace(
+                model,
+                physical_key,
+                &paged_contract,
+                Arc::new(paged_plan),
+                &paged,
+                1,
+            )
+            .is_err());
+        assert_eq!(manager.next_allocation_generation, generation);
+        assert_eq!(
+            manager.models.get(&model).unwrap().invocation_slots.len(),
+            1
+        );
+        assert!(manager
+            .models
+            .get(&model)
+            .unwrap()
+            .invocation_paged
+            .is_empty());
+        manager.unload_model(model).unwrap();
+    }
+
+    #[test]
+    fn unified_slot_map_rejects_static_and_tensor_for_the_same_physical_key() {
+        let (static_contract, static_plan, static_workspace) =
+            static_attention_plan_and_workspace();
+        let (tensor_contract, tensor_plan, tensor_workspace) =
+            tensor_invocation_plan_and_workspace();
+        let model = ModelInstanceId::new(53);
+        let physical_key = key();
+        let mut manager = PhysicalStateManager::cpu(None);
+        manager
+            .allocate_invocation_workspace(
+                model,
+                physical_key,
+                &static_contract,
+                static_plan,
+                &static_workspace,
+                1,
+            )
+            .unwrap();
+        let generation = manager.next_allocation_generation;
+        assert!(manager
+            .allocate_invocation_workspace(
+                model,
+                physical_key,
+                &tensor_contract,
+                tensor_plan,
+                &tensor_workspace,
+                1,
+            )
+            .is_err());
+        assert_eq!(manager.next_allocation_generation, generation);
+        let physical = manager.models.get(&model).unwrap();
+        assert_eq!(physical.invocation_slots.len(), 1);
+        assert!(matches!(
+            &physical.invocation_slots[&physical_key].owner,
+            InvocationSlotPoolOwner::StaticAttention(_)
+        ));
+        manager.unload_model(model).unwrap();
+    }
+
+    #[test]
+    fn active_typed_lease_blocks_unload_then_allows_retry() {
+        let (contract, plan, _paged, tensor) = mixed_plan_and_workspaces();
+        let model = ModelInstanceId::new(48);
+        let mut tensor_key = key();
+        tensor_key.domain = StateDomainId::new(2);
+        let mut manager = PhysicalStateManager::cpu(None);
+        let backing = manager
+            .allocate_invocation_workspace(model, tensor_key, &contract, plan, &tensor, 1)
+            .unwrap();
+        let lease = backing.lease().unwrap();
+        assert!(manager.unload_model(model).is_err());
+        assert!(backing.lease().is_err());
+        drop(lease);
+        assert!(manager.unload_model(model).unwrap());
+        assert!(backing.validate_live().is_err());
+    }
+
+    #[test]
+    fn generic_dispatcher_allocates_static_slots_with_exact_bytes_and_retryable_unload() {
+        let (contract, plan, workspace) = static_attention_plan_and_workspace();
+        let model = ModelInstanceId::new(54);
+        let expected_bytes = plan.non_paged[0].maximum_bytes() * 2;
+        let mut manager = PhysicalStateManager::cpu(None);
+        let backing = manager
+            .allocate_invocation_workspace(model, key(), &contract, plan, &workspace, 2)
+            .unwrap();
+        let physical = manager.models.get(&model).unwrap();
+        let owned = &physical.invocation_slots[&key()];
+        assert!(matches!(
+            &owned.owner,
+            InvocationSlotPoolOwner::StaticAttention(_)
+        ));
+        assert_eq!(owned.owner.maximum_bytes(), expected_bytes);
+        assert_eq!(
+            owned.resources,
+            arena_resources(BackendKind::Cpu, expected_bytes)
+        );
+        let first = backing.lease().unwrap();
+        let second = backing.lease().unwrap();
+        assert!(matches!(backing.lease(), Err(Error::Backpressure(_))));
+        assert!(manager.unload_model(model).is_err());
+        assert!(backing.lease().is_err());
+        drop((first, second));
+        assert!(manager.unload_model(model).unwrap());
+    }
+
+    #[test]
+    fn mixed_unload_closes_paged_and_typed_owners_before_retry() {
+        let (contract, plan, paged, tensor) = mixed_plan_and_workspaces();
+        let model = ModelInstanceId::new(50);
+        let paged_key = key();
+        let mut tensor_key = key();
+        tensor_key.domain = StateDomainId::new(2);
+        let mut manager = PhysicalStateManager::cpu(None);
+        let paged_backing = manager
+            .allocate_invocation_workspace(model, paged_key, &contract, plan.clone(), &paged, 1)
+            .unwrap();
+        let tensor_backing = manager
+            .allocate_invocation_workspace(model, tensor_key, &contract, plan, &tensor, 1)
+            .unwrap();
+        let paged_lease = paged_backing.lease().unwrap();
+        let tensor_lease = tensor_backing.lease().unwrap();
+
+        assert!(manager.unload_model(model).is_err());
+        assert!(paged_backing.lease().is_err());
+        assert!(tensor_backing.lease().is_err());
+
+        drop((paged_lease, tensor_lease));
+        assert!(manager.unload_model(model).unwrap());
+        assert_eq!(manager.model_count(), 0);
+    }
+
+    #[test]
+    fn typed_allocation_failure_does_not_publish_or_advance_generation() {
+        let (contract, plan, _paged, tensor) = mixed_plan_and_workspaces();
+        let mut tensor_key = key();
+        tensor_key.domain = StateDomainId::new(2);
+        let mut manager = PhysicalStateManager::cpu(None);
+        manager.next_allocation_generation = u32::MAX;
+        assert!(manager
+            .allocate_invocation_workspace(
+                ModelInstanceId::new(49),
+                tensor_key,
+                &contract,
+                plan,
+                &tensor,
+                1,
+            )
+            .is_err());
+        assert_eq!(manager.next_allocation_generation, u32::MAX);
+        assert_eq!(manager.model_count(), 0);
+    }
+
+    #[test]
+    fn typed_reservation_denial_precedes_materialization_and_publication() {
+        let (contract, plan, tensor) = tensor_invocation_plan_and_workspace();
+        let capacity = ResourceVector {
+            host_bytes: ResourceAmount::Known(u64::MAX),
+            ..ResourceVector::zero()
+        };
+        let authority = Arc::new(ResourceAuthority::new(Arc::new(TestCapacityProvider {
+            capacity,
+        })));
+        let saturated = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Model, "saturated-test-ledger"),
+                capacity,
+            )
+            .unwrap();
+        let mut manager = PhysicalStateManager::cpu(Some(authority.clone()));
+        let generation = manager.next_allocation_generation;
+
+        assert!(manager
+            .allocate_invocation_workspace(
+                ModelInstanceId::new(51),
+                key(),
+                &contract,
+                plan,
+                &tensor,
+                1,
+            )
+            .is_err());
+        assert_eq!(manager.next_allocation_generation, generation);
+        assert_eq!(manager.model_count(), 0);
+        assert_eq!(authority.snapshot().reservations, 1);
+        drop(saturated);
+        assert_eq!(authority.snapshot().reservations, 0);
+    }
+
+    #[test]
+    fn static_reservation_denial_precedes_materialization_and_generation_advance() {
+        let (contract, plan, workspace) = static_attention_plan_and_workspace();
+        let capacity = ResourceVector {
+            host_bytes: ResourceAmount::Known(u64::MAX),
+            ..ResourceVector::zero()
+        };
+        let authority = Arc::new(ResourceAuthority::new(Arc::new(TestCapacityProvider {
+            capacity,
+        })));
+        let saturated = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Model, "saturated-static-test-ledger"),
+                capacity,
+            )
+            .unwrap();
+        let mut manager = PhysicalStateManager::cpu(Some(authority.clone()));
+        let generation = manager.next_allocation_generation;
+        assert!(manager
+            .allocate_invocation_workspace(
+                ModelInstanceId::new(55),
+                key(),
+                &contract,
+                plan,
+                &workspace,
+                2,
+            )
+            .is_err());
+        assert_eq!(manager.next_allocation_generation, generation);
+        assert_eq!(manager.model_count(), 0);
+        assert_eq!(authority.snapshot().reservations, 1);
+        drop(saturated);
+        assert_eq!(authority.snapshot().reservations, 0);
+    }
+
+    #[test]
+    fn retained_tensor_runtime_reuses_exact_contract_and_exposes_transactions() {
+        let model = ModelInstanceId::new(43);
+        let contract = retained_tensor_contract(8);
+        let mut manager = PhysicalStateManager::cpu(None);
+        let runtime = manager
+            .allocate_retained_tensor(model, &contract, 2)
+            .unwrap();
+        let reused = manager
+            .allocate_retained_tensor(model, &contract, 2)
+            .unwrap();
+        assert!(Arc::ptr_eq(&runtime, &reused));
+        assert!(runtime.state_plan_v2().paged_attention.is_empty());
+        assert_eq!(runtime.state_plan_v2().non_paged.len(), 1);
+        assert_eq!(runtime.sequence_capacity(), 2);
+        assert_eq!(runtime.maximum_bytes(), 4 * 8 * 4);
+        assert!(manager
+            .allocate_retained_tensor(model, &retained_tensor_contract(4), 2)
+            .is_err());
+        assert!(manager
+            .allocate_retained_tensor(model, &contract, 1)
+            .is_err());
+
+        let sequence = runtime.register_sequence().unwrap();
+        let second_sequence = runtime.register_sequence().unwrap();
+        assert!(runtime.register_sequence().is_err());
+        let transaction = runtime.begin_transaction(sequence).unwrap();
+        runtime
+            .stage_replace(
+                transaction,
+                StateDomainId::new(1),
+                0,
+                1,
+                vec![crate::backends::state::StateComponentValue {
+                    component: StateComponentId::new(1),
+                    tensor: Some(Tensor::from_slice(&[1.0_f32, 2.0], 2, &Device::Cpu).unwrap()),
+                }],
+            )
+            .unwrap();
+        runtime.commit_transaction(transaction, 1).unwrap();
+        assert_eq!(
+            runtime
+                .read(sequence, StateDomainId::new(1))
+                .unwrap()
+                .unwrap()
+                .cursor,
+            1
+        );
+
+        assert!(manager.unload_model(model).is_err());
+        assert!(runtime.register_sequence().is_err());
+        runtime.release_sequence(sequence).unwrap();
+        runtime.release_sequence(second_sequence).unwrap();
+        assert!(manager.unload_model(model).unwrap());
+        assert_eq!(manager.model_count(), 0);
+    }
+
+    #[test]
+    fn retained_tensor_generation_overflow_does_not_publish_an_owner() {
+        let mut manager = PhysicalStateManager::cpu(None);
+        manager.next_allocation_generation = u32::MAX;
+        assert!(manager
+            .allocate_retained_tensor(ModelInstanceId::new(44), &retained_tensor_contract(8), 1,)
+            .is_err());
+        assert_eq!(manager.model_count(), 0);
+    }
+
+    #[test]
+    fn retained_static_attention_is_exactly_reserved_and_blocks_unload_until_release() {
+        let contract = retained_static_attention_contract();
+        let plan = negotiate_state_plan(
+            &contract,
+            &StateBackendPlanRequest {
+                backend: BackendKind::Cpu,
+                device_ordinal: None,
+                page_tokens_hint: None,
+                storage_dtype_hint: Some(StateDType::F32),
+            },
+        )
+        .unwrap();
+        let expected_bytes = plan.non_paged[0].maximum_bytes() * 2;
+        let model = ModelInstanceId::new(56);
+        let mut manager = PhysicalStateManager::cpu(None);
+        let runtime = manager
+            .allocate_retained_static_attention(model, &contract, StateDomainId::new(1), 2)
+            .unwrap();
+        assert_eq!(runtime.maximum_bytes(), expected_bytes);
+        let owned = manager
+            .models
+            .get(&model)
+            .unwrap()
+            .retained_static_attention
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            owned.resources,
+            arena_resources(BackendKind::Cpu, expected_bytes)
+        );
+        assert!(Arc::ptr_eq(
+            &runtime,
+            &manager
+                .allocate_retained_static_attention(model, &contract, StateDomainId::new(1), 2,)
+                .unwrap()
+        ));
+        let sequence = runtime.register_sequence().unwrap();
+        assert!(manager.unload_model(model).is_err());
+        assert!(runtime.register_sequence().is_err());
+        runtime.release_sequence(sequence).unwrap();
+        drop(runtime);
+        assert!(manager.unload_model(model).unwrap());
+        assert_eq!(manager.model_count(), 0);
+    }
+
+    #[test]
+    fn retained_static_materialization_failure_rolls_back_owner_lease_and_generation() {
+        let contract = retained_static_attention_contract();
+        let plan = negotiate_state_plan(
+            &contract,
+            &StateBackendPlanRequest {
+                backend: BackendKind::Cpu,
+                device_ordinal: None,
+                page_tokens_hint: None,
+                storage_dtype_hint: Some(StateDType::F32),
+            },
+        )
+        .unwrap();
+        let exact_bytes = plan.non_paged[0].maximum_bytes();
+        let capacity = ResourceVector {
+            host_bytes: ResourceAmount::Known(u64::MAX),
+            ..ResourceVector::zero()
+        };
+        let authority = Arc::new(ResourceAuthority::new(Arc::new(TestCapacityProvider {
+            capacity,
+        })));
+        let mut manager = PhysicalStateManager::cpu(Some(authority.clone()));
+        manager.retained_static_materialized_observation = Some(ResourceVector {
+            host_bytes: ResourceAmount::Known(exact_bytes + 1),
+            ..ResourceVector::zero()
+        });
+        let generation = manager.next_allocation_generation;
+        assert!(manager
+            .allocate_retained_static_attention(
+                ModelInstanceId::new(57),
+                &contract,
+                StateDomainId::new(1),
+                1,
+            )
+            .is_err());
+        assert_eq!(manager.next_allocation_generation, generation);
+        assert_eq!(manager.model_count(), 0);
+        assert_eq!(authority.snapshot().reservations, 0);
+    }
+
+    #[test]
+    fn mixed_paged_and_retained_static_plan_allocates_accounts_and_unloads_together() {
+        let contract = mixed_paged_and_retained_static_contract();
+        let plan = Arc::new(
+            negotiate_state_plan(
+                &contract,
+                &StateBackendPlanRequest {
+                    backend: BackendKind::Cpu,
+                    device_ordinal: None,
+                    page_tokens_hint: Some(16),
+                    storage_dtype_hint: Some(StateDType::F32),
+                },
+            )
+            .unwrap(),
+        );
+        assert_eq!(plan.paged_attention.len(), 1);
+        assert_eq!(plan.non_paged.len(), 1);
+        let workspace = InvocationWorkspaceDomain::State {
+            state: contract.domains[0].clone(),
+            capacity: InvocationStateCapacity::PagedTokens { max_tokens: 17 },
+            placement: PlacementPolicy::BackendLocalWithHostOffload,
+            formula: WorkspaceFormula {
+                fixed_bytes: 1024 * 1024,
+                dimensions: vec![],
+                terms: vec![],
+            },
+        };
+        let model = ModelInstanceId::new(58);
+        let mut manager = PhysicalStateManager::cpu(None);
+        let paged = manager
+            .allocate_invocation_workspace(model, key(), &contract, plan, &workspace, 1)
+            .unwrap();
+        let static_runtime = manager
+            .allocate_retained_static_attention(model, &contract, StateDomainId::new(2), 2)
+            .unwrap();
+        let static_bytes = static_runtime.maximum_bytes();
+        let physical = manager.models.get(&model).unwrap();
+        assert_eq!(physical.invocation_paged.len(), 1);
+        assert_eq!(
+            physical
+                .retained_static_attention
+                .as_ref()
+                .unwrap()
+                .resources,
+            arena_resources(BackendKind::Cpu, static_bytes)
+        );
+        let paged_lease = paged.lease().unwrap();
+        let sequence = static_runtime.register_sequence().unwrap();
+        assert!(manager.unload_model(model).is_err());
+        assert!(paged.lease().is_err());
+        drop(paged_lease);
+        static_runtime.release_sequence(sequence).unwrap();
+        drop(static_runtime);
+        assert!(manager.unload_model(model).unwrap());
+        assert_eq!(manager.model_count(), 0);
+    }
+}

@@ -62,8 +62,16 @@ For built-in speaker IDs, see [Voice Presets](/models/voice-presets).
 |--------|---------------|
 | Qwen3 GGUF | `Qwen3-0.6B-GGUF`, `Qwen3-1.7B-GGUF`, `Qwen3-4B-GGUF`, `Qwen3-8B-GGUF` |
 | Qwen3.5 GGUF | `Qwen3.5-0.8B`, `Qwen3.5-2B`, `Qwen3.5-4B`, `Qwen3.5-9B` |
+| Qwen3.8 FP8 | `Qwen3.8-27B-FP8` (text chat; 28.74 GiB checkpoint payload) |
 | LFM2.5 text | `LFM2.5-1.2B-Instruct-GGUF`, `LFM2.5-1.2B-Thinking-GGUF` |
 | Gemma | `Gemma-3-1b-it` |
+
+`Qwen3.8-27B-FP8` uses the separate `Qwen38Chat` architecture/model family.
+Qwen3.5 compatibility or backend evidence is not applied to it implicitly.
+The listed 28.74 GiB is checkpoint payload size, not an expanded runtime-memory
+estimate. On CUDA, projections use the documented
+[Q8_0 compressed fallback](/support-matrix#qwen38-cuda-weight-residency); this
+is not native FP8 execution.
 
 ### Currently Disabled (Not Listed by `izwi list`)
 

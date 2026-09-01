@@ -25,6 +25,14 @@ pub async fn run(cli: Cli, theme: Theme) -> Result<()> {
             port,
             models_dir,
             max_batch_size,
+            physical_execution_mode,
+            max_physical_in_flight,
+            max_scheduler_batch_size,
+            max_loaded_models,
+            max_retained_sequences,
+            max_staged_transactions,
+            max_queued_requests,
+            max_sequence_length,
             backend,
             threads,
             max_concurrent,
@@ -42,6 +50,14 @@ pub async fn run(cli: Cli, theme: Theme) -> Result<()> {
                 port,
                 models_dir,
                 max_batch_size,
+                physical_execution_mode,
+                max_physical_in_flight,
+                max_scheduler_batch_size,
+                max_loaded_models,
+                max_retained_sequences,
+                max_staged_transactions,
+                max_queued_requests,
+                max_sequence_length,
                 backend,
                 threads,
                 max_concurrent,
@@ -215,7 +231,15 @@ fn build_serve_args(
     host: Option<String>,
     port: Option<u16>,
     models_dir: Option<std::path::PathBuf>,
-    max_batch_size: Option<usize>,
+    max_batch_size: Option<izwi_core::BatchSizePreference>,
+    physical_execution_mode: Option<izwi_core::PhysicalExecutionMode>,
+    max_physical_in_flight: Option<izwi_core::PhysicalInFlightLimit>,
+    max_scheduler_batch_size: Option<usize>,
+    max_loaded_models: Option<usize>,
+    max_retained_sequences: Option<usize>,
+    max_staged_transactions: Option<usize>,
+    max_queued_requests: Option<usize>,
+    max_sequence_length: Option<izwi_core::ContextLengthPreference>,
     backend: Option<Backend>,
     threads: Option<usize>,
     max_concurrent: Option<usize>,
@@ -232,6 +256,14 @@ fn build_serve_args(
         models_dir,
         backend: backend.as_ref().map(Backend::as_preference),
         max_batch_size,
+        physical_execution_mode,
+        max_physical_in_flight,
+        max_scheduler_batch_size,
+        max_loaded_models,
+        max_retained_sequences,
+        max_staged_transactions,
+        max_queued_requests,
+        max_sequence_length,
         num_threads: threads,
         max_concurrent_requests: max_concurrent,
         request_timeout_secs: timeout,
@@ -275,8 +307,15 @@ mod tests {
         std::env::remove_var(izwi_core::serve_runtime::ENV_HOST);
         std::env::remove_var(izwi_core::serve_runtime::ENV_PORT);
         std::env::remove_var(izwi_core::serve_runtime::ENV_MODELS_DIR);
+        std::env::remove_var(izwi_core::serve_runtime::ENV_MAX_LOADED_MODELS);
         std::env::remove_var(izwi_core::serve_runtime::ENV_BACKEND);
         std::env::remove_var(izwi_core::serve_runtime::ENV_MAX_BATCH_SIZE);
+        std::env::remove_var(izwi_core::serve_runtime::ENV_PHYSICAL_EXECUTION_MODE);
+        std::env::remove_var(izwi_core::serve_runtime::ENV_MAX_PHYSICAL_IN_FLIGHT);
+        std::env::remove_var(izwi_core::serve_runtime::ENV_MAX_SCHEDULER_BATCH_SIZE);
+        std::env::remove_var(izwi_core::serve_runtime::ENV_MAX_RETAINED_SEQUENCES);
+        std::env::remove_var(izwi_core::serve_runtime::ENV_MAX_STAGED_TRANSACTIONS);
+        std::env::remove_var(izwi_core::serve_runtime::ENV_MAX_QUEUED_REQUESTS);
         std::env::remove_var(izwi_core::serve_runtime::ENV_NUM_THREADS);
         std::env::remove_var(izwi_core::serve_runtime::ENV_MAX_CONCURRENT);
         std::env::remove_var(izwi_core::serve_runtime::ENV_TIMEOUT);
@@ -304,6 +343,12 @@ mod tests {
             .set_value("runtime.max_batch_size", "4")
             .expect("batch size should be set");
         config
+            .set_value("runtime.physical_execution_mode", "shadow")
+            .expect("physical execution mode should be set");
+        config
+            .set_value("runtime.max_physical_in_flight", "3")
+            .expect("physical execution limit should be set");
+        config
             .set_value("ui.enabled", "false")
             .expect("ui.enabled should be set");
         config
@@ -311,12 +356,25 @@ mod tests {
             .expect("config should be saved");
 
         std::env::set_var(izwi_core::serve_runtime::ENV_MAX_BATCH_SIZE, "5");
+        std::env::set_var(
+            izwi_core::serve_runtime::ENV_PHYSICAL_EXECUTION_MODE,
+            "concurrent",
+        );
+        std::env::set_var(izwi_core::serve_runtime::ENV_MAX_PHYSICAL_IN_FLIGHT, "4");
         std::env::set_var(izwi_core::serve_runtime::ENV_TIMEOUT, "600");
 
         let args = build_serve_args(
             Some(&config_path),
             ServeMode::Server,
             Some("cli-host".to_string()),
+            None,
+            None,
+            None,
+            Some(izwi_core::PhysicalExecutionMode::Serial),
+            Some(izwi_core::PhysicalInFlightLimit::new(2).unwrap()),
+            None,
+            Some(1),
+            None,
             None,
             None,
             None,
@@ -333,7 +391,13 @@ mod tests {
         .expect("serve args should resolve");
 
         assert_eq!(args.runtime.host, "cli-host");
-        assert_eq!(args.runtime.max_batch_size, 5);
+        assert_eq!(args.runtime.max_batch_size.fixed_rows(), Some(5));
+        assert_eq!(
+            args.runtime.physical_execution_mode,
+            izwi_core::PhysicalExecutionMode::Serial
+        );
+        assert_eq!(args.runtime.max_physical_in_flight.get(), 2);
+        assert_eq!(args.runtime.max_loaded_models, 1);
         assert_eq!(args.runtime.request_timeout_secs, 600);
         assert_eq!(args.runtime.backend, BackendPreference::Cuda);
         assert!(args.runtime.cors_enabled);
@@ -353,6 +417,14 @@ mod tests {
         let args = build_serve_args(
             None,
             ServeMode::Server,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
             None,
             None,
             None,

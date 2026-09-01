@@ -279,6 +279,39 @@ describe("ChatApiClient thread streaming", () => {
     vi.restoreAllMocks();
   });
 
+  it("forwards Qwen reasoning and sampling controls", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({}), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new ChatApiClient(
+      new ApiHttpClient("http://localhost/v1"),
+    );
+
+    await client.sendChatThreadMessage("thread-1", {
+      model_id: "Qwen3.8-27B-FP8",
+      content: "Hello",
+      reasoning_effort: "low",
+      preserve_thinking: false,
+      top_k: 7,
+      repetition_penalty: 1.2,
+      presence_penalty: 0.4,
+    });
+
+    const init = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    expect(JSON.parse(String(init.body))).toMatchObject({
+      model: "Qwen3.8-27B-FP8",
+      reasoning_effort: "low",
+      preserve_thinking: false,
+      top_k: 7,
+      repetition_penalty: 1.2,
+      presence_penalty: 0.4,
+    });
+  });
+
   it("does not turn an explicit terminal error into success", async () => {
     vi.stubGlobal(
       "fetch",

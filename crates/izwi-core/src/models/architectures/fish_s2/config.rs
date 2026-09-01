@@ -235,7 +235,10 @@ impl FishS2TextConfig {
                 "Fish S2 {label} dimensions must be non-zero"
             )));
         }
-        if self.num_attention_heads % self.num_key_value_heads != 0 {
+        if !self
+            .num_attention_heads
+            .is_multiple_of(self.num_key_value_heads)
+        {
             return Err(Error::ModelLoadError(format!(
                 "Fish S2 {label} attention heads must be divisible by KV heads"
             )));
@@ -255,7 +258,10 @@ impl FishS2AudioDecoderConfig {
                 "Fish S2 {label} dimensions must be non-zero"
             )));
         }
-        if self.num_attention_heads % self.num_key_value_heads != 0 {
+        if !self
+            .num_attention_heads
+            .is_multiple_of(self.num_key_value_heads)
+        {
             return Err(Error::ModelLoadError(format!(
                 "Fish S2 {label} attention heads must be divisible by KV heads"
             )));

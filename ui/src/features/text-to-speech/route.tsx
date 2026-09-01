@@ -62,6 +62,7 @@ export function TextToSpeechPage({
     null,
   );
   const [recordDeletePending, setRecordDeletePending] = useState(false);
+  const [recordCancelPending, setRecordCancelPending] = useState(false);
   const [savedVoiceNameById, setSavedVoiceNameById] = useState<
     Record<string, string>
   >({});
@@ -351,6 +352,26 @@ export function TextToSpeechPage({
     }
   };
 
+  const handleDetailCancel = async () => {
+    if (!recordId || recordCancelPending) {
+      return;
+    }
+
+    setRecordCancelPending(true);
+    setRecordActionError(null);
+    try {
+      const cancelled = await api.cancelTextToSpeechRecord(recordId);
+      setStreamingRecord(cancelled.record);
+      await Promise.all([refreshRecord(), refreshHistory()]);
+    } catch (err) {
+      setRecordActionError(
+        err instanceof Error ? err.message : "Failed to cancel generation.",
+      );
+    } finally {
+      setRecordCancelPending(false);
+    }
+  };
+
   const handleDeleteRecord = useCallback(
     async (targetRecordId: string) => {
       await api.deleteTextToSpeechRecord(targetRecordId);
@@ -366,6 +387,17 @@ export function TextToSpeechPage({
       }
     },
     [navigate, recordId, refreshHistory, streamingRecord?.id],
+  );
+
+  const handleCancelRecord = useCallback(
+    async (targetRecordId: string) => {
+      await api.cancelTextToSpeechRecord(targetRecordId);
+      if (streamingRecord?.id === targetRecordId) {
+        setStreamingRecord(null);
+      }
+      await refreshHistory();
+    },
+    [refreshHistory, streamingRecord?.id],
   );
 
   return (
@@ -397,7 +429,9 @@ export function TextToSpeechPage({
             error={recordError}
             deleteError={recordActionError}
             deletePending={recordDeletePending}
+            cancelPending={recordCancelPending}
             onBack={() => navigate("/text-to-speech")}
+            onCancel={() => void handleDetailCancel()}
             onDelete={() => void handleDetailDelete()}
           />
         </>
@@ -447,6 +481,7 @@ export function TextToSpeechPage({
               navigate(`/text-to-speech/${nextRecordId}`);
             }}
             onDeleteRecord={handleDeleteRecord}
+            onCancelRecord={handleCancelRecord}
           />
         </>
       )}

@@ -1,6 +1,7 @@
 //! Fish Audio S2 Pro TTS architecture boundary.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use candle_core::{DType, IndexOp, Tensor};
@@ -10,7 +11,12 @@ use serde::Serialize;
 
 use crate::backends::DeviceProfile;
 use crate::catalog::ModelVariant;
+use crate::engine::StageDescriptor;
 use crate::error::{Error, Result};
+use crate::models::shared::attention::physical::PhysicalPagedKvCache;
+use crate::models::shared::sampling::{
+    bounded_device_sampling_candidates, device_candidates_cover_top_p, sample_device_candidates,
+};
 
 pub mod artifacts;
 pub mod codec;
@@ -18,6 +24,8 @@ pub mod config;
 pub mod contracts;
 pub mod dac;
 pub mod fast;
+mod physical;
+mod retained;
 pub mod slow;
 pub mod tokenizer;
 pub mod weights;
@@ -30,16 +38,28 @@ pub use contracts::{
     semantic_token_id, FishS2DacContract, FishS2PromptTensorShape,
 };
 pub use dac::{FishS2DacConfig, FishS2DacDecoder};
-pub use fast::{
-    FishS2FastCache, FishS2FastConfig, FishS2FastDecoder, FishS2GeneratedFrame, FishS2Sampler,
+pub use fast::{FishS2FastConfig, FishS2FastDecoder, FishS2GeneratedFrame, FishS2Sampler};
+pub(crate) use physical::{
+    FishS2PhysicalStateSpec, FISH_S2_FAST_STATE_DOMAIN, FISH_S2_FAST_STATE_GROUP,
+    FISH_S2_SLOW_STATE_DOMAIN, FISH_S2_SLOW_STATE_GROUP,
 };
-pub use slow::{FishS2SlowCache, FishS2SlowConfig, FishS2SlowOutput, FishS2SlowTransformer};
+#[allow(unused_imports)]
+pub(crate) use retained::{
+    FishS2PreparedArtifact, FishS2RetainedCheckpoint, FishS2RetainedState, FishS2RetainedStep,
+};
+pub use slow::{FishS2SlowConfig, FishS2SlowOutput, FishS2SlowTransformer};
 pub use tokenizer::{
     FishS2ConditioningPrompt, FishS2PromptTokenizer, FishS2SpecialTokens, FishS2VqCodes,
 };
 pub use weights::{FishS2TensorSpec, FishS2WeightIndex, FishS2Weights};
 
+pub(crate) const FISH_S2_TTS_PREPARATION_STAGE: &str = "tts.prepare.fish_s2";
+pub(crate) const FISH_S2_TTS_PREFILL_STAGE: &str = "tts.prefill.fish_s2";
+pub(crate) const FISH_S2_TTS_DECODE_STAGE: &str = "tts.decode.fish_s2";
+pub(crate) const FISH_S2_TTS_LEGACY_STAGE: &str = "tts.scalar";
+
 pub struct FishS2TtsModel {
+    model_identity: u64,
     variant: ModelVariant,
     config: FishS2Config,
     artifacts: FishS2ArtifactManifest,
@@ -53,6 +73,7 @@ struct FishS2NativeRuntime {
     fast: FishS2FastDecoder,
     dac: FishS2DacDecoder,
     semantic_allowed_mask: Vec<bool>,
+    dtype: DType,
 }
 
 #[derive(Debug, Clone)]
@@ -62,7 +83,7 @@ pub struct FishS2Reference {
     pub text: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FishS2GenerationParams {
     pub max_frames: usize,
     pub temperature: f32,
@@ -113,6 +134,7 @@ const FISH_S2_DTYPE_ENV: &str = "IZWI_FISH_S2_DTYPE";
 const RAS_WIN_SIZE: usize = 10;
 const RAS_HIGH_TEMP: f32 = 1.0;
 const RAS_HIGH_TOP_P: f32 = 0.9;
+static NEXT_FISH_S2_MODEL_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
 impl FishS2TtsModel {
     pub fn load_metadata(model_dir: &Path, variant: ModelVariant) -> Result<Self> {
@@ -125,6 +147,7 @@ impl FishS2TtsModel {
         let artifacts = FishS2ArtifactManifest::load(model_dir)?;
         let codec = FishS2CodecArtifact::load(model_dir)?;
         Ok(Self {
+            model_identity: next_fish_s2_model_identity()?,
             variant,
             config,
             artifacts,
@@ -182,9 +205,36 @@ impl FishS2TtsModel {
 
     pub fn generate_with_reference(
         &self,
+        _text: &str,
+        _reference: FishS2Reference,
+        _params: FishS2GenerationParams,
+    ) -> Result<FishS2GenerationOutput> {
+        Err(Error::InferenceError(
+            "Fish S2 generation requires lifecycle-owned slow and fast physical page leases"
+                .to_string(),
+        ))
+    }
+
+    pub(crate) fn physical_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<FishS2PhysicalStateSpec> {
+        let runtime = self.runtime.as_ref().ok_or_else(|| {
+            Error::ModelLoadError(
+                "Fish Audio S2 Pro metadata was loaded without native inference modules"
+                    .to_string(),
+            )
+        })?;
+        physical::fish_s2_physical_state_spec(&self.config, runtime.dtype, stage_graphs)
+    }
+
+    pub(crate) fn generate_with_reference_physical(
+        &self,
         text: &str,
         reference: FishS2Reference,
         params: FishS2GenerationParams,
+        slow_cache: &mut PhysicalPagedKvCache,
+        fast_cache: &mut PhysicalPagedKvCache,
     ) -> Result<FishS2GenerationOutput> {
         self.codec.ensure_native_supported()?;
         let runtime = self.runtime.as_ref().ok_or_else(|| {
@@ -193,8 +243,23 @@ impl FishS2TtsModel {
                     .to_string(),
             )
         })?;
-        runtime.generate_with_reference(&self.config, text, reference, params)
+        runtime.generate_with_reference_physical(
+            &self.config,
+            text,
+            reference,
+            params,
+            slow_cache,
+            fast_cache,
+        )
     }
+}
+
+fn next_fish_s2_model_identity() -> Result<u64> {
+    NEXT_FISH_S2_MODEL_IDENTITY
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .map_err(|_| Error::ModelLoadError("Fish S2 model identity space exhausted".into()))
 }
 
 impl FishS2NativeRuntime {
@@ -208,6 +273,7 @@ impl FishS2NativeRuntime {
         let tokenizer = FishS2PromptTokenizer::load(model_dir, config)?;
         let dtype_override = std::env::var(FISH_S2_DTYPE_ENV).ok();
         let weights = FishS2Weights::load(model_dir, device, dtype_override.as_deref())?;
+        let dtype = weights.dtype();
         let slow = FishS2SlowTransformer::load(
             FishS2SlowConfig::from_config(config)?,
             weights.var_builder(),
@@ -226,15 +292,18 @@ impl FishS2NativeRuntime {
             fast,
             dac,
             semantic_allowed_mask,
+            dtype,
         })
     }
 
-    fn generate_with_reference(
+    fn generate_with_reference_physical(
         &self,
         config: &FishS2Config,
         text: &str,
         reference: FishS2Reference,
         params: FishS2GenerationParams,
+        slow_cache: &mut PhysicalPagedKvCache,
+        fast_cache: &mut PhysicalPagedKvCache,
     ) -> Result<FishS2GenerationOutput> {
         let text = text.trim();
         let reference_text = reference.text.trim();
@@ -283,7 +352,6 @@ impl FishS2NativeRuntime {
 
         let max_frames = params
             .max_frames
-            .min(ModelVariant::FISH_S2_PRO_MAX_OUTPUT_FRAMES)
             .min(config.max_seq_len - prompt.prompt_length);
         if max_frames == 0 {
             return Err(Error::InvalidInput(
@@ -298,11 +366,14 @@ impl FishS2NativeRuntime {
         let mut fast_sampler = FishS2Sampler::new(temperature, top_p, FISH_S2_FAST_SAMPLER_SEED);
         let im_end_token_id = self.tokenizer.specials().eos;
 
-        let mut slow_cache = self.slow.new_cache();
+        if slow_cache.context_len() != 0 {
+            return Err(Error::InvalidInput(format!(
+                "Fish S2 slow invocation cache must begin empty, got context {}",
+                slow_cache.context_len()
+            )));
+        }
         let started = Instant::now();
-        let mut slow_output = self
-            .slow
-            .forward_prompt(&prompt, Some(&mut slow_cache), false)?;
+        let mut slow_output = self.slow.forward_prompt(&prompt, slow_cache, false)?;
         let slow_prefill_ms = elapsed_ms(started);
         let mut generated_codebooks = vec![Vec::new(); config.num_codebooks];
         let mut recent_semantic_tokens = Vec::with_capacity(RAS_WIN_SIZE);
@@ -331,6 +402,7 @@ impl FishS2NativeRuntime {
                 semantic_token_id,
                 &slow_output.hidden_states,
                 &mut fast_sampler,
+                fast_cache,
             )?;
             append_generated_frame(&mut generated_codebooks, &frame)?;
 
@@ -341,10 +413,10 @@ impl FishS2NativeRuntime {
 
             let frame_prompt = generated_frame_prompt(config.num_codebooks, &frame)?;
             let frame_embeds = self.slow.embed_prompt(&frame_prompt)?;
-            let start_pos = slow_cache.current_len();
-            slow_output =
-                self.slow
-                    .forward_embeds(&frame_embeds, start_pos, Some(&mut slow_cache), false)?;
+            let start_pos = slow_cache.context_len();
+            slow_output = self
+                .slow
+                .forward_embeds(&frame_embeds, start_pos, slow_cache, false)?;
         }
         let ar_decode_ms = elapsed_ms(started);
 
@@ -399,6 +471,7 @@ impl Default for FishS2GenerationParams {
     }
 }
 
+#[derive(Clone)]
 struct FishS2SemanticSampler {
     temperature: f32,
     top_p: f32,
@@ -424,12 +497,11 @@ fn sample_semantic_token(
     sampler: &mut FishS2SemanticSampler,
 ) -> Result<u32> {
     let row = last_logits_row(logits)?;
-    let values = row.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-    if values.len() != allowed_mask.len() {
+    if row.dim(0)? != allowed_mask.len() {
         return Err(Error::InferenceError(format!(
             "Fish S2 semantic mask length {} does not match logits length {}",
             allowed_mask.len(),
-            values.len()
+            row.dim(0)?
         )));
     }
 
@@ -443,6 +515,66 @@ fn sample_semantic_token(
         }
         &first_frame_mask
     };
+
+    if let Some(candidates) = bounded_device_sampling_candidates(
+        &row,
+        row.dim(0)?,
+        0,
+        sampler.temperature,
+        &[],
+        1.0,
+        0.0,
+        Some(sampling_mask),
+    )? {
+        if device_candidates_cover_top_p(&candidates, sampler.top_p) {
+            if let Some(mut sampled) =
+                sample_device_candidates(&candidates, sampler.top_p, sampler.rng.r#gen::<f32>())
+            {
+                if sampled != im_end_token_id
+                    && previous_semantic_tokens.contains(&sampled)
+                    && sampling_mask
+                        .get(sampled as usize)
+                        .copied()
+                        .unwrap_or(false)
+                {
+                    let retry = bounded_device_sampling_candidates(
+                        &row,
+                        row.dim(0)?,
+                        0,
+                        RAS_HIGH_TEMP,
+                        &[],
+                        1.0,
+                        0.0,
+                        Some(sampling_mask),
+                    )?;
+                    let retry_sample = retry.as_ref().and_then(|retry| {
+                        device_candidates_cover_top_p(retry, RAS_HIGH_TOP_P).then(|| {
+                            sample_device_candidates(
+                                retry,
+                                RAS_HIGH_TOP_P,
+                                sampler.rng.r#gen::<f32>(),
+                            )
+                        })?
+                    });
+                    if let Some(retry_sample) = retry_sample {
+                        sampled = retry_sample;
+                    } else {
+                        let values = row.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+                        return sample_masked_values(
+                            &values,
+                            sampling_mask,
+                            RAS_HIGH_TEMP,
+                            RAS_HIGH_TOP_P,
+                            &mut sampler.rng,
+                        );
+                    }
+                }
+                return Ok(sampled);
+            }
+        }
+    }
+
+    let values = row.to_dtype(DType::F32)?.to_vec1::<f32>()?;
 
     let mut sampled = sample_masked_values(
         &values,

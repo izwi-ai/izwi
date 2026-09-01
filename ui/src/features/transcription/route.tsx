@@ -710,6 +710,26 @@ export function TranscriptionPage({
   }, [record, recordId, streamingRecord]);
   const isNewSpeakerAttributedAsrMode =
     newSpeechTextMode === "speaker_attributed_asr";
+  const reconcileStreamedTranscription = useCallback(
+    async (createdRecordId: string | null) => {
+      if (!createdRecordId) {
+        await refreshRecord().catch(() => undefined);
+        return;
+      }
+
+      try {
+        const persistedRecord = isNewSpeakerAttributedAsrMode
+          ? await api.getSpeakerAttributedAsrRecord(createdRecordId)
+          : await api.getTranscriptionRecord(createdRecordId);
+        setStreamingRecord(persistedRecord);
+      } catch {
+        await refreshRecord().catch(() => undefined);
+      } finally {
+        await refreshHistory().catch(() => undefined);
+      }
+    },
+    [isNewSpeakerAttributedAsrMode, refreshHistory, refreshRecord],
+  );
   const newTranscriptionSelectedModel = isNewSpeakerAttributedAsrMode
     ? resolvedSpeakerAttributedAsrModel
     : resolvedSelectedModel;
@@ -925,8 +945,19 @@ export function TranscriptionPage({
                       onStreamingFinal={(finalRecord) => {
                         setStreamingRecord(finalRecord);
                       }}
-                      onStreamingError={() => {
-                        void refreshRecord();
+                      onStreamingError={(message, createdRecordId) => {
+                        setStreamingRecord((current) =>
+                          current && current.id === createdRecordId
+                            ? {
+                                ...current,
+                                processing_status: "failed",
+                                processing_error: message,
+                              }
+                            : current,
+                        );
+                      }}
+                      onStreamingDone={(createdRecordId) => {
+                        void reconcileStreamedTranscription(createdRecordId);
                       }}
                     />
                   ) : (

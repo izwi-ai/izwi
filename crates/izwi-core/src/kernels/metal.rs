@@ -10,6 +10,8 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 #[cfg(feature = "metal")]
+use candle_core::Storage;
+#[cfg(feature = "metal")]
 use candle_core::{
     backend::BackendStorage, bail, CpuStorage, CustomOp2, CustomOp3, Layout, MetalStorage,
     Result as CandleResult, Shape,
@@ -23,9 +25,30 @@ use super::metal_encoder::IzwiMetalCommandEncoderExt;
 use super::{FusedKernelError, FusedResult, FusedSiluMulResult};
 
 #[cfg(feature = "metal")]
+const METAL_PAGED_ATTENTION_PARTITION_TOKENS: usize = 512;
+#[cfg(feature = "metal")]
+const METAL_PAGED_ATTENTION_SPLIT_MIN_CONTEXT: usize = 2048;
+#[cfg(feature = "metal")]
+const METAL_PAGED_ATTENTION_SPLIT_MAX_BASE_WORKGROUPS: usize = 64;
+// This path is intentionally conservative until hardware-backed benchmarks
+// establish a lower crossover point for packed prefill on supported GPUs.
+#[cfg(feature = "metal")]
+const METAL_PAGED_PREFILL_SPLIT_MIN_CONTEXT: usize = 4096;
+#[cfg(feature = "metal")]
+const METAL_PAGED_PREFILL_SPLIT_MAX_BASE_WORKGROUPS: usize = 64;
+
+#[cfg(feature = "metal")]
 const IZWI_METAL_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
+
+// The split-KV organization below (independent online-softmax partitions
+// followed by a log-sum-exp merge) is adapted from vllm-metal's Apache-2.0
+// paged-attention implementation at commit
+// cc1b679725085ddb40f9beb0ed36e7745ae8d688:
+// https://github.com/vllm-project/vllm-metal/blob/cc1b679725085ddb40f9beb0ed36e7745ae8d688/vllm_metal/metal/kernels_v2/pagedattention.metal
+// Copyright contributors to the vLLM project. Licensed under Apache-2.0.
+// Modified for Izwi's Candle custom-op ABI and page-major K/V layout.
 
 kernel void izwi_silu_mul_f32(
     device const float* gate [[buffer(0)]],
@@ -458,6 +481,982 @@ kernel void izwi_decode_gqa_attention_f16(
     }
 }
 
+kernel void izwi_paged_decode_attention_f32(
+    device const float* q [[buffer(0)]],
+    device const float* k [[buffer(1)]],
+    device const float* v [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    device const uint* metadata [[buffer(4)]],
+    constant uint& batch_size [[buffer(5)]],
+    constant uint& num_heads [[buffer(6)]],
+    constant uint& num_kv_heads [[buffer(7)]],
+    constant uint& page_tokens [[buffer(8)]],
+    constant uint& max_blocks [[buffer(9)]],
+    constant uint& key_head_dim [[buffer(10)]],
+    constant uint& value_head_dim [[buffer(11)]],
+    constant float& scale [[buffer(12)]],
+    constant float& softcap [[buffer(13)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint2 threads_per_group [[threads_per_threadgroup]]
+) {
+    threadgroup float dot_scratch[256];
+    threadgroup float accumulator[512];
+    threadgroup float online_state[4];
+
+    const uint head = group.x;
+    const uint row = group.y;
+    if (row >= batch_size || head >= num_heads) {
+        return;
+    }
+
+    const uint context_len = metadata[row];
+    const uint first_page_offset = metadata[batch_size + row];
+    const uint kv_group = num_heads / num_kv_heads;
+    const uint kv_head = head / kv_group;
+    const uint q_base = (row * num_heads + head) * key_head_dim;
+    const uint table_base = 2 * batch_size + row * max_blocks;
+
+    const uint threads_per_threadgroup = threads_per_group.x;
+    for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+        accumulator[dim] = 0.0f;
+    }
+    if (tid == 0) {
+        online_state[0] = -INFINITY;
+        online_state[1] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint pos = 0; pos < context_len; pos++) {
+        const uint physical_pos = first_page_offset + pos;
+        const uint logical_page = physical_pos / page_tokens;
+        const uint page_offset = physical_pos - logical_page * page_tokens;
+        const uint physical_page = metadata[table_base + logical_page];
+        const uint slot = physical_page * page_tokens + page_offset;
+        const uint k_base = (slot * num_kv_heads + kv_head) * key_head_dim;
+
+        float local_dot = 0.0f;
+        for (uint dim = tid; dim < key_head_dim; dim += threads_per_threadgroup) {
+            local_dot += q[q_base + dim] * k[k_base + dim];
+        }
+        dot_scratch[tid] = local_dot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = threads_per_threadgroup >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                dot_scratch[tid] += dot_scratch[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (tid == 0) {
+            float score = dot_scratch[0] * scale;
+            if (softcap > 0.0f) {
+                score = softcap * tanh(score / softcap);
+            }
+            const float next_max = max(online_state[0], score);
+            const float alpha = online_state[1] == 0.0f
+                ? 0.0f
+                : exp(online_state[0] - next_max);
+            const float beta = exp(score - next_max);
+            online_state[0] = next_max;
+            online_state[1] = online_state[1] * alpha + beta;
+            online_state[2] = alpha;
+            online_state[3] = beta;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const uint v_base = (slot * num_kv_heads + kv_head) * value_head_dim;
+        for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+            accumulator[dim] = accumulator[dim] * online_state[2]
+                + v[v_base + dim] * online_state[3];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const uint out_base = (row * num_heads + head) * value_head_dim;
+    const float inv_sum = 1.0f / online_state[1];
+    for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+        output[out_base + dim] = accumulator[dim] * inv_sum;
+    }
+}
+
+kernel void izwi_paged_decode_attention_f16(
+    device const half* q [[buffer(0)]],
+    device const half* k [[buffer(1)]],
+    device const half* v [[buffer(2)]],
+    device half* output [[buffer(3)]],
+    device const uint* metadata [[buffer(4)]],
+    constant uint& batch_size [[buffer(5)]],
+    constant uint& num_heads [[buffer(6)]],
+    constant uint& num_kv_heads [[buffer(7)]],
+    constant uint& page_tokens [[buffer(8)]],
+    constant uint& max_blocks [[buffer(9)]],
+    constant uint& key_head_dim [[buffer(10)]],
+    constant uint& value_head_dim [[buffer(11)]],
+    constant float& scale [[buffer(12)]],
+    constant float& softcap [[buffer(13)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint2 threads_per_group [[threads_per_threadgroup]]
+) {
+    threadgroup float dot_scratch[256];
+    threadgroup float accumulator[512];
+    threadgroup float online_state[4];
+
+    const uint head = group.x;
+    const uint row = group.y;
+    if (row >= batch_size || head >= num_heads) {
+        return;
+    }
+
+    const uint context_len = metadata[row];
+    const uint first_page_offset = metadata[batch_size + row];
+    const uint kv_group = num_heads / num_kv_heads;
+    const uint kv_head = head / kv_group;
+    const uint q_base = (row * num_heads + head) * key_head_dim;
+    const uint table_base = 2 * batch_size + row * max_blocks;
+
+    const uint threads_per_threadgroup = threads_per_group.x;
+    for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+        accumulator[dim] = 0.0f;
+    }
+    if (tid == 0) {
+        online_state[0] = -INFINITY;
+        online_state[1] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint pos = 0; pos < context_len; pos++) {
+        const uint physical_pos = first_page_offset + pos;
+        const uint logical_page = physical_pos / page_tokens;
+        const uint page_offset = physical_pos - logical_page * page_tokens;
+        const uint physical_page = metadata[table_base + logical_page];
+        const uint slot = physical_page * page_tokens + page_offset;
+        const uint k_base = (slot * num_kv_heads + kv_head) * key_head_dim;
+
+        float local_dot = 0.0f;
+        for (uint dim = tid; dim < key_head_dim; dim += threads_per_threadgroup) {
+            local_dot += float(q[q_base + dim]) * float(k[k_base + dim]);
+        }
+        dot_scratch[tid] = local_dot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = threads_per_threadgroup >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                dot_scratch[tid] += dot_scratch[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (tid == 0) {
+            float score = dot_scratch[0] * scale;
+            if (softcap > 0.0f) {
+                score = softcap * tanh(score / softcap);
+            }
+            const float next_max = max(online_state[0], score);
+            const float alpha = online_state[1] == 0.0f
+                ? 0.0f
+                : exp(online_state[0] - next_max);
+            const float beta = exp(score - next_max);
+            online_state[0] = next_max;
+            online_state[1] = online_state[1] * alpha + beta;
+            online_state[2] = alpha;
+            online_state[3] = beta;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const uint v_base = (slot * num_kv_heads + kv_head) * value_head_dim;
+        for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+            accumulator[dim] = accumulator[dim] * online_state[2]
+                + float(v[v_base + dim]) * online_state[3];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const uint out_base = (row * num_heads + head) * value_head_dim;
+    const float inv_sum = 1.0f / online_state[1];
+    for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+        output[out_base + dim] = half(accumulator[dim] * inv_sum);
+    }
+}
+
+kernel void izwi_paged_decode_attention_split_f32(
+    device const float* q [[buffer(0)]],
+    device const float* k [[buffer(1)]],
+    device const float* v [[buffer(2)]],
+    device float* partial_values [[buffer(3)]],
+    device float* partial_maxes [[buffer(4)]],
+    device float* partial_sums [[buffer(5)]],
+    device const uint* metadata [[buffer(6)]],
+    constant uint& batch_size [[buffer(7)]],
+    constant uint& num_heads [[buffer(8)]],
+    constant uint& num_kv_heads [[buffer(9)]],
+    constant uint& page_tokens [[buffer(10)]],
+    constant uint& max_blocks [[buffer(11)]],
+    constant uint& key_head_dim [[buffer(12)]],
+    constant uint& value_head_dim [[buffer(13)]],
+    constant float& scale [[buffer(14)]],
+    constant float& softcap [[buffer(15)]],
+    constant uint& partition_tokens [[buffer(16)]],
+    constant uint& max_partitions [[buffer(17)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint3 threads_per_group [[threads_per_threadgroup]]
+) {
+    threadgroup float dot_scratch[256];
+    threadgroup float accumulator[512];
+    threadgroup float online_state[4];
+
+    const uint head = group.x;
+    const uint row = group.y;
+    const uint partition = group.z;
+    if (row >= batch_size || head >= num_heads || partition >= max_partitions) {
+        return;
+    }
+
+    const uint context_len = metadata[row];
+    const uint partition_start = partition * partition_tokens;
+    const uint partition_end = min(partition_start + partition_tokens, context_len);
+    const uint partial_index = (row * num_heads + head) * max_partitions + partition;
+    const uint partial_base = partial_index * value_head_dim;
+    const uint threads_per_threadgroup = threads_per_group.x;
+
+    for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+        accumulator[dim] = 0.0f;
+    }
+    if (tid == 0) {
+        online_state[0] = -INFINITY;
+        online_state[1] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (partition_start < context_len) {
+        const uint first_page_offset = metadata[batch_size + row];
+        const uint kv_group = num_heads / num_kv_heads;
+        const uint kv_head = head / kv_group;
+        const uint q_base = (row * num_heads + head) * key_head_dim;
+        const uint table_base = 2 * batch_size + row * max_blocks;
+
+        for (uint pos = partition_start; pos < partition_end; pos++) {
+            const uint physical_pos = first_page_offset + pos;
+            const uint logical_page = physical_pos / page_tokens;
+            const uint page_offset = physical_pos - logical_page * page_tokens;
+            const uint physical_page = metadata[table_base + logical_page];
+            const uint slot = physical_page * page_tokens + page_offset;
+            const uint k_base = (slot * num_kv_heads + kv_head) * key_head_dim;
+
+            float local_dot = 0.0f;
+            for (uint dim = tid; dim < key_head_dim; dim += threads_per_threadgroup) {
+                local_dot += q[q_base + dim] * k[k_base + dim];
+            }
+            dot_scratch[tid] = local_dot;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint stride = threads_per_threadgroup >> 1; stride > 0; stride >>= 1) {
+                if (tid < stride) {
+                    dot_scratch[tid] += dot_scratch[tid + stride];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            if (tid == 0) {
+                float score = dot_scratch[0] * scale;
+                if (softcap > 0.0f) {
+                    score = softcap * tanh(score / softcap);
+                }
+                const float next_max = max(online_state[0], score);
+                const float alpha = online_state[1] == 0.0f
+                    ? 0.0f
+                    : exp(online_state[0] - next_max);
+                const float beta = exp(score - next_max);
+                online_state[0] = next_max;
+                online_state[1] = online_state[1] * alpha + beta;
+                online_state[2] = alpha;
+                online_state[3] = beta;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const uint v_base = (slot * num_kv_heads + kv_head) * value_head_dim;
+            for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+                accumulator[dim] = accumulator[dim] * online_state[2]
+                    + v[v_base + dim] * online_state[3];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+        partial_values[partial_base + dim] = accumulator[dim];
+    }
+    if (tid == 0) {
+        partial_maxes[partial_index] = online_state[0];
+        partial_sums[partial_index] = online_state[1];
+    }
+}
+
+kernel void izwi_paged_decode_attention_split_f16(
+    device const half* q [[buffer(0)]],
+    device const half* k [[buffer(1)]],
+    device const half* v [[buffer(2)]],
+    device float* partial_values [[buffer(3)]],
+    device float* partial_maxes [[buffer(4)]],
+    device float* partial_sums [[buffer(5)]],
+    device const uint* metadata [[buffer(6)]],
+    constant uint& batch_size [[buffer(7)]],
+    constant uint& num_heads [[buffer(8)]],
+    constant uint& num_kv_heads [[buffer(9)]],
+    constant uint& page_tokens [[buffer(10)]],
+    constant uint& max_blocks [[buffer(11)]],
+    constant uint& key_head_dim [[buffer(12)]],
+    constant uint& value_head_dim [[buffer(13)]],
+    constant float& scale [[buffer(14)]],
+    constant float& softcap [[buffer(15)]],
+    constant uint& partition_tokens [[buffer(16)]],
+    constant uint& max_partitions [[buffer(17)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint3 threads_per_group [[threads_per_threadgroup]]
+) {
+    threadgroup float dot_scratch[256];
+    threadgroup float accumulator[512];
+    threadgroup float online_state[4];
+
+    const uint head = group.x;
+    const uint row = group.y;
+    const uint partition = group.z;
+    if (row >= batch_size || head >= num_heads || partition >= max_partitions) {
+        return;
+    }
+
+    const uint context_len = metadata[row];
+    const uint partition_start = partition * partition_tokens;
+    const uint partition_end = min(partition_start + partition_tokens, context_len);
+    const uint partial_index = (row * num_heads + head) * max_partitions + partition;
+    const uint partial_base = partial_index * value_head_dim;
+    const uint threads_per_threadgroup = threads_per_group.x;
+
+    for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+        accumulator[dim] = 0.0f;
+    }
+    if (tid == 0) {
+        online_state[0] = -INFINITY;
+        online_state[1] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (partition_start < context_len) {
+        const uint first_page_offset = metadata[batch_size + row];
+        const uint kv_group = num_heads / num_kv_heads;
+        const uint kv_head = head / kv_group;
+        const uint q_base = (row * num_heads + head) * key_head_dim;
+        const uint table_base = 2 * batch_size + row * max_blocks;
+
+        for (uint pos = partition_start; pos < partition_end; pos++) {
+            const uint physical_pos = first_page_offset + pos;
+            const uint logical_page = physical_pos / page_tokens;
+            const uint page_offset = physical_pos - logical_page * page_tokens;
+            const uint physical_page = metadata[table_base + logical_page];
+            const uint slot = physical_page * page_tokens + page_offset;
+            const uint k_base = (slot * num_kv_heads + kv_head) * key_head_dim;
+
+            float local_dot = 0.0f;
+            for (uint dim = tid; dim < key_head_dim; dim += threads_per_threadgroup) {
+                local_dot += float(q[q_base + dim]) * float(k[k_base + dim]);
+            }
+            dot_scratch[tid] = local_dot;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint stride = threads_per_threadgroup >> 1; stride > 0; stride >>= 1) {
+                if (tid < stride) {
+                    dot_scratch[tid] += dot_scratch[tid + stride];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            if (tid == 0) {
+                float score = dot_scratch[0] * scale;
+                if (softcap > 0.0f) {
+                    score = softcap * tanh(score / softcap);
+                }
+                const float next_max = max(online_state[0], score);
+                const float alpha = online_state[1] == 0.0f
+                    ? 0.0f
+                    : exp(online_state[0] - next_max);
+                const float beta = exp(score - next_max);
+                online_state[0] = next_max;
+                online_state[1] = online_state[1] * alpha + beta;
+                online_state[2] = alpha;
+                online_state[3] = beta;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const uint v_base = (slot * num_kv_heads + kv_head) * value_head_dim;
+            for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+                accumulator[dim] = accumulator[dim] * online_state[2]
+                    + float(v[v_base + dim]) * online_state[3];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+        partial_values[partial_base + dim] = accumulator[dim];
+    }
+    if (tid == 0) {
+        partial_maxes[partial_index] = online_state[0];
+        partial_sums[partial_index] = online_state[1];
+    }
+}
+
+kernel void izwi_paged_decode_attention_reduce_f32(
+    device const float* partial_values [[buffer(0)]],
+    device const float* partial_maxes [[buffer(1)]],
+    device const float* partial_sums [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    device const uint* context_lens [[buffer(4)]],
+    constant uint& num_heads [[buffer(5)]],
+    constant uint& value_head_dim [[buffer(6)]],
+    constant uint& partition_tokens [[buffer(7)]],
+    constant uint& max_partitions [[buffer(8)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint2 threads_per_group [[threads_per_threadgroup]]
+) {
+    threadgroup float merge_state[2];
+    const uint head = group.x;
+    const uint row = group.y;
+    const uint partial_base = (row * num_heads + head) * max_partitions;
+    const uint partition_count = (context_lens[row] + partition_tokens - 1) / partition_tokens;
+
+    if (tid == 0) {
+        float global_max = -INFINITY;
+        for (uint partition = 0; partition < partition_count; partition++) {
+            global_max = max(global_max, partial_maxes[partial_base + partition]);
+        }
+        float global_sum = 0.0f;
+        for (uint partition = 0; partition < partition_count; partition++) {
+            global_sum += partial_sums[partial_base + partition]
+                * exp(partial_maxes[partial_base + partition] - global_max);
+        }
+        merge_state[0] = global_max;
+        merge_state[1] = global_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint value_base = partial_base * value_head_dim;
+    const uint out_base = (row * num_heads + head) * value_head_dim;
+    const uint threads_per_threadgroup = threads_per_group.x;
+    for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+        float acc = 0.0f;
+        for (uint partition = 0; partition < partition_count; partition++) {
+            const float weight = exp(partial_maxes[partial_base + partition] - merge_state[0]);
+            acc += partial_values[value_base + partition * value_head_dim + dim] * weight;
+        }
+        output[out_base + dim] = acc / merge_state[1];
+    }
+}
+
+kernel void izwi_paged_decode_attention_reduce_f16(
+    device const float* partial_values [[buffer(0)]],
+    device const float* partial_maxes [[buffer(1)]],
+    device const float* partial_sums [[buffer(2)]],
+    device half* output [[buffer(3)]],
+    device const uint* context_lens [[buffer(4)]],
+    constant uint& num_heads [[buffer(5)]],
+    constant uint& value_head_dim [[buffer(6)]],
+    constant uint& partition_tokens [[buffer(7)]],
+    constant uint& max_partitions [[buffer(8)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint2 threads_per_group [[threads_per_threadgroup]]
+) {
+    threadgroup float merge_state[2];
+    const uint head = group.x;
+    const uint row = group.y;
+    const uint partial_base = (row * num_heads + head) * max_partitions;
+    const uint partition_count = (context_lens[row] + partition_tokens - 1) / partition_tokens;
+
+    if (tid == 0) {
+        float global_max = -INFINITY;
+        for (uint partition = 0; partition < partition_count; partition++) {
+            global_max = max(global_max, partial_maxes[partial_base + partition]);
+        }
+        float global_sum = 0.0f;
+        for (uint partition = 0; partition < partition_count; partition++) {
+            global_sum += partial_sums[partial_base + partition]
+                * exp(partial_maxes[partial_base + partition] - global_max);
+        }
+        merge_state[0] = global_max;
+        merge_state[1] = global_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint value_base = partial_base * value_head_dim;
+    const uint out_base = (row * num_heads + head) * value_head_dim;
+    const uint threads_per_threadgroup = threads_per_group.x;
+    for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+        float acc = 0.0f;
+        for (uint partition = 0; partition < partition_count; partition++) {
+            const float weight = exp(partial_maxes[partial_base + partition] - merge_state[0]);
+            acc += partial_values[value_base + partition * value_head_dim + dim] * weight;
+        }
+        output[out_base + dim] = half(acc / merge_state[1]);
+    }
+}
+
+kernel void izwi_paged_prefill_attention_f32(
+    device const float* q [[buffer(0)]],
+    device const float* k [[buffer(1)]],
+    device const float* v [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    device const uint* metadata [[buffer(4)]],
+    constant uint& sequence_count [[buffer(5)]],
+    constant uint& total_queries [[buffer(6)]],
+    constant uint& num_heads [[buffer(7)]],
+    constant uint& num_kv_heads [[buffer(8)]],
+    constant uint& page_tokens [[buffer(9)]],
+    constant uint& max_blocks [[buffer(10)]],
+    constant uint& key_head_dim [[buffer(11)]],
+    constant uint& value_head_dim [[buffer(12)]],
+    constant float& scale [[buffer(13)]],
+    constant float& softcap [[buffer(14)]],
+    constant uint& window_tokens [[buffer(15)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint2 threads_per_group [[threads_per_threadgroup]]
+) {
+    threadgroup float dot_scratch[256];
+    threadgroup float accumulator[512];
+    threadgroup float online_state[4];
+
+    const uint head = group.x;
+    const uint query_index = group.y;
+    if (query_index >= total_queries || head >= num_heads) {
+        return;
+    }
+
+    const uint query_rows_base = sequence_count * (4 + max_blocks);
+    const uint sequence = metadata[query_rows_base + query_index];
+    const uint query_start = metadata[sequence];
+    const uint query_len = metadata[sequence_count + sequence];
+    const uint context_len = metadata[2 * sequence_count + sequence];
+    const uint first_page_offset = metadata[3 * sequence_count + sequence];
+    const uint query_offset = query_index - query_start;
+    const uint visible_context = context_len - query_len + query_offset + 1;
+    const uint window_start = window_tokens > 0 && visible_context > window_tokens
+        ? visible_context - window_tokens
+        : 0;
+    const uint table_base = 4 * sequence_count + sequence * max_blocks;
+    const uint kv_group = num_heads / num_kv_heads;
+    const uint kv_head = head / kv_group;
+    const uint q_base = (query_index * num_heads + head) * key_head_dim;
+    const uint threads_per_threadgroup = threads_per_group.x;
+
+    for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+        accumulator[dim] = 0.0f;
+    }
+    if (tid == 0) {
+        online_state[0] = -INFINITY;
+        online_state[1] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint pos = window_start; pos < visible_context; pos++) {
+        const uint physical_pos = first_page_offset + pos;
+        const uint logical_page = physical_pos / page_tokens;
+        const uint page_offset = physical_pos - logical_page * page_tokens;
+        const uint physical_page = metadata[table_base + logical_page];
+        const uint slot = physical_page * page_tokens + page_offset;
+        const uint k_base = (slot * num_kv_heads + kv_head) * key_head_dim;
+        float local_dot = 0.0f;
+        for (uint dim = tid; dim < key_head_dim; dim += threads_per_threadgroup) {
+            local_dot += q[q_base + dim] * k[k_base + dim];
+        }
+        dot_scratch[tid] = local_dot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = threads_per_threadgroup >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                dot_scratch[tid] += dot_scratch[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (tid == 0) {
+            float score = dot_scratch[0] * scale;
+            if (softcap > 0.0f) {
+                score = softcap * tanh(score / softcap);
+            }
+            const float next_max = max(online_state[0], score);
+            const float alpha = online_state[1] == 0.0f
+                ? 0.0f
+                : exp(online_state[0] - next_max);
+            const float beta = exp(score - next_max);
+            online_state[0] = next_max;
+            online_state[1] = online_state[1] * alpha + beta;
+            online_state[2] = alpha;
+            online_state[3] = beta;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const uint v_base = (slot * num_kv_heads + kv_head) * value_head_dim;
+        for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+            accumulator[dim] = accumulator[dim] * online_state[2]
+                + v[v_base + dim] * online_state[3];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const uint out_base = (query_index * num_heads + head) * value_head_dim;
+    const float inv_sum = 1.0f / online_state[1];
+    for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+        output[out_base + dim] = accumulator[dim] * inv_sum;
+    }
+}
+
+kernel void izwi_paged_prefill_attention_f16(
+    device const half* q [[buffer(0)]],
+    device const half* k [[buffer(1)]],
+    device const half* v [[buffer(2)]],
+    device half* output [[buffer(3)]],
+    device const uint* metadata [[buffer(4)]],
+    constant uint& sequence_count [[buffer(5)]],
+    constant uint& total_queries [[buffer(6)]],
+    constant uint& num_heads [[buffer(7)]],
+    constant uint& num_kv_heads [[buffer(8)]],
+    constant uint& page_tokens [[buffer(9)]],
+    constant uint& max_blocks [[buffer(10)]],
+    constant uint& key_head_dim [[buffer(11)]],
+    constant uint& value_head_dim [[buffer(12)]],
+    constant float& scale [[buffer(13)]],
+    constant float& softcap [[buffer(14)]],
+    constant uint& window_tokens [[buffer(15)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint2 threads_per_group [[threads_per_threadgroup]]
+) {
+    threadgroup float dot_scratch[256];
+    threadgroup float accumulator[512];
+    threadgroup float online_state[4];
+
+    const uint head = group.x;
+    const uint query_index = group.y;
+    if (query_index >= total_queries || head >= num_heads) {
+        return;
+    }
+
+    const uint query_rows_base = sequence_count * (4 + max_blocks);
+    const uint sequence = metadata[query_rows_base + query_index];
+    const uint query_start = metadata[sequence];
+    const uint query_len = metadata[sequence_count + sequence];
+    const uint context_len = metadata[2 * sequence_count + sequence];
+    const uint first_page_offset = metadata[3 * sequence_count + sequence];
+    const uint query_offset = query_index - query_start;
+    const uint visible_context = context_len - query_len + query_offset + 1;
+    const uint window_start = window_tokens > 0 && visible_context > window_tokens
+        ? visible_context - window_tokens
+        : 0;
+    const uint table_base = 4 * sequence_count + sequence * max_blocks;
+    const uint kv_group = num_heads / num_kv_heads;
+    const uint kv_head = head / kv_group;
+    const uint q_base = (query_index * num_heads + head) * key_head_dim;
+    const uint threads_per_threadgroup = threads_per_group.x;
+
+    for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+        accumulator[dim] = 0.0f;
+    }
+    if (tid == 0) {
+        online_state[0] = -INFINITY;
+        online_state[1] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint pos = window_start; pos < visible_context; pos++) {
+        const uint physical_pos = first_page_offset + pos;
+        const uint logical_page = physical_pos / page_tokens;
+        const uint page_offset = physical_pos - logical_page * page_tokens;
+        const uint physical_page = metadata[table_base + logical_page];
+        const uint slot = physical_page * page_tokens + page_offset;
+        const uint k_base = (slot * num_kv_heads + kv_head) * key_head_dim;
+        float local_dot = 0.0f;
+        for (uint dim = tid; dim < key_head_dim; dim += threads_per_threadgroup) {
+            local_dot += float(q[q_base + dim]) * float(k[k_base + dim]);
+        }
+        dot_scratch[tid] = local_dot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = threads_per_threadgroup >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                dot_scratch[tid] += dot_scratch[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (tid == 0) {
+            float score = dot_scratch[0] * scale;
+            if (softcap > 0.0f) {
+                score = softcap * tanh(score / softcap);
+            }
+            const float next_max = max(online_state[0], score);
+            const float alpha = online_state[1] == 0.0f
+                ? 0.0f
+                : exp(online_state[0] - next_max);
+            const float beta = exp(score - next_max);
+            online_state[0] = next_max;
+            online_state[1] = online_state[1] * alpha + beta;
+            online_state[2] = alpha;
+            online_state[3] = beta;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const uint v_base = (slot * num_kv_heads + kv_head) * value_head_dim;
+        for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+            accumulator[dim] = accumulator[dim] * online_state[2]
+                + float(v[v_base + dim]) * online_state[3];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const uint out_base = (query_index * num_heads + head) * value_head_dim;
+    const float inv_sum = 1.0f / online_state[1];
+    for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+        output[out_base + dim] = half(accumulator[dim] * inv_sum);
+    }
+}
+
+kernel void izwi_paged_prefill_attention_split_f32(
+    device const float* q [[buffer(0)]],
+    device const float* k [[buffer(1)]],
+    device const float* v [[buffer(2)]],
+    device float* partial_values [[buffer(3)]],
+    device float* partial_maxes [[buffer(4)]],
+    device float* partial_sums [[buffer(5)]],
+    device const uint* metadata [[buffer(6)]],
+    constant uint& sequence_count [[buffer(7)]],
+    constant uint& total_queries [[buffer(8)]],
+    constant uint& num_heads [[buffer(9)]],
+    constant uint& num_kv_heads [[buffer(10)]],
+    constant uint& page_tokens [[buffer(11)]],
+    constant uint& max_blocks [[buffer(12)]],
+    constant uint& key_head_dim [[buffer(13)]],
+    constant uint& value_head_dim [[buffer(14)]],
+    constant float& scale [[buffer(15)]],
+    constant float& softcap [[buffer(16)]],
+    constant uint& window_tokens [[buffer(17)]],
+    constant uint& partition_tokens [[buffer(18)]],
+    constant uint& max_partitions [[buffer(19)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint3 threads_per_group [[threads_per_threadgroup]]
+) {
+    threadgroup float dot_scratch[256];
+    threadgroup float accumulator[512];
+    threadgroup float online_state[4];
+
+    const uint head = group.x;
+    const uint query_index = group.y;
+    const uint partition = group.z;
+    if (query_index >= total_queries || head >= num_heads || partition >= max_partitions) {
+        return;
+    }
+
+    const uint query_rows_base = sequence_count * (4 + max_blocks);
+    const uint sequence = metadata[query_rows_base + query_index];
+    const uint query_start = metadata[sequence];
+    const uint query_len = metadata[sequence_count + sequence];
+    const uint context_len = metadata[2 * sequence_count + sequence];
+    const uint first_page_offset = metadata[3 * sequence_count + sequence];
+    const uint query_offset = query_index - query_start;
+    const uint visible_context = context_len - query_len + query_offset + 1;
+    const uint window_start = window_tokens > 0 && visible_context > window_tokens
+        ? visible_context - window_tokens
+        : 0;
+    const uint attended_tokens = visible_context - window_start;
+    const uint relative_start = partition * partition_tokens;
+    const uint relative_end = min(relative_start + partition_tokens, attended_tokens);
+    const uint partial_index = (query_index * num_heads + head) * max_partitions + partition;
+    const uint partial_base = partial_index * value_head_dim;
+    const uint threads_per_threadgroup = threads_per_group.x;
+
+    for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+        accumulator[dim] = 0.0f;
+    }
+    if (tid == 0) {
+        online_state[0] = -INFINITY;
+        online_state[1] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (relative_start < attended_tokens) {
+        const uint table_base = 4 * sequence_count + sequence * max_blocks;
+        const uint kv_group = num_heads / num_kv_heads;
+        const uint kv_head = head / kv_group;
+        const uint q_base = (query_index * num_heads + head) * key_head_dim;
+        for (uint relative_pos = relative_start; relative_pos < relative_end; relative_pos++) {
+            const uint physical_pos = first_page_offset + window_start + relative_pos;
+            const uint logical_page = physical_pos / page_tokens;
+            const uint page_offset = physical_pos - logical_page * page_tokens;
+            const uint physical_page = metadata[table_base + logical_page];
+            const uint slot = physical_page * page_tokens + page_offset;
+            const uint k_base = (slot * num_kv_heads + kv_head) * key_head_dim;
+            float local_dot = 0.0f;
+            for (uint dim = tid; dim < key_head_dim; dim += threads_per_threadgroup) {
+                local_dot += q[q_base + dim] * k[k_base + dim];
+            }
+            dot_scratch[tid] = local_dot;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint stride = threads_per_threadgroup >> 1; stride > 0; stride >>= 1) {
+                if (tid < stride) {
+                    dot_scratch[tid] += dot_scratch[tid + stride];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            if (tid == 0) {
+                float score = dot_scratch[0] * scale;
+                if (softcap > 0.0f) {
+                    score = softcap * tanh(score / softcap);
+                }
+                const float next_max = max(online_state[0], score);
+                const float alpha = online_state[1] == 0.0f ? 0.0f : exp(online_state[0] - next_max);
+                const float beta = exp(score - next_max);
+                online_state[0] = next_max;
+                online_state[1] = online_state[1] * alpha + beta;
+                online_state[2] = alpha;
+                online_state[3] = beta;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const uint v_base = (slot * num_kv_heads + kv_head) * value_head_dim;
+            for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+                accumulator[dim] = accumulator[dim] * online_state[2]
+                    + v[v_base + dim] * online_state[3];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+        partial_values[partial_base + dim] = accumulator[dim];
+    }
+    if (tid == 0) {
+        partial_maxes[partial_index] = online_state[0];
+        partial_sums[partial_index] = online_state[1];
+    }
+}
+
+kernel void izwi_paged_prefill_attention_split_f16(
+    device const half* q [[buffer(0)]],
+    device const half* k [[buffer(1)]],
+    device const half* v [[buffer(2)]],
+    device float* partial_values [[buffer(3)]],
+    device float* partial_maxes [[buffer(4)]],
+    device float* partial_sums [[buffer(5)]],
+    device const uint* metadata [[buffer(6)]],
+    constant uint& sequence_count [[buffer(7)]],
+    constant uint& total_queries [[buffer(8)]],
+    constant uint& num_heads [[buffer(9)]],
+    constant uint& num_kv_heads [[buffer(10)]],
+    constant uint& page_tokens [[buffer(11)]],
+    constant uint& max_blocks [[buffer(12)]],
+    constant uint& key_head_dim [[buffer(13)]],
+    constant uint& value_head_dim [[buffer(14)]],
+    constant float& scale [[buffer(15)]],
+    constant float& softcap [[buffer(16)]],
+    constant uint& window_tokens [[buffer(17)]],
+    constant uint& partition_tokens [[buffer(18)]],
+    constant uint& max_partitions [[buffer(19)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint3 threads_per_group [[threads_per_threadgroup]]
+) {
+    threadgroup float dot_scratch[256];
+    threadgroup float accumulator[512];
+    threadgroup float online_state[4];
+
+    const uint head = group.x;
+    const uint query_index = group.y;
+    const uint partition = group.z;
+    if (query_index >= total_queries || head >= num_heads || partition >= max_partitions) {
+        return;
+    }
+
+    const uint query_rows_base = sequence_count * (4 + max_blocks);
+    const uint sequence = metadata[query_rows_base + query_index];
+    const uint query_start = metadata[sequence];
+    const uint query_len = metadata[sequence_count + sequence];
+    const uint context_len = metadata[2 * sequence_count + sequence];
+    const uint first_page_offset = metadata[3 * sequence_count + sequence];
+    const uint query_offset = query_index - query_start;
+    const uint visible_context = context_len - query_len + query_offset + 1;
+    const uint window_start = window_tokens > 0 && visible_context > window_tokens
+        ? visible_context - window_tokens
+        : 0;
+    const uint attended_tokens = visible_context - window_start;
+    const uint relative_start = partition * partition_tokens;
+    const uint relative_end = min(relative_start + partition_tokens, attended_tokens);
+    const uint partial_index = (query_index * num_heads + head) * max_partitions + partition;
+    const uint partial_base = partial_index * value_head_dim;
+    const uint threads_per_threadgroup = threads_per_group.x;
+
+    for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+        accumulator[dim] = 0.0f;
+    }
+    if (tid == 0) {
+        online_state[0] = -INFINITY;
+        online_state[1] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (relative_start < attended_tokens) {
+        const uint table_base = 4 * sequence_count + sequence * max_blocks;
+        const uint kv_group = num_heads / num_kv_heads;
+        const uint kv_head = head / kv_group;
+        const uint q_base = (query_index * num_heads + head) * key_head_dim;
+        for (uint relative_pos = relative_start; relative_pos < relative_end; relative_pos++) {
+            const uint physical_pos = first_page_offset + window_start + relative_pos;
+            const uint logical_page = physical_pos / page_tokens;
+            const uint page_offset = physical_pos - logical_page * page_tokens;
+            const uint physical_page = metadata[table_base + logical_page];
+            const uint slot = physical_page * page_tokens + page_offset;
+            const uint k_base = (slot * num_kv_heads + kv_head) * key_head_dim;
+            float local_dot = 0.0f;
+            for (uint dim = tid; dim < key_head_dim; dim += threads_per_threadgroup) {
+                local_dot += float(q[q_base + dim]) * float(k[k_base + dim]);
+            }
+            dot_scratch[tid] = local_dot;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint stride = threads_per_threadgroup >> 1; stride > 0; stride >>= 1) {
+                if (tid < stride) {
+                    dot_scratch[tid] += dot_scratch[tid + stride];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            if (tid == 0) {
+                float score = dot_scratch[0] * scale;
+                if (softcap > 0.0f) {
+                    score = softcap * tanh(score / softcap);
+                }
+                const float next_max = max(online_state[0], score);
+                const float alpha = online_state[1] == 0.0f ? 0.0f : exp(online_state[0] - next_max);
+                const float beta = exp(score - next_max);
+                online_state[0] = next_max;
+                online_state[1] = online_state[1] * alpha + beta;
+                online_state[2] = alpha;
+                online_state[3] = beta;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const uint v_base = (slot * num_kv_heads + kv_head) * value_head_dim;
+            for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+                accumulator[dim] = accumulator[dim] * online_state[2]
+                    + float(v[v_base + dim]) * online_state[3];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+        partial_values[partial_base + dim] = accumulator[dim];
+    }
+    if (tid == 0) {
+        partial_maxes[partial_index] = online_state[0];
+        partial_sums[partial_index] = online_state[1];
+    }
+}
+
 kernel void izwi_qwen35_causal_conv_sequence_f32(
     device const float* input [[buffer(0)]],
     device const float* weight [[buffer(1)]],
@@ -661,6 +1660,59 @@ kernel void izwi_lfm_shortconv_sequence3_f32(
     }
     output[gid] = value;
 }
+
+kernel void izwi_lfm_shortconv_ring_f32(
+    device const float* ring [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device const float* weight [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& batch [[buffer(4)]],
+    constant uint& hidden [[buffer(5)]],
+    constant uint& steps [[buffer(6)]],
+    constant uint& capacity [[buffer(7)]],
+    constant ulong& expected_cursor [[buffer(8)]],
+    constant ulong& valid_length [[buffer(9)]],
+    constant uint& output_elements [[buffer(10)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= output_elements) {
+        return;
+    }
+    const uint step = gid % steps;
+    const uint hidden_idx = (gid / steps) % hidden;
+    const uint batch_idx = gid / (steps * hidden);
+    const long window_start =
+        long(expected_cursor) + long(step) + 1 - long(capacity);
+    const ulong oldest = expected_cursor - valid_length;
+    float value = 0.0f;
+    for (uint tap = 0; tap < capacity; ++tap) {
+        const long source = window_start + long(tap);
+        if (source < 0) {
+            continue;
+        }
+        const ulong absolute_source = ulong(source);
+        float source_value;
+        if (absolute_source < expected_cursor) {
+            if (absolute_source < oldest) {
+                continue;
+            }
+            const ulong physical = absolute_source % ulong(capacity);
+            source_value =
+                ring[(physical * ulong(batch) + ulong(batch_idx)) *
+                     ulong(hidden) + ulong(hidden_idx)];
+        } else {
+            const ulong input_step = absolute_source - expected_cursor;
+            if (input_step > ulong(step)) {
+                continue;
+            }
+            source_value =
+                input[(batch_idx * hidden + hidden_idx) * steps +
+                      uint(input_step)];
+        }
+        value += source_value * weight[hidden_idx * capacity + tap];
+    }
+    output[gid] = value;
+}
 "#;
 
 #[cfg(feature = "metal")]
@@ -729,7 +1781,7 @@ impl CustomOp2 for SiluMulOp {
         encoder.set_output_buffer(2, Some(&output), 0);
         encoder.set_bytes(3, &(elem_count as u32));
 
-        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().min(256).max(1);
+        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().clamp(1, 256);
         encoder.dispatch_threads(
             objc2_metal::MTLSize {
                 width: elem_count,
@@ -893,8 +1945,7 @@ impl CustomOp3 for QkRmsNormOp {
             .head_dim
             .next_power_of_two()
             .min(pipeline.max_total_threads_per_threadgroup())
-            .min(256)
-            .max(1);
+            .clamp(1, 256);
         encoder.dispatch_thread_groups(
             objc2_metal::MTLSize {
                 width: rows,
@@ -1040,8 +2091,7 @@ impl CustomOp2 for RmsNormOp {
             .hidden_dim
             .next_power_of_two()
             .min(pipeline.max_total_threads_per_threadgroup())
-            .min(1024)
-            .max(1);
+            .clamp(1, 1024);
         encoder.dispatch_thread_groups(
             objc2_metal::MTLSize {
                 width: self.rows,
@@ -1156,7 +2206,7 @@ impl CustomOp3 for RopePairBshdOp {
             || self.q_heads == 0
             || self.k_heads == 0
             || self.head_dim == 0
-            || self.head_dim % 2 != 0
+            || !self.head_dim.is_multiple_of(2)
         {
             bail!("izwi-rope-pair-bshd-metal requires non-empty even head_dim")
         }
@@ -1169,10 +2219,10 @@ impl CustomOp3 for RopePairBshdOp {
         if cos_sin_layout.shape().elem_count() != self.seq_len.saturating_mul(self.head_dim) {
             bail!("izwi-rope-pair-bshd-metal packed cos/sin shape mismatch")
         }
-        if self.q_rows % self.q_heads != 0
-            || self.k_rows % self.k_heads != 0
-            || (self.q_rows / self.q_heads) % self.seq_len != 0
-            || (self.k_rows / self.k_heads) % self.seq_len != 0
+        if !self.q_rows.is_multiple_of(self.q_heads)
+            || !self.k_rows.is_multiple_of(self.k_heads)
+            || !(self.q_rows / self.q_heads).is_multiple_of(self.seq_len)
+            || !(self.k_rows / self.k_heads).is_multiple_of(self.seq_len)
         {
             bail!("izwi-rope-pair-bshd-metal rows do not match heads/seq_len")
         }
@@ -1220,7 +2270,7 @@ impl CustomOp3 for RopePairBshdOp {
         encoder.set_bytes(8, &(self.k_heads as u32));
         encoder.set_bytes(9, &(self.head_dim as u32));
 
-        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().min(256).max(1);
+        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().clamp(1, 256);
         encoder.dispatch_threads(
             objc2_metal::MTLSize {
                 width: elem_count,
@@ -1294,6 +2344,39 @@ struct DecodeGqaAttentionOp {
 }
 
 #[cfg(feature = "metal")]
+#[derive(Debug, Clone)]
+struct PagedDecodeAttentionOp {
+    metadata: Vec<u32>,
+    device_metadata: Tensor,
+    batch_size: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    page_tokens: usize,
+    max_blocks: usize,
+    key_head_dim: usize,
+    value_head_dim: usize,
+    scale: f32,
+    softcap: Option<f32>,
+}
+
+#[cfg(feature = "metal")]
+#[derive(Debug, Clone)]
+struct PagedPrefillAttentionOp {
+    metadata: Vec<u32>,
+    sequence_count: usize,
+    total_queries: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    page_tokens: usize,
+    max_blocks: usize,
+    key_head_dim: usize,
+    value_head_dim: usize,
+    scale: f32,
+    softcap: Option<f32>,
+    window_tokens: Option<u32>,
+}
+
+#[cfg(feature = "metal")]
 #[derive(Debug, Clone, Copy)]
 struct LfmShortConvDecode3Op {
     batch_size: usize,
@@ -1313,6 +2396,17 @@ struct LfmShortConvSequence3Op {
     batch_size: usize,
     hidden_size: usize,
     seq_len: usize,
+}
+
+#[cfg(feature = "metal")]
+#[derive(Debug, Clone, Copy)]
+struct LfmShortConvRingOp {
+    batch_size: usize,
+    hidden_size: usize,
+    steps: usize,
+    capacity: usize,
+    expected_cursor: u64,
+    valid_length: u64,
 }
 
 #[cfg(feature = "metal")]
@@ -1358,7 +2452,7 @@ impl CustomOp3 for DecodeGqaAttentionOp {
             || self.kv_len > self.kv_capacity_len
             || self.kv_len > 2048
             || self.head_dim == 0
-            || self.num_heads % self.num_kv_heads != 0
+            || !self.num_heads.is_multiple_of(self.num_kv_heads)
         {
             bail!("izwi-decode-gqa-attention-metal unsupported shape")
         }
@@ -1417,8 +2511,7 @@ impl CustomOp3 for DecodeGqaAttentionOp {
             .head_dim
             .next_power_of_two()
             .min(pipeline.max_total_threads_per_threadgroup())
-            .min(256)
-            .max(1);
+            .clamp(1, 256);
         encoder.dispatch_thread_groups(
             objc2_metal::MTLSize {
                 width: self.num_heads,
@@ -1481,6 +2574,788 @@ fn decode_gqa_attention_pipeline(
         .insert(key, pipeline.clone());
 
     Ok(pipeline)
+}
+
+#[cfg(feature = "metal")]
+impl CustomOp3 for PagedDecodeAttentionOp {
+    fn name(&self) -> &'static str {
+        "izwi-paged-decode-attention-metal"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+        _s3: &CpuStorage,
+        _l3: &Layout,
+    ) -> CandleResult<(CpuStorage, Shape)> {
+        bail!("izwi-paged-decode-attention-metal requires Metal tensors")
+    }
+
+    fn metal_fwd(
+        &self,
+        q_storage: &MetalStorage,
+        q_layout: &Layout,
+        k_storage: &MetalStorage,
+        k_layout: &Layout,
+        v_storage: &MetalStorage,
+        v_layout: &Layout,
+    ) -> CandleResult<(MetalStorage, Shape)> {
+        let dtype = q_storage.dtype();
+        if k_storage.dtype() != dtype || v_storage.dtype() != dtype {
+            bail!("izwi-paged-decode-attention-metal requires matching dtypes")
+        }
+        if !matches!(dtype, DType::F32 | DType::F16) {
+            bail!("izwi-paged-decode-attention-metal only supports F32 and F16 tensors")
+        }
+        if !q_layout.is_contiguous() || !k_layout.is_contiguous() || !v_layout.is_contiguous() {
+            bail!("izwi-paged-decode-attention-metal requires contiguous tensors")
+        }
+        if self.batch_size == 0
+            || self.num_heads == 0
+            || self.num_kv_heads == 0
+            || !self.num_heads.is_multiple_of(self.num_kv_heads)
+            || self.page_tokens == 0
+            || self.max_blocks == 0
+            || self.key_head_dim == 0
+            || self.value_head_dim == 0
+            || self.key_head_dim > 512
+            || self.value_head_dim > 512
+            || self
+                .softcap
+                .is_some_and(|softcap| !softcap.is_finite() || softcap <= 0.0)
+            || self.metadata.len()
+                != self
+                    .batch_size
+                    .saturating_mul(2)
+                    .saturating_add(self.batch_size.saturating_mul(self.max_blocks))
+        {
+            bail!("izwi-paged-decode-attention-metal unsupported shape")
+        }
+        let q_elems = self
+            .batch_size
+            .saturating_mul(self.num_heads)
+            .saturating_mul(self.key_head_dim);
+        if q_layout.shape().elem_count() != q_elems {
+            bail!("izwi-paged-decode-attention-metal query shape mismatch")
+        }
+        let k_dims = k_layout.shape().dims();
+        let v_dims = v_layout.shape().dims();
+        if k_dims.len() != 4
+            || v_dims.len() != 4
+            || k_dims[0] != v_dims[0]
+            || k_dims[1] != self.page_tokens
+            || v_dims[1] != self.page_tokens
+            || k_dims[2] != self.num_kv_heads
+            || v_dims[2] != self.num_kv_heads
+            || k_dims[3] != self.key_head_dim
+            || v_dims[3] != self.value_head_dim
+        {
+            bail!("izwi-paged-decode-attention-metal page-major K/V shape mismatch")
+        }
+        let mut max_context_len = 0usize;
+        for row in 0..self.batch_size {
+            let context_len = self.metadata[row] as usize;
+            let first_page_offset = self.metadata[self.batch_size + row] as usize;
+            if context_len == 0 || first_page_offset >= self.page_tokens {
+                bail!("izwi-paged-decode-attention-metal invalid row metadata")
+            }
+            let physical_tokens = context_len.checked_add(first_page_offset).ok_or_else(|| {
+                candle_core::Error::Msg("paged attention context overflow".into())
+            })?;
+            let required_pages = physical_tokens.div_ceil(self.page_tokens);
+            if required_pages == 0 || required_pages > self.max_blocks {
+                bail!("izwi-paged-decode-attention-metal incomplete block table")
+            }
+            let table_base = self.batch_size.saturating_mul(2) + row * self.max_blocks;
+            if self.metadata[table_base..table_base + required_pages]
+                .iter()
+                .any(|&page| page as usize >= k_dims[0])
+            {
+                bail!("izwi-paged-decode-attention-metal physical page is out of bounds")
+            }
+            max_context_len = max_context_len.max(context_len);
+        }
+        let values = [
+            self.batch_size,
+            self.num_heads,
+            self.num_kv_heads,
+            self.page_tokens,
+            self.max_blocks,
+            self.key_head_dim,
+            self.value_head_dim,
+        ];
+        if values.iter().any(|&value| value > u32::MAX as usize) {
+            bail!("izwi-paged-decode-attention-metal tensor is too large")
+        }
+
+        let elem_count = self
+            .batch_size
+            .checked_mul(self.num_heads)
+            .and_then(|value| value.checked_mul(self.value_head_dim))
+            .ok_or_else(|| candle_core::Error::Msg("paged attention output overflow".into()))?;
+        let (metadata_storage, metadata_layout) = self.device_metadata.storage_and_layout();
+        let metadata_storage = match &*metadata_storage {
+            Storage::Metal(storage) => storage,
+            _ => bail!("izwi-paged-decode-attention-metal requires Metal metadata"),
+        };
+        if metadata_storage.dtype() != DType::U32
+            || !metadata_layout.is_contiguous()
+            || metadata_layout.shape().elem_count() != self.metadata.len()
+        {
+            bail!("izwi-paged-decode-attention-metal invalid device metadata")
+        }
+        let metadata_offset = metadata_layout.start_offset() * DType::U32.size_in_bytes();
+        let device = q_storage.device().clone();
+        let output = device.new_buffer(elem_count, dtype, "izwi-paged-decode-attention")?;
+        let encoder = device.command_encoder()?;
+        let reduction_width = self
+            .key_head_dim
+            .max(self.value_head_dim)
+            .next_power_of_two()
+            .clamp(1, 256);
+        let base_workgroups = self.batch_size.saturating_mul(self.num_heads);
+        let use_split_kv = max_context_len > METAL_PAGED_ATTENTION_SPLIT_MIN_CONTEXT
+            && base_workgroups <= METAL_PAGED_ATTENTION_SPLIT_MAX_BASE_WORKGROUPS;
+
+        if use_split_kv {
+            // Adapted from vllm-metal's split-KV dispatch at commit
+            // cc1b679725085ddb40f9beb0ed36e7745ae8d688 (Apache-2.0): partition
+            // long, low-occupancy contexts and merge partial online-softmax
+            // states in a second dispatch. Izwi keeps partial values in F32 to
+            // avoid an intermediate F16 round-trip.
+            let max_partitions = max_context_len.div_ceil(METAL_PAGED_ATTENTION_PARTITION_TOKENS);
+            let partial_count = base_workgroups
+                .checked_mul(max_partitions)
+                .ok_or_else(|| candle_core::Error::Msg("paged attention split overflow".into()))?;
+            let partial_value_count = partial_count
+                .checked_mul(self.value_head_dim)
+                .ok_or_else(|| candle_core::Error::Msg("paged attention split overflow".into()))?;
+            let partial_values = device.new_buffer(
+                partial_value_count,
+                DType::F32,
+                "izwi-paged-attention-parts",
+            )?;
+            let partial_maxes =
+                device.new_buffer(partial_count, DType::F32, "izwi-paged-attention-maxes")?;
+            let partial_sums =
+                device.new_buffer(partial_count, DType::F32, "izwi-paged-attention-sums")?;
+            let (split_pipeline, reduce_pipeline) =
+                paged_decode_attention_split_pipelines(device.metal_device(), dtype)?;
+
+            encoder.set_label("izwi-paged-decode-attention-split");
+            encoder.set_compute_pipeline_state(&split_pipeline);
+            encoder.set_input_buffer(
+                0,
+                Some(q_storage.buffer()),
+                q_layout.start_offset() * dtype.size_in_bytes(),
+            );
+            encoder.set_input_buffer(
+                1,
+                Some(k_storage.buffer()),
+                k_layout.start_offset() * dtype.size_in_bytes(),
+            );
+            encoder.set_input_buffer(
+                2,
+                Some(v_storage.buffer()),
+                v_layout.start_offset() * dtype.size_in_bytes(),
+            );
+            encoder.set_output_buffer(3, Some(&partial_values), 0);
+            encoder.set_output_buffer(4, Some(&partial_maxes), 0);
+            encoder.set_output_buffer(5, Some(&partial_sums), 0);
+            encoder.set_input_buffer(6, Some(metadata_storage.buffer()), metadata_offset);
+            encoder.set_bytes(7, &(self.batch_size as u32));
+            encoder.set_bytes(8, &(self.num_heads as u32));
+            encoder.set_bytes(9, &(self.num_kv_heads as u32));
+            encoder.set_bytes(10, &(self.page_tokens as u32));
+            encoder.set_bytes(11, &(self.max_blocks as u32));
+            encoder.set_bytes(12, &(self.key_head_dim as u32));
+            encoder.set_bytes(13, &(self.value_head_dim as u32));
+            encoder.set_bytes(14, &self.scale);
+            encoder.set_bytes(15, &self.softcap.unwrap_or(0.0));
+            encoder.set_bytes(16, &(METAL_PAGED_ATTENTION_PARTITION_TOKENS as u32));
+            encoder.set_bytes(17, &(max_partitions as u32));
+            encoder.dispatch_thread_groups(
+                objc2_metal::MTLSize {
+                    width: self.num_heads,
+                    height: self.batch_size,
+                    depth: max_partitions,
+                },
+                objc2_metal::MTLSize {
+                    width: reduction_width,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            encoder.insert_memory_barrier();
+
+            encoder.set_label("izwi-paged-decode-attention-reduce");
+            encoder.set_compute_pipeline_state(&reduce_pipeline);
+            encoder.set_input_buffer(0, Some(&partial_values), 0);
+            encoder.set_input_buffer(1, Some(&partial_maxes), 0);
+            encoder.set_input_buffer(2, Some(&partial_sums), 0);
+            encoder.set_output_buffer(3, Some(&output), 0);
+            encoder.set_input_buffer(4, Some(metadata_storage.buffer()), metadata_offset);
+            encoder.set_bytes(5, &(self.num_heads as u32));
+            encoder.set_bytes(6, &(self.value_head_dim as u32));
+            encoder.set_bytes(7, &(METAL_PAGED_ATTENTION_PARTITION_TOKENS as u32));
+            encoder.set_bytes(8, &(max_partitions as u32));
+            encoder.dispatch_thread_groups(
+                objc2_metal::MTLSize {
+                    width: self.num_heads,
+                    height: self.batch_size,
+                    depth: 1,
+                },
+                objc2_metal::MTLSize {
+                    width: reduction_width,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        } else {
+            encoder.set_label("izwi-paged-decode-attention");
+            let pipeline = paged_decode_attention_pipeline(device.metal_device(), dtype)?;
+            encoder.set_compute_pipeline_state(&pipeline);
+            encoder.set_input_buffer(
+                0,
+                Some(q_storage.buffer()),
+                q_layout.start_offset() * dtype.size_in_bytes(),
+            );
+            encoder.set_input_buffer(
+                1,
+                Some(k_storage.buffer()),
+                k_layout.start_offset() * dtype.size_in_bytes(),
+            );
+            encoder.set_input_buffer(
+                2,
+                Some(v_storage.buffer()),
+                v_layout.start_offset() * dtype.size_in_bytes(),
+            );
+            encoder.set_output_buffer(3, Some(&output), 0);
+            encoder.set_input_buffer(4, Some(metadata_storage.buffer()), metadata_offset);
+            encoder.set_bytes(5, &(self.batch_size as u32));
+            encoder.set_bytes(6, &(self.num_heads as u32));
+            encoder.set_bytes(7, &(self.num_kv_heads as u32));
+            encoder.set_bytes(8, &(self.page_tokens as u32));
+            encoder.set_bytes(9, &(self.max_blocks as u32));
+            encoder.set_bytes(10, &(self.key_head_dim as u32));
+            encoder.set_bytes(11, &(self.value_head_dim as u32));
+            encoder.set_bytes(12, &self.scale);
+            encoder.set_bytes(13, &self.softcap.unwrap_or(0.0));
+            encoder.dispatch_thread_groups(
+                objc2_metal::MTLSize {
+                    width: self.num_heads,
+                    height: self.batch_size,
+                    depth: 1,
+                },
+                objc2_metal::MTLSize {
+                    width: reduction_width,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        }
+        drop(encoder);
+
+        Ok((
+            MetalStorage::new(output, device, elem_count, dtype),
+            Shape::from((self.batch_size, self.num_heads, self.value_head_dim)),
+        ))
+    }
+}
+
+#[cfg(feature = "metal")]
+fn paged_decode_attention_pipeline(
+    device: &MetalDevice,
+    dtype: DType,
+) -> CandleResult<ComputePipeline> {
+    static PIPELINES: OnceLock<Mutex<HashMap<(u64, DType), ComputePipeline>>> = OnceLock::new();
+    let registry_id = device.registry_id();
+    let pipelines = PIPELINES.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (registry_id, dtype);
+    if let Some(pipeline) = pipelines
+        .lock()
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+        .get(&key)
+        .cloned()
+    {
+        return Ok(pipeline);
+    }
+
+    let function_name = match dtype {
+        DType::F32 => "izwi_paged_decode_attention_f32",
+        DType::F16 => "izwi_paged_decode_attention_f16",
+        _ => bail!("izwi-paged-decode-attention-metal only supports F32 and F16 tensors"),
+    };
+    let library = device
+        .new_library_with_source(IZWI_METAL_SOURCE, None)
+        .map_err(candle_core::Error::wrap)?;
+    let function = library
+        .get_function(function_name, None)
+        .map_err(candle_core::Error::wrap)?;
+    let pipeline = device
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(candle_core::Error::wrap)?;
+    pipelines
+        .lock()
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+        .insert(key, pipeline.clone());
+    Ok(pipeline)
+}
+
+#[cfg(feature = "metal")]
+fn paged_decode_attention_split_pipelines(
+    device: &MetalDevice,
+    dtype: DType,
+) -> CandleResult<(ComputePipeline, ComputePipeline)> {
+    static PIPELINES: OnceLock<Mutex<HashMap<(u64, DType), (ComputePipeline, ComputePipeline)>>> =
+        OnceLock::new();
+    let registry_id = device.registry_id();
+    let pipelines = PIPELINES.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (registry_id, dtype);
+    if let Some(pipelines) = pipelines
+        .lock()
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+        .get(&key)
+        .cloned()
+    {
+        return Ok(pipelines);
+    }
+
+    let (split_name, reduce_name) = match dtype {
+        DType::F32 => (
+            "izwi_paged_decode_attention_split_f32",
+            "izwi_paged_decode_attention_reduce_f32",
+        ),
+        DType::F16 => (
+            "izwi_paged_decode_attention_split_f16",
+            "izwi_paged_decode_attention_reduce_f16",
+        ),
+        _ => bail!("izwi-paged-decode-attention-metal only supports F32 and F16 tensors"),
+    };
+    let library = device
+        .new_library_with_source(IZWI_METAL_SOURCE, None)
+        .map_err(candle_core::Error::wrap)?;
+    let split_function = library
+        .get_function(split_name, None)
+        .map_err(candle_core::Error::wrap)?;
+    let reduce_function = library
+        .get_function(reduce_name, None)
+        .map_err(candle_core::Error::wrap)?;
+    let split_pipeline = device
+        .new_compute_pipeline_state_with_function(&split_function)
+        .map_err(candle_core::Error::wrap)?;
+    let reduce_pipeline = device
+        .new_compute_pipeline_state_with_function(&reduce_function)
+        .map_err(candle_core::Error::wrap)?;
+    pipelines
+        .lock()
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+        .insert(key, (split_pipeline.clone(), reduce_pipeline.clone()));
+    Ok((split_pipeline, reduce_pipeline))
+}
+
+#[cfg(feature = "metal")]
+impl CustomOp3 for PagedPrefillAttentionOp {
+    fn name(&self) -> &'static str {
+        "izwi-paged-prefill-attention-metal"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+        _s3: &CpuStorage,
+        _l3: &Layout,
+    ) -> CandleResult<(CpuStorage, Shape)> {
+        bail!("izwi-paged-prefill-attention-metal requires Metal tensors")
+    }
+
+    fn metal_fwd(
+        &self,
+        q_storage: &MetalStorage,
+        q_layout: &Layout,
+        k_storage: &MetalStorage,
+        k_layout: &Layout,
+        v_storage: &MetalStorage,
+        v_layout: &Layout,
+    ) -> CandleResult<(MetalStorage, Shape)> {
+        let dtype = q_storage.dtype();
+        if k_storage.dtype() != dtype || v_storage.dtype() != dtype {
+            bail!("izwi-paged-prefill-attention-metal requires matching dtypes")
+        }
+        if !matches!(dtype, DType::F32 | DType::F16) {
+            bail!("izwi-paged-prefill-attention-metal only supports F32 and F16 tensors")
+        }
+        if !q_layout.is_contiguous() || !k_layout.is_contiguous() || !v_layout.is_contiguous() {
+            bail!("izwi-paged-prefill-attention-metal requires contiguous tensors")
+        }
+        let expected_metadata = self
+            .sequence_count
+            .checked_mul(4usize.saturating_add(self.max_blocks))
+            .ok_or_else(|| candle_core::Error::Msg("paged prefill metadata overflow".into()))?;
+        if self.sequence_count == 0
+            || self.total_queries == 0
+            || self.num_heads == 0
+            || self.num_kv_heads == 0
+            || !self.num_heads.is_multiple_of(self.num_kv_heads)
+            || self.page_tokens == 0
+            || self.max_blocks == 0
+            || self.key_head_dim == 0
+            || self.value_head_dim == 0
+            || self.key_head_dim > 512
+            || self.value_head_dim > 512
+            || self.metadata.len() != expected_metadata
+            || !self.scale.is_finite()
+            || self.scale <= 0.0
+            || self
+                .softcap
+                .is_some_and(|softcap| !softcap.is_finite() || softcap <= 0.0)
+            || self.window_tokens == Some(0)
+        {
+            bail!("izwi-paged-prefill-attention-metal unsupported shape")
+        }
+        let q_elems = self
+            .total_queries
+            .checked_mul(self.num_heads)
+            .and_then(|value| value.checked_mul(self.key_head_dim))
+            .ok_or_else(|| candle_core::Error::Msg("paged prefill query overflow".into()))?;
+        if q_layout.shape().elem_count() != q_elems {
+            bail!("izwi-paged-prefill-attention-metal query shape mismatch")
+        }
+        let k_dims = k_layout.shape().dims();
+        let v_dims = v_layout.shape().dims();
+        if k_dims.len() != 4
+            || v_dims.len() != 4
+            || k_dims[0] != v_dims[0]
+            || k_dims[1] != self.page_tokens
+            || v_dims[1] != self.page_tokens
+            || k_dims[2] != self.num_kv_heads
+            || v_dims[2] != self.num_kv_heads
+            || k_dims[3] != self.key_head_dim
+            || v_dims[3] != self.value_head_dim
+        {
+            bail!("izwi-paged-prefill-attention-metal page-major K/V shape mismatch")
+        }
+
+        let mut next_query = 0usize;
+        let mut query_rows = Vec::with_capacity(self.total_queries);
+        let mut query_attention_lens = Vec::with_capacity(self.total_queries);
+        let mut max_attention_len = 0usize;
+        for sequence in 0..self.sequence_count {
+            let query_start = self.metadata[sequence] as usize;
+            let query_len = self.metadata[self.sequence_count + sequence] as usize;
+            let context_len = self.metadata[2 * self.sequence_count + sequence] as usize;
+            let first_page_offset = self.metadata[3 * self.sequence_count + sequence] as usize;
+            if query_start != next_query
+                || query_len == 0
+                || query_len > context_len
+                || first_page_offset >= self.page_tokens
+            {
+                bail!("izwi-paged-prefill-attention-metal invalid sequence metadata")
+            }
+            let physical_tokens = context_len
+                .checked_add(first_page_offset)
+                .ok_or_else(|| candle_core::Error::Msg("paged prefill context overflow".into()))?;
+            let required_pages = physical_tokens.div_ceil(self.page_tokens);
+            if required_pages == 0 || required_pages > self.max_blocks {
+                bail!("izwi-paged-prefill-attention-metal incomplete block table")
+            }
+            let table_base = 4 * self.sequence_count + sequence * self.max_blocks;
+            if self.metadata[table_base..table_base + required_pages]
+                .iter()
+                .any(|&page| page as usize >= k_dims[0])
+            {
+                bail!("izwi-paged-prefill-attention-metal physical page is out of bounds")
+            }
+            next_query = next_query
+                .checked_add(query_len)
+                .ok_or_else(|| candle_core::Error::Msg("paged prefill query overflow".into()))?;
+            for query_offset in 0..query_len {
+                let visible_context = context_len - query_len + query_offset + 1;
+                let attention_len = self.window_tokens.map_or(visible_context, |window| {
+                    visible_context.min(window as usize)
+                });
+                query_rows.push(sequence as u32);
+                query_attention_lens.push(attention_len as u32);
+                max_attention_len = max_attention_len.max(attention_len);
+            }
+        }
+        if next_query != self.total_queries {
+            bail!("izwi-paged-prefill-attention-metal rows do not cover every query")
+        }
+        let values = [
+            self.sequence_count,
+            self.total_queries,
+            self.num_heads,
+            self.num_kv_heads,
+            self.page_tokens,
+            self.max_blocks,
+            self.key_head_dim,
+            self.value_head_dim,
+        ];
+        if values.iter().any(|&value| value > u32::MAX as usize) {
+            bail!("izwi-paged-prefill-attention-metal tensor is too large")
+        }
+
+        let elem_count = self
+            .total_queries
+            .checked_mul(self.num_heads)
+            .and_then(|value| value.checked_mul(self.value_head_dim))
+            .ok_or_else(|| candle_core::Error::Msg("paged prefill output overflow".into()))?;
+        let device = q_storage.device().clone();
+        let output = device.new_buffer(elem_count, dtype, "izwi-paged-prefill-attention")?;
+        // Append direct query-to-sequence rows after the compact sequence
+        // records. Both short and split kernels now perform O(1) row lookup.
+        let mut expanded_metadata = self.metadata.clone();
+        expanded_metadata.extend_from_slice(&query_rows);
+        let metadata = device.new_buffer_with_data(&expanded_metadata)?;
+        let encoder = device.command_encoder()?;
+        let reduction_width = self
+            .key_head_dim
+            .max(self.value_head_dim)
+            .next_power_of_two()
+            .clamp(1, 256);
+        let base_workgroups = self.total_queries.saturating_mul(self.num_heads);
+        let use_split_kv = max_attention_len > METAL_PAGED_PREFILL_SPLIT_MIN_CONTEXT
+            && base_workgroups <= METAL_PAGED_PREFILL_SPLIT_MAX_BASE_WORKGROUPS;
+
+        if use_split_kv {
+            let max_partitions = max_attention_len.div_ceil(METAL_PAGED_ATTENTION_PARTITION_TOKENS);
+            let partial_count = base_workgroups
+                .checked_mul(max_partitions)
+                .ok_or_else(|| candle_core::Error::Msg("paged prefill split overflow".into()))?;
+            let partial_value_count = partial_count
+                .checked_mul(self.value_head_dim)
+                .ok_or_else(|| candle_core::Error::Msg("paged prefill split overflow".into()))?;
+            let partial_values =
+                device.new_buffer(partial_value_count, DType::F32, "izwi-paged-prefill-parts")?;
+            let partial_maxes =
+                device.new_buffer(partial_count, DType::F32, "izwi-paged-prefill-maxes")?;
+            let partial_sums =
+                device.new_buffer(partial_count, DType::F32, "izwi-paged-prefill-sums")?;
+            let attention_lens = device.new_buffer_with_data(&query_attention_lens)?;
+            let (split_pipeline, reduce_pipeline) =
+                paged_prefill_attention_split_pipelines(device.metal_device(), dtype)?;
+
+            encoder.set_label("izwi-paged-prefill-attention-split");
+            encoder.set_compute_pipeline_state(&split_pipeline);
+            encoder.set_input_buffer(
+                0,
+                Some(q_storage.buffer()),
+                q_layout.start_offset() * dtype.size_in_bytes(),
+            );
+            encoder.set_input_buffer(
+                1,
+                Some(k_storage.buffer()),
+                k_layout.start_offset() * dtype.size_in_bytes(),
+            );
+            encoder.set_input_buffer(
+                2,
+                Some(v_storage.buffer()),
+                v_layout.start_offset() * dtype.size_in_bytes(),
+            );
+            encoder.set_output_buffer(3, Some(&partial_values), 0);
+            encoder.set_output_buffer(4, Some(&partial_maxes), 0);
+            encoder.set_output_buffer(5, Some(&partial_sums), 0);
+            encoder.set_input_buffer(6, Some(&metadata), 0);
+            encoder.set_bytes(7, &(self.sequence_count as u32));
+            encoder.set_bytes(8, &(self.total_queries as u32));
+            encoder.set_bytes(9, &(self.num_heads as u32));
+            encoder.set_bytes(10, &(self.num_kv_heads as u32));
+            encoder.set_bytes(11, &(self.page_tokens as u32));
+            encoder.set_bytes(12, &(self.max_blocks as u32));
+            encoder.set_bytes(13, &(self.key_head_dim as u32));
+            encoder.set_bytes(14, &(self.value_head_dim as u32));
+            encoder.set_bytes(15, &self.scale);
+            encoder.set_bytes(16, &self.softcap.unwrap_or(0.0));
+            encoder.set_bytes(17, &self.window_tokens.unwrap_or(0));
+            encoder.set_bytes(18, &(METAL_PAGED_ATTENTION_PARTITION_TOKENS as u32));
+            encoder.set_bytes(19, &(max_partitions as u32));
+            encoder.dispatch_thread_groups(
+                objc2_metal::MTLSize {
+                    width: self.num_heads,
+                    height: self.total_queries,
+                    depth: max_partitions,
+                },
+                objc2_metal::MTLSize {
+                    width: reduction_width,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            encoder.insert_memory_barrier();
+
+            encoder.set_label("izwi-paged-prefill-attention-reduce");
+            encoder.set_compute_pipeline_state(&reduce_pipeline);
+            encoder.set_input_buffer(0, Some(&partial_values), 0);
+            encoder.set_input_buffer(1, Some(&partial_maxes), 0);
+            encoder.set_input_buffer(2, Some(&partial_sums), 0);
+            encoder.set_output_buffer(3, Some(&output), 0);
+            encoder.set_input_buffer(4, Some(&attention_lens), 0);
+            encoder.set_bytes(5, &(self.num_heads as u32));
+            encoder.set_bytes(6, &(self.value_head_dim as u32));
+            encoder.set_bytes(7, &(METAL_PAGED_ATTENTION_PARTITION_TOKENS as u32));
+            encoder.set_bytes(8, &(max_partitions as u32));
+            encoder.dispatch_thread_groups(
+                objc2_metal::MTLSize {
+                    width: self.num_heads,
+                    height: self.total_queries,
+                    depth: 1,
+                },
+                objc2_metal::MTLSize {
+                    width: reduction_width,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        } else {
+            encoder.set_label("izwi-paged-prefill-attention");
+            let pipeline = paged_prefill_attention_pipeline(device.metal_device(), dtype)?;
+            encoder.set_compute_pipeline_state(&pipeline);
+            encoder.set_input_buffer(
+                0,
+                Some(q_storage.buffer()),
+                q_layout.start_offset() * dtype.size_in_bytes(),
+            );
+            encoder.set_input_buffer(
+                1,
+                Some(k_storage.buffer()),
+                k_layout.start_offset() * dtype.size_in_bytes(),
+            );
+            encoder.set_input_buffer(
+                2,
+                Some(v_storage.buffer()),
+                v_layout.start_offset() * dtype.size_in_bytes(),
+            );
+            encoder.set_output_buffer(3, Some(&output), 0);
+            encoder.set_input_buffer(4, Some(&metadata), 0);
+            encoder.set_bytes(5, &(self.sequence_count as u32));
+            encoder.set_bytes(6, &(self.total_queries as u32));
+            encoder.set_bytes(7, &(self.num_heads as u32));
+            encoder.set_bytes(8, &(self.num_kv_heads as u32));
+            encoder.set_bytes(9, &(self.page_tokens as u32));
+            encoder.set_bytes(10, &(self.max_blocks as u32));
+            encoder.set_bytes(11, &(self.key_head_dim as u32));
+            encoder.set_bytes(12, &(self.value_head_dim as u32));
+            encoder.set_bytes(13, &self.scale);
+            encoder.set_bytes(14, &self.softcap.unwrap_or(0.0));
+            encoder.set_bytes(15, &self.window_tokens.unwrap_or(0));
+            encoder.dispatch_thread_groups(
+                objc2_metal::MTLSize {
+                    width: self.num_heads,
+                    height: self.total_queries,
+                    depth: 1,
+                },
+                objc2_metal::MTLSize {
+                    width: reduction_width.min(pipeline.max_total_threads_per_threadgroup()),
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        }
+        drop(encoder);
+
+        Ok((
+            MetalStorage::new(output, device, elem_count, dtype),
+            Shape::from((self.total_queries, self.num_heads, self.value_head_dim)),
+        ))
+    }
+}
+
+#[cfg(feature = "metal")]
+fn paged_prefill_attention_pipeline(
+    device: &MetalDevice,
+    dtype: DType,
+) -> CandleResult<ComputePipeline> {
+    static PIPELINES: OnceLock<Mutex<HashMap<(u64, DType), ComputePipeline>>> = OnceLock::new();
+    let registry_id = device.registry_id();
+    let pipelines = PIPELINES.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (registry_id, dtype);
+    if let Some(pipeline) = pipelines
+        .lock()
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+        .get(&key)
+        .cloned()
+    {
+        return Ok(pipeline);
+    }
+
+    let function_name = match dtype {
+        DType::F32 => "izwi_paged_prefill_attention_f32",
+        DType::F16 => "izwi_paged_prefill_attention_f16",
+        _ => bail!("izwi-paged-prefill-attention-metal only supports F32 and F16 tensors"),
+    };
+    let library = device
+        .new_library_with_source(IZWI_METAL_SOURCE, None)
+        .map_err(candle_core::Error::wrap)?;
+    let function = library
+        .get_function(function_name, None)
+        .map_err(candle_core::Error::wrap)?;
+    let pipeline = device
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(candle_core::Error::wrap)?;
+    pipelines
+        .lock()
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+        .insert(key, pipeline.clone());
+    Ok(pipeline)
+}
+
+#[cfg(feature = "metal")]
+fn paged_prefill_attention_split_pipelines(
+    device: &MetalDevice,
+    dtype: DType,
+) -> CandleResult<(ComputePipeline, ComputePipeline)> {
+    static PIPELINES: OnceLock<Mutex<HashMap<(u64, DType), (ComputePipeline, ComputePipeline)>>> =
+        OnceLock::new();
+    let registry_id = device.registry_id();
+    let pipelines = PIPELINES.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (registry_id, dtype);
+    if let Some(pipelines) = pipelines
+        .lock()
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+        .get(&key)
+        .cloned()
+    {
+        return Ok(pipelines);
+    }
+
+    let (split_name, reduce_name) = match dtype {
+        DType::F32 => (
+            "izwi_paged_prefill_attention_split_f32",
+            "izwi_paged_decode_attention_reduce_f32",
+        ),
+        DType::F16 => (
+            "izwi_paged_prefill_attention_split_f16",
+            "izwi_paged_decode_attention_reduce_f16",
+        ),
+        _ => bail!("izwi-paged-prefill-attention-metal only supports F32 and F16 tensors"),
+    };
+    let library = device
+        .new_library_with_source(IZWI_METAL_SOURCE, None)
+        .map_err(candle_core::Error::wrap)?;
+    let split_function = library
+        .get_function(split_name, None)
+        .map_err(candle_core::Error::wrap)?;
+    let reduce_function = library
+        .get_function(reduce_name, None)
+        .map_err(candle_core::Error::wrap)?;
+    let split_pipeline = device
+        .new_compute_pipeline_state_with_function(&split_function)
+        .map_err(candle_core::Error::wrap)?;
+    let reduce_pipeline = device
+        .new_compute_pipeline_state_with_function(&reduce_function)
+        .map_err(candle_core::Error::wrap)?;
+    pipelines
+        .lock()
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+        .insert(key, (split_pipeline.clone(), reduce_pipeline.clone()));
+    Ok((split_pipeline, reduce_pipeline))
 }
 
 #[cfg(feature = "metal")]
@@ -1562,7 +3437,7 @@ impl CustomOp3 for LfmShortConvDecode3Op {
         encoder.set_bytes(4, &(self.hidden_size as u32));
         encoder.set_bytes(5, &(elem_count as u32));
 
-        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().min(256).max(1);
+        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().clamp(1, 256);
         encoder.dispatch_threads(
             objc2_metal::MTLSize {
                 width: elem_count,
@@ -1685,7 +3560,7 @@ impl CustomOp2 for LfmShortConvUpdate3Op {
         encoder.set_bytes(3, &(self.hidden_size as u32));
         encoder.set_bytes(4, &(elem_count as u32));
 
-        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().min(256).max(1);
+        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().clamp(1, 256);
         encoder.dispatch_threads(
             objc2_metal::MTLSize {
                 width: elem_count,
@@ -1811,7 +3686,7 @@ impl CustomOp2 for LfmShortConvSequence3Op {
         encoder.set_bytes(4, &(self.seq_len as u32));
         encoder.set_bytes(5, &(elem_count as u32));
 
-        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().min(256).max(1);
+        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().clamp(1, 256);
         encoder.dispatch_threads(
             objc2_metal::MTLSize {
                 width: elem_count,
@@ -1864,6 +3739,165 @@ fn lfm_shortconv_sequence3_pipeline(device: &MetalDevice) -> CandleResult<Comput
         .map_err(|err| candle_core::Error::Msg(err.to_string()))?
         .insert(registry_id, pipeline.clone());
 
+    Ok(pipeline)
+}
+
+#[cfg(feature = "metal")]
+impl CustomOp3 for LfmShortConvRingOp {
+    fn name(&self) -> &'static str {
+        "izwi-lfm-shortconv-ring-metal"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _ring: &CpuStorage,
+        _ring_layout: &Layout,
+        _input: &CpuStorage,
+        _input_layout: &Layout,
+        _weight: &CpuStorage,
+        _weight_layout: &Layout,
+    ) -> CandleResult<(CpuStorage, Shape)> {
+        bail!("izwi-lfm-shortconv-ring-metal requires Metal tensors")
+    }
+
+    fn metal_fwd(
+        &self,
+        ring_storage: &MetalStorage,
+        ring_layout: &Layout,
+        input_storage: &MetalStorage,
+        input_layout: &Layout,
+        weight_storage: &MetalStorage,
+        weight_layout: &Layout,
+    ) -> CandleResult<(MetalStorage, Shape)> {
+        if ring_storage.dtype() != DType::F32
+            || input_storage.dtype() != DType::F32
+            || weight_storage.dtype() != DType::F32
+        {
+            bail!("izwi-lfm-shortconv-ring-metal only supports F32 tensors")
+        }
+        if !ring_layout.is_contiguous()
+            || !input_layout.is_contiguous()
+            || !weight_layout.is_contiguous()
+        {
+            bail!("izwi-lfm-shortconv-ring-metal requires contiguous tensors")
+        }
+        if self.batch_size == 0
+            || self.hidden_size == 0
+            || self.steps == 0
+            || self.capacity == 0
+            || self.valid_length > self.capacity as u64
+            || self.valid_length > self.expected_cursor
+        {
+            bail!("izwi-lfm-shortconv-ring-metal received invalid geometry")
+        }
+        let elem_count = self
+            .batch_size
+            .checked_mul(self.hidden_size)
+            .and_then(|value| value.checked_mul(self.steps))
+            .ok_or_else(|| {
+                candle_core::Error::Msg("izwi-lfm-shortconv-ring-metal output overflow".to_string())
+            })?;
+        if ring_layout.shape().elem_count()
+            != self
+                .capacity
+                .saturating_mul(self.batch_size)
+                .saturating_mul(self.hidden_size)
+            || input_layout.shape().elem_count() != elem_count
+            || weight_layout.shape().elem_count() != self.hidden_size.saturating_mul(self.capacity)
+        {
+            bail!("izwi-lfm-shortconv-ring-metal input shape mismatch")
+        }
+        if [
+            self.batch_size,
+            self.hidden_size,
+            self.steps,
+            self.capacity,
+            elem_count,
+        ]
+        .into_iter()
+        .any(|value| value > u32::MAX as usize)
+        {
+            bail!("izwi-lfm-shortconv-ring-metal tensor is too large")
+        }
+
+        let device = ring_storage.device().clone();
+        let output = device.new_buffer(elem_count, DType::F32, "izwi-lfm-shortconv-ring")?;
+        let encoder = device.command_encoder()?;
+        encoder.set_label("izwi-lfm-shortconv-ring");
+        let pipeline = lfm_shortconv_ring_pipeline(device.metal_device())?;
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_input_buffer(
+            0,
+            Some(ring_storage.buffer()),
+            ring_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_input_buffer(
+            1,
+            Some(input_storage.buffer()),
+            input_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_input_buffer(
+            2,
+            Some(weight_storage.buffer()),
+            weight_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_output_buffer(3, Some(&output), 0);
+        encoder.set_bytes(4, &(self.batch_size as u32));
+        encoder.set_bytes(5, &(self.hidden_size as u32));
+        encoder.set_bytes(6, &(self.steps as u32));
+        encoder.set_bytes(7, &(self.capacity as u32));
+        encoder.set_bytes(8, &self.expected_cursor);
+        encoder.set_bytes(9, &self.valid_length);
+        encoder.set_bytes(10, &(elem_count as u32));
+
+        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().clamp(1, 256);
+        encoder.dispatch_threads(
+            objc2_metal::MTLSize {
+                width: elem_count,
+                height: 1,
+                depth: 1,
+            },
+            objc2_metal::MTLSize {
+                width: threads_per_threadgroup,
+                height: 1,
+                depth: 1,
+            },
+        );
+        drop(encoder);
+
+        Ok((
+            MetalStorage::new(output, device, elem_count, DType::F32),
+            Shape::from((self.batch_size, self.hidden_size, self.steps)),
+        ))
+    }
+}
+
+#[cfg(feature = "metal")]
+fn lfm_shortconv_ring_pipeline(device: &MetalDevice) -> CandleResult<ComputePipeline> {
+    static PIPELINES: OnceLock<Mutex<HashMap<u64, ComputePipeline>>> = OnceLock::new();
+    let registry_id = device.registry_id();
+    let pipelines = PIPELINES.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(pipeline) = pipelines
+        .lock()
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+        .get(&registry_id)
+        .cloned()
+    {
+        return Ok(pipeline);
+    }
+    let library = device
+        .new_library_with_source(IZWI_METAL_SOURCE, None)
+        .map_err(candle_core::Error::wrap)?;
+    let function = library
+        .get_function("izwi_lfm_shortconv_ring_f32", None)
+        .map_err(candle_core::Error::wrap)?;
+    let pipeline = device
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(candle_core::Error::wrap)?;
+    pipelines
+        .lock()
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+        .insert(registry_id, pipeline.clone());
     Ok(pipeline)
 }
 
@@ -1980,7 +4014,7 @@ impl CustomOp3 for Qwen35CausalConvSequenceOp {
         encoder.set_bytes(7, &(output_elem_count as u32));
         encoder.set_bytes(8, &(total_elem_count as u32));
 
-        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().min(256).max(1);
+        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().clamp(1, 256);
         encoder.dispatch_threads(
             objc2_metal::MTLSize {
                 width: total_elem_count,
@@ -2048,6 +4082,20 @@ struct Qwen35GatedDeltaSequenceOp {
 }
 
 #[cfg(feature = "metal")]
+fn qwen35_gated_delta_tiled_layout_supported(
+    num_k_heads: usize,
+    num_v_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+) -> bool {
+    num_k_heads == 16
+        && matches!(num_v_heads, 16 | 32)
+        && num_v_heads.is_multiple_of(num_k_heads)
+        && head_k_dim > 0
+        && (1..=256).contains(&head_v_dim)
+}
+
+#[cfg(feature = "metal")]
 impl CustomOp3 for Qwen35GatedDeltaSequenceOp {
     fn name(&self) -> &'static str {
         "izwi-qwen35-gated-delta-sequence-metal"
@@ -2088,12 +4136,12 @@ impl CustomOp3 for Qwen35GatedDeltaSequenceOp {
         }
         if self.seq_len == 0
             || self.tile_size == 0
-            || self.num_k_heads != 16
-            || !matches!(self.num_v_heads, 16 | 32)
-            || self.num_v_heads % self.num_k_heads != 0
-            || self.head_k_dim == 0
-            || self.head_v_dim == 0
-            || self.head_v_dim > 256
+            || !qwen35_gated_delta_tiled_layout_supported(
+                self.num_k_heads,
+                self.num_v_heads,
+                self.head_k_dim,
+                self.head_v_dim,
+            )
         {
             bail!(
                 "izwi-qwen35-gated-delta-sequence-metal requires Qwen3.5 16K/16V or 16K/32V non-empty heads with head_v_dim <= 256"
@@ -2199,8 +4247,7 @@ impl CustomOp3 for Qwen35GatedDeltaSequenceOp {
             .head_v_dim
             .next_power_of_two()
             .min(pipeline.max_total_threads_per_threadgroup())
-            .min(256)
-            .max(1);
+            .clamp(1, 256);
         let threadgroups = objc2_metal::MTLSize {
             width: self.num_v_heads,
             height: 1,
@@ -2705,7 +4752,7 @@ pub fn try_fused_decode_gqa_attention_with_kv_len(
             || kv_len > 2048
             || num_heads == 0
             || num_kv_heads == 0
-            || num_heads % num_kv_heads != 0
+            || !num_heads.is_multiple_of(num_kv_heads)
             || head_dim == 0
             || !q.device().is_metal()
             || !k.device().is_metal()
@@ -2739,6 +4786,97 @@ pub fn try_fused_decode_gqa_attention_with_kv_len(
 
     #[allow(unreachable_code)]
     None
+}
+
+/// Dispatch one decode token per row directly against page-major arena K/V.
+///
+/// `metadata` is `[context_lens..., first_page_offsets...,
+/// padded_block_table...]`. The Metal kernel
+/// resolves each logical token to a physical page while applying online
+/// softmax, so this path never gathers pages or expands grouped-query heads.
+#[cfg(feature = "metal")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn paged_decode_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    metadata: Vec<u32>,
+    device_metadata: &Tensor,
+    batch_size: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    page_tokens: usize,
+    max_blocks: usize,
+    key_head_dim: usize,
+    value_head_dim: usize,
+    scale: f32,
+    softcap: Option<f32>,
+) -> CandleResult<Tensor> {
+    q.apply_op3_no_bwd(
+        k,
+        v,
+        &PagedDecodeAttentionOp {
+            metadata,
+            device_metadata: device_metadata.clone(),
+            batch_size,
+            num_heads,
+            num_kv_heads,
+            page_tokens,
+            max_blocks,
+            key_head_dim,
+            value_head_dim,
+            scale,
+            softcap,
+        },
+    )
+}
+
+/// Dispatch a packed ragged prefill directly against page-major arena K/V.
+///
+/// `metadata` is compact per sequence rather than expanded per query:
+/// `[query_starts..., query_lens..., context_lens..., first_page_offsets...,
+/// padded_block_table...]`. Dispatch appends a direct query-to-sequence map so
+/// shaders avoid scanning ragged sequence boundaries. Each query derives its
+/// causal visible context in the shader. Long, low-occupancy rows are split
+/// into bounded online-softmax partitions and merged in F32; the conservative
+/// crossover remains a candidate for hardware-backed promotion tuning.
+#[cfg(feature = "metal")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn paged_prefill_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    metadata: Vec<u32>,
+    sequence_count: usize,
+    total_queries: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    page_tokens: usize,
+    max_blocks: usize,
+    key_head_dim: usize,
+    value_head_dim: usize,
+    scale: f32,
+    softcap: Option<f32>,
+    window_tokens: Option<u32>,
+) -> CandleResult<Tensor> {
+    q.apply_op3_no_bwd(
+        k,
+        v,
+        &PagedPrefillAttentionOp {
+            metadata,
+            sequence_count,
+            total_queries,
+            num_heads,
+            num_kv_heads,
+            page_tokens,
+            max_blocks,
+            key_head_dim,
+            value_head_dim,
+            scale,
+            softcap,
+            window_tokens,
+        },
+    )
 }
 
 pub fn try_lfm_shortconv_decode3(cache: &Tensor, bx: &Tensor, conv: &Tensor) -> Option<Tensor> {
@@ -2872,10 +5010,92 @@ pub fn try_lfm_shortconv_sequence3(bx: &Tensor, conv: &Tensor) -> Option<Tensor>
     None
 }
 
+pub fn try_lfm_shortconv_ring_sequence(
+    ring: &Tensor,
+    input: &Tensor,
+    weight: &Tensor,
+    expected_cursor: u64,
+    valid_length: u64,
+) -> Option<Tensor> {
+    #[cfg(not(feature = "metal"))]
+    let _ = (ring, input, weight, expected_cursor, valid_length);
+
+    if !use_fused_kernels() {
+        return None;
+    }
+
+    #[cfg(feature = "metal")]
+    {
+        let (capacity, batch_size, hidden_size) = ring.dims3().ok()?;
+        let (input_batch, input_hidden, steps) = input.dims3().ok()?;
+        let (weight_hidden, weight_capacity) = weight.dims2().ok()?;
+        if capacity == 0
+            || batch_size == 0
+            || hidden_size == 0
+            || steps == 0
+            || input_batch != batch_size
+            || input_hidden != hidden_size
+            || weight_hidden != hidden_size
+            || weight_capacity != capacity
+            || valid_length > capacity as u64
+            || valid_length > expected_cursor
+            || !ring.device().is_metal()
+            || !input.device().is_metal()
+            || !weight.device().is_metal()
+            || !ring.device().same_device(input.device())
+            || !ring.device().same_device(weight.device())
+            || ring.dtype() != DType::F32
+            || input.dtype() != DType::F32
+            || weight.dtype() != DType::F32
+            || !ring.is_contiguous()
+            || !input.is_contiguous()
+            || !weight.is_contiguous()
+        {
+            return None;
+        }
+        return ring
+            .apply_op3_no_bwd(
+                input,
+                weight,
+                &LfmShortConvRingOp {
+                    batch_size,
+                    hidden_size,
+                    steps,
+                    capacity,
+                    expected_cursor,
+                    valid_length,
+                },
+            )
+            .ok();
+    }
+
+    #[allow(unreachable_code)]
+    None
+}
+
 /// Run Qwen3.5's stateful causal depthwise-convolution sequence path in one
 /// Metal dispatch. Inputs use token-major `[1, sequence, channels]` layout;
 /// history is `[channels, kernel_size - 1]` in oldest-to-newest order.
 pub fn try_qwen35_causal_conv_sequence(
+    input: &Tensor,
+    weight: &Tensor,
+    history: &Tensor,
+) -> Option<(Tensor, Tensor)> {
+    try_qwen_hybrid_causal_conv_sequence(input, weight, history)
+}
+
+/// Run Qwen3.8's independently routed causal depthwise-convolution sequence
+/// path. The entry point is intentionally separate so Qwen3.8 kernel policy
+/// and specialization can evolve without changing Qwen3.5 dispatch.
+pub fn try_qwen38_causal_conv_sequence(
+    input: &Tensor,
+    weight: &Tensor,
+    history: &Tensor,
+) -> Option<(Tensor, Tensor)> {
+    try_qwen_hybrid_causal_conv_sequence(input, weight, history)
+}
+
+fn try_qwen_hybrid_causal_conv_sequence(
     input: &Tensor,
     weight: &Tensor,
     history: &Tensor,
@@ -3017,19 +5237,19 @@ pub fn try_tiled_deltanet_recurrence(
             || v_seq_len != seq_len
             || g_seq_len != seq_len
             || b_seq_len != seq_len
-            || num_k_heads != 16
             || k_num_heads != num_k_heads
-            || !matches!(num_v_heads, 16 | 32)
-            || num_v_heads % num_k_heads != 0
+            || !qwen35_gated_delta_tiled_layout_supported(
+                num_k_heads,
+                num_v_heads,
+                head_k_dim,
+                head_v_dim,
+            )
             || g_heads != num_v_heads
             || b_heads != num_v_heads
             || s_heads != num_v_heads
             || k_head_k_dim != head_k_dim
             || s_head_k_dim != head_k_dim
             || s_head_v_dim != head_v_dim
-            || head_k_dim == 0
-            || head_v_dim == 0
-            || head_v_dim > 256
             || !queries.device().is_metal()
             || !keys.device().is_metal()
             || !values.device().is_metal()
@@ -3298,6 +5518,17 @@ mod tests {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     use candle_nn::Module;
 
+    #[cfg(feature = "metal")]
+    #[test]
+    fn qwen35_native_48_value_heads_remain_on_portable_recurrence() {
+        assert!(qwen35_gated_delta_tiled_layout_supported(16, 16, 128, 128));
+        assert!(qwen35_gated_delta_tiled_layout_supported(16, 32, 128, 128));
+        // The current shader indexes converted-GGUF tiled heads with
+        // `value_head % key_heads`. Native Qwen3.8 uses repeat-interleave head
+        // ordering, so its 16K/48V geometry must stay on the portable path.
+        assert!(!qwen35_gated_delta_tiled_layout_supported(16, 48, 128, 128));
+    }
+
     fn qwen35_causal_conv_reference(
         input: &[f32],
         weight: &[f32],
@@ -3409,6 +5640,14 @@ mod tests {
         }
     }
 
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    fn metal_test_device() -> Option<Device> {
+        static DEVICE: std::sync::OnceLock<Option<Device>> = std::sync::OnceLock::new();
+        DEVICE
+            .get_or_init(|| crate::backends::metal_device_if_available(0))
+            .clone()
+    }
+
     #[test]
     fn test_l2_norm_matches_reference() {
         let device = Device::Cpu;
@@ -3417,10 +5656,7 @@ mod tests {
         // Reference implementation
         let sq_sum: f32 = [1.0f32, 2.0, 3.0, 4.0].iter().map(|x| x * x).sum();
         let norm = sq_sum.sqrt();
-        let expected = vec![
-            vec![1.0f32 / norm, 2.0 / norm],
-            vec![3.0 / norm, 4.0 / norm],
-        ];
+        let expected = [[1.0f32 / norm, 2.0 / norm], [3.0 / norm, 4.0 / norm]];
 
         // Fused implementation (falls back to CPU for non-Metal)
         let eps = 1e-6;
@@ -3458,7 +5694,7 @@ mod tests {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     #[test]
     fn metal_silu_mul_kernel_matches_reference_if_available() {
-        let Ok(device) = Device::new_metal(0) else {
+        let Some(device) = metal_test_device() else {
             return;
         };
         for dtype in [DType::F32, DType::F16] {
@@ -3497,6 +5733,470 @@ mod tests {
                     "{dtype:?} mismatch at {idx}: {actual} != {expected}"
                 );
             }
+        }
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn metal_one_pass_paged_attention_softcap_matches_reference_if_available() {
+        let Some(device) = metal_test_device() else {
+            return;
+        };
+        let cpu = Device::Cpu;
+        let query_data = vec![2.0f32, -1.0];
+        let key_data = vec![4.0f32, 0.0, 0.0, 2.0];
+        let value_data = vec![1.0f32, 3.0, 5.0, -2.0];
+        let metadata = vec![2, 0, 0];
+        let device_metadata = Tensor::from_vec(metadata.clone(), metadata.len(), &device).unwrap();
+
+        for dtype in [DType::F32, DType::F16] {
+            let query = Tensor::from_vec(query_data.clone(), (1, 1, 2), &device)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let keys = Tensor::from_vec(key_data.clone(), (1, 2, 1, 2), &device)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let values = Tensor::from_vec(value_data.clone(), (1, 2, 1, 2), &device)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            for softcap in [None, Some(0.5f32)] {
+                let actual = paged_decode_attention(
+                    &query,
+                    &keys,
+                    &values,
+                    metadata.clone(),
+                    &device_metadata,
+                    1,
+                    1,
+                    1,
+                    2,
+                    1,
+                    2,
+                    2,
+                    1.0,
+                    softcap,
+                )
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_device(&cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+                let scores = [8.0f32, -2.0]
+                    .map(|score| softcap.map_or(score, |cap| cap * (score / cap).tanh()));
+                let max_score = scores[0].max(scores[1]);
+                let weights = scores.map(|score| (score - max_score).exp());
+                let denominator = weights[0] + weights[1];
+                let expected = [
+                    (weights[0] * 1.0 + weights[1] * 5.0) / denominator,
+                    (weights[0] * 3.0 + weights[1] * -2.0) / denominator,
+                ];
+                let tolerance = if dtype == DType::F16 { 5e-3 } else { 1e-5 };
+                assert_f32_close(&actual, &expected, tolerance, "one-pass paged attention");
+            }
+        }
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn metal_split_paged_attention_matches_online_reference_if_available() {
+        let Some(device) = metal_test_device() else {
+            return;
+        };
+        let cpu = Device::Cpu;
+        let context_len = METAL_PAGED_ATTENTION_SPLIT_MIN_CONTEXT + 1;
+        let page_tokens = 16usize;
+        let page_count = context_len.div_ceil(page_tokens);
+        let head_dim = 4usize;
+        let padded_tokens = page_count * page_tokens;
+        let query_data = vec![0.25f32, -0.5, 0.75, 1.0];
+        let key_data = (0..padded_tokens * head_dim)
+            .map(|index| ((index % 37) as f32 - 18.0) / 19.0)
+            .collect::<Vec<_>>();
+        let value_data = (0..padded_tokens * head_dim)
+            .map(|index| ((index % 29) as f32 - 14.0) / 11.0)
+            .collect::<Vec<_>>();
+
+        for dtype in [DType::F32, DType::F16] {
+            let query = Tensor::from_vec(query_data.clone(), (1, 1, head_dim), &device)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let keys = Tensor::from_vec(
+                key_data.clone(),
+                (page_count, page_tokens, 1, head_dim),
+                &device,
+            )
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+            let values = Tensor::from_vec(
+                value_data.clone(),
+                (page_count, page_tokens, 1, head_dim),
+                &device,
+            )
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+
+            let mut metadata = Vec::with_capacity(2 + page_count);
+            metadata.push(context_len as u32);
+            metadata.push(0);
+            metadata.extend((0..page_count).map(|page| page as u32));
+            let device_metadata =
+                Tensor::from_vec(metadata.clone(), metadata.len(), &device).unwrap();
+            let actual = paged_decode_attention(
+                &query,
+                &keys,
+                &values,
+                metadata,
+                &device_metadata,
+                1,
+                1,
+                1,
+                page_tokens,
+                page_count,
+                head_dim,
+                head_dim,
+                0.5,
+                Some(0.7),
+            )
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_device(&cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+            let query_reference = query
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_device(&cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let key_reference = keys
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_device(&cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let value_reference = values
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_device(&cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let mut max_score = f32::NEG_INFINITY;
+            let mut scores = Vec::with_capacity(context_len);
+            for token in 0..context_len {
+                let base = token * head_dim;
+                let raw_score = (0..head_dim)
+                    .map(|dim| query_reference[dim] * key_reference[base + dim])
+                    .sum::<f32>()
+                    * 0.5;
+                let score = 0.7 * (raw_score / 0.7).tanh();
+                max_score = max_score.max(score);
+                scores.push(score);
+            }
+            let denominator = scores
+                .iter()
+                .map(|score| (*score - max_score).exp())
+                .sum::<f32>();
+            let mut expected = vec![0.0f32; head_dim];
+            for (token, score) in scores.iter().enumerate() {
+                let probability = (*score - max_score).exp() / denominator;
+                let base = token * head_dim;
+                for dim in 0..head_dim {
+                    expected[dim] += probability * value_reference[base + dim];
+                }
+            }
+            let tolerance = if dtype == DType::F16 { 2e-3 } else { 2e-5 };
+            assert_f32_close(&actual, &expected, tolerance, "split paged attention");
+        }
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn metal_packed_varlen_prefill_matches_ragged_reference_if_available() {
+        let Some(device) = metal_test_device() else {
+            return;
+        };
+        let cpu = Device::Cpu;
+        let page_tokens = 4usize;
+        let head_dim = 2usize;
+        let query_data = vec![0.5f32, 1.0, -0.25, 0.75, 1.0, -0.5];
+        let key_data = vec![
+            9.0f32, 9.0, 0.0, 1.0, 1.0, 0.0, 0.5, 0.5, 1.0, 1.0, -1.0, 0.5, 7.0, 7.0, 8.0, 8.0,
+        ];
+        let value_data = vec![
+            9.0f32, 9.0, 1.0, 0.0, 0.0, 2.0, 3.0, 1.0, 2.0, 1.0, -1.0, 3.0, 7.0, 7.0, 8.0, 8.0,
+        ];
+        // Two compact rows: q=[0..2), final context=3, first-page offset=1;
+        // q=[2..3), final context=2, first-page offset=0.
+        let metadata = vec![0, 2, 2, 1, 3, 2, 1, 0, 0, 1];
+        let slots = [&[1usize, 2][..], &[1usize, 2, 3][..], &[4usize, 5][..]];
+
+        for dtype in [DType::F32, DType::F16] {
+            let queries = Tensor::from_vec(query_data.clone(), (3, 1, head_dim), &device)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let keys = Tensor::from_vec(key_data.clone(), (2, page_tokens, 1, head_dim), &device)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let values =
+                Tensor::from_vec(value_data.clone(), (2, page_tokens, 1, head_dim), &device)
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap();
+            let actual = paged_prefill_attention(
+                &queries,
+                &keys,
+                &values,
+                metadata.clone(),
+                2,
+                3,
+                1,
+                1,
+                page_tokens,
+                1,
+                head_dim,
+                head_dim,
+                1.0,
+                Some(0.75),
+                Some(2),
+            )
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_device(&cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+            let queries = queries
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_device(&cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let keys = keys
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_device(&cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let values = values
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_device(&cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let mut expected = Vec::with_capacity(3 * head_dim);
+            for query_index in 0..3 {
+                let q_base = query_index * head_dim;
+                let visible_slots = slots[query_index];
+                let visible_slots = &visible_slots[visible_slots.len().saturating_sub(2)..];
+                let mut scores = Vec::with_capacity(visible_slots.len());
+                let mut max_score = f32::NEG_INFINITY;
+                for &slot in visible_slots {
+                    let k_base = slot * head_dim;
+                    let raw_score = (0..head_dim)
+                        .map(|dim| queries[q_base + dim] * keys[k_base + dim])
+                        .sum::<f32>();
+                    let score = 0.75 * (raw_score / 0.75).tanh();
+                    max_score = max_score.max(score);
+                    scores.push(score);
+                }
+                let denominator = scores
+                    .iter()
+                    .map(|score| (*score - max_score).exp())
+                    .sum::<f32>();
+                for dim in 0..head_dim {
+                    let value = scores
+                        .iter()
+                        .zip(visible_slots)
+                        .map(|(score, slot)| {
+                            ((*score - max_score).exp() / denominator)
+                                * values[slot * head_dim + dim]
+                        })
+                        .sum::<f32>();
+                    expected.push(value);
+                }
+            }
+            let tolerance = if dtype == DType::F16 { 2e-3 } else { 2e-5 };
+            assert_f32_close(&actual, &expected, tolerance, "packed paged prefill");
+        }
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn metal_split_packed_prefill_matches_asymmetric_gqa_reference_if_available() {
+        let Some(device) = metal_test_device() else {
+            return;
+        };
+        let cpu = Device::Cpu;
+        let page_tokens = 64usize;
+        let context_len = METAL_PAGED_PREFILL_SPLIT_MIN_CONTEXT + 1;
+        let first_page_offset = 1usize;
+        let page_count = (context_len + first_page_offset).div_ceil(page_tokens);
+        let num_heads = 2usize;
+        let key_head_dim = 2usize;
+        let value_head_dim = 3usize;
+        let query_data = vec![0.5f32, -0.25, -0.125, 0.75];
+        let mut key_data = vec![0.0f32; page_count * page_tokens * key_head_dim];
+        let mut value_data = vec![0.0f32; page_count * page_tokens * value_head_dim];
+        for slot in 0..page_count * page_tokens {
+            key_data[slot * key_head_dim] = ((slot % 17) as f32 - 8.0) / 9.0;
+            key_data[slot * key_head_dim + 1] = ((slot % 13) as f32 - 6.0) / 7.0;
+            for dim in 0..value_head_dim {
+                value_data[slot * value_head_dim + dim] =
+                    ((slot * (dim + 3) % 29) as f32 - 14.0) / 11.0;
+            }
+        }
+        let mut metadata = Vec::with_capacity(4 + page_count);
+        metadata.extend([0, 1, context_len as u32, first_page_offset as u32]);
+        metadata.extend((0..page_count).map(|page| page as u32));
+
+        for dtype in [DType::F32, DType::F16] {
+            let queries =
+                Tensor::from_vec(query_data.clone(), (1, num_heads, key_head_dim), &device)
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap();
+            let keys = Tensor::from_vec(
+                key_data.clone(),
+                (page_count, page_tokens, 1, key_head_dim),
+                &device,
+            )
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+            let values = Tensor::from_vec(
+                value_data.clone(),
+                (page_count, page_tokens, 1, value_head_dim),
+                &device,
+            )
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+            let actual = paged_prefill_attention(
+                &queries,
+                &keys,
+                &values,
+                metadata.clone(),
+                1,
+                1,
+                num_heads,
+                1,
+                page_tokens,
+                page_count,
+                key_head_dim,
+                value_head_dim,
+                0.5,
+                Some(0.8),
+                None,
+            )
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_device(&cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+            let queries = queries
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_device(&cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let keys = keys
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_device(&cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let values = values
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_device(&cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let mut expected = Vec::with_capacity(num_heads * value_head_dim);
+            for head in 0..num_heads {
+                let q_base = head * key_head_dim;
+                let mut scores = Vec::with_capacity(context_len);
+                let mut max_score = f32::NEG_INFINITY;
+                for token in 0..context_len {
+                    let slot = first_page_offset + token;
+                    let k_base = slot * key_head_dim;
+                    let raw_score = (0..key_head_dim)
+                        .map(|dim| queries[q_base + dim] * keys[k_base + dim])
+                        .sum::<f32>()
+                        * 0.5;
+                    let score = 0.8 * (raw_score / 0.8).tanh();
+                    max_score = max_score.max(score);
+                    scores.push(score);
+                }
+                let denominator = scores
+                    .iter()
+                    .map(|score| (*score - max_score).exp())
+                    .sum::<f32>();
+                for dim in 0..value_head_dim {
+                    let value = scores
+                        .iter()
+                        .enumerate()
+                        .map(|(token, score)| {
+                            let slot = first_page_offset + token;
+                            ((*score - max_score).exp() / denominator)
+                                * values[slot * value_head_dim + dim]
+                        })
+                        .sum::<f32>();
+                    expected.push(value);
+                }
+            }
+            let tolerance = if dtype == DType::F16 { 4e-3 } else { 5e-5 };
+            assert_f32_close(&actual, &expected, tolerance, "split packed paged prefill");
         }
     }
 
@@ -3591,7 +6291,7 @@ mod tests {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     #[test]
     fn metal_qwen35_causal_conv_sequence_matches_cpu_reference_if_available() {
-        let Ok(Ok(device)) = std::panic::catch_unwind(|| Device::new_metal(0)) else {
+        let Some(device) = metal_test_device() else {
             return;
         };
         let seq_len = 2;
@@ -3635,7 +6335,7 @@ mod tests {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     #[test]
     fn metal_qwen35_gated_delta_matches_cpu_reference_for_both_layouts_if_available() {
-        let Ok(Ok(device)) = std::panic::catch_unwind(|| Device::new_metal(0)) else {
+        let Some(device) = metal_test_device() else {
             return;
         };
         // Cross several tile boundaries so the test also verifies that each
@@ -3722,7 +6422,7 @@ mod tests {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     #[test]
     fn metal_qwen35_gated_delta_rejects_invalid_dtype_and_head_layout_if_available() {
-        let Ok(Ok(device)) = std::panic::catch_unwind(|| Device::new_metal(0)) else {
+        let Some(device) = metal_test_device() else {
             return;
         };
         let query = Tensor::zeros((1, 2, 16, 2), DType::F32, &device).unwrap();
@@ -3764,7 +6464,7 @@ mod tests {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     #[test]
     fn metal_lfm_shortconv_decode3_matches_reference_if_available() {
-        let Ok(device) = Device::new_metal(0) else {
+        let Some(device) = metal_test_device() else {
             return;
         };
         let cache = Tensor::from_vec(
@@ -3790,9 +6490,9 @@ mod tests {
         let out = try_lfm_shortconv_decode3(&cache, &bx, &conv)
             .expect("shortconv decode3 should run on Metal");
         let actual = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let expected = vec![
+        let expected = [
             2.0 * 0.5 + 3.0 * 1.5 + 7.0 * 2.5,
-            5.0 * -1.0 + 6.0 * 0.25 + 8.0 * 0.75,
+            -5.0 + 6.0 * 0.25 + 8.0 * 0.75,
         ];
         for (idx, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
             assert!(
@@ -3805,7 +6505,7 @@ mod tests {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     #[test]
     fn metal_lfm_shortconv_update3_matches_reference_if_available() {
-        let Ok(device) = Device::new_metal(0) else {
+        let Some(device) = metal_test_device() else {
             return;
         };
         let cache = Tensor::from_vec(
@@ -3833,7 +6533,7 @@ mod tests {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     #[test]
     fn metal_lfm_shortconv_sequence3_matches_reference_if_available() {
-        let Ok(device) = Device::new_metal(0) else {
+        let Some(device) = metal_test_device() else {
             return;
         };
         let bx = Tensor::from_vec(
@@ -3879,8 +6579,44 @@ mod tests {
 
     #[cfg(all(feature = "metal", target_os = "macos"))]
     #[test]
+    fn metal_lfm_shortconv_consumes_wrapped_physical_ring() {
+        let Some(device) = metal_test_device() else {
+            return;
+        };
+        let ring = Tensor::from_vec(
+            vec![
+                12.0f32, 22.0, // physical slot 0 = absolute step 3
+                10.0, 20.0, // physical slot 1 = absolute step 1
+                11.0, 21.0, // physical slot 2 = absolute step 2
+            ],
+            (3, 1, 2),
+            &device,
+        )
+        .unwrap();
+        let input = Tensor::from_vec(vec![13.0f32, 14.0, 23.0, 24.0], (1, 2, 2), &device).unwrap();
+        let weight =
+            Tensor::from_vec(vec![1.0f32, 10.0, 100.0, -1.0, 0.5, 2.0], (2, 3), &device).unwrap();
+        let output = try_lfm_shortconv_ring_sequence(&ring, &input, &weight, 4, 3)
+            .expect("physical ShortConv ring kernel should run on Metal");
+        let actual = output.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let expected = [
+            11.0 + 12.0 * 10.0 + 13.0 * 100.0,
+            12.0 + 13.0 * 10.0 + 14.0 * 100.0,
+            -21.0 + 22.0 * 0.5 + 23.0 * 2.0,
+            -22.0 + 23.0 * 0.5 + 24.0 * 2.0,
+        ];
+        for (index, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 1e-5,
+                "physical ShortConv mismatch at {index}: {actual} != {expected}"
+            );
+        }
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
     fn metal_rms_norm_kernel_matches_reference_if_available() {
-        let Ok(device) = Device::new_metal(0) else {
+        let Some(device) = metal_test_device() else {
             return;
         };
         for dtype in [DType::F32, DType::F16] {
@@ -3931,7 +6667,7 @@ mod tests {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     #[test]
     fn metal_rope_pair_bshd_kernel_matches_reference_if_available() {
-        let Ok(device) = Device::new_metal(0) else {
+        let Some(device) = metal_test_device() else {
             return;
         };
         for dtype in [DType::F32, DType::F16] {
@@ -4039,7 +6775,7 @@ mod tests {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     #[test]
     fn metal_decode_gqa_attention_kernel_matches_reference_if_available() {
-        let Ok(device) = Device::new_metal(0) else {
+        let Some(device) = metal_test_device() else {
             return;
         };
         for dtype in [DType::F32, DType::F16] {
@@ -4167,7 +6903,7 @@ mod tests {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     #[test]
     fn metal_qk_rms_norm_kernel_matches_reference_if_available() {
-        let Ok(device) = Device::new_metal(0) else {
+        let Some(device) = metal_test_device() else {
             return;
         };
         for dtype in [DType::F32, DType::F16] {

@@ -319,11 +319,7 @@ fn map_observation(row: &QueryResult) -> anyhow::Result<VoiceObservation> {
 }
 
 fn sanitize_category(raw: &str) -> String {
-    let normalized = raw
-        .trim()
-        .to_lowercase()
-        .replace('_', " ")
-        .replace('-', " ");
+    let normalized = raw.trim().to_lowercase().replace(['_', '-'], " ");
     let simplified = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
     if simplified.is_empty() {
         "general".to_string()

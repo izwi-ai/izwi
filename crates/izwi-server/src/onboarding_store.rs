@@ -112,7 +112,11 @@ fn model_to_state(model: Option<onboarding_state::Model>) -> OnboardingState {
 }
 
 fn i64_to_u64(value: i64) -> Option<u64> {
-    if value > 0 { Some(value as u64) } else { None }
+    if value > 0 {
+        Some(value as u64)
+    } else {
+        None
+    }
 }
 
 fn current_timestamp() -> u64 {
@@ -123,7 +127,11 @@ fn current_timestamp() -> u64 {
 }
 
 fn bool_to_i64(value: bool) -> i64 {
-    if value { 1 } else { 0 }
+    if value {
+        1
+    } else {
+        0
+    }
 }
 
 fn i64_to_bool(value: i64) -> bool {

@@ -25,13 +25,14 @@
 //! ```
 
 mod cache;
+#[cfg(test)]
+pub(crate) use cache::managed::{plan_managed_state_capacity, ManagedStateCapacityRequest};
 mod config;
 mod core;
 pub mod execution;
 mod execution_group;
 mod executor;
-mod kv_cache;
-mod metal_kv_cache;
+pub(crate) use executor::{decode_request_audio_with_rate, qwen3_asr_requires_long_form};
 pub mod metrics;
 mod output;
 mod request;
@@ -40,56 +41,124 @@ mod scheduler;
 pub mod signal_frontend;
 mod types;
 
+#[allow(unused_imports)]
+pub(crate) use cache::invocation::{
+    InvocationPagedKvCompletion, InvocationPagedKvLease, InvocationPagedKvPoolHandle,
+    InvocationPagedKvPoolId, InvocationPagedKvPoolOwner, InvocationPagedKvSlotRef,
+};
+#[allow(unused_imports)]
+pub(crate) use cache::invocation_tensor::{
+    InvocationStaticAttentionLease, InvocationTensorLease, InvocationTensorPoolHandle,
+    InvocationTensorPoolId, InvocationTensorPoolOwner, InvocationTensorSlotRef,
+};
+
+pub(crate) use cache::composite::{
+    CompositeRetainedStateRuntimeIdV2, CompositeRetainedStateRuntimeV2,
+};
+#[cfg(test)]
+pub(crate) use cache::managed::ManagedKvCacheManager;
+pub(crate) use cache::managed::ManagedKvModelRuntime;
+pub use cache::managed::{
+    ManagedKvArenaRuntimeSnapshot, ManagedKvCoordinatorSnapshot, ManagedKvModelRuntimeSnapshot,
+    ManagedKvOperationSnapshot, ManagedKvRuntimeSnapshot, ManagedKvRuntimeTotalsSnapshot,
+};
+#[cfg(test)]
+pub(crate) use cache::physical::PhysicalStateManager;
+pub(crate) use cache::physical::{RetainedTensorStateRuntimeIdV2, RetainedTensorStateRuntimeV2};
+#[allow(unused_imports)]
+pub(crate) use cache::retained_static_attention::{
+    RetainedStaticAttentionBatchRow, RetainedStaticAttentionRuntimeIdV2,
+    RetainedStaticAttentionRuntimeV2, RetainedStaticAttentionSequenceId,
+    RetainedStaticAttentionTransactionId,
+};
+pub use cache::telemetry::ManagedKvTelemetrySnapshot;
+pub(crate) use config::resolve_backend_model_context;
+pub(crate) use config::tts_explicit_output_limit;
 pub use config::EngineCoreConfig;
 pub use core::EngineCore;
+pub(crate) use execution::{
+    continuous_asr_host_workspace_per_row_bytes, continuous_asr_workspace_per_row_bytes,
+    ClockedStateProjection,
+};
 pub use execution::{
     AdapterAbiRevision, AdapterBindingKey, AdapterInstanceId, BatchBudget, BatchDispatch,
     BatchDispatchKind, BatchId, BatchKey, BatchLaneKey, CacheMode, CancellationGranularity,
-    ConcurrencyClass, DeadlinePhase, DispatchState, ExecutionAdapterBinding, ExecutionCapabilities,
-    ExecutionDisposition, ExecutionDomain, ExecutionFailure, ExecutionGroupId, ExecutionMode,
-    ExecutionPlan, ExecutionProfile, ExecutionReport, ExecutionState, ExecutionTracker,
-    FailureKind, FailureOrigin, FailureScope, FinishReason, HealthImpact, InputRange,
-    MembershipSafePoint, ModelInstanceId, NativeBatchMode, OutcomeProvenance, OutputVisibility,
-    PhysicalBatch, PhysicalBatchReport, PhysicalBatchRowReport, PlanId, PrefillMode, ReadyQuantum,
-    RetryDisposition, SequencePhase, SessionEpoch, SessionKey, StageDescriptor, StageId,
-    StageProgressKind, StageShapePolicy, StageWorkSelector, StateDisposition, TerminalOutcome,
-    WorkCost, WorkUnit, YieldReason,
+    ClockedStateSelection, ClockedStateSpan, ConcurrencyClass, DeadlinePhase, DispatchState,
+    ExecutionAdapterBinding, ExecutionCapabilities, ExecutionDisposition, ExecutionDomain,
+    ExecutionFailure, ExecutionGroupId, ExecutionMode, ExecutionPlan, ExecutionProfile,
+    ExecutionReport, ExecutionState, ExecutionTracker, FailureKind, FailureOrigin, FailureScope,
+    FinishReason, HealthImpact, InputRange, ManagedCacheDomainReceipt,
+    ManagedCacheDomainReservation, ManagedCacheReceipt, ManagedCacheReservation,
+    ManagedClockedStateReceipt, ManagedClockedStateReservation, ManagedSessionGeneration,
+    ManagedTensorStateReservation, MembershipSafePoint, ModelInstanceId, NativeBatchMode,
+    OutcomeProvenance, OutputVisibility, PhysicalBatch, PhysicalBatchReport,
+    PhysicalBatchRowReport, PhysicalLaunchPolicy, PlanId, PrefillMode, ReadyQuantum,
+    RealtimeOperationId, RealtimePreparationMode, RealtimeStageOutcome, RealtimeSubphase,
+    RetryDisposition, SequencePhase, SequenceRestartReason, SessionEpoch, SessionKey,
+    StageDescriptor, StageId, StageProgressKind, StageShapePolicy, StageWorkSelector,
+    StateDisposition, TerminalOutcome, WorkCost, WorkUnit, YieldReason,
 };
 pub use executor::{
-    CacheReleaseReport, ExecutorOutput, ExecutorStepResult, ModelExecutor, ModelSessionResult,
-    PhysicalBatchExecution, PhysicalDispatchError, PhysicalDispatchResult, WorkerConfig,
-    REQUEST_DEADLINE_EXCEEDED,
-};
-pub use kv_cache::{
-    BlockAllocator, CacheResidency, KVCacheConfig as KVConfig, KVCacheManager, KVCacheStats,
-    PinnedBlockHandle,
+    CacheReleaseOutcome, CacheReleaseReport, ExecutorOutput, ExecutorStepResult, ModelExecutor,
+    ModelSessionResult, PhysicalBatchExecution, PhysicalDispatchError, PhysicalDispatchResult,
+    WorkerConfig, REQUEST_DEADLINE_EXCEEDED,
 };
 pub use metrics::{
-    engine_batch_metrics_snapshot, engine_metric_catalog, engine_request_parallel_batches_total,
+    engine_batch_metrics_snapshot, engine_metric_catalog,
+    engine_physical_execution_metrics_snapshot, engine_request_parallel_batches_total,
     engine_stream_backpressure_total, engine_stream_metrics_snapshot,
     engine_tensor_batch_max_width, engine_tensor_batches_total, prometheus_engine_metric_name,
     prometheus_engine_metric_type, BenchmarkResult, EngineBatchMetricsSnapshot,
     EngineDeadlinePhaseMetricsSnapshot, EngineDispatchStateMetricsSnapshot,
-    EngineFailureOriginMetricsSnapshot, EngineMetricDescriptor, EngineStreamMetricsSnapshot,
-    EngineWorkspaceDomainMetricsSnapshot, MetricsCollector, MetricsSnapshot,
-    ENGINE_EXECUTOR_BATCH_WORKSPACE_BYTES_TOTAL,
-    ENGINE_EXECUTOR_BATCH_WORKSPACE_DOMAIN_BYTES_TOTAL, ENGINE_EXECUTOR_DEADLINE_PHASE_ROWS_TOTAL,
-    ENGINE_EXECUTOR_DISPATCH_STATE_ROWS_TOTAL, ENGINE_EXECUTOR_FAILURE_ORIGIN_ROWS_TOTAL,
-    ENGINE_EXECUTOR_PHYSICAL_BATCH_REJECTIONS_TOTAL,
+    EngineDurationMetricsSnapshot, EngineFailureOriginMetricsSnapshot, EngineMetricDescriptor,
+    EnginePhysicalDeferMetricsSnapshot, EnginePhysicalDeferReason,
+    EnginePhysicalExecutionMetricsSnapshot, EnginePhysicalExecutionMode,
+    EnginePhysicalFallbackMetricsSnapshot, EnginePhysicalFallbackReason,
+    EngineStreamMetricsSnapshot, EngineWorkspaceDomainMetricsSnapshot, MetricsCollector,
+    MetricsSnapshot, ENGINE_EXECUTOR_BATCH_WORKSPACE_BYTES_TOTAL,
+    ENGINE_EXECUTOR_BATCH_WORKSPACE_DOMAIN_BYTES_TOTAL,
+    ENGINE_EXECUTOR_CONTINUOUS_ENVELOPE_SCALAR_FALLBACKS_TOTAL,
+    ENGINE_EXECUTOR_DEADLINE_PHASE_ROWS_TOTAL, ENGINE_EXECUTOR_DISPATCH_STATE_ROWS_TOTAL,
+    ENGINE_EXECUTOR_FAILURE_ORIGIN_ROWS_TOTAL, ENGINE_EXECUTOR_MODEL_DECODE_CALLS_TOTAL,
+    ENGINE_EXECUTOR_MODEL_SCALAR_ROW_DISPATCHES_TOTAL, ENGINE_EXECUTOR_MODEL_TENSOR_BATCHES_TOTAL,
+    ENGINE_EXECUTOR_MODEL_TENSOR_BATCH_MAX_WIDTH, ENGINE_EXECUTOR_MODEL_TENSOR_BATCH_ROWS_TOTAL,
+    ENGINE_EXECUTOR_MODEL_TENSOR_MULTIROW_CALLS_TOTAL, ENGINE_EXECUTOR_PHYSICAL_BATCHES_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_BATCH_CAPACITY_ROWS_TOTAL, ENGINE_EXECUTOR_PHYSICAL_BATCH_FILL_RATIO,
+    ENGINE_EXECUTOR_PHYSICAL_BATCH_MATERIALIZED_ELEMENTS_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_BATCH_MAX_WIDTH, ENGINE_EXECUTOR_PHYSICAL_BATCH_PADDING_RATIO,
+    ENGINE_EXECUTOR_PHYSICAL_BATCH_REJECTIONS_TOTAL, ENGINE_EXECUTOR_PHYSICAL_BATCH_ROWS_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_BATCH_USEFUL_ELEMENTS_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_COHORT_WAIT_OBSERVATIONS_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_COHORT_WAIT_SECONDS_MAX,
+    ENGINE_EXECUTOR_PHYSICAL_COHORT_WAIT_SECONDS_TOTAL, ENGINE_EXECUTOR_PHYSICAL_DEFERS_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_DISPATCHES_COMPLETED_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_DISPATCHES_IN_FLIGHT,
+    ENGINE_EXECUTOR_PHYSICAL_DISPATCHES_MAX_IN_FLIGHT,
+    ENGINE_EXECUTOR_PHYSICAL_DISPATCHES_STARTED_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_DISPATCH_OBSERVATIONS_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_DISPATCH_SECONDS_MAX, ENGINE_EXECUTOR_PHYSICAL_DISPATCH_SECONDS_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_EXECUTION_CAP, ENGINE_EXECUTOR_PHYSICAL_EXECUTION_MODE,
+    ENGINE_EXECUTOR_PHYSICAL_FALLBACKS_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_PERMIT_WAIT_OBSERVATIONS_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_PERMIT_WAIT_SECONDS_MAX,
+    ENGINE_EXECUTOR_PHYSICAL_PERMIT_WAIT_SECONDS_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_WORKSPACE_CURRENT_BYTES,
+    ENGINE_EXECUTOR_PHYSICAL_WORKSPACE_HIGH_WATER_BYTES,
     ENGINE_EXECUTOR_REQUEST_PARALLEL_BATCHES_TOTAL, ENGINE_EXECUTOR_TENSOR_BATCHES_TOTAL,
     ENGINE_EXECUTOR_TENSOR_BATCH_CAPACITY_ROWS_TOTAL, ENGINE_EXECUTOR_TENSOR_BATCH_FILL_RATIO,
     ENGINE_EXECUTOR_TENSOR_BATCH_MATERIALIZED_ELEMENTS_TOTAL,
     ENGINE_EXECUTOR_TENSOR_BATCH_MAX_WIDTH, ENGINE_EXECUTOR_TENSOR_BATCH_PADDING_RATIO,
     ENGINE_EXECUTOR_TENSOR_BATCH_ROWS_TOTAL, ENGINE_EXECUTOR_TENSOR_BATCH_USEFUL_ELEMENTS_TOTAL,
-    ENGINE_EXECUTOR_TENSOR_CONTINUOUS_BATCHES_TOTAL, ENGINE_EXECUTOR_TENSOR_STATIC_BATCHES_TOTAL,
-    ENGINE_KV_CACHE_ALLOCATED_BLOCKS, ENGINE_KV_CACHE_CHURN_RATIO,
-    ENGINE_KV_CACHE_COPY_ON_WRITE_SPLITS_TOTAL, ENGINE_KV_CACHE_EVICTIONS_TOTAL,
-    ENGINE_KV_CACHE_FREE_BLOCKS, ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS, ENGINE_KV_CACHE_HITS_TOTAL,
+    ENGINE_EXECUTOR_TENSOR_CONTINUOUS_BATCHES_TOTAL,
+    ENGINE_EXECUTOR_TENSOR_CONTINUOUS_MULTIROW_BATCHES_TOTAL,
+    ENGINE_EXECUTOR_TENSOR_STATIC_BATCHES_TOTAL, ENGINE_KV_CACHE_ALLOCATED_BLOCKS,
+    ENGINE_KV_CACHE_EVICTIONS_TOTAL, ENGINE_KV_CACHE_FREE_BLOCKS,
+    ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS, ENGINE_KV_CACHE_HITS_TOTAL,
     ENGINE_KV_CACHE_MEMORY_CAPACITY_BYTES, ENGINE_KV_CACHE_MEMORY_USED_BYTES,
-    ENGINE_KV_CACHE_MISSES_TOTAL, ENGINE_KV_CACHE_PINNED_BLOCKS,
-    ENGINE_KV_CACHE_PREFIX_REUSE_BLOCKS_TOTAL, ENGINE_KV_CACHE_SHARED_PREFIXES,
-    ENGINE_KV_CACHE_SOFT_MAX_BLOCKS, ENGINE_KV_CACHE_UTILIZATION_RATIO, ENGINE_METRIC_CATALOG,
-    ENGINE_SCHEDULER_PREEMPTIONS_TOTAL, ENGINE_SCHEDULER_QUEUE_DEPTH,
+    ENGINE_KV_CACHE_MISSES_TOTAL, ENGINE_KV_CACHE_UTILIZATION_RATIO, ENGINE_METRIC_CATALOG,
+    ENGINE_SCHEDULER_INCREMENTAL_PREFILL_QUANTA_COMMITTED_TOTAL,
+    ENGINE_SCHEDULER_INCREMENTAL_PREFILL_TOKENS_COMMITTED_TOTAL,
+    ENGINE_SCHEDULER_MULTISPAN_PREFILL_REQUESTS_TOTAL, ENGINE_SCHEDULER_QUEUE_DEPTH,
     ENGINE_SCHEDULER_RUNNING_REQUESTS, ENGINE_SCHEDULER_STEP_TOKENS_TOTAL,
     ENGINE_STREAM_BACKPRESSURE_TOTAL, ENGINE_STREAM_CHECKPOINTS_COMMITTED_TOTAL,
     ENGINE_STREAM_CHECKPOINT_REJECTIONS_TOTAL, ENGINE_STREAM_DELIVERY_FAILURES_TOTAL,
@@ -97,7 +166,8 @@ pub use metrics::{
 pub use output::{AsrProgress, AsrProgressPhase, OutputProcessor, StreamingOutput};
 pub use request::{
     AsrEngineInput, AudioChatEngineInput, ChatEngineInput, EngineAudioInput, EngineCoreRequest,
-    EngineStreamPolicy, EngineTask, RequestProcessor, RequestStatus, TtsEngineInput, WorkloadClass,
+    EngineStreamPolicy, EngineTask, RealtimeAsrOperationAck, RealtimeAsrOperationKind,
+    RequestProcessor, RequestStatus, TtsEngineInput, WorkloadClass,
 };
 pub use resources::{
     BatchWorkspaceLease, CapacitySource, PhysicalCapacityProvider, PhysicalCapacitySnapshot,
@@ -114,8 +184,15 @@ pub use types::{
 
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
-use crate::models::architectures::qwen35::chat::Qwen35PreparedPrompt;
-use crate::models::registry::{ChatModelLease, ModelRegistry};
+use crate::models::architectures::lfm25_audio::model::Lfm25AudioPreparedAsrArtifact;
+use crate::models::architectures::qwen3::asr::{Qwen3AsrAudioBatchRow, Qwen3AsrPreparedAudio};
+use crate::models::architectures::vibevoice::asr::{
+    VibeVoiceAsrPreparationDecision, VibeVoiceAsrPreparedArtifact,
+};
+use crate::models::architectures::whisper::asr::WhisperAudioBatchRow;
+use crate::models::registry::{
+    ChatModelLease, Lfm25AudioModelLease, ModelRegistry, NativeChatPreparedPrompt,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
@@ -130,6 +207,48 @@ struct RequestControl {
     session_epoch: SequenceId,
     cancellation: Arc<std::sync::atomic::AtomicBool>,
     model_variant: Option<ModelVariant>,
+}
+
+/// Opaque ownership fence for one exact Engine-managed realtime ASR session.
+#[derive(Debug, Clone)]
+pub(crate) struct RealtimeAsrSessionHandle {
+    session: SessionKey,
+    committed_outputs: Arc<Mutex<mpsc::Receiver<StreamingOutput>>>,
+    operation_gate: Arc<Mutex<()>>,
+}
+
+impl RealtimeAsrSessionHandle {
+    pub(crate) fn request_id(&self) -> &str {
+        &self.session.request_id
+    }
+}
+
+/// Awaitable proof that the exact realtime session has left both executor and
+/// managed-cache ownership. Dropping a receipt does not cancel Core cleanup.
+pub(crate) struct RealtimeAsrCleanupReceipt {
+    confirmation: oneshot::Receiver<Result<()>>,
+}
+
+impl RealtimeAsrCleanupReceipt {
+    pub(crate) async fn confirmed(self) -> Result<()> {
+        self.confirmation.await.map_err(|_| {
+            Error::InferenceError("Engine stopped before realtime ASR cleanup was confirmed".into())
+        })?
+    }
+}
+
+impl PartialEq for RealtimeAsrSessionHandle {
+    fn eq(&self, other: &Self) -> bool {
+        self.session == other.session
+    }
+}
+
+impl Eq for RealtimeAsrSessionHandle {}
+
+impl std::hash::Hash for RealtimeAsrSessionHandle {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.session.hash(state);
+    }
 }
 
 struct CompletionMailbox {
@@ -271,6 +390,48 @@ struct OwnedStepContext {
     completion_mailboxes: Arc<std::sync::Mutex<HashMap<RequestId, CompletionMailbox>>>,
 }
 
+struct OwnedRunnerRecoveryGuard {
+    core: Arc<RwLock<EngineCore>>,
+    recovery: Option<execution_group::PreparedStepRecovery>,
+    abort: tokio::task::AbortHandle,
+}
+
+impl OwnedRunnerRecoveryGuard {
+    async fn recover_now(&mut self) {
+        self.abort.abort();
+        let Some(recovery) = self.recovery.take() else {
+            return;
+        };
+        recovery.wait_for_task_drain().await;
+        self.core
+            .write()
+            .await
+            .rollback_in_flight_dispatches(recovery.batch_ids());
+    }
+
+    fn disarm(&mut self) {
+        self.recovery = None;
+    }
+}
+
+impl Drop for OwnedRunnerRecoveryGuard {
+    fn drop(&mut self) {
+        let Some(recovery) = self.recovery.take() else {
+            return;
+        };
+        self.abort.abort();
+        let core = self.core.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                recovery.wait_for_task_drain().await;
+                core.write()
+                    .await
+                    .rollback_in_flight_dispatches(recovery.batch_ids());
+            });
+        }
+    }
+}
+
 impl OwnedStepContext {
     fn take_completion_sender(
         &self,
@@ -309,10 +470,11 @@ impl OwnedStepContext {
     ) -> std::result::Result<executor::CommittedStreamDelivery, executor::StreamDeliveryFailure>
     {
         let session = progress.session.clone();
-        match {
+        let res = {
             let mut core = self.core.write().await;
             core.commit_incremental_stream_progress(progress)
-        } {
+        };
+        match res {
             Ok(delivery) => Ok(delivery),
             Err(error) => {
                 warn!(
@@ -361,35 +523,56 @@ impl OwnedStepContext {
     async fn execute_prepared(
         &self,
         prepared: execution_group::PreparedEngineStep,
-    ) -> Result<execution_group::ExecutedEngineStep> {
+        defer_unregistered_terminal_ack: bool,
+    ) -> Result<Vec<EngineOutput>> {
         let (progress_tx, mut progress_rx) = mpsc::channel(request::STREAM_PROGRESS_QUEUE_CAPACITY);
+        let (completion_tx, mut completion_rx) = mpsc::unbounded_channel();
         let progress_budget =
             request::StreamProgressBudget::new(request::STREAM_PROGRESS_MAX_BUFFERED_BYTES);
-        let mut runner = tokio::spawn(execution_group::ExecutionGroupRunner::execute(
-            prepared,
-            progress_tx,
-            progress_budget,
-        ));
+        let recovery = prepared.recovery();
+        let runner_registration = recovery.register_runner();
+        let mut runner = tokio::spawn(async move {
+            execution_group::ExecutionGroupRunner::execute(
+                prepared,
+                runner_registration,
+                progress_tx,
+                progress_budget,
+                Some(completion_tx),
+            )
+            .await
+        });
+        let mut recovery_guard = OwnedRunnerRecoveryGuard {
+            core: self.core.clone(),
+            recovery: Some(recovery.clone()),
+            abort: runner.abort_handle(),
+        };
         let (mut deliveries, mut delivery_failures) =
             executor::IncrementalStreamDeliveryWorkers::new();
         let mut failures = HashMap::new();
         let mut progress_closed = false;
+        let mut completion_closed = false;
         let mut delivery_failures_closed = false;
+        let mut runner_finished = false;
+        let mut fallback_batches = Vec::new();
+        let mut completed_outputs = HashMap::<BatchId, Vec<EngineOutput>>::new();
 
-        let mut executed = loop {
+        while !runner_finished || !completion_closed {
             tokio::select! {
-                result = &mut runner => {
-                    break match result {
-                        Ok(executed) => executed,
+                result = &mut runner, if !runner_finished => {
+                    match result {
+                        Ok(executed) => fallback_batches.extend(executed.batches),
                         Err(error) if error.is_panic() => {
+                            recovery_guard.recover_now().await;
                             std::panic::resume_unwind(error.into_panic())
                         }
                         Err(error) => {
+                            recovery_guard.recover_now().await;
                             return Err(Error::InferenceError(format!(
                                 "execution group task was cancelled: {error}"
                             )));
                         }
-                    };
+                    }
+                    runner_finished = true;
                 }
                 progress = progress_rx.recv(), if !progress_closed => {
                     match progress {
@@ -403,6 +586,23 @@ impl OwnedStepContext {
                         None => progress_closed = true,
                     }
                 }
+                completion = completion_rx.recv(), if !completion_closed => {
+                    match completion {
+                        Some(batch) => {
+                            let batch_id = batch.physical_batch.batch_id;
+                            let outputs = self.commit_completed_dispatch(
+                                batch,
+                                &mut progress_rx,
+                                &mut delivery_failures,
+                                &mut failures,
+                                &mut deliveries,
+                                defer_unregistered_terminal_ack,
+                            ).await?;
+                            completed_outputs.insert(batch_id, outputs);
+                        }
+                        None => completion_closed = true,
+                    }
+                }
                 failure = delivery_failures.recv(), if !delivery_failures_closed => {
                     match failure {
                         Some(failure) => self.record_stream_failure(
@@ -414,7 +614,22 @@ impl OwnedStepContext {
                     }
                 }
             }
-        };
+        }
+
+        for batch in fallback_batches {
+            let batch_id = batch.physical_batch.batch_id;
+            let outputs = self
+                .commit_completed_dispatch(
+                    batch,
+                    &mut progress_rx,
+                    &mut delivery_failures,
+                    &mut failures,
+                    &mut deliveries,
+                    defer_unregistered_terminal_ack,
+                )
+                .await?;
+            completed_outputs.insert(batch_id, outputs);
+        }
 
         while let Some(progress) = progress_rx.recv().await {
             self.enqueue_incremental_progress(progress, &mut failures, &mut deliveries)
@@ -429,45 +644,85 @@ impl OwnedStepContext {
             self.cancel_failed_stream(&failure);
             failures.entry(failure.session.clone()).or_insert(failure);
         }
-        let failures = failures.into_values().collect::<Vec<_>>();
-        executed.apply_stream_delivery_failures(&failures);
-        Ok(executed)
+
+        // An empty prepared step can still own durable terminal outbox rows.
+        let tail = {
+            let mut core = self.core.write().await;
+            core.commit_step(execution_group::ExecutedEngineStep {
+                batches: Vec::new(),
+            })
+            .await?
+        };
+        let mut tail_outputs = self
+            .deliver_and_route_committed(tail, defer_unregistered_terminal_ack)
+            .await?;
+
+        let mut outputs = Vec::new();
+        for batch_id in recovery.batch_ids() {
+            if let Some(mut batch_outputs) = completed_outputs.remove(batch_id) {
+                outputs.append(&mut batch_outputs);
+            }
+        }
+        for mut unordered in completed_outputs.into_values() {
+            outputs.append(&mut unordered);
+        }
+        outputs.append(&mut tail_outputs);
+        recovery_guard.disarm();
+        Ok(outputs)
     }
 
-    async fn run(self, defer_unregistered_terminal_ack: bool) -> Result<Vec<EngineOutput>> {
-        let _step = self.step_gate.lock().await;
-        let prepared = {
+    async fn commit_completed_dispatch(
+        &self,
+        batch: execution_group::ExecutedPhysicalBatch,
+        progress_rx: &mut mpsc::Receiver<request::FencedStreamProgress>,
+        delivery_failures: &mut mpsc::UnboundedReceiver<executor::StreamDeliveryFailure>,
+        failures: &mut HashMap<SessionKey, executor::StreamDeliveryFailure>,
+        deliveries: &mut executor::IncrementalStreamDeliveryWorkers,
+        defer_unregistered_terminal_ack: bool,
+    ) -> Result<Vec<EngineOutput>> {
+        while let Ok(progress) = progress_rx.try_recv() {
+            self.enqueue_incremental_progress(progress, failures, deliveries)
+                .await;
+        }
+        let sessions = batch
+            .results
+            .iter()
+            .map(|result| result.session.clone())
+            .collect::<HashSet<_>>();
+        for failure in deliveries.finish_sessions(&sessions).await {
+            self.record_stream_failure(failure, failures, deliveries);
+        }
+        while let Ok(failure) = delivery_failures.try_recv() {
+            self.record_stream_failure(failure, failures, deliveries);
+        }
+        let dispatch_failures = failures
+            .values()
+            .filter(|failure| sessions.contains(&failure.session))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut executed = execution_group::ExecutedEngineStep {
+            batches: vec![batch],
+        };
+        executed.apply_stream_delivery_failures(&dispatch_failures);
+        let committed = {
             let mut core = self.core.write().await;
-            core.prepare_step().await?
+            core.commit_step(executed).await?
         };
-        let executed = match prepared {
-            Some(prepared) => Some(self.execute_prepared(prepared).await?),
-            None => None,
-        };
-        let (mut outputs, stream_deliveries) = {
-            let mut core = self.core.write().await;
-            match executed {
-                Some(executed) => {
-                    let committed = core.commit_step(executed).await?;
-                    (committed.outputs, committed.stream_deliveries)
-                }
-                None => (Vec::new(), Vec::new()),
-            }
-        };
-        let failed_streams = executor::deliver_committed_streams(stream_deliveries).await;
+        self.deliver_and_route_committed(committed, defer_unregistered_terminal_ack)
+            .await
+    }
+
+    async fn deliver_and_route_committed(
+        &self,
+        committed: core::CommittedEngineStep,
+        defer_unregistered_terminal_ack: bool,
+    ) -> Result<Vec<EngineOutput>> {
+        let mut outputs = committed.outputs;
+        let failed_streams = executor::deliver_committed_streams(committed.stream_deliveries).await;
         if !failed_streams.is_empty() {
             let mut core = self.core.write().await;
             core.reconcile_stream_delivery_failures(&mut outputs, failed_streams)
                 .await;
-        }
-
-        // Keep every await before terminal dispatch. Once a completion sender
-        // is notified, routing and exact-session acknowledgement finish
-        // synchronously inside this owned transaction.
-        {
-            let mut metrics = self.metrics.write().await;
-            metrics.total_steps += 1;
-            metrics.requests_processed += outputs.len() as u64;
         }
 
         let mut core = self.core.write().await;
@@ -479,7 +734,6 @@ impl OwnedStepContext {
             } else {
                 false
             };
-
             if (routed_to_mailbox || !defer_unregistered_terminal_ack)
                 && !core.acknowledge_terminal_output(&session)
             {
@@ -489,7 +743,6 @@ impl OwnedStepContext {
                     "Terminal output had no matching delivery fence"
                 );
             }
-
             let mut controls = self
                 .request_controls
                 .lock()
@@ -501,12 +754,62 @@ impl OwnedStepContext {
                 controls.remove(&output.request_id);
             }
         }
+        Ok(outputs)
+    }
+
+    async fn run(self, defer_unregistered_terminal_ack: bool) -> Result<Vec<EngineOutput>> {
+        let _step = self.step_gate.lock().await;
+        let prepared = {
+            let mut core = self.core.write().await;
+            core.prepare_step().await?
+        };
+        let outputs = match prepared {
+            Some(prepared) => {
+                self.execute_prepared(prepared, defer_unregistered_terminal_ack)
+                    .await?
+            }
+            None => Vec::new(),
+        };
+
+        // Keep every await before terminal dispatch. Once a completion sender
+        // is notified, routing and exact-session acknowledgement finish
+        // synchronously inside this owned transaction.
+        {
+            let mut metrics = self.metrics.write().await;
+            metrics.total_steps += 1;
+            metrics.requests_processed += outputs.len() as u64;
+        }
 
         Ok(outputs)
     }
 }
 
 impl Engine {
+    fn physical_execution_telemetry_mode(
+        mode: crate::config::PhysicalExecutionMode,
+    ) -> EnginePhysicalExecutionMode {
+        match mode {
+            crate::config::PhysicalExecutionMode::Serial => EnginePhysicalExecutionMode::Serial,
+            crate::config::PhysicalExecutionMode::Shadow => EnginePhysicalExecutionMode::Shadow,
+            crate::config::PhysicalExecutionMode::Concurrent => {
+                EnginePhysicalExecutionMode::Concurrent
+            }
+        }
+    }
+
+    fn physical_execution_telemetry_policy(
+        config: &EngineCoreConfig,
+        admitted_capacity: Option<usize>,
+    ) -> (EnginePhysicalExecutionMode, usize) {
+        let capacity = config.resolved_physical_execution_capacity();
+        (
+            Self::physical_execution_telemetry_mode(config.physical_execution_mode),
+            admitted_capacity
+                .unwrap_or_else(|| capacity.physical_launch_limit.get())
+                .max(1),
+        )
+    }
+
     fn queue_capacity_from_env(key: &str) -> Option<usize> {
         std::env::var(key)
             .ok()
@@ -551,7 +854,17 @@ impl Engine {
         info!("Initializing inference engine");
 
         let model_registry = worker_config.model_registry.clone();
+        let admitted_capacity = worker_config
+            .physical_execution_admission
+            .as_ref()
+            .map(|admission| admission.capacity());
         let core = EngineCore::new_with_worker(config.clone(), worker_config)?;
+        let (physical_execution_mode, effective_physical_execution_cap) =
+            Self::physical_execution_telemetry_policy(&config, admitted_capacity);
+        metrics::set_engine_effective_physical_execution(
+            physical_execution_mode,
+            effective_physical_execution_cap,
+        );
         let request_processor = RequestProcessor::new(config.clone());
         let output_processor = OutputProcessor::new(config.sample_rate);
         let direct_request_preparation_capacity = config.max_batch_size.max(1);
@@ -662,8 +975,8 @@ impl Engine {
                 &EngineCoreRequest,
             ) -> Result<(
                 Vec<TokenId>,
-                Option<Qwen35PreparedPrompt>,
-                Option<ChatModelLease>,
+                Option<NativeChatPreparedPrompt>,
+                Option<(ChatModelLease, usize)>,
             )> + Send
             + 'static,
     {
@@ -712,20 +1025,22 @@ impl Engine {
             // running on Tokio's blocking pool.
             let _permit = permit;
             let mut request = request;
-            let (prompt_tokens, prepared_qwen35_prompt, model) = prepare(&request)?;
-            if let Some(model) = model {
+            let (prompt_tokens, prepared_chat_prompt, model) = prepare(&request)?;
+            if let Some((model, context_limit)) = model {
                 request.install_chat_execution_preparation_with_model(
                     model_variant,
                     prompt_tokens,
-                    prepared_qwen35_prompt,
+                    prepared_chat_prompt,
                     model,
+                    context_limit,
                 )?;
             } else {
                 #[cfg(test)]
                 request.install_chat_execution_preparation(
                     model_variant,
                     prompt_tokens,
-                    prepared_qwen35_prompt,
+                    prepared_chat_prompt,
+                    4096,
                 )?;
                 #[cfg(not(test))]
                 return Err(Error::InferenceError(format!(
@@ -853,6 +1168,8 @@ impl Engine {
                     .to_string(),
             )
         })?;
+        let backend = self.config.backend;
+        let configured_context_limit = self.config.max_seq_len;
 
         Self::prepare_direct_chat_request_with(
             request,
@@ -870,9 +1187,21 @@ impl Engine {
                 let model = registry.blocking_get_chat(variant).ok_or_else(|| {
                     Error::ModelNotFound(format!("Chat model {variant} is not loaded"))
                 })?;
-                let (prompt_tokens, prepared_qwen35_prompt) = model
+                let context_limit =
+                    registry
+                        .effective_context(variant)
+                        .unwrap_or(resolve_backend_model_context(
+                            backend,
+                            configured_context_limit,
+                            model.max_context_tokens()?,
+                        )?);
+                let (prompt_tokens, prepared_chat_prompt) = model
                     .prepare_prompt_for_execution(messages, &request.chat_generation_config())?;
-                Ok((prompt_tokens, prepared_qwen35_prompt, Some(model)))
+                Ok((
+                    prompt_tokens,
+                    prepared_chat_prompt,
+                    Some((model, context_limit)),
+                ))
             },
         )
         .await
@@ -893,19 +1222,759 @@ impl Engine {
         })?;
 
         match request.task_type {
+            TaskType::ASR if variant.family() == crate::catalog::ModelFamily::Lfm25Audio => {
+                let model = registry
+                    .get_lfm25_audio_lease(variant)
+                    .await
+                    .ok_or_else(|| {
+                        Error::ModelNotFound(format!(
+                            "LFM2.5 Audio ASR model {variant} is not loaded"
+                        ))
+                    })?;
+                if request.prepared_asr_execution_shape().is_none() {
+                    let model_for_preparation = model.clone();
+                    let request_id = request.id.clone();
+                    let deadline = request.deadline;
+                    let context_limit = registry
+                        .effective_context(variant)
+                        .unwrap_or(self.config.max_seq_len);
+                    let acquire_permit = self
+                        .direct_request_preparation_permits
+                        .clone()
+                        .acquire_owned();
+                    let permit = match deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline.into(), acquire_permit)
+                            .await
+                            .map_err(|_| Error::Timeout(request_id.clone()))?,
+                        None => acquire_permit.await,
+                    }
+                    .map_err(|_| {
+                        Error::InferenceError(
+                            "Direct LFM2.5 Audio ASR preparation queue is unavailable".into(),
+                        )
+                    })?;
+                    let worker = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        let request = request;
+                        let (samples, sample_rate) =
+                            executor::decode_request_audio_with_rate(&request)?;
+                        if model_for_preparation.asr_requires_long_form(&samples, sample_rate) {
+                            return Self::finalize_direct_lfm25_audio_asr_preparation(
+                                request,
+                                variant,
+                                model_for_preparation,
+                                samples,
+                                sample_rate,
+                                context_limit,
+                                None,
+                                None,
+                            );
+                        }
+
+                        let envelope = model_for_preparation
+                            .lfm25_audio_asr_preparation_resource_envelope(
+                                samples.len(),
+                                sample_rate,
+                            )?;
+                        let artifact = model_for_preparation
+                            .prepare_lfm25_audio_asr_artifact(&samples, sample_rate)?;
+                        let geometry = envelope.geometry;
+                        if artifact.source_samples != geometry.source_samples
+                            || artifact.source_sample_rate != geometry.source_sample_rate
+                            || artifact.resampled_samples != geometry.resampled_samples
+                            || artifact.effective_feature_frames
+                                != geometry.effective_feature_frames
+                            || artifact.audio_tokens != geometry.encoder_frames
+                            || artifact.prompt_tokens != geometry.prompt_tokens
+                            || artifact.materialized_tensor_elements
+                                != geometry.materialized_tensor_elements
+                            || artifact.retained_resident_bytes != geometry.retained_resident_bytes
+                            || artifact.retained_resident_bytes
+                                > envelope.max_retained_resident_bytes
+                            || artifact.materialized_tensor_elements
+                                > envelope.max_materialized_tensor_elements
+                        {
+                            return Err(Error::InferenceError(
+                                "Direct LFM2.5 Audio ASR artifact disagrees with its admitted preparation envelope"
+                                    .into(),
+                            ));
+                        }
+                        let prompt_tokens = artifact.prompt_tokens;
+                        Self::finalize_direct_lfm25_audio_asr_preparation(
+                            request,
+                            variant,
+                            model_for_preparation,
+                            samples,
+                            sample_rate,
+                            context_limit,
+                            Some(prompt_tokens),
+                            Some(artifact),
+                        )
+                    });
+                    request = match deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline.into(), worker)
+                            .await
+                            .map_err(|_| Error::Timeout(request_id.clone()))?,
+                        None => worker.await,
+                    }
+                    .map_err(|error| {
+                        Error::InferenceError(format!(
+                            "LFM2.5 Audio ASR request {request_id} preparation worker failed: {error}"
+                        ))
+                    })??;
+                } else {
+                    request.install_lfm25_audio_asr_execution_model(variant, model)?;
+                }
+            }
             TaskType::ASR if variant.family() != crate::catalog::ModelFamily::Voxtral => {
                 let model = registry.get_asr_lease(variant).await.ok_or_else(|| {
                     Error::ModelNotFound(format!("ASR model {variant} is not loaded"))
                 })?;
+                if variant.family() == crate::catalog::ModelFamily::Qwen3Asr
+                    && request.prepared_asr_execution_shape().is_none()
+                {
+                    let model_for_shape = model.clone();
+                    let request_id = request.id.clone();
+                    let deadline = request.deadline;
+                    let context_limit = registry
+                        .effective_context(variant)
+                        .unwrap_or(self.config.max_seq_len);
+                    let acquire_permit = self
+                        .direct_request_preparation_permits
+                        .clone()
+                        .acquire_owned();
+                    let permit = match deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline.into(), acquire_permit)
+                            .await
+                            .map_err(|_| Error::Timeout(request_id.clone()))?,
+                        None => acquire_permit.await,
+                    }
+                    .map_err(|_| {
+                        Error::InferenceError(
+                            "Direct Qwen3 ASR preparation queue is unavailable".to_string(),
+                        )
+                    })?;
+                    let worker = tokio::task::spawn_blocking(move || {
+                        // The tower's transient host/device work is bounded by
+                        // the same Engine-owned preparation capacity as direct
+                        // payload processing. Its immutable result moves into
+                        // EngineCoreRequest and is thereafter bounded by the
+                        // Engine's retained-sequence/request capacity.
+                        let _permit = permit;
+                        let request = request;
+                        let (samples, sample_rate) =
+                            executor::decode_request_audio_with_rate(&request)?;
+                        let long_form = executor::qwen3_asr_requires_long_form(
+                            &samples,
+                            sample_rate,
+                            model_for_shape.max_audio_seconds_hint(),
+                        );
+                        let input_tokens = (!long_form)
+                            .then(|| {
+                                model_for_shape.incremental_prompt_token_count(
+                                    &samples,
+                                    sample_rate,
+                                    request.asr_language_for_execution(),
+                                    request.asr_prompt_for_execution(),
+                                )
+                            })
+                            .transpose()?;
+                        let prepared_encoder = if long_form {
+                            None
+                        } else {
+                            let geometry = model_for_shape
+                                .audio_preparation_row_geometry(samples.len(), sample_rate)?;
+                            let rows = [Qwen3AsrAudioBatchRow {
+                                audio: &samples,
+                                sample_rate,
+                            }];
+                            let mut artifacts =
+                                model_for_shape.prepare_qwen3_audio_tower_batch(&rows)?;
+                            let artifact = artifacts.pop().ok_or_else(|| {
+                                Error::InferenceError(
+                                    "Direct Qwen3 ASR width-one encoder returned no artifact"
+                                        .to_string(),
+                                )
+                            })?;
+                            if !artifacts.is_empty()
+                                || artifact.audio_tokens()? != geometry.audio_tokens
+                                || artifact.resident_tensor_bytes()?
+                                    != geometry.retained_artifact_bytes
+                            {
+                                return Err(Error::InferenceError(
+                                    "Direct Qwen3 ASR encoder artifact disagrees with admitted geometry"
+                                        .to_string(),
+                                ));
+                            }
+                            Some(Arc::new(artifact))
+                        };
+                        Self::finalize_direct_qwen_asr_preparation(
+                            request,
+                            variant,
+                            samples,
+                            sample_rate,
+                            context_limit,
+                            input_tokens,
+                            prepared_encoder,
+                        )
+                    });
+                    let prepared = match deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline.into(), worker)
+                            .await
+                            .map_err(|_| Error::Timeout(request_id.clone()))?,
+                        None => worker.await,
+                    }
+                    .map_err(|error| {
+                        Error::InferenceError(format!(
+                            "ASR request {request_id} sequence-shape worker failed: {error}"
+                        ))
+                    })??;
+                    request = prepared;
+                } else if variant.family() == crate::catalog::ModelFamily::WhisperAsr
+                    && request.prepared_asr_execution_shape().is_none()
+                {
+                    let model_for_shape = model.clone();
+                    let request_id = request.id.clone();
+                    let deadline = request.deadline;
+                    let context_limit = registry
+                        .effective_context(variant)
+                        .unwrap_or(self.config.max_seq_len);
+                    let acquire_permit = self
+                        .direct_request_preparation_permits
+                        .clone()
+                        .acquire_owned();
+                    let permit = match deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline.into(), acquire_permit)
+                            .await
+                            .map_err(|_| Error::Timeout(request_id.clone()))?,
+                        None => acquire_permit.await,
+                    }
+                    .map_err(|_| {
+                        Error::InferenceError(
+                            "Direct Whisper preparation queue is unavailable".into(),
+                        )
+                    })?;
+                    let worker = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        let request = request;
+                        let (samples, sample_rate) =
+                            executor::decode_request_audio_with_rate(&request)?;
+                        let long_form = executor::qwen3_asr_requires_long_form(
+                            &samples,
+                            sample_rate,
+                            model_for_shape.max_audio_seconds_hint(),
+                        );
+                        if long_form {
+                            return Self::finalize_direct_whisper_asr_preparation(
+                                request,
+                                variant,
+                                samples,
+                                sample_rate,
+                                context_limit,
+                                None,
+                                None,
+                            );
+                        }
+                        let geometry = model_for_shape
+                            .whisper_window_preparation_geometry(&samples, sample_rate)?;
+                        let mut artifacts = model_for_shape.prepare_whisper_window_batch(&[
+                            WhisperAudioBatchRow {
+                                audio: &samples,
+                                sample_rate,
+                            },
+                        ])?;
+                        let artifact = artifacts.pop().ok_or_else(|| {
+                            Error::InferenceError(
+                                "Direct Whisper width-one encoder returned no artifact".into(),
+                            )
+                        })?;
+                        if !artifacts.is_empty()
+                            || artifact.cross_memory_tokens() != geometry.cross_memory_tokens
+                            || artifact.resident_tensor_bytes()? != geometry.retained_artifact_bytes
+                        {
+                            return Err(Error::InferenceError(
+                                "Direct Whisper artifact disagrees with prepared geometry".into(),
+                            ));
+                        }
+                        let input_tokens = model_for_shape.whisper_incremental_prompt_token_count(
+                            &artifact,
+                            request.asr_language_for_execution(),
+                            request.asr_prompt_for_execution(),
+                        )?;
+                        Self::finalize_direct_whisper_asr_preparation(
+                            request,
+                            variant,
+                            samples,
+                            sample_rate,
+                            context_limit,
+                            Some(input_tokens),
+                            Some(Arc::new(artifact)),
+                        )
+                    });
+                    request = match deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline.into(), worker)
+                            .await
+                            .map_err(|_| Error::Timeout(request_id.clone()))?,
+                        None => worker.await,
+                    }
+                    .map_err(|error| {
+                        Error::InferenceError(format!(
+                            "Whisper request {request_id} preparation worker failed: {error}"
+                        ))
+                    })??;
+                } else if variant.family() == crate::catalog::ModelFamily::VibeVoiceAsr
+                    && request.prepared_asr_execution_shape().is_none()
+                {
+                    let model_for_shape = model.clone();
+                    let request_id = request.id.clone();
+                    let deadline = request.deadline;
+                    let context_limit = registry
+                        .effective_context(variant)
+                        .unwrap_or(self.config.max_seq_len);
+                    let acquire_permit = self
+                        .direct_request_preparation_permits
+                        .clone()
+                        .acquire_owned();
+                    let permit = match deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline.into(), acquire_permit)
+                            .await
+                            .map_err(|_| Error::Timeout(request_id.clone()))?,
+                        None => acquire_permit.await,
+                    }
+                    .map_err(|_| {
+                        Error::InferenceError(
+                            "Direct VibeVoice ASR preparation queue is unavailable".into(),
+                        )
+                    })?;
+                    let worker = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        let request = request;
+                        let (samples, sample_rate) =
+                            executor::decode_request_audio_with_rate(&request)?;
+                        let decision = model_for_shape.vibevoice_retained_preparation_decision(
+                            samples.len(),
+                            sample_rate,
+                            request.asr_language_for_execution(),
+                            request.asr_prompt_for_execution(),
+                        )?;
+                        match decision {
+                            VibeVoiceAsrPreparationDecision::LegacyInvocation => {
+                                Self::finalize_direct_vibevoice_asr_preparation(
+                                    request,
+                                    variant,
+                                    samples,
+                                    sample_rate,
+                                    context_limit,
+                                    None,
+                                    None,
+                                )
+                            }
+                            VibeVoiceAsrPreparationDecision::Retained(geometry) => {
+                                let artifact = model_for_shape
+                                    .prepare_vibevoice_retained_artifact(
+                                        &samples,
+                                        sample_rate,
+                                        request.asr_language_for_execution(),
+                                        request.asr_prompt_for_execution(),
+                                    )?;
+                                if artifact.geometry() != geometry
+                                    || artifact.resident_host_bytes()
+                                        != geometry.retained_host_bytes
+                                    || artifact.resident_tensor_bytes()
+                                        != geometry.retained_device_bytes
+                                {
+                                    return Err(Error::InferenceError(
+                                        "Direct VibeVoice ASR artifact disagrees with prepared geometry"
+                                            .into(),
+                                    ));
+                                }
+                                model_for_shape.validate_vibevoice_retained_artifact(
+                                    &artifact,
+                                    &samples,
+                                    sample_rate,
+                                    request.asr_language_for_execution(),
+                                    request.asr_prompt_for_execution(),
+                                )?;
+                                Self::finalize_direct_vibevoice_asr_preparation(
+                                    request,
+                                    variant,
+                                    samples,
+                                    sample_rate,
+                                    context_limit,
+                                    Some(geometry.prompt_tokens),
+                                    Some(Arc::new(artifact)),
+                                )
+                            }
+                        }
+                    });
+                    request = match deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline.into(), worker)
+                            .await
+                            .map_err(|_| Error::Timeout(request_id.clone()))?,
+                        None => worker.await,
+                    }
+                    .map_err(|error| {
+                        Error::InferenceError(format!(
+                            "VibeVoice ASR request {request_id} preparation worker failed: {error}"
+                        ))
+                    })??;
+                } else if variant.family() == crate::catalog::ModelFamily::GraniteSpeechAsr
+                    && request.prepared_asr_execution_shape().is_none()
+                {
+                    let model_for_shape = model.clone();
+                    let request_id = request.id.clone();
+                    let deadline = request.deadline;
+                    let context_limit = registry
+                        .effective_context(variant)
+                        .unwrap_or(self.config.max_seq_len);
+                    let acquire_permit = self
+                        .direct_request_preparation_permits
+                        .clone()
+                        .acquire_owned();
+                    let permit = match deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline.into(), acquire_permit)
+                            .await
+                            .map_err(|_| Error::Timeout(request_id.clone()))?,
+                        None => acquire_permit.await,
+                    }
+                    .map_err(|_| {
+                        Error::InferenceError(
+                            "Direct Granite Speech preparation queue is unavailable".into(),
+                        )
+                    })?;
+                    let worker = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        let request = request;
+                        let (samples, sample_rate) =
+                            executor::decode_request_audio_with_rate(&request)?;
+                        let long_form = executor::qwen3_asr_requires_long_form(
+                            &samples,
+                            sample_rate,
+                            model_for_shape.max_audio_seconds_hint(),
+                        );
+                        if long_form {
+                            return Self::finalize_direct_granite_speech_asr_preparation(
+                                request,
+                                variant,
+                                samples,
+                                sample_rate,
+                                context_limit,
+                                None,
+                                None,
+                            );
+                        }
+                        let geometry = model_for_shape
+                            .granite_speech_retained_preparation_geometry(
+                                &samples,
+                                sample_rate,
+                                request.asr_language_for_execution(),
+                                request.asr_prompt_for_execution(),
+                            )?;
+                        let artifact = model_for_shape.prepare_granite_speech_prompt_artifact(
+                            &samples,
+                            sample_rate,
+                            request.asr_language_for_execution(),
+                            request.asr_prompt_for_execution(),
+                        )?;
+                        if artifact.prompt_tokens() != geometry.prompt_tokens
+                            || artifact.audio_tokens() != geometry.audio_tokens
+                            || artifact.resident_tensor_bytes()? != geometry.retained_device_bytes
+                        {
+                            return Err(Error::InferenceError(
+                                "Direct Granite Speech artifact disagrees with prepared geometry"
+                                    .into(),
+                            ));
+                        }
+                        Self::finalize_direct_granite_speech_asr_preparation(
+                            request,
+                            variant,
+                            samples,
+                            sample_rate,
+                            context_limit,
+                            Some(geometry.prompt_tokens),
+                            Some(artifact),
+                        )
+                    });
+                    request = match deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline.into(), worker)
+                            .await
+                            .map_err(|_| Error::Timeout(request_id.clone()))?,
+                        None => worker.await,
+                    }
+                    .map_err(|error| {
+                        Error::InferenceError(format!(
+                            "Granite Speech request {request_id} preparation worker failed: {error}"
+                        ))
+                    })??;
+                }
                 request.install_asr_execution_model(variant, model)?;
+            }
+            TaskType::TTS if variant.family() == crate::catalog::ModelFamily::Lfm25Audio => {
+                let model = registry
+                    .get_lfm25_audio_lease(variant)
+                    .await
+                    .ok_or_else(|| {
+                        Error::ModelNotFound(format!(
+                            "LFM2.5 Audio TTS model {variant} is not loaded"
+                        ))
+                    })?;
+                if request
+                    .prepared_lfm25_audio_tts_artifact_for_executor()?
+                    .is_none()
+                {
+                    let request_id = request.id.clone();
+                    let deadline = request.deadline;
+                    let context_limit = registry
+                        .effective_context(variant)
+                        .unwrap_or(self.config.max_seq_len);
+                    let acquire_permit = self
+                        .direct_request_preparation_permits
+                        .clone()
+                        .acquire_owned();
+                    let permit = match deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline.into(), acquire_permit)
+                            .await
+                            .map_err(|_| Error::Timeout(request_id.clone()))?,
+                        None => acquire_permit.await,
+                    }
+                    .map_err(|_| {
+                        Error::InferenceError(
+                            "Direct LFM2.5 Audio TTS preparation queue is unavailable".into(),
+                        )
+                    })?;
+                    let worker = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        let mut request = request;
+                        let messages = request.lfm25_audio_tts_messages_for_preparation()?;
+                        let artifact = model.prepare_lfm25_audio_tts_artifact(&messages)?;
+                        request.install_lfm25_audio_tts_execution_model(
+                            variant,
+                            model,
+                            artifact,
+                            context_limit,
+                        )?;
+                        Ok::<_, Error>(request)
+                    });
+                    request = match deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline.into(), worker)
+                            .await
+                            .map_err(|_| Error::Timeout(request_id.clone()))?,
+                        None => worker.await,
+                    }
+                    .map_err(|error| {
+                        Error::InferenceError(format!(
+                            "LFM2.5 Audio TTS request {request_id} preparation worker failed: {error}"
+                        ))
+                    })??;
+                }
             }
             TaskType::TTS if variant.family() == crate::catalog::ModelFamily::Qwen3Tts => {
                 let model = registry.get_qwen_tts_lease(variant).await.ok_or_else(|| {
                     Error::ModelNotFound(format!("Qwen TTS model {variant} is not loaded"))
                 })?;
-                request.install_qwen_tts_execution_model(variant, model)?;
+                let reference = if request.has_tts_reference_for_execution() {
+                    let encoded = request
+                        .tts_reference_audio_for_execution()
+                        .ok_or_else(|| {
+                            Error::InvalidInput(
+                                "reference_audio and reference_text must both be provided"
+                                    .to_string(),
+                            )
+                        })?
+                        .to_string();
+                    let text = request
+                        .tts_reference_text_for_execution()
+                        .filter(|text| !text.trim().is_empty())
+                        .ok_or_else(|| {
+                            Error::InvalidInput("reference_text cannot be empty".to_string())
+                        })?
+                        .to_string();
+                    let request_id = request.id.clone();
+                    let (audio_samples, sample_rate) = tokio::task::spawn_blocking(move || {
+                        crate::runtime::audio_io::decode_reference_audio_base64(&encoded)
+                    })
+                    .await
+                    .map_err(|error| {
+                        Error::InferenceError(format!(
+                            "Qwen TTS request {request_id} reference worker failed: {error}"
+                        ))
+                    })??;
+                    Some(Arc::new(
+                        crate::models::architectures::qwen3::tts::SpeakerReference {
+                            audio_samples,
+                            text,
+                            sample_rate,
+                        },
+                    ))
+                } else {
+                    None
+                };
+                let context_limit = registry
+                    .effective_context(variant)
+                    .unwrap_or(self.config.max_seq_len);
+                request.install_qwen_tts_execution_model(
+                    variant,
+                    model,
+                    reference,
+                    context_limit,
+                )?;
             }
             TaskType::ASR | TaskType::TTS | TaskType::Chat | TaskType::SpeechToSpeech => {}
+        }
+        Ok(request)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_direct_lfm25_audio_asr_preparation(
+        mut request: EngineCoreRequest,
+        variant: ModelVariant,
+        model: Lfm25AudioModelLease,
+        samples: Vec<f32>,
+        sample_rate: u32,
+        context_limit: usize,
+        input_tokens: Option<usize>,
+        artifact: Option<Arc<Lfm25AudioPreparedAsrArtifact>>,
+    ) -> Result<EngineCoreRequest> {
+        Self::validate_direct_lfm25_audio_asr_preparation_pair(input_tokens, artifact.as_deref())?;
+
+        request.install_prepared_asr_audio(variant, samples, sample_rate)?;
+        match (input_tokens, artifact) {
+            (None, None) => {
+                request.install_prepared_asr_long_form_atomic()?;
+                request.install_lfm25_audio_asr_execution_model(variant, model)?;
+            }
+            (Some(input_tokens), Some(artifact)) => {
+                request.install_prepared_sequence_input_tokens(input_tokens, context_limit)?;
+                request.install_lfm25_audio_asr_execution_model(variant, model)?;
+                request.install_prepared_lfm25_audio_asr_artifact(variant, artifact)?;
+            }
+            _ => unreachable!("route/artifact pair was validated above"),
+        }
+        Ok(request)
+    }
+
+    fn validate_direct_lfm25_audio_asr_preparation_pair(
+        input_tokens: Option<usize>,
+        artifact: Option<&Lfm25AudioPreparedAsrArtifact>,
+    ) -> Result<()> {
+        match (input_tokens, artifact) {
+            (None, None) => Ok(()),
+            (Some(input_tokens), Some(artifact)) if input_tokens == artifact.prompt_tokens => {
+                Ok(())
+            }
+            (Some(_), Some(_)) => Err(Error::InferenceError(
+                "Direct LFM2.5 Audio ASR prompt shape disagrees with its prepared artifact".into(),
+            )),
+            _ => Err(Error::InferenceError(
+                "Direct LFM2.5 Audio ASR route and prepared artifact disagree".into(),
+            )),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_direct_qwen_asr_preparation(
+        mut request: EngineCoreRequest,
+        variant: ModelVariant,
+        samples: Vec<f32>,
+        sample_rate: u32,
+        context_limit: usize,
+        input_tokens: Option<usize>,
+        encoder_artifact: Option<Arc<Qwen3AsrPreparedAudio>>,
+    ) -> Result<EngineCoreRequest> {
+        request.install_prepared_asr_audio(variant, samples, sample_rate)?;
+        match (input_tokens, encoder_artifact) {
+            (None, None) => request.install_prepared_asr_long_form_atomic()?,
+            (Some(input_tokens), Some(artifact)) => {
+                request.install_prepared_sequence_input_tokens(input_tokens, context_limit)?;
+                request.install_prepared_asr_encoder_artifact(variant, artifact)?;
+            }
+            _ => {
+                return Err(Error::InferenceError(
+                    "Direct Qwen3 ASR route and encoder artifact disagree".to_string(),
+                ));
+            }
+        }
+        Ok(request)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_direct_whisper_asr_preparation(
+        mut request: EngineCoreRequest,
+        variant: ModelVariant,
+        samples: Vec<f32>,
+        sample_rate: u32,
+        context_limit: usize,
+        input_tokens: Option<usize>,
+        encoder_artifact: Option<
+            Arc<crate::models::architectures::whisper::asr::WhisperPreparedWindow>,
+        >,
+    ) -> Result<EngineCoreRequest> {
+        request.install_prepared_asr_audio(variant, samples, sample_rate)?;
+        match (input_tokens, encoder_artifact) {
+            (None, None) => request.install_prepared_asr_long_form_atomic()?,
+            (Some(input_tokens), Some(artifact)) => {
+                request.install_prepared_sequence_input_tokens(input_tokens, context_limit)?;
+                request.install_prepared_whisper_window(variant, artifact)?;
+            }
+            _ => {
+                return Err(Error::InferenceError(
+                    "Direct Whisper route and encoder artifact disagree".into(),
+                ));
+            }
+        }
+        Ok(request)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_direct_vibevoice_asr_preparation(
+        mut request: EngineCoreRequest,
+        variant: ModelVariant,
+        samples: Vec<f32>,
+        sample_rate: u32,
+        context_limit: usize,
+        input_tokens: Option<usize>,
+        artifact: Option<Arc<VibeVoiceAsrPreparedArtifact>>,
+    ) -> Result<EngineCoreRequest> {
+        request.install_prepared_asr_audio(variant, samples, sample_rate)?;
+        match (input_tokens, artifact) {
+            (None, None) => request.install_prepared_asr_long_form_atomic()?,
+            (Some(input_tokens), Some(artifact)) => {
+                request.install_prepared_sequence_input_tokens(input_tokens, context_limit)?;
+                request.install_prepared_vibevoice_artifact(variant, artifact)?;
+            }
+            _ => {
+                return Err(Error::InferenceError(
+                    "Direct VibeVoice route and prepared artifact disagree".into(),
+                ));
+            }
+        }
+        Ok(request)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_direct_granite_speech_asr_preparation(
+        mut request: EngineCoreRequest,
+        variant: ModelVariant,
+        samples: Vec<f32>,
+        sample_rate: u32,
+        context_limit: usize,
+        input_tokens: Option<usize>,
+        artifact: Option<
+            Arc<crate::models::architectures::granite_speech::asr::GraniteSpeechPreparedPromptArtifact>,
+        >,
+    ) -> Result<EngineCoreRequest> {
+        request.install_prepared_asr_audio(variant, samples, sample_rate)?;
+        match (input_tokens, artifact) {
+            (None, None) => request.install_prepared_asr_long_form_atomic()?,
+            (Some(input_tokens), Some(artifact)) => {
+                request.install_prepared_sequence_input_tokens(input_tokens, context_limit)?;
+                request.install_prepared_granite_speech_artifact(variant, artifact)?;
+            }
+            _ => {
+                return Err(Error::InferenceError(
+                    "Direct Granite Speech route and prepared artifact disagree".into(),
+                ));
+            }
         }
         Ok(request)
     }
@@ -1240,6 +2309,304 @@ impl Engine {
         self.core.read().await.get_session_key(request_id)
     }
 
+    /// Start a retained realtime ASR session without publishing it through
+    /// RuntimeService capability discovery. The request must already carry the
+    /// exact loaded execution/state binding selected by its owner.
+    pub(crate) async fn start_realtime_asr_session(
+        &self,
+        mut request: EngineCoreRequest,
+    ) -> Result<RealtimeAsrSessionHandle> {
+        let variant = request.model_variant.ok_or_else(|| {
+            Error::InvalidInput("realtime ASR session is missing a model variant".into())
+        })?;
+        if request.task_type != TaskType::ASR
+            || !matches!(
+                variant.family(),
+                crate::catalog::ModelFamily::Voxtral | crate::catalog::ModelFamily::NemotronAsr
+            )
+        {
+            return Err(Error::InvalidInput(
+                "Engine realtime ASR sessions require an authenticated realtime ASR family".into(),
+            ));
+        }
+        request.enable_realtime_asr_ingress()?;
+        let (streaming_tx, committed_outputs) =
+            mpsc::channel(Self::streaming_queue_capacity(&request));
+        request.streaming = true;
+        request.streaming_tx = Some(streaming_tx);
+        let cancellation = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        request.set_cancellation_signal(cancellation.clone());
+        let request_id = request.id.clone();
+        let _step = self.step_gate.lock().await;
+        let session = self.core.write().await.add_realtime_asr_session(request)?;
+        self.request_controls
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(
+                request_id,
+                RequestControl {
+                    session_epoch: session.epoch,
+                    cancellation,
+                    model_variant: Some(variant),
+                },
+            );
+        self.wake_notify.notify_one();
+        Ok(RealtimeAsrSessionHandle {
+            session,
+            committed_outputs: Arc::new(Mutex::new(committed_outputs)),
+            operation_gate: Arc::new(Mutex::new(())),
+        })
+    }
+
+    async fn await_realtime_asr_operation_with_outputs(
+        &self,
+        handle: &RealtimeAsrSessionHandle,
+        expected_operation: RealtimeOperationId,
+        mut waiter: request::RealtimeAsrOperationWaiter,
+    ) -> Result<(RealtimeAsrOperationAck, Vec<StreamingOutput>)> {
+        let mut receiver = handle.committed_outputs.lock().await;
+        let mut outputs = Vec::new();
+        let mut receiver_open = true;
+        let outcome = loop {
+            tokio::select! {
+                outcome = &mut waiter => break outcome.map_err(|_| {
+                    Error::InferenceError(
+                        "realtime ASR operation waiter closed without an authoritative result".into(),
+                    )
+                })?,
+                output = receiver.recv(), if receiver_open => match output {
+                    Some(output) => outputs.push(output),
+                    None => receiver_open = false,
+                },
+            }
+        };
+
+        // The engine run loop holds this gate through Core commit and stream
+        // delivery. The waiter can resolve during Core commit. Continue
+        // draining concurrently while waiting to reacquire the gate so a
+        // bounded output channel cannot block that delivery and deadlock the
+        // operation's final barrier.
+        let delivery_barrier = self.step_gate.lock();
+        tokio::pin!(delivery_barrier);
+        let _delivery_barrier = loop {
+            tokio::select! {
+                barrier = &mut delivery_barrier => break barrier,
+                output = receiver.recv(), if receiver_open => match output {
+                    Some(output) => outputs.push(output),
+                    None => receiver_open = false,
+                },
+            }
+        };
+        while let Ok(output) = receiver.try_recv() {
+            outputs.push(output);
+        }
+        let acknowledgement = Self::realtime_operation_result(expected_operation, outcome)?;
+        Ok((acknowledgement, outputs))
+    }
+
+    fn realtime_operation_result(
+        expected_operation: RealtimeOperationId,
+        outcome: request::RealtimeAsrOperationOutcome,
+    ) -> Result<RealtimeAsrOperationAck> {
+        match outcome {
+            Ok(ack) if ack.operation_id() == expected_operation => Ok(ack),
+            Ok(_) => Err(Error::InferenceError(
+                "realtime ASR acknowledgement crossed its operation identity fence".into(),
+            )),
+            Err(request::RealtimeAsrTerminalOutcome::Cancelled) => Err(Error::Cancelled(
+                "realtime ASR session was cancelled".into(),
+            )),
+            Err(request::RealtimeAsrTerminalOutcome::TimedOut) => Err(Error::Timeout(
+                "realtime ASR session exceeded its deadline".into(),
+            )),
+            Err(request::RealtimeAsrTerminalOutcome::Unloaded) => Err(Error::ModelNotFound(
+                "realtime ASR model was unloaded".into(),
+            )),
+            Err(request::RealtimeAsrTerminalOutcome::Completed) => Err(Error::InferenceError(
+                "realtime ASR session completed before this operation committed".into(),
+            )),
+            Err(request::RealtimeAsrTerminalOutcome::Failed(message)) => {
+                Err(Error::InferenceError(message.to_string()))
+            }
+        }
+    }
+
+    /// Queue one exact source-sample interval and wait for its authoritative
+    /// commit acknowledgement. Engine stepping must be running concurrently.
+    pub(crate) async fn push_realtime_asr_samples(
+        &self,
+        handle: &RealtimeAsrSessionHandle,
+        samples: Vec<f32>,
+        sample_rate: u32,
+        max_output_steps: usize,
+        max_cache_append: usize,
+    ) -> Result<RealtimeAsrOperationAck> {
+        self.push_realtime_asr_samples_with_outputs(
+            handle,
+            samples,
+            sample_rate,
+            max_output_steps,
+            max_cache_append,
+        )
+        .await
+        .map(|(ack, _)| ack)
+    }
+
+    pub(crate) async fn push_realtime_asr_samples_with_outputs(
+        &self,
+        handle: &RealtimeAsrSessionHandle,
+        samples: Vec<f32>,
+        sample_rate: u32,
+        max_output_steps: usize,
+        max_cache_append: usize,
+    ) -> Result<(RealtimeAsrOperationAck, Vec<StreamingOutput>)> {
+        let logical_units = u64::try_from(samples.len()).unwrap_or(u64::MAX).max(1);
+        self.push_realtime_asr_samples_with_outputs_and_cost(
+            handle,
+            samples,
+            sample_rate,
+            max_output_steps,
+            max_cache_append,
+            WorkCost::new(logical_units, logical_units, 0),
+        )
+        .await
+    }
+
+    pub(crate) async fn push_realtime_asr_samples_with_outputs_and_cost(
+        &self,
+        handle: &RealtimeAsrSessionHandle,
+        samples: Vec<f32>,
+        sample_rate: u32,
+        max_output_steps: usize,
+        max_cache_append: usize,
+        preparation_cost: WorkCost,
+    ) -> Result<(RealtimeAsrOperationAck, Vec<StreamingOutput>)> {
+        let _operation = handle.operation_gate.lock().await;
+        let (operation_id, waiter) = {
+            let _step = self.step_gate.lock().await;
+            let mut core = self.core.write().await;
+            core.enqueue_realtime_asr_push_with_cost(
+                &handle.session,
+                Arc::from(samples),
+                sample_rate,
+                max_output_steps,
+                max_cache_append,
+                preparation_cost,
+            )
+            .await?
+        };
+        self.wake_notify.notify_one();
+        self.await_realtime_asr_operation_with_outputs(handle, operation_id, waiter)
+            .await
+    }
+
+    /// Fence input and wait until the exact finish operation commits.
+    pub(crate) async fn finish_realtime_asr_session(
+        &self,
+        handle: &RealtimeAsrSessionHandle,
+        max_output_steps: usize,
+        max_cache_append: usize,
+    ) -> Result<RealtimeAsrOperationAck> {
+        self.finish_realtime_asr_session_with_outputs(handle, max_output_steps, max_cache_append)
+            .await
+            .map(|(ack, _)| ack)
+    }
+
+    pub(crate) async fn finish_realtime_asr_session_with_outputs(
+        &self,
+        handle: &RealtimeAsrSessionHandle,
+        max_output_steps: usize,
+        max_cache_append: usize,
+    ) -> Result<(RealtimeAsrOperationAck, Vec<StreamingOutput>)> {
+        self.finish_realtime_asr_session_with_outputs_and_cost(
+            handle,
+            max_output_steps,
+            max_cache_append,
+            WorkCost::new(1, 1, 0),
+        )
+        .await
+    }
+
+    pub(crate) async fn finish_realtime_asr_session_with_outputs_and_cost(
+        &self,
+        handle: &RealtimeAsrSessionHandle,
+        max_output_steps: usize,
+        max_cache_append: usize,
+        preparation_cost: WorkCost,
+    ) -> Result<(RealtimeAsrOperationAck, Vec<StreamingOutput>)> {
+        let _operation = handle.operation_gate.lock().await;
+        let (operation_id, waiter) = {
+            let _step = self.step_gate.lock().await;
+            let mut core = self.core.write().await;
+            core.enqueue_realtime_asr_finish_with_cost(
+                &handle.session,
+                max_output_steps,
+                max_cache_append,
+                preparation_cost,
+            )
+            .await?
+        };
+        self.wake_notify.notify_one();
+        self.await_realtime_asr_operation_with_outputs(handle, operation_id, waiter)
+            .await
+    }
+
+    /// Abort only the exact session incarnation carried by this handle.
+    pub(crate) async fn abort_realtime_asr_session(
+        &self,
+        handle: &RealtimeAsrSessionHandle,
+    ) -> Result<bool> {
+        self.abort_request_session(&handle.session).await
+    }
+
+    /// Begin exact-session cleanup and return proof that executor and managed
+    /// cache ownership have both been released. Acceptance of cancellation is
+    /// deliberately not treated as cleanup confirmation.
+    pub(crate) async fn cleanup_realtime_asr_session(
+        &self,
+        handle: &RealtimeAsrSessionHandle,
+    ) -> Result<RealtimeAsrCleanupReceipt> {
+        {
+            let controls = self
+                .request_controls
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if let Some(control) = controls
+                .get(&handle.session.request_id)
+                .filter(|control| control.session_epoch == handle.session.epoch)
+            {
+                control
+                    .cancellation
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        // Cleanup has no output consumer. Close the bounded receiver before
+        // waiting for confirmation so terminal delivery cannot backpressure
+        // the run loop that owns cleanup retries. An active operation holds
+        // this mutex until cancellation resolves its exact waiter.
+        handle.committed_outputs.lock().await.close();
+        let _step = self.step_gate.lock().await;
+        let confirmation = self
+            .core
+            .write()
+            .await
+            .begin_confirmed_session_cleanup(&handle.session)
+            .await;
+        let mut controls = self
+            .request_controls
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if controls
+            .get(&handle.session.request_id)
+            .is_some_and(|control| control.session_epoch == handle.session.epoch)
+        {
+            controls.remove(&handle.session.request_id);
+        }
+        drop(controls);
+        self.wake_notify.notify_one();
+        Ok(RealtimeAsrCleanupReceipt { confirmation })
+    }
+
     #[cfg(test)]
     pub(crate) async fn hold_core_step_lock_for_test(
         &self,
@@ -1265,23 +2632,28 @@ impl Engine {
 
     /// Abort only the request incarnation named by `session`.
     pub async fn abort_request_session(&self, session: &SessionKey) -> Result<bool> {
-        if let Some(control) = self
-            .request_controls
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .get(&session.request_id)
-        {
-            if control.session_epoch == session.epoch {
-                control
-                    .cancellation
-                    .store(true, std::sync::atomic::Ordering::Release);
-            }
-        }
+        let signaled = {
+            let controls = self
+                .request_controls
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            controls
+                .get(&session.request_id)
+                .filter(|control| control.session_epoch == session.epoch)
+                .map(|control| {
+                    control
+                        .cancellation
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    true
+                })
+                .unwrap_or(false)
+        };
         let _step = self.step_gate.lock().await;
         let mut core = self.core.write().await;
         let aborted = core.abort_request_session(session).await;
         drop(core);
-        if aborted {
+        let accepted = signaled || aborted;
+        if accepted {
             let mut controls = self
                 .request_controls
                 .lock()
@@ -1295,7 +2667,7 @@ impl Engine {
             drop(controls);
             self.wake_notify.notify_one();
         }
-        Ok(aborted)
+        Ok(accepted)
     }
 
     /// Abort all requests currently routed to a specific model variant.
@@ -1330,6 +2702,150 @@ impl Engine {
     pub async fn purge_model_cache(&self, variant: ModelVariant) -> CacheReleaseReport {
         let _step = self.step_gate.lock().await;
         self.core.write().await.purge_model_cache(variant).await
+    }
+
+    pub(crate) async fn synchronize_worker_device(&self) -> Result<()> {
+        let _step = self.step_gate.lock().await;
+        self.core.read().await.synchronize_worker_device()
+    }
+
+    /// Admit and allocate managed physical state before the model generation
+    /// becomes Ready.
+    pub(crate) async fn load_managed_model_cache(
+        &self,
+        model_instance: ModelInstanceId,
+        capability: &crate::kv::InferenceStateCapability,
+        logical_context_tokens: Option<usize>,
+    ) -> Result<Option<Arc<ManagedKvModelRuntime>>> {
+        self.load_managed_model_cache_with_capacity_policy(
+            model_instance,
+            capability,
+            logical_context_tokens,
+            None,
+            false,
+        )
+        .await
+    }
+
+    pub(crate) async fn load_managed_model_cache_with_capacity_policy(
+        &self,
+        model_instance: ModelInstanceId,
+        capability: &crate::kv::InferenceStateCapability,
+        logical_context_tokens: Option<usize>,
+        staged_transaction_rows: Option<u32>,
+        fit_cuda_resident_context: bool,
+    ) -> Result<Option<Arc<ManagedKvModelRuntime>>> {
+        let _step = self.step_gate.lock().await;
+        self.core
+            .write()
+            .await
+            .load_managed_model_cache_with_capacity_policy(
+                model_instance,
+                capability,
+                logical_context_tokens,
+                staged_transaction_rows,
+                fit_cuda_resident_context,
+            )
+    }
+
+    pub(crate) async fn load_managed_model_state(
+        &self,
+        model_instance: ModelInstanceId,
+        retained_state: &crate::kv::v2::InferenceStateContract,
+        logical_context_tokens: Option<usize>,
+    ) -> Result<Arc<ManagedKvModelRuntime>> {
+        let _step = self.step_gate.lock().await;
+        self.core.write().await.load_managed_model_state(
+            model_instance,
+            retained_state,
+            logical_context_tokens,
+        )
+    }
+
+    pub(crate) async fn load_managed_model_state_with_portable_copies(
+        &self,
+        model_instance: ModelInstanceId,
+        retained_state: &crate::kv::v2::InferenceStateContract,
+        logical_context_tokens: Option<usize>,
+        portable_state_copies: u32,
+    ) -> Result<Arc<ManagedKvModelRuntime>> {
+        let _step = self.step_gate.lock().await;
+        self.core
+            .write()
+            .await
+            .load_managed_model_state_with_portable_copies(
+                model_instance,
+                retained_state,
+                logical_context_tokens,
+                portable_state_copies,
+            )
+    }
+
+    pub(crate) async fn load_composite_retained_state(
+        &self,
+        model_instance: ModelInstanceId,
+        contract: &crate::kv::v2::InferenceStateContract,
+        static_domain: crate::kv::v2::StateDomainId,
+        logical_context_tokens: Option<usize>,
+    ) -> Result<Arc<CompositeRetainedStateRuntimeV2>> {
+        let _step = self.step_gate.lock().await;
+        self.core.write().await.load_composite_retained_state(
+            model_instance,
+            contract,
+            static_domain,
+            logical_context_tokens,
+        )
+    }
+
+    pub(crate) async fn load_retained_tensor_state(
+        &self,
+        model_instance: ModelInstanceId,
+        contract: &crate::kv::v2::InferenceStateContract,
+        sequence_capacity: u32,
+    ) -> Result<Arc<RetainedTensorStateRuntimeV2>> {
+        let _step = self.step_gate.lock().await;
+        self.core.write().await.load_retained_tensor_state(
+            model_instance,
+            contract,
+            sequence_capacity,
+        )
+    }
+
+    pub(crate) async fn resolve_and_load_invocation_workspace(
+        &self,
+        model_instance: ModelInstanceId,
+        adapter_instance: AdapterInstanceId,
+        stage_graph: [u8; 32],
+        stage: StageId,
+        contract: &crate::kv::v2::InferenceStateContract,
+        domain: &crate::kv::v2::InvocationWorkspaceDomain,
+        slot_count: u32,
+    ) -> Result<Arc<dyn crate::kv::v2::InvocationWorkspaceBackingV2>> {
+        let _step = self.step_gate.lock().await;
+        self.core
+            .write()
+            .await
+            .resolve_and_load_invocation_workspace(
+                model_instance,
+                adapter_instance,
+                stage_graph,
+                stage,
+                contract,
+                domain,
+                slot_count,
+            )
+    }
+
+    /// Retire the managed KV arenas for one exact loaded-model generation.
+    pub async fn unload_managed_model_cache(
+        &self,
+        model_instance: ModelInstanceId,
+    ) -> Result<bool> {
+        let _step = self.step_gate.lock().await;
+        self.core
+            .write()
+            .await
+            .unload_managed_model_cache(model_instance)
     }
 
     /// Abort every request currently tracked by the engine.
@@ -1382,10 +2898,9 @@ impl Engine {
         core.running_request_count()
     }
 
-    /// Get KV cache statistics.
-    pub async fn kv_cache_stats(&self) -> KVCacheStats {
-        let core = self.core.read().await;
-        core.kv_cache_stats()
+    /// Snapshot exact physical arena backing, page ownership, and counters.
+    pub async fn kv_cache_snapshot(&self) -> ManagedKvRuntimeSnapshot {
+        self.core.read().await.managed_kv_runtime_snapshot()
     }
 
     /// Check if scheduler currently has runnable or queued work.
@@ -1404,6 +2919,189 @@ mod tests {
     use crate::backends::{BackendKind, DeviceProfile};
     use crate::error::Error;
     use crate::models::shared::chat::{ChatMediaInput, ChatMediaKind, ChatMessage, ChatRole};
+
+    #[test]
+    fn non_streaming_qwen_asr_shape_replaces_the_placeholder_before_admission() {
+        let mut request = EngineCoreRequest::asr_bytes(vec![1, 2, 3]);
+        assert!(!request.streaming);
+        assert_eq!(
+            request.num_prompt_tokens(),
+            1,
+            "fixture starts with a placeholder"
+        );
+
+        request
+            .install_prepared_sequence_input_tokens(37, 64)
+            .expect("exact multimodal shape");
+        assert_eq!(request.num_prompt_tokens(), 37);
+        assert!(request.uses_asr_retained_sequence());
+        assert!(request.install_prepared_asr_long_form_atomic().is_err());
+    }
+
+    #[test]
+    fn direct_lfm25_audio_asr_route_requires_a_complete_normal_or_long_form_pair() {
+        Engine::validate_direct_lfm25_audio_asr_preparation_pair(None, None)
+            .expect("long-form route has neither prompt tokens nor a retained artifact");
+        let error = Engine::validate_direct_lfm25_audio_asr_preparation_pair(Some(32), None)
+            .expect_err("normal route cannot omit its retained artifact");
+        assert!(error
+            .to_string()
+            .contains("route and prepared artifact disagree"));
+    }
+
+    #[test]
+    fn direct_qwen_asr_normal_route_installs_the_encoder_artifact_before_core_admission() {
+        let variant = ModelVariant::Qwen3Asr06BGguf;
+        let request = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+        let artifact =
+            Arc::new(Qwen3AsrPreparedAudio::for_test(7, 16).expect("test encoder artifact"));
+
+        let prepared = Engine::finalize_direct_qwen_asr_preparation(
+            request,
+            variant,
+            vec![0.0; 16_000],
+            16_000,
+            4_096,
+            Some(32),
+            Some(artifact.clone()),
+        )
+        .expect("normal direct Qwen3 ASR preparation");
+
+        assert!(prepared.uses_asr_retained_sequence());
+        assert_eq!(prepared.num_prompt_tokens(), 32);
+        assert_eq!(
+            prepared
+                .prepared_asr_encoder_artifact_retained_bytes()
+                .unwrap(),
+            7 * 16 * std::mem::size_of::<f32>() as u64
+        );
+        assert!(Arc::ptr_eq(
+            &prepared
+                .prepared_asr_encoder_artifact_for_executor()
+                .unwrap()
+                .expect("installed artifact"),
+            &artifact,
+        ));
+    }
+
+    #[test]
+    fn direct_qwen_asr_long_form_route_retains_no_encoder_artifact() {
+        let variant = ModelVariant::Qwen3Asr06BGguf;
+        let request = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+
+        let prepared = Engine::finalize_direct_qwen_asr_preparation(
+            request,
+            variant,
+            vec![0.0; 16_000],
+            16_000,
+            4_096,
+            None,
+            None,
+        )
+        .expect("long-form direct Qwen3 ASR preparation");
+
+        assert!(prepared.uses_asr_long_form_atomic());
+        assert!(prepared
+            .prepared_asr_encoder_artifact_for_executor()
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            prepared
+                .prepared_asr_encoder_artifact_retained_bytes()
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn direct_whisper_normal_route_installs_exact_prepared_window() {
+        let variant = ModelVariant::WhisperLargeV3Turbo;
+        let request = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+        let artifact = Arc::new(
+            crate::models::architectures::whisper::asr::WhisperPreparedWindow::for_test(7, 4, 16)
+                .unwrap(),
+        );
+        let expected_bytes = artifact.resident_tensor_bytes().unwrap();
+        let prepared = Engine::finalize_direct_whisper_asr_preparation(
+            request,
+            variant,
+            vec![0.0; 16_000],
+            16_000,
+            448,
+            Some(12),
+            Some(artifact.clone()),
+        )
+        .unwrap();
+        assert!(prepared.uses_asr_retained_sequence());
+        assert_eq!(prepared.num_prompt_tokens(), 12);
+        assert_eq!(
+            prepared
+                .prepared_asr_encoder_artifact_retained_bytes()
+                .unwrap(),
+            expected_bytes
+        );
+        assert!(Arc::ptr_eq(
+            &prepared
+                .prepared_whisper_window_for_executor()
+                .unwrap()
+                .unwrap(),
+            &artifact,
+        ));
+    }
+
+    #[test]
+    fn direct_whisper_long_form_route_retains_no_prepared_window() {
+        let variant = ModelVariant::WhisperLargeV3Turbo;
+        let request = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+        let prepared = Engine::finalize_direct_whisper_asr_preparation(
+            request,
+            variant,
+            vec![0.0; 16_000],
+            16_000,
+            448,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(prepared.uses_asr_long_form_atomic());
+        assert!(prepared
+            .prepared_whisper_window_for_executor()
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            prepared
+                .prepared_asr_encoder_artifact_retained_bytes()
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn direct_vibevoice_long_form_route_retains_no_prepared_artifact() {
+        let variant = ModelVariant::VibeVoiceAsr;
+        let request = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+        let prepared = Engine::finalize_direct_vibevoice_asr_preparation(
+            request,
+            variant,
+            vec![0.0; 16_000],
+            16_000,
+            4_096,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(prepared.uses_asr_long_form_atomic());
+        assert!(prepared
+            .prepared_vibevoice_artifact_for_executor()
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            prepared
+                .prepared_asr_encoder_artifact_retained_resources()
+                .unwrap(),
+            (0, 0)
+        );
+    }
 
     struct EndlessSequenceExecutor;
 
@@ -1577,6 +3275,117 @@ mod tests {
         emitted: std::sync::Mutex<Option<oneshot::Sender<()>>>,
         release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
         variant: ModelVariant,
+    }
+
+    struct ReverseTerminalExecutor {
+        slow_request: RequestId,
+        slow_entered: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+        release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        cleanup: Arc<std::sync::Mutex<Vec<RequestId>>>,
+        variant: ModelVariant,
+    }
+
+    impl ModelExecutor for ReverseTerminalExecutor {
+        fn execution_profile(&self, _request: &EngineCoreRequest) -> Option<ExecutionProfile> {
+            let mut profile = ExecutionProfile::fail_closed(
+                BackendKind::Cpu,
+                Some(self.variant),
+                ExecutionMode::Atomic,
+            );
+            profile.concurrency = ConcurrencyClass::Batchable;
+            profile.physical_launch_policy = PhysicalLaunchPolicy::concurrent(2).unwrap();
+            profile.max_batch_size = 2;
+            profile.resolved_from_loaded_model = true;
+            Some(profile)
+        }
+
+        fn execute_physical_batch(
+            &self,
+            execution: PhysicalBatchExecution<'_>,
+        ) -> PhysicalDispatchResult {
+            execution.validate().expect("test physical batch");
+            let request = execution.requests[0];
+            if request.id == self.slow_request {
+                if let Some(entered) = self
+                    .slow_entered
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .take()
+                {
+                    let _ = entered.send(());
+                }
+                let (released, wake) = self.release.as_ref();
+                let mut released = released.lock().unwrap_or_else(|poison| poison.into_inner());
+                while !*released {
+                    released = wake
+                        .wait(released)
+                        .unwrap_or_else(|poison| poison.into_inner());
+                }
+            } else {
+                request
+                    .stream_staging_buffer()
+                    .push_with_policy(
+                        StreamingOutput {
+                            request_id: request.id.clone(),
+                            sequence: 0,
+                            samples: Vec::new(),
+                            sample_rate: 0,
+                            is_final: false,
+                            text: Some("fast-progress".to_string()),
+                            stats: None,
+                            asr_progress: None,
+                        },
+                        request.stream_policy,
+                    )
+                    .expect("publish fast progress");
+            }
+            let dispatch = execution.expected_dispatch();
+            Ok(execution
+                .scheduled
+                .iter()
+                .map(|scheduled| {
+                    ExecutorStepResult::new(
+                        scheduled,
+                        ExecutorOutput::terminal(scheduled.request_id.clone()),
+                    )
+                    .with_dispatch(dispatch)
+                })
+                .collect())
+        }
+
+        fn execute_prefill(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            unreachable!("physical boundary must own dispatch")
+        }
+
+        fn execute_decode(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            unreachable!("physical boundary must own dispatch")
+        }
+
+        fn is_ready(&self) -> bool {
+            true
+        }
+        fn initialize(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn shutdown(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn cleanup_session(&self, session: &SessionKey) -> CacheReleaseReport {
+            self.cleanup
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push(session.request_id.clone());
+            CacheReleaseReport::confirmed(1)
+        }
     }
 
     impl IncrementalBlockingExecutor {
@@ -1818,6 +3627,111 @@ mod tests {
         let config = EngineCoreConfig::default();
         let engine = Engine::new(config);
         assert!(engine.is_ok());
+    }
+
+    #[tokio::test]
+    async fn realtime_operation_drains_bounded_outputs_before_commit_delivery_barrier() {
+        let engine = Arc::new(Engine::new(EngineCoreConfig::default()).unwrap());
+        let (tx, rx) = mpsc::channel(1);
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let operation_id = RealtimeOperationId::new(7);
+        let handle = RealtimeAsrSessionHandle {
+            session: SessionKey::new("realtime-delivery-barrier".into(), 1),
+            committed_outputs: Arc::new(Mutex::new(rx)),
+            operation_gate: Arc::new(Mutex::new(())),
+        };
+        let barrier = engine.step_gate.lock().await;
+        let task_engine = engine.clone();
+        let task_handle = handle.clone();
+        let drain = tokio::spawn(async move {
+            task_engine
+                .await_realtime_asr_operation_with_outputs(&task_handle, operation_id, ack_rx)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!drain.is_finished());
+        tx.send(StreamingOutput {
+            request_id: handle.request_id().to_string(),
+            sequence: 0,
+            samples: Vec::new(),
+            sample_rate: 0,
+            is_final: false,
+            text: Some("committed".into()),
+            stats: None,
+            asr_progress: None,
+        })
+        .await
+        .unwrap();
+        tx.send(StreamingOutput {
+            request_id: handle.request_id().to_string(),
+            sequence: 1,
+            samples: Vec::new(),
+            sample_rate: 0,
+            is_final: false,
+            text: Some(" tail".into()),
+            stats: None,
+            asr_progress: None,
+        })
+        .await
+        .expect("concurrent drain must free the bounded channel");
+        ack_tx
+            .send(Ok(request::RealtimeAsrOperationAck::for_test(
+                operation_id,
+                request::RealtimeAsrOperationKind::Push,
+                1,
+            )))
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert!(!drain.is_finished());
+        drop(barrier);
+        let (_ack, outputs) = drain.await.unwrap().unwrap();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].text.as_deref(), Some("committed"));
+        assert_eq!(outputs[1].text.as_deref(), Some(" tail"));
+    }
+
+    #[test]
+    fn physical_execution_telemetry_mode_preserves_the_bounded_rollout_axis() {
+        for (configured, expected) in [
+            (
+                crate::config::PhysicalExecutionMode::Serial,
+                EnginePhysicalExecutionMode::Serial,
+            ),
+            (
+                crate::config::PhysicalExecutionMode::Shadow,
+                EnginePhysicalExecutionMode::Shadow,
+            ),
+            (
+                crate::config::PhysicalExecutionMode::Concurrent,
+                EnginePhysicalExecutionMode::Concurrent,
+            ),
+        ] {
+            assert_eq!(
+                Engine::physical_execution_telemetry_mode(configured),
+                expected
+            );
+        }
+
+        let mut shadow = EngineCoreConfig {
+            physical_execution_mode: crate::config::PhysicalExecutionMode::Shadow,
+            max_physical_in_flight: crate::config::PhysicalInFlightLimit::new(4).unwrap(),
+            ..EngineCoreConfig::default()
+        };
+        assert_eq!(
+            Engine::physical_execution_telemetry_policy(&shadow, None),
+            (EnginePhysicalExecutionMode::Shadow, 1)
+        );
+
+        shadow.physical_execution_mode = crate::config::PhysicalExecutionMode::Concurrent;
+        assert_eq!(
+            Engine::physical_execution_telemetry_policy(&shadow, None),
+            (EnginePhysicalExecutionMode::Concurrent, 4)
+        );
+        assert_eq!(
+            Engine::physical_execution_telemetry_policy(&shadow, Some(1)),
+            (EnginePhysicalExecutionMode::Concurrent, 1),
+            "effective telemetry must report the actual shared admission cap"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2277,6 +4191,142 @@ mod tests {
                 .is_empty(),
             "terminal routing must consume both exact-session mailboxes"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fast_terminal_mailbox_and_cache_cleanup_do_not_wait_for_slow_peer() {
+        let variant = ModelVariant::Kokoro82M;
+        let (slow_entered_tx, slow_entered_rx) = oneshot::channel();
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let cleanup = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let config = EngineCoreConfig {
+            max_batch_size: 2,
+            max_tokens_per_step: 2,
+            min_tokens_per_step: 1,
+            enable_adaptive_batching: false,
+            physical_execution_mode: crate::config::PhysicalExecutionMode::Concurrent,
+            max_physical_in_flight: crate::config::PhysicalInFlightLimit::new(2).unwrap(),
+            ..Default::default()
+        };
+        let core = EngineCore::new_with_unified_executor(
+            config.clone(),
+            executor::UnifiedExecutor::new_for_test(Box::new(ReverseTerminalExecutor {
+                slow_request: "slow-mailbox".to_string(),
+                slow_entered: std::sync::Mutex::new(Some(slow_entered_tx)),
+                release: release.clone(),
+                cleanup: cleanup.clone(),
+                variant,
+            })),
+        )
+        .unwrap();
+        let engine = Arc::new(Engine {
+            core: Arc::new(RwLock::new(core)),
+            step_gate: Arc::new(Mutex::new(())),
+            request_processor: RequestProcessor::new(config.clone()),
+            output_processor: OutputProcessor::new(config.sample_rate),
+            direct_request_preparation_permits: Arc::new(Semaphore::new(2)),
+            config,
+            model_registry: None,
+            running: std::sync::atomic::AtomicBool::new(false),
+            metrics: Arc::new(RwLock::new(EngineMetrics::default())),
+            wake_notify: Arc::new(Notify::new()),
+            request_controls: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            completion_mailboxes: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            next_completion_registration: std::sync::atomic::AtomicU64::new(1),
+        });
+
+        let policy = PhysicalLaunchPolicy::concurrent(2).unwrap();
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, Some(variant), ExecutionMode::Atomic);
+        profile.concurrency = ConcurrencyClass::Batchable;
+        profile.physical_launch_policy = policy;
+        profile.max_batch_size = 2;
+        profile.resolved_from_loaded_model = true;
+        let mut stage = StageDescriptor::from_execution_profile(
+            StageId::new(88),
+            "test.reverse.terminal",
+            &profile,
+            NativeBatchMode::None,
+        );
+        stage.selector = StageWorkSelector::Atomic;
+        stage.output_visibility = OutputVisibility::IncrementalCommitted;
+        let slow_binding = ExecutionAdapterBinding {
+            execution_group_id: ExecutionGroupId::new(88),
+            model_instance_id: ModelInstanceId::new(88),
+            adapter_instance_id: AdapterInstanceId::new(88),
+            adapter_abi_revision: AdapterAbiRevision::new(1),
+            model_variant: variant,
+            capability_id: "tts".to_string(),
+            stages: Arc::from([stage]),
+        };
+        let mut fast_binding = slow_binding.clone();
+        fast_binding.execution_group_id = ExecutionGroupId::new(89);
+        fast_binding.model_instance_id = ModelInstanceId::new(89);
+        fast_binding.adapter_instance_id = AdapterInstanceId::new(89);
+        let mut slow = EngineCoreRequest::tts("slow").with_model_variant(variant);
+        slow.id = "slow-mailbox".to_string();
+        slow.prompt_tokens = vec![1];
+        slow.bind_execution_adapter(slow_binding).unwrap();
+        let mut fast = EngineCoreRequest::tts("fast").with_model_variant(variant);
+        fast.id = "fast-mailbox".to_string();
+        fast.prompt_tokens = vec![1];
+        fast.bind_execution_adapter(fast_binding).unwrap();
+        fast.streaming = true;
+        let (fast_stream_tx, mut fast_stream_rx) = mpsc::channel(4);
+        fast.streaming_tx = Some(fast_stream_tx);
+
+        let (slow_registration, slow_rx) =
+            engine.register_completion_mailbox(slow.id.clone()).unwrap();
+        let (fast_registration, fast_rx) =
+            engine.register_completion_mailbox(fast.id.clone()).unwrap();
+        {
+            let mut core = engine.core.write().await;
+            core.add_request(slow).unwrap();
+            core.add_request(fast).unwrap();
+            let slow_session = core.get_session_key(&"slow-mailbox".to_string()).unwrap();
+            let fast_session = core.get_session_key(&"fast-mailbox".to_string()).unwrap();
+            engine.bind_completion_mailbox(
+                &slow_session.request_id,
+                slow_registration.registration_id,
+                slow_session.epoch,
+            );
+            engine.bind_completion_mailbox(
+                &fast_session.request_id,
+                fast_registration.registration_id,
+                fast_session.epoch,
+            );
+        }
+
+        let stepping = engine.clone();
+        let step = tokio::spawn(async move { stepping.step().await });
+        slow_entered_rx.await.expect("slow dispatch did not enter");
+        let fast_output = tokio::time::timeout(Duration::from_secs(1), fast_rx).await;
+        let progress = fast_stream_rx.try_recv();
+        let step_finished_early = step.is_finished();
+        let fast_still_active = engine.has_request(&"fast-mailbox".to_string()).await;
+        let slow_still_active = engine.has_request(&"slow-mailbox".to_string()).await;
+        let fast_cleaned = cleanup
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .contains(&"fast-mailbox".to_string());
+
+        let (released, wake) = release.as_ref();
+        *released.lock().unwrap_or_else(|poison| poison.into_inner()) = true;
+        wake.notify_all();
+        let slow_output = slow_rx.await.expect("slow mailbox closed");
+        assert_eq!(slow_output.request_id, "slow-mailbox");
+        step.await.unwrap().unwrap();
+        let fast_output = fast_output
+            .expect("fast mailbox waited for slow peer")
+            .expect("fast mailbox closed");
+        assert_eq!(fast_output.request_id, "fast-mailbox");
+        assert!(!step_finished_early, "slow peer unexpectedly completed");
+        let progress = progress.expect("terminal mailbox overtook committed progress delivery");
+        assert_eq!(progress.text.as_deref(), Some("fast-progress"));
+        assert!(!fast_still_active);
+        assert!(slow_still_active);
+        assert!(fast_cleaned);
+        drop((slow_registration, fast_registration));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

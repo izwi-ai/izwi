@@ -67,7 +67,7 @@ Different features require different models:
 | Feature | Required Models |
 |---------|-----------------|
 | Voice | TTS + ASR + Chat model (or unified `LFM2.5-Audio-1.5B-GGUF`) |
-| Chat | Chat model (Qwen3, Qwen3.5, LFM2.5, or Gemma) |
+| Chat | Chat model (Qwen3, Qwen3.5, Qwen3.8, LFM2.5, or Gemma) |
 | Speaker Attributed ASR | `Granite-Speech-4.1-2B-Plus` |
 | Voices | Built-in voice model for presets; Base or VibeVoice model for cloning; VoiceDesign model for design |
 | Text-to-Speech | TTS model |

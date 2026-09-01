@@ -34,7 +34,25 @@ pub async fn execute(args: ServeArgs) -> Result<()> {
         args.runtime.host, args.runtime.port
     );
     println!("  Models dir:     {}", args.runtime.models_dir.display());
-    println!("  Max batch:      {}", args.runtime.max_batch_size);
+    println!("  Tensor batch:   {}", args.runtime.max_batch_size);
+    let physical_capacity = args
+        .runtime
+        .engine_config()
+        .resolved_physical_execution_capacity();
+    println!(
+        "  Physical exec:  {} (configured {}, effective {})",
+        args.runtime.physical_execution_mode,
+        args.runtime.max_physical_in_flight,
+        physical_capacity.physical_launch_limit
+    );
+    println!(
+        "  Scheduler rows: {}",
+        args.runtime.max_scheduler_batch_size
+    );
+    println!("  Retained seqs:  {}", args.runtime.max_retained_sequences);
+    println!("  Staged txns:    {}", args.runtime.max_staged_transactions);
+    println!("  Runtime queue:  {}", args.runtime.max_queued_requests);
+    println!("  Context:        {}", args.runtime.max_sequence_length);
     println!("  Max concurrent: {}", args.runtime.max_concurrent_requests);
     println!("  Timeout:        {}s", args.runtime.request_timeout_secs);
     println!("  Backend:        {}", args.runtime.backend.as_str());
@@ -169,6 +187,38 @@ fn set_server_env(args: &ServeArgs) {
     std::env::set_var(
         "IZWI_MAX_BATCH_SIZE",
         args.runtime.max_batch_size.to_string(),
+    );
+    std::env::set_var(
+        "IZWI_PHYSICAL_EXECUTION_MODE",
+        args.runtime.physical_execution_mode.to_string(),
+    );
+    std::env::set_var(
+        "IZWI_MAX_PHYSICAL_IN_FLIGHT",
+        args.runtime.max_physical_in_flight.to_string(),
+    );
+    std::env::set_var(
+        "IZWI_MAX_SCHEDULER_BATCH_SIZE",
+        args.runtime.max_scheduler_batch_size.to_string(),
+    );
+    std::env::set_var(
+        "IZWI_MAX_LOADED_MODELS",
+        args.runtime.max_loaded_models.to_string(),
+    );
+    std::env::set_var(
+        "IZWI_MAX_RETAINED_SEQUENCES",
+        args.runtime.max_retained_sequences.to_string(),
+    );
+    std::env::set_var(
+        "IZWI_MAX_STAGED_TRANSACTIONS",
+        args.runtime.max_staged_transactions.to_string(),
+    );
+    std::env::set_var(
+        "IZWI_MAX_QUEUED_REQUESTS",
+        args.runtime.max_queued_requests.to_string(),
+    );
+    std::env::set_var(
+        "IZWI_MAX_SEQUENCE_LENGTH",
+        args.runtime.max_sequence_length.to_string(),
     );
     std::env::set_var("IZWI_BACKEND", args.runtime.backend.as_str());
     std::env::set_var("IZWI_NUM_THREADS", args.runtime.num_threads.to_string());
@@ -557,12 +607,19 @@ mod tests {
         std::env::remove_var("IZWI_HOST");
         std::env::remove_var("IZWI_PORT");
         std::env::remove_var("IZWI_MAX_BATCH_SIZE");
+        std::env::remove_var("IZWI_PHYSICAL_EXECUTION_MODE");
+        std::env::remove_var("IZWI_MAX_PHYSICAL_IN_FLIGHT");
+        std::env::remove_var("IZWI_MAX_SCHEDULER_BATCH_SIZE");
+        std::env::remove_var("IZWI_MAX_RETAINED_SEQUENCES");
+        std::env::remove_var("IZWI_MAX_STAGED_TRANSACTIONS");
+        std::env::remove_var("IZWI_MAX_QUEUED_REQUESTS");
         std::env::remove_var("IZWI_MAX_CONCURRENT");
         std::env::remove_var("IZWI_TIMEOUT");
         std::env::remove_var("IZWI_SERVE_MODE");
         std::env::remove_var("IZWI_BACKEND");
         std::env::remove_var("IZWI_NUM_THREADS");
         std::env::remove_var("IZWI_MODELS_DIR");
+        std::env::remove_var("IZWI_MAX_LOADED_MODELS");
         std::env::remove_var("IZWI_CORS");
         std::env::remove_var("IZWI_CORS_ORIGINS");
         std::env::remove_var("IZWI_NO_UI");
@@ -576,7 +633,20 @@ mod tests {
                 host: "0.0.0.0".to_string(),
                 port: 8080,
                 models_dir: PathBuf::from("/tmp/models"),
-                max_batch_size: 8,
+                max_loaded_models: 1,
+                max_batch_size: izwi_core::BatchSizePreference::Auto,
+                physical_execution_mode: izwi_core::PhysicalExecutionMode::Shadow,
+                max_physical_in_flight: izwi_core::PhysicalInFlightLimit::new(3).unwrap(),
+                max_scheduler_batch_size: 8,
+                enable_prefix_caching: false,
+                managed_prefix_cache_salt: None,
+                max_prefix_cache_pages: 128,
+                enable_chunked_prefill: false,
+                chunked_prefill_threshold: 192,
+                max_retained_sequences: 8,
+                max_staged_transactions: 8,
+                max_queued_requests: 128,
+                max_sequence_length: izwi_core::ContextLengthPreference::Auto,
                 backend: BackendPreference::Auto,
                 num_threads: 4,
                 max_concurrent_requests: 100,
@@ -602,6 +672,14 @@ mod tests {
         assert_eq!(std::env::var("IZWI_CORS").as_deref(), Ok("1"));
         assert_eq!(std::env::var("IZWI_NO_UI").as_deref(), Ok("1"));
         assert_eq!(std::env::var("IZWI_LOG_FORMAT").as_deref(), Ok("text"));
+        assert_eq!(
+            std::env::var("IZWI_PHYSICAL_EXECUTION_MODE").as_deref(),
+            Ok("shadow")
+        );
+        assert_eq!(
+            std::env::var("IZWI_MAX_PHYSICAL_IN_FLIGHT").as_deref(),
+            Ok("3")
+        );
         assert_eq!(
             std::env::var("IZWI_MODELS_DIR").as_deref(),
             Ok("/tmp/models")

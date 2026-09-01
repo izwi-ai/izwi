@@ -9,11 +9,30 @@ import {
   TRANSCRIPTION_PREFERRED_MODELS,
   VOICE_CLONING_PREFERRED_MODELS,
   getChatRouteModelLabel,
-  isThinkingChatModel,
   resolvePreferredRouteModel,
 } from "./routeModelCatalog";
+import { getModelProviderLabel, MODEL_DETAILS } from "./modelMetadata";
 
 describe("route model catalog", () => {
+  it("keeps Qwen3.8 discoverable without making the 27B model the default", () => {
+    expect(CHAT_PREFERRED_MODELS).toContain("Qwen3.8-27B-FP8");
+    expect(CHAT_PREFERRED_MODELS[0]).toBe("Qwen3-8B-GGUF");
+  });
+
+  it("describes Qwen3.8 as a text-only Qwen chat model", () => {
+    expect(getModelProviderLabel("Qwen3.8-27B-FP8")).toBe("Qwen");
+    expect(MODEL_DETAILS["Qwen3.8-27B-FP8"]?.category).toBe("chat");
+    expect(MODEL_DETAILS["Qwen3.8-27B-FP8"]?.capabilities).not.toContain(
+      "Multimodal",
+    );
+    expect(MODEL_DETAILS["Qwen3.8-27B-FP8"]?.capabilities).toContain(
+      "Reasoning Effort",
+    );
+    expect(MODEL_DETAILS["Qwen3.8-27B-FP8"]?.description).not.toContain(
+      "Qwen3.5",
+    );
+  });
+
   it("prioritizes Qwen3-8B as the default chat pick", () => {
     const selected = resolvePreferredRouteModel({
       models: [
@@ -123,11 +142,6 @@ describe("route model catalog", () => {
     );
   });
 
-  it("treats Qwen3.5 models as thinking-capable chat models", () => {
-    expect(isThinkingChatModel("Qwen3.5-4B")).toBe(true);
-    expect(isThinkingChatModel("Parakeet-TDT-0.6B-v3")).toBe(false);
-  });
-
   it("uses Qwen chat-route labels without injecting chat into the model name", () => {
     expect(getChatRouteModelLabel("Qwen3-0.6B-GGUF")).toBe(
       "Qwen3 0.6B GGUF (Q8_0)",
@@ -137,6 +151,9 @@ describe("route model catalog", () => {
     );
     expect(getChatRouteModelLabel("Qwen3.5-4B")).toBe(
       "Qwen3.5 4B GGUF (Q4_K_M)",
+    );
+    expect(getChatRouteModelLabel("Qwen3.8-27B-FP8")).toBe(
+      "Qwen3.8 27B (FP8)",
     );
   });
 });

@@ -7,7 +7,7 @@ use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use super::config::EngineCoreConfig;
@@ -15,18 +15,38 @@ use super::metrics::record_engine_stream_backpressure;
 use super::output::StreamingOutput;
 use super::types::{GenerationParams, Priority, RequestId, TaskType, TokenId};
 use super::{
-    BatchId, BatchLaneKey, OutputVisibility, PlanId, ResourceAmount, ResourceVector, SessionKey,
+    BatchId, BatchLaneKey, ClockedStateProjection, ClockedStateSpan, InputRange, OutputVisibility,
+    PlanId, RealtimeOperationId, ResourceAmount, ResourceVector, SessionKey, StageDescriptor,
     StageId, WorkCost,
 };
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
-use crate::models::architectures::qwen3::tts::Qwen3TtsModel;
-use crate::models::architectures::qwen35::chat::Qwen35PreparedPrompt;
-use crate::models::registry::{
-    AsrModelLease, ChatModelLease, NativeAsrModel, NativeChatModel, QwenTtsModelLease,
+use crate::models::architectures::fish_s2::{FishS2GenerationParams, FishS2PreparedArtifact};
+use crate::models::architectures::granite_speech::asr::GraniteSpeechPreparedPromptArtifact;
+use crate::models::architectures::kokoro::KokoroPreparedRequest;
+use crate::models::architectures::lfm25_audio::{
+    lfm25_audio_tts_system_prompt, model::Lfm25AudioPreparedAsrArtifact,
+    tts_retained::Lfm25AudioPreparedTtsArtifact, Lfm25AudioGenerationConfig,
 };
-use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRequestConfig};
+use crate::models::architectures::parakeet::asr::ParakeetPreparedEncoderArtifact;
+use crate::models::architectures::qwen3::asr::Qwen3AsrPreparedAudio;
+use crate::models::architectures::qwen3::tts::{
+    Qwen3TtsModel, SpeakerReference, TtsGenerationParams, TtsSessionCacheRequest,
+};
+use crate::models::architectures::vibevoice::asr::VibeVoiceAsrPreparedArtifact;
+use crate::models::architectures::vibevoice::tts::{
+    VibeVoiceTtsGenerationParams, VibeVoiceTtsPreparedArtifact,
+};
+use crate::models::architectures::voxtral::tts::retained::VoxtralTtsPreparedArtifact;
+use crate::models::architectures::voxtral::tts::VoxtralTtsGenerationParams;
+use crate::models::architectures::whisper::asr::WhisperPreparedWindow;
+use crate::models::registry::{
+    AsrModelLease, ChatModelLease, FishS2TtsModelLease, KokoroTtsModelLease, Lfm25AudioModelLease,
+    NativeAsrModel, NativeChatModel, NativeChatPreparedPrompt, QwenTtsModelLease,
+    VibeVoiceTtsModelLease, VoxtralTtsModelLease,
+};
+use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRequestConfig, ChatRole};
 use crate::runtime::audio_io::{
     validate_base64_audio_retained_size, validate_base64_audio_source_input,
     MAX_AUDIO_SOURCE_BYTES, MAX_REFERENCE_SOURCE_BYTES,
@@ -47,20 +67,15 @@ pub enum RequestStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum EngineStreamPolicy {
+    #[default]
     FailOnFull,
     BlockWithDeadline {
         timeout_ms: u64,
     },
     /// Drop the newly produced output when the bounded queue is full.
     DropNewest,
-}
-
-impl Default for EngineStreamPolicy {
-    fn default() -> Self {
-        Self::FailOnFull
-    }
 }
 
 impl EngineStreamPolicy {
@@ -80,6 +95,7 @@ impl EngineStreamPolicy {
 /// Coarse workload class used by admission and latency-aware scheduling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum WorkloadClass {
     /// Realtime voice or transcription work where first output latency matters most.
     Realtime,
@@ -88,17 +104,12 @@ pub enum WorkloadClass {
     /// User-visible streaming work such as chat or TTS over SSE/websocket.
     Streaming,
     /// Default online API work.
+    #[default]
     Online,
     /// Offline batch jobs.
     Batch,
     /// Opportunistic background work.
     Background,
-}
-
-impl Default for WorkloadClass {
-    fn default() -> Self {
-        Self::Online
-    }
 }
 
 impl WorkloadClass {
@@ -166,6 +177,121 @@ pub struct AsrEngineInput {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) enum RealtimeAsrOperationPayload {
+    Push {
+        samples: Arc<[f32]>,
+        sample_rate: u32,
+    },
+    Finish,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RealtimeAsrOperationKind {
+    Push,
+    Finish,
+}
+
+impl RealtimeAsrOperationPayload {
+    const fn kind(&self) -> RealtimeAsrOperationKind {
+        match self {
+            Self::Push { .. } => RealtimeAsrOperationKind::Push,
+            Self::Finish => RealtimeAsrOperationKind::Finish,
+        }
+    }
+
+    fn accepted_samples(&self) -> usize {
+        match self {
+            Self::Push { samples, .. } => samples.len(),
+            Self::Finish => 0,
+        }
+    }
+}
+
+/// Durable acknowledgement for one exact externally allocated operation ID.
+/// The acknowledgement intentionally carries no payload owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RealtimeAsrOperationAck {
+    operation_id: RealtimeOperationId,
+    kind: RealtimeAsrOperationKind,
+    accepted_samples: usize,
+}
+
+impl RealtimeAsrOperationAck {
+    #[cfg(test)]
+    pub(crate) const fn for_test(
+        operation_id: RealtimeOperationId,
+        kind: RealtimeAsrOperationKind,
+        accepted_samples: usize,
+    ) -> Self {
+        Self {
+            operation_id,
+            kind,
+            accepted_samples,
+        }
+    }
+
+    pub const fn operation_id(&self) -> RealtimeOperationId {
+        self.operation_id
+    }
+
+    pub const fn kind(&self) -> RealtimeAsrOperationKind {
+        self.kind
+    }
+
+    pub const fn accepted_samples(&self) -> usize {
+        self.accepted_samples
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RealtimeAsrTerminalOutcome {
+    Completed,
+    Cancelled,
+    TimedOut,
+    Unloaded,
+    Failed(Arc<str>),
+}
+
+pub(crate) type RealtimeAsrOperationOutcome =
+    std::result::Result<RealtimeAsrOperationAck, RealtimeAsrTerminalOutcome>;
+pub(crate) type RealtimeAsrOperationWaiter = oneshot::Receiver<RealtimeAsrOperationOutcome>;
+
+#[derive(Debug)]
+struct RealtimeAsrIngressOperation {
+    payload: RealtimeAsrOperationPayload,
+    preparation_cost: WorkCost,
+    completion: oneshot::Sender<RealtimeAsrOperationOutcome>,
+}
+
+#[derive(Debug, Default)]
+struct RealtimeAsrIngressState {
+    operations: std::collections::HashMap<RealtimeOperationId, RealtimeAsrIngressOperation>,
+    highest_operation_id: Option<RealtimeOperationId>,
+    terminal: Option<RealtimeAsrTerminalOutcome>,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct RealtimeAsrIngress {
+    state: Mutex<RealtimeAsrIngressState>,
+}
+
+impl Drop for RealtimeAsrIngress {
+    fn drop(&mut self) {
+        let state = self
+            .state
+            .get_mut()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let terminal = state
+            .terminal
+            .clone()
+            .unwrap_or(RealtimeAsrTerminalOutcome::Cancelled);
+        for (_, operation) in state.operations.drain() {
+            let _ = operation.completion.send(Err(terminal.clone()));
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct ChatEngineInput {
     pub messages: Vec<ChatMessage>,
     pub chat_config: ChatRequestConfig,
@@ -206,7 +332,8 @@ pub(super) struct ChatExecutionReady {
     model_variant: ModelVariant,
     model: PreparedChatModel,
     fingerprint: u64,
-    prepared_qwen35_prompt: Option<Qwen35PreparedPrompt>,
+    prepared_chat_prompt: Option<NativeChatPreparedPrompt>,
+    context_limit: usize,
     core_validated: bool,
 }
 
@@ -227,14 +354,26 @@ enum PreparedChatModel {
 #[derive(Clone)]
 enum PreparedIncrementalModel {
     Asr(AsrModelLease),
+    Lfm25AudioAsr(Lfm25AudioModelLease),
+    Lfm25AudioTts(Lfm25AudioModelLease),
     QwenTts(QwenTtsModelLease),
+    VibeVoiceTts(VibeVoiceTtsModelLease),
+    FishS2Tts(FishS2TtsModelLease),
+    VoxtralTts(VoxtralTtsModelLease),
+    KokoroTts(KokoroTtsModelLease),
 }
 
 impl fmt::Debug for PreparedIncrementalModel {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Asr(model) => write!(formatter, "Asr({:p})", &**model),
+            Self::Lfm25AudioAsr(model) => write!(formatter, "Lfm25AudioAsr({:p})", &**model),
+            Self::Lfm25AudioTts(model) => write!(formatter, "Lfm25AudioTts({:p})", &**model),
             Self::QwenTts(model) => write!(formatter, "QwenTts({:p})", &**model),
+            Self::VibeVoiceTts(model) => write!(formatter, "VibeVoiceTts({:p})", &**model),
+            Self::FishS2Tts(model) => write!(formatter, "FishS2Tts({:p})", &**model),
+            Self::VoxtralTts(model) => write!(formatter, "VoxtralTts({:p})", &**model),
+            Self::KokoroTts(model) => write!(formatter, "KokoroTts({:p})", &**model),
         }
     }
 }
@@ -243,6 +382,23 @@ impl fmt::Debug for PreparedIncrementalModel {
 pub(super) struct IncrementalModelExecutionReady {
     model_variant: ModelVariant,
     model: PreparedIncrementalModel,
+    qwen_tts: Option<PreparedQwenTtsInput>,
+    lfm25_audio_tts: Option<Arc<Lfm25AudioPreparedTtsArtifact>>,
+    vibevoice_tts: Option<Arc<VibeVoiceTtsPreparedArtifact>>,
+    vibevoice_tts_params: Option<VibeVoiceTtsGenerationParams>,
+    fish_s2_tts: Option<Arc<FishS2PreparedArtifact>>,
+    fish_s2_tts_params: Option<FishS2GenerationParams>,
+    voxtral_tts: Option<Arc<VoxtralTtsPreparedArtifact>>,
+    voxtral_tts_params: Option<VoxtralTtsGenerationParams>,
+    kokoro_tts: Option<Arc<KokoroPreparedRequest>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedQwenTtsInput {
+    pub(crate) reference: Option<Arc<SpeakerReference>>,
+    pub(crate) speaker: Option<String>,
+    pub(crate) prefill_tokens: usize,
+    pub(crate) max_frames: usize,
 }
 
 /// Exact, host-prepared cost for one loaded adapter stage. Model preparation
@@ -750,6 +906,104 @@ fn escaped_json_string_upper_bound(value: &str) -> Result<usize> {
         .ok_or_else(|| Error::InvalidInput("Direct chat JSON string size overflow".to_string()))
 }
 
+/// Exact Qwen3 ASR execution shape resolved from decoded media before
+/// scheduler admission. Retained sequence rows use managed KV; long-form rows
+/// use only their invocation-scoped atomic pipeline workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreparedAsrExecutionShape {
+    RetainedSequence { input_tokens: usize },
+    LongFormAtomic,
+}
+
+#[derive(Clone)]
+pub(super) struct PreparedAsrAudio {
+    model_variant: ModelVariant,
+    samples: Arc<[f32]>,
+    sample_rate: u32,
+    source_fingerprint: u64,
+}
+
+#[derive(Clone)]
+pub(super) struct PreparedAsrEncoderArtifact {
+    model_variant: ModelVariant,
+    artifact: PreparedAsrEncoderArtifactValue,
+    source_fingerprint: u64,
+}
+
+#[derive(Clone)]
+enum PreparedAsrEncoderArtifactValue {
+    Qwen3(Arc<Qwen3AsrPreparedAudio>),
+    Whisper(Arc<WhisperPreparedWindow>),
+    VibeVoice(Arc<VibeVoiceAsrPreparedArtifact>),
+    GraniteSpeech(Arc<GraniteSpeechPreparedPromptArtifact>),
+    Lfm25Audio(Arc<Lfm25AudioPreparedAsrArtifact>),
+    Parakeet(Arc<ParakeetPreparedEncoderArtifact>),
+}
+
+impl fmt::Debug for PreparedAsrEncoderArtifact {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedAsrEncoderArtifact")
+            .field("model_variant", &self.model_variant)
+            .field("artifact", &self.artifact.family_name())
+            .field("source_fingerprint", &self.source_fingerprint)
+            .finish()
+    }
+}
+
+impl PreparedAsrEncoderArtifactValue {
+    const fn family_name(&self) -> &'static str {
+        match self {
+            Self::Qwen3(_) => "qwen3",
+            Self::Whisper(_) => "whisper",
+            Self::VibeVoice(_) => "vibevoice",
+            Self::GraniteSpeech(_) => "granite_speech",
+            Self::Lfm25Audio(_) => "lfm25_audio",
+            Self::Parakeet(_) => "parakeet",
+        }
+    }
+
+    fn resident_resources(&self) -> Result<(u64, u64)> {
+        match self {
+            Self::Qwen3(value) => Ok((0, value.resident_tensor_bytes()?)),
+            Self::Whisper(value) => Ok((0, value.resident_tensor_bytes()?)),
+            Self::VibeVoice(value) => {
+                Ok((value.resident_host_bytes(), value.resident_tensor_bytes()))
+            }
+            Self::GraniteSpeech(value) => {
+                Ok((value.resident_host_bytes(), value.resident_tensor_bytes()?))
+            }
+            Self::Lfm25Audio(value) => {
+                Ok((value.retained_host_bytes, value.retained_resident_bytes))
+            }
+            Self::Parakeet(value) => Ok((0, value.resident_tensor_bytes()?)),
+        }
+    }
+
+    fn clocked_state_projections(&self) -> &[ClockedStateProjection] {
+        match self {
+            Self::VibeVoice(value) => value.tokenizer_state_projections(),
+            Self::Qwen3(_)
+            | Self::Whisper(_)
+            | Self::GraniteSpeech(_)
+            | Self::Lfm25Audio(_)
+            | Self::Parakeet(_) => &[],
+        }
+    }
+}
+
+impl fmt::Debug for PreparedAsrAudio {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedAsrAudio")
+            .field("model_variant", &self.model_variant)
+            .field("samples", &self.samples.len())
+            .field("sample_rate", &self.sample_rate)
+            .field("source_fingerprint", &self.source_fingerprint)
+            .finish()
+    }
+}
+
 /// A request to the engine core.
 #[derive(Debug, Clone)]
 pub struct EngineCoreRequest {
@@ -772,10 +1026,28 @@ pub struct EngineCoreRequest {
     /// Exact loaded capability adapter selected by the runtime. Direct engine
     /// callers without a lifecycle bundle remain on compatibility dispatch.
     pub(super) execution_adapter_binding: Option<super::ExecutionAdapterBinding>,
+    /// ABI-v2 state truth resolved by the lifecycle before the request can
+    /// enter scheduler execution.
+    pub(super) v2_state_descriptor: Option<crate::kv::v2::CapabilityStateDescriptorV2>,
+    pub(super) v2_state_fingerprint: Option<[u8; 32]>,
+    /// Exact load-sealed runtime proof for stateless/zero-workspace ABI-v2
+    /// capabilities. Stateful variants replace this proof only when they own
+    /// backend allocations and completion tracking.
+    pub(super) v2_state_runtime: Option<Arc<crate::kv::v2::CapabilityStateRuntimeV2>>,
+    /// Immutable model-level physical KV runtime installed by the engine.
+    pub(super) managed_cache_runtime: Option<Arc<super::cache::managed::ManagedKvModelRuntime>>,
     /// Request-specific shape/workspace facts produced by the exact loaded
     /// model. The engine remains model-neutral and keys these facts by the
     /// opaque stage identity from the loaded adapter contract.
     pub(super) prepared_stage_costs: Vec<PreparedStageCost>,
+    /// Exact logical input span produced by model-specific multimodal
+    /// preprocessing before scheduler admission. Text models derive this from
+    /// `prompt_tokens`; speech and future multimodal adapters publish it here
+    /// instead of manufacturing placeholder token IDs.
+    pub(super) prepared_sequence_input_tokens: Option<usize>,
+    pub(super) prepared_asr_execution_shape: Option<PreparedAsrExecutionShape>,
+    pub(super) prepared_asr_audio: Option<PreparedAsrAudio>,
+    pub(super) prepared_asr_encoder_artifact: Option<PreparedAsrEncoderArtifact>,
     /// Executor-produced stream events remain invisible until their exact
     /// execution report has committed.
     pub(super) stream_staging: StreamStagingBuffer,
@@ -828,6 +1100,9 @@ pub struct EngineCoreRequest {
     /// Exact ASR/Qwen-TTS model identity retained for standalone incremental
     /// execution. Public fields cannot manufacture this lifecycle fence.
     pub(super) incremental_model_execution_ready: Option<IncrementalModelExecutionReady>,
+    /// Engine-owned, session-fenced realtime operation payloads. The immutable
+    /// request owns the mailbox; only Engine ingress can install/remove rows.
+    pub(super) realtime_asr_ingress: Option<Arc<RealtimeAsrIngress>>,
     /// Enable streaming output
     pub streaming: bool,
     /// Backpressure behavior for streaming output.
@@ -840,6 +1115,190 @@ pub struct EngineCoreRequest {
 }
 
 impl EngineCoreRequest {
+    pub(crate) fn enable_realtime_asr_ingress(&mut self) -> Result<()> {
+        if self.task_type != TaskType::ASR || self.realtime_asr_ingress.is_some() {
+            return Err(Error::InvalidInput(format!(
+                "request {} cannot enable realtime ASR ingress",
+                self.id
+            )));
+        }
+        self.streaming = true;
+        self.realtime_asr_ingress = Some(Arc::new(RealtimeAsrIngress::default()));
+        Ok(())
+    }
+
+    pub(crate) fn is_realtime_asr_session(&self) -> bool {
+        self.realtime_asr_ingress.is_some()
+    }
+
+    pub(crate) fn install_realtime_asr_operation(
+        &self,
+        operation_id: RealtimeOperationId,
+        payload: RealtimeAsrOperationPayload,
+    ) -> Result<RealtimeAsrOperationWaiter> {
+        let logical_units = match &payload {
+            RealtimeAsrOperationPayload::Push { samples, .. } => {
+                u64::try_from(samples.len()).unwrap_or(u64::MAX).max(1)
+            }
+            RealtimeAsrOperationPayload::Finish => 1,
+        };
+        self.install_realtime_asr_operation_with_cost(
+            operation_id,
+            payload,
+            WorkCost::new(logical_units, logical_units, 0),
+        )
+    }
+
+    pub(crate) fn install_realtime_asr_operation_with_cost(
+        &self,
+        operation_id: RealtimeOperationId,
+        payload: RealtimeAsrOperationPayload,
+        preparation_cost: WorkCost,
+    ) -> Result<RealtimeAsrOperationWaiter> {
+        let ingress = self.realtime_asr_ingress.as_ref().ok_or_else(|| {
+            Error::InvalidInput("request is not an engine-owned realtime ASR session".into())
+        })?;
+        let mut state = ingress
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if state.terminal.is_some() {
+            return Err(Error::InferenceError(
+                "realtime ASR session is already terminal".into(),
+            ));
+        }
+        if state
+            .highest_operation_id
+            .is_some_and(|highest| operation_id <= highest)
+        {
+            return Err(Error::InferenceError(format!(
+                "realtime ASR operation identity {} is duplicate or stale",
+                operation_id.get()
+            )));
+        }
+        let (completion, waiter) = oneshot::channel();
+        match state.operations.entry(operation_id) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(RealtimeAsrIngressOperation {
+                    payload,
+                    preparation_cost,
+                    completion,
+                });
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {
+                return Err(Error::InferenceError(
+                    "realtime ASR operation identity was installed twice".into(),
+                ));
+            }
+        }
+        state.highest_operation_id = Some(operation_id);
+        Ok(waiter)
+    }
+
+    pub(crate) fn realtime_asr_preparation_cost(
+        &self,
+        operation_id: RealtimeOperationId,
+    ) -> Result<WorkCost> {
+        let ingress = self.realtime_asr_ingress.as_ref().ok_or_else(|| {
+            Error::InvalidInput("request is not an engine-owned realtime ASR session".into())
+        })?;
+        ingress
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .operations
+            .get(&operation_id)
+            .map(|operation| operation.preparation_cost)
+            .ok_or_else(|| {
+                Error::InferenceError(format!(
+                    "realtime ASR operation {} has no retained preparation cost",
+                    operation_id.get()
+                ))
+            })
+    }
+
+    pub(crate) fn realtime_asr_operation(
+        &self,
+        operation_id: RealtimeOperationId,
+    ) -> Result<RealtimeAsrOperationPayload> {
+        let ingress = self.realtime_asr_ingress.as_ref().ok_or_else(|| {
+            Error::InvalidInput("request is not an engine-owned realtime ASR session".into())
+        })?;
+        ingress
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .operations
+            .get(&operation_id)
+            .map(|operation| operation.payload.clone())
+            .ok_or_else(|| {
+                Error::InferenceError(format!(
+                    "realtime ASR operation {} has no retained payload",
+                    operation_id.get()
+                ))
+            })
+    }
+
+    /// Atomically retires one payload before publishing its acknowledgement.
+    /// A repeated or unknown identity is rejected and cannot acknowledge a
+    /// later operation that happens to have the same payload shape.
+    pub(super) fn complete_realtime_asr_operation(
+        &self,
+        operation_id: RealtimeOperationId,
+    ) -> Result<()> {
+        let ingress = self.realtime_asr_ingress.as_ref().ok_or_else(|| {
+            Error::InvalidInput("request is not an engine-owned realtime ASR session".into())
+        })?;
+        let operation = ingress
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .operations
+            .remove(&operation_id)
+            .ok_or_else(|| {
+                Error::InferenceError(format!(
+                    "realtime ASR operation {} is unknown, stale, or already completed",
+                    operation_id.get()
+                ))
+            })?;
+        let acknowledgement = RealtimeAsrOperationAck {
+            operation_id,
+            kind: operation.payload.kind(),
+            accepted_samples: operation.payload.accepted_samples(),
+        };
+        // Sending may fail when an external waiter was cancelled. The payload
+        // is still authoritatively retired and must not be resurrected.
+        let _ = operation.completion.send(Ok(acknowledgement));
+        Ok(())
+    }
+
+    /// Fences future installation, retires every retained payload, and wakes
+    /// all operation waiters with the same authoritative terminal outcome.
+    pub(super) fn terminate_realtime_asr_ingress(
+        &self,
+        terminal: RealtimeAsrTerminalOutcome,
+    ) -> Result<usize> {
+        let ingress = self.realtime_asr_ingress.as_ref().ok_or_else(|| {
+            Error::InvalidInput("request is not an engine-owned realtime ASR session".into())
+        })?;
+        let operations = {
+            let mut state = ingress
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if state.terminal.is_some() {
+                return Ok(0);
+            }
+            state.terminal = Some(terminal.clone());
+            std::mem::take(&mut state.operations)
+        };
+        let retired = operations.len();
+        for (_, operation) in operations {
+            let _ = operation.completion.send(Err(terminal.clone()));
+        }
+        Ok(retired)
+    }
+
     fn sync_task_from_fields(&mut self) {
         if self.task_type == TaskType::Chat {
             self.task = EngineTask::Chat(ChatEngineInput {
@@ -875,7 +1334,7 @@ impl EngineCoreRequest {
             (EngineTask::SpeechToSpeech(input), TaskType::SpeechToSpeech) => &input.audio,
             _ => return None,
         };
-        (!audio.is_empty()).then(|| match audio {
+        (!audio.is_empty()).then_some(match audio {
             EngineAudioInput::Base64(value) => BorrowedEngineAudioInput::Base64(value),
             EngineAudioInput::Bytes(value) => BorrowedEngineAudioInput::Bytes(value),
         })
@@ -897,7 +1356,7 @@ impl EngineCoreRequest {
     fn selected_asr_language(&self) -> Option<&String> {
         self.language
             .as_ref()
-            .or_else(|| match (&self.task, self.task_type) {
+            .or(match (&self.task, self.task_type) {
                 (EngineTask::Asr(input), TaskType::ASR) => input.language.as_ref(),
                 _ => None,
             })
@@ -906,7 +1365,7 @@ impl EngineCoreRequest {
     fn selected_asr_prompt(&self) -> Option<&String> {
         self.asr_prompt
             .as_ref()
-            .or_else(|| match (&self.task, self.task_type) {
+            .or(match (&self.task, self.task_type) {
                 (EngineTask::Asr(input), TaskType::ASR) => input.prompt.as_ref(),
                 _ => None,
             })
@@ -937,7 +1396,7 @@ impl EngineCoreRequest {
     fn selected_speech_system_prompt(&self) -> Option<&String> {
         self.system_prompt
             .as_ref()
-            .or_else(|| match (&self.task, self.task_type) {
+            .or(match (&self.task, self.task_type) {
                 (EngineTask::SpeechToSpeech(input), TaskType::SpeechToSpeech) => {
                     input.system_prompt.as_ref()
                 }
@@ -963,6 +1422,17 @@ impl EngineCoreRequest {
         self.selected_tts_reference().0.map(String::as_str)
     }
 
+    pub(crate) fn tts_text_for_execution(&self) -> Option<&str> {
+        self.text.as_deref()
+    }
+
+    pub(crate) fn tts_speaker_for_execution(&self) -> Option<&str> {
+        self.params
+            .speaker
+            .as_deref()
+            .or(self.params.voice.as_deref())
+    }
+
     pub(crate) fn tts_reference_text_for_execution(&self) -> Option<&str> {
         self.selected_tts_reference().1.map(String::as_str)
     }
@@ -978,6 +1448,33 @@ impl EngineCoreRequest {
 
     pub(crate) fn asr_prompt_for_execution(&self) -> Option<&str> {
         self.selected_asr_prompt().map(String::as_str)
+    }
+
+    fn asr_execution_source_fingerprint(&self, model_variant: ModelVariant) -> Result<u64> {
+        if self.task_type != TaskType::ASR || self.model_variant != Some(model_variant) {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} source identity does not match its routed task/model",
+                self.id
+            )));
+        }
+        let audio = self.selected_audio_input().ok_or_else(|| {
+            Error::InvalidInput(format!("ASR request {} is missing audio input", self.id))
+        })?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        model_variant.hash(&mut hasher);
+        match audio {
+            BorrowedEngineAudioInput::Base64(value) => {
+                0_u8.hash(&mut hasher);
+                value.as_bytes().hash(&mut hasher);
+            }
+            BorrowedEngineAudioInput::Bytes(value) => {
+                1_u8.hash(&mut hasher);
+                value.as_slice().hash(&mut hasher);
+            }
+        }
+        self.asr_language_for_execution().hash(&mut hasher);
+        self.asr_prompt_for_execution().hash(&mut hasher);
+        Ok(hasher.finish())
     }
 
     pub(crate) fn speech_messages_for_execution(&self) -> &[ChatMessage] {
@@ -1498,10 +1995,15 @@ impl EngineCoreRequest {
         if self.task_type != TaskType::Chat {
             return Ok(());
         }
+        let context_limit = self
+            .chat_execution_ready
+            .as_ref()
+            .map(|ready| ready.context_limit)
+            .unwrap_or(max_seq_len);
         let prompt_tokens = self.prompt_tokens.len();
-        if max_seq_len == 0 || prompt_tokens >= max_seq_len {
+        if context_limit == 0 || prompt_tokens >= context_limit {
             return Err(Error::InvalidInput(format!(
-                "Chat request {} exact prompt has {prompt_tokens} tokens and leaves no output capacity in the configured {max_seq_len}-token context",
+                "Chat request {} exact prompt has {prompt_tokens} tokens and leaves no output capacity in the resolved {context_limit}-token context",
                 self.id
             )));
         }
@@ -1509,7 +2011,7 @@ impl EngineCoreRequest {
             .params
             .max_tokens
             .max(1)
-            .min(max_seq_len - prompt_tokens);
+            .min(context_limit - prompt_tokens);
         Ok(())
     }
 
@@ -1520,14 +2022,16 @@ impl EngineCoreRequest {
         &mut self,
         model_variant: ModelVariant,
         prompt_tokens: Vec<TokenId>,
-        prepared_qwen35_prompt: Option<Qwen35PreparedPrompt>,
+        prepared_chat_prompt: Option<NativeChatPreparedPrompt>,
         model: ChatModelLease,
+        context_limit: usize,
     ) -> Result<()> {
         self.install_chat_execution_preparation_inner(
             model_variant,
             prompt_tokens,
-            prepared_qwen35_prompt,
+            prepared_chat_prompt,
             PreparedChatModel::Exact(model),
+            context_limit,
         )
     }
 
@@ -1536,13 +2040,15 @@ impl EngineCoreRequest {
         &mut self,
         model_variant: ModelVariant,
         prompt_tokens: Vec<TokenId>,
-        prepared_qwen35_prompt: Option<Qwen35PreparedPrompt>,
+        prepared_chat_prompt: Option<NativeChatPreparedPrompt>,
+        context_limit: usize,
     ) -> Result<()> {
         self.install_chat_execution_preparation_inner(
             model_variant,
             prompt_tokens,
-            prepared_qwen35_prompt,
+            prepared_chat_prompt,
             PreparedChatModel::ValidationOnly,
+            context_limit,
         )
     }
 
@@ -1550,8 +2056,9 @@ impl EngineCoreRequest {
         &mut self,
         model_variant: ModelVariant,
         prompt_tokens: Vec<TokenId>,
-        prepared_qwen35_prompt: Option<Qwen35PreparedPrompt>,
+        prepared_chat_prompt: Option<NativeChatPreparedPrompt>,
         model: PreparedChatModel,
+        context_limit: usize,
     ) -> Result<()> {
         self.chat_execution_ready = None;
         if self.task_type != TaskType::Chat {
@@ -1581,31 +2088,39 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
+        if context_limit == 0 {
+            return Err(Error::InvalidInput(format!(
+                "Chat request {} preparation has a zero context limit",
+                self.id
+            )));
+        }
 
-        let is_qwen35 = model_variant.family() == ModelFamily::Qwen35Chat;
-        match prepared_qwen35_prompt.as_ref() {
-            Some(_) if !is_qwen35 => {
+        let family = model_variant.family();
+        let needs_prepared_prompt =
+            matches!(family, ModelFamily::Qwen35Chat | ModelFamily::Qwen38Chat);
+        match prepared_chat_prompt.as_ref() {
+            Some(prepared) if prepared.family() != family => {
                 return Err(Error::InvalidInput(format!(
-                    "Chat request {} routed a Qwen3.5 prompt artifact to {model_variant}",
+                    "Chat request {} routed a mismatched prepared prompt artifact to {model_variant}",
                     self.id
                 )));
             }
             Some(prepared) if prepared.prompt_ids() != prompt_tokens => {
                 return Err(Error::InvalidInput(format!(
-                    "Chat request {} Qwen3.5 prompt artifact does not match its exact prompt tokens",
+                    "Chat request {} prepared prompt artifact does not match its exact prompt tokens",
                     self.id
                 )));
             }
-            None if is_qwen35 => {
+            None if needs_prepared_prompt => {
                 return Err(Error::InvalidInput(format!(
-                    "Chat request {} is missing its prepared Qwen3.5 prompt artifact",
+                    "Chat request {} is missing its prepared hybrid-Qwen prompt artifact",
                     self.id
                 )));
             }
             _ => {}
         }
 
-        if prepared_qwen35_prompt.is_some() {
+        if prepared_chat_prompt.is_some() {
             // The opaque artifact owns all decoded/encoded vision state needed
             // by execution. Do not retain or repeatedly fingerprint multi-MB
             // data URLs (or signed remote URLs) on the scheduler hot path.
@@ -1630,7 +2145,8 @@ impl EngineCoreRequest {
             model_variant,
             model,
             fingerprint,
-            prepared_qwen35_prompt,
+            prepared_chat_prompt,
+            context_limit,
             core_validated: false,
         });
         Ok(())
@@ -1648,6 +2164,7 @@ impl EngineCoreRequest {
         }) else {
             return Ok(None);
         };
+        #[allow(clippy::infallible_destructuring_match)]
         let model = match model {
             PreparedChatModel::Exact(model) => model,
             #[cfg(test)]
@@ -1749,19 +2266,23 @@ impl EngineCoreRequest {
             )));
         }
 
-        match ready.prepared_qwen35_prompt.as_ref() {
+        match ready.prepared_chat_prompt.as_ref() {
             Some(prepared)
-                if model_variant.family() != ModelFamily::Qwen35Chat
+                if prepared.family() != model_variant.family()
                     || prepared.prompt_ids() != self.prompt_tokens =>
             {
                 Err(Error::InvalidInput(format!(
-                    "Chat request {} has a mismatched Qwen3.5 prompt artifact",
+                    "Chat request {} has a mismatched prepared prompt artifact",
                     self.id
                 )))
             }
-            None if model_variant.family() == ModelFamily::Qwen35Chat => {
+            None if matches!(
+                model_variant.family(),
+                ModelFamily::Qwen35Chat | ModelFamily::Qwen38Chat
+            ) =>
+            {
                 Err(Error::InvalidInput(format!(
-                    "Chat request {} is missing its prepared Qwen3.5 prompt artifact",
+                    "Chat request {} is missing its prepared hybrid-Qwen prompt artifact",
                     self.id
                 )))
             }
@@ -1819,14 +2340,14 @@ impl EngineCoreRequest {
         self.validate_chat_execution_preparation()
     }
 
-    pub(crate) fn prepared_qwen35_prompt_for_executor(
+    pub(crate) fn prepared_chat_prompt_for_executor(
         &self,
-    ) -> Result<Option<&Qwen35PreparedPrompt>> {
+    ) -> Result<Option<&NativeChatPreparedPrompt>> {
         self.validate_chat_execution_for_executor()?;
         Ok(self
             .chat_execution_ready
             .as_ref()
-            .and_then(|ready| ready.prepared_qwen35_prompt.as_ref()))
+            .and_then(|ready| ready.prepared_chat_prompt.as_ref()))
     }
 
     pub(crate) fn prepared_chat_model_for_executor(&self) -> Result<Arc<NativeChatModel>> {
@@ -1856,10 +2377,1324 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
+        let prepared_continuous_cost = self
+            .uses_asr_retained_sequence()
+            .then(|| {
+                Self::continuous_asr_stage_cost(self.execution_adapter_binding.as_ref(), &model)
+            })
+            .transpose()?
+            .flatten();
+        self.prepared_stage_costs.clear();
         self.incremental_model_execution_ready = Some(IncrementalModelExecutionReady {
             model_variant,
             model: PreparedIncrementalModel::Asr(model),
+            qwen_tts: None,
+            lfm25_audio_tts: None,
+            vibevoice_tts: None,
+            vibevoice_tts_params: None,
+            fish_s2_tts: None,
+            fish_s2_tts_params: None,
+            voxtral_tts: None,
+            voxtral_tts_params: None,
+            kokoro_tts: None,
         });
+        if let Some((stage_id, cost)) = prepared_continuous_cost {
+            self.install_prepared_stage_cost(stage_id, cost)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn install_lfm25_audio_asr_execution_model(
+        &mut self,
+        model_variant: ModelVariant,
+        model: Lfm25AudioModelLease,
+    ) -> Result<()> {
+        if model_variant.family() != ModelFamily::Lfm25Audio
+            || self.task_type != TaskType::ASR
+            || self.model_variant != Some(model_variant)
+        {
+            return Err(Error::InvalidInput(format!(
+                "LFM2.5 Audio ASR request {} model preparation does not match its routed task/model",
+                self.id
+            )));
+        }
+        self.prepared_stage_costs.clear();
+        self.incremental_model_execution_ready = Some(IncrementalModelExecutionReady {
+            model_variant,
+            model: PreparedIncrementalModel::Lfm25AudioAsr(model),
+            qwen_tts: None,
+            lfm25_audio_tts: None,
+            vibevoice_tts: None,
+            vibevoice_tts_params: None,
+            fish_s2_tts: None,
+            fish_s2_tts_params: None,
+            voxtral_tts: None,
+            voxtral_tts_params: None,
+            kokoro_tts: None,
+        });
+        Ok(())
+    }
+
+    fn continuous_asr_stage_cost(
+        binding: Option<&super::ExecutionAdapterBinding>,
+        model: &NativeAsrModel,
+    ) -> Result<Option<(StageId, WorkCost)>> {
+        let Some(stage) = binding.and_then(|binding| {
+            binding
+                .stages
+                .iter()
+                .find(|stage| stage.batch_mode == super::NativeBatchMode::Continuous)
+        }) else {
+            return Ok(None);
+        };
+        if matches!(model, NativeAsrModel::Parakeet(_)) {
+            let cost = WorkCost::new(
+                1,
+                1,
+                crate::models::architectures::parakeet::asr::PARAKEET_RETAINED_WORKSPACE_PER_ROW_BYTES,
+            );
+            if !cost
+                .workspace
+                .workspace_bytes()
+                .is_ok_and(|bytes| bytes <= stage.max_workspace_bytes)
+            {
+                return Err(Error::Overloaded(
+                    "Parakeet retained decode workspace exceeds its loaded adapter budget"
+                        .to_string(),
+                ));
+            }
+            return Ok(Some((stage.id, cost)));
+        }
+        if !model.supports_continuous_decode_batch() {
+            return Err(Error::InvalidInput(
+                "loaded adapter selected continuous decode for an incompatible ASR model"
+                    .to_string(),
+            ));
+        }
+        let accelerator_bytes = model.continuous_decode_batch_workspace_per_row_bytes()?;
+        let host_bytes = super::continuous_asr_host_workspace_per_row_bytes()?;
+        let cost = WorkCost::with_workspace(
+            1,
+            1,
+            ResourceVector {
+                host_bytes: ResourceAmount::Known(host_bytes),
+                temporary_bytes: ResourceAmount::Known(accelerator_bytes),
+                ..ResourceVector::zero()
+            },
+        );
+        if super::continuous_asr_workspace_per_row_bytes(accelerator_bytes)?
+            > stage.max_workspace_bytes
+        {
+            return Err(Error::Overloaded(
+                "continuous ASR decode workspace exceeds its loaded adapter budget".to_string(),
+            ));
+        }
+        Ok(Some((stage.id, cost)))
+    }
+
+    fn continuous_lfm25_audio_asr_stage_cost(
+        binding: Option<&super::ExecutionAdapterBinding>,
+        model: &crate::models::registry::NativeAudioChatModel,
+        prompt_tokens: usize,
+        max_new_tokens: usize,
+    ) -> Result<Option<(StageId, WorkCost)>> {
+        let Some(stage) = binding.and_then(|binding| {
+            binding
+                .stages
+                .iter()
+                .find(|stage| stage.batch_mode == super::NativeBatchMode::Continuous)
+        }) else {
+            return Ok(None);
+        };
+        let position = prompt_tokens
+            .checked_add(max_new_tokens.max(1))
+            .and_then(|value| value.checked_sub(1))
+            .ok_or_else(|| {
+                Error::Overloaded("LFM2.5 Audio ASR decode position overflowed".into())
+            })?;
+        let envelope = model.lfm25_audio_asr_decode_resource_envelope(position)?;
+        let cost = WorkCost::with_workspace(
+            envelope.work_units,
+            envelope.materialized_tensor_elements,
+            ResourceVector {
+                host_bytes: ResourceAmount::Known(envelope.host_workspace_bytes),
+                device_bytes: ResourceAmount::Known(envelope.device_workspace_bytes),
+                unified_bytes: ResourceAmount::Known(envelope.unified_workspace_bytes),
+                ..ResourceVector::zero()
+            },
+        );
+        if !cost
+            .workspace
+            .workspace_bytes()
+            .is_ok_and(|bytes| bytes <= stage.max_workspace_bytes)
+        {
+            return Err(Error::Overloaded(
+                "LFM2.5 Audio ASR decode workspace exceeds its loaded adapter budget".into(),
+            ));
+        }
+        Ok(Some((stage.id, cost)))
+    }
+
+    fn lfm25_audio_tts_stage_costs(
+        binding: Option<&super::ExecutionAdapterBinding>,
+        model: &crate::models::registry::NativeAudioChatModel,
+        prompt_tokens: usize,
+        max_new_tokens: usize,
+    ) -> Result<Vec<(StageId, WorkCost)>> {
+        let Some(binding) = binding else {
+            return Ok(Vec::new());
+        };
+        let mut costs = Vec::new();
+        for stage in binding.stages.iter().filter(|stage| {
+            matches!(
+                stage.selector,
+                super::StageWorkSelector::SequencePrefill
+                    | super::StageWorkSelector::SequenceDecode
+            )
+        }) {
+            let envelope = if stage.selector == super::StageWorkSelector::SequencePrefill {
+                model.lfm25_audio_tts_prefill_resource_envelope(0, prompt_tokens, prompt_tokens)?
+            } else {
+                let position = prompt_tokens
+                    .checked_add(max_new_tokens.max(1))
+                    .and_then(|value| value.checked_sub(1))
+                    .ok_or_else(|| {
+                        Error::Overloaded("LFM2.5 Audio TTS position overflowed".into())
+                    })?;
+                model.lfm25_audio_tts_decode_resource_envelope(position, true)?
+            };
+            let cost = WorkCost::with_workspace(
+                envelope.work_units,
+                envelope.materialized_tensor_elements,
+                ResourceVector {
+                    host_bytes: ResourceAmount::Known(envelope.host_workspace_bytes),
+                    device_bytes: ResourceAmount::Known(envelope.device_workspace_bytes),
+                    unified_bytes: ResourceAmount::Known(envelope.unified_workspace_bytes),
+                    ..ResourceVector::zero()
+                },
+            );
+            if !cost
+                .workspace
+                .workspace_bytes()
+                .is_ok_and(|bytes| bytes <= stage.max_workspace_bytes)
+            {
+                return Err(Error::Overloaded(
+                    "LFM2.5 Audio TTS workspace exceeds its loaded adapter budget".into(),
+                ));
+            }
+            costs.push((stage.id, cost));
+        }
+        Ok(costs)
+    }
+
+    fn continuous_tts_stage_cost(
+        binding: Option<&super::ExecutionAdapterBinding>,
+        model: &Qwen3TtsModel,
+        prefill_tokens: usize,
+        max_frames: usize,
+    ) -> Result<Option<(StageId, WorkCost)>> {
+        let Some(stage) = binding.and_then(|binding| {
+            binding
+                .stages
+                .iter()
+                .find(|stage| stage.batch_mode == super::NativeBatchMode::Continuous)
+        }) else {
+            return Ok(None);
+        };
+        if !model.supports_continuous_decode_batch() {
+            return Err(Error::InvalidInput(
+                "loaded adapter selected continuous decode for an incompatible TTS model".into(),
+            ));
+        }
+        let (host_bytes, accelerator_bytes) =
+            model.continuous_decode_bounded_workspace_per_row_bytes(prefill_tokens, max_frames)?;
+        let cost = WorkCost::with_workspace(
+            1,
+            1,
+            ResourceVector {
+                host_bytes: ResourceAmount::Known(host_bytes),
+                temporary_bytes: ResourceAmount::Known(accelerator_bytes),
+                ..ResourceVector::zero()
+            },
+        );
+        if !cost
+            .workspace
+            .workspace_bytes()
+            .is_ok_and(|bytes| bytes <= stage.max_workspace_bytes)
+        {
+            return Err(Error::Overloaded(
+                "continuous TTS decode workspace exceeds its loaded adapter budget".into(),
+            ));
+        }
+        Ok(Some((stage.id, cost)))
+    }
+
+    fn kokoro_tts_stage_cost(
+        binding: Option<&super::ExecutionAdapterBinding>,
+        prepared: &KokoroPreparedRequest,
+    ) -> Result<Option<(StageId, WorkCost)>> {
+        let Some(stage) = binding.and_then(|binding| {
+            binding.stages.iter().find(|stage| {
+                stage.selector == super::StageWorkSelector::Atomic
+                    && stage.batch_mode == super::NativeBatchMode::Static
+            })
+        }) else {
+            return Ok(None);
+        };
+        let tensor_elements = prepared
+            .token_ids
+            .len()
+            .checked_add(prepared.ref_style.elem_count())
+            .and_then(|elements| u64::try_from(elements).ok())
+            .ok_or_else(|| Error::Overloaded("Kokoro prepared tensor size overflowed".into()))?;
+        Ok(Some((stage.id, WorkCost::new(1, tensor_elements, 0))))
+    }
+
+    fn native_prepared_stage(
+        binding: Option<&super::ExecutionAdapterBinding>,
+        selector: super::StageWorkSelector,
+    ) -> Option<&super::StageDescriptor> {
+        binding.and_then(|binding| {
+            binding.stages.iter().find(|stage| {
+                stage.selector == selector && stage.batch_mode != super::NativeBatchMode::None
+            })
+        })
+    }
+
+    fn fit_qwen_tts_layout_to_loaded_context(
+        mut layout: crate::models::architectures::qwen3::tts::Qwen3TtsPhysicalSessionLayout,
+        max_sequence_tokens: usize,
+        request_id: &str,
+    ) -> Result<crate::models::architectures::qwen3::tts::Qwen3TtsPhysicalSessionLayout> {
+        let output_capacity = max_sequence_tokens
+            .checked_sub(layout.prefill_tokens)
+            .filter(|capacity| *capacity > 0)
+            .ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "Qwen TTS request {request_id} exact prefill has {} tokens and leaves no output capacity in the configured {max_sequence_tokens}-token context",
+                    layout.prefill_tokens
+                ))
+            })?;
+        layout.max_frames = layout.max_frames.min(output_capacity);
+        Ok(layout)
+    }
+
+    fn resumable_tts_prefill_stage_cost(
+        binding: Option<&super::ExecutionAdapterBinding>,
+        model: &Qwen3TtsModel,
+        prefill_tokens: usize,
+        max_frames: usize,
+        has_reference: bool,
+    ) -> Result<Option<(StageId, WorkCost)>> {
+        let Some(stage) =
+            Self::native_prepared_stage(binding, super::StageWorkSelector::SequencePrefill)
+        else {
+            return Ok(None);
+        };
+        let (host_bytes, accelerator_bytes) =
+            model.resumable_prefill_workspace_bytes(prefill_tokens, max_frames, has_reference)?;
+        let cost = WorkCost::with_workspace(
+            1,
+            1,
+            ResourceVector {
+                host_bytes: ResourceAmount::Known(host_bytes),
+                temporary_bytes: ResourceAmount::Known(accelerator_bytes),
+                ..ResourceVector::zero()
+            },
+        );
+        if !cost
+            .workspace
+            .workspace_bytes()
+            .is_ok_and(|bytes| bytes <= stage.max_workspace_bytes)
+        {
+            return Err(Error::Overloaded(
+                "resumable TTS prefill workspace exceeds its loaded adapter budget".into(),
+            ));
+        }
+        Ok(Some((stage.id, cost)))
+    }
+
+    pub(crate) fn install_prepared_asr_audio(
+        &mut self,
+        model_variant: ModelVariant,
+        samples: Vec<f32>,
+        sample_rate: u32,
+    ) -> Result<()> {
+        if sample_rate == 0 || samples.is_empty() {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} decoded to an empty or zero-rate audio artifact",
+                self.id
+            )));
+        }
+        if samples.iter().any(|sample| !sample.is_finite()) {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} decoded to non-finite audio samples",
+                self.id
+            )));
+        }
+        let source_fingerprint = self.asr_execution_source_fingerprint(model_variant)?;
+        if let Some(current) = self.prepared_asr_audio.as_ref() {
+            if current.model_variant == model_variant
+                && current.sample_rate == sample_rate
+                && current.source_fingerprint == source_fingerprint
+                && current.samples.as_ref() == samples.as_slice()
+            {
+                return Ok(());
+            }
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} changed its prepared decoded-audio artifact",
+                self.id
+            )));
+        }
+        self.prepared_asr_audio = Some(PreparedAsrAudio {
+            model_variant,
+            samples: Arc::from(samples.into_boxed_slice()),
+            sample_rate,
+            source_fingerprint,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn prepared_asr_audio_for_executor(&self) -> Result<Option<(Arc<[f32]>, u32)>> {
+        let Some(prepared) = self.prepared_asr_audio.as_ref() else {
+            return Ok(None);
+        };
+        if self.model_variant != Some(prepared.model_variant)
+            || self.asr_execution_source_fingerprint(prepared.model_variant)?
+                != prepared.source_fingerprint
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} changed after decoded-audio preparation",
+                self.id
+            )));
+        }
+        Ok(Some((prepared.samples.clone(), prepared.sample_rate)))
+    }
+
+    pub(crate) fn prepared_asr_audio_retained_bytes(&self) -> Result<usize> {
+        self.prepared_asr_audio.as_ref().map_or(Ok(0), |prepared| {
+            prepared
+                .samples
+                .len()
+                .checked_mul(std::mem::size_of::<f32>())
+                .ok_or_else(|| {
+                    Error::Overloaded("prepared ASR decoded-audio storage overflowed".to_string())
+                })
+        })
+    }
+
+    pub(crate) fn install_prepared_asr_encoder_artifact(
+        &mut self,
+        model_variant: ModelVariant,
+        artifact: Arc<Qwen3AsrPreparedAudio>,
+    ) -> Result<()> {
+        if self.task_type != TaskType::ASR || self.model_variant != Some(model_variant) {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} encoder artifact does not match its routed task/model",
+                self.id
+            )));
+        }
+        if self.uses_asr_long_form_atomic() {
+            return Err(Error::InvalidInput(format!(
+                "long-form ASR request {} cannot retain a normal-route encoder artifact",
+                self.id
+            )));
+        }
+        let source_fingerprint = self.asr_execution_source_fingerprint(model_variant)?;
+        if let Some(current) = self.prepared_asr_encoder_artifact.as_ref() {
+            if current.model_variant == model_variant
+                && current.source_fingerprint == source_fingerprint
+                && matches!(&current.artifact, PreparedAsrEncoderArtifactValue::Qwen3(value) if Arc::ptr_eq(value, &artifact))
+            {
+                return Ok(());
+            }
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} changed its prepared encoder artifact",
+                self.id
+            )));
+        }
+        self.prepared_asr_encoder_artifact = Some(PreparedAsrEncoderArtifact {
+            model_variant,
+            artifact: PreparedAsrEncoderArtifactValue::Qwen3(artifact),
+            source_fingerprint,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn prepared_asr_encoder_artifact_for_executor(
+        &self,
+    ) -> Result<Option<Arc<Qwen3AsrPreparedAudio>>> {
+        let Some(prepared) = self.prepared_asr_encoder_artifact.as_ref() else {
+            return Ok(None);
+        };
+        if self.model_variant != Some(prepared.model_variant)
+            || self.asr_execution_source_fingerprint(prepared.model_variant)?
+                != prepared.source_fingerprint
+            || self.uses_asr_long_form_atomic()
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} changed after encoder preparation",
+                self.id
+            )));
+        }
+        match &prepared.artifact {
+            PreparedAsrEncoderArtifactValue::Qwen3(value) => Ok(Some(value.clone())),
+            PreparedAsrEncoderArtifactValue::Whisper(_)
+            | PreparedAsrEncoderArtifactValue::VibeVoice(_)
+            | PreparedAsrEncoderArtifactValue::GraniteSpeech(_)
+            | PreparedAsrEncoderArtifactValue::Lfm25Audio(_)
+            | PreparedAsrEncoderArtifactValue::Parakeet(_) => Err(Error::InvalidInput(
+                "foreign encoder artifact was requested through the Qwen3 accessor".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn install_prepared_whisper_window(
+        &mut self,
+        model_variant: ModelVariant,
+        artifact: Arc<WhisperPreparedWindow>,
+    ) -> Result<()> {
+        if model_variant.family() != crate::catalog::ModelFamily::WhisperAsr
+            || self.task_type != TaskType::ASR
+            || self.model_variant != Some(model_variant)
+            || self.uses_asr_long_form_atomic()
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} Whisper artifact does not match its normal routed model",
+                self.id
+            )));
+        }
+        let source_fingerprint = self.asr_execution_source_fingerprint(model_variant)?;
+        if self.prepared_asr_encoder_artifact.is_some() {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} already owns an encoder artifact",
+                self.id
+            )));
+        }
+        self.prepared_asr_encoder_artifact = Some(PreparedAsrEncoderArtifact {
+            model_variant,
+            artifact: PreparedAsrEncoderArtifactValue::Whisper(artifact),
+            source_fingerprint,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn prepared_whisper_window_for_executor(
+        &self,
+    ) -> Result<Option<Arc<WhisperPreparedWindow>>> {
+        let Some(prepared) = self.prepared_asr_encoder_artifact.as_ref() else {
+            return Ok(None);
+        };
+        if self.model_variant != Some(prepared.model_variant)
+            || self.asr_execution_source_fingerprint(prepared.model_variant)?
+                != prepared.source_fingerprint
+            || self.uses_asr_long_form_atomic()
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} changed after Whisper encoder preparation",
+                self.id
+            )));
+        }
+        match &prepared.artifact {
+            PreparedAsrEncoderArtifactValue::Whisper(value) => Ok(Some(value.clone())),
+            PreparedAsrEncoderArtifactValue::Qwen3(_)
+            | PreparedAsrEncoderArtifactValue::VibeVoice(_)
+            | PreparedAsrEncoderArtifactValue::GraniteSpeech(_)
+            | PreparedAsrEncoderArtifactValue::Lfm25Audio(_)
+            | PreparedAsrEncoderArtifactValue::Parakeet(_) => Err(Error::InvalidInput(
+                "foreign encoder artifact was requested through the Whisper accessor".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn install_prepared_vibevoice_artifact(
+        &mut self,
+        model_variant: ModelVariant,
+        artifact: Arc<VibeVoiceAsrPreparedArtifact>,
+    ) -> Result<()> {
+        if model_variant.family() != ModelFamily::VibeVoiceAsr
+            || self.task_type != TaskType::ASR
+            || self.model_variant != Some(model_variant)
+            || self.uses_asr_long_form_atomic()
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} VibeVoice artifact does not match its normal routed model",
+                self.id
+            )));
+        }
+        let source_fingerprint = self.asr_execution_source_fingerprint(model_variant)?;
+        if self.prepared_asr_encoder_artifact.is_some() {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} already owns an encoder artifact",
+                self.id
+            )));
+        }
+        self.prepared_asr_encoder_artifact = Some(PreparedAsrEncoderArtifact {
+            model_variant,
+            artifact: PreparedAsrEncoderArtifactValue::VibeVoice(artifact),
+            source_fingerprint,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn prepared_vibevoice_artifact_for_executor(
+        &self,
+    ) -> Result<Option<Arc<VibeVoiceAsrPreparedArtifact>>> {
+        let Some(prepared) = self.prepared_asr_encoder_artifact.as_ref() else {
+            return Ok(None);
+        };
+        if self.model_variant != Some(prepared.model_variant)
+            || self.asr_execution_source_fingerprint(prepared.model_variant)?
+                != prepared.source_fingerprint
+            || self.uses_asr_long_form_atomic()
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} changed after VibeVoice encoder preparation",
+                self.id
+            )));
+        }
+        match &prepared.artifact {
+            PreparedAsrEncoderArtifactValue::VibeVoice(value) => Ok(Some(value.clone())),
+            PreparedAsrEncoderArtifactValue::Qwen3(_)
+            | PreparedAsrEncoderArtifactValue::Whisper(_)
+            | PreparedAsrEncoderArtifactValue::GraniteSpeech(_)
+            | PreparedAsrEncoderArtifactValue::Lfm25Audio(_)
+            | PreparedAsrEncoderArtifactValue::Parakeet(_) => Err(Error::InvalidInput(
+                "foreign encoder artifact was requested through the VibeVoice accessor".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn install_prepared_granite_speech_artifact(
+        &mut self,
+        model_variant: ModelVariant,
+        artifact: Arc<GraniteSpeechPreparedPromptArtifact>,
+    ) -> Result<()> {
+        if model_variant.family() != ModelFamily::GraniteSpeechAsr
+            || self.task_type != TaskType::ASR
+            || self.model_variant != Some(model_variant)
+            || self.uses_asr_long_form_atomic()
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} Granite Speech artifact does not match its normal routed model",
+                self.id
+            )));
+        }
+        let source_fingerprint = self.asr_execution_source_fingerprint(model_variant)?;
+        if self.prepared_asr_encoder_artifact.is_some() {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} already owns an encoder artifact",
+                self.id
+            )));
+        }
+        self.prepared_asr_encoder_artifact = Some(PreparedAsrEncoderArtifact {
+            model_variant,
+            artifact: PreparedAsrEncoderArtifactValue::GraniteSpeech(artifact),
+            source_fingerprint,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn prepared_granite_speech_artifact_for_executor(
+        &self,
+    ) -> Result<Option<Arc<GraniteSpeechPreparedPromptArtifact>>> {
+        let Some(prepared) = self.prepared_asr_encoder_artifact.as_ref() else {
+            return Ok(None);
+        };
+        if self.model_variant != Some(prepared.model_variant)
+            || self.asr_execution_source_fingerprint(prepared.model_variant)?
+                != prepared.source_fingerprint
+            || self.uses_asr_long_form_atomic()
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} changed after Granite Speech preparation",
+                self.id
+            )));
+        }
+        match &prepared.artifact {
+            PreparedAsrEncoderArtifactValue::GraniteSpeech(value) => Ok(Some(value.clone())),
+            PreparedAsrEncoderArtifactValue::Qwen3(_)
+            | PreparedAsrEncoderArtifactValue::Whisper(_)
+            | PreparedAsrEncoderArtifactValue::VibeVoice(_)
+            | PreparedAsrEncoderArtifactValue::Lfm25Audio(_)
+            | PreparedAsrEncoderArtifactValue::Parakeet(_) => Err(Error::InvalidInput(
+                "foreign encoder artifact was requested through the Granite Speech accessor".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn install_prepared_lfm25_audio_asr_artifact(
+        &mut self,
+        model_variant: ModelVariant,
+        artifact: Arc<Lfm25AudioPreparedAsrArtifact>,
+    ) -> Result<()> {
+        if model_variant.family() != ModelFamily::Lfm25Audio
+            || self.task_type != TaskType::ASR
+            || self.model_variant != Some(model_variant)
+            || self.uses_asr_long_form_atomic()
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} LFM2.5 Audio artifact does not match its normal routed model",
+                self.id
+            )));
+        }
+        let source_fingerprint = self.asr_execution_source_fingerprint(model_variant)?;
+        if self.prepared_asr_encoder_artifact.is_some() {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} already owns an encoder artifact",
+                self.id
+            )));
+        }
+        let prepared_cost = self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| match &ready.model {
+                PreparedIncrementalModel::Lfm25AudioAsr(model) => Some(model),
+                _ => None,
+            })
+            .map(|model| {
+                Self::continuous_lfm25_audio_asr_stage_cost(
+                    self.execution_adapter_binding.as_ref(),
+                    model,
+                    artifact.prompt_tokens,
+                    self.params.max_tokens,
+                )
+            })
+            .transpose()?
+            .flatten();
+        self.prepared_asr_encoder_artifact = Some(PreparedAsrEncoderArtifact {
+            model_variant,
+            artifact: PreparedAsrEncoderArtifactValue::Lfm25Audio(artifact),
+            source_fingerprint,
+        });
+        if let Some((stage_id, cost)) = prepared_cost {
+            self.install_prepared_stage_cost(stage_id, cost)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn prepared_lfm25_audio_asr_artifact_for_executor(
+        &self,
+    ) -> Result<Option<Arc<Lfm25AudioPreparedAsrArtifact>>> {
+        let Some(prepared) = self.prepared_asr_encoder_artifact.as_ref() else {
+            return Ok(None);
+        };
+        if self.model_variant != Some(prepared.model_variant)
+            || self.asr_execution_source_fingerprint(prepared.model_variant)?
+                != prepared.source_fingerprint
+            || self.uses_asr_long_form_atomic()
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} changed after LFM2.5 Audio preparation",
+                self.id
+            )));
+        }
+        match &prepared.artifact {
+            PreparedAsrEncoderArtifactValue::Lfm25Audio(value) => Ok(Some(value.clone())),
+            PreparedAsrEncoderArtifactValue::Qwen3(_)
+            | PreparedAsrEncoderArtifactValue::Whisper(_)
+            | PreparedAsrEncoderArtifactValue::VibeVoice(_)
+            | PreparedAsrEncoderArtifactValue::GraniteSpeech(_)
+            | PreparedAsrEncoderArtifactValue::Parakeet(_) => Err(Error::InvalidInput(
+                "foreign encoder artifact was requested through the LFM2.5 Audio accessor".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn install_prepared_parakeet_artifact(
+        &mut self,
+        model_variant: ModelVariant,
+        artifact: Arc<ParakeetPreparedEncoderArtifact>,
+    ) -> Result<()> {
+        if model_variant.family() != ModelFamily::ParakeetAsr
+            || self.task_type != TaskType::ASR
+            || self.model_variant != Some(model_variant)
+            || self.uses_asr_long_form_atomic()
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} Parakeet artifact does not match its normal routed model",
+                self.id
+            )));
+        }
+        let source_fingerprint = self.asr_execution_source_fingerprint(model_variant)?;
+        if self.prepared_asr_encoder_artifact.is_some() {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} already owns an encoder artifact",
+                self.id
+            )));
+        }
+        self.prepared_asr_encoder_artifact = Some(PreparedAsrEncoderArtifact {
+            model_variant,
+            artifact: PreparedAsrEncoderArtifactValue::Parakeet(artifact),
+            source_fingerprint,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn prepared_parakeet_artifact_for_executor(
+        &self,
+    ) -> Result<Option<Arc<ParakeetPreparedEncoderArtifact>>> {
+        let Some(prepared) = self.prepared_asr_encoder_artifact.as_ref() else {
+            return Ok(None);
+        };
+        if self.model_variant != Some(prepared.model_variant)
+            || self.asr_execution_source_fingerprint(prepared.model_variant)?
+                != prepared.source_fingerprint
+            || self.uses_asr_long_form_atomic()
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} changed after Parakeet preparation",
+                self.id
+            )));
+        }
+        match &prepared.artifact {
+            PreparedAsrEncoderArtifactValue::Parakeet(value) => Ok(Some(value.clone())),
+            _ => Err(Error::InvalidInput(
+                "foreign encoder artifact was requested through the Parakeet accessor".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn prepared_asr_encoder_artifact_retained_bytes(&self) -> Result<u64> {
+        self.prepared_asr_encoder_artifact
+            .as_ref()
+            .map_or(Ok(0), |prepared| {
+                prepared
+                    .artifact
+                    .resident_resources()
+                    .map(|(_, device)| device)
+            })
+    }
+
+    pub(crate) fn prepared_asr_encoder_artifact_retained_resources(&self) -> Result<(u64, u64)> {
+        self.prepared_asr_encoder_artifact
+            .as_ref()
+            .map_or(Ok((0, 0)), |prepared| {
+                prepared.artifact.resident_resources()
+            })
+    }
+
+    /// Derive independently clocked retained-state work from immutable
+    /// preparation metadata. This method never chooses a model or a stage:
+    /// the already-bound stage authorizes exact group/clock pairs, while Core
+    /// authenticates the returned spans against the physical state plan.
+    pub(crate) fn project_auxiliary_state_spans(
+        &self,
+        stage: &StageDescriptor,
+        input: InputRange,
+    ) -> Result<Option<Arc<[ClockedStateSpan]>>> {
+        let Some(authorized) = stage.retained_state_selections.as_deref() else {
+            return Ok(None);
+        };
+        if self
+            .incremental_model_execution_ready
+            .as_ref()
+            .is_some_and(|ready| {
+                matches!(ready.model, PreparedIncrementalModel::VibeVoiceTts(_))
+                    && ready.vibevoice_tts.is_some()
+            })
+        {
+            if authorized.is_empty() {
+                return Ok(Some(Arc::from([])));
+            }
+            let selection = super::ClockedStateSelection::new(
+                crate::models::architectures::vibevoice::VIBEVOICE_TTS_TOKENIZER_GROUP,
+                crate::kv::v2::StateClock::CodecFrames,
+            )?;
+            if authorized != [selection.clone()] {
+                return Err(Error::InvalidInput(format!(
+                    "stage {} does not authorize the VibeVoice TTS tokenizer clock",
+                    stage.name
+                )));
+            }
+            let prompt_tokens = self.prepared_sequence_input_tokens.ok_or_else(|| {
+                Error::InferenceError(
+                    "prepared VibeVoice TTS request lost its prompt boundary".into(),
+                )
+            })?;
+            let start = input.start.checked_sub(prompt_tokens).ok_or_else(|| {
+                Error::InvalidInput(
+                    "VibeVoice TTS tokenizer state cannot advance during prompt prefill".into(),
+                )
+            })?;
+            let end = input.end.checked_sub(prompt_tokens).ok_or_else(|| {
+                Error::InvalidInput(
+                    "VibeVoice TTS tokenizer state crossed its prompt boundary".into(),
+                )
+            })?;
+            return Ok(Some(Arc::from([ClockedStateSpan::new(
+                selection.group(),
+                selection.clock().clone(),
+                InputRange::new(start, end)?,
+            )?])));
+        }
+        let projections = if let Some(prepared) = self.prepared_asr_encoder_artifact.as_ref() {
+            if self.model_variant != Some(prepared.model_variant)
+                || self.asr_execution_source_fingerprint(prepared.model_variant)?
+                    != prepared.source_fingerprint
+                || self.uses_asr_long_form_atomic()
+            {
+                return Err(Error::InvalidInput(format!(
+                    "ASR request {} changed after auxiliary state projection preparation",
+                    self.id
+                )));
+            }
+            prepared.artifact.clocked_state_projections()
+        } else {
+            &[]
+        };
+
+        let mut previous = None;
+        let mut spans = Vec::new();
+        for projection in projections {
+            let group = projection.selection().group();
+            let primary = projection.primary();
+            if let Some((previous_group, previous_clock, previous_end)) = previous.as_ref() {
+                if group.get() < *previous_group
+                    || (group.get() == *previous_group
+                        && (projection.selection().clock() != previous_clock
+                            || primary.start < *previous_end))
+                {
+                    return Err(Error::InvalidInput(format!(
+                        "request {} has non-canonical clocked state projections",
+                        self.id
+                    )));
+                }
+            }
+            previous = Some((
+                group.get(),
+                projection.selection().clock().clone(),
+                primary.end,
+            ));
+
+            let Some(span) = projection.project(input)? else {
+                continue;
+            };
+            if !authorized
+                .iter()
+                .any(|selection| selection == projection.selection())
+            {
+                return Err(Error::InvalidInput(format!(
+                    "stage {} does not authorize request {} auxiliary group {} {:?}",
+                    stage.name,
+                    self.id,
+                    group.get(),
+                    projection.selection().clock()
+                )));
+            }
+            spans.push(span);
+        }
+
+        Ok(Some(Arc::from(spans)))
+    }
+
+    pub(crate) fn project_paged_state_input(
+        &self,
+        domain: crate::kv::CacheDomainId,
+        phase: super::SequencePhase,
+        input: InputRange,
+    ) -> Result<InputRange> {
+        let is_vibevoice_tts =
+            self.incremental_model_execution_ready
+                .as_ref()
+                .is_some_and(|ready| {
+                    matches!(ready.model, PreparedIncrementalModel::VibeVoiceTts(_))
+                        && ready.vibevoice_tts.is_some()
+                });
+        if !is_vibevoice_tts
+            || domain != crate::models::architectures::vibevoice::VIBEVOICE_TTS_NEGATIVE_DOMAIN
+        {
+            return Ok(input);
+        }
+        match phase {
+            super::SequencePhase::Prefill if input.start == 0 => InputRange::new(0, 1),
+            super::SequencePhase::Prefill => Err(Error::InferenceError(
+                "VibeVoice TTS requires its exact prompt prefill in one quantum".into(),
+            )),
+            super::SequencePhase::Decode => {
+                let prompt_tokens = self.prepared_sequence_input_tokens.ok_or_else(|| {
+                    Error::InferenceError(
+                        "prepared VibeVoice TTS request lost its prompt boundary".into(),
+                    )
+                })?;
+                let start = input
+                    .start
+                    .checked_sub(prompt_tokens)
+                    .and_then(|frames| frames.checked_add(1))
+                    .ok_or_else(|| {
+                        Error::InvalidInput(
+                            "VibeVoice TTS negative cache start crossed its prompt boundary".into(),
+                        )
+                    })?;
+                let end = input
+                    .end
+                    .checked_sub(prompt_tokens)
+                    .and_then(|frames| frames.checked_add(1))
+                    .ok_or_else(|| {
+                        Error::InvalidInput(
+                            "VibeVoice TTS negative cache end crossed its prompt boundary".into(),
+                        )
+                    })?;
+                InputRange::new(start, end)
+            }
+        }
+    }
+
+    pub(crate) fn install_prepared_sequence_input_tokens(
+        &mut self,
+        input_tokens: usize,
+        max_sequence_tokens: usize,
+    ) -> Result<()> {
+        if self.task_type != TaskType::ASR {
+            return Err(Error::InvalidInput(format!(
+                "Request {} cannot install multimodal sequence shape for {:?}",
+                self.id, self.task_type
+            )));
+        }
+        if self.prepared_asr_execution_shape == Some(PreparedAsrExecutionShape::LongFormAtomic) {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} cannot change its prepared long-form route to retained sequence execution",
+                self.id
+            )));
+        }
+        if input_tokens == 0 || input_tokens >= max_sequence_tokens {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} exact prefill has {input_tokens} tokens and leaves no output capacity in the configured {max_sequence_tokens}-token context",
+                self.id
+            )));
+        }
+        if self
+            .prepared_sequence_input_tokens
+            .is_some_and(|current| current != input_tokens)
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} changed its prepared multimodal sequence shape",
+                self.id
+            )));
+        }
+        self.params.max_tokens = self
+            .params
+            .max_tokens
+            .max(1)
+            .min(max_sequence_tokens - input_tokens);
+        self.prepared_sequence_input_tokens = Some(input_tokens);
+        self.prepared_asr_execution_shape =
+            Some(PreparedAsrExecutionShape::RetainedSequence { input_tokens });
+        Ok(())
+    }
+
+    pub(crate) fn install_prepared_asr_long_form_atomic(&mut self) -> Result<()> {
+        if self.task_type != TaskType::ASR {
+            return Err(Error::InvalidInput(format!(
+                "Request {} cannot install an ASR long-form route for {:?}",
+                self.id, self.task_type
+            )));
+        }
+        if self.prepared_sequence_input_tokens.is_some()
+            || matches!(
+                self.prepared_asr_execution_shape,
+                Some(PreparedAsrExecutionShape::RetainedSequence { .. })
+            )
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} cannot change its prepared retained sequence route to long-form execution",
+                self.id
+            )));
+        }
+        self.prepared_asr_execution_shape = Some(PreparedAsrExecutionShape::LongFormAtomic);
+        Ok(())
+    }
+
+    pub(crate) fn prepared_asr_execution_shape(&self) -> Option<PreparedAsrExecutionShape> {
+        self.prepared_asr_execution_shape
+    }
+
+    pub(crate) fn uses_asr_retained_sequence(&self) -> bool {
+        matches!(
+            self.prepared_asr_execution_shape,
+            Some(PreparedAsrExecutionShape::RetainedSequence { .. })
+        )
+    }
+
+    pub(crate) fn uses_asr_long_form_atomic(&self) -> bool {
+        self.prepared_asr_execution_shape == Some(PreparedAsrExecutionShape::LongFormAtomic)
+    }
+
+    pub(crate) fn lfm25_audio_tts_messages_for_preparation(&self) -> Result<Vec<ChatMessage>> {
+        let text = self
+            .text
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| {
+                Error::InvalidInput("LFM2.5 Audio TTS request is missing text".into())
+            })?;
+        let speaker = self
+            .params
+            .speaker
+            .as_deref()
+            .or(self.params.voice.as_deref());
+        Ok(vec![
+            ChatMessage {
+                role: ChatRole::System,
+                content: lfm25_audio_tts_system_prompt(speaker).to_string(),
+            },
+            ChatMessage {
+                role: ChatRole::User,
+                content: text.trim().to_string(),
+            },
+        ])
+    }
+
+    pub(crate) fn install_lfm25_audio_tts_execution_model(
+        &mut self,
+        model_variant: ModelVariant,
+        model: Lfm25AudioModelLease,
+        artifact: Arc<Lfm25AudioPreparedTtsArtifact>,
+        max_sequence_tokens: usize,
+    ) -> Result<()> {
+        if model_variant.family() != ModelFamily::Lfm25Audio
+            || self.task_type != TaskType::TTS
+            || self.model_variant != Some(model_variant)
+        {
+            return Err(Error::InvalidInput(format!(
+                "LFM2.5 Audio TTS request {} model preparation does not match its routed task/model",
+                self.id
+            )));
+        }
+        let expected = self.lfm25_audio_tts_messages_for_preparation()?;
+        if artifact.source_messages.len() != expected.len()
+            || artifact
+                .source_messages
+                .iter()
+                .zip(&expected)
+                .any(|(actual, expected)| {
+                    actual.role != expected.role || actual.content != expected.content
+                })
+            || artifact.prompt_tokens == 0
+            || artifact.prompt_tokens >= max_sequence_tokens
+        {
+            return Err(Error::InvalidInput(format!(
+                "LFM2.5 Audio TTS request {} prepared prompt does not match its exact input/context",
+                self.id
+            )));
+        }
+        let available = max_sequence_tokens - artifact.prompt_tokens;
+        self.params.max_tokens = if self.params.max_tokens == 0 {
+            1_024.min(available)
+        } else {
+            self.params.max_tokens.min(available)
+        };
+        if self.params.max_tokens == 0 {
+            return Err(Error::InvalidInput(
+                "LFM2.5 Audio TTS request leaves no output capacity".into(),
+            ));
+        }
+        let stage_costs = Self::lfm25_audio_tts_stage_costs(
+            self.execution_adapter_binding.as_ref(),
+            &model,
+            artifact.prompt_tokens,
+            self.params.max_tokens,
+        )?;
+        self.prepared_stage_costs.clear();
+        self.prepared_sequence_input_tokens = Some(artifact.prompt_tokens);
+        self.incremental_model_execution_ready = Some(IncrementalModelExecutionReady {
+            model_variant,
+            model: PreparedIncrementalModel::Lfm25AudioTts(model),
+            qwen_tts: None,
+            lfm25_audio_tts: Some(artifact),
+            vibevoice_tts: None,
+            vibevoice_tts_params: None,
+            fish_s2_tts: None,
+            fish_s2_tts_params: None,
+            voxtral_tts: None,
+            voxtral_tts_params: None,
+            kokoro_tts: None,
+        });
+        for (stage, cost) in stage_costs {
+            self.install_prepared_stage_cost(stage, cost)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn lfm25_audio_tts_generation_config(&self) -> Lfm25AudioGenerationConfig {
+        Lfm25AudioGenerationConfig::default()
+    }
+
+    pub(crate) fn install_vibevoice_tts_execution_model(
+        &mut self,
+        model_variant: ModelVariant,
+        model: VibeVoiceTtsModelLease,
+        artifact: Arc<VibeVoiceTtsPreparedArtifact>,
+        params: VibeVoiceTtsGenerationParams,
+        max_sequence_tokens: usize,
+    ) -> Result<()> {
+        if self.task_type != TaskType::TTS
+            || self.model_variant != Some(model_variant)
+            || model_variant.family() != ModelFamily::VibeVoiceTts
+            || artifact.prompt_tokens() == 0
+            || artifact.prompt_tokens() >= max_sequence_tokens
+            || params.max_frames == 0
+        {
+            return Err(Error::InvalidInput(format!(
+                "VibeVoice TTS request {} preparation does not match its routed model/context",
+                self.id
+            )));
+        }
+        self.prepared_stage_costs.clear();
+        self.prepared_sequence_input_tokens = Some(artifact.prompt_tokens());
+        self.params.max_tokens = params.max_frames;
+        self.incremental_model_execution_ready = Some(IncrementalModelExecutionReady {
+            model_variant,
+            model: PreparedIncrementalModel::VibeVoiceTts(model),
+            qwen_tts: None,
+            lfm25_audio_tts: None,
+            vibevoice_tts: Some(artifact),
+            vibevoice_tts_params: Some(params),
+            fish_s2_tts: None,
+            fish_s2_tts_params: None,
+            voxtral_tts: None,
+            voxtral_tts_params: None,
+            kokoro_tts: None,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn install_fish_s2_tts_execution_model(
+        &mut self,
+        model_variant: ModelVariant,
+        model: FishS2TtsModelLease,
+        artifact: Arc<FishS2PreparedArtifact>,
+        params: FishS2GenerationParams,
+        max_sequence_tokens: usize,
+    ) -> Result<()> {
+        if self.task_type != TaskType::TTS
+            || self.model_variant != Some(model_variant)
+            || model_variant.family() != ModelFamily::FishS2Tts
+            || artifact.prompt_tokens() == 0
+            || artifact.prompt_tokens() >= max_sequence_tokens
+            || params.max_frames == 0
+        {
+            return Err(Error::InvalidInput(format!(
+                "Fish S2 TTS request {} preparation does not match its routed model/context",
+                self.id
+            )));
+        }
+        self.prepared_stage_costs.clear();
+        self.prepared_sequence_input_tokens = Some(artifact.prompt_tokens());
+        self.params.max_tokens = params.max_frames;
+        self.incremental_model_execution_ready = Some(IncrementalModelExecutionReady {
+            model_variant,
+            model: PreparedIncrementalModel::FishS2Tts(model),
+            qwen_tts: None,
+            lfm25_audio_tts: None,
+            vibevoice_tts: None,
+            vibevoice_tts_params: None,
+            fish_s2_tts: Some(artifact),
+            fish_s2_tts_params: Some(params),
+            voxtral_tts: None,
+            voxtral_tts_params: None,
+            kokoro_tts: None,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn install_voxtral_tts_execution_model(
+        &mut self,
+        model_variant: ModelVariant,
+        model: VoxtralTtsModelLease,
+        artifact: Arc<VoxtralTtsPreparedArtifact>,
+        params: VoxtralTtsGenerationParams,
+        max_sequence_tokens: usize,
+    ) -> Result<()> {
+        if self.task_type != TaskType::TTS
+            || self.model_variant != Some(model_variant)
+            || model_variant.family() != ModelFamily::VoxtralTts
+            || artifact.prompt_tokens == 0
+            || artifact.prompt_tokens >= max_sequence_tokens
+            || params.max_frames == 0
+        {
+            return Err(Error::InvalidInput(format!(
+                "Voxtral TTS request {} preparation does not match its routed model/context",
+                self.id
+            )));
+        }
+        self.prepared_stage_costs.clear();
+        self.prepared_sequence_input_tokens = Some(artifact.prompt_tokens);
+        self.params.max_tokens = params.max_frames;
+        self.incremental_model_execution_ready = Some(IncrementalModelExecutionReady {
+            model_variant,
+            model: PreparedIncrementalModel::VoxtralTts(model),
+            qwen_tts: None,
+            lfm25_audio_tts: None,
+            vibevoice_tts: None,
+            vibevoice_tts_params: None,
+            fish_s2_tts: None,
+            fish_s2_tts_params: None,
+            voxtral_tts: Some(artifact),
+            voxtral_tts_params: Some(params),
+            kokoro_tts: None,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn install_kokoro_tts_execution_model(
+        &mut self,
+        model_variant: ModelVariant,
+        model: KokoroTtsModelLease,
+        artifact: Arc<KokoroPreparedRequest>,
+        max_sequence_tokens: usize,
+    ) -> Result<()> {
+        let text = self
+            .text
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| Error::InvalidInput("Kokoro TTS request is missing text".into()))?;
+        let speaker = self
+            .params
+            .speaker
+            .as_deref()
+            .or(self.params.voice.as_deref());
+        let input_tokens =
+            artifact.token_ids.len().checked_add(2).ok_or_else(|| {
+                Error::InvalidInput("Kokoro prepared token count overflowed".into())
+            })?;
+        if self.task_type != TaskType::TTS
+            || self.model_variant != Some(model_variant)
+            || model_variant.family() != ModelFamily::KokoroTts
+            || artifact.source_text != text
+            || artifact.requested_speaker.as_deref() != speaker
+            || artifact.requested_language.as_deref() != self.language.as_deref()
+            || artifact.requested_speed.to_bits() != self.params.speed.to_bits()
+            || artifact.token_ids.is_empty()
+            || artifact.phonemes.is_empty()
+            || !artifact.speed.is_finite()
+            || input_tokens > max_sequence_tokens
+        {
+            return Err(Error::InvalidInput(format!(
+                "Kokoro TTS request {} preparation does not match its routed input/model/context",
+                self.id
+            )));
+        }
+        let prepared_stage_cost =
+            Self::kokoro_tts_stage_cost(self.execution_adapter_binding.as_ref(), &artifact)?;
+        self.prepared_stage_costs.clear();
+        self.prepared_sequence_input_tokens = Some(input_tokens);
+        self.incremental_model_execution_ready = Some(IncrementalModelExecutionReady {
+            model_variant,
+            model: PreparedIncrementalModel::KokoroTts(model),
+            qwen_tts: None,
+            lfm25_audio_tts: None,
+            vibevoice_tts: None,
+            vibevoice_tts_params: None,
+            fish_s2_tts: None,
+            fish_s2_tts_params: None,
+            voxtral_tts: None,
+            voxtral_tts_params: None,
+            kokoro_tts: Some(artifact),
+        });
+        if let Some((stage, cost)) = prepared_stage_cost {
+            self.install_prepared_stage_cost(stage, cost)?;
+        }
         Ok(())
     }
 
@@ -1867,6 +3702,8 @@ impl EngineCoreRequest {
         &mut self,
         model_variant: ModelVariant,
         model: QwenTtsModelLease,
+        reference: Option<Arc<SpeakerReference>>,
+        max_sequence_tokens: usize,
     ) -> Result<()> {
         if self.task_type != TaskType::TTS
             || self.model_variant != Some(model_variant)
@@ -1877,71 +3714,139 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
-        self.prepared_stage_costs.clear();
-        let static_stage = self.execution_adapter_binding.as_ref().and_then(|binding| {
-            binding
-                .stages
-                .iter()
-                .find(|stage| stage.batch_mode == super::NativeBatchMode::Static)
-                .cloned()
-        });
         let model_arc = model.model_arc();
-        let prepared_static_cost = static_stage
-            .filter(|_| {
-                !self.streaming
-                    && !self.has_tts_reference_for_execution()
-                    && self
-                        .text
-                        .as_deref()
-                        .is_some_and(|text| !text.trim().is_empty())
-                    && model_variant
-                        .speech_capabilities()
-                        .is_some_and(|capabilities| capabilities.supports_builtin_voices)
-            })
-            .map(|stage| {
-                let speakers = model_arc.available_speakers();
-                let requested = self
-                    .params
-                    .speaker
-                    .as_deref()
-                    .or(self.params.voice.as_deref())
-                    .filter(|speaker| !speaker.trim().is_empty())
-                    .or_else(|| speakers.first().map(|speaker| speaker.as_str()))
-                    .ok_or_else(|| {
-                        Error::InvalidInput(format!(
-                            "Qwen TTS request {} requires a loaded preset speaker",
-                            self.id
-                        ))
-                    })?;
-                let layout = model_arc.preset_speaker_batch_layout(
-                    self.text.as_deref().unwrap_or_default(),
-                    requested,
-                    self.language.as_deref(),
-                    self.voice_description.as_deref(),
-                )?;
-                let tensor_elements = u64::try_from(layout.prefill_tokens).map_err(|_| {
-                    Error::Overloaded(
-                        "Qwen3-TTS static prefill shape exceeds work accounting".to_string(),
-                    )
+        self.prepared_stage_costs.clear();
+        let text = self
+            .text
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| Error::InvalidInput("Qwen TTS request is missing text".to_string()))?;
+        let speakers = model_arc.available_speakers();
+        let speaker = if reference.is_some() || speakers.is_empty() {
+            None
+        } else {
+            let requested = self
+                .params
+                .speaker
+                .as_deref()
+                .or(self.params.voice.as_deref())
+                .filter(|speaker| !speaker.trim().is_empty())
+                .unwrap_or_else(|| speakers[0].as_str());
+            let resolved = speakers
+                .iter()
+                .find(|speaker| speaker.eq_ignore_ascii_case(requested))
+                .ok_or_else(|| {
+                    Error::InvalidInput(format!(
+                        "Unknown speaker '{requested}'. Available speakers: {}",
+                        speakers
+                            .iter()
+                            .map(|speaker| speaker.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
                 })?;
-                Ok::<(StageId, WorkCost), Error>((
-                    stage.id,
-                    WorkCost::new(1, tensor_elements, layout.collation_workspace_bytes),
-                ))
-            })
-            .transpose()?;
+            Some((*resolved).clone())
+        };
+        let params = self.qwen_tts_generation_params();
+        let layout = model_arc.physical_session_layout(TtsSessionCacheRequest {
+            text,
+            reference: reference.as_deref(),
+            language: self.language.as_deref(),
+            instruct: self.voice_description.as_deref(),
+            uses_preset_speaker: speaker.is_some(),
+            max_frames: params.max_frames,
+        })?;
+        let layout =
+            Self::fit_qwen_tts_layout_to_loaded_context(layout, max_sequence_tokens, &self.id)?;
+        let prepared_continuous_cost = Self::continuous_tts_stage_cost(
+            self.execution_adapter_binding.as_ref(),
+            &model_arc,
+            layout.prefill_tokens,
+            layout.max_frames,
+        )?;
+        let prepared_prefill_cost = Self::resumable_tts_prefill_stage_cost(
+            self.execution_adapter_binding.as_ref(),
+            &model_arc,
+            layout.prefill_tokens,
+            layout.max_frames,
+            reference.is_some(),
+        )?;
+        if layout.prefill_tokens == 0 {
+            return Err(Error::InvalidInput(format!(
+                "Qwen TTS request {} exact prefill is empty",
+                self.id
+            )));
+        }
+        self.params.max_tokens = layout.max_frames;
+        self.prepared_sequence_input_tokens = Some(layout.prefill_tokens);
         self.incremental_model_execution_ready = Some(IncrementalModelExecutionReady {
             model_variant,
             model: PreparedIncrementalModel::QwenTts(model),
+            qwen_tts: Some(PreparedQwenTtsInput {
+                reference,
+                speaker,
+                prefill_tokens: layout.prefill_tokens,
+                max_frames: layout.max_frames,
+            }),
+            lfm25_audio_tts: None,
+            vibevoice_tts: None,
+            vibevoice_tts_params: None,
+            fish_s2_tts: None,
+            fish_s2_tts_params: None,
+            voxtral_tts: None,
+            voxtral_tts_params: None,
+            kokoro_tts: None,
         });
-        if let Some((stage_id, cost)) = prepared_static_cost {
+        if let Some((stage_id, cost)) = prepared_continuous_cost {
+            self.install_prepared_stage_cost(stage_id, cost)?;
+        }
+        if let Some((stage_id, cost)) = prepared_prefill_cost {
             self.install_prepared_stage_cost(stage_id, cost)?;
         }
         Ok(())
     }
 
+    pub(crate) fn qwen_tts_generation_params(&self) -> TtsGenerationParams {
+        let model_max_frames = self
+            .model_variant
+            .and_then(|variant| variant.tts_max_output_frames_hint())
+            .unwrap_or(ModelVariant::QWEN3_TTS_MAX_OUTPUT_FRAMES);
+        let prepared_max_frames = self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| ready.qwen_tts.as_ref())
+            .map(|prepared| prepared.max_frames);
+        TtsGenerationParams {
+            temperature: self.params.temperature.max(0.0),
+            top_p: self.params.top_p.clamp(0.0, 1.0),
+            top_k: if self.params.top_k == 0 {
+                50
+            } else {
+                self.params.top_k
+            },
+            repetition_penalty: self.params.repetition_penalty.max(1.0),
+            max_frames: if let Some(max_frames) = prepared_max_frames {
+                max_frames
+            } else if self.params.max_tokens == 0 {
+                model_max_frames
+            } else {
+                self.params.max_tokens.clamp(16, model_max_frames.max(16))
+            },
+        }
+    }
+
     fn validate_incremental_model_execution_preparation(&self) -> Result<()> {
         let Some(ready) = self.incremental_model_execution_ready.as_ref() else {
+            if self.prepared_sequence_input_tokens.is_some()
+                || self.prepared_asr_execution_shape.is_some()
+                || self.prepared_asr_audio.is_some()
+                || self.prepared_asr_encoder_artifact.is_some()
+            {
+                return Err(Error::InvalidInput(format!(
+                    "Request {} carries prepared multimodal input without an exact loaded model",
+                    self.id
+                )));
+            }
             return Ok(());
         };
         if self.model_variant != Some(ready.model_variant) {
@@ -1950,10 +3855,251 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
+        if matches!(&ready.model, PreparedIncrementalModel::Asr(_))
+            && matches!(
+                ready.model_variant.family(),
+                ModelFamily::Qwen3Asr
+                    | ModelFamily::WhisperAsr
+                    | ModelFamily::VibeVoiceAsr
+                    | ModelFamily::GraniteSpeechAsr
+                    | ModelFamily::ParakeetAsr
+            )
+        {
+            if self.prepared_asr_audio_for_executor()?.is_none() {
+                return Err(Error::InvalidInput(format!(
+                    "Qwen3 ASR request {} is missing its exact decoded-audio artifact",
+                    self.id
+                )));
+            }
+            match self.prepared_asr_execution_shape {
+                Some(PreparedAsrExecutionShape::RetainedSequence { input_tokens })
+                    if self.prepared_sequence_input_tokens == Some(input_tokens)
+                        && match ready.model_variant.family() {
+                            ModelFamily::Qwen3Asr => {
+                                self.prepared_asr_encoder_artifact_for_executor()?.is_some()
+                            }
+                            ModelFamily::WhisperAsr => {
+                                self.prepared_whisper_window_for_executor()?.is_some()
+                            }
+                            ModelFamily::VibeVoiceAsr => {
+                                self.prepared_vibevoice_artifact_for_executor()?.is_some()
+                            }
+                            ModelFamily::GraniteSpeechAsr => self
+                                .prepared_granite_speech_artifact_for_executor()?
+                                .is_some(),
+                            ModelFamily::ParakeetAsr => {
+                                self.prepared_parakeet_artifact_for_executor()?.is_some()
+                            }
+                            _ => false,
+                        } => {}
+                Some(PreparedAsrExecutionShape::LongFormAtomic)
+                    if self.prepared_sequence_input_tokens.is_none()
+                        && self.prepared_asr_encoder_artifact.is_none() => {}
+                _ => {
+                    return Err(Error::InvalidInput(format!(
+                        "ASR request {} is missing a consistent exact media execution shape",
+                        self.id
+                    )));
+                }
+            }
+        }
+        if matches!(&ready.model, PreparedIncrementalModel::Lfm25AudioAsr(_)) {
+            if ready.model_variant.family() != ModelFamily::Lfm25Audio
+                || self.prepared_asr_audio_for_executor()?.is_none()
+            {
+                return Err(Error::InvalidInput(format!(
+                    "LFM2.5 Audio ASR request {} is missing its exact decoded-audio artifact",
+                    self.id
+                )));
+            }
+            match self.prepared_asr_execution_shape {
+                Some(PreparedAsrExecutionShape::RetainedSequence { input_tokens })
+                    if self.prepared_sequence_input_tokens == Some(input_tokens)
+                        && self
+                            .prepared_lfm25_audio_asr_artifact_for_executor()?
+                            .is_some() => {}
+                Some(PreparedAsrExecutionShape::LongFormAtomic)
+                    if self.prepared_sequence_input_tokens.is_none()
+                        && self.prepared_asr_encoder_artifact.is_none() => {}
+                _ => {
+                    return Err(Error::InvalidInput(format!(
+                        "LFM2.5 Audio ASR request {} is missing a consistent exact media execution shape",
+                        self.id
+                    )));
+                }
+            }
+        }
+        if matches!(&ready.model, PreparedIncrementalModel::Lfm25AudioTts(_)) {
+            let expected = self.lfm25_audio_tts_messages_for_preparation()?;
+            let prepared = ready.lfm25_audio_tts.as_ref().ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "LFM2.5 Audio TTS request {} is missing its prepared prompt",
+                    self.id
+                ))
+            })?;
+            if ready.model_variant.family() != ModelFamily::Lfm25Audio
+                || self.prepared_sequence_input_tokens != Some(prepared.prompt_tokens)
+                || prepared.source_messages.len() != expected.len()
+                || prepared
+                    .source_messages
+                    .iter()
+                    .zip(&expected)
+                    .any(|(actual, expected)| {
+                        actual.role != expected.role || actual.content != expected.content
+                    })
+            {
+                return Err(Error::InvalidInput(format!(
+                    "LFM2.5 Audio TTS request {} changed after preparation",
+                    self.id
+                )));
+            }
+        }
+        if matches!(&ready.model, PreparedIncrementalModel::VibeVoiceTts(_)) {
+            let prepared = ready.vibevoice_tts.as_ref().ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "VibeVoice TTS request {} is missing its prepared prompt",
+                    self.id
+                ))
+            })?;
+            let params = ready.vibevoice_tts_params.as_ref().ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "VibeVoice TTS request {} is missing its sealed generation geometry",
+                    self.id
+                ))
+            })?;
+            if ready.model_variant.family() != ModelFamily::VibeVoiceTts
+                || self.prepared_sequence_input_tokens != Some(prepared.prompt_tokens())
+                || self.params.max_tokens != params.max_frames
+            {
+                return Err(Error::InvalidInput(format!(
+                    "VibeVoice TTS request {} changed after preparation",
+                    self.id
+                )));
+            }
+        }
+        if matches!(&ready.model, PreparedIncrementalModel::FishS2Tts(_)) {
+            let prepared = ready.fish_s2_tts.as_ref().ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "Fish S2 TTS request {} is missing its prepared prompt",
+                    self.id
+                ))
+            })?;
+            let params = ready.fish_s2_tts_params.as_ref().ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "Fish S2 TTS request {} is missing its sealed generation geometry",
+                    self.id
+                ))
+            })?;
+            if ready.model_variant.family() != ModelFamily::FishS2Tts
+                || self.prepared_sequence_input_tokens != Some(prepared.prompt_tokens())
+                || self.params.max_tokens != params.max_frames
+            {
+                return Err(Error::InvalidInput(format!(
+                    "Fish S2 TTS request {} changed after preparation",
+                    self.id
+                )));
+            }
+        }
+        if matches!(&ready.model, PreparedIncrementalModel::VoxtralTts(_)) {
+            let prepared = ready.voxtral_tts.as_ref().ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "Voxtral TTS request {} is missing its prepared prompt",
+                    self.id
+                ))
+            })?;
+            let params = ready.voxtral_tts_params.as_ref().ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "Voxtral TTS request {} is missing its sealed generation geometry",
+                    self.id
+                ))
+            })?;
+            if ready.model_variant.family() != ModelFamily::VoxtralTts
+                || self.prepared_sequence_input_tokens != Some(prepared.prompt_tokens)
+                || self.params.max_tokens != params.max_frames
+            {
+                return Err(Error::InvalidInput(format!(
+                    "Voxtral TTS request {} changed after preparation",
+                    self.id
+                )));
+            }
+        }
+        if matches!(&ready.model, PreparedIncrementalModel::KokoroTts(_)) {
+            let prepared = ready.kokoro_tts.as_ref().ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "Kokoro TTS request {} is missing its prepared input",
+                    self.id
+                ))
+            })?;
+            let text = self.text.as_deref().unwrap_or_default();
+            let speaker = self
+                .params
+                .speaker
+                .as_deref()
+                .or(self.params.voice.as_deref());
+            let input_tokens = prepared.token_ids.len().checked_add(2).ok_or_else(|| {
+                Error::InvalidInput("Kokoro prepared token count overflowed".into())
+            })?;
+            if ready.model_variant.family() != ModelFamily::KokoroTts
+                || prepared.source_text != text
+                || prepared.requested_speaker.as_deref() != speaker
+                || prepared.requested_language.as_deref() != self.language.as_deref()
+                || prepared.requested_speed.to_bits() != self.params.speed.to_bits()
+                || prepared.token_ids.is_empty()
+                || prepared.phonemes.is_empty()
+                || !prepared.speed.is_finite()
+                || self.prepared_sequence_input_tokens != Some(input_tokens)
+            {
+                return Err(Error::InvalidInput(format!(
+                    "Kokoro TTS request {} changed after preparation",
+                    self.id
+                )));
+            }
+        }
         match (&ready.model, self.task_type) {
-            (PreparedIncrementalModel::Asr(_), TaskType::ASR) => Ok(()),
+            (PreparedIncrementalModel::Asr(_), TaskType::ASR) if ready.qwen_tts.is_none() => Ok(()),
+            (PreparedIncrementalModel::Lfm25AudioAsr(_), TaskType::ASR)
+                if ready.qwen_tts.is_none() =>
+            {
+                Ok(())
+            }
+            (PreparedIncrementalModel::Lfm25AudioTts(_), TaskType::TTS)
+                if ready.qwen_tts.is_none() && ready.lfm25_audio_tts.is_some() =>
+            {
+                Ok(())
+            }
             (PreparedIncrementalModel::QwenTts(_), TaskType::TTS)
-                if ready.model_variant.family() == ModelFamily::Qwen3Tts =>
+                if ready.model_variant.family() == ModelFamily::Qwen3Tts
+                    && ready.qwen_tts.as_ref().is_some_and(|prepared| {
+                        self.prepared_sequence_input_tokens == Some(prepared.prefill_tokens)
+                            && self.params.max_tokens == prepared.max_frames
+                    }) =>
+            {
+                Ok(())
+            }
+            (PreparedIncrementalModel::VibeVoiceTts(_), TaskType::TTS)
+                if ready.model_variant.family() == ModelFamily::VibeVoiceTts
+                    && ready.vibevoice_tts.is_some()
+                    && ready.vibevoice_tts_params.is_some() =>
+            {
+                Ok(())
+            }
+            (PreparedIncrementalModel::FishS2Tts(_), TaskType::TTS)
+                if ready.model_variant.family() == ModelFamily::FishS2Tts
+                    && ready.fish_s2_tts.is_some()
+                    && ready.fish_s2_tts_params.is_some() =>
+            {
+                Ok(())
+            }
+            (PreparedIncrementalModel::VoxtralTts(_), TaskType::TTS)
+                if ready.model_variant.family() == ModelFamily::VoxtralTts
+                    && ready.voxtral_tts.is_some()
+                    && ready.voxtral_tts_params.is_some() =>
+            {
+                Ok(())
+            }
+            (PreparedIncrementalModel::KokoroTts(_), TaskType::TTS)
+                if ready.model_variant.family() == ModelFamily::KokoroTts
+                    && ready.kokoro_tts.is_some() =>
             {
                 Ok(())
             }
@@ -1971,7 +4117,13 @@ impl EngineCoreRequest {
             .as_ref()
             .and_then(|ready| match &ready.model {
                 PreparedIncrementalModel::Asr(model) => Some(model.model_arc()),
-                PreparedIncrementalModel::QwenTts(_) => None,
+                PreparedIncrementalModel::Lfm25AudioAsr(_)
+                | PreparedIncrementalModel::Lfm25AudioTts(_)
+                | PreparedIncrementalModel::QwenTts(_) => None,
+                PreparedIncrementalModel::VibeVoiceTts(_)
+                | PreparedIncrementalModel::FishS2Tts(_)
+                | PreparedIncrementalModel::VoxtralTts(_)
+                | PreparedIncrementalModel::KokoroTts(_) => None,
             }))
     }
 
@@ -1982,8 +4134,178 @@ impl EngineCoreRequest {
             .as_ref()
             .and_then(|ready| match &ready.model {
                 PreparedIncrementalModel::Asr(model) => Some(model.clone()),
-                PreparedIncrementalModel::QwenTts(_) => None,
+                PreparedIncrementalModel::Lfm25AudioAsr(_)
+                | PreparedIncrementalModel::Lfm25AudioTts(_)
+                | PreparedIncrementalModel::QwenTts(_) => None,
+                PreparedIncrementalModel::VibeVoiceTts(_)
+                | PreparedIncrementalModel::FishS2Tts(_)
+                | PreparedIncrementalModel::VoxtralTts(_)
+                | PreparedIncrementalModel::KokoroTts(_) => None,
             }))
+    }
+
+    pub(crate) fn prepared_lfm25_audio_asr_model_lease_for_executor(
+        &self,
+    ) -> Result<Option<Lfm25AudioModelLease>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| match &ready.model {
+                PreparedIncrementalModel::Lfm25AudioAsr(model) => Some(model.clone()),
+                PreparedIncrementalModel::Asr(_)
+                | PreparedIncrementalModel::Lfm25AudioTts(_)
+                | PreparedIncrementalModel::QwenTts(_) => None,
+                PreparedIncrementalModel::VibeVoiceTts(_)
+                | PreparedIncrementalModel::FishS2Tts(_)
+                | PreparedIncrementalModel::VoxtralTts(_)
+                | PreparedIncrementalModel::KokoroTts(_) => None,
+            }))
+    }
+
+    pub(crate) fn prepared_lfm25_audio_tts_model_lease_for_executor(
+        &self,
+    ) -> Result<Option<Lfm25AudioModelLease>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| match &ready.model {
+                PreparedIncrementalModel::Lfm25AudioTts(model) => Some(model.clone()),
+                _ => None,
+            }))
+    }
+
+    pub(crate) fn prepared_lfm25_audio_tts_artifact_for_executor(
+        &self,
+    ) -> Result<Option<Arc<Lfm25AudioPreparedTtsArtifact>>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| ready.lfm25_audio_tts.clone()))
+    }
+
+    pub(crate) fn prepared_vibevoice_tts_model_lease_for_executor(
+        &self,
+    ) -> Result<Option<VibeVoiceTtsModelLease>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| match &ready.model {
+                PreparedIncrementalModel::VibeVoiceTts(model) => Some(model.clone()),
+                _ => None,
+            }))
+    }
+
+    pub(crate) fn prepared_vibevoice_tts_artifact_for_executor(
+        &self,
+    ) -> Result<Option<Arc<VibeVoiceTtsPreparedArtifact>>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| ready.vibevoice_tts.clone()))
+    }
+
+    pub(crate) fn vibevoice_tts_generation_params_for_executor(
+        &self,
+    ) -> Result<Option<VibeVoiceTtsGenerationParams>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| ready.vibevoice_tts_params.clone()))
+    }
+
+    pub(crate) fn prepared_fish_s2_tts_model_lease_for_executor(
+        &self,
+    ) -> Result<Option<FishS2TtsModelLease>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| match &ready.model {
+                PreparedIncrementalModel::FishS2Tts(model) => Some(model.clone()),
+                _ => None,
+            }))
+    }
+
+    pub(crate) fn prepared_fish_s2_tts_artifact_for_executor(
+        &self,
+    ) -> Result<Option<Arc<FishS2PreparedArtifact>>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| ready.fish_s2_tts.clone()))
+    }
+
+    pub(crate) fn fish_s2_tts_generation_params_for_executor(
+        &self,
+    ) -> Result<Option<FishS2GenerationParams>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| ready.fish_s2_tts_params.clone()))
+    }
+
+    pub(crate) fn prepared_voxtral_tts_model_lease_for_executor(
+        &self,
+    ) -> Result<Option<VoxtralTtsModelLease>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| match &ready.model {
+                PreparedIncrementalModel::VoxtralTts(model) => Some(model.clone()),
+                _ => None,
+            }))
+    }
+
+    pub(crate) fn prepared_voxtral_tts_artifact_for_executor(
+        &self,
+    ) -> Result<Option<Arc<VoxtralTtsPreparedArtifact>>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| ready.voxtral_tts.clone()))
+    }
+
+    pub(crate) fn voxtral_tts_generation_params_for_executor(
+        &self,
+    ) -> Result<Option<VoxtralTtsGenerationParams>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| ready.voxtral_tts_params))
+    }
+
+    pub(crate) fn prepared_kokoro_tts_model_lease_for_executor(
+        &self,
+    ) -> Result<Option<KokoroTtsModelLease>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| match &ready.model {
+                PreparedIncrementalModel::KokoroTts(model) => Some(model.clone()),
+                _ => None,
+            }))
+    }
+
+    pub(crate) fn prepared_kokoro_tts_artifact_for_executor(
+        &self,
+    ) -> Result<Option<Arc<KokoroPreparedRequest>>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| ready.kokoro_tts.clone()))
     }
 
     pub(crate) fn prepared_qwen_tts_model_for_executor(
@@ -1995,7 +4317,13 @@ impl EngineCoreRequest {
             .as_ref()
             .and_then(|ready| match &ready.model {
                 PreparedIncrementalModel::QwenTts(model) => Some(model.model_arc()),
-                PreparedIncrementalModel::Asr(_) => None,
+                PreparedIncrementalModel::Asr(_)
+                | PreparedIncrementalModel::Lfm25AudioAsr(_)
+                | PreparedIncrementalModel::Lfm25AudioTts(_) => None,
+                PreparedIncrementalModel::VibeVoiceTts(_)
+                | PreparedIncrementalModel::FishS2Tts(_)
+                | PreparedIncrementalModel::VoxtralTts(_)
+                | PreparedIncrementalModel::KokoroTts(_) => None,
             }))
     }
 
@@ -2008,8 +4336,26 @@ impl EngineCoreRequest {
             .as_ref()
             .and_then(|ready| match &ready.model {
                 PreparedIncrementalModel::QwenTts(model) => Some(model.clone()),
-                PreparedIncrementalModel::Asr(_) => None,
+                PreparedIncrementalModel::Asr(_)
+                | PreparedIncrementalModel::Lfm25AudioAsr(_)
+                | PreparedIncrementalModel::Lfm25AudioTts(_) => None,
+                PreparedIncrementalModel::VibeVoiceTts(_)
+                | PreparedIncrementalModel::FishS2Tts(_)
+                | PreparedIncrementalModel::VoxtralTts(_)
+                | PreparedIncrementalModel::KokoroTts(_) => None,
             }))
+    }
+
+    pub(crate) fn prepared_qwen_tts_input_for_executor(&self) -> Result<&PreparedQwenTtsInput> {
+        self.validate_incremental_model_execution_preparation()?;
+        self.incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| ready.qwen_tts.as_ref())
+            .ok_or_else(|| {
+                Error::InferenceError(
+                    "Qwen TTS request is missing exact host preparation".to_string(),
+                )
+            })
     }
 
     pub(crate) fn chat_generation_config(&self) -> ChatGenerationConfig {
@@ -2054,7 +4400,15 @@ impl EngineCoreRequest {
             model_variant: None,
             model_instance_id: None,
             execution_adapter_binding: None,
+            v2_state_descriptor: None,
+            v2_state_fingerprint: None,
+            v2_state_runtime: None,
+            managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
+            prepared_sequence_input_tokens: None,
+            prepared_asr_execution_shape: None,
+            prepared_asr_audio: None,
+            prepared_asr_encoder_artifact: None,
             stream_staging: StreamStagingBuffer::default(),
             text: Some(text),
             chat_messages: None,
@@ -2078,6 +4432,7 @@ impl EngineCoreRequest {
             prompt_tokens: Vec::new(),
             chat_execution_ready: None,
             incremental_model_execution_ready: None,
+            realtime_asr_ingress: None,
             streaming: false,
             stream_policy: EngineStreamPolicy::default(),
             streaming_tx: None,
@@ -2101,7 +4456,15 @@ impl EngineCoreRequest {
             model_variant: None,
             model_instance_id: None,
             execution_adapter_binding: None,
+            v2_state_descriptor: None,
+            v2_state_fingerprint: None,
+            v2_state_runtime: None,
+            managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
+            prepared_sequence_input_tokens: None,
+            prepared_asr_execution_shape: None,
+            prepared_asr_audio: None,
+            prepared_asr_encoder_artifact: None,
             stream_staging: StreamStagingBuffer::default(),
             text: None,
             chat_messages: None,
@@ -2125,6 +4488,7 @@ impl EngineCoreRequest {
             prompt_tokens: Vec::new(),
             chat_execution_ready: None,
             incremental_model_execution_ready: None,
+            realtime_asr_ingress: None,
             streaming: false,
             stream_policy: EngineStreamPolicy::default(),
             streaming_tx: None,
@@ -2148,7 +4512,15 @@ impl EngineCoreRequest {
             model_variant: None,
             model_instance_id: None,
             execution_adapter_binding: None,
+            v2_state_descriptor: None,
+            v2_state_fingerprint: None,
+            v2_state_runtime: None,
+            managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
+            prepared_sequence_input_tokens: None,
+            prepared_asr_execution_shape: None,
+            prepared_asr_audio: None,
+            prepared_asr_encoder_artifact: None,
             stream_staging: StreamStagingBuffer::default(),
             text: None,
             chat_messages: None,
@@ -2172,6 +4544,7 @@ impl EngineCoreRequest {
             prompt_tokens: Vec::new(),
             chat_execution_ready: None,
             incremental_model_execution_ready: None,
+            realtime_asr_ingress: None,
             streaming: false,
             stream_policy: EngineStreamPolicy::default(),
             streaming_tx: None,
@@ -2192,7 +4565,15 @@ impl EngineCoreRequest {
             model_variant: None,
             model_instance_id: None,
             execution_adapter_binding: None,
+            v2_state_descriptor: None,
+            v2_state_fingerprint: None,
+            v2_state_runtime: None,
+            managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
+            prepared_sequence_input_tokens: None,
+            prepared_asr_execution_shape: None,
+            prepared_asr_audio: None,
+            prepared_asr_encoder_artifact: None,
             stream_staging: StreamStagingBuffer::default(),
             text: None,
             chat_messages: Some(messages),
@@ -2216,6 +4597,7 @@ impl EngineCoreRequest {
             prompt_tokens: Vec::new(),
             chat_execution_ready: None,
             incremental_model_execution_ready: None,
+            realtime_asr_ingress: None,
             streaming: false,
             stream_policy: EngineStreamPolicy::default(),
             streaming_tx: None,
@@ -2237,7 +4619,15 @@ impl EngineCoreRequest {
             model_variant: None,
             model_instance_id: None,
             execution_adapter_binding: None,
+            v2_state_descriptor: None,
+            v2_state_fingerprint: None,
+            v2_state_runtime: None,
+            managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
+            prepared_sequence_input_tokens: None,
+            prepared_asr_execution_shape: None,
+            prepared_asr_audio: None,
+            prepared_asr_encoder_artifact: None,
             stream_staging: StreamStagingBuffer::default(),
             text: None,
             chat_messages: None,
@@ -2261,6 +4651,7 @@ impl EngineCoreRequest {
             prompt_tokens: Vec::new(),
             chat_execution_ready: None,
             incremental_model_execution_ready: None,
+            realtime_asr_ingress: None,
             streaming: false,
             stream_policy: EngineStreamPolicy::default(),
             streaming_tx: None,
@@ -2282,7 +4673,15 @@ impl EngineCoreRequest {
             model_variant: None,
             model_instance_id: None,
             execution_adapter_binding: None,
+            v2_state_descriptor: None,
+            v2_state_fingerprint: None,
+            v2_state_runtime: None,
+            managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
+            prepared_sequence_input_tokens: None,
+            prepared_asr_execution_shape: None,
+            prepared_asr_audio: None,
+            prepared_asr_encoder_artifact: None,
             stream_staging: StreamStagingBuffer::default(),
             text: None,
             chat_messages: None,
@@ -2306,6 +4705,7 @@ impl EngineCoreRequest {
             prompt_tokens: Vec::new(),
             chat_execution_ready: None,
             incremental_model_execution_ready: None,
+            realtime_asr_ingress: None,
             streaming: false,
             stream_policy: EngineStreamPolicy::default(),
             streaming_tx: None,
@@ -2363,8 +4763,142 @@ impl EngineCoreRequest {
             .map(|ready| Self::continuous_chat_stage_cost(Some(&binding), &ready.model))
             .transpose()?
             .flatten();
+        let prepared_asr_continuous_cost = self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| match &ready.model {
+                PreparedIncrementalModel::Asr(model) => Some(model),
+                PreparedIncrementalModel::Lfm25AudioAsr(_)
+                | PreparedIncrementalModel::Lfm25AudioTts(_)
+                | PreparedIncrementalModel::QwenTts(_) => None,
+                PreparedIncrementalModel::VibeVoiceTts(_)
+                | PreparedIncrementalModel::FishS2Tts(_)
+                | PreparedIncrementalModel::VoxtralTts(_)
+                | PreparedIncrementalModel::KokoroTts(_) => None,
+            })
+            .filter(|_| self.uses_asr_retained_sequence())
+            .map(|model| Self::continuous_asr_stage_cost(Some(&binding), model))
+            .transpose()?
+            .flatten();
+        let prepared_lfm25_asr_continuous_cost = self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| match &ready.model {
+                PreparedIncrementalModel::Lfm25AudioAsr(model) => Some(model),
+                _ => None,
+            })
+            .zip(self.prepared_asr_encoder_artifact.as_ref())
+            .and_then(|(model, prepared)| match &prepared.artifact {
+                PreparedAsrEncoderArtifactValue::Lfm25Audio(artifact) => {
+                    Some((model, artifact.prompt_tokens))
+                }
+                _ => None,
+            })
+            .filter(|_| self.uses_asr_retained_sequence())
+            .map(|(model, prompt_tokens)| {
+                Self::continuous_lfm25_audio_asr_stage_cost(
+                    Some(&binding),
+                    model,
+                    prompt_tokens,
+                    self.params.max_tokens,
+                )
+            })
+            .transpose()?
+            .flatten();
+        let prepared_lfm25_tts_costs = self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(
+                |ready| match (&ready.model, ready.lfm25_audio_tts.as_ref()) {
+                    (PreparedIncrementalModel::Lfm25AudioTts(model), Some(artifact)) => {
+                        Some((model, artifact.prompt_tokens))
+                    }
+                    _ => None,
+                },
+            )
+            .map(|(model, prompt_tokens)| {
+                Self::lfm25_audio_tts_stage_costs(
+                    Some(&binding),
+                    model,
+                    prompt_tokens,
+                    self.params.max_tokens,
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let prepared_tts_continuous_cost = self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| match (&ready.model, ready.qwen_tts.as_ref()) {
+                (PreparedIncrementalModel::QwenTts(model), Some(prepared)) => Some((
+                    model.model_arc(),
+                    prepared.prefill_tokens,
+                    prepared.max_frames,
+                )),
+                (
+                    PreparedIncrementalModel::Asr(_) | PreparedIncrementalModel::Lfm25AudioAsr(_),
+                    _,
+                ) => None,
+                _ => None,
+            })
+            .map(|(model, prefill_tokens, max_frames)| {
+                Self::continuous_tts_stage_cost(Some(&binding), &model, prefill_tokens, max_frames)
+            })
+            .transpose()?
+            .flatten();
+        let prepared_tts_prefill_cost = self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| match (&ready.model, ready.qwen_tts.as_ref()) {
+                (PreparedIncrementalModel::QwenTts(model), Some(prepared)) => Some((
+                    model.model_arc(),
+                    prepared.prefill_tokens,
+                    prepared.max_frames,
+                    prepared.reference.is_some(),
+                )),
+                _ => None,
+            })
+            .map(|(model, prefill_tokens, max_frames, has_reference)| {
+                Self::resumable_tts_prefill_stage_cost(
+                    Some(&binding),
+                    &model,
+                    prefill_tokens,
+                    max_frames,
+                    has_reference,
+                )
+            })
+            .transpose()?
+            .flatten();
+        let prepared_kokoro_tts_cost = self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| match (&ready.model, ready.kokoro_tts.as_ref()) {
+                (PreparedIncrementalModel::KokoroTts(_), Some(prepared)) => Some(prepared),
+                _ => None,
+            })
+            .map(|prepared| Self::kokoro_tts_stage_cost(Some(&binding), prepared))
+            .transpose()?
+            .flatten();
         self.execution_adapter_binding = Some(binding);
         if let Some((stage_id, cost)) = prepared_continuous_cost {
+            self.install_prepared_stage_cost(stage_id, cost)?;
+        }
+        if let Some((stage_id, cost)) = prepared_asr_continuous_cost {
+            self.install_prepared_stage_cost(stage_id, cost)?;
+        }
+        if let Some((stage_id, cost)) = prepared_lfm25_asr_continuous_cost {
+            self.install_prepared_stage_cost(stage_id, cost)?;
+        }
+        for (stage_id, cost) in prepared_lfm25_tts_costs {
+            self.install_prepared_stage_cost(stage_id, cost)?;
+        }
+        if let Some((stage_id, cost)) = prepared_tts_continuous_cost {
+            self.install_prepared_stage_cost(stage_id, cost)?;
+        }
+        if let Some((stage_id, cost)) = prepared_tts_prefill_cost {
+            self.install_prepared_stage_cost(stage_id, cost)?;
+        }
+        if let Some((stage_id, cost)) = prepared_kokoro_tts_cost {
             self.install_prepared_stage_cost(stage_id, cost)?;
         }
         Ok(())
@@ -2372,6 +4906,124 @@ impl EngineCoreRequest {
 
     pub(crate) fn execution_adapter_binding(&self) -> Option<&super::ExecutionAdapterBinding> {
         self.execution_adapter_binding.as_ref()
+    }
+
+    pub(crate) fn bind_v2_state_descriptor(
+        &mut self,
+        descriptor: crate::kv::v2::CapabilityStateDescriptorV2,
+        fingerprint: [u8; 32],
+    ) -> Result<()> {
+        if self
+            .v2_state_descriptor
+            .as_ref()
+            .is_some_and(|current| current != &descriptor)
+        {
+            return Err(Error::InvalidInput(
+                "engine request is already bound to a different state ABI v2 contract".to_string(),
+            ));
+        }
+        if self
+            .v2_state_fingerprint
+            .is_some_and(|current| current != fingerprint)
+        {
+            return Err(Error::InvalidInput(
+                "engine request is already bound to a different state ABI v2 fingerprint"
+                    .to_string(),
+            ));
+        }
+        if let Some(execution) = &self.execution_adapter_binding {
+            let expected = descriptor.fingerprint(&execution.stages)?;
+            if expected != fingerprint {
+                return Err(Error::InvalidInput(
+                    "state ABI v2 fingerprint does not match the bound execution stages"
+                        .to_string(),
+                ));
+            }
+        }
+        self.v2_state_descriptor = Some(descriptor);
+        self.v2_state_fingerprint = Some(fingerprint);
+        Ok(())
+    }
+
+    pub(crate) fn bind_v2_state_runtime(
+        &mut self,
+        runtime: Arc<crate::kv::v2::CapabilityStateRuntimeV2>,
+        fingerprint: [u8; 32],
+        backend: crate::backends::BackendKind,
+    ) -> Result<()> {
+        if runtime.state_fingerprint != fingerprint {
+            return Err(Error::InvalidInput(
+                "state ABI v2 runtime fingerprint does not match its capability binding"
+                    .to_string(),
+            ));
+        }
+        let execution = self.execution_adapter_binding.as_ref().ok_or_else(|| {
+            Error::InvalidInput(
+                "state ABI v2 runtime requires a bound execution adapter".to_string(),
+            )
+        })?;
+        runtime.validate_against(backend, execution)?;
+        if self
+            .v2_state_runtime
+            .as_ref()
+            .is_some_and(|current| current.id != runtime.id)
+        {
+            return Err(Error::InvalidInput(
+                "engine request is already bound to a different state ABI v2 runtime".to_string(),
+            ));
+        }
+        if self
+            .v2_state_runtime
+            .as_ref()
+            .is_some_and(|current| current.id == runtime.id)
+        {
+            return Ok(());
+        }
+        self.bind_v2_state_descriptor(runtime.descriptor.clone(), fingerprint)?;
+        self.v2_state_runtime = Some(runtime);
+        Ok(())
+    }
+
+    pub(crate) fn v2_state_runtime(&self) -> Option<&Arc<crate::kv::v2::CapabilityStateRuntimeV2>> {
+        self.v2_state_runtime.as_ref()
+    }
+
+    pub(crate) fn v2_state_descriptor(
+        &self,
+    ) -> Option<&crate::kv::v2::CapabilityStateDescriptorV2> {
+        self.v2_state_descriptor.as_ref()
+    }
+
+    pub(crate) fn v2_state_fingerprint(&self) -> Option<[u8; 32]> {
+        self.v2_state_fingerprint
+    }
+
+    pub(crate) fn install_managed_cache_runtime(
+        &mut self,
+        runtime: Arc<super::cache::managed::ManagedKvModelRuntime>,
+    ) -> Result<()> {
+        if self.model_instance_id != Some(runtime.plan().model_instance) {
+            return Err(Error::InvalidInput(
+                "managed-cache runtime does not match the request model instance".to_string(),
+            ));
+        }
+        if self
+            .managed_cache_runtime
+            .as_ref()
+            .is_some_and(|current| current.plan().id != runtime.plan().id)
+        {
+            return Err(Error::InvalidInput(
+                "engine request is already bound to a different managed-cache plan".to_string(),
+            ));
+        }
+        self.managed_cache_runtime = Some(runtime);
+        Ok(())
+    }
+
+    pub(crate) fn managed_cache_runtime(
+        &self,
+    ) -> Option<&Arc<super::cache::managed::ManagedKvModelRuntime>> {
+        self.managed_cache_runtime.as_ref()
     }
 
     fn validate_prepared_stage_costs(&self) -> Result<()> {
@@ -2582,7 +5234,9 @@ impl EngineCoreRequest {
 
     /// Get number of prompt tokens.
     pub fn num_prompt_tokens(&self) -> usize {
-        if !self.prompt_tokens.is_empty() {
+        if let Some(input_tokens) = self.prepared_sequence_input_tokens {
+            input_tokens
+        } else if !self.prompt_tokens.is_empty() {
             self.prompt_tokens.len()
         } else if let Some(prompt) = self.asr_prompt_for_execution() {
             (prompt.len() / 4).max(1)
@@ -2707,13 +5361,16 @@ impl RequestProcessor {
         if params.max_tokens > 0 {
             params.max_tokens = match task_type {
                 TaskType::TTS => {
-                    if let Some(tts_limit) =
-                        model_variant.and_then(|variant| variant.tts_max_output_frames_hint())
-                    {
-                        params.max_tokens.min(tts_limit)
-                    } else {
-                        params.max_tokens.min(self.config.max_seq_len)
-                    }
+                    let tts_limit = model_variant
+                        .map(|variant| {
+                            super::tts_explicit_output_limit(
+                                self.config.backend,
+                                variant,
+                                self.config.max_seq_len,
+                            )
+                        })
+                        .unwrap_or(self.config.max_seq_len);
+                    params.max_tokens.min(tts_limit)
                 }
                 _ => params.max_tokens.min(self.config.max_seq_len),
             };
@@ -2939,8 +5596,132 @@ impl RequestBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::BackendKind;
     use crate::model::ModelVariant;
     use crate::models::shared::chat::ChatRole;
+
+    #[test]
+    fn prepared_asr_audio_is_arc_retained_exactly_and_rejects_source_drift() {
+        let variant = ModelVariant::Qwen3Asr06BGguf;
+        let mut request = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+        request.asr_prompt = Some("original".to_string());
+        request
+            .install_prepared_asr_audio(variant, vec![0.25, -0.5, 0.75, 0.0], 16_000)
+            .unwrap();
+        assert_eq!(
+            request.prepared_asr_audio_retained_bytes().unwrap(),
+            4 * std::mem::size_of::<f32>()
+        );
+        let (first, sample_rate) = request
+            .prepared_asr_audio_for_executor()
+            .unwrap()
+            .expect("prepared audio");
+        assert_eq!(sample_rate, 16_000);
+        let cloned = request.clone();
+        let (second, _) = cloned
+            .prepared_asr_audio_for_executor()
+            .unwrap()
+            .expect("cloned prepared audio");
+        assert!(Arc::ptr_eq(&first, &second));
+
+        request.asr_prompt = Some("changed".to_string());
+        assert!(request
+            .prepared_asr_audio_for_executor()
+            .unwrap_err()
+            .to_string()
+            .contains("changed after decoded-audio preparation"));
+    }
+
+    #[test]
+    fn prepared_qwen_asr_routes_are_mutually_exclusive() {
+        let variant = ModelVariant::Qwen3Asr06BGguf;
+        let mut normal = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+        normal
+            .install_prepared_asr_audio(variant, vec![0.0; 16], 16_000)
+            .unwrap();
+        normal
+            .install_prepared_sequence_input_tokens(32, 4096)
+            .unwrap();
+        assert!(normal.uses_asr_retained_sequence());
+        assert!(normal.install_prepared_asr_long_form_atomic().is_err());
+
+        let mut long = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+        long.install_prepared_asr_audio(variant, vec![0.0; 16], 16_000)
+            .unwrap();
+        long.install_prepared_asr_long_form_atomic().unwrap();
+        assert!(long.uses_asr_long_form_atomic());
+        assert!(long
+            .install_prepared_sequence_input_tokens(32, 4096)
+            .is_err());
+    }
+
+    #[test]
+    fn vibevoice_request_projects_only_acoustic_prefill_into_audio_samples() {
+        let variant = ModelVariant::VibeVoiceAsr;
+        let mut request = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+        request
+            .install_prepared_asr_audio(variant, vec![0.0; 9_600], 24_000)
+            .unwrap();
+        request
+            .install_prepared_sequence_input_tokens(12, 4096)
+            .unwrap();
+        request
+            .install_prepared_vibevoice_artifact(
+                variant,
+                Arc::new(VibeVoiceAsrPreparedArtifact::for_test(12, 4..7, 9_600, 8).unwrap()),
+            )
+            .unwrap();
+
+        let profile = super::super::ExecutionProfile::fail_closed(
+            BackendKind::Cpu,
+            Some(variant),
+            super::super::ExecutionMode::Sequence,
+        );
+        let mut prefill = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            crate::models::architectures::vibevoice::VIBEVOICE_ASR_PREFILL_STAGE,
+            &profile,
+            super::super::NativeBatchMode::None,
+        );
+        prefill.retained_state_selections = Some(vec![super::super::ClockedStateSelection::new(
+            crate::models::architectures::vibevoice::VIBEVOICE_ASR_TOKENIZER_GROUP,
+            crate::kv::v2::StateClock::AudioSamples,
+        )
+        .unwrap()]);
+
+        let before = request
+            .project_auxiliary_state_spans(&prefill, InputRange::new(0, 4).unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(before.is_empty());
+        let overlap = request
+            .project_auxiliary_state_spans(&prefill, InputRange::new(3, 6).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(overlap.len(), 1);
+        assert_eq!(overlap[0].input(), InputRange::new(0, 6_400).unwrap());
+
+        let mut unauthorized = prefill.clone();
+        unauthorized.retained_state_selections = Some(vec![]);
+        assert!(request
+            .project_auxiliary_state_spans(&unauthorized, InputRange::new(4, 5).unwrap())
+            .is_err());
+        let mut legacy = prefill.clone();
+        legacy.retained_state_selections = None;
+        assert!(request
+            .project_auxiliary_state_spans(&legacy, InputRange::new(4, 5).unwrap())
+            .unwrap()
+            .is_none());
+
+        let mut decode = prefill;
+        decode.name = crate::models::architectures::vibevoice::VIBEVOICE_ASR_DECODE_STAGE.into();
+        decode.retained_state_selections = Some(vec![]);
+        assert!(request
+            .project_auxiliary_state_spans(&decode, InputRange::new(12, 13).unwrap())
+            .unwrap()
+            .unwrap()
+            .is_empty());
+    }
 
     #[test]
     fn maximal_stream_backpressure_timeout_fails_without_panicking() {
@@ -2969,7 +5750,9 @@ mod tests {
 
         assert_eq!(request.model_instance_id(), None);
         request.bind_model_instance(first).expect("initial binding");
-        request.bind_model_instance(first).expect("idempotent binding");
+        request
+            .bind_model_instance(first)
+            .expect("idempotent binding");
         assert_eq!(request.model_instance_id(), Some(first));
         assert!(request.bind_model_instance(second).is_err());
         assert_eq!(request.model_instance_id(), Some(first));
@@ -3013,6 +5796,64 @@ mod tests {
         let mut mismatched = binding;
         mismatched.adapter_instance_id = super::super::AdapterInstanceId::new(3);
         assert!(request.bind_execution_adapter(mismatched).is_err());
+    }
+
+    #[test]
+    fn qwen_scalar_prefill_is_not_a_native_prepared_cost_stage() {
+        let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
+        let profile = super::super::ExecutionProfile::fail_closed(
+            crate::backends::BackendKind::Metal,
+            Some(variant),
+            super::super::ExecutionMode::Sequence,
+        );
+        let mut stage = super::super::StageDescriptor::from_execution_profile(
+            super::super::StageId::new(1),
+            "tts.prefill.physical",
+            &profile,
+            super::super::NativeBatchMode::None,
+        );
+        stage.selector = super::super::StageWorkSelector::SequencePrefill;
+        let binding = super::super::ExecutionAdapterBinding {
+            execution_group_id: super::super::ExecutionGroupId::new(1),
+            model_instance_id: super::super::ModelInstanceId::new(2),
+            adapter_instance_id: super::super::AdapterInstanceId::new(3),
+            adapter_abi_revision: super::super::AdapterAbiRevision::new(1),
+            model_variant: variant,
+            capability_id: "tts".to_string(),
+            stages: std::sync::Arc::from([stage]),
+        };
+
+        assert!(EngineCoreRequest::native_prepared_stage(
+            Some(&binding),
+            super::super::StageWorkSelector::SequencePrefill,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn qwen_tts_output_budget_fits_the_loaded_context_before_admission() {
+        let fitted = EngineCoreRequest::fit_qwen_tts_layout_to_loaded_context(
+            crate::models::architectures::qwen3::tts::Qwen3TtsPhysicalSessionLayout {
+                prefill_tokens: 9,
+                max_frames: ModelVariant::QWEN3_TTS_MAX_OUTPUT_FRAMES,
+            },
+            1_024,
+            "request-1",
+        )
+        .expect("output budget should fit");
+
+        assert_eq!(fitted.prefill_tokens, 9);
+        assert_eq!(fitted.max_frames, 1_015);
+        assert_eq!(fitted.prefill_tokens + fitted.max_frames, 1_024);
+        assert!(EngineCoreRequest::fit_qwen_tts_layout_to_loaded_context(
+            crate::models::architectures::qwen3::tts::Qwen3TtsPhysicalSessionLayout {
+                prefill_tokens: 1_024,
+                max_frames: 1,
+            },
+            1_024,
+            "request-2",
+        )
+        .is_err());
     }
 
     #[test]
@@ -3482,6 +6323,39 @@ mod tests {
     }
 
     #[test]
+    fn request_processor_unlocks_explicit_cuda_audio_contexts() {
+        for (variant, expected) in [
+            (ModelVariant::Lfm25Audio15BGguf, 5000),
+            (ModelVariant::FishAudioS2Pro, 5000),
+            (ModelVariant::Voxtral4BTts2603, 2048),
+        ] {
+            let processor = RequestProcessor::new(EngineCoreConfig {
+                backend: BackendKind::Cuda,
+                ..EngineCoreConfig::default()
+            });
+            let mut request = EngineCoreRequest::tts("Test");
+            request.model_variant = Some(variant);
+            request.params.max_tokens = 5000;
+
+            let processed = processor.process(request).expect("CUDA TTS request");
+            assert_eq!(processed.params.max_tokens, expected, "{variant}");
+        }
+
+        for backend in [BackendKind::Cpu, BackendKind::Metal] {
+            let processor = RequestProcessor::new(EngineCoreConfig {
+                backend,
+                ..EngineCoreConfig::default()
+            });
+            let mut request = EngineCoreRequest::tts("Test");
+            request.model_variant = Some(ModelVariant::FishAudioS2Pro);
+            request.params.max_tokens = 5000;
+
+            let processed = processor.process(request).expect("portable TTS request");
+            assert_eq!(processed.params.max_tokens, 4096, "{backend:?}");
+        }
+    }
+
+    #[test]
     fn test_request_processor_defaults_chat_max_tokens() {
         let config = EngineCoreConfig::default();
         let expected_default = 2048usize.min(config.max_seq_len);
@@ -3495,6 +6369,25 @@ mod tests {
 
         let processed = processor.process(request).expect("request should process");
         assert_eq!(processed.params.max_tokens, expected_default);
+    }
+
+    #[test]
+    fn cuda_chat_automatic_output_budget_adapts_to_backend_context_capacity() {
+        for context_capacity in [16_384, 65_536, 262_144] {
+            let processor = RequestProcessor::new(EngineCoreConfig {
+                backend: BackendKind::Cuda,
+                max_seq_len: context_capacity,
+                ..EngineCoreConfig::default()
+            });
+            let mut request = EngineCoreRequest::chat(vec![ChatMessage {
+                role: ChatRole::User,
+                content: "Hello".to_string(),
+            }]);
+            request.params.max_tokens = usize::MAX;
+
+            let processed = processor.process(request).expect("CUDA chat request");
+            assert_eq!(processed.params.max_tokens, context_capacity);
+        }
     }
 
     #[test]
@@ -3535,20 +6428,39 @@ mod tests {
         .with_model_variant(ModelVariant::Qwen306B);
         request.params.max_tokens = 100;
         request
-            .install_chat_execution_preparation(ModelVariant::Qwen306B, vec![1, 2, 3], None)
+            .install_chat_execution_preparation(ModelVariant::Qwen306B, vec![1, 2, 3], None, 5)
             .unwrap();
         request
             .enforce_chat_context_window(5)
             .expect("two output tokens remain");
         assert_eq!(request.params.max_tokens, 2);
 
+        let mut automatic = EngineCoreRequest::chat(vec![ChatMessage {
+            role: ChatRole::User,
+            content: "Hello".to_string(),
+        }])
+        .with_model_variant(ModelVariant::Qwen306B);
+        automatic.params.max_tokens = usize::MAX;
+        automatic
+            .install_chat_execution_preparation(ModelVariant::Qwen306B, vec![1, 2, 3], None, 8_192)
+            .unwrap();
+        automatic
+            .enforce_chat_context_window(8_192)
+            .expect("automatic output budget should use the exact remaining context");
+        assert_eq!(automatic.params.max_tokens, 8_189);
+
         let mut full = EngineCoreRequest::chat(vec![ChatMessage {
             role: ChatRole::User,
             content: "Hello".to_string(),
         }])
         .with_model_variant(ModelVariant::Qwen306B);
-        full.install_chat_execution_preparation(ModelVariant::Qwen306B, vec![1, 2, 3, 4, 5], None)
-            .unwrap();
+        full.install_chat_execution_preparation(
+            ModelVariant::Qwen306B,
+            vec![1, 2, 3, 4, 5],
+            None,
+            5,
+        )
+        .unwrap();
         assert!(matches!(
             full.enforce_chat_context_window(5),
             Err(Error::InvalidInput(message)) if message.contains("leaves no output capacity")
@@ -3597,7 +6509,12 @@ mod tests {
         });
 
         request
-            .install_chat_execution_preparation(ModelVariant::Qwen306B, vec![41, 42, 43], None)
+            .install_chat_execution_preparation(
+                ModelVariant::Qwen306B,
+                vec![41, 42, 43],
+                None,
+                4096,
+            )
             .expect("exact preparation should install");
         request
             .validate_chat_execution_preparation()
@@ -3621,7 +6538,12 @@ mod tests {
             }])
             .with_model_variant(ModelVariant::Qwen306B);
             request
-                .install_chat_execution_preparation(ModelVariant::Qwen306B, vec![41, 42, 43], None)
+                .install_chat_execution_preparation(
+                    ModelVariant::Qwen306B,
+                    vec![41, 42, 43],
+                    None,
+                    4096,
+                )
                 .unwrap();
             request
         };
@@ -3664,6 +6586,24 @@ mod tests {
             },
             other => panic!("unexpected task payload: {other:?}"),
         }
+    }
+
+    #[test]
+    fn prepared_multimodal_shape_is_the_scheduler_prompt_span() {
+        let mut request = EngineCoreRequest::asr_bytes(vec![1, 2, 3]);
+        request.params.max_tokens = 32;
+        request
+            .install_prepared_sequence_input_tokens(40, 64)
+            .expect("exact ASR shape");
+
+        assert_eq!(request.num_prompt_tokens(), 40);
+        assert_eq!(request.params.max_tokens, 24);
+        assert!(request
+            .install_prepared_sequence_input_tokens(41, 64)
+            .is_err());
+        assert!(EngineCoreRequest::asr_bytes(vec![1])
+            .install_prepared_sequence_input_tokens(64, 64)
+            .is_err());
     }
 
     #[test]
@@ -3712,5 +6652,164 @@ mod tests {
 
         let processed = processor.process(request).expect("request should process");
         assert_eq!(processed.params.max_tokens, expected_default);
+    }
+
+    #[test]
+    fn realtime_operation_duplicate_rejection_preserves_authoritative_payload() {
+        let mut request = EngineCoreRequest::asr_bytes(Vec::new());
+        request
+            .enable_realtime_asr_ingress()
+            .expect("ASR session ingress");
+        let operation_id = RealtimeOperationId::new(7);
+        let _waiter = request
+            .install_realtime_asr_operation(
+                operation_id,
+                RealtimeAsrOperationPayload::Push {
+                    samples: Arc::from([1.0_f32, 2.0]),
+                    sample_rate: 16_000,
+                },
+            )
+            .expect("first payload installation");
+
+        assert!(request
+            .install_realtime_asr_operation(operation_id, RealtimeAsrOperationPayload::Finish)
+            .is_err());
+        match request
+            .realtime_asr_operation(operation_id)
+            .expect("original payload remains authoritative")
+        {
+            RealtimeAsrOperationPayload::Push {
+                samples,
+                sample_rate,
+            } => {
+                assert_eq!(&*samples, &[1.0, 2.0]);
+                assert_eq!(sample_rate, 16_000);
+            }
+            RealtimeAsrOperationPayload::Finish => panic!("duplicate replaced original payload"),
+        }
+    }
+
+    #[test]
+    fn realtime_operation_completion_is_exactly_once_and_releases_payload() {
+        let mut request = EngineCoreRequest::asr_bytes(Vec::new());
+        request
+            .enable_realtime_asr_ingress()
+            .expect("ASR session ingress");
+        let operation_id = RealtimeOperationId::new(11);
+        let samples: Arc<[f32]> = Arc::from([3.0_f32, 4.0, 5.0]);
+        let samples_weak = Arc::downgrade(&samples);
+        let mut waiter = request
+            .install_realtime_asr_operation(
+                operation_id,
+                RealtimeAsrOperationPayload::Push {
+                    samples: Arc::clone(&samples),
+                    sample_rate: 16_000,
+                },
+            )
+            .expect("payload installation");
+        drop(samples);
+
+        request
+            .complete_realtime_asr_operation(operation_id)
+            .expect("first completion");
+        assert_eq!(
+            waiter.try_recv().expect("completion acknowledgement"),
+            Ok(RealtimeAsrOperationAck {
+                operation_id,
+                kind: RealtimeAsrOperationKind::Push,
+                accepted_samples: 3,
+            })
+        );
+        assert!(samples_weak.upgrade().is_none());
+        assert!(request
+            .complete_realtime_asr_operation(operation_id)
+            .is_err());
+        assert!(request.realtime_asr_operation(operation_id).is_err());
+    }
+
+    #[test]
+    fn realtime_operation_ids_cannot_be_reinstalled_or_move_backwards() {
+        let mut request = EngineCoreRequest::asr_bytes(Vec::new());
+        request
+            .enable_realtime_asr_ingress()
+            .expect("ASR session ingress");
+        let operation_id = RealtimeOperationId::new(13);
+        let _waiter = request
+            .install_realtime_asr_operation(operation_id, RealtimeAsrOperationPayload::Finish)
+            .expect("payload installation");
+        request
+            .complete_realtime_asr_operation(operation_id)
+            .expect("completion");
+
+        assert!(request
+            .install_realtime_asr_operation(
+                RealtimeOperationId::new(12),
+                RealtimeAsrOperationPayload::Finish,
+            )
+            .is_err());
+        assert!(request
+            .install_realtime_asr_operation(operation_id, RealtimeAsrOperationPayload::Finish)
+            .is_err());
+        let _next_waiter = request
+            .install_realtime_asr_operation(
+                RealtimeOperationId::new(14),
+                RealtimeAsrOperationPayload::Finish,
+            )
+            .expect("strictly newer identity remains valid");
+    }
+
+    #[test]
+    fn realtime_session_terminal_drains_waiters_payloads_and_fences_ingress() {
+        let mut request = EngineCoreRequest::asr_bytes(Vec::new());
+        request
+            .enable_realtime_asr_ingress()
+            .expect("ASR session ingress");
+        let samples: Arc<[f32]> = Arc::from([8.0_f32, 9.0]);
+        let samples_weak = Arc::downgrade(&samples);
+        let mut push_waiter = request
+            .install_realtime_asr_operation(
+                RealtimeOperationId::new(20),
+                RealtimeAsrOperationPayload::Push {
+                    samples: Arc::clone(&samples),
+                    sample_rate: 48_000,
+                },
+            )
+            .expect("push installation");
+        let mut finish_waiter = request
+            .install_realtime_asr_operation(
+                RealtimeOperationId::new(21),
+                RealtimeAsrOperationPayload::Finish,
+            )
+            .expect("finish installation");
+        drop(samples);
+
+        let terminal = RealtimeAsrTerminalOutcome::Failed(Arc::from("model unloaded"));
+        assert_eq!(
+            request
+                .terminate_realtime_asr_ingress(terminal.clone())
+                .expect("terminal drain"),
+            2
+        );
+        assert_eq!(
+            push_waiter.try_recv().expect("push terminal"),
+            Err(terminal.clone())
+        );
+        assert_eq!(
+            finish_waiter.try_recv().expect("finish terminal"),
+            Err(terminal)
+        );
+        assert!(samples_weak.upgrade().is_none());
+        assert_eq!(
+            request
+                .terminate_realtime_asr_ingress(RealtimeAsrTerminalOutcome::Cancelled)
+                .expect("idempotent terminal drain"),
+            0
+        );
+        assert!(request
+            .install_realtime_asr_operation(
+                RealtimeOperationId::new(22),
+                RealtimeAsrOperationPayload::Finish,
+            )
+            .is_err());
     }
 }

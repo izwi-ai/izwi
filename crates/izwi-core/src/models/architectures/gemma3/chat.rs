@@ -4,27 +4,137 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::Arc;
 
+#[cfg(test)]
+use candle_core::D;
 use candle_core::{DType, IndexOp, Tensor};
 use candle_nn::VarBuilder;
-use candle_transformers::models::gemma3::{Config as Gemma3Config, Model as Gemma3Model};
+use candle_transformers::models::gemma3::Config as Gemma3Config;
 use serde_json::Value;
 use tracing::{info, warn};
 
+use crate::backends::kv::KvWriteBatchCompletion;
 use crate::backends::DeviceProfile;
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
+use crate::kv::v2::StateDomainId;
+use crate::kv::{InferenceStateCapability, InferenceStateContractProvider};
 use crate::model::ModelVariant;
-use crate::models::shared::attention::flash::should_enable_flash_attention_v2;
-use crate::models::shared::chat::{ChatMessage, ChatRole};
+use crate::models::architectures::gemma3::core::Gemma3PhysicalModel;
+use crate::models::shared::attention::paged::default_kv_page_size;
+use crate::models::shared::attention::physical::PhysicalPagedKvCache;
+use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
 use crate::models::shared::config::checkpoint_dtype_from_config_json;
+use crate::models::shared::sampling::ChatSampler;
 use crate::tokenizer::Tokenizer;
 
 #[derive(Debug, Clone)]
 pub struct ChatGenerationOutput {
     pub text: String,
     pub tokens_generated: usize,
+}
+
+pub struct ChatDecodeState {
+    cache: PhysicalPagedKvCache,
+    unconsumed_logits: Option<Tensor>,
+    position: usize,
+    pending_token: Option<u32>,
+    /// Scheduler-visible prompt cursor, separate from a reused physical
+    /// prefix position on the first scheduler-visible span.
+    prefill_progress: usize,
+    generated_ids: Vec<u32>,
+    sampler: ChatSampler,
+    assembled: String,
+    stagnant_steps: usize,
+    max_new_tokens: usize,
+    finished: bool,
+}
+
+pub(crate) struct ChatDecodeCheckpoint {
+    cache: PhysicalPagedKvCache,
+    unconsumed_logits: Option<Tensor>,
+    position: usize,
+    pending_token: Option<u32>,
+    prefill_progress: usize,
+    generated_ids: Vec<u32>,
+    sampler: ChatSampler,
+    assembled: String,
+    stagnant_steps: usize,
+    finished: bool,
+}
+
+impl ChatDecodeState {
+    pub(crate) fn prefill_progress(&self) -> usize {
+        self.prefill_progress
+    }
+
+    pub(crate) fn install_physical_reservation(
+        &mut self,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<()> {
+        let checkpoint = self.begin_managed_quantum(cache)?;
+        drop(checkpoint);
+        Ok(())
+    }
+
+    pub(crate) fn begin_managed_quantum(
+        &mut self,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<ChatDecodeCheckpoint> {
+        if self.cache.arena().id() != cache.arena().id()
+            || self.cache.arena().config().group != cache.arena().config().group
+        {
+            return Err(Error::InferenceError(
+                "a Gemma session cannot switch physical KV authority".into(),
+            ));
+        }
+        if cache.context_len() != self.position {
+            return Err(Error::InferenceError(format!(
+                "physical Gemma reservation starts at {}, but decode state is at {}",
+                cache.context_len(),
+                self.position
+            )));
+        }
+        let checkpoint = ChatDecodeCheckpoint {
+            cache: std::mem::replace(&mut self.cache, cache),
+            unconsumed_logits: self.unconsumed_logits.clone(),
+            position: self.position,
+            pending_token: self.pending_token,
+            prefill_progress: self.prefill_progress,
+            generated_ids: self.generated_ids.clone(),
+            sampler: self.sampler.clone(),
+            assembled: self.assembled.clone(),
+            stagnant_steps: self.stagnant_steps,
+            finished: self.finished,
+        };
+        Ok(checkpoint)
+    }
+
+    pub(crate) fn rollback_managed_quantum(&mut self, checkpoint: ChatDecodeCheckpoint) {
+        self.cache = checkpoint.cache;
+        self.unconsumed_logits = checkpoint.unconsumed_logits;
+        self.position = checkpoint.position;
+        self.pending_token = checkpoint.pending_token;
+        self.prefill_progress = checkpoint.prefill_progress;
+        self.generated_ids = checkpoint.generated_ids;
+        self.sampler = checkpoint.sampler;
+        self.assembled = checkpoint.assembled;
+        self.stagnant_steps = checkpoint.stagnant_steps;
+        self.finished = checkpoint.finished;
+    }
+
+    pub(crate) fn take_physical_write_completions(&mut self) -> Vec<Arc<KvWriteBatchCompletion>> {
+        self.cache.take_completed_writes()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatDecodeStep {
+    pub delta: String,
+    pub text: String,
+    pub tokens_generated: usize,
+    pub finished: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +201,7 @@ struct GemmaDefaults {
     num_hidden_layers: usize,
     num_key_value_heads: usize,
     head_dim: usize,
+    max_position_embeddings: usize,
 }
 
 fn defaults_for_variant(variant: ModelVariant) -> GemmaDefaults {
@@ -102,6 +213,7 @@ fn defaults_for_variant(variant: ModelVariant) -> GemmaDefaults {
             num_hidden_layers: 26,
             num_key_value_heads: 1,
             head_dim: 256,
+            max_position_embeddings: 32_768,
         },
         ModelVariant::Gemma34BIt => GemmaDefaults {
             hidden_size: 2560,
@@ -110,6 +222,7 @@ fn defaults_for_variant(variant: ModelVariant) -> GemmaDefaults {
             num_hidden_layers: 34,
             num_key_value_heads: 4,
             head_dim: 256,
+            max_position_embeddings: 131_072,
         },
         _ => GemmaDefaults {
             hidden_size: 2560,
@@ -118,6 +231,7 @@ fn defaults_for_variant(variant: ModelVariant) -> GemmaDefaults {
             num_hidden_layers: 34,
             num_key_value_heads: 4,
             head_dim: 256,
+            max_position_embeddings: 131_072,
         },
     }
 }
@@ -186,8 +300,11 @@ fn parse_gemma3_config(
     set_default("query_pre_attn_scalar", Value::from(256u64));
     set_default("sliding_window", Value::from(512u64));
     set_default("sliding_window_pattern", Value::from(6u64));
-    set_default("max_position_embeddings", Value::from(32_768u64));
-    let resolved_vocab_size = checkpoint_vocab_size.unwrap_or_else(|| {
+    set_default(
+        "max_position_embeddings",
+        Value::from(defaults.max_position_embeddings as u64),
+    );
+    let resolved_vocab_size = checkpoint_vocab_size.unwrap_or({
         if has_text_config {
             262_208
         } else {
@@ -313,11 +430,34 @@ fn select_gemma3_dense_dtype(device: &DeviceProfile, checkpoint_dtype: Option<DT
 pub struct Gemma3ChatModel {
     variant: ModelVariant,
     device: DeviceProfile,
+    compute_dtype: DType,
     tokenizer: GemmaTokenizer,
-    text_model: Mutex<Gemma3Model>,
+    text_model: Gemma3PhysicalModel,
+}
+
+impl InferenceStateContractProvider for Gemma3ChatModel {
+    fn inference_state_contract(&self) -> Result<InferenceStateCapability> {
+        Ok(InferenceStateCapability::Managed(
+            self.text_model.managed_inference_state_contract(
+                StateDomainId::new(1),
+                self.compute_dtype,
+                default_kv_page_size(),
+            )?,
+        ))
+    }
 }
 
 impl Gemma3ChatModel {
+    pub fn max_context_tokens(&self) -> Result<usize> {
+        let context = self.text_model.max_context_tokens();
+        if context == 0 {
+            return Err(Error::ModelLoadError(
+                "Gemma 3 checkpoint has a zero context length".into(),
+            ));
+        }
+        Ok(context)
+    }
+
     pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
         let tokenizer = GemmaTokenizer::load(model_dir)?;
 
@@ -443,21 +583,20 @@ impl Gemma3ChatModel {
             vb_base
         };
 
-        let use_flash_attn = should_enable_flash_attention_v2(&device.device);
-        let text_model = Gemma3Model::new(use_flash_attn, &config, vb).map_err(Error::from)?;
+        let text_model = Gemma3PhysicalModel::load(config, vb)?;
 
         info!(
-            "Loaded Gemma chat model {} on {:?} (flash_attn={})",
+            "Loaded physical Gemma chat model {} on {:?}",
             variant.dir_name(),
-            device.kind,
-            use_flash_attn
+            device.kind
         );
 
         Ok(Self {
             variant,
             device,
+            compute_dtype: dtype,
             tokenizer,
-            text_model: Mutex::new(text_model),
+            text_model,
         })
     }
 
@@ -472,79 +611,235 @@ impl Gemma3ChatModel {
 
     pub fn generate_with_callback(
         &self,
+        _messages: &[ChatMessage],
+        _max_new_tokens: usize,
+        _on_delta: &mut dyn FnMut(&str),
+    ) -> Result<ChatGenerationOutput> {
+        Err(Error::InvalidInput(
+            "Gemma generation requires scheduler-owned physical state".into(),
+        ))
+    }
+
+    pub fn start_decode_managed(
+        &self,
         messages: &[ChatMessage],
         max_new_tokens: usize,
-        on_delta: &mut dyn FnMut(&str),
-    ) -> Result<ChatGenerationOutput> {
+        config: &ChatGenerationConfig,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<ChatDecodeState> {
         let prompt_ids = self.build_prompt(messages)?;
-        if prompt_ids.is_empty() {
+        let mut state =
+            self.begin_resumable_prefill_managed(&prompt_ids, max_new_tokens, config, cache)?;
+        self.continue_resumable_prefill(&mut state, &prompt_ids, 0, prompt_ids.len())?;
+        Ok(state)
+    }
+
+    pub(crate) fn begin_resumable_prefill_managed(
+        &self,
+        prompt_ids: &[u32],
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<ChatDecodeState> {
+        if prompt_ids.is_empty() || cache.context_len() >= prompt_ids.len() {
             return Err(Error::InvalidInput(
-                "Gemma prompt produced no tokens".to_string(),
+                "Gemma resumable prefill requires at least one private prompt token".into(),
             ));
         }
-        let mut input_ids = Tensor::from_vec(vec![prompt_ids[0]], (1, 1), &self.device.device)?;
-        let mut seqlen_offset = 0usize;
-
-        let mut generated_ids = Vec::new();
-        let mut assembled = String::new();
-        let mut stagnant_steps = 0usize;
-
-        let mut model = self
-            .text_model
-            .lock()
-            .map_err(|_| Error::InferenceError("Gemma model mutex poisoned".to_string()))?;
-        model.clear_kv_cache();
-
-        // Keep prefill token-by-token to avoid known Candle slice_set issues
-        // with some Metal execution paths on Gemma.
-        for &token in prompt_ids.iter().skip(1) {
-            model
-                .forward(&input_ids, seqlen_offset)
-                .map_err(Error::from)?;
-            seqlen_offset += 1;
-            input_ids = Tensor::from_vec(vec![token], (1, 1), &self.device.device)?;
-        }
-
-        for _ in 0..max_new_tokens {
-            let logits = model
-                .forward(&input_ids, seqlen_offset)
-                .map_err(Error::from)?;
-            let next = select_next_token(&logits, self.tokenizer.vocab_size)?;
-
-            if next == self.tokenizer.specials.end_of_turn
-                || next == self.tokenizer.specials.eos
-                || next == self.tokenizer.specials.start_of_turn
-                || self.tokenizer.specials.bos.is_some_and(|bos| next == bos)
-            {
-                break;
-            }
-
-            generated_ids.push(next);
-
-            let decoded = self.tokenizer.decode_text(&generated_ids)?;
-            let delta = text_delta(&assembled, &decoded);
-            for ch in delta.chars() {
-                let mut buf = [0u8; 4];
-                on_delta(ch.encode_utf8(&mut buf));
-            }
-            if decoded == assembled {
-                stagnant_steps += 1;
-                if stagnant_steps >= 4 {
-                    break;
-                }
-            } else {
-                stagnant_steps = 0;
-                assembled = decoded;
-            }
-
-            seqlen_offset += 1;
-            input_ids = Tensor::from_vec(vec![next], (1, 1), &self.device.device)?;
-        }
-
-        Ok(ChatGenerationOutput {
-            text: assembled.trim().to_string(),
-            tokens_generated: generated_ids.len(),
+        let position = cache.context_len();
+        Ok(ChatDecodeState {
+            cache,
+            unconsumed_logits: None,
+            position,
+            pending_token: None,
+            prefill_progress: 0,
+            generated_ids: Vec::new(),
+            sampler: ChatSampler::new(config.clone(), prompt_ids),
+            assembled: String::new(),
+            stagnant_steps: 0,
+            max_new_tokens: max_new_tokens.max(1),
+            finished: false,
         })
+    }
+
+    pub(crate) fn continue_resumable_prefill(
+        &self,
+        state: &mut ChatDecodeState,
+        prompt_ids: &[u32],
+        span_start: usize,
+        span_end: usize,
+    ) -> Result<bool> {
+        if state.prefill_progress != span_start
+            || span_start >= span_end
+            || span_end > prompt_ids.len()
+            || state.finished
+            || state.unconsumed_logits.is_some()
+            || state.pending_token.is_some()
+            || !state.generated_ids.is_empty()
+        {
+            return Err(Error::InvalidInput(format!(
+                "Gemma resumable prefill span [{span_start},{span_end}) is incompatible with cursor {} and prompt length {}",
+                state.prefill_progress,
+                prompt_ids.len()
+            )));
+        }
+        let physical_start = state.cache.context_len();
+        let first_span = span_start == 0;
+        if state.position != physical_start
+            || (!first_span && physical_start != span_start)
+            || (first_span && physical_start >= span_end)
+        {
+            return Err(Error::InferenceError(format!(
+                "Gemma resumable prefill physical cursor {physical_start} is incompatible with logical span [{span_start},{span_end})"
+            )));
+        }
+        let input = Tensor::from_slice(
+            &prompt_ids[physical_start..span_end],
+            (1, span_end - physical_start),
+            &self.device.device,
+        )?;
+        let logits = self
+            .text_model
+            .forward_physical(&input, physical_start, &mut state.cache)?;
+        if state.cache.context_len() != span_end {
+            return Err(Error::InferenceError(format!(
+                "Gemma resumable prefill committed physical cursor {} instead of {span_end}",
+                state.cache.context_len()
+            )));
+        }
+        state.position = span_end;
+        state.prefill_progress = span_end;
+        let complete = span_end == prompt_ids.len();
+        if complete {
+            state.unconsumed_logits = Some(logits);
+        }
+        Ok(complete)
+    }
+
+    pub fn decode_step(&self, state: &mut ChatDecodeState) -> Result<ChatDecodeStep> {
+        if state.finished || state.generated_ids.len() >= state.max_new_tokens {
+            state.finished = true;
+            return Ok(state.step(String::new()));
+        }
+        if let Some(token) = state.pending_token.take() {
+            let input = Tensor::from_vec(vec![token], (1, 1), &self.device.device)?;
+            state.unconsumed_logits = Some(self.text_model.forward_physical(
+                &input,
+                state.position,
+                &mut state.cache,
+            )?);
+            state.position += 1;
+        }
+        let logits = state.unconsumed_logits.take().ok_or_else(|| {
+            Error::InferenceError("Gemma decode quantum has no unconsumed logits".into())
+        })?;
+        let next = state.sampler.sample(&logits, self.tokenizer.vocab_size)?;
+        self.apply_sample(state, next)
+    }
+
+    pub fn decode_step_batch(
+        &self,
+        states: &mut [&mut ChatDecodeState],
+    ) -> Result<Vec<ChatDecodeStep>> {
+        if states.is_empty() {
+            return Ok(Vec::new());
+        }
+        if states.iter().any(|state| {
+            state.finished
+                || state.generated_ids.len() >= state.max_new_tokens
+                || state.unconsumed_logits.is_some()
+        }) {
+            return Err(Error::InvalidInput(
+                "Gemma continuous batch contains an unready decode state".into(),
+            ));
+        }
+        let tokens = states
+            .iter_mut()
+            .map(|state| {
+                state.pending_token.take().ok_or_else(|| {
+                    Error::InferenceError(
+                        "Gemma continuous decode state has no scheduled token".into(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let positions = states
+            .iter()
+            .map(|state| state.position)
+            .collect::<Vec<_>>();
+        let input = Tensor::from_vec(tokens, (states.len(), 1), &self.device.device)?;
+        let mut caches = states
+            .iter_mut()
+            .map(|state| &mut state.cache)
+            .collect::<Vec<_>>();
+        let logits =
+            self.text_model
+                .forward_physical_decode_batch(&input, &positions, &mut caches)?;
+        for state in states.iter_mut() {
+            state.position += 1;
+        }
+        let mut steps = Vec::with_capacity(states.len());
+        for (row, state) in states.iter_mut().enumerate() {
+            let next = state
+                .sampler
+                .sample(&logits.i(row)?, self.tokenizer.vocab_size)?;
+            steps.push(self.apply_sample(state, next)?);
+        }
+        Ok(steps)
+    }
+
+    fn apply_sample(&self, state: &mut ChatDecodeState, next: u32) -> Result<ChatDecodeStep> {
+        if next == self.tokenizer.specials.end_of_turn
+            || next == self.tokenizer.specials.eos
+            || next == self.tokenizer.specials.start_of_turn
+            || self.tokenizer.specials.bos.is_some_and(|bos| next == bos)
+            || state.sampler.is_configured_stop(next)
+        {
+            state.finished = true;
+            return Ok(state.step(String::new()));
+        }
+        state.generated_ids.push(next);
+        state.pending_token = Some(next);
+        let decoded = self.tokenizer.decode_text(&state.generated_ids)?;
+        let delta = text_delta(&state.assembled, &decoded);
+        if decoded == state.assembled {
+            state.stagnant_steps += 1;
+            if state.stagnant_steps >= 4 {
+                state.finished = true;
+            }
+        } else {
+            state.stagnant_steps = 0;
+            state.assembled = decoded;
+        }
+        if state.generated_ids.len() >= state.max_new_tokens {
+            state.finished = true;
+        }
+        Ok(state.step(delta))
+    }
+
+    pub fn supports_incremental_decode(&self) -> bool {
+        true
+    }
+
+    pub fn supports_continuous_decode_batch(&self) -> bool {
+        true
+    }
+
+    pub fn continuous_decode_batch_workspace_per_row_bytes(&self) -> Result<u64> {
+        u64::try_from(self.text_model.hidden_size())
+            .ok()
+            .and_then(|hidden| {
+                hidden.checked_mul(u64::try_from(self.compute_dtype.size_in_bytes()).ok()?)
+            })
+            .ok_or_else(|| Error::Overloaded("Gemma decode workspace estimate overflow".into()))
+    }
+
+    pub fn runtime_device_kind(&self) -> String {
+        format!("{:?}", self.device.kind).to_ascii_lowercase()
+    }
+
+    pub fn runtime_compute_dtype(&self) -> Option<String> {
+        Some(format!("{:?}", self.compute_dtype).to_ascii_lowercase())
     }
 
     pub fn prompt_token_ids(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
@@ -625,16 +920,23 @@ impl Gemma3ChatModel {
     }
 }
 
+impl ChatDecodeState {
+    fn step(&self, delta: String) -> ChatDecodeStep {
+        ChatDecodeStep {
+            delta,
+            text: self.assembled.trim().to_string(),
+            tokens_generated: self.generated_ids.len(),
+            finished: self.finished,
+        }
+    }
+}
+
 fn strip_think_blocks(input: &str) -> String {
     let mut output = input.to_string();
     let open = "<think>";
     let close = "</think>";
 
-    loop {
-        let Some(start) = output.find(open) else {
-            break;
-        };
-
+    while let Some(start) = output.find(open) {
         let search_from = start + open.len();
         if let Some(end_rel) = output[search_from..].find(close) {
             let end = search_from + end_rel + close.len();
@@ -683,23 +985,33 @@ fn strip_unused_placeholders(input: &str) -> String {
     out
 }
 
+#[cfg(test)]
 fn argmax(logits: &Tensor, vocab_limit: usize) -> Result<u32> {
-    let values = logits.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-    let capped = vocab_limit.min(values.len());
+    let capped = vocab_limit.min(logits.dim(0)?);
     if capped == 0 {
         return Err(Error::InferenceError(
             "No valid logits in constrained vocabulary".to_string(),
         ));
     }
-    let (idx, _) = values
-        .iter()
-        .take(capped)
-        .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .ok_or_else(|| Error::InferenceError("Empty logits".to_string()))?;
-    Ok(idx as u32)
+    let logits = if capped < logits.dim(0)? {
+        logits.narrow(0, 0, capped)?
+    } else {
+        logits.clone()
+    };
+    let idx = logits.argmax(D::Minus1)?;
+    let idx = if idx.rank() == 0 {
+        idx
+    } else {
+        idx.squeeze(0)?
+    };
+    crate::models::shared::telemetry::record_dtype_cast();
+    crate::models::shared::telemetry::record_host_read(DType::U32, 1);
+    idx.to_dtype(DType::U32)?
+        .to_scalar::<u32>()
+        .map_err(Error::from)
 }
 
+#[cfg(test)]
 fn select_next_token(logits: &Tensor, vocab_limit: usize) -> Result<u32> {
     match logits.rank() {
         // [vocab]
@@ -736,9 +1048,13 @@ fn text_delta(previous: &str, current: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{select_gemma3_dense_dtype, strip_unused_placeholders};
+    use super::{
+        argmax, parse_gemma3_config, select_gemma3_dense_dtype, select_next_token,
+        strip_unused_placeholders,
+    };
     use crate::backends::{DeviceCapabilities, DeviceKind, DeviceProfile};
-    use candle_core::{DType, Device};
+    use crate::model::ModelVariant;
+    use candle_core::{DType, Device, Tensor};
 
     #[test]
     fn strip_unused_placeholders_removes_marker_tokens() {
@@ -752,6 +1068,27 @@ mod tests {
         let input = "a <unused> b <unusedx12> c";
         let output = strip_unused_placeholders(input);
         assert_eq!(output, input);
+    }
+
+    #[test]
+    fn missing_context_uses_variant_native_limit() {
+        let config = r#"{"vocab_size": 262208}"#;
+        let one_b = parse_gemma3_config(config, ModelVariant::Gemma31BIt, 262_208, None)
+            .expect("1B defaults");
+        let four_b = parse_gemma3_config(config, ModelVariant::Gemma34BIt, 262_208, None)
+            .expect("4B defaults");
+
+        assert_eq!(one_b.max_position_embeddings, 32_768);
+        assert_eq!(four_b.max_position_embeddings, 131_072);
+    }
+
+    #[test]
+    fn explicit_context_overrides_variant_default() {
+        let config = r#"{"vocab_size":262208,"max_position_embeddings":777}"#;
+        let parsed = parse_gemma3_config(config, ModelVariant::Gemma34BIt, 262_208, None)
+            .expect("explicit context");
+
+        assert_eq!(parsed.max_position_embeddings, 777);
     }
 
     #[test]
@@ -771,5 +1108,34 @@ mod tests {
             select_gemma3_dense_dtype(&profile, Some(DType::F32)),
             DType::F32
         );
+    }
+
+    #[test]
+    fn gemma3_argmax_stays_inside_the_constrained_vocabulary() {
+        let device = Device::Cpu;
+        let logits = Tensor::from_vec(vec![0.1f32, 0.8, 0.4, 10.0], (4,), &device)
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap();
+
+        assert_eq!(argmax(&logits, 3).unwrap(), 1);
+    }
+
+    #[test]
+    fn gemma3_selects_from_the_last_sequence_position() {
+        let device = Device::Cpu;
+        let logits =
+            Tensor::from_vec(vec![0.9f32, 0.1, 0.0, -0.2, 0.4, 0.7], (2, 3), &device).unwrap();
+
+        assert_eq!(select_next_token(&logits, 3).unwrap(), 2);
+    }
+
+    #[test]
+    fn gemma3_argmax_rejects_an_empty_vocabulary() {
+        let device = Device::Cpu;
+        let logits = Tensor::from_vec(vec![0.1f32, 0.2], (2,), &device).unwrap();
+        let err = argmax(&logits, 0).expect_err("zero vocabulary should be rejected");
+
+        assert!(format!("{err}").contains("No valid logits"));
     }
 }

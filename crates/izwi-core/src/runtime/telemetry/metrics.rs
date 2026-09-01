@@ -12,7 +12,29 @@ use crate::engine::{
     engine_metric_catalog, prometheus_engine_metric_name, prometheus_engine_metric_type,
     EngineDeadlinePhaseMetricsSnapshot, EngineDispatchStateMetricsSnapshot,
     EngineFailureOriginMetricsSnapshot, EngineMetricDescriptor, EngineOutput,
-    EngineWorkspaceDomainMetricsSnapshot,
+    EnginePhysicalExecutionMetricsSnapshot, EngineWorkspaceDomainMetricsSnapshot,
+    ManagedKvRuntimeSnapshot, ENGINE_EXECUTOR_PHYSICAL_BATCHES_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_BATCH_CAPACITY_ROWS_TOTAL, ENGINE_EXECUTOR_PHYSICAL_BATCH_FILL_RATIO,
+    ENGINE_EXECUTOR_PHYSICAL_BATCH_MATERIALIZED_ELEMENTS_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_BATCH_MAX_WIDTH, ENGINE_EXECUTOR_PHYSICAL_BATCH_PADDING_RATIO,
+    ENGINE_EXECUTOR_PHYSICAL_BATCH_ROWS_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_BATCH_USEFUL_ELEMENTS_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_COHORT_WAIT_OBSERVATIONS_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_COHORT_WAIT_SECONDS_MAX,
+    ENGINE_EXECUTOR_PHYSICAL_COHORT_WAIT_SECONDS_TOTAL, ENGINE_EXECUTOR_PHYSICAL_DEFERS_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_DISPATCHES_COMPLETED_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_DISPATCHES_IN_FLIGHT,
+    ENGINE_EXECUTOR_PHYSICAL_DISPATCHES_MAX_IN_FLIGHT,
+    ENGINE_EXECUTOR_PHYSICAL_DISPATCHES_STARTED_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_DISPATCH_OBSERVATIONS_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_DISPATCH_SECONDS_MAX, ENGINE_EXECUTOR_PHYSICAL_DISPATCH_SECONDS_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_EXECUTION_CAP, ENGINE_EXECUTOR_PHYSICAL_EXECUTION_MODE,
+    ENGINE_EXECUTOR_PHYSICAL_FALLBACKS_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_PERMIT_WAIT_OBSERVATIONS_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_PERMIT_WAIT_SECONDS_MAX,
+    ENGINE_EXECUTOR_PHYSICAL_PERMIT_WAIT_SECONDS_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_WORKSPACE_CURRENT_BYTES,
+    ENGINE_EXECUTOR_PHYSICAL_WORKSPACE_HIGH_WATER_BYTES,
 };
 use crate::models::shared::telemetry::{
     prometheus as kernel_path_prometheus, snapshot as kernel_path_telemetry_snapshot,
@@ -55,11 +77,9 @@ pub struct InferenceBrokerRuntimeTelemetrySnapshot {
 pub struct EngineRuntimeTelemetrySnapshot {
     pub scheduler_queue_depth: u64,
     pub scheduler_running_requests: u64,
-    pub kv_cache_hits_total: u64,
-    pub kv_cache_misses_total: u64,
-    pub kv_cache_evictions_total: u64,
-    pub kv_cache_allocated_blocks: u64,
-    pub kv_cache_prefix_reuse_blocks_total: u64,
+    pub incremental_prefill_quanta_committed_total: u64,
+    pub incremental_prefill_tokens_committed_total: u64,
+    pub multispan_prefill_requests_total: u64,
     pub stream_backpressure_total: u64,
     pub stream_checkpoints_committed_total: u64,
     pub stream_checkpoint_rejections_total: u64,
@@ -67,6 +87,7 @@ pub struct EngineRuntimeTelemetrySnapshot {
     pub tensor_batches_total: u64,
     pub tensor_static_batches_total: u64,
     pub tensor_continuous_batches_total: u64,
+    pub tensor_continuous_multirow_batches_total: u64,
     pub request_parallel_batches_total: u64,
     pub physical_batch_rejections_total: u64,
     pub tensor_batch_max_width: u64,
@@ -81,34 +102,16 @@ pub struct EngineRuntimeTelemetrySnapshot {
     pub workspace_domains: EngineWorkspaceDomainMetricsSnapshot,
     pub tensor_batch_fill_ratio: f64,
     pub tensor_batch_padding_ratio: f64,
-    pub kv_cache: EngineKvCacheRuntimeSnapshot,
-}
-
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct EngineKvCacheRuntimeSnapshot {
-    pub block_accounting: &'static str,
-    pub memory_accounting: &'static str,
-    pub total_blocks: u64,
-    pub soft_max_blocks: u64,
-    pub allocated_blocks: u64,
-    pub free_blocks: u64,
-    pub block_size: u64,
-    pub dtype_bytes: u64,
-    pub block_memory_bytes: u64,
-    pub memory_used_bytes: u64,
-    pub memory_capacity_bytes: u64,
-    pub utilization_ratio: f64,
-    pub gpu_resident_blocks: u64,
-    pub pinned_blocks: u64,
-    pub shared_prefixes: u64,
-    pub total_allocations: u64,
-    pub total_frees: u64,
-    pub shared_prefix_hits: u64,
-    pub shared_prefix_misses: u64,
-    pub shared_prefix_blocks_reused: u64,
-    pub persistent_prefix_evictions: u64,
-    pub copy_on_write_splits: u64,
-    pub last_churn_ratio: f64,
+    pub model_tensor_batches_total: u64,
+    pub model_tensor_batch_rows_total: u64,
+    pub model_tensor_batch_max_width: u64,
+    pub model_scalar_row_dispatches_total: u64,
+    pub model_decode_calls_total: u64,
+    pub model_tensor_multirow_calls_total: u64,
+    pub continuous_envelope_scalar_fallbacks_total: u64,
+    pub physical_execution: EnginePhysicalExecutionMetricsSnapshot,
+    /// Exact backend-owned managed arenas, page ownership, and counters.
+    pub kv_cache: ManagedKvRuntimeSnapshot,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -1114,6 +1117,169 @@ pub(crate) fn push_engine_labeled_metric(
     }
 }
 
+pub(crate) fn push_engine_labeled_metric_f64(
+    payload: &mut String,
+    name: &str,
+    label_name: &str,
+    values: &[(&str, f64)],
+) {
+    let prometheus_name = prometheus_engine_metric_name(name);
+    let metric_type = prometheus_engine_metric_type(name);
+    push_engine_metric_help(payload, name, &prometheus_name);
+    payload.push_str(&format!("# TYPE {prometheus_name} {metric_type}\n"));
+    for (label_value, value) in values {
+        payload.push_str(&format!(
+            "{prometheus_name}{{{label_name}=\"{label_value}\"}} {value:.6}\n"
+        ));
+    }
+}
+
+pub(crate) fn push_engine_physical_execution_metrics(
+    payload: &mut String,
+    snapshot: &EnginePhysicalExecutionMetricsSnapshot,
+) {
+    push_engine_labeled_metric(
+        payload,
+        ENGINE_EXECUTOR_PHYSICAL_EXECUTION_MODE,
+        "mode",
+        &snapshot.effective_mode.labeled_values(),
+    );
+    push_engine_metric(
+        payload,
+        ENGINE_EXECUTOR_PHYSICAL_EXECUTION_CAP,
+        snapshot.effective_cap,
+    );
+    push_engine_metric(
+        payload,
+        ENGINE_EXECUTOR_PHYSICAL_DISPATCHES_IN_FLIGHT,
+        snapshot.dispatches_in_flight,
+    );
+    push_engine_metric(
+        payload,
+        ENGINE_EXECUTOR_PHYSICAL_DISPATCHES_MAX_IN_FLIGHT,
+        snapshot.dispatches_max_in_flight,
+    );
+    push_engine_metric(
+        payload,
+        ENGINE_EXECUTOR_PHYSICAL_DISPATCHES_STARTED_TOTAL,
+        snapshot.dispatches_started_total,
+    );
+    push_engine_metric(
+        payload,
+        ENGINE_EXECUTOR_PHYSICAL_DISPATCHES_COMPLETED_TOTAL,
+        snapshot.dispatches_completed_total,
+    );
+    push_engine_metric_f64(
+        payload,
+        ENGINE_EXECUTOR_PHYSICAL_DISPATCH_SECONDS_TOTAL,
+        snapshot.dispatch_duration.total_seconds,
+    );
+    push_engine_metric(
+        payload,
+        ENGINE_EXECUTOR_PHYSICAL_DISPATCH_OBSERVATIONS_TOTAL,
+        snapshot.dispatch_duration.observations_total,
+    );
+    push_engine_metric_f64(
+        payload,
+        ENGINE_EXECUTOR_PHYSICAL_DISPATCH_SECONDS_MAX,
+        snapshot.dispatch_duration.max_seconds,
+    );
+    push_engine_metric_f64(
+        payload,
+        ENGINE_EXECUTOR_PHYSICAL_COHORT_WAIT_SECONDS_TOTAL,
+        snapshot.cohort_wait.total_seconds,
+    );
+    push_engine_metric(
+        payload,
+        ENGINE_EXECUTOR_PHYSICAL_COHORT_WAIT_OBSERVATIONS_TOTAL,
+        snapshot.cohort_wait.observations_total,
+    );
+    push_engine_metric_f64(
+        payload,
+        ENGINE_EXECUTOR_PHYSICAL_COHORT_WAIT_SECONDS_MAX,
+        snapshot.cohort_wait.max_seconds,
+    );
+    push_engine_metric_f64(
+        payload,
+        ENGINE_EXECUTOR_PHYSICAL_PERMIT_WAIT_SECONDS_TOTAL,
+        snapshot.permit_wait.total_seconds,
+    );
+    push_engine_metric(
+        payload,
+        ENGINE_EXECUTOR_PHYSICAL_PERMIT_WAIT_OBSERVATIONS_TOTAL,
+        snapshot.permit_wait.observations_total,
+    );
+    push_engine_metric_f64(
+        payload,
+        ENGINE_EXECUTOR_PHYSICAL_PERMIT_WAIT_SECONDS_MAX,
+        snapshot.permit_wait.max_seconds,
+    );
+    push_engine_metric(
+        payload,
+        ENGINE_EXECUTOR_PHYSICAL_BATCHES_TOTAL,
+        snapshot.batches_total,
+    );
+    push_engine_metric(
+        payload,
+        ENGINE_EXECUTOR_PHYSICAL_BATCH_MAX_WIDTH,
+        snapshot.batch_max_width,
+    );
+    push_engine_metric(
+        payload,
+        ENGINE_EXECUTOR_PHYSICAL_BATCH_ROWS_TOTAL,
+        snapshot.batch_rows_total,
+    );
+    push_engine_metric(
+        payload,
+        ENGINE_EXECUTOR_PHYSICAL_BATCH_CAPACITY_ROWS_TOTAL,
+        snapshot.batch_capacity_rows_total,
+    );
+    push_engine_metric(
+        payload,
+        ENGINE_EXECUTOR_PHYSICAL_BATCH_USEFUL_ELEMENTS_TOTAL,
+        snapshot.batch_useful_elements_total,
+    );
+    push_engine_metric(
+        payload,
+        ENGINE_EXECUTOR_PHYSICAL_BATCH_MATERIALIZED_ELEMENTS_TOTAL,
+        snapshot.batch_materialized_elements_total,
+    );
+    push_engine_metric_f64(
+        payload,
+        ENGINE_EXECUTOR_PHYSICAL_BATCH_FILL_RATIO,
+        snapshot.batch_fill_ratio,
+    );
+    push_engine_metric_f64(
+        payload,
+        ENGINE_EXECUTOR_PHYSICAL_BATCH_PADDING_RATIO,
+        snapshot.batch_padding_ratio,
+    );
+    push_engine_labeled_metric(
+        payload,
+        ENGINE_EXECUTOR_PHYSICAL_FALLBACKS_TOTAL,
+        "reason",
+        &snapshot.fallbacks.labeled_values(),
+    );
+    push_engine_labeled_metric(
+        payload,
+        ENGINE_EXECUTOR_PHYSICAL_DEFERS_TOTAL,
+        "reason",
+        &snapshot.defers.labeled_values(),
+    );
+    push_engine_labeled_metric(
+        payload,
+        ENGINE_EXECUTOR_PHYSICAL_WORKSPACE_CURRENT_BYTES,
+        "domain",
+        &snapshot.workspace_current.labeled_values(),
+    );
+    push_engine_labeled_metric(
+        payload,
+        ENGINE_EXECUTOR_PHYSICAL_WORKSPACE_HIGH_WATER_BYTES,
+        "domain",
+        &snapshot.workspace_high_water.labeled_values(),
+    );
+}
+
 fn push_engine_metric_help(payload: &mut String, name: &str, prometheus_name: &str) {
     if let Some(descriptor) = engine_metric_catalog()
         .iter()
@@ -1182,6 +1348,23 @@ mod tests {
             None => ExecutorOutput::terminal(request_id.to_string()),
         };
         OutputProcessor::new(24_000).process(output, 1, Duration::ZERO)
+    }
+
+    #[test]
+    fn engine_snapshot_serializes_managed_kv_as_the_only_cache_domain() {
+        let snapshot = EngineRuntimeTelemetrySnapshot {
+            kv_cache: ManagedKvRuntimeSnapshot::default(),
+            ..EngineRuntimeTelemetrySnapshot::default()
+        };
+
+        let value = serde_json::to_value(snapshot).expect("serialize engine telemetry");
+        assert_eq!(
+            value["kv_cache"]["memory_accounting"],
+            "resident_paged_plus_authorized_tensor"
+        );
+        assert!(value["kv_cache"].get("totals").is_some());
+        assert!(value.get("managed_kv_cache").is_none());
+        assert!(value.get("kv_cache_allocated_blocks").is_none());
     }
 
     #[tokio::test]
@@ -1478,6 +1661,106 @@ mod tests {
         assert!(payload.contains(
             "izwi_engine_executor_dispatch_state_rows_total{state=\"produced_output\"} 5"
         ));
+    }
+
+    #[test]
+    fn physical_execution_snapshot_serializes_and_emits_only_bounded_metric_families() {
+        let mut physical = EnginePhysicalExecutionMetricsSnapshot {
+            effective_mode: crate::engine::EnginePhysicalExecutionMode::Concurrent,
+            effective_cap: 4,
+            dispatches_in_flight: 2,
+            dispatches_max_in_flight: 3,
+            dispatches_started_total: 11,
+            dispatches_completed_total: 9,
+            batches_total: 7,
+            batch_max_width: 8,
+            batch_rows_total: 28,
+            batch_capacity_rows_total: 32,
+            batch_useful_elements_total: 80,
+            batch_materialized_elements_total: 100,
+            batch_fill_ratio: 0.875,
+            batch_padding_ratio: 0.2,
+            ..EnginePhysicalExecutionMetricsSnapshot::default()
+        };
+        physical.dispatch_duration = crate::engine::EngineDurationMetricsSnapshot {
+            observations_total: 9,
+            total_seconds: 1.25,
+            max_seconds: 0.4,
+        };
+        physical.cohort_wait = crate::engine::EngineDurationMetricsSnapshot {
+            observations_total: 7,
+            total_seconds: 0.3,
+            max_seconds: 0.09,
+        };
+        physical.permit_wait = crate::engine::EngineDurationMetricsSnapshot {
+            observations_total: 5,
+            total_seconds: 0.2,
+            max_seconds: 0.07,
+        };
+        physical.fallbacks.uncertified_profile = 3;
+        physical.defers.workspace_capacity = 2;
+        physical.workspace_current.device = 1024;
+        physical.workspace_high_water.device = 2048;
+
+        let json = serde_json::to_value(EngineRuntimeTelemetrySnapshot {
+            physical_execution: physical,
+            ..EngineRuntimeTelemetrySnapshot::default()
+        })
+        .expect("serialize engine telemetry");
+        assert_eq!(
+            json["physical_execution"]["effective_mode"],
+            serde_json::json!("concurrent")
+        );
+        assert_eq!(
+            json["physical_execution"]["fallbacks"]["uncertified_profile"],
+            serde_json::json!(3)
+        );
+
+        let mut payload = String::new();
+        push_engine_physical_execution_metrics(&mut payload, &physical);
+
+        assert_eq!(
+            payload
+                .matches("izwi_engine_executor_physical_execution_mode{mode=")
+                .count(),
+            3
+        );
+        assert_eq!(
+            payload
+                .matches("izwi_engine_executor_physical_fallbacks_total{reason=")
+                .count(),
+            7
+        );
+        assert_eq!(
+            payload
+                .matches("izwi_engine_executor_physical_defers_total{reason=")
+                .count(),
+            6
+        );
+        assert_eq!(
+            payload
+                .matches("izwi_engine_executor_physical_workspace_current_bytes{domain=")
+                .count(),
+            4
+        );
+        assert_eq!(
+            payload
+                .matches("izwi_engine_executor_physical_workspace_high_water_bytes{domain=")
+                .count(),
+            4
+        );
+        assert!(payload.contains("# TYPE izwi_engine_executor_physical_execution_mode gauge"));
+        assert!(
+            payload.contains("izwi_engine_executor_physical_execution_mode{mode=\"concurrent\"} 1")
+        );
+        assert!(payload.contains(
+            "izwi_engine_executor_physical_fallbacks_total{reason=\"uncertified_profile\"} 3"
+        ));
+        assert!(payload.contains("izwi_engine_executor_physical_dispatch_seconds_total 1.250000"));
+        assert!(payload.contains(
+            "izwi_engine_executor_physical_workspace_high_water_bytes{domain=\"device\"} 2048"
+        ));
+        assert!(payload.contains("# HELP izwi_engine_executor_physical_batch_fill_ratio"));
     }
 
     #[tokio::test]

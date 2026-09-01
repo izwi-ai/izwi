@@ -1,3 +1,4 @@
+use izwi_core::{ChatReasoningEffort, ChatTemplateKwargs};
 use serde::{Deserialize, Serialize};
 
 #[allow(dead_code)]
@@ -21,6 +22,12 @@ pub struct ResponsesCreateRequest {
     #[serde(default)]
     pub top_p: Option<f32>,
     #[serde(default)]
+    pub top_k: Option<usize>,
+    #[serde(default)]
+    pub repetition_penalty: Option<f32>,
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    #[serde(default)]
     pub store: Option<bool>,
     #[serde(default)]
     pub tools: Option<Vec<serde_json::Value>>,
@@ -28,6 +35,12 @@ pub struct ResponsesCreateRequest {
     pub tool_choice: Option<serde_json::Value>,
     #[serde(default)]
     pub enable_thinking: Option<bool>,
+    #[serde(default)]
+    pub reasoning_effort: Option<ChatReasoningEffort>,
+    #[serde(default)]
+    pub preserve_thinking: Option<bool>,
+    #[serde(default)]
+    pub chat_template_kwargs: Option<ChatTemplateKwargs>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

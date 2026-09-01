@@ -1,6 +1,500 @@
 //! Voxtral family implementations.
 
+use candle_core::DType;
+
+use crate::engine::{
+    ConcurrencyClass, MembershipSafePoint, NativeBatchMode, OutputVisibility, StageDescriptor,
+    StageProgressKind, StageShapePolicy, StageWorkSelector,
+};
+use crate::error::{Error, Result};
+use crate::kv::v2::{
+    stage_graph_fingerprint, CapabilityStateDescriptorV2, CheckpointPolicy, InferenceStateContract,
+    InvocationLeaseScope, InvocationStageWorkspace, InvocationStateCapacity,
+    InvocationWorkspaceDomain, InvocationWorkspaceProfile, InvocationWorkspaceSet, PlacementPolicy,
+    PrefixPolicy, RetainedStateCapability, StateDType, StateDomainId, StateDomainSpec, StateScope,
+    WorkspaceFormula, CURRENT_INFERENCE_STATE_ABI,
+};
+
 mod layers;
 pub mod lm;
 pub mod realtime;
 pub mod tts;
+
+use lm::VoxtralLM;
+
+pub(crate) const VOXTRAL_REALTIME_EXECUTION_ABI: u32 = 24;
+pub(crate) const VOXTRAL_REALTIME_PREPARATION_STAGE: &str = "asr.realtime.voxtral.preparation";
+pub(crate) const VOXTRAL_REALTIME_PROMPT_PREFILL_STAGE: &str =
+    "asr.realtime.voxtral.prompt_prefill";
+pub(crate) const VOXTRAL_REALTIME_DECODE_STAGE: &str = "asr.realtime.voxtral.decode";
+pub(crate) const VOXTRAL_REALTIME_COMPLETION_STAGE: &str = "asr.realtime.voxtral.completion";
+
+pub(crate) fn authenticate_voxtral_realtime_execution_binding(
+    binding: &crate::engine::ExecutionAdapterBinding,
+) -> Result<()> {
+    if binding.model_variant != crate::model::ModelVariant::VoxtralMini4BRealtime2602
+        || binding.capability_id != "realtime_asr"
+        || binding.adapter_abi_revision
+            != crate::engine::AdapterAbiRevision::new(VOXTRAL_REALTIME_EXECUTION_ABI)
+        || binding.stages.len() != 4
+    {
+        return Err(Error::InvalidInput(
+            "realtime ASR request is not bound to the exact Voxtral execution ABI".into(),
+        ));
+    }
+    let expected = [
+        (
+            0,
+            VOXTRAL_REALTIME_PREPARATION_STAGE,
+            StageWorkSelector::RealtimePreparation,
+            NativeBatchMode::Static,
+            StageShapePolicy::Padded,
+        ),
+        (
+            1,
+            VOXTRAL_REALTIME_PROMPT_PREFILL_STAGE,
+            StageWorkSelector::RealtimePromptPrefill,
+            NativeBatchMode::None,
+            StageShapePolicy::Exact,
+        ),
+        (
+            2,
+            VOXTRAL_REALTIME_DECODE_STAGE,
+            StageWorkSelector::RealtimeDecodeContinuation,
+            NativeBatchMode::Continuous,
+            StageShapePolicy::Ragged,
+        ),
+        (
+            3,
+            VOXTRAL_REALTIME_COMPLETION_STAGE,
+            StageWorkSelector::RealtimeCompletion,
+            NativeBatchMode::None,
+            StageShapePolicy::Exact,
+        ),
+    ];
+    if !binding
+        .stages
+        .iter()
+        .zip(expected)
+        .all(|(stage, expected)| {
+            stage.id == crate::engine::StageId::new(expected.0)
+                && stage.name == expected.1
+                && stage.selector == expected.2
+                && stage.batch_mode == expected.3
+                && stage.shape_policy == expected.4
+                && stage.output_visibility == OutputVisibility::AfterQuantumCommit
+        })
+    {
+        return Err(Error::InvalidInput(
+            "realtime ASR request crossed the sealed Voxtral stage graph".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct VoxtralPhysicalStateSpec {
+    pub(crate) descriptor: CapabilityStateDescriptorV2,
+    pub(crate) invocation: InferenceStateContract,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct VoxtralRealtimePhysicalStateSpec {
+    pub(crate) descriptor: CapabilityStateDescriptorV2,
+    pub(crate) retained: InferenceStateContract,
+    pub(crate) retained_max_tokens: usize,
+}
+
+pub(crate) fn voxtral_invocation_contract(
+    model: &VoxtralLM,
+    dtype: DType,
+    preferred_page_tokens: usize,
+    domains: &[StateDomainId],
+) -> Result<InferenceStateContract> {
+    if domains.is_empty() {
+        return Err(Error::ModelLoadError(
+            "Voxtral invocation state has no cache domains".into(),
+        ));
+    }
+    let mut state_domains = Vec::with_capacity(domains.len());
+    let mut groups = Vec::with_capacity(domains.len());
+    for domain in domains {
+        let contract =
+            model.managed_inference_state_contract(*domain, dtype, preferred_page_tokens)?;
+        state_domains.extend(contract.domains);
+        groups.extend(contract.groups);
+    }
+    let mut contract = InferenceStateContract {
+        abi: CURRENT_INFERENCE_STATE_ABI,
+        domains: state_domains,
+        groups,
+    };
+    for domain in &mut contract.domains {
+        let StateDomainSpec::PagedAttention(domain) = domain else {
+            return Err(Error::ModelLoadError(
+                "Voxtral invocation state must be paged attention".into(),
+            ));
+        };
+        domain.header.scope = StateScope::Invocation;
+        domain.header.prefix = PrefixPolicy::Disabled;
+        domain.header.checkpoint = CheckpointPolicy::None;
+    }
+    for group in &mut contract.groups {
+        group.prefix_shareable = false;
+    }
+    contract.validate()?;
+    Ok(contract)
+}
+
+pub(crate) fn voxtral_retained_contract(
+    mut contract: InferenceStateContract,
+) -> Result<InferenceStateContract> {
+    for domain in &mut contract.domains {
+        let StateDomainSpec::PagedAttention(domain) = domain else {
+            return Err(Error::ModelLoadError(
+                "Voxtral retained state must be paged attention".into(),
+            ));
+        };
+        domain.header.scope = StateScope::Retained;
+        domain.header.prefix = PrefixPolicy::Disabled;
+        domain.header.checkpoint = CheckpointPolicy::Transactional;
+    }
+    for group in &mut contract.groups {
+        group.prefix_shareable = false;
+    }
+    contract.validate()?;
+    Ok(contract)
+}
+
+pub(crate) fn voxtral_realtime_physical_state_spec(
+    stage_graphs: &[&[StageDescriptor]],
+    retained: InferenceStateContract,
+    max_context_tokens: usize,
+) -> Result<VoxtralRealtimePhysicalStateSpec> {
+    if stage_graphs.is_empty() || max_context_tokens == 0 {
+        return Err(Error::ModelLoadError(
+            "Voxtral retained realtime state requires stages and a non-zero context".into(),
+        ));
+    }
+    for stages in stage_graphs {
+        let preparation = stages.iter().find(|stage| {
+            stage.name == VOXTRAL_REALTIME_PREPARATION_STAGE
+                && stage.selector == StageWorkSelector::RealtimePreparation
+        });
+        let prompt = stages.iter().find(|stage| {
+            stage.name == VOXTRAL_REALTIME_PROMPT_PREFILL_STAGE
+                && stage.selector == StageWorkSelector::RealtimePromptPrefill
+        });
+        let decode = stages.iter().find(|stage| {
+            stage.name == VOXTRAL_REALTIME_DECODE_STAGE
+                && stage.selector == StageWorkSelector::RealtimeDecodeContinuation
+        });
+        let completion = stages.iter().find(|stage| {
+            stage.name == VOXTRAL_REALTIME_COMPLETION_STAGE
+                && stage.selector == StageWorkSelector::RealtimeCompletion
+        });
+        let native_width = preparation.map(|stage| stage.max_batch_size).unwrap_or(0);
+        let valid = stages.len() == 4
+            && preparation.is_some_and(|stage| {
+                stage.id.get() == 0
+                    && stage.progress == StageProgressKind::InputDriven
+                    && stage.membership_safe_point == MembershipSafePoint::InputBoundary
+                    && stage.output_visibility == OutputVisibility::AfterQuantumCommit
+                    && stage.batch_mode == NativeBatchMode::Static
+                    && stage.max_batch_size > 0
+                    && stage.max_work_units < u64::MAX
+                    && stage.workspace_per_row_bytes > 0
+                    && stage.max_workspace_bytes >= stage.workspace_per_row_bytes
+                    && u64::try_from(stage.max_batch_size)
+                        .ok()
+                        .and_then(|width| stage.workspace_per_row_bytes.checked_mul(width))
+                        == Some(stage.max_workspace_bytes)
+                    && stage.shape_policy == StageShapePolicy::Padded
+                    && stage.concurrency == ConcurrencyClass::Batchable
+            })
+            && prompt.is_some_and(|stage| {
+                stage.id.get() == 1
+                    && stage.progress == StageProgressKind::InputDriven
+                    && stage.membership_safe_point == MembershipSafePoint::InputBoundary
+                    && stage.output_visibility == OutputVisibility::AfterQuantumCommit
+                    && stage.batch_mode == NativeBatchMode::None
+                    && stage.max_batch_size == 1
+                    && stage.max_work_units < u64::MAX
+                    && stage.max_workspace_bytes > 0
+                    && stage.shape_policy == StageShapePolicy::Exact
+                    && stage.concurrency == ConcurrencyClass::Exclusive
+            })
+            && decode.is_some_and(|stage| {
+                stage.id.get() == 2
+                    && stage.progress == StageProgressKind::Iterative
+                    && stage.membership_safe_point == MembershipSafePoint::QuantumBoundary
+                    && stage.output_visibility == OutputVisibility::AfterQuantumCommit
+                    && stage.batch_mode == NativeBatchMode::Continuous
+                    && stage.max_batch_size > 0
+                    && stage.max_batch_size == native_width
+                    && stage.max_work_units == u64::try_from(native_width).unwrap_or(0)
+                    && stage.max_work_units < u64::MAX
+                    && stage.workspace_per_row_bytes > 0
+                    && stage.max_workspace_bytes >= stage.workspace_per_row_bytes
+                    && u64::try_from(stage.max_batch_size)
+                        .ok()
+                        .and_then(|width| stage.workspace_per_row_bytes.checked_mul(width))
+                        == Some(stage.max_workspace_bytes)
+                    && stage.shape_policy == StageShapePolicy::Ragged
+                    && stage.concurrency == ConcurrencyClass::Batchable
+            })
+            && completion.is_some_and(|stage| {
+                stage.id.get() == 3
+                    && stage.output_visibility == OutputVisibility::AfterQuantumCommit
+                    && stage.batch_mode == NativeBatchMode::None
+                    && stage.max_batch_size == 1
+                    && stage.max_work_units == 1
+                    && stage.max_workspace_bytes == 0
+                    && stage.shape_policy == StageShapePolicy::Exact
+                    && stage.concurrency == ConcurrencyClass::Exclusive
+            });
+        if !valid {
+            return Err(Error::ModelLoadError(
+                "Voxtral realtime requires its exact sealed preparation, prompt, decode, and completion graph"
+                    .into(),
+            ));
+        }
+    }
+    let max_domain_id = retained
+        .domains
+        .iter()
+        .map(|domain| domain.id().get())
+        .max()
+        .ok_or_else(|| Error::ModelLoadError("Voxtral retained contract is empty".into()))?;
+    let mut profiles = Vec::with_capacity(stage_graphs.len());
+    for stages in stage_graphs {
+        let mut ordered = stages.iter().collect::<Vec<_>>();
+        ordered.sort_unstable_by_key(|stage| stage.id);
+        let mut invocation_stages = Vec::with_capacity(ordered.len());
+        for (index, stage) in ordered.into_iter().enumerate() {
+            let per_row_workspace = if stage.workspace_per_row_bytes == 0 {
+                stage.max_workspace_bytes
+            } else {
+                stage.workspace_per_row_bytes
+            };
+            let domains = if per_row_workspace == 0 {
+                Vec::new()
+            } else {
+                let scratch_id = max_domain_id
+                    .checked_add(u32::try_from(index + 1).map_err(|_| {
+                        Error::ModelLoadError(
+                            "Voxtral realtime execution stage count exceeds u32".into(),
+                        )
+                    })?)
+                    .ok_or_else(|| {
+                        Error::ModelLoadError("Voxtral realtime scratch domain overflow".into())
+                    })?;
+                vec![InvocationWorkspaceDomain::Scratch {
+                    id: StateDomainId::new(scratch_id),
+                    placement: PlacementPolicy::BackendLocal,
+                    alignment_bytes: 64,
+                    zero_on_release: false,
+                    formula: WorkspaceFormula {
+                        fixed_bytes: per_row_workspace,
+                        dimensions: vec![],
+                        terms: vec![],
+                    },
+                }]
+            };
+            invocation_stages.push(InvocationStageWorkspace {
+                stage: stage.id,
+                lease_scope: InvocationLeaseScope::PerRow,
+                groups: Vec::new(),
+                domains,
+            });
+        }
+        profiles.push(InvocationWorkspaceProfile {
+            stage_graph_fingerprint: stage_graph_fingerprint(stages)?,
+            stages: invocation_stages,
+        });
+    }
+    profiles.sort_unstable_by_key(|profile| profile.stage_graph_fingerprint);
+    profiles.dedup();
+    let descriptor = CapabilityStateDescriptorV2 {
+        abi: CURRENT_INFERENCE_STATE_ABI,
+        retained: RetainedStateCapability::Managed {
+            contract: retained.clone(),
+        },
+        invocation: InvocationWorkspaceSet::Bounded { profiles },
+    };
+    for stages in stage_graphs {
+        descriptor.validate_against_stages(stages)?;
+    }
+    Ok(VoxtralRealtimePhysicalStateSpec {
+        descriptor,
+        retained,
+        retained_max_tokens: max_context_tokens,
+    })
+}
+
+pub(crate) fn voxtral_physical_state_spec(
+    stage_graphs: &[&[StageDescriptor]],
+    invocation: InferenceStateContract,
+    max_context_tokens: usize,
+) -> Result<VoxtralPhysicalStateSpec> {
+    if stage_graphs.is_empty() || max_context_tokens == 0 {
+        return Err(Error::ModelLoadError(
+            "Voxtral invocation state requires stages and a non-zero context".into(),
+        ));
+    }
+    let max_tokens = u64::try_from(max_context_tokens)
+        .map_err(|_| Error::ModelLoadError("Voxtral context exceeds u64".into()))?;
+    let max_domain_id = invocation
+        .domains
+        .iter()
+        .map(|domain| domain.id().get())
+        .max()
+        .ok_or_else(|| Error::ModelLoadError("Voxtral invocation contract is empty".into()))?;
+    let mut profiles = Vec::with_capacity(stage_graphs.len());
+    for stages in stage_graphs {
+        let mut ordered = stages.iter().collect::<Vec<_>>();
+        ordered.sort_unstable_by_key(|stage| stage.id);
+        let mut invocation_stages = Vec::with_capacity(ordered.len());
+        for (index, stage) in ordered.into_iter().enumerate() {
+            let mut domains = invocation
+                .domains
+                .iter()
+                .cloned()
+                .map(|state| {
+                    Ok(InvocationWorkspaceDomain::State {
+                        placement: state.header().placement,
+                        formula: WorkspaceFormula {
+                            fixed_bytes: voxtral_paged_invocation_bytes(&state, max_tokens)?,
+                            dimensions: vec![],
+                            terms: vec![],
+                        },
+                        state,
+                        capacity: InvocationStateCapacity::decoder_context(max_tokens)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if stage.max_workspace_bytes > 0 {
+                let scratch_id = max_domain_id
+                    .checked_add(u32::try_from(index + 1).map_err(|_| {
+                        Error::ModelLoadError("Voxtral execution stage count exceeds u32".into())
+                    })?)
+                    .ok_or_else(|| {
+                        Error::ModelLoadError("Voxtral scratch domain id overflow".into())
+                    })?;
+                domains.push(InvocationWorkspaceDomain::Scratch {
+                    id: crate::kv::v2::StateDomainId::new(scratch_id),
+                    placement: PlacementPolicy::BackendLocal,
+                    alignment_bytes: 64,
+                    zero_on_release: false,
+                    formula: WorkspaceFormula {
+                        fixed_bytes: stage.max_workspace_bytes,
+                        dimensions: vec![],
+                        terms: vec![],
+                    },
+                });
+            }
+            invocation_stages.push(InvocationStageWorkspace {
+                stage: stage.id,
+                lease_scope: InvocationLeaseScope::PerRow,
+                groups: invocation.groups.clone(),
+                domains,
+            });
+        }
+        profiles.push(InvocationWorkspaceProfile {
+            stage_graph_fingerprint: stage_graph_fingerprint(stages)?,
+            stages: invocation_stages,
+        });
+    }
+    profiles.sort_unstable_by_key(|profile| profile.stage_graph_fingerprint);
+    profiles.dedup();
+    let descriptor = CapabilityStateDescriptorV2 {
+        abi: CURRENT_INFERENCE_STATE_ABI,
+        retained: RetainedStateCapability::Stateless,
+        invocation: InvocationWorkspaceSet::Bounded { profiles },
+    };
+    for stages in stage_graphs {
+        descriptor.validate_against_stages(stages)?;
+    }
+    Ok(VoxtralPhysicalStateSpec {
+        descriptor,
+        invocation,
+    })
+}
+
+fn voxtral_paged_invocation_bytes(state: &StateDomainSpec, max_tokens: u64) -> Result<u64> {
+    let StateDomainSpec::PagedAttention(spec) = state else {
+        return Err(Error::ModelLoadError(
+            "Voxtral invocation workspace is not paged attention".into(),
+        ));
+    };
+    let page_tokens = u64::from(spec.page_size.preferred_tokens);
+    let rounded_tokens = max_tokens
+        .checked_add(page_tokens.saturating_sub(1))
+        .and_then(|tokens| tokens.checked_div(page_tokens))
+        .and_then(|pages| pages.checked_mul(page_tokens))
+        .ok_or_else(|| Error::ModelLoadError("Voxtral page capacity overflow".into()))?;
+    let elements_per_token = spec.layers.iter().try_fold(0_u64, |total, layer| {
+        let layer_elements = u64::from(layer.kv_heads)
+            .checked_mul(u64::from(layer.key_head_dim) + u64::from(layer.value_head_dim))
+            .ok_or_else(|| Error::ModelLoadError("Voxtral KV geometry overflow".into()))?;
+        total
+            .checked_add(layer_elements)
+            .ok_or_else(|| Error::ModelLoadError("Voxtral KV geometry overflow".into()))
+    })?;
+    let element_bytes = spec
+        .accepted_dtypes
+        .iter()
+        .map(|dtype| match dtype {
+            StateDType::F32 => Ok(4_u64),
+            StateDType::F16 | StateDType::Bf16 => Ok(2_u64),
+            StateDType::I64 | StateDType::I8 | StateDType::Q4 => Err(Error::ModelLoadError(
+                "Voxtral invocation paging requires a dense loaded KV dtype".into(),
+            )),
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .min()
+        .ok_or_else(|| Error::ModelLoadError("Voxtral KV dtype set is empty".into()))?;
+    elements_per_token
+        .checked_mul(rounded_tokens)
+        .and_then(|elements| elements.checked_mul(element_bytes))
+        .ok_or_else(|| Error::ModelLoadError("Voxtral invocation byte bound overflow".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::voxtral_retained_contract;
+    use crate::kv::v2::{
+        test_contract, CheckpointPolicy, PrefixPolicy, RetainedStateCapability, StateScope,
+    };
+
+    #[test]
+    fn realtime_contract_is_transactional_retained_and_not_prefix_shareable() {
+        let mut invocation = test_contract();
+        for domain in &mut invocation.domains {
+            match domain {
+                crate::kv::v2::StateDomainSpec::PagedAttention(domain) => {
+                    domain.header.scope = StateScope::Invocation;
+                    domain.header.checkpoint = CheckpointPolicy::None;
+                }
+                other => panic!("unexpected test domain: {other:?}"),
+            }
+        }
+
+        let retained = voxtral_retained_contract(invocation).unwrap();
+
+        assert!(retained.domains.iter().all(|domain| {
+            domain.header().scope == StateScope::Retained
+                && domain.header().checkpoint == CheckpointPolicy::Transactional
+                && domain.header().prefix == PrefixPolicy::Disabled
+        }));
+        assert!(retained.groups.iter().all(|group| !group.prefix_shareable));
+        let capability = RetainedStateCapability::Managed {
+            contract: retained.clone(),
+        };
+        assert!(matches!(
+            capability,
+            RetainedStateCapability::Managed { contract } if contract == retained
+        ));
+    }
+}

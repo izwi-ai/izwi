@@ -10,6 +10,16 @@ export interface SpeechModelCapabilities {
   supports_auto_long_form: boolean;
 }
 
+export type ChatReasoningEffort = "xhigh" | "medium" | "low";
+
+export interface ChatModelCapabilities {
+  supports_thinking: boolean;
+  default_thinking_enabled: boolean;
+  reasoning_efforts: ChatReasoningEffort[];
+  default_reasoning_effort: ChatReasoningEffort | null;
+  supports_preserve_thinking: boolean;
+}
+
 export interface ModelRouteCapabilities {
   openai_chat_completions: boolean;
   openai_responses: boolean;
@@ -47,6 +57,7 @@ export interface ModelInfo {
   error_message: string | null;
   modalities?: string[];
   route_capabilities?: ModelRouteCapabilities;
+  chat_capabilities?: ChatModelCapabilities | null;
   speech_capabilities?: SpeechModelCapabilities | null;
 }
 

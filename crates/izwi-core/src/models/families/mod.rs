@@ -70,6 +70,7 @@ const QWEN35_CHAT_VARIANTS: &[ModelVariant] = &[
     ModelVariant::Qwen354BGguf,
     ModelVariant::Qwen359BGguf,
 ];
+const QWEN38_CHAT_VARIANTS: &[ModelVariant] = &[ModelVariant::Qwen3827BFp8];
 const LFM2_CHAT_VARIANTS: &[ModelVariant] = &[
     ModelVariant::Lfm2512BInstructGguf,
     ModelVariant::Lfm2512BThinkingGguf,
@@ -212,6 +213,13 @@ pub const MODEL_FAMILY_REGISTRATIONS: &[FamilyRegistration] = &[
         family: ModelFamily::Qwen35Chat,
         module_path: "crate::models::architectures::qwen35::chat",
         variants: QWEN35_CHAT_VARIANTS,
+        capabilities: CHAT_CAPABILITIES,
+        fixture_ids: CHAT_FIXTURES,
+    },
+    FamilyRegistration {
+        family: ModelFamily::Qwen38Chat,
+        module_path: "crate::models::architectures::qwen38::chat",
+        variants: QWEN38_CHAT_VARIANTS,
         capabilities: CHAT_CAPABILITIES,
         fixture_ids: CHAT_FIXTURES,
     },

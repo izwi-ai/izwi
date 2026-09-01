@@ -38,6 +38,10 @@ interface ModelCatalogContextValue {
 
 const ModelCatalogContext = createContext<ModelCatalogContextValue | null>(null);
 
+function modelActionError(err: unknown, fallback: string): string {
+  return err instanceof Error && err.message.trim() ? err.message : fallback;
+}
+
 interface ModelCatalogProviderProps {
   children: ReactNode;
 }
@@ -57,6 +61,7 @@ export function ModelCatalogProvider({
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const activeDownloadsRef = useRef<Set<string>>(new Set());
   const activeModelLoadsRef = useRef<Set<string>>(new Set());
+  const cancelledModelLoadsRef = useRef<Set<string>>(new Set());
   const eventSourcesRef = useRef<Record<string, EventSource>>({});
   const reconnectTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>(
     {},
@@ -563,19 +568,25 @@ export function ModelCatalogProvider({
         );
 
         await api.loadModel(variant);
-        setSelectedModelState(variant);
-        void trackModelLoaded(variant);
-        notify({
-          title: "Model loaded",
-          description: `${getModelLabel(variant)} is now active.`,
-          tone: "success",
-        });
+        if (!cancelledModelLoadsRef.current.has(variant)) {
+          setSelectedModelState(variant);
+          void trackModelLoaded(variant);
+          notify({
+            title: "Model loaded",
+            description: `${getModelLabel(variant)} is now active.`,
+            tone: "success",
+          });
+        }
       } catch (err) {
+        if (cancelledModelLoadsRef.current.has(variant)) {
+          return;
+        }
         console.error("Load failed:", err);
-        setError("Failed to load model. Please try again.");
+        const message = modelActionError(err, "Failed to load model. Please try again.");
+        setError(message);
         notify({
           title: "Model load failed",
-          description: `Izwi could not load ${getModelLabel(variant)}.`,
+          description: message,
           tone: "danger",
         });
       } finally {
@@ -588,6 +599,14 @@ export function ModelCatalogProvider({
 
   const unloadModel = useCallback(
     async (variant: string) => {
+      const cancellingLoad =
+        activeModelLoadsRef.current.has(variant) ||
+        models.some(
+          (model) => model.variant === variant && model.status === "loading",
+        );
+      if (cancellingLoad) {
+        cancelledModelLoadsRef.current.add(variant);
+      }
       try {
         await api.unloadModel(variant);
         await refreshModels();
@@ -595,21 +614,29 @@ export function ModelCatalogProvider({
           current === variant ? null : current,
         );
         notify({
-          title: "Model unloaded",
-          description: `${getModelLabel(variant)} was unloaded from memory.`,
+          title: cancellingLoad ? "Model load cancelled" : "Model unloaded",
+          description: cancellingLoad
+            ? `${getModelLabel(variant)} was stopped and unloaded.`
+            : `${getModelLabel(variant)} was unloaded from memory.`,
           tone: "info",
         });
       } catch (err) {
         console.error("Unload failed:", err);
-        setError("Failed to unload model. Please try again.");
+        const message = modelActionError(
+          err,
+          "Failed to unload model. Please try again.",
+        );
+        setError(message);
         notify({
           title: "Model unload failed",
-          description: `Izwi could not unload ${getModelLabel(variant)}.`,
+          description: message,
           tone: "danger",
         });
+      } finally {
+        cancelledModelLoadsRef.current.delete(variant);
       }
     },
-    [getModelLabel, notify, refreshModels],
+    [getModelLabel, models, notify, refreshModels],
   );
 
   const deleteModel = useCallback(

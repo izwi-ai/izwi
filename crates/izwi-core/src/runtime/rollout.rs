@@ -1,287 +1,254 @@
-//! Fail-closed rollout controls for scheduler execution modes.
+//! Fail-closed rollout policy for physical inference-state providers.
 //!
-//! Rollout is keyed by both the concrete model and the selected backend. This
-//! prevents enabling an optimization validated on one device from implicitly
-//! enabling it on CPU, Metal, or CUDA peers with different execution behavior.
+//! Provider selection is part of the resolved state plan, not a best-effort
+//! runtime fallback. The one process-level override supported here can only
+//! demote a certified optimized provider to its certified portable provider.
 
-use std::collections::HashMap;
+use std::ffi::OsStr;
 
-use serde::Serialize;
 use crate::backends::BackendKind;
-use crate::catalog::{parse_model_variant, ModelVariant};
+use crate::catalog::{ModelFamily, ModelVariant};
 use crate::error::{Error, Result};
+use crate::kv::v2::{PagedOperationImplementation, ResolvedStatePlan};
+use crate::runtime::adapters::CapabilityKind;
 
-const EXECUTION_ROLLOUT_ENV: &str = "IZWI_EXECUTION_ROLLOUT";
-const EXECUTION_ROLLOUT_OVERRIDES_ENV: &str = "IZWI_EXECUTION_ROLLOUT_OVERRIDES";
+pub(crate) const DISABLE_OPTIMIZED_KV_PROVIDER_ENV: &str = "IZWI_KV_DISABLE_OPTIMIZED_PROVIDER";
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ExecutionRolloutMode {
-    #[default]
-    Off,
-    Static,
-    Continuous,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct KvProviderRollout {
+    optimized_provider_enabled: bool,
 }
 
-impl ExecutionRolloutMode {
-    fn parse(raw: &str) -> Result<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "off" => Ok(Self::Off),
-            "static" => Ok(Self::Static),
-            "shadow" => Err(Error::InvalidInput(
-                "Shadow execution rollout is not implemented; use `off` or an exact model@backend=static override"
-                    .to_string(),
-            )),
-            "continuous" => Ok(Self::Continuous),
-            value => Err(Error::InvalidInput(format!(
-                "Unsupported execution rollout mode `{value}`"
-            ))),
-        }
+impl KvProviderRollout {
+    pub(crate) fn from_process_env() -> Result<Self> {
+        Self::from_disable_optimized_value(
+            std::env::var_os(DISABLE_OPTIMIZED_KV_PROVIDER_ENV).as_deref(),
+        )
     }
 
-    pub(crate) fn observes(self) -> bool {
-        !matches!(self, Self::Off)
-    }
-
-    pub(crate) fn executes(self) -> bool {
-        matches!(self, Self::Static | Self::Continuous)
-    }
-
-    pub(crate) fn continuous_batching(self) -> bool {
-        matches!(self, Self::Continuous)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct ExecutionRolloutKey {
-    model_variant: ModelVariant,
-    backend_kind: BackendKind,
-}
-
-#[derive(Debug, Clone, Default)]
-pub(crate) struct ExecutionRolloutPolicy {
-    default: ExecutionRolloutMode,
-    overrides: HashMap<ExecutionRolloutKey, ExecutionRolloutMode>,
-}
-
-impl ExecutionRolloutPolicy {
-    /// Read rollout configuration fail-closed. Invalid production
-    /// configuration is a startup error rather than a silently ignored typo.
-    pub(crate) fn from_env() -> Result<Self> {
-        let default = std::env::var(EXECUTION_ROLLOUT_ENV).ok();
-        let overrides = std::env::var(EXECUTION_ROLLOUT_OVERRIDES_ENV).ok();
-        Self::try_from_raw(default.as_deref(), overrides.as_deref())
-    }
-
-    pub(crate) fn try_from_raw(default: Option<&str>, overrides: Option<&str>) -> Result<Self> {
-        let default = default
-            .map(ExecutionRolloutMode::parse)
-            .transpose()?
-            .unwrap_or_default();
-        if default.executes() {
-            return Err(Error::InvalidInput(
-                "Execution rollout defaults may only be `off`; tensor execution requires exact model@backend overrides"
-                    .to_string(),
-            ));
-        }
-        let mut policy = Self {
-            default,
-            overrides: HashMap::new(),
+    fn from_disable_optimized_value(value: Option<&OsStr>) -> Result<Self> {
+        let disable_optimized = match value {
+            None => false,
+            Some(value) => {
+                let value = value.to_str().ok_or_else(|| {
+                    invalid(format!(
+                        "{DISABLE_OPTIMIZED_KV_PROVIDER_ENV} must contain UTF-8"
+                    ))
+                })?;
+                match value.trim().to_ascii_lowercase().as_str() {
+                    "1" | "true" | "yes" | "on" => true,
+                    "0" | "false" | "no" | "off" => false,
+                    _ => {
+                        return Err(invalid(format!(
+                            "{DISABLE_OPTIMIZED_KV_PROVIDER_ENV} must be one of \
+                             1/true/yes/on or 0/false/no/off, got `{value}`"
+                        )))
+                    }
+                }
+            }
         };
-
-        for entry in overrides.unwrap_or_default().split(',') {
-            let entry = entry.trim();
-            if entry.is_empty() {
-                continue;
-            }
-
-            let (scope, raw_mode) = entry.split_once('=').ok_or_else(|| {
-                Error::InvalidInput(format!(
-                    "Invalid execution rollout override `{entry}`; expected model@backend=mode"
-                ))
-            })?;
-            let (raw_model, raw_backend) = scope.split_once('@').ok_or_else(|| {
-                Error::InvalidInput(format!(
-                    "Invalid execution rollout scope `{scope}`; expected model@backend"
-                ))
-            })?;
-            let key = ExecutionRolloutKey {
-                model_variant: parse_model_variant(raw_model)
-                    .map_err(|err| Error::InvalidInput(err.to_string()))?,
-                backend_kind: parse_backend(raw_backend)?,
-            };
-            let mode = ExecutionRolloutMode::parse(raw_mode)?;
-            if policy.overrides.insert(key, mode).is_some() {
-                return Err(Error::InvalidInput(format!(
-                    "Duplicate execution rollout override for {scope}"
-                )));
-            }
-        }
-
-        Ok(policy)
+        Ok(Self {
+            optimized_provider_enabled: !disable_optimized,
+        })
     }
 
-    pub(crate) fn mode_for(
-        &self,
-        model_variant: ModelVariant,
-        backend_kind: BackendKind,
-    ) -> ExecutionRolloutMode {
-        self.overrides
-            .get(&ExecutionRolloutKey {
-                model_variant,
-                backend_kind,
-            })
-            .copied()
-            .unwrap_or(self.default)
+    pub(crate) const fn optimized_provider_enabled(self) -> bool {
+        self.optimized_provider_enabled
     }
 }
 
-fn parse_backend(raw: &str) -> Result<BackendKind> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "cpu" => Ok(BackendKind::Cpu),
-        "metal" => Ok(BackendKind::Metal),
-        "cuda" => Ok(BackendKind::Cuda),
-        value => Err(Error::InvalidInput(format!(
-            "Unsupported execution rollout backend `{value}`"
-        ))),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KvProviderEligibility {
+    PortableRouteValidated,
+    OptimizedEligibleUnverified,
+}
+
+/// Validate that the loaded-model route has a complete provider after backend
+/// negotiation and before the model generation can become Ready.
+///
+/// An `Optimized` operation in the resolved plan is source/build eligibility,
+/// not CUDA runtime or performance evidence. Only retained NVIDIA artifacts
+/// may promote that separate evidence state.
+pub(crate) fn validate_managed_state_plan_eligibility(
+    variant: ModelVariant,
+    capability: CapabilityKind,
+    plan: &ResolvedStatePlan,
+) -> Result<KvProviderEligibility> {
+    let route_validated = matches!(
+        (variant.family(), capability),
+        (
+            ModelFamily::Qwen3Chat
+                | ModelFamily::Qwen35Chat
+                | ModelFamily::Qwen38Chat
+                | ModelFamily::Gemma3Chat
+                | ModelFamily::Lfm2Chat,
+            CapabilityKind::Chat
+        ) | (ModelFamily::Qwen3Asr, CapabilityKind::Asr)
+            | (
+                ModelFamily::Lfm25Audio,
+                CapabilityKind::Asr | CapabilityKind::Tts
+            )
+            | (
+                ModelFamily::Qwen3Tts,
+                CapabilityKind::Tts | CapabilityKind::StreamingTts
+            )
+            | (ModelFamily::VibeVoiceTts, CapabilityKind::Tts)
+            | (ModelFamily::FishS2Tts, CapabilityKind::Tts)
+            | (ModelFamily::GraniteSpeechAsr, CapabilityKind::Asr)
+    );
+    if !route_validated {
+        return Err(Error::ModelLoadError(format!(
+            "managed KV provider route is not validated for model {variant}, capability {}",
+            capability.as_str()
+        )));
     }
+
+    let optimized = plan.paged_attention.iter().any(|group| {
+        let implementations = group.operations.implementations;
+        implementations.write == PagedOperationImplementation::Optimized
+            || implementations.prefill == PagedOperationImplementation::Optimized
+            || implementations.decode == PagedOperationImplementation::Optimized
+    });
+    if optimized && plan.backend != BackendKind::Cuda {
+        return Err(Error::ModelLoadError(format!(
+            "optimized managed KV provider is not eligible for {:?}",
+            plan.backend
+        )));
+    }
+
+    Ok(if optimized {
+        KvProviderEligibility::OptimizedEligibleUnverified
+    } else {
+        KvProviderEligibility::PortableRouteValidated
+    })
+}
+
+fn invalid(message: impl Into<String>) -> Error {
+    Error::InvalidInput(message.into())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const BACKENDS: [BackendKind; 3] = [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda];
+    use crate::backends::state::{negotiate_state_plan, StateBackendPlanRequest};
+    use crate::kv::v2::test_contract;
 
     #[test]
-    fn rollout_defaults_every_model_and_backend_to_off() {
-        let policy = ExecutionRolloutPolicy::default();
-
-        for model_variant in ModelVariant::all().iter().copied() {
-            for backend_kind in BACKENDS {
-                assert_eq!(
-                    policy.mode_for(model_variant, backend_kind),
-                    ExecutionRolloutMode::Off,
-                    "unexpected rollout for {model_variant:?} on {backend_kind:?}"
-                );
-            }
-        }
+    fn optimized_provider_is_enabled_without_an_operator_override() {
+        assert!(KvProviderRollout::from_disable_optimized_value(None)
+            .unwrap()
+            .optimized_provider_enabled());
     }
 
     #[test]
-    fn rollout_modes_only_enable_their_declared_behavior() {
-        assert!(!ExecutionRolloutMode::Off.observes());
-        assert!(!ExecutionRolloutMode::Off.executes());
-        assert!(!ExecutionRolloutMode::Off.continuous_batching());
-
-        assert!(ExecutionRolloutMode::Static.observes());
-        assert!(ExecutionRolloutMode::Static.executes());
-        assert!(!ExecutionRolloutMode::Static.continuous_batching());
-
-        assert!(ExecutionRolloutMode::Continuous.observes());
-        assert!(ExecutionRolloutMode::Continuous.executes());
-        assert!(ExecutionRolloutMode::Continuous.continuous_batching());
-    }
-
-    #[test]
-    fn exact_model_backend_override_wins_over_default() {
-        let policy = ExecutionRolloutPolicy::try_from_raw(
-            Some("off"),
-            Some("Qwen3-0.6B@metal=static"),
-        )
-        .expect("valid rollout policy");
-
-        assert_eq!(
-            policy.mode_for(ModelVariant::Qwen306B, BackendKind::Cpu),
-            ExecutionRolloutMode::Off
-        );
-        assert_eq!(
-            policy.mode_for(ModelVariant::Qwen306B, BackendKind::Metal),
-            ExecutionRolloutMode::Static
-        );
-        assert_eq!(
-            policy.mode_for(ModelVariant::Qwen306B, BackendKind::Cuda),
-            ExecutionRolloutMode::Off
-        );
-    }
-
-    #[test]
-    fn malformed_configuration_cannot_enable_execution() {
-        for (default, overrides) in [
-            (Some("enabled"), None),
-            (Some("shadow"), None),
-            (Some("static"), None),
-            (Some("continuous"), None),
-            (Some("off"), Some("Qwen3-0.6B@cuda=enabled")),
-            (Some("off"), Some("unknown-model@cuda=continuous")),
-            (Some("off"), Some("Qwen3-0.6B@gpu=continuous")),
-            (Some("off"), Some("Qwen3-0.6B@cuda")),
-        ] {
-            let policy =
-                ExecutionRolloutPolicy::try_from_raw(default, overrides).unwrap_or_default();
-            assert_eq!(
-                policy.mode_for(ModelVariant::Qwen306B, BackendKind::Cuda),
-                ExecutionRolloutMode::Off
+    fn optimized_provider_kill_switch_accepts_only_explicit_booleans() {
+        for value in ["1", "true", "YES", "on"] {
+            assert!(
+                !KvProviderRollout::from_disable_optimized_value(Some(OsStr::new(value)))
+                    .unwrap()
+                    .optimized_provider_enabled(),
+                "{value}"
             );
         }
-    }
-
-    #[test]
-    fn blanket_execution_defaults_are_rejected() {
-        for mode in ["static", "continuous"] {
-            let err = ExecutionRolloutPolicy::try_from_raw(Some(mode), None)
-                .expect_err("execution must be scoped to an exact model and backend");
-            assert!(err.to_string().contains("exact model@backend"));
+        for value in ["0", "false", "NO", "off"] {
+            assert!(
+                KvProviderRollout::from_disable_optimized_value(Some(OsStr::new(value)))
+                    .unwrap()
+                    .optimized_provider_enabled(),
+                "{value}"
+            );
         }
+
+        let error =
+            KvProviderRollout::from_disable_optimized_value(Some(OsStr::new("maybe"))).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains(DISABLE_OPTIMIZED_KV_PROVIDER_ENV));
+        assert!(error.to_string().contains("1/true/yes/on"));
     }
 
     #[test]
-    fn continuous_override_is_scoped_to_an_exact_model_and_backend() {
-        let policy = ExecutionRolloutPolicy::try_from_raw(
-            Some("off"),
-            Some("Qwen3-0.6B@cuda=continuous"),
+    fn managed_provider_promotion_is_bound_to_exact_model_capability_cells() {
+        let plan = negotiate_state_plan(
+            &test_contract(),
+            &StateBackendPlanRequest {
+                backend: BackendKind::Cpu,
+                device_ordinal: None,
+                page_tokens_hint: Some(16),
+                storage_dtype_hint: None,
+            },
         )
-        .expect("valid continuous rollout");
+        .unwrap();
 
         assert_eq!(
-            policy.mode_for(ModelVariant::Qwen306B, BackendKind::Cuda),
-            ExecutionRolloutMode::Continuous
+            validate_managed_state_plan_eligibility(
+                ModelVariant::Qwen306B,
+                CapabilityKind::Chat,
+                &plan,
+            )
+            .unwrap(),
+            KvProviderEligibility::PortableRouteValidated
         );
         assert_eq!(
-            policy.mode_for(ModelVariant::Qwen306B, BackendKind::Metal),
-            ExecutionRolloutMode::Off
+            validate_managed_state_plan_eligibility(
+                ModelVariant::Lfm2512BInstructGguf,
+                CapabilityKind::Chat,
+                &plan,
+            )
+            .unwrap(),
+            KvProviderEligibility::PortableRouteValidated
         );
-    }
-
-    #[test]
-    fn duplicate_override_is_rejected_instead_of_using_order() {
-        let err = ExecutionRolloutPolicy::try_from_raw(
-            Some("off"),
-            Some("Qwen3-0.6B@cpu=static,Qwen3-0.6B@cpu=static"),
+        assert_eq!(
+            validate_managed_state_plan_eligibility(
+                ModelVariant::Lfm25Audio15BGguf,
+                CapabilityKind::Asr,
+                &plan,
+            )
+            .unwrap(),
+            KvProviderEligibility::PortableRouteValidated
+        );
+        assert_eq!(
+            validate_managed_state_plan_eligibility(
+                ModelVariant::Lfm25Audio15BGguf,
+                CapabilityKind::Tts,
+                &plan,
+            )
+            .unwrap(),
+            KvProviderEligibility::PortableRouteValidated
+        );
+        assert_eq!(
+            validate_managed_state_plan_eligibility(
+                ModelVariant::VibeVoice15BTts,
+                CapabilityKind::Tts,
+                &plan,
+            )
+            .unwrap(),
+            KvProviderEligibility::PortableRouteValidated
+        );
+        assert_eq!(
+            validate_managed_state_plan_eligibility(
+                ModelVariant::FishAudioS2Pro,
+                CapabilityKind::Tts,
+                &plan,
+            )
+            .unwrap(),
+            KvProviderEligibility::PortableRouteValidated
+        );
+        assert_eq!(
+            validate_managed_state_plan_eligibility(
+                ModelVariant::GraniteSpeech412BPlus,
+                CapabilityKind::Asr,
+                &plan,
+            )
+            .unwrap(),
+            KvProviderEligibility::PortableRouteValidated
+        );
+        let error = validate_managed_state_plan_eligibility(
+            ModelVariant::WhisperLargeV3Turbo,
+            CapabilityKind::Asr,
+            &plan,
         )
-        .expect_err("duplicate override must fail closed");
-
-        assert!(err.to_string().contains("Duplicate"));
-    }
-
-    #[test]
-    fn static_tts_rollout_never_leaks_across_backends() {
-        let model = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
-        let override_value = format!("{}@metal=static", model);
-        let policy = ExecutionRolloutPolicy::try_from_raw(Some("off"), Some(&override_value))
-            .expect("valid exact rollout");
-
-        assert_eq!(
-            policy.mode_for(model, BackendKind::Metal),
-            ExecutionRolloutMode::Static
-        );
-        assert_eq!(
-            policy.mode_for(model, BackendKind::Cpu),
-            ExecutionRolloutMode::Off
-        );
-        assert_eq!(
-            policy.mode_for(model, BackendKind::Cuda),
-            ExecutionRolloutMode::Off
-        );
+        .unwrap_err();
+        assert!(error.to_string().contains("not validated"));
     }
 }

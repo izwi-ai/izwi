@@ -7,6 +7,8 @@ export type {
 } from "@/shared/api/pagination";
 
 export type {
+  ChatModelCapabilities,
+  ChatReasoningEffort,
   ModelInfo,
   ModelsResponse,
   SpeechModelCapabilities,
@@ -17,6 +19,7 @@ export type {
   ASRStreamCallbacks,
   ASRTranscribeRequest,
   ASRTranscribeResponse,
+  CancelSpeechHistoryRecordResponse,
   DiarizationRecord,
   DiarizationRecordCreateRequest,
   DiarizationProcessingStatus,

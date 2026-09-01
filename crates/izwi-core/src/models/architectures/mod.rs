@@ -15,6 +15,7 @@ pub mod nemotron;
 pub mod parakeet;
 pub mod qwen3;
 pub mod qwen35;
+pub mod qwen38;
 pub mod sortformer;
 pub mod vibevoice;
 pub mod voxtral;

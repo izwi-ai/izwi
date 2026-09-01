@@ -72,7 +72,7 @@ impl ModelManager {
             models.keys().copied().collect()
         };
 
-        let updates = stream::iter(variants.into_iter())
+        let updates = stream::iter(variants)
             .map(|variant| async move {
                 let download_state = self.downloader.state_manager().get_state(variant).await;
                 let latest_progress = if download_state == DownloadState::Downloading {

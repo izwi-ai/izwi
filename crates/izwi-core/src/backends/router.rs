@@ -1,10 +1,14 @@
 use crate::catalog::{
-    CudaQuantizationInfo, CudaSupportInfo, CudaSupportLevel, InferenceBackendHint, ModelVariant,
+    CudaExecutionStatus, CudaQuantizationInfo, CudaSupportInfo, InferenceBackendHint, ModelVariant,
 };
 use crate::kernels::cuda;
 use crate::models::shared::attention::flash::cuda_flash_attention_capabilities;
 
 use super::capabilities::BackendCapabilities;
+use super::cuda_plan::{
+    evaluate_cuda_plan_eligibility, resolve_cuda_execution_plan, CudaExecutionPlan,
+    CudaRuntimeObservation,
+};
 use super::device::{DeviceProfile, DeviceSelector};
 use super::types::{BackendContext, BackendPreference, BackendSelectionSource, ExecutionBackend};
 
@@ -134,6 +138,23 @@ impl BackendRouter {
         self.context.execution_backend
     }
 
+    pub fn cuda_execution_plan(&self, variant: ModelVariant) -> CudaExecutionPlan {
+        let eligibility =
+            evaluate_cuda_plan_eligibility(variant.cuda_support(), variant.cuda_quantization());
+        let device = &self.context.device;
+        resolve_cuda_execution_plan(
+            eligibility,
+            CudaRuntimeObservation {
+                cuda_compiled: self.context.capabilities.cuda_compiled,
+                cuda_backend_selected: self.context.execution_backend
+                    == ExecutionBackend::CandleCuda,
+                cuda_device_observed: device.device.is_cuda(),
+                device_name: device.capabilities.cuda_device_name.clone(),
+                compute_capability: device.capabilities.cuda_compute_capability,
+            },
+        )
+    }
+
     pub fn select(&self, variant: ModelVariant) -> BackendPlan {
         let default_desc = match self.context.execution_backend {
             ExecutionBackend::CandleMetal => "Metal backend",
@@ -142,8 +163,13 @@ impl BackendRouter {
         };
         let cuda_support = variant.cuda_support();
         let cuda_quantization = variant.cuda_quantization();
-        let diagnostics =
-            self.cuda_diagnostics_for_selection(variant, cuda_support, cuda_quantization);
+        let cuda_execution_plan = self.cuda_execution_plan(variant);
+        let diagnostics = self.cuda_diagnostics_for_selection(
+            variant,
+            cuda_support,
+            cuda_quantization,
+            &cuda_execution_plan,
+        );
 
         match variant.backend_hint() {
             InferenceBackendHint::CandleNative => BackendPlan {
@@ -168,6 +194,7 @@ impl BackendRouter {
         variant: ModelVariant,
         cuda_support: CudaSupportInfo,
         cuda_quantization: CudaQuantizationInfo,
+        cuda_execution_plan: &CudaExecutionPlan,
     ) -> Vec<String> {
         if self.context.execution_backend != ExecutionBackend::CandleCuda {
             return Vec::new();
@@ -184,6 +211,19 @@ impl BackendRouter {
             },
             kernel_status.reason
         ));
+        diagnostics.push(format!(
+            "CUDA runtime plan for {} is eligible={}, executable={}, catalog_blocker={}, runtime_blocker={}",
+            variant.dir_name(),
+            cuda_execution_plan.eligibility.eligible,
+            cuda_execution_plan.executable,
+            cuda_execution_plan
+                .eligibility
+                .blocker
+                .map_or("none", |blocker| blocker.as_str()),
+            cuda_execution_plan
+                .runtime_blocker
+                .map_or("none", |blocker| blocker.as_str())
+        ));
 
         let flash = cuda_flash_attention_capabilities();
         diagnostics.push(format!(
@@ -197,21 +237,29 @@ impl BackendRouter {
             flash.supports_varlen
         ));
 
-        match cuda_support.level {
-            CudaSupportLevel::CpuOnly | CudaSupportLevel::Disabled | CudaSupportLevel::Unknown => {
-                diagnostics.push(format!(
-                    "CUDA support for {} is {}: {}",
-                    variant.dir_name(),
-                    cuda_support.level.as_str(),
-                    cuda_support.reason
-                ));
-            }
-            CudaSupportLevel::CandleCudaGeneric => diagnostics.push(format!(
-                "CUDA support for {} is generic Candle CUDA and needs smoke validation: {}",
+        diagnostics.push(format!(
+            "CUDA execution for {} is {} with {} evidence (legacy level={}): {}",
+            variant.dir_name(),
+            cuda_support.execution_status.as_str(),
+            cuda_support.evidence.as_str(),
+            cuda_support.level.as_str(),
+            cuda_support.reason
+        ));
+        if !cuda_support.evidence_is_sufficient() {
+            diagnostics.push(format!(
+                "CUDA execution claim for {} is inconsistent: {} status is not supported by {} evidence",
                 variant.dir_name(),
-                cuda_support.reason
-            )),
-            CudaSupportLevel::NativeCuda => {}
+                cuda_support.execution_status.as_str(),
+                cuda_support.evidence.as_str()
+            ));
+        } else if matches!(
+            cuda_support.execution_status,
+            CudaExecutionStatus::Portable | CudaExecutionStatus::EligibleUnverified
+        ) {
+            diagnostics.push(format!(
+                "CUDA optimized provider for {} remains unverified; keep the portable provider and rollback available",
+                variant.dir_name()
+            ));
         }
 
         if !cuda_quantization.is_allowed_for_cuda() {
@@ -245,7 +293,7 @@ fn append_diagnostics(mut reason: String, diagnostics: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{CudaQuantizationSupportLevel, ModelVariant};
+    use crate::catalog::{CudaQuantizationSupportLevel, CudaSupportLevel, ModelVariant};
     use crate::env_test_lock;
 
     #[test]
@@ -319,7 +367,7 @@ mod tests {
     }
 
     #[test]
-    fn cuda_selection_reports_cpu_only_models() {
+    fn cuda_selection_reports_neural_tokenizer_without_inventing_device_evidence() {
         let context = BackendContext::new(
             BackendPreference::Cuda,
             BackendSelectionSource::Config,
@@ -344,9 +392,10 @@ mod tests {
         let plan = router.select(ModelVariant::Qwen3TtsTokenizer12Hz);
 
         assert_eq!(plan.backend, ExecutionBackend::CandleCuda);
-        assert_eq!(plan.cuda_support.level, CudaSupportLevel::CpuOnly);
+        assert_eq!(plan.cuda_support.level, CudaSupportLevel::CandleCudaGeneric);
         assert!(
-            plan.reason.contains("cpu_only"),
+            plan.reason.contains("eligible_unverified")
+                && plan.reason.contains("cuda_device_not_observed"),
             "reason should carry CUDA support diagnostics: {}",
             plan.reason
         );
@@ -400,6 +449,46 @@ mod tests {
             plan.reason.contains("dense dequantized fallback"),
             "reason should carry CUDA quantization diagnostics: {}",
             plan.reason
+        );
+    }
+
+    #[test]
+    fn synthetic_cuda_kind_does_not_count_as_an_observed_cuda_device() {
+        let context = BackendContext::new(
+            BackendPreference::Cuda,
+            BackendSelectionSource::Config,
+            BackendCapabilities {
+                cpu_compiled: true,
+                metal_compiled: false,
+                cuda_compiled: true,
+            },
+            DeviceProfile {
+                device: candle_core::Device::Cpu,
+                kind: crate::backends::DeviceKind::Cuda,
+                capabilities: crate::backends::DeviceCapabilities {
+                    cuda_device_name: Some("synthetic gpu".to_string()),
+                    cuda_compute_capability: Some((8, 0)),
+                    ..Default::default()
+                },
+                memory_pool: None,
+            },
+            "Synthetic CUDA profile",
+        );
+        let router = BackendRouter::from_context(context);
+        let plan = router.cuda_execution_plan(ModelVariant::Qwen34BGguf);
+
+        assert!(plan.eligibility.eligible);
+        assert!(!plan.executable);
+        assert!(!plan.cuda_device_observed);
+        assert_eq!(plan.device_name, None);
+        assert_eq!(plan.compute_capability, None);
+        assert_eq!(
+            plan.runtime_blocker,
+            Some(crate::backends::CudaPlanBlocker::CudaDeviceNotObserved)
+        );
+        assert_eq!(
+            plan.eligibility.evidence,
+            crate::catalog::CudaEvidenceLevel::SourceReviewed
         );
     }
 }

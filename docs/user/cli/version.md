@@ -64,7 +64,10 @@ Features:
   (none)
 ```
 
-`Compiled Backends` reflects cargo features compiled into the binary. It does not mean the server is currently running on that backend; use [`izwi status --detailed`](/cli/status) to verify runtime selection.
+`Compiled Backends` reflects cargo features compiled into the binary. It does
+not mean the server is currently running on that backend; for example, a macOS
+release can contain Metal code while selecting CPU on macOS 12-14. Use
+[`izwi status --detailed`](/cli/status) to verify runtime selection.
 
 ---
 

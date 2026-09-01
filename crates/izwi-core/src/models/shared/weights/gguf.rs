@@ -152,6 +152,35 @@ impl GgufLoader {
         self.tensor_count
     }
 
+    /// Return exact stored tensor payload bytes and the largest individual
+    /// tensor without materializing checkpoint data.
+    pub fn tensor_storage_inventory(&self) -> Result<(u64, u64)> {
+        self.content
+            .tensor_infos
+            .values()
+            .try_fold((0_u64, 0_u64), |(total, largest), info| {
+                let elements = u64::try_from(info.shape.elem_count()).map_err(|_| {
+                    Error::ModelLoadError("GGUF tensor element count exceeds u64".into())
+                })?;
+                let block = u64::try_from(info.ggml_dtype.block_size()).map_err(|_| {
+                    Error::ModelLoadError("GGUF tensor block size exceeds u64".into())
+                })?;
+                let type_bytes = u64::try_from(info.ggml_dtype.type_size()).map_err(|_| {
+                    Error::ModelLoadError("GGUF tensor type size exceeds u64".into())
+                })?;
+                let bytes = elements
+                    .checked_div(block)
+                    .and_then(|blocks| blocks.checked_mul(type_bytes))
+                    .ok_or_else(|| Error::ModelLoadError("GGUF tensor size overflow".into()))?;
+                Ok((
+                    total.checked_add(bytes).ok_or_else(|| {
+                        Error::ModelLoadError("GGUF tensor inventory overflow".into())
+                    })?,
+                    largest.max(bytes),
+                ))
+            })
+    }
+
     /// Get a raw metadata value.
     pub fn metadata_value(&self, key: &str) -> Option<&GgufValue> {
         self.metadata.get(key)
@@ -174,6 +203,27 @@ impl GgufLoader {
             GgufValue::U64(n) => Some(*n),
             GgufValue::I64(n) => Some(*n as u64),
             GgufValue::U32(n) => Some(*n as u64),
+            _ => None,
+        })
+    }
+
+    /// Read numeric GGUF metadata without requiring the checkpoint to encode
+    /// the value with one particular integer or floating-point width.
+    pub fn get_metadata_f64(&self, key: &str) -> Option<f64> {
+        self.metadata.get(key).and_then(|value| match value {
+            GgufValue::F64(value) => Some(*value),
+            GgufValue::F32(value) => Some(f64::from(*value)),
+            GgufValue::U64(value) => Some(*value as f64),
+            GgufValue::I64(value) => Some(*value as f64),
+            GgufValue::U32(value) => Some(f64::from(*value)),
+            GgufValue::I32(value) => Some(f64::from(*value)),
+            _ => None,
+        })
+    }
+
+    pub fn get_metadata_array_len(&self, key: &str) -> Option<usize> {
+        self.metadata.get(key).and_then(|value| match value {
+            GgufValue::Array(values) => Some(values.len()),
             _ => None,
         })
     }
@@ -247,9 +297,12 @@ fn var_builder_from_safetensors(
         if model_path.exists() {
             // Single file
             let vb = unsafe {
-                VarBuilder::from_mmaped_safetensors(&[model_path.clone()], dtype, device).map_err(
-                    |e| Error::ModelLoadError(format!("Failed to load safetensors: {}", e)),
-                )?
+                VarBuilder::from_mmaped_safetensors(
+                    std::slice::from_ref(&model_path),
+                    dtype,
+                    device,
+                )
+                .map_err(|e| Error::ModelLoadError(format!("Failed to load safetensors: {}", e)))?
             };
             Ok(vb)
         } else if index_path.exists() {

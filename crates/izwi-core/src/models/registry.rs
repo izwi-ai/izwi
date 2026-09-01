@@ -6,57 +6,119 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Notify, OnceCell, RwLock};
 use tracing::info;
 
-use crate::backends::{DTypeSelectionRequest, DeviceProfile};
+use crate::backends::state::PhysicalStateTransactionId;
+use crate::backends::{BackendKind, DTypeSelectionRequest, DeviceProfile};
 use crate::catalog::{ModelFamily, ModelTask};
+use crate::engine::{
+    InvocationStaticAttentionLease, InvocationTensorLease, RetainedStaticAttentionRuntimeV2,
+    RetainedStaticAttentionSequenceId, RetainedTensorStateRuntimeV2, StageDescriptor, WorkCost,
+};
 use crate::error::{Error, Result};
+use crate::kv::v2::{InvocationStateBackingKindV2, InvocationWorkspaceLeaseSetV2};
+use crate::kv::{InferenceStateCapability, InferenceStateContractProvider};
 use crate::model::ModelVariant;
 use crate::models::architectures::fish_s2::FishS2TtsModel;
-use crate::models::architectures::gemma3::chat::Gemma3ChatModel;
+use crate::models::architectures::gemma3::chat::{
+    ChatDecodeCheckpoint as Gemma3ChatDecodeCheckpoint, ChatDecodeState as Gemma3ChatDecodeState,
+    Gemma3ChatModel,
+};
 use crate::models::architectures::granite_speech::asr::{
     GraniteSpeechAsrGenerationOptions, GraniteSpeechAsrModel, GraniteSpeechAsrTranscriptionOutput,
-    GraniteSpeechTask,
+    GraniteSpeechDecodeCheckpoint, GraniteSpeechDecodeState, GraniteSpeechDecodeStep,
+    GraniteSpeechPhysicalStateSpec, GraniteSpeechPreparationBatchGeometry,
+    GraniteSpeechPreparationBatchRow, GraniteSpeechPreparedGeometry,
+    GraniteSpeechPreparedPromptArtifact, GraniteSpeechTask,
 };
 use crate::models::architectures::kokoro::KokoroTtsModel;
-use crate::models::architectures::lfm2::chat::Lfm2ChatModel;
+use crate::models::architectures::lfm2::chat::{
+    ChatDecodeState as Lfm2ChatDecodeState, Lfm2ChatDecodeCheckpoint, Lfm2ChatModel,
+};
 use crate::models::architectures::lfm25_audio::{
+    asr_retained::{
+        Lfm25AudioAsrDecodeStep, Lfm25AudioAsrPrefillBatch, Lfm25AudioAsrPrefillStep,
+        Lfm25AudioAsrQuantumCheckpoint, Lfm25AudioAsrRetainedState,
+    },
+    model::{
+        Lfm25AudioAsrPreparationResourceEnvelope, Lfm25AudioAsrPreparationStageCeiling,
+        Lfm25AudioAsrStepResourceEnvelope, Lfm25AudioPreparedAsrArtifact,
+        Lfm25AudioTtsStageCeiling, Lfm25AudioTtsStepResourceEnvelope,
+    },
+    physical::{
+        Lfm25AudioPhysicalStateSpec, Lfm25AudioRetainedStateSpec, Lfm25AudioStateMode,
+        LFM25_DEPTHFORMER_STATE_DOMAIN, LFM25_MAIN_ATTENTION_STATE_DOMAIN,
+        LFM25_MAIN_SHORTCONV_STATE_DOMAIN,
+    },
+    state::Lfm25AudioRetainedMode,
+    tts_retained::{
+        Lfm25AudioPreparedTtsArtifact, Lfm25AudioTtsDecodeBatch, Lfm25AudioTtsDecodeStep,
+        Lfm25AudioTtsPrefillBatch, Lfm25AudioTtsPrefillStep, Lfm25AudioTtsQuantumCheckpoint,
+        Lfm25AudioTtsRetainedState,
+    },
     Lfm25AudioGenerationConfig, Lfm25AudioModel, Lfm25AudioStreamConfig,
 };
 use crate::models::architectures::nemotron::asr::{
     NemotronAsrDecodeStep, NemotronAsrModel, NemotronAsrTranscriptionOutput,
+    NemotronOfflinePhysicalStateSpec, NemotronRealtimePhysicalStateSpec,
     NemotronRealtimeResourceReservation, NemotronStreamingState,
 };
 use crate::models::architectures::parakeet::asr::{
-    ParakeetAsrModel, ParakeetAsrTranscriptionOutput,
+    ParakeetAsrModel, ParakeetAsrTranscriptionOutput, ParakeetPhysicalStateSpec,
 };
 use crate::models::architectures::qwen3::asr::{
-    AsrDecodeState as Qwen3AsrDecodeState, AsrDecodeStep as Qwen3AsrDecodeStep,
-    AsrTranscriptionOutput as Qwen3AsrTranscriptionOutput, Qwen3AsrModel,
+    AsrDecodeCheckpoint as Qwen3AsrDecodeCheckpoint, AsrDecodeState as Qwen3AsrDecodeState,
+    AsrDecodeStep as Qwen3AsrDecodeStep, AsrTranscriptionOutput as Qwen3AsrTranscriptionOutput,
+    Qwen3AsrAudioBatchRow, Qwen3AsrModel, Qwen3AsrPhysicalStateSpec, Qwen3AsrPreparedAudio,
 };
 use crate::models::architectures::qwen3::chat::{
-    ChatDecodeState as Qwen3ChatDecodeState, ChatGenerationOutput, Qwen3ChatModel,
+    ChatDecodeCheckpoint as Qwen3ChatDecodeCheckpoint, ChatDecodeState as Qwen3ChatDecodeState,
+    ChatGenerationOutput, Qwen3ChatModel,
 };
 use crate::models::architectures::qwen3::tts::Qwen3TtsModel;
 use crate::models::architectures::qwen35::chat::{
-    ChatDecodeState as Qwen35ChatDecodeState, Qwen35ChatModel, Qwen35PrefixSnapshot,
-    Qwen35PreparedPrompt,
+    ChatDecodeState as Qwen35ChatDecodeState, Qwen35ChatModel, Qwen35PreparedPrompt,
+    Qwen35SharedStepCheckpoint,
+};
+use crate::models::architectures::qwen38::chat::{
+    ChatDecodeState as Qwen38ChatDecodeState, Qwen38ChatModel, Qwen38PreparedPrompt,
+    Qwen38SharedStepCheckpoint,
 };
 use crate::models::architectures::sortformer::diarization::{
-    SortformerDiarizerModel, SortformerWorkspaceEstimate, SortformerWorkspaceEvent,
+    SortformerDiarizerModel, SortformerPhysicalStateSpec, SortformerWorkspaceEstimate,
+    SortformerWorkspaceEvent,
 };
 use crate::models::architectures::vibevoice::asr::{
-    VibeVoiceAsrGenerationOptions, VibeVoiceAsrModel, VibeVoiceAsrTranscriptionOutput,
+    VibeVoiceAsrDecodeCheckpoint, VibeVoiceAsrDecodeState, VibeVoiceAsrDecodeStep,
+    VibeVoiceAsrGenerationOptions, VibeVoiceAsrModel, VibeVoiceAsrPreparationDecision,
+    VibeVoiceAsrPreparationStageSeal, VibeVoiceAsrPreparedArtifact,
+    VibeVoiceAsrPreparedTokenizerSpan, VibeVoiceAsrRetainedPrefillBatchRow,
+    VibeVoiceAsrRetainedTokenizerQuantum, VibeVoiceAsrTranscriptionOutput,
 };
 use crate::models::architectures::vibevoice::tts::VibeVoiceTtsModel;
-use crate::models::architectures::voxtral::realtime::VoxtralRealtimeModel;
+use crate::models::architectures::vibevoice::VibeVoicePhysicalStateSpec;
+use crate::models::architectures::voxtral::realtime::model::{
+    VoxtralRealtimePreparationBatchGeometry, VoxtralRealtimePreparationBatchRow,
+    VoxtralRealtimePreparationGeometry, VoxtralRealtimePreparationMode,
+    VoxtralRealtimePreparationStageSeal, VoxtralRealtimePreparedAudio,
+    VoxtralRealtimePreparedResourceUsage, VoxtralRealtimeStreamPeakReservation,
+};
+use crate::models::architectures::voxtral::realtime::{
+    VoxtralRealtimeCheckpoint, VoxtralRealtimeDecodeBatchRow, VoxtralRealtimeModel,
+    VoxtralRealtimeResourceUsage, VoxtralRealtimeState, VoxtralRealtimeStep,
+};
 use crate::models::architectures::voxtral::tts::VoxtralTtsModel;
 use crate::models::architectures::whisper::asr::{
-    AsrTranscriptionOutput as WhisperAsrTranscriptionOutput, WhisperTurboAsrModel,
+    AsrTranscriptionOutput as WhisperAsrTranscriptionOutput, WhisperAudioBatchRow,
+    WhisperAudioPreparationStageSeal, WhisperDecodeCheckpoint, WhisperDecodeState,
+    WhisperPreparedWindow, WhisperTerminalTransition, WhisperTurboAsrModel,
+    WhisperWindowPreparationBatchGeometry, WhisperWindowPreparationGeometry,
 };
+use crate::models::architectures::whisper::WhisperPhysicalStateSpec;
+use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage};
 use crate::runtime::{DiarizationConfig, DiarizationResult};
 
@@ -256,6 +318,16 @@ fn load_qwen35_chat_model(
     )?))
 }
 
+fn load_qwen38_chat_model(
+    model_dir: &Path,
+    variant: ModelVariant,
+    device: DeviceProfile,
+) -> Result<NativeChatModel> {
+    Ok(NativeChatModel::Qwen38(Qwen38ChatModel::load(
+        model_dir, variant, device,
+    )?))
+}
+
 fn load_lfm25_audio_model(
     model_dir: &Path,
     variant: ModelVariant,
@@ -370,6 +442,11 @@ const CHAT_LOADER_REGISTRY: &[ChatLoaderRegistration] = &[
         name: "qwen35_chat",
         family: ModelFamily::Qwen35Chat,
         loader: load_qwen35_chat_model,
+    },
+    ChatLoaderRegistration {
+        name: "qwen38_chat",
+        family: ModelFamily::Qwen38Chat,
+        loader: load_qwen38_chat_model,
     },
     ChatLoaderRegistration {
         name: "gemma_chat",
@@ -538,6 +615,29 @@ pub enum NativeAsrModel {
     GraniteSpeech(GraniteSpeechAsrModel),
 }
 
+pub(crate) fn reject_foreign_whisper_prefill(
+    cross_runtime: Arc<RetainedStaticAttentionRuntimeV2>,
+    cross_sequence: RetainedStaticAttentionSequenceId,
+) -> Result<NativeAsrDecodeState> {
+    cross_runtime.release_sequence(cross_sequence)?;
+    Err(Error::InvalidInput(
+        "prepared Whisper window was supplied to another ASR model".into(),
+    ))
+}
+
+impl InferenceStateContractProvider for NativeAsrModel {
+    fn inference_state_contract(&self) -> Result<InferenceStateCapability> {
+        match self {
+            Self::Qwen3(model) => model.inference_state_contract(),
+            Self::Parakeet(_)
+            | Self::Nemotron(_)
+            | Self::WhisperTurbo(_)
+            | Self::VibeVoice(_)
+            | Self::GraniteSpeech(_) => Ok(InferenceStateCapability::Stateless),
+        }
+    }
+}
+
 pub enum NativeAudioChatModel {
     Lfm25Audio(Lfm25AudioModel),
 }
@@ -553,17 +653,243 @@ pub struct NativeAudioChatGeneration {
     pub diagnostics: Option<serde_json::Value>,
 }
 
+#[allow(private_interfaces)]
 pub enum NativeAsrDecodeState {
     Qwen3(Qwen3AsrDecodeState),
+    Whisper(WhisperDecodeState),
+    VibeVoice(VibeVoiceAsrDecodeState),
+    GraniteSpeech(GraniteSpeechDecodeState),
     Nemotron(NemotronStreamingState),
 }
 
+pub(crate) enum NativeAsrDecodeCheckpoint {
+    Qwen3(Qwen3AsrDecodeCheckpoint),
+    Whisper(WhisperDecodeCheckpoint),
+    VibeVoice(VibeVoiceAsrDecodeCheckpoint),
+    GraniteSpeech(GraniteSpeechDecodeCheckpoint),
+}
+
 impl NativeAsrDecodeState {
-    /// Complete model-owned session cache claim when it can be observed.
-    pub fn session_cache_bytes(&self) -> Option<u64> {
+    pub(crate) fn vibevoice_prepared_artifact(&self) -> Option<Arc<VibeVoiceAsrPreparedArtifact>> {
         match self {
-            Self::Qwen3(state) => state.session_cache_bytes(),
-            Self::Nemotron(state) => state.session_cache_bytes(),
+            Self::VibeVoice(state) => state.prepared_artifact(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn uses_managed_qwen3_kv(&self) -> bool {
+        match self {
+            Self::Qwen3(state) => state.uses_managed_kv(),
+            Self::Whisper(state) => state.uses_managed_kv(),
+            Self::VibeVoice(_) => true,
+            Self::GraniteSpeech(state) => state.uses_managed_kv(),
+            Self::Nemotron(_) => false,
+        }
+    }
+
+    pub(crate) fn take_managed_write_completions(
+        &mut self,
+    ) -> Vec<Arc<crate::backends::kv::KvWriteBatchCompletion>> {
+        match self {
+            Self::Qwen3(state) => state.take_managed_write_completions(),
+            Self::Whisper(state) => state.take_managed_write_completions(),
+            Self::VibeVoice(state) => state.take_managed_write_completions(),
+            Self::GraniteSpeech(state) => state.take_managed_write_completions(),
+            Self::Nemotron(_) => Vec::new(),
+        }
+    }
+
+    pub(crate) fn sequence_position(&self) -> Option<usize> {
+        match self {
+            Self::Qwen3(state) => Some(state.sequence_position()),
+            Self::Whisper(state) => Some(state.self_context_len()),
+            Self::VibeVoice(state) => Some(state.sequence_position()),
+            Self::GraniteSpeech(state) => Some(state.sequence_position()),
+            Self::Nemotron(_) => None,
+        }
+    }
+
+    pub(crate) fn install_qwen3_managed_reservation(
+        &mut self,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<()> {
+        match self {
+            Self::Qwen3(state) => state.install_managed_reservation(cache),
+            Self::Whisper(_) | Self::VibeVoice(_) | Self::GraniteSpeech(_) | Self::Nemotron(_) => {
+                Err(Error::InvalidInput(
+                    "managed Qwen3 KV cache was supplied to a non-Qwen3 ASR state".to_string(),
+                ))
+            }
+        }
+    }
+
+    pub(crate) fn begin_managed_quantum(
+        &mut self,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<NativeAsrDecodeCheckpoint> {
+        match self {
+            Self::Qwen3(state) => state
+                .begin_managed_quantum(cache)
+                .map(NativeAsrDecodeCheckpoint::Qwen3),
+            Self::Whisper(state) => state
+                .begin_managed_quantum(cache)
+                .map(NativeAsrDecodeCheckpoint::Whisper),
+            Self::VibeVoice(state) => state
+                .begin_managed_quantum(cache)
+                .map(NativeAsrDecodeCheckpoint::VibeVoice),
+            Self::GraniteSpeech(state) => state
+                .begin_managed_quantum(cache)
+                .map(NativeAsrDecodeCheckpoint::GraniteSpeech),
+            Self::Nemotron(_) => Err(Error::InvalidInput(
+                "managed Qwen3 KV cache was supplied to a non-Qwen3 ASR state".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn begin_whisper_managed_generation(
+        &mut self,
+        cache: PhysicalPagedKvCache,
+        new_generation: crate::engine::ManagedSessionGeneration,
+    ) -> Result<NativeAsrDecodeCheckpoint> {
+        let new_generation = new_generation.get();
+        let expected_generation = new_generation.checked_sub(1).ok_or_else(|| {
+            Error::InferenceError(
+                "Whisper managed restart received an invalid zero session generation".into(),
+            )
+        })?;
+        match self {
+            Self::Whisper(state) => state
+                .begin_managed_generation(cache, expected_generation, new_generation)
+                .map(NativeAsrDecodeCheckpoint::Whisper),
+            Self::Qwen3(_) | Self::VibeVoice(_) | Self::GraniteSpeech(_) | Self::Nemotron(_) => {
+                Err(Error::InvalidInput(
+                    "Whisper managed generation was supplied to another ASR state".into(),
+                ))
+            }
+        }
+    }
+
+    pub(crate) fn rollback_managed_quantum(
+        &mut self,
+        checkpoint: NativeAsrDecodeCheckpoint,
+    ) -> Result<()> {
+        match (self, checkpoint) {
+            (Self::Qwen3(state), NativeAsrDecodeCheckpoint::Qwen3(checkpoint)) => {
+                state.rollback_managed_quantum(checkpoint);
+                Ok(())
+            }
+            (Self::Whisper(state), NativeAsrDecodeCheckpoint::Whisper(mut checkpoint)) => {
+                state.rollback_managed_quantum(&mut checkpoint)
+            }
+            (Self::VibeVoice(state), NativeAsrDecodeCheckpoint::VibeVoice(mut checkpoint)) => {
+                state.rollback_managed_quantum(&mut checkpoint)
+            }
+            (
+                Self::GraniteSpeech(state),
+                NativeAsrDecodeCheckpoint::GraniteSpeech(mut checkpoint),
+            ) => state.rollback_managed_quantum(&mut checkpoint),
+            _ => Err(Error::InvalidInput(
+                "ASR managed checkpoint was supplied to a different decoder state".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn commit_managed_quantum(
+        &mut self,
+        checkpoint: NativeAsrDecodeCheckpoint,
+    ) -> Result<()> {
+        match (self, checkpoint) {
+            (Self::Whisper(state), NativeAsrDecodeCheckpoint::Whisper(mut checkpoint)) => {
+                state.commit_managed_quantum(&mut checkpoint)
+            }
+            (Self::VibeVoice(state), NativeAsrDecodeCheckpoint::VibeVoice(mut checkpoint)) => {
+                state.commit_managed_quantum(&mut checkpoint)
+            }
+            (
+                Self::GraniteSpeech(state),
+                NativeAsrDecodeCheckpoint::GraniteSpeech(mut checkpoint),
+            ) => state.commit_managed_quantum(&mut checkpoint),
+            (Self::Qwen3(_), NativeAsrDecodeCheckpoint::Qwen3(_)) => Ok(()),
+            _ => Err(Error::InvalidInput(
+                "ASR managed checkpoint does not match its decoder state".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn bind_qwen3_tensor_sequence(&mut self, sequence: u64) -> Result<()> {
+        match self {
+            Self::Qwen3(state) => state.bind_tensor_sequence(sequence),
+            Self::Whisper(_) | Self::VibeVoice(_) | Self::GraniteSpeech(_) | Self::Nemotron(_) => {
+                Err(Error::InvalidInput(
+                    "Qwen3 ASR tensor-state reservation was supplied to a non-Qwen3 state"
+                        .to_string(),
+                ))
+            }
+        }
+    }
+
+    pub(crate) fn restore_qwen3_prepared_tensor_state(
+        &mut self,
+        arena: &crate::backends::state::TensorStateArena,
+    ) -> Result<()> {
+        match self {
+            Self::Qwen3(state) => state.restore_prepared_tensor_state(arena),
+            Self::Whisper(_) | Self::VibeVoice(_) | Self::GraniteSpeech(_) | Self::Nemotron(_) => {
+                Err(Error::InvalidInput(
+                    "Qwen3 ASR tensor-state arena was supplied to a non-Qwen3 state".to_string(),
+                ))
+            }
+        }
+    }
+
+    pub(crate) fn stage_qwen3_prepared_tensor_state(
+        &mut self,
+        arena: &crate::backends::state::TensorStateArena,
+        transaction: u64,
+    ) -> Result<()> {
+        match self {
+            Self::Qwen3(state) => state.stage_prepared_tensor_state(arena, transaction),
+            Self::Whisper(_) | Self::VibeVoice(_) | Self::GraniteSpeech(_) | Self::Nemotron(_) => {
+                Err(Error::InvalidInput(
+                    "Qwen3 ASR tensor-state arena was supplied to a non-Qwen3 state".to_string(),
+                ))
+            }
+        }
+    }
+
+    pub(crate) fn prefill_progress(&self) -> Option<usize> {
+        match self {
+            Self::Qwen3(state) => Some(state.prefill_progress()),
+            Self::Whisper(state) => Some(state.prefill_progress()),
+            Self::VibeVoice(state) => Some(state.prefill_progress()),
+            Self::GraniteSpeech(state) => Some(state.prefill_progress()),
+            Self::Nemotron(_) => None,
+        }
+    }
+
+    pub(crate) fn prefill_token_count(&self) -> Option<usize> {
+        match self {
+            Self::Qwen3(state) => Some(state.prefill_token_count()),
+            Self::Whisper(state) => Some(state.prefill_token_count()),
+            Self::VibeVoice(state) => Some(state.prefill_token_count()),
+            Self::GraniteSpeech(state) => Some(state.prefill_token_count()),
+            Self::Nemotron(_) => None,
+        }
+    }
+
+    pub(crate) fn take_staged_asr_decode_step(&mut self) -> Option<NativeAsrDecodeStep> {
+        match self {
+            Self::VibeVoice(state) => {
+                state
+                    .take_staged_decode_step()
+                    .map(|step| NativeAsrDecodeStep {
+                        delta: step.delta,
+                        text: step.text,
+                        tokens_generated: step.tokens_generated,
+                        finished: step.finished,
+                    })
+            }
+            Self::Qwen3(_) | Self::Whisper(_) | Self::GraniteSpeech(_) | Self::Nemotron(_) => None,
         }
     }
 }
@@ -671,6 +997,856 @@ fn granite_speech_asr_options(
 }
 
 impl NativeAsrModel {
+    pub(crate) fn prepare_granite_speech_prompt_artifact_batch(
+        &self,
+        rows: &[GraniteSpeechPreparationBatchRow<'_>],
+    ) -> Result<Vec<Arc<GraniteSpeechPreparedPromptArtifact>>> {
+        match self {
+            Self::GraniteSpeech(model) => model.prepare_prompt_artifact_batch(rows),
+            _ => Err(Error::InvalidInput(
+                "Granite Speech batch preparation was supplied to another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn granite_speech_preparation_batch_geometry(
+        &self,
+        rows: &[GraniteSpeechPreparedGeometry],
+    ) -> Result<GraniteSpeechPreparationBatchGeometry> {
+        match self {
+            Self::GraniteSpeech(model) => model.preparation_batch_geometry(rows),
+            _ => Err(Error::InvalidInput(
+                "Granite Speech batch geometry was requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn granite_speech_preparation_row_cost_for_batch(
+        &self,
+        index: usize,
+        rows: &[GraniteSpeechPreparedGeometry],
+        batch: GraniteSpeechPreparationBatchGeometry,
+    ) -> Result<WorkCost> {
+        match self {
+            Self::GraniteSpeech(model) => model.preparation_row_cost_for_batch(index, rows, batch),
+            _ => Err(Error::InvalidInput(
+                "Granite Speech batch cost was requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn prepare_qwen3_audio_tower_batch(
+        &self,
+        rows: &[Qwen3AsrAudioBatchRow<'_>],
+    ) -> Result<Vec<Qwen3AsrPreparedAudio>> {
+        match self {
+            Self::Qwen3(model) => model.prepare_audio_tower_batch(rows),
+            _ => Err(Error::InvalidInput(
+                "Qwen3 ASR audio-tower preparation was supplied to another ASR model".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn whisper_window_preparation_geometry(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+    ) -> Result<WhisperWindowPreparationGeometry> {
+        match self {
+            Self::WhisperTurbo(model) => model.window_preparation_geometry(audio, sample_rate),
+            _ => Err(Error::InvalidInput(
+                "Whisper window geometry was requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn whisper_window_preparation_stage_seal(
+        &self,
+        backend: crate::backends::BackendKind,
+        width: usize,
+    ) -> Result<WhisperAudioPreparationStageSeal> {
+        match self {
+            Self::WhisperTurbo(model) => model.window_preparation_stage_seal(backend, width),
+            _ => Err(Error::InvalidInput(
+                "Whisper preparation seal was requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn prepare_whisper_window_batch(
+        &self,
+        rows: &[WhisperAudioBatchRow<'_>],
+    ) -> Result<Vec<WhisperPreparedWindow>> {
+        match self {
+            Self::WhisperTurbo(model) => model.prepare_window_batch(rows),
+            _ => Err(Error::InvalidInput(
+                "Whisper window preparation was supplied to another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn whisper_incremental_prompt_token_count(
+        &self,
+        prepared: &WhisperPreparedWindow,
+        language: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Result<usize> {
+        match self {
+            Self::WhisperTurbo(model) => model
+                .incremental_prompt_token_count_from_prepared_window(prepared, language, prompt),
+            _ => Err(Error::InvalidInput(
+                "prepared Whisper window was supplied to another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn start_whisper_resumable_prefill(
+        &self,
+        prepared: &WhisperPreparedWindow,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        max_new_tokens: Option<usize>,
+        cache: PhysicalPagedKvCache,
+        cross_runtime: Arc<RetainedStaticAttentionRuntimeV2>,
+        cross_sequence: RetainedStaticAttentionSequenceId,
+    ) -> Result<NativeAsrDecodeState> {
+        match self {
+            Self::WhisperTurbo(model) => Ok(NativeAsrDecodeState::Whisper(
+                model.begin_resumable_prefill_managed_from_prepared_window(
+                    prepared,
+                    language,
+                    prompt,
+                    max_new_tokens,
+                    cache,
+                    cross_runtime,
+                    cross_sequence,
+                )?,
+            )),
+            _ => reject_foreign_whisper_prefill(cross_runtime, cross_sequence),
+        }
+    }
+
+    pub(crate) fn continue_whisper_resumable_prefill(
+        &self,
+        state: &mut NativeAsrDecodeState,
+        start: usize,
+        end: usize,
+    ) -> Result<bool> {
+        match (self, state) {
+            (Self::WhisperTurbo(model), NativeAsrDecodeState::Whisper(state)) => {
+                model.continue_resumable_prefill(state, start, end)
+            }
+            _ => Err(Error::InvalidInput(
+                "Whisper prefill state was routed to another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn decode_whisper_retained_step(
+        &self,
+        state: &mut NativeAsrDecodeState,
+    ) -> Result<NativeAsrDecodeStep> {
+        match (self, state) {
+            (Self::WhisperTurbo(model), NativeAsrDecodeState::Whisper(state)) => {
+                let step = model.decode_step_retained(state)?;
+                Ok(NativeAsrDecodeStep {
+                    delta: step.delta,
+                    text: step.text,
+                    tokens_generated: step.tokens_generated,
+                    finished: step.finished,
+                })
+            }
+            _ => Err(Error::InvalidInput(
+                "Whisper decode state was routed to another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn resolve_whisper_terminal_transition(
+        &self,
+        state: &mut NativeAsrDecodeState,
+    ) -> Result<WhisperTerminalTransition> {
+        match (self, state) {
+            (Self::WhisperTurbo(model), NativeAsrDecodeState::Whisper(state)) => {
+                model.resolve_terminal_transition(state)
+            }
+            _ => Err(Error::InvalidInput(
+                "Whisper terminal state was routed to another ASR model".into(),
+            )),
+        }
+    }
+
+    /// Execute an atomic ASR operation through its complete lifecycle-owned
+    /// invocation workspace. This is the model-adapter boundary used by direct
+    /// runtime pipelines; callers never select or omit physical domains.
+    pub(crate) fn transcribe_with_details_and_prompt_and_options_from_invocation_workspace(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        options: NativeAsrGenerationOptions,
+        leases: &mut InvocationWorkspaceLeaseSetV2,
+    ) -> Result<NativeAsrTranscription> {
+        match self {
+            Self::Qwen3(_) => {
+                let cache = leases
+                    .lease_exact_kind_mut(InvocationStateBackingKindV2::PagedAttention)?
+                    .paged_cache_mut()?;
+                self.transcribe_qwen3_with_details_and_prompt_physical(
+                    audio,
+                    sample_rate,
+                    language,
+                    prompt,
+                    cache,
+                )
+            }
+            Self::WhisperTurbo(_) => {
+                let (self_attention, cross_attention) = leases.lease_exact_kind_pair_mut(
+                    InvocationStateBackingKindV2::PagedAttention,
+                    InvocationStateBackingKindV2::StaticAttention,
+                )?;
+                let self_kv = self_attention.paged_cache_mut()?;
+                let cross_kv = cross_attention.typed_mut::<InvocationStaticAttentionLease>()?;
+                self.transcribe_whisper_with_details_and_prompt_physical(
+                    audio,
+                    sample_rate,
+                    language,
+                    prompt,
+                    self_kv,
+                    cross_kv,
+                )
+            }
+            Self::VibeVoice(_) => self
+                .transcribe_vibevoice_with_details_and_prompt_and_options_physical(
+                    audio,
+                    sample_rate,
+                    language,
+                    prompt,
+                    options,
+                    leases,
+                ),
+            Self::GraniteSpeech(_) => {
+                let cache = leases
+                    .lease_exact_kind_mut(InvocationStateBackingKindV2::PagedAttention)?
+                    .paged_cache_mut()?;
+                self.transcribe_granite_speech_with_details_and_prompt_and_options_physical(
+                    audio,
+                    sample_rate,
+                    language,
+                    prompt,
+                    options,
+                    cache,
+                )
+            }
+            Self::Parakeet(_) => {
+                let state = leases
+                    .lease_exact_kind_mut(InvocationStateBackingKindV2::Tensor)?
+                    .typed_mut::<InvocationTensorLease>()?;
+                self.transcribe_parakeet_with_details_physical(audio, sample_rate, language, state)
+            }
+            Self::Nemotron(_) => {
+                let (predictor, acoustic) = leases.lease_exact_kind_pair_mut(
+                    InvocationStateBackingKindV2::Tensor,
+                    InvocationStateBackingKindV2::StaticTensor,
+                )?;
+                self.transcribe_nemotron_with_details_and_prompt_physical(
+                    audio,
+                    sample_rate,
+                    language,
+                    prompt,
+                    predictor.typed_mut::<InvocationTensorLease>()?,
+                    acoustic.typed_mut::<InvocationTensorLease>()?,
+                )
+            }
+        }
+    }
+
+    pub(crate) fn nemotron_offline_physical_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<NemotronOfflinePhysicalStateSpec> {
+        match self {
+            Self::Nemotron(model) => model.offline_physical_state_spec(stage_graphs),
+            _ => Err(Error::ModelLoadError(
+                "non-Nemotron ASR model cannot author offline Nemotron physical state".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn transcribe_nemotron_with_details_and_prompt_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        predictor: &mut InvocationTensorLease,
+        acoustic: &mut InvocationTensorLease,
+    ) -> Result<NativeAsrTranscription> {
+        let Self::Nemotron(model) = self else {
+            return Err(Error::InferenceError(
+                "Nemotron offline physical state was routed to a different model".to_string(),
+            ));
+        };
+        let NemotronAsrTranscriptionOutput {
+            text,
+            language,
+            diagnostics,
+        } = model.transcribe_with_details_and_prompt_physical(
+            audio,
+            sample_rate,
+            language,
+            prompt,
+            predictor,
+            acoustic,
+        )?;
+        Ok(NativeAsrTranscription {
+            text,
+            language,
+            diagnostics,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn transcribe_nemotron_with_callback_and_prompt_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        predictor: &mut InvocationTensorLease,
+        acoustic: &mut InvocationTensorLease,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<String> {
+        let Self::Nemotron(model) = self else {
+            return Err(Error::InferenceError(
+                "Nemotron offline physical state was routed to a different model".to_string(),
+            ));
+        };
+        model.transcribe_with_callback_and_prompt_physical(
+            audio,
+            sample_rate,
+            language,
+            prompt,
+            predictor,
+            acoustic,
+            on_delta,
+        )
+    }
+
+    pub(crate) fn parakeet_physical_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<ParakeetPhysicalStateSpec> {
+        match self {
+            Self::Parakeet(model) => model.physical_state_spec(stage_graphs),
+            _ => Err(Error::ModelLoadError(
+                "non-Parakeet ASR model cannot author Parakeet physical state".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn transcribe_parakeet_with_details_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        state: &mut InvocationTensorLease,
+    ) -> Result<NativeAsrTranscription> {
+        let Self::Parakeet(model) = self else {
+            return Err(Error::InferenceError(
+                "Parakeet physical ASR state was routed to a different model".to_string(),
+            ));
+        };
+        let ParakeetAsrTranscriptionOutput {
+            text,
+            language,
+            diagnostics,
+        } = model.transcribe_with_details_physical(audio, sample_rate, language, state)?;
+        Ok(NativeAsrTranscription {
+            text,
+            language,
+            diagnostics,
+        })
+    }
+
+    pub(crate) fn transcribe_parakeet_with_callback_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        state: &mut InvocationTensorLease,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<String> {
+        let Self::Parakeet(model) = self else {
+            return Err(Error::InferenceError(
+                "Parakeet physical ASR state was routed to a different model".to_string(),
+            ));
+        };
+        model.transcribe_with_callback_physical(audio, sample_rate, language, state, on_delta)
+    }
+
+    pub(crate) fn whisper_physical_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<WhisperPhysicalStateSpec> {
+        match self {
+            Self::WhisperTurbo(model) => model.physical_state_spec(stage_graphs),
+            _ => Err(Error::ModelLoadError(
+                "non-Whisper ASR model cannot author Whisper physical state".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn transcribe_whisper_with_details_and_prompt_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        self_kv: &mut PhysicalPagedKvCache,
+        cross_kv: &mut InvocationStaticAttentionLease,
+    ) -> Result<NativeAsrTranscription> {
+        let Self::WhisperTurbo(model) = self else {
+            return Err(Error::InferenceError(
+                "Whisper physical ASR state was routed to a different model".to_string(),
+            ));
+        };
+        let WhisperAsrTranscriptionOutput {
+            text,
+            language,
+            diagnostics,
+        } = model.transcribe_with_details_and_prompt_physical(
+            audio,
+            sample_rate,
+            language,
+            prompt,
+            self_kv,
+            cross_kv,
+        )?;
+        Ok(NativeAsrTranscription {
+            text,
+            language,
+            diagnostics,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn transcribe_whisper_with_callback_and_prompt_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        self_kv: &mut PhysicalPagedKvCache,
+        cross_kv: &mut InvocationStaticAttentionLease,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<String> {
+        let Self::WhisperTurbo(model) = self else {
+            return Err(Error::InferenceError(
+                "Whisper physical ASR state was routed to a different model".to_string(),
+            ));
+        };
+        model.transcribe_with_callback_and_prompt_physical(
+            audio,
+            sample_rate,
+            language,
+            prompt,
+            self_kv,
+            cross_kv,
+            on_delta,
+        )
+    }
+
+    pub(crate) fn granite_speech_physical_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<GraniteSpeechPhysicalStateSpec> {
+        match self {
+            Self::GraniteSpeech(model) => model.physical_state_spec(stage_graphs),
+            _ => Err(Error::ModelLoadError(
+                "non-Granite ASR model cannot author Granite Speech physical state".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn prepare_granite_speech_prompt_artifact(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Result<Arc<GraniteSpeechPreparedPromptArtifact>> {
+        match self {
+            Self::GraniteSpeech(model) => {
+                let audio = model.prepare_audio_retained(audio, sample_rate)?;
+                model.prepare_prompt_artifact(
+                    audio.as_ref(),
+                    language,
+                    GraniteSpeechTask::Asr,
+                    prompt,
+                    None,
+                )
+            }
+            _ => Err(Error::InvalidInput(
+                "Granite Speech preparation was requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn granite_speech_retained_preparation_geometry(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Result<GraniteSpeechPreparedGeometry> {
+        match self {
+            Self::GraniteSpeech(model) => {
+                model.retained_preparation_geometry(audio, sample_rate, language, prompt)
+            }
+            _ => Err(Error::InvalidInput(
+                "Granite Speech geometry was requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn transcribe_granite_speech_with_details_and_prompt_and_options_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        options: NativeAsrGenerationOptions,
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<NativeAsrTranscription> {
+        let Self::GraniteSpeech(model) = self else {
+            return Err(Error::InferenceError(
+                "Granite Speech physical ASR pages were routed to a different model".to_string(),
+            ));
+        };
+        let GraniteSpeechAsrTranscriptionOutput {
+            text,
+            language,
+            diagnostics,
+        } = model.transcribe_with_details_and_prompt_and_options_physical(
+            audio,
+            sample_rate,
+            language,
+            prompt,
+            granite_speech_asr_options(options),
+            cache,
+        )?;
+        Ok(NativeAsrTranscription {
+            text,
+            language,
+            diagnostics,
+        })
+    }
+
+    pub(crate) fn transcribe_granite_speech_with_details_prompt_prefix_and_options_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        prefix_text: Option<&str>,
+        options: NativeAsrGenerationOptions,
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<NativeAsrTranscription> {
+        let Self::GraniteSpeech(model) = self else {
+            return Err(Error::InferenceError(
+                "Granite Speech physical ASR pages were routed to a different model".to_string(),
+            ));
+        };
+        let GraniteSpeechAsrTranscriptionOutput {
+            text,
+            language,
+            diagnostics,
+        } = model.transcribe_with_details_and_prompt_prefix_and_options_physical(
+            audio,
+            sample_rate,
+            language,
+            prompt,
+            prefix_text,
+            granite_speech_asr_options(options),
+            cache,
+        )?;
+        Ok(NativeAsrTranscription {
+            text,
+            language,
+            diagnostics,
+        })
+    }
+
+    pub(crate) fn transcribe_granite_speech_with_callback_and_prompt_and_options_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        options: NativeAsrGenerationOptions,
+        cache: &mut PhysicalPagedKvCache,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<String> {
+        let Self::GraniteSpeech(model) = self else {
+            return Err(Error::InferenceError(
+                "Granite Speech physical ASR pages were routed to a different model".to_string(),
+            ));
+        };
+        model
+            .transcribe_with_callback_and_prompt_and_options_physical(
+                audio,
+                sample_rate,
+                language,
+                prompt,
+                granite_speech_asr_options(options),
+                cache,
+                on_delta,
+            )
+            .map(|output| output.text)
+    }
+
+    pub(crate) fn transcribe_granite_speech_task_and_options_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        task: GraniteSpeechTask,
+        prefix_text: Option<&str>,
+        options: NativeAsrGenerationOptions,
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<NativeAsrTranscription> {
+        let Self::GraniteSpeech(model) = self else {
+            return Err(Error::InferenceError(
+                "Granite Speech physical ASR pages were routed to a different model".to_string(),
+            ));
+        };
+        let GraniteSpeechAsrTranscriptionOutput {
+            text,
+            language,
+            diagnostics,
+        } = model.transcribe_with_details_task_prefix_and_options_physical(
+            audio,
+            sample_rate,
+            language,
+            task,
+            prefix_text,
+            granite_speech_asr_options(options),
+            cache,
+        )?;
+        Ok(NativeAsrTranscription {
+            text,
+            language,
+            diagnostics,
+        })
+    }
+
+    pub(crate) fn vibevoice_physical_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<VibeVoicePhysicalStateSpec> {
+        match self {
+            Self::VibeVoice(model) => model.physical_state_spec(stage_graphs),
+            _ => Err(Error::ModelLoadError(
+                "non-VibeVoice ASR model cannot author VibeVoice physical state".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn vibevoice_scalar_preparation_stage_seal(
+        &self,
+        backend: BackendKind,
+    ) -> Result<VibeVoiceAsrPreparationStageSeal> {
+        match self {
+            Self::VibeVoice(model) => model.scalar_preparation_stage_seal(backend),
+            _ => Err(Error::ModelLoadError(
+                "non-VibeVoice ASR model cannot seal VibeVoice preparation".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn vibevoice_retained_preparation_decision(
+        &self,
+        input_samples: usize,
+        input_sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Result<VibeVoiceAsrPreparationDecision> {
+        match self {
+            Self::VibeVoice(model) => model.retained_preparation_decision(
+                input_samples,
+                input_sample_rate,
+                language,
+                prompt,
+            ),
+            _ => Err(Error::InvalidInput(
+                "VibeVoice preparation route was requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn prepare_vibevoice_retained_artifact(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Result<VibeVoiceAsrPreparedArtifact> {
+        match self {
+            Self::VibeVoice(model) => {
+                model.prepare_retained_artifact(audio, sample_rate, language, prompt)
+            }
+            _ => Err(Error::InvalidInput(
+                "VibeVoice preparation was requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn validate_vibevoice_retained_artifact(
+        &self,
+        artifact: &VibeVoiceAsrPreparedArtifact,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Result<()> {
+        match self {
+            Self::VibeVoice(model) => {
+                model.validate_retained_artifact(artifact, audio, sample_rate, language, prompt)
+            }
+            _ => Err(Error::InvalidInput(
+                "VibeVoice artifact validation was requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn transcribe_vibevoice_with_details_and_prompt_and_options_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        options: NativeAsrGenerationOptions,
+        leases: &mut InvocationWorkspaceLeaseSetV2,
+    ) -> Result<NativeAsrTranscription> {
+        let Self::VibeVoice(model) = self else {
+            return Err(Error::InferenceError(
+                "VibeVoice physical ASR pages were routed to a different model".to_string(),
+            ));
+        };
+        let VibeVoiceAsrTranscriptionOutput {
+            text,
+            language,
+            diagnostics,
+        } = model.transcribe_with_details_and_prompt_and_options_physical(
+            audio,
+            sample_rate,
+            language,
+            prompt,
+            vibevoice_asr_options(options),
+            leases,
+        )?;
+        Ok(NativeAsrTranscription {
+            text,
+            language,
+            diagnostics,
+        })
+    }
+
+    pub(crate) fn transcribe_vibevoice_with_callback_and_prompt_and_options_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        options: NativeAsrGenerationOptions,
+        leases: &mut InvocationWorkspaceLeaseSetV2,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<String> {
+        let Self::VibeVoice(model) = self else {
+            return Err(Error::InferenceError(
+                "VibeVoice physical ASR pages were routed to a different model".to_string(),
+            ));
+        };
+        model.transcribe_with_callback_and_prompt_and_options_physical(
+            audio,
+            sample_rate,
+            language,
+            prompt,
+            vibevoice_asr_options(options),
+            leases,
+            on_delta,
+        )
+    }
+
+    pub(crate) fn qwen3_physical_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<Qwen3AsrPhysicalStateSpec> {
+        match self {
+            Self::Qwen3(model) => model.physical_state_spec(stage_graphs),
+            _ => Err(Error::ModelLoadError(
+                "non-Qwen ASR model cannot author Qwen3 physical state".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn transcribe_qwen3_with_details_and_prompt_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<NativeAsrTranscription> {
+        let Self::Qwen3(model) = self else {
+            return Err(Error::InferenceError(
+                "Qwen3 physical ASR pages were routed to a non-Qwen model".to_string(),
+            ));
+        };
+        let Qwen3AsrTranscriptionOutput {
+            text,
+            language,
+            diagnostics,
+        } = model.transcribe_with_details_and_prompt_physical(
+            audio,
+            sample_rate,
+            language,
+            prompt,
+            cache,
+        )?;
+        Ok(NativeAsrTranscription {
+            text,
+            language,
+            diagnostics,
+        })
+    }
+
+    pub(crate) fn transcribe_qwen3_with_callback_and_prompt_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        on_delta: &mut dyn FnMut(&str),
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<String> {
+        let Self::Qwen3(model) = self else {
+            return Err(Error::InferenceError(
+                "Qwen3 physical ASR pages were routed to a non-Qwen model".to_string(),
+            ));
+        };
+        model.transcribe_with_callback_and_prompt_physical(
+            audio,
+            sample_rate,
+            language,
+            prompt,
+            on_delta,
+            cache,
+        )
+    }
+
     pub fn transcribe(
         &self,
         audio: &[f32],
@@ -1057,21 +2233,51 @@ impl NativeAsrModel {
     }
 
     pub fn supports_incremental_decode(&self) -> bool {
-        matches!(self, Self::Qwen3(_))
+        match self {
+            Self::Qwen3(_) => true,
+            Self::GraniteSpeech(model) => model.supports_incremental_decode(),
+            _ => false,
+        }
     }
 
-    pub fn session_cache_reservation_bytes(
-        &self,
-        language: Option<&str>,
-        prompt: Option<&str>,
-        max_new_tokens: usize,
-    ) -> Result<u64> {
+    pub fn supports_resumable_prefill(&self) -> bool {
         match self {
-            Self::Qwen3(model) => {
-                model.session_cache_reservation_bytes(language, prompt, max_new_tokens)
-            }
+            Self::Qwen3(model) => model.supports_resumable_prefill(),
+            Self::VibeVoice(_) => true,
+            Self::GraniteSpeech(model) => model.supports_resumable_prefill(),
+            _ => false,
+        }
+    }
+
+    pub fn supports_continuous_decode_batch(&self) -> bool {
+        match self {
+            Self::Qwen3(model) => model.supports_continuous_decode_batch(),
+            Self::Parakeet(_) => true,
+            Self::VibeVoice(model) => model.supports_continuous_decode_batch(),
+            Self::GraniteSpeech(model) => model.supports_continuous_decode_batch(),
+            _ => false,
+        }
+    }
+
+    pub fn supports_static_prefill_batch(&self) -> bool {
+        matches!(self, Self::Parakeet(_) | Self::VibeVoice(_))
+    }
+
+    pub fn continuous_decode_is_tensor_batched(&self) -> bool {
+        matches!(self, Self::Qwen3(model) if model.continuous_decode_is_tensor_batched())
+            || matches!(self, Self::VibeVoice(_) | Self::GraniteSpeech(_))
+    }
+
+    pub fn continuous_decode_batch_workspace_per_row_bytes(&self) -> Result<u64> {
+        match self {
+            Self::Qwen3(model) => model.continuous_decode_batch_workspace_per_row_bytes(),
+            Self::Parakeet(_) => Ok(
+                crate::models::architectures::parakeet::asr::PARAKEET_RETAINED_WORKSPACE_PER_ROW_BYTES,
+            ),
+            Self::VibeVoice(model) => model.continuous_decode_workspace_per_row_bytes(),
+            Self::GraniteSpeech(model) => model.continuous_decode_workspace_per_row_bytes(),
             _ => Err(Error::InvalidInput(
-                "Loaded ASR model does not expose incremental cache authorization".to_string(),
+                "Loaded ASR model does not expose continuous tensor decode".to_string(),
             )),
         }
     }
@@ -1132,6 +2338,65 @@ impl NativeAsrModel {
             )),
             _ => Err(Error::InvalidInput(
                 "Realtime audio stream state is not available for this ASR model".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn realtime_physical_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<NemotronRealtimePhysicalStateSpec> {
+        match self {
+            Self::Nemotron(model) => model.realtime_physical_state_spec(stage_graphs),
+            _ => Err(Error::InvalidInput(
+                "Realtime physical state is not available for this ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn hydrate_realtime_physical_state(
+        &self,
+        state: &mut NativeAsrRealtimeState,
+        runtime: &RetainedTensorStateRuntimeV2,
+        transaction: PhysicalStateTransactionId,
+    ) -> Result<()> {
+        match (self, state) {
+            (Self::Nemotron(model), NativeAsrRealtimeState::Nemotron(state)) => {
+                model.hydrate_realtime_physical_state(state, runtime, transaction)
+            }
+            _ => Err(Error::InvalidInput(
+                "ASR realtime physical state does not match the loaded model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn stage_realtime_physical_state(
+        &self,
+        state: &mut NativeAsrRealtimeState,
+        runtime: &RetainedTensorStateRuntimeV2,
+        transaction: PhysicalStateTransactionId,
+        target_cursor: u64,
+    ) -> Result<()> {
+        match (self, state) {
+            (Self::Nemotron(model), NativeAsrRealtimeState::Nemotron(state)) => {
+                model.stage_realtime_physical_state(state, runtime, transaction, target_cursor)
+            }
+            _ => Err(Error::InvalidInput(
+                "ASR realtime physical state does not match the loaded model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn clear_realtime_tensor_handles(
+        &self,
+        state: &mut NativeAsrRealtimeState,
+    ) -> Result<()> {
+        match (self, state) {
+            (Self::Nemotron(model), NativeAsrRealtimeState::Nemotron(state)) => {
+                model.clear_realtime_tensor_handles(state)
+            }
+            _ => Err(Error::InvalidInput(
+                "ASR realtime physical state does not match the loaded model".into(),
             )),
         }
     }
@@ -1216,6 +2481,24 @@ impl NativeAsrModel {
         }
     }
 
+    pub(crate) fn incremental_prompt_token_count(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Result<usize> {
+        match self {
+            Self::Qwen3(model) => {
+                model.incremental_prompt_token_count(audio, sample_rate, language, prompt)
+            }
+            _ => Err(Error::InvalidInput(
+                "Loaded ASR model does not expose multimodal sequence shape preparation"
+                    .to_string(),
+            )),
+        }
+    }
+
     pub fn start_decode_state(
         &self,
         audio: &[f32],
@@ -1235,14 +2518,8 @@ impl NativeAsrModel {
         max_new_tokens: usize,
     ) -> Result<NativeAsrDecodeState> {
         match self {
-            Self::Qwen3(model) => Ok(NativeAsrDecodeState::Qwen3(
-                model.start_decode_with_prompt(
-                    audio,
-                    sample_rate,
-                    language,
-                    prompt,
-                    max_new_tokens,
-                )?,
+            Self::Qwen3(_) => Err(Error::InvalidInput(
+                "Incremental Qwen3 ASR requires scheduler-owned physical state".to_string(),
             )),
             Self::Parakeet(_) => Err(Error::InvalidInput(
                 "Incremental decode state is not available for this ASR model".to_string(),
@@ -1268,6 +2545,230 @@ impl NativeAsrModel {
         }
     }
 
+    /// Start Qwen3 ASR with an exact scheduler-owned cache reservation.
+    /// Other ASR architectures fail closed until they provide their own
+    /// managed-cache adapter instead of being selected by family inference.
+    pub(crate) fn start_decode_state_with_prompt_managed(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        max_new_tokens: usize,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<NativeAsrDecodeState> {
+        match self {
+            Self::Qwen3(model) => Ok(NativeAsrDecodeState::Qwen3(
+                model.start_decode_with_prompt_managed(
+                    audio,
+                    sample_rate,
+                    language,
+                    prompt,
+                    max_new_tokens,
+                    cache,
+                )?,
+            )),
+            _ => Err(Error::InvalidInput(
+                "managed Qwen3 KV cache was supplied to a non-Qwen3 ASR model".to_string(),
+            )),
+        }
+    }
+
+    /// Prepare Qwen3 ASR's immutable multimodal decoder input while leaving
+    /// its scheduler-owned physical KV empty. Exact prompt spans are committed
+    /// later through [`Self::continue_resumable_prefill`].
+    pub(crate) fn start_resumable_prefill_state_with_prompt_managed(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        max_new_tokens: usize,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<NativeAsrDecodeState> {
+        match self {
+            Self::Qwen3(model) => Ok(NativeAsrDecodeState::Qwen3(
+                model.begin_resumable_prefill_managed(
+                    audio,
+                    sample_rate,
+                    language,
+                    prompt,
+                    max_new_tokens,
+                    cache,
+                )?,
+            )),
+            _ => Err(Error::InvalidInput(
+                "resumable Qwen3 KV prefill was supplied to a non-Qwen3 ASR model".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn start_resumable_prefill_from_prepared_audio_managed(
+        &self,
+        prepared: &Qwen3AsrPreparedAudio,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        max_new_tokens: usize,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<NativeAsrDecodeState> {
+        match self {
+            Self::Qwen3(model) => Ok(NativeAsrDecodeState::Qwen3(
+                model.begin_resumable_prefill_managed_from_prepared_audio(
+                    prepared,
+                    language,
+                    prompt,
+                    max_new_tokens,
+                    cache,
+                )?,
+            )),
+            _ => Err(Error::InvalidInput(
+                "prepared Qwen3 ASR audio was supplied to another ASR model".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn start_decode_state_from_prepared_audio_managed(
+        &self,
+        prepared: &Qwen3AsrPreparedAudio,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        max_new_tokens: usize,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<NativeAsrDecodeState> {
+        match self {
+            Self::Qwen3(model) => Ok(NativeAsrDecodeState::Qwen3(
+                model.start_decode_with_prompt_managed_from_prepared_audio(
+                    prepared,
+                    language,
+                    prompt,
+                    max_new_tokens,
+                    cache,
+                )?,
+            )),
+            _ => Err(Error::InvalidInput(
+                "prepared Qwen3 ASR audio was supplied to another ASR model".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn start_vibevoice_resumable_prefill_managed(
+        &self,
+        prepared: Arc<VibeVoiceAsrPreparedArtifact>,
+        options: NativeAsrGenerationOptions,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<NativeAsrDecodeState> {
+        match self {
+            Self::VibeVoice(model) => Ok(NativeAsrDecodeState::VibeVoice(
+                model.begin_resumable_prefill_managed(
+                    prepared,
+                    vibevoice_asr_options(options),
+                    cache,
+                )?,
+            )),
+            _ => Err(Error::InvalidInput(
+                "prepared VibeVoice ASR input was supplied to another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn start_granite_speech_resumable_prefill_managed(
+        &self,
+        prepared: Arc<GraniteSpeechPreparedPromptArtifact>,
+        options: NativeAsrGenerationOptions,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<NativeAsrDecodeState> {
+        match self {
+            Self::GraniteSpeech(model) => Ok(NativeAsrDecodeState::GraniteSpeech(
+                model.begin_resumable_prefill_managed(
+                    prepared,
+                    granite_speech_asr_options(options),
+                    cache,
+                )?,
+            )),
+            _ => Err(Error::InvalidInput(
+                "prepared Granite Speech input was supplied to another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn continue_resumable_prefill(
+        &self,
+        state: &mut NativeAsrDecodeState,
+        span_start: usize,
+        span_end: usize,
+    ) -> Result<bool> {
+        match (self, state) {
+            (Self::Qwen3(model), NativeAsrDecodeState::Qwen3(state)) => {
+                model.continue_resumable_prefill(state, span_start, span_end)
+            }
+            (Self::VibeVoice(model), NativeAsrDecodeState::VibeVoice(state)) => {
+                model.continue_resumable_prefill(state, span_start, span_end)
+            }
+            (Self::GraniteSpeech(model), NativeAsrDecodeState::GraniteSpeech(state)) => {
+                model.continue_resumable_prefill(state, span_start, span_end)
+            }
+            _ => Err(Error::InvalidInput(
+                "ASR resumable-prefill state does not match loaded ASR model".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn continue_vibevoice_resumable_prefill_retained(
+        &self,
+        state: &mut NativeAsrDecodeState,
+        span_start: usize,
+        span_end: usize,
+        tokenizer_quantum: Option<VibeVoiceAsrRetainedTokenizerQuantum>,
+    ) -> Result<bool> {
+        match (self, state) {
+            (Self::VibeVoice(model), NativeAsrDecodeState::VibeVoice(state)) => model
+                .continue_resumable_prefill_retained(
+                    state,
+                    span_start,
+                    span_end,
+                    tokenizer_quantum,
+                ),
+            _ => Err(Error::InvalidInput(
+                "retained VibeVoice prefill state does not match the loaded ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn prepare_vibevoice_retained_tokenizer_batch(
+        &self,
+        rows: &[VibeVoiceAsrRetainedPrefillBatchRow],
+    ) -> Result<Vec<VibeVoiceAsrPreparedTokenizerSpan>> {
+        match self {
+            Self::VibeVoice(model) => model.prepare_retained_tokenizer_batch(rows),
+            _ => Err(Error::InvalidInput(
+                "VibeVoice tokenizer batch was supplied to another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn continue_vibevoice_resumable_prefill_prepared(
+        &self,
+        state: &mut NativeAsrDecodeState,
+        span_start: usize,
+        span_end: usize,
+        tokenizer_quantum: VibeVoiceAsrRetainedTokenizerQuantum,
+        prepared: &VibeVoiceAsrPreparedTokenizerSpan,
+    ) -> Result<bool> {
+        match (self, state) {
+            (Self::VibeVoice(model), NativeAsrDecodeState::VibeVoice(state)) => model
+                .continue_resumable_prefill_prepared(
+                    state,
+                    span_start,
+                    span_end,
+                    tokenizer_quantum,
+                    prepared,
+                ),
+            _ => Err(Error::InvalidInput(
+                "prepared VibeVoice tokenizer span does not match the loaded ASR model".into(),
+            )),
+        }
+    }
+
     pub fn decode_step(&self, state: &mut NativeAsrDecodeState) -> Result<NativeAsrDecodeStep> {
         match (self, state) {
             (Self::Qwen3(model), NativeAsrDecodeState::Qwen3(state)) => {
@@ -1288,8 +2789,104 @@ impl NativeAsrModel {
                     finished: step.finished,
                 })
             }
+            (Self::VibeVoice(model), NativeAsrDecodeState::VibeVoice(state)) => {
+                let step: VibeVoiceAsrDecodeStep = model.decode_step(state)?;
+                Ok(NativeAsrDecodeStep {
+                    delta: step.delta,
+                    text: step.text,
+                    tokens_generated: step.tokens_generated,
+                    finished: step.finished,
+                })
+            }
+            (Self::GraniteSpeech(model), NativeAsrDecodeState::GraniteSpeech(state)) => {
+                let step: GraniteSpeechDecodeStep = model.decode_step(state)?;
+                Ok(NativeAsrDecodeStep {
+                    delta: step.delta,
+                    text: step.text,
+                    tokens_generated: step.tokens_generated,
+                    finished: step.finished,
+                })
+            }
             _ => Err(Error::InvalidInput(
                 "ASR decode state does not match loaded ASR model".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn decode_step_batch(
+        &self,
+        states: &mut [&mut NativeAsrDecodeState],
+    ) -> Result<Vec<NativeAsrDecodeStep>> {
+        match self {
+            Self::Qwen3(model) => {
+                let mut typed = states
+                    .iter_mut()
+                    .map(|state| match &mut **state {
+                        NativeAsrDecodeState::Qwen3(state) => Ok(state),
+                        _ => Err(Error::InvalidInput(
+                            "continuous Qwen3 ASR batch contains a foreign state".to_string(),
+                        )),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                model.decode_step_batch(&mut typed).map(|steps| {
+                    steps
+                        .into_iter()
+                        .map(|step| NativeAsrDecodeStep {
+                            delta: step.delta,
+                            text: step.text,
+                            tokens_generated: step.tokens_generated,
+                            finished: step.finished,
+                        })
+                        .collect()
+                })
+            }
+            Self::VibeVoice(model) => {
+                let mut typed = states
+                    .iter_mut()
+                    .map(|state| match &mut **state {
+                        NativeAsrDecodeState::VibeVoice(state) => Ok(state),
+                        _ => Err(Error::InvalidInput(
+                            "continuous VibeVoice ASR batch contains a foreign state".to_string(),
+                        )),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                model.decode_step_batch(&mut typed).map(|steps| {
+                    steps
+                        .into_iter()
+                        .map(|step| NativeAsrDecodeStep {
+                            delta: step.delta,
+                            text: step.text,
+                            tokens_generated: step.tokens_generated,
+                            finished: step.finished,
+                        })
+                        .collect()
+                })
+            }
+            Self::GraniteSpeech(model) => {
+                let mut typed = states
+                    .iter_mut()
+                    .map(|state| match &mut **state {
+                        NativeAsrDecodeState::GraniteSpeech(state) => Ok(state),
+                        _ => Err(Error::InvalidInput(
+                            "continuous Granite Speech ASR batch contains a foreign state"
+                                .to_string(),
+                        )),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                model.decode_step_batch(&mut typed).map(|steps| {
+                    steps
+                        .into_iter()
+                        .map(|step| NativeAsrDecodeStep {
+                            delta: step.delta,
+                            text: step.text,
+                            tokens_generated: step.tokens_generated,
+                            finished: step.finished,
+                        })
+                        .collect()
+                })
+            }
+            _ => Err(Error::InvalidInput(
+                "Loaded ASR model does not expose continuous tensor decode".to_string(),
             )),
         }
     }
@@ -1324,6 +2921,17 @@ fn lfm25_audio_asr_long_form_config() -> AsrLongFormConfig {
         .min(cfg.hard_max_chunk_secs);
     cfg.overlap_secs = cfg.overlap_secs.clamp(0.0, cfg.target_chunk_secs * 0.45);
     cfg
+}
+
+fn lfm25_audio_asr_requires_long_form(audio: &[f32], sample_rate: u32) -> bool {
+    plan_audio_chunks(
+        audio,
+        sample_rate,
+        &lfm25_audio_asr_long_form_config(),
+        None,
+    )
+    .len()
+        > 1
 }
 
 fn lfm25_audio_asr_single_pass_max_new_tokens(max_tokens: Option<usize>) -> usize {
@@ -1383,25 +2991,325 @@ fn env_positive_usize(key: &str) -> Option<usize> {
 }
 
 impl NativeAudioChatModel {
-    pub fn generate_sequential(
+    pub(crate) fn retained_asr_state_spec(
         &self,
-        messages: &[ChatMessage],
-        max_new_tokens: usize,
-    ) -> Result<NativeAudioChatGeneration> {
-        self.generate_sequential_with_callback(messages, max_new_tokens, &mut |_delta| {})
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<Lfm25AudioRetainedStateSpec> {
+        match self {
+            Self::Lfm25Audio(model) => {
+                model.retained_state_spec(Lfm25AudioRetainedMode::Asr, stage_graphs)
+            }
+        }
     }
 
-    pub fn generate_sequential_with_callback(
+    pub(crate) fn retained_tts_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<Lfm25AudioRetainedStateSpec> {
+        match self {
+            Self::Lfm25Audio(model) => {
+                model.retained_state_spec(Lfm25AudioRetainedMode::Tts, stage_graphs)
+            }
+        }
+    }
+
+    pub(crate) fn prepare_lfm25_audio_tts_artifact(
+        &self,
+        messages: &[ChatMessage],
+    ) -> Result<Arc<Lfm25AudioPreparedTtsArtifact>> {
+        match self {
+            Self::Lfm25Audio(model) => model.prepare_lfm25_audio_tts_artifact(messages),
+        }
+    }
+
+    pub(crate) fn lfm25_audio_tts_stage_ceiling(&self) -> Result<Lfm25AudioTtsStageCeiling> {
+        match self {
+            Self::Lfm25Audio(model) => model.tts_stage_ceiling(),
+        }
+    }
+
+    pub(crate) fn lfm25_audio_tts_prefill_resource_envelope(
+        &self,
+        start: usize,
+        tokens: usize,
+        prompt_tokens: usize,
+    ) -> Result<Lfm25AudioTtsStepResourceEnvelope> {
+        match self {
+            Self::Lfm25Audio(model) => {
+                model.tts_prefill_resource_envelope(start, tokens, prompt_tokens)
+            }
+        }
+    }
+
+    pub(crate) fn lfm25_audio_tts_decode_resource_envelope(
+        &self,
+        position: usize,
+        include_depthformer: bool,
+    ) -> Result<Lfm25AudioTtsStepResourceEnvelope> {
+        match self {
+            Self::Lfm25Audio(model) => {
+                model.tts_decode_resource_envelope(position, include_depthformer)
+            }
+        }
+    }
+
+    pub(crate) fn new_lfm25_audio_retained_tts_state(
+        &self,
+        artifact: Arc<Lfm25AudioPreparedTtsArtifact>,
+        requested_max_new_tokens: usize,
+        generation: Lfm25AudioGenerationConfig,
+    ) -> Result<Lfm25AudioTtsRetainedState> {
+        match self {
+            Self::Lfm25Audio(model) => {
+                model.new_retained_tts_state(artifact, requested_max_new_tokens, generation)
+            }
+        }
+    }
+
+    pub(crate) fn lfm25_audio_tts_prefill_step(
+        &self,
+        state: &mut Lfm25AudioTtsRetainedState,
+        main: &mut PhysicalPagedKvCache,
+        checkpoint: &Lfm25AudioTtsQuantumCheckpoint,
+        max_tokens: usize,
+    ) -> Result<Lfm25AudioTtsPrefillStep> {
+        match self {
+            Self::Lfm25Audio(model) => {
+                model.retained_tts_prefill_step(state, main, checkpoint, max_tokens)
+            }
+        }
+    }
+
+    pub(crate) fn lfm25_audio_tts_prefill_batch(
+        &self,
+        states: &mut [&mut Lfm25AudioTtsRetainedState],
+        mains: &mut [&mut PhysicalPagedKvCache],
+        checkpoints: &[&Lfm25AudioTtsQuantumCheckpoint],
+        max_tokens: &[usize],
+    ) -> Result<Lfm25AudioTtsPrefillBatch> {
+        match self {
+            Self::Lfm25Audio(model) => {
+                model.retained_tts_prefill_batch(states, mains, checkpoints, max_tokens)
+            }
+        }
+    }
+
+    pub(crate) fn lfm25_audio_tts_decode_step(
+        &self,
+        state: &mut Lfm25AudioTtsRetainedState,
+        main: &mut PhysicalPagedKvCache,
+        depthformer: Option<&mut PhysicalPagedKvCache>,
+        checkpoint: &Lfm25AudioTtsQuantumCheckpoint,
+    ) -> Result<Lfm25AudioTtsDecodeStep> {
+        match self {
+            Self::Lfm25Audio(model) => {
+                model.retained_tts_decode_step(state, main, depthformer, checkpoint)
+            }
+        }
+    }
+
+    pub(crate) fn lfm25_audio_tts_audio_decode_batch(
+        &self,
+        states: &mut [&mut Lfm25AudioTtsRetainedState],
+        mains: &mut [&mut PhysicalPagedKvCache],
+        depthformers: &mut [&mut PhysicalPagedKvCache],
+        checkpoints: &[&Lfm25AudioTtsQuantumCheckpoint],
+    ) -> Result<Lfm25AudioTtsDecodeBatch> {
+        match self {
+            Self::Lfm25Audio(model) => {
+                model.retained_tts_audio_decode_batch(states, mains, depthformers, checkpoints)
+            }
+        }
+    }
+
+    pub(crate) fn lfm25_audio_tts_text_decode_batch(
+        &self,
+        states: &mut [&mut Lfm25AudioTtsRetainedState],
+        mains: &mut [&mut PhysicalPagedKvCache],
+        checkpoints: &[&Lfm25AudioTtsQuantumCheckpoint],
+    ) -> Result<Lfm25AudioTtsDecodeBatch> {
+        match self {
+            Self::Lfm25Audio(model) => {
+                model.retained_tts_text_decode_batch(states, mains, checkpoints)
+            }
+        }
+    }
+
+    pub(crate) fn detokenize_lfm25_audio_retained_tts_state(
+        &self,
+        state: &Lfm25AudioTtsRetainedState,
+    ) -> Result<Vec<f32>> {
+        match self {
+            Self::Lfm25Audio(model) => model.detokenize_retained_tts_state(state),
+        }
+    }
+
+    pub(crate) fn lfm25_audio_tts_output_sample_rate(&self) -> u32 {
+        match self {
+            Self::Lfm25Audio(model) => model.decoder_config().output_sample_rate,
+        }
+    }
+
+    pub(crate) fn asr_requires_long_form(&self, audio: &[f32], sample_rate: u32) -> bool {
+        lfm25_audio_asr_requires_long_form(audio, sample_rate)
+    }
+
+    pub(crate) fn prepare_lfm25_audio_asr_artifact(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+    ) -> Result<Arc<Lfm25AudioPreparedAsrArtifact>> {
+        match self {
+            Self::Lfm25Audio(model) => model.prepare_asr_artifact(audio, sample_rate),
+        }
+    }
+
+    pub(crate) fn lfm25_audio_asr_preparation_stage_ceiling(
+        &self,
+    ) -> Result<Lfm25AudioAsrPreparationStageCeiling> {
+        match self {
+            Self::Lfm25Audio(model) => model.asr_preparation_stage_ceiling(),
+        }
+    }
+
+    pub(crate) fn lfm25_audio_asr_preparation_resource_envelope(
+        &self,
+        source_samples: usize,
+        source_sample_rate: u32,
+    ) -> Result<Lfm25AudioAsrPreparationResourceEnvelope> {
+        match self {
+            Self::Lfm25Audio(model) => {
+                model.asr_preparation_resource_envelope(source_samples, source_sample_rate)
+            }
+        }
+    }
+
+    pub(crate) fn new_lfm25_audio_retained_asr_state(
+        &self,
+        artifact: Arc<Lfm25AudioPreparedAsrArtifact>,
+        requested_max_new_tokens: usize,
+    ) -> Result<Lfm25AudioAsrRetainedState> {
+        match self {
+            Self::Lfm25Audio(model) => {
+                model.new_retained_asr_state(artifact, requested_max_new_tokens)
+            }
+        }
+    }
+
+    pub(crate) fn lfm25_audio_asr_prefill_resource_envelope(
+        &self,
+        start: usize,
+        tokens: usize,
+        prompt_tokens: usize,
+    ) -> Result<Lfm25AudioAsrStepResourceEnvelope> {
+        match self {
+            Self::Lfm25Audio(model) => {
+                model.asr_prefill_resource_envelope(start, tokens, prompt_tokens)
+            }
+        }
+    }
+
+    pub(crate) fn lfm25_audio_asr_decode_resource_envelope(
+        &self,
+        position: usize,
+    ) -> Result<Lfm25AudioAsrStepResourceEnvelope> {
+        match self {
+            Self::Lfm25Audio(model) => model.asr_decode_resource_envelope(position),
+        }
+    }
+
+    pub(crate) fn lfm25_audio_asr_prefill_step(
+        &self,
+        state: &mut Lfm25AudioAsrRetainedState,
+        cache: &mut PhysicalPagedKvCache,
+        checkpoint: &Lfm25AudioAsrQuantumCheckpoint,
+        max_tokens: usize,
+    ) -> Result<Lfm25AudioAsrPrefillStep> {
+        match self {
+            Self::Lfm25Audio(model) => {
+                model.retained_asr_prefill_step(state, cache, checkpoint, max_tokens)
+            }
+        }
+    }
+
+    pub(crate) fn lfm25_audio_asr_prefill_batch(
+        &self,
+        states: &mut [&mut Lfm25AudioAsrRetainedState],
+        caches: &mut [&mut PhysicalPagedKvCache],
+        checkpoints: &[&Lfm25AudioAsrQuantumCheckpoint],
+        max_tokens: &[usize],
+    ) -> Result<Lfm25AudioAsrPrefillBatch> {
+        match self {
+            Self::Lfm25Audio(model) => {
+                model.retained_asr_prefill_batch(states, caches, checkpoints, max_tokens)
+            }
+        }
+    }
+
+    pub(crate) fn lfm25_audio_asr_decode_step(
+        &self,
+        state: &mut Lfm25AudioAsrRetainedState,
+        cache: &mut PhysicalPagedKvCache,
+        checkpoint: &Lfm25AudioAsrQuantumCheckpoint,
+    ) -> Result<Lfm25AudioAsrDecodeStep> {
+        match self {
+            Self::Lfm25Audio(model) => model.retained_asr_decode_step(state, cache, checkpoint),
+        }
+    }
+
+    pub(crate) fn lfm25_audio_asr_decode_will_append(
+        &self,
+        state: &Lfm25AudioAsrRetainedState,
+    ) -> Result<bool> {
+        match self {
+            Self::Lfm25Audio(model) => model.retained_asr_decode_will_append(state),
+        }
+    }
+
+    pub(crate) fn lfm25_audio_asr_decode_append_batch(
+        &self,
+        states: &mut [&mut Lfm25AudioAsrRetainedState],
+        caches: &mut [&mut PhysicalPagedKvCache],
+        checkpoints: &[&Lfm25AudioAsrQuantumCheckpoint],
+    ) -> Result<Vec<Lfm25AudioAsrDecodeStep>> {
+        match self {
+            Self::Lfm25Audio(model) => {
+                model.retained_asr_decode_append_batch(states, caches, checkpoints)
+            }
+        }
+    }
+
+    pub(crate) fn physical_state_spec(
+        &self,
+        mode: Lfm25AudioStateMode,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<Lfm25AudioPhysicalStateSpec> {
+        match self {
+            Self::Lfm25Audio(model) => model.physical_state_spec(mode, stage_graphs),
+        }
+    }
+
+    pub(crate) fn generate_sequential_with_callback_from_invocation_workspace(
         &self,
         messages: &[ChatMessage],
         max_new_tokens: usize,
+        leases: &mut InvocationWorkspaceLeaseSetV2,
         on_text_delta: &mut dyn FnMut(&str),
     ) -> Result<NativeAudioChatGeneration> {
         match self {
             Self::Lfm25Audio(model) => {
-                let output = model.generate_sequential_with_callback(
+                let (attention, shortconv, depthformer) = leases.lease_triplet_mut(
+                    LFM25_MAIN_ATTENTION_STATE_DOMAIN,
+                    LFM25_MAIN_SHORTCONV_STATE_DOMAIN,
+                    LFM25_DEPTHFORMER_STATE_DOMAIN,
+                )?;
+                let output = model.generate_sequential_with_config_and_callback_physical(
                     messages,
                     max_new_tokens,
+                    &Lfm25AudioGenerationConfig::default(),
+                    attention.paged_cache_mut()?,
+                    shortconv.typed_mut::<InvocationTensorLease>()?,
+                    depthformer.paged_cache_mut()?,
                     on_text_delta,
                 )?;
                 Ok(NativeAudioChatGeneration {
@@ -1418,7 +3326,7 @@ impl NativeAudioChatModel {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn generate_interleaved_with_config_and_callback(
+    pub(crate) fn generate_interleaved_with_config_and_callback_from_invocation_workspace(
         &self,
         history_messages: &[ChatMessage],
         audio: &[f32],
@@ -1427,12 +3335,18 @@ impl NativeAudioChatModel {
         system_prompt: Option<&str>,
         generation_config: &Lfm25AudioGenerationConfig,
         stream_config: &Lfm25AudioStreamConfig,
+        leases: &mut InvocationWorkspaceLeaseSetV2,
         on_text_delta: &mut dyn FnMut(&str),
         on_audio_samples: &mut dyn FnMut(&[f32]),
     ) -> Result<NativeAudioChatGeneration> {
         match self {
             Self::Lfm25Audio(model) => {
-                let output = model.generate_interleaved_with_config_and_callback(
+                let (attention, shortconv, depthformer) = leases.lease_triplet_mut(
+                    LFM25_MAIN_ATTENTION_STATE_DOMAIN,
+                    LFM25_MAIN_SHORTCONV_STATE_DOMAIN,
+                    LFM25_DEPTHFORMER_STATE_DOMAIN,
+                )?;
+                let output = model.generate_interleaved_with_config_and_callback_physical(
                     history_messages,
                     audio,
                     sample_rate,
@@ -1440,6 +3354,9 @@ impl NativeAudioChatModel {
                     system_prompt,
                     generation_config,
                     stream_config,
+                    attention.paged_cache_mut()?,
+                    shortconv.typed_mut::<InvocationTensorLease>()?,
+                    depthformer.paged_cache_mut()?,
                     on_text_delta,
                     on_audio_samples,
                 )?;
@@ -1456,42 +3373,43 @@ impl NativeAudioChatModel {
         }
     }
 
-    pub fn transcribe(&self, audio: &[f32], sample_rate: u32) -> Result<NativeAsrTranscription> {
-        self.transcribe_long_form_with_callback(audio, sample_rate, None, &mut |_delta| {})
-    }
-
-    pub fn transcribe_with_callback(
-        &self,
-        audio: &[f32],
-        sample_rate: u32,
-        on_delta: &mut dyn FnMut(&str),
-    ) -> Result<NativeAsrTranscription> {
-        self.transcribe_long_form_with_callback(audio, sample_rate, None, on_delta)
-    }
-
-    pub fn transcribe_with_callback_and_max_tokens(
+    pub(crate) fn transcribe_with_callback_and_max_tokens_from_invocation_workspace(
         &self,
         audio: &[f32],
         sample_rate: u32,
         max_tokens: Option<usize>,
+        leases: &mut InvocationWorkspaceLeaseSetV2,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<NativeAsrTranscription> {
-        self.transcribe_long_form_with_callback(audio, sample_rate, max_tokens, on_delta)
+        self.transcribe_long_form_with_callback_from_invocation_workspace(
+            audio,
+            sample_rate,
+            max_tokens,
+            leases,
+            on_delta,
+        )
     }
 
-    pub fn transcribe_single_pass_with_callback_and_options(
+    pub(crate) fn transcribe_single_pass_with_callback_and_options_from_invocation_workspace(
         &self,
         audio: &[f32],
         sample_rate: u32,
         options: NativeAsrGenerationOptions,
+        leases: &mut InvocationWorkspaceLeaseSetV2,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<NativeAsrTranscription> {
         match self {
             Self::Lfm25Audio(model) => {
-                let output = model.transcribe_to_output_with_callback(
+                let (attention, shortconv) = leases.lease_pair_mut(
+                    LFM25_MAIN_ATTENTION_STATE_DOMAIN,
+                    LFM25_MAIN_SHORTCONV_STATE_DOMAIN,
+                )?;
+                let output = model.transcribe_to_output_with_callback_physical(
                     audio,
                     sample_rate,
                     options.max_new_tokens.max(1),
+                    attention.paged_cache_mut()?,
+                    shortconv.typed_mut::<InvocationTensorLease>()?,
                     on_delta,
                 )?;
                 Ok(NativeAsrTranscription {
@@ -1503,26 +3421,29 @@ impl NativeAudioChatModel {
         }
     }
 
-    pub fn transcribe_long_form_with_callback(
+    pub(crate) fn transcribe_long_form_with_callback_from_invocation_workspace(
         &self,
         audio: &[f32],
         sample_rate: u32,
         max_tokens: Option<usize>,
+        leases: &mut InvocationWorkspaceLeaseSetV2,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<NativeAsrTranscription> {
         let duration_secs = audio_duration_secs(audio, sample_rate);
         let chunk_cfg = lfm25_audio_asr_long_form_config();
         let chunks = plan_audio_chunks(audio, sample_rate, &chunk_cfg, None);
         if chunks.len() <= 1 {
-            return self.transcribe_single_pass_with_callback_and_options(
-                audio,
-                sample_rate,
-                NativeAsrGenerationOptions {
-                    max_new_tokens: lfm25_audio_asr_single_pass_max_new_tokens(max_tokens),
-                    ..NativeAsrGenerationOptions::default()
-                },
-                on_delta,
-            );
+            return self
+                .transcribe_single_pass_with_callback_and_options_from_invocation_workspace(
+                    audio,
+                    sample_rate,
+                    NativeAsrGenerationOptions {
+                        max_new_tokens: lfm25_audio_asr_single_pass_max_new_tokens(max_tokens),
+                        ..NativeAsrGenerationOptions::default()
+                    },
+                    leases,
+                    on_delta,
+                );
         }
 
         let mut assembler = TranscriptAssembler::new(chunk_cfg.clone());
@@ -1543,15 +3464,17 @@ impl NativeAudioChatModel {
             let chunk_duration_secs = audio_duration_secs(chunk_audio, sample_rate);
             let chunk_max_tokens =
                 lfm25_audio_asr_chunk_max_new_tokens(chunk_duration_secs, max_tokens);
-            let output = self.transcribe_single_pass_with_callback_and_options(
-                chunk_audio,
-                sample_rate,
-                NativeAsrGenerationOptions {
-                    max_new_tokens: chunk_max_tokens,
-                    ..NativeAsrGenerationOptions::default()
-                },
-                &mut |_delta| {},
-            )?;
+            let output = self
+                .transcribe_single_pass_with_callback_and_options_from_invocation_workspace(
+                    chunk_audio,
+                    sample_rate,
+                    NativeAsrGenerationOptions {
+                        max_new_tokens: chunk_max_tokens,
+                        ..NativeAsrGenerationOptions::default()
+                    },
+                    leases,
+                    &mut |_delta| {},
+                )?;
             let delta = assembler.push_chunk_text(&output.text);
             if !delta.is_empty() {
                 on_delta(&delta);
@@ -1606,6 +3529,15 @@ impl NativeAudioChatModel {
 }
 
 impl NativeDiarizationModel {
+    pub(crate) fn physical_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<SortformerPhysicalStateSpec> {
+        match self {
+            Self::Sortformer(model) => model.physical_state_spec(stage_graphs),
+        }
+    }
+
     pub fn diarize(
         &self,
         audio: &[f32],
@@ -1642,13 +3574,63 @@ impl NativeDiarizationModel {
             }
         }
     }
+
+    pub(crate) fn diarize_with_workspace_observer_physical<F>(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        config: &DiarizationConfig,
+        state: &mut InvocationTensorLease,
+        observer: F,
+    ) -> Result<DiarizationResult>
+    where
+        F: FnMut(SortformerWorkspaceEvent) -> Result<()>,
+    {
+        match self {
+            Self::Sortformer(model) => model.diarize_with_workspace_observer_physical(
+                audio,
+                sample_rate,
+                config,
+                state,
+                observer,
+            ),
+        }
+    }
 }
 
 pub enum NativeChatModel {
     Qwen3(Qwen3ChatModel),
     Qwen35(Qwen35ChatModel),
+    Qwen38(Qwen38ChatModel),
     Gemma3(Gemma3ChatModel),
     Lfm2(Lfm2ChatModel),
+}
+
+impl NativeChatModel {
+    /// Native context carried by the exact loaded checkpoint. This deliberately
+    /// excludes optional rope-scaling modes that the local adapter has not
+    /// implemented.
+    pub fn max_context_tokens(&self) -> Result<usize> {
+        match self {
+            Self::Qwen3(model) => model.max_context_tokens(),
+            Self::Qwen35(model) => model.max_context_tokens(),
+            Self::Qwen38(model) => model.max_context_tokens(),
+            Self::Gemma3(model) => model.max_context_tokens(),
+            Self::Lfm2(model) => model.max_context_tokens(),
+        }
+    }
+}
+
+impl InferenceStateContractProvider for NativeChatModel {
+    fn inference_state_contract(&self) -> Result<InferenceStateCapability> {
+        match self {
+            Self::Qwen3(model) => model.inference_state_contract(),
+            Self::Qwen35(model) => model.inference_state_contract(),
+            Self::Qwen38(model) => model.inference_state_contract(),
+            Self::Gemma3(model) => model.inference_state_contract(),
+            Self::Lfm2(model) => model.inference_state_contract(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1697,6 +3679,7 @@ impl Drop for ModelUseGuard {
 struct TrackedModelEntry<T> {
     model: OnceCell<Arc<T>>,
     uses: Arc<ModelUseState>,
+    ready: AtomicBool,
 }
 
 impl<T> Default for TrackedModelEntry<T> {
@@ -1704,6 +3687,7 @@ impl<T> Default for TrackedModelEntry<T> {
         Self {
             model: OnceCell::new(),
             uses: Arc::new(ModelUseState::default()),
+            ready: AtomicBool::new(false),
         }
     }
 }
@@ -1716,6 +3700,34 @@ impl<T> TrackedModelEntry<T> {
             model,
             _guard: guard,
         })
+    }
+
+    fn ready_model(&self) -> Option<Arc<T>> {
+        self.ready
+            .load(Ordering::Acquire)
+            .then(|| self.model.get().cloned())
+            .flatten()
+    }
+
+    fn acquire_ready(&self) -> Option<TrackedModelLease<T>> {
+        if !self.ready.load(Ordering::Acquire) {
+            return None;
+        }
+        self.acquire()
+    }
+
+    fn publish_ready(&self) -> Result<()> {
+        if self.model.get().is_none() {
+            return Err(Error::ModelLoadError(
+                "cannot publish an uninitialized model entry".into(),
+            ));
+        }
+        self.ready.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn reset_ready(&self) {
+        self.ready.store(false, Ordering::Release);
     }
 }
 
@@ -1772,9 +3784,336 @@ pub struct AsrModelLease {
     inner: TrackedModelLease<NativeAsrModel>,
 }
 
+/// A loaded LFM2.5 Audio model handle that fences registry unload for its
+/// exact model instance until the final retained ASR/TTS lease clone drops.
+///
+/// The legacy audio-chat discovery APIs continue to return `Arc` handles so
+/// existing AudioChat and SpeechToSpeech call sites retain their public
+/// behavior. Retained sequence routes must acquire this lease instead.
+#[derive(Clone)]
+pub struct Lfm25AudioModelLease {
+    inner: TrackedModelLease<NativeAudioChatModel>,
+}
+
+impl Lfm25AudioModelLease {
+    pub(crate) fn model_arc(&self) -> Arc<NativeAudioChatModel> {
+        self.inner.model.clone()
+    }
+}
+
+impl Deref for Lfm25AudioModelLease {
+    type Target = NativeAudioChatModel;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+/// A loaded Voxtral realtime handle that fences registry unload for its exact
+/// model instance until the final offline or realtime operation releases it.
+#[derive(Clone)]
+pub struct VoxtralModelLease {
+    inner: TrackedModelLease<VoxtralRealtimeModel>,
+}
+
+impl VoxtralModelLease {
+    pub(crate) fn model_arc(&self) -> Arc<VoxtralRealtimeModel> {
+        self.inner.model.clone()
+    }
+
+    pub(crate) fn start_realtime_state(&self, language: Option<&str>) -> VoxtralRealtimeState {
+        self.inner.model.start_realtime_state(language)
+    }
+
+    pub(crate) fn realtime_max_output_steps(&self) -> Result<usize> {
+        self.inner.model.realtime_max_output_steps()
+    }
+
+    pub(crate) fn realtime_stream_resource_usage(
+        &self,
+        state: &VoxtralRealtimeState,
+    ) -> Result<VoxtralRealtimeResourceUsage> {
+        self.inner.model.realtime_stream_resource_usage(state)
+    }
+
+    pub(crate) fn begin_realtime_quantum(
+        &self,
+        state: &mut VoxtralRealtimeState,
+        cache: &PhysicalPagedKvCache,
+    ) -> Result<VoxtralRealtimeCheckpoint> {
+        self.inner.model.begin_realtime_quantum(state, cache)
+    }
+
+    pub(crate) fn commit_realtime_quantum(
+        &self,
+        state: &mut VoxtralRealtimeState,
+        cache: &PhysicalPagedKvCache,
+        checkpoint: &mut VoxtralRealtimeCheckpoint,
+    ) -> Result<()> {
+        self.inner
+            .model
+            .commit_realtime_quantum(state, cache, checkpoint)
+    }
+
+    pub(crate) fn rollback_realtime_quantum(
+        &self,
+        state: &mut VoxtralRealtimeState,
+        cache: &mut PhysicalPagedKvCache,
+        checkpoint: &mut VoxtralRealtimeCheckpoint,
+    ) -> Result<()> {
+        self.inner
+            .model
+            .rollback_realtime_quantum(state, cache, checkpoint)
+    }
+
+    pub(crate) fn apply_realtime_push_physical(
+        &self,
+        state: &mut VoxtralRealtimeState,
+        cache: &mut PhysicalPagedKvCache,
+        samples: &[f32],
+        sample_rate: u32,
+        max_output_steps: usize,
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<Vec<VoxtralRealtimeStep>> {
+        self.inner.model.apply_realtime_push_physical(
+            state,
+            cache,
+            samples,
+            sample_rate,
+            max_output_steps,
+            should_cancel,
+        )
+    }
+
+    pub(crate) fn apply_realtime_finish_physical(
+        &self,
+        state: &mut VoxtralRealtimeState,
+        cache: &mut PhysicalPagedKvCache,
+        max_output_steps: usize,
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<Vec<VoxtralRealtimeStep>> {
+        self.inner.model.apply_realtime_finish_physical(
+            state,
+            cache,
+            max_output_steps,
+            should_cancel,
+        )
+    }
+
+    pub(crate) fn realtime_preparation_geometry(
+        &self,
+        state: &VoxtralRealtimeState,
+        appended_samples: usize,
+        sample_rate: u32,
+        mode: VoxtralRealtimePreparationMode,
+    ) -> Result<VoxtralRealtimePreparationGeometry> {
+        self.inner
+            .model
+            .realtime_preparation_geometry(state, appended_samples, sample_rate, mode)
+    }
+
+    pub(crate) fn realtime_preparation_batch_geometry(
+        &self,
+        rows: &[VoxtralRealtimePreparationGeometry],
+    ) -> Result<VoxtralRealtimePreparationBatchGeometry> {
+        self.inner.model.realtime_preparation_batch_geometry(rows)
+    }
+
+    pub(crate) fn realtime_preparation_stage_seal(
+        &self,
+    ) -> Result<VoxtralRealtimePreparationStageSeal> {
+        self.inner.model.realtime_preparation_stage_seal()
+    }
+
+    pub(crate) fn realtime_stream_peak_reservation(
+        &self,
+    ) -> Result<VoxtralRealtimeStreamPeakReservation> {
+        self.inner.model.realtime_stream_peak_reservation()
+    }
+
+    pub(crate) fn realtime_preparation_geometry_for_source_samples(
+        &self,
+        source_samples: usize,
+        sample_rate: u32,
+        mode: VoxtralRealtimePreparationMode,
+    ) -> Result<VoxtralRealtimePreparationGeometry> {
+        self.inner
+            .model
+            .realtime_preparation_geometry_for_source_samples(source_samples, sample_rate, mode)
+    }
+
+    pub(crate) fn realtime_prepared_resource_usage(
+        &self,
+        geometry: VoxtralRealtimePreparationGeometry,
+    ) -> Result<VoxtralRealtimePreparedResourceUsage> {
+        self.inner.model.realtime_prepared_resource_usage(geometry)
+    }
+
+    pub(crate) fn prepare_realtime_audio_batch(
+        &self,
+        rows: &[VoxtralRealtimePreparationBatchRow<'_>],
+    ) -> Result<Vec<VoxtralRealtimePreparedAudio>> {
+        self.inner.model.prepare_realtime_audio_batch(rows)
+    }
+
+    pub(crate) fn install_realtime_audio_preparation(
+        &self,
+        state: &mut VoxtralRealtimeState,
+        prepared: VoxtralRealtimePreparedAudio,
+    ) -> Result<usize> {
+        self.inner
+            .model
+            .install_realtime_audio_preparation(state, prepared)
+    }
+
+    pub(crate) fn decode_realtime_step_batch(
+        &self,
+        rows: &mut [VoxtralRealtimeDecodeBatchRow<'_>],
+    ) -> Result<Vec<VoxtralRealtimeStep>> {
+        self.inner.model.decode_realtime_step_batch(rows)
+    }
+
+    pub(crate) fn realtime_prompt_cache_append(
+        &self,
+        state: &VoxtralRealtimeState,
+    ) -> Result<Option<usize>> {
+        self.inner.model.realtime_prompt_cache_append(state)
+    }
+
+    pub(crate) fn realtime_decode_ready(&self, state: &VoxtralRealtimeState) -> bool {
+        self.inner.model.realtime_decode_ready(state)
+    }
+
+    pub(crate) fn prefill_realtime_in_quantum(
+        &self,
+        state: &mut VoxtralRealtimeState,
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<VoxtralRealtimeStep> {
+        self.inner.model.prefill_realtime_in_quantum(state, cache)
+    }
+
+    pub(crate) fn complete_realtime_in_quantum(
+        &self,
+        state: &mut VoxtralRealtimeState,
+        cache: &PhysicalPagedKvCache,
+    ) -> Result<VoxtralRealtimeStep> {
+        self.inner.model.complete_realtime_in_quantum(state, cache)
+    }
+}
+
+impl Deref for VoxtralModelLease {
+    type Target = VoxtralRealtimeModel;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
 impl AsrModelLease {
     pub(crate) fn model_arc(&self) -> Arc<NativeAsrModel> {
         self.inner.model.clone()
+    }
+
+    pub(crate) fn granite_speech_preparation_batch_geometry(
+        &self,
+        rows: &[GraniteSpeechPreparedGeometry],
+    ) -> Result<GraniteSpeechPreparationBatchGeometry> {
+        self.inner
+            .model
+            .granite_speech_preparation_batch_geometry(rows)
+    }
+
+    pub(crate) fn granite_speech_preparation_row_cost_for_batch(
+        &self,
+        index: usize,
+        rows: &[GraniteSpeechPreparedGeometry],
+        batch: GraniteSpeechPreparationBatchGeometry,
+    ) -> Result<WorkCost> {
+        self.inner
+            .model
+            .granite_speech_preparation_row_cost_for_batch(index, rows, batch)
+    }
+
+    pub(crate) fn audio_preparation_batch_geometry(
+        &self,
+        rows: &[crate::models::architectures::qwen3::asr::Qwen3AsrAudioPreparationGeometry],
+    ) -> Result<crate::models::architectures::qwen3::asr::Qwen3AsrAudioPreparationBatchGeometry>
+    {
+        match self.inner.model.as_ref() {
+            NativeAsrModel::Qwen3(model) => model.audio_preparation_batch_geometry(rows),
+            _ => Err(Error::InvalidInput(
+                "Qwen3 ASR preparation geometry was requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn audio_preparation_row_geometry(
+        &self,
+        input_samples: usize,
+        input_sample_rate: u32,
+    ) -> Result<crate::models::architectures::qwen3::asr::Qwen3AsrAudioPreparationGeometry> {
+        match self.inner.model.as_ref() {
+            NativeAsrModel::Qwen3(model) => {
+                model.audio_preparation_row_geometry(input_samples, input_sample_rate)
+            }
+            _ => Err(Error::InvalidInput(
+                "Qwen3 ASR preparation geometry was requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn audio_preparation_row_cost_for_batch(
+        &self,
+        row_index: usize,
+        rows: &[crate::models::architectures::qwen3::asr::Qwen3AsrAudioPreparationGeometry],
+        batch: &crate::models::architectures::qwen3::asr::Qwen3AsrAudioPreparationBatchGeometry,
+    ) -> Result<WorkCost> {
+        match self.inner.model.as_ref() {
+            NativeAsrModel::Qwen3(model) => {
+                model.audio_preparation_row_cost_for_batch(row_index, rows, batch)
+            }
+            _ => Err(Error::InvalidInput(
+                "Qwen3 ASR preparation cost was requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn whisper_window_preparation_geometry(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+    ) -> Result<WhisperWindowPreparationGeometry> {
+        self.inner
+            .model
+            .whisper_window_preparation_geometry(audio, sample_rate)
+    }
+
+    pub(crate) fn whisper_window_preparation_batch_geometry(
+        &self,
+        rows: &[WhisperWindowPreparationGeometry],
+    ) -> Result<WhisperWindowPreparationBatchGeometry> {
+        match self.inner.model.as_ref() {
+            NativeAsrModel::WhisperTurbo(model) => model.window_preparation_batch_geometry(rows),
+            _ => Err(Error::InvalidInput(
+                "Whisper preparation geometry was requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn whisper_window_preparation_row_cost_for_batch(
+        &self,
+        index: usize,
+        rows: &[WhisperWindowPreparationGeometry],
+        batch: &WhisperWindowPreparationBatchGeometry,
+    ) -> Result<WorkCost> {
+        match self.inner.model.as_ref() {
+            NativeAsrModel::WhisperTurbo(model) => {
+                model.window_preparation_row_cost_for_batch(index, rows, batch)
+            }
+            _ => Err(Error::InvalidInput(
+                "Whisper preparation cost was requested from another ASR model".into(),
+            )),
+        }
     }
 }
 
@@ -1807,31 +4146,347 @@ impl Deref for QwenTtsModelLease {
     }
 }
 
+/// A loaded VibeVoice TTS handle that fences unload for the exact model
+/// instance retained by an admitted incremental request.
+#[derive(Clone)]
+pub struct VibeVoiceTtsModelLease {
+    inner: TrackedModelLease<VibeVoiceTtsModel>,
+}
+
+/// A loaded Fish S2 TTS handle that fences unload for the exact model
+/// instance retained by an admitted incremental request.
+#[derive(Clone)]
+pub struct FishS2TtsModelLease {
+    inner: TrackedModelLease<FishS2TtsModel>,
+}
+
+/// A loaded Voxtral TTS handle that fences unload for the exact model
+/// instance retained by an admitted incremental request.
+#[derive(Clone)]
+pub struct VoxtralTtsModelLease {
+    inner: TrackedModelLease<VoxtralTtsModel>,
+}
+
+impl VoxtralTtsModelLease {
+    pub(crate) fn model_arc(&self) -> Arc<VoxtralTtsModel> {
+        self.inner.model.clone()
+    }
+}
+
+impl Deref for VoxtralTtsModelLease {
+    type Target = VoxtralTtsModel;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl FishS2TtsModelLease {
+    pub(crate) fn model_arc(&self) -> Arc<FishS2TtsModel> {
+        self.inner.model.clone()
+    }
+}
+
+impl Deref for FishS2TtsModelLease {
+    type Target = FishS2TtsModel;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+/// Exact Kokoro model instance retained by a prepared static batch row.
+#[derive(Clone)]
+pub struct KokoroTtsModelLease {
+    inner: TrackedModelLease<KokoroTtsModel>,
+}
+
+impl KokoroTtsModelLease {
+    pub(crate) fn model_arc(&self) -> Arc<KokoroTtsModel> {
+        self.inner.model.clone()
+    }
+}
+
+impl Deref for KokoroTtsModelLease {
+    type Target = KokoroTtsModel;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl VibeVoiceTtsModelLease {
+    pub(crate) fn model_arc(&self) -> Arc<VibeVoiceTtsModel> {
+        self.inner.model.clone()
+    }
+}
+
+impl Deref for VibeVoiceTtsModelLease {
+    type Target = VibeVoiceTtsModel;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
 pub enum NativeChatDecodeState {
     Qwen3(Qwen3ChatDecodeState),
     Qwen35(Qwen35ChatDecodeState),
+    Qwen38(Qwen38ChatDecodeState),
+    Gemma3(Gemma3ChatDecodeState),
+    Lfm2(Lfm2ChatDecodeState),
+}
+
+pub(crate) enum NativeChatDecodeCheckpoint {
+    Qwen3(Qwen3ChatDecodeCheckpoint),
+    Qwen35(Qwen35SharedStepCheckpoint),
+    Gemma3(Gemma3ChatDecodeCheckpoint),
+    Qwen38(Qwen38SharedStepCheckpoint),
+    Lfm2(Lfm2ChatDecodeCheckpoint),
+}
+
+#[derive(Debug, Clone)]
+pub enum NativeChatPreparedPrompt {
+    Qwen35(Qwen35PreparedPrompt),
+    Qwen38(Qwen38PreparedPrompt),
+}
+
+impl NativeChatPreparedPrompt {
+    pub fn prompt_ids(&self) -> &[u32] {
+        match self {
+            Self::Qwen35(prepared) => prepared.prompt_ids(),
+            Self::Qwen38(prepared) => prepared.prompt_ids(),
+        }
+    }
+
+    pub fn family(&self) -> ModelFamily {
+        match self {
+            Self::Qwen35(_) => ModelFamily::Qwen35Chat,
+            Self::Qwen38(_) => ModelFamily::Qwen38Chat,
+        }
+    }
+
+    pub(crate) fn as_qwen35(&self) -> Option<&Qwen35PreparedPrompt> {
+        match self {
+            Self::Qwen35(prepared) => Some(prepared),
+            Self::Qwen38(_) => None,
+        }
+    }
+
+    pub(crate) fn as_qwen38(&self) -> Option<&Qwen38PreparedPrompt> {
+        match self {
+            Self::Qwen38(prepared) => Some(prepared),
+            Self::Qwen35(_) => None,
+        }
+    }
 }
 
 impl NativeChatDecodeState {
-    /// Complete model-owned session cache claim when it can be observed.
-    pub fn session_cache_bytes(&self) -> Option<u64> {
+    pub(crate) fn begin_continuous_quantum(
+        &mut self,
+        cache: PhysicalPagedKvCache,
+        mtp_cache: Option<PhysicalPagedKvCache>,
+    ) -> Result<NativeChatDecodeCheckpoint> {
         match self {
-            Self::Qwen3(state) => state.session_cache_bytes(),
-            Self::Qwen35(state) => state.session_cache_bytes(),
+            Self::Qwen3(state) => {
+                if mtp_cache.is_some() {
+                    return Err(Error::InvalidInput(
+                        "Qwen3.8 MTP reservation was routed to a Qwen3 state".into(),
+                    ));
+                }
+                state
+                    .begin_managed_quantum(cache)
+                    .map(NativeChatDecodeCheckpoint::Qwen3)
+            }
+            Self::Gemma3(state) => {
+                if mtp_cache.is_some() {
+                    return Err(Error::InvalidInput(
+                        "Qwen3.8 MTP reservation was routed to a Gemma3 state".into(),
+                    ));
+                }
+                state
+                    .begin_managed_quantum(cache)
+                    .map(NativeChatDecodeCheckpoint::Gemma3)
+            }
+            Self::Qwen38(state) => state
+                .begin_shared_step_quantum(cache, mtp_cache)
+                .map(NativeChatDecodeCheckpoint::Qwen38),
+            Self::Qwen35(state) => {
+                if mtp_cache.is_some() {
+                    return Err(Error::InvalidInput(
+                        "Qwen3.8 MTP reservation was routed to a Qwen3.5 state".into(),
+                    ));
+                }
+                state
+                    .begin_shared_step_quantum(cache)
+                    .map(NativeChatDecodeCheckpoint::Qwen35)
+            }
+            Self::Lfm2(state) => {
+                if mtp_cache.is_some() {
+                    return Err(Error::InvalidInput(
+                        "Qwen3.8 MTP reservation was routed to an LFM2 state".into(),
+                    ));
+                }
+                state
+                    .begin_managed_quantum(cache)
+                    .map(NativeChatDecodeCheckpoint::Lfm2)
+            }
         }
     }
 
-    pub(crate) fn take_pending_qwen35_prefix_snapshot(&mut self) -> Option<Qwen35PrefixSnapshot> {
-        match self {
-            Self::Qwen35(state) => state.take_pending_prefix_snapshot(),
-            Self::Qwen3(_) => None,
+    pub(crate) fn rollback_continuous_quantum(
+        &mut self,
+        checkpoint: NativeChatDecodeCheckpoint,
+    ) -> Result<()> {
+        match (self, checkpoint) {
+            (Self::Qwen3(state), NativeChatDecodeCheckpoint::Qwen3(checkpoint)) => {
+                state.rollback_managed_quantum(checkpoint);
+                Ok(())
+            }
+            (Self::Gemma3(state), NativeChatDecodeCheckpoint::Gemma3(checkpoint)) => {
+                state.rollback_managed_quantum(checkpoint);
+                Ok(())
+            }
+            (Self::Qwen38(state), NativeChatDecodeCheckpoint::Qwen38(checkpoint)) => {
+                state.rollback_shared_step_quantum(checkpoint);
+                Ok(())
+            }
+            (Self::Qwen35(state), NativeChatDecodeCheckpoint::Qwen35(checkpoint)) => {
+                state.rollback_shared_step_quantum(checkpoint);
+                Ok(())
+            }
+            (Self::Lfm2(state), NativeChatDecodeCheckpoint::Lfm2(checkpoint)) => {
+                state.rollback_managed_quantum(checkpoint);
+                Ok(())
+            }
+            _ => Err(Error::InferenceError(
+                "continuous chat rollback checkpoint changed model family".into(),
+            )),
         }
     }
 
-    pub(crate) fn reused_qwen35_prefix_tokens(&self) -> usize {
+    pub(crate) fn install_managed_reservations(
+        &mut self,
+        cache: PhysicalPagedKvCache,
+        mtp_cache: Option<PhysicalPagedKvCache>,
+    ) -> Result<()> {
         match self {
-            Self::Qwen35(state) => state.reused_prefix_tokens(),
-            Self::Qwen3(_) => 0,
+            Self::Qwen38(state) => {
+                if state.uses_mtp_physical_kv() != mtp_cache.is_some() {
+                    return Err(Error::InferenceError(
+                        "Qwen3.8 managed MTP reservation does not match the decode state policy"
+                            .into(),
+                    ));
+                }
+                state.install_physical_reservation(cache)?;
+                if let Some(mtp_cache) = mtp_cache {
+                    state.install_mtp_physical_reservation(mtp_cache)?;
+                }
+                Ok(())
+            }
+            Self::Qwen3(state) => {
+                if mtp_cache.is_some() {
+                    return Err(Error::InvalidInput(
+                        "Qwen3.8 MTP reservation was routed to a Qwen3 state".into(),
+                    ));
+                }
+                state.install_managed_reservation(cache)
+            }
+            Self::Qwen35(state) => {
+                if mtp_cache.is_some() {
+                    return Err(Error::InvalidInput(
+                        "Qwen3.8 MTP reservation was routed to a Qwen3.5 state".into(),
+                    ));
+                }
+                state.install_physical_reservation(cache)
+            }
+            Self::Gemma3(state) => {
+                if mtp_cache.is_some() {
+                    return Err(Error::InvalidInput(
+                        "Qwen3.8 MTP reservation was routed to a Gemma3 state".into(),
+                    ));
+                }
+                state.install_physical_reservation(cache)
+            }
+            Self::Lfm2(state) => {
+                if mtp_cache.is_some() {
+                    return Err(Error::InvalidInput(
+                        "Qwen3.8 MTP reservation was routed to LFM2".into(),
+                    ));
+                }
+                state.install_managed_reservation(cache)
+            }
+        }
+    }
+
+    pub(crate) fn uses_managed_kv(&self) -> bool {
+        match self {
+            Self::Qwen3(state) => state.uses_managed_kv(),
+            Self::Qwen35(state) => state.uses_physical_kv(),
+            Self::Qwen38(state) => state.uses_physical_kv(),
+            Self::Gemma3(_) => true,
+            Self::Lfm2(_) => true,
+        }
+    }
+
+    pub(crate) fn take_managed_write_completions(
+        &mut self,
+    ) -> Vec<Arc<crate::backends::kv::KvWriteBatchCompletion>> {
+        match self {
+            Self::Qwen3(state) => state.take_managed_write_completions(),
+            Self::Qwen35(state) => state.take_physical_write_completions(),
+            Self::Qwen38(state) => state.take_physical_write_completions(),
+            Self::Gemma3(state) => state.take_physical_write_completions(),
+            Self::Lfm2(state) => state.take_physical_write_completions(),
+        }
+    }
+
+    pub(crate) fn bind_hybrid_tensor_sequence(&mut self, sequence: u64) -> Result<()> {
+        match self {
+            Self::Qwen35(state) => state.bind_tensor_sequence(sequence),
+            Self::Qwen38(state) => state.bind_tensor_sequence(sequence),
+            Self::Lfm2(state) => state.bind_tensor_sequence(sequence),
+            Self::Qwen3(_) => Err(Error::InvalidInput(
+                "tensor-state reservation was routed to a dense Qwen3 model".into(),
+            )),
+            Self::Gemma3(_) => Err(Error::InvalidInput(
+                "tensor-state reservation was routed to a Gemma3 model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn restore_hybrid_tensor_state(
+        &mut self,
+        arena: &crate::backends::state::TensorStateArena,
+    ) -> Result<()> {
+        match self {
+            Self::Qwen35(state) => state.restore_tensor_state(arena),
+            Self::Qwen38(state) => state.restore_tensor_state(arena),
+            Self::Lfm2(state) => state.restore_tensor_state(arena),
+            Self::Qwen3(_) => Err(Error::InvalidInput(
+                "tensor-state arena was routed to a dense Qwen3 model".into(),
+            )),
+            Self::Gemma3(_) => Err(Error::InvalidInput(
+                "tensor-state arena was routed to a Gemma3 model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn stage_hybrid_tensor_state(
+        &mut self,
+        arena: &crate::backends::state::TensorStateArena,
+        transaction: u64,
+    ) -> Result<()> {
+        match self {
+            Self::Qwen35(state) => state.stage_tensor_state(arena, transaction),
+            Self::Qwen38(state) => state.stage_tensor_state(arena, transaction),
+            Self::Lfm2(state) => state.stage_tensor_state(arena, transaction),
+            Self::Qwen3(_) => Err(Error::InvalidInput(
+                "tensor-state arena was routed to a dense Qwen3 model".into(),
+            )),
+            Self::Gemma3(_) => Err(Error::InvalidInput(
+                "tensor-state arena was routed to a Gemma3 model".into(),
+            )),
         }
     }
 }
@@ -1841,21 +4496,32 @@ pub struct NativeChatDecodeStep {
     pub delta: String,
     pub text: String,
     pub tokens_generated: usize,
+    pub input_tokens_committed: usize,
     pub finished: bool,
 }
 
 impl NativeChatModel {
-    /// Prepare the exact prompt consumed by execution. Qwen3.5 returns its
-    /// reusable multimodal artifact; text-only families return token IDs only.
+    /// Prepare the exact prompt consumed by execution. Hybrid Qwen families
+    /// return their independently typed reusable artifacts.
     pub fn prepare_prompt_for_execution(
         &self,
         messages: &[ChatMessage],
         config: &ChatGenerationConfig,
-    ) -> Result<(Vec<u32>, Option<Qwen35PreparedPrompt>)> {
+    ) -> Result<(Vec<u32>, Option<NativeChatPreparedPrompt>)> {
         match self {
             Self::Qwen35(model) => {
                 let prepared = model.prepare_prompt_for_execution(messages, config)?;
-                Ok((prepared.prompt_ids().to_vec(), Some(prepared)))
+                Ok((
+                    prepared.prompt_ids().to_vec(),
+                    Some(NativeChatPreparedPrompt::Qwen35(prepared)),
+                ))
+            }
+            Self::Qwen38(model) => {
+                let prepared = model.prepare_prompt_for_execution(messages, config)?;
+                Ok((
+                    prepared.prompt_ids().to_vec(),
+                    Some(NativeChatPreparedPrompt::Qwen38(prepared)),
+                ))
             }
             _ => Ok((self.prompt_token_ids_with_config(messages, config)?, None)),
         }
@@ -1873,6 +4539,7 @@ impl NativeChatModel {
         match self {
             Self::Qwen3(model) => model.prompt_token_ids(messages),
             Self::Qwen35(model) => model.prompt_token_ids_with_config(messages, config),
+            Self::Qwen38(model) => model.prompt_token_ids_with_config(messages, config),
             Self::Gemma3(model) => model.prompt_token_ids(messages),
             Self::Lfm2(model) => model.prompt_token_ids(messages),
         }
@@ -1891,17 +4558,16 @@ impl NativeChatModel {
         &self,
         messages: &[ChatMessage],
         max_new_tokens: usize,
-        config: &ChatGenerationConfig,
+        _config: &ChatGenerationConfig,
     ) -> Result<ChatGenerationOutput> {
         match self {
             Self::Qwen3(model) => model.generate(messages, max_new_tokens),
-            Self::Qwen35(model) => {
-                let output = model.generate_with_config(messages, max_new_tokens, config)?;
-                Ok(ChatGenerationOutput {
-                    text: output.text,
-                    tokens_generated: output.tokens_generated,
-                })
-            }
+            Self::Qwen35(_) => Err(Error::InvalidInput(
+                "Qwen3.5 chat requires scheduler-owned physical state".to_string(),
+            )),
+            Self::Qwen38(_) => Err(Error::InvalidInput(
+                "Qwen3.8 chat requires scheduler-owned physical state".to_string(),
+            )),
             Self::Gemma3(model) => {
                 let output = model.generate(messages, max_new_tokens)?;
                 Ok(ChatGenerationOutput {
@@ -1909,13 +4575,9 @@ impl NativeChatModel {
                     tokens_generated: output.tokens_generated,
                 })
             }
-            Self::Lfm2(model) => {
-                let output = model.generate(messages, max_new_tokens)?;
-                Ok(ChatGenerationOutput {
-                    text: output.text,
-                    tokens_generated: output.tokens_generated,
-                })
-            }
+            Self::Lfm2(_) => Err(Error::InvalidInput(
+                "LFM2 chat requires invocation-owned physical state".into(),
+            )),
         }
     }
 
@@ -1933,23 +4595,17 @@ impl NativeChatModel {
         &self,
         messages: &[ChatMessage],
         max_new_tokens: usize,
-        config: &ChatGenerationConfig,
+        _config: &ChatGenerationConfig,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<ChatGenerationOutput> {
         match self {
             Self::Qwen3(model) => model.generate_with_callback(messages, max_new_tokens, on_delta),
-            Self::Qwen35(model) => {
-                let output = model.generate_with_callback_and_config(
-                    messages,
-                    max_new_tokens,
-                    config,
-                    on_delta,
-                )?;
-                Ok(ChatGenerationOutput {
-                    text: output.text,
-                    tokens_generated: output.tokens_generated,
-                })
-            }
+            Self::Qwen35(_) => Err(Error::InvalidInput(
+                "Qwen3.5 chat requires scheduler-owned physical state".to_string(),
+            )),
+            Self::Qwen38(_) => Err(Error::InvalidInput(
+                "Qwen3.8 chat requires scheduler-owned physical state".to_string(),
+            )),
             Self::Gemma3(model) => {
                 let output = model.generate_with_callback(messages, max_new_tokens, on_delta)?;
                 Ok(ChatGenerationOutput {
@@ -1957,13 +4613,9 @@ impl NativeChatModel {
                     tokens_generated: output.tokens_generated,
                 })
             }
-            Self::Lfm2(model) => {
-                let output = model.generate_with_callback(messages, max_new_tokens, on_delta)?;
-                Ok(ChatGenerationOutput {
-                    text: output.text,
-                    tokens_generated: output.tokens_generated,
-                })
-            }
+            Self::Lfm2(_) => Err(Error::InvalidInput(
+                "LFM2 chat requires invocation-owned physical state".into(),
+            )),
         }
     }
 
@@ -1971,7 +4623,8 @@ impl NativeChatModel {
         match self {
             Self::Qwen3(model) => model.supports_incremental_decode(),
             Self::Qwen35(model) => model.supports_incremental_decode(),
-            Self::Gemma3(_) => false,
+            Self::Qwen38(model) => model.supports_incremental_decode(),
+            Self::Gemma3(model) => model.supports_incremental_decode(),
             Self::Lfm2(model) => model.supports_incremental_decode(),
         }
     }
@@ -1979,34 +4632,40 @@ impl NativeChatModel {
     pub fn supports_continuous_decode_batch(&self) -> bool {
         match self {
             Self::Qwen3(model) => model.supports_continuous_decode_batch(),
-            Self::Qwen35(_) | Self::Gemma3(_) | Self::Lfm2(_) => false,
+            Self::Qwen35(model) => model.supports_continuous_decode_batch(),
+            Self::Gemma3(model) => model.supports_continuous_decode_batch(),
+            Self::Qwen38(model) => model.supports_continuous_decode_batch(),
+            Self::Lfm2(model) => model.supports_continuous_decode_batch(),
         }
+    }
+
+    /// Whether scheduler-authored prompt spans can be committed and resumed
+    /// on the same managed decode state. Incremental decode alone does not
+    /// imply this stronger prefill safe-point contract.
+    pub fn supports_resumable_prefill(&self) -> bool {
+        matches!(
+            self,
+            Self::Qwen3(_) | Self::Qwen35(_) | Self::Qwen38(_) | Self::Gemma3(_) | Self::Lfm2(_)
+        )
+    }
+
+    /// Whether one continuous model call executes all live rows through a
+    /// single tensor-batched forward path. This is intentionally stricter than
+    /// continuous scheduler membership.
+    pub fn continuous_decode_is_tensor_batched(&self) -> bool {
+        matches!(
+            self,
+            Self::Qwen3(_) | Self::Qwen35(_) | Self::Gemma3(_) | Self::Qwen38(_) | Self::Lfm2(_)
+        )
     }
 
     pub fn continuous_decode_batch_workspace_per_row_bytes(&self) -> Result<u64> {
         match self {
             Self::Qwen3(model) => model.continuous_decode_batch_workspace_per_row_bytes(),
-            Self::Qwen35(_) | Self::Gemma3(_) | Self::Lfm2(_) => Err(Error::InvalidInput(
-                "loaded chat model has no continuous decode workspace contract".to_string(),
-            )),
-        }
-    }
-
-    pub fn session_cache_reservation_bytes(
-        &self,
-        prompt_tokens: usize,
-        max_new_tokens: usize,
-    ) -> Result<u64> {
-        match self {
-            Self::Qwen3(model) => {
-                model.session_cache_reservation_bytes(prompt_tokens, max_new_tokens)
-            }
-            Self::Qwen35(model) => {
-                model.session_cache_reservation_bytes(prompt_tokens, max_new_tokens)
-            }
-            Self::Gemma3(_) | Self::Lfm2(_) => Err(Error::InvalidInput(
-                "Loaded chat model does not expose incremental cache authorization".to_string(),
-            )),
+            Self::Qwen35(model) => model.continuous_decode_batch_workspace_per_row_bytes(),
+            Self::Gemma3(model) => model.continuous_decode_batch_workspace_per_row_bytes(),
+            Self::Qwen38(model) => model.continuous_decode_batch_workspace_per_row_bytes(),
+            Self::Lfm2(model) => model.continuous_decode_batch_workspace_per_row_bytes(),
         }
     }
 
@@ -2017,6 +4676,288 @@ impl NativeChatModel {
     ) -> Result<NativeChatDecodeState> {
         let config = ChatGenerationConfig::default();
         self.start_decode_state_with_config(messages, max_new_tokens, &config)
+    }
+
+    /// Native Qwen3 entry point used once the engine has reserved a physical
+    /// block table. Other families remain on their existing compatibility
+    /// cache until they publish an equivalent managed adapter.
+    pub fn start_qwen3_decode_state_managed(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<NativeChatDecodeState> {
+        match self {
+            Self::Qwen3(model) => Ok(NativeChatDecodeState::Qwen3(model.start_decode_managed(
+                messages,
+                max_new_tokens,
+                config,
+                cache,
+            )?)),
+            _ => Err(Error::InvalidInput(
+                "managed Qwen3 KV cache was routed to another model family".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn start_qwen35_decode_state_managed(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+        prepared: Option<&Qwen35PreparedPrompt>,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<NativeChatDecodeState> {
+        match self {
+            Self::Qwen35(model) => Ok(NativeChatDecodeState::Qwen35(
+                model.start_decode_state_physical(
+                    messages,
+                    max_new_tokens,
+                    config,
+                    prepared,
+                    cache,
+                )?,
+            )),
+            _ => Err(Error::InvalidInput(
+                "managed Qwen3.5 state was routed to another model family".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn start_qwen38_decode_state_managed(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+        prepared: Option<&Qwen38PreparedPrompt>,
+        target_cache: PhysicalPagedKvCache,
+        mtp_cache: Option<PhysicalPagedKvCache>,
+    ) -> Result<NativeChatDecodeState> {
+        match self {
+            Self::Qwen38(model) => Ok(NativeChatDecodeState::Qwen38(
+                model.start_decode_state_physical(
+                    messages,
+                    max_new_tokens,
+                    config,
+                    prepared,
+                    target_cache,
+                    mtp_cache,
+                )?,
+            )),
+            _ => Err(Error::InvalidInput(
+                "managed Qwen3.8 state was routed to another model family".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn start_resumable_prefill_state_managed(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+        prepared: Option<&NativeChatPreparedPrompt>,
+        prompt_ids: &[u32],
+        target_cache: PhysicalPagedKvCache,
+        mtp_cache: Option<PhysicalPagedKvCache>,
+    ) -> Result<NativeChatDecodeState> {
+        match self {
+            Self::Qwen3(model) if prepared.is_none() && mtp_cache.is_none() => Ok(
+                NativeChatDecodeState::Qwen3(model.begin_resumable_prefill_managed(
+                    prompt_ids,
+                    max_new_tokens,
+                    config,
+                    target_cache,
+                )?),
+            ),
+            Self::Qwen35(model) if mtp_cache.is_none() => {
+                let prepared = prepared
+                    .and_then(NativeChatPreparedPrompt::as_qwen35)
+                    .ok_or_else(|| {
+                        Error::InvalidInput(
+                            "Qwen3.5 resumable prefill requires its prepared prompt artifact"
+                                .into(),
+                        )
+                    })?;
+                if prepared.prompt_ids() != prompt_ids {
+                    return Err(Error::InvalidInput(
+                        "Qwen3.5 prepared artifact disagrees with sealed prompt tokens".into(),
+                    ));
+                }
+                Ok(NativeChatDecodeState::Qwen35(
+                    model.begin_resumable_prefill_state_physical(
+                        prepared,
+                        max_new_tokens,
+                        config,
+                        target_cache,
+                    )?,
+                ))
+            }
+            Self::Qwen38(model) => {
+                let prepared = match prepared {
+                    Some(prepared) => Some(prepared.as_qwen38().ok_or_else(|| {
+                        Error::InvalidInput(
+                            "resumable prefill prepared artifact belongs to another model family"
+                                .into(),
+                        )
+                    })?),
+                    None => None,
+                };
+                if prepared.is_some_and(|prepared| prepared.prompt_ids() != prompt_ids) {
+                    return Err(Error::InvalidInput(
+                        "resumable prefill prepared artifact disagrees with sealed prompt tokens"
+                            .into(),
+                    ));
+                }
+                Ok(NativeChatDecodeState::Qwen38(
+                    model.begin_chunked_prefill_state_physical(
+                        messages,
+                        max_new_tokens,
+                        config,
+                        prepared,
+                        target_cache,
+                        mtp_cache,
+                    )?,
+                ))
+            }
+            Self::Gemma3(model) if prepared.is_none() && mtp_cache.is_none() => Ok(
+                NativeChatDecodeState::Gemma3(model.begin_resumable_prefill_managed(
+                    prompt_ids,
+                    max_new_tokens,
+                    config,
+                    target_cache,
+                )?),
+            ),
+            Self::Lfm2(model) if prepared.is_none() && mtp_cache.is_none() => Ok(
+                NativeChatDecodeState::Lfm2(model.begin_resumable_prefill_state_managed(
+                    prompt_ids,
+                    max_new_tokens,
+                    config,
+                    target_cache,
+                )?),
+            ),
+            _ => Err(Error::InvalidInput(
+                "chat model or prepared state does not support resumable managed prefill".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn continue_resumable_prefill(
+        &self,
+        state: &mut NativeChatDecodeState,
+        messages: &[ChatMessage],
+        config: &ChatGenerationConfig,
+        prepared: Option<&NativeChatPreparedPrompt>,
+        prompt_ids: &[u32],
+        span_start: usize,
+        span_end: usize,
+        prompt_tokens: usize,
+    ) -> Result<bool> {
+        if prompt_ids.len() != prompt_tokens {
+            return Err(Error::InvalidInput(format!(
+                "resumable prefill sealed {} prompt ids but scheduled {prompt_tokens}",
+                prompt_ids.len()
+            )));
+        }
+        let complete = match (self, state) {
+            (Self::Qwen3(model), NativeChatDecodeState::Qwen3(state)) if prepared.is_none() => {
+                let complete =
+                    model.continue_resumable_prefill(state, prompt_ids, span_start, span_end)?;
+                (complete, state.prefill_progress())
+            }
+            (Self::Qwen35(model), NativeChatDecodeState::Qwen35(state)) => {
+                let prepared = prepared
+                    .and_then(NativeChatPreparedPrompt::as_qwen35)
+                    .ok_or_else(|| {
+                        Error::InvalidInput(
+                            "Qwen3.5 resumable prefill requires its prepared prompt artifact"
+                                .into(),
+                        )
+                    })?;
+                if prepared.prompt_ids() != prompt_ids {
+                    return Err(Error::InvalidInput(
+                        "Qwen3.5 prepared artifact disagrees with sealed prompt tokens".into(),
+                    ));
+                }
+                let complete = model
+                    .continue_resumable_prefill_physical(state, prepared, span_start, span_end)?;
+                (complete, state.prefill_progress())
+            }
+            (Self::Qwen38(model), NativeChatDecodeState::Qwen38(state)) => {
+                let prepared = match prepared {
+                    Some(prepared) => Some(prepared.as_qwen38().ok_or_else(|| {
+                        Error::InvalidInput(
+                            "resumable prefill prepared artifact belongs to another model family"
+                                .into(),
+                        )
+                    })?),
+                    None => None,
+                };
+                if prepared.is_some_and(|prepared| prepared.prompt_ids() != prompt_ids) {
+                    return Err(Error::InvalidInput(
+                        "resumable prefill prepared artifact disagrees with sealed prompt tokens"
+                            .into(),
+                    ));
+                }
+                let complete = model.continue_chunked_prefill_physical(
+                    state,
+                    messages,
+                    config,
+                    prepared,
+                    span_start,
+                    span_end,
+                    prompt_tokens,
+                )?;
+                (complete, state.prefill_progress())
+            }
+            (Self::Gemma3(model), NativeChatDecodeState::Gemma3(state)) if prepared.is_none() => {
+                let complete =
+                    model.continue_resumable_prefill(state, prompt_ids, span_start, span_end)?;
+                (complete, state.prefill_progress())
+            }
+            (Self::Lfm2(model), NativeChatDecodeState::Lfm2(state)) if prepared.is_none() => {
+                let complete = model
+                    .continue_resumable_prefill_managed(state, prompt_ids, span_start, span_end)?;
+                (complete, state.prefill_progress())
+            }
+            _ => {
+                return Err(Error::InvalidInput(
+                    "resumable prefill state does not match the loaded chat model".into(),
+                ))
+            }
+        };
+        if complete.1 != span_end {
+            return Err(Error::InferenceError(format!(
+                "resumable prefill committed cursor {} instead of {span_end}",
+                complete.1
+            )));
+        }
+        if complete.0 != (span_end == prompt_tokens) {
+            return Err(Error::InferenceError(
+                "resumable prefill completion disagrees with the sealed prompt length".into(),
+            ));
+        }
+        Ok(complete.0)
+    }
+
+    pub(crate) fn start_gemma3_decode_state_managed(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<NativeChatDecodeState> {
+        match self {
+            Self::Gemma3(model) => Ok(NativeChatDecodeState::Gemma3(model.start_decode_managed(
+                messages,
+                max_new_tokens,
+                config,
+                cache,
+            )?)),
+            _ => Err(Error::InvalidInput(
+                "managed Gemma3 state was routed to another model family".into(),
+            )),
+        }
     }
 
     pub fn start_decode_state_with_config(
@@ -2030,52 +4971,28 @@ impl NativeChatModel {
 
     pub fn start_decode_state_with_prepared(
         &self,
-        messages: &[ChatMessage],
-        max_new_tokens: usize,
-        config: &ChatGenerationConfig,
-        prepared_qwen35: Option<&Qwen35PreparedPrompt>,
-    ) -> Result<NativeChatDecodeState> {
-        self.start_decode_state_with_prefix(
-            messages,
-            max_new_tokens,
-            config,
-            prepared_qwen35,
-            None,
-            None,
-        )
-    }
-
-    pub(crate) fn start_decode_state_with_prefix(
-        &self,
-        messages: &[ChatMessage],
-        max_new_tokens: usize,
-        config: &ChatGenerationConfig,
-        prepared_qwen35: Option<&Qwen35PreparedPrompt>,
-        prefix: Option<&Qwen35PrefixSnapshot>,
-        capture_prefix_max_bytes: Option<u64>,
+        _messages: &[ChatMessage],
+        _max_new_tokens: usize,
+        _config: &ChatGenerationConfig,
+        prepared: Option<&NativeChatPreparedPrompt>,
     ) -> Result<NativeChatDecodeState> {
         match self {
-            Self::Qwen3(model) => {
-                if prepared_qwen35.is_some() || prefix.is_some() {
+            Self::Qwen3(_) => {
+                if prepared.is_some() {
                     return Err(Error::InvalidInput(
                         "Qwen3.5 prepared prompt was routed to a Qwen3 model".to_string(),
                     ));
                 }
-                Ok(NativeChatDecodeState::Qwen3(
-                    model.start_decode(messages, max_new_tokens)?,
+                Err(Error::InvalidInput(
+                    "incremental Qwen3 chat requires scheduler-owned physical state".to_string(),
                 ))
             }
-            Self::Qwen35(model) => {
-                let state = model.start_decode_state_with_optional_prepared_and_prefix(
-                    messages,
-                    max_new_tokens,
-                    config,
-                    prepared_qwen35,
-                    prefix,
-                    capture_prefix_max_bytes,
-                )?;
-                Ok(NativeChatDecodeState::Qwen35(state))
-            }
+            Self::Qwen35(_) => Err(Error::InvalidInput(
+                "incremental Qwen3.5 chat requires scheduler-owned physical state".into(),
+            )),
+            Self::Qwen38(_) => Err(Error::InvalidInput(
+                "incremental Qwen3.8 chat requires scheduler-owned physical state".into(),
+            )),
             Self::Gemma3(_) => Err(Error::InvalidInput(
                 "Incremental decode state is not available for this chat model".to_string(),
             )),
@@ -2093,6 +5010,7 @@ impl NativeChatModel {
                     delta: step.delta,
                     text: step.text,
                     tokens_generated: step.tokens_generated,
+                    input_tokens_committed: 1,
                     finished: step.finished,
                 })
             }
@@ -2102,6 +5020,37 @@ impl NativeChatModel {
                     delta: step.delta,
                     text: step.text,
                     tokens_generated: step.tokens_generated,
+                    input_tokens_committed: step.input_tokens_committed,
+                    finished: step.finished,
+                })
+            }
+            (Self::Qwen38(model), NativeChatDecodeState::Qwen38(state)) => {
+                let step = model.decode_step(state)?;
+                Ok(NativeChatDecodeStep {
+                    delta: step.delta,
+                    text: step.text,
+                    tokens_generated: step.tokens_generated,
+                    input_tokens_committed: step.input_tokens_committed,
+                    finished: step.finished,
+                })
+            }
+            (Self::Gemma3(model), NativeChatDecodeState::Gemma3(state)) => {
+                let step = model.decode_step(state)?;
+                Ok(NativeChatDecodeStep {
+                    delta: step.delta,
+                    text: step.text,
+                    tokens_generated: step.tokens_generated,
+                    input_tokens_committed: 1,
+                    finished: step.finished,
+                })
+            }
+            (Self::Lfm2(model), NativeChatDecodeState::Lfm2(state)) => {
+                let step = model.decode_step(state)?;
+                Ok(NativeChatDecodeStep {
+                    delta: step.delta,
+                    text: step.text,
+                    tokens_generated: step.tokens_generated,
+                    input_tokens_committed: step.input_tokens_committed,
                     finished: step.finished,
                 })
             }
@@ -2111,37 +5060,179 @@ impl NativeChatModel {
         }
     }
 
+    pub(crate) fn decode_quantum(
+        &self,
+        state: &mut NativeChatDecodeState,
+        input_budget: usize,
+    ) -> Result<NativeChatDecodeStep> {
+        if let (Self::Qwen38(model), NativeChatDecodeState::Qwen38(state)) = (self, &mut *state) {
+            let step = model.decode_quantum(state, input_budget.max(1))?;
+            return Ok(NativeChatDecodeStep {
+                delta: step.delta,
+                text: step.text,
+                tokens_generated: step.tokens_generated,
+                input_tokens_committed: step.input_tokens_committed,
+                finished: step.finished,
+            });
+        }
+        let mut delta = String::new();
+        let mut text = String::new();
+        let mut tokens_generated = 0usize;
+        let mut input_tokens_committed = 0usize;
+        let mut finished = false;
+        for _ in 0..input_budget.max(1) {
+            let step = self.decode_step(state)?;
+            delta.push_str(&step.delta);
+            text = step.text;
+            tokens_generated = step.tokens_generated;
+            input_tokens_committed =
+                input_tokens_committed.saturating_add(step.input_tokens_committed);
+            finished = step.finished;
+            if finished {
+                break;
+            }
+        }
+        Ok(NativeChatDecodeStep {
+            delta,
+            text,
+            tokens_generated,
+            input_tokens_committed,
+            finished,
+        })
+    }
+
     pub fn decode_step_batch(
         &self,
         states: &mut [&mut NativeChatDecodeState],
     ) -> Result<Vec<NativeChatDecodeStep>> {
-        let Self::Qwen3(model) = self else {
-            return Err(Error::InvalidInput(
-                "Loaded chat model has no continuous tensor decode adapter".to_string(),
-            ));
-        };
-        let mut qwen_states = Vec::with_capacity(states.len());
-        for state in states.iter_mut() {
-            match &mut **state {
-                NativeChatDecodeState::Qwen3(state) => qwen_states.push(state),
-                NativeChatDecodeState::Qwen35(_) => {
-                    return Err(Error::InvalidInput(
-                        "Qwen3 continuous batch received a Qwen3.5 decode state".to_string(),
-                    ))
-                }
-            }
-        }
-        model.decode_step_batch(&mut qwen_states).map(|steps| {
+        let convert = |steps: Vec<crate::models::architectures::qwen3::chat::ChatDecodeStep>| {
             steps
                 .into_iter()
                 .map(|step| NativeChatDecodeStep {
                     delta: step.delta,
                     text: step.text,
                     tokens_generated: step.tokens_generated,
+                    input_tokens_committed: 1,
                     finished: step.finished,
                 })
                 .collect()
-        })
+        };
+        match self {
+            Self::Qwen3(model) => {
+                let mut typed = Vec::with_capacity(states.len());
+                for state in states.iter_mut() {
+                    match &mut **state {
+                        NativeChatDecodeState::Qwen3(state) => typed.push(state),
+                        _ => {
+                            return Err(Error::InvalidInput(
+                                "Qwen3 continuous batch received another model's state".into(),
+                            ))
+                        }
+                    }
+                }
+                model.decode_step_batch(&mut typed).map(convert)
+            }
+            Self::Gemma3(model) => {
+                let mut typed = Vec::with_capacity(states.len());
+                for state in states.iter_mut() {
+                    match &mut **state {
+                        NativeChatDecodeState::Gemma3(state) => typed.push(state),
+                        _ => {
+                            return Err(Error::InvalidInput(
+                                "Gemma3 continuous batch received another model's state".into(),
+                            ))
+                        }
+                    }
+                }
+                model.decode_step_batch(&mut typed).map(|steps| {
+                    steps
+                        .into_iter()
+                        .map(|step| NativeChatDecodeStep {
+                            delta: step.delta,
+                            text: step.text,
+                            tokens_generated: step.tokens_generated,
+                            input_tokens_committed: 1,
+                            finished: step.finished,
+                        })
+                        .collect()
+                })
+            }
+            Self::Qwen38(model) => {
+                let mut typed = Vec::with_capacity(states.len());
+                for state in states.iter_mut() {
+                    match &mut **state {
+                        NativeChatDecodeState::Qwen38(state) => typed.push(state),
+                        _ => {
+                            return Err(Error::InvalidInput(
+                                "Qwen3.8 continuous batch received another model's state".into(),
+                            ))
+                        }
+                    }
+                }
+                model.decode_step_batch(&mut typed).map(|steps| {
+                    steps
+                        .into_iter()
+                        .map(|step| NativeChatDecodeStep {
+                            delta: step.delta,
+                            text: step.text,
+                            tokens_generated: step.tokens_generated,
+                            input_tokens_committed: 1,
+                            finished: step.finished,
+                        })
+                        .collect()
+                })
+            }
+            Self::Qwen35(model) => {
+                let mut typed = Vec::with_capacity(states.len());
+                for state in states.iter_mut() {
+                    match &mut **state {
+                        NativeChatDecodeState::Qwen35(state) => typed.push(state),
+                        _ => {
+                            return Err(Error::InvalidInput(
+                                "Qwen3.5 continuous batch received another model's state".into(),
+                            ))
+                        }
+                    }
+                }
+                model.decode_step_batch(&mut typed).map(|steps| {
+                    steps
+                        .into_iter()
+                        .map(|step| NativeChatDecodeStep {
+                            delta: step.delta,
+                            text: step.text,
+                            tokens_generated: step.tokens_generated,
+                            input_tokens_committed: step.input_tokens_committed,
+                            finished: step.finished,
+                        })
+                        .collect()
+                })
+            }
+            Self::Lfm2(model) => {
+                let mut typed = Vec::with_capacity(states.len());
+                for state in states.iter_mut() {
+                    match &mut **state {
+                        NativeChatDecodeState::Lfm2(state) => typed.push(state),
+                        _ => {
+                            return Err(Error::InvalidInput(
+                                "LFM2 continuous batch received another model's state".into(),
+                            ))
+                        }
+                    }
+                }
+                model.decode_step_batch(&mut typed).map(|steps| {
+                    steps
+                        .into_iter()
+                        .map(|step| NativeChatDecodeStep {
+                            delta: step.delta,
+                            text: step.text,
+                            tokens_generated: step.tokens_generated,
+                            input_tokens_committed: step.input_tokens_committed,
+                            finished: step.finished,
+                        })
+                        .collect()
+                })
+            }
+        }
     }
 }
 
@@ -2150,16 +5241,20 @@ pub struct ModelRegistry {
     models_dir: PathBuf,
     device: DeviceProfile,
     asr_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<NativeAsrModel>>>>>,
-    audio_chat_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<NativeAudioChatModel>>>>>>,
+    audio_chat_models:
+        Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<NativeAudioChatModel>>>>>,
     diarization_models:
         Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<NativeDiarizationModel>>>>>>,
     chat_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<NativeChatModel>>>>>,
-    voxtral_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<VoxtralRealtimeModel>>>>>>,
-    voxtral_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<VoxtralTtsModel>>>>>>,
-    vibevoice_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<VibeVoiceTtsModel>>>>>>,
-    fish_s2_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<FishS2TtsModel>>>>>>,
+    voxtral_models:
+        Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<VoxtralRealtimeModel>>>>>,
+    voxtral_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<VoxtralTtsModel>>>>>,
+    vibevoice_tts_models:
+        Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<VibeVoiceTtsModel>>>>>,
+    fish_s2_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<FishS2TtsModel>>>>>,
     qwen_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<Qwen3TtsModel>>>>>,
-    kokoro_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<KokoroTtsModel>>>>>>,
+    kokoro_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<KokoroTtsModel>>>>>,
+    effective_contexts: Arc<std::sync::RwLock<HashMap<ModelVariant, usize>>>,
 }
 
 /// Explicit name for the in-memory registry of loaded native model handles.
@@ -2184,6 +5279,8 @@ pub struct LoadedModelDiagnostics {
     pub default_compute_dtype: String,
     pub default_dtype_reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_context_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub supports_incremental_decode: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supports_realtime_stream_decode: Option<bool>,
@@ -2205,11 +5302,7 @@ impl LoadedModelActualRuntime {
         }
     }
 
-    fn from_diagnostics(
-        diagnostics: &Value,
-        device_pointer: &str,
-        dtype_pointer: &str,
-    ) -> Self {
+    fn from_diagnostics(diagnostics: &Value, device_pointer: &str, dtype_pointer: &str) -> Self {
         Self::from_values(
             diagnostics.pointer(device_pointer).and_then(Value::as_str),
             diagnostics.pointer(dtype_pointer).and_then(Value::as_str),
@@ -2249,6 +5342,7 @@ fn loaded_model_diagnostics_entry(
         actual_compute_dtype: actual_runtime.compute_dtype,
         default_compute_dtype: format!("{:?}", dtype_selection.dtype).to_ascii_lowercase(),
         default_dtype_reason: dtype_selection.reason.into_owned(),
+        effective_context_tokens: None,
         supports_incremental_decode,
         supports_realtime_stream_decode,
         family_diagnostics,
@@ -2271,6 +5365,7 @@ fn model_family_name(family: ModelFamily) -> &'static str {
         ModelFamily::SortformerDiarization => "sortformer_diarization",
         ModelFamily::Qwen3Chat => "qwen3_chat",
         ModelFamily::Qwen35Chat => "qwen35_chat",
+        ModelFamily::Qwen38Chat => "qwen38_chat",
         ModelFamily::Lfm2Chat => "lfm2_chat",
         ModelFamily::Lfm25Audio => "lfm25_audio",
         ModelFamily::Gemma3Chat => "gemma3_chat",
@@ -2318,11 +5413,8 @@ fn native_asr_runtime_diagnostics(
         }
         NativeAsrModel::GraniteSpeech(model) => {
             let diagnostics = model.diagnostics_summary();
-            let actual_runtime = LoadedModelActualRuntime::from_diagnostics(
-                &diagnostics,
-                "/device_kind",
-                "/dtype",
-            );
+            let actual_runtime =
+                LoadedModelActualRuntime::from_diagnostics(&diagnostics, "/device_kind", "/dtype");
             (actual_runtime, Some(diagnostics))
         }
         _ => (LoadedModelActualRuntime::default(), None),
@@ -2345,6 +5437,7 @@ fn native_chat_model_kind(model: &NativeChatModel) -> &'static str {
     match model {
         NativeChatModel::Qwen3(_) => "qwen3_chat",
         NativeChatModel::Qwen35(_) => "qwen35_chat",
+        NativeChatModel::Qwen38(_) => "qwen38_chat",
         NativeChatModel::Gemma3(_) => "gemma3_chat",
         NativeChatModel::Lfm2(_) => "lfm2_chat",
     }
@@ -2365,7 +5458,44 @@ impl ModelRegistry {
             fish_s2_tts_models: Arc::new(RwLock::new(HashMap::new())),
             qwen_tts_models: Arc::new(RwLock::new(HashMap::new())),
             kokoro_models: Arc::new(RwLock::new(HashMap::new())),
+            effective_contexts: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
+    }
+
+    pub(crate) fn publish_effective_context(
+        &self,
+        variant: ModelVariant,
+        tokens: u64,
+    ) -> Result<()> {
+        let tokens = usize::try_from(tokens)
+            .map_err(|_| Error::ModelLoadError("effective context exceeds usize".into()))?;
+        if tokens == 0 {
+            return Err(Error::ModelLoadError(
+                "effective context must be greater than zero".into(),
+            ));
+        }
+        self.effective_contexts
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .entry(variant)
+            .and_modify(|current| *current = (*current).min(tokens))
+            .or_insert(tokens);
+        Ok(())
+    }
+
+    pub(crate) fn effective_context(&self, variant: ModelVariant) -> Option<usize> {
+        self.effective_contexts
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(&variant)
+            .copied()
+    }
+
+    pub(crate) fn clear_effective_context(&self, variant: ModelVariant) {
+        self.effective_contexts
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(&variant);
     }
 
     pub fn device(&self) -> &DeviceProfile {
@@ -2382,15 +5512,15 @@ impl ModelRegistry {
         {
             let guard = self.asr_models.read().await;
             for (variant, entry) in guard.iter() {
-                let Some(model) = entry.model.get() else {
+                let Some(model) = entry.ready_model() else {
                     continue;
                 };
-                let (actual_runtime, family_diagnostics) = native_asr_runtime_diagnostics(model);
+                let (actual_runtime, family_diagnostics) = native_asr_runtime_diagnostics(&model);
                 diagnostics.push(loaded_model_diagnostics_entry(
                     &self.device,
                     *variant,
                     "native_asr",
-                    native_asr_model_kind(model),
+                    native_asr_model_kind(&model),
                     actual_runtime,
                     Some(model.supports_incremental_decode()),
                     Some(model.supports_realtime_stream_decode()),
@@ -2401,8 +5531,8 @@ impl ModelRegistry {
 
         {
             let guard = self.audio_chat_models.read().await;
-            for (variant, cell) in guard.iter() {
-                let Some(model) = cell.get() else {
+            for (variant, entry) in guard.iter() {
+                let Some(model) = entry.model.get() else {
                     continue;
                 };
                 diagnostics.push(loaded_model_diagnostics_entry(
@@ -2427,8 +5557,8 @@ impl ModelRegistry {
 
         {
             let guard = self.diarization_models.read().await;
-            for (variant, cell) in guard.iter() {
-                let Some(model) = cell.get() else {
+            for (variant, entry) in guard.iter() {
+                let Some(model) = entry.get() else {
                     continue;
                 };
                 diagnostics.push(loaded_model_diagnostics_entry(
@@ -2460,23 +5590,26 @@ impl ModelRegistry {
                             Some(model.runtime_device_kind().as_str()),
                             model.runtime_compute_dtype().as_deref(),
                         ),
-                        NativeChatModel::Qwen35(model) => LoadedModelActualRuntime::from_values(
+                        NativeChatModel::Qwen38(model) => LoadedModelActualRuntime::from_values(
                             Some(model.device_kind().as_str()),
-                            None,
+                            model.runtime_compute_dtype(),
                         ),
                         _ => LoadedModelActualRuntime::default(),
                     },
                     Some(model.supports_incremental_decode()),
                     None,
-                    None,
+                    match model.as_ref() {
+                        NativeChatModel::Qwen38(model) => Some(model.runtime_diagnostics()),
+                        _ => None,
+                    },
                 ));
             }
         }
 
         {
             let guard = self.voxtral_models.read().await;
-            for (variant, cell) in guard.iter() {
-                if cell.get().is_some() {
+            for (variant, entry) in guard.iter() {
+                if entry.ready_model().is_some() {
                     diagnostics.push(loaded_model_diagnostics_entry(
                         &self.device,
                         *variant,
@@ -2493,8 +5626,8 @@ impl ModelRegistry {
 
         {
             let guard = self.voxtral_tts_models.read().await;
-            for (variant, cell) in guard.iter() {
-                if cell.get().is_some() {
+            for (variant, entry) in guard.iter() {
+                if entry.ready_model().is_some() {
                     diagnostics.push(loaded_model_diagnostics_entry(
                         &self.device,
                         *variant,
@@ -2512,7 +5645,7 @@ impl ModelRegistry {
         {
             let guard = self.vibevoice_tts_models.read().await;
             for (variant, cell) in guard.iter() {
-                let Some(model) = cell.get() else {
+                let Some(model) = cell.model.get() else {
                     continue;
                 };
                 let model_diagnostics = model.diagnostics();
@@ -2535,8 +5668,8 @@ impl ModelRegistry {
 
         {
             let guard = self.fish_s2_tts_models.read().await;
-            for (variant, cell) in guard.iter() {
-                let Some(model) = cell.get() else {
+            for (variant, entry) in guard.iter() {
+                let Some(model) = entry.model.get() else {
                     continue;
                 };
                 diagnostics.push(loaded_model_diagnostics_entry(
@@ -2578,8 +5711,8 @@ impl ModelRegistry {
 
         {
             let guard = self.kokoro_models.read().await;
-            for (variant, cell) in guard.iter() {
-                if cell.get().is_some() {
+            for (variant, entry) in guard.iter() {
+                if entry.model.get().is_some() {
                     diagnostics.push(loaded_model_diagnostics_entry(
                         &self.device,
                         *variant,
@@ -2594,6 +5727,16 @@ impl ModelRegistry {
             }
         }
 
+        for entry in &mut diagnostics {
+            entry.effective_context_tokens = self
+                .effective_contexts
+                .read()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .iter()
+                .find_map(|(variant, tokens)| {
+                    (variant.dir_name() == entry.variant_id).then_some(*tokens)
+                });
+        }
         diagnostics.sort_by(|left, right| {
             left.variant_id
                 .cmp(&right.variant_id)
@@ -2674,12 +5817,18 @@ impl ModelRegistry {
             Error::InvalidInput(format!("Unsupported audio-chat model variant: {variant}"))
         })?;
 
-        let cell = {
+        let (entry, loading_guard) = {
             let mut guard = self.audio_chat_models.write().await;
-            guard
+            let entry = guard
                 .entry(variant)
-                .or_insert_with(|| Arc::new(OnceCell::new()))
-                .clone()
+                .or_insert_with(|| Arc::new(TrackedModelEntry::default()))
+                .clone();
+            let loading_guard = entry.uses.acquire().ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "LFM2.5 Audio model {variant} exceeded its active-use accounting capacity"
+                ))
+            })?;
+            (entry, loading_guard)
         };
 
         info!(
@@ -2687,7 +5836,8 @@ impl ModelRegistry {
             registration.name
         );
 
-        let model = cell
+        entry
+            .model
             .get_or_try_init({
                 let model_dir = model_dir.to_path_buf();
                 let device = self.device.clone();
@@ -2704,7 +5854,19 @@ impl ModelRegistry {
             })
             .await?;
 
-        Ok(model.clone())
+        let model = {
+            let guard = self.audio_chat_models.read().await;
+            guard
+                .get(&variant)
+                .filter(|current| Arc::ptr_eq(current, &entry))
+                .and_then(|current| current.model.get().cloned())
+        };
+        drop(loading_guard);
+        model.ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "LFM2.5 Audio model {variant} load was superseded before publication"
+            ))
+        })
     }
 
     pub async fn load_chat(
@@ -2818,17 +5980,23 @@ impl ModelRegistry {
         &self,
         variant: ModelVariant,
         model_dir: &Path,
-    ) -> Result<Arc<VoxtralRealtimeModel>> {
+    ) -> Result<VoxtralModelLease> {
         let registration = resolve_voxtral_loader_registration(variant).ok_or_else(|| {
             Error::InvalidInput(format!("Unsupported Voxtral model variant: {variant}"))
         })?;
 
-        let cell = {
+        let (entry, loading_guard) = {
             let mut guard = self.voxtral_models.write().await;
-            guard
+            let entry = guard
                 .entry(variant)
-                .or_insert_with(|| Arc::new(OnceCell::new()))
-                .clone()
+                .or_insert_with(|| Arc::new(TrackedModelEntry::default()))
+                .clone();
+            let loading_guard = entry.uses.acquire().ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "Voxtral model {variant} exceeded its active-use accounting capacity"
+                ))
+            })?;
+            (entry, loading_guard)
         };
 
         info!(
@@ -2836,7 +6004,8 @@ impl ModelRegistry {
             registration.name
         );
 
-        let model = cell
+        entry
+            .model
             .get_or_try_init({
                 let model_dir = model_dir.to_path_buf();
                 let device = self.device.clone();
@@ -2849,8 +6018,20 @@ impl ModelRegistry {
                 }
             })
             .await?;
-
-        Ok(model.clone())
+        let lease = {
+            let guard = self.voxtral_models.read().await;
+            guard
+                .get(&variant)
+                .filter(|current| Arc::ptr_eq(current, &entry))
+                .and_then(|current| current.acquire())
+                .map(|inner| VoxtralModelLease { inner })
+        };
+        drop(loading_guard);
+        lease.ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "Voxtral model {variant} load was superseded before publication"
+            ))
+        })
     }
 
     pub async fn load_qwen_tts(
@@ -2931,12 +6112,18 @@ impl ModelRegistry {
             Error::InvalidInput(format!("Unsupported Voxtral TTS model variant: {variant}"))
         })?;
 
-        let cell = {
+        let (entry, loading_guard) = {
             let mut guard = self.voxtral_tts_models.write().await;
-            guard
+            let entry = guard
                 .entry(variant)
-                .or_insert_with(|| Arc::new(OnceCell::new()))
-                .clone()
+                .or_insert_with(|| Arc::new(TrackedModelEntry::default()))
+                .clone();
+            let loading_guard = entry.uses.acquire().ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "Voxtral TTS model {variant} exceeded its active-use accounting capacity"
+                ))
+            })?;
+            (entry, loading_guard)
         };
 
         info!(
@@ -2944,7 +6131,8 @@ impl ModelRegistry {
             registration.name
         );
 
-        let model = cell
+        entry
+            .model
             .get_or_try_init({
                 let model_dir = model_dir.to_path_buf();
                 let device = self.device.clone();
@@ -2957,8 +6145,19 @@ impl ModelRegistry {
                 }
             })
             .await?;
-
-        Ok(model.clone())
+        let model = {
+            let guard = self.voxtral_tts_models.read().await;
+            guard
+                .get(&variant)
+                .filter(|current| Arc::ptr_eq(current, &entry))
+                .and_then(|current| current.model.get().cloned())
+        };
+        drop(loading_guard);
+        model.ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "Voxtral TTS model {variant} load was superseded before publication"
+            ))
+        })
     }
 
     pub async fn load_vibevoice_tts(
@@ -2972,12 +6171,18 @@ impl ModelRegistry {
             ))
         })?;
 
-        let cell = {
+        let (entry, loading_guard) = {
             let mut guard = self.vibevoice_tts_models.write().await;
-            guard
+            let entry = guard
                 .entry(variant)
-                .or_insert_with(|| Arc::new(OnceCell::new()))
-                .clone()
+                .or_insert_with(|| Arc::new(TrackedModelEntry::default()))
+                .clone();
+            let loading_guard = entry.uses.acquire().ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "VibeVoice TTS model {variant} exceeded its active-use accounting capacity"
+                ))
+            })?;
+            (entry, loading_guard)
         };
 
         info!(
@@ -2985,7 +6190,8 @@ impl ModelRegistry {
             registration.name
         );
 
-        let model = cell
+        entry
+            .model
             .get_or_try_init({
                 let model_dir = model_dir.to_path_buf();
                 let device = self.device.clone();
@@ -2998,8 +6204,19 @@ impl ModelRegistry {
                 }
             })
             .await?;
-
-        Ok(model.clone())
+        let model = {
+            let guard = self.vibevoice_tts_models.read().await;
+            guard
+                .get(&variant)
+                .filter(|current| Arc::ptr_eq(current, &entry))
+                .and_then(|current| current.model.get().cloned())
+        };
+        drop(loading_guard);
+        model.ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "VibeVoice TTS model {variant} load was superseded before publication"
+            ))
+        })
     }
 
     pub async fn load_fish_s2_tts(
@@ -3011,12 +6228,18 @@ impl ModelRegistry {
             Error::InvalidInput(format!("Unsupported Fish S2 TTS model variant: {variant}"))
         })?;
 
-        let cell = {
+        let (entry, loading_guard) = {
             let mut guard = self.fish_s2_tts_models.write().await;
-            guard
+            let entry = guard
                 .entry(variant)
-                .or_insert_with(|| Arc::new(OnceCell::new()))
-                .clone()
+                .or_insert_with(|| Arc::new(TrackedModelEntry::default()))
+                .clone();
+            let loading_guard = entry.uses.acquire().ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "Fish S2 TTS model {variant} exceeded its active-use accounting capacity"
+                ))
+            })?;
+            (entry, loading_guard)
         };
 
         info!(
@@ -3024,7 +6247,8 @@ impl ModelRegistry {
             registration.name
         );
 
-        let model = cell
+        entry
+            .model
             .get_or_try_init({
                 let model_dir = model_dir.to_path_buf();
                 let device = self.device.clone();
@@ -3037,8 +6261,19 @@ impl ModelRegistry {
                 }
             })
             .await?;
-
-        Ok(model.clone())
+        let model = {
+            let guard = self.fish_s2_tts_models.read().await;
+            guard
+                .get(&variant)
+                .filter(|current| Arc::ptr_eq(current, &entry))
+                .and_then(|current| current.model.get().cloned())
+        };
+        drop(loading_guard);
+        model.ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "Fish S2 TTS model {variant} load was superseded before publication"
+            ))
+        })
     }
 
     pub async fn load_kokoro(
@@ -3050,12 +6285,18 @@ impl ModelRegistry {
             Error::InvalidInput(format!("Unsupported Kokoro model variant: {variant}"))
         })?;
 
-        let cell = {
+        let (entry, loading_guard) = {
             let mut guard = self.kokoro_models.write().await;
-            guard
+            let entry = guard
                 .entry(variant)
-                .or_insert_with(|| Arc::new(OnceCell::new()))
-                .clone()
+                .or_insert_with(|| Arc::new(TrackedModelEntry::default()))
+                .clone();
+            let loading_guard = entry.uses.acquire().ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "Kokoro model {variant} exceeded its active-use accounting capacity"
+                ))
+            })?;
+            (entry, loading_guard)
         };
 
         info!(
@@ -3063,7 +6304,8 @@ impl ModelRegistry {
             registration.name
         );
 
-        let model = cell
+        entry
+            .model
             .get_or_try_init({
                 let model_dir = model_dir.to_path_buf();
                 let device = self.device.clone();
@@ -3076,29 +6318,36 @@ impl ModelRegistry {
                 }
             })
             .await?;
-
-        Ok(model.clone())
+        let model = {
+            let guard = self.kokoro_models.read().await;
+            guard
+                .get(&variant)
+                .filter(|current| Arc::ptr_eq(current, &entry))
+                .and_then(|current| current.model.get().cloned())
+        };
+        drop(loading_guard);
+        model.ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "Kokoro model {variant} load was superseded before publication"
+            ))
+        })
     }
 
     pub async fn get_asr(&self, variant: ModelVariant) -> Option<Arc<NativeAsrModel>> {
         let guard = self.asr_models.read().await;
-        guard
-            .get(&variant)
-            .and_then(|entry| entry.model.get().cloned())
+        guard.get(&variant).and_then(|entry| entry.ready_model())
     }
 
     pub fn try_get_asr(&self, variant: ModelVariant) -> Option<Arc<NativeAsrModel>> {
         let guard = self.asr_models.try_read().ok()?;
-        guard
-            .get(&variant)
-            .and_then(|entry| entry.model.get().cloned())
+        guard.get(&variant).and_then(|entry| entry.ready_model())
     }
 
     pub async fn get_asr_lease(&self, variant: ModelVariant) -> Option<AsrModelLease> {
         let guard = self.asr_models.read().await;
         guard
             .get(&variant)
-            .and_then(|entry| entry.acquire())
+            .and_then(|entry| entry.acquire_ready())
             .map(|inner| AsrModelLease { inner })
     }
 
@@ -3106,8 +6355,32 @@ impl ModelRegistry {
         let guard = self.asr_models.try_read().ok()?;
         guard
             .get(&variant)
-            .and_then(|entry| entry.acquire())
+            .and_then(|entry| entry.acquire_ready())
             .map(|inner| AsrModelLease { inner })
+    }
+
+    /// Internal lifecycle view of a fully instantiated ASR handle that has not
+    /// crossed the external Ready publication barrier yet.
+    pub(crate) async fn get_loading_asr(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<Arc<NativeAsrModel>> {
+        let guard = self.asr_models.read().await;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.model.get().cloned())
+    }
+
+    /// Publish an instantiated ASR handle only after adapter sealing, backend
+    /// synchronization, and physical state planning have all committed.
+    pub(crate) async fn publish_asr_ready(&self, variant: ModelVariant) -> Result<()> {
+        let guard = self.asr_models.read().await;
+        let entry = guard.get(&variant).ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "cannot publish missing ASR model {variant} as ready"
+            ))
+        })?;
+        entry.publish_ready()
     }
 
     pub async fn get_diarization(
@@ -3149,7 +6422,46 @@ impl ModelRegistry {
 
     pub async fn get_audio_chat(&self, variant: ModelVariant) -> Option<Arc<NativeAudioChatModel>> {
         let guard = self.audio_chat_models.read().await;
-        guard.get(&variant).and_then(|cell| cell.get().cloned())
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.model.get().cloned())
+    }
+
+    pub async fn get_lfm25_audio_lease(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<Lfm25AudioModelLease> {
+        let guard = self.audio_chat_models.read().await;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire_ready())
+            .map(|inner| Lfm25AudioModelLease { inner })
+    }
+
+    /// Internal lifecycle view of an instantiated LFM2.5 Audio model before
+    /// its adapter, physical-state, and bundle publications have committed.
+    /// Retained inference must use `get_lfm25_audio_lease` instead.
+    pub(crate) async fn get_loading_lfm25_audio_lease(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<Lfm25AudioModelLease> {
+        let guard = self.audio_chat_models.read().await;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire())
+            .map(|inner| Lfm25AudioModelLease { inner })
+    }
+
+    /// Publish retained LFM2.5 Audio discovery only after lifecycle sealing
+    /// and authoritative slot publication have both committed.
+    pub(crate) async fn publish_lfm25_audio_ready(&self, variant: ModelVariant) -> Result<()> {
+        let guard = self.audio_chat_models.read().await;
+        let entry = guard.get(&variant).ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "cannot publish missing LFM2.5 Audio model {variant} as ready"
+            ))
+        })?;
+        entry.publish_ready()
     }
 
     pub fn try_get_chat(&self, variant: ModelVariant) -> Option<ChatModelLease> {
@@ -3162,47 +6474,204 @@ impl ModelRegistry {
 
     pub fn try_get_audio_chat(&self, variant: ModelVariant) -> Option<Arc<NativeAudioChatModel>> {
         let guard = self.audio_chat_models.try_read().ok()?;
-        guard.get(&variant).and_then(|cell| cell.get().cloned())
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.model.get().cloned())
     }
 
-    pub async fn get_voxtral(&self, variant: ModelVariant) -> Option<Arc<VoxtralRealtimeModel>> {
+    pub fn try_get_lfm25_audio_lease(&self, variant: ModelVariant) -> Option<Lfm25AudioModelLease> {
+        let guard = self.audio_chat_models.try_read().ok()?;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire_ready())
+            .map(|inner| Lfm25AudioModelLease { inner })
+    }
+
+    pub async fn get_voxtral_lease(&self, variant: ModelVariant) -> Option<VoxtralModelLease> {
         let guard = self.voxtral_models.read().await;
-        guard.get(&variant).and_then(|cell| cell.get().cloned())
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire_ready())
+            .map(|inner| VoxtralModelLease { inner })
     }
 
-    pub fn try_get_voxtral(&self, variant: ModelVariant) -> Option<Arc<VoxtralRealtimeModel>> {
+    pub fn try_get_voxtral_lease(&self, variant: ModelVariant) -> Option<VoxtralModelLease> {
         let guard = self.voxtral_models.try_read().ok()?;
-        guard.get(&variant).and_then(|cell| cell.get().cloned())
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire_ready())
+            .map(|inner| VoxtralModelLease { inner })
+    }
+
+    /// Internal lifecycle view before the external Ready publication barrier.
+    pub(crate) async fn get_loading_voxtral(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<Arc<VoxtralRealtimeModel>> {
+        let guard = self.voxtral_models.read().await;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.model.get().cloned())
+    }
+
+    pub(crate) async fn publish_voxtral_ready(&self, variant: ModelVariant) -> Result<()> {
+        let guard = self.voxtral_models.read().await;
+        let entry = guard.get(&variant).ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "cannot publish missing Voxtral model {variant} as ready"
+            ))
+        })?;
+        entry.publish_ready()
     }
 
     pub async fn get_voxtral_tts(&self, variant: ModelVariant) -> Option<Arc<VoxtralTtsModel>> {
         let guard = self.voxtral_tts_models.read().await;
-        guard.get(&variant).and_then(|cell| cell.get().cloned())
+        guard.get(&variant).and_then(|entry| entry.ready_model())
     }
 
     pub fn try_get_voxtral_tts(&self, variant: ModelVariant) -> Option<Arc<VoxtralTtsModel>> {
         let guard = self.voxtral_tts_models.try_read().ok()?;
-        guard.get(&variant).and_then(|cell| cell.get().cloned())
+        guard.get(&variant).and_then(|entry| entry.ready_model())
+    }
+
+    pub async fn get_voxtral_tts_lease(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<VoxtralTtsModelLease> {
+        let guard = self.voxtral_tts_models.read().await;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire_ready())
+            .map(|inner| VoxtralTtsModelLease { inner })
+    }
+
+    pub fn try_get_voxtral_tts_lease(&self, variant: ModelVariant) -> Option<VoxtralTtsModelLease> {
+        let guard = self.voxtral_tts_models.try_read().ok()?;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire_ready())
+            .map(|inner| VoxtralTtsModelLease { inner })
+    }
+
+    pub(crate) async fn get_loading_voxtral_tts(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<Arc<VoxtralTtsModel>> {
+        let guard = self.voxtral_tts_models.read().await;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.model.get().cloned())
+    }
+
+    pub(crate) async fn publish_voxtral_tts_ready(&self, variant: ModelVariant) -> Result<()> {
+        let guard = self.voxtral_tts_models.read().await;
+        let entry = guard.get(&variant).ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "cannot publish missing Voxtral TTS model {variant} as ready"
+            ))
+        })?;
+        entry.publish_ready()
     }
 
     pub async fn get_vibevoice_tts(&self, variant: ModelVariant) -> Option<Arc<VibeVoiceTtsModel>> {
         let guard = self.vibevoice_tts_models.read().await;
-        guard.get(&variant).and_then(|cell| cell.get().cloned())
+        guard.get(&variant).and_then(|entry| entry.ready_model())
     }
 
     pub fn try_get_vibevoice_tts(&self, variant: ModelVariant) -> Option<Arc<VibeVoiceTtsModel>> {
         let guard = self.vibevoice_tts_models.try_read().ok()?;
-        guard.get(&variant).and_then(|cell| cell.get().cloned())
+        guard.get(&variant).and_then(|entry| entry.ready_model())
+    }
+
+    pub async fn get_vibevoice_tts_lease(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<VibeVoiceTtsModelLease> {
+        let guard = self.vibevoice_tts_models.read().await;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire_ready())
+            .map(|inner| VibeVoiceTtsModelLease { inner })
+    }
+
+    pub fn try_get_vibevoice_tts_lease(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<VibeVoiceTtsModelLease> {
+        let guard = self.vibevoice_tts_models.try_read().ok()?;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire_ready())
+            .map(|inner| VibeVoiceTtsModelLease { inner })
+    }
+
+    pub(crate) async fn get_loading_vibevoice_tts(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<Arc<VibeVoiceTtsModel>> {
+        let guard = self.vibevoice_tts_models.read().await;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.model.get().cloned())
+    }
+
+    pub(crate) async fn publish_vibevoice_tts_ready(&self, variant: ModelVariant) -> Result<()> {
+        let guard = self.vibevoice_tts_models.read().await;
+        let entry = guard.get(&variant).ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "cannot publish missing VibeVoice TTS model {variant} as ready"
+            ))
+        })?;
+        entry.publish_ready()
     }
 
     pub async fn get_fish_s2_tts(&self, variant: ModelVariant) -> Option<Arc<FishS2TtsModel>> {
         let guard = self.fish_s2_tts_models.read().await;
-        guard.get(&variant).and_then(|cell| cell.get().cloned())
+        guard.get(&variant).and_then(|entry| entry.ready_model())
     }
 
     pub fn try_get_fish_s2_tts(&self, variant: ModelVariant) -> Option<Arc<FishS2TtsModel>> {
         let guard = self.fish_s2_tts_models.try_read().ok()?;
-        guard.get(&variant).and_then(|cell| cell.get().cloned())
+        guard.get(&variant).and_then(|entry| entry.ready_model())
+    }
+
+    pub async fn get_fish_s2_tts_lease(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<FishS2TtsModelLease> {
+        let guard = self.fish_s2_tts_models.read().await;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire_ready())
+            .map(|inner| FishS2TtsModelLease { inner })
+    }
+
+    pub fn try_get_fish_s2_tts_lease(&self, variant: ModelVariant) -> Option<FishS2TtsModelLease> {
+        let guard = self.fish_s2_tts_models.try_read().ok()?;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire_ready())
+            .map(|inner| FishS2TtsModelLease { inner })
+    }
+
+    pub(crate) async fn get_loading_fish_s2_tts(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<Arc<FishS2TtsModel>> {
+        let guard = self.fish_s2_tts_models.read().await;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.model.get().cloned())
+    }
+
+    pub(crate) async fn publish_fish_s2_tts_ready(&self, variant: ModelVariant) -> Result<()> {
+        let guard = self.fish_s2_tts_models.read().await;
+        let entry = guard.get(&variant).ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "cannot publish missing Fish S2 TTS model {variant} as ready"
+            ))
+        })?;
+        entry.publish_ready()
     }
 
     pub async fn get_qwen_tts(&self, variant: ModelVariant) -> Option<Arc<Qwen3TtsModel>> {
@@ -3237,18 +6706,58 @@ impl ModelRegistry {
 
     pub async fn get_kokoro(&self, variant: ModelVariant) -> Option<Arc<KokoroTtsModel>> {
         let guard = self.kokoro_models.read().await;
-        guard.get(&variant).and_then(|cell| cell.get().cloned())
+        guard.get(&variant).and_then(|entry| entry.ready_model())
     }
 
     pub fn try_get_kokoro(&self, variant: ModelVariant) -> Option<Arc<KokoroTtsModel>> {
         let guard = self.kokoro_models.try_read().ok()?;
-        guard.get(&variant).and_then(|cell| cell.get().cloned())
+        guard.get(&variant).and_then(|entry| entry.ready_model())
+    }
+
+    pub async fn get_kokoro_lease(&self, variant: ModelVariant) -> Option<KokoroTtsModelLease> {
+        let guard = self.kokoro_models.read().await;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire_ready())
+            .map(|inner| KokoroTtsModelLease { inner })
+    }
+
+    pub fn try_get_kokoro_lease(&self, variant: ModelVariant) -> Option<KokoroTtsModelLease> {
+        let guard = self.kokoro_models.try_read().ok()?;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire_ready())
+            .map(|inner| KokoroTtsModelLease { inner })
+    }
+
+    pub(crate) async fn get_loading_kokoro(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<Arc<KokoroTtsModel>> {
+        let guard = self.kokoro_models.read().await;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.model.get().cloned())
+    }
+
+    pub(crate) async fn publish_kokoro_ready(&self, variant: ModelVariant) -> Result<()> {
+        let guard = self.kokoro_models.read().await;
+        let entry = guard.get(&variant).ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "cannot publish missing Kokoro model {variant} as ready"
+            ))
+        })?;
+        entry.publish_ready()
     }
 
     pub async fn unload_asr(&self, variant: ModelVariant) {
         let entry = {
             let mut guard = self.asr_models.write().await;
-            guard.remove(&variant)
+            let entry = guard.remove(&variant);
+            if let Some(entry) = &entry {
+                entry.reset_ready();
+            }
+            entry
         };
         if let Some(entry) = entry {
             entry.uses.wait_until_idle().await;
@@ -3271,28 +6780,70 @@ impl ModelRegistry {
     }
 
     pub async fn unload_audio_chat(&self, variant: ModelVariant) {
-        let mut guard = self.audio_chat_models.write().await;
-        guard.remove(&variant);
+        let entry = {
+            let mut guard = self.audio_chat_models.write().await;
+            let entry = guard.remove(&variant);
+            if let Some(entry) = &entry {
+                entry.reset_ready();
+            }
+            entry
+        };
+        if let Some(entry) = entry {
+            entry.uses.wait_until_idle().await;
+        }
     }
 
     pub async fn unload_voxtral(&self, variant: ModelVariant) {
-        let mut guard = self.voxtral_models.write().await;
-        guard.remove(&variant);
+        let entry = {
+            let mut guard = self.voxtral_models.write().await;
+            guard.remove(&variant)
+        };
+        if let Some(entry) = entry {
+            entry.reset_ready();
+            entry.uses.wait_until_idle().await;
+        }
     }
 
     pub async fn unload_voxtral_tts(&self, variant: ModelVariant) {
-        let mut guard = self.voxtral_tts_models.write().await;
-        guard.remove(&variant);
+        let entry = {
+            let mut guard = self.voxtral_tts_models.write().await;
+            let entry = guard.remove(&variant);
+            if let Some(entry) = &entry {
+                entry.reset_ready();
+            }
+            entry
+        };
+        if let Some(entry) = entry {
+            entry.uses.wait_until_idle().await;
+        }
     }
 
     pub async fn unload_vibevoice_tts(&self, variant: ModelVariant) {
-        let mut guard = self.vibevoice_tts_models.write().await;
-        guard.remove(&variant);
+        let entry = {
+            let mut guard = self.vibevoice_tts_models.write().await;
+            let entry = guard.remove(&variant);
+            if let Some(entry) = &entry {
+                entry.reset_ready();
+            }
+            entry
+        };
+        if let Some(entry) = entry {
+            entry.uses.wait_until_idle().await;
+        }
     }
 
     pub async fn unload_fish_s2_tts(&self, variant: ModelVariant) {
-        let mut guard = self.fish_s2_tts_models.write().await;
-        guard.remove(&variant);
+        let entry = {
+            let mut guard = self.fish_s2_tts_models.write().await;
+            let entry = guard.remove(&variant);
+            if let Some(entry) = &entry {
+                entry.reset_ready();
+            }
+            entry
+        };
+        if let Some(entry) = entry {
+            entry.uses.wait_until_idle().await;
+        }
     }
 
     pub async fn unload_qwen_tts(&self, variant: ModelVariant) {
@@ -3306,8 +6857,17 @@ impl ModelRegistry {
     }
 
     pub async fn unload_kokoro(&self, variant: ModelVariant) {
-        let mut guard = self.kokoro_models.write().await;
-        guard.remove(&variant);
+        let entry = {
+            let mut guard = self.kokoro_models.write().await;
+            let entry = guard.remove(&variant);
+            if let Some(entry) = &entry {
+                entry.reset_ready();
+            }
+            entry
+        };
+        if let Some(entry) = entry {
+            entry.uses.wait_until_idle().await;
+        }
     }
 }
 
@@ -3346,6 +6906,20 @@ mod tests {
         assert_eq!(diagnostics.default_compute_dtype, "f32");
         assert_eq!(diagnostics.supports_incremental_decode, Some(true));
         assert!(diagnostics.default_dtype_reason.contains("CPU"));
+    }
+
+    #[test]
+    fn effective_context_only_narrows_within_a_loaded_generation() {
+        let registry = ModelRegistry::new(PathBuf::new(), DeviceProfile::cpu());
+        let variant = ModelVariant::Lfm25Audio15BGguf;
+
+        registry
+            .publish_effective_context(variant, 128_000)
+            .unwrap();
+        registry.publish_effective_context(variant, 65_536).unwrap();
+        registry.publish_effective_context(variant, 96_000).unwrap();
+
+        assert_eq!(registry.effective_context(variant), Some(65_536));
     }
 
     #[test]
@@ -3400,6 +6974,72 @@ mod tests {
         assert_eq!(state.active.load(Ordering::Acquire), 0);
     }
 
+    #[test]
+    fn asr_registry_publication_barrier_gates_direct_handles_and_leases() {
+        let entry = TrackedModelEntry::<&'static str>::default();
+        entry
+            .model
+            .set(Arc::new("loaded-asr"))
+            .expect("seed loading ASR handle");
+
+        assert!(entry.ready_model().is_none());
+        assert!(entry.acquire_ready().is_none());
+
+        entry.publish_ready().expect("publish ASR ready");
+        assert_eq!(entry.ready_model().as_deref().copied(), Some("loaded-asr"));
+        assert_eq!(
+            entry.acquire_ready().as_deref().copied(),
+            Some("loaded-asr")
+        );
+
+        entry.reset_ready();
+        assert!(entry.ready_model().is_none());
+        assert!(entry.acquire_ready().is_none());
+    }
+
+    #[test]
+    fn lfm25_loading_lease_is_tracked_but_retained_discovery_is_ready_gated() {
+        let entry = TrackedModelEntry::<&'static str>::default();
+        entry
+            .model
+            .set(Arc::new("loading-lfm25-audio"))
+            .expect("seed loading LFM2.5 Audio handle");
+
+        let loading = entry.acquire().expect("lifecycle loading lease");
+        assert_eq!(*loading, "loading-lfm25-audio");
+        assert!(entry.acquire_ready().is_none());
+
+        entry
+            .publish_ready()
+            .expect("publish retained LFM2.5 Audio discovery");
+        let retained = entry.acquire_ready().expect("ready retained lease");
+        assert_eq!(*retained, "loading-lfm25-audio");
+
+        entry.reset_ready();
+        assert!(entry.acquire_ready().is_none());
+        assert_eq!(*loading, "loading-lfm25-audio");
+        assert_eq!(*retained, "loading-lfm25-audio");
+    }
+
+    #[tokio::test]
+    async fn failed_asr_initialization_never_crosses_publication_barrier() {
+        let entry = TrackedModelEntry::<&'static str>::default();
+        let error = entry
+            .model
+            .get_or_try_init(|| async {
+                Err::<Arc<&'static str>, Error>(Error::ModelLoadError(
+                    "injected ASR load failure".into(),
+                ))
+            })
+            .await
+            .expect_err("injected ASR load must fail");
+
+        assert!(error.to_string().contains("injected ASR load failure"));
+        assert!(entry.ready_model().is_none());
+        assert!(entry.acquire_ready().is_none());
+        assert!(entry.publish_ready().is_err());
+    }
+
     async fn assert_session_lease_survives_concurrent_reload(old: &'static str, new: &'static str) {
         let models = Arc::new(RwLock::new(HashMap::<
             &'static str,
@@ -3445,9 +7085,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn asr_and_qwen_tts_sessions_keep_exact_identity_across_unload_reload() {
+    async fn retained_model_sessions_keep_exact_identity_across_unload_reload() {
         assert_session_lease_survives_concurrent_reload("old-asr", "new-asr").await;
         assert_session_lease_survives_concurrent_reload("old-qwen-tts", "new-qwen-tts").await;
+        assert_session_lease_survives_concurrent_reload("old-lfm25-audio", "new-lfm25-audio").await;
     }
 
     #[test]
@@ -3520,6 +7161,31 @@ mod tests {
         if let Some(previous) = previous {
             std::env::set_var("IZWI_LFM25_ASR_CHUNK_MAX_NEW_TOKENS", previous);
         }
+    }
+
+    #[test]
+    fn lfm_audio_asr_route_decision_uses_the_authoritative_chunk_planner() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let cfg = lfm25_audio_asr_long_form_config();
+        let sample_rate = 100_u32;
+        let one_chunk_samples = (cfg.hard_max_chunk_secs * sample_rate as f32)
+            .floor()
+            .max(1.0) as usize;
+        let multi_chunk_samples = one_chunk_samples
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(1))
+            .expect("test audio length");
+
+        let one_chunk = vec![0.0; one_chunk_samples];
+        assert_eq!(
+            lfm25_audio_asr_requires_long_form(&one_chunk, sample_rate),
+            plan_audio_chunks(&one_chunk, sample_rate, &cfg, None).len() > 1
+        );
+        let multi_chunk = vec![0.0; multi_chunk_samples];
+        assert!(lfm25_audio_asr_requires_long_form(
+            &multi_chunk,
+            sample_rate
+        ));
     }
 
     #[test]

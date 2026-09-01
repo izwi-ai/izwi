@@ -4,12 +4,11 @@
 //! Implementation mirrors the official 12Hz decoder architecture:
 //! RVQ projection -> pre-conv -> pre-transformer -> upsample stack -> decoder blocks -> waveform.
 
-use candle_core::{DType, Device, IndexOp, Tensor, D};
+use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{
     ops, Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, LayerNorm, LayerNormConfig,
     Linear, Module, RmsNorm, VarBuilder,
 };
-use candle_transformers::utils::repeat_kv as candle_repeat_kv;
 use serde::Deserialize;
 use tracing::{debug, info};
 
@@ -17,6 +16,7 @@ use crate::error::{Error, Result};
 use crate::models::shared::attention::flash::{
     flash_attention_requested, try_fused_self_attention,
 };
+use crate::models::shared::attention::gqa::{compact_gqa_sdpa_bhsd, CompactGqaMask};
 
 /// Speech Tokenizer Configuration
 #[derive(Debug, Clone, Deserialize)]
@@ -604,9 +604,6 @@ impl EncoderAttention {
         q = self.apply_rope(q)?;
         k = self.apply_rope(k)?;
 
-        let k = repeat_kv(&k, self.num_heads, self.num_kv_heads)?;
-        let v = repeat_kv(&v, self.num_heads, self.num_kv_heads)?;
-
         let q = q.transpose(1, 2)?;
         let k = k.transpose(1, 2)?;
         let v = v.transpose(1, 2)?;
@@ -624,19 +621,14 @@ impl EncoderAttention {
                 return self.o_proj.forward(&out).map_err(Error::from);
             }
         }
-        let q = q.reshape((bsz * self.num_heads, seq_len, self.head_dim))?;
-        let k = k.reshape((bsz * self.num_heads, total_len, self.head_dim))?;
-        let v = v.reshape((bsz * self.num_heads, total_len, self.head_dim))?;
-
-        let mut att = q.matmul(&k.transpose(1, 2)?)?;
-        let scale =
-            Tensor::new((self.head_dim as f32).sqrt(), att.device())?.to_dtype(att.dtype())?;
-        att = att.broadcast_div(&scale)?;
-        let mask = causal_mask(seq_len, total_len, 0, att.device(), att.dtype())?;
-        att = att.broadcast_add(&mask)?;
-        let att = ops::softmax(&att, D::Minus1)?;
-        let out = att.matmul(&v)?;
-        let out = out.reshape((bsz, self.num_heads, seq_len, self.head_dim))?;
+        let mask = causal_mask(seq_len, total_len, 0, q.device(), q.dtype())?;
+        let out = compact_gqa_sdpa_bhsd(
+            &q,
+            &k,
+            &v,
+            Some(CompactGqaMask::Additive(&mask)),
+            1.0 / (self.head_dim as f64).sqrt(),
+        )?;
         let out = out
             .transpose(1, 2)?
             .reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
@@ -1005,9 +997,6 @@ impl Attention {
         q = self.apply_rope(q)?;
         k = self.apply_rope(k)?;
 
-        let k = repeat_kv(&k, self.num_heads, self.num_kv_heads)?;
-        let v = repeat_kv(&v, self.num_heads, self.num_kv_heads)?;
-
         let q = q.transpose(1, 2)?;
         let k = k.transpose(1, 2)?;
         let v = v.transpose(1, 2)?;
@@ -1026,22 +1015,14 @@ impl Attention {
             }
         }
 
-        let q = q.reshape((bsz * self.num_heads, seq_len, self.head_dim))?;
-        let k = k.reshape((bsz * self.num_heads, total_len, self.head_dim))?;
-        let v = v.reshape((bsz * self.num_heads, total_len, self.head_dim))?;
-
-        let mut att = q.matmul(&k.transpose(1, 2)?)?;
-        let scale =
-            Tensor::new((self.head_dim as f32).sqrt(), att.device())?.to_dtype(att.dtype())?;
-        att = att.broadcast_div(&scale)?;
-
-        let mask = causal_mask(seq_len, total_len, 0, att.device(), att.dtype())?;
-        att = att.broadcast_add(&mask)?;
-
-        let att = ops::softmax(&att, D::Minus1)?;
-        let out = att.matmul(&v)?;
-
-        let out = out.reshape((bsz, self.num_heads, seq_len, self.head_dim))?;
+        let mask = causal_mask(seq_len, total_len, 0, q.device(), q.dtype())?;
+        let out = compact_gqa_sdpa_bhsd(
+            &q,
+            &k,
+            &v,
+            Some(CompactGqaMask::Additive(&mask)),
+            1.0 / (self.head_dim as f64).sqrt(),
+        )?;
         let out = out
             .transpose(1, 2)?
             .reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
@@ -1134,8 +1115,8 @@ impl DecoderLayer {
 
 /// Encoder-side normalized codebook.
 struct EncoderCodebook {
-    embeddings: Vec<f32>,
-    norms: Vec<f32>,
+    embeddings: Tensor,
+    norms: Tensor,
     codebook_size: usize,
     codebook_dim: usize,
 }
@@ -1146,41 +1127,60 @@ impl EncoderCodebook {
         let cluster_usage = vb
             .get((codebook_size,), "codebook.cluster_usage")?
             .clamp(1e-7f64, f64::MAX)?;
-        let embeddings = embedding_sum.broadcast_div(&cluster_usage.unsqueeze(1)?)?;
-        let embeddings_2d = embeddings.to_dtype(DType::F32)?.to_vec2::<f32>()?;
-        let mut flat = Vec::with_capacity(codebook_size * codebook_dim);
-        let mut norms = Vec::with_capacity(codebook_size);
-        for row in &embeddings_2d {
-            norms.push(row.iter().map(|v| v * v).sum());
-            flat.extend_from_slice(row);
+        let embeddings = embedding_sum
+            .broadcast_div(&cluster_usage.unsqueeze(1)?)?
+            .to_dtype(DType::F32)?;
+        Self::from_embeddings(embeddings, codebook_size, codebook_dim)
+    }
+
+    fn from_embeddings(
+        embeddings: Tensor,
+        codebook_size: usize,
+        codebook_dim: usize,
+    ) -> Result<Self> {
+        if embeddings.dims2()? != (codebook_size, codebook_dim) {
+            return Err(Error::ModelLoadError(format!(
+                "Unexpected speech tokenizer codebook shape {:?}; expected ({codebook_size}, {codebook_dim})",
+                embeddings.dims()
+            )));
         }
+        let embeddings = embeddings.to_dtype(DType::F32)?;
+        let norms = embeddings.sqr()?.sum(1)?;
         Ok(Self {
-            embeddings: flat,
+            embeddings,
             norms,
             codebook_size,
             codebook_dim,
         })
     }
 
-    fn embedding(&self, index: usize) -> &[f32] {
-        let start = index * self.codebook_dim;
-        &self.embeddings[start..start + self.codebook_dim]
-    }
-
-    fn nearest_index(&self, frame: &[f32]) -> usize {
-        let frame_norm: f32 = frame.iter().map(|v| v * v).sum();
-        let mut best_idx = 0usize;
-        let mut best_dist = f32::INFINITY;
-        for idx in 0..self.codebook_size {
-            let emb = self.embedding(idx);
-            let dot: f32 = frame.iter().zip(emb.iter()).map(|(a, b)| a * b).sum();
-            let dist = frame_norm + self.norms[idx] - 2.0 * dot;
-            if dist < best_dist {
-                best_dist = dist;
-                best_idx = idx;
-            }
+    fn quantize(&self, frames: &Tensor) -> Result<(Tensor, Tensor)> {
+        let (frame_count, frame_dim) = frames.dims2()?;
+        if frame_dim != self.codebook_dim {
+            return Err(Error::InferenceError(format!(
+                "Speech tokenizer RVQ frame dim {frame_dim} does not match codebook dim {}",
+                self.codebook_dim
+            )));
         }
-        best_idx
+        if frame_count == 0 {
+            return Ok((
+                Tensor::zeros((0,), DType::U32, frames.device())?,
+                Tensor::zeros((0, self.codebook_dim), DType::F32, frames.device())?,
+            ));
+        }
+        let frames = frames.to_dtype(DType::F32)?;
+        let frame_norms = frames.sqr()?.sum_keepdim(1)?;
+        let distances = frame_norms
+            .broadcast_add(&self.norms.unsqueeze(0)?)?
+            .broadcast_sub(&(frames.matmul(&self.embeddings.t()?)? * 2.0)?)?;
+        let indices = distances.argmin(1)?;
+        if indices.dims1()? != frame_count {
+            return Err(Error::InferenceError(
+                "Speech tokenizer RVQ argmin returned an unexpected shape".to_string(),
+            ));
+        }
+        let quantized = self.embeddings.index_select(&indices, 0)?;
+        Ok((indices, quantized))
     }
 }
 
@@ -1250,24 +1250,26 @@ impl EncoderResidualVectorQuantizer {
 
         let mut all_indices = Vec::with_capacity(num_quantizers);
         for layer in self.codebooks.iter().take(num_quantizers) {
-            let residual_bt = residual.i(0)?.transpose(0, 1)?;
-            let frames = residual_bt.to_dtype(DType::F32)?.to_vec2::<f32>()?;
-            let mut indices = Vec::with_capacity(seq_len);
-            let mut quantized = vec![0f32; dim * seq_len];
-
-            for (t, frame) in frames.iter().enumerate() {
-                let idx = layer.nearest_index(frame);
-                indices.push(idx as u32);
-                let emb = layer.embedding(idx);
-                for d in 0..dim {
-                    quantized[d * seq_len + t] = emb[d];
-                }
+            if layer.codebook_size == 0 || layer.codebook_dim != dim {
+                return Err(Error::InferenceError(format!(
+                    "Speech tokenizer RVQ codebook geometry ({}, {}) does not match residual dim {dim}",
+                    layer.codebook_size, layer.codebook_dim
+                )));
             }
-
-            let quantized = Tensor::from_vec(quantized, (1, dim, seq_len), residual.device())?
-                .to_dtype(residual.dtype())?;
+            crate::models::shared::telemetry::record_layout_copy();
+            let residual_bt = residual.i(0)?.transpose(0, 1)?.contiguous()?;
+            let (indices, quantized) = layer.quantize(&residual_bt)?;
+            crate::models::shared::telemetry::record_host_read(DType::U32, seq_len);
+            let indices_host = indices.to_vec1::<u32>()?;
+            let quantized = quantized.transpose(0, 1)?.unsqueeze(0)?;
+            let quantized = if quantized.dtype() == residual.dtype() {
+                quantized
+            } else {
+                crate::models::shared::telemetry::record_dtype_cast();
+                quantized.to_dtype(residual.dtype())?
+            };
             residual = residual.broadcast_sub(&quantized)?;
-            all_indices.push(indices);
+            all_indices.push(indices_host);
         }
         Ok(all_indices)
     }
@@ -1728,6 +1730,157 @@ impl SpeechTokenizerDecoder {
         Ok(ceil_div(resampled_samples, self.encode_downsample_rate).max(1))
     }
 
+    pub(crate) fn decoded_sample_upper_bound(&self, codec_frames: usize) -> Result<usize> {
+        if self.decode_upsample_rate == 0 {
+            return Err(Error::ModelError(
+                "speech-tokenizer decode upsample rate must be non-zero".into(),
+            ));
+        }
+        codec_frames
+            .checked_mul(self.decode_upsample_rate)
+            .ok_or_else(|| Error::Overloaded("speech-tokenizer sample bound overflow".into()))
+    }
+
+    pub(crate) fn reference_encode_temporary_upper_bound_bytes(
+        &self,
+        max_seconds: usize,
+        element_bytes: usize,
+    ) -> Result<u64> {
+        let encoder = self.encoder.as_ref().ok_or_else(|| {
+            Error::ModelError("speech-tokenizer reference encoder is unavailable".into())
+        })?;
+        let cfg = &encoder.config;
+        let samples = self
+            .input_sample_rate
+            .checked_mul(max_seconds)
+            .ok_or_else(|| {
+                Error::Overloaded("speech-tokenizer reference sample overflow".into())
+            })?;
+        let frames = ceil_div(samples, self.encode_downsample_rate.max(1));
+        let u64_value = |value: usize, label: &str| {
+            u64::try_from(value).map_err(|_| {
+                Error::Overloaded(format!("speech-tokenizer reference {label} exceeds u64"))
+            })
+        };
+        let mul = |left: u64, right: u64| {
+            left.checked_mul(right).ok_or_else(|| {
+                Error::Overloaded("speech-tokenizer reference workspace overflow".into())
+            })
+        };
+        let add = |left: u64, right: u64| {
+            left.checked_add(right).ok_or_else(|| {
+                Error::Overloaded("speech-tokenizer reference workspace overflow".into())
+            })
+        };
+        let samples = u64_value(samples, "samples")?;
+        let frames = u64_value(frames, "frames")?;
+        let conv_width = [cfg.num_filters, cfg.hidden_size, cfg.intermediate_size]
+            .into_iter()
+            .max()
+            .unwrap_or(1);
+        let convolution = mul(mul(samples, u64_value(conv_width, "conv width")?)?, 8)?;
+        let attention = mul(
+            mul(u64_value(cfg.num_attention_heads, "head count")?, frames)?,
+            frames,
+        )?;
+        let transformer_width = cfg
+            .hidden_size
+            .checked_mul(8)
+            .and_then(|value| {
+                cfg.intermediate_size
+                    .checked_mul(3)
+                    .and_then(|ffn| value.checked_add(ffn))
+            })
+            .ok_or_else(|| {
+                Error::Overloaded("speech-tokenizer reference transformer overflow".into())
+            })?;
+        let transformer = mul(frames, u64_value(transformer_width, "transformer width")?)?;
+        let quantizer_width = cfg
+            .codebook_size
+            .checked_add(
+                cfg.vector_quantization_hidden_dimension
+                    .checked_mul(4)
+                    .ok_or_else(|| {
+                        Error::Overloaded("speech-tokenizer reference quantizer overflow".into())
+                    })?,
+            )
+            .ok_or_else(|| {
+                Error::Overloaded("speech-tokenizer reference quantizer overflow".into())
+            })?;
+        let quantizer = mul(frames, u64_value(quantizer_width, "quantizer width")?)?;
+        let elements = add(add(convolution, attention)?, add(transformer, quantizer)?)?;
+        mul(elements, u64_value(element_bytes, "dtype width")?)
+    }
+
+    /// Conservative backend-temporary peak for a terminal codec/vocoder pass.
+    /// It follows the actual decoder geometry: transformer attention runs at
+    /// codec-frame width, then each configured upsample stage increases time
+    /// while decoder blocks reduce channels.
+    pub(crate) fn decode_temporary_upper_bound_bytes(
+        &self,
+        codec_frames: usize,
+        element_bytes: usize,
+    ) -> Result<u64> {
+        let frames = u64::try_from(codec_frames)
+            .map_err(|_| Error::Overloaded("speech-tokenizer frame bound exceeds u64".into()))?;
+        let checked_mul = |left: u64, right: u64| {
+            left.checked_mul(right)
+                .ok_or_else(|| Error::Overloaded("speech-tokenizer workspace overflow".into()))
+        };
+        let hidden = u64::try_from(self.config.hidden_size)
+            .map_err(|_| Error::Overloaded("speech-tokenizer hidden width exceeds u64".into()))?;
+        let heads = u64::try_from(self.config.num_attention_heads)
+            .map_err(|_| Error::Overloaded("speech-tokenizer head count exceeds u64".into()))?;
+        let attention = checked_mul(checked_mul(heads, frames)?, frames)?;
+        let transformer_linear = checked_mul(hidden, frames)?
+            .checked_mul(12)
+            .ok_or_else(|| Error::Overloaded("speech-tokenizer workspace overflow".into()))?;
+
+        let mut time = frames;
+        let latent = u64::try_from(self.config.latent_dim)
+            .map_err(|_| Error::Overloaded("speech-tokenizer latent width exceeds u64".into()))?;
+        let mut peak_activation = checked_mul(latent, time)?;
+        for ratio in &self.config.upsampling_ratios {
+            time = checked_mul(
+                time,
+                u64::try_from(*ratio).map_err(|_| {
+                    Error::Overloaded("speech-tokenizer upsample ratio exceeds u64".into())
+                })?,
+            )?;
+            peak_activation = peak_activation.max(checked_mul(latent, time)?);
+        }
+        let mut channels = u64::try_from(self.config.decoder_dim)
+            .map_err(|_| Error::Overloaded("speech-tokenizer decoder width exceeds u64".into()))?;
+        peak_activation = peak_activation.max(checked_mul(channels, time)?);
+        for rate in &self.config.upsample_rates {
+            time = checked_mul(
+                time,
+                u64::try_from(*rate).map_err(|_| {
+                    Error::Overloaded("speech-tokenizer decoder rate exceeds u64".into())
+                })?,
+            )?;
+            channels = (channels / 2).max(1);
+            peak_activation = peak_activation.max(checked_mul(channels, time)?);
+        }
+        // Convolution/residual blocks may retain inputs, outputs, and gated
+        // intermediates simultaneously; eight activation widths is a closed
+        // upper envelope for these inference-only stages.
+        let codec_elements = attention
+            .checked_add(transformer_linear)
+            .and_then(|value| {
+                peak_activation
+                    .checked_mul(8)
+                    .and_then(|peak| value.checked_add(peak))
+            })
+            .ok_or_else(|| Error::Overloaded("speech-tokenizer workspace overflow".into()))?;
+        checked_mul(
+            codec_elements,
+            u64::try_from(element_bytes).map_err(|_| {
+                Error::Overloaded("speech-tokenizer dtype width exceeds u64".into())
+            })?,
+        )
+    }
+
     /// Encode reference waveform into speech-tokenizer codec groups.
     pub fn encode_reference_audio(
         &self,
@@ -1818,22 +1971,6 @@ impl SpeechTokenizerDecoder {
     }
 }
 
-/// Repeat KV heads for GQA.
-fn repeat_kv(x: &Tensor, num_heads: usize, num_kv_heads: usize) -> Result<Tensor> {
-    if num_heads == num_kv_heads {
-        return Ok(x.clone());
-    }
-    if num_kv_heads == 0 || !num_heads.is_multiple_of(num_kv_heads) {
-        return Err(Error::InvalidInput(format!(
-            "Invalid GQA head config: num_heads={num_heads}, num_kv_heads={num_kv_heads}"
-        )));
-    }
-    let repeats = num_heads / num_kv_heads;
-    let x = x.transpose(1, 2)?;
-    let out = candle_repeat_kv(x, repeats)?;
-    out.transpose(1, 2).map_err(Error::from)
-}
-
 /// Build standard RoPE cos/sin cache.
 fn build_rope_cache(
     seq_len: usize,
@@ -1906,7 +2043,10 @@ fn normalized_codec_indices(
 ) -> Vec<i64> {
     let mut values = Vec::with_capacity(seq_len);
     for t in 0..seq_len {
-        let token = tokens.and_then(|tokens| tokens.get(t)).copied().unwrap_or(0);
+        let token = tokens
+            .and_then(|tokens| tokens.get(t))
+            .copied()
+            .unwrap_or(0);
         values.push(normalized_codec_index(token, codebook_size));
     }
     values
@@ -1983,5 +2123,44 @@ mod tests {
             resampled_audio_len(usize::MAX, 1, u32::MAX),
             Err(Error::Overloaded(_))
         ));
+    }
+
+    #[test]
+    fn encoder_codebook_quantizes_frames_with_candle_ops() {
+        let device = &Device::Cpu;
+        let codebook = EncoderCodebook::from_embeddings(
+            Tensor::from_vec(
+                vec![0.0f32, 0.0, 1.0, 0.0, 0.0, 1.0, 2.0, 2.0],
+                (4, 2),
+                device,
+            )
+            .expect("embeddings"),
+            4,
+            2,
+        )
+        .expect("codebook");
+        let frames = Tensor::from_vec(vec![0.9f32, 0.1, 0.1, 0.8], (2, 2), device).expect("frames");
+
+        let (indices, quantized) = codebook.quantize(&frames).expect("quantize");
+        assert_eq!(indices.to_vec1::<u32>().expect("indices"), vec![1, 2]);
+        assert_eq!(
+            quantized.to_vec2::<f32>().expect("quantized"),
+            vec![vec![1.0, 0.0], vec![0.0, 1.0]]
+        );
+    }
+
+    #[test]
+    fn encoder_codebook_argmin_preserves_first_index_on_ties() {
+        let device = &Device::Cpu;
+        let codebook = EncoderCodebook::from_embeddings(
+            Tensor::from_vec(vec![0.0f32, 0.0, 0.0, 0.0], (2, 2), device).expect("embeddings"),
+            2,
+            2,
+        )
+        .expect("codebook");
+        let frames = Tensor::from_vec(vec![1.0f32, 1.0], (1, 2), device).expect("frames");
+
+        let (indices, _) = codebook.quantize(&frames).expect("quantize");
+        assert_eq!(indices.to_vec1::<u32>().expect("indices"), vec![0]);
     }
 }

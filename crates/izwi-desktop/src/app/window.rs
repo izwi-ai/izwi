@@ -50,6 +50,21 @@ pub fn handle_run_event<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R>, eve
     }
 }
 
+pub fn event_ends_desktop_session<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+    event: &RunEvent,
+) -> bool {
+    match event {
+        RunEvent::ExitRequested { .. } | RunEvent::Exit => true,
+        RunEvent::WindowEvent {
+            label,
+            event: WindowEvent::Destroyed,
+            ..
+        } => label == "main" && !app_handle.state::<TrayVisibilityState>().is_visible(),
+        _ => false,
+    }
+}
+
 fn js_string_literal(value: &str) -> String {
     let escaped = value
         .replace('\\', "\\\\")

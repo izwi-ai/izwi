@@ -1,0 +1,130 @@
+# One API-exercisable representative per CUDA model implementation family.
+# Models must be preprovisioned on the protected NVIDIA certification runner.
+# Forced alignment, diarization, and the standalone speech tokenizer do not yet
+# have benchmark subcommands; their absence is reported by the workflow rather
+# than silently treated as model evidence.
+
+[[benchmarks]]
+name = "qwen3-chat-cuda"
+command = "chat"
+model = "Qwen3-0.6B-GGUF"
+iterations = 1
+prompt = "Reply with one short sentence about CUDA batching."
+max_tokens = 16
+
+[[benchmarks]]
+name = "qwen35-chat-cuda"
+command = "chat"
+model = "Qwen3.5-0.8B"
+iterations = 1
+prompt = "Reply with one short sentence about paged attention."
+max_tokens = 16
+
+[[benchmarks]]
+name = "lfm2-chat-cuda"
+command = "chat"
+model = "LFM2.5-1.2B-Instruct-GGUF"
+iterations = 1
+prompt = "Reply with one short sentence about KV caches."
+max_tokens = 16
+
+[[benchmarks]]
+name = "gemma3-chat-cuda"
+command = "chat"
+model = "Gemma-3-1b-it"
+iterations = 1
+prompt = "Reply with one short sentence about GPU inference."
+max_tokens = 16
+
+[[benchmarks]]
+name = "qwen3-tts-cuda"
+command = "tts"
+model = "Qwen3-TTS-12Hz-0.6B-Base"
+iterations = 1
+text = "CUDA model evidence."
+
+[[benchmarks]]
+name = "kokoro-tts-cuda"
+command = "tts"
+model = "Kokoro-82M"
+iterations = 1
+text = "CUDA model evidence."
+
+[[benchmarks]]
+name = "voxtral-tts-cuda"
+command = "tts"
+model = "Voxtral-4B-TTS-2603"
+iterations = 1
+text = "CUDA model evidence."
+
+[[benchmarks]]
+name = "vibevoice-tts-cuda"
+command = "tts"
+model = "VibeVoice-1.5B"
+iterations = 1
+text = "CUDA model evidence."
+reference_audio = "../../data/fox.wav"
+reference_text_file = "../../data/fox.md"
+
+[[benchmarks]]
+name = "fish-s2-tts-cuda"
+command = "tts"
+model = "FishAudio-S2-Pro"
+iterations = 1
+text = "CUDA model evidence."
+
+[[benchmarks]]
+name = "lfm25-audio-tts-cuda"
+command = "tts"
+model = "LFM2.5-Audio-1.5B-GGUF"
+iterations = 1
+text = "CUDA model evidence."
+
+[[benchmarks]]
+name = "parakeet-asr-cuda"
+command = "asr"
+model = "Parakeet-TDT-0.6B-v3"
+file = "../../data/test.wav"
+iterations = 1
+
+[[benchmarks]]
+name = "whisper-asr-cuda"
+command = "asr"
+model = "Whisper-Large-v3-Turbo"
+file = "../../data/test.wav"
+iterations = 1
+
+[[benchmarks]]
+name = "qwen3-asr-cuda"
+command = "asr"
+model = "Qwen3-ASR-0.6B-GGUF"
+file = "../../data/test.wav"
+iterations = 1
+
+[[benchmarks]]
+name = "vibevoice-asr-cuda"
+command = "asr"
+model = "VibeVoice-ASR"
+file = "../../data/test.wav"
+iterations = 1
+
+[[benchmarks]]
+name = "nemotron-asr-cuda"
+command = "asr"
+model = "Nemotron-3.5-ASR-Streaming-0.6B"
+file = "../../data/test.wav"
+iterations = 1
+
+[[benchmarks]]
+name = "granite-asr-cuda"
+command = "asr"
+model = "Granite-Speech-4.1-2B-Plus"
+file = "../../data/test.wav"
+iterations = 1
+
+[[benchmarks]]
+name = "voxtral-realtime-asr-cuda"
+command = "asr"
+model = "Voxtral-Mini-4B-Realtime-2602"
+file = "../../data/test.wav"
+iterations = 1

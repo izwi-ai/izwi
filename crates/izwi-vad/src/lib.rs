@@ -136,7 +136,7 @@ impl VadScorer {
         }
 
         let mut frames = Vec::with_capacity(frame_count);
-        for frame in self.vad_buffer.chunks_exact(VAD_FRAME_SAMPLES) {
+        for frame in self.vad_buffer.as_chunks::<VAD_FRAME_SAMPLES>().0 {
             let score = self.detector.predict_f32(frame).clamp(0.0, 1.0);
             let start_vad_sample = self.processed_vad_samples;
             let end_vad_sample = start_vad_sample + VAD_FRAME_SAMPLES;

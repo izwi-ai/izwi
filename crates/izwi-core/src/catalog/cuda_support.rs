@@ -29,15 +29,142 @@ impl CudaSupportLevel {
     }
 }
 
+/// Runtime maturity of the CUDA execution path advertised for a model.
+///
+/// This is intentionally independent from [`CudaSupportLevel`]. The legacy
+/// level describes what kind of implementation exists, while this status says
+/// how far that implementation has progressed through validation and rollout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CudaExecutionStatus {
+    Unsupported,
+    /// Portable Candle CUDA tensor graph; this is a provider class, not proof
+    /// that CUDA compilation or execution was observed on the current host.
+    Portable,
+    /// An optimized provider is source-eligible but lacks runtime validation.
+    EligibleUnverified,
+    CandleOptimized,
+    CustomOptimized,
+    Certified,
+}
+
+impl CudaExecutionStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unsupported => "unsupported",
+            Self::Portable => "portable",
+            Self::EligibleUnverified => "eligible_unverified",
+            Self::CandleOptimized => "candle_optimized",
+            Self::CustomOptimized => "custom_optimized",
+            Self::Certified => "certified",
+        }
+    }
+
+    pub const fn is_optimized(self) -> bool {
+        matches!(
+            self,
+            Self::CandleOptimized | Self::CustomOptimized | Self::Certified
+        )
+    }
+}
+
+/// Highest CUDA evidence state actually observed for a support claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CudaEvidenceLevel {
+    NotObserved,
+    SourceReviewed,
+    PortableVerified,
+    CudaCompiled,
+    CudaRuntimeValidated,
+    CudaPerformanceCertified,
+}
+
+impl CudaEvidenceLevel {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotObserved => "not_observed",
+            Self::SourceReviewed => "source_reviewed",
+            Self::PortableVerified => "portable_verified",
+            Self::CudaCompiled => "cuda_compiled",
+            Self::CudaRuntimeValidated => "cuda_runtime_validated",
+            Self::CudaPerformanceCertified => "cuda_performance_certified",
+        }
+    }
+
+    pub const fn proves_cuda_runtime(self) -> bool {
+        matches!(
+            self,
+            Self::CudaRuntimeValidated | Self::CudaPerformanceCertified
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct CudaSupportInfo {
+    /// Legacy implementation classification retained for API compatibility.
     pub level: CudaSupportLevel,
+    pub execution_status: CudaExecutionStatus,
+    pub evidence: CudaEvidenceLevel,
     pub reason: &'static str,
 }
 
 impl CudaSupportInfo {
     pub const fn new(level: CudaSupportLevel, reason: &'static str) -> Self {
-        Self { level, reason }
+        let (execution_status, evidence) = match level {
+            CudaSupportLevel::NativeCuda | CudaSupportLevel::CandleCudaGeneric => (
+                CudaExecutionStatus::EligibleUnverified,
+                CudaEvidenceLevel::SourceReviewed,
+            ),
+            CudaSupportLevel::CpuOnly | CudaSupportLevel::Disabled => (
+                CudaExecutionStatus::Unsupported,
+                CudaEvidenceLevel::SourceReviewed,
+            ),
+            CudaSupportLevel::Unknown => (
+                CudaExecutionStatus::Unsupported,
+                CudaEvidenceLevel::NotObserved,
+            ),
+        };
+        Self {
+            level,
+            execution_status,
+            evidence,
+            reason,
+        }
+    }
+
+    pub const fn try_with_evidence(
+        level: CudaSupportLevel,
+        execution_status: CudaExecutionStatus,
+        evidence: CudaEvidenceLevel,
+        reason: &'static str,
+    ) -> Option<Self> {
+        let info = Self {
+            level,
+            execution_status,
+            evidence,
+            reason,
+        };
+        if info.evidence_is_sufficient() {
+            Some(info)
+        } else {
+            None
+        }
+    }
+
+    pub const fn evidence_is_sufficient(self) -> bool {
+        match self.execution_status {
+            CudaExecutionStatus::Unsupported => true,
+            CudaExecutionStatus::Portable | CudaExecutionStatus::EligibleUnverified => {
+                !matches!(self.evidence, CudaEvidenceLevel::NotObserved)
+            }
+            CudaExecutionStatus::CandleOptimized | CudaExecutionStatus::CustomOptimized => {
+                self.evidence.proves_cuda_runtime()
+            }
+            CudaExecutionStatus::Certified => {
+                matches!(self.evidence, CudaEvidenceLevel::CudaPerformanceCertified)
+            }
+        }
     }
 }
 
@@ -47,6 +174,54 @@ impl Default for CudaSupportInfo {
             CudaSupportLevel::Unknown,
             "CUDA support was not recorded in serialized model metadata",
         )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CudaOperatorKind {
+    DenseGemm,
+    QuantizedGemm,
+    Convolution,
+    Attention,
+    PagedAttention,
+    Rope,
+    Normalization,
+    Sampling,
+    State,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CudaProviderClass {
+    NotApplicable,
+    HostOrchestration,
+    CandleTensor,
+    CandleCudnnEligible,
+    CandleFlashAttentionEligible,
+    IzwiCudaEligible,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CudaOperatorCapability {
+    pub operator: CudaOperatorKind,
+    pub provider: CudaProviderClass,
+    pub evidence: CudaEvidenceLevel,
+    pub reason: &'static str,
+}
+
+impl CudaOperatorCapability {
+    const fn source_reviewed(
+        operator: CudaOperatorKind,
+        provider: CudaProviderClass,
+        reason: &'static str,
+    ) -> Self {
+        Self {
+            operator,
+            provider,
+            evidence: CudaEvidenceLevel::SourceReviewed,
+            reason,
+        }
     }
 }
 
@@ -112,6 +287,160 @@ impl Default for CudaQuantizationInfo {
 }
 
 impl ModelVariant {
+    pub fn cuda_operator_capabilities(&self) -> [CudaOperatorCapability; 9] {
+        use CudaOperatorKind as Operator;
+        use CudaProviderClass as Provider;
+
+        if !self.is_enabled() {
+            return std::array::from_fn(|index| {
+                let operator = CUDA_OPERATOR_ORDER[index];
+                CudaOperatorCapability::source_reviewed(
+                    operator,
+                    Provider::NotApplicable,
+                    "variant is disabled in the application catalog",
+                )
+            });
+        }
+
+        let family = self.family();
+        let convolution = match family {
+            ModelFamily::Qwen3Tts
+            | ModelFamily::KokoroTts
+            | ModelFamily::VoxtralTts
+            | ModelFamily::VibeVoiceTts
+            | ModelFamily::FishS2Tts
+            | ModelFamily::ParakeetAsr
+            | ModelFamily::WhisperAsr
+            | ModelFamily::Qwen3Asr
+            | ModelFamily::VibeVoiceAsr
+            | ModelFamily::NemotronAsr
+            | ModelFamily::GraniteSpeechAsr
+            | ModelFamily::SortformerDiarization
+            | ModelFamily::Lfm2Chat
+            | ModelFamily::Lfm25Audio
+            | ModelFamily::Qwen3ForcedAligner
+            | ModelFamily::Voxtral
+            | ModelFamily::Tokenizer => CudaOperatorCapability::source_reviewed(
+                Operator::Convolution,
+                Provider::CandleCudnnEligible,
+                "convolution uses Candle tensor operators and is eligible for cuDNN only when build, layout, dtype, and grouping constraints match",
+            ),
+            ModelFamily::Qwen35Chat => CudaOperatorCapability::source_reviewed(
+                Operator::Convolution,
+                Provider::IzwiCudaEligible,
+                "Qwen3.5 recurrent blocks have an existing Izwi CUDA causal-convolution provider with a Candle fallback",
+            ),
+            ModelFamily::Qwen38Chat => CudaOperatorCapability::source_reviewed(
+                Operator::Convolution,
+                Provider::IzwiCudaEligible,
+                "Qwen3.8 DeltaNet blocks require independently verified Izwi CUDA causal-convolution coverage with a Candle fallback; Qwen3.5 evidence is not inherited",
+            ),
+            ModelFamily::Qwen3Chat | ModelFamily::Gemma3Chat => {
+                CudaOperatorCapability::source_reviewed(
+                    Operator::Convolution,
+                    Provider::NotApplicable,
+                    "text decoder graph has no convolutional hot path",
+                )
+            }
+        };
+        let attention_provider = match family {
+            ModelFamily::KokoroTts
+            | ModelFamily::ParakeetAsr
+            | ModelFamily::NemotronAsr
+            | ModelFamily::SortformerDiarization
+            | ModelFamily::Lfm25Audio => Provider::CandleTensor,
+            _ => Provider::CandleFlashAttentionEligible,
+        };
+        let paged_provider = match family {
+            ModelFamily::Qwen3Chat
+            | ModelFamily::Qwen35Chat
+            | ModelFamily::Qwen38Chat
+            | ModelFamily::Lfm2Chat
+            | ModelFamily::Gemma3Chat
+            | ModelFamily::Qwen3Tts
+            | ModelFamily::VoxtralTts
+            | ModelFamily::VibeVoiceTts
+            | ModelFamily::FishS2Tts
+            | ModelFamily::WhisperAsr
+            | ModelFamily::Qwen3Asr
+            | ModelFamily::VibeVoiceAsr
+            | ModelFamily::NemotronAsr
+            | ModelFamily::GraniteSpeechAsr
+            | ModelFamily::Lfm25Audio
+            | ModelFamily::Qwen3ForcedAligner
+            | ModelFamily::Voxtral => Provider::IzwiCudaEligible,
+            ModelFamily::KokoroTts
+            | ModelFamily::ParakeetAsr
+            | ModelFamily::SortformerDiarization
+            | ModelFamily::Tokenizer => Provider::NotApplicable,
+        };
+        let rope_provider = match family {
+            ModelFamily::KokoroTts
+            | ModelFamily::ParakeetAsr
+            | ModelFamily::NemotronAsr
+            | ModelFamily::SortformerDiarization => Provider::NotApplicable,
+            _ => Provider::CandleTensor,
+        };
+        let sampling_provider = match family {
+            ModelFamily::KokoroTts
+            | ModelFamily::SortformerDiarization
+            | ModelFamily::Tokenizer => Provider::NotApplicable,
+            _ => Provider::CandleTensor,
+        };
+        let quantization_provider = match self.cuda_quantization().level {
+            CudaQuantizationSupportLevel::CandleQuantizedGeneric => Provider::CandleTensor,
+            CudaQuantizationSupportLevel::DenseDequantizedFallback => Provider::HostOrchestration,
+            CudaQuantizationSupportLevel::Dense => Provider::NotApplicable,
+            CudaQuantizationSupportLevel::CpuOnly
+            | CudaQuantizationSupportLevel::Disabled
+            | CudaQuantizationSupportLevel::Unknown => Provider::NotApplicable,
+        };
+
+        [
+            CudaOperatorCapability::source_reviewed(
+                Operator::DenseGemm,
+                Provider::CandleTensor,
+                "dense projections use Candle matmul/linear dispatch on the selected device",
+            ),
+            CudaOperatorCapability::source_reviewed(
+                Operator::QuantizedGemm,
+                quantization_provider,
+                "provider reflects the checkpoint loading and quantized projection path; it is not CUDA runtime proof",
+            ),
+            convolution,
+            CudaOperatorCapability::source_reviewed(
+                Operator::Attention,
+                attention_provider,
+                "FlashAttention eligibility remains conditional on explicit policy, build, device, dtype, shape, and mask semantics",
+            ),
+            CudaOperatorCapability::source_reviewed(
+                Operator::PagedAttention,
+                paged_provider,
+                "iterative decoders use the shared physical paged-attention contract; other graphs mark this operator not applicable",
+            ),
+            CudaOperatorCapability::source_reviewed(
+                Operator::Rope,
+                rope_provider,
+                "RoPE uses Candle tensor kernels where the architecture has rotary position encoding",
+            ),
+            CudaOperatorCapability::source_reviewed(
+                Operator::Normalization,
+                Provider::CandleTensor,
+                "normalization has a Candle tensor reference path on the selected device",
+            ),
+            CudaOperatorCapability::source_reviewed(
+                Operator::Sampling,
+                sampling_provider,
+                "autoregressive selection uses Candle reductions where implemented and explicit host orchestration otherwise",
+            ),
+            CudaOperatorCapability::source_reviewed(
+                Operator::State,
+                paged_provider,
+                "state provider reflects load-sealed physical/invocation ownership, not observed CUDA execution",
+            ),
+        ]
+    }
+
     pub fn cuda_support(&self) -> CudaSupportInfo {
         if !self.is_enabled() {
             return CudaSupportInfo::new(
@@ -120,10 +449,17 @@ impl ModelVariant {
             );
         }
 
+        if self.is_qwen38_fp8() {
+            return CudaSupportInfo::new(
+                CudaSupportLevel::CandleCudaGeneric,
+                "Qwen3.8 block-scaled FP8 is eligible on Candle CUDA through a scale-aware Q8_0 compressed projection fallback; this is not native FP8 execution, and source review is not runtime validation",
+            );
+        }
+
         match self.family() {
             ModelFamily::Tokenizer => CudaSupportInfo::new(
-                CudaSupportLevel::CpuOnly,
-                "tokenizer-only artifact does not run an inference backend",
+                CudaSupportLevel::CandleCudaGeneric,
+                "Qwen3 TTS tokenizer is a neural speech codec whose encoder, RVQ, transformer, and decoder use Candle CUDA tensor kernels when selected",
             ),
             ModelFamily::SortformerDiarization => CudaSupportInfo::new(
                 CudaSupportLevel::CandleCudaGeneric,
@@ -154,6 +490,7 @@ impl ModelVariant {
             | ModelFamily::VibeVoiceAsr
             | ModelFamily::Qwen3Chat
             | ModelFamily::Qwen35Chat
+            | ModelFamily::Qwen38Chat
             | ModelFamily::Lfm2Chat
             | ModelFamily::Lfm25Audio
             | ModelFamily::Gemma3Chat
@@ -177,10 +514,17 @@ impl ModelVariant {
             );
         }
 
+        if self.is_qwen38_fp8() {
+            return CudaQuantizationInfo::new(
+                CudaQuantizationSupportLevel::CandleQuantizedGeneric,
+                "Qwen3.8 stores 128x128 block-scaled FP8 Safetensors weights; CUDA applies weight_scale_inv before converting projections to resident Q8_0 Candle weights, a compressed fallback rather than native FP8 execution",
+            );
+        }
+
         match self.family() {
             ModelFamily::Tokenizer => CudaQuantizationInfo::new(
-                CudaQuantizationSupportLevel::CpuOnly,
-                "tokenizer-only artifact does not run quantized CUDA inference",
+                CudaQuantizationSupportLevel::Dense,
+                "Qwen3 TTS tokenizer is a dense neural speech codec; CUDA dtype policy, not text-tokenizer orchestration, controls its execution",
             ),
             ModelFamily::SortformerDiarization => CudaQuantizationInfo::new(
                 CudaQuantizationSupportLevel::Dense,
@@ -211,7 +555,11 @@ impl ModelVariant {
                     "GGUF text model uses Candle quantized weights on the selected device",
                 )
             }
-            _ if self.is_qwen_asr_gguf() || self.is_lfm25_audio_gguf() => {
+            _ if self.is_qwen_asr_gguf() => CudaQuantizationInfo::new(
+                CudaQuantizationSupportLevel::CandleQuantizedGeneric,
+                "Qwen3-ASR uses quantized GGUF QMatMul text projections while the audio tower and bridge remain dense",
+            ),
+            _ if self.is_lfm25_audio_gguf() => {
                 CudaQuantizationInfo::new(
                     CudaQuantizationSupportLevel::DenseDequantizedFallback,
                     "GGUF speech/audio bundle is loaded through dense VarBuilder paths",
@@ -229,6 +577,18 @@ impl ModelVariant {
     }
 }
 
+const CUDA_OPERATOR_ORDER: [CudaOperatorKind; 9] = [
+    CudaOperatorKind::DenseGemm,
+    CudaOperatorKind::QuantizedGemm,
+    CudaOperatorKind::Convolution,
+    CudaOperatorKind::Attention,
+    CudaOperatorKind::PagedAttention,
+    CudaOperatorKind::Rope,
+    CudaOperatorKind::Normalization,
+    CudaOperatorKind::Sampling,
+    CudaOperatorKind::State,
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,6 +602,44 @@ mod tests {
                 "{variant} must include a CUDA support reason"
             );
         }
+    }
+
+    #[test]
+    fn cuda_operator_inventory_is_complete_and_source_reviewed() {
+        use std::collections::HashSet;
+
+        for variant in ModelVariant::all() {
+            let capabilities = variant.cuda_operator_capabilities();
+            assert_eq!(capabilities.len(), CUDA_OPERATOR_ORDER.len());
+            assert_eq!(
+                capabilities
+                    .iter()
+                    .map(|capability| capability.operator)
+                    .collect::<HashSet<_>>()
+                    .len(),
+                CUDA_OPERATOR_ORDER.len(),
+                "{variant} has duplicate CUDA operator records"
+            );
+            for capability in capabilities {
+                assert_eq!(capability.evidence, CudaEvidenceLevel::SourceReviewed);
+                assert!(!capability.reason.trim().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn neural_tokenizer_reports_codec_operator_coverage() {
+        let capabilities = ModelVariant::Qwen3TtsTokenizer12Hz.cuda_operator_capabilities();
+        let convolution = capabilities
+            .iter()
+            .find(|capability| capability.operator == CudaOperatorKind::Convolution)
+            .expect("convolution capability");
+        assert_eq!(convolution.provider, CudaProviderClass::CandleCudnnEligible);
+        let sampling = capabilities
+            .iter()
+            .find(|capability| capability.operator == CudaOperatorKind::Sampling)
+            .expect("sampling capability");
+        assert_eq!(sampling.provider, CudaProviderClass::NotApplicable);
     }
 
     #[test]
@@ -260,11 +658,14 @@ mod tests {
     }
 
     #[test]
-    fn known_cpu_only_families_are_explicit() {
+    fn neural_speech_tokenizer_is_cuda_eligible_but_unverified() {
+        let support = ModelVariant::Qwen3TtsTokenizer12Hz.cuda_support();
+        assert_eq!(support.level, CudaSupportLevel::CandleCudaGeneric);
         assert_eq!(
-            ModelVariant::Qwen3TtsTokenizer12Hz.cuda_support_level(),
-            CudaSupportLevel::CpuOnly
+            support.execution_status,
+            CudaExecutionStatus::EligibleUnverified
         );
+        assert_eq!(support.evidence, CudaEvidenceLevel::SourceReviewed);
     }
 
     #[test]
@@ -283,18 +684,22 @@ mod tests {
     }
 
     #[test]
-    fn enabled_inference_families_report_candle_cuda_kernel_coverage() {
+    fn enabled_inference_families_report_source_reviewed_unverified_cuda() {
         for variant in ModelVariant::all()
             .iter()
             .copied()
             .filter(ModelVariant::is_enabled)
-            .filter(|variant| variant.family() != ModelFamily::Tokenizer)
         {
             let info = variant.cuda_support();
             assert_eq!(
-                info.level,
-                CudaSupportLevel::CandleCudaGeneric,
-                "{variant} should use the Candle CUDA support class"
+                info.execution_status,
+                CudaExecutionStatus::EligibleUnverified,
+                "{variant} must not claim CUDA validation from source review"
+            );
+            assert_eq!(
+                info.evidence,
+                CudaEvidenceLevel::SourceReviewed,
+                "{variant} should not claim unobserved CUDA runtime evidence"
             );
             assert!(
                 info.reason.contains("Candle CUDA"),
@@ -302,6 +707,96 @@ mod tests {
                 info.reason
             );
         }
+    }
+
+    #[test]
+    fn support_metadata_serializes_execution_and_evidence_independently() {
+        let value = serde_json::to_value(ModelVariant::Qwen34BGguf.cuda_support())
+            .expect("serialize CUDA support");
+
+        assert_eq!(value["level"], "candle_cuda_generic");
+        assert_eq!(value["execution_status"], "eligible_unverified");
+        assert_eq!(value["evidence"], "source_reviewed");
+    }
+
+    #[test]
+    fn default_support_metadata_does_not_invent_cuda_evidence() {
+        let info = CudaSupportInfo::default();
+        assert_eq!(info.execution_status, CudaExecutionStatus::Unsupported);
+        assert_eq!(info.evidence, CudaEvidenceLevel::NotObserved);
+        assert!(!info.evidence.proves_cuda_runtime());
+    }
+
+    #[test]
+    fn qwen38_fp8_cuda_metadata_reports_q8_0_compressed_fallback() {
+        let variant = ModelVariant::Qwen3827BFp8;
+        let support = variant.cuda_support();
+        let quantization = variant.cuda_quantization();
+
+        assert_eq!(support.level, CudaSupportLevel::CandleCudaGeneric);
+        assert_eq!(variant.family(), ModelFamily::Qwen38Chat);
+        assert_eq!(
+            support.execution_status,
+            CudaExecutionStatus::EligibleUnverified
+        );
+        assert!(support.reason.contains("block-scaled"));
+        assert!(support.reason.contains("scale-aware Q8_0"));
+        assert!(support.reason.contains("not native FP8"));
+        assert_eq!(
+            quantization.level,
+            CudaQuantizationSupportLevel::CandleQuantizedGeneric
+        );
+        assert!(quantization.reason.contains("weight_scale_inv"));
+        assert!(quantization.reason.contains("Q8_0"));
+        assert!(quantization.reason.contains("rather than native FP8"));
+
+        let quantized_gemm = variant
+            .cuda_operator_capabilities()
+            .into_iter()
+            .find(|capability| capability.operator == CudaOperatorKind::QuantizedGemm)
+            .expect("Qwen3.8 quantized GEMM capability");
+        assert_eq!(quantized_gemm.provider, CudaProviderClass::CandleTensor);
+
+        let convolution = variant
+            .cuda_operator_capabilities()
+            .into_iter()
+            .find(|capability| capability.operator == CudaOperatorKind::Convolution)
+            .expect("Qwen3.8 convolution capability");
+        assert_eq!(convolution.provider, CudaProviderClass::IzwiCudaEligible);
+        assert!(convolution.reason.contains("Qwen3.8"));
+        assert!(convolution.reason.contains("not inherited"));
+    }
+
+    #[test]
+    fn optimized_status_requires_runtime_evidence_by_contract() {
+        for status in [
+            CudaExecutionStatus::CandleOptimized,
+            CudaExecutionStatus::CustomOptimized,
+            CudaExecutionStatus::Certified,
+        ] {
+            assert!(status.is_optimized());
+        }
+        assert!(!CudaExecutionStatus::EligibleUnverified.is_optimized());
+        assert!(CudaEvidenceLevel::CudaRuntimeValidated.proves_cuda_runtime());
+        assert!(CudaEvidenceLevel::CudaPerformanceCertified.proves_cuda_runtime());
+        assert!(!CudaEvidenceLevel::CudaCompiled.proves_cuda_runtime());
+
+        let invalid = CudaSupportInfo::try_with_evidence(
+            CudaSupportLevel::NativeCuda,
+            CudaExecutionStatus::CandleOptimized,
+            CudaEvidenceLevel::CudaCompiled,
+            "compile-only evidence",
+        );
+        assert!(invalid.is_none());
+
+        let certified = CudaSupportInfo::try_with_evidence(
+            CudaSupportLevel::NativeCuda,
+            CudaExecutionStatus::Certified,
+            CudaEvidenceLevel::CudaPerformanceCertified,
+            "runtime and performance evidence",
+        )
+        .expect("performance evidence should permit a certified claim");
+        assert!(certified.evidence_is_sufficient());
     }
 
     #[test]
@@ -323,8 +818,12 @@ mod tests {
         );
         assert_eq!(
             ModelVariant::Qwen3Asr06BGguf.cuda_quantization().level,
-            CudaQuantizationSupportLevel::DenseDequantizedFallback
+            CudaQuantizationSupportLevel::CandleQuantizedGeneric
         );
+        assert!(ModelVariant::Qwen3Asr06BGguf
+            .cuda_quantization()
+            .reason
+            .contains("QMatMul"));
         assert_eq!(
             ModelVariant::Qwen3Tts12Hz06BBase4Bit
                 .cuda_quantization()
@@ -354,6 +853,7 @@ mod tests {
         assert!(dequant.uses_dense_dequantized_fallback());
 
         let tokenizer = ModelVariant::Qwen3TtsTokenizer12Hz.cuda_quantization();
-        assert!(!tokenizer.is_allowed_for_cuda());
+        assert!(tokenizer.is_allowed_for_cuda());
+        assert_eq!(tokenizer.level, CudaQuantizationSupportLevel::Dense);
     }
 }

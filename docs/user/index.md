@@ -40,14 +40,17 @@ Izwi is a powerful, privacy-focused audio AI platform that runs entirely on your
 
 | Requirement | Minimum | Recommended |
 |-------------|---------|-------------|
-| **macOS** | 12.0+ (Monterey) | 14.0+ (Sonoma) |
+| **macOS** | 12.0+ (Monterey, CPU) | 15.0+ (Metal on Apple Silicon) |
 | **Linux** | Ubuntu 20.04+ | Ubuntu 22.04+ |
 | **Windows** | Windows 10 | Windows 11 |
 | **RAM** | 8 GB | 16 GB+ |
 | **Storage** | 10 GB free | 50 GB+ free |
 | **GPU** | — | Apple Silicon / NVIDIA GPU (see support matrix) |
 
-> **Note:** Izwi is optimized for Apple Silicon Macs with Metal acceleration. NVIDIA CUDA support exists in the runtime, but artifact-level support varies by source build, Docker image, and release package. See the [Runtime Support Matrix](/support-matrix).
+> **Note:** Izwi uses Metal acceleration on Apple Silicon with macOS 15+ and
+> falls back to CPU on macOS 12-14. NVIDIA CUDA support exists in the runtime,
+> but artifact-level support varies by source build, Docker image, and release
+> package. See the [Runtime Support Matrix](/support-matrix).
 
 ---
 

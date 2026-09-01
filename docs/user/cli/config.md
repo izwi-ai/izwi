@@ -60,6 +60,9 @@ izwi config set <KEY> <VALUE>
 
 Examples:
 
+Metal backend configuration requires Apple Silicon with macOS 15+; older macOS
+releases fall back to CPU.
+
 ```bash
 izwi config set server.host 127.0.0.1
 izwi config set server.cors true

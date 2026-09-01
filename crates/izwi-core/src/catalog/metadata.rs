@@ -5,6 +5,23 @@ use std::path::PathBuf;
 
 use super::{CudaQuantizationInfo, CudaSupportInfo};
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatReasoningEffort {
+    #[default]
+    Xhigh,
+    Medium,
+    Low,
+}
+
+/// Revision-pinned model limits used when converted artifacts omit otherwise
+/// authoritative configuration metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArtifactContextManifest {
+    pub native_context_tokens: usize,
+    pub evidence: &'static str,
+}
+
 /// Available TTS model variants
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ModelVariant {
@@ -194,6 +211,14 @@ pub enum ModelVariant {
         alias = "Qwen3.5-9B-Q4_K_M.gguf"
     )]
     Qwen359BGguf,
+    /// Qwen3.8 27B hybrid chat model with block-scaled FP8 Safetensors weights.
+    #[serde(
+        rename = "Qwen3.8-27B-FP8",
+        alias = "Qwen/Qwen3.8-27B-FP8",
+        alias = "qwen3.8-27b-fp8",
+        alias = "Qwen3.8-27B"
+    )]
+    Qwen3827BFp8,
     /// Gemma 3 1B instruction-tuned chat model
     #[serde(rename = "Gemma-3-1b-it")]
     Gemma31BIt,
@@ -237,6 +262,9 @@ pub enum ModelVariant {
 }
 
 impl ModelVariant {
+    /// Revision used for the first supported Qwen3.8-27B-FP8 artifact contract.
+    pub const QWEN38_27B_FP8_ARTIFACT_REVISION: &'static str =
+        "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a";
     /// Official Qwen3-TTS generation limit from upstream generation configs
     /// (`max_new_tokens` in Hugging Face `generation_config.json`).
     pub const QWEN3_TTS_MAX_OUTPUT_FRAMES: usize = 8192;
@@ -247,11 +275,40 @@ impl ModelVariant {
     pub const LFM25_AUDIO_BUILT_IN_VOICE_COUNT: usize = 4;
     pub const VOXTRAL_TTS_BUILT_IN_VOICE_COUNT: usize = 20;
     pub const VOXTRAL_TTS_MAX_OUTPUT_FRAMES: usize = 1500;
+    pub const VOXTRAL_TTS_CUDA_MAX_OUTPUT_FRAMES: usize = 2048;
     pub const VOXTRAL_TTS_FRAME_RATE_HZ: f32 = 12.5;
     pub const VIBEVOICE_TTS_MAX_OUTPUT_FRAMES: usize = 40_500;
     pub const VIBEVOICE_TTS_FRAME_RATE_HZ: f32 = 7.5;
     pub const FISH_S2_PRO_MAX_OUTPUT_FRAMES: usize = 4096;
+    pub const FISH_S2_PRO_NATIVE_CONTEXT_TOKENS: usize = 32_768;
+    pub const LFM25_AUDIO_NATIVE_CONTEXT_TOKENS: usize = 32_768;
     pub const FISH_S2_PRO_FRAME_RATE_HZ: f32 = 21.5;
+
+    /// Return a revision-pinned native context for artifacts whose conversion
+    /// format is known to omit it. Embedded and sidecar metadata must still be
+    /// checked for conflicts before this value is used.
+    pub fn artifact_context_manifest(self) -> Option<ArtifactContextManifest> {
+        match self {
+            Self::Qwen3Asr06BGguf => Some(ArtifactContextManifest {
+                native_context_tokens: 65_536,
+                evidence: "Qwen/Qwen3-ASR-0.6B@9ba1d4a/config.json",
+            }),
+            Self::Qwen3Asr17BGguf => Some(ArtifactContextManifest {
+                native_context_tokens: 65_536,
+                evidence: "Qwen/Qwen3-ASR-1.7B@c85e7e3/config.json",
+            }),
+            _ => None,
+        }
+    }
+
+    /// Pinned Hugging Face artifact revision, when mutable `main` is not an
+    /// acceptable source for this variant.
+    pub fn artifact_revision(self) -> Option<&'static str> {
+        match self {
+            Self::Qwen3827BFp8 => Some(Self::QWEN38_27B_FP8_ARTIFACT_REVISION),
+            _ => None,
+        }
+    }
 
     /// Get HuggingFace repository ID
     pub fn repo_id(&self) -> &'static str {
@@ -311,6 +368,7 @@ impl ModelVariant {
             Self::Qwen352BGguf => "unsloth/Qwen3.5-2B-GGUF",
             Self::Qwen354BGguf => "unsloth/Qwen3.5-4B-GGUF",
             Self::Qwen359BGguf => "unsloth/Qwen3.5-9B-GGUF",
+            Self::Qwen3827BFp8 => "Qwen/Qwen3.8-27B-FP8",
             Self::Gemma31BIt => "google/gemma-3-1b-it",
             Self::Gemma34BIt => "google/gemma-3-4b-it",
             Self::Qwen3ForcedAligner06B => "Qwen/Qwen3-ForcedAligner-0.6B",
@@ -367,6 +425,7 @@ impl ModelVariant {
             Self::Qwen352BGguf => "Qwen3.5 2B GGUF",
             Self::Qwen354BGguf => "Qwen3.5 4B GGUF",
             Self::Qwen359BGguf => "Qwen3.5 9B GGUF",
+            Self::Qwen3827BFp8 => "Qwen3.8 27B FP8",
             Self::Gemma31BIt => "Gemma 3 1B Instruct",
             Self::Gemma34BIt => "Gemma 3 4B Instruct",
             Self::Qwen3ForcedAligner06B => "Qwen3-ForcedAligner 0.6B",
@@ -423,6 +482,7 @@ impl ModelVariant {
             Self::Qwen352BGguf => "Qwen3.5-2B",
             Self::Qwen354BGguf => "Qwen3.5-4B",
             Self::Qwen359BGguf => "Qwen3.5-9B",
+            Self::Qwen3827BFp8 => "Qwen3.8-27B-FP8",
             Self::Gemma31BIt => "Gemma-3-1b-it",
             Self::Gemma34BIt => "Gemma-3-4b-it",
             Self::Qwen3ForcedAligner06B => "Qwen3-ForcedAligner-0.6B",
@@ -479,8 +539,9 @@ impl ModelVariant {
             Self::Qwen352BGguf => 1_949_063_104, // local GGUF + mmproj + tokenizer assets
             Self::Qwen354BGguf => 3_413_361_504, // local GGUF + mmproj + tokenizer assets
             Self::Qwen359BGguf => 6_598_688_544, // local GGUF + mmproj + tokenizer assets
-            Self::Gemma31BIt => 2_200_000_000,  // ~2.05 GB (est)
-            Self::Gemma34BIt => 8_600_000_000,  // ~8.01 GB (est)
+            Self::Qwen3827BFp8 => 30_889_968_808, // pinned indexed FP8 bundle + chat/tokenizer metadata
+            Self::Gemma31BIt => 2_200_000_000,    // ~2.05 GB (est)
+            Self::Gemma34BIt => 8_600_000_000,    // ~8.01 GB (est)
             Self::Qwen3ForcedAligner06B => 1_840_072_459, // ~1.71 GB
             Self::Qwen3ForcedAligner06B4Bit => 703_200_000, // ~0.65 GB
             Self::VoxtralMini4BRealtime2602 => 8_000_000_000, // ~7.45 GB (est)
@@ -534,6 +595,9 @@ impl ModelVariant {
             Self::Qwen352BGguf => 5.5,
             Self::Qwen354BGguf => 9.0,
             Self::Qwen359BGguf => 16.0,
+            // Backend-specific admission replaces this coarse catalog hint:
+            // packed FP8 CUDA needs less, while the CPU F32 fallback needs more.
+            Self::Qwen3827BFp8 => 80.0,
             Self::Gemma31BIt => 3.5,
             Self::Gemma34BIt => 11.0,
             Self::Qwen3ForcedAligner06B => 2.5,
@@ -600,6 +664,7 @@ impl ModelVariant {
             self.family(),
             crate::catalog::ModelFamily::Qwen3Chat
                 | crate::catalog::ModelFamily::Qwen35Chat
+                | crate::catalog::ModelFamily::Qwen38Chat
                 | crate::catalog::ModelFamily::Gemma3Chat
                 | crate::catalog::ModelFamily::Lfm2Chat
         )
@@ -629,7 +694,7 @@ impl ModelVariant {
             Self::VibeVoiceAsr | Self::VibeVoice15BTts => Some("MIT"),
             Self::FishAudioS2Pro => Some("Fish Audio Research License"),
             Self::Nemotron35AsrStreaming06B => Some("OpenMDW-1.1"),
-            Self::GraniteSpeech412BPlus => Some("Apache-2.0"),
+            Self::GraniteSpeech412BPlus | Self::Qwen3827BFp8 => Some("Apache-2.0"),
             _ => None,
         }
     }
@@ -736,6 +801,34 @@ impl ModelVariant {
         Some(capabilities)
     }
 
+    /// Machine-readable chat controls that the selected runtime actually
+    /// consumes. Keep reasoning effort narrower than generic thinking support:
+    /// today only Qwen3.8 implements the three-level effort contract.
+    pub fn chat_capabilities(&self) -> Option<ChatModelCapabilities> {
+        let (default_thinking_enabled, reasoning_efforts, supports_preserve_thinking) = match self {
+            Self::Qwen3827BFp8 => (
+                true,
+                vec![
+                    ChatReasoningEffort::Xhigh,
+                    ChatReasoningEffort::Medium,
+                    ChatReasoningEffort::Low,
+                ],
+                true,
+            ),
+            Self::Qwen3508BGguf | Self::Qwen352BGguf => (false, Vec::new(), false),
+            Self::Qwen354BGguf | Self::Qwen359BGguf => (true, Vec::new(), false),
+            _ => return None,
+        };
+
+        Some(ChatModelCapabilities {
+            supports_thinking: true,
+            default_thinking_enabled,
+            default_reasoning_effort: reasoning_efforts.first().copied(),
+            reasoning_efforts,
+            supports_preserve_thinking,
+        })
+    }
+
     /// Max output codec frames for this TTS variant, if known.
     pub fn tts_max_output_frames_hint(&self) -> Option<usize> {
         match self.family() {
@@ -822,6 +915,7 @@ impl ModelVariant {
                 | Self::Qwen352BGguf
                 | Self::Qwen354BGguf
                 | Self::Qwen359BGguf
+                | Self::Qwen3827BFp8
                 | Self::Qwen3ForcedAligner06B4Bit
         )
     }
@@ -872,6 +966,11 @@ impl ModelVariant {
         )
     }
 
+    /// Whether this is the revision-pinned native Qwen3.8 FP8 checkpoint.
+    pub fn is_qwen38_fp8(&self) -> bool {
+        matches!(self, Self::Qwen3827BFp8)
+    }
+
     /// Whether this is an LFM2.5 chat GGUF variant.
     pub fn is_lfm2_chat_gguf(&self) -> bool {
         matches!(
@@ -903,6 +1002,7 @@ impl ModelVariant {
             | Self::Qwen352BGguf
             | Self::Qwen354BGguf
             | Self::Qwen359BGguf
+            | Self::Qwen3827BFp8
             | Self::Gemma31BIt
             | Self::Qwen3Tts12Hz06BBase4Bit
             | Self::Qwen3Tts12Hz06BCustomVoice4Bit
@@ -971,6 +1071,7 @@ impl ModelVariant {
             Self::Qwen352BGguf,
             Self::Qwen354BGguf,
             Self::Qwen359BGguf,
+            Self::Qwen3827BFp8,
             Self::Gemma31BIt,
             Self::Gemma34BIt,
             Self::Qwen3ForcedAligner06B,
@@ -1019,6 +1120,16 @@ pub struct SpeechModelCapabilities {
     pub supports_auto_long_form: bool,
 }
 
+/// Machine-readable controls exposed by chat-capable model runtimes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatModelCapabilities {
+    pub supports_thinking: bool,
+    pub default_thinking_enabled: bool,
+    pub reasoning_efforts: Vec<ChatReasoningEffort>,
+    pub default_reasoning_effort: Option<ChatReasoningEffort>,
+    pub supports_preserve_thinking: bool,
+}
+
 /// Complete model information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelInfo {
@@ -1029,6 +1140,8 @@ pub struct ModelInfo {
     pub size_bytes: Option<u64>,
     pub download_progress: Option<f32>,
     pub error_message: Option<String>,
+    #[serde(default)]
+    pub chat_capabilities: Option<ChatModelCapabilities>,
     pub speech_capabilities: Option<SpeechModelCapabilities>,
     #[serde(skip_deserializing)]
     pub cuda_support: CudaSupportInfo,
@@ -1046,6 +1159,7 @@ impl ModelInfo {
             size_bytes: None,
             download_progress: None,
             error_message: None,
+            chat_capabilities: variant.chat_capabilities(),
             speech_capabilities: variant.speech_capabilities(),
             cuda_support: variant.cuda_support(),
             cuda_quantization: variant.cuda_quantization(),
@@ -1063,7 +1177,42 @@ impl ModelInfo {
 mod tests {
     use crate::catalog::ModelTask;
 
-    use super::{ModelVariant, SpeechModelCapabilities};
+    use super::{ChatReasoningEffort, ModelVariant, SpeechModelCapabilities};
+
+    #[test]
+    fn chat_capabilities_expose_reasoning_effort_only_for_qwen38() {
+        let qwen38 = ModelVariant::Qwen3827BFp8
+            .chat_capabilities()
+            .expect("Qwen3.8 chat capabilities");
+        assert!(qwen38.supports_thinking);
+        assert!(qwen38.default_thinking_enabled);
+        assert_eq!(
+            qwen38.reasoning_efforts,
+            vec![
+                ChatReasoningEffort::Xhigh,
+                ChatReasoningEffort::Medium,
+                ChatReasoningEffort::Low,
+            ]
+        );
+        assert_eq!(
+            qwen38.default_reasoning_effort,
+            Some(ChatReasoningEffort::Xhigh)
+        );
+        assert!(qwen38.supports_preserve_thinking);
+
+        let qwen35 = ModelVariant::Qwen354BGguf
+            .chat_capabilities()
+            .expect("Qwen3.5 chat capabilities");
+        assert!(qwen35.supports_thinking);
+        assert!(qwen35.default_thinking_enabled);
+        assert!(qwen35.reasoning_efforts.is_empty());
+        assert_eq!(qwen35.default_reasoning_effort, None);
+
+        assert_eq!(ModelVariant::Gemma31BIt.chat_capabilities(), None);
+        assert_eq!(ModelVariant::Lfm2512BInstructGguf.chat_capabilities(), None);
+        assert_eq!(ModelVariant::Lfm2512BThinkingGguf.chat_capabilities(), None);
+        assert_eq!(ModelVariant::Qwen34BGguf.chat_capabilities(), None);
+    }
 
     #[test]
     fn qwen3_tts_variants_expose_output_hints() {
@@ -1148,6 +1297,47 @@ mod tests {
                 variant.dir_name()
             );
         }
+    }
+
+    #[test]
+    fn qwen38_fp8_catalog_contract_has_distinct_chat_family() {
+        let variant = ModelVariant::Qwen3827BFp8;
+
+        assert!(variant.is_enabled());
+        assert!(variant.is_chat());
+        assert!(variant.is_quantized());
+        assert!(!variant.is_gguf());
+        assert!(variant.is_qwen38_fp8());
+        assert!(!variant.is_qwen35_chat_gguf());
+        assert_eq!(variant.family(), crate::catalog::ModelFamily::Qwen38Chat);
+        assert_eq!(variant.repo_id(), "Qwen/Qwen3.8-27B-FP8");
+        assert_eq!(variant.dir_name(), "Qwen3.8-27B-FP8");
+        assert_eq!(variant.display_name(), "Qwen3.8 27B FP8");
+        assert_eq!(variant.license_label(), Some("Apache-2.0"));
+        assert_eq!(
+            variant.artifact_revision(),
+            Some(ModelVariant::QWEN38_27B_FP8_ARTIFACT_REVISION)
+        );
+    }
+
+    #[test]
+    fn qwen38_fp8_serde_accepts_canonical_and_repository_identifiers() {
+        for identifier in [
+            "Qwen3.8-27B-FP8",
+            "Qwen/Qwen3.8-27B-FP8",
+            "qwen3.8-27b-fp8",
+            "Qwen3.8-27B",
+        ] {
+            let encoded = serde_json::to_string(identifier).expect("serialize identifier");
+            let parsed: ModelVariant =
+                serde_json::from_str(&encoded).expect("deserialize Qwen3.8 alias");
+            assert_eq!(parsed, ModelVariant::Qwen3827BFp8, "alias {identifier}");
+        }
+
+        assert_eq!(
+            serde_json::to_string(&ModelVariant::Qwen3827BFp8).expect("serialize variant"),
+            "\"Qwen3.8-27B-FP8\""
+        );
     }
 
     #[test]

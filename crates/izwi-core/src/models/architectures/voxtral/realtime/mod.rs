@@ -10,8 +10,16 @@
 
 mod audio;
 mod config;
-mod model;
-mod streaming;
+pub(crate) mod model;
+pub(crate) mod streaming;
 mod tokenizer;
 
 pub use model::VoxtralRealtimeModel;
+pub(crate) use model::{
+    VoxtralRealtimeCheckpoint, VoxtralRealtimeDecodeBatchRow,
+    VoxtralRealtimePreparationBatchGeometry, VoxtralRealtimePreparationBatchRow,
+    VoxtralRealtimePreparationGeometry, VoxtralRealtimePreparationMode,
+    VoxtralRealtimePreparationStageSeal, VoxtralRealtimePreparedAudio,
+    VoxtralRealtimePreparedResourceUsage, VoxtralRealtimeStep,
+};
+pub(crate) use streaming::{VoxtralRealtimeResourceUsage, VoxtralRealtimeState};

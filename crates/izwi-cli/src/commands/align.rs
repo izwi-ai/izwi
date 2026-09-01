@@ -79,7 +79,7 @@ pub async fn execute(args: AlignArgs, server: &str) -> Result<()> {
     if let Some(output_path) = output {
         tokio::fs::write(&output_path, result)
             .await
-            .map_err(|e| CliError::Io(e))?;
+            .map_err(CliError::Io)?;
         println!("Alignment saved to: {}", output_path.display());
     } else {
         println!("{}", result);

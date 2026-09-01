@@ -381,9 +381,9 @@ impl MelSpectrogram {
         let n = waveform.len();
         if n == 1 {
             let mut out = Vec::with_capacity(n + pad * 2);
-            out.extend(std::iter::repeat(waveform[0]).take(pad));
+            out.extend(std::iter::repeat_n(waveform[0], pad));
             out.push(waveform[0]);
-            out.extend(std::iter::repeat(waveform[0]).take(pad));
+            out.extend(std::iter::repeat_n(waveform[0], pad));
             return out;
         }
 

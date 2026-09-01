@@ -1,4 +1,5 @@
 import type {
+  ChatModelCapabilities,
   ChatMessage,
   ChatThreadContentPart,
   ChatThreadMessageRecord,
@@ -16,6 +17,7 @@ export interface ChatPlaygroundProps {
   selectedModel: string | null;
   selectedModelReady: boolean;
   supportsThinking: boolean;
+  chatCapabilities?: ChatModelCapabilities | null;
   modelLabel?: string | null;
   modelOptions: ModelOption[];
   onSelectModel: (variant: string) => void;
@@ -284,6 +286,13 @@ export function isQwen35ThinkingModel(variant: string | null): boolean {
   return variant.trim().toLowerCase().startsWith("qwen3.5-");
 }
 
+export function isQwen38ThinkingModel(variant: string | null): boolean {
+  if (!variant) {
+    return false;
+  }
+  return variant.trim().toLowerCase().startsWith("qwen3.8-");
+}
+
 export function defaultThinkingEnabledForModel(variant: string | null): boolean {
   if (!variant) {
     return false;
@@ -294,6 +303,9 @@ export function defaultThinkingEnabledForModel(variant: string | null): boolean 
     return false;
   }
   if (normalized === "qwen3.5-4b" || normalized === "qwen3.5-9b") {
+    return true;
+  }
+  if (isQwen38ThinkingModel(variant)) {
     return true;
   }
   if (isLfm25ThinkingModel(variant)) {
@@ -321,14 +333,18 @@ export function isLfm25ThinkingModel(variant: string | null): boolean {
 export function supportsImplicitOpenThinkTagParsing(
   variant: string | null,
 ): boolean {
-  return isLfm25ThinkingModel(variant) || isQwen35ThinkingModel(variant);
+  return (
+    isLfm25ThinkingModel(variant) ||
+    isQwen35ThinkingModel(variant) ||
+    isQwen38ThinkingModel(variant)
+  );
 }
 
 export function systemPromptForModel(
   variant: string | null,
   thinkingEnabled: boolean,
 ): string {
-  if (isQwen35ThinkingModel(variant)) {
+  if (isQwen35ThinkingModel(variant) || isQwen38ThinkingModel(variant)) {
     return NEUTRAL_SYSTEM_PROMPT.content;
   }
   if (thinkingEnabled) {

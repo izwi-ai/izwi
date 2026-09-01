@@ -2,6 +2,7 @@
 
 use axum::{extract::State, Json};
 use izwi_core::backends::{CudaRuntimeDiagnostics, DTypeSelectionRequest};
+use izwi_core::config::ResolvedKvCachePolicy;
 use izwi_core::runtime_models::shared::attention::flash::{
     flash_attention_compiled, flash_attention_requested,
 };
@@ -19,6 +20,7 @@ pub struct HealthResponse {
 
 #[derive(Serialize)]
 pub struct RuntimeBackendResponse {
+    pub build_git_sha: Option<&'static str>,
     pub requested_backend: String,
     pub requested_backend_available: bool,
     pub selected_backend: String,
@@ -27,6 +29,7 @@ pub struct RuntimeBackendResponse {
     pub compiled_backends: CompiledBackendsResponse,
     pub detected_device: DetectedDeviceResponse,
     pub dtype_policy: DTypePolicyResponse,
+    pub kv_cache_policy: ResolvedKvCachePolicy,
     pub fused_attention: FusedAttentionResponse,
     pub cuda_runtime: CudaRuntimeResponse,
     pub loaded_models: Vec<LoadedModelDiagnostics>,
@@ -50,6 +53,8 @@ pub struct DetectedDeviceResponse {
     pub has_unified_memory: bool,
     pub recommended_batch_size: usize,
     pub available_memory_bytes: Option<usize>,
+    pub cuda_total_memory_bytes: Option<usize>,
+    pub cuda_device_ordinal: Option<usize>,
     pub cuda_compute_capability: Option<String>,
     pub cuda_device_name: Option<String>,
 }
@@ -92,6 +97,7 @@ pub async fn health_check(State(state): State<AppState>) -> Json<HealthResponse>
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
         runtime: RuntimeBackendResponse {
+            build_git_sha: option_env!("IZWI_BUILD_GIT_SHA"),
             requested_backend: context.preference.as_str().to_string(),
             requested_backend_available,
             selected_backend: context.backend_kind.as_str().to_string(),
@@ -110,6 +116,8 @@ pub async fn health_check(State(state): State<AppState>) -> Json<HealthResponse>
                 has_unified_memory: device.capabilities.has_unified_memory,
                 recommended_batch_size: device.capabilities.recommended_batch_size,
                 available_memory_bytes: device.capabilities.available_memory_bytes,
+                cuda_total_memory_bytes: device.capabilities.cuda_total_memory_bytes,
+                cuda_device_ordinal: device.capabilities.cuda_device_ordinal,
                 cuda_compute_capability: device
                     .capabilities
                     .cuda_compute_capability
@@ -120,6 +128,7 @@ pub async fn health_check(State(state): State<AppState>) -> Json<HealthResponse>
                 selected_dtype: format!("{:?}", dtype_selection.dtype).to_ascii_lowercase(),
                 reason: dtype_selection.reason.into_owned(),
             },
+            kv_cache_policy: state.runtime.resolved_kv_cache_policy().clone(),
             fused_attention: FusedAttentionResponse {
                 cuda_flash_attention_compiled: flash_attention_compiled(),
                 requested: flash_attention_requested(),
@@ -165,6 +174,9 @@ fn current_server_binary_name() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use izwi_core::config::{
+        EffectiveKvCachePolicy, KvCacheDtype, PrefixCachePolicy, RequestedKvCachePolicy,
+    };
 
     #[test]
     fn cuda_runtime_health_response_does_not_expose_local_paths() {
@@ -194,6 +206,7 @@ mod tests {
     #[test]
     fn runtime_backend_health_serializes_loaded_tts_model_diagnostics() {
         let response = RuntimeBackendResponse {
+            build_git_sha: Some("test-sha"),
             requested_backend: "cuda".to_string(),
             requested_backend_available: true,
             selected_backend: "cuda".to_string(),
@@ -212,12 +225,27 @@ mod tests {
                 has_unified_memory: false,
                 recommended_batch_size: 1,
                 available_memory_bytes: None,
+                cuda_total_memory_bytes: None,
+                cuda_device_ordinal: Some(0),
                 cuda_compute_capability: Some("8.9".to_string()),
                 cuda_device_name: Some("CUDA Device".to_string()),
             },
             dtype_policy: DTypePolicyResponse {
                 selected_dtype: "bf16".to_string(),
                 reason: "policy".to_string(),
+            },
+            kv_cache_policy: ResolvedKvCachePolicy {
+                requested: RequestedKvCachePolicy {
+                    page_size: 16,
+                    dtype: KvCacheDtype::Float16,
+                    prefix: PrefixCachePolicy::Disabled,
+                },
+                effective: EffectiveKvCachePolicy {
+                    page_size: 16,
+                    dtype: KvCacheDtype::Bfloat16,
+                    prefix: PrefixCachePolicy::Disabled,
+                },
+                fallback_reason: Some("selected backend cache dtype for CUDA".to_string()),
             },
             fused_attention: FusedAttentionResponse {
                 cuda_flash_attention_compiled: true,
@@ -246,6 +274,7 @@ mod tests {
                 actual_compute_dtype: Some("f16".to_string()),
                 default_compute_dtype: "bf16".to_string(),
                 default_dtype_reason: "CUDA default uses BF16".to_string(),
+                effective_context_tokens: None,
                 supports_incremental_decode: None,
                 supports_realtime_stream_decode: None,
                 family_diagnostics: Some(serde_json::json!({
@@ -270,17 +299,17 @@ mod tests {
         assert_eq!(value["loaded_tts_model"]["device_kind"], "Cuda");
         assert_eq!(value["loaded_tts_model"]["dtype"], "BF16");
         assert_eq!(value["loaded_models"][0]["family"], "vibevoice_tts");
-        assert_eq!(
-            value["loaded_models"][0]["actual_compute_dtype"],
-            "f16"
-        );
-        assert_eq!(
-            value["loaded_models"][0]["default_compute_dtype"],
-            "bf16"
-        );
+        assert_eq!(value["loaded_models"][0]["actual_compute_dtype"], "f16");
+        assert_eq!(value["loaded_models"][0]["default_compute_dtype"], "bf16");
         assert_eq!(
             value["loaded_models"][0]["family_diagnostics"]["dtype"],
             "BF16"
+        );
+        assert_eq!(value["kv_cache_policy"]["requested"]["dtype"], "float16");
+        assert_eq!(value["kv_cache_policy"]["effective"]["dtype"], "bfloat16");
+        assert_eq!(
+            value["kv_cache_policy"]["fallback_reason"],
+            "selected backend cache dtype for CUDA"
         );
     }
 }

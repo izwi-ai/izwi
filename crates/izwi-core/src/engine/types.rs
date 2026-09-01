@@ -14,9 +14,6 @@ pub type SequenceId = u64;
 /// Token ID type.
 pub type TokenId = u32;
 
-/// Block ID for KV cache.
-pub type BlockId = usize;
-
 /// Generation parameters for audio synthesis.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenerationParams {
@@ -285,12 +282,6 @@ pub struct EngineMetrics {
     pub avg_tokens_per_second: f32,
     /// Average real-time factor
     pub avg_rtf: f32,
-    /// Current KV cache memory usage in bytes
-    pub kv_cache_memory_bytes: usize,
-    /// Number of KV cache blocks allocated
-    pub kv_cache_blocks_allocated: usize,
-    /// Number of KV cache blocks free
-    pub kv_cache_blocks_free: usize,
     /// Timestamp of last update
     #[serde(skip)]
     pub last_updated: Option<Instant>,
@@ -325,11 +316,14 @@ impl EngineMetrics {
 }
 
 /// Priority level for requests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
 pub enum Priority {
     /// Low priority (background tasks)
     Low = 0,
     /// Normal priority (default)
+    #[default]
     Normal = 1,
     /// High priority (user-facing)
     High = 2,
@@ -337,16 +331,11 @@ pub enum Priority {
     Critical = 3,
 }
 
-impl Default for Priority {
-    fn default() -> Self {
-        Self::Normal
-    }
-}
-
 /// Task type for the request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum TaskType {
     /// Text-to-speech
+    #[default]
     TTS,
     /// Automatic speech recognition
     ASR,
@@ -354,10 +343,4 @@ pub enum TaskType {
     Chat,
     /// Speech-to-speech generation.
     SpeechToSpeech,
-}
-
-impl Default for TaskType {
-    fn default() -> Self {
-        Self::TTS
-    }
 }

@@ -1,6 +1,6 @@
 //! Runtime service orchestrator.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -17,62 +17,103 @@ use crate::backends::{
     BackendKind, BackendPreference, BackendRouter, BackendSelectionSource, DeviceProfile,
 };
 use crate::catalog::{ModelFamily, ModelInfo, ModelVariant};
-use crate::config::EngineConfig;
+use crate::config::{EngineConfig, PrefixCachePolicy, ResolvedKvCachePolicy};
 use crate::engine::{
-    engine_batch_metrics_snapshot, engine_stream_metrics_snapshot, Engine as CoreEngine,
-    EngineAudioInput, EngineCoreConfig, EngineCoreRequest, EngineOutput, EngineStreamPolicy,
-    EngineTask, GenerationParams, OutputFinishReason, ResourceAmount, ResourceVector, SessionKey,
-    StreamingOutput, TaskType, WorkerConfig, WorkloadClass,
+    engine_batch_metrics_snapshot, engine_stream_metrics_snapshot, AdapterBindingKey,
+    Engine as CoreEngine, EngineAudioInput, EngineCoreConfig, EngineCoreRequest, EngineOutput,
+    EngineStreamPolicy, EngineTask, GenerationParams, OutputFinishReason, ResourceAmount,
+    ResourceVector, SessionKey, StreamingOutput, TaskType, WorkUnit, WorkerConfig, WorkloadClass,
     ENGINE_EXECUTOR_BATCH_WORKSPACE_BYTES_TOTAL,
-    ENGINE_EXECUTOR_BATCH_WORKSPACE_DOMAIN_BYTES_TOTAL, ENGINE_EXECUTOR_DEADLINE_PHASE_ROWS_TOTAL,
-    ENGINE_EXECUTOR_DISPATCH_STATE_ROWS_TOTAL, ENGINE_EXECUTOR_FAILURE_ORIGIN_ROWS_TOTAL,
+    ENGINE_EXECUTOR_BATCH_WORKSPACE_DOMAIN_BYTES_TOTAL,
+    ENGINE_EXECUTOR_CONTINUOUS_ENVELOPE_SCALAR_FALLBACKS_TOTAL,
+    ENGINE_EXECUTOR_DEADLINE_PHASE_ROWS_TOTAL, ENGINE_EXECUTOR_DISPATCH_STATE_ROWS_TOTAL,
+    ENGINE_EXECUTOR_FAILURE_ORIGIN_ROWS_TOTAL, ENGINE_EXECUTOR_MODEL_DECODE_CALLS_TOTAL,
+    ENGINE_EXECUTOR_MODEL_SCALAR_ROW_DISPATCHES_TOTAL, ENGINE_EXECUTOR_MODEL_TENSOR_BATCHES_TOTAL,
+    ENGINE_EXECUTOR_MODEL_TENSOR_BATCH_MAX_WIDTH, ENGINE_EXECUTOR_MODEL_TENSOR_BATCH_ROWS_TOTAL,
+    ENGINE_EXECUTOR_MODEL_TENSOR_MULTIROW_CALLS_TOTAL,
     ENGINE_EXECUTOR_PHYSICAL_BATCH_REJECTIONS_TOTAL,
     ENGINE_EXECUTOR_REQUEST_PARALLEL_BATCHES_TOTAL, ENGINE_EXECUTOR_TENSOR_BATCHES_TOTAL,
     ENGINE_EXECUTOR_TENSOR_BATCH_CAPACITY_ROWS_TOTAL, ENGINE_EXECUTOR_TENSOR_BATCH_FILL_RATIO,
     ENGINE_EXECUTOR_TENSOR_BATCH_MATERIALIZED_ELEMENTS_TOTAL,
     ENGINE_EXECUTOR_TENSOR_BATCH_MAX_WIDTH, ENGINE_EXECUTOR_TENSOR_BATCH_PADDING_RATIO,
     ENGINE_EXECUTOR_TENSOR_BATCH_ROWS_TOTAL, ENGINE_EXECUTOR_TENSOR_BATCH_USEFUL_ELEMENTS_TOTAL,
-    ENGINE_EXECUTOR_TENSOR_CONTINUOUS_BATCHES_TOTAL, ENGINE_EXECUTOR_TENSOR_STATIC_BATCHES_TOTAL,
-    ENGINE_KV_CACHE_ALLOCATED_BLOCKS, ENGINE_KV_CACHE_CHURN_RATIO,
-    ENGINE_KV_CACHE_COPY_ON_WRITE_SPLITS_TOTAL, ENGINE_KV_CACHE_EVICTIONS_TOTAL,
-    ENGINE_KV_CACHE_FREE_BLOCKS, ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS, ENGINE_KV_CACHE_HITS_TOTAL,
+    ENGINE_EXECUTOR_TENSOR_CONTINUOUS_BATCHES_TOTAL,
+    ENGINE_EXECUTOR_TENSOR_CONTINUOUS_MULTIROW_BATCHES_TOTAL,
+    ENGINE_EXECUTOR_TENSOR_STATIC_BATCHES_TOTAL, ENGINE_KV_CACHE_ALLOCATED_BLOCKS,
+    ENGINE_KV_CACHE_EVICTIONS_TOTAL, ENGINE_KV_CACHE_FREE_BLOCKS,
+    ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS, ENGINE_KV_CACHE_HITS_TOTAL,
     ENGINE_KV_CACHE_MEMORY_CAPACITY_BYTES, ENGINE_KV_CACHE_MEMORY_USED_BYTES,
-    ENGINE_KV_CACHE_MISSES_TOTAL, ENGINE_KV_CACHE_PINNED_BLOCKS,
-    ENGINE_KV_CACHE_PREFIX_REUSE_BLOCKS_TOTAL, ENGINE_KV_CACHE_SHARED_PREFIXES,
-    ENGINE_KV_CACHE_SOFT_MAX_BLOCKS, ENGINE_KV_CACHE_UTILIZATION_RATIO,
-    ENGINE_SCHEDULER_QUEUE_DEPTH, ENGINE_SCHEDULER_RUNNING_REQUESTS,
-    ENGINE_STREAM_BACKPRESSURE_TOTAL, ENGINE_STREAM_CHECKPOINTS_COMMITTED_TOTAL,
-    ENGINE_STREAM_CHECKPOINT_REJECTIONS_TOTAL, ENGINE_STREAM_DELIVERY_FAILURES_TOTAL,
-    REQUEST_DEADLINE_EXCEEDED,
+    ENGINE_KV_CACHE_MISSES_TOTAL, ENGINE_KV_CACHE_UTILIZATION_RATIO,
+    ENGINE_SCHEDULER_INCREMENTAL_PREFILL_QUANTA_COMMITTED_TOTAL,
+    ENGINE_SCHEDULER_INCREMENTAL_PREFILL_TOKENS_COMMITTED_TOTAL,
+    ENGINE_SCHEDULER_MULTISPAN_PREFILL_REQUESTS_TOTAL, ENGINE_SCHEDULER_QUEUE_DEPTH,
+    ENGINE_SCHEDULER_RUNNING_REQUESTS, ENGINE_STREAM_BACKPRESSURE_TOTAL,
+    ENGINE_STREAM_CHECKPOINTS_COMMITTED_TOTAL, ENGINE_STREAM_CHECKPOINT_REJECTIONS_TOTAL,
+    ENGINE_STREAM_DELIVERY_FAILURES_TOTAL, REQUEST_DEADLINE_EXCEEDED,
 };
 use crate::error::{Error, Result};
 use crate::model::ModelResidencyLease;
+use crate::models::architectures::fish_s2::{FishS2GenerationParams, FishS2Reference};
+use crate::models::architectures::granite_speech::asr::{
+    GraniteSpeechPreparationBatchRow, GraniteSpeechPreparedGeometry,
+    GraniteSpeechPreparedPromptArtifact,
+};
+use crate::models::architectures::kokoro::{kokoro_output_budget, kokoro_peak_workspace};
+use crate::models::architectures::qwen3::asr::{
+    Qwen3AsrAudioBatchRow, Qwen3AsrAudioPreparationGeometry, Qwen3AsrPreparedAudio,
+};
+use crate::models::architectures::vibevoice::asr::{
+    VibeVoiceAsrPreparationDecision, VibeVoiceAsrPreparedArtifact, VibeVoiceAsrPreparedGeometry,
+};
+use crate::models::architectures::vibevoice::tts::{
+    vibevoice_tts_auto_max_frames_for_text, VibeVoiceSpeakerReference, VibeVoiceTtsGenerationParams,
+};
+use crate::models::architectures::voxtral::tts::VoxtralTtsGenerationParams;
+use crate::models::architectures::whisper::asr::{
+    WhisperAudioBatchRow, WhisperPreparedWindow, WhisperWindowPreparationGeometry,
+};
+use crate::models::registry::AsrModelLease;
 use crate::models::shared::chat::{ChatMessage, ChatRequestConfig};
 use crate::runtime::adapters::{
-    CapabilityKind, ExecutionTargetKind, LoadedExecutionContract, LoadedModelBundle,
-    RuntimeAdapterRegistry, StreamingRequirements,
+    CapabilityKind, ExecutionTargetKind, LoadedCapabilityBinding, LoadedExecutionContract,
+    LoadedModelBundle, RuntimeAdapterRegistry, StreamingRequirements,
 };
 use crate::runtime::asr::RealtimeAsrSessionPolicy;
+use crate::runtime::audio_io::decode_reference_audio_base64;
 use crate::runtime::broker::{
     InferenceBroker, InferenceBrokerObservation, InferenceBrokerSnapshot,
 };
 use crate::runtime::coordinator::{
     CoordinatorLane, CoordinatorSnapshot, InferenceCoordinator, JobLease, JobResourceObservation,
-    JobSpec,
+    JobSpec, PreparationArtifact, PreparationCancellation, PreparationRowOutcome,
 };
 use crate::runtime::lifecycle::controller::ModelLifecycleController;
 use crate::runtime::pipeline::{PipelineExecutor, PipelineGraph};
-use crate::runtime::rollout::ExecutionRolloutPolicy;
 use crate::runtime::routing::RouteSource;
 use crate::runtime::telemetry::{
-    push_engine_labeled_metric, push_engine_metric, push_engine_metric_f64,
-    EngineKvCacheRuntimeSnapshot, EngineRuntimeTelemetrySnapshot, RuntimeObservationContext,
-    RuntimeStageObservation, RuntimeStageOutcome, RuntimeStageOutputCounters, RuntimeStageTiming,
-    RuntimeTelemetryCollector, RuntimeTelemetrySnapshot,
+    push_engine_labeled_metric, push_engine_labeled_metric_f64, push_engine_metric,
+    push_engine_metric_f64, push_engine_physical_execution_metrics, EngineRuntimeTelemetrySnapshot,
+    RuntimeObservationContext, RuntimeStageObservation, RuntimeStageOutcome,
+    RuntimeStageOutputCounters, RuntimeStageTiming, RuntimeTelemetryCollector,
+    RuntimeTelemetrySnapshot,
 };
 use crate::runtime::types::RuntimeRequestContext;
 use crate::runtime_models::{LoadedModelDiagnostics, ModelRegistry};
 use crate::tokenizer::Tokenizer;
+
+fn effective_physical_execution_parallelism(
+    mode: crate::config::PhysicalExecutionMode,
+    request_parallelism: usize,
+    configured_launch_limit: usize,
+) -> usize {
+    if mode == crate::config::PhysicalExecutionMode::Concurrent {
+        request_parallelism.max(configured_launch_limit).max(1)
+    } else {
+        // Serial is the emergency rollback path and Shadow must observe
+        // decisions without allowing direct-capability calls to overlap.
+        1
+    }
+}
 
 fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(msg) = payload.downcast_ref::<&str>() {
@@ -245,10 +286,28 @@ async fn route_terminal_output(
     telemetry.record_request_finished(&output).await;
 }
 
-fn reported_gpu_resident_blocks(_backend_kind: BackendKind, _logical_blocks: u64) -> u64 {
-    // Scheduler blocks are logical quotas until an ExternalPaged executor binds
-    // them to tensor pages and reports measured residency.
-    0
+fn managed_kv_used_bytes(snapshot: &crate::engine::ManagedKvRuntimeSnapshot) -> u64 {
+    snapshot
+        .models
+        .iter()
+        .flat_map(|model| &model.arenas)
+        .map(|arena| {
+            arena
+                .coordinator
+                .allocated_pages
+                .saturating_mul(arena.bytes_per_page)
+        })
+        .fold(0_u64, u64::saturating_add)
+}
+
+fn managed_kv_device_pages(snapshot: &crate::engine::ManagedKvRuntimeSnapshot) -> u64 {
+    snapshot
+        .models
+        .iter()
+        .filter(|model| model.backend != BackendKind::Cpu)
+        .flat_map(|model| &model.arenas)
+        .map(|arena| arena.coordinator.allocated_pages)
+        .fold(0_u64, u64::saturating_add)
 }
 
 fn transient_resources(backend: BackendKind, input_bytes: usize) -> ResourceVector {
@@ -476,7 +535,7 @@ fn add_audio_input_allocation(
     }
 }
 
-fn retained_engine_request_input_bytes(request: &EngineCoreRequest) -> Result<usize> {
+pub(super) fn retained_engine_request_input_bytes(request: &EngineCoreRequest) -> Result<usize> {
     let mut total = 0usize;
     add_owned_string_capacity(&mut total, &request.id, "request ID")?;
     add_optional_string_capacity(&mut total, request.text.as_ref(), "request text")?;
@@ -575,10 +634,12 @@ fn retained_engine_request_input_bytes(request: &EngineCoreRequest) -> Result<us
         }
     }
 
-    // Prepared multimodal tensors are deliberately excluded here. Their
-    // decoder/tensor authorization remains pending until preparation creates
-    // them; an already-prepared direct request is conservatively double-counted
-    // instead of falsely reporting accelerator bytes as materialized.
+    total = total
+        .checked_add(request.prepared_asr_audio_retained_bytes()?)
+        .ok_or_else(|| Error::Overloaded("prepared ASR input storage overflowed".to_string()))?;
+    // Device-resident prepared multimodal tensors remain excluded here. The
+    // decoded Qwen3 ASR artifact above is host-owned and therefore counted
+    // exactly by its immutable f32 slice length.
     Ok(total)
 }
 
@@ -588,6 +649,76 @@ fn host_input_observation(input_bytes: usize) -> Result<JobResourceObservation> 
             Error::InvalidInput("runtime retained input size exceeds u64".to_string())
         })?,
     ))
+}
+
+fn retained_lfm25_audio_tts_artifact_host_bytes(messages: &[ChatMessage]) -> Result<u64> {
+    let mut bytes = 0usize;
+    add_chat_messages_allocations(&mut bytes, messages, messages.len())?;
+    u64::try_from(bytes)
+        .map_err(|_| Error::Overloaded("LFM2.5 Audio TTS retained prompt exceeds u64".into()))
+}
+
+fn lfm25_audio_tts_preparation_workspace(backend: BackendKind, bytes: u64) -> ResourceVector {
+    let mut workspace = ResourceVector::zero();
+    match backend {
+        BackendKind::Cpu => workspace.host_bytes = ResourceAmount::Known(bytes),
+        BackendKind::Metal => workspace.unified_bytes = ResourceAmount::Known(bytes),
+        BackendKind::Cuda => workspace.device_bytes = ResourceAmount::Known(bytes),
+    }
+    workspace
+}
+
+fn retained_artifact_resources(
+    backend: BackendKind,
+    host_bytes: u64,
+    accelerator_bytes: u64,
+) -> Result<ResourceVector> {
+    let total = host_bytes
+        .checked_add(accelerator_bytes)
+        .ok_or_else(|| Error::Overloaded("ASR encoder retained resource overflow".to_string()))?;
+    let mut resources = ResourceVector::zero();
+    match backend {
+        BackendKind::Cpu => resources.host_bytes = ResourceAmount::Known(total),
+        BackendKind::Metal => resources.unified_bytes = ResourceAmount::Known(total),
+        BackendKind::Cuda => {
+            resources.host_bytes = ResourceAmount::Known(host_bytes);
+            resources.device_bytes = ResourceAmount::Known(accelerator_bytes);
+        }
+    }
+    Ok(resources)
+}
+
+fn asr_encoder_retained_resources(
+    backend: BackendKind,
+    host_bytes: u64,
+    accelerator_bytes: u64,
+) -> Result<ResourceVector> {
+    retained_artifact_resources(backend, host_bytes, accelerator_bytes)
+}
+
+fn kokoro_synthesis_resources(
+    backend: BackendKind,
+    text: &str,
+    speed: f32,
+) -> Result<ResourceVector> {
+    let budget = kokoro_output_budget(text, speed)?;
+    let workspace = kokoro_peak_workspace(
+        u64::try_from(budget.max_chunk_expanded_frames)
+            .map_err(|_| Error::Overloaded("Kokoro frame budget exceeds u64".into()))?,
+    )?;
+    let output_bytes = u64::try_from(budget.max_samples)
+        .ok()
+        .and_then(|samples| samples.checked_mul(std::mem::size_of::<f32>() as u64))
+        .ok_or_else(|| Error::Overloaded("Kokoro output reservation overflowed".into()))?;
+    let host_bytes = output_bytes
+        .checked_add(workspace.host_bytes)
+        .ok_or_else(|| Error::Overloaded("Kokoro host reservation overflowed".into()))?;
+    super::tts::direct_tts_physical_resources(
+        backend,
+        host_bytes,
+        workspace.cpu_tensor_bytes,
+        workspace.accelerator_tensor_bytes,
+    )
 }
 
 fn ensure_preparation_copy_deadline(job: &JobLease) -> Result<()> {
@@ -690,22 +821,34 @@ pub(crate) fn media_preparation_resources(
 fn coordinator_lane_for_metadata(
     task_type: TaskType,
     model_variant: Option<ModelVariant>,
-    streaming: bool,
+    _streaming: bool,
     workload_class: WorkloadClass,
 ) -> CoordinatorLane {
     let sequence = model_variant.is_some_and(|variant| match task_type {
         TaskType::Chat => {
-            matches!(variant.family(), ModelFamily::Qwen35Chat)
-                || matches!(
-                    variant,
-                    ModelVariant::Qwen306B
-                        | ModelVariant::Qwen306B4Bit
-                        | ModelVariant::Qwen317B
-                        | ModelVariant::Qwen317B4Bit
-                )
+            matches!(
+                variant.family(),
+                ModelFamily::Qwen35Chat | ModelFamily::Qwen38Chat
+            ) || matches!(
+                variant,
+                ModelVariant::Qwen306B
+                    | ModelVariant::Qwen306B4Bit
+                    | ModelVariant::Qwen317B
+                    | ModelVariant::Qwen317B4Bit
+            )
         }
-        TaskType::ASR => variant.family() == ModelFamily::Qwen3Asr && streaming,
-        TaskType::TTS => variant.family() == ModelFamily::Qwen3Tts,
+        TaskType::ASR => matches!(
+            variant.family(),
+            ModelFamily::Qwen3Asr
+                | ModelFamily::WhisperAsr
+                | ModelFamily::VibeVoiceAsr
+                | ModelFamily::GraniteSpeechAsr
+                | ModelFamily::Lfm25Audio
+        ),
+        TaskType::TTS => matches!(
+            variant.family(),
+            ModelFamily::Qwen3Tts | ModelFamily::Lfm25Audio
+        ),
         TaskType::SpeechToSpeech => false,
     });
     if workload_class == WorkloadClass::Realtime {
@@ -718,6 +861,27 @@ fn coordinator_lane_for_metadata(
 }
 
 fn coordinator_lane_for_request(request: &EngineCoreRequest) -> CoordinatorLane {
+    if request.task_type == TaskType::ASR
+        && request.model_variant.is_some_and(|variant| {
+            matches!(
+                variant.family(),
+                ModelFamily::Qwen3Asr
+                    | ModelFamily::WhisperAsr
+                    | ModelFamily::VibeVoiceAsr
+                    | ModelFamily::GraniteSpeechAsr
+                    | ModelFamily::Lfm25Audio
+            )
+        })
+        && request.prepared_asr_execution_shape().is_none()
+    {
+        // This admission owns only decoded-media preparation. It must not be
+        // eligible for retained decoder execution before the exact route and
+        // immutable audio-tower artifact are known.
+        return CoordinatorLane::Atomic;
+    }
+    if request.workload_class != WorkloadClass::Realtime && request.uses_asr_long_form_atomic() {
+        return CoordinatorLane::Atomic;
+    }
     coordinator_lane_for_metadata(
         request.task_type,
         request.model_variant,
@@ -726,9 +890,1007 @@ fn coordinator_lane_for_request(request: &EngineCoreRequest) -> CoordinatorLane 
     )
 }
 
+type QwenAsrEncoderOutcome = PreparationRowOutcome<Qwen3AsrPreparedAudio>;
+
+struct QwenAsrEncoderPending {
+    job: JobLease,
+    contract: LoadedExecutionContract,
+    model: AsrModelLease,
+    samples: Arc<[f32]>,
+    sample_rate: u32,
+    geometry: Qwen3AsrAudioPreparationGeometry,
+    retained_host_bytes: u64,
+    cancellation: PreparationCancellation,
+    response: Option<oneshot::Sender<QwenAsrEncoderOutcome>>,
+}
+
+struct PreparationCancellationGuard {
+    cancellation: PreparationCancellation,
+    armed: bool,
+}
+
+impl Drop for PreparationCancellationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancellation.cancel();
+        }
+    }
+}
+
+#[derive(Default)]
+struct QwenAsrEncoderBatcherState {
+    pending: HashMap<QwenAsrEncoderQueueKey, VecDeque<QwenAsrEncoderPending>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct QwenAsrEncoderQueueKey {
+    binding: AdapterBindingKey,
+    mel_frame_bucket: usize,
+}
+
+struct QwenAsrEncoderBatcher {
+    coordinator: Arc<InferenceCoordinator>,
+    state: Mutex<QwenAsrEncoderBatcherState>,
+}
+
+type WhisperEncoderOutcome = PreparationRowOutcome<WhisperPreparedWindow>;
+
+struct WhisperEncoderPending {
+    job: JobLease,
+    contract: LoadedExecutionContract,
+    model: AsrModelLease,
+    samples: Arc<[f32]>,
+    sample_rate: u32,
+    geometry: WhisperWindowPreparationGeometry,
+    retained_host_bytes: u64,
+    cancellation: PreparationCancellation,
+    response: Option<oneshot::Sender<WhisperEncoderOutcome>>,
+}
+
+#[derive(Default)]
+struct WhisperEncoderBatcherState {
+    pending: HashMap<WhisperEncoderQueueKey, VecDeque<WhisperEncoderPending>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct WhisperEncoderQueueKey {
+    binding: AdapterBindingKey,
+    mel_frame_bucket: usize,
+}
+
+struct WhisperEncoderBatcher {
+    coordinator: Arc<InferenceCoordinator>,
+    state: Mutex<WhisperEncoderBatcherState>,
+}
+
+type VibeVoiceEncoderOutcome = PreparationRowOutcome<VibeVoiceAsrPreparedArtifact>;
+
+type GraniteSpeechEncoderOutcome = PreparationRowOutcome<Arc<GraniteSpeechPreparedPromptArtifact>>;
+
+struct GraniteSpeechEncoderPending {
+    job: JobLease,
+    contract: LoadedExecutionContract,
+    model: AsrModelLease,
+    samples: Arc<[f32]>,
+    sample_rate: u32,
+    language: Option<String>,
+    prompt: Option<String>,
+    geometry: GraniteSpeechPreparedGeometry,
+    retained_host_bytes: u64,
+    artifact_host_bytes: u64,
+    cancellation: PreparationCancellation,
+    response: Option<oneshot::Sender<GraniteSpeechEncoderOutcome>>,
+}
+
+#[derive(Default)]
+struct GraniteSpeechEncoderBatcherState {
+    pending: HashMap<GraniteSpeechEncoderQueueKey, VecDeque<GraniteSpeechEncoderPending>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct GraniteSpeechEncoderQueueKey {
+    binding: AdapterBindingKey,
+    audio_token_bucket: usize,
+    prompt_token_bucket: usize,
+    deadline_budget_bucket: Option<u64>,
+}
+
+struct GraniteSpeechEncoderBatcher {
+    coordinator: Arc<InferenceCoordinator>,
+    state: Mutex<GraniteSpeechEncoderBatcherState>,
+}
+
+fn granite_speech_deadline_budget_bucket(deadline: Option<Instant>, now: Instant) -> Option<u64> {
+    deadline.map(|deadline| {
+        u64::try_from(deadline.saturating_duration_since(now).as_millis()).unwrap_or(u64::MAX) / 100
+    })
+}
+
+struct VibeVoiceEncoderPending {
+    job: JobLease,
+    contract: LoadedExecutionContract,
+    model: AsrModelLease,
+    samples: Arc<[f32]>,
+    sample_rate: u32,
+    language: Option<String>,
+    prompt: Option<String>,
+    geometry: VibeVoiceAsrPreparedGeometry,
+    retained_request_host_bytes: u64,
+    cancellation: PreparationCancellation,
+}
+
+struct VibeVoiceEncoderBatcher {
+    coordinator: Arc<InferenceCoordinator>,
+}
+
+impl VibeVoiceEncoderBatcher {
+    fn new(coordinator: Arc<InferenceCoordinator>) -> Self {
+        Self { coordinator }
+    }
+
+    async fn submit(&self, pending: VibeVoiceEncoderPending) -> Result<VibeVoiceEncoderOutcome> {
+        let work = WorkUnit::PreSequencePreparation {
+            kind: "asr.encoder.vibevoice".into(),
+        };
+        let cost = pending.geometry.work_cost();
+        let cancellation = pending.cancellation.clone();
+        let row = self.coordinator.seal_preparation_row(
+            pending.job,
+            &pending.contract,
+            &work,
+            cost,
+            pending.geometry.embedding_elements,
+            pending.cancellation,
+        )?;
+        let model = pending.model;
+        let samples = pending.samples;
+        let sample_rate = pending.sample_rate;
+        let language = pending.language;
+        let prompt = pending.prompt;
+        let retained_request_host_bytes = pending.retained_request_host_bytes;
+        let mut guard = PreparationCancellationGuard {
+            cancellation,
+            armed: true,
+        };
+        let mut outcomes = self
+            .coordinator
+            .run_loaded_native_preparation_batch(vec![row], pending.contract, work, move |live| {
+                if live != [0] {
+                    return Err(Error::InferenceError(
+                        "VibeVoice scalar preparation received a non-scalar live set".into(),
+                    ));
+                }
+                let artifact = model.prepare_vibevoice_retained_artifact(
+                    samples.as_ref(),
+                    sample_rate,
+                    language.as_deref(),
+                    prompt.as_deref(),
+                )?;
+                let host_bytes = retained_request_host_bytes
+                    .checked_add(artifact.resident_host_bytes())
+                    .ok_or_else(|| {
+                        Error::Overloaded("VibeVoice ASR retained host accounting overflow".into())
+                    })?;
+                Ok(vec![Ok(PreparationArtifact {
+                    retained: JobResourceObservation {
+                        host_bytes,
+                        accelerator_bytes: artifact.resident_tensor_bytes(),
+                    },
+                    value: artifact,
+                })])
+            })
+            .await?;
+        guard.armed = false;
+        outcomes.pop().ok_or_else(|| {
+            Error::InferenceError("VibeVoice scalar preparation returned no outcome".into())
+        })
+    }
+}
+
+impl WhisperEncoderBatcher {
+    fn new(coordinator: Arc<InferenceCoordinator>) -> Self {
+        Self {
+            coordinator,
+            state: Mutex::new(WhisperEncoderBatcherState::default()),
+        }
+    }
+
+    async fn submit(
+        self: &Arc<Self>,
+        mut pending: WhisperEncoderPending,
+    ) -> Result<WhisperEncoderOutcome> {
+        let work = WorkUnit::PreSequencePreparation {
+            kind: "asr.encoder.whisper".to_string(),
+        };
+        let binding = pending.contract.adapter_binding()?;
+        let stage = binding.stage_for_work(&work)?;
+        if stage.name != "asr.encoder.whisper" {
+            return Err(Error::InvalidInput(
+                "Whisper loaded contract did not select asr.encoder.whisper".into(),
+            ));
+        }
+        let key = WhisperEncoderQueueKey {
+            binding: binding.key_for_stage(stage.id)?,
+            mel_frame_bucket: pending
+                .geometry
+                .useful_mel_frames
+                .checked_next_power_of_two()
+                .ok_or_else(|| Error::Overloaded("Whisper mel-frame bucket overflow".into()))?,
+        };
+        let max_width = stage.max_batch_size.max(1);
+        let formation_delay = stage.max_formation_delay;
+        let deadline = pending.job.spec.deadline;
+        let cancellation = pending.cancellation.clone();
+        let (sender, receiver) = oneshot::channel();
+        pending.response = Some(sender);
+        let mut immediate = None;
+        let first;
+        {
+            let mut state = self.state.lock().await;
+            let queue = state.pending.entry(key.clone()).or_default();
+            first = queue.is_empty();
+            queue.push_back(pending);
+            let pressure = deadline.is_some_and(|deadline| {
+                deadline
+                    <= Instant::now()
+                        .checked_add(formation_delay)
+                        .unwrap_or(deadline)
+            });
+            if queue.len() >= max_width || pressure {
+                immediate = Some(queue.drain(..queue.len().min(max_width)).collect());
+                if queue.is_empty() {
+                    state.pending.remove(&key);
+                }
+            }
+        }
+        if let Some(batch) = immediate {
+            self.spawn(batch);
+        } else if first {
+            let batcher = self.clone();
+            tokio::spawn(async move {
+                yield_now().await;
+                if !formation_delay.is_zero() {
+                    tokio::time::sleep(formation_delay).await;
+                }
+                let batch = {
+                    let mut state = batcher.state.lock().await;
+                    let Some(queue) = state.pending.get_mut(&key) else {
+                        return;
+                    };
+                    let batch = queue
+                        .drain(..queue.len().min(max_width))
+                        .collect::<Vec<_>>();
+                    if queue.is_empty() {
+                        state.pending.remove(&key);
+                    }
+                    batch
+                };
+                batcher.spawn(batch);
+            });
+        }
+        struct CancelOnDrop(PreparationCancellation, bool);
+        impl Drop for CancelOnDrop {
+            fn drop(&mut self) {
+                if self.1 {
+                    self.0.cancel();
+                }
+            }
+        }
+        let mut guard = CancelOnDrop(cancellation, true);
+        let outcome = receiver.await.map_err(|_| {
+            Error::InferenceError("Whisper encoder batch worker stopped before reply".into())
+        })?;
+        guard.1 = false;
+        Ok(outcome)
+    }
+
+    fn spawn(self: &Arc<Self>, batch: Vec<WhisperEncoderPending>) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            this.run_batch(batch).await;
+        });
+    }
+
+    async fn run_batch(&self, mut rows: Vec<WhisperEncoderPending>) {
+        let Some(first) = rows.first() else {
+            return;
+        };
+        let contract = first.contract.clone();
+        let model = first.model.clone();
+        let geometries = rows.iter().map(|row| row.geometry).collect::<Vec<_>>();
+        let batch_geometry = match model.whisper_window_preparation_batch_geometry(&geometries) {
+            Ok(value) => value,
+            Err(error) => {
+                Self::fail(rows, error);
+                return;
+            }
+        };
+        let mut sealed = Vec::with_capacity(rows.len());
+        let work = WorkUnit::PreSequencePreparation {
+            kind: "asr.encoder.whisper".into(),
+        };
+        for (index, row) in rows.iter().enumerate() {
+            let cost = match model.whisper_window_preparation_row_cost_for_batch(
+                index,
+                &geometries,
+                &batch_geometry,
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    Self::fail(rows, error);
+                    return;
+                }
+            };
+            match self.coordinator.seal_preparation_row(
+                row.job.clone(),
+                &row.contract,
+                &work,
+                cost,
+                batch_geometry.materialized_tensor_elements_per_row,
+                row.cancellation.clone(),
+            ) {
+                Ok(value) => sealed.push(value),
+                Err(error) => {
+                    Self::fail(rows, error);
+                    return;
+                }
+            }
+        }
+        let inputs = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.samples.clone(),
+                    row.sample_rate,
+                    row.retained_host_bytes,
+                )
+            })
+            .collect::<Vec<_>>();
+        let senders = rows
+            .drain(..)
+            .map(|mut row| {
+                row.response
+                    .take()
+                    .expect("queued Whisper row has response channel")
+            })
+            .collect::<Vec<_>>();
+        let physical = model.clone();
+        let result = self
+            .coordinator
+            .run_loaded_native_preparation_batch(sealed, contract, work, move |live| {
+                let selected = live
+                    .iter()
+                    .map(|index| WhisperAudioBatchRow {
+                        audio: inputs[*index].0.as_ref(),
+                        sample_rate: inputs[*index].1,
+                    })
+                    .collect::<Vec<_>>();
+                let prepared = physical.prepare_whisper_window_batch(&selected)?;
+                Ok(prepared
+                    .into_iter()
+                    .zip(live)
+                    .map(|(artifact, index)| {
+                        Ok(PreparationArtifact {
+                            retained: JobResourceObservation {
+                                host_bytes: inputs[*index].2,
+                                accelerator_bytes: artifact.resident_tensor_bytes()?,
+                            },
+                            value: artifact,
+                        })
+                    })
+                    .collect::<Vec<Result<PreparationArtifact<WhisperPreparedWindow>>>>())
+            })
+            .await;
+        match result {
+            Ok(outcomes) => {
+                for (sender, outcome) in senders.into_iter().zip(outcomes) {
+                    let _ = sender.send(outcome);
+                }
+            }
+            Err(error) => {
+                for sender in senders {
+                    let _ = sender.send(PreparationRowOutcome::Failed(Error::InferenceError(
+                        error.to_string(),
+                    )));
+                }
+            }
+        }
+    }
+
+    fn fail(rows: Vec<WhisperEncoderPending>, error: Error) {
+        for row in rows {
+            if let Some(sender) = row.response {
+                let _ = sender.send(PreparationRowOutcome::Failed(Error::InferenceError(
+                    error.to_string(),
+                )));
+            }
+        }
+    }
+}
+
+impl GraniteSpeechEncoderBatcher {
+    fn new(coordinator: Arc<InferenceCoordinator>) -> Self {
+        Self {
+            coordinator,
+            state: Mutex::new(GraniteSpeechEncoderBatcherState::default()),
+        }
+    }
+
+    async fn submit(
+        self: &Arc<Self>,
+        mut pending: GraniteSpeechEncoderPending,
+    ) -> Result<GraniteSpeechEncoderOutcome> {
+        let work = WorkUnit::PreSequencePreparation {
+            kind: "asr.encoder.granite_speech".into(),
+        };
+        let binding = pending.contract.adapter_binding()?;
+        let stage = binding.stage_for_work(&work)?;
+        if stage.name != "asr.encoder.granite_speech" {
+            return Err(Error::InvalidInput(
+                "Granite Speech loaded contract did not select asr.encoder.granite_speech".into(),
+            ));
+        }
+        let deadline = pending.job.spec.deadline;
+        let now = Instant::now();
+        let key = GraniteSpeechEncoderQueueKey {
+            binding: binding.key_for_stage(stage.id)?,
+            audio_token_bucket: pending
+                .geometry
+                .audio_tokens
+                .checked_next_power_of_two()
+                .ok_or_else(|| {
+                    Error::Overloaded("Granite Speech audio-token bucket overflow".into())
+                })?,
+            prompt_token_bucket: pending
+                .geometry
+                .prompt_tokens
+                .checked_next_power_of_two()
+                .ok_or_else(|| {
+                    Error::Overloaded("Granite Speech prompt-token bucket overflow".into())
+                })?,
+            deadline_budget_bucket: granite_speech_deadline_budget_bucket(deadline, now),
+        };
+        let max_width = stage.max_batch_size.max(1);
+        let formation_delay = stage.max_formation_delay;
+        let cancellation = pending.cancellation.clone();
+        let (sender, receiver) = oneshot::channel();
+        pending.response = Some(sender);
+
+        let mut immediate = None;
+        let first;
+        {
+            let mut state = self.state.lock().await;
+            let queue = state.pending.entry(key.clone()).or_default();
+            first = queue.is_empty();
+            queue.push_back(pending);
+            let deadline_pressure = deadline.is_some_and(|deadline| {
+                deadline
+                    <= Instant::now()
+                        .checked_add(formation_delay)
+                        .unwrap_or(deadline)
+            });
+            if queue.len() >= max_width || deadline_pressure {
+                immediate = Some(Self::drain(queue, max_width));
+                if queue.is_empty() {
+                    state.pending.remove(&key);
+                }
+            }
+        }
+        if let Some(batch) = immediate {
+            self.spawn_batch(batch);
+        } else if first {
+            let batcher = self.clone();
+            tokio::spawn(async move {
+                yield_now().await;
+                if !formation_delay.is_zero() {
+                    let should_wait = {
+                        let state = batcher.state.lock().await;
+                        state.pending.get(&key).is_some_and(|queue| {
+                            !queue.iter().any(|row| {
+                                row.job.spec.deadline.is_some_and(|deadline| {
+                                    deadline
+                                        <= Instant::now()
+                                            .checked_add(formation_delay)
+                                            .unwrap_or(deadline)
+                                })
+                            })
+                        })
+                    };
+                    if should_wait {
+                        tokio::time::sleep(formation_delay).await;
+                    }
+                }
+                if let Some(batch) = batcher.take_batch(&key, max_width).await {
+                    batcher.spawn_batch(batch);
+                }
+            });
+        }
+
+        let mut guard = PreparationCancellationGuard {
+            cancellation,
+            armed: true,
+        };
+        let outcome = receiver.await.map_err(|_| {
+            Error::InferenceError("Granite Speech encoder batch worker stopped before reply".into())
+        })?;
+        guard.armed = false;
+        Ok(outcome)
+    }
+
+    fn drain(
+        queue: &mut VecDeque<GraniteSpeechEncoderPending>,
+        max_width: usize,
+    ) -> Vec<GraniteSpeechEncoderPending> {
+        queue.drain(..queue.len().min(max_width)).collect()
+    }
+
+    async fn take_batch(
+        &self,
+        key: &GraniteSpeechEncoderQueueKey,
+        max_width: usize,
+    ) -> Option<Vec<GraniteSpeechEncoderPending>> {
+        let mut state = self.state.lock().await;
+        let queue = state.pending.get_mut(key)?;
+        let batch = Self::drain(queue, max_width);
+        if queue.is_empty() {
+            state.pending.remove(key);
+        }
+        (!batch.is_empty()).then_some(batch)
+    }
+
+    fn spawn_batch(self: &Arc<Self>, batch: Vec<GraniteSpeechEncoderPending>) {
+        let batcher = self.clone();
+        tokio::spawn(async move {
+            batcher.run_batch(batch).await;
+        });
+    }
+
+    async fn run_batch(&self, mut batch: Vec<GraniteSpeechEncoderPending>) {
+        let now = Instant::now();
+        let mut live = Vec::with_capacity(batch.len());
+        for mut row in batch.drain(..) {
+            let terminal = if row.cancellation.is_cancelled() {
+                Some(PreparationRowOutcome::Cancelled)
+            } else if row
+                .job
+                .spec
+                .deadline
+                .is_some_and(|deadline| deadline <= now)
+            {
+                Some(PreparationRowOutcome::TimedOut)
+            } else {
+                None
+            };
+            if let Some(outcome) = terminal {
+                if let Some(response) = row.response.take() {
+                    let _ = response.send(outcome);
+                }
+            } else {
+                live.push(row);
+            }
+        }
+        batch = live;
+        let Some(first) = batch.first() else {
+            return;
+        };
+        let contract = first.contract.clone();
+        let model = first.model.clone();
+        let geometries = batch.iter().map(|row| row.geometry).collect::<Vec<_>>();
+        let batch_geometry = match model.granite_speech_preparation_batch_geometry(&geometries) {
+            Ok(geometry) => geometry,
+            Err(error) => {
+                Self::fail_batch(batch, error);
+                return;
+            }
+        };
+        let work = WorkUnit::PreSequencePreparation {
+            kind: "asr.encoder.granite_speech".into(),
+        };
+        let mut sealed = Vec::with_capacity(batch.len());
+        for (index, row) in batch.iter().enumerate() {
+            let cost = match model.granite_speech_preparation_row_cost_for_batch(
+                index,
+                &geometries,
+                batch_geometry,
+            ) {
+                Ok(cost) => cost,
+                Err(error) => {
+                    Self::fail_batch(batch, error);
+                    return;
+                }
+            };
+            match self.coordinator.seal_preparation_row(
+                row.job.clone(),
+                &row.contract,
+                &work,
+                cost,
+                batch_geometry.materialized_tensor_elements_per_row,
+                row.cancellation.clone(),
+            ) {
+                Ok(seal) => sealed.push(seal),
+                Err(error) => {
+                    Self::fail_batch(batch, error);
+                    return;
+                }
+            }
+        }
+
+        let inputs = batch
+            .iter()
+            .map(|row| {
+                (
+                    row.samples.clone(),
+                    row.sample_rate,
+                    row.language.clone(),
+                    row.prompt.clone(),
+                    row.geometry,
+                    row.retained_host_bytes,
+                    row.artifact_host_bytes,
+                )
+            })
+            .collect::<Vec<_>>();
+        let senders = batch
+            .drain(..)
+            .map(|mut row| {
+                row.response
+                    .take()
+                    .expect("queued Granite Speech row has response channel")
+            })
+            .collect::<Vec<_>>();
+        let physical_model = model.clone();
+        let result = self
+            .coordinator
+            .run_loaded_native_preparation_batch(sealed, contract, work, move |live| {
+                let selected = live
+                    .iter()
+                    .map(|index| GraniteSpeechPreparationBatchRow {
+                        audio: inputs[*index].0.as_ref(),
+                        sample_rate: inputs[*index].1,
+                        language: inputs[*index].2.as_deref(),
+                        prompt: inputs[*index].3.as_deref(),
+                    })
+                    .collect::<Vec<_>>();
+                let prepared =
+                    physical_model.prepare_granite_speech_prompt_artifact_batch(&selected)?;
+                if prepared.len() != live.len() {
+                    return Err(Error::InferenceError(
+                        "Granite Speech preparation batch returned the wrong row count".into(),
+                    ));
+                }
+                Ok(prepared
+                    .into_iter()
+                    .zip(live.iter().copied())
+                    .map(|(artifact, index)| {
+                        let geometry = inputs[index].4;
+                        let resident_tensor_bytes = artifact.resident_tensor_bytes()?;
+                        if artifact.prompt_tokens() != geometry.prompt_tokens
+                            || artifact.audio_tokens() != geometry.audio_tokens
+                            || artifact.resident_host_bytes() != inputs[index].6
+                            || resident_tensor_bytes != geometry.retained_device_bytes
+                        {
+                            return Err(Error::InferenceError(
+                                "Granite Speech batch artifact drifted from admitted geometry"
+                                    .into(),
+                            ));
+                        }
+                        Ok(PreparationArtifact {
+                            retained: JobResourceObservation {
+                                host_bytes: inputs[index].5,
+                                accelerator_bytes: resident_tensor_bytes,
+                            },
+                            value: artifact,
+                        })
+                    })
+                    .collect::<Vec<Result<PreparationArtifact<
+                        Arc<GraniteSpeechPreparedPromptArtifact>,
+                    >>>>())
+            })
+            .await;
+        match result {
+            Ok(outcomes) => {
+                for (sender, outcome) in senders.into_iter().zip(outcomes) {
+                    let _ = sender.send(outcome);
+                }
+            }
+            Err(error) => {
+                let message = error.to_string();
+                for sender in senders {
+                    let _ = sender.send(PreparationRowOutcome::Failed(Error::InferenceError(
+                        message.clone(),
+                    )));
+                }
+            }
+        }
+    }
+
+    fn fail_batch(batch: Vec<GraniteSpeechEncoderPending>, error: Error) {
+        let message = error.to_string();
+        for row in batch {
+            if let Some(response) = row.response {
+                let _ = response.send(PreparationRowOutcome::Failed(Error::InferenceError(
+                    message.clone(),
+                )));
+            }
+        }
+    }
+}
+
+impl QwenAsrEncoderBatcher {
+    fn new(coordinator: Arc<InferenceCoordinator>) -> Self {
+        Self {
+            coordinator,
+            state: Mutex::new(QwenAsrEncoderBatcherState::default()),
+        }
+    }
+
+    async fn submit(
+        self: &Arc<Self>,
+        pending: QwenAsrEncoderPending,
+    ) -> Result<QwenAsrEncoderOutcome> {
+        let work = WorkUnit::PreSequencePreparation {
+            kind: "asr.encoder.audio".to_string(),
+        };
+        let binding = pending.contract.adapter_binding()?;
+        let stage = binding.stage_for_work(&work)?;
+        if stage.name != "asr.encoder.audio" {
+            return Err(Error::InvalidInput(
+                "Qwen3 ASR loaded contract did not select asr.encoder.audio".to_string(),
+            ));
+        }
+        let key = QwenAsrEncoderQueueKey {
+            binding: binding.key_for_stage(stage.id)?,
+            // The loaded padded-stage contract allows at most 100% padding.
+            // Power-of-two duration buckets keep every admitted row within a
+            // factor of two while preserving ragged logical lengths.
+            mel_frame_bucket: pending
+                .geometry
+                .mel_frames
+                .checked_next_power_of_two()
+                .ok_or_else(|| {
+                    Error::Overloaded("Qwen3 ASR mel-frame bucket overflow".to_string())
+                })?,
+        };
+        let max_width = stage.max_batch_size.max(1);
+        let formation_delay = stage.max_formation_delay;
+        let deadline = pending.job.spec.deadline;
+        let cancellation = pending.cancellation.clone();
+        let (response, receiver) = oneshot::channel();
+        let mut pending = pending;
+        pending.response = Some(response);
+
+        let mut immediate = None;
+        let first;
+        {
+            let mut state = self.state.lock().await;
+            let queue = state.pending.entry(key.clone()).or_default();
+            first = queue.is_empty();
+            queue.push_back(pending);
+            let deadline_pressure = deadline.is_some_and(|deadline| {
+                deadline
+                    <= Instant::now()
+                        .checked_add(formation_delay)
+                        .unwrap_or(deadline)
+            });
+            if queue.len() >= max_width || deadline_pressure {
+                immediate = Some(Self::drain(queue, max_width));
+                if queue.is_empty() {
+                    state.pending.remove(&key);
+                }
+            }
+        }
+
+        if let Some(batch) = immediate {
+            self.spawn_batch(batch);
+        } else if first {
+            let batcher = self.clone();
+            tokio::spawn(async move {
+                // A zero-delay stage still yields once so requests already
+                // runnable in this executor turn can join without imposing a
+                // timer-derived latency floor.
+                yield_now().await;
+                if !formation_delay.is_zero() {
+                    let should_wait = {
+                        let state = batcher.state.lock().await;
+                        state.pending.get(&key).is_some_and(|queue| {
+                            !queue.iter().any(|row| {
+                                row.job.spec.deadline.is_some_and(|deadline| {
+                                    deadline
+                                        <= Instant::now()
+                                            .checked_add(formation_delay)
+                                            .unwrap_or(deadline)
+                                })
+                            })
+                        })
+                    };
+                    if should_wait {
+                        tokio::time::sleep(formation_delay).await;
+                    }
+                }
+                if let Some(batch) = batcher.take_batch(&key, max_width).await {
+                    batcher.spawn_batch(batch);
+                }
+            });
+        }
+
+        let mut guard = PreparationCancellationGuard {
+            cancellation,
+            armed: true,
+        };
+        let outcome = receiver.await.map_err(|_| {
+            Error::InferenceError("Qwen3 ASR encoder batch worker stopped before reply".to_string())
+        })?;
+        guard.armed = false;
+        Ok(outcome)
+    }
+
+    fn drain(
+        queue: &mut VecDeque<QwenAsrEncoderPending>,
+        max_width: usize,
+    ) -> Vec<QwenAsrEncoderPending> {
+        let width = queue.len().min(max_width);
+        queue.drain(..width).collect()
+    }
+
+    async fn take_batch(
+        &self,
+        key: &QwenAsrEncoderQueueKey,
+        max_width: usize,
+    ) -> Option<Vec<QwenAsrEncoderPending>> {
+        let mut state = self.state.lock().await;
+        let queue = state.pending.get_mut(key)?;
+        let batch = Self::drain(queue, max_width);
+        if queue.is_empty() {
+            state.pending.remove(key);
+        }
+        (!batch.is_empty()).then_some(batch)
+    }
+
+    fn spawn_batch(self: &Arc<Self>, batch: Vec<QwenAsrEncoderPending>) {
+        let batcher = self.clone();
+        tokio::spawn(async move {
+            batcher.run_batch(batch).await;
+        });
+    }
+
+    async fn run_batch(&self, mut batch: Vec<QwenAsrEncoderPending>) {
+        let Some(first) = batch.first() else {
+            return;
+        };
+        let contract = first.contract.clone();
+        let model = first.model.clone();
+        let geometries = batch.iter().map(|row| row.geometry).collect::<Vec<_>>();
+        let batch_geometry = match model.audio_preparation_batch_geometry(&geometries) {
+            Ok(geometry) => geometry,
+            Err(error) => {
+                Self::fail_batch(batch, error);
+                return;
+            }
+        };
+        let materialized_per_row = match batch_geometry
+            .padded_mel_elements_per_row
+            .checked_add(batch_geometry.padded_output_elements_per_row)
+        {
+            Some(value) => value,
+            None => {
+                Self::fail_batch(
+                    batch,
+                    Error::Overloaded("Qwen3 ASR padded work accounting overflow".to_string()),
+                );
+                return;
+            }
+        };
+        let work = WorkUnit::PreSequencePreparation {
+            kind: "asr.encoder.audio".to_string(),
+        };
+        let mut sealed = Vec::with_capacity(batch.len());
+        for (index, row) in batch.iter().enumerate() {
+            let cost = match model.audio_preparation_row_cost_for_batch(
+                index,
+                &geometries,
+                &batch_geometry,
+            ) {
+                Ok(cost) => cost,
+                Err(error) => {
+                    Self::fail_batch(batch, error);
+                    return;
+                }
+            };
+            match self.coordinator.seal_preparation_row(
+                row.job.clone(),
+                &row.contract,
+                &work,
+                cost,
+                materialized_per_row,
+                row.cancellation.clone(),
+            ) {
+                Ok(seal) => sealed.push(seal),
+                Err(error) => {
+                    Self::fail_batch(batch, error);
+                    return;
+                }
+            }
+        }
+        // The sealed rows now own the only JobLease clones used by the
+        // physical transaction. Drop the queue-owned originals before the
+        // runner converts successful jobs into unique admission bridges.
+        let samples = batch
+            .iter()
+            .map(|row| {
+                (
+                    row.samples.clone(),
+                    row.sample_rate,
+                    row.retained_host_bytes,
+                )
+            })
+            .collect::<Vec<_>>();
+        let senders = batch
+            .drain(..)
+            .map(|mut row| {
+                row.response
+                    .take()
+                    .expect("queued Qwen3 ASR row has a response channel")
+            })
+            .collect::<Vec<_>>();
+        let physical_model = model.clone();
+        let result = self
+            .coordinator
+            .run_loaded_native_preparation_batch(sealed, contract, work, move |live| {
+                let selected = live
+                    .iter()
+                    .map(|index| Qwen3AsrAudioBatchRow {
+                        audio: samples[*index].0.as_ref(),
+                        sample_rate: samples[*index].1,
+                    })
+                    .collect::<Vec<_>>();
+                let prepared = physical_model.prepare_qwen3_audio_tower_batch(&selected)?;
+                Ok(prepared
+                    .into_iter()
+                    .zip(live.iter())
+                    .map(|(artifact, index)| {
+                        Ok(PreparationArtifact {
+                            retained: JobResourceObservation {
+                                host_bytes: samples[*index].2,
+                                accelerator_bytes: artifact.resident_tensor_bytes()?,
+                            },
+                            value: artifact,
+                        })
+                    })
+                    .collect::<Vec<Result<PreparationArtifact<Qwen3AsrPreparedAudio>>>>())
+            })
+            .await;
+        match result {
+            Ok(outcomes) => {
+                for (sender, outcome) in senders.into_iter().zip(outcomes) {
+                    let _ = sender.send(outcome);
+                }
+            }
+            Err(error) => {
+                let message = error.to_string();
+                for sender in senders {
+                    let _ = sender.send(PreparationRowOutcome::Failed(Error::InferenceError(
+                        message.clone(),
+                    )));
+                }
+            }
+        }
+    }
+
+    fn fail_batch(batch: Vec<QwenAsrEncoderPending>, error: Error) {
+        let message = error.to_string();
+        for row in batch {
+            if let Some(response) = row.response {
+                let _ = response.send(PreparationRowOutcome::Failed(Error::InferenceError(
+                    message.clone(),
+                )));
+            }
+        }
+    }
+}
+
 /// Main inference engine runtime.
 pub struct RuntimeService {
     pub(crate) config: EngineConfig,
+    cache_policy: ResolvedKvCachePolicy,
     pub(crate) backend_router: BackendRouter,
     pub(crate) inference_broker: InferenceBroker,
     pub(crate) adapter_registry: Arc<RuntimeAdapterRegistry>,
@@ -740,6 +1902,10 @@ pub struct RuntimeService {
     pub(crate) streaming_config: StreamingConfig,
     pub(crate) core_engine: Arc<CoreEngine>,
     pub(crate) coordinator: Arc<InferenceCoordinator>,
+    qwen_asr_encoder_batcher: Arc<QwenAsrEncoderBatcher>,
+    whisper_encoder_batcher: Arc<WhisperEncoderBatcher>,
+    vibevoice_encoder_batcher: Arc<VibeVoiceEncoderBatcher>,
+    granite_speech_encoder_batcher: Arc<GraniteSpeechEncoderBatcher>,
     pub(super) asr_realtime_sessions: RealtimeAsrSessionPolicy,
     telemetry: Arc<RuntimeTelemetryCollector>,
     completion_waiters: Arc<RuntimeCompletionWaiters>,
@@ -787,16 +1953,83 @@ fn bind_request_to_residency(
             "loaded execution bundle does not match authoritative model residency".to_string(),
         ));
     }
+    if request.model_variant.is_some_and(|variant| {
+        matches!(
+            variant.family(),
+            ModelFamily::Qwen3Asr
+                | ModelFamily::WhisperAsr
+                | ModelFamily::VibeVoiceAsr
+                | ModelFamily::GraniteSpeechAsr
+                | ModelFamily::Lfm25Audio
+        ) && request.prepared_asr_execution_shape().is_some()
+    }) && request.prepared_asr_audio_for_executor()?.is_none()
+    {
+        return Err(Error::InvalidInput(
+            "ASR execution shape has no matching decoded-audio artifact".to_string(),
+        ));
+    }
+    if request.model_variant.is_some_and(|variant| {
+        variant.family() == ModelFamily::WhisperAsr
+            && request.prepared_asr_execution_shape().is_some()
+            && !request.uses_asr_long_form_atomic()
+    }) && request.prepared_whisper_window_for_executor()?.is_none()
+    {
+        return Err(Error::InvalidInput(
+            "Whisper normal execution shape has no matching prepared window".into(),
+        ));
+    }
+    if request.model_variant.is_some_and(|variant| {
+        variant.family() == ModelFamily::GraniteSpeechAsr
+            && request.prepared_asr_execution_shape().is_some()
+            && !request.uses_asr_long_form_atomic()
+    }) && request
+        .prepared_granite_speech_artifact_for_executor()?
+        .is_none()
+    {
+        return Err(Error::InvalidInput(
+            "Granite Speech normal execution shape has no matching prepared artifact".into(),
+        ));
+    }
+    if request.model_variant.is_some_and(|variant| {
+        variant.family() == ModelFamily::VibeVoiceAsr
+            && request.prepared_asr_execution_shape().is_some()
+            && !request.uses_asr_long_form_atomic()
+    }) && request
+        .prepared_vibevoice_artifact_for_executor()?
+        .is_none()
+    {
+        return Err(Error::InvalidInput(
+            "VibeVoice normal execution shape has no matching prepared artifact".into(),
+        ));
+    }
+    if request.model_variant.is_some_and(|variant| {
+        variant.family() == ModelFamily::Lfm25Audio
+            && request.prepared_asr_execution_shape().is_some()
+            && !request.uses_asr_long_form_atomic()
+    }) && request
+        .prepared_lfm25_audio_asr_artifact_for_executor()?
+        .is_none()
+    {
+        return Err(Error::InvalidInput(
+            "LFM2.5 Audio normal execution shape has no matching prepared artifact".into(),
+        ));
+    }
     let streaming = if request.streaming && !model_streaming_required {
         StreamingRequirements::transport_only()
     } else {
         StreamingRequirements::native(model_streaming_required)
-    };
-    let binding = bundle.adapter_binding_for_streaming(
+    }
+    .with_asr_long_form(request.uses_asr_long_form_atomic());
+    let LoadedCapabilityBinding { execution, state } = bundle.capability_binding_for_streaming(
         CapabilityKind::for_engine_task(request.task_type),
         streaming,
     )?;
-    request.bind_execution_adapter(binding)?;
+    request.bind_execution_adapter(execution)?;
+    request.bind_v2_state_runtime(
+        state.clone(),
+        state.state_fingerprint,
+        bundle.backend_kind(),
+    )?;
     Ok(())
 }
 
@@ -848,7 +2081,48 @@ fn loaded_contract_for_residency(
             expected_target.expect("checked as some")
         )));
     }
+    let state_binding = bundle.capability_binding_for_streaming(
+        capability,
+        StreamingRequirements::native(streaming_required),
+    )?;
+    state_binding
+        .state
+        .validate_against(backend_kind, &state_binding.execution)?;
     Ok(contract)
+}
+
+fn loaded_binding_for_residency(
+    lease: &ModelResidencyLease,
+    bundle: Option<&LoadedModelBundle>,
+    capability: CapabilityKind,
+    streaming_required: bool,
+    execution_group_id: crate::engine::ExecutionGroupId,
+    backend_kind: BackendKind,
+    expected_target: Option<ExecutionTargetKind>,
+) -> Result<(LoadedExecutionContract, LoadedCapabilityBinding)> {
+    let contract = loaded_contract_for_residency(
+        lease,
+        bundle,
+        capability,
+        streaming_required,
+        execution_group_id,
+        backend_kind,
+        expected_target,
+    )?;
+    let bundle = bundle.expect("validated by loaded_contract_for_residency");
+    let binding = bundle.capability_binding_for_streaming(
+        capability,
+        StreamingRequirements::native(streaming_required),
+    )?;
+    if binding.execution != contract.adapter_binding()? {
+        return Err(Error::InferenceError(
+            "loaded capability state binding does not match its execution contract".into(),
+        ));
+    }
+    binding
+        .state
+        .validate_against(backend_kind, &binding.execution)?;
+    Ok((contract, binding))
 }
 
 struct WaiterRegistrationGuard {
@@ -1068,6 +2342,10 @@ impl RuntimeService {
 
     /// Create a new inference engine.
     pub fn new(config: EngineConfig) -> Result<Self> {
+        // Reject unsupported or unsafe cache policy before any model registry,
+        // device arena, or readiness state can be created.
+        let cache_policy =
+            config.resolved_kv_cache_policy(EngineCoreConfig::default().max_blocks)?;
         configure_runtime_threading(config.num_threads.max(1));
         let model_manager = Arc::new(ModelManager::new(config.clone())?);
 
@@ -1083,38 +2361,67 @@ impl RuntimeService {
         ));
 
         let mut core_config = EngineCoreConfig::for_qwen3_tts();
+        core_config.portable_context_auto = config.max_sequence_length.explicit_tokens().is_none();
+        core_config.portable_context_reserve_bytes = config.portable_context_reserve_bytes;
         core_config.models_dir = config.models_dir.clone();
-        core_config.max_batch_size = config.max_batch_size.max(1);
-        core_config.max_seq_len = config.max_sequence_length.max(1);
+        core_config.max_batch_size = config.max_scheduler_batch_size.max(1);
+        core_config.max_tensor_batch_size = config.max_batch_size;
+        core_config.physical_execution_mode = config.physical_execution_mode;
+        core_config.max_physical_in_flight = config.max_physical_in_flight;
+        core_config.max_retained_sequences = config.max_retained_sequences.max(1);
+        core_config.max_staged_transactions = config.max_staged_transactions.max(1);
+        core_config.max_queued_requests = config.max_queued_requests.max(1);
         core_config.backend = selected_backend_kind;
         core_config.num_threads = config.num_threads.max(1);
         core_config.block_size = config.kv_page_size.max(1);
-        core_config.kv_cache_dtype = config.kv_cache_dtype.clone();
+        core_config.apply_backend_context_capacity(config.portable_context_ceiling());
+        core_config.kv_cache_dtype = cache_policy.effective.dtype.to_string();
+        core_config.enable_prefix_caching = config.enable_prefix_caching;
+        core_config.managed_prefix_cache_salt = config.managed_prefix_cache_salt.clone();
+        core_config.max_prefix_cache_pages = match &cache_policy.effective.prefix {
+            PrefixCachePolicy::Disabled => 0,
+            PrefixCachePolicy::Namespaced { max_pages, .. } => *max_pages,
+        };
+        core_config.enable_chunked_prefill = config.enable_chunked_prefill;
+        core_config.chunked_prefill_threshold = config.chunked_prefill_threshold.max(1);
 
         let mut worker_config = WorkerConfig::from(&core_config);
         worker_config.models_dir = config.models_dir.clone();
-        worker_config.kv_cache_dtype = config.kv_cache_dtype.clone();
+        worker_config.kv_cache_dtype = cache_policy.effective.dtype.to_string();
         worker_config.kv_page_size = config.kv_page_size.max(1);
         worker_config.model_registry = Some(model_registry.clone());
         worker_config.backend = selected_backend_kind;
         worker_config.backend_context = backend_context.clone();
-        let execution_rollout = ExecutionRolloutPolicy::from_env()?;
         let adapter_registry = Arc::new(RuntimeAdapterRegistry::built_in_with_execution_limits(
-            execution_rollout,
             worker_config.max_tensor_batch_size,
             worker_config.request_parallelism,
         )?);
         worker_config.static_tensor_batch_variants =
             Arc::new(adapter_registry.static_tensor_batch_variants(selected_backend_kind));
-        let execution_parallelism = worker_config.request_parallelism;
+        let execution_parallelism = effective_physical_execution_parallelism(
+            core_config.physical_execution_mode,
+            worker_config.request_parallelism,
+            core_config
+                .resolved_physical_execution_capacity()
+                .physical_launch_limit
+                .get(),
+        );
         let coordinator = Arc::new(InferenceCoordinator::new_with_device(
             selected_backend_kind,
             device.clone(),
             execution_parallelism,
-            config.max_batch_size.max(1).saturating_mul(16).max(64),
+            core_config.max_queued_requests,
         )?);
+        let qwen_asr_encoder_batcher = Arc::new(QwenAsrEncoderBatcher::new(coordinator.clone()));
+        let whisper_encoder_batcher = Arc::new(WhisperEncoderBatcher::new(coordinator.clone()));
+        let vibevoice_encoder_batcher = Arc::new(VibeVoiceEncoderBatcher::new(coordinator.clone()));
+        let granite_speech_encoder_batcher =
+            Arc::new(GraniteSpeechEncoderBatcher::new(coordinator.clone()));
         let asr_realtime_sessions = RealtimeAsrSessionPolicy::from_env()?;
+        let realtime_asr_sequence_capacity = asr_realtime_sessions.retained_sequence_capacity()?;
         worker_config.resource_authority = Some(coordinator.resource_authority());
+        worker_config.physical_execution_admission =
+            Some(coordinator.physical_execution_admission());
         let core_engine = Arc::new(CoreEngine::new_with_worker(core_config, worker_config)?);
         let backend_router = BackendRouter::from_context(backend_context);
         let tokenizer = Arc::new(RwLock::new(None));
@@ -1131,10 +2438,16 @@ impl RuntimeService {
             tokenizer.clone(),
             codec.clone(),
             loaded_tts_variant.clone(),
+            realtime_asr_sequence_capacity,
         ));
+
+        let max_loaded_models = config
+            .max_loaded_models
+            .or_else(|| positive_usize_env("IZWI_MAX_LOADED_MODELS"));
 
         Ok(Self {
             config,
+            cache_policy,
             backend_router,
             inference_broker: InferenceBroker::from_env(),
             adapter_registry,
@@ -1145,6 +2458,10 @@ impl RuntimeService {
             streaming_config: StreamingConfig::default(),
             core_engine,
             coordinator,
+            qwen_asr_encoder_batcher,
+            whisper_encoder_batcher,
+            vibevoice_encoder_batcher,
+            granite_speech_encoder_batcher,
             asr_realtime_sessions,
             telemetry: Arc::new(RuntimeTelemetryCollector::new(2048)),
             completion_waiters: Arc::new(Mutex::new(HashMap::new())),
@@ -1153,7 +2470,7 @@ impl RuntimeService {
             step_driver_wakeup: Arc::new(Notify::new()),
             step_driver_started: AtomicBool::new(false),
             loaded_tts_variant,
-            max_loaded_models: positive_usize_env("IZWI_MAX_LOADED_MODELS"),
+            max_loaded_models,
             model_lifecycle,
             device,
         })
@@ -1338,6 +2655,11 @@ impl RuntimeService {
         &self.config
     }
 
+    /// Immutable requested/effective KV cache policy selected at startup.
+    pub fn resolved_kv_cache_policy(&self) -> &ResolvedKvCachePolicy {
+        &self.cache_policy
+    }
+
     /// Get codec sample rate.
     pub async fn sample_rate(&self) -> u32 {
         self.codec.read().await.sample_rate()
@@ -1446,7 +2768,6 @@ impl RuntimeService {
         }
 
         let engine = self.core_engine.clone();
-        let coordinator = self.coordinator.clone();
         let waiters = self.completion_waiters.clone();
         let telemetry = self.telemetry.clone();
         let wakeup = self.step_driver_wakeup.clone();
@@ -1462,11 +2783,9 @@ impl RuntimeService {
                     idle_backoff_ms = (idle_backoff_ms.saturating_mul(2)).min(50);
                     continue;
                 }
-                let step_result = std::panic::AssertUnwindSafe(
-                    coordinator.run_engine_step(engine.step_for_dispatch()),
-                )
-                .catch_unwind()
-                .await;
+                let step_result = std::panic::AssertUnwindSafe(engine.step_for_dispatch())
+                    .catch_unwind()
+                    .await;
                 match step_result {
                     Ok(Ok(outputs)) => {
                         if outputs.is_empty() {
@@ -1785,14 +3104,27 @@ impl RuntimeService {
             effective_context.workload_class = WorkloadClass::Streaming;
         }
         let request_id = uuid::Uuid::new_v4().to_string();
-        let mut spec = self.coordinator_job_for_input(
-            request_id,
+        let initial_lane = if task_type == TaskType::ASR
+            && matches!(
+                variant.family(),
+                ModelFamily::Qwen3Asr
+                    | ModelFamily::WhisperAsr
+                    | ModelFamily::VibeVoiceAsr
+                    | ModelFamily::GraniteSpeechAsr
+                    | ModelFamily::Lfm25Audio
+            ) {
+            CoordinatorLane::Atomic
+        } else {
             coordinator_lane_for_metadata(
                 task_type,
                 Some(variant),
                 streaming,
                 effective_context.workload_class,
-            ),
+            )
+        };
+        let mut spec = self.coordinator_job_for_input(
+            request_id,
+            initial_lane,
             effective_context,
             input_bytes,
         );
@@ -1822,6 +3154,12 @@ impl RuntimeService {
             None => self.load_model_for_inference(variant).await?,
         };
         let registry = self.model_registry.clone();
+        // Input preparation can temporarily retain both the caller-provided
+        // payload and a job-owned copy. Restore the pending claim before that
+        // temporary representation is moved into or replaced by the canonical
+        // request. The final retained request is observed below, so shrinking
+        // and growing representations follow one ordered transition.
+        job.prepare_materialized_release(JobResourceObservation::default())?;
         let (residency_lease, mut request) = self
             .coordinator
             .run_host_blocking_stage(&job, move || {
@@ -1840,6 +3178,11 @@ impl RuntimeService {
         request.priority = effective_context.priority;
         request.admission_ms = effective_context.admission_ms;
         request.deadline = effective_context.deadline;
+        let retained_request_host_bytes =
+            u64::try_from(retained_engine_request_input_bytes(&request)?).map_err(|_| {
+                Error::Overloaded("prepared engine request retained input exceeds u64".into())
+            })?;
+        job.record_materialized_usage(JobResourceObservation::host(retained_request_host_bytes))?;
         Ok(AdmittedEngineRequest {
             request,
             job,
@@ -1863,12 +3206,56 @@ impl RuntimeService {
             },
             input_bytes,
         );
-        if task_decodes_audio(request.task_type)
+        let audio_decode_required = task_decodes_audio(request.task_type)
+            && !(request.task_type == TaskType::ASR
+                && request.model_variant.is_some_and(|variant| {
+                    matches!(
+                        variant.family(),
+                        ModelFamily::Qwen3Asr
+                            | ModelFamily::WhisperAsr
+                            | ModelFamily::VibeVoiceAsr
+                            | ModelFamily::GraniteSpeechAsr
+                            | ModelFamily::Lfm25Audio
+                    )
+                })
+                && request.prepared_asr_audio_for_executor()?.is_some());
+        if audio_decode_required
             || (request.task_type == TaskType::TTS && request.has_tts_reference_for_execution())
         {
             spec.resources = spec.resources.checked_add(audio_decode_resources(
                 self.backend_router.context().backend_kind,
             ))?;
+        }
+        let (asr_encoder_host_bytes, asr_encoder_device_bytes) =
+            request.prepared_asr_encoder_artifact_retained_resources()?;
+        if asr_encoder_host_bytes > 0 || asr_encoder_device_bytes > 0 {
+            spec.resources = spec.resources.checked_add(asr_encoder_retained_resources(
+                self.backend_router.context().backend_kind,
+                asr_encoder_host_bytes,
+                asr_encoder_device_bytes,
+            )?)?;
+        }
+        if request.task_type == TaskType::TTS
+            && request
+                .model_variant
+                .is_some_and(|variant| variant.family() == ModelFamily::Qwen3Tts)
+        {
+            let frames =
+                u64::try_from(request.qwen_tts_generation_params().max_frames).map_err(|_| {
+                    Error::Overloaded("Qwen3-TTS output frame bound exceeds u64".into())
+                })?;
+            let output_bytes = frames
+                .checked_mul(1_920)
+                .and_then(|samples| samples.checked_mul(std::mem::size_of::<f32>() as u64))
+                .ok_or_else(|| Error::Overloaded("Qwen3-TTS output reservation overflow".into()))?;
+            let mut output = ResourceVector::zero();
+            match self.backend_router.context().backend_kind {
+                BackendKind::Metal => output.unified_bytes = ResourceAmount::Known(output_bytes),
+                BackendKind::Cpu | BackendKind::Cuda => {
+                    output.host_bytes = ResourceAmount::Known(output_bytes)
+                }
+            }
+            spec.resources = spec.resources.checked_add(output)?;
         }
         if request.task_type == TaskType::Chat && !request.chat_config.media_inputs.is_empty() {
             if !request
@@ -1934,6 +3321,32 @@ impl RuntimeService {
         Ok((lease, contract))
     }
 
+    pub(crate) async fn load_capability_with_state_for_job(
+        &self,
+        job: &JobLease,
+        variant: ModelVariant,
+        capability: CapabilityKind,
+        streaming_required: bool,
+        expected_target: ExecutionTargetKind,
+    ) -> Result<(
+        ModelResidencyLease,
+        LoadedExecutionContract,
+        LoadedCapabilityBinding,
+    )> {
+        let lease = self.load_model_for_job(job, variant).await?;
+        let bundle = self.model_lifecycle.try_get_ready_bundle(variant);
+        let (contract, binding) = loaded_binding_for_residency(
+            &lease,
+            bundle.as_deref(),
+            capability,
+            streaming_required,
+            self.coordinator.execution_group_id(),
+            self.backend_router.context().backend_kind,
+            Some(expected_target),
+        )?;
+        Ok((lease, contract, binding))
+    }
+
     /// Bound the pre-session Engine admission transaction by the request's
     /// absolute deadline. Cancelling this future before the core write lock is
     /// acquired cannot create a scheduler session; once that lock is acquired,
@@ -1982,12 +3395,2326 @@ impl RuntimeService {
             .await
     }
 
+    async fn prepare_qwen3_asr_shape_for_binding(
+        &self,
+        request: EngineCoreRequest,
+        job: JobLease,
+        residency_lease: Option<&ModelResidencyLease>,
+    ) -> Result<(EngineCoreRequest, JobLease)> {
+        if request.task_type != TaskType::ASR
+            || request
+                .model_variant
+                .is_none_or(|variant| variant.family() != ModelFamily::Qwen3Asr)
+            || request.prepared_asr_execution_shape().is_some()
+        {
+            return Ok((request, job));
+        }
+        let variant = request.model_variant.expect("validated Qwen3 ASR variant");
+        let model = self
+            .model_registry
+            .get_asr_lease(variant)
+            .await
+            .ok_or_else(|| Error::ModelNotFound(format!("ASR model {variant} is not loaded")))?;
+        let residency_lease = residency_lease.ok_or_else(|| {
+            Error::InferenceError(
+                "Qwen3 ASR preparation requires authoritative model residency".to_string(),
+            )
+        })?;
+        let loaded_bundle = self
+            .model_lifecycle
+            .try_get_ready_bundle(residency_lease.variant());
+        let encoder_contract = loaded_contract_for_residency(
+            residency_lease,
+            loaded_bundle.as_deref(),
+            CapabilityKind::Asr,
+            false,
+            self.coordinator.execution_group_id(),
+            self.backend_router.context().backend_kind,
+            Some(ExecutionTargetKind::TokenEngine),
+        )?;
+        let context_limit = self
+            .model_registry
+            .effective_context(variant)
+            .ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "Qwen3 ASR model {variant} has no load-sealed effective context"
+                ))
+            })?;
+        let model_for_shape = model.clone();
+        let (prepared, geometry) = self
+            .coordinator
+            .run_host_blocking_stage(&job, move || {
+                let mut request = request;
+                let (samples, sample_rate) =
+                    crate::engine::decode_request_audio_with_rate(&request)?;
+                let long_form = crate::engine::qwen3_asr_requires_long_form(
+                    &samples,
+                    sample_rate,
+                    model_for_shape.max_audio_seconds_hint(),
+                );
+                let geometry = (!long_form)
+                    .then(|| {
+                        model_for_shape.audio_preparation_row_geometry(samples.len(), sample_rate)
+                    })
+                    .transpose()?;
+                let input_tokens = (!long_form)
+                    .then(|| {
+                        model_for_shape.incremental_prompt_token_count(
+                            &samples,
+                            sample_rate,
+                            request.asr_language_for_execution(),
+                            request.asr_prompt_for_execution(),
+                        )
+                    })
+                    .transpose()?;
+                request.install_prepared_asr_audio(variant, samples, sample_rate)?;
+                if long_form {
+                    request.install_prepared_asr_long_form_atomic()?;
+                } else {
+                    request.install_prepared_sequence_input_tokens(
+                        input_tokens.expect("normal Qwen3 ASR shape"),
+                        context_limit,
+                    )?;
+                }
+                Ok((request, geometry))
+            })
+            .await?;
+        let retained_host_bytes = u64::try_from(retained_engine_request_input_bytes(&prepared)?)
+            .map_err(|_| Error::Overloaded("Qwen3 ASR retained host input exceeds u64".into()))?;
+        job.record_materialized_usage(JobResourceObservation::host(retained_host_bytes))?;
+        let initial_bridge = self.coordinator.bridge_preparation_admission(job)?;
+
+        if prepared.uses_asr_long_form_atomic() {
+            let (execution, observation) = self.coordinator_job_for_request(&prepared)?;
+            let execution_job = match self
+                .coordinator
+                .admit_observed_from_preparation(initial_bridge, execution, observation)
+                .await
+            {
+                Ok(job) => job,
+                Err(failure) => {
+                    drop(prepared);
+                    let error = failure.error;
+                    drop(failure.bridge);
+                    return Err(error);
+                }
+            };
+            return Ok((prepared, execution_job));
+        }
+
+        let geometry = geometry.ok_or_else(|| {
+            Error::InferenceError("normal Qwen3 ASR route lost encoder geometry".to_string())
+        })?;
+        let encoder_resources = asr_encoder_retained_resources(
+            self.backend_router.context().backend_kind,
+            retained_host_bytes,
+            geometry.retained_artifact_bytes,
+        )?;
+        let encoder_spec = JobSpec {
+            request_id: prepared.id.clone(),
+            lane: CoordinatorLane::Atomic,
+            priority: prepared.priority,
+            workload_class: prepared.workload_class,
+            deadline: prepared.deadline,
+            resources: encoder_resources,
+        };
+        let encoder_job = match self
+            .coordinator
+            .admit_observed_from_preparation(
+                initial_bridge,
+                encoder_spec,
+                JobResourceObservation::host(retained_host_bytes),
+            )
+            .await
+        {
+            Ok(job) => job,
+            Err(failure) => {
+                drop(prepared);
+                let error = failure.error;
+                drop(failure.bridge);
+                return Err(error);
+            }
+        };
+        let (samples, sample_rate) = prepared
+            .prepared_asr_audio_for_executor()?
+            .ok_or_else(|| Error::InferenceError("Qwen3 ASR decoded audio was lost".into()))?;
+        let outcome = self
+            .qwen_asr_encoder_batcher
+            .submit(QwenAsrEncoderPending {
+                job: encoder_job,
+                contract: encoder_contract,
+                model,
+                samples,
+                sample_rate,
+                geometry,
+                retained_host_bytes,
+                cancellation: PreparationCancellation::default(),
+                response: None,
+            })
+            .await?;
+        let (artifact, bridge) = match outcome {
+            PreparationRowOutcome::Committed { artifact, bridge } => (artifact.value, bridge),
+            PreparationRowOutcome::Cancelled => return Err(Error::Cancelled(prepared.id.clone())),
+            PreparationRowOutcome::TimedOut => return Err(Error::Timeout(prepared.id.clone())),
+            PreparationRowOutcome::Failed(error) => return Err(error),
+        };
+        let artifact_audio_tokens = match artifact.audio_tokens() {
+            Ok(tokens) => tokens,
+            Err(error) => {
+                drop(artifact);
+                drop(bridge);
+                return Err(error);
+            }
+        };
+        if artifact_audio_tokens != geometry.audio_tokens {
+            drop(artifact);
+            drop(bridge);
+            return Err(Error::InferenceError(
+                "Qwen3 ASR encoder artifact token geometry drifted after admission".to_string(),
+            ));
+        }
+        let accelerator_bytes = match artifact.resident_tensor_bytes() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                drop(artifact);
+                drop(bridge);
+                return Err(error);
+            }
+        };
+        let artifact = Arc::new(artifact);
+        let mut prepared = prepared;
+        if let Err(error) =
+            prepared.install_prepared_asr_encoder_artifact(variant, artifact.clone())
+        {
+            drop(artifact);
+            drop(prepared);
+            drop(bridge);
+            return Err(error);
+        }
+        let execution = match self.coordinator_job_for_request(&prepared) {
+            Ok((execution, _)) => execution,
+            Err(error) => {
+                drop(artifact);
+                drop(prepared);
+                drop(bridge);
+                return Err(error);
+            }
+        };
+        let observation = JobResourceObservation {
+            host_bytes: retained_host_bytes,
+            accelerator_bytes,
+        };
+        let execution_job = match self
+            .coordinator
+            .admit_observed_from_preparation(bridge, execution, observation)
+            .await
+        {
+            Ok(job) => job,
+            Err(failure) => {
+                drop(artifact);
+                drop(prepared);
+                let error = failure.error;
+                drop(failure.bridge);
+                return Err(error);
+            }
+        };
+        Ok((prepared, execution_job))
+    }
+
+    async fn prepare_whisper_asr_shape_for_binding(
+        &self,
+        request: EngineCoreRequest,
+        job: JobLease,
+        residency_lease: Option<&ModelResidencyLease>,
+    ) -> Result<(EngineCoreRequest, JobLease)> {
+        if request.task_type != TaskType::ASR
+            || request
+                .model_variant
+                .is_none_or(|variant| variant.family() != ModelFamily::WhisperAsr)
+            || request.prepared_asr_execution_shape().is_some()
+        {
+            return Ok((request, job));
+        }
+        let variant = request.model_variant.expect("validated Whisper variant");
+        let model = self
+            .model_registry
+            .get_asr_lease(variant)
+            .await
+            .ok_or_else(|| Error::ModelNotFound(format!("ASR model {variant} is not loaded")))?;
+        let residency = residency_lease.ok_or_else(|| {
+            Error::InferenceError("Whisper preparation requires model residency".into())
+        })?;
+        let loaded_bundle = self
+            .model_lifecycle
+            .try_get_ready_bundle(residency.variant());
+        let encoder_contract = loaded_contract_for_residency(
+            residency,
+            loaded_bundle.as_deref(),
+            CapabilityKind::Asr,
+            false,
+            self.coordinator.execution_group_id(),
+            self.backend_router.context().backend_kind,
+            Some(ExecutionTargetKind::TokenEngine),
+        )?;
+        let context_limit = self
+            .model_registry
+            .effective_context(variant)
+            .ok_or_else(|| {
+                Error::ModelLoadError(format!("Whisper model {variant} has no effective context"))
+            })?;
+        let model_for_shape = model.clone();
+        let (prepared, geometry) = self
+            .coordinator
+            .run_host_blocking_stage(&job, move || {
+                let mut request = request;
+                let (samples, sample_rate) =
+                    crate::engine::decode_request_audio_with_rate(&request)?;
+                let long_form = crate::engine::qwen3_asr_requires_long_form(
+                    &samples,
+                    sample_rate,
+                    model_for_shape.max_audio_seconds_hint(),
+                );
+                let geometry = (!long_form)
+                    .then(|| {
+                        model_for_shape.whisper_window_preparation_geometry(&samples, sample_rate)
+                    })
+                    .transpose()?;
+                request.install_prepared_asr_audio(variant, samples, sample_rate)?;
+                if long_form {
+                    request.install_prepared_asr_long_form_atomic()?;
+                }
+                Ok((request, geometry))
+            })
+            .await?;
+        let retained_host_bytes = u64::try_from(retained_engine_request_input_bytes(&prepared)?)
+            .map_err(|_| Error::Overloaded("Whisper retained input exceeds u64".into()))?;
+        job.record_materialized_usage(JobResourceObservation::host(retained_host_bytes))?;
+        let bridge = self.coordinator.bridge_preparation_admission(job)?;
+        if prepared.uses_asr_long_form_atomic() {
+            let (spec, observation) = match self.coordinator_job_for_request(&prepared) {
+                Ok(value) => value,
+                Err(error) => {
+                    drop(prepared);
+                    drop(bridge);
+                    return Err(error);
+                }
+            };
+            return match self
+                .coordinator
+                .admit_observed_from_preparation(bridge, spec, observation)
+                .await
+            {
+                Ok(job) => Ok((prepared, job)),
+                Err(failure) => {
+                    drop(prepared);
+                    let error = failure.error;
+                    drop(failure.bridge);
+                    Err(error)
+                }
+            };
+        }
+        let geometry = match geometry {
+            Some(geometry) => geometry,
+            None => {
+                drop(prepared);
+                drop(bridge);
+                return Err(Error::InferenceError("Whisper geometry was lost".into()));
+            }
+        };
+        let resources = match asr_encoder_retained_resources(
+            self.backend_router.context().backend_kind,
+            retained_host_bytes,
+            geometry.retained_artifact_bytes,
+        ) {
+            Ok(resources) => resources,
+            Err(error) => {
+                drop(prepared);
+                drop(bridge);
+                return Err(error);
+            }
+        };
+        let prep_spec = JobSpec {
+            request_id: prepared.id.clone(),
+            lane: CoordinatorLane::Atomic,
+            priority: prepared.priority,
+            workload_class: prepared.workload_class,
+            deadline: prepared.deadline,
+            resources,
+        };
+        let prep_job = match self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                prep_spec,
+                JobResourceObservation::host(retained_host_bytes),
+            )
+            .await
+        {
+            Ok(job) => job,
+            Err(failure) => {
+                drop(prepared);
+                let error = failure.error;
+                drop(failure.bridge);
+                return Err(error);
+            }
+        };
+        let (samples, sample_rate) = prepared
+            .prepared_asr_audio_for_executor()?
+            .ok_or_else(|| Error::InferenceError("Whisper decoded audio was lost".into()))?;
+        let outcome = self
+            .whisper_encoder_batcher
+            .submit(WhisperEncoderPending {
+                job: prep_job,
+                contract: encoder_contract,
+                model: model.clone(),
+                samples,
+                sample_rate,
+                geometry,
+                retained_host_bytes,
+                cancellation: PreparationCancellation::default(),
+                response: None,
+            })
+            .await?;
+        let (artifact, bridge) = match outcome {
+            PreparationRowOutcome::Committed { artifact, bridge } => (artifact.value, bridge),
+            PreparationRowOutcome::Cancelled => return Err(Error::Cancelled(prepared.id.clone())),
+            PreparationRowOutcome::TimedOut => return Err(Error::Timeout(prepared.id.clone())),
+            PreparationRowOutcome::Failed(error) => return Err(error),
+        };
+        let accelerator_bytes = match artifact.resident_tensor_bytes() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                drop(artifact);
+                drop(prepared);
+                drop(bridge);
+                return Err(error);
+            }
+        };
+        if artifact.cross_memory_tokens() != geometry.cross_memory_tokens
+            || accelerator_bytes != geometry.retained_artifact_bytes
+        {
+            drop(artifact);
+            drop(prepared);
+            drop(bridge);
+            return Err(Error::InferenceError(
+                "Whisper encoder artifact geometry drifted after admission".into(),
+            ));
+        }
+        let input_tokens = match model.whisper_incremental_prompt_token_count(
+            &artifact,
+            prepared.asr_language_for_execution(),
+            prepared.asr_prompt_for_execution(),
+        ) {
+            Ok(tokens) => tokens,
+            Err(error) => {
+                drop(artifact);
+                drop(prepared);
+                drop(bridge);
+                return Err(error);
+            }
+        };
+        let mut prepared = prepared;
+        if let Err(error) =
+            prepared.install_prepared_sequence_input_tokens(input_tokens, context_limit)
+        {
+            drop(artifact);
+            drop(prepared);
+            drop(bridge);
+            return Err(error);
+        }
+        if let Err(error) = prepared.install_prepared_whisper_window(variant, Arc::new(artifact)) {
+            drop(prepared);
+            drop(bridge);
+            return Err(error);
+        }
+        let (execution, _) = match self.coordinator_job_for_request(&prepared) {
+            Ok(value) => value,
+            Err(error) => {
+                drop(prepared);
+                drop(bridge);
+                return Err(error);
+            }
+        };
+        let observation = JobResourceObservation {
+            host_bytes: retained_host_bytes,
+            accelerator_bytes,
+        };
+        match self
+            .coordinator
+            .admit_observed_from_preparation(bridge, execution, observation)
+            .await
+        {
+            Ok(job) => Ok((prepared, job)),
+            Err(failure) => {
+                drop(prepared);
+                let error = failure.error;
+                drop(failure.bridge);
+                Err(error)
+            }
+        }
+    }
+
+    async fn prepare_vibevoice_asr_shape_for_binding(
+        &self,
+        request: EngineCoreRequest,
+        job: JobLease,
+        residency_lease: Option<&ModelResidencyLease>,
+    ) -> Result<(EngineCoreRequest, JobLease)> {
+        if request.task_type != TaskType::ASR
+            || request
+                .model_variant
+                .is_none_or(|variant| variant.family() != ModelFamily::VibeVoiceAsr)
+            || request.prepared_asr_execution_shape().is_some()
+        {
+            return Ok((request, job));
+        }
+        let variant = request.model_variant.expect("validated VibeVoice variant");
+        let model = self
+            .model_registry
+            .get_asr_lease(variant)
+            .await
+            .ok_or_else(|| Error::ModelNotFound(format!("ASR model {variant} is not loaded")))?;
+        let residency = residency_lease.ok_or_else(|| {
+            Error::InferenceError("VibeVoice preparation requires model residency".into())
+        })?;
+        let loaded_bundle = self
+            .model_lifecycle
+            .try_get_ready_bundle(residency.variant());
+        let preparation_contract = loaded_contract_for_residency(
+            residency,
+            loaded_bundle.as_deref(),
+            CapabilityKind::Asr,
+            false,
+            self.coordinator.execution_group_id(),
+            self.backend_router.context().backend_kind,
+            Some(ExecutionTargetKind::TokenEngine),
+        )?;
+        let context_limit = self
+            .model_registry
+            .effective_context(variant)
+            .ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "VibeVoice ASR model {variant} has no effective context"
+                ))
+            })?;
+        let model_for_shape = model.clone();
+        let (prepared, geometry) = self
+            .coordinator
+            .run_host_blocking_stage(&job, move || {
+                let mut request = request;
+                let (samples, sample_rate) =
+                    crate::engine::decode_request_audio_with_rate(&request)?;
+                let decision = model_for_shape.vibevoice_retained_preparation_decision(
+                    samples.len(),
+                    sample_rate,
+                    request.asr_language_for_execution(),
+                    request.asr_prompt_for_execution(),
+                )?;
+                request.install_prepared_asr_audio(variant, samples, sample_rate)?;
+                match decision {
+                    VibeVoiceAsrPreparationDecision::Retained(geometry) => {
+                        request.install_prepared_sequence_input_tokens(
+                            geometry.prompt_tokens,
+                            context_limit,
+                        )?;
+                        Ok((request, Some(geometry)))
+                    }
+                    VibeVoiceAsrPreparationDecision::LegacyInvocation => {
+                        request.install_prepared_asr_long_form_atomic()?;
+                        Ok((request, None))
+                    }
+                }
+            })
+            .await?;
+        let retained_request_host_bytes =
+            u64::try_from(retained_engine_request_input_bytes(&prepared)?).map_err(|_| {
+                Error::Overloaded("VibeVoice ASR retained input exceeds u64".into())
+            })?;
+        job.record_materialized_usage(JobResourceObservation::host(retained_request_host_bytes))?;
+        let bridge = self.coordinator.bridge_preparation_admission(job)?;
+        if prepared.uses_asr_long_form_atomic() {
+            let (spec, observation) = match self.coordinator_job_for_request(&prepared) {
+                Ok(value) => value,
+                Err(error) => {
+                    drop(prepared);
+                    drop(bridge);
+                    return Err(error);
+                }
+            };
+            return match self
+                .coordinator
+                .admit_observed_from_preparation(bridge, spec, observation)
+                .await
+            {
+                Ok(job) => Ok((prepared, job)),
+                Err(failure) => {
+                    drop(prepared);
+                    let error = failure.error;
+                    drop(failure.bridge);
+                    Err(error)
+                }
+            };
+        }
+        let geometry = geometry.ok_or_else(|| {
+            Error::InferenceError("VibeVoice normal route lost preparation geometry".into())
+        })?;
+        let retained_host_bytes = retained_request_host_bytes
+            .checked_add(geometry.retained_host_bytes)
+            .ok_or_else(|| Error::Overloaded("VibeVoice retained host bytes overflow".into()))?;
+        let resources = asr_encoder_retained_resources(
+            self.backend_router.context().backend_kind,
+            retained_host_bytes,
+            geometry.retained_device_bytes,
+        )?;
+        let preparation_spec = JobSpec {
+            request_id: prepared.id.clone(),
+            lane: CoordinatorLane::Atomic,
+            priority: prepared.priority,
+            workload_class: prepared.workload_class,
+            deadline: prepared.deadline,
+            resources,
+        };
+        let preparation_job = match self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                preparation_spec,
+                JobResourceObservation::host(retained_request_host_bytes),
+            )
+            .await
+        {
+            Ok(job) => job,
+            Err(failure) => {
+                drop(prepared);
+                let error = failure.error;
+                drop(failure.bridge);
+                return Err(error);
+            }
+        };
+        let (samples, sample_rate) = prepared
+            .prepared_asr_audio_for_executor()?
+            .ok_or_else(|| Error::InferenceError("VibeVoice decoded audio was lost".into()))?;
+        let outcome = self
+            .vibevoice_encoder_batcher
+            .submit(VibeVoiceEncoderPending {
+                job: preparation_job,
+                contract: preparation_contract,
+                model: model.clone(),
+                samples,
+                sample_rate,
+                language: prepared.asr_language_for_execution().map(str::to_owned),
+                prompt: prepared.asr_prompt_for_execution().map(str::to_owned),
+                geometry,
+                retained_request_host_bytes,
+                cancellation: PreparationCancellation::default(),
+            })
+            .await?;
+        let (artifact, bridge) = match outcome {
+            PreparationRowOutcome::Committed { artifact, bridge } => (artifact.value, bridge),
+            PreparationRowOutcome::Cancelled => return Err(Error::Cancelled(prepared.id.clone())),
+            PreparationRowOutcome::TimedOut => return Err(Error::Timeout(prepared.id.clone())),
+            PreparationRowOutcome::Failed(error) => return Err(error),
+        };
+        if artifact.geometry() != geometry
+            || artifact.resident_host_bytes() != geometry.retained_host_bytes
+            || artifact.resident_tensor_bytes() != geometry.retained_device_bytes
+        {
+            drop(artifact);
+            drop(prepared);
+            drop(bridge);
+            return Err(Error::InferenceError(
+                "VibeVoice ASR preparation artifact drifted from admitted geometry".into(),
+            ));
+        }
+        let mut prepared = prepared;
+        if let Err(error) =
+            prepared.install_prepared_vibevoice_artifact(variant, Arc::new(artifact))
+        {
+            drop(prepared);
+            drop(bridge);
+            return Err(error);
+        }
+        let (execution, _) = match self.coordinator_job_for_request(&prepared) {
+            Ok(value) => value,
+            Err(error) => {
+                drop(prepared);
+                drop(bridge);
+                return Err(error);
+            }
+        };
+        let observation = JobResourceObservation {
+            host_bytes: retained_host_bytes,
+            accelerator_bytes: geometry.retained_device_bytes,
+        };
+        match self
+            .coordinator
+            .admit_observed_from_preparation(bridge, execution, observation)
+            .await
+        {
+            Ok(job) => Ok((prepared, job)),
+            Err(failure) => {
+                drop(prepared);
+                let error = failure.error;
+                drop(failure.bridge);
+                Err(error)
+            }
+        }
+    }
+
+    async fn prepare_granite_speech_asr_shape_for_binding(
+        &self,
+        request: EngineCoreRequest,
+        job: JobLease,
+        residency_lease: Option<&ModelResidencyLease>,
+    ) -> Result<(EngineCoreRequest, JobLease)> {
+        if request.task_type != TaskType::ASR
+            || request
+                .model_variant
+                .is_none_or(|variant| variant.family() != ModelFamily::GraniteSpeechAsr)
+            || request.prepared_asr_execution_shape().is_some()
+        {
+            return Ok((request, job));
+        }
+        let variant = request
+            .model_variant
+            .expect("validated Granite Speech variant");
+        let model = self
+            .model_registry
+            .get_asr_lease(variant)
+            .await
+            .ok_or_else(|| Error::ModelNotFound(format!("ASR model {variant} is not loaded")))?;
+        let residency = residency_lease.ok_or_else(|| {
+            Error::InferenceError("Granite Speech preparation requires model residency".into())
+        })?;
+        let loaded_bundle = self
+            .model_lifecycle
+            .try_get_ready_bundle(residency.variant());
+        let preparation_contract = loaded_contract_for_residency(
+            residency,
+            loaded_bundle.as_deref(),
+            CapabilityKind::Asr,
+            false,
+            self.coordinator.execution_group_id(),
+            self.backend_router.context().backend_kind,
+            Some(ExecutionTargetKind::TokenEngine),
+        )?;
+        let context_limit = self
+            .model_registry
+            .effective_context(variant)
+            .ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "Granite Speech model {variant} has no effective context"
+                ))
+            })?;
+        let model_for_shape = model.clone();
+        let (prepared, geometry) = self
+            .coordinator
+            .run_host_blocking_stage(&job, move || {
+                let mut request = request;
+                let (samples, sample_rate) =
+                    crate::engine::decode_request_audio_with_rate(&request)?;
+                let long_form = crate::engine::qwen3_asr_requires_long_form(
+                    &samples,
+                    sample_rate,
+                    model_for_shape.max_audio_seconds_hint(),
+                );
+                // Granite's retained decoder is not quality-certified: the
+                // real model can collapse to tokenizer id 0 for every output
+                // step while its invocation-scoped physical route produces
+                // the expected transcript. Keep retained preparation behind
+                // the model's truthful capability declaration so production
+                // requests use the correctness-proven atomic route.
+                let geometry = (!long_form && model_for_shape.supports_resumable_prefill())
+                    .then(|| {
+                        model_for_shape.granite_speech_retained_preparation_geometry(
+                            &samples,
+                            sample_rate,
+                            request.asr_language_for_execution(),
+                            request.asr_prompt_for_execution(),
+                        )
+                    })
+                    .transpose()?;
+                request.install_prepared_asr_audio(variant, samples, sample_rate)?;
+                if let Some(geometry) = geometry {
+                    request.install_prepared_sequence_input_tokens(
+                        geometry.prompt_tokens,
+                        context_limit,
+                    )?;
+                    Ok((request, Some(geometry)))
+                } else {
+                    request.install_prepared_asr_long_form_atomic()?;
+                    Ok((request, None))
+                }
+            })
+            .await?;
+        let retained_host_bytes = u64::try_from(retained_engine_request_input_bytes(&prepared)?)
+            .map_err(|_| Error::Overloaded("Granite Speech retained input exceeds u64".into()))?;
+        job.record_materialized_usage(JobResourceObservation::host(retained_host_bytes))?;
+        let bridge = self.coordinator.bridge_preparation_admission(job)?;
+        if prepared.uses_asr_long_form_atomic() {
+            let (spec, observation) = self.coordinator_job_for_request(&prepared)?;
+            return match self
+                .coordinator
+                .admit_observed_from_preparation(bridge, spec, observation)
+                .await
+            {
+                Ok(job) => Ok((prepared, job)),
+                Err(failure) => {
+                    drop(prepared);
+                    let error = failure.error;
+                    drop(failure.bridge);
+                    Err(error)
+                }
+            };
+        }
+        let geometry = geometry.ok_or_else(|| {
+            Error::InferenceError("Granite Speech normal route lost preparation geometry".into())
+        })?;
+        let artifact_host_bytes = u64::try_from(
+            prepared.asr_language_for_execution().map_or(0, str::len),
+        )
+        .map_err(|_| Error::Overloaded("Granite Speech language bytes exceed u64".into()))?;
+        let total_retained_host_bytes = retained_host_bytes
+            .checked_add(artifact_host_bytes)
+            .ok_or_else(|| {
+                Error::Overloaded("Granite Speech retained host bytes overflow".into())
+            })?;
+        let resources = asr_encoder_retained_resources(
+            self.backend_router.context().backend_kind,
+            total_retained_host_bytes,
+            geometry.retained_device_bytes,
+        )?;
+        let prep_spec = JobSpec {
+            request_id: prepared.id.clone(),
+            lane: CoordinatorLane::Atomic,
+            priority: prepared.priority,
+            workload_class: prepared.workload_class,
+            deadline: prepared.deadline,
+            resources,
+        };
+        let prep_job = match self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                prep_spec,
+                JobResourceObservation::host(retained_host_bytes),
+            )
+            .await
+        {
+            Ok(job) => job,
+            Err(failure) => {
+                drop(prepared);
+                let error = failure.error;
+                drop(failure.bridge);
+                return Err(error);
+            }
+        };
+        let (samples, sample_rate) = prepared
+            .prepared_asr_audio_for_executor()?
+            .ok_or_else(|| Error::InferenceError("Granite Speech decoded audio was lost".into()))?;
+        let outcome = self
+            .granite_speech_encoder_batcher
+            .submit(GraniteSpeechEncoderPending {
+                job: prep_job,
+                contract: preparation_contract,
+                model: model.clone(),
+                samples,
+                sample_rate,
+                language: prepared.asr_language_for_execution().map(str::to_owned),
+                prompt: prepared.asr_prompt_for_execution().map(str::to_owned),
+                geometry,
+                retained_host_bytes: total_retained_host_bytes,
+                artifact_host_bytes,
+                cancellation: PreparationCancellation::default(),
+                response: None,
+            })
+            .await?;
+        let (artifact, bridge) = match outcome {
+            PreparationRowOutcome::Committed { artifact, bridge } => (artifact.value, bridge),
+            PreparationRowOutcome::Cancelled => return Err(Error::Cancelled(prepared.id.clone())),
+            PreparationRowOutcome::TimedOut => return Err(Error::Timeout(prepared.id.clone())),
+            PreparationRowOutcome::Failed(error) => return Err(error),
+        };
+        if artifact.prompt_tokens() != geometry.prompt_tokens
+            || artifact.audio_tokens() != geometry.audio_tokens
+            || artifact.resident_host_bytes() != artifact_host_bytes
+            || artifact.resident_tensor_bytes()? != geometry.retained_device_bytes
+        {
+            drop(artifact);
+            drop(prepared);
+            drop(bridge);
+            return Err(Error::InferenceError(
+                "Granite Speech artifact drifted from admitted geometry".into(),
+            ));
+        }
+        let mut prepared = prepared;
+        prepared.install_prepared_granite_speech_artifact(variant, artifact)?;
+        let (execution, _) = self.coordinator_job_for_request(&prepared)?;
+        match self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                execution,
+                JobResourceObservation {
+                    host_bytes: total_retained_host_bytes,
+                    accelerator_bytes: geometry.retained_device_bytes,
+                },
+            )
+            .await
+        {
+            Ok(job) => Ok((prepared, job)),
+            Err(failure) => {
+                drop(prepared);
+                let error = failure.error;
+                drop(failure.bridge);
+                Err(error)
+            }
+        }
+    }
+
+    async fn prepare_lfm25_audio_asr_shape_for_binding(
+        &self,
+        request: EngineCoreRequest,
+        job: JobLease,
+        residency_lease: Option<&ModelResidencyLease>,
+    ) -> Result<(EngineCoreRequest, JobLease)> {
+        if request.task_type != TaskType::ASR
+            || request
+                .model_variant
+                .is_none_or(|variant| variant.family() != ModelFamily::Lfm25Audio)
+            || request.prepared_asr_execution_shape().is_some()
+        {
+            return Ok((request, job));
+        }
+        let variant = request
+            .model_variant
+            .expect("validated LFM2.5 Audio variant");
+        let model = self
+            .model_registry
+            .get_lfm25_audio_lease(variant)
+            .await
+            .ok_or_else(|| {
+                Error::ModelNotFound(format!("LFM2.5 Audio model {variant} is not loaded"))
+            })?;
+        let residency = residency_lease.ok_or_else(|| {
+            Error::InferenceError("LFM2.5 Audio ASR preparation requires model residency".into())
+        })?;
+        let loaded_bundle = self
+            .model_lifecycle
+            .try_get_ready_bundle(residency.variant());
+        let preparation_contract = loaded_contract_for_residency(
+            residency,
+            loaded_bundle.as_deref(),
+            CapabilityKind::Asr,
+            false,
+            self.coordinator.execution_group_id(),
+            self.backend_router.context().backend_kind,
+            Some(ExecutionTargetKind::TokenEngine),
+        )?;
+        let context_limit = self
+            .model_registry
+            .effective_context(variant)
+            .ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "LFM2.5 Audio model {variant} has no effective context"
+                ))
+            })?;
+        let model_for_shape = model.clone();
+        let (prepared, envelope) = self
+            .coordinator
+            .run_host_blocking_stage(&job, move || {
+                let mut request = request;
+                let (samples, sample_rate) =
+                    crate::engine::decode_request_audio_with_rate(&request)?;
+                let long_form = model_for_shape.asr_requires_long_form(&samples, sample_rate);
+                let envelope = (!long_form)
+                    .then(|| {
+                        model_for_shape.lfm25_audio_asr_preparation_resource_envelope(
+                            samples.len(),
+                            sample_rate,
+                        )
+                    })
+                    .transpose()?;
+                request.install_prepared_asr_audio(variant, samples, sample_rate)?;
+                if let Some(envelope) = envelope {
+                    request.install_prepared_sequence_input_tokens(
+                        envelope.geometry.prompt_tokens,
+                        context_limit,
+                    )?;
+                    Ok((request, Some(envelope)))
+                } else {
+                    request.install_prepared_asr_long_form_atomic()?;
+                    Ok((request, None))
+                }
+            })
+            .await?;
+        let retained_request_host_bytes =
+            u64::try_from(retained_engine_request_input_bytes(&prepared)?).map_err(|_| {
+                Error::Overloaded("LFM2.5 Audio ASR retained input exceeds u64".into())
+            })?;
+        job.record_materialized_usage(JobResourceObservation::host(retained_request_host_bytes))?;
+        let bridge = self.coordinator.bridge_preparation_admission(job)?;
+        if prepared.uses_asr_long_form_atomic() {
+            let (spec, observation) = self.coordinator_job_for_request(&prepared)?;
+            return match self
+                .coordinator
+                .admit_observed_from_preparation(bridge, spec, observation)
+                .await
+            {
+                Ok(job) => Ok((prepared, job)),
+                Err(failure) => {
+                    drop(prepared);
+                    let error = failure.error;
+                    drop(failure.bridge);
+                    Err(error)
+                }
+            };
+        }
+        let envelope = envelope.ok_or_else(|| {
+            Error::InferenceError("LFM2.5 Audio normal route lost preparation envelope".into())
+        })?;
+        if envelope.backend != self.backend_router.context().backend_kind {
+            drop(prepared);
+            drop(bridge);
+            return Err(Error::InferenceError(
+                "LFM2.5 Audio preparation envelope used the wrong backend domain".into(),
+            ));
+        }
+        let preparation_resources = asr_encoder_retained_resources(
+            self.backend_router.context().backend_kind,
+            retained_request_host_bytes,
+            envelope.max_retained_resident_bytes,
+        )?;
+        let preparation_spec = JobSpec {
+            request_id: prepared.id.clone(),
+            lane: CoordinatorLane::Atomic,
+            priority: prepared.priority,
+            workload_class: prepared.workload_class,
+            deadline: prepared.deadline,
+            resources: preparation_resources,
+        };
+        let preparation_job = match self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                preparation_spec,
+                JobResourceObservation::host(retained_request_host_bytes),
+            )
+            .await
+        {
+            Ok(job) => job,
+            Err(failure) => {
+                drop(prepared);
+                let error = failure.error;
+                drop(failure.bridge);
+                return Err(error);
+            }
+        };
+        let (samples, sample_rate) = prepared
+            .prepared_asr_audio_for_executor()?
+            .ok_or_else(|| Error::InferenceError("LFM2.5 Audio decoded audio was lost".into()))?;
+        let work = WorkUnit::PreSequencePreparation {
+            kind: "asr.encoder.lfm25_audio".into(),
+        };
+        let cost = crate::engine::WorkCost::with_workspace(
+            envelope.max_work_units,
+            envelope.max_materialized_tensor_elements,
+            ResourceVector {
+                host_bytes: ResourceAmount::Known(envelope.max_host_workspace_bytes),
+                device_bytes: ResourceAmount::Known(envelope.max_device_workspace_bytes),
+                unified_bytes: ResourceAmount::Known(envelope.max_unified_workspace_bytes),
+                ..ResourceVector::zero()
+            },
+        );
+        let cancellation = PreparationCancellation::default();
+        let row = self.coordinator.seal_preparation_row(
+            preparation_job,
+            &preparation_contract,
+            &work,
+            cost,
+            envelope.max_materialized_tensor_elements,
+            cancellation.clone(),
+        )?;
+        let model_for_preparation = model.clone();
+        let mut cancellation_guard = PreparationCancellationGuard {
+            cancellation,
+            armed: true,
+        };
+        let mut outcomes = self
+            .coordinator
+            .run_loaded_native_preparation_batch(
+                vec![row],
+                preparation_contract,
+                work,
+                move |live| {
+                    if live != [0] {
+                        return Err(Error::InferenceError(
+                            "LFM2.5 Audio scalar preparation received a non-scalar live set".into(),
+                        ));
+                    }
+                    let artifact = model_for_preparation
+                        .prepare_lfm25_audio_asr_artifact(samples.as_ref(), sample_rate)?;
+                    let retained_host_bytes = retained_request_host_bytes
+                        .checked_add(artifact.retained_host_bytes)
+                        .ok_or_else(|| {
+                            Error::Overloaded(
+                                "LFM2.5 Audio ASR retained host accounting overflow".into(),
+                            )
+                        })?;
+                    Ok(vec![Ok(PreparationArtifact {
+                        retained: JobResourceObservation {
+                            host_bytes: retained_host_bytes,
+                            accelerator_bytes: artifact.retained_resident_bytes,
+                        },
+                        value: artifact,
+                    })])
+                },
+            )
+            .await?;
+        cancellation_guard.armed = false;
+        let outcome = outcomes.pop().ok_or_else(|| {
+            Error::InferenceError("LFM2.5 Audio scalar preparation returned no outcome".into())
+        })?;
+        let (artifact, bridge) = match outcome {
+            PreparationRowOutcome::Committed { artifact, bridge } => (artifact.value, bridge),
+            PreparationRowOutcome::Cancelled => return Err(Error::Cancelled(prepared.id.clone())),
+            PreparationRowOutcome::TimedOut => return Err(Error::Timeout(prepared.id.clone())),
+            PreparationRowOutcome::Failed(error) => return Err(error),
+        };
+        if artifact.source_samples != envelope.geometry.source_samples
+            || artifact.source_sample_rate != envelope.geometry.source_sample_rate
+            || artifact.resampled_samples != envelope.geometry.resampled_samples
+            || artifact.mel_frames != envelope.geometry.total_mel_frames
+            || artifact.effective_feature_frames != envelope.geometry.effective_feature_frames
+            || artifact.audio_tokens != envelope.geometry.encoder_frames
+            || artifact.prompt_tokens != envelope.geometry.prompt_tokens
+            || artifact.materialized_tensor_elements
+                != envelope.geometry.materialized_tensor_elements
+            || artifact.retained_resident_bytes != envelope.geometry.retained_resident_bytes
+        {
+            drop(artifact);
+            drop(prepared);
+            drop(bridge);
+            return Err(Error::InferenceError(
+                "LFM2.5 Audio ASR artifact drifted from admitted geometry".into(),
+            ));
+        }
+        let retained_host_bytes = retained_request_host_bytes
+            .checked_add(artifact.retained_host_bytes)
+            .ok_or_else(|| {
+                Error::Overloaded("LFM2.5 Audio ASR retained host accounting overflow".into())
+            })?;
+        let accelerator_bytes = artifact.retained_resident_bytes;
+        let mut prepared = prepared;
+        prepared.install_prepared_lfm25_audio_asr_artifact(variant, artifact)?;
+        let (execution, _) = self.coordinator_job_for_request(&prepared)?;
+        match self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                execution,
+                JobResourceObservation {
+                    host_bytes: retained_host_bytes,
+                    accelerator_bytes,
+                },
+            )
+            .await
+        {
+            Ok(job) => Ok((prepared, job)),
+            Err(failure) => {
+                drop(prepared);
+                let error = failure.error;
+                drop(failure.bridge);
+                Err(error)
+            }
+        }
+    }
+
+    async fn prepare_parakeet_asr_shape_for_binding(
+        &self,
+        request: EngineCoreRequest,
+        job: JobLease,
+        residency_lease: Option<&ModelResidencyLease>,
+    ) -> Result<(EngineCoreRequest, JobLease)> {
+        if request.task_type != TaskType::ASR
+            || request
+                .model_variant
+                .is_none_or(|variant| variant.family() != ModelFamily::ParakeetAsr)
+            || request.prepared_asr_execution_shape().is_some()
+        {
+            return Ok((request, job));
+        }
+        let variant = request.model_variant.expect("validated Parakeet variant");
+        let model = self
+            .model_registry
+            .get_asr_lease(variant)
+            .await
+            .ok_or_else(|| Error::ModelNotFound(format!("ASR model {variant} is not loaded")))?;
+        let model_arc = model.model_arc();
+        let crate::models::registry::NativeAsrModel::Parakeet(_) = model_arc.as_ref() else {
+            return Err(Error::ModelLoadError(
+                "Parakeet registry lease crossed model family".into(),
+            ));
+        };
+        let residency = residency_lease.ok_or_else(|| {
+            Error::InferenceError("Parakeet preparation requires model residency".into())
+        })?;
+        let loaded_bundle = self
+            .model_lifecycle
+            .try_get_ready_bundle(residency.variant());
+        let contract = loaded_contract_for_residency(
+            residency,
+            loaded_bundle.as_deref(),
+            CapabilityKind::Asr,
+            false,
+            self.coordinator.execution_group_id(),
+            self.backend_router.context().backend_kind,
+            Some(ExecutionTargetKind::TokenEngine),
+        )?;
+        let context_limit = self
+            .model_registry
+            .effective_context(variant)
+            .ok_or_else(|| {
+                Error::ModelLoadError(format!("Parakeet model {variant} has no effective context"))
+            })?;
+        let prepared = self
+            .coordinator
+            .run_host_blocking_stage(&job, move || {
+                let mut request = request;
+                let (samples, sample_rate) =
+                    crate::engine::decode_request_audio_with_rate(&request)?;
+                request.install_prepared_asr_audio(variant, samples, sample_rate)?;
+                request.install_prepared_sequence_input_tokens(1, context_limit)?;
+                Ok(request)
+            })
+            .await?;
+        let retained_host_bytes = u64::try_from(retained_engine_request_input_bytes(&prepared)?)
+            .map_err(|_| Error::Overloaded("Parakeet retained input exceeds u64".into()))?;
+        job.record_materialized_usage(JobResourceObservation::host(retained_host_bytes))?;
+        let (samples, sample_rate) = prepared
+            .prepared_asr_audio_for_executor()?
+            .ok_or_else(|| Error::InferenceError("Parakeet decoded audio was lost".into()))?;
+        if sample_rate == 0 {
+            return Err(Error::InvalidInput(
+                "Parakeet sample rate must be greater than zero".into(),
+            ));
+        }
+        let resampled = samples
+            .len()
+            .checked_mul(16_000)
+            .and_then(|value| value.checked_add(sample_rate as usize - 1))
+            .map(|value| value / sample_rate as usize)
+            .ok_or_else(|| Error::Overloaded("Parakeet resampled length overflowed".into()))?;
+        let feature_frames = resampled.div_ceil(160).max(1);
+        let encoded_frames = feature_frames.div_ceil(8).max(1);
+        let retained_device_ceiling = u64::try_from(encoded_frames)
+            .ok()
+            .and_then(|frames| frames.checked_mul(1024 * 4))
+            .ok_or_else(|| {
+                Error::Overloaded("Parakeet retained tensor estimate overflowed".into())
+            })?;
+        let materialized_elements = u64::try_from(feature_frames)
+            .ok()
+            .and_then(|frames| frames.checked_mul(1024 * 16))
+            .ok_or_else(|| Error::Overloaded("Parakeet preparation geometry overflowed".into()))?;
+        let workspace_bytes = materialized_elements
+            .checked_mul(4)
+            .ok_or_else(|| Error::Overloaded("Parakeet preparation workspace overflowed".into()))?;
+        let bridge = self.coordinator.bridge_preparation_admission(job)?;
+        let prep_spec = JobSpec {
+            request_id: prepared.id.clone(),
+            lane: CoordinatorLane::Atomic,
+            priority: prepared.priority,
+            workload_class: prepared.workload_class,
+            deadline: prepared.deadline,
+            resources: asr_encoder_retained_resources(
+                self.backend_router.context().backend_kind,
+                retained_host_bytes,
+                retained_device_ceiling,
+            )?,
+        };
+        let prep_job = match self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                prep_spec,
+                JobResourceObservation::host(retained_host_bytes),
+            )
+            .await
+        {
+            Ok(job) => job,
+            Err(failure) => return Err(failure.error),
+        };
+        let work = WorkUnit::PreSequencePreparation {
+            kind: "asr.encoder.parakeet".into(),
+        };
+        let cost = crate::engine::WorkCost::with_workspace(
+            u64::try_from(samples.len())
+                .map_err(|_| Error::Overloaded("Parakeet sample work exceeds u64".into()))?,
+            materialized_elements,
+            retained_artifact_resources(
+                self.backend_router.context().backend_kind,
+                0,
+                workspace_bytes,
+            )?,
+        );
+        let cancellation = PreparationCancellation::default();
+        let row = self.coordinator.seal_preparation_row(
+            prep_job,
+            &contract,
+            &work,
+            cost,
+            materialized_elements,
+            cancellation.clone(),
+        )?;
+        let language = prepared.asr_language_for_execution().map(str::to_owned);
+        let model_for_preparation = model.clone();
+        let mut guard = PreparationCancellationGuard {
+            cancellation,
+            armed: true,
+        };
+        let mut outcomes = self
+            .coordinator
+            .run_loaded_native_preparation_batch(vec![row], contract, work, move |live| {
+                if live != [0] {
+                    return Err(Error::InferenceError(
+                        "Parakeet encoder preparation must remain scalar".into(),
+                    ));
+                }
+                let model_arc = model_for_preparation.model_arc();
+                let crate::models::registry::NativeAsrModel::Parakeet(model) = model_arc.as_ref()
+                else {
+                    return Err(Error::InferenceError(
+                        "Parakeet preparation crossed model family".into(),
+                    ));
+                };
+                let artifact = Arc::new(model.prepare_retained_encoder(
+                    samples.as_ref(),
+                    sample_rate,
+                    language.as_deref(),
+                )?);
+                let accelerator_bytes = artifact.resident_tensor_bytes()?;
+                if accelerator_bytes > retained_device_ceiling {
+                    return Err(Error::InferenceError(format!(
+                        "Parakeet encoder artifact exceeded its admitted ceiling: {accelerator_bytes} > {retained_device_ceiling}"
+                    )));
+                }
+                Ok(vec![Ok(PreparationArtifact {
+                    retained: JobResourceObservation {
+                        host_bytes: retained_host_bytes,
+                        accelerator_bytes,
+                    },
+                    value: artifact,
+                })])
+            })
+            .await?;
+        guard.armed = false;
+        let outcome = outcomes.pop().ok_or_else(|| {
+            Error::InferenceError("Parakeet preparation returned no outcome".into())
+        })?;
+        let (artifact, bridge) = match outcome {
+            PreparationRowOutcome::Committed { artifact, bridge } => (artifact, bridge),
+            PreparationRowOutcome::Cancelled => return Err(Error::Cancelled(prepared.id.clone())),
+            PreparationRowOutcome::TimedOut => return Err(Error::Timeout(prepared.id.clone())),
+            PreparationRowOutcome::Failed(error) => return Err(error),
+        };
+        let mut prepared = prepared;
+        prepared.install_prepared_parakeet_artifact(variant, artifact.value)?;
+        let (execution, _) = self.coordinator_job_for_request(&prepared)?;
+        match self
+            .coordinator
+            .admit_observed_from_preparation(bridge, execution, artifact.retained)
+            .await
+        {
+            Ok(job) => Ok((prepared, job)),
+            Err(failure) => Err(failure.error),
+        }
+    }
+
+    async fn prepare_asr_shape_for_binding(
+        &self,
+        request: EngineCoreRequest,
+        job: JobLease,
+        residency_lease: Option<&ModelResidencyLease>,
+    ) -> Result<(EngineCoreRequest, JobLease)> {
+        let (request, job) = self
+            .prepare_qwen3_asr_shape_for_binding(request, job, residency_lease)
+            .await?;
+        let (request, job) = self
+            .prepare_whisper_asr_shape_for_binding(request, job, residency_lease)
+            .await?;
+        let (request, job) = self
+            .prepare_vibevoice_asr_shape_for_binding(request, job, residency_lease)
+            .await?;
+        let (request, job) = self
+            .prepare_granite_speech_asr_shape_for_binding(request, job, residency_lease)
+            .await?;
+        let (request, job) = self
+            .prepare_parakeet_asr_shape_for_binding(request, job, residency_lease)
+            .await?;
+        self.prepare_lfm25_audio_asr_shape_for_binding(request, job, residency_lease)
+            .await
+    }
+
+    async fn prepare_kokoro_tts_for_binding(
+        &self,
+        request: EngineCoreRequest,
+        job: JobLease,
+        residency_lease: Option<&ModelResidencyLease>,
+    ) -> Result<(EngineCoreRequest, JobLease)> {
+        if request.task_type != TaskType::TTS
+            || request
+                .model_variant
+                .is_none_or(|variant| variant.family() != ModelFamily::KokoroTts)
+            || request
+                .prepared_kokoro_tts_artifact_for_executor()?
+                .is_some()
+        {
+            return Ok((request, job));
+        }
+        let variant = request.model_variant.expect("validated Kokoro TTS variant");
+        let model = self
+            .model_registry
+            .get_kokoro_lease(variant)
+            .await
+            .ok_or_else(|| {
+                Error::ModelNotFound(format!("Kokoro TTS model {variant} is not loaded"))
+            })?;
+        let residency = residency_lease.ok_or_else(|| {
+            Error::InferenceError("Kokoro TTS preparation requires model residency".into())
+        })?;
+        let loaded_bundle = self
+            .model_lifecycle
+            .try_get_ready_bundle(residency.variant());
+        let contract = loaded_contract_for_residency(
+            residency,
+            loaded_bundle.as_deref(),
+            CapabilityKind::Tts,
+            false,
+            self.coordinator.execution_group_id(),
+            self.backend_router.context().backend_kind,
+            Some(ExecutionTargetKind::TokenEngine),
+        )?;
+        let context_limit = self
+            .model_registry
+            .effective_context(variant)
+            .ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "Kokoro TTS model {variant} has no effective context"
+                ))
+            })?;
+        let text = request
+            .tts_text_for_execution()
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| Error::InvalidInput("Kokoro TTS request is missing text".into()))?
+            .to_string();
+        let speaker = request.tts_speaker_for_execution().map(str::to_string);
+        let language = request.language.clone();
+        let speed = request.params.speed;
+        let budget = kokoro_output_budget(&text, speed)?;
+        let retained_request_bytes = u64::try_from(retained_engine_request_input_bytes(&request)?)
+            .map_err(|_| Error::Overloaded("Kokoro retained request exceeds u64".into()))?;
+        job.record_materialized_usage(JobResourceObservation::host(retained_request_bytes))?;
+        let bridge = self.coordinator.bridge_preparation_admission(job)?;
+        let artifact_host_ceiling = retained_request_bytes
+            .checked_mul(2)
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    u64::try_from(budget.max_model_tokens)
+                        .ok()?
+                        .checked_mul(8)?,
+                )
+            })
+            .ok_or_else(|| Error::Overloaded("Kokoro artifact ceiling overflowed".into()))?;
+        let preparation_spec = JobSpec {
+            request_id: request.id.clone(),
+            lane: CoordinatorLane::Atomic,
+            priority: request.priority,
+            workload_class: request.workload_class,
+            deadline: request.deadline,
+            resources: retained_artifact_resources(
+                self.backend_router.context().backend_kind,
+                artifact_host_ceiling,
+                256 * std::mem::size_of::<f32>() as u64,
+            )?,
+        };
+        let preparation_job = match self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                preparation_spec,
+                JobResourceObservation::host(retained_request_bytes),
+            )
+            .await
+        {
+            Ok(job) => job,
+            Err(failure) => return Err(failure.error),
+        };
+        let work = WorkUnit::PreSequencePreparation {
+            kind: "tts.prepare.kokoro".into(),
+        };
+        let max_model_tokens = u64::try_from(budget.max_model_tokens)
+            .map_err(|_| Error::Overloaded("Kokoro token budget exceeds u64".into()))?;
+        let cost = crate::engine::WorkCost::new(1, max_model_tokens, 0);
+        let cancellation = PreparationCancellation::default();
+        let row = self.coordinator.seal_preparation_row(
+            preparation_job,
+            &contract,
+            &work,
+            cost,
+            max_model_tokens,
+            cancellation.clone(),
+        )?;
+        let model_for_preparation = model.clone();
+        let mut cancellation_guard = PreparationCancellationGuard {
+            cancellation,
+            armed: true,
+        };
+        let mut outcomes = self
+            .coordinator
+            .run_loaded_native_preparation_batch(vec![row], contract, work, move |live| {
+                if live != [0] {
+                    return Err(Error::InferenceError(
+                        "Kokoro preparation must remain scalar".into(),
+                    ));
+                }
+                let artifact = Arc::new(model_for_preparation.prepare_request(
+                    &text,
+                    speaker.as_deref(),
+                    language.as_deref(),
+                    speed,
+                )?);
+                let retained = JobResourceObservation {
+                    host_bytes: retained_request_bytes
+                        .checked_add(artifact.retained_host_bytes()?)
+                        .ok_or_else(|| {
+                            Error::Overloaded("Kokoro retained bytes overflowed".into())
+                        })?,
+                    accelerator_bytes: artifact.retained_tensor_bytes()?,
+                };
+                Ok(vec![Ok(PreparationArtifact {
+                    retained,
+                    value: artifact,
+                })])
+            })
+            .await?;
+        cancellation_guard.armed = false;
+        let (artifact, bridge) = match outcomes
+            .pop()
+            .ok_or_else(|| Error::InferenceError("Kokoro preparation returned no outcome".into()))?
+        {
+            PreparationRowOutcome::Committed { artifact, bridge } => (artifact, bridge),
+            PreparationRowOutcome::Cancelled => return Err(Error::Cancelled(request.id.clone())),
+            PreparationRowOutcome::TimedOut => return Err(Error::Timeout(request.id.clone())),
+            PreparationRowOutcome::Failed(error) => return Err(error),
+        };
+        let retained = artifact.retained;
+        let mut prepared = request;
+        prepared.install_kokoro_tts_execution_model(
+            variant,
+            model,
+            artifact.value,
+            context_limit,
+        )?;
+        let (mut execution, _) = self.coordinator_job_for_request(&prepared)?;
+        let prepared_text = prepared
+            .tts_text_for_execution()
+            .ok_or_else(|| Error::InferenceError("prepared Kokoro request lost its text".into()))?;
+        execution.resources = execution.resources.checked_add(kokoro_synthesis_resources(
+            self.backend_router.context().backend_kind,
+            prepared_text,
+            prepared.params.speed,
+        )?)?;
+        match self
+            .coordinator
+            .admit_observed_from_preparation(bridge, execution, retained)
+            .await
+        {
+            Ok(job) => Ok((prepared, job)),
+            Err(failure) => Err(failure.error),
+        }
+    }
+
+    async fn prepare_vibevoice_tts_for_binding(
+        &self,
+        request: EngineCoreRequest,
+        job: JobLease,
+        residency_lease: Option<&ModelResidencyLease>,
+    ) -> Result<(EngineCoreRequest, JobLease)> {
+        if request.task_type != TaskType::TTS
+            || request
+                .model_variant
+                .is_none_or(|variant| variant.family() != ModelFamily::VibeVoiceTts)
+            || request
+                .prepared_vibevoice_tts_artifact_for_executor()?
+                .is_some()
+        {
+            return Ok((request, job));
+        }
+        let variant = request
+            .model_variant
+            .expect("validated VibeVoice TTS variant");
+        let model = self
+            .model_registry
+            .get_vibevoice_tts_lease(variant)
+            .await
+            .ok_or_else(|| {
+                Error::ModelNotFound(format!("VibeVoice TTS model {variant} is not loaded"))
+            })?;
+        let residency = residency_lease.ok_or_else(|| {
+            Error::InferenceError("VibeVoice TTS preparation requires model residency".into())
+        })?;
+        let loaded_bundle = self
+            .model_lifecycle
+            .try_get_ready_bundle(residency.variant());
+        let contract = loaded_contract_for_residency(
+            residency,
+            loaded_bundle.as_deref(),
+            CapabilityKind::Tts,
+            false,
+            self.coordinator.execution_group_id(),
+            self.backend_router.context().backend_kind,
+            Some(ExecutionTargetKind::TokenEngine),
+        )?;
+        let context_limit = self
+            .model_registry
+            .effective_context(variant)
+            .ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "VibeVoice TTS model {variant} has no effective context"
+                ))
+            })?;
+        let text = request
+            .tts_text_for_execution()
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| Error::InvalidInput("VibeVoice TTS request is missing text".into()))?
+            .trim()
+            .to_string();
+        let reference_audio = request.tts_reference_audio_for_execution().ok_or_else(|| {
+            Error::InvalidInput("VibeVoice TTS requires reference_audio and reference_text".into())
+        })?;
+        let reference_text = request
+            .tts_reference_text_for_execution()
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| {
+                Error::InvalidInput(
+                    "VibeVoice TTS requires reference_audio and reference_text".into(),
+                )
+            })?;
+        let (audio_samples, sample_rate) = decode_reference_audio_base64(reference_audio)?;
+        let reference = VibeVoiceSpeakerReference {
+            audio_samples,
+            sample_rate,
+            text: reference_text.to_string(),
+        };
+        let requested_speaker = request.tts_speaker_for_execution().map(str::to_string);
+        let auto_frame_budget = request.params.max_tokens == 0;
+        let params = VibeVoiceTtsGenerationParams {
+            cfg_scale: 1.5,
+            diffusion_steps: model.default_diffusion_steps().max(1),
+            max_frames: if auto_frame_budget {
+                vibevoice_tts_auto_max_frames_for_text(&text)
+            } else {
+                request
+                    .params
+                    .max_tokens
+                    .clamp(1, ModelVariant::VIBEVOICE_TTS_MAX_OUTPUT_FRAMES)
+            },
+            auto_frame_budget,
+        };
+        let retained_request_bytes = u64::try_from(retained_engine_request_input_bytes(&request)?)
+            .map_err(|_| Error::Overloaded("VibeVoice TTS retained request exceeds u64".into()))?;
+        job.record_materialized_usage(JobResourceObservation::host(retained_request_bytes))?;
+        let bridge = self.coordinator.bridge_preparation_admission(job)?;
+        let preparation_spec = JobSpec {
+            request_id: request.id.clone(),
+            lane: CoordinatorLane::Atomic,
+            priority: request.priority,
+            workload_class: request.workload_class,
+            deadline: request.deadline,
+            resources: asr_encoder_retained_resources(
+                self.backend_router.context().backend_kind,
+                retained_request_bytes,
+                512 * 1024 * 1024,
+            )?,
+        };
+        let preparation_job = match self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                preparation_spec,
+                JobResourceObservation::host(retained_request_bytes),
+            )
+            .await
+        {
+            Ok(job) => job,
+            Err(failure) => return Err(failure.error),
+        };
+        let work = WorkUnit::PreSequencePreparation {
+            kind: "tts.prepare.vibevoice".into(),
+        };
+        let cost = crate::engine::WorkCost::with_workspace(
+            u64::try_from(context_limit)
+                .map_err(|_| Error::Overloaded("VibeVoice context exceeds u64".into()))?,
+            u64::try_from(context_limit).unwrap_or(u64::MAX),
+            lfm25_audio_tts_preparation_workspace(
+                self.backend_router.context().backend_kind,
+                512 * 1024 * 1024,
+            ),
+        );
+        let cancellation = PreparationCancellation::default();
+        let row = self.coordinator.seal_preparation_row(
+            preparation_job,
+            &contract,
+            &work,
+            cost,
+            u64::try_from(context_limit).unwrap_or(u64::MAX),
+            cancellation.clone(),
+        )?;
+        let model_for_preparation = model.clone();
+        let mut cancellation_guard = PreparationCancellationGuard {
+            cancellation,
+            armed: true,
+        };
+        let mut outcomes = self
+            .coordinator
+            .run_loaded_native_preparation_batch(vec![row], contract, work, move |live| {
+                if live != [0] {
+                    return Err(Error::InferenceError(
+                        "VibeVoice TTS preparation must remain scalar".into(),
+                    ));
+                }
+                let artifact = model_for_preparation.prepare_retained_artifact(
+                    &text,
+                    &reference,
+                    requested_speaker.as_deref(),
+                )?;
+                let accelerator_bytes = artifact.retained_tensor_bytes()?;
+                Ok(vec![Ok(PreparationArtifact {
+                    retained: JobResourceObservation {
+                        host_bytes: retained_request_bytes,
+                        accelerator_bytes,
+                    },
+                    value: artifact,
+                })])
+            })
+            .await?;
+        cancellation_guard.armed = false;
+        let (artifact, bridge) = match outcomes.pop().ok_or_else(|| {
+            Error::InferenceError("VibeVoice TTS preparation returned no outcome".into())
+        })? {
+            PreparationRowOutcome::Committed { artifact, bridge } => (artifact, bridge),
+            PreparationRowOutcome::Cancelled => return Err(Error::Cancelled(request.id.clone())),
+            PreparationRowOutcome::TimedOut => return Err(Error::Timeout(request.id.clone())),
+            PreparationRowOutcome::Failed(error) => return Err(error),
+        };
+        let accelerator_bytes = artifact.retained.accelerator_bytes;
+        let mut prepared = request;
+        prepared.install_vibevoice_tts_execution_model(
+            variant,
+            model,
+            artifact.value,
+            params,
+            context_limit,
+        )?;
+        let (execution, _) = self.coordinator_job_for_request(&prepared)?;
+        match self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                execution,
+                JobResourceObservation {
+                    host_bytes: retained_request_bytes,
+                    accelerator_bytes,
+                },
+            )
+            .await
+        {
+            Ok(job) => Ok((prepared, job)),
+            Err(failure) => Err(failure.error),
+        }
+    }
+
+    async fn prepare_fish_s2_tts_for_binding(
+        &self,
+        request: EngineCoreRequest,
+        job: JobLease,
+        residency_lease: Option<&ModelResidencyLease>,
+    ) -> Result<(EngineCoreRequest, JobLease)> {
+        if request.task_type != TaskType::TTS
+            || request
+                .model_variant
+                .is_none_or(|variant| variant.family() != ModelFamily::FishS2Tts)
+            || request
+                .prepared_fish_s2_tts_artifact_for_executor()?
+                .is_some()
+        {
+            return Ok((request, job));
+        }
+        let variant = request
+            .model_variant
+            .expect("validated Fish S2 TTS variant");
+        let model = self
+            .model_registry
+            .get_fish_s2_tts_lease(variant)
+            .await
+            .ok_or_else(|| {
+                Error::ModelNotFound(format!("Fish S2 TTS model {variant} is not loaded"))
+            })?;
+        let residency = residency_lease.ok_or_else(|| {
+            Error::InferenceError("Fish S2 TTS preparation requires model residency".into())
+        })?;
+        let loaded_bundle = self
+            .model_lifecycle
+            .try_get_ready_bundle(residency.variant());
+        let contract = loaded_contract_for_residency(
+            residency,
+            loaded_bundle.as_deref(),
+            CapabilityKind::Tts,
+            false,
+            self.coordinator.execution_group_id(),
+            self.backend_router.context().backend_kind,
+            Some(ExecutionTargetKind::TokenEngine),
+        )?;
+        let context_limit = self
+            .model_registry
+            .effective_context(variant)
+            .ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "Fish S2 TTS model {variant} has no effective context"
+                ))
+            })?;
+        let text = request
+            .tts_text_for_execution()
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| Error::InvalidInput("Fish S2 TTS request is missing text".into()))?
+            .trim()
+            .to_string();
+        let reference_audio = request.tts_reference_audio_for_execution().ok_or_else(|| {
+            Error::InvalidInput("Fish S2 requires reference_audio and reference_text".into())
+        })?;
+        let reference_text = request
+            .tts_reference_text_for_execution()
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| {
+                Error::InvalidInput("Fish S2 requires reference_audio and reference_text".into())
+            })?;
+        let (audio_samples, sample_rate) = decode_reference_audio_base64(reference_audio)?;
+        let reference = FishS2Reference {
+            audio_samples,
+            sample_rate,
+            text: reference_text.to_string(),
+        };
+        let params = FishS2GenerationParams {
+            max_frames: if request.params.max_tokens == 0 {
+                FishS2GenerationParams::default().max_frames
+            } else {
+                request
+                    .params
+                    .max_tokens
+                    .min(context_limit.saturating_sub(1))
+                    .max(1)
+            },
+            ..FishS2GenerationParams::default()
+        };
+        let retained_request_bytes = u64::try_from(retained_engine_request_input_bytes(&request)?)
+            .map_err(|_| Error::Overloaded("Fish S2 TTS retained request exceeds u64".into()))?;
+        job.record_materialized_usage(JobResourceObservation::host(retained_request_bytes))?;
+        let bridge = self.coordinator.bridge_preparation_admission(job)?;
+        let preparation_spec = JobSpec {
+            request_id: request.id.clone(),
+            lane: CoordinatorLane::Atomic,
+            priority: request.priority,
+            workload_class: request.workload_class,
+            deadline: request.deadline,
+            resources: asr_encoder_retained_resources(
+                self.backend_router.context().backend_kind,
+                retained_request_bytes,
+                512 * 1024 * 1024,
+            )?,
+        };
+        let preparation_job = match self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                preparation_spec,
+                JobResourceObservation::host(retained_request_bytes),
+            )
+            .await
+        {
+            Ok(job) => job,
+            Err(failure) => return Err(failure.error),
+        };
+        let work = WorkUnit::PreSequencePreparation {
+            kind: "tts.prepare.fish_s2".into(),
+        };
+        let cost = crate::engine::WorkCost::with_workspace(
+            u64::try_from(context_limit)
+                .map_err(|_| Error::Overloaded("Fish S2 context exceeds u64".into()))?,
+            u64::try_from(context_limit).unwrap_or(u64::MAX),
+            lfm25_audio_tts_preparation_workspace(
+                self.backend_router.context().backend_kind,
+                512 * 1024 * 1024,
+            ),
+        );
+        let cancellation = PreparationCancellation::default();
+        let row = self.coordinator.seal_preparation_row(
+            preparation_job,
+            &contract,
+            &work,
+            cost,
+            u64::try_from(context_limit).unwrap_or(u64::MAX),
+            cancellation.clone(),
+        )?;
+        let model_for_preparation = model.clone();
+        let mut cancellation_guard = PreparationCancellationGuard {
+            cancellation,
+            armed: true,
+        };
+        let mut outcomes = self
+            .coordinator
+            .run_loaded_native_preparation_batch(vec![row], contract, work, move |live| {
+                if live != [0] {
+                    return Err(Error::InferenceError(
+                        "Fish S2 TTS preparation must remain scalar".into(),
+                    ));
+                }
+                let artifact = model_for_preparation.prepare_retained_artifact(&text, reference)?;
+                let retained_host_bytes = retained_request_bytes
+                    .checked_add(artifact.retained_bytes()?)
+                    .ok_or_else(|| Error::Overloaded("Fish S2 retained bytes overflow".into()))?;
+                Ok(vec![Ok(PreparationArtifact {
+                    retained: JobResourceObservation::host(retained_host_bytes),
+                    value: artifact,
+                })])
+            })
+            .await?;
+        cancellation_guard.armed = false;
+        let (artifact, bridge) = match outcomes.pop().ok_or_else(|| {
+            Error::InferenceError("Fish S2 TTS preparation returned no outcome".into())
+        })? {
+            PreparationRowOutcome::Committed { artifact, bridge } => (artifact, bridge),
+            PreparationRowOutcome::Cancelled => return Err(Error::Cancelled(request.id.clone())),
+            PreparationRowOutcome::TimedOut => return Err(Error::Timeout(request.id.clone())),
+            PreparationRowOutcome::Failed(error) => return Err(error),
+        };
+        let retained = artifact.retained;
+        let mut prepared = request;
+        prepared.install_fish_s2_tts_execution_model(
+            variant,
+            model,
+            artifact.value,
+            params,
+            context_limit,
+        )?;
+        let (execution, _) = self.coordinator_job_for_request(&prepared)?;
+        match self
+            .coordinator
+            .admit_observed_from_preparation(bridge, execution, retained)
+            .await
+        {
+            Ok(job) => Ok((prepared, job)),
+            Err(failure) => Err(failure.error),
+        }
+    }
+
+    async fn prepare_voxtral_tts_for_binding(
+        &self,
+        request: EngineCoreRequest,
+        job: JobLease,
+        residency_lease: Option<&ModelResidencyLease>,
+    ) -> Result<(EngineCoreRequest, JobLease)> {
+        if request.task_type != TaskType::TTS
+            || request
+                .model_variant
+                .is_none_or(|variant| variant.family() != ModelFamily::VoxtralTts)
+            || request
+                .prepared_voxtral_tts_artifact_for_executor()?
+                .is_some()
+        {
+            return Ok((request, job));
+        }
+        let variant = request
+            .model_variant
+            .expect("validated Voxtral TTS variant");
+        let model = self
+            .model_registry
+            .get_voxtral_tts_lease(variant)
+            .await
+            .ok_or_else(|| {
+                Error::ModelNotFound(format!("Voxtral TTS model {variant} is not loaded"))
+            })?;
+        let residency = residency_lease.ok_or_else(|| {
+            Error::InferenceError("Voxtral TTS preparation requires model residency".into())
+        })?;
+        let loaded_bundle = self
+            .model_lifecycle
+            .try_get_ready_bundle(residency.variant());
+        let contract = loaded_contract_for_residency(
+            residency,
+            loaded_bundle.as_deref(),
+            CapabilityKind::Tts,
+            false,
+            self.coordinator.execution_group_id(),
+            self.backend_router.context().backend_kind,
+            Some(ExecutionTargetKind::TokenEngine),
+        )?;
+        let context_limit = self
+            .model_registry
+            .effective_context(variant)
+            .ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "Voxtral TTS model {variant} has no effective context"
+                ))
+            })?;
+        let text = request
+            .tts_text_for_execution()
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| Error::InvalidInput("Voxtral TTS request is missing text".into()))?
+            .trim()
+            .to_string();
+        let voice = request
+            .tts_speaker_for_execution()
+            .map(str::to_string)
+            .or_else(|| model.available_speakers().into_iter().next())
+            .ok_or_else(|| Error::InvalidInput("Voxtral TTS has no available voice".into()))?;
+        let params = VoxtralTtsGenerationParams {
+            max_frames: request
+                .params
+                .max_tokens
+                .max(1)
+                .min(context_limit.saturating_sub(1).max(1)),
+            ..Default::default()
+        };
+        let retained_request_bytes = u64::try_from(retained_engine_request_input_bytes(&request)?)
+            .map_err(|_| Error::Overloaded("Voxtral TTS retained request exceeds u64".into()))?;
+        job.record_materialized_usage(JobResourceObservation::host(retained_request_bytes))?;
+        let bridge = self.coordinator.bridge_preparation_admission(job)?;
+        let preparation_job = self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                JobSpec {
+                    request_id: request.id.clone(),
+                    lane: CoordinatorLane::Atomic,
+                    priority: request.priority,
+                    workload_class: request.workload_class,
+                    deadline: request.deadline,
+                    resources: asr_encoder_retained_resources(
+                        self.backend_router.context().backend_kind,
+                        retained_request_bytes,
+                        512 * 1024 * 1024,
+                    )?,
+                },
+                JobResourceObservation::host(retained_request_bytes),
+            )
+            .await
+            .map_err(|failure| failure.error)?;
+        let work = WorkUnit::PreSequencePreparation {
+            kind: "tts.prepare.voxtral".into(),
+        };
+        let cost = crate::engine::WorkCost::with_workspace(
+            context_limit as u64,
+            context_limit as u64,
+            lfm25_audio_tts_preparation_workspace(
+                self.backend_router.context().backend_kind,
+                512 * 1024 * 1024,
+            ),
+        );
+        let cancellation = PreparationCancellation::default();
+        let row = self.coordinator.seal_preparation_row(
+            preparation_job,
+            &contract,
+            &work,
+            cost,
+            context_limit as u64,
+            cancellation.clone(),
+        )?;
+        let model_for_preparation = model.clone();
+        let mut cancellation_guard = PreparationCancellationGuard {
+            cancellation,
+            armed: true,
+        };
+        let mut outcomes = self
+            .coordinator
+            .run_loaded_native_preparation_batch(vec![row], contract, work, move |live| {
+                if live != [0] {
+                    return Err(Error::InferenceError(
+                        "Voxtral TTS preparation must remain scalar".into(),
+                    ));
+                }
+                let artifact = model_for_preparation.prepare_retained_artifact(&text, &voice)?;
+                Ok(vec![Ok(PreparationArtifact {
+                    retained: JobResourceObservation {
+                        host_bytes: retained_request_bytes,
+                        accelerator_bytes: artifact.retained_resident_bytes,
+                    },
+                    value: artifact,
+                })])
+            })
+            .await?;
+        cancellation_guard.armed = false;
+        let (artifact, bridge) = match outcomes.pop().ok_or_else(|| {
+            Error::InferenceError("Voxtral TTS preparation returned no outcome".into())
+        })? {
+            PreparationRowOutcome::Committed { artifact, bridge } => (artifact, bridge),
+            PreparationRowOutcome::Cancelled => return Err(Error::Cancelled(request.id.clone())),
+            PreparationRowOutcome::TimedOut => return Err(Error::Timeout(request.id.clone())),
+            PreparationRowOutcome::Failed(error) => return Err(error),
+        };
+        let retained = artifact.retained;
+        let mut prepared = request;
+        prepared.install_voxtral_tts_execution_model(
+            variant,
+            model,
+            artifact.value,
+            params,
+            context_limit,
+        )?;
+        let (execution, _) = self.coordinator_job_for_request(&prepared)?;
+        self.coordinator
+            .admit_observed_from_preparation(bridge, execution, retained)
+            .await
+            .map(|job| (prepared, job))
+            .map_err(|failure| failure.error)
+    }
+
+    async fn prepare_lfm25_audio_tts_for_binding(
+        &self,
+        request: EngineCoreRequest,
+        job: JobLease,
+        residency_lease: Option<&ModelResidencyLease>,
+    ) -> Result<(EngineCoreRequest, JobLease)> {
+        if request.task_type != TaskType::TTS
+            || request
+                .model_variant
+                .is_none_or(|variant| variant.family() != ModelFamily::Lfm25Audio)
+            || request
+                .prepared_lfm25_audio_tts_artifact_for_executor()?
+                .is_some()
+        {
+            return Ok((request, job));
+        }
+        let variant = request
+            .model_variant
+            .expect("validated LFM2.5 Audio TTS variant");
+        let model = self
+            .model_registry
+            .get_lfm25_audio_lease(variant)
+            .await
+            .ok_or_else(|| {
+                Error::ModelNotFound(format!("LFM2.5 Audio model {variant} is not loaded"))
+            })?;
+        let residency = residency_lease.ok_or_else(|| {
+            Error::InferenceError("LFM2.5 Audio TTS preparation requires model residency".into())
+        })?;
+        let loaded_bundle = self
+            .model_lifecycle
+            .try_get_ready_bundle(residency.variant());
+        let preparation_contract = loaded_contract_for_residency(
+            residency,
+            loaded_bundle.as_deref(),
+            CapabilityKind::Tts,
+            false,
+            self.coordinator.execution_group_id(),
+            self.backend_router.context().backend_kind,
+            Some(ExecutionTargetKind::TokenEngine),
+        )?;
+        let context_limit = self
+            .model_registry
+            .effective_context(variant)
+            .ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "LFM2.5 Audio model {variant} has no effective context"
+                ))
+            })?;
+        let ceiling = model.lfm25_audio_tts_stage_ceiling()?;
+        let backend = self.backend_router.context().backend_kind;
+        if ceiling.backend != backend {
+            return Err(Error::InferenceError(
+                "LFM2.5 Audio TTS preparation ceiling used the wrong backend domain".into(),
+            ));
+        }
+        let retained_request_host_bytes =
+            u64::try_from(retained_engine_request_input_bytes(&request)?).map_err(|_| {
+                Error::Overloaded("LFM2.5 Audio TTS retained input exceeds u64".into())
+            })?;
+        job.record_materialized_usage(JobResourceObservation::host(retained_request_host_bytes))?;
+        let bridge = self.coordinator.bridge_preparation_admission(job)?;
+        let preparation_resources = asr_encoder_retained_resources(
+            backend,
+            retained_request_host_bytes,
+            ceiling.max_retained_resident_bytes,
+        )?;
+        let preparation_spec = JobSpec {
+            request_id: request.id.clone(),
+            lane: CoordinatorLane::Atomic,
+            priority: request.priority,
+            workload_class: request.workload_class,
+            deadline: request.deadline,
+            resources: preparation_resources,
+        };
+        let preparation_job = match self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                preparation_spec,
+                JobResourceObservation::host(retained_request_host_bytes),
+            )
+            .await
+        {
+            Ok(job) => job,
+            Err(failure) => {
+                drop(request);
+                let error = failure.error;
+                drop(failure.bridge);
+                return Err(error);
+            }
+        };
+        let messages = request.lfm25_audio_tts_messages_for_preparation()?;
+        let work = WorkUnit::PreSequencePreparation {
+            kind: "tts.prepare.lfm25_audio".into(),
+        };
+        let workspace = lfm25_audio_tts_preparation_workspace(backend, ceiling.max_workspace_bytes);
+        let cost = crate::engine::WorkCost::with_workspace(
+            u64::try_from(ceiling.max_prompt_tokens).map_err(|_| {
+                Error::Overloaded("LFM2.5 Audio TTS prompt ceiling exceeds u64".into())
+            })?,
+            ceiling.max_materialized_tensor_elements,
+            workspace,
+        );
+        let cancellation = PreparationCancellation::default();
+        let row = self.coordinator.seal_preparation_row(
+            preparation_job,
+            &preparation_contract,
+            &work,
+            cost,
+            ceiling.max_materialized_tensor_elements,
+            cancellation.clone(),
+        )?;
+        let model_for_preparation = model.clone();
+        let mut cancellation_guard = PreparationCancellationGuard {
+            cancellation,
+            armed: true,
+        };
+        let mut outcomes = self
+            .coordinator
+            .run_loaded_native_preparation_batch(
+                vec![row],
+                preparation_contract,
+                work,
+                move |live| {
+                    if live != [0] {
+                        return Err(Error::InferenceError(
+                            "LFM2.5 Audio TTS preparation received a non-scalar live set".into(),
+                        ));
+                    }
+                    let artifact =
+                        model_for_preparation.prepare_lfm25_audio_tts_artifact(&messages)?;
+                    let artifact_host_bytes = retained_lfm25_audio_tts_artifact_host_bytes(
+                        artifact.source_messages.as_ref(),
+                    )?;
+                    let retained_host_bytes = retained_request_host_bytes
+                        .checked_add(artifact_host_bytes)
+                        .ok_or_else(|| {
+                            Error::Overloaded(
+                                "LFM2.5 Audio TTS retained host accounting overflow".into(),
+                            )
+                        })?;
+                    Ok(vec![Ok(PreparationArtifact {
+                        retained: JobResourceObservation {
+                            host_bytes: retained_host_bytes,
+                            accelerator_bytes: artifact.retained_resident_bytes,
+                        },
+                        value: artifact,
+                    })])
+                },
+            )
+            .await?;
+        cancellation_guard.armed = false;
+        let outcome = outcomes.pop().ok_or_else(|| {
+            Error::InferenceError("LFM2.5 Audio TTS preparation returned no outcome".into())
+        })?;
+        let (artifact, bridge) = match outcome {
+            PreparationRowOutcome::Committed { artifact, bridge } => (artifact.value, bridge),
+            PreparationRowOutcome::Cancelled => return Err(Error::Cancelled(request.id.clone())),
+            PreparationRowOutcome::TimedOut => return Err(Error::Timeout(request.id.clone())),
+            PreparationRowOutcome::Failed(error) => return Err(error),
+        };
+        if artifact.prompt_tokens == 0
+            || artifact.prompt_tokens > ceiling.max_prompt_tokens
+            || artifact.materialized_tensor_elements > ceiling.max_materialized_tensor_elements
+            || artifact.retained_resident_bytes > ceiling.max_retained_resident_bytes
+        {
+            drop(artifact);
+            drop(request);
+            drop(bridge);
+            return Err(Error::InferenceError(
+                "LFM2.5 Audio TTS artifact exceeded its admitted preparation ceiling".into(),
+            ));
+        }
+        let artifact_host_bytes =
+            retained_lfm25_audio_tts_artifact_host_bytes(artifact.source_messages.as_ref())?;
+        let retained_host_bytes = retained_request_host_bytes
+            .checked_add(artifact_host_bytes)
+            .ok_or_else(|| {
+                Error::Overloaded("LFM2.5 Audio TTS retained host accounting overflow".into())
+            })?;
+        let accelerator_bytes = artifact.retained_resident_bytes;
+        let mut prepared = request;
+        prepared.install_lfm25_audio_tts_execution_model(
+            variant,
+            model,
+            artifact,
+            context_limit,
+        )?;
+        let (execution, _) = self.coordinator_job_for_request(&prepared)?;
+        match self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                execution,
+                JobResourceObservation {
+                    host_bytes: retained_host_bytes,
+                    accelerator_bytes,
+                },
+            )
+            .await
+        {
+            Ok(job) => Ok((prepared, job)),
+            Err(failure) => {
+                drop(prepared);
+                let error = failure.error;
+                drop(failure.bridge);
+                Err(error)
+            }
+        }
+    }
+
     async fn run_request_after_admission(
         &self,
-        mut request: EngineCoreRequest,
+        request: EngineCoreRequest,
         job: JobLease,
         residency_lease: Option<ModelResidencyLease>,
     ) -> Result<EngineOutput> {
+        let (request, job) = self
+            .prepare_asr_shape_for_binding(request, job, residency_lease.as_ref())
+            .await?;
+        let (request, job) = self
+            .prepare_kokoro_tts_for_binding(request, job, residency_lease.as_ref())
+            .await?;
+        let (request, job) = self
+            .prepare_vibevoice_tts_for_binding(request, job, residency_lease.as_ref())
+            .await?;
+        let (request, job) = self
+            .prepare_fish_s2_tts_for_binding(request, job, residency_lease.as_ref())
+            .await?;
+        let (request, job) = self
+            .prepare_voxtral_tts_for_binding(request, job, residency_lease.as_ref())
+            .await?;
+        let (mut request, job) = self
+            .prepare_lfm25_audio_tts_for_binding(request, job, residency_lease.as_ref())
+            .await?;
         let loaded_bundle = residency_lease
             .as_ref()
             .and_then(|lease| self.model_lifecycle.try_get_ready_bundle(lease.variant()));
@@ -2063,12 +5790,8 @@ impl RuntimeService {
             self.record_engine_error_observation(&observation_request, false, err.to_string());
             return Err(err);
         }
-        if let Err(err) = self
-            .bind_waiter(&request_id, waiter_registration_id, guard.session.epoch)
-            .await
-        {
-            return Err(err);
-        }
+        self.bind_waiter(&request_id, waiter_registration_id, guard.session.epoch)
+            .await?;
         waiter_guard.disarm();
         self.telemetry.record_request_queued(&request_id).await;
         self.step_driver_wakeup.notify_one();
@@ -2263,7 +5986,7 @@ impl RuntimeService {
 
     async fn run_streaming_request_after_admission<F, Fut>(
         &self,
-        mut request: EngineCoreRequest,
+        request: EngineCoreRequest,
         mut on_chunk: F,
         job: JobLease,
         residency_lease: Option<ModelResidencyLease>,
@@ -2273,6 +5996,12 @@ impl RuntimeService {
         F: FnMut(StreamingOutput) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
+        let (request, job) = self
+            .prepare_asr_shape_for_binding(request, job, residency_lease.as_ref())
+            .await?;
+        let (mut request, job) = self
+            .prepare_lfm25_audio_tts_for_binding(request, job, residency_lease.as_ref())
+            .await?;
         let loaded_bundle = residency_lease
             .as_ref()
             .and_then(|lease| self.model_lifecycle.try_get_ready_bundle(lease.variant()));
@@ -2345,16 +6074,12 @@ impl RuntimeService {
             let err = Error::Timeout(stream_request_id.clone());
             return Err(self.defer_streaming_failure(&mut guard, &observation_request, err));
         }
-        if let Err(err) = self
-            .bind_waiter(
-                &stream_request_id,
-                waiter_registration_id,
-                guard.session.epoch,
-            )
-            .await
-        {
-            return Err(err);
-        }
+        self.bind_waiter(
+            &stream_request_id,
+            waiter_registration_id,
+            guard.session.epoch,
+        )
+        .await?;
         waiter_guard.disarm();
         self.telemetry.record_request_queued(&request_id).await;
         self.step_driver_wakeup.notify_one();
@@ -2384,7 +6109,7 @@ impl RuntimeService {
                         ));
                     }
 
-                    if let Err(err) = self
+                    self
                         .deliver_streaming_chunk_before_deadline(
                             &mut on_chunk,
                             chunk,
@@ -2393,10 +6118,7 @@ impl RuntimeService {
                             &observation_request,
                             &mut guard,
                         )
-                        .await
-                    {
-                        return Err(err);
-                    }
+                        .await?
                 }
                 completion = &mut completion_rx, if completion_result.is_none() => {
                     let completion = match completion {
@@ -2517,49 +6239,18 @@ impl RuntimeService {
     async fn engine_telemetry_snapshot(&self) -> EngineRuntimeTelemetrySnapshot {
         let queue_depth = self.core_engine.pending_requests().await as u64;
         let running_requests = self.core_engine.running_requests().await as u64;
-        let kv_cache = self.core_engine.kv_cache_stats().await;
+        let kv_cache = self.core_engine.kv_cache_snapshot().await;
         let stream = engine_stream_metrics_snapshot();
-        let kv_cache_hits_total = kv_cache.telemetry.shared_prefix_hits;
-        let kv_cache_misses_total = kv_cache.telemetry.shared_prefix_misses;
-        let backend_kind = self.backend_context().backend_kind;
-        let kv_cache_snapshot = EngineKvCacheRuntimeSnapshot {
-            block_accounting: "logical",
-            memory_accounting: "estimated_from_config",
-            total_blocks: kv_cache.total_blocks as u64,
-            soft_max_blocks: kv_cache.soft_max_blocks as u64,
-            allocated_blocks: kv_cache.allocated_blocks as u64,
-            free_blocks: kv_cache.free_blocks as u64,
-            block_size: kv_cache.block_size as u64,
-            dtype_bytes: kv_cache.dtype_bytes as u64,
-            block_memory_bytes: kv_cache.block_memory_bytes as u64,
-            memory_used_bytes: kv_cache.memory_used_bytes as u64,
-            memory_capacity_bytes: kv_cache.memory_capacity_bytes as u64,
-            utilization_ratio: kv_cache.utilization(),
-            gpu_resident_blocks: reported_gpu_resident_blocks(
-                backend_kind,
-                kv_cache.gpu_resident_blocks as u64,
-            ),
-            pinned_blocks: kv_cache.pinned_blocks as u64,
-            shared_prefixes: kv_cache.shared_prefixes as u64,
-            total_allocations: kv_cache.telemetry.total_allocations,
-            total_frees: kv_cache.telemetry.total_frees,
-            shared_prefix_hits: kv_cache.telemetry.shared_prefix_hits,
-            shared_prefix_misses: kv_cache.telemetry.shared_prefix_misses,
-            shared_prefix_blocks_reused: kv_cache.telemetry.shared_prefix_blocks_reused,
-            persistent_prefix_evictions: kv_cache.telemetry.persistent_prefix_evictions,
-            copy_on_write_splits: kv_cache.telemetry.copy_on_write_splits,
-            last_churn_ratio: kv_cache.telemetry.last_churn_ratio,
-        };
 
         let batch = engine_batch_metrics_snapshot();
         EngineRuntimeTelemetrySnapshot {
             scheduler_queue_depth: queue_depth,
             scheduler_running_requests: running_requests,
-            kv_cache_hits_total,
-            kv_cache_misses_total,
-            kv_cache_evictions_total: kv_cache.telemetry.persistent_prefix_evictions,
-            kv_cache_allocated_blocks: kv_cache.allocated_blocks as u64,
-            kv_cache_prefix_reuse_blocks_total: kv_cache.telemetry.shared_prefix_blocks_reused,
+            incremental_prefill_quanta_committed_total: batch
+                .incremental_prefill_quanta_committed_total,
+            incremental_prefill_tokens_committed_total: batch
+                .incremental_prefill_tokens_committed_total,
+            multispan_prefill_requests_total: batch.multispan_prefill_requests_total,
             stream_backpressure_total: stream.backpressure_total,
             stream_checkpoints_committed_total: stream.checkpoints_committed_total,
             stream_checkpoint_rejections_total: stream.checkpoint_rejections_total,
@@ -2567,6 +6258,8 @@ impl RuntimeService {
             tensor_batches_total: batch.tensor_batches_total,
             tensor_static_batches_total: batch.tensor_static_batches_total,
             tensor_continuous_batches_total: batch.tensor_continuous_batches_total,
+            tensor_continuous_multirow_batches_total: batch
+                .tensor_continuous_multirow_batches_total,
             request_parallel_batches_total: batch.request_parallel_batches_total,
             physical_batch_rejections_total: batch.physical_batch_rejections_total,
             tensor_batch_max_width: batch.tensor_batch_max_width,
@@ -2582,7 +6275,16 @@ impl RuntimeService {
             workspace_domains: batch.workspace_domains,
             tensor_batch_fill_ratio: batch.tensor_batch_fill_ratio,
             tensor_batch_padding_ratio: batch.tensor_batch_padding_ratio,
-            kv_cache: kv_cache_snapshot,
+            model_tensor_batches_total: batch.model_tensor_batches_total,
+            model_tensor_batch_rows_total: batch.model_tensor_batch_rows_total,
+            model_tensor_batch_max_width: batch.model_tensor_batch_max_width,
+            model_scalar_row_dispatches_total: batch.model_scalar_row_dispatches_total,
+            model_decode_calls_total: batch.model_decode_calls_total,
+            model_tensor_multirow_calls_total: batch.model_tensor_multirow_calls_total,
+            continuous_envelope_scalar_fallbacks_total: batch
+                .continuous_envelope_scalar_fallbacks_total,
+            physical_execution: batch.physical_execution,
+            kv_cache,
         }
     }
 
@@ -2600,78 +6302,92 @@ impl RuntimeService {
         );
         push_engine_metric(
             payload,
+            ENGINE_SCHEDULER_INCREMENTAL_PREFILL_QUANTA_COMMITTED_TOTAL,
+            snapshot.incremental_prefill_quanta_committed_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_SCHEDULER_INCREMENTAL_PREFILL_TOKENS_COMMITTED_TOTAL,
+            snapshot.incremental_prefill_tokens_committed_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_SCHEDULER_MULTISPAN_PREFILL_REQUESTS_TOTAL,
+            snapshot.multispan_prefill_requests_total,
+        );
+        push_engine_metric(
+            payload,
             ENGINE_KV_CACHE_HITS_TOTAL,
-            snapshot.kv_cache_hits_total,
+            snapshot.kv_cache.counters.prefix_hits,
         );
         push_engine_metric(
             payload,
             ENGINE_KV_CACHE_MISSES_TOTAL,
-            snapshot.kv_cache_misses_total,
+            snapshot.kv_cache.counters.prefix_misses,
         );
         push_engine_metric(
             payload,
             ENGINE_KV_CACHE_EVICTIONS_TOTAL,
-            snapshot.kv_cache_evictions_total,
+            snapshot.kv_cache.counters.prefix_evictions,
         );
-        push_engine_metric(
+        push_engine_labeled_metric(
             payload,
             ENGINE_KV_CACHE_ALLOCATED_BLOCKS,
-            snapshot.kv_cache_allocated_blocks,
+            "accounting",
+            &[(
+                "physical_pages",
+                snapshot.kv_cache.totals.coordinator.allocated_pages,
+            )],
         );
-        push_engine_metric(
+        push_engine_labeled_metric(
             payload,
             ENGINE_KV_CACHE_FREE_BLOCKS,
-            snapshot.kv_cache.free_blocks,
+            "accounting",
+            &[(
+                "physical_pages",
+                snapshot.kv_cache.totals.coordinator.free_pages,
+            )],
         );
-        push_engine_metric(
-            payload,
-            ENGINE_KV_CACHE_SOFT_MAX_BLOCKS,
-            snapshot.kv_cache.soft_max_blocks,
-        );
-        push_engine_metric_f64(
+        push_engine_labeled_metric_f64(
             payload,
             ENGINE_KV_CACHE_UTILIZATION_RATIO,
-            snapshot.kv_cache.utilization_ratio,
+            "accounting",
+            &[(
+                "physical_pages",
+                if snapshot.kv_cache.totals.coordinator.capacity_pages == 0 {
+                    0.0
+                } else {
+                    snapshot.kv_cache.totals.coordinator.allocated_pages as f64
+                        / snapshot.kv_cache.totals.coordinator.capacity_pages as f64
+                },
+            )],
         );
-        push_engine_metric(
+        push_engine_labeled_metric(
             payload,
             ENGINE_KV_CACHE_MEMORY_USED_BYTES,
-            snapshot.kv_cache.memory_used_bytes,
+            "accounting",
+            &[(
+                "physical_managed_pages",
+                managed_kv_used_bytes(&snapshot.kv_cache),
+            )],
         );
-        push_engine_metric(
+        push_engine_labeled_metric(
             payload,
             ENGINE_KV_CACHE_MEMORY_CAPACITY_BYTES,
-            snapshot.kv_cache.memory_capacity_bytes,
+            "accounting",
+            &[(
+                snapshot.kv_cache.memory_accounting,
+                snapshot.kv_cache.totals.physical_bytes,
+            )],
         );
-        push_engine_metric(
-            payload,
-            ENGINE_KV_CACHE_SHARED_PREFIXES,
-            snapshot.kv_cache.shared_prefixes,
-        );
-        push_engine_metric(
-            payload,
-            ENGINE_KV_CACHE_PREFIX_REUSE_BLOCKS_TOTAL,
-            snapshot.kv_cache_prefix_reuse_blocks_total,
-        );
-        push_engine_metric(
-            payload,
-            ENGINE_KV_CACHE_COPY_ON_WRITE_SPLITS_TOTAL,
-            snapshot.kv_cache.copy_on_write_splits,
-        );
-        push_engine_metric_f64(
-            payload,
-            ENGINE_KV_CACHE_CHURN_RATIO,
-            snapshot.kv_cache.last_churn_ratio,
-        );
-        push_engine_metric(
+        push_engine_labeled_metric(
             payload,
             ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS,
-            snapshot.kv_cache.gpu_resident_blocks,
-        );
-        push_engine_metric(
-            payload,
-            ENGINE_KV_CACHE_PINNED_BLOCKS,
-            snapshot.kv_cache.pinned_blocks,
+            "accounting",
+            &[(
+                "physical_device_pages",
+                managed_kv_device_pages(&snapshot.kv_cache),
+            )],
         );
         push_engine_metric(
             payload,
@@ -2717,6 +6433,46 @@ impl RuntimeService {
             payload,
             ENGINE_EXECUTOR_TENSOR_CONTINUOUS_BATCHES_TOTAL,
             snapshot.tensor_continuous_batches_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_EXECUTOR_TENSOR_CONTINUOUS_MULTIROW_BATCHES_TOTAL,
+            snapshot.tensor_continuous_multirow_batches_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_EXECUTOR_MODEL_TENSOR_BATCHES_TOTAL,
+            snapshot.model_tensor_batches_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_EXECUTOR_MODEL_TENSOR_BATCH_ROWS_TOTAL,
+            snapshot.model_tensor_batch_rows_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_EXECUTOR_MODEL_TENSOR_BATCH_MAX_WIDTH,
+            snapshot.model_tensor_batch_max_width,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_EXECUTOR_MODEL_SCALAR_ROW_DISPATCHES_TOTAL,
+            snapshot.model_scalar_row_dispatches_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_EXECUTOR_MODEL_DECODE_CALLS_TOTAL,
+            snapshot.model_decode_calls_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_EXECUTOR_MODEL_TENSOR_MULTIROW_CALLS_TOTAL,
+            snapshot.model_tensor_multirow_calls_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_EXECUTOR_CONTINUOUS_ENVELOPE_SCALAR_FALLBACKS_TOTAL,
+            snapshot.continuous_envelope_scalar_fallbacks_total,
         );
         push_engine_metric(
             payload,
@@ -2782,6 +6538,7 @@ impl RuntimeService {
             ENGINE_EXECUTOR_TENSOR_BATCH_PADDING_RATIO,
             snapshot.tensor_batch_padding_ratio,
         );
+        push_engine_physical_execution_metrics(payload, &snapshot.physical_execution);
     }
 
     fn push_coordinator_prometheus_metrics(&self, payload: &mut String) {
@@ -2808,7 +6565,9 @@ izwi_inference_coordinator_rejected_total {}\n\
 # TYPE izwi_inference_coordinator_expired_total counter\n\
 izwi_inference_coordinator_expired_total {}\n\
 # TYPE izwi_inference_coordinator_draining gauge\n\
-izwi_inference_coordinator_draining {}\n",
+izwi_inference_coordinator_draining {}\n\
+# TYPE izwi_inference_coordinator_poisoned gauge\n\
+izwi_inference_coordinator_poisoned {}\n",
             snapshot.capacity,
             snapshot.active_jobs,
             snapshot.active_executions,
@@ -2820,6 +6579,7 @@ izwi_inference_coordinator_draining {}\n",
             snapshot.rejected_total,
             snapshot.expired_total,
             u8::from(snapshot.draining),
+            u8::from(snapshot.poisoned),
         ));
     }
 
@@ -2973,6 +6733,48 @@ mod tests {
     };
     use crate::runtime::broker::{InferenceBroker, InferenceBrokerMode};
 
+    #[test]
+    fn granite_speech_deadline_buckets_separate_unbounded_and_materially_different_budgets() {
+        let now = Instant::now();
+        assert_eq!(granite_speech_deadline_budget_bucket(None, now), None);
+        assert_eq!(
+            granite_speech_deadline_budget_bucket(Some(now + Duration::from_millis(199)), now),
+            Some(1)
+        );
+        assert_eq!(
+            granite_speech_deadline_budget_bucket(Some(now + Duration::from_millis(200)), now),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn direct_execution_capacity_obeys_rollout_mode() {
+        assert_eq!(
+            effective_physical_execution_parallelism(
+                crate::config::PhysicalExecutionMode::Serial,
+                4,
+                8,
+            ),
+            1
+        );
+        assert_eq!(
+            effective_physical_execution_parallelism(
+                crate::config::PhysicalExecutionMode::Shadow,
+                4,
+                8,
+            ),
+            1
+        );
+        assert_eq!(
+            effective_physical_execution_parallelism(
+                crate::config::PhysicalExecutionMode::Concurrent,
+                4,
+                8,
+            ),
+            8
+        );
+    }
+
     fn terminal_output(reason: ExecutionFinishReason) -> EngineOutput {
         OutputProcessor::new(24_000).process_execution(
             ExecutorOutput::terminal("terminal-request".to_string()),
@@ -3052,6 +6854,7 @@ mod tests {
             .expect("matching residency");
         assert_eq!(request.model_instance_id(), Some(instance));
         assert!(request.execution_adapter_binding().is_some());
+        assert!(request.v2_state_runtime().is_some());
 
         let mut wrong = EngineCoreRequest::tts("wrong").with_model_variant(ModelVariant::Qwen306B);
         assert!(bind_request_to_residency(&mut wrong, Some(&lease), Some(&bundle), false).is_err());
@@ -3064,10 +6867,10 @@ mod tests {
     }
 
     #[test]
-    fn residency_binding_separates_transport_from_model_streaming() {
+    fn residency_binding_uses_one_descriptor_for_execution_and_state_truth() {
         let residency = crate::model::ModelResidency::default();
-        let instance = crate::engine::ModelInstanceId::new(18);
-        let variant = ModelVariant::ParakeetTdt06BV3;
+        let instance = crate::engine::ModelInstanceId::new(19);
+        let variant = ModelVariant::Kokoro82M;
         let lease = residency.acquire_instance_lease(variant, instance);
         let bundle = LoadedModelBundle::bind(
             &RuntimeAdapterRegistry::built_in(),
@@ -3077,21 +6880,97 @@ mod tests {
             BackendKind::Cpu,
         )
         .expect("loaded bundle");
+        let mut request = EngineCoreRequest::tts("state").with_model_variant(variant);
 
-        let mut transport = EngineCoreRequest::asr_bytes(vec![1])
-            .with_model_variant(variant)
-            .with_streaming(true);
-        bind_request_to_residency(&mut transport, Some(&lease), Some(&bundle), false)
-            .expect("transport-only ASR binding");
+        bind_request_to_residency(&mut request, Some(&lease), Some(&bundle), false)
+            .expect("matching loaded capability descriptor");
+
+        let execution = request
+            .execution_adapter_binding()
+            .expect("execution binding");
+        let state = request.v2_state_runtime().expect("state binding");
+        assert_eq!(execution.model_instance_id, instance);
+        state.validate_against(BackendKind::Cpu, execution).unwrap();
+    }
+
+    #[test]
+    fn residency_binding_preserves_v2_state_without_opaque_fallback() {
+        let residency = crate::model::ModelResidency::default();
+        let instance = crate::engine::ModelInstanceId::new(20);
+        let variant = ModelVariant::Kokoro82M;
+        let lease = residency.acquire_instance_lease(variant, instance);
+        let registry = RuntimeAdapterRegistry::built_in();
+        let compatibility = LoadedModelBundle::bind(
+            &registry,
+            crate::engine::ExecutionGroupId::new(3),
+            instance,
+            variant,
+            BackendKind::Cpu,
+        )
+        .expect("compatibility bundle");
+        let offline = compatibility
+            .contract_for_streaming(CapabilityKind::Tts, StreamingRequirements::NONE)
+            .expect("offline TTS contract")
+            .stages;
+        let transport = compatibility
+            .contract_for_streaming(CapabilityKind::Tts, StreamingRequirements::transport_only())
+            .expect("transport TTS contract")
+            .stages;
+        let native = compatibility
+            .contract_for_streaming(
+                CapabilityKind::Tts,
+                StreamingRequirements {
+                    transport_output: false,
+                    model_native: true,
+                    asr_long_form: false,
+                },
+            )
+            .expect("native TTS contract")
+            .stages;
+        let native_transport = compatibility
+            .contract_for_streaming(CapabilityKind::Tts, StreamingRequirements::native(true))
+            .expect("native transport TTS contract")
+            .stages;
+        let descriptor =
+            crate::kv::v2::CapabilityStateDescriptorV2::stateless_for_stage_graphs_test(&[
+                &offline,
+                &transport,
+                &native,
+                &native_transport,
+            ]);
+        let bundle = LoadedModelBundle::bind_with_state_publications(
+            &registry,
+            crate::engine::ExecutionGroupId::new(3),
+            instance,
+            variant,
+            BackendKind::Cpu,
+            HashMap::from([(
+                CapabilityKind::Tts,
+                crate::runtime::adapters::LoadedStatePublication::V2(descriptor.clone()),
+            )]),
+        )
+        .expect("v2 loaded bundle");
+        let mut request = EngineCoreRequest::tts("stateless").with_model_variant(variant);
+        bind_request_to_residency(&mut request, Some(&lease), Some(&bundle), false)
+            .expect("matching v2 loaded capability descriptor");
+
+        assert_eq!(request.v2_state_descriptor(), Some(&descriptor));
         assert_eq!(
-            transport.execution_adapter_binding().unwrap().stages[0].output_visibility,
-            crate::engine::OutputVisibility::IncrementalCommitted
+            request.v2_state_fingerprint(),
+            Some(descriptor.fingerprint(&offline).unwrap())
         );
-
-        let mut native = EngineCoreRequest::asr_bytes(vec![1])
-            .with_model_variant(variant)
-            .with_streaming(true);
-        assert!(bind_request_to_residency(&mut native, Some(&lease), Some(&bundle), true).is_err());
+        assert!(request.v2_state_runtime().is_some());
+        let direct = loaded_contract_for_residency(
+            &lease,
+            Some(&bundle),
+            CapabilityKind::Tts,
+            false,
+            crate::engine::ExecutionGroupId::new(3),
+            BackendKind::Cpu,
+            None,
+        )
+        .expect("direct runners may use a load-sealed stateless v2 runtime");
+        assert_eq!(direct.model_instance_id, instance);
     }
 
     #[test]
@@ -3113,7 +6992,7 @@ mod tests {
         let contract = loaded_contract_for_residency(
             &lease,
             Some(&bundle),
-            CapabilityKind::Tts,
+            CapabilityKind::StreamingTts,
             false,
             group,
             BackendKind::Cpu,
@@ -3126,7 +7005,7 @@ mod tests {
         assert!(loaded_contract_for_residency(
             &lease,
             Some(&bundle),
-            CapabilityKind::Tts,
+            CapabilityKind::StreamingTts,
             false,
             group,
             BackendKind::Cpu,
@@ -3136,7 +7015,7 @@ mod tests {
         assert!(loaded_contract_for_residency(
             &lease,
             Some(&bundle),
-            CapabilityKind::Tts,
+            CapabilityKind::StreamingTts,
             false,
             crate::engine::ExecutionGroupId::new(group.get() + 1),
             BackendKind::Cpu,
@@ -3489,9 +7368,8 @@ mod tests {
 
         let request_id = "nonstreaming-admission-deadline".to_string();
         let deadline = Instant::now() + Duration::from_millis(25);
-        let residency_variant = ModelVariant::Kokoro82M;
         let mut request = EngineCoreRequest::tts("bounded Engine admission")
-            .with_model_variant(residency_variant)
+            .with_model_variant(ModelVariant::Kokoro82M)
             .with_deadline(Some(deadline));
         request.id = request_id.clone();
         request.prompt_tokens = vec![1];
@@ -3503,29 +7381,26 @@ mod tests {
             .admit_observed(spec, observation)
             .await
             .expect("job admission");
-        let residency_lease = runtime
-            .model_manager
-            .acquire_residency_lease(residency_variant);
-
         let err = tokio::time::timeout(
             Duration::from_secs(1),
-            runtime.run_request_after_admission(request, job, Some(residency_lease)),
+            runtime.await_engine_admission_for_job(
+                &job,
+                runtime.core_engine.add_request_with_session(request),
+            ),
         )
         .await
         .expect("Engine admission waited for the core lock past its deadline")
         .expect_err("expired Engine admission unexpectedly succeeded");
-        assert!(matches!(err, Error::Timeout(id) if id == request_id));
+        assert!(
+            matches!(err, Error::Timeout(ref id) if id == &request_id),
+            "expected request deadline timeout, got {err:?}"
+        );
+        drop(job);
         assert!(
             !step_lock.is_finished(),
             "the core lock was released too early"
         );
         assert_eq!(runtime.coordinator_snapshot().active_jobs, 0);
-        assert_eq!(
-            runtime
-                .model_manager
-                .active_residency_leases(residency_variant),
-            0
-        );
         assert!(!runtime
             .completion_waiters
             .lock()
@@ -3793,7 +7668,11 @@ mod tests {
         let (spec, observation) = runtime
             .coordinator_job_for_request(&request)
             .expect("job shape");
-        let isolated_coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 1));
+        let isolated_coordinator = Arc::new(InferenceCoordinator::new(
+            runtime.backend_context().backend_kind,
+            1,
+            1,
+        ));
         let job = isolated_coordinator
             .admit_observed(spec, observation)
             .await
@@ -4267,12 +8146,18 @@ mod tests {
 
         assert!(payload.contains("izwi_engine_scheduler_queue_depth"));
         assert!(payload.contains("izwi_engine_scheduler_running_requests"));
-        assert!(payload.contains("izwi_engine_kv_cache_allocated_blocks"));
-        assert!(payload.contains("izwi_engine_kv_cache_soft_max_blocks"));
-        assert!(payload.contains("izwi_engine_kv_cache_utilization_ratio"));
-        assert!(payload.contains("izwi_engine_kv_cache_copy_on_write_splits_total"));
-        assert!(payload.contains("allocated logical KV-cache blocks"));
-        assert!(payload.contains("Estimated KV-cache bytes"));
+        assert!(payload
+            .contains("izwi_engine_kv_cache_allocated_blocks{accounting=\"physical_pages\"}"));
+        assert!(payload
+            .contains("izwi_engine_kv_cache_utilization_ratio{accounting=\"physical_pages\"}"));
+        assert!(payload.contains(
+            "izwi_engine_kv_cache_memory_capacity_bytes{accounting=\"resident_paged_plus_authorized_tensor\"}"
+        ));
+        assert!(payload.contains("allocated physical KV-cache pages"));
+        assert!(payload
+            .contains("Resident managed KV pages plus authorized retained tensor-state bytes"));
+        assert!(!payload.contains("izwi_engine_kv_cache_soft_max_blocks"));
+        assert!(!payload.contains("izwi_engine_kv_cache_copy_on_write_splits_total"));
         assert!(payload.contains("izwi_engine_stream_backpressure_total"));
         assert!(payload.contains("izwi_engine_stream_checkpoints_committed_total"));
         assert!(payload.contains("izwi_engine_stream_checkpoint_rejections_total"));
@@ -4282,6 +8167,14 @@ mod tests {
         assert!(payload.contains("izwi_engine_executor_tensor_batch_max_width"));
         assert!(payload.contains("izwi_engine_executor_tensor_static_batches_total"));
         assert!(payload.contains("izwi_engine_executor_tensor_continuous_batches_total"));
+        assert!(payload.contains("izwi_engine_executor_tensor_continuous_multirow_batches_total"));
+        assert!(payload.contains("izwi_engine_executor_model_decode_calls_total"));
+        assert!(payload.contains("izwi_engine_executor_model_tensor_batches_total"));
+        assert!(payload.contains("izwi_engine_executor_model_tensor_multirow_calls_total"));
+        assert!(payload.contains("izwi_engine_executor_model_tensor_batch_rows_total"));
+        assert!(payload.contains("izwi_engine_executor_model_tensor_batch_max_width"));
+        assert!(payload.contains("izwi_engine_executor_model_scalar_row_dispatches_total"));
+        assert!(payload.contains("izwi_engine_executor_continuous_envelope_scalar_fallbacks_total"));
         assert!(payload.contains("izwi_engine_executor_physical_batch_rejections_total"));
         assert!(payload
             .contains("izwi_engine_executor_dispatch_state_rows_total{state=\"not_started\"}"));
@@ -4295,6 +8188,19 @@ mod tests {
         ));
         assert!(payload.contains("izwi_engine_executor_tensor_batch_fill_ratio"));
         assert!(payload.contains("izwi_engine_executor_tensor_batch_padding_ratio"));
+        assert!(payload.contains("izwi_engine_executor_physical_execution_mode{mode=\"serial\"}"));
+        assert!(payload.contains("izwi_engine_executor_physical_execution_cap"));
+        assert!(payload.contains("izwi_engine_executor_physical_dispatches_in_flight"));
+        assert!(payload.contains("izwi_engine_executor_physical_dispatch_seconds_total"));
+        assert!(payload.contains(
+            "izwi_engine_executor_physical_fallbacks_total{reason=\"uncertified_profile\"}"
+        ));
+        assert!(payload
+            .contains("izwi_engine_executor_physical_defers_total{reason=\"workspace_capacity\"}"));
+        assert!(payload.contains(
+            "izwi_engine_executor_physical_workspace_high_water_bytes{domain=\"device\"}"
+        ));
+        assert!(payload.contains("izwi_engine_executor_physical_batch_fill_ratio"));
         assert!(payload.contains("# TYPE izwi_inference_coordinator_active_jobs gauge"));
         assert!(payload.contains("# TYPE izwi_inference_coordinator_admitted_total counter"));
         assert!(payload.contains("izwi_inference_coordinator_reserved_memory_bytes"));
@@ -4302,15 +8208,24 @@ mod tests {
         assert!(payload.contains("izwi_inference_coordinator_reserved_device_memory_bytes"));
         assert!(payload.contains("izwi_inference_coordinator_reserved_unified_memory_bytes"));
         assert!(payload.contains("izwi_inference_coordinator_draining 0"));
+        assert!(payload.contains("izwi_inference_coordinator_poisoned 0"));
 
         let snapshot = runtime.telemetry_snapshot().await;
         assert_eq!(snapshot.coordinator, runtime.coordinator_snapshot());
-        assert!(snapshot.engine.kv_cache.total_blocks > 0);
-        assert!(snapshot.engine.kv_cache.block_size > 0);
-        assert_eq!(snapshot.engine.kv_cache.block_accounting, "logical");
+        assert!(snapshot.engine.physical_execution.effective_cap >= 1);
+        let serialized = serde_json::to_value(&snapshot).expect("serialize runtime telemetry");
+        let effective_mode = serialized["engine"]["physical_execution"]["effective_mode"]
+            .as_str()
+            .expect("bounded effective physical execution mode");
+        assert!(["serial", "shadow", "concurrent"].contains(&effective_mode));
         assert_eq!(
             snapshot.engine.kv_cache.memory_accounting,
-            "estimated_from_config"
+            "resident_paged_plus_authorized_tensor"
+        );
+        assert_eq!(snapshot.engine.kv_cache.totals.models, 0);
+        assert_eq!(
+            snapshot.engine.kv_cache.totals.coordinator.capacity_pages,
+            0
         );
     }
 
@@ -4332,10 +8247,54 @@ mod tests {
     }
 
     #[test]
-    fn logical_blocks_are_never_reported_as_measured_gpu_residency() {
-        assert_eq!(reported_gpu_resident_blocks(BackendKind::Cpu, 17), 0);
-        assert_eq!(reported_gpu_resident_blocks(BackendKind::Metal, 17), 0);
-        assert_eq!(reported_gpu_resident_blocks(BackendKind::Cuda, 17), 0);
+    fn managed_kv_prometheus_projections_use_physical_arenas() {
+        use crate::engine::{
+            ManagedKvArenaRuntimeSnapshot, ManagedKvCoordinatorSnapshot,
+            ManagedKvModelRuntimeSnapshot, ManagedKvOperationSnapshot, ModelInstanceId,
+        };
+
+        let arena = |allocated_pages| ManagedKvArenaRuntimeSnapshot {
+            generation: 0,
+            group_id: 1,
+            domain_id: 1,
+            device_ordinal: Some(0),
+            page_tokens: 16,
+            token_capacity: 160,
+            bytes_per_page: 128,
+            physical_bytes: 1_280,
+            coordinator: ManagedKvCoordinatorSnapshot {
+                capacity_pages: 10,
+                allocated_pages,
+                free_pages: 10 - allocated_pages,
+                ..ManagedKvCoordinatorSnapshot::default()
+            },
+            operations: ManagedKvOperationSnapshot::default(),
+        };
+        let model = |model_instance, backend, allocated_pages| ManagedKvModelRuntimeSnapshot {
+            model_instance: ModelInstanceId::new(model_instance),
+            plan_fingerprint: format!("plan-{model_instance}"),
+            state_plan_v2_fingerprint: format!("state-plan-v2-{model_instance}"),
+            backend,
+            device_ordinal: Some(0),
+            resident_paged_bytes: 1_280,
+            authorized_tensor_bytes: 0,
+            physical_bytes: 1_280,
+            registered_sessions: 1,
+            single_sequence_token_capacity: 160,
+            full_context_sequence_capacity: 1,
+            arenas: vec![arena(allocated_pages)],
+        };
+        let snapshot = crate::engine::ManagedKvRuntimeSnapshot {
+            models: vec![
+                model(1, BackendKind::Cpu, 3),
+                model(2, BackendKind::Metal, 4),
+                model(3, BackendKind::Cuda, 5),
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(managed_kv_used_bytes(&snapshot), 12 * 128);
+        assert_eq!(managed_kv_device_pages(&snapshot), 9);
     }
 
     #[tokio::test]
@@ -4402,6 +8361,80 @@ mod tests {
                 .as_deref(),
             Some("None")
         );
+    }
+
+    #[tokio::test]
+    async fn whisper_transport_streaming_preserves_normal_and_long_form_routes() {
+        let mut runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+        runtime.inference_broker = InferenceBroker::with_mode(InferenceBrokerMode::Shadow);
+        let variant = ModelVariant::WhisperLargeV3Turbo;
+
+        let mut normal = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+        normal.streaming = true;
+        normal
+            .install_prepared_asr_audio(variant, vec![0.0; 160], 16_000)
+            .unwrap();
+        normal
+            .install_prepared_sequence_input_tokens(16, 448)
+            .unwrap();
+        normal
+            .install_prepared_whisper_window(
+                variant,
+                Arc::new(
+                    crate::models::architectures::whisper::asr::WhisperPreparedWindow::for_test(
+                        4, 2, 8,
+                    )
+                    .unwrap(),
+                ),
+            )
+            .unwrap();
+        let (normal_spec, normal_observation) = runtime
+            .coordinator_job_for_request(&normal)
+            .expect("normal streaming job");
+        let normal_job = runtime
+            .coordinator
+            .admit_observed(normal_spec, normal_observation)
+            .await
+            .expect("normal streaming admission");
+        let (normal, normal_job) = runtime
+            .prepare_asr_shape_for_binding(normal, normal_job, None)
+            .await
+            .expect("shared streaming preparation must preserve normal shape");
+        drop(normal_job);
+        assert_eq!(
+            coordinator_lane_for_request(&normal),
+            CoordinatorLane::Resumable
+        );
+        runtime
+            .observe_broker_request_with_streaming_required(&normal, false)
+            .expect("transport streaming must retain Whisper normal offline execution");
+
+        let mut long_form = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+        long_form.streaming = true;
+        long_form
+            .install_prepared_asr_audio(variant, vec![0.0; 160], 16_000)
+            .unwrap();
+        long_form.install_prepared_asr_long_form_atomic().unwrap();
+        let (long_spec, long_observation) = runtime
+            .coordinator_job_for_request(&long_form)
+            .expect("long-form streaming job");
+        let long_job = runtime
+            .coordinator
+            .admit_observed(long_spec, long_observation)
+            .await
+            .expect("long-form streaming admission");
+        let (long_form, long_job) = runtime
+            .prepare_asr_shape_for_binding(long_form, long_job, None)
+            .await
+            .expect("shared streaming preparation must preserve long-form shape");
+        drop(long_job);
+        assert_eq!(
+            coordinator_lane_for_request(&long_form),
+            CoordinatorLane::Atomic
+        );
+        runtime
+            .observe_broker_request_with_streaming_required(&long_form, false)
+            .expect("transport streaming must retain Whisper long-form offline execution");
     }
 
     #[tokio::test]
@@ -4528,6 +8561,39 @@ mod tests {
     }
 
     #[test]
+    fn lfm25_audio_tts_preparation_charges_prompt_and_backend_workspace_exactly() {
+        let messages = vec![
+            ChatMessage {
+                role: crate::models::shared::chat::ChatRole::System,
+                content: String::from("system"),
+            },
+            ChatMessage {
+                role: crate::models::shared::chat::ChatRole::User,
+                content: String::from("speak this"),
+            },
+        ];
+        let expected_host = messages.len() * std::mem::size_of::<ChatMessage>()
+            + messages
+                .iter()
+                .map(|message| message.content.capacity())
+                .sum::<usize>();
+        assert_eq!(
+            retained_lfm25_audio_tts_artifact_host_bytes(&messages).unwrap(),
+            expected_host as u64
+        );
+
+        let cpu = lfm25_audio_tts_preparation_workspace(BackendKind::Cpu, 17);
+        let metal = lfm25_audio_tts_preparation_workspace(BackendKind::Metal, 17);
+        let cuda = lfm25_audio_tts_preparation_workspace(BackendKind::Cuda, 17);
+        assert_eq!(cpu.host_bytes, ResourceAmount::Known(17));
+        assert_eq!(metal.unified_bytes, ResourceAmount::Known(17));
+        assert_eq!(cuda.device_bytes, ResourceAmount::Known(17));
+        assert!(cpu.is_fully_known());
+        assert!(metal.is_fully_known());
+        assert!(cuda.is_fully_known());
+    }
+
+    #[test]
     fn audio_decode_workspace_maps_to_host_or_unified_memory() {
         let cpu = audio_decode_resources(BackendKind::Cpu);
         let metal = audio_decode_resources(BackendKind::Metal);
@@ -4648,7 +8714,7 @@ mod tests {
         reference_tts.reference_text = Some("reference transcript".to_string());
         let mut canonical_reference_tts = reference_tts.clone();
         canonical_reference_tts
-            .canonicalize_direct_payloads(runtime.config.max_sequence_length)
+            .canonicalize_direct_payloads(runtime.config.portable_context_ceiling())
             .expect("canonical TTS reference");
         assert!(canonical_reference_tts.reference_audio.is_none());
         assert!(canonical_reference_tts.has_tts_reference_for_execution());
@@ -4681,6 +8747,62 @@ mod tests {
     }
 
     #[test]
+    fn direct_qwen_asr_job_accounts_the_prepared_audio_artifact_exactly() {
+        let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+        let backend = runtime.backend_context().backend_kind;
+        let variant = ModelVariant::Qwen3Asr06BGguf;
+        let mut request = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+        let before = retained_engine_request_input_bytes(&request).unwrap();
+        request
+            .install_prepared_asr_audio(variant, vec![0.0; 257], 16_000)
+            .unwrap();
+        request
+            .install_prepared_sequence_input_tokens(32, 4096)
+            .unwrap();
+        let after = retained_engine_request_input_bytes(&request).unwrap();
+        assert_eq!(after - before, 257 * std::mem::size_of::<f32>());
+
+        let (spec, observation) = runtime
+            .coordinator_job_for_request(&request)
+            .expect("prepared Qwen ASR coordinator job");
+        assert_eq!(observation.host_bytes, after as u64);
+        assert_eq!(spec.resources, transient_resources(backend, after));
+    }
+
+    #[test]
+    fn direct_whisper_asr_job_accounts_prepared_audio_and_encoder_artifact_exactly() {
+        let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+        let backend = runtime.backend_context().backend_kind;
+        let variant = ModelVariant::WhisperLargeV3Turbo;
+        let mut request = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+        request
+            .install_prepared_asr_audio(variant, vec![0.0; 257], 16_000)
+            .unwrap();
+        request
+            .install_prepared_sequence_input_tokens(32, 448)
+            .unwrap();
+        let artifact = Arc::new(
+            crate::models::architectures::whisper::asr::WhisperPreparedWindow::for_test(7, 4, 16)
+                .unwrap(),
+        );
+        let encoder_bytes = artifact.resident_tensor_bytes().unwrap();
+        request
+            .install_prepared_whisper_window(variant, artifact)
+            .unwrap();
+
+        let host_bytes = retained_engine_request_input_bytes(&request).unwrap();
+        let expected = transient_resources(backend, host_bytes)
+            .checked_add(asr_encoder_retained_resources(backend, 0, encoder_bytes).unwrap())
+            .unwrap();
+        let (spec, observation) = runtime
+            .coordinator_job_for_request(&request)
+            .expect("prepared Whisper ASR coordinator job");
+
+        assert_eq!(observation.host_bytes, host_bytes as u64);
+        assert_eq!(spec.resources, expected);
+    }
+
+    #[test]
     fn engine_requests_use_truthful_controller_lanes() {
         let mut qwen_tts = EngineCoreRequest::tts("hello");
         qwen_tts.model_variant = Some(ModelVariant::Qwen3Tts12Hz06BBase);
@@ -4698,12 +8820,98 @@ mod tests {
         offline_asr.streaming = true;
         assert_eq!(
             coordinator_lane_for_request(&offline_asr),
-            CoordinatorLane::Resumable
+            CoordinatorLane::Atomic
+        );
+        offline_asr
+            .install_prepared_asr_audio(ModelVariant::Qwen3Asr06BGguf, vec![0.0; 16_000], 16_000)
+            .unwrap();
+        offline_asr.install_prepared_asr_long_form_atomic().unwrap();
+        assert_eq!(
+            coordinator_lane_for_request(&offline_asr),
+            CoordinatorLane::Atomic
         );
         offline_asr.workload_class = WorkloadClass::Realtime;
         assert_eq!(
             coordinator_lane_for_request(&offline_asr),
             CoordinatorLane::Realtime
         );
+
+        let whisper_variant = ModelVariant::WhisperLargeV3Turbo;
+        let mut whisper = EngineCoreRequest::asr("audio").with_model_variant(whisper_variant);
+        assert_eq!(
+            coordinator_lane_for_request(&whisper),
+            CoordinatorLane::Atomic
+        );
+        whisper
+            .install_prepared_sequence_input_tokens(16, 448)
+            .unwrap();
+        assert_eq!(
+            coordinator_lane_for_request(&whisper),
+            CoordinatorLane::Resumable
+        );
+        let mut whisper_long = EngineCoreRequest::asr("audio").with_model_variant(whisper_variant);
+        whisper_long
+            .install_prepared_asr_long_form_atomic()
+            .unwrap();
+        assert_eq!(
+            coordinator_lane_for_request(&whisper_long),
+            CoordinatorLane::Atomic
+        );
+
+        let vibe_variant = ModelVariant::VibeVoiceAsr;
+        let mut vibe = EngineCoreRequest::asr("audio").with_model_variant(vibe_variant);
+        assert_eq!(coordinator_lane_for_request(&vibe), CoordinatorLane::Atomic);
+        vibe.install_prepared_sequence_input_tokens(32, 4_096)
+            .unwrap();
+        assert_eq!(
+            coordinator_lane_for_request(&vibe),
+            CoordinatorLane::Resumable
+        );
+        let mut vibe_long = EngineCoreRequest::asr("audio").with_model_variant(vibe_variant);
+        vibe_long.install_prepared_asr_long_form_atomic().unwrap();
+        assert_eq!(
+            coordinator_lane_for_request(&vibe_long),
+            CoordinatorLane::Atomic
+        );
+
+        let lfm_variant = ModelVariant::Lfm25Audio15BGguf;
+        let mut lfm = EngineCoreRequest::asr("audio").with_model_variant(lfm_variant);
+        assert_eq!(coordinator_lane_for_request(&lfm), CoordinatorLane::Atomic);
+        lfm.install_prepared_sequence_input_tokens(32, 4_096)
+            .unwrap();
+        assert_eq!(
+            coordinator_lane_for_request(&lfm),
+            CoordinatorLane::Resumable
+        );
+        let mut lfm_long = EngineCoreRequest::asr("audio").with_model_variant(lfm_variant);
+        lfm_long.install_prepared_asr_long_form_atomic().unwrap();
+        assert_eq!(
+            coordinator_lane_for_request(&lfm_long),
+            CoordinatorLane::Atomic
+        );
+    }
+
+    #[test]
+    fn qwen_tts_coordinator_reserves_request_max_output_exactly() {
+        let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+        let backend = runtime.backend_context().backend_kind;
+        let mut request = EngineCoreRequest::tts("hello");
+        request.model_variant = Some(ModelVariant::Qwen3Tts12Hz06BBase);
+        let output_bytes = (request.qwen_tts_generation_params().max_frames as u64)
+            * 1_920
+            * std::mem::size_of::<f32>() as u64;
+        let mut output = ResourceVector::zero();
+        match backend {
+            BackendKind::Metal => output.unified_bytes = ResourceAmount::Known(output_bytes),
+            BackendKind::Cpu | BackendKind::Cuda => {
+                output.host_bytes = ResourceAmount::Known(output_bytes)
+            }
+        }
+        let mut plain = request.clone();
+        plain.model_variant = None;
+        let (plain_spec, _) = runtime.coordinator_job_for_request(&plain).unwrap();
+        let expected = plain_spec.resources.checked_add(output).unwrap();
+        let (spec, _) = runtime.coordinator_job_for_request(&request).unwrap();
+        assert_eq!(spec.resources, expected);
     }
 }

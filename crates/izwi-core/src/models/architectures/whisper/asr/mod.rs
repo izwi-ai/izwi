@@ -6,11 +6,14 @@
 //! - Hugging Face `transformers`: language/task prompt handling and suppress token
 //!   masks from `generation_config.json`.
 
+#![allow(clippy::items_after_test_module)]
+
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use candle_core::{DType, IndexOp, Tensor};
@@ -18,18 +21,28 @@ use candle_nn::VarBuilder;
 use candle_transformers::models::whisper::{self, Config as WhisperConfig};
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
-use rand::Rng;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tracing::{debug, info};
 
 use crate::audio::{MelConfig, MelNorm, MelScale, MelSpectrogram};
-use crate::backends::{DeviceKind, DeviceProfile};
+use crate::backends::state::StaticAttentionLayerValue;
+use crate::backends::{backend_kind_for_device, BackendKind, DeviceKind, DeviceProfile};
 use crate::catalog::ModelFamily;
+use crate::engine::{
+    InvocationStaticAttentionLease, RetainedStaticAttentionRuntimeV2,
+    RetainedStaticAttentionSequenceId, StageDescriptor, WorkCost,
+};
 use crate::error::{Error, Result};
+use crate::models::shared::attention::physical::PhysicalPagedKvCache;
+use crate::models::shared::memory::accounting::TensorStorageAccounting;
 use crate::tokenizer::Tokenizer;
 
 use super::model::Whisper as LocalWhisper;
+use super::physical::WhisperPhysicalStateSpec;
 
 const SAMPLE_RATE: u32 = whisper::SAMPLE_RATE as u32;
 const DEFAULT_MAX_NEW_TOKENS: usize = 448;
@@ -51,6 +64,8 @@ const DEFAULT_NO_SPEECH_THRESHOLD: f32 = 0.6;
 const REPETITION_GUARD_MIN_SPAN_TOKENS: usize = 8;
 const REPETITION_GUARD_MAX_SPAN_TOKENS: usize = 96;
 const REPETITION_GUARD_MIN_TOTAL_TOKENS: usize = 20;
+static NEXT_WHISPER_PREPARATION_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_WHISPER_DECODE_STATE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Deserialize, Default)]
 struct WhisperGenerationConfig {
@@ -96,6 +111,615 @@ pub struct AsrTranscriptionOutput {
     pub text: String,
     pub language: Option<String>,
     pub diagnostics: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct WhisperAudioBatchRow<'a> {
+    pub(crate) audio: &'a [f32],
+    pub(crate) sample_rate: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WhisperWindowPreparationGeometry {
+    pub(crate) input_samples: usize,
+    pub(crate) input_sample_rate: u32,
+    pub(crate) resampled_samples: usize,
+    pub(crate) useful_mel_frames: usize,
+    pub(crate) materialized_mel_elements: u64,
+    pub(crate) cross_memory_tokens: usize,
+    pub(crate) useful_tensor_elements: u64,
+    pub(crate) retained_artifact_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WhisperWindowPreparationBatchGeometry {
+    pub(crate) rows: usize,
+    pub(crate) total_useful_tensor_elements: u64,
+    pub(crate) materialized_tensor_elements_per_row: u64,
+    pub(crate) workspace_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WhisperAudioPreparationStageSeal {
+    pub(crate) backend: BackendKind,
+    pub(crate) dtype: String,
+    pub(crate) max_batch_size: usize,
+    pub(crate) max_workspace_bytes: u64,
+}
+
+#[derive(Clone)]
+pub(crate) struct WhisperPreparedWindow {
+    preparation_id: u64,
+    source_identity: [u8; 32],
+    input_samples: usize,
+    input_sample_rate: u32,
+    memory_tokens: usize,
+    layers: Vec<StaticAttentionLayerValue>,
+}
+
+impl WhisperPreparedWindow {
+    pub(crate) const fn cross_memory_tokens(&self) -> usize {
+        self.memory_tokens
+    }
+
+    pub(crate) fn resident_tensor_bytes(&self) -> Result<u64> {
+        let mut accounting = TensorStorageAccounting::default();
+        for layer in &self.layers {
+            accounting.add_tensor(&layer.keys).ok_or_else(|| {
+                Error::Overloaded("Whisper prepared key accounting overflow".into())
+            })?;
+            accounting.add_tensor(&layer.values).ok_or_else(|| {
+                Error::Overloaded("Whisper prepared value accounting overflow".into())
+            })?;
+        }
+        Ok(accounting.bytes())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(memory_tokens: usize, layers: usize, width: usize) -> Result<Self> {
+        if memory_tokens == 0 || layers == 0 || width == 0 {
+            return Err(Error::InvalidInput(
+                "test Whisper prepared-window geometry must be non-zero".into(),
+            ));
+        }
+        let layers = (0..layers)
+            .map(|model_layer| {
+                let model_layer = u32::try_from(model_layer).map_err(|_| {
+                    Error::InvalidInput("test Whisper layer count exceeds u32".into())
+                })?;
+                Ok(StaticAttentionLayerValue {
+                    model_layer,
+                    keys: Tensor::zeros(
+                        (memory_tokens, 1, width),
+                        DType::F32,
+                        &candle_core::Device::Cpu,
+                    )?,
+                    values: Tensor::zeros(
+                        (memory_tokens, 1, width),
+                        DType::F32,
+                        &candle_core::Device::Cpu,
+                    )?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            preparation_id: 1,
+            source_identity: [1; 32],
+            input_samples: SAMPLE_RATE as usize,
+            input_sample_rate: SAMPLE_RATE,
+            memory_tokens,
+            layers,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WhisperDecodeStep {
+    pub(crate) delta: String,
+    pub(crate) text: String,
+    pub(crate) tokens_generated: usize,
+    pub(crate) finished: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum WhisperTerminalTransition {
+    Accept {
+        text: String,
+        selected_temperature: f32,
+    },
+    RetryRequired {
+        next_temperature: f32,
+        reasons: Vec<&'static str>,
+        expected_generation: u64,
+        new_generation: u64,
+    },
+    SkipNoSpeech {
+        no_speech_probability: Option<f32>,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WhisperPendingRetry {
+    next_temperature: f32,
+    expected_generation: u64,
+    new_generation: u64,
+    next_attempt_generation: u32,
+}
+
+pub(crate) struct WhisperDecodeState {
+    state_id: u64,
+    next_quantum_nonce: u64,
+    active_quantum: Option<u64>,
+    current_managed_generation: u64,
+    managed_completions_drained: bool,
+    self_kv: PhysicalPagedKvCache,
+    cross_runtime: Arc<RetainedStaticAttentionRuntimeV2>,
+    cross_sequence: Option<RetainedStaticAttentionSequenceId>,
+    prompt: Vec<u32>,
+    prefill_progress: usize,
+    pending_logits: Option<Tensor>,
+    generated_tokens: Vec<u32>,
+    assembled: String,
+    sum_logprobs: f64,
+    sampled_token_count: usize,
+    no_speech_prob: Option<f32>,
+    ended_with_eot: bool,
+    repetition_loop: bool,
+    decode_steps: usize,
+    best_attempt: Option<(WhisperDecodeAttempt, f32)>,
+    pending_retry: Option<WhisperPendingRetry>,
+    temperature: f32,
+    attempt_generation: u32,
+    max_steps: usize,
+    finished: bool,
+    rng: StdRng,
+}
+
+/// Owns a registered retained cross-attention sequence until construction of
+/// [`WhisperDecodeState`] succeeds. The caller transfers ownership at the
+/// model boundary; every fallible validation and installation branch must
+/// therefore release through this guard rather than relying on caller cleanup.
+struct WhisperCrossSequenceOwner {
+    runtime: Arc<RetainedStaticAttentionRuntimeV2>,
+    sequence: Option<RetainedStaticAttentionSequenceId>,
+}
+
+impl WhisperCrossSequenceOwner {
+    fn new(
+        runtime: Arc<RetainedStaticAttentionRuntimeV2>,
+        sequence: RetainedStaticAttentionSequenceId,
+    ) -> Self {
+        Self {
+            runtime,
+            sequence: Some(sequence),
+        }
+    }
+
+    fn sequence(&self) -> RetainedStaticAttentionSequenceId {
+        self.sequence
+            .expect("Whisper cross-sequence owner is armed until state transfer")
+    }
+
+    fn into_decode_state_parts(
+        mut self,
+    ) -> (
+        Arc<RetainedStaticAttentionRuntimeV2>,
+        RetainedStaticAttentionSequenceId,
+    ) {
+        let sequence = self
+            .sequence
+            .take()
+            .expect("Whisper cross-sequence ownership transfers exactly once");
+        (Arc::clone(&self.runtime), sequence)
+    }
+}
+
+impl Drop for WhisperCrossSequenceOwner {
+    fn drop(&mut self) {
+        if let Some(sequence) = self.sequence.take() {
+            let _ = self.runtime.release_sequence(sequence);
+        }
+    }
+}
+
+fn acquire_whisper_cross_sequence_owner(
+    owner: WhisperCrossSequenceOwner,
+    prepared: &WhisperPreparedWindow,
+    expected_preparation_id: u64,
+    expected_memory_tokens: usize,
+    expected_layers: usize,
+    self_context_len: usize,
+    allocate_state_id: impl FnOnce() -> Result<u64>,
+) -> Result<(WhisperCrossSequenceOwner, u64)> {
+    if prepared.preparation_id != expected_preparation_id
+        || prepared.memory_tokens != expected_memory_tokens
+        || prepared.layers.len() != expected_layers
+    {
+        return Err(Error::InvalidInput(
+            "Whisper prepared window belongs to another model or geometry".into(),
+        ));
+    }
+    let state_id = allocate_state_id()?;
+    if self_context_len != 0 || owner.runtime.read(owner.sequence())?.is_some() {
+        return Err(Error::InvalidInput(
+            "Whisper retained prefill requires empty self and cross state".into(),
+        ));
+    }
+    Ok((owner, state_id))
+}
+
+pub(crate) struct WhisperDecodeCheckpoint {
+    state_id: u64,
+    quantum_nonce: u64,
+    payload: Option<WhisperDecodeCheckpointPayload>,
+}
+
+struct WhisperDecodeCheckpointPayload {
+    self_kv: PhysicalPagedKvCache,
+    cross_sequence: Option<RetainedStaticAttentionSequenceId>,
+    prefill_progress: usize,
+    pending_logits: Option<Tensor>,
+    generated_tokens: Vec<u32>,
+    assembled: String,
+    sum_logprobs: f64,
+    sampled_token_count: usize,
+    no_speech_prob: Option<f32>,
+    ended_with_eot: bool,
+    repetition_loop: bool,
+    decode_steps: usize,
+    best_attempt: Option<(WhisperDecodeAttempt, f32)>,
+    pending_retry: Option<WhisperPendingRetry>,
+    temperature: f32,
+    attempt_generation: u32,
+    max_steps: usize,
+    finished: bool,
+    rng: StdRng,
+    managed_completions_drained: bool,
+    current_managed_generation: u64,
+}
+
+impl WhisperDecodeState {
+    pub(crate) const fn prefill_progress(&self) -> usize {
+        self.prefill_progress
+    }
+
+    pub(crate) fn prefill_token_count(&self) -> usize {
+        self.prompt.len()
+    }
+
+    pub(crate) const fn attempt_generation(&self) -> u32 {
+        self.attempt_generation
+    }
+
+    pub(crate) fn self_context_len(&self) -> usize {
+        self.self_kv.context_len()
+    }
+
+    pub(crate) const fn uses_managed_kv(&self) -> bool {
+        true
+    }
+
+    pub(crate) fn take_managed_write_completions(
+        &mut self,
+    ) -> Vec<Arc<crate::backends::kv::KvWriteBatchCompletion>> {
+        let completions = self.self_kv.take_completed_writes();
+        self.managed_completions_drained = true;
+        completions
+    }
+
+    pub(crate) fn install_managed_reservation(
+        &mut self,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<()> {
+        let mut checkpoint = self.begin_managed_quantum(cache)?;
+        self.commit_managed_quantum(&mut checkpoint)?;
+        Ok(())
+    }
+
+    pub(crate) fn begin_managed_quantum(
+        &mut self,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<WhisperDecodeCheckpoint> {
+        if self.active_quantum.is_some() {
+            return Err(Error::InferenceError(
+                "a Whisper managed quantum is already active".into(),
+            ));
+        }
+        if !self.managed_completions_drained {
+            return Err(Error::InferenceError(
+                "Whisper managed KV write completions must be drained before the next quantum"
+                    .into(),
+            ));
+        }
+        if self.self_kv.arena().id() != cache.arena().id()
+            || self.self_kv.arena().config().group != cache.arena().config().group
+        {
+            return Err(Error::InferenceError(
+                "a Whisper session cannot switch managed KV authority".into(),
+            ));
+        }
+        if cache.context_len() != self.self_kv.context_len() {
+            return Err(Error::InferenceError(format!(
+                "managed Whisper reservation starts at {}, but decode state is at {}",
+                cache.context_len(),
+                self.self_kv.context_len()
+            )));
+        }
+        self.activate_managed_checkpoint(cache)
+    }
+
+    pub(crate) fn begin_managed_generation(
+        &mut self,
+        cache: PhysicalPagedKvCache,
+        expected_generation: u64,
+        new_generation: u64,
+    ) -> Result<WhisperDecodeCheckpoint> {
+        if self.active_quantum.is_some() {
+            return Err(Error::InferenceError(
+                "a Whisper managed quantum is already active".into(),
+            ));
+        }
+        if !self.managed_completions_drained {
+            return Err(Error::InferenceError(
+                "Whisper managed KV write completions must be drained before retry generation"
+                    .into(),
+            ));
+        }
+        let pending = self.pending_retry.ok_or_else(|| {
+            Error::InferenceError("Whisper has no pending managed temperature retry".into())
+        })?;
+        if pending.expected_generation != expected_generation
+            || pending.new_generation != new_generation
+            || self.current_managed_generation != expected_generation
+            || expected_generation.checked_add(1) != Some(new_generation)
+        {
+            return Err(Error::InferenceError(
+                "Whisper managed retry generation is stale or out of order".into(),
+            ));
+        }
+        let current_id = self.self_kv.arena().id();
+        let replacement_id = cache.arena().id();
+        if replacement_id != current_id
+            || cache.arena().config().group != self.self_kv.arena().config().group
+        {
+            return Err(Error::InferenceError(
+                "Whisper managed retry cannot switch session KV authority".into(),
+            ));
+        }
+        if cache.context_len() != 0 {
+            return Err(Error::InferenceError(
+                "Whisper managed retry generation must begin at context zero".into(),
+            ));
+        }
+        let sequence = self.cross_sequence.ok_or_else(|| {
+            Error::InferenceError("Whisper retained cross sequence was released".into())
+        })?;
+        self.cross_runtime.read(sequence)?.ok_or_else(|| {
+            Error::InferenceError("Whisper retained cross memory is not installed".into())
+        })?;
+
+        let checkpoint = self.activate_managed_checkpoint(cache)?;
+        let retry_seed = self.rng.gen::<u64>();
+        self.prefill_progress = 0;
+        self.pending_logits = None;
+        self.generated_tokens.clear();
+        self.assembled.clear();
+        self.sum_logprobs = 0.0;
+        self.sampled_token_count = 0;
+        self.no_speech_prob = None;
+        self.ended_with_eot = false;
+        self.repetition_loop = false;
+        self.decode_steps = 0;
+        self.temperature = pending.next_temperature;
+        self.attempt_generation = pending.next_attempt_generation;
+        self.finished = false;
+        self.rng = StdRng::seed_from_u64(retry_seed);
+        self.pending_retry = None;
+        self.current_managed_generation = new_generation;
+        self.managed_completions_drained = true;
+        Ok(checkpoint)
+    }
+
+    pub(crate) fn commit_managed_quantum(
+        &mut self,
+        checkpoint: &mut WhisperDecodeCheckpoint,
+    ) -> Result<()> {
+        self.validate_active_checkpoint(checkpoint)?;
+        let payload = checkpoint.payload.take().ok_or_else(|| {
+            Error::InferenceError("Whisper managed checkpoint was already consumed".into())
+        })?;
+        self.active_quantum = None;
+        drop(payload);
+        Ok(())
+    }
+
+    pub(crate) fn rollback_managed_quantum(
+        &mut self,
+        checkpoint: &mut WhisperDecodeCheckpoint,
+    ) -> Result<()> {
+        self.validate_active_checkpoint(checkpoint)?;
+        let payload = checkpoint.payload.take().ok_or_else(|| {
+            Error::InferenceError("Whisper managed checkpoint was already consumed".into())
+        })?;
+        self.self_kv = payload.self_kv;
+        self.cross_sequence = payload.cross_sequence;
+        self.prefill_progress = payload.prefill_progress;
+        self.pending_logits = payload.pending_logits;
+        self.generated_tokens = payload.generated_tokens;
+        self.assembled = payload.assembled;
+        self.sum_logprobs = payload.sum_logprobs;
+        self.sampled_token_count = payload.sampled_token_count;
+        self.no_speech_prob = payload.no_speech_prob;
+        self.ended_with_eot = payload.ended_with_eot;
+        self.repetition_loop = payload.repetition_loop;
+        self.decode_steps = payload.decode_steps;
+        self.best_attempt = payload.best_attempt;
+        self.pending_retry = payload.pending_retry;
+        self.temperature = payload.temperature;
+        self.attempt_generation = payload.attempt_generation;
+        self.max_steps = payload.max_steps;
+        self.finished = payload.finished;
+        self.rng = payload.rng;
+        self.managed_completions_drained = payload.managed_completions_drained;
+        self.current_managed_generation = payload.current_managed_generation;
+        self.active_quantum = None;
+        Ok(())
+    }
+
+    fn validate_active_checkpoint(&self, checkpoint: &WhisperDecodeCheckpoint) -> Result<()> {
+        if checkpoint.state_id != self.state_id
+            || self.active_quantum != Some(checkpoint.quantum_nonce)
+            || checkpoint.payload.is_none()
+        {
+            return Err(Error::InferenceError(
+                "Whisper managed checkpoint is foreign, stale, or out of order".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn activate_managed_checkpoint(
+        &mut self,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<WhisperDecodeCheckpoint> {
+        let quantum_nonce = self.next_quantum_nonce;
+        self.next_quantum_nonce = self.next_quantum_nonce.checked_add(1).ok_or_else(|| {
+            Error::InferenceError("Whisper managed quantum nonce overflow".into())
+        })?;
+        self.active_quantum = Some(quantum_nonce);
+        Ok(WhisperDecodeCheckpoint {
+            state_id: self.state_id,
+            quantum_nonce,
+            payload: Some(WhisperDecodeCheckpointPayload {
+                self_kv: std::mem::replace(&mut self.self_kv, cache),
+                cross_sequence: self.cross_sequence,
+                prefill_progress: self.prefill_progress,
+                pending_logits: self.pending_logits.clone(),
+                generated_tokens: self.generated_tokens.clone(),
+                assembled: self.assembled.clone(),
+                sum_logprobs: self.sum_logprobs,
+                sampled_token_count: self.sampled_token_count,
+                no_speech_prob: self.no_speech_prob,
+                ended_with_eot: self.ended_with_eot,
+                repetition_loop: self.repetition_loop,
+                decode_steps: self.decode_steps,
+                best_attempt: self.best_attempt.clone(),
+                pending_retry: self.pending_retry,
+                temperature: self.temperature,
+                attempt_generation: self.attempt_generation,
+                max_steps: self.max_steps,
+                finished: self.finished,
+                rng: self.rng.clone(),
+                managed_completions_drained: self.managed_completions_drained,
+                current_managed_generation: self.current_managed_generation,
+            }),
+        })
+    }
+}
+
+impl Drop for WhisperDecodeState {
+    fn drop(&mut self) {
+        if let Some(sequence) = self.cross_sequence.take() {
+            let _ = self.cross_runtime.release_sequence(sequence);
+        }
+    }
+}
+
+#[derive(Clone)]
+struct WhisperDecodeStepSnapshot {
+    pending_logits: Option<Tensor>,
+    generated_tokens: Vec<u32>,
+    assembled: String,
+    sum_logprobs: f64,
+    sampled_token_count: usize,
+    no_speech_prob: Option<f32>,
+    ended_with_eot: bool,
+    repetition_loop: bool,
+    decode_steps: usize,
+    best_attempt: Option<(WhisperDecodeAttempt, f32)>,
+    finished: bool,
+    rng: StdRng,
+    managed_completions_drained: bool,
+}
+
+impl WhisperDecodeStepSnapshot {
+    fn capture(state: &WhisperDecodeState) -> Self {
+        Self {
+            pending_logits: state.pending_logits.clone(),
+            generated_tokens: state.generated_tokens.clone(),
+            assembled: state.assembled.clone(),
+            sum_logprobs: state.sum_logprobs,
+            sampled_token_count: state.sampled_token_count,
+            no_speech_prob: state.no_speech_prob,
+            ended_with_eot: state.ended_with_eot,
+            repetition_loop: state.repetition_loop,
+            decode_steps: state.decode_steps,
+            best_attempt: state.best_attempt.clone(),
+            finished: state.finished,
+            rng: state.rng.clone(),
+            managed_completions_drained: state.managed_completions_drained,
+        }
+    }
+
+    fn restore(self, state: &mut WhisperDecodeState) {
+        state.pending_logits = self.pending_logits;
+        state.generated_tokens = self.generated_tokens;
+        state.assembled = self.assembled;
+        state.sum_logprobs = self.sum_logprobs;
+        state.sampled_token_count = self.sampled_token_count;
+        state.no_speech_prob = self.no_speech_prob;
+        state.ended_with_eot = self.ended_with_eot;
+        state.repetition_loop = self.repetition_loop;
+        state.decode_steps = self.decode_steps;
+        state.best_attempt = self.best_attempt;
+        state.finished = self.finished;
+        state.rng = self.rng;
+        state.managed_completions_drained = self.managed_completions_drained;
+    }
+}
+
+fn with_whisper_decode_step_transaction<T>(
+    state: &mut WhisperDecodeState,
+    operation: impl FnOnce(&mut WhisperDecodeState) -> Result<T>,
+) -> Result<T> {
+    let checkpoint = state.self_kv.logical_checkpoint();
+    let snapshot = WhisperDecodeStepSnapshot::capture(state);
+    match operation(state) {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            let rollback = state.self_kv.restore_logical_checkpoint(checkpoint);
+            snapshot.restore(state);
+            match rollback {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(Error::InferenceError(format!(
+                    "Whisper decode step failed ({error}); state rollback also failed: {rollback_error}"
+                ))),
+            }
+        }
+    }
+}
+
+fn restart_whisper_temperature_attempt(
+    _state: &mut WhisperDecodeState,
+    temperature: f32,
+) -> Result<()> {
+    if !temperature.is_finite() || temperature < 0.0 {
+        return Err(Error::InvalidInput(
+            "Whisper retry temperature must be finite and non-negative".into(),
+        ));
+    }
+    Err(Error::InferenceError(
+        "Whisper managed temperature retry requires a scheduler-owned retained-sequence reset"
+            .into(),
+    ))
+}
+
+fn next_whisper_decode_state_id() -> Result<u64> {
+    NEXT_WHISPER_DECODE_STATE_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .map_err(|_| Error::InferenceError("Whisper decode-state identity overflow".into()))
 }
 
 #[derive(Debug, Clone)]
@@ -147,7 +771,6 @@ struct WhisperRuntimeTuning {
     max_new_tokens_cap: usize,
     decode_budget_buffer_tokens: usize,
     default_language: Option<String>,
-    reuse_detected_language: bool,
     trim_silence: bool,
     silence_trim_threshold_scale: f32,
     silence_trim_min_abs: f32,
@@ -179,8 +802,6 @@ impl WhisperRuntimeTuning {
             decode_budget_buffer_tokens: env_usize("IZWI_WHISPER_MAX_NEW_TOKENS_BUFFER")
                 .unwrap_or(DEFAULT_ADAPTIVE_BUDGET_BUFFER_TOKENS),
             default_language: env_nonempty_string("IZWI_WHISPER_DEFAULT_LANGUAGE"),
-            reuse_detected_language: env_bool("IZWI_WHISPER_REUSE_DETECTED_LANGUAGE")
-                .unwrap_or(true),
             trim_silence: env_bool("IZWI_WHISPER_TRIM_SILENCE").unwrap_or(true),
             silence_trim_threshold_scale: env_f32("IZWI_WHISPER_SILENCE_TRIM_THRESHOLD_SCALE")
                 .unwrap_or(DEFAULT_SILENCE_TRIM_THRESHOLD_SCALE),
@@ -235,53 +856,83 @@ enum WhisperModel {
 
 impl WhisperModel {
     fn load(vb: &VarBuilder, config: WhisperConfig) -> Result<Self> {
-        LocalWhisper::load(vb, config)
-            .map(Self::Local)
-            .map_err(Error::from)
+        LocalWhisper::load(vb, config).map(Self::Local)
     }
 
-    fn reset_kv_cache(&mut self) {
+    fn encoder_forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
-            Self::Local(model) => model.reset_kv_cache(),
+            Self::Local(model) => model.encoder.forward(x),
         }
     }
 
-    fn encoder_forward(&mut self, x: &Tensor, flush_kv_cache: bool) -> Result<Tensor> {
+    fn encoder_forward_batch(&self, x: &Tensor) -> Result<Tensor> {
         match self {
-            Self::Local(model) => model
-                .encoder
-                .forward(x, flush_kv_cache)
-                .map_err(Error::from),
+            Self::Local(model) => model.encoder.forward_batch(x),
         }
     }
 
-    fn decoder_forward(
-        &mut self,
-        x: &Tensor,
+    fn prepare_cross_attention_memory(
+        &self,
         audio_features: &Tensor,
-        flush_kv_cache: bool,
-    ) -> Result<Tensor> {
-        self.decoder_forward_at(x, audio_features, 0, flush_kv_cache)
+    ) -> Result<Vec<StaticAttentionLayerValue>> {
+        match self {
+            Self::Local(model) => model.decoder.prepare_cross_attention_memory(audio_features),
+        }
     }
 
-    fn decoder_forward_at(
-        &mut self,
-        x: &Tensor,
+    fn install_cross_attention_memory(
+        &self,
         audio_features: &Tensor,
+        source_identity: [u8; 32],
+        cross_kv: &mut InvocationStaticAttentionLease,
+    ) -> Result<()> {
+        match self {
+            Self::Local(model) => model.decoder.install_cross_attention_memory(
+                audio_features,
+                source_identity,
+                cross_kv,
+            ),
+        }
+    }
+
+    fn decoder_forward_physical_at(
+        &self,
+        x: &Tensor,
         position_offset: usize,
-        flush_kv_cache: bool,
+        self_kv: &mut PhysicalPagedKvCache,
+        cross_kv: &InvocationStaticAttentionLease,
     ) -> Result<Tensor> {
         match self {
-            Self::Local(model) => model
-                .decoder
-                .forward_at(x, audio_features, position_offset, flush_kv_cache)
-                .map_err(Error::from),
+            Self::Local(model) => {
+                model
+                    .decoder
+                    .forward_physical_at(x, position_offset, self_kv, cross_kv)
+            }
+        }
+    }
+
+    fn decoder_forward_retained_at(
+        &self,
+        x: &Tensor,
+        position_offset: usize,
+        self_kv: &mut PhysicalPagedKvCache,
+        cross_runtime: &RetainedStaticAttentionRuntimeV2,
+        cross_sequence: RetainedStaticAttentionSequenceId,
+    ) -> Result<Tensor> {
+        match self {
+            Self::Local(model) => model.decoder.forward_retained_at(
+                x,
+                position_offset,
+                self_kv,
+                cross_runtime,
+                cross_sequence,
+            ),
         }
     }
 
     fn decoder_final_linear(&self, x: &Tensor) -> Result<Tensor> {
         match self {
-            Self::Local(model) => model.decoder.final_linear(x).map_err(Error::from),
+            Self::Local(model) => model.decoder.final_linear(x),
         }
     }
 }
@@ -315,10 +966,32 @@ fn whisper_impl_name(cuda_dtype_shim: bool) -> &'static str {
     }
 }
 
+fn physical_state_required() -> Error {
+    Error::InferenceError(
+        "Whisper ASR requires lifecycle-owned physical invocation state".to_string(),
+    )
+}
+
+fn whisper_cross_source_identity(audio: &[f32], sample_rate: u32) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"izwi-whisper-cross-attention-v2");
+    hasher.update(sample_rate.to_le_bytes());
+    hasher.update((audio.len() as u64).to_le_bytes());
+    for sample in audio {
+        hasher.update(sample.to_bits().to_le_bytes());
+    }
+    let mut identity: [u8; 32] = hasher.finalize().into();
+    if identity.iter().all(|byte| *byte == 0) {
+        identity[0] = 1;
+    }
+    identity
+}
+
 pub struct WhisperTurboAsrModel {
+    preparation_id: u64,
     device: DeviceProfile,
     model_dtype: DType,
-    whisper: Mutex<WhisperModel>,
+    whisper: WhisperModel,
     config: WhisperConfig,
     generation: WhisperGenerationConfig,
     tokenizer: Tokenizer,
@@ -333,7 +1006,6 @@ pub struct WhisperTurboAsrModel {
     token_id_to_language_code: HashMap<u32, String>,
     runtime_tuning: WhisperRuntimeTuning,
     cuda_dtype_shim: bool,
-    cached_detected_language: Mutex<Option<(u32, String)>>,
 }
 
 impl WhisperTurboAsrModel {
@@ -438,9 +1110,10 @@ impl WhisperTurboAsrModel {
         );
 
         Ok(Self {
+            preparation_id: NEXT_WHISPER_PREPARATION_ID.fetch_add(1, Ordering::Relaxed),
             device,
             model_dtype,
-            whisper: Mutex::new(whisper),
+            whisper,
             config,
             generation,
             tokenizer,
@@ -455,7 +1128,6 @@ impl WhisperTurboAsrModel {
             token_id_to_language_code,
             runtime_tuning,
             cuda_dtype_shim: use_cuda_dtype_shim,
-            cached_detected_language: Mutex::new(None),
         })
     }
 
@@ -470,15 +1142,12 @@ impl WhisperTurboAsrModel {
 
     pub fn transcribe_with_prompt(
         &self,
-        audio: &[f32],
-        sample_rate: u32,
-        language: Option<&str>,
-        initial_prompt: Option<&str>,
+        _audio: &[f32],
+        _sample_rate: u32,
+        _language: Option<&str>,
+        _initial_prompt: Option<&str>,
     ) -> Result<String> {
-        let mut no_op = |_delta: &str| {};
-        Ok(self
-            .transcribe_impl(audio, sample_rate, language, initial_prompt, &mut no_op)?
-            .text)
+        Err(physical_state_required())
     }
 
     pub fn transcribe_with_details(
@@ -492,13 +1161,12 @@ impl WhisperTurboAsrModel {
 
     pub fn transcribe_with_details_and_prompt(
         &self,
-        audio: &[f32],
-        sample_rate: u32,
-        language: Option<&str>,
-        initial_prompt: Option<&str>,
+        _audio: &[f32],
+        _sample_rate: u32,
+        _language: Option<&str>,
+        _initial_prompt: Option<&str>,
     ) -> Result<AsrTranscriptionOutput> {
-        let mut no_op = |_delta: &str| {};
-        self.transcribe_impl(audio, sample_rate, language, initial_prompt, &mut no_op)
+        Err(physical_state_required())
     }
 
     pub fn transcribe_with_callback(
@@ -513,17 +1181,802 @@ impl WhisperTurboAsrModel {
 
     pub fn transcribe_with_callback_and_prompt(
         &self,
-        audio: &[f32],
-        sample_rate: u32,
-        language: Option<&str>,
-        initial_prompt: Option<&str>,
-        on_delta: &mut dyn FnMut(&str),
+        _audio: &[f32],
+        _sample_rate: u32,
+        _language: Option<&str>,
+        _initial_prompt: Option<&str>,
+        _on_delta: &mut dyn FnMut(&str),
     ) -> Result<String> {
-        self.transcribe_streaming(audio, sample_rate, language, initial_prompt, on_delta)
+        Err(physical_state_required())
     }
 
     pub fn max_audio_seconds_hint(&self) -> Option<f32> {
         Some(MAX_AUDIO_SECONDS_HINT)
+    }
+
+    pub(crate) fn window_preparation_geometry(
+        &self,
+        audio: &[f32],
+        input_sample_rate: u32,
+    ) -> Result<WhisperWindowPreparationGeometry> {
+        let effective_samples = self.trimmed_audio_slice(audio, input_sample_rate).len();
+        self.window_preparation_geometry_for_lengths(
+            audio.len(),
+            effective_samples,
+            input_sample_rate,
+        )
+    }
+
+    fn window_preparation_geometry_for_lengths(
+        &self,
+        input_samples: usize,
+        effective_samples: usize,
+        input_sample_rate: u32,
+    ) -> Result<WhisperWindowPreparationGeometry> {
+        if input_samples == 0 || input_sample_rate == 0 {
+            return Err(Error::InvalidInput(
+                "Whisper window preparation requires non-empty audio and a sample rate".into(),
+            ));
+        }
+        let resampled_samples = if input_sample_rate == SAMPLE_RATE || effective_samples < 2 {
+            effective_samples
+        } else {
+            ((effective_samples as f64) * SAMPLE_RATE as f64 / input_sample_rate as f64)
+                .round()
+                .max(1.0) as usize
+        };
+        let target_mel_frames =
+            self.config
+                .max_source_positions
+                .checked_mul(2)
+                .ok_or_else(|| {
+                    Error::Overloaded("Whisper maximum mel-frame geometry overflow".into())
+                })?;
+        let raw_mel_frames = resampled_samples
+            .checked_div(whisper::HOP_LENGTH)
+            .and_then(|frames| frames.checked_add(1))
+            .ok_or_else(|| Error::Overloaded("Whisper mel-frame geometry overflow".into()))?;
+        let useful_mel_frames = raw_mel_frames.min(target_mel_frames);
+        let mel_elements = checked_product_u64(
+            &[useful_mel_frames, self.config.num_mel_bins],
+            "Whisper useful mel geometry",
+        )?;
+        let materialized_mel_elements = checked_product_u64(
+            &[target_mel_frames, self.config.num_mel_bins],
+            "Whisper materialized mel geometry",
+        )?;
+        let cross_elements = checked_product_u64(
+            &[
+                self.config.decoder_layers,
+                self.config.max_source_positions,
+                self.config.d_model,
+                2,
+            ],
+            "Whisper retained cross-memory geometry",
+        )?;
+        let dtype_bytes = u64::try_from(self.model_dtype.size_in_bytes())
+            .map_err(|_| Error::Overloaded("Whisper dtype width exceeds u64".into()))?;
+        let retained_artifact_bytes = cross_elements.checked_mul(dtype_bytes).ok_or_else(|| {
+            Error::Overloaded("Whisper retained cross-memory bytes overflow".into())
+        })?;
+        Ok(WhisperWindowPreparationGeometry {
+            input_samples,
+            input_sample_rate,
+            resampled_samples,
+            useful_mel_frames,
+            materialized_mel_elements,
+            cross_memory_tokens: self.config.max_source_positions,
+            useful_tensor_elements: mel_elements.checked_add(cross_elements).ok_or_else(|| {
+                Error::Overloaded("Whisper useful tensor geometry overflow".into())
+            })?,
+            retained_artifact_bytes,
+        })
+    }
+
+    pub(crate) fn window_preparation_batch_geometry(
+        &self,
+        rows: &[WhisperWindowPreparationGeometry],
+    ) -> Result<WhisperWindowPreparationBatchGeometry> {
+        if rows.is_empty() {
+            return Err(Error::InvalidInput(
+                "Whisper window preparation batch is empty".into(),
+            ));
+        }
+        let total_useful_tensor_elements = rows.iter().try_fold(0_u64, |total, row| {
+            total
+                .checked_add(row.useful_tensor_elements)
+                .ok_or_else(|| Error::Overloaded("Whisper batch useful geometry overflow".into()))
+        })?;
+        let retained_elements = checked_product_u64(
+            &[
+                self.config.decoder_layers,
+                self.config.max_source_positions,
+                self.config.d_model,
+                2,
+            ],
+            "Whisper materialized cross-memory geometry",
+        )?;
+        let materialized_tensor_elements_per_row = rows[0]
+            .materialized_mel_elements
+            .checked_add(retained_elements)
+            .ok_or_else(|| {
+                Error::Overloaded("Whisper materialized row geometry overflow".into())
+            })?;
+        let width = rows.len();
+        let encoder_tokens = self.config.max_source_positions;
+        let hidden = self.config.d_model;
+        let heads = self.config.encoder_attention_heads;
+        let batch_hidden = checked_product_u64(
+            &[width, encoder_tokens, hidden],
+            "Whisper encoder hidden geometry",
+        )?;
+        let attention = checked_product_u64(
+            &[width, heads, encoder_tokens, encoder_tokens],
+            "Whisper encoder attention geometry",
+        )?;
+        let ffn = checked_product_u64(
+            &[width, encoder_tokens, hidden, 4],
+            "Whisper encoder FFN geometry",
+        )?;
+        let encoder_hidden_working = batch_hidden
+            .checked_mul(4)
+            .ok_or_else(|| Error::Overloaded("Whisper encoder hidden workspace overflow".into()))?;
+        let device_elements = checked_product_u64(&[width], "Whisper batch width")?
+            .checked_mul(materialized_tensor_elements_per_row)
+            .and_then(|value| value.checked_add(encoder_hidden_working))
+            .and_then(|value| value.checked_add(attention))
+            .and_then(|value| value.checked_add(ffn))
+            .ok_or_else(|| {
+                Error::Overloaded("Whisper device workspace geometry overflow".into())
+            })?;
+        let host_elements = rows.iter().try_fold(0_u64, |total, row| {
+            total
+                .checked_add(
+                    u64::try_from(row.resampled_samples).map_err(|_| {
+                        Error::Overloaded("Whisper resampled row exceeds u64".into())
+                    })?,
+                )
+                .and_then(|value| value.checked_add(row.materialized_mel_elements))
+                .ok_or_else(|| Error::Overloaded("Whisper host workspace geometry overflow".into()))
+        })?;
+        let workspace_bytes = device_elements
+            .checked_mul(
+                u64::try_from(self.model_dtype.size_in_bytes())
+                    .map_err(|_| Error::Overloaded("Whisper dtype width exceeds u64".into()))?,
+            )
+            .and_then(|device| {
+                host_elements
+                    .checked_mul(std::mem::size_of::<f32>() as u64)
+                    .and_then(|host| device.checked_add(host))
+            })
+            .ok_or_else(|| Error::Overloaded("Whisper batch workspace bytes overflow".into()))?;
+        Ok(WhisperWindowPreparationBatchGeometry {
+            rows: rows.len(),
+            total_useful_tensor_elements,
+            materialized_tensor_elements_per_row,
+            workspace_bytes,
+        })
+    }
+
+    pub(crate) fn window_preparation_row_cost_for_batch(
+        &self,
+        row_index: usize,
+        rows: &[WhisperWindowPreparationGeometry],
+        batch: &WhisperWindowPreparationBatchGeometry,
+    ) -> Result<WorkCost> {
+        let row = rows.get(row_index).ok_or_else(|| {
+            Error::InvalidInput("Whisper preparation row index is out of range".into())
+        })?;
+        if rows.len() != batch.rows {
+            return Err(Error::InvalidInput(
+                "Whisper preparation rows disagree with batch geometry".into(),
+            ));
+        }
+        let width = u64::try_from(batch.rows)
+            .map_err(|_| Error::Overloaded("Whisper batch width exceeds u64".into()))?;
+        let share = batch.workspace_bytes / width
+            + u64::from((row_index as u64) < batch.workspace_bytes % width);
+        Ok(WorkCost::new(
+            row.useful_mel_frames as u64,
+            row.useful_tensor_elements,
+            share,
+        ))
+    }
+
+    pub(crate) const fn window_retained_tensor_bytes(
+        &self,
+        row: &WhisperWindowPreparationGeometry,
+    ) -> u64 {
+        row.retained_artifact_bytes
+    }
+
+    pub(crate) fn window_max_batch_workspace_bytes(&self, width: usize) -> Result<u64> {
+        if width == 0 {
+            return Err(Error::InvalidInput(
+                "Whisper preparation batch width must be non-zero".into(),
+            ));
+        }
+        let samples = (SAMPLE_RATE as usize)
+            .checked_mul(MAX_AUDIO_SECONDS_HINT as usize)
+            .ok_or_else(|| Error::Overloaded("Whisper maximum window samples overflow".into()))?;
+        let row = self.window_preparation_geometry_for_lengths(samples, samples, SAMPLE_RATE)?;
+        self.window_preparation_batch_geometry(&vec![row; width])
+            .map(|batch| batch.workspace_bytes)
+    }
+
+    pub(crate) fn window_preparation_stage_seal(
+        &self,
+        backend: BackendKind,
+        width: usize,
+    ) -> Result<WhisperAudioPreparationStageSeal> {
+        let loaded = backend_kind_for_device(&self.device.device);
+        if backend != loaded {
+            return Err(Error::ModelLoadError(format!(
+                "Whisper preparation backend mismatch: model={loaded:?}, adapter={backend:?}"
+            )));
+        }
+        Ok(WhisperAudioPreparationStageSeal {
+            backend,
+            dtype: format!("{:?}", self.model_dtype).to_ascii_lowercase(),
+            max_batch_size: width,
+            max_workspace_bytes: self.window_max_batch_workspace_bytes(width)?,
+        })
+    }
+
+    pub(crate) fn prepare_window_batch(
+        &self,
+        rows: &[WhisperAudioBatchRow<'_>],
+    ) -> Result<Vec<WhisperPreparedWindow>> {
+        if rows.is_empty() {
+            return Err(Error::InvalidInput(
+                "Whisper window preparation requires at least one row".into(),
+            ));
+        }
+        let mut mels = Vec::with_capacity(rows.len());
+        let mut identities = Vec::with_capacity(rows.len());
+        for row in rows {
+            if row.audio.is_empty() || row.sample_rate == 0 {
+                return Err(Error::InvalidInput(
+                    "Whisper window preparation received an empty row".into(),
+                ));
+            }
+            let trimmed = self.trimmed_audio_slice(row.audio, row.sample_rate);
+            mels.push(self.prepare_mel(trimmed, row.sample_rate)?);
+            identities.push((
+                whisper_cross_source_identity(trimmed, row.sample_rate),
+                row.audio.len(),
+                row.sample_rate,
+            ));
+        }
+        let mel_refs = mels.iter().collect::<Vec<_>>();
+        let mel_batch = Tensor::cat(&mel_refs, 0)?;
+        let encoded = self.whisper.encoder_forward_batch(&mel_batch)?;
+        let mut prepared = Vec::with_capacity(rows.len());
+        for (index, (source_identity, input_samples, input_sample_rate)) in
+            identities.into_iter().enumerate()
+        {
+            let features = encoded.narrow(0, index, 1)?;
+            let memory_tokens = features.dim(1)?;
+            let layers = self.whisper.prepare_cross_attention_memory(&features)?;
+            prepared.push(WhisperPreparedWindow {
+                preparation_id: self.preparation_id,
+                source_identity,
+                input_samples,
+                input_sample_rate,
+                memory_tokens,
+                layers,
+            });
+        }
+        Ok(prepared)
+    }
+
+    pub(crate) fn incremental_prompt_token_count_from_prepared_window(
+        &self,
+        prepared: &WhisperPreparedWindow,
+        language: Option<&str>,
+        initial_prompt: Option<&str>,
+    ) -> Result<usize> {
+        self.validate_prepared_window(prepared)?;
+        let language_token = if let Some(language) = language {
+            self.resolve_language_token(language)?
+                .map(|(token, _)| token)
+        } else if let Some(default) = self.runtime_tuning.default_language.as_deref() {
+            self.resolve_language_token(default)?
+                .map(|(token, _)| token)
+        } else {
+            self.language_token_ids.first().copied()
+        };
+        let initial_prompt_tokens = self.encode_initial_prompt_tokens(initial_prompt)?;
+        Ok(build_whisper_prompt_prefix(
+            &self.special,
+            language_token,
+            &initial_prompt_tokens,
+            self.config.max_target_positions,
+            self.runtime_tuning.initial_prompt_max_tokens,
+        )?
+        .ids
+        .len())
+    }
+
+    pub(crate) fn begin_resumable_prefill_managed_from_prepared_window(
+        &self,
+        prepared: &WhisperPreparedWindow,
+        language: Option<&str>,
+        initial_prompt: Option<&str>,
+        max_new_tokens: Option<usize>,
+        mut self_kv: PhysicalPagedKvCache,
+        cross_runtime: Arc<RetainedStaticAttentionRuntimeV2>,
+        cross_sequence: RetainedStaticAttentionSequenceId,
+    ) -> Result<WhisperDecodeState> {
+        // Ownership transfers at entry, before any validation or state access.
+        let cross_owner = WhisperCrossSequenceOwner::new(cross_runtime, cross_sequence);
+        let (cross_owner, state_id) = acquire_whisper_cross_sequence_owner(
+            cross_owner,
+            prepared,
+            self.preparation_id,
+            self.config.max_source_positions,
+            self.config.decoder_layers,
+            self_kv.context_len(),
+            next_whisper_decode_state_id,
+        )?;
+        let cross_sequence = cross_owner.sequence();
+        cross_owner.runtime.install(
+            cross_sequence,
+            prepared.source_identity,
+            prepared.layers.clone(),
+        )?;
+
+        let initialized: Result<(Vec<u32>, usize)> = (|| {
+            let resolved_language = self.resolve_request_language_retained(
+                language,
+                &mut self_kv,
+                cross_owner.runtime.as_ref(),
+                cross_sequence,
+            )?;
+            // Language detection is a complete nested decoder sequence. The
+            // prompt begins from a fresh self-KV generation while immutable
+            // cross memory remains installed under the same sequence identity.
+            if self_kv.context_len() != 0 {
+                self_kv.reset_invocation()?;
+            }
+            let initial_prompt_tokens = self.encode_initial_prompt_tokens(initial_prompt)?;
+            let prompt = build_whisper_prompt_prefix(
+                &self.special,
+                resolved_language.as_ref().map(|(token, _)| *token),
+                &initial_prompt_tokens,
+                self.config.max_target_positions,
+                self.runtime_tuning.initial_prompt_max_tokens,
+            )?
+            .ids;
+            let configured_steps = max_new_tokens.unwrap_or_else(|| {
+                self.resolve_max_decode_tokens(prepared.input_samples, prepared.input_sample_rate)
+            });
+            let max_steps = decode_step_budget(
+                prompt.len(),
+                self.config.max_target_positions,
+                configured_steps,
+            )?;
+            Ok((prompt, max_steps))
+        })();
+        let (prompt, max_steps) = initialized?;
+        let (cross_runtime, cross_sequence) = cross_owner.into_decode_state_parts();
+
+        Ok(WhisperDecodeState {
+            state_id,
+            next_quantum_nonce: 1,
+            active_quantum: None,
+            current_managed_generation: 1,
+            managed_completions_drained: true,
+            self_kv,
+            cross_runtime,
+            cross_sequence: Some(cross_sequence),
+            prompt,
+            prefill_progress: 0,
+            pending_logits: None,
+            generated_tokens: Vec::new(),
+            assembled: String::new(),
+            sum_logprobs: 0.0,
+            sampled_token_count: 0,
+            no_speech_prob: None,
+            ended_with_eot: false,
+            repetition_loop: false,
+            decode_steps: 0,
+            best_attempt: None,
+            pending_retry: None,
+            temperature: self.decode_temperatures().first().copied().unwrap_or(0.0),
+            attempt_generation: 1,
+            max_steps,
+            finished: false,
+            rng: StdRng::from_entropy(),
+        })
+    }
+
+    pub(crate) fn continue_resumable_prefill(
+        &self,
+        state: &mut WhisperDecodeState,
+        span_start: usize,
+        span_end: usize,
+    ) -> Result<bool> {
+        if span_start != state.prefill_progress
+            || span_end <= span_start
+            || span_end > state.prompt.len()
+            || state.finished
+        {
+            return Err(Error::InvalidInput(
+                "Whisper prefill span is non-monotonic or out of range".into(),
+            ));
+        }
+        let sequence = state.cross_sequence.ok_or_else(|| {
+            Error::InferenceError("Whisper retained cross sequence was released".into())
+        })?;
+        let checkpoint = state.self_kv.logical_checkpoint();
+        let tokens =
+            Tensor::new(&state.prompt[span_start..span_end], &self.device.device)?.unsqueeze(0)?;
+        let output = match self.whisper.decoder_forward_retained_at(
+            &tokens,
+            span_start,
+            &mut state.self_kv,
+            state.cross_runtime.as_ref(),
+            sequence,
+        ) {
+            Ok(output) => output,
+            Err(error) => {
+                state.self_kv.restore_logical_checkpoint(checkpoint)?;
+                return Err(error);
+            }
+        };
+        let pending_logits = if span_end == state.prompt.len() {
+            let sequence_len = output.dim(1)?;
+            match self
+                .whisper
+                .decoder_final_linear(&output.i((..1, sequence_len - 1..))?)
+                .and_then(|logits| logits.i(0).map_err(Error::from))
+                .and_then(|logits| logits.i(0).map_err(Error::from))
+            {
+                Ok(logits) => Some(logits),
+                Err(error) => {
+                    state.self_kv.restore_logical_checkpoint(checkpoint)?;
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+        state.prefill_progress = span_end;
+        state.pending_logits = pending_logits;
+        state.managed_completions_drained = false;
+        Ok(span_end == state.prompt.len())
+    }
+
+    pub(crate) fn restart_temperature_attempt(
+        &self,
+        state: &mut WhisperDecodeState,
+        temperature: f32,
+    ) -> Result<()> {
+        restart_whisper_temperature_attempt(state, temperature)
+    }
+
+    pub(crate) fn resolve_terminal_transition(
+        &self,
+        state: &mut WhisperDecodeState,
+    ) -> Result<WhisperTerminalTransition> {
+        if !state.finished {
+            return Err(Error::InvalidInput(
+                "Whisper terminal policy requires a finished decode attempt".into(),
+            ));
+        }
+        let avg_logprob = if state.sampled_token_count > 0 {
+            (state.sum_logprobs / state.sampled_token_count as f64) as f32
+        } else {
+            f32::NEG_INFINITY
+        };
+        let attempt = WhisperDecodeAttempt {
+            text: state.assembled.trim().to_string(),
+            avg_logprob,
+            no_speech_prob: state.no_speech_prob,
+            ended_with_eot: state.ended_with_eot,
+            repetition_loop: state.repetition_loop,
+            compression_ratio: token_compression_ratio(
+                &state.generated_tokens,
+                self.config.vocab_size,
+            ),
+            generated_token_count: state.generated_tokens.len(),
+            sampled_token_count: state.sampled_token_count,
+            decode_steps: state.decode_steps,
+            profile: WhisperDecodeProfile::new(false),
+        };
+        let logprob_threshold = self
+            .generation
+            .logprob_threshold
+            .unwrap_or(DEFAULT_LOGPROB_THRESHOLD);
+        let no_speech_threshold = self
+            .generation
+            .no_speech_threshold
+            .unwrap_or(DEFAULT_NO_SPEECH_THRESHOLD);
+        let temperatures = self.decode_temperatures();
+        let next_temperature = usize::try_from(state.attempt_generation)
+            .ok()
+            .and_then(|index| temperatures.get(index))
+            .copied();
+        let expected_generation = state.current_managed_generation;
+        let new_generation = if next_temperature.is_some() {
+            expected_generation.checked_add(1).ok_or_else(|| {
+                Error::InferenceError("Whisper managed KV generation overflow".into())
+            })?
+        } else {
+            expected_generation
+        };
+        let (transition, best_attempt) = whisper_terminal_policy_transition(
+            attempt,
+            state.temperature,
+            state.best_attempt.take(),
+            next_temperature,
+            logprob_threshold,
+            no_speech_threshold,
+            self.generation.compression_ratio_threshold,
+            expected_generation,
+            new_generation,
+        );
+        state.best_attempt = best_attempt;
+        state.pending_retry = match &transition {
+            WhisperTerminalTransition::RetryRequired {
+                next_temperature,
+                expected_generation,
+                new_generation,
+                ..
+            } => Some(WhisperPendingRetry {
+                next_temperature: *next_temperature,
+                expected_generation: *expected_generation,
+                new_generation: *new_generation,
+                next_attempt_generation: state.attempt_generation.checked_add(1).ok_or_else(
+                    || Error::InferenceError("Whisper retry attempt generation overflow".into()),
+                )?,
+            }),
+            _ => None,
+        };
+        match &transition {
+            WhisperTerminalTransition::Accept { text, .. } => state.assembled = text.clone(),
+            WhisperTerminalTransition::SkipNoSpeech { .. } => state.assembled.clear(),
+            WhisperTerminalTransition::RetryRequired { .. } => {}
+        }
+        Ok(transition)
+    }
+
+    pub(crate) fn decode_step_retained(
+        &self,
+        state: &mut WhisperDecodeState,
+    ) -> Result<WhisperDecodeStep> {
+        if state.prefill_progress != state.prompt.len() || state.pending_logits.is_none() {
+            return Err(Error::InvalidInput(
+                "Whisper decode requires completed prefill and pending logits".into(),
+            ));
+        }
+        if state.finished || state.generated_tokens.len() >= state.max_steps {
+            state.finished = true;
+            return Ok(WhisperDecodeStep {
+                delta: String::new(),
+                text: state.assembled.trim().to_string(),
+                tokens_generated: state.generated_tokens.len(),
+                finished: true,
+            });
+        }
+        with_whisper_decode_step_transaction(state, |state| {
+            self.decode_step_retained_transaction(state)
+        })
+    }
+
+    fn decode_step_retained_transaction(
+        &self,
+        state: &mut WhisperDecodeState,
+    ) -> Result<WhisperDecodeStep> {
+        let logits = state
+            .pending_logits
+            .take()
+            .expect("validated pending logits");
+        let at_begin = state.generated_tokens.is_empty();
+        let mut log_probs = Vec::new();
+        let mut profile = WhisperDecodeProfile::new(false);
+        let (next, next_logprob, step_no_speech_prob) = self.select_next_token(
+            &logits,
+            at_begin,
+            state.temperature <= 0.0,
+            state.temperature,
+            &mut state.rng,
+            &mut log_probs,
+            &mut profile,
+        )?;
+        state.decode_steps = state
+            .decode_steps
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidInput("Whisper decode-step count overflow".into()))?;
+        state.sampled_token_count = state
+            .sampled_token_count
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidInput("Whisper sampled-token count overflow".into()))?;
+        state.sum_logprobs += f64::from(next_logprob);
+        if at_begin {
+            state.no_speech_prob = step_no_speech_prob;
+        }
+        if next == self.special.eot {
+            state.ended_with_eot = true;
+            state.finished = true;
+        } else {
+            let generated_after_step =
+                state.generated_tokens.len().checked_add(1).ok_or_else(|| {
+                    Error::InvalidInput("Whisper generated token count overflow".into())
+                })?;
+            let reaches_limit = generated_after_step >= state.max_steps;
+            if !reaches_limit {
+                let sequence = state.cross_sequence.ok_or_else(|| {
+                    Error::InferenceError("Whisper retained cross sequence was released".into())
+                })?;
+                let position = state
+                    .prompt
+                    .len()
+                    .checked_add(state.generated_tokens.len())
+                    .ok_or_else(|| {
+                        Error::InvalidInput("Whisper decode position overflow".into())
+                    })?;
+                let token = Tensor::new(&[[next]], &self.device.device)?;
+                let output = self.whisper.decoder_forward_retained_at(
+                    &token,
+                    position,
+                    &mut state.self_kv,
+                    state.cross_runtime.as_ref(),
+                    sequence,
+                )?;
+                state.managed_completions_drained = false;
+                let next_logits = self
+                    .whisper
+                    .decoder_final_linear(&output.i((..1, 0..1))?)
+                    .and_then(|logits| logits.i(0).map_err(Error::from))
+                    .and_then(|logits| logits.i(0).map_err(Error::from))?;
+                state.pending_logits = Some(next_logits);
+            } else {
+                state.finished = true;
+            }
+            state.generated_tokens.push(next);
+            if let Some((span, repeats)) = find_suffix_token_repetition(&state.generated_tokens) {
+                let trim = span.saturating_mul(repeats.saturating_sub(1));
+                if trim > 0 && trim <= state.generated_tokens.len() {
+                    state
+                        .generated_tokens
+                        .truncate(state.generated_tokens.len() - trim);
+                }
+                state.repetition_loop = true;
+                state.finished = true;
+            }
+        }
+        let decoded = self.decode_generated_text(&state.generated_tokens)?;
+        let text = decoded.trim().to_string();
+        let delta = text_delta(&state.assembled, &text);
+        state.assembled = text.clone();
+        Ok(WhisperDecodeStep {
+            delta: delta.to_string(),
+            text,
+            tokens_generated: state.generated_tokens.len(),
+            finished: state.finished,
+        })
+    }
+
+    pub(crate) const fn supports_resumable_prefill(&self) -> bool {
+        true
+    }
+
+    pub(crate) const fn supports_continuous_decode_batch(&self) -> bool {
+        false
+    }
+
+    fn validate_prepared_window(&self, prepared: &WhisperPreparedWindow) -> Result<()> {
+        if prepared.preparation_id != self.preparation_id
+            || prepared.memory_tokens != self.config.max_source_positions
+            || prepared.layers.len() != self.config.decoder_layers
+        {
+            return Err(Error::InvalidInput(
+                "Whisper prepared window belongs to another model or geometry".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn resolve_request_language_retained(
+        &self,
+        language: Option<&str>,
+        self_kv: &mut PhysicalPagedKvCache,
+        cross_runtime: &RetainedStaticAttentionRuntimeV2,
+        cross_sequence: RetainedStaticAttentionSequenceId,
+    ) -> Result<Option<(u32, String)>> {
+        if let Some(language) = language {
+            return self.resolve_language_token(language);
+        }
+        if let Some(default) = self.runtime_tuning.default_language.as_deref() {
+            return self.resolve_language_token(default);
+        }
+        if self.language_token_ids.is_empty() {
+            return Ok(None);
+        }
+        self_kv.reset_invocation()?;
+        let tokens = Tensor::new(&[[self.special.sot]], &self.device.device)?;
+        let output = self.whisper.decoder_forward_retained_at(
+            &tokens,
+            0,
+            self_kv,
+            cross_runtime,
+            cross_sequence,
+        )?;
+        let logits = self
+            .whisper
+            .decoder_final_linear(&output.i(..1)?)?
+            .i(0)?
+            .i(0)?;
+        let resolved = if let Some(language) = self.detect_language_token_on_cuda(&logits)? {
+            Some(language)
+        } else {
+            let logits = tensor_to_f32_vec1(&logits)?;
+            self.language_token_ids
+                .iter()
+                .filter_map(|token| logits.get(*token as usize).map(|score| (*token, *score)))
+                .max_by(|left, right| left.1.total_cmp(&right.1))
+                .and_then(|(token, _)| {
+                    self.token_id_to_language_code
+                        .get(&token)
+                        .cloned()
+                        .map(|code| (token, code))
+                })
+        };
+        Ok(resolved)
+    }
+
+    pub(crate) fn physical_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<WhisperPhysicalStateSpec> {
+        super::physical::whisper_physical_state_spec(
+            &self.config,
+            self.model_dtype,
+            self.device.kind.into(),
+            stage_graphs,
+        )
+    }
+
+    pub(crate) fn transcribe_with_details_and_prompt_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        initial_prompt: Option<&str>,
+        self_kv: &mut PhysicalPagedKvCache,
+        cross_kv: &mut InvocationStaticAttentionLease,
+    ) -> Result<AsrTranscriptionOutput> {
+        self.transcribe_impl(
+            audio,
+            sample_rate,
+            language,
+            initial_prompt,
+            self_kv,
+            cross_kv,
+        )
+    }
+
+    pub(crate) fn transcribe_with_callback_and_prompt_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        initial_prompt: Option<&str>,
+        self_kv: &mut PhysicalPagedKvCache,
+        cross_kv: &mut InvocationStaticAttentionLease,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<String> {
+        self.transcribe_streaming(
+            audio,
+            sample_rate,
+            language,
+            initial_prompt,
+            self_kv,
+            cross_kv,
+            on_delta,
+        )
     }
 
     fn transcribe_impl(
@@ -532,7 +1985,8 @@ impl WhisperTurboAsrModel {
         sample_rate: u32,
         language: Option<&str>,
         initial_prompt: Option<&str>,
-        _on_delta: &mut dyn FnMut(&str),
+        self_kv: &mut PhysicalPagedKvCache,
+        cross_kv: &mut InvocationStaticAttentionLease,
     ) -> Result<AsrTranscriptionOutput> {
         if audio.is_empty() {
             return Err(Error::InvalidInput("Empty audio input".to_string()));
@@ -543,20 +1997,20 @@ impl WhisperTurboAsrModel {
         let mel_started = Instant::now();
         let mel = self.prepare_mel(trimmed_audio, sample_rate)?;
         let mel_prepare_ms = mel_started.elapsed().as_secs_f64() * 1000.0;
-        let mut whisper = self
-            .whisper
-            .lock()
-            .map_err(|_| Error::InferenceError("Whisper model mutex poisoned".to_string()))?;
 
-        whisper.reset_kv_cache();
         self.synchronize_profile_device()?;
         let encoder_started = Instant::now();
-        let audio_features = whisper.encoder_forward(&mel, true)?;
+        let audio_features = self.whisper.encoder_forward(&mel)?;
+        self.whisper.install_cross_attention_memory(
+            &audio_features,
+            whisper_cross_source_identity(trimmed_audio, sample_rate),
+            cross_kv,
+        )?;
         self.synchronize_profile_device()?;
         let encoder_forward_ms = elapsed_ms(encoder_started);
 
         let language_resolution =
-            self.resolve_request_language(&mut whisper, &audio_features, language)?;
+            self.resolve_request_language(&self.whisper, language, self_kv, cross_kv)?;
         let resolved_language = language_resolution.resolved.clone();
         let language_hint_used = language_resolution.hint_used;
         let language_detect_ms = language_resolution.detect_ms;
@@ -600,11 +2054,12 @@ impl WhisperTurboAsrModel {
         for (idx, temperature) in temperatures.iter().copied().enumerate() {
             attempted_temperatures.push(temperature);
             let attempt = self.decode_attempt(
-                &mut whisper,
-                &audio_features,
+                &self.whisper,
                 &prompt,
                 max_steps,
                 temperature,
+                self_kv,
+                cross_kv,
             )?;
             let no_speech_skip =
                 should_skip_as_no_speech(&attempt, logprob_threshold, no_speech_threshold);
@@ -712,7 +2167,6 @@ impl WhisperTurboAsrModel {
             "language_resolution": {
                 "strategy": language_resolution.strategy,
                 "default_language": self.runtime_tuning.default_language,
-                "reuse_detected_language": self.runtime_tuning.reuse_detected_language,
             },
             "prompt": {
                 "initial_prompt_requested": prompt_diagnostics.initial_prompt_requested,
@@ -779,6 +2233,8 @@ impl WhisperTurboAsrModel {
         sample_rate: u32,
         language: Option<&str>,
         initial_prompt: Option<&str>,
+        self_kv: &mut PhysicalPagedKvCache,
+        cross_kv: &mut InvocationStaticAttentionLease,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<String> {
         if audio.is_empty() {
@@ -787,16 +2243,15 @@ impl WhisperTurboAsrModel {
 
         let trimmed_audio = self.trimmed_audio_slice(audio, sample_rate);
         let mel = self.prepare_mel(trimmed_audio, sample_rate)?;
-        let mut whisper = self
-            .whisper
-            .lock()
-            .map_err(|_| Error::InferenceError("Whisper model mutex poisoned".to_string()))?;
-
-        whisper.reset_kv_cache();
-        let audio_features = whisper.encoder_forward(&mel, true)?;
+        let audio_features = self.whisper.encoder_forward(&mel)?;
+        self.whisper.install_cross_attention_memory(
+            &audio_features,
+            whisper_cross_source_identity(trimmed_audio, sample_rate),
+            cross_kv,
+        )?;
 
         let language_resolution =
-            self.resolve_request_language(&mut whisper, &audio_features, language)?;
+            self.resolve_request_language(&self.whisper, language, self_kv, cross_kv)?;
         let resolved_language = language_resolution.resolved;
 
         let initial_prompt_tokens = self.encode_initial_prompt_tokens(initial_prompt)?;
@@ -829,11 +2284,12 @@ impl WhisperTurboAsrModel {
 
         let first_temperature = temperatures.first().copied().unwrap_or(0.0);
         let first_attempt = self.decode_attempt_streaming(
-            &mut whisper,
-            &audio_features,
+            &self.whisper,
             &prompt,
             max_steps,
             first_temperature,
+            self_kv,
+            cross_kv,
             on_delta,
         )?;
 
@@ -855,11 +2311,12 @@ impl WhisperTurboAsrModel {
 
         for (idx, temperature) in temperatures.iter().copied().enumerate().skip(1) {
             let attempt = self.decode_attempt(
-                &mut whisper,
-                &audio_features,
+                &self.whisper,
                 &prompt,
                 max_steps,
                 temperature,
+                self_kv,
+                cross_kv,
             )?;
 
             if should_skip_as_no_speech(&attempt, logprob_threshold, no_speech_threshold) {
@@ -1076,15 +2533,17 @@ impl WhisperTurboAsrModel {
 
     fn detect_language_token(
         &self,
-        whisper: &mut WhisperModel,
-        audio_features: &Tensor,
+        whisper: &WhisperModel,
+        self_kv: &mut PhysicalPagedKvCache,
+        cross_kv: &InvocationStaticAttentionLease,
     ) -> Result<Option<(u32, String)>> {
         if self.language_token_ids.is_empty() {
             return Ok(None);
         }
 
+        self_kv.reset_invocation()?;
         let tokens = Tensor::new(&[[self.special.sot]], &self.device.device)?;
-        let ys = whisper.decoder_forward(&tokens, audio_features, true)?;
+        let ys = whisper.decoder_forward_physical_at(&tokens, 0, self_kv, cross_kv)?;
         let logits = whisper.decoder_final_linear(&ys.i(..1)?)?.i(0)?.i(0)?;
         if let Some(language) = self.detect_language_token_on_cuda(&logits)? {
             return Ok(Some(language));
@@ -1188,15 +2647,13 @@ impl WhisperTurboAsrModel {
 
     fn resolve_request_language(
         &self,
-        whisper: &mut WhisperModel,
-        audio_features: &Tensor,
+        whisper: &WhisperModel,
         language: Option<&str>,
+        self_kv: &mut PhysicalPagedKvCache,
+        cross_kv: &InvocationStaticAttentionLease,
     ) -> Result<WhisperLanguageResolution> {
         if let Some(language) = language {
             let resolved = self.resolve_language_token(language)?;
-            if let Some((token, code)) = resolved.as_ref() {
-                self.update_cached_language(*token, code.clone());
-            }
             return Ok(WhisperLanguageResolution {
                 resolved,
                 hint_used: true,
@@ -1207,9 +2664,6 @@ impl WhisperTurboAsrModel {
 
         if let Some(default_language) = self.runtime_tuning.default_language.as_deref() {
             let resolved = self.resolve_language_token(default_language)?;
-            if let Some((token, code)) = resolved.as_ref() {
-                self.update_cached_language(*token, code.clone());
-            }
             return Ok(WhisperLanguageResolution {
                 resolved,
                 hint_used: false,
@@ -1218,47 +2672,17 @@ impl WhisperTurboAsrModel {
             });
         }
 
-        if self.runtime_tuning.reuse_detected_language {
-            if let Some(cached) = self.cached_language() {
-                return Ok(WhisperLanguageResolution {
-                    resolved: Some(cached),
-                    hint_used: false,
-                    detect_ms: 0.0,
-                    strategy: "cached",
-                });
-            }
-        }
-
         self.synchronize_profile_device()?;
         let detect_started = Instant::now();
-        let resolved = self.detect_language_token(whisper, audio_features)?;
+        let resolved = self.detect_language_token(whisper, self_kv, cross_kv)?;
         self.synchronize_profile_device()?;
         let detect_ms = elapsed_ms(detect_started);
-        if let Some((token, code)) = resolved.as_ref() {
-            self.update_cached_language(*token, code.clone());
-        }
         Ok(WhisperLanguageResolution {
             resolved,
             hint_used: false,
             detect_ms,
             strategy: "detected",
         })
-    }
-
-    fn cached_language(&self) -> Option<(u32, String)> {
-        self.cached_detected_language
-            .lock()
-            .ok()
-            .and_then(|guard| guard.as_ref().cloned())
-    }
-
-    fn update_cached_language(&self, token: u32, code: String) {
-        if !self.runtime_tuning.reuse_detected_language {
-            return;
-        }
-        if let Ok(mut guard) = self.cached_detected_language.lock() {
-            *guard = Some((token, code));
-        }
     }
 
     fn trimmed_audio_slice<'a>(&self, audio: &'a [f32], sample_rate: u32) -> &'a [f32] {
@@ -1467,12 +2891,14 @@ fn pad_or_trim_mel_frames(mel_spec: &mut Vec<Vec<f32>>, n_mels: usize, target_fr
 impl WhisperTurboAsrModel {
     fn decode_attempt(
         &self,
-        whisper: &mut WhisperModel,
-        audio_features: &Tensor,
+        whisper: &WhisperModel,
         prompt_prefix: &[u32],
         max_steps: usize,
         temperature: f32,
+        self_kv: &mut PhysicalPagedKvCache,
+        cross_kv: &InvocationStaticAttentionLease,
     ) -> Result<WhisperDecodeAttempt> {
+        self_kv.reset_invocation()?;
         let mut rng = rand::thread_rng();
         let deterministic = temperature <= 0.0;
         let mut prompt = prompt_prefix.to_vec();
@@ -1490,13 +2916,13 @@ impl WhisperTurboAsrModel {
         for step_idx in 0..max_steps {
             decode_steps = decode_steps.saturating_add(1);
             let mut single_token = [0u32; 1];
-            let (input_tokens, position_offset, flush_cache) = if step_idx == 0 {
-                (prompt.as_slice(), 0, true)
+            let (input_tokens, position_offset) = if step_idx == 0 {
+                (prompt.as_slice(), 0)
             } else {
                 single_token[0] = *prompt.last().ok_or_else(|| {
                     Error::InferenceError("Whisper decode prompt is empty".to_string())
                 })?;
-                (&single_token[..], prompt.len().saturating_sub(1), false)
+                (&single_token[..], prompt.len().saturating_sub(1))
             };
             self.synchronize_profile_device()?;
             let step_started = if profile_enabled {
@@ -1515,21 +2941,21 @@ impl WhisperTurboAsrModel {
             };
             let ys = if profile_enabled {
                 let started = Instant::now();
-                let ys = whisper.decoder_forward_at(
+                let ys = whisper.decoder_forward_physical_at(
                     &tokens_t,
-                    audio_features,
                     position_offset,
-                    flush_cache,
+                    self_kv,
+                    cross_kv,
                 )?;
                 self.synchronize_profile_device()?;
                 profile.decoder_forward_ms += elapsed_ms(started);
                 ys
             } else {
-                whisper.decoder_forward_at(
+                whisper.decoder_forward_physical_at(
                     &tokens_t,
-                    audio_features,
                     position_offset,
-                    flush_cache,
+                    self_kv,
+                    cross_kv,
                 )?
             };
             let (_, seq_len, _) = ys.dims3()?;
@@ -1621,13 +3047,15 @@ impl WhisperTurboAsrModel {
 
     fn decode_attempt_streaming(
         &self,
-        whisper: &mut WhisperModel,
-        audio_features: &Tensor,
+        whisper: &WhisperModel,
         prompt_prefix: &[u32],
         max_steps: usize,
         temperature: f32,
+        self_kv: &mut PhysicalPagedKvCache,
+        cross_kv: &InvocationStaticAttentionLease,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<WhisperDecodeAttempt> {
+        self_kv.reset_invocation()?;
         let mut rng = rand::thread_rng();
         let deterministic = temperature <= 0.0;
         let mut prompt = prompt_prefix.to_vec();
@@ -1645,20 +3073,20 @@ impl WhisperTurboAsrModel {
         for step_idx in 0..max_steps {
             decode_steps = decode_steps.saturating_add(1);
             let mut single_token = [0u32; 1];
-            let (input_tokens, position_offset, flush_cache) = if step_idx == 0 {
-                (prompt.as_slice(), 0, true)
+            let (input_tokens, position_offset) = if step_idx == 0 {
+                (prompt.as_slice(), 0)
             } else {
                 single_token[0] = *prompt.last().ok_or_else(|| {
                     Error::InferenceError("Whisper decode prompt is empty".to_string())
                 })?;
-                (&single_token[..], prompt.len().saturating_sub(1), false)
+                (&single_token[..], prompt.len().saturating_sub(1))
             };
             let tokens_t = Tensor::new(input_tokens, &self.device.device)?.unsqueeze(0)?;
-            let ys = whisper.decoder_forward_at(
+            let ys = whisper.decoder_forward_physical_at(
                 &tokens_t,
-                audio_features,
                 position_offset,
-                flush_cache,
+                self_kv,
+                cross_kv,
             )?;
             let (_, seq_len, _) = ys.dims3()?;
             let logits = whisper
@@ -2339,6 +3767,60 @@ fn decode_retry_reasons(
     reasons
 }
 
+fn whisper_terminal_policy_transition(
+    attempt: WhisperDecodeAttempt,
+    temperature: f32,
+    mut best: Option<(WhisperDecodeAttempt, f32)>,
+    next_temperature: Option<f32>,
+    logprob_threshold: f32,
+    no_speech_threshold: f32,
+    compression_ratio_threshold: Option<f32>,
+    expected_generation: u64,
+    new_generation: u64,
+) -> (
+    WhisperTerminalTransition,
+    Option<(WhisperDecodeAttempt, f32)>,
+) {
+    if should_skip_as_no_speech(&attempt, logprob_threshold, no_speech_threshold) {
+        return (
+            WhisperTerminalTransition::SkipNoSpeech {
+                no_speech_probability: attempt.no_speech_prob,
+            },
+            None,
+        );
+    }
+    let retry_reasons =
+        decode_retry_reasons(&attempt, logprob_threshold, compression_ratio_threshold);
+    if best
+        .as_ref()
+        .map(|(current, _)| is_better_attempt(&attempt, current))
+        .unwrap_or(true)
+    {
+        best = Some((attempt.clone(), temperature));
+    }
+    if !retry_reasons.is_empty() {
+        if let Some(next_temperature) = next_temperature {
+            return (
+                WhisperTerminalTransition::RetryRequired {
+                    next_temperature,
+                    reasons: retry_reasons,
+                    expected_generation,
+                    new_generation,
+                },
+                best,
+            );
+        }
+    }
+    let (selected, selected_temperature) = best.unwrap_or((attempt, temperature));
+    (
+        WhisperTerminalTransition::Accept {
+            text: selected.text.trim().to_string(),
+            selected_temperature,
+        },
+        None,
+    )
+}
+
 fn should_retry_decode(
     attempt: &WhisperDecodeAttempt,
     logprob_threshold: f32,
@@ -2508,22 +3990,64 @@ fn decode_step_budget(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use candle_core::{DType, Device, Tensor};
+    use rand::{Rng, SeedableRng};
+
     use super::{
-        adaptive_decode_budget, apply_whisper_decode_constraints, best_finite_logit,
-        build_whisper_decode_mask_tensors, build_whisper_prompt_prefix, capped_decode_temperatures,
-        contiguous_token_range, decode_retry_reasons, decode_step_budget,
-        find_suffix_token_repetition, greedy_decode_step_from_masked_logits,
-        has_low_word_diversity, logits_to_log_probs, logits_to_log_probs_in_place,
-        pad_or_trim_mel_frames, probability_for_token_from_logits, scaled_logsumexp,
-        tensor_to_f32_vec1, text_delta, token_contains_numeral_or_symbol, trimmed_audio_bounds,
-        use_cuda_whisper_dtype_shim, whisper_decode_profile_diagnostics,
-        whisper_device_diagnostics, whisper_impl_name, WhisperDecodeAttempt, WhisperDecodeProfile,
-        WhisperSpecialTokens,
+        acquire_whisper_cross_sequence_owner, adaptive_decode_budget,
+        apply_whisper_decode_constraints, best_finite_logit, build_whisper_decode_mask_tensors,
+        build_whisper_prompt_prefix, capped_decode_temperatures, contiguous_token_range,
+        decode_retry_reasons, decode_step_budget, find_suffix_token_repetition,
+        greedy_decode_step_from_masked_logits, has_low_word_diversity, logits_to_log_probs,
+        logits_to_log_probs_in_place, pad_or_trim_mel_frames, probability_for_token_from_logits,
+        scaled_logsumexp, tensor_to_f32_vec1, text_delta, token_contains_numeral_or_symbol,
+        trimmed_audio_bounds, use_cuda_whisper_dtype_shim, whisper_cross_source_identity,
+        whisper_decode_profile_diagnostics, whisper_device_diagnostics, whisper_impl_name,
+        whisper_terminal_policy_transition, with_whisper_decode_step_transaction,
+        WhisperDecodeAttempt, WhisperDecodeProfile, WhisperDecodeState, WhisperPreparedWindow,
+        WhisperSpecialTokens, WhisperTerminalTransition,
     };
+    use crate::backends::kv::{CpuKvArena, KvArenaConfig, KvLayerConfig};
+    use crate::backends::state::{negotiate_state_plan, StateBackendPlanRequest};
+    use crate::backends::BackendKind;
+    use crate::engine::{ModelInstanceId, RetainedStaticAttentionRuntimeV2};
+    use crate::error::{Error, Result};
+    use crate::kv::v2::{
+        CheckpointPolicy, InferenceStateContract, KeyEncoding, PlacementPolicy, PrefixPolicy,
+        StateClock, StateDType, StateDomainHeader, StateDomainId, StateDomainSpec, StateGroupId,
+        StateGroupSpec, StateScope, StaticAttentionDomainSpec, StaticAttentionLayerSpec,
+        CURRENT_INFERENCE_STATE_ABI,
+    };
+    use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
+    use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 
     #[test]
     fn whisper_dtype_shim_is_cuda_only() {
         assert!(!use_cuda_whisper_dtype_shim(&candle_core::Device::Cpu));
+    }
+
+    #[test]
+    fn cross_attention_source_identity_authenticates_audio_and_rate() {
+        let audio = [0.0, -0.25, 0.5, 1.0];
+        let identity = whisper_cross_source_identity(&audio, 16_000);
+        assert_ne!(identity, [0; 32]);
+        assert_eq!(
+            identity,
+            whisper_cross_source_identity(&audio, 16_000),
+            "the same encoder source must have a stable identity"
+        );
+        assert_ne!(
+            identity,
+            whisper_cross_source_identity(&audio, 48_000),
+            "sample rate is part of the encoder source"
+        );
+        assert_ne!(
+            identity,
+            whisper_cross_source_identity(&[0.0, -0.25, 0.5, 0.75], 16_000),
+            "sample bits are part of the encoder source"
+        );
     }
 
     #[test]
@@ -2999,6 +4523,894 @@ mod tests {
         assert!(reasons.contains(&"compression_ratio"));
         assert!(reasons.contains(&"low_word_diversity"));
     }
+
+    fn terminal_attempt(
+        text: &str,
+        avg_logprob: f32,
+        no_speech_prob: Option<f32>,
+        ended_with_eot: bool,
+    ) -> WhisperDecodeAttempt {
+        WhisperDecodeAttempt {
+            text: text.into(),
+            avg_logprob,
+            no_speech_prob,
+            ended_with_eot,
+            repetition_loop: false,
+            compression_ratio: Some(1.0),
+            generated_token_count: 2,
+            sampled_token_count: 3,
+            decode_steps: 3,
+            profile: WhisperDecodeProfile::default(),
+        }
+    }
+
+    #[test]
+    fn terminal_policy_no_speech_precedes_temperature_retry() {
+        let (transition, best) = whisper_terminal_policy_transition(
+            terminal_attempt("hallucination", -2.0, Some(0.9), false),
+            0.0,
+            None,
+            Some(0.2),
+            -1.0,
+            0.6,
+            Some(2.4),
+            1,
+            2,
+        );
+        assert_eq!(
+            transition,
+            WhisperTerminalTransition::SkipNoSpeech {
+                no_speech_probability: Some(0.9)
+            }
+        );
+        assert!(best.is_none());
+    }
+
+    #[test]
+    fn terminal_policy_requests_configured_retry_and_retains_best_attempt() {
+        let attempt = terminal_attempt("first", -2.0, Some(0.1), false);
+        let (transition, best) = whisper_terminal_policy_transition(
+            attempt.clone(),
+            0.0,
+            None,
+            Some(0.2),
+            -1.0,
+            0.6,
+            Some(2.4),
+            1,
+            2,
+        );
+        let WhisperTerminalTransition::RetryRequired {
+            next_temperature,
+            reasons,
+            expected_generation,
+            new_generation,
+        } = transition
+        else {
+            panic!("low-quality attempt must require retry");
+        };
+        assert_eq!(next_temperature, 0.2);
+        assert_eq!((expected_generation, new_generation), (1, 2));
+        assert!(reasons.contains(&"missing_eot"));
+        assert!(reasons.contains(&"low_logprob"));
+        assert_eq!(best.expect("retained best").0.text, attempt.text);
+    }
+
+    #[test]
+    fn terminal_policy_final_attempt_selects_better_prior_attempt() {
+        let prior = terminal_attempt("better transcript", -0.2, Some(0.1), true);
+        let final_attempt = terminal_attempt("worse", -2.0, Some(0.1), false);
+        let (transition, best) = whisper_terminal_policy_transition(
+            final_attempt,
+            0.2,
+            Some((prior, 0.0)),
+            None,
+            -1.0,
+            0.6,
+            Some(2.4),
+            1,
+            2,
+        );
+        assert_eq!(
+            transition,
+            WhisperTerminalTransition::Accept {
+                text: "better transcript".into(),
+                selected_temperature: 0.0,
+            }
+        );
+        assert!(best.is_none());
+    }
+
+    fn early_failure_cross_runtime(
+        model: ModelInstanceId,
+    ) -> Arc<RetainedStaticAttentionRuntimeV2> {
+        let static_domain = StateDomainId::new(1);
+        let contract = InferenceStateContract {
+            abi: CURRENT_INFERENCE_STATE_ABI,
+            domains: vec![StateDomainSpec::StaticAttention(
+                StaticAttentionDomainSpec {
+                    header: StateDomainHeader {
+                        id: static_domain,
+                        scope: StateScope::Retained,
+                        clock: StateClock::EncoderTokens,
+                        placement: PlacementPolicy::BackendLocal,
+                        prefix: PrefixPolicy::Disabled,
+                        checkpoint: CheckpointPolicy::Transactional,
+                    },
+                    layers: vec![StaticAttentionLayerSpec {
+                        model_layer: 0,
+                        query_heads: 1,
+                        kv_heads: 1,
+                        key_head_dim: 2,
+                        value_head_dim: 2,
+                        key_encoding: KeyEncoding::Raw,
+                    }],
+                    max_memory_tokens: 2,
+                    accepted_dtypes: vec![StateDType::F32],
+                },
+            )],
+            groups: vec![StateGroupSpec {
+                id: StateGroupId::new(1),
+                domains: vec![static_domain],
+                prefix_shareable: false,
+            }],
+        };
+        let plan = Arc::new(
+            negotiate_state_plan(
+                &contract,
+                &StateBackendPlanRequest {
+                    backend: BackendKind::Cpu,
+                    device_ordinal: None,
+                    page_tokens_hint: None,
+                    storage_dtype_hint: Some(StateDType::F32),
+                },
+            )
+            .expect("test static state plan"),
+        );
+        Arc::new(
+            RetainedStaticAttentionRuntimeV2::new(
+                model,
+                1,
+                &contract,
+                plan,
+                static_domain,
+                1,
+                Device::Cpu,
+            )
+            .expect("test static runtime"),
+        )
+    }
+
+    fn assert_cross_sequence_released_for_reuse(runtime: &RetainedStaticAttentionRuntimeV2) {
+        let replacement = runtime
+            .register_sequence()
+            .expect("failed prefill entry must release capacity for immediate reuse");
+        runtime
+            .release_sequence(replacement)
+            .expect("replacement sequence release");
+    }
+
+    #[test]
+    fn managed_prefill_early_failures_release_cross_sequence_for_reuse() {
+        let prepared = WhisperPreparedWindow::for_test(2, 1, 2).expect("prepared window");
+
+        let runtime = early_failure_cross_runtime(ModelInstanceId::new(991));
+        let sequence = runtime.register_sequence().expect("validation sequence");
+        let error = acquire_whisper_cross_sequence_owner(
+            super::WhisperCrossSequenceOwner::new(runtime.clone(), sequence),
+            &prepared,
+            2,
+            2,
+            1,
+            0,
+            || Ok(1),
+        )
+        .err()
+        .expect("foreign prepared identity must fail");
+        assert!(error.to_string().contains("another model or geometry"));
+        assert_cross_sequence_released_for_reuse(runtime.as_ref());
+
+        let runtime = early_failure_cross_runtime(ModelInstanceId::new(992));
+        let sequence = runtime.register_sequence().expect("state-id sequence");
+        let error = acquire_whisper_cross_sequence_owner(
+            super::WhisperCrossSequenceOwner::new(runtime.clone(), sequence),
+            &prepared,
+            1,
+            2,
+            1,
+            0,
+            || Err(Error::InferenceError("forced state-id failure".into())),
+        )
+        .err()
+        .expect("state identity allocation must fail deterministically");
+        assert!(error.to_string().contains("forced state-id failure"));
+        assert_cross_sequence_released_for_reuse(runtime.as_ref());
+
+        let runtime = early_failure_cross_runtime(ModelInstanceId::new(993));
+        let sequence = runtime.register_sequence().expect("self-context sequence");
+        let error = acquire_whisper_cross_sequence_owner(
+            super::WhisperCrossSequenceOwner::new(runtime.clone(), sequence),
+            &prepared,
+            1,
+            2,
+            1,
+            1,
+            || Ok(1),
+        )
+        .err()
+        .expect("nonempty self context must fail");
+        assert!(error
+            .to_string()
+            .contains("requires empty self and cross state"));
+        assert_cross_sequence_released_for_reuse(runtime.as_ref());
+
+        let runtime = early_failure_cross_runtime(ModelInstanceId::new(994));
+        let sequence = runtime.register_sequence().expect("cross-read sequence");
+        runtime
+            .install(sequence, prepared.source_identity, prepared.layers.clone())
+            .expect("preinstall cross memory");
+        let error = acquire_whisper_cross_sequence_owner(
+            super::WhisperCrossSequenceOwner::new(runtime.clone(), sequence),
+            &prepared,
+            1,
+            2,
+            1,
+            0,
+            || Ok(1),
+        )
+        .err()
+        .expect("nonempty cross read must fail");
+        assert!(error
+            .to_string()
+            .contains("requires empty self and cross state"));
+        assert_cross_sequence_released_for_reuse(runtime.as_ref());
+
+        let runtime = early_failure_cross_runtime(ModelInstanceId::new(995));
+        let sequence = runtime
+            .register_sequence()
+            .expect("install-failure sequence");
+        let incompatible =
+            WhisperPreparedWindow::for_test(2, 1, 3).expect("incompatible prepared window");
+        let (owner, _) = acquire_whisper_cross_sequence_owner(
+            super::WhisperCrossSequenceOwner::new(runtime.clone(), sequence),
+            &incompatible,
+            1,
+            2,
+            1,
+            0,
+            || Ok(1),
+        )
+        .expect("entry validation before forced install failure");
+        let error = owner
+            .runtime
+            .install(
+                owner.sequence(),
+                incompatible.source_identity,
+                incompatible.layers.clone(),
+            )
+            .expect_err("incompatible layer width must fail installation");
+        assert!(!error.to_string().is_empty());
+        drop(owner);
+        assert_cross_sequence_released_for_reuse(runtime.as_ref());
+
+        let runtime = early_failure_cross_runtime(ModelInstanceId::new(996));
+        let sequence = runtime
+            .register_sequence()
+            .expect("post-install failure sequence");
+        let (owner, _) = acquire_whisper_cross_sequence_owner(
+            super::WhisperCrossSequenceOwner::new(runtime.clone(), sequence),
+            &prepared,
+            1,
+            2,
+            1,
+            0,
+            || Ok(1),
+        )
+        .expect("post-install entry");
+        owner
+            .runtime
+            .install(
+                owner.sequence(),
+                prepared.source_identity,
+                prepared.layers.clone(),
+            )
+            .expect("install before simulated prompt initialization failure");
+        drop(owner);
+        assert_cross_sequence_released_for_reuse(runtime.as_ref());
+
+        let runtime = early_failure_cross_runtime(ModelInstanceId::new(997));
+        let sequence = runtime
+            .register_sequence()
+            .expect("foreign-model rejection sequence");
+        let error =
+            crate::models::registry::reject_foreign_whisper_prefill(runtime.clone(), sequence)
+                .err()
+                .expect("foreign model must reject Whisper prefill");
+        assert!(error.to_string().contains("another ASR model"));
+        assert_cross_sequence_released_for_reuse(runtime.as_ref());
+    }
+
+    fn transactional_test_state() -> WhisperDecodeState {
+        let state_id = super::next_whisper_decode_state_id().expect("test state identity");
+        let model = ModelInstanceId::new(90 + state_id);
+        let arena_id = KvArenaId {
+            model_instance: model,
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            generation: 1,
+        };
+        let group = KvGroupId::new(1);
+        let binding = KvLayerBinding {
+            model_layer: 0,
+            physical_layer: 0,
+        };
+        let arena = Arc::new(
+            CpuKvArena::new(KvArenaConfig {
+                id: arena_id,
+                group,
+                page_tokens: 4,
+                capacity_pages: 1,
+                growth: None,
+                dtype: DType::F32,
+                layers: vec![KvLayerConfig {
+                    binding,
+                    num_kv_heads: 1,
+                    key_head_dim: 2,
+                    value_head_dim: 2,
+                }],
+            })
+            .expect("test KV arena"),
+        );
+        let self_kv = PhysicalPagedKvCache::new(
+            arena,
+            vec![binding],
+            vec![CacheBlockRef {
+                arena: arena_id,
+                group,
+                index: 0,
+                slot_generation: 1,
+            }],
+            0,
+        )
+        .expect("test physical cache");
+
+        let static_domain = StateDomainId::new(1);
+        let contract = InferenceStateContract {
+            abi: CURRENT_INFERENCE_STATE_ABI,
+            domains: vec![StateDomainSpec::StaticAttention(
+                StaticAttentionDomainSpec {
+                    header: StateDomainHeader {
+                        id: static_domain,
+                        scope: StateScope::Retained,
+                        clock: StateClock::EncoderTokens,
+                        placement: PlacementPolicy::BackendLocal,
+                        prefix: PrefixPolicy::Disabled,
+                        checkpoint: CheckpointPolicy::Transactional,
+                    },
+                    layers: vec![StaticAttentionLayerSpec {
+                        model_layer: 0,
+                        query_heads: 1,
+                        kv_heads: 1,
+                        key_head_dim: 2,
+                        value_head_dim: 2,
+                        key_encoding: KeyEncoding::Raw,
+                    }],
+                    max_memory_tokens: 2,
+                    accepted_dtypes: vec![StateDType::F32],
+                },
+            )],
+            groups: vec![StateGroupSpec {
+                id: StateGroupId::new(1),
+                domains: vec![static_domain],
+                prefix_shareable: false,
+            }],
+        };
+        let plan = Arc::new(
+            negotiate_state_plan(
+                &contract,
+                &StateBackendPlanRequest {
+                    backend: BackendKind::Cpu,
+                    device_ordinal: None,
+                    page_tokens_hint: None,
+                    storage_dtype_hint: Some(StateDType::F32),
+                },
+            )
+            .expect("test static state plan"),
+        );
+        let cross_runtime = Arc::new(
+            RetainedStaticAttentionRuntimeV2::new(
+                model,
+                1,
+                &contract,
+                plan,
+                static_domain,
+                1,
+                Device::Cpu,
+            )
+            .expect("test static runtime"),
+        );
+        let cross_sequence = cross_runtime
+            .register_sequence()
+            .expect("test static sequence");
+        WhisperDecodeState {
+            state_id,
+            next_quantum_nonce: 1,
+            active_quantum: None,
+            current_managed_generation: 1,
+            managed_completions_drained: true,
+            self_kv,
+            cross_runtime,
+            cross_sequence: Some(cross_sequence),
+            prompt: vec![1],
+            prefill_progress: 1,
+            pending_logits: Some(
+                Tensor::from_vec(vec![0.25_f32, 0.75], (2,), &Device::Cpu).expect("test logits"),
+            ),
+            generated_tokens: vec![],
+            assembled: String::new(),
+            sum_logprobs: 0.0,
+            sampled_token_count: 0,
+            no_speech_prob: None,
+            ended_with_eot: false,
+            repetition_loop: false,
+            decode_steps: 0,
+            best_attempt: None,
+            pending_retry: None,
+            temperature: 1.0,
+            attempt_generation: 1,
+            max_steps: 3,
+            finished: false,
+            rng: rand::rngs::StdRng::seed_from_u64(7),
+        }
+    }
+
+    fn append_test_decode_token(state: &mut WhisperDecodeState, token: u32) -> Result<()> {
+        let mut prepared = state
+            .self_kv
+            .prepare_append(state.self_kv.context_len(), 1)?;
+        let qkv = Tensor::zeros((1, 1, 2), DType::F32, &Device::Cpu)?;
+        state
+            .self_kv
+            .write_and_attend(0, &mut prepared, &qkv, &qkv, &qkv, 1.0)?;
+        state.self_kv.commit_prepared(prepared)?;
+        state.managed_completions_drained = false;
+        state.pending_logits = None;
+        state.generated_tokens.push(token);
+        state.assembled = format!("token-{token}");
+        Ok(())
+    }
+
+    fn replacement_test_cache(
+        state: &WhisperDecodeState,
+        context_len: usize,
+    ) -> PhysicalPagedKvCache {
+        PhysicalPagedKvCache::new(
+            state.self_kv.arena().clone(),
+            vec![KvLayerBinding {
+                model_layer: 0,
+                physical_layer: 0,
+            }],
+            state.self_kv.blocks.clone(),
+            context_len,
+        )
+        .expect("replacement physical cache")
+    }
+
+    fn generation_test_cache(
+        state: &WhisperDecodeState,
+        _managed_generation: u64,
+        context_len: usize,
+    ) -> PhysicalPagedKvCache {
+        let arena_id = state.self_kv.arena().id();
+        let group = state.self_kv.arena().config().group;
+        let binding = KvLayerBinding {
+            model_layer: 0,
+            physical_layer: 0,
+        };
+        let arena = Arc::new(
+            CpuKvArena::new(KvArenaConfig {
+                id: arena_id,
+                group,
+                page_tokens: 4,
+                capacity_pages: 1,
+                growth: None,
+                dtype: DType::F32,
+                layers: vec![KvLayerConfig {
+                    binding,
+                    num_kv_heads: 1,
+                    key_head_dim: 2,
+                    value_head_dim: 2,
+                }],
+            })
+            .expect("retry-generation arena"),
+        );
+        PhysicalPagedKvCache::new(
+            arena,
+            vec![binding],
+            vec![CacheBlockRef {
+                arena: arena_id,
+                group,
+                index: 0,
+                slot_generation: 1,
+            }],
+            context_len,
+        )
+        .expect("retry-generation cache")
+    }
+
+    fn install_test_cross_memory(state: &WhisperDecodeState) {
+        let sequence = state.cross_sequence.expect("test cross sequence");
+        state
+            .cross_runtime
+            .install(
+                sequence,
+                [7; 32],
+                vec![crate::backends::state::StaticAttentionLayerValue {
+                    model_layer: 0,
+                    keys: Tensor::zeros((1, 1, 2), DType::F32, &Device::Cpu)
+                        .expect("test cross keys"),
+                    values: Tensor::zeros((1, 1, 2), DType::F32, &Device::Cpu)
+                        .expect("test cross values"),
+                }],
+            )
+            .expect("install test cross memory");
+    }
+
+    #[test]
+    fn post_append_text_decode_failure_rolls_back_for_exact_retry() {
+        let mut state = transactional_test_state();
+        let original_logits = state
+            .pending_logits
+            .as_ref()
+            .expect("initial logits")
+            .to_vec1::<f32>()
+            .expect("host logits");
+        let mut expected_rng = state.rng.clone();
+        let expected_sample = expected_rng.gen::<u32>();
+
+        let error = with_whisper_decode_step_transaction(&mut state, |state| {
+            let sampled = state.rng.gen::<u32>();
+            append_test_decode_token(state, sampled)?;
+            state.finished = true;
+            Err::<(), _>(Error::InferenceError(
+                "forced post-append text decode failure".into(),
+            ))
+        })
+        .expect_err("forced text decode failure");
+        assert!(error
+            .to_string()
+            .contains("forced post-append text decode failure"));
+        assert_eq!(state.self_kv.context_len(), 0);
+        assert!(state.generated_tokens.is_empty());
+        assert!(state.assembled.is_empty());
+        assert!(!state.finished);
+        assert_eq!(
+            state
+                .pending_logits
+                .as_ref()
+                .expect("restored logits")
+                .to_vec1::<f32>()
+                .expect("restored host logits"),
+            original_logits
+        );
+
+        let retried_sample = with_whisper_decode_step_transaction(&mut state, |state| {
+            let sampled = state.rng.gen::<u32>();
+            append_test_decode_token(state, sampled)?;
+            Ok(sampled)
+        })
+        .expect("exact retry");
+        assert_eq!(retried_sample, expected_sample);
+        assert_eq!(state.self_kv.context_len(), 1);
+        assert_eq!(state.generated_tokens, vec![expected_sample]);
+        assert_eq!(state.assembled, format!("token-{expected_sample}"));
+    }
+
+    #[test]
+    fn managed_quantum_rollback_restores_reservation_semantics_and_static_identity() {
+        let mut state = transactional_test_state();
+        let static_sequence = state.cross_sequence;
+        let original_logits = state
+            .pending_logits
+            .as_ref()
+            .expect("initial logits")
+            .to_vec1::<f32>()
+            .expect("initial host logits");
+        let replacement = replacement_test_cache(&state, 0);
+        let mut checkpoint = state
+            .begin_managed_quantum(replacement)
+            .expect("begin managed quantum");
+
+        append_test_decode_token(&mut state, 41).expect("append inside quantum");
+        state.prefill_progress = 0;
+        state.temperature = 0.7;
+        state.attempt_generation = 9;
+        state.max_steps = 1;
+        state.finished = true;
+        let _ = state.rng.gen::<u32>();
+        state
+            .rollback_managed_quantum(&mut checkpoint)
+            .expect("rollback managed quantum");
+
+        assert_eq!(state.self_kv.context_len(), 0);
+        assert_eq!(state.cross_sequence, static_sequence);
+        assert_eq!(state.prefill_progress, 1);
+        assert!(state.generated_tokens.is_empty());
+        assert!(state.assembled.is_empty());
+        assert_eq!(state.temperature, 1.0);
+        assert_eq!(state.attempt_generation, 1);
+        assert_eq!(state.max_steps, 3);
+        assert!(!state.finished);
+        assert_eq!(
+            state
+                .pending_logits
+                .as_ref()
+                .expect("restored logits")
+                .to_vec1::<f32>()
+                .expect("restored host logits"),
+            original_logits
+        );
+    }
+
+    #[test]
+    fn managed_quantum_commit_exposes_authenticated_completions_once() {
+        let mut state = transactional_test_state();
+        let static_sequence = state.cross_sequence;
+        let replacement = replacement_test_cache(&state, 0);
+        let mut checkpoint = state
+            .begin_managed_quantum(replacement)
+            .expect("begin managed quantum");
+        append_test_decode_token(&mut state, 17).expect("append inside quantum");
+        let completions = state.take_managed_write_completions();
+        assert_eq!(completions.len(), 1);
+        assert!(state.take_managed_write_completions().is_empty());
+        state
+            .commit_managed_quantum(&mut checkpoint)
+            .expect("commit managed quantum");
+        assert_eq!(state.self_kv.context_len(), 1);
+        assert_eq!(state.cross_sequence, static_sequence);
+
+        let terminal = replacement_test_cache(&state, 1);
+        let mut checkpoint = state
+            .begin_managed_quantum(terminal)
+            .expect("begin zero-append terminal quantum");
+        state.finished = true;
+        assert!(state.take_managed_write_completions().is_empty());
+        state
+            .commit_managed_quantum(&mut checkpoint)
+            .expect("commit zero-append terminal quantum");
+        assert_eq!(state.self_kv.context_len(), 1);
+        assert_eq!(state.cross_sequence, static_sequence);
+    }
+
+    #[test]
+    fn managed_quantum_requires_exact_continuation_position() {
+        let mut state = transactional_test_state();
+        let replacement = replacement_test_cache(&state, 1);
+        let error = match state.begin_managed_quantum(replacement) {
+            Ok(_) => panic!("future reservation must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("reservation starts at 1, but decode state is at 0"));
+        assert_eq!(state.self_kv.context_len(), 0);
+    }
+
+    #[test]
+    fn managed_quantum_rejects_nested_and_undrained_replacement() {
+        let mut state = transactional_test_state();
+        let replacement = replacement_test_cache(&state, 0);
+        let mut checkpoint = state
+            .begin_managed_quantum(replacement)
+            .expect("begin managed quantum");
+        let nested = replacement_test_cache(&state, 0);
+        let error = match state.begin_managed_quantum(nested) {
+            Ok(_) => panic!("nested managed quantum must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("already active"));
+
+        append_test_decode_token(&mut state, 23).expect("append inside quantum");
+        state
+            .commit_managed_quantum(&mut checkpoint)
+            .expect("commit managed quantum");
+        let undrained = replacement_test_cache(&state, 1);
+        let error = match state.begin_managed_quantum(undrained) {
+            Ok(_) => panic!("undrained completions must reject the next quantum"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("must be drained"));
+        assert_eq!(state.take_managed_write_completions().len(), 1);
+        let drained = replacement_test_cache(&state, 1);
+        let mut checkpoint = state
+            .begin_managed_quantum(drained)
+            .expect("drained continuation");
+        state
+            .rollback_managed_quantum(&mut checkpoint)
+            .expect("rollback drained continuation");
+    }
+
+    #[test]
+    fn managed_quantum_rejects_wrong_row_checkpoint_without_consuming_either() {
+        let mut first = transactional_test_state();
+        let mut second = transactional_test_state();
+        let first_replacement = replacement_test_cache(&first, 0);
+        let mut first_checkpoint = first
+            .begin_managed_quantum(first_replacement)
+            .expect("first quantum");
+        let second_replacement = replacement_test_cache(&second, 0);
+        let mut second_checkpoint = second
+            .begin_managed_quantum(second_replacement)
+            .expect("second quantum");
+
+        let error = second
+            .commit_managed_quantum(&mut first_checkpoint)
+            .expect_err("foreign checkpoint must be rejected");
+        assert!(error
+            .to_string()
+            .contains("foreign, stale, or out of order"));
+        first
+            .rollback_managed_quantum(&mut first_checkpoint)
+            .expect("foreign rejection must not consume first checkpoint");
+        second
+            .rollback_managed_quantum(&mut second_checkpoint)
+            .expect("foreign rejection must not clear second active quantum");
+    }
+
+    #[test]
+    fn managed_quantum_checkpoint_is_single_use_and_out_of_order_safe() {
+        let mut state = transactional_test_state();
+        let first_replacement = replacement_test_cache(&state, 0);
+        let mut first = state
+            .begin_managed_quantum(first_replacement)
+            .expect("first quantum");
+        state
+            .commit_managed_quantum(&mut first)
+            .expect("commit first quantum");
+        let stale = state
+            .commit_managed_quantum(&mut first)
+            .expect_err("committed checkpoint must be stale");
+        assert!(stale
+            .to_string()
+            .contains("foreign, stale, or out of order"));
+
+        let second_replacement = replacement_test_cache(&state, 0);
+        let mut second = state
+            .begin_managed_quantum(second_replacement)
+            .expect("second quantum");
+        let out_of_order = state
+            .rollback_managed_quantum(&mut first)
+            .expect_err("older checkpoint must not roll back a newer quantum");
+        assert!(out_of_order
+            .to_string()
+            .contains("foreign, stale, or out of order"));
+        state
+            .rollback_managed_quantum(&mut second)
+            .expect("newer active checkpoint remains valid");
+    }
+
+    #[test]
+    fn managed_generation_resets_attempt_and_preserves_static_cross_identity() {
+        let mut state = transactional_test_state();
+        install_test_cross_memory(&state);
+        let sequence = state.cross_sequence.expect("cross sequence");
+        let cross_before = state
+            .cross_runtime
+            .read(sequence)
+            .expect("read cross memory")
+            .expect("installed cross memory");
+        state.generated_tokens = vec![9, 10];
+        state.assembled = "bad attempt".into();
+        state.sum_logprobs = -8.0;
+        state.sampled_token_count = 2;
+        state.finished = true;
+        state.best_attempt = Some((terminal_attempt("best so far", -0.5, Some(0.1), true), 0.0));
+        state.pending_retry = Some(super::WhisperPendingRetry {
+            next_temperature: 0.2,
+            expected_generation: 1,
+            new_generation: 2,
+            next_attempt_generation: 2,
+        });
+        let replacement = generation_test_cache(&state, 2, 0);
+        let mut checkpoint = state
+            .begin_managed_generation(replacement, 1, 2)
+            .expect("begin retry generation");
+
+        assert_eq!(state.self_kv.arena().id().generation, 1);
+        assert_eq!(state.current_managed_generation, 2);
+        assert_eq!(state.self_kv.context_len(), 0);
+        assert_eq!(state.prefill_progress, 0);
+        assert!(state.pending_logits.is_none());
+        assert!(state.generated_tokens.is_empty());
+        assert!(state.assembled.is_empty());
+        assert_eq!(state.temperature, 0.2);
+        assert_eq!(state.attempt_generation, 2);
+        assert!(!state.finished);
+        assert!(state.pending_retry.is_none());
+        assert_eq!(
+            state.best_attempt.as_ref().expect("preserved best").0.text,
+            "best so far"
+        );
+        assert_eq!(
+            state
+                .cross_runtime
+                .read(sequence)
+                .expect("read preserved cross")
+                .expect("preserved cross memory"),
+            cross_before
+        );
+
+        state
+            .rollback_managed_quantum(&mut checkpoint)
+            .expect("rollback retry generation");
+        assert_eq!(state.self_kv.arena().id().generation, 1);
+        assert_eq!(state.current_managed_generation, 1);
+        assert_eq!(state.generated_tokens, vec![9, 10]);
+        assert_eq!(state.assembled, "bad attempt");
+        assert!(state.pending_retry.is_some());
+        assert_eq!(state.cross_sequence, Some(sequence));
+    }
+
+    #[test]
+    fn managed_generation_rejects_no_pending_and_stale_generations() {
+        let mut state = transactional_test_state();
+        install_test_cross_memory(&state);
+        let no_pending = generation_test_cache(&state, 2, 0);
+        let error = match state.begin_managed_generation(no_pending, 1, 2) {
+            Ok(_) => panic!("retry generation requires pending policy transition"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("no pending"));
+
+        state.pending_retry = Some(super::WhisperPendingRetry {
+            next_temperature: 0.2,
+            expected_generation: 1,
+            new_generation: 2,
+            next_attempt_generation: 2,
+        });
+        let stale = generation_test_cache(&state, 2, 0);
+        let error = match state.begin_managed_generation(stale, 0, 2) {
+            Ok(_) => panic!("stale expected generation must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("stale or out of order"));
+        assert_eq!(state.self_kv.arena().id().generation, 1);
+        assert_eq!(state.current_managed_generation, 1);
+        assert!(state.pending_retry.is_some());
+    }
+
+    #[test]
+    fn managed_generation_rejects_wrong_authority_and_nonzero_context() {
+        let mut state = transactional_test_state();
+        install_test_cross_memory(&state);
+        state.pending_retry = Some(super::WhisperPendingRetry {
+            next_temperature: 0.2,
+            expected_generation: 1,
+            new_generation: 2,
+            next_attempt_generation: 2,
+        });
+        let nonzero = generation_test_cache(&state, 2, 1);
+        let error = match state.begin_managed_generation(nonzero, 1, 2) {
+            Ok(_) => panic!("retry generation must start at zero"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("context zero"));
+
+        let mut foreign = transactional_test_state();
+        install_test_cross_memory(&foreign);
+        foreign.pending_retry = state.pending_retry;
+        let wrong_authority = generation_test_cache(&foreign, 2, 0);
+        let error = match state.begin_managed_generation(wrong_authority, 1, 2) {
+            Ok(_) => panic!("foreign retry cache must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("cannot switch session KV authority"));
+        assert_eq!(state.self_kv.arena().id().generation, 1);
+        assert_eq!(state.current_managed_generation, 1);
+    }
 }
 
 fn resample_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
@@ -3018,6 +5430,17 @@ fn resample_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
         out.push(audio[left] * (1.0 - frac) + audio[right] * frac);
     }
     out
+}
+
+fn checked_product_u64(values: &[usize], label: &str) -> Result<u64> {
+    values.iter().try_fold(1_u64, |product, value| {
+        product
+            .checked_mul(
+                u64::try_from(*value)
+                    .map_err(|_| Error::Overloaded(format!("{label} exceeds u64")))?,
+            )
+            .ok_or_else(|| Error::Overloaded(format!("{label} overflow")))
+    })
 }
 
 fn language_name_to_code(language: &str) -> Option<&'static str> {

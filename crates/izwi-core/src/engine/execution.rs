@@ -6,8 +6,14 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::backends::kv::KvWriteBatchCompletion;
+use crate::backends::state::{TensorStateBatchCompletion, TensorStateSelection};
 use crate::backends::BackendKind;
+use crate::config::PhysicalInFlightLimit;
+use crate::engine::cache::coordinator::GroupBlockTable;
 use crate::error::{Error, Result};
+pub use crate::kv::v2::{StateClock, StateGroupId};
+use crate::kv::{CacheBlockRef, CacheDomainId, KvArenaId, KvSlotRef};
 use crate::model::ModelVariant;
 
 use super::resources::{ResourceEstimate, ResourceVector};
@@ -76,6 +82,172 @@ impl InputRange {
     pub fn len(self) -> usize {
         self.end.saturating_sub(self.start)
     }
+
+    pub fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Load-authored authorization for one independently clocked retained-state
+/// group. A selection permits a stage to advance the group; it does not by
+/// itself require every row or quantum to do so.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ClockedStateSelection {
+    group: StateGroupId,
+    clock: StateClock,
+}
+
+impl ClockedStateSelection {
+    pub fn new(group: StateGroupId, clock: StateClock) -> Result<Self> {
+        if group.get() == 0 {
+            return Err(Error::InvalidInput(
+                "clocked retained-state selection has a zero group id".into(),
+            ));
+        }
+        if matches!(&clock, StateClock::Custom(name) if name.trim().is_empty()) {
+            return Err(Error::InvalidInput(
+                "custom retained-state clock name cannot be empty".into(),
+            ));
+        }
+        Ok(Self { group, clock })
+    }
+
+    pub const fn group(&self) -> StateGroupId {
+        self.group
+    }
+
+    pub const fn clock(&self) -> &StateClock {
+        &self.clock
+    }
+}
+
+/// Exact input interval by which one retained-state group advances in a
+/// sequence quantum. Spans are sealed by Core after exact stage and physical
+/// state-plan authentication; executors may consume but never invent them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ClockedStateSpan {
+    group: StateGroupId,
+    clock: StateClock,
+    input: InputRange,
+}
+
+impl ClockedStateSpan {
+    pub fn new(group: StateGroupId, clock: StateClock, input: InputRange) -> Result<Self> {
+        if group.get() == 0 {
+            return Err(Error::InvalidInput(
+                "clocked retained-state span has a zero group id".into(),
+            ));
+        }
+        if input.is_empty() {
+            return Err(Error::InvalidInput(
+                "clocked retained-state span cannot be empty".into(),
+            ));
+        }
+        Ok(Self {
+            group,
+            clock,
+            input,
+        })
+    }
+
+    pub const fn group(&self) -> StateGroupId {
+        self.group
+    }
+
+    pub const fn clock(&self) -> &StateClock {
+        &self.clock
+    }
+
+    pub const fn input(&self) -> InputRange {
+        self.input
+    }
+}
+
+/// Immutable request-owned mapping from a primary sequence interval to an
+/// independently clocked retained-state interval. Preparation authors these
+/// projections; Core intersects and seals them for each scheduled quantum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClockedStateProjection {
+    primary: InputRange,
+    selection: ClockedStateSelection,
+    auxiliary: InputRange,
+    scale: usize,
+}
+
+impl ClockedStateProjection {
+    pub(crate) fn new(
+        primary: InputRange,
+        selection: ClockedStateSelection,
+        auxiliary: InputRange,
+    ) -> Result<Self> {
+        if primary.is_empty() || auxiliary.is_empty() {
+            return Err(Error::InvalidInput(
+                "clocked retained-state projection ranges cannot be empty".into(),
+            ));
+        }
+        if !auxiliary.len().is_multiple_of(primary.len()) {
+            return Err(Error::InvalidInput(
+                "clocked retained-state projection has no exact integral scale".into(),
+            ));
+        }
+        let scale = auxiliary.len() / primary.len();
+        if scale == 0 {
+            return Err(Error::InvalidInput(
+                "clocked retained-state projection has a zero scale".into(),
+            ));
+        }
+        Ok(Self {
+            primary,
+            selection,
+            auxiliary,
+            scale,
+        })
+    }
+
+    pub(crate) const fn selection(&self) -> &ClockedStateSelection {
+        &self.selection
+    }
+
+    pub(crate) const fn primary(&self) -> InputRange {
+        self.primary
+    }
+
+    pub(crate) const fn auxiliary(&self) -> InputRange {
+        self.auxiliary
+    }
+
+    pub(crate) const fn scale(&self) -> usize {
+        self.scale
+    }
+
+    pub(crate) fn project(&self, scheduled: InputRange) -> Result<Option<ClockedStateSpan>> {
+        let start = scheduled.start.max(self.primary.start);
+        let end = scheduled.end.min(self.primary.end);
+        if end <= start {
+            return Ok(None);
+        }
+        let mapped_start = start
+            .checked_sub(self.primary.start)
+            .and_then(|offset| offset.checked_mul(self.scale))
+            .and_then(|offset| self.auxiliary.start.checked_add(offset))
+            .ok_or_else(|| Error::InvalidInput("clocked state projection start overflow".into()))?;
+        let mapped_end = end
+            .checked_sub(self.primary.start)
+            .and_then(|offset| offset.checked_mul(self.scale))
+            .and_then(|offset| self.auxiliary.start.checked_add(offset))
+            .ok_or_else(|| Error::InvalidInput("clocked state projection end overflow".into()))?;
+        if mapped_end > self.auxiliary.end {
+            return Err(Error::InvalidInput(
+                "clocked state projection exceeds its authenticated auxiliary interval".into(),
+            ));
+        }
+        ClockedStateSpan::new(
+            self.selection.group(),
+            self.selection.clock().clone(),
+            InputRange::new(mapped_start, mapped_end)?,
+        )
+        .map(Some)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -84,12 +256,125 @@ pub enum SequencePhase {
     Decode,
 }
 
+/// Stable identity for one externally submitted realtime operation within an
+/// exact scheduler session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RealtimeOperationId(u64);
+
+impl RealtimeOperationId {
+    pub(crate) const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RealtimePreparationMode {
+    Push,
+    Finish,
+}
+
+/// Scheduler-visible phase of one externally submitted realtime operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RealtimeSubphase {
+    Preparation,
+    PromptPrefill { cache_append: usize },
+    DecodeContinuation,
+    Completion,
+}
+
+/// Executor-authored, core-committed transition for one exact realtime phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RealtimeStageOutcome {
+    pub plan_id: PlanId,
+    pub operation_id: RealtimeOperationId,
+    pub completed: RealtimeSubphase,
+    pub next: Option<RealtimeSubphase>,
+    pub input_consumed: usize,
+    pub output_steps: usize,
+    pub cache_append: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum WorkUnit {
+    /// A model stage that must complete before the request's execution shape
+    /// and persistent sequence state can be admitted. Preparation is a
+    /// distinct transaction: it must not be represented as decoder prefill.
+    PreSequencePreparation {
+        kind: String,
+    },
     SequenceStep {
         phase: SequencePhase,
         input: InputRange,
         max_output_steps: usize,
+        /// Core-sealed retained tensor/static-state work distinct from the
+        /// primary decoder-token interval.
+        /// `None` preserves legacy decoder-coupled retained state. `Some([])`
+        /// is an authenticated explicit selection of no auxiliary group.
+        auxiliary_state: Option<Arc<[ClockedStateSpan]>>,
+    },
+    /// A model-authenticated terminal sequence stage that does not append KV.
+    /// TTS codecs use this after acoustic decode has committed its final frame.
+    SequenceFinalize {
+        max_output_steps: usize,
+    },
+    /// One input-driven realtime quantum. `input` is the exact absolute input
+    /// interval accepted by this push; output is bounded independently because
+    /// a realtime model may emit zero or more events for one input chunk.
+    RealtimePush {
+        operation_id: RealtimeOperationId,
+        input: InputRange,
+        max_output_steps: usize,
+        /// Conservative decoder-KV append ceiling, independent of the source
+        /// sample interval and externally visible output-event count.
+        max_cache_append: usize,
+    },
+    /// Signal that no more realtime input will arrive and allow the model to
+    /// flush at most `max_output_steps` pending output events.
+    RealtimeFinish {
+        operation_id: RealtimeOperationId,
+        max_output_steps: usize,
+        max_cache_append: usize,
+    },
+    /// Pure audio preparation for one queued realtime push or finish. This
+    /// stage owns no decoder KV mutation and may use padded static batching.
+    RealtimePreparation {
+        operation_id: RealtimeOperationId,
+        mode: RealtimePreparationMode,
+        input: InputRange,
+        max_output_steps: usize,
+        max_cache_append: usize,
+        /// Scheduler-authored semantic revision for retained preparation state.
+        retained_state_input: InputRange,
+        /// Core-sealed retained state advanced once for this external
+        /// operation. Paged-only realtime models leave this unset.
+        auxiliary_state: Option<Arc<[ClockedStateSpan]>>,
+    },
+    /// One scalar prompt-prefill transaction whose exact KV append was learned
+    /// from the committed preparation outcome.
+    RealtimePromptPrefill {
+        operation_id: RealtimeOperationId,
+        max_output_steps: usize,
+        cache_append: usize,
+    },
+    /// One ready retained decode token. Continuous batches contain only rows
+    /// that can perform this exact tensor/KV mutation.
+    RealtimeDecodeContinuation {
+        operation_id: RealtimeOperationId,
+        max_output_steps: usize,
+        max_cache_append: usize,
+        /// Scheduler-authored global decode-step interval for retained state.
+        retained_state_input: InputRange,
+        /// Core-sealed retained state advanced by this decode quantum.
+        auxiliary_state: Option<Arc<[ClockedStateSpan]>>,
+    },
+    /// Zero-tensor control phase used to seal a closed/exhausted stream and its
+    /// final marker without claiming a decode dispatch.
+    RealtimeCompletion {
+        operation_id: RealtimeOperationId,
     },
     AtomicJob {
         kind: String,
@@ -169,8 +454,16 @@ pub enum StageProgressKind {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StageWorkSelector {
     Any,
+    PreSequencePreparation,
     SequencePrefill,
     SequenceDecode,
+    SequenceFinalize,
+    RealtimePush,
+    RealtimeFinish,
+    RealtimePreparation,
+    RealtimePromptPrefill,
+    RealtimeDecodeContinuation,
+    RealtimeCompletion,
     Atomic,
     Pipeline { ordinal: Option<usize> },
 }
@@ -179,6 +472,7 @@ impl StageWorkSelector {
     fn matches(self, work: &WorkUnit) -> bool {
         match (self, work) {
             (Self::Any, _) => true,
+            (Self::PreSequencePreparation, WorkUnit::PreSequencePreparation { .. }) => true,
             (
                 Self::SequencePrefill,
                 WorkUnit::SequenceStep {
@@ -193,6 +487,13 @@ impl StageWorkSelector {
                     ..
                 },
             )
+            | (Self::SequenceFinalize, WorkUnit::SequenceFinalize { .. })
+            | (Self::RealtimePush, WorkUnit::RealtimePush { .. })
+            | (Self::RealtimeFinish, WorkUnit::RealtimeFinish { .. })
+            | (Self::RealtimePreparation, WorkUnit::RealtimePreparation { .. })
+            | (Self::RealtimePromptPrefill, WorkUnit::RealtimePromptPrefill { .. })
+            | (Self::RealtimeDecodeContinuation, WorkUnit::RealtimeDecodeContinuation { .. })
+            | (Self::RealtimeCompletion, WorkUnit::RealtimeCompletion { .. })
             | (Self::Atomic, WorkUnit::AtomicJob { .. }) => true,
             (
                 Self::Pipeline { ordinal },
@@ -248,6 +549,10 @@ pub struct StageDescriptor {
     pub domain: ExecutionDomain,
     pub progress: StageProgressKind,
     pub concurrency: ConcurrencyClass,
+    /// Load-sealed certification for overlap between distinct physical calls.
+    /// This remains independent from row formation within one physical batch.
+    #[serde(default)]
+    pub physical_launch_policy: PhysicalLaunchPolicy,
     pub batch_mode: NativeBatchMode,
     pub max_batch_size: usize,
     pub max_work_units: u64,
@@ -260,6 +565,13 @@ pub struct StageDescriptor {
     pub shape_policy: StageShapePolicy,
     pub membership_safe_point: MembershipSafePoint,
     pub output_visibility: OutputVisibility,
+    /// Canonical load-authored authorization for independently clocked
+    /// retained groups this stage may advance.
+    #[serde(default)]
+    /// `None` preserves the legacy contract in which every retained group is
+    /// coupled to the primary decoder cursor. `Some([])` explicitly selects no
+    /// auxiliary group; a non-empty value authorizes exactly those groups.
+    pub retained_state_selections: Option<Vec<ClockedStateSelection>>,
 }
 
 impl StageDescriptor {
@@ -307,6 +619,7 @@ impl StageDescriptor {
             },
             progress,
             concurrency,
+            physical_launch_policy: profile.effective_physical_launch_policy(),
             batch_mode,
             max_batch_size: profile.max_batch_size.max(1),
             max_work_units: u64::MAX,
@@ -323,6 +636,7 @@ impl StageDescriptor {
             shape_policy,
             membership_safe_point,
             output_visibility: OutputVisibility::AfterQuantumCommit,
+            retained_state_selections: None,
         }
     }
 
@@ -331,6 +645,22 @@ impl StageDescriptor {
             return Err(Error::InvalidInput(
                 "execution stage name cannot be empty".to_string(),
             ));
+        }
+        let mut previous_group = None;
+        for selection in self
+            .retained_state_selections
+            .as_deref()
+            .unwrap_or_default()
+        {
+            if selection.group().get() == 0
+                || previous_group.is_some_and(|previous| previous >= selection.group().get())
+            {
+                return Err(Error::InvalidInput(
+                    "execution stage retained-state selections must have nonzero, strictly increasing group ids"
+                        .into(),
+                ));
+            }
+            previous_group = Some(selection.group().get());
         }
         if self.max_batch_size == 0 || self.max_work_units == 0 {
             return Err(Error::InvalidInput(
@@ -370,6 +700,19 @@ impl StageDescriptor {
                 "request-parallel stages must use independent row shapes".to_string(),
             ));
         }
+        if matches!(
+            self.physical_launch_policy,
+            PhysicalLaunchPolicy::Concurrent { .. }
+        ) && (self.domain != ExecutionDomain::ExecutionGroup
+            || self.batch_mode != NativeBatchMode::None
+            || self.concurrency != ConcurrencyClass::Batchable
+            || self.shape_policy != StageShapePolicy::Independent)
+        {
+            return Err(Error::InvalidInput(
+                "concurrent physical launches require independent scalar execution-group rows"
+                    .to_string(),
+            ));
+        }
         if self.shape_policy != StageShapePolicy::Padded && self.max_padding_basis_points != 0 {
             return Err(Error::InvalidInput(
                 "only padded execution stages may declare padding overhead".to_string(),
@@ -388,6 +731,28 @@ impl StageDescriptor {
         {
             return Err(Error::InvalidInput(
                 "native tensor stages cannot publish in-flight output checkpoints".to_string(),
+            ));
+        }
+        if matches!(
+            self.selector,
+            StageWorkSelector::RealtimePush
+                | StageWorkSelector::RealtimeFinish
+                | StageWorkSelector::RealtimePreparation
+                | StageWorkSelector::RealtimePromptPrefill
+        ) && (self.progress != StageProgressKind::InputDriven
+            || self.membership_safe_point != MembershipSafePoint::InputBoundary)
+        {
+            return Err(Error::InvalidInput(
+                "realtime work stages require input-driven progress at an input boundary"
+                    .to_string(),
+            ));
+        }
+        if self.selector == StageWorkSelector::RealtimeDecodeContinuation
+            && (self.progress != StageProgressKind::Iterative
+                || self.membership_safe_point != MembershipSafePoint::QuantumBoundary)
+        {
+            return Err(Error::InvalidInput(
+                "realtime decode continuation requires iterative quantum-boundary progress".into(),
             ));
         }
         Ok(())
@@ -472,7 +837,9 @@ impl ExecutionAdapterBinding {
             .iter()
             .filter(|stage| stage.selector == StageWorkSelector::Any);
         let stage = fallback.next().ok_or_else(|| {
-            Error::InvalidInput("execution adapter has no stage for scheduled work".to_string())
+            Error::InvalidInput(format!(
+                "execution adapter has no stage for scheduled work: {work:?}"
+            ))
         })?;
         if fallback.next().is_some() {
             return Err(Error::InvalidInput(
@@ -529,7 +896,7 @@ impl WorkCost {
         }
     }
 
-    fn checked_add(self, other: Self) -> Option<Self> {
+    pub(crate) fn checked_add(self, other: Self) -> Option<Self> {
         Some(Self {
             logical_units: self.logical_units.checked_add(other.logical_units)?,
             tensor_elements: self.tensor_elements.checked_add(other.tensor_elements)?,
@@ -542,6 +909,17 @@ impl Default for WorkCost {
     fn default() -> Self {
         Self::with_workspace(0, 0, ResourceVector::zero())
     }
+}
+
+pub(crate) fn continuous_asr_host_workspace_per_row_bytes() -> Result<u64> {
+    u64::try_from(std::mem::size_of::<u32>() + 4 * std::mem::size_of::<usize>())
+        .map_err(|_| Error::Overloaded("continuous ASR host workspace estimate overflow".into()))
+}
+
+pub(crate) fn continuous_asr_workspace_per_row_bytes(accelerator_bytes: u64) -> Result<u64> {
+    accelerator_bytes
+        .checked_add(continuous_asr_host_workspace_per_row_bytes()?)
+        .ok_or_else(|| Error::Overloaded("continuous ASR workspace estimate overflow".into()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -736,7 +1114,6 @@ impl Default for OutcomeProvenance {
 #[serde(rename_all = "snake_case")]
 pub enum CacheMode {
     None,
-    OpaqueModelOwned,
     ExternalPaged,
 }
 
@@ -752,8 +1129,57 @@ pub enum CancellationGranularity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConcurrencyClass {
+    /// One logical row per physical-batch envelope.
     Exclusive,
+    /// Multiple compatible rows may share one physical-batch envelope, either
+    /// as a tensor invocation or as independent compatibility rows. This does
+    /// not certify overlap between distinct physical model calls.
     Batchable,
+}
+
+/// Backend/model certification for overlapping distinct physical launches.
+///
+/// This is intentionally separate from [`ConcurrencyClass`], which describes
+/// row formation within one physical invocation. Policies fail closed to
+/// execution-group serialization until a loaded backend/model contract
+/// explicitly certifies a narrower scope or concurrent model calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PhysicalLaunchPolicy {
+    #[default]
+    ExecutionGroupExclusive,
+    ModelExclusive,
+    Concurrent {
+        /// Per-model ceiling, independently clamped by the engine-wide
+        /// physical in-flight limit.
+        max_in_flight_per_model: PhysicalInFlightLimit,
+    },
+}
+
+impl PhysicalLaunchPolicy {
+    pub fn concurrent(max_in_flight_per_model: usize) -> Result<Self> {
+        Ok(Self::Concurrent {
+            max_in_flight_per_model: PhysicalInFlightLimit::new(max_in_flight_per_model).map_err(
+                |_| {
+                    Error::InvalidInput(
+                        "concurrent physical launch policy requires a non-zero per-model limit"
+                            .to_string(),
+                    )
+                },
+            )?,
+        })
+    }
+
+    /// Effective same-model overlap after applying the engine-wide physical
+    /// launch limit. Group/model-exclusive policies always resolve to one.
+    pub fn effective_max_in_flight_per_model(self, engine_limit: PhysicalInFlightLimit) -> usize {
+        match self {
+            Self::ExecutionGroupExclusive | Self::ModelExclusive => 1,
+            Self::Concurrent {
+                max_in_flight_per_model,
+            } => max_in_flight_per_model.get().min(engine_limit.get()),
+        }
+    }
 }
 
 /// Effective execution behavior for one model/request/backend combination.
@@ -773,12 +1199,20 @@ pub struct ExecutionProfile {
     pub cache_mode: CacheMode,
     pub cancellation: CancellationGranularity,
     pub concurrency: ConcurrencyClass,
+    /// Certification for overlap between separate physical calls. Missing or
+    /// unsealed contracts remain execution-group exclusive.
+    #[serde(default)]
+    pub physical_launch_policy: PhysicalLaunchPolicy,
     pub recompute_safe: bool,
     /// The executor can synchronously prove that all model-owned cache state
     /// for an exact session has been released before recomputation or reuse.
     pub cache_release_safe: bool,
     pub prefix_reuse_safe: bool,
     pub max_batch_size: usize,
+    /// Model-preferred number of decode inputs in one isolated scheduler
+    /// transaction. The scheduler may reduce this for fairness or latency.
+    #[serde(default = "default_preferred_decode_tokens")]
+    pub preferred_decode_tokens: usize,
     pub resolved_from_loaded_model: bool,
     pub compute_dtype: String,
     pub kv_dtype: String,
@@ -809,10 +1243,12 @@ impl ExecutionProfile {
                 }
             },
             concurrency: ConcurrencyClass::Exclusive,
+            physical_launch_policy: PhysicalLaunchPolicy::ExecutionGroupExclusive,
             recompute_safe: false,
             cache_release_safe: false,
             prefix_reuse_safe: false,
             max_batch_size: 1,
+            preferred_decode_tokens: 1,
             resolved_from_loaded_model: false,
             compute_dtype: "unknown".to_string(),
             kv_dtype: "none".to_string(),
@@ -842,6 +1278,21 @@ impl ExecutionProfile {
             },
         }
     }
+
+    /// Return the launch policy that may be consumed by physical admission.
+    /// Catalog or fallback profiles cannot promote execution concurrency even
+    /// if an unsealed policy value was copied into the profile.
+    pub fn effective_physical_launch_policy(&self) -> PhysicalLaunchPolicy {
+        if self.resolved_from_loaded_model {
+            self.physical_launch_policy
+        } else {
+            PhysicalLaunchPolicy::ExecutionGroupExclusive
+        }
+    }
+}
+
+const fn default_preferred_decode_tokens() -> usize {
+    1
 }
 
 impl Default for ExecutionCapabilities {
@@ -903,6 +1354,757 @@ pub struct ReadyQuantum {
     pub lane: BatchLaneKey,
     pub work: WorkUnit,
     pub cost: WorkCost,
+    /// Optional shadow/managed-cache transaction fenced to this exact row.
+    pub managed_cache: Option<ManagedCacheReservation>,
+}
+
+/// Backend-neutral identity of one row-level managed-cache reservation.
+///
+/// Physical tables and pins remain owned by the cache coordinator. Carrying
+/// this compact fence in the execution envelope lets report validation reject
+/// a receipt for another plan, request incarnation, arena generation, domain,
+/// or table version before engine state is committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ManagedSessionGeneration(u64);
+
+impl ManagedSessionGeneration {
+    pub const INITIAL: Self = Self(1);
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub(crate) fn next(self) -> Result<Self> {
+        self.0
+            .checked_add(1)
+            .map(Self)
+            .ok_or_else(|| Error::InferenceError("managed session generation overflow".into()))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedCacheReservation {
+    pub txn_id: PlanId,
+    pub session: SessionKey,
+    pub session_generation: ManagedSessionGeneration,
+    pub domains: Vec<ManagedCacheDomainReservation>,
+    pub clocked_state: Option<ManagedClockedStateReservation>,
+    /// Authenticated at admission from realtime push/finish work. Ordinary
+    /// sequence work must continue to advance every managed KV domain.
+    pub(crate) allow_unchanged_prefix: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedClockedStateReservation {
+    model_instance: ModelInstanceId,
+    pub sequence: u64,
+    /// `None` is a legacy all-domain decoder-coupled transaction; `Some`
+    /// authenticates the exact independently clocked selected groups.
+    selections: Option<Arc<[TensorStateSelection]>>,
+}
+
+/// Compatibility name retained while decoder-coupled model adapters migrate
+/// to the explicit clocked-state vocabulary.
+pub type ManagedTensorStateReservation = ManagedClockedStateReservation;
+
+impl ManagedClockedStateReservation {
+    pub(crate) fn legacy(model_instance: ModelInstanceId, sequence: u64) -> Result<Self> {
+        Self::new(model_instance, sequence, None)
+    }
+
+    pub(crate) fn selected(
+        model_instance: ModelInstanceId,
+        sequence: u64,
+        selections: Arc<[TensorStateSelection]>,
+    ) -> Result<Self> {
+        if selections.is_empty() {
+            return Err(Error::InvalidInput(
+                "managed clocked-state reservation has no selected groups".into(),
+            ));
+        }
+        Self::new(model_instance, sequence, Some(selections))
+    }
+
+    fn new(
+        model_instance: ModelInstanceId,
+        sequence: u64,
+        selections: Option<Arc<[TensorStateSelection]>>,
+    ) -> Result<Self> {
+        if sequence == 0 {
+            return Err(Error::InvalidInput(
+                "managed clocked-state reservation has a zero sequence id".into(),
+            ));
+        }
+        Ok(Self {
+            model_instance,
+            sequence,
+            selections,
+        })
+    }
+
+    pub(crate) const fn model_instance(&self) -> ModelInstanceId {
+        self.model_instance
+    }
+
+    pub(crate) const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub(crate) fn selections(&self) -> Option<&[TensorStateSelection]> {
+        self.selections.as_deref()
+    }
+}
+
+/// One physical cache-domain transaction within a row reservation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedCacheDomainReservation {
+    pub arena: KvArenaId,
+    pub domain: CacheDomainId,
+    pub expected_version: u64,
+    pub expected_committed_tokens: u32,
+    /// Logical context already present in the provisional table when model
+    /// execution starts. This may exceed the committed request-table length
+    /// when admission attached immutable pages from the prefix index.
+    pub execution_start_tokens: u32,
+    pub target_committed_tokens: u32,
+    pub target_window_start: u32,
+    /// Hidden-token offset in the first provisional physical page.
+    pub first_page_offset: u32,
+    pub provisional_groups: Vec<GroupBlockTable>,
+    pub writable_blocks: Vec<CacheBlockRef>,
+}
+
+impl ManagedCacheReservation {
+    pub fn validate_for_row(&self, row: &ReadyQuantum) -> Result<()> {
+        if self.txn_id != row.plan_id || self.session != row.session {
+            return Err(Error::InvalidInput(
+                "managed-cache reservation does not match its physical row".to_string(),
+            ));
+        }
+        if self.domains.is_empty() && self.clocked_state.is_none() {
+            return Err(Error::InvalidInput(
+                "managed-cache reservation has no paged or clocked state".to_string(),
+            ));
+        }
+        let unchanged_prefix_work = matches!(
+            &row.work,
+            WorkUnit::SequenceStep {
+                phase: SequencePhase::Decode,
+                ..
+            } | WorkUnit::RealtimePush { .. }
+                | WorkUnit::RealtimeFinish { .. }
+                | WorkUnit::RealtimePreparation { .. }
+                | WorkUnit::RealtimeCompletion { .. }
+        );
+        if self.allow_unchanged_prefix != unchanged_prefix_work {
+            return Err(Error::InvalidInput(
+                "managed-cache zero-append authority does not match the exact row work".into(),
+            ));
+        }
+        if let Some(clocked) = self.clocked_state.as_ref() {
+            if clocked.model_instance() != row.lane.model_instance
+                || self
+                    .domains
+                    .iter()
+                    .any(|domain| domain.arena.model_instance != clocked.model_instance())
+            {
+                return Err(Error::InvalidInput(
+                    "managed clocked-state reservation crossed its exact model instance".into(),
+                ));
+            }
+        }
+        let auxiliary = match &row.work {
+            WorkUnit::SequenceStep {
+                auxiliary_state, ..
+            } => auxiliary_state.as_deref(),
+            _ => None,
+        };
+        match (auxiliary, self.clocked_state.as_ref()) {
+            (None, Some(reservation)) if reservation.selections().is_some() => {
+                return Err(Error::InvalidInput(
+                    "selected clocked-state reservation was attached to legacy sequence work"
+                        .into(),
+                ));
+            }
+            (Some(spans), None) if !spans.is_empty() => {
+                return Err(Error::InvalidInput(
+                    "clocked-state sequence spans have no physical reservation".into(),
+                ));
+            }
+            (Some([]), None) => {}
+            (Some([]), Some(_)) => {
+                return Err(Error::InvalidInput(
+                    "explicit empty clocked-state work cannot reserve a tensor transaction".into(),
+                ));
+            }
+            (Some(spans), Some(reservation)) => {
+                let selections = reservation.selections().ok_or_else(|| {
+                    Error::InvalidInput(
+                        "explicit clocked-state work received a legacy physical reservation".into(),
+                    )
+                })?;
+                if spans.len() != selections.len() {
+                    return Err(Error::InvalidInput(
+                        "clocked-state reservation does not match the row's exact ordered spans"
+                            .into(),
+                    ));
+                }
+                for (span, selection) in spans.iter().zip(selections) {
+                    let expected_cursor = u64::try_from(span.input().start).map_err(|_| {
+                        Error::InvalidInput(
+                            "clocked-state span start exceeds physical cursor width".into(),
+                        )
+                    })?;
+                    let target_cursor = u64::try_from(span.input().end).map_err(|_| {
+                        Error::InvalidInput(
+                            "clocked-state span end exceeds physical cursor width".into(),
+                        )
+                    })?;
+                    if selection.group != span.group()
+                        || &selection.clock != span.clock()
+                        || selection.expected_cursor != expected_cursor
+                        || selection.target_cursor != target_cursor
+                    {
+                        return Err(Error::InvalidInput(
+                            "clocked-state reservation does not match the row's exact ordered spans"
+                                .into(),
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+        if self
+            .clocked_state
+            .as_ref()
+            .is_some_and(|reservation| reservation.sequence() == 0)
+        {
+            return Err(Error::InvalidInput(
+                "managed tensor-state reservation has a zero sequence id".into(),
+            ));
+        }
+        let mut identities = HashSet::with_capacity(self.domains.len());
+        for domain in &self.domains {
+            if domain.execution_start_tokens < domain.expected_committed_tokens
+                || domain.target_committed_tokens < domain.execution_start_tokens
+                || domain.target_window_start > domain.target_committed_tokens
+                || domain.first_page_offset > domain.target_committed_tokens
+            {
+                return Err(Error::InvalidInput(
+                    "managed-cache reservation has an invalid token range".to_string(),
+                ));
+            }
+            if !identities.insert((domain.arena, domain.domain)) {
+                return Err(Error::InvalidInput(
+                    "managed-cache reservation repeats a cache domain".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Reconcile backend-sealed physical writes with this exact row.
+    pub(crate) fn completed_write_receipt(
+        &self,
+        completions: &[Arc<KvWriteBatchCompletion>],
+    ) -> Result<ManagedCacheReceipt> {
+        self.completed_write_receipt_inner(completions, None)
+    }
+
+    /// Reconcile sealed backend writes with one common accepted prefix of the
+    /// scheduler's maximum reservation.
+    ///
+    /// The receipt retains this exact reservation as its transaction fence.
+    /// `committed_tokens` is an absolute logical cursor. It may equal every
+    /// domain's execution start to authenticate a successful zero-append
+    /// realtime quantum; otherwise it must advance without exceeding the
+    /// reserved target.
+    pub(crate) fn completed_write_receipt_for_prefix(
+        &self,
+        completions: &[Arc<KvWriteBatchCompletion>],
+        committed_tokens: u32,
+    ) -> Result<ManagedCacheReceipt> {
+        self.completed_write_receipt_inner(completions, Some(committed_tokens))
+    }
+
+    fn completed_write_receipt_inner(
+        &self,
+        completions: &[Arc<KvWriteBatchCompletion>],
+        accepted_prefix: Option<u32>,
+    ) -> Result<ManagedCacheReceipt> {
+        let unchanged_prefix = accepted_prefix.is_some_and(|committed| {
+            self.domains
+                .iter()
+                .all(|domain| committed == domain.execution_start_tokens)
+        });
+        if unchanged_prefix {
+            if !self.allow_unchanged_prefix {
+                return Err(Error::InferenceError(
+                    "unchanged managed-cache prefix lacks terminal or realtime authority".into(),
+                ));
+            }
+            if !completions.is_empty() {
+                return Err(Error::InferenceError(
+                    "unchanged managed-cache prefix returned unexpected backend writes".into(),
+                ));
+            }
+            return Ok(ManagedCacheReceipt {
+                reservation: self.clone(),
+                domains: self
+                    .domains
+                    .iter()
+                    .map(|domain| ManagedCacheDomainReceipt {
+                        arena: domain.arena,
+                        domain: domain.domain,
+                        written_blocks: Vec::new(),
+                        page_tokens: 1,
+                    })
+                    .collect(),
+                accepted_prefix,
+                clocked_state: None,
+            });
+        }
+        if completions.is_empty() && !self.domains.is_empty() {
+            return Err(Error::InferenceError(
+                "managed-cache row returned no backend write completion".into(),
+            ));
+        }
+        let mut receipts = Vec::with_capacity(self.domains.len());
+        for domain in &self.domains {
+            let committed_tokens = accepted_prefix.unwrap_or(domain.target_committed_tokens);
+            if committed_tokens < domain.execution_start_tokens
+                || committed_tokens > domain.target_committed_tokens
+            {
+                return Err(Error::InferenceError(
+                    "managed-cache accepted prefix is outside the reserved append range".into(),
+                ));
+            }
+            let writable = domain
+                .writable_blocks
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>();
+            if writable.len() != domain.writable_blocks.len() || writable.is_empty() {
+                return Err(Error::InferenceError(
+                    "managed-cache reservation has an invalid writable block set".into(),
+                ));
+            }
+            let group = domain
+                .provisional_groups
+                .iter()
+                .find(|table| writable.iter().any(|block| block.group == table.group))
+                .ok_or_else(|| {
+                    Error::InferenceError(
+                        "managed-cache reservation has no table for its writable blocks".into(),
+                    )
+                })?;
+            if writable.iter().any(|block| {
+                block.arena != domain.arena
+                    || block.group != group.group
+                    || !group.blocks.contains(block)
+            }) {
+                return Err(Error::InferenceError(
+                    "managed-cache writable blocks cross an arena or group fence".into(),
+                ));
+            }
+
+            let matching = completions
+                .iter()
+                .filter(|completion| completion.arena() == domain.arena)
+                .collect::<Vec<_>>();
+            let page_tokens = matching
+                .first()
+                .map(|completion| completion.page_tokens())
+                .ok_or_else(|| {
+                    Error::InferenceError(
+                        "managed-cache domain has no matching backend completion".into(),
+                    )
+                })?;
+            if page_tokens == 0
+                || matching
+                    .iter()
+                    .any(|completion| completion.page_tokens() != page_tokens)
+            {
+                return Err(Error::InferenceError(
+                    "managed-cache completions disagree on page geometry".into(),
+                ));
+            }
+            let expected = expected_domain_slots(domain, group, page_tokens, committed_tokens)?;
+            let mut observed = HashSet::with_capacity(expected.len());
+            for completion in matching {
+                for slot in completion.slots() {
+                    if writable.contains(&slot.block) && !observed.insert(*slot) {
+                        return Err(Error::InferenceError(
+                            "managed-cache physical slot was acknowledged more than once".into(),
+                        ));
+                    }
+                }
+            }
+            if observed != expected {
+                return Err(Error::InferenceError(
+                    "managed-cache completion does not match the row's exact physical slots".into(),
+                ));
+            }
+            let written_blocks = domain
+                .writable_blocks
+                .iter()
+                .copied()
+                .filter(|block| expected.iter().any(|slot| slot.block == *block))
+                .collect::<Vec<_>>();
+            if written_blocks.is_empty() {
+                return Err(Error::InferenceError(
+                    "managed-cache accepted prefix has no writable physical page".into(),
+                ));
+            }
+            receipts.push(ManagedCacheDomainReceipt {
+                arena: domain.arena,
+                domain: domain.domain,
+                written_blocks,
+                page_tokens,
+            });
+        }
+        Ok(ManagedCacheReceipt {
+            reservation: self.clone(),
+            domains: receipts,
+            accepted_prefix,
+            clocked_state: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn completed_write_receipt_for_test(&self) -> ManagedCacheReceipt {
+        ManagedCacheReceipt {
+            reservation: self.clone(),
+            domains: self
+                .domains
+                .iter()
+                .map(|domain| ManagedCacheDomainReceipt {
+                    arena: domain.arena,
+                    domain: domain.domain,
+                    written_blocks: domain.writable_blocks.clone(),
+                    page_tokens: inferred_page_tokens_for_test(domain),
+                })
+                .collect(),
+            accepted_prefix: None,
+            clocked_state: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn completed_write_receipt_for_prefix_for_test(
+        &self,
+        committed_tokens: u32,
+        page_tokens: u32,
+    ) -> Result<ManagedCacheReceipt> {
+        let mut domains = Vec::with_capacity(self.domains.len());
+        for domain in &self.domains {
+            if committed_tokens <= domain.execution_start_tokens
+                || committed_tokens > domain.target_committed_tokens
+            {
+                return Err(Error::InvalidInput(
+                    "test managed-cache prefix is outside the reservation".into(),
+                ));
+            }
+            let writable = domain
+                .writable_blocks
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>();
+            let group = domain
+                .provisional_groups
+                .iter()
+                .find(|group| writable.iter().any(|block| block.group == group.group))
+                .ok_or_else(|| {
+                    Error::InvalidInput("test reservation has no writable group".into())
+                })?;
+            let expected = expected_domain_slots(domain, group, page_tokens, committed_tokens)?;
+            let written_blocks = domain
+                .writable_blocks
+                .iter()
+                .copied()
+                .filter(|block| expected.iter().any(|slot| slot.block == *block))
+                .collect::<Vec<_>>();
+            domains.push(ManagedCacheDomainReceipt {
+                arena: domain.arena,
+                domain: domain.domain,
+                written_blocks,
+                page_tokens,
+            });
+        }
+        Ok(ManagedCacheReceipt {
+            reservation: self.clone(),
+            domains,
+            accepted_prefix: Some(committed_tokens),
+            clocked_state: None,
+        })
+    }
+}
+
+fn expected_domain_slots(
+    domain: &ManagedCacheDomainReservation,
+    table: &GroupBlockTable,
+    page_tokens: u32,
+    committed_tokens: u32,
+) -> Result<HashSet<KvSlotRef>> {
+    if committed_tokens <= domain.execution_start_tokens
+        || committed_tokens > domain.target_committed_tokens
+    {
+        return Err(Error::InferenceError(
+            "managed-cache reservation has no physical append range".into(),
+        ));
+    }
+    let first_logical_page = domain.target_window_start / page_tokens;
+    let mut slots =
+        HashSet::with_capacity((committed_tokens - domain.execution_start_tokens) as usize);
+    for position in domain.execution_start_tokens..committed_tokens {
+        let logical_page = position / page_tokens;
+        let table_index = logical_page
+            .checked_sub(first_logical_page)
+            .ok_or_else(|| {
+                Error::InferenceError("managed-cache append precedes its physical window".into())
+            })?;
+        let block = table
+            .blocks
+            .get(table_index as usize)
+            .copied()
+            .ok_or_else(|| {
+                Error::InferenceError("managed-cache append exceeds its physical table".into())
+            })?;
+        slots.insert(KvSlotRef {
+            block,
+            offset: position % page_tokens,
+        });
+    }
+    Ok(slots)
+}
+
+/// Physical completion acknowledgement for one managed-cache row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedCacheReceipt {
+    pub reservation: ManagedCacheReservation,
+    pub domains: Vec<ManagedCacheDomainReceipt>,
+    // `None` preserves the legacy exact-full-reservation receipt. `Some` is a
+    // common accepted cursor authenticated from sealed backend completions.
+    accepted_prefix: Option<u32>,
+    clocked_state: Option<ManagedClockedStateReceipt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedClockedStateReceipt {
+    completion: TensorStateBatchCompletion,
+}
+
+impl ManagedClockedStateReceipt {
+    pub(crate) fn new(completion: TensorStateBatchCompletion) -> Self {
+        Self { completion }
+    }
+
+    pub(crate) const fn completion(&self) -> &TensorStateBatchCompletion {
+        &self.completion
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedCacheDomainReceipt {
+    pub arena: KvArenaId,
+    pub domain: CacheDomainId,
+    pub written_blocks: Vec<CacheBlockRef>,
+    page_tokens: u32,
+}
+
+impl ManagedCacheReceipt {
+    pub(crate) const fn accepted_prefix(&self) -> Option<u32> {
+        self.accepted_prefix
+    }
+
+    pub(crate) const fn clocked_state(&self) -> Option<&ManagedClockedStateReceipt> {
+        self.clocked_state.as_ref()
+    }
+
+    pub(crate) fn with_clocked_state_completion(
+        mut self,
+        completion: TensorStateBatchCompletion,
+    ) -> Result<Self> {
+        if self.clocked_state.is_some() {
+            return Err(Error::InvalidInput(
+                "managed receipt already carries a clocked-state completion".into(),
+            ));
+        }
+        let reservation = self.reservation.clocked_state.as_ref().ok_or_else(|| {
+            Error::InvalidInput(
+                "clocked-state completion has no matching managed reservation".into(),
+            )
+        })?;
+        let selected = reservation.selections().ok_or_else(|| {
+            Error::InvalidInput(
+                "legacy clocked-state reservation cannot accept a selected completion".into(),
+            )
+        })?;
+        if completion.sequence().get() != reservation.sequence()
+            || completion.selections().ne(selected.iter())
+        {
+            return Err(Error::InvalidInput(
+                "clocked-state completion does not match its exact managed reservation".into(),
+            ));
+        }
+        self.clocked_state = Some(ManagedClockedStateReceipt::new(completion));
+        Ok(self)
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        match (
+            self.reservation.clocked_state.as_ref(),
+            self.clocked_state.as_ref(),
+        ) {
+            (Some(reservation), Some(receipt)) => {
+                let selected = reservation.selections().ok_or_else(|| {
+                    Error::InferenceError(
+                        "legacy clocked-state reservation cannot carry a selected completion"
+                            .into(),
+                    )
+                })?;
+                if receipt.completion().sequence().get() != reservation.sequence()
+                    || receipt.completion().selections().ne(selected.iter())
+                {
+                    return Err(Error::InferenceError(
+                        "clocked-state receipt does not match its exact reservation".into(),
+                    ));
+                }
+            }
+            (Some(reservation), None) if reservation.selections().is_some() => {
+                return Err(Error::InferenceError(
+                    "selected clocked-state reservation has no arena completion".into(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(Error::InferenceError(
+                    "clocked-state receipt has no matching reservation".into(),
+                ));
+            }
+            _ => {}
+        }
+        if self.domains.len() != self.reservation.domains.len() {
+            return Err(Error::InferenceError(
+                "managed-cache receipt does not cover every reserved domain".to_string(),
+            ));
+        }
+        let mut identities = HashSet::with_capacity(self.domains.len());
+        for receipt in &self.domains {
+            let reservation = self
+                .reservation
+                .domains
+                .iter()
+                .find(|reserved| {
+                    reserved.arena == receipt.arena && reserved.domain == receipt.domain
+                })
+                .ok_or_else(|| {
+                    Error::InferenceError(
+                        "managed-cache receipt contains a foreign cache domain".to_string(),
+                    )
+                })?;
+            if !identities.insert((receipt.arena, receipt.domain)) {
+                return Err(Error::InferenceError(
+                    "managed-cache receipt repeats a cache domain".to_string(),
+                ));
+            }
+            let blocks = receipt
+                .written_blocks
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>();
+            let committed_tokens = self
+                .accepted_prefix
+                .unwrap_or(reservation.target_committed_tokens);
+            let unchanged = committed_tokens == reservation.execution_start_tokens;
+            if committed_tokens < reservation.execution_start_tokens
+                || committed_tokens > reservation.target_committed_tokens
+                || receipt.page_tokens == 0
+            {
+                return Err(Error::InferenceError(
+                    "managed-cache receipt has an invalid committed prefix".into(),
+                ));
+            }
+            let writable = reservation
+                .writable_blocks
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>();
+            if unchanged {
+                if !self.reservation.allow_unchanged_prefix {
+                    return Err(Error::InferenceError(
+                        "unchanged managed-cache receipt lacks terminal or realtime authority"
+                            .into(),
+                    ));
+                }
+                if !blocks.is_empty() {
+                    return Err(Error::InferenceError(
+                        "unchanged managed-cache receipt acknowledged physical writes".into(),
+                    ));
+                }
+                continue;
+            }
+            let group = reservation
+                .provisional_groups
+                .iter()
+                .find(|group| writable.iter().any(|block| block.group == group.group))
+                .ok_or_else(|| {
+                    Error::InferenceError(
+                        "managed-cache receipt has no reserved writable group".into(),
+                    )
+                })?;
+            let expected_blocks =
+                expected_domain_slots(reservation, group, receipt.page_tokens, committed_tokens)?
+                    .into_iter()
+                    .map(|slot| slot.block)
+                    .filter(|block| writable.contains(block))
+                    .collect::<HashSet<_>>();
+            if blocks.len() != receipt.written_blocks.len()
+                || blocks != expected_blocks
+                || receipt
+                    .written_blocks
+                    .iter()
+                    .any(|block| block.arena != receipt.arena)
+            {
+                return Err(Error::InferenceError(
+                    "managed-cache receipt does not match the domain writable set".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn inferred_page_tokens_for_test(domain: &ManagedCacheDomainReservation) -> u32 {
+    let upper = domain.target_committed_tokens.max(1);
+    (1..=upper)
+        .find(|page_tokens| {
+            domain.target_window_start % page_tokens == domain.first_page_offset
+                && domain.provisional_groups.iter().any(|group| {
+                    expected_domain_slots(
+                        domain,
+                        group,
+                        *page_tokens,
+                        domain.target_committed_tokens,
+                    )
+                    .is_ok_and(|slots| {
+                        let blocks = slots
+                            .into_iter()
+                            .map(|slot| slot.block)
+                            .collect::<HashSet<_>>();
+                        domain
+                            .writable_blocks
+                            .iter()
+                            .all(|block| blocks.contains(block))
+                    })
+                })
+        })
+        .unwrap_or(upper)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -951,8 +2153,7 @@ impl PhysicalBatch {
 
         let mut keys = HashSet::with_capacity(self.rows.len());
         let mut cost = WorkCost::default();
-        let mut row_count = 0usize;
-        for row in &self.rows {
+        for (row_count, row) in self.rows.iter().enumerate() {
             if row.lane != self.lane {
                 return Err(Error::InvalidInput(
                     "physical batch contains an incompatible lane".to_string(),
@@ -971,7 +2172,6 @@ impl PhysicalBatch {
             cost = cost.checked_add(row.cost).ok_or_else(|| {
                 Error::InvalidInput("physical batch work accounting overflowed".to_string())
             })?;
-            row_count += 1;
         }
 
         if self.materialized_tensor_elements < cost.tensor_elements {
@@ -1015,6 +2215,7 @@ pub enum StateDisposition {
     Unchanged,
     ValidNext,
     RolledBack,
+    RestartPending,
     Poisoned,
 }
 
@@ -1022,6 +2223,7 @@ pub enum StateDisposition {
 pub struct PhysicalBatchRowReport {
     pub execution: ExecutionReport,
     pub state: StateDisposition,
+    pub managed_cache: Option<ManagedCacheReceipt>,
 }
 
 impl PhysicalBatchRowReport {
@@ -1051,6 +2253,23 @@ impl PhysicalBatchRowReport {
             {
                 return Err(Error::InferenceError(
                     "recompute retry cannot publish advanced model state".to_string(),
+                ));
+            }
+            ExecutionDisposition::RestartSequence(_)
+                if self.state != StateDisposition::RestartPending =>
+            {
+                return Err(Error::InferenceError(
+                    "sequence restart requires rolled-back restart-pending model state".to_string(),
+                ));
+            }
+            _ if self.state == StateDisposition::RestartPending
+                && !matches!(
+                    self.execution.disposition,
+                    ExecutionDisposition::RestartSequence(_)
+                ) =>
+            {
+                return Err(Error::InferenceError(
+                    "restart-pending model state requires a sequence restart outcome".to_string(),
                 ));
             }
             _ => {}
@@ -1166,6 +2385,52 @@ impl PhysicalBatchReport {
             })?;
             row.execution.validate_against(plan)?;
             row.validate_state()?;
+            let expected_row = expected
+                .get(&key)
+                .expect("reported row was validated above");
+            if matches!(
+                row.execution.disposition,
+                ExecutionDisposition::RestartSequence(_)
+            ) {
+                if expected_row.managed_cache.is_none() {
+                    return Err(Error::InferenceError(
+                        "sequence restart requires an exact managed-cache reservation".to_string(),
+                    ));
+                }
+                if row.managed_cache.is_some() {
+                    return Err(Error::InferenceError(
+                        "sequence restart cannot publish a managed-cache receipt".to_string(),
+                    ));
+                }
+            }
+            match (&expected_row.managed_cache, &row.managed_cache) {
+                (None, None) => {}
+                (None, Some(_)) => {
+                    return Err(Error::InferenceError(
+                        "physical batch report contains an unplanned managed-cache receipt"
+                            .to_string(),
+                    ));
+                }
+                (Some(reservation), Some(receipt)) => {
+                    if &receipt.reservation != reservation {
+                        return Err(Error::InferenceError(
+                            "managed-cache receipt does not match its exact row reservation"
+                                .to_string(),
+                        ));
+                    }
+                    receipt.validate()?;
+                }
+                (Some(_), None) if row.state == StateDisposition::ValidNext => {
+                    return Err(Error::InferenceError(
+                        "continuing managed-cache row omitted its physical write receipt"
+                            .to_string(),
+                    ));
+                }
+                (Some(_), None) => {
+                    // Failed, rolled-back, poisoned, or terminal rows abort the
+                    // reservation instead of publishing cache state.
+                }
+            }
         }
         if reported.len() != expected.len() {
             return Err(Error::InferenceError(
@@ -1188,6 +2453,8 @@ pub enum TerminalOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum YieldReason {
     QuantumExhausted,
+    /// Decoder state is durably ready for a distinct terminal sequence stage.
+    AwaitingFinalization,
     Backpressure,
     AwaitingInput,
     Preempted,
@@ -1199,6 +2466,13 @@ pub enum FinishReason {
     Cancelled,
     TimedOut,
     Rejected,
+}
+
+/// Model-authored reason for discarding one committed generation attempt and
+/// rebuilding the same logical sequence from context zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SequenceRestartReason {
+    ModelFallback,
 }
 
 impl FinishReason {
@@ -1267,6 +2541,7 @@ impl ExecutionFailure {
 pub enum ExecutionDisposition {
     Progress,
     Yielded(YieldReason),
+    RestartSequence(SequenceRestartReason),
     Finished(FinishReason),
     Failed(ExecutionFailure),
 }
@@ -1277,10 +2552,13 @@ pub enum ExecutionState {
     Admitted,
     Prefilling,
     Decoding,
+    RealtimeRunning,
+    RealtimeFinishing,
     AtomicRunning,
     PipelineRunning,
     Cancelling,
     PreemptedRecompute,
+    RestartPending,
     Terminal(TerminalOutcome),
 }
 
@@ -1297,22 +2575,42 @@ impl ExecutionState {
                 )
                 | (
                     Admitted,
-                    Prefilling | Decoding | AtomicRunning | PipelineRunning | Cancelling
+                    Prefilling
+                        | Decoding
+                        | RealtimeRunning
+                        | RealtimeFinishing
+                        | AtomicRunning
+                        | PipelineRunning
+                        | Cancelling
                 )
                 | (
                     Prefilling,
-                    Prefilling | Decoding | Cancelling | PreemptedRecompute
+                    Prefilling | Decoding | Cancelling | PreemptedRecompute | RestartPending
                 )
-                | (Decoding, Decoding | Cancelling | PreemptedRecompute)
+                | (
+                    Decoding,
+                    Decoding | Cancelling | PreemptedRecompute | RestartPending
+                )
                 | (AtomicRunning, Cancelling)
+                | (
+                    RealtimeRunning,
+                    RealtimeRunning | RealtimeFinishing | Cancelling
+                )
+                | (RealtimeFinishing, RealtimeFinishing | Cancelling)
                 | (PipelineRunning, PipelineRunning | Cancelling)
                 | (PreemptedRecompute, Admitted | Prefilling | Cancelling)
+                | (RestartPending, Cancelling)
                 | (
                     Cancelling,
                     Terminal(TerminalOutcome::Cancelled | TerminalOutcome::TimedOut)
                 )
                 | (
-                    Prefilling | Decoding | AtomicRunning | PipelineRunning,
+                    Prefilling
+                        | Decoding
+                        | RealtimeRunning
+                        | RealtimeFinishing
+                        | AtomicRunning
+                        | PipelineRunning,
                     Terminal(_)
                 )
         );
@@ -1372,6 +2670,7 @@ impl ExecutionReport {
                 "execution report has an invalid dispatch width".to_string(),
             ));
         }
+        validate_plan_clocked_state(plan)?;
         match self.dispatch.kind {
             BatchDispatchKind::NotDispatched
                 if !matches!(
@@ -1456,6 +2755,12 @@ impl ExecutionReport {
             ));
         }
         match plan.work {
+            WorkUnit::PreSequencePreparation { .. } => {
+                return Err(Error::InferenceError(
+                    "pre-sequence preparation must complete before EngineCore admission"
+                        .to_string(),
+                ));
+            }
             WorkUnit::SequenceStep {
                 input,
                 max_output_steps,
@@ -1473,6 +2778,92 @@ impl ExecutionReport {
                     return Err(Error::InferenceError(
                         "executor reported progress without consuming or producing work"
                             .to_string(),
+                    ));
+                }
+            }
+            WorkUnit::SequenceFinalize { max_output_steps } => {
+                if self.input_consumed != 0 || self.output_produced > max_output_steps {
+                    return Err(Error::InferenceError(
+                        "sequence finalization reported progress beyond its terminal quantum"
+                            .into(),
+                    ));
+                }
+                if !matches!(
+                    self.disposition,
+                    ExecutionDisposition::Finished(_) | ExecutionDisposition::Failed(_)
+                ) {
+                    return Err(Error::InferenceError(
+                        "sequence finalization must finish or fail in one transaction".into(),
+                    ));
+                }
+            }
+            WorkUnit::RealtimePush {
+                input,
+                max_output_steps,
+                ..
+            } => {
+                if input.is_empty() {
+                    return Err(Error::InferenceError(
+                        "realtime push requires a non-empty input interval".to_string(),
+                    ));
+                }
+                if self.input_consumed > input.len() || self.output_produced > max_output_steps {
+                    return Err(Error::InferenceError(
+                        "executor reported progress beyond the realtime push quantum".to_string(),
+                    ));
+                }
+                if matches!(self.disposition, ExecutionDisposition::Progress)
+                    && self.input_consumed == 0
+                    && self.output_produced == 0
+                {
+                    return Err(Error::InferenceError(
+                        "executor reported realtime progress without consuming or producing work"
+                            .to_string(),
+                    ));
+                }
+            }
+            WorkUnit::RealtimeFinish {
+                max_output_steps, ..
+            } => {
+                if self.input_consumed != 0 || self.output_produced > max_output_steps {
+                    return Err(Error::InferenceError(
+                        "executor reported progress beyond the realtime finish quantum".to_string(),
+                    ));
+                }
+                if matches!(self.disposition, ExecutionDisposition::Progress)
+                    && self.output_produced == 0
+                {
+                    return Err(Error::InferenceError(
+                        "executor reported realtime finish progress without producing work"
+                            .to_string(),
+                    ));
+                }
+            }
+            WorkUnit::RealtimePreparation { input, .. } => {
+                if self.input_consumed != 0 || self.output_produced != 0 {
+                    return Err(Error::InferenceError(format!(
+                        "realtime preparation for {} source samples reported decoder progress",
+                        input.len()
+                    )));
+                }
+            }
+            WorkUnit::RealtimePromptPrefill {
+                max_output_steps, ..
+            }
+            | WorkUnit::RealtimeDecodeContinuation {
+                max_output_steps, ..
+            } => {
+                if self.input_consumed != 0 || self.output_produced > max_output_steps.min(1) {
+                    return Err(Error::InferenceError(
+                        "realtime decoder subphase reported progress beyond its exact quantum"
+                            .into(),
+                    ));
+                }
+            }
+            WorkUnit::RealtimeCompletion { .. } => {
+                if self.input_consumed != 0 || self.output_produced != 0 {
+                    return Err(Error::InferenceError(
+                        "realtime completion cannot report tensor progress".into(),
                     ));
                 }
             }
@@ -1494,11 +2885,30 @@ impl ExecutionReport {
             ));
         }
         match &self.disposition {
-            ExecutionDisposition::Progress | ExecutionDisposition::Yielded(_) => {
+            ExecutionDisposition::Progress
+            | ExecutionDisposition::Yielded(_)
+            | ExecutionDisposition::RestartSequence(_) => {
                 if self.output_finished || self.output_has_error {
                     return Err(Error::InferenceError(
                         "non-terminal execution returned a terminal or errored payload".to_string(),
                     ));
+                }
+                if matches!(self.disposition, ExecutionDisposition::RestartSequence(_)) {
+                    if !self.safe_point {
+                        return Err(Error::InferenceError(
+                            "sequence restart requires a declared safe point".to_string(),
+                        ));
+                    }
+                    if self.input_consumed != 0 || self.output_produced != 0 {
+                        return Err(Error::InferenceError(
+                            "sequence restart cannot report committed progress".to_string(),
+                        ));
+                    }
+                    if !matches!(plan.work, WorkUnit::SequenceStep { .. }) {
+                        return Err(Error::InferenceError(
+                            "sequence restart is only valid for sequence execution".to_string(),
+                        ));
+                    }
                 }
             }
             ExecutionDisposition::Finished(_) => {
@@ -1541,6 +2951,52 @@ impl ExecutionReport {
         }
         Ok(())
     }
+}
+
+fn validate_plan_clocked_state(plan: &ExecutionPlan) -> Result<()> {
+    let WorkUnit::SequenceStep {
+        auxiliary_state, ..
+    } = &plan.work
+    else {
+        return Ok(());
+    };
+    let policy = plan
+        .stage
+        .as_ref()
+        .and_then(|stage| stage.retained_state_selections.as_deref());
+    match (policy, auxiliary_state.as_deref()) {
+        (None, None) => return Ok(()),
+        (Some(selections), Some(spans)) => {
+            let mut previous_group = None;
+            for span in spans {
+                if span.input().is_empty()
+                    || previous_group.is_some_and(|previous| previous >= span.group().get())
+                {
+                    return Err(Error::InferenceError(
+                        "sequence auxiliary retained-state spans are not canonical and unique"
+                            .into(),
+                    ));
+                }
+                if selections
+                    .binary_search_by_key(&span.group().get(), |selection| selection.group().get())
+                    .ok()
+                    .and_then(|index| selections.get(index))
+                    .is_none_or(|selection| selection.clock() != span.clock())
+                {
+                    return Err(Error::InferenceError(
+                        "sequence auxiliary retained-state span is not authorized by its exact stage"
+                            .into(),
+                    ));
+                }
+                previous_group = Some(span.group().get());
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+    Err(Error::InferenceError(
+        "sequence auxiliary retained-state policy was not sealed into its plan".into(),
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -1626,6 +3082,7 @@ impl ExecutionTracker {
             {
                 Some(ExecutionState::PreemptedRecompute)
             }
+            ExecutionDisposition::RestartSequence(_) => Some(ExecutionState::RestartPending),
             ExecutionDisposition::Progress
             | ExecutionDisposition::Yielded(_)
             | ExecutionDisposition::Failed(_) => None,
@@ -1683,6 +3140,50 @@ mod tests {
     }
 
     #[test]
+    fn clocked_state_projection_maps_split_quanta_exactly() {
+        let projection = ClockedStateProjection::new(
+            InputRange::new(10, 14).unwrap(),
+            ClockedStateSelection::new(StateGroupId::new(2), StateClock::AudioSamples).unwrap(),
+            InputRange::new(1_000, 1_640).unwrap(),
+        )
+        .unwrap();
+        let first = projection
+            .project(InputRange::new(8, 12).unwrap())
+            .unwrap()
+            .unwrap();
+        let second = projection
+            .project(InputRange::new(12, 16).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.input(), InputRange::new(1_000, 1_320).unwrap());
+        assert_eq!(second.input(), InputRange::new(1_320, 1_640).unwrap());
+        assert!(projection
+            .project(InputRange::new(14, 15).unwrap())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn stage_clocked_state_authorization_is_canonical_and_tri_state() {
+        let profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        let mut stage = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            "prefill",
+            &profile,
+            NativeBatchMode::None,
+        );
+        assert!(stage.retained_state_selections.is_none());
+        stage.retained_state_selections = Some(vec![]);
+        stage.validate().unwrap();
+        stage.retained_state_selections = Some(vec![
+            ClockedStateSelection::new(StateGroupId::new(2), StateClock::AudioSamples).unwrap(),
+            ClockedStateSelection::new(StateGroupId::new(1), StateClock::EncoderTokens).unwrap(),
+        ]);
+        assert!(stage.validate().is_err());
+    }
+
+    #[test]
     fn legacy_stage_descriptor_stays_fail_closed_at_width_one() {
         let profile = ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Atomic);
         let stage = StageDescriptor::from_execution_profile(
@@ -1695,7 +3196,138 @@ mod tests {
         assert_eq!(stage.max_batch_size, 1);
         assert_eq!(stage.batch_mode, NativeBatchMode::None);
         assert_eq!(stage.progress, StageProgressKind::Atomic);
+        assert_eq!(
+            stage.physical_launch_policy,
+            PhysicalLaunchPolicy::ExecutionGroupExclusive
+        );
+        assert_eq!(
+            profile.physical_launch_policy,
+            PhysicalLaunchPolicy::ExecutionGroupExclusive
+        );
         assert!(stage.validate().is_ok());
+    }
+
+    #[test]
+    fn tensor_batchability_does_not_certify_overlapping_physical_launches() {
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cuda, None, ExecutionMode::Atomic);
+        profile.concurrency = ConcurrencyClass::Batchable;
+        profile.max_batch_size = 8;
+
+        assert_eq!(
+            profile.physical_launch_policy,
+            PhysicalLaunchPolicy::ExecutionGroupExclusive
+        );
+        assert_eq!(
+            profile
+                .physical_launch_policy
+                .effective_max_in_flight_per_model(PhysicalInFlightLimit::new(8).unwrap()),
+            1
+        );
+
+        profile.resolved_from_loaded_model = true;
+        let stage = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            "tensor.batchable",
+            &profile,
+            NativeBatchMode::Static,
+        );
+        assert_eq!(stage.concurrency, ConcurrencyClass::Batchable);
+        assert_eq!(
+            stage.physical_launch_policy,
+            PhysicalLaunchPolicy::ExecutionGroupExclusive
+        );
+        let mut falsely_concurrent = stage;
+        falsely_concurrent.physical_launch_policy = PhysicalLaunchPolicy::concurrent(8).unwrap();
+        assert!(falsely_concurrent.validate().is_err());
+    }
+
+    #[test]
+    fn unresolved_profiles_cannot_promote_physical_launches() {
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Atomic);
+        profile.physical_launch_policy = PhysicalLaunchPolicy::concurrent(4).unwrap();
+
+        assert_eq!(
+            profile.effective_physical_launch_policy(),
+            PhysicalLaunchPolicy::ExecutionGroupExclusive
+        );
+
+        profile.resolved_from_loaded_model = true;
+        assert_eq!(
+            profile.effective_physical_launch_policy(),
+            PhysicalLaunchPolicy::concurrent(4).unwrap()
+        );
+    }
+
+    #[test]
+    fn physical_launch_policy_clamps_model_and_engine_capacity_axes() {
+        let engine_limit = PhysicalInFlightLimit::new(4).unwrap();
+        assert_eq!(
+            PhysicalLaunchPolicy::ExecutionGroupExclusive
+                .effective_max_in_flight_per_model(engine_limit),
+            1
+        );
+        assert_eq!(
+            PhysicalLaunchPolicy::ModelExclusive.effective_max_in_flight_per_model(engine_limit),
+            1
+        );
+        assert_eq!(
+            PhysicalLaunchPolicy::concurrent(3)
+                .unwrap()
+                .effective_max_in_flight_per_model(engine_limit),
+            3
+        );
+        assert_eq!(
+            PhysicalLaunchPolicy::concurrent(8)
+                .unwrap()
+                .effective_max_in_flight_per_model(engine_limit),
+            4
+        );
+        assert!(PhysicalLaunchPolicy::concurrent(0).is_err());
+    }
+
+    #[test]
+    fn physical_launch_policy_deserialization_fails_closed() {
+        let profile = ExecutionProfile::fail_closed(
+            BackendKind::Cpu,
+            Some(ModelVariant::Qwen306B),
+            ExecutionMode::Atomic,
+        );
+        let mut legacy = serde_json::to_value(&profile).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("physical_launch_policy");
+        let legacy: ExecutionProfile = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            legacy.physical_launch_policy,
+            PhysicalLaunchPolicy::ExecutionGroupExclusive
+        );
+
+        let stage = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            "legacy-stage",
+            &profile,
+            NativeBatchMode::None,
+        );
+        let mut legacy_stage = serde_json::to_value(&stage).unwrap();
+        legacy_stage
+            .as_object_mut()
+            .unwrap()
+            .remove("physical_launch_policy");
+        let legacy_stage: StageDescriptor = serde_json::from_value(legacy_stage).unwrap();
+        assert_eq!(
+            legacy_stage.physical_launch_policy,
+            PhysicalLaunchPolicy::ExecutionGroupExclusive
+        );
+
+        for invalid in [
+            r#"{"kind":"concurrent","max_in_flight_per_model":0}"#,
+            r#"{"kind":"backend_default"}"#,
+        ] {
+            assert!(serde_json::from_str::<PhysicalLaunchPolicy>(invalid).is_err());
+        }
     }
 
     #[test]
@@ -1733,11 +3365,13 @@ mod tests {
             phase: SequencePhase::Prefill,
             input: InputRange { start: 0, end: 8 },
             max_output_steps: 1,
+            auxiliary_state: None,
         };
         let decode_work = WorkUnit::SequenceStep {
             phase: SequencePhase::Decode,
             input: InputRange { start: 8, end: 9 },
             max_output_steps: 1,
+            auxiliary_state: None,
         };
         assert_eq!(
             binding.stage_for_work(&prefill_work).unwrap().id,
@@ -1750,6 +3384,172 @@ mod tests {
     }
 
     #[test]
+    fn preparation_selector_is_distinct_from_decoder_prefill() {
+        let profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        let mut preparation = StageDescriptor::from_execution_profile(
+            StageId::new(9),
+            "audio.encoder.prepare",
+            &profile,
+            NativeBatchMode::Static,
+        );
+        preparation.selector = StageWorkSelector::PreSequencePreparation;
+        preparation.progress = StageProgressKind::Atomic;
+        preparation.shape_policy = StageShapePolicy::Ragged;
+        preparation.max_padding_basis_points = 0;
+        preparation.membership_safe_point = MembershipSafePoint::OperationBoundary;
+        let mut prefill = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            "decoder.prefill",
+            &profile,
+            NativeBatchMode::None,
+        );
+        prefill.selector = StageWorkSelector::SequencePrefill;
+        let binding = ExecutionAdapterBinding {
+            execution_group_id: ExecutionGroupId::new(1),
+            model_instance_id: ModelInstanceId::new(2),
+            adapter_instance_id: AdapterInstanceId::new(3),
+            adapter_abi_revision: AdapterAbiRevision::new(1),
+            model_variant: ModelVariant::Qwen306B,
+            capability_id: "asr".to_string(),
+            stages: Arc::from([preparation, prefill]),
+        };
+        binding.validate().unwrap();
+
+        let preparation_work = WorkUnit::PreSequencePreparation {
+            kind: "asr.encoder.audio".to_string(),
+        };
+        let prefill_work = WorkUnit::SequenceStep {
+            phase: SequencePhase::Prefill,
+            input: InputRange { start: 0, end: 1 },
+            max_output_steps: 0,
+            auxiliary_state: None,
+        };
+        assert_eq!(
+            binding.stage_for_work(&preparation_work).unwrap().id,
+            StageId::new(9)
+        );
+        assert_eq!(
+            binding.stage_for_work(&prefill_work).unwrap().id,
+            StageId::new(1)
+        );
+    }
+
+    #[test]
+    fn realtime_selectors_route_push_and_finish_to_distinct_stages() {
+        let profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Realtime);
+        let mut push = StageDescriptor::from_execution_profile(
+            StageId::new(10),
+            "audio.realtime.push",
+            &profile,
+            NativeBatchMode::None,
+        );
+        push.selector = StageWorkSelector::RealtimePush;
+        let mut finish = StageDescriptor::from_execution_profile(
+            StageId::new(11),
+            "audio.realtime.finish",
+            &profile,
+            NativeBatchMode::None,
+        );
+        finish.selector = StageWorkSelector::RealtimeFinish;
+        let binding = ExecutionAdapterBinding {
+            execution_group_id: ExecutionGroupId::new(1),
+            model_instance_id: ModelInstanceId::new(2),
+            adapter_instance_id: AdapterInstanceId::new(3),
+            adapter_abi_revision: AdapterAbiRevision::new(1),
+            model_variant: ModelVariant::VoxtralMini4BRealtime2602,
+            capability_id: "realtime_asr".to_string(),
+            stages: Arc::from([push, finish]),
+        };
+        binding.validate().unwrap();
+
+        assert_eq!(
+            binding
+                .stage_for_work(&WorkUnit::RealtimePush {
+                    operation_id: RealtimeOperationId::new(1),
+                    input: InputRange::new(160, 320).unwrap(),
+                    max_output_steps: 2,
+                    max_cache_append: 8,
+                })
+                .unwrap()
+                .id,
+            StageId::new(10)
+        );
+        assert_eq!(
+            binding
+                .stage_for_work(&WorkUnit::RealtimeFinish {
+                    operation_id: RealtimeOperationId::new(2),
+                    max_output_steps: 4,
+                    max_cache_append: 8,
+                })
+                .unwrap()
+                .id,
+            StageId::new(11)
+        );
+    }
+
+    #[test]
+    fn realtime_subphase_selectors_are_exact_and_disjoint() {
+        let operation_id = RealtimeOperationId::new(9);
+        let works = [
+            WorkUnit::RealtimePreparation {
+                operation_id,
+                mode: RealtimePreparationMode::Push,
+                input: InputRange::new(0, 160).unwrap(),
+                max_output_steps: 2,
+                max_cache_append: 4,
+                retained_state_input: InputRange::new(8, 9).unwrap(),
+                auxiliary_state: None,
+            },
+            WorkUnit::RealtimePromptPrefill {
+                operation_id,
+                max_output_steps: 2,
+                cache_append: 2,
+            },
+            WorkUnit::RealtimeDecodeContinuation {
+                operation_id,
+                max_output_steps: 1,
+                max_cache_append: 1,
+                retained_state_input: InputRange::new(4, 5).unwrap(),
+                auxiliary_state: None,
+            },
+            WorkUnit::RealtimeCompletion { operation_id },
+        ];
+        let selectors = [
+            StageWorkSelector::RealtimePreparation,
+            StageWorkSelector::RealtimePromptPrefill,
+            StageWorkSelector::RealtimeDecodeContinuation,
+            StageWorkSelector::RealtimeCompletion,
+        ];
+        for (work_index, work) in works.iter().enumerate() {
+            for (selector_index, selector) in selectors.iter().copied().enumerate() {
+                assert_eq!(selector.matches(work), work_index == selector_index);
+            }
+        }
+    }
+
+    #[test]
+    fn realtime_stage_requires_input_driven_input_boundary_contract() {
+        let profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Realtime);
+        let mut stage = StageDescriptor::from_execution_profile(
+            StageId::new(10),
+            "audio.realtime.push",
+            &profile,
+            NativeBatchMode::None,
+        );
+        stage.selector = StageWorkSelector::RealtimePush;
+        stage.validate().unwrap();
+
+        stage.progress = StageProgressKind::Iterative;
+        assert!(stage.validate().is_err());
+        stage.progress = StageProgressKind::InputDriven;
+        stage.membership_safe_point = MembershipSafePoint::QuantumBoundary;
+        assert!(stage.validate().is_err());
+    }
+
+    #[test]
     fn continuous_stage_requires_repeatable_safe_points() {
         let invalid = StageDescriptor {
             id: StageId::new(2),
@@ -1758,6 +3558,7 @@ mod tests {
             domain: ExecutionDomain::ExecutionGroup,
             progress: StageProgressKind::Atomic,
             concurrency: ConcurrencyClass::Batchable,
+            physical_launch_policy: PhysicalLaunchPolicy::ExecutionGroupExclusive,
             batch_mode: NativeBatchMode::Continuous,
             max_batch_size: 2,
             max_work_units: 2,
@@ -1770,6 +3571,7 @@ mod tests {
             shape_policy: StageShapePolicy::Ragged,
             membership_safe_point: MembershipSafePoint::OperationBoundary,
             output_visibility: OutputVisibility::AfterQuantumCommit,
+            retained_state_selections: None,
         };
         assert!(invalid.validate().is_err());
 
@@ -1836,6 +3638,7 @@ mod tests {
                 kind: "test".to_string(),
             },
             cost: WorkCost::new(1, 10, 8),
+            managed_cache: None,
         };
         let mut batch = PhysicalBatch {
             batch_id: BatchId::new(1),
@@ -1860,6 +3663,23 @@ mod tests {
         batch.materialized_tensor_elements = 10;
         batch.rows[0].lane.shape_bucket = "tokens.2".to_string();
         assert!(batch.validate().is_err());
+    }
+
+    #[test]
+    fn loaded_model_adapter_and_abi_identity_prevent_cross_cohorting() {
+        let baseline = lane();
+
+        let mut reloaded_model = baseline.clone();
+        reloaded_model.model_instance = ModelInstanceId::new(99);
+        assert_ne!(baseline, reloaded_model);
+
+        let mut reloaded_adapter = baseline.clone();
+        reloaded_adapter.adapter_instance = AdapterInstanceId::new(99);
+        assert_ne!(baseline, reloaded_adapter);
+
+        let mut upgraded_adapter = baseline.clone();
+        upgraded_adapter.adapter_abi = AdapterAbiRevision::new(99);
+        assert_ne!(baseline, upgraded_adapter);
     }
 
     #[test]
@@ -1903,6 +3723,7 @@ mod tests {
                     lane: lane.clone(),
                     work: first.work.clone(),
                     cost: WorkCost::new(1, 10, 8),
+                    managed_cache: None,
                 },
                 ReadyQuantum {
                     plan_id: second.plan_id,
@@ -1910,6 +3731,7 @@ mod tests {
                     lane: lane.clone(),
                     work: second.work.clone(),
                     cost: WorkCost::new(1, 10, 8),
+                    managed_cache: None,
                 },
             ],
             materialized_tensor_elements: 20,
@@ -1938,10 +3760,12 @@ mod tests {
                 PhysicalBatchRowReport {
                     execution: second_report.clone(),
                     state: StateDisposition::ValidNext,
+                    managed_cache: None,
                 },
                 PhysicalBatchRowReport {
                     execution: first_report.clone(),
                     state: StateDisposition::ValidNext,
+                    managed_cache: None,
                 },
             ],
         };
@@ -1952,6 +3776,7 @@ mod tests {
         report.rows[1] = PhysicalBatchRowReport {
             execution: first_report,
             state: StateDisposition::ValidNext,
+            managed_cache: None,
         };
         report.rows[1].execution.session = SessionKey::new("foreign".to_string(), 99);
         assert!(report.validate_against(&batch, &active).is_err());
@@ -1984,6 +3809,7 @@ mod tests {
                 lane: lane.clone(),
                 work: plan.work.clone(),
                 cost: WorkCost::new(1, 0, 0),
+                managed_cache: None,
             })
             .collect::<Vec<_>>();
         let batch = PhysicalBatch {
@@ -2020,6 +3846,7 @@ mod tests {
                     PhysicalBatchRowReport {
                         execution,
                         state: StateDisposition::Unchanged,
+                        managed_cache: None,
                     }
                 })
                 .collect(),
@@ -2039,6 +3866,7 @@ mod tests {
                 phase: SequencePhase::Decode,
                 input: InputRange { start: 0, end: 0 },
                 max_output_steps: 1,
+                auxiliary_state: None,
             },
         );
         plan.batch_mode = NativeBatchMode::Continuous;
@@ -2053,6 +3881,7 @@ mod tests {
                 lane: lane.clone(),
                 work: plan.work.clone(),
                 cost: WorkCost::new(1, 1, 1),
+                managed_cache: None,
             }],
             materialized_tensor_elements: 1,
             workspace: ResourceVector::temporary_workspace(1),
@@ -2076,11 +3905,159 @@ mod tests {
             rows: vec![PhysicalBatchRowReport {
                 execution,
                 state: StateDisposition::ValidNext,
+                managed_cache: None,
             }],
         };
         assert!(report.validate_against(&batch, &active).is_err());
         report.rows[0].state = StateDisposition::RolledBack;
         assert!(report.validate_against(&batch, &active).is_ok());
+    }
+
+    #[test]
+    fn managed_cache_report_requires_the_exact_row_receipt() {
+        use crate::kv::KvGroupId;
+
+        let lane = lane();
+        let session = SessionKey::new("managed".to_string(), 7);
+        let plan = plan_for(
+            session.clone(),
+            WorkUnit::SequenceStep {
+                phase: SequencePhase::Decode,
+                input: InputRange { start: 4, end: 7 },
+                max_output_steps: 1,
+                auxiliary_state: None,
+            },
+        );
+        let arena = KvArenaId {
+            model_instance: lane.model_instance,
+            backend: lane.backend,
+            device_ordinal: lane.device_ordinal,
+            generation: 3,
+        };
+        let written_blocks = (1..=3)
+            .map(|index| CacheBlockRef {
+                arena,
+                group: KvGroupId::new(0),
+                index,
+                slot_generation: 8,
+            })
+            .collect::<Vec<_>>();
+        let reservation = ManagedCacheReservation {
+            txn_id: plan.plan_id,
+            session: session.clone(),
+            session_generation: ManagedSessionGeneration::INITIAL,
+            domains: vec![ManagedCacheDomainReservation {
+                arena,
+                domain: CacheDomainId::new(2),
+                expected_version: 11,
+                expected_committed_tokens: 4,
+                execution_start_tokens: 4,
+                target_committed_tokens: 7,
+                target_window_start: 4,
+                first_page_offset: 0,
+                provisional_groups: vec![GroupBlockTable {
+                    group: KvGroupId::new(0),
+                    blocks: written_blocks.clone(),
+                }],
+                writable_blocks: written_blocks.clone(),
+            }],
+            clocked_state: None,
+            allow_unchanged_prefix: true,
+        };
+        let mut unauthorized = reservation.clone();
+        unauthorized.allow_unchanged_prefix = false;
+        assert!(unauthorized
+            .completed_write_receipt_for_prefix(&[], 4)
+            .expect_err("a reservation without authority cannot authenticate a zero KV append")
+            .to_string()
+            .contains("lacks terminal or realtime authority"));
+        let batch = PhysicalBatch {
+            batch_id: BatchId::new(99),
+            lane: lane.clone(),
+            mode: NativeBatchMode::None,
+            budget: BatchBudget::width_one(),
+            rows: vec![ReadyQuantum {
+                plan_id: plan.plan_id,
+                session: session.clone(),
+                lane: lane.clone(),
+                work: plan.work.clone(),
+                cost: WorkCost::new(1, 1, 0),
+                managed_cache: Some(reservation.clone()),
+            }],
+            materialized_tensor_elements: 1,
+            workspace: ResourceVector::zero(),
+        };
+        let mut execution = report_for(&plan, ExecutionDisposition::Progress);
+        execution.input_consumed = 1;
+        execution.dispatch = BatchDispatch::serial();
+        let mut report = PhysicalBatchReport {
+            batch_id: batch.batch_id,
+            lane,
+            dispatch: BatchDispatch::serial(),
+            observed_resources: ResourceVector::zero(),
+            elapsed: Duration::ZERO,
+            rows: vec![PhysicalBatchRowReport {
+                execution,
+                state: StateDisposition::ValidNext,
+                managed_cache: Some(ManagedCacheReceipt {
+                    reservation: reservation.clone(),
+                    domains: vec![ManagedCacheDomainReceipt {
+                        arena,
+                        domain: CacheDomainId::new(2),
+                        written_blocks: written_blocks.clone(),
+                        page_tokens: 1,
+                    }],
+                    accepted_prefix: None,
+                    clocked_state: None,
+                }),
+            }],
+        };
+        let active = HashMap::from([(plan.plan_id, plan)]);
+
+        assert!(report.validate_against(&batch, &active).is_ok());
+        report.rows[0].managed_cache = Some(
+            reservation
+                .completed_write_receipt_for_prefix_for_test(5, 1)
+                .unwrap(),
+        );
+        assert!(report.validate_against(&batch, &active).is_ok());
+        let mut forged_prefix = report.rows[0].managed_cache.clone().unwrap();
+        forged_prefix.accepted_prefix = Some(4);
+        report.rows[0].managed_cache = Some(forged_prefix);
+        assert!(report.validate_against(&batch, &active).is_err());
+        let mut forged_blocks = reservation
+            .completed_write_receipt_for_prefix_for_test(6, 1)
+            .unwrap();
+        forged_blocks.domains[0].written_blocks = vec![written_blocks[2]];
+        report.rows[0].managed_cache = Some(forged_blocks);
+        assert!(report.validate_against(&batch, &active).is_err());
+        report.rows[0].managed_cache = None;
+        assert!(report.validate_against(&batch, &active).is_err());
+        let mut restart = report_for(
+            active.get(&7).unwrap(),
+            ExecutionDisposition::RestartSequence(SequenceRestartReason::ModelFallback),
+        );
+        restart.dispatch = BatchDispatch::serial();
+        report.rows[0] = PhysicalBatchRowReport {
+            execution: restart,
+            state: StateDisposition::RestartPending,
+            managed_cache: None,
+        };
+        assert!(report.validate_against(&batch, &active).is_ok());
+        report.rows[0].state = StateDisposition::RolledBack;
+        assert!(report.validate_against(&batch, &active).is_err());
+        report.rows[0].state = StateDisposition::RestartPending;
+        report.rows[0].managed_cache = Some(reservation.completed_write_receipt_for_test());
+        assert!(report.validate_against(&batch, &active).is_err());
+        let mut foreign = reservation;
+        foreign.domains[0].expected_version += 1;
+        report.rows[0].managed_cache = Some(ManagedCacheReceipt {
+            reservation: foreign,
+            domains: Vec::new(),
+            accepted_prefix: None,
+            clocked_state: None,
+        });
+        assert!(report.validate_against(&batch, &active).is_err());
     }
 
     #[test]
@@ -2097,6 +4074,27 @@ mod tests {
     }
 
     #[test]
+    fn realtime_lifecycle_closes_input_irreversibly_before_terminal() {
+        let state = ExecutionState::Queued
+            .transition(ExecutionState::Admitted)
+            .unwrap()
+            .transition(ExecutionState::RealtimeRunning)
+            .unwrap()
+            .transition(ExecutionState::RealtimeRunning)
+            .unwrap()
+            .transition(ExecutionState::RealtimeFinishing)
+            .unwrap()
+            .transition(ExecutionState::RealtimeFinishing)
+            .unwrap();
+        assert!(state.transition(ExecutionState::RealtimeRunning).is_err());
+        assert!(state.transition(ExecutionState::Decoding).is_err());
+        assert!(state
+            .transition(ExecutionState::Terminal(TerminalOutcome::Completed))
+            .unwrap()
+            .is_terminal());
+    }
+
+    #[test]
     fn report_cannot_exceed_sequence_plan() {
         let session = SessionKey::new("request".to_string(), 11);
         let plan = ExecutionPlan {
@@ -2106,6 +4104,7 @@ mod tests {
                 phase: SequencePhase::Prefill,
                 input: InputRange::new(4, 8).unwrap(),
                 max_output_steps: 1,
+                auxiliary_state: None,
             },
             batch_key: BatchKey {
                 backend: BackendKind::Cpu,
@@ -2136,6 +4135,56 @@ mod tests {
             output_finished: false,
             output_has_error: false,
         };
+        assert!(report.validate_against(&plan).is_err());
+    }
+
+    #[test]
+    fn report_authenticates_exact_clocked_state_policy() {
+        let selection =
+            ClockedStateSelection::new(StateGroupId::new(2), StateClock::AudioSamples).unwrap();
+        let span = ClockedStateSpan::new(
+            selection.group(),
+            selection.clock().clone(),
+            InputRange::new(160, 320).unwrap(),
+        )
+        .unwrap();
+        let mut plan = plan_for(
+            SessionKey::new("clocked".into(), 1),
+            WorkUnit::SequenceStep {
+                phase: SequencePhase::Prefill,
+                input: InputRange::new(1, 2).unwrap(),
+                max_output_steps: 1,
+                auxiliary_state: Some(Arc::from([span])),
+            },
+        );
+        let profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        let mut stage = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            "prefill",
+            &profile,
+            NativeBatchMode::None,
+        );
+        stage.retained_state_selections = Some(vec![selection]);
+        plan.stage = Some(stage);
+        let mut report = report_for(
+            &plan,
+            ExecutionDisposition::Finished(FinishReason::Completed),
+        );
+        report.input_consumed = 1;
+        assert!(report.validate_against(&plan).is_ok());
+
+        if let WorkUnit::SequenceStep {
+            auxiliary_state, ..
+        } = &mut plan.work
+        {
+            *auxiliary_state = Some(Arc::from([ClockedStateSpan::new(
+                StateGroupId::new(2),
+                StateClock::AudioFrames,
+                InputRange::new(1, 2).unwrap(),
+            )
+            .unwrap()]));
+        }
         assert!(report.validate_against(&plan).is_err());
     }
 
@@ -2213,7 +4262,9 @@ mod tests {
 
     fn report_for(plan: &ExecutionPlan, disposition: ExecutionDisposition) -> ExecutionReport {
         let (output_finished, output_has_error) = match &disposition {
-            ExecutionDisposition::Progress | ExecutionDisposition::Yielded(_) => (false, false),
+            ExecutionDisposition::Progress
+            | ExecutionDisposition::Yielded(_)
+            | ExecutionDisposition::RestartSequence(_) => (false, false),
             ExecutionDisposition::Finished(_) => (true, false),
             ExecutionDisposition::Failed(failure) => {
                 (failure.retry == RetryDisposition::Never, true)
@@ -2245,6 +4296,25 @@ mod tests {
     }
 
     #[test]
+    fn pre_sequence_preparation_cannot_terminalize_an_engine_core_session() {
+        let plan = plan_for(
+            SessionKey::new("pre-core-preparation".to_string(), 1),
+            WorkUnit::PreSequencePreparation {
+                kind: "asr.encoder.audio".to_string(),
+            },
+        );
+        let report = report_for(
+            &plan,
+            ExecutionDisposition::Finished(FinishReason::Completed),
+        );
+
+        let error = report
+            .validate_against(&plan)
+            .expect_err("pre-sequence preparation must remain outside EngineCore");
+        assert!(error.to_string().contains("before EngineCore admission"));
+    }
+
+    #[test]
     fn reports_are_fenced_by_session_epoch_and_plan_id() {
         let session = SessionKey::new("same-id".to_string(), 3);
         let plan = plan_for(
@@ -2253,6 +4323,7 @@ mod tests {
                 phase: SequencePhase::Decode,
                 input: InputRange { start: 0, end: 0 },
                 max_output_steps: 1,
+                auxiliary_state: None,
             },
         );
         let mut wrong_epoch = report_for(
@@ -2278,6 +4349,7 @@ mod tests {
                 phase: SequencePhase::Decode,
                 input: InputRange { start: 0, end: 0 },
                 max_output_steps: 1,
+                auxiliary_state: None,
             },
         );
         let no_progress = report_for(&plan, ExecutionDisposition::Progress);
@@ -2290,6 +4362,88 @@ mod tests {
         assert!(yielded.validate_against(&plan).is_ok());
         yielded.safe_point = false;
         assert!(yielded.validate_against(&plan).is_err());
+    }
+
+    #[test]
+    fn realtime_reports_authenticate_push_and_finish_bounds() {
+        let push = plan_for(
+            SessionKey::new("realtime-push".to_string(), 1),
+            WorkUnit::RealtimePush {
+                operation_id: RealtimeOperationId::new(1),
+                input: InputRange::new(100, 180).unwrap(),
+                max_output_steps: 2,
+                max_cache_append: 4,
+            },
+        );
+        let mut report = report_for(&push, ExecutionDisposition::Progress);
+        report.input_consumed = 80;
+        report.output_produced = 2;
+        assert!(report.validate_against(&push).is_ok());
+        report.input_consumed = 81;
+        assert!(report.validate_against(&push).is_err());
+
+        let empty_push = plan_for(
+            SessionKey::new("empty-realtime-push".to_string(), 1),
+            WorkUnit::RealtimePush {
+                operation_id: RealtimeOperationId::new(1),
+                input: InputRange::new(100, 100).unwrap(),
+                max_output_steps: 1,
+                max_cache_append: 2,
+            },
+        );
+        assert!(report_for(&empty_push, ExecutionDisposition::Progress)
+            .validate_against(&empty_push)
+            .is_err());
+
+        let finish = plan_for(
+            SessionKey::new("realtime-finish".to_string(), 1),
+            WorkUnit::RealtimeFinish {
+                operation_id: RealtimeOperationId::new(2),
+                max_output_steps: 3,
+                max_cache_append: 4,
+            },
+        );
+        let mut report = report_for(&finish, ExecutionDisposition::Progress);
+        report.output_produced = 3;
+        assert!(report.validate_against(&finish).is_ok());
+        report.input_consumed = 1;
+        assert!(report.validate_against(&finish).is_err());
+        report.input_consumed = 0;
+        report.output_produced = 4;
+        assert!(report.validate_against(&finish).is_err());
+    }
+
+    #[test]
+    fn sequence_restart_requires_zero_progress_safe_point_and_enters_restart_pending() {
+        let session = SessionKey::new("restart".to_string(), 9);
+        let plan = plan_for(
+            session.clone(),
+            WorkUnit::SequenceStep {
+                phase: SequencePhase::Decode,
+                input: InputRange { start: 4, end: 5 },
+                max_output_steps: 1,
+                auxiliary_state: None,
+            },
+        );
+        let disposition =
+            ExecutionDisposition::RestartSequence(SequenceRestartReason::ModelFallback);
+        let report = report_for(&plan, disposition.clone());
+        assert!(report.validate_against(&plan).is_ok());
+
+        let mut unsafe_report = report.clone();
+        unsafe_report.safe_point = false;
+        assert!(unsafe_report.validate_against(&plan).is_err());
+        let mut progressed = report.clone();
+        progressed.output_produced = 1;
+        assert!(progressed.validate_against(&plan).is_err());
+
+        let mut tracker = ExecutionTracker::new(session);
+        tracker.transition(ExecutionState::Admitted).unwrap();
+        tracker.transition(ExecutionState::Decoding).unwrap();
+        tracker.begin_plan(&plan).unwrap();
+        tracker.commit(&plan, &report).unwrap();
+        assert_eq!(tracker.state(), ExecutionState::RestartPending);
+        assert_eq!(tracker.active_plan_id(), None);
     }
 
     #[test]
@@ -2320,6 +4474,7 @@ mod tests {
                 phase: SequencePhase::Decode,
                 input: InputRange { start: 0, end: 0 },
                 max_output_steps: 1,
+                auxiliary_state: None,
             },
         );
         let mut tracker = ExecutionTracker::new(session);
@@ -2354,6 +4509,7 @@ mod tests {
                 phase: SequencePhase::Decode,
                 input: InputRange { start: 0, end: 0 },
                 max_output_steps: 1,
+                auxiliary_state: None,
             },
         );
         let mut tracker = ExecutionTracker::new(session);
@@ -2399,6 +4555,7 @@ mod tests {
                 phase: SequencePhase::Decode,
                 input: InputRange { start: 0, end: 0 },
                 max_output_steps: 1,
+                auxiliary_state: None,
             },
         );
 
@@ -2429,6 +4586,7 @@ mod tests {
                 phase: SequencePhase::Decode,
                 input: InputRange { start: 0, end: 0 },
                 max_output_steps: 1,
+                auxiliary_state: None,
             },
         );
         let mut failed = report_for(
@@ -2471,6 +4629,7 @@ mod tests {
                 phase: SequencePhase::Decode,
                 input: InputRange { start: 0, end: 0 },
                 max_output_steps: 1,
+                auxiliary_state: None,
             },
         );
         let mut tracker = ExecutionTracker::new(session);
@@ -2508,6 +4667,10 @@ mod tests {
         assert_eq!(profile.prefill, PrefillMode::None);
         assert_eq!(profile.cache_mode, CacheMode::None);
         assert_eq!(profile.concurrency, ConcurrencyClass::Exclusive);
+        assert_eq!(
+            profile.physical_launch_policy,
+            PhysicalLaunchPolicy::ExecutionGroupExclusive
+        );
         assert!(!profile.resolved_from_loaded_model);
         assert!(!capabilities.incremental_prefill);
         assert!(!capabilities.incremental_decode);
@@ -2528,7 +4691,7 @@ mod tests {
         profile.prefill = PrefillMode::Full;
         profile.incremental_decode = true;
         profile.decode_batch = NativeBatchMode::Static;
-        profile.cache_mode = CacheMode::OpaqueModelOwned;
+        profile.cache_mode = CacheMode::None;
         profile.max_batch_size = 4;
 
         let capabilities = profile.capabilities();
@@ -2538,5 +4701,30 @@ mod tests {
         assert!(capabilities.cancellable_between_steps);
         assert!(!capabilities.physical_cache);
         assert_eq!(capabilities.max_batch_size, 4);
+    }
+
+    #[test]
+    fn sequence_finalize_accepts_only_one_terminal_cache_free_transaction() {
+        let plan = plan_for(
+            SessionKey::new("tts-finalize".to_string(), 1),
+            WorkUnit::SequenceFinalize {
+                max_output_steps: 1,
+            },
+        );
+        let completed = report_for(
+            &plan,
+            ExecutionDisposition::Finished(FinishReason::Completed),
+        );
+        assert!(completed.validate_against(&plan).is_ok());
+
+        let yielded = report_for(
+            &plan,
+            ExecutionDisposition::Yielded(YieldReason::QuantumExhausted),
+        );
+        assert!(yielded.validate_against(&plan).is_err());
+
+        let mut consumed_input = completed;
+        consumed_input.input_consumed = 1;
+        assert!(consumed_input.validate_against(&plan).is_err());
     }
 }

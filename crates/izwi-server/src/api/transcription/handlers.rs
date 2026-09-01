@@ -81,6 +81,7 @@ struct ParsedTranscriptionCreateRequest {
     audio_bytes: Vec<u8>,
     audio_mime_type: Option<String>,
     audio_filename: Option<String>,
+    duration_secs: Option<f64>,
     record_mode: TranscriptionRecordMode,
     model_id: Option<String>,
     aligner_model_id: Option<String>,
@@ -102,6 +103,8 @@ struct BatchTranscriptionRequest {
     generate_summary: bool,
     min_speakers: Option<usize>,
     max_speakers: Option<usize>,
+    #[serde(default)]
+    duration_secs: Option<f64>,
 }
 
 impl BatchTranscriptionRequest {
@@ -115,6 +118,7 @@ impl BatchTranscriptionRequest {
             generate_summary: parsed.generate_summary,
             min_speakers: parsed.min_speakers,
             max_speakers: parsed.max_speakers,
+            duration_secs: parsed.duration_secs,
         }
     }
 
@@ -123,6 +127,7 @@ impl BatchTranscriptionRequest {
             audio_bytes: Vec::new(),
             audio_mime_type: None,
             audio_filename: None,
+            duration_secs: self.duration_secs,
             record_mode: self.record_mode,
             model_id: self.model_id,
             aligner_model_id: self.aligner_model_id,
@@ -388,7 +393,7 @@ async fn create_pending_record(
             processing_status: TranscriptionProcessingStatus::Pending,
             processing_error: None,
             processing_progress: None,
-            duration_secs: None,
+            duration_secs: parsed.duration_secs,
             processing_time_ms: 0.0,
             rtf: None,
             audio_mime_type: resolve_source_audio_mime_type(
@@ -599,6 +604,12 @@ fn asr_queue_class(duration_secs: f64) -> QueueClass {
     }
 }
 
+fn duration_secs_from_millis(duration_ms: Option<u64>) -> Option<f64> {
+    duration_ms
+        .filter(|duration_ms| *duration_ms > 0)
+        .map(|duration_ms| duration_ms as f64 / 1_000.0)
+}
+
 pub(crate) fn batch_asr_stage_executor(state: AppState) -> Arc<dyn StageExecutor> {
     Arc::new(BatchAsrStageExecutor { state })
 }
@@ -653,7 +664,11 @@ async fn execute_batch_asr_stage(
     let request: BatchTranscriptionRequest =
         serde_json::from_value(claimed.job.request_json.clone())
             .context("Failed to decode ASR batch request")?;
-    let parsed = request.into_parsed();
+    let mut parsed = request.into_parsed();
+    if parsed.duration_secs.is_none() {
+        parsed.duration_secs =
+            duration_secs_from_millis(claimed.stage.resource_hints.estimated_duration_ms);
+    }
     let canonical_audio = resolve_batch_asr_audio(state, &claimed).await?;
 
     let (_record, output_artifact) = process_transcription_record(
@@ -1024,6 +1039,7 @@ async fn process_transcription_record_inner(
 
     // Keep transcription processing unbounded by wall-clock timeout so valid
     // long jobs can finish and persist successfully.
+    let input_duration_secs = parsed.duration_secs.unwrap_or_default();
     let artifacts = match parsed.record_mode {
         TranscriptionRecordMode::Transcription => {
             generate_transcription_artifacts(
@@ -1033,6 +1049,7 @@ async fn process_transcription_record_inner(
                 aligner_model_id.as_deref(),
                 requested_language.as_deref(),
                 parsed.include_timestamps,
+                input_duration_secs,
                 correlation_id.as_deref(),
                 runtime_context,
                 move |delta| {
@@ -1079,6 +1096,7 @@ async fn process_transcription_record_inner(
                 requested_language.as_deref(),
                 parsed.min_speakers,
                 parsed.max_speakers,
+                input_duration_secs,
                 move |progress| {
                     if let Some(tx) = &progress_tx {
                         let _ = tx.try_send(progress_event_payload(progress.clone()));
@@ -1183,6 +1201,7 @@ async fn generate_transcription_artifacts<F, P>(
     aligner_model_id: Option<&str>,
     requested_language: Option<&str>,
     include_timestamps: bool,
+    input_duration_secs: f64,
     correlation_id: Option<&str>,
     runtime_context: RuntimeRequestContext,
     on_delta: F,
@@ -1218,7 +1237,7 @@ where
     let (aligner_model_id, words, segments) =
         if include_timestamps && !output.text.trim().is_empty() {
             if let Ok(mut callback) = progress_callback.lock() {
-                callback(transcription_aligning_progress(output.duration_secs));
+                callback(transcription_aligning_progress(input_duration_secs));
             }
             let resolved_aligner_model_id =
                 aligner_model_id.unwrap_or(DEFAULT_TRANSCRIPTION_ALIGNER_MODEL);
@@ -1241,7 +1260,7 @@ where
         transcription_mode: TranscriptionRecordMode::Transcription,
         text: output.text,
         language: resolved_language,
-        duration_secs: output.duration_secs as f64,
+        duration_secs: input_duration_secs,
         aligner_model_id,
         segments,
         words,
@@ -1259,6 +1278,7 @@ async fn generate_speaker_attributed_asr_artifacts<P>(
     requested_language: Option<&str>,
     min_speakers: Option<usize>,
     max_speakers: Option<usize>,
+    input_duration_secs: f64,
     on_progress: P,
 ) -> Result<GeneratedTranscriptionArtifacts, ApiError>
 where
@@ -1297,7 +1317,7 @@ where
         transcription_mode: TranscriptionRecordMode::SpeakerAttributedAsr,
         text: output.text.clone(),
         language: resolved_language,
-        duration_secs: output.duration_secs as f64,
+        duration_secs: input_duration_secs,
         aligner_model_id: None,
         segments: Vec::new(),
         words: Vec::new(),
@@ -1327,9 +1347,9 @@ fn transcription_processing_progress() -> AsrProgress {
     }
 }
 
-fn transcription_aligning_progress(duration_secs: f32) -> AsrProgress {
+fn transcription_aligning_progress(duration_secs: f64) -> AsrProgress {
     let duration_secs = if duration_secs.is_finite() && duration_secs >= 0.0 {
-        Some(f64::from(duration_secs))
+        Some(duration_secs)
     } else {
         None
     };
@@ -1359,7 +1379,8 @@ async fn parse_create_request(req: Request) -> Result<ParsedTranscriptionCreateR
 
         let model_id = payload.model_id.or(payload.model);
         let audio_payload = decode_base64_audio_payload(payload.audio_base64.as_str())?;
-        inspect_audio_payload_with_diagnostics("transcription.create", &audio_payload)?;
+        let inspection =
+            inspect_audio_payload_with_diagnostics("transcription.create", &audio_payload)?;
         let audio_mime_type = audio_payload
             .content_type_hint()
             .map(str::to_string)
@@ -1369,6 +1390,7 @@ async fn parse_create_request(req: Request) -> Result<ParsedTranscriptionCreateR
             audio_bytes: audio_payload.bytes,
             audio_mime_type: Some(audio_mime_type),
             audio_filename: None,
+            duration_secs: Some(f64::from(inspection.duration_secs)),
             record_mode: TranscriptionRecordMode::Transcription,
             model_id,
             aligner_model_id: sanitize_optional(payload.aligner_model_id),
@@ -1406,10 +1428,14 @@ async fn parse_create_request(req: Request) -> Result<ParsedTranscriptionCreateR
                     )
                     .await?
                     {
-                        inspect_audio_payload_with_diagnostics("transcription.create", &payload)?;
+                        let inspection = inspect_audio_payload_with_diagnostics(
+                            "transcription.create",
+                            &payload,
+                        )?;
                         out.audio_filename = payload.filename;
                         out.audio_mime_type = payload.source_mime_type;
                         out.audio_bytes = payload.bytes;
+                        out.duration_secs = Some(f64::from(inspection.duration_secs));
                     }
                 }
                 "audio_base64" => {
@@ -1421,11 +1447,15 @@ async fn parse_create_request(req: Request) -> Result<ParsedTranscriptionCreateR
                     )
                     .await?
                     {
-                        inspect_audio_payload_with_diagnostics("transcription.create", &payload)?;
+                        let inspection = inspect_audio_payload_with_diagnostics(
+                            "transcription.create",
+                            &payload,
+                        )?;
                         if out.audio_mime_type.is_none() {
                             out.audio_mime_type = payload.content_type_hint().map(str::to_string);
                         }
                         out.audio_bytes = payload.bytes;
+                        out.duration_secs = Some(f64::from(inspection.duration_secs));
                     }
                 }
                 "model" | "model_id" => {
@@ -1873,8 +1903,7 @@ async fn generate_transcription_summary_attempt(
             transcription_summary_params(),
             ChatRequestConfig {
                 enable_thinking,
-                tools: Vec::new(),
-                media_inputs: Vec::new(),
+                ..Default::default()
             },
             correlation_id,
             runtime_context,
@@ -1887,11 +1916,12 @@ async fn generate_transcription_summary_attempt(
 }
 
 fn transcription_summary_params() -> GenerationParams {
-    let mut params = GenerationParams::default();
-    params.max_tokens = DEFAULT_TRANSCRIPTION_SUMMARY_MAX_TOKENS;
-    params.temperature = 0.2;
-    params.top_p = 0.9;
-    params
+    GenerationParams {
+        max_tokens: DEFAULT_TRANSCRIPTION_SUMMARY_MAX_TOKENS,
+        temperature: 0.2,
+        top_p: 0.9,
+        ..Default::default()
+    }
 }
 
 fn transcription_summary_messages(transcription: &str) -> Vec<ChatMessage> {
@@ -1940,11 +1970,7 @@ fn strip_think_sections(input: &str) -> String {
     let open_tag = "<think>";
     let close_tag = "</think>";
 
-    loop {
-        let Some(start) = out.find(open_tag) else {
-            break;
-        };
-
+    while let Some(start) = out.find(open_tag) {
         if let Some(end_rel) = out[start + open_tag.len()..].find(close_tag) {
             let end = start + open_tag.len() + end_rel;
             let mut next = String::with_capacity(out.len());
@@ -1998,12 +2024,13 @@ mod tests {
     use izwi_core::{AsrProgress, AsrProgressPhase};
 
     use super::{
-        alignments_to_word_records, asr_queue_class, build_segment_records, initial_summary_state,
-        multipart_field_api_error, parse_bool, parse_create_request, progress_event_payload,
-        sanitize_summary_output, send_transcription_terminal_events,
-        should_retry_transcription_summary_generation, transcription_summary_messages,
-        transcription_summary_params, validate_batch_transcription_model, QueueClass,
-        TranscriptionSummaryStatus, TranscriptionWordRecord, TRANSCRIPTION_TERMINAL_SEND_TIMEOUT,
+        alignments_to_word_records, asr_queue_class, build_segment_records,
+        duration_secs_from_millis, initial_summary_state, multipart_field_api_error, parse_bool,
+        parse_create_request, progress_event_payload, sanitize_summary_output,
+        send_transcription_terminal_events, should_retry_transcription_summary_generation,
+        transcription_summary_messages, transcription_summary_params,
+        validate_batch_transcription_model, QueueClass, TranscriptionSummaryStatus,
+        TranscriptionWordRecord, TRANSCRIPTION_TERMINAL_SEND_TIMEOUT,
     };
 
     fn wav_bytes() -> Vec<u8> {
@@ -2021,6 +2048,13 @@ mod tests {
     fn durable_asr_uses_a_separate_queue_for_long_form_audio() {
         assert_eq!(asr_queue_class(299.999), QueueClass::BatchAsr);
         assert_eq!(asr_queue_class(300.0), QueueClass::LongFormAsr);
+    }
+
+    #[test]
+    fn durable_asr_recovers_input_duration_from_stage_hints() {
+        assert_eq!(duration_secs_from_millis(Some(4_321)), Some(4.321));
+        assert_eq!(duration_secs_from_millis(Some(0)), None);
+        assert_eq!(duration_secs_from_millis(None), None);
     }
 
     #[tokio::test]
@@ -2043,6 +2077,7 @@ mod tests {
         assert!(!parsed.audio_bytes.is_empty());
         assert_eq!(parsed.audio_mime_type.as_deref(), Some("audio/wav"));
         assert_eq!(parsed.model_id.as_deref(), Some("Parakeet-TDT-0.6B-v3"));
+        assert!(parsed.duration_secs.is_some_and(|duration| duration > 0.0));
         assert!(!parsed.generate_summary);
     }
 

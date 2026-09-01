@@ -10,7 +10,7 @@ use crate::catalog::ModelVariant;
 use crate::engine::ExecutionProfile;
 use crate::error::{Error, Result};
 use crate::runtime::adapters::{
-    compatibility_execution_profile, AdapterMetadata, CapabilityKind, ExecutionTargetKind,
+    scalar_execution_profile, AdapterMetadata, CapabilityKind, ExecutionTargetKind,
     RuntimeAdapterRegistry, StreamingMode,
 };
 use serde::Serialize;
@@ -60,7 +60,7 @@ impl CapabilityExecutionPlan {
         streaming_required: bool,
     ) -> Self {
         let mut execution_profile =
-            compatibility_execution_profile(metadata, backend_kind, streaming_required);
+            scalar_execution_profile(metadata, backend_kind, streaming_required);
         execution_profile.resolved_from_loaded_model = false;
         Self {
             adapter_id: metadata.id,
@@ -109,7 +109,7 @@ impl<'a> CapabilityExecutionRegistry<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::ExecutionMode;
+    use crate::engine::{ExecutionMode, PrefillMode};
     use crate::model::ModelVariant;
 
     #[test]
@@ -172,10 +172,10 @@ mod tests {
 
         for (variant, expected_mode) in [
             (ModelVariant::Qwen306B, ExecutionMode::Sequence),
-            (ModelVariant::Qwen306BGguf, ExecutionMode::Atomic),
+            (ModelVariant::Qwen306BGguf, ExecutionMode::Sequence),
             (ModelVariant::Qwen354BGguf, ExecutionMode::Sequence),
-            (ModelVariant::Lfm2512BInstructGguf, ExecutionMode::Atomic),
-            (ModelVariant::Gemma34BIt, ExecutionMode::Atomic),
+            (ModelVariant::Lfm2512BInstructGguf, ExecutionMode::Sequence),
+            (ModelVariant::Gemma34BIt, ExecutionMode::Sequence),
         ] {
             let plan = registry
                 .plan(CapabilityExecutionRequest::new(
@@ -190,7 +190,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen_asr_route_only_claims_sequence_execution_for_streaming_today() {
+    fn qwen_asr_route_claims_the_same_retained_decoder_for_offline_and_streaming() {
         let adapters = RuntimeAdapterRegistry::built_in();
         let registry = CapabilityExecutionRegistry::new(&adapters);
         let offline = registry
@@ -211,8 +211,12 @@ mod tests {
             )
             .expect("streaming ASR plan");
 
-        assert_eq!(offline.execution_profile.mode, ExecutionMode::Atomic);
+        assert_eq!(offline.execution_profile.mode, ExecutionMode::Sequence);
         assert_eq!(streaming.execution_profile.mode, ExecutionMode::Sequence);
+        // The catalog-only plan has no exact loaded-model proof. Loaded
+        // Qwen ASR adapters upgrade this to Incremental after sealing.
+        assert_eq!(offline.execution_profile.prefill, PrefillMode::Full);
+        assert_eq!(streaming.execution_profile.prefill, PrefillMode::Full);
         assert_eq!(streaming.execution_profile.backend, BackendKind::Metal);
     }
 }

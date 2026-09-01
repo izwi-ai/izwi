@@ -1,16 +1,18 @@
 //! Native LFM2.5 Audio GGUF architecture support.
 
+pub(crate) mod asr_retained;
 mod audio_output;
-mod backbone;
 mod bundle;
-mod cache;
 mod config;
 mod conformer;
 mod detokenizer;
-mod model;
+pub(crate) mod model;
+pub(crate) mod physical;
 mod preprocessor;
 mod sampling;
+pub(crate) mod state;
 mod tokenizer;
+pub(crate) mod tts_retained;
 
 pub const LFM25_AUDIO_BUILT_IN_SPEAKERS: [&str; 4] =
     ["US Female", "US Male", "UK Female", "UK Male"];
@@ -21,7 +23,6 @@ pub use model::{
     Lfm25AudioGenerationOutput, Lfm25AudioModel, Lfm25AudioStreamConfig, Lfm25AudioTextOutput,
 };
 pub use sampling::{Lfm25AudioGenerationConfig, Lfm25SamplingConfig};
-
 fn normalize_speaker_key(speaker: Option<&str>) -> String {
     speaker
         .unwrap_or("")

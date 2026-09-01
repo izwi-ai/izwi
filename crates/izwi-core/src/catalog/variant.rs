@@ -20,6 +20,7 @@ pub enum ModelFamily {
     SortformerDiarization,
     Qwen3Chat,
     Qwen35Chat,
+    Qwen38Chat,
     Lfm2Chat,
     Lfm25Audio,
     Gemma3Chat,
@@ -119,6 +120,7 @@ impl ModelVariant {
             Qwen306B | Qwen306B4Bit | Qwen306BGguf | Qwen317B | Qwen317B4Bit | Qwen317BGguf
             | Qwen34BGguf | Qwen38BGguf | Qwen314BGguf => ModelFamily::Qwen3Chat,
             Qwen3508BGguf | Qwen352BGguf | Qwen354BGguf | Qwen359BGguf => ModelFamily::Qwen35Chat,
+            Qwen3827BFp8 => ModelFamily::Qwen38Chat,
             Lfm2512BInstructGguf | Lfm2512BThinkingGguf => ModelFamily::Lfm2Chat,
             Lfm25Audio15BGguf => ModelFamily::Lfm25Audio,
             Gemma31BIt | Gemma34BIt => ModelFamily::Gemma3Chat,
@@ -143,6 +145,7 @@ impl ModelVariant {
             ModelFamily::SortformerDiarization => ModelTask::Diarization,
             ModelFamily::Qwen3Chat
             | ModelFamily::Qwen35Chat
+            | ModelFamily::Qwen38Chat
             | ModelFamily::Lfm2Chat
             | ModelFamily::Gemma3Chat => ModelTask::Chat,
             ModelFamily::Qwen3ForcedAligner => ModelTask::ForcedAlign,
@@ -188,15 +191,12 @@ pub fn parse_tts_model_variant(input: &str) -> Result<ModelVariant, ParseModelVa
 pub fn parse_chat_model_variant(
     input: Option<&str>,
 ) -> Result<ModelVariant, ParseModelVariantError> {
-    match input.unwrap_or("Qwen3-8B-GGUF") {
-        id => {
-            let variant = parse_model_variant(id)?;
-            if variant.is_chat() {
-                Ok(variant)
-            } else {
-                Err(ParseModelVariantError::new(id))
-            }
-        }
+    let id = input.unwrap_or("Qwen3-8B-GGUF");
+    let variant = parse_model_variant(id)?;
+    if variant.is_chat() {
+        Ok(variant)
+    } else {
+        Err(ParseModelVariantError::new(id))
     }
 }
 
@@ -205,15 +205,12 @@ pub fn parse_chat_model_variant(
 pub fn resolve_diarization_llm_variant(
     input: Option<&str>,
 ) -> Result<ModelVariant, ParseModelVariantError> {
-    match input.unwrap_or("Qwen3.5-4B") {
-        id => {
-            let variant = parse_model_variant(id)?;
-            if variant == ModelVariant::Qwen354BGguf || variant == ModelVariant::Qwen317BGguf {
-                Ok(variant)
-            } else {
-                Err(ParseModelVariantError::new(id))
-            }
-        }
+    let id = input.unwrap_or("Qwen3.5-4B");
+    let variant = parse_model_variant(id)?;
+    if variant == ModelVariant::Qwen354BGguf || variant == ModelVariant::Qwen317BGguf {
+        Ok(variant)
+    } else {
+        Err(ParseModelVariantError::new(id))
     }
 }
 
@@ -246,8 +243,6 @@ pub fn resolve_asr_model_variant(input: Option<&str>) -> ModelVariant {
                 WhisperLargeV3Turbo
             } else if let Some(qwen_asr) = resolve_qwen3_asr_variant(&normalized) {
                 qwen_asr
-            } else if normalized.contains("parakeet") {
-                ParakeetTdt06BV3
             } else {
                 ParakeetTdt06BV3
             }
@@ -265,14 +260,7 @@ pub fn resolve_diarization_model_variant(input: Option<&str>) -> ModelVariant {
     match parse_model_variant(raw) {
         Ok(variant) if variant.is_diarization() => variant,
         Ok(_) => DiarStreamingSortformer4SpkV21,
-        Err(_) => {
-            let normalized = normalize_identifier(raw);
-            if normalized.contains("sortformer") || normalized.contains("diar") {
-                DiarStreamingSortformer4SpkV21
-            } else {
-                DiarStreamingSortformer4SpkV21
-            }
-        }
+        Err(_) => DiarStreamingSortformer4SpkV21,
     }
 }
 
@@ -399,6 +387,14 @@ fn resolve_by_heuristic(normalized: &str) -> Option<ModelVariant> {
 
     if let Some(qwen35_variant) = resolve_qwen35_chat_variant(normalized) {
         return Some(qwen35_variant);
+    }
+
+    if normalized.contains("qwen38")
+        && normalized.contains("27b")
+        && !normalized.contains("asr")
+        && !normalized.contains("tts")
+    {
+        return Some(Qwen3827BFp8);
     }
 
     if normalized.contains("qwen3") && !normalized.contains("asr") && !normalized.contains("tts") {
@@ -612,11 +608,7 @@ fn matches_variant_alias(variant: ModelVariant, raw: &str, normalized: &str) -> 
         return true;
     }
 
-    let maybe_compact = raw
-        .trim()
-        .replace('_', "-")
-        .replace(' ', "-")
-        .to_ascii_lowercase();
+    let maybe_compact = raw.trim().replace(['_', ' '], "-").to_ascii_lowercase();
 
     variant.dir_name().eq_ignore_ascii_case(&maybe_compact)
         || variant.repo_id().eq_ignore_ascii_case(&maybe_compact)
@@ -757,6 +749,21 @@ mod tests {
     fn parse_qwen35_chat_q4_file_alias() {
         let parsed = parse_chat_model_variant(Some("Qwen3.5-9B-Q4_K_M.gguf")).unwrap();
         assert_eq!(parsed, ModelVariant::Qwen359BGguf);
+    }
+
+    #[test]
+    fn parse_qwen38_fp8_chat_aliases() {
+        for alias in [
+            "Qwen3.8-27B-FP8",
+            "Qwen/Qwen3.8-27B-FP8",
+            "Qwen3.8 27B FP8",
+            "Qwen3.8-27B",
+        ] {
+            let parsed = parse_chat_model_variant(Some(alias)).expect("Qwen3.8 chat alias");
+            assert_eq!(parsed, ModelVariant::Qwen3827BFp8, "alias {alias}");
+            assert_eq!(parsed.family(), ModelFamily::Qwen38Chat);
+            assert_eq!(parsed.primary_task(), ModelTask::Chat);
+        }
     }
 
     #[test]

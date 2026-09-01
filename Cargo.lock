@@ -3636,7 +3636,7 @@ checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
 
 [[package]]
 name = "izwi-agent"
-version = "0.1.0-beta-17"
+version = "0.1.0-beta-18"
 dependencies = [
  "async-trait",
  "serde",
@@ -3647,7 +3647,7 @@ dependencies = [
 
 [[package]]
 name = "izwi-asr-toolkit"
-version = "0.1.0-beta-17"
+version = "0.1.0-beta-18"
 dependencies = [
  "hound",
  "izwi-vad",
@@ -3655,7 +3655,7 @@ dependencies = [
 
 [[package]]
 name = "izwi-cli"
-version = "0.1.0-beta-17"
+version = "0.1.0-beta-18"
 dependencies = [
  "ansi_term",
  "anyhow",
@@ -3699,7 +3699,7 @@ dependencies = [
 
 [[package]]
 name = "izwi-core"
-version = "0.1.0-beta-17"
+version = "0.1.0-beta-18"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3711,9 +3711,11 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "cudaforge",
+ "cudarc 0.19.8",
  "dirs 5.0.1",
  "flate2",
  "futures",
+ "half",
  "hf-hub",
  "hound",
  "image",
@@ -3721,6 +3723,7 @@ dependencies = [
  "izwi-asr-toolkit",
  "izwi-vad",
  "memmap2",
+ "objc2 0.6.3",
  "objc2-metal 0.3.2",
  "rand 0.8.5",
  "rand_chacha 0.3.1",
@@ -3734,6 +3737,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "symphonia",
  "tar",
  "tekken-rs",
@@ -3750,7 +3754,7 @@ dependencies = [
 
 [[package]]
 name = "izwi-desktop"
-version = "0.1.0-beta-17"
+version = "0.1.0-beta-18"
 dependencies = [
  "anyhow",
  "clap",
@@ -3772,7 +3776,7 @@ dependencies = [
 
 [[package]]
 name = "izwi-hooks"
-version = "0.1.0-beta-17"
+version = "0.1.0-beta-18"
 dependencies = [
  "async-trait",
  "sea-orm",
@@ -3784,7 +3788,7 @@ dependencies = [
 
 [[package]]
 name = "izwi-server"
-version = "0.1.0-beta-17"
+version = "0.1.0-beta-18"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3822,7 +3826,7 @@ dependencies = [
 
 [[package]]
 name = "izwi-vad"
-version = "0.1.0-beta-17"
+version = "0.1.0-beta-18"
 dependencies = [
  "earshot",
 ]

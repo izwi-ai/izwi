@@ -14,11 +14,11 @@ concurrency:
 
 env:
   CUDA_COMPUTE_CAP: "80"
-  IZWI_CUDA_FEATURES: "cuda,cudnn,flash-attn"
+  IZWI_CUDA_FEATURES: "cuda,cudnn"
 
 jobs:
   cargo-cuda-flash-attn:
-    name: Cargo Validation (CUDA FlashAttention)
+    name: CUDA FlashAttention Compile (Driverless)
     runs-on: ubuntu-latest
     timeout-minutes: 90
     container:
@@ -46,8 +46,8 @@ jobs:
             --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Run CUDA FlashAttention backend validation
-        run: scripts/ci/check-backend-truth.sh cargo-cuda
+      - name: Compile CUDA FlashAttention harnesses without execution
+        run: scripts/ci/check-backend-truth.sh cargo-cuda-compile
 
   docker-cuda-flash-attn:
     name: Docker Build (CUDA FlashAttention)

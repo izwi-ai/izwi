@@ -4,6 +4,7 @@ description = "HTTP API server for Izwi TTS inference engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+build = "build.rs"
 
 [[bin]]
 name = "izwi-server"
@@ -11,9 +12,12 @@ path = "src/main.rs"
 
 [features]
 default = []
-cuda = ["izwi-core/cuda"]
+cuda-base = ["izwi-core/cuda"]
+cudnn-base = ["cuda-base", "izwi-core/cudnn"]
+cuda = ["cuda-base", "izwi-core/flash-attn"]
 cudnn = ["cuda", "izwi-core/cudnn"]
-flash-attn = ["cuda", "izwi-core/flash-attn"]
+flash-attn = ["cuda"]
+metal = ["izwi-core/metal"]
 db-mysql = ["sea-orm/sqlx-mysql"]
 db-postgres = ["sea-orm/sqlx-postgres"]
 
@@ -61,7 +65,7 @@ sea-orm = { version = "=2.0.0-rc.38", default-features = false, features = [
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-izwi-core = { path = "../izwi-core", default-features = false, features = ["metal", "accelerate"] }
+izwi-core = { path = "../izwi-core", default-features = false, features = ["accelerate"] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 izwi-core = { path = "../izwi-core", default-features = false }

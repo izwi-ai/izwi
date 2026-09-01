@@ -2,6 +2,9 @@
 //!
 //! Inspired by vLLM, SGlang, Ollama, and llama.cpp CLIs
 #![allow(dead_code)]
+// CLI dispatch and benchmark commands deliberately mirror their complete set
+// of command-line options at the boundary.
+#![allow(clippy::too_many_arguments)]
 
 use clap::Parser;
 
@@ -12,19 +15,6 @@ mod error;
 mod http;
 mod style;
 mod utils;
-
-#[cfg(test)]
-mod test_support {
-    use std::sync::{Mutex, MutexGuard, OnceLock};
-
-    pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("environment lock poisoned")
-    }
-}
 
 pub use app::cli::{
     AudioFormat, Backend, BenchCommands, Cli, Commands, ConfigCommands, LogFormat, ModelCommands,
@@ -49,4 +39,17 @@ async fn main() -> Result<()> {
     }
 
     app::run(cli, theme).await
+}
+
+#[cfg(test)]
+mod test_support {
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("environment lock poisoned")
+    }
 }

@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { ModelInfo } from "@/api";
@@ -19,6 +19,32 @@ function buildModel(overrides: Partial<ModelInfo>): ModelInfo {
 }
 
 describe("RouteModelModal", () => {
+  it("allows a loading model to be cancelled", () => {
+    const onUnload = vi.fn();
+    render(
+      <RouteModelModal
+        isOpen
+        onClose={vi.fn()}
+        title="ASR Models"
+        description="Manage ASR models."
+        models={[buildModel({ status: "loading" })]}
+        loading={false}
+        selectedVariant={null}
+        downloadProgress={{}}
+        onDownload={vi.fn()}
+        onLoad={vi.fn()}
+        onUnload={onUnload}
+        onDelete={vi.fn()}
+        onUseModel={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel load" }));
+    expect(onUnload).toHaveBeenCalledWith(
+      "diar_streaming_sortformer_4spk-v2.1",
+    );
+  });
+
   it("renders manage-mode rows without selected route affordances", () => {
     render(
       <RouteModelModal

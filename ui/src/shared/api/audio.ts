@@ -137,6 +137,12 @@ export interface SpeechHistoryRecord {
   audio_filename: string | null;
 }
 
+export interface CancelSpeechHistoryRecordResponse {
+  id: string;
+  cancelled: boolean;
+  record: SpeechHistoryRecord;
+}
+
 export interface SpeechHistoryRecordCreateRequest {
   model_id: string;
   text: string;
@@ -1852,6 +1858,15 @@ export class AudioApiClient {
     recordId: string,
   ): Promise<{ id: string; deleted: boolean }> {
     return this.deleteSpeechHistoryRecord("text-to-speech", recordId);
+  }
+
+  async cancelTextToSpeechRecord(
+    recordId: string,
+  ): Promise<CancelSpeechHistoryRecordResponse> {
+    return this.http.request(
+      `${this.speechHistoryRecordPath("text-to-speech", recordId)}/cancel`,
+      { method: "POST" },
+    );
   }
 
   async listVoiceDesignRecords(): Promise<SpeechHistoryRecordSummary[]> {

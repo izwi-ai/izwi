@@ -4,7 +4,7 @@ use crate::error::{Error, Result};
 use crate::models::architectures::granite_speech::asr::config::{
     GraniteSpeechConfig, GraniteSpeechProcessorConfig, GraniteSpeechTokenizerConfig,
 };
-use crate::tokenizer::Tokenizer;
+use crate::tokenizer::{IncrementalDecoder, Tokenizer};
 
 pub const GRANITE_SPEECH_SYSTEM_PROMPT: &str = "Knowledge Cutoff Date: April 2024.\nToday's Date: December 19, 2024.\nYou are Granite, developed by IBM. You are a helpful AI assistant";
 pub const GRANITE_SPEECH_ASR_PROMPT: &str =
@@ -114,6 +114,25 @@ impl GraniteSpeechPromptTokenizer {
 
     pub fn decode(&self, tokens: &[u32]) -> Result<String> {
         self.tokenizer.decode(tokens)
+    }
+
+    pub(crate) fn incremental_decoder(&self) -> IncrementalDecoder {
+        IncrementalDecoder::new(true)
+    }
+
+    pub(crate) fn decode_incrementally(
+        &self,
+        decoder: &mut IncrementalDecoder,
+        token: u32,
+    ) -> Result<String> {
+        self.tokenizer.decode_incrementally(decoder, token)
+    }
+
+    pub(crate) fn finish_incremental_decode(
+        &self,
+        decoder: &mut IncrementalDecoder,
+    ) -> Result<String> {
+        self.tokenizer.finish_incremental_decode(decoder)
     }
 
     pub fn build_prompt(

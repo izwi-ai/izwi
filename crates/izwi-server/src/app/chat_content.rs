@@ -287,17 +287,19 @@ mod tests {
     }
 
     #[test]
-    fn validate_media_inputs_rejects_non_qwen35_variants() {
-        let err = validate_media_inputs_for_variant(
-            ModelVariant::Qwen34BGguf,
-            &[ChatMediaInput {
-                kind: ChatMediaKind::Image,
-                source: "https://example.com/cat.png".to_string(),
-            }],
-        )
-        .expect_err("non-qwen35 multimodal should fail");
+    fn validate_media_inputs_rejects_non_qwen35_variants_including_qwen38() {
+        for variant in [ModelVariant::Qwen34BGguf, ModelVariant::Qwen3827BFp8] {
+            let err = validate_media_inputs_for_variant(
+                variant,
+                &[ChatMediaInput {
+                    kind: ChatMediaKind::Image,
+                    source: "https://example.com/cat.png".to_string(),
+                }],
+            )
+            .expect_err("non-qwen35 multimodal should fail");
 
-        assert!(err.contains("currently supported only for Qwen3.5"));
+            assert!(err.contains("currently supported only for Qwen3.5"));
+        }
     }
 
     #[test]

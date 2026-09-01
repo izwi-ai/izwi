@@ -99,9 +99,41 @@ pub enum Commands {
         #[arg(short, long)]
         models_dir: Option<PathBuf>,
 
-        /// Maximum batch size
+        /// Physical tensor batch width (`auto` or a positive row count)
+        #[arg(long, value_name = "AUTO_OR_ROWS")]
+        max_batch_size: Option<izwi_core::BatchSizePreference>,
+
+        /// Physical launch rollout mode (`serial`, `shadow`, `concurrent`)
+        #[arg(long, value_name = "MODE")]
+        physical_execution_mode: Option<izwi_core::PhysicalExecutionMode>,
+
+        /// Maximum candidate physical launches in flight
+        #[arg(long, value_name = "COUNT")]
+        max_physical_in_flight: Option<izwi_core::PhysicalInFlightLimit>,
+
+        /// Maximum logical rows selected by one scheduler step
         #[arg(long)]
-        max_batch_size: Option<usize>,
+        max_scheduler_batch_size: Option<usize>,
+
+        /// Maximum simultaneously resident model variants
+        #[arg(long)]
+        max_loaded_models: Option<usize>,
+
+        /// Maximum retained sequence/session rows
+        #[arg(long)]
+        max_retained_sequences: Option<usize>,
+
+        /// Maximum simultaneously staged managed-state transactions
+        #[arg(long)]
+        max_staged_transactions: Option<usize>,
+
+        /// Maximum admitted jobs in the runtime inference queue
+        #[arg(long)]
+        max_queued_requests: Option<usize>,
+
+        /// Portable context length (`auto` or a positive token count)
+        #[arg(long, value_name = "AUTO_OR_TOKENS")]
+        max_sequence_length: Option<izwi_core::ContextLengthPreference>,
 
         /// Backend preference (`auto`, `cpu`, `metal`, `cuda`)
         #[arg(long, value_enum)]
@@ -300,7 +332,7 @@ pub enum Commands {
     /// Interactive chat with audio understanding capabilities.
     #[command(name = "chat")]
     Chat {
-        /// Model to use (e.g., qwen3-0.6b, qwen3-0.6b-4bit, qwen3-1.7b, gemma-3-1b-it)
+        /// Model to use (for example Qwen3-8B-GGUF, Qwen3.8-27B-FP8, or Gemma-3-1b-it)
         #[arg(short, long, default_value = "qwen3-0.6b-4bit")]
         model: String,
 
@@ -550,6 +582,18 @@ pub enum BenchCommands {
         /// Enable warmup iteration
         #[arg(long)]
         warmup: bool,
+
+        /// Use SSE streaming and measure first-audio/inter-chunk latency
+        #[arg(long)]
+        stream: bool,
+
+        /// Explicit maximum generated audio frames
+        #[arg(long)]
+        max_output_tokens: Option<usize>,
+
+        /// Per-request client timeout in seconds
+        #[arg(long, default_value = "900")]
+        timeout_secs: u64,
     },
 
     /// Benchmark ASR inference
@@ -581,6 +625,10 @@ pub enum BenchCommands {
         /// Enable warmup iteration
         #[arg(long)]
         warmup: bool,
+
+        /// Use SSE streaming and measure first-transcript/inter-delta latency
+        #[arg(long)]
+        stream: bool,
     },
 
     /// Benchmark system throughput
@@ -746,6 +794,49 @@ impl Backend {
             Self::Cpu => BackendPreference::Cpu,
             Self::Metal => BackendPreference::Metal,
             Self::Cuda => BackendPreference::Cuda,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Commands};
+    use clap::Parser;
+    use izwi_core::PhysicalExecutionMode;
+
+    #[test]
+    fn chat_model_accepts_qwen38_catalog_id_as_free_form_input() {
+        let cli = Cli::try_parse_from(["izwi", "chat", "--model", "Qwen3.8-27B-FP8"])
+            .expect("Qwen3.8 catalog id should parse");
+
+        match cli.command {
+            Commands::Chat { model, .. } => assert_eq!(model, "Qwen3.8-27B-FP8"),
+            _ => panic!("expected chat command"),
+        }
+    }
+
+    #[test]
+    fn serve_parses_typed_physical_execution_controls() {
+        let cli = Cli::try_parse_from([
+            "izwi",
+            "serve",
+            "--physical-execution-mode",
+            "shadow",
+            "--max-physical-in-flight",
+            "3",
+        ])
+        .expect("physical execution controls should parse");
+
+        match cli.command {
+            Commands::Serve {
+                physical_execution_mode,
+                max_physical_in_flight,
+                ..
+            } => {
+                assert_eq!(physical_execution_mode, Some(PhysicalExecutionMode::Shadow));
+                assert_eq!(max_physical_in_flight.map(|limit| limit.get()), Some(3));
+            }
+            _ => panic!("expected serve command"),
         }
     }
 }

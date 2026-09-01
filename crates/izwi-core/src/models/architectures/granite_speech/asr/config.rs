@@ -419,9 +419,7 @@ mod tests {
         let mut cfg = plus_config();
         cfg.projector_config.encoder_hidden_size = 1024;
         let err = cfg.validate_plus().unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("concatenated encoder width 2048"));
+        assert!(err.to_string().contains("concatenated encoder width 2048"));
     }
 
     #[test]

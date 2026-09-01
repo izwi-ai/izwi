@@ -7,11 +7,20 @@ usage() {
 Usage: scripts/ci/check-backend-truth.sh <command>
 
 Commands:
+  hygiene       Run repository format, Clippy, all-target, diff, and shell gates
   cargo-cpu     Run CPU-focused cargo checks and core scheduler regressions
-  cargo-metal   Run Metal-focused cargo checks and core scheduler regressions on macOS
-  cargo-cuda    Run CUDA-focused checks, portable regressions, and a device smoke when available
+  cargo-metal   Require macOS 15+ and run Metal-focused validation
+  cargo-metal-fallback
+                Require macOS 12-14 and prove Metal-enabled code falls back to CPU
+  cargo-cuda-compile
+                Compile/link CUDA harnesses without executing CUDA-linked binaries
+  cargo-cuda    Compatibility alias for cargo-cuda-compile
+  cargo-cuda-device
+                Require NVIDIA hardware and run native/FA2 numerical certification
   docker-cpu    Validate the default Docker Compose config, build, and smoke the CPU image
   docker-cuda   Validate the CUDA Docker Compose profile, build, and audit the CUDA image
+  test-cuda-feature-mapping
+                Validate wrapper-to-core CUDA feature translation without running Cargo
 EOF
 }
 
@@ -30,8 +39,84 @@ resolve_cuda_compute_cap() {
     fi
 }
 
-resolve_cuda_features() {
+resolve_cuda_wrapper_features() {
     echo "${IZWI_CUDA_FEATURES:-cuda,cudnn}"
+}
+
+resolve_cuda_core_features() {
+    local wrapper_features="$1"
+    local require_cuda=0
+    local require_cudnn=0
+    local require_flash_attn=0
+    local feature
+    local features=()
+
+    IFS=',' read -r -a features <<<"${wrapper_features}"
+    for feature in "${features[@]}"; do
+        feature="${feature//[[:space:]]/}"
+        case "${feature}" in
+            cuda-base)
+                require_cuda=1
+                ;;
+            cudnn-base)
+                require_cuda=1
+                require_cudnn=1
+                ;;
+            cuda|flash-attn)
+                require_cuda=1
+                require_flash_attn=1
+                ;;
+            cudnn)
+                require_cuda=1
+                require_cudnn=1
+                require_flash_attn=1
+                ;;
+            "")
+                ;;
+            *)
+                echo "Unsupported izwi-cli/izwi-server CUDA feature: ${feature}" >&2
+                return 1
+                ;;
+        esac
+    done
+
+    if [[ "${require_cuda}" -ne 1 ]]; then
+        echo "CUDA validation requires a cuda or cuda-base wrapper feature" >&2
+        return 1
+    fi
+
+    local core_features="cuda"
+    if [[ "${require_cudnn}" -eq 1 ]]; then
+        core_features+=",cudnn"
+    fi
+    if [[ "${require_flash_attn}" -eq 1 ]]; then
+        core_features+=",flash-attn"
+    fi
+    echo "${core_features}"
+}
+
+assert_cuda_feature_mapping() {
+    local wrapper_features="$1"
+    local expected_core_features="$2"
+    local actual_core_features
+    actual_core_features="$(resolve_cuda_core_features "${wrapper_features}")"
+    if [[ "${actual_core_features}" != "${expected_core_features}" ]]; then
+        echo "CUDA feature mapping mismatch for ${wrapper_features}: expected ${expected_core_features}, got ${actual_core_features}" >&2
+        return 1
+    fi
+}
+
+test_cuda_feature_mapping() {
+    assert_cuda_feature_mapping "cuda-base,cudnn-base" "cuda,cudnn"
+    assert_cuda_feature_mapping "cuda,cudnn" "cuda,cudnn,flash-attn"
+    assert_cuda_feature_mapping "flash-attn" "cuda,flash-attn"
+
+    if resolve_cuda_core_features "cuda,unknown-feature" >/dev/null 2>&1; then
+        echo "Unknown CUDA wrapper features must fail closed" >&2
+        return 1
+    fi
+
+    echo "CUDA wrapper/core feature mapping is valid."
 }
 
 run_core_scheduler_regressions() {
@@ -84,15 +169,17 @@ cuda_device_available() {
 }
 
 compile_cuda_test_harnesses() {
-    local cuda_features="$1"
+    local wrapper_features="$1"
+    local core_features="$2"
 
     echo "Compiling CUDA-linked test harnesses without executing them"
-    cargo test --locked -p izwi-core --features "${cuda_features}" --lib --no-run
-    cargo test --locked -p izwi-server --features "${cuda_features}" --lib --no-run
+    cargo test --locked -p izwi-core --features "${core_features}" --lib --no-run
+    cargo test --locked -p izwi-server --features "${wrapper_features}" --lib --no-run
+    cargo test --locked -p izwi-cli --features "${wrapper_features}" --no-run
 }
 
 smoke_cuda_device_if_available() {
-    local cuda_features="$1"
+    local wrapper_features="$1"
 
     if ! cuda_device_available; then
         echo "No usable NVIDIA device exposed; portable CUDA regressions completed."
@@ -109,7 +196,7 @@ smoke_cuda_device_if_available() {
     local health_payload=""
 
     echo "Smoke-checking the CUDA device through izwi-server"
-    cargo build --locked -p izwi-server --features "${cuda_features}"
+    cargo build --locked -p izwi-server --features "${wrapper_features}"
     IZWI_MODELS_DIR="${RUNNER_TEMP:-/tmp}/izwi-cuda-smoke-models" \
     IZWI_PRELOAD_MODELS= \
     IZWI_WARMUP_PRELOADED_MODELS=0 \
@@ -232,7 +319,8 @@ audit_cuda_docker_server() {
             fi
         '
 
-    if cuda_features_include "${cuda_features}" "cudnn"; then
+    if cuda_features_include "${cuda_features}" "cudnn" \
+        || cuda_features_include "${cuda_features}" "cudnn-base"; then
         docker run --rm \
             --entrypoint /bin/sh \
             "${image}" \
@@ -272,8 +360,10 @@ run_cargo_cpu() {
 
     cargo check --locked -p izwi-cli
     cargo check --locked -p izwi-server
-    run_core_scheduler_regressions
-    run_server_scheduler_regressions
+    cargo test --locked -p izwi-core --lib --tests
+    cargo test --locked -p izwi-server --lib
+    scripts/bench/run_kv_cache_matrix.sh --lane default --iterations 1 --warmup 0
+    scripts/ci/run-kv-lifecycle-soak.sh --profile pr
 }
 
 run_cargo_metal() {
@@ -283,42 +373,155 @@ run_cargo_metal() {
         echo "Metal checks require macOS." >&2
         exit 1
     fi
+    if [[ "$(sw_vers -productVersion | cut -d. -f1)" -lt 15 ]]; then
+        echo "Metal acceleration validation requires macOS 15 or later." >&2
+        exit 1
+    fi
 
     cargo check --locked -p izwi-core --features metal
     cargo check --locked -p izwi-cli --features metal
-    cargo check --locked -p izwi-server
-    run_core_scheduler_regressions metal
-    run_server_scheduler_regressions
+    cargo check --locked -p izwi-server --features metal
+    cargo test --locked -p izwi-core --features metal --lib --tests
+    cargo test --locked -p izwi-server --features metal --lib
+    scripts/bench/run_kv_cache_matrix.sh --lane metal --iterations 1 --warmup 0 --require-device
 }
 
-run_cargo_cuda() {
+run_cargo_metal_fallback() {
+    require_command cargo
+
+    if [[ "$(uname -s)" != "Darwin" ]]; then
+        echo "macOS fallback checks require macOS." >&2
+        exit 1
+    fi
+    if [[ "$(sw_vers -productVersion | cut -d. -f1)" -ge 15 ]]; then
+        echo "The legacy CPU fallback lane requires macOS 12-14." >&2
+        exit 1
+    fi
+
+    cargo check --locked -p izwi-core --features metal
+    cargo check --locked -p izwi-cli
+    cargo check --locked -p izwi-server
+    cargo test --locked -p izwi-core --features metal \
+        pre_macos15_auto_and_explicit_metal_preferences_fall_back_to_cpu --lib
+    cargo test --locked -p izwi-core --features metal \
+        unsupported_metal_runtime_never_invokes_candle_probe --lib
+    cargo test --locked -p izwi-server --lib
+}
+
+run_hygiene() {
+    require_command cargo
+    require_command rg
+
+    # Tauri validates the generated frontend and bundle resources during
+    # build-script execution, even though Clippy/check do not create an
+    # application bundle. Release builds still use the real configuration;
+    # hygiene clears only those generated inputs so a clean checkout can lint
+    # the desktop crate without building the UI or synthetic release binaries.
+    local tauri_check_config='{"build":{"frontendDist":null},"bundle":{"resources":null,"linux":{"deb":{"files":{}}}}}'
+
+    git diff --check
+    local unguarded_metal_constructors
+    unguarded_metal_constructors="$(
+        rg -n 'Device::(new_metal|metal_if_available)' crates --glob '*.rs' \
+            | grep -v '^crates/izwi-core/src/backends/device.rs:' || true
+    )"
+    if [[ -n "${unguarded_metal_constructors}" ]]; then
+        echo "Metal device construction must use izwi_core::backends::metal_device_if_available:" >&2
+        printf '%s\n' "${unguarded_metal_constructors}" >&2
+        exit 1
+    fi
+    # The repository still has a documented, pre-existing workspace rustfmt
+    # backlog. Gate the production KV surface touched by this rollout without
+    # rewriting or silently grandfathering new drift in those files.
+    rustfmt --edition 2021 --check --config skip_children=true \
+        crates/izwi-core/src/backends/kv/mod.rs \
+        crates/izwi-core/src/backends/kv/cpu.rs \
+        crates/izwi-core/src/backends/kv/accelerator.rs \
+        crates/izwi-core/src/kernels/cuda.rs \
+        crates/izwi-core/src/kernels/metal.rs \
+        crates/izwi-core/src/runtime/rollout.rs \
+        crates/izwi-core/src/engine/cache/managed_stress.rs \
+        crates/izwi-core/examples/kv-cache-bench.rs \
+        crates/izwi-core/tests/kv_public_compatibility.rs
+    TAURI_CONFIG="${tauri_check_config}" \
+        cargo clippy --locked --workspace --all-targets -- -D warnings
+    TAURI_CONFIG="${tauri_check_config}" \
+        cargo check --locked --workspace --all-targets
+    bash -n scripts/ci/*.sh scripts/bench/*.sh
+    scripts/bench/test-run-kv-cache-matrix.sh
+    scripts/test-install-cli-backend-selection.sh
+    scripts/bench/test-run-cuda-model-evidence.sh
+    scripts/bench/test-run-cuda-model-load-evidence.sh
+}
+
+run_cargo_cuda_compile() {
     require_command cargo
     require_command nvcc
+    test_cuda_feature_mapping
 
     local cuda_compute_cap
     cuda_compute_cap="$(resolve_cuda_compute_cap)"
-    local cuda_features
-    cuda_features="$(resolve_cuda_features)"
+    local wrapper_features
+    wrapper_features="$(resolve_cuda_wrapper_features)"
+    local core_features
+    core_features="$(resolve_cuda_core_features "${wrapper_features}")"
 
     export CUDA_COMPUTE_CAP="${cuda_compute_cap}"
     echo "Using CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}"
-    echo "Using IZWI_CUDA_FEATURES=${cuda_features}"
+    echo "Using wrapper CUDA features=${wrapper_features}"
+    echo "Using izwi-core CUDA features=${core_features}"
 
-    cargo check --locked -p izwi-cli --features "${cuda_features}"
-    cargo check --locked -p izwi-server --features "${cuda_features}"
-    if cuda_device_available; then
-        run_core_scheduler_regressions "${cuda_features}"
-        run_server_scheduler_regressions "${cuda_features}"
-    else
-        # CUDA devel images provide linker stubs but GitHub's ordinary hosted
-        # runners do not mount the NVIDIA driver library (`libcuda.so.1`). Build
-        # the CUDA test harnesses to retain compile/link coverage, then execute
-        # the backend-neutral scheduler regressions without CUDA linkage.
-        compile_cuda_test_harnesses "${cuda_features}"
-        run_core_scheduler_regressions
-        run_server_scheduler_regressions
+    cargo check --locked -p izwi-cli --features "${wrapper_features}"
+    cargo check --locked -p izwi-server --features "${wrapper_features}"
+    # CUDA devel images provide linker stubs but ordinary hosted runners do not
+    # mount the driver-owned `libcuda.so.1`. Compile/link CUDA harnesses without
+    # running them, then execute only backend-neutral regressions.
+    compile_cuda_test_harnesses "${wrapper_features}" "${core_features}"
+    run_core_scheduler_regressions
+    run_server_scheduler_regressions
+
+    echo "CUDA evidence level: cuda_compiled (runtime not observed)"
+}
+
+run_cargo_cuda() {
+    echo "cargo-cuda is a compatibility alias for compile-only CUDA evidence." >&2
+    echo "Use cargo-cuda-device for required real-device execution." >&2
+    run_cargo_cuda_compile
+}
+
+run_cargo_cuda_device_profile() {
+    local wrapper_features
+    wrapper_features="$(resolve_cuda_wrapper_features)"
+    local core_features
+    core_features="$(resolve_cuda_core_features "${wrapper_features}")"
+
+    cargo check --locked -p izwi-cli --features "${wrapper_features}"
+    cargo check --locked -p izwi-server --features "${wrapper_features}"
+    run_core_scheduler_regressions "${core_features}"
+    run_server_scheduler_regressions "${wrapper_features}"
+    smoke_cuda_device_if_available "${wrapper_features}"
+}
+
+run_cargo_cuda_device() {
+    require_command cargo
+    require_command nvcc
+    if ! cuda_device_available; then
+        echo "CUDA hardware certification requires a device visible to nvidia-smi." >&2
+        exit 1
     fi
-    smoke_cuda_device_if_available "${cuda_features}"
+
+    test_cuda_feature_mapping
+    export CUDA_COMPUTE_CAP="$(resolve_cuda_compute_cap)"
+    echo "Using CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}"
+
+    IZWI_CUDA_FEATURES="cuda-base,cudnn-base" run_cargo_cuda_device_profile
+    IZWI_CUDA_FEATURES="cuda,cudnn" run_cargo_cuda_device_profile
+    scripts/bench/run_kv_cache_matrix.sh \
+        --lane cuda \
+        --iterations "${IZWI_KV_CERT_ITERATIONS:-30}" \
+        --warmup "${IZWI_KV_CERT_WARMUP:-5}" \
+        --require-device \
+        --output "${IZWI_KV_CERT_OUTPUT:-target/kv-cache-cuda-certification.jsonl}"
 }
 
 run_docker_cpu() {
@@ -331,23 +534,26 @@ run_docker_cpu() {
 
 run_docker_cuda() {
     require_command docker
+    test_cuda_feature_mapping
 
     local cuda_compute_cap
     cuda_compute_cap="$(resolve_cuda_compute_cap)"
-    local cuda_features
-    cuda_features="$(resolve_cuda_features)"
+    local wrapper_features
+    wrapper_features="$(resolve_cuda_wrapper_features)"
+    local core_features
+    core_features="$(resolve_cuda_core_features "${wrapper_features}")"
 
     docker compose --profile cuda config >/dev/null
-    if cuda_features_include "${cuda_features}" "flash-attn"; then
+    if cuda_features_include "${core_features}" "flash-attn"; then
         assert_cuda_docker_builder_dependencies Dockerfile
     fi
     docker build \
         --build-arg CUDA_COMPUTE_CAP="${cuda_compute_cap}" \
-        --build-arg IZWI_CUDA_FEATURES="${cuda_features}" \
+        --build-arg IZWI_CUDA_FEATURES="${wrapper_features}" \
         --target production-cuda \
         -t izwi-ci:production-cuda \
         .
-    audit_cuda_docker_server izwi-ci:production-cuda "${cuda_features}"
+    audit_cuda_docker_server izwi-ci:production-cuda "${wrapper_features}"
 }
 
 main() {
@@ -357,20 +563,35 @@ main() {
     fi
 
     case "$1" in
+        hygiene)
+            run_hygiene
+            ;;
         cargo-cpu)
             run_cargo_cpu
             ;;
         cargo-metal)
             run_cargo_metal
             ;;
+        cargo-metal-fallback)
+            run_cargo_metal_fallback
+            ;;
+        cargo-cuda-compile)
+            run_cargo_cuda_compile
+            ;;
         cargo-cuda)
             run_cargo_cuda
+            ;;
+        cargo-cuda-device)
+            run_cargo_cuda_device
             ;;
         docker-cpu)
             run_docker_cpu
             ;;
         docker-cuda)
             run_docker_cuda
+            ;;
+        test-cuda-feature-mapping)
+            test_cuda_feature_mapping
             ;;
         -h|--help|help)
             usage

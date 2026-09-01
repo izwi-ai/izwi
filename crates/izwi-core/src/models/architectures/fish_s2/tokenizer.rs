@@ -214,7 +214,7 @@ where
                 let ids = encode_text(text)?;
                 let len = ids.len();
                 row0.extend(ids);
-                vq_mask.extend(std::iter::repeat(false).take(len));
+                vq_mask.extend(std::iter::repeat_n(false, len));
             }
             FishS2PromptPart::Vq(codes) => {
                 validate_vq_codes(config, codes)?;

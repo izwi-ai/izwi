@@ -1,7 +1,7 @@
 //! Chat runtime methods routed through the unified core engine.
 
 use crate::catalog::ModelFamily;
-use crate::engine::{GenerationParams, TaskType};
+use crate::engine::{resolve_backend_model_context, GenerationParams, TaskType};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::qwen35::media_resource_estimate;
@@ -139,7 +139,8 @@ impl RuntimeService {
             )));
         }
         let correlation_id = correlation_id.map(ToOwned::to_owned);
-        let context_limit = self.config.max_sequence_length.max(1);
+        let backend = self.backend_router.context().backend_kind;
+        let configured_context_limit = self.config.portable_context_ceiling();
         let input_bytes = retained_chat_preparation_input_bytes(
             &messages,
             messages.capacity(),
@@ -164,10 +165,17 @@ impl RuntimeService {
                 let model = registry
                     .blocking_get_chat(variant)
                     .ok_or_else(|| Error::ModelNotFound(variant.to_string()))?;
+                let context_limit = registry.effective_context(variant).unwrap_or(
+                    resolve_backend_model_context(
+                        backend,
+                        configured_context_limit,
+                        model.max_context_tokens()?,
+                    )?,
+                );
                 let original_messages = messages;
                 let initial =
                     model.prepare_prompt_for_execution(&original_messages, &prompt_config)?;
-                let (messages, prompt_tokens, prepared_qwen35_prompt, trimmed_messages) =
+                let (messages, prompt_tokens, prepared_chat_prompt, trimmed_messages) =
                     if initial.0.len() < context_limit {
                         (original_messages, initial.0, initial.1, 0usize)
                     } else {
@@ -269,8 +277,9 @@ impl RuntimeService {
                 request.install_chat_execution_preparation_with_model(
                     variant,
                     exact_prompt_tokens,
-                    prepared_qwen35_prompt,
+                    prepared_chat_prompt,
                     model,
+                    context_limit,
                 )?;
                 Ok(request)
             },
@@ -313,8 +322,10 @@ impl RuntimeService {
         correlation_id: Option<&str>,
         runtime_context: RuntimeRequestContext,
     ) -> Result<ChatGeneration> {
-        let mut params = GenerationParams::default();
-        params.max_tokens = max_new_tokens.max(1);
+        let params = GenerationParams {
+            max_tokens: max_new_tokens.max(1),
+            ..Default::default()
+        };
         let admitted = self
             .build_chat_request_with_params_and_config(
                 variant,
@@ -464,8 +475,10 @@ impl RuntimeService {
     where
         F: FnMut(String) + Send + 'static,
     {
-        let mut params = GenerationParams::default();
-        params.max_tokens = max_new_tokens.max(1);
+        let params = GenerationParams {
+            max_tokens: max_new_tokens.max(1),
+            ..Default::default()
+        };
         let admitted = self
             .build_chat_request_with_params_and_config(
                 variant,

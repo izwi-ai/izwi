@@ -9,7 +9,8 @@ Build Izwi from source for development, backend-specific installs, or to customi
 See the [Runtime Support Matrix](/support-matrix) before choosing a build target. In particular:
 
 - GitHub Release artifacts and source builds do not expose the same backend set.
-- Metal is the primary accelerated source-build path on Apple Silicon.
+- Metal is the primary accelerated source-build path on Apple Silicon with
+  macOS 15+; macOS 12-14 use CPU.
 - CUDA source builds are useful for development, custom validation, and fallback debugging. Linux and Windows GitHub Release artifacts are CPU-only; the CUDA distribution path is the Docker CUDA image/profile on NVIDIA Linux hosts.
 
 ---
@@ -91,14 +92,15 @@ Backend-specific examples:
 # CPU-focused build
 IZWI_BUILD_BACKEND=cpu ./scripts/install-cli.sh
 
-# Apple Silicon / Metal build
+# Apple Silicon / Metal build (macOS 15+)
 IZWI_BUILD_BACKEND=metal ./scripts/install-cli.sh
 
 # NVIDIA CUDA build
 IZWI_BUILD_BACKEND=cuda ./scripts/install-cli.sh
 ```
 
-On Linux, the script defaults to `cpu`. On Apple Silicon macOS, it defaults to `metal`.
+On Linux and macOS 12-14, the script defaults to `cpu`. On Apple Silicon with
+macOS 15+, it defaults to `metal`.
 
 The repository's Cargo configuration includes a stable-Rust workaround for
 Candle `0.11.0` on Apple Silicon. Keep `.cargo/config.toml` in the checkout and
@@ -114,8 +116,9 @@ If you only want specific binaries, use package-scoped commands:
 cargo build --release -p izwi-cli
 cargo build --release -p izwi-server
 
-# Metal-capable CLI (macOS)
+# Metal-capable CLI and server (macOS 15+)
 cargo build --release -p izwi-cli --features metal
+cargo build --release -p izwi-server --features metal
 
 # CUDA-capable CLI + server
 cargo build --release -p izwi-cli --features cuda
@@ -305,7 +308,7 @@ sudo apt install -y libssl-dev pkg-config
 
 ### Metal not available (macOS)
 
-Ensure you're on Apple Silicon and macOS 12.0+:
+Ensure you're on Apple Silicon and macOS 15.0+:
 
 ```bash
 uname -m  # Should show "arm64"

@@ -1,26 +1,40 @@
 mod decode;
 pub(crate) mod metal_kernels;
 mod nemo;
+mod physical;
 mod preprocessor;
 
 use std::path::Path;
 use std::time::Instant;
 
-use candle_core::{DType, Device, IndexOp, Tensor};
+use candle_core::{DType, Device, IndexOp, Tensor, D};
 use candle_nn::ops;
 use candle_nn::{
     batch_norm, layer_norm, Conv1d, Conv1dConfig, Conv2d, Conv2dConfig, LayerNorm, Linear, Module,
     ModuleT, VarBuilder,
 };
 
+use crate::backends::state::{
+    InvocationTensorComponentValue, InvocationTensorUpdateV2, PhysicalStateTransactionId,
+    StateComponentValue, TensorStateArena,
+};
 use crate::backends::DeviceProfile;
+use crate::engine::{InvocationTensorLease, StageDescriptor};
 use crate::error::{Error, Result};
+use crate::kv::v2::{
+    ComponentShapeInstantiation, DomainStepIntent, ShapeAxis, ShapeDimensionValue,
+    StateComponentId, StateUpdateKind,
+};
 use crate::model::ModelVariant;
+use crate::models::shared::memory::accounting::{
+    deep_copy_tensor_storage, TensorStorageAccounting,
+};
 use crate::models::shared::weights::mlx;
 use crate::tokenizer::Tokenizer;
 
 use decode::decode_tokens;
 use nemo::{ensure_parakeet_artifacts, ParakeetArtifacts};
+pub(crate) use physical::{ParakeetPhysicalStateSpec, PARAKEET_PREDICTOR_STATE_GROUP};
 use preprocessor::ParakeetPreprocessor;
 
 const SAMPLE_RATE: u32 = 16_000;
@@ -35,11 +49,74 @@ const CONV_KERNEL_1D: usize = 9;
 const SUBSAMPLING_FACTOR: usize = 8;
 const FRAME_HOP_MS: f32 = 10.0;
 const DEFAULT_MAX_SYMBOLS: usize = 10;
+pub(crate) const PARAKEET_RETAINED_PREFILL_STAGE: &str = "asr.prefill.parakeet.predictor";
+pub(crate) const PARAKEET_RETAINED_DECODE_STAGE: &str = "asr.decode.parakeet.joint";
+pub(crate) const PARAKEET_RETAINED_WORKSPACE_PER_ROW_BYTES: u64 = 16 * 1024 * 1024;
 
 pub struct ParakeetAsrTranscriptionOutput {
     pub text: String,
     pub language: Option<String>,
     pub diagnostics: Option<serde_json::Value>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ParakeetPreparedEncoderArtifact {
+    encoded: Tensor,
+    encoded_len: usize,
+    input_samples: usize,
+    input_sample_rate: u32,
+    resampled_samples: usize,
+    feature_frames: usize,
+    language: Option<String>,
+}
+
+impl ParakeetPreparedEncoderArtifact {
+    pub(crate) fn decode_budget(&self, max_symbols: usize) -> Result<usize> {
+        self.encoded_len
+            .checked_mul(max_symbols)
+            .and_then(|value| value.checked_mul(8))
+            .map(|value| value.max(1))
+            .ok_or_else(|| Error::Overloaded("Parakeet retained decode budget overflowed".into()))
+    }
+
+    pub(crate) fn resident_tensor_bytes(&self) -> Result<u64> {
+        let mut accounting = TensorStorageAccounting::default();
+        accounting.add_tensor(&self.encoded).ok_or_else(|| {
+            Error::Overloaded("Parakeet encoder artifact storage accounting overflowed".into())
+        })?;
+        Ok(accounting.bytes())
+    }
+
+    pub(crate) const fn encoded_len(&self) -> usize {
+        self.encoded_len
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ParakeetRetainedDecodeState {
+    predictor: ParakeetPredictorBatchState,
+    predictor_out: Tensor,
+    t: usize,
+    last_emit_t: usize,
+    emit_count_at_t: usize,
+    guard_steps: usize,
+    token_ids: Vec<usize>,
+    assembled: String,
+    counters: ParakeetDecodeCounters,
+    finished: bool,
+}
+
+pub(crate) struct ParakeetRetainedDecodeBatchRow<'a> {
+    pub(crate) artifact: &'a ParakeetPreparedEncoderArtifact,
+    pub(crate) state: &'a mut ParakeetRetainedDecodeState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParakeetRetainedDecodeStep {
+    pub(crate) delta: String,
+    pub(crate) text: String,
+    pub(crate) tokens_generated: usize,
+    pub(crate) finished: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -70,6 +147,7 @@ struct ParakeetDecodeCounters {
     tdt_emitted_tokens: usize,
     tdt_blank_steps: usize,
     host_argmax_reads: usize,
+    device_argmax_scalar_reads: usize,
 }
 
 pub struct ParakeetAsrModel {
@@ -101,6 +179,385 @@ impl ParakeetDecoder {
 }
 
 impl ParakeetAsrModel {
+    pub(crate) fn new_predictor_batch_state(
+        &self,
+        batch: usize,
+    ) -> Result<ParakeetPredictorBatchState> {
+        if batch == 0 {
+            return Err(Error::InvalidInput(
+                "Parakeet predictor batch must contain at least one row".into(),
+            ));
+        }
+        self.network
+            .predictor
+            .initial_state(batch, self.network.predictor.embed.device())
+    }
+
+    /// Execute one native recurrent predictor step for independent request
+    /// rows. This is a real B-wide LSTM call; callers retain scalar fallback
+    /// by passing one label and one-row state.
+    pub(crate) fn predictor_step_batch(
+        &self,
+        labels: &[usize],
+        state: &mut ParakeetPredictorBatchState,
+    ) -> Result<Tensor> {
+        self.network
+            .predictor
+            .step_batch(labels, state, self.network.predictor.embed.device())
+    }
+
+    /// Run the joint network across independent rows without padding a time
+    /// dimension. `encoded_rows` is `[B,Denc]` and `predictor_rows` is
+    /// `[B,1,Dpred]`; the result is `[B,V+durations]`.
+    pub(crate) fn joint_batch_rows(
+        &self,
+        encoded_rows: &Tensor,
+        predictor_rows: &Tensor,
+    ) -> Result<Tensor> {
+        self.network
+            .joint
+            .joint_batch_rows(encoded_rows, predictor_rows)
+    }
+
+    pub(crate) fn physical_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<ParakeetPhysicalStateSpec> {
+        physical::parakeet_physical_state_spec(stage_graphs)
+    }
+
+    pub(crate) fn prepare_retained_encoder(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+    ) -> Result<ParakeetPreparedEncoderArtifact> {
+        if audio.is_empty() {
+            return Err(Error::InvalidInput("Empty audio input".into()));
+        }
+        if sample_rate == 0 {
+            return Err(Error::InvalidInput(
+                "Parakeet sample rate must be greater than zero".into(),
+            ));
+        }
+        let mono = if sample_rate == SAMPLE_RATE {
+            audio.to_vec()
+        } else {
+            resample_linear(audio, sample_rate, SAMPLE_RATE)
+        };
+        let (features, feature_frames, _) = self
+            .preprocessor
+            .compute_features_with_upload_timing(&mono)?;
+        let mut timings = ParakeetTimings::default();
+        let (encoded, encoded_len) =
+            self.network
+                .encode_with_timings(&features, feature_frames, &mut timings)?;
+        if encoded_len == 0 {
+            return Err(Error::InferenceError(
+                "Parakeet encoder produced no decodable frames".into(),
+            ));
+        }
+        let encoded = encoded.narrow(1, 0, encoded_len)?;
+        Ok(ParakeetPreparedEncoderArtifact {
+            encoded: deep_copy_tensor_storage(&encoded)?,
+            encoded_len,
+            input_samples: audio.len(),
+            input_sample_rate: sample_rate,
+            resampled_samples: mono.len(),
+            feature_frames,
+            language: language.map(ToOwned::to_owned),
+        })
+    }
+
+    pub(crate) fn start_retained_decode(&self) -> Result<ParakeetRetainedDecodeState> {
+        self.start_retained_decode_batch(1)?
+            .pop()
+            .ok_or_else(|| Error::InferenceError("Parakeet B1 prefill produced no row".into()))
+    }
+
+    pub(crate) fn start_retained_decode_batch(
+        &self,
+        batch: usize,
+    ) -> Result<Vec<ParakeetRetainedDecodeState>> {
+        let mut cohort = self.new_predictor_batch_state(batch)?;
+        let labels = vec![self.blank_idx; batch];
+        let outputs = self.predictor_step_batch(&labels, &mut cohort)?;
+        let mut predictors = (0..batch)
+            .map(|_| self.new_predictor_batch_state(1))
+            .collect::<Result<Vec<_>>>()?;
+        let mut targets = predictors.iter_mut().collect::<Vec<_>>();
+        cohort.scatter_rows(&mut targets)?;
+        drop(targets);
+        predictors
+            .into_iter()
+            .enumerate()
+            .map(|(index, predictor)| {
+                Ok(ParakeetRetainedDecodeState {
+                    predictor,
+                    predictor_out: outputs.narrow(0, index, 1)?.contiguous()?,
+                    t: 0,
+                    last_emit_t: usize::MAX,
+                    emit_count_at_t: 0,
+                    guard_steps: 0,
+                    token_ids: Vec::new(),
+                    assembled: String::new(),
+                    counters: ParakeetDecodeCounters::default(),
+                    finished: false,
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn hydrate_retained_decode_physical_state(
+        &self,
+        state: &mut ParakeetRetainedDecodeState,
+        arena: &TensorStateArena,
+        transaction: PhysicalStateTransactionId,
+    ) -> Result<()> {
+        let snapshot = arena
+            .read_transaction_base(transaction, physical::PARAKEET_PREDICTOR_STATE_DOMAIN)?
+            .ok_or_else(|| {
+                Error::InferenceError(
+                    "Parakeet retained predictor has no committed physical snapshot".into(),
+                )
+            })?;
+        if snapshot.components.len() != 5
+            || snapshot
+                .components
+                .iter()
+                .enumerate()
+                .any(|(index, value)| {
+                    value.component != StateComponentId::new((index + 1) as u32)
+                        || value.tensor.is_none()
+                })
+        {
+            return Err(Error::InferenceError(
+                "Parakeet retained predictor snapshot has non-canonical components".into(),
+            ));
+        }
+        let tensor = |index: usize| {
+            snapshot.components[index].tensor.clone().ok_or_else(|| {
+                Error::InferenceError("Parakeet retained predictor snapshot lost a tensor".into())
+            })
+        };
+        state.predictor = ParakeetPredictorBatchState {
+            h0: tensor(0)?,
+            c0: tensor(1)?,
+            h1: tensor(2)?,
+            c1: tensor(3)?,
+        };
+        state.predictor_out = tensor(4)?;
+        Ok(())
+    }
+
+    pub(crate) fn stage_retained_decode_physical_state(
+        &self,
+        state: &ParakeetRetainedDecodeState,
+        arena: &TensorStateArena,
+        transaction: PhysicalStateTransactionId,
+        target_cursor: u64,
+    ) -> Result<()> {
+        let expected_cursor = arena
+            .read_transaction_base(transaction, physical::PARAKEET_PREDICTOR_STATE_DOMAIN)?
+            .map_or(0, |snapshot| snapshot.cursor);
+        if target_cursor <= expected_cursor {
+            return Err(Error::InferenceError(format!(
+                "Parakeet retained predictor cursor did not advance: {expected_cursor} -> {target_cursor}"
+            )));
+        }
+        let tensors = [
+            state.predictor.h0.clone(),
+            state.predictor.c0.clone(),
+            state.predictor.h1.clone(),
+            state.predictor.c1.clone(),
+            state.predictor_out.clone(),
+        ];
+        let values = tensors
+            .into_iter()
+            .enumerate()
+            .map(|(index, tensor)| StateComponentValue {
+                component: StateComponentId::new((index + 1) as u32),
+                tensor: Some(tensor),
+            })
+            .collect();
+        arena.stage_replace(
+            transaction,
+            physical::PARAKEET_PREDICTOR_STATE_DOMAIN,
+            expected_cursor,
+            target_cursor,
+            values,
+        )
+    }
+
+    pub(crate) fn retained_decode_output(
+        &self,
+        artifact: &ParakeetPreparedEncoderArtifact,
+        state: &ParakeetRetainedDecodeState,
+    ) -> ParakeetAsrTranscriptionOutput {
+        ParakeetAsrTranscriptionOutput {
+            text: state.assembled.clone(),
+            language: artifact.language.clone(),
+            diagnostics: Some(serde_json::json!({
+                "input_samples": artifact.input_samples,
+                "input_sample_rate": artifact.input_sample_rate,
+                "resampled_samples": artifact.resampled_samples,
+                "feature_frames": artifact.feature_frames,
+                "encoded_frames": artifact.encoded_len,
+                "tdt_joint_steps": state.counters.tdt_joint_steps,
+                "tdt_emitted_tokens": state.counters.tdt_emitted_tokens,
+                "tdt_blank_steps": state.counters.tdt_blank_steps,
+                "host_argmax_reads": state.counters.host_argmax_reads,
+                "device_argmax_scalar_reads": state.counters.device_argmax_scalar_reads,
+            })),
+        }
+    }
+
+    pub(crate) const fn retained_decode_finished(state: &ParakeetRetainedDecodeState) -> bool {
+        state.finished
+    }
+
+    pub(crate) fn retained_decode_step_batch(
+        &self,
+        rows: &mut [ParakeetRetainedDecodeBatchRow<'_>],
+    ) -> Result<Vec<ParakeetRetainedDecodeStep>> {
+        if rows.is_empty() || rows.iter().any(|row| row.state.finished) {
+            return Err(Error::InvalidInput(
+                "Parakeet retained cohort requires live rows".into(),
+            ));
+        }
+        let checkpoints = rows.iter().map(|row| row.state.clone()).collect::<Vec<_>>();
+        let result = (|| {
+            loop {
+                let encoded_rows = rows
+                    .iter()
+                    .map(|row| {
+                        if row.state.t >= row.artifact.encoded_len {
+                            return Err(Error::InferenceError(
+                                "Parakeet retained cursor exceeded encoder artifact".into(),
+                            ));
+                        }
+                        row.artifact
+                            .encoded
+                            .i((0, row.state.t, ..))?
+                            .unsqueeze(0)
+                            .map_err(Error::from)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let encoded_refs = encoded_rows.iter().collect::<Vec<_>>();
+                let encoded = Tensor::cat(&encoded_refs, 0)?;
+                let predictor_rows = rows
+                    .iter()
+                    .map(|row| &row.state.predictor_out)
+                    .collect::<Vec<_>>();
+                let predictor = Tensor::cat(&predictor_rows, 0)?;
+                let logits = self.joint_batch_rows(&encoded, &predictor)?;
+                let (_, output_width) = logits.dims2()?;
+                let mut emitted = Vec::new();
+                for (index, row) in rows.iter_mut().enumerate() {
+                    let token_end = self.blank_idx + 1;
+                    if output_width < token_end + self.num_durations {
+                        return Err(Error::InferenceError(
+                            "Parakeet retained joint output has invalid geometry".into(),
+                        ));
+                    }
+                    let row_logits = logits.i(index)?;
+                    let label = argmax_1d(&row_logits.narrow(0, 0, token_end)?)?;
+                    let duration =
+                        argmax_1d(&row_logits.narrow(0, token_end, self.num_durations)?)?
+                            .min(self.num_durations.saturating_sub(1));
+                    let mut jump = duration;
+                    if label == self.blank_idx && jump == 0 {
+                        jump = 1;
+                    }
+                    let t_cur = row.state.t;
+                    row.state.t = row.state.t.saturating_add(jump);
+                    row.state.guard_steps = row.state.guard_steps.saturating_add(1);
+                    row.state.counters.tdt_joint_steps =
+                        row.state.counters.tdt_joint_steps.saturating_add(1);
+                    row.state.counters.device_argmax_scalar_reads = row
+                        .state
+                        .counters
+                        .device_argmax_scalar_reads
+                        .saturating_add(2);
+                    if label == self.blank_idx {
+                        row.state.counters.tdt_blank_steps =
+                            row.state.counters.tdt_blank_steps.saturating_add(1);
+                        continue;
+                    }
+                    if t_cur == row.state.last_emit_t {
+                        row.state.emit_count_at_t = row.state.emit_count_at_t.saturating_add(1);
+                    } else {
+                        row.state.last_emit_t = t_cur;
+                        row.state.emit_count_at_t = 1;
+                    }
+                    if row.state.emit_count_at_t > self.max_symbols {
+                        row.state.t = t_cur.saturating_add(1);
+                        continue;
+                    }
+                    row.state.token_ids.push(label);
+                    emitted.push((index, label));
+                }
+                if !emitted.is_empty() {
+                    let refs = emitted
+                        .iter()
+                        .map(|(index, _)| &rows[*index].state.predictor)
+                        .collect::<Vec<_>>();
+                    let mut cohort = ParakeetPredictorBatchState::gather_rows(&refs)?;
+                    let labels = emitted.iter().map(|(_, label)| *label).collect::<Vec<_>>();
+                    let outputs = self.predictor_step_batch(&labels, &mut cohort)?;
+                    let mut scattered = emitted
+                        .iter()
+                        .map(|(index, _)| rows[*index].state.predictor.clone())
+                        .collect::<Vec<_>>();
+                    let mut targets = scattered.iter_mut().collect::<Vec<_>>();
+                    cohort.scatter_rows(&mut targets)?;
+                    drop(targets);
+                    for ((cohort_index, (row_index, _)), predictor) in
+                        emitted.iter().enumerate().zip(scattered)
+                    {
+                        rows[*row_index].state.predictor = predictor;
+                        rows[*row_index].state.predictor_out =
+                            outputs.narrow(0, cohort_index, 1)?.contiguous()?;
+                    }
+                }
+                let mut steps = Vec::with_capacity(rows.len());
+                for row in rows.iter_mut() {
+                    let previous = row.state.assembled.clone();
+                    row.state.assembled = self.decoder.decode(&row.state.token_ids);
+                    let delta = text_delta(&previous, &row.state.assembled);
+                    let guard_limit = row
+                        .artifact
+                        .encoded_len
+                        .saturating_mul(self.max_symbols)
+                        .saturating_mul(8)
+                        .max(512);
+                    row.state.finished = row.state.t >= row.artifact.encoded_len
+                        || row.state.guard_steps >= guard_limit;
+                    row.state.counters.tdt_emitted_tokens = row.state.token_ids.len();
+                    steps.push(ParakeetRetainedDecodeStep {
+                        delta,
+                        text: row.state.assembled.clone(),
+                        tokens_generated: row.state.token_ids.len(),
+                        finished: row.state.finished,
+                    });
+                }
+                // A scheduler quantum produces at most one token per row, but
+                // blank-only joint evaluations are consumed inside that
+                // quantum. This matches the original greedy decoder and
+                // avoids one scheduler transaction per blank encoder frame.
+                if !emitted.is_empty() || steps.iter().any(|step| step.finished) {
+                    break Ok(steps);
+                }
+            }
+        })();
+        if result.is_err() {
+            for (row, checkpoint) in rows.iter_mut().zip(checkpoints) {
+                *row.state = checkpoint;
+            }
+        }
+        result
+    }
+
     pub fn load(
         model_dir: &Path,
         variant: ModelVariant,
@@ -186,6 +643,23 @@ impl ParakeetAsrModel {
         self.transcribe_with_callback_internal(audio, sample_rate, language, &mut no_op)
     }
 
+    pub(crate) fn transcribe_with_details_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        predictor_state: &mut InvocationTensorLease,
+    ) -> Result<ParakeetAsrTranscriptionOutput> {
+        let mut no_op = |_delta: &str| {};
+        self.transcribe_with_callback_internal_physical(
+            audio,
+            sample_rate,
+            language,
+            predictor_state,
+            &mut no_op,
+        )
+    }
+
     pub fn transcribe_with_callback(
         &self,
         audio: &[f32],
@@ -198,11 +672,63 @@ impl ParakeetAsrModel {
             .text)
     }
 
+    pub(crate) fn transcribe_with_callback_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        predictor_state: &mut InvocationTensorLease,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<String> {
+        Ok(self
+            .transcribe_with_callback_internal_physical(
+                audio,
+                sample_rate,
+                language,
+                predictor_state,
+                on_delta,
+            )?
+            .text)
+    }
+
     fn transcribe_with_callback_internal(
         &self,
         audio: &[f32],
         sample_rate: u32,
         language: Option<&str>,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<ParakeetAsrTranscriptionOutput> {
+        self.transcribe_with_callback_internal_impl(audio, sample_rate, language, None, on_delta)
+    }
+
+    fn transcribe_with_callback_internal_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        predictor_state: &mut InvocationTensorLease,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<ParakeetAsrTranscriptionOutput> {
+        if predictor_state.domain() != physical::PARAKEET_PREDICTOR_STATE_DOMAIN {
+            return Err(Error::InferenceError(
+                "Parakeet ASR received a foreign physical predictor domain".into(),
+            ));
+        }
+        self.transcribe_with_callback_internal_impl(
+            audio,
+            sample_rate,
+            language,
+            Some(predictor_state),
+            on_delta,
+        )
+    }
+
+    fn transcribe_with_callback_internal_impl(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        predictor_state: Option<&mut InvocationTensorLease>,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<ParakeetAsrTranscriptionOutput> {
         if audio.is_empty() {
@@ -246,15 +772,27 @@ impl ParakeetAsrModel {
         };
 
         let decode_started = Instant::now();
-        self.network.decode_tdt_greedy(
-            &encoded,
-            encoded_len,
-            self.blank_idx,
-            self.num_durations,
-            self.max_symbols,
-            &mut decode_counters,
-            &mut on_token,
-        )?;
+        match predictor_state {
+            Some(state) => self.network.decode_tdt_greedy_physical(
+                &encoded,
+                encoded_len,
+                self.blank_idx,
+                self.num_durations,
+                self.max_symbols,
+                &mut decode_counters,
+                state,
+                &mut on_token,
+            )?,
+            None => self.network.decode_tdt_greedy(
+                &encoded,
+                encoded_len,
+                self.blank_idx,
+                self.num_durations,
+                self.max_symbols,
+                &mut decode_counters,
+                &mut on_token,
+            )?,
+        }
         timings.tdt_decode_ms = elapsed_ms(decode_started);
 
         if assembled.is_empty() {
@@ -346,6 +884,7 @@ fn parakeet_diagnostics_json(
             "tdt_emitted_tokens": decode.tdt_emitted_tokens,
             "tdt_blank_steps": decode.tdt_blank_steps,
             "host_argmax_reads": decode.host_argmax_reads,
+            "device_argmax_scalar_reads": decode.device_argmax_scalar_reads,
             "generated_tokens": decode.tdt_emitted_tokens,
             "max_symbols_per_frame": max_symbols,
         },
@@ -472,10 +1011,70 @@ impl ParakeetNetwork {
         let encoded = encoded.i((0, ..encoded_len, ..))?; // [T, D]
 
         let mut predictor_state = self.predictor.initial_state(1, encoded.device())?;
-        let mut predictor_out =
+        let predictor_out =
             self.predictor
                 .step(blank_idx, &mut predictor_state, encoded.device())?;
+        self.decode_tdt_greedy_loop(
+            &encoded,
+            encoded_len,
+            blank_idx,
+            num_durations,
+            max_symbols,
+            counters,
+            predictor_out,
+            |label| {
+                self.predictor
+                    .step(label, &mut predictor_state, encoded.device())
+            },
+            on_token,
+        )
+    }
 
+    #[allow(clippy::too_many_arguments)]
+    fn decode_tdt_greedy_physical(
+        &self,
+        encoded: &Tensor,
+        encoded_len: usize,
+        blank_idx: usize,
+        num_durations: usize,
+        max_symbols: usize,
+        counters: &mut ParakeetDecodeCounters,
+        predictor_state: &mut InvocationTensorLease,
+        on_token: &mut dyn FnMut(usize),
+    ) -> Result<()> {
+        let encoded = encoded.i((0, ..encoded_len, ..))?;
+        let predictor_out =
+            self.predictor
+                .initialize_physical(blank_idx, predictor_state, encoded.device())?;
+        self.decode_tdt_greedy_loop(
+            &encoded,
+            encoded_len,
+            blank_idx,
+            num_durations,
+            max_symbols,
+            counters,
+            predictor_out,
+            |label| {
+                self.predictor
+                    .step_physical(label, predictor_state, encoded.device())
+            },
+            on_token,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_tdt_greedy_loop(
+        &self,
+        encoded: &Tensor,
+        encoded_len: usize,
+        blank_idx: usize,
+        num_durations: usize,
+        max_symbols: usize,
+        counters: &mut ParakeetDecodeCounters,
+        mut predictor_out: Tensor,
+        mut predictor_step: impl FnMut(usize) -> Result<Tensor>,
+        on_token: &mut dyn FnMut(usize),
+    ) -> Result<()> {
         let mut t = 0usize;
         let mut last_emit_t = usize::MAX;
         let mut emit_count_at_t = 0usize;
@@ -501,7 +1100,8 @@ impl ParakeetNetwork {
             let duration_logits = logits.i((blank_idx + 1)..)?;
 
             counters.tdt_joint_steps = counters.tdt_joint_steps.saturating_add(1);
-            counters.host_argmax_reads = counters.host_argmax_reads.saturating_add(2);
+            counters.device_argmax_scalar_reads =
+                counters.device_argmax_scalar_reads.saturating_add(2);
             let mut label = argmax_1d(&token_logits)?;
             let duration_idx = argmax_1d(&duration_logits)?;
             let mut jump = duration_idx.min(num_durations.saturating_sub(1));
@@ -526,7 +1126,8 @@ impl ParakeetNetwork {
                 let duration_logits = logits.i((blank_idx + 1)..)?;
 
                 counters.tdt_joint_steps = counters.tdt_joint_steps.saturating_add(1);
-                counters.host_argmax_reads = counters.host_argmax_reads.saturating_add(2);
+                counters.device_argmax_scalar_reads =
+                    counters.device_argmax_scalar_reads.saturating_add(2);
                 label = argmax_1d(&token_logits)?;
                 let duration_idx = argmax_1d(&duration_logits)?;
                 jump = duration_idx.min(num_durations.saturating_sub(1));
@@ -555,9 +1156,7 @@ impl ParakeetNetwork {
             }
 
             on_token(label);
-            predictor_out = self
-                .predictor
-                .step(label, &mut predictor_state, encoded.device())?;
+            predictor_out = predictor_step(label)?;
         }
 
         Ok(())
@@ -682,7 +1281,7 @@ fn forward_depthwise_conv2d(conv: &Conv2d, x: &Tensor) -> Result<Tensor> {
 
 fn subsampled_len_3x(mut len: usize) -> usize {
     for _ in 0..3 {
-        len = (len + 1) / 2;
+        len = len.div_ceil(2);
     }
     len
 }
@@ -1003,11 +1602,59 @@ struct Predictor {
 }
 
 #[derive(Clone)]
-struct PredictorState {
+pub(crate) struct ParakeetPredictorBatchState {
     h0: Tensor,
     c0: Tensor,
     h1: Tensor,
     c1: Tensor,
+}
+
+impl ParakeetPredictorBatchState {
+    pub(crate) fn gather_rows(rows: &[&Self]) -> Result<Self> {
+        if rows.is_empty() {
+            return Err(Error::InvalidInput(
+                "Parakeet predictor cohort cannot be empty".into(),
+            ));
+        }
+        let gather = |select: fn(&Self) -> &Tensor| {
+            let tensors = rows.iter().map(|row| select(row)).collect::<Vec<_>>();
+            Tensor::cat(&tensors, 0).map_err(Error::from)
+        };
+        Ok(Self {
+            h0: gather(|state| &state.h0)?,
+            c0: gather(|state| &state.c0)?,
+            h1: gather(|state| &state.h1)?,
+            c1: gather(|state| &state.c1)?,
+        })
+    }
+
+    pub(crate) fn scatter_rows(&self, rows: &mut [&mut Self]) -> Result<()> {
+        let batch = self.h0.dim(0)?;
+        if batch == 0
+            || rows.len() != batch
+            || [self.c0.dim(0)?, self.h1.dim(0)?, self.c1.dim(0)?]
+                .into_iter()
+                .any(|value| value != batch)
+        {
+            return Err(Error::InvalidInput(
+                "Parakeet predictor cohort scatter has incompatible geometry".into(),
+            ));
+        }
+        let provisional = (0..batch)
+            .map(|index| {
+                Ok(Self {
+                    h0: self.h0.narrow(0, index, 1)?.contiguous()?,
+                    c0: self.c0.narrow(0, index, 1)?.contiguous()?,
+                    h1: self.h1.narrow(0, index, 1)?.contiguous()?,
+                    c1: self.c1.narrow(0, index, 1)?.contiguous()?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for (target, value) in rows.iter_mut().zip(provisional) {
+            **target = value;
+        }
+        Ok(())
+    }
 }
 
 impl Predictor {
@@ -1027,9 +1674,9 @@ impl Predictor {
         })
     }
 
-    fn initial_state(&self, batch: usize, device: &Device) -> Result<PredictorState> {
+    fn initial_state(&self, batch: usize, device: &Device) -> Result<ParakeetPredictorBatchState> {
         let zeros = |dim| Tensor::zeros((batch, dim), DType::F32, device).map_err(Error::from);
-        Ok(PredictorState {
+        Ok(ParakeetPredictorBatchState {
             h0: zeros(PRED_HIDDEN)?,
             c0: zeros(PRED_HIDDEN)?,
             h1: zeros(PRED_HIDDEN)?,
@@ -1037,23 +1684,188 @@ impl Predictor {
         })
     }
 
-    fn step(&self, label: usize, state: &mut PredictorState, device: &Device) -> Result<Tensor> {
-        let x = if label == self.blank_idx {
-            Tensor::zeros((1, PRED_HIDDEN), DType::F32, device)?
-        } else {
-            self.embed.i((label, ..))?.unsqueeze(0)?
-        };
+    fn step(
+        &self,
+        label: usize,
+        state: &mut ParakeetPredictorBatchState,
+        device: &Device,
+    ) -> Result<Tensor> {
+        self.step_batch(std::slice::from_ref(&label), state, device)
+    }
+
+    fn step_batch(
+        &self,
+        labels: &[usize],
+        state: &mut ParakeetPredictorBatchState,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let batch = labels.len();
+        if batch == 0
+            || [
+                state.h0.dim(0),
+                state.c0.dim(0),
+                state.h1.dim(0),
+                state.c1.dim(0),
+            ]
+            .into_iter()
+            .any(|value| value.ok() != Some(batch))
+        {
+            return Err(Error::InvalidInput(
+                "Parakeet predictor labels and recurrent batch state disagree".into(),
+            ));
+        }
+        let rows = labels
+            .iter()
+            .map(|&label| {
+                if label == self.blank_idx {
+                    Tensor::zeros((1, PRED_HIDDEN), DType::F32, device).map_err(Error::from)
+                } else if label < self.blank_idx {
+                    self.embed
+                        .i((label, ..))
+                        .and_then(|row| row.unsqueeze(0))
+                        .map_err(Error::from)
+                } else {
+                    Err(Error::InvalidInput(format!(
+                        "Parakeet predictor label {label} exceeds blank index {}",
+                        self.blank_idx
+                    )))
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let refs = rows.iter().collect::<Vec<_>>();
+        let x = Tensor::cat(&refs, 0)?;
 
         let (h0, c0) = self.lstm_l0.step(&x, &state.h0, &state.c0)?;
+        let (h1, c1) = self.lstm_l1.step(&h0, &state.h1, &state.c1)?;
+        // Publish all four recurrent tensors only after both layers succeed.
         state.h0 = h0;
         state.c0 = c0;
-
-        let (h1, c1) = self.lstm_l1.step(&state.h0, &state.h1, &state.c1)?;
         state.h1 = h1;
         state.c1 = c1;
 
         Ok(state.h1.unsqueeze(1)?) // [B=1, U=1, H]
     }
+
+    fn initialize_physical(
+        &self,
+        label: usize,
+        lease: &mut InvocationTensorLease,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let cursor = lease.arena()?.absolute_cursor();
+        if cursor != 0 {
+            return Err(Error::InferenceError(
+                "Parakeet predictor invocation state was not reset before decode".into(),
+            ));
+        }
+        let mut state = self.initial_state(1, device)?;
+        let output = self.step(label, &mut state, device)?;
+        commit_parakeet_predictor_state(lease, cursor, &state, &output)?;
+        Ok(output)
+    }
+
+    fn step_physical(
+        &self,
+        label: usize,
+        lease: &mut InvocationTensorLease,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let snapshot = lease.read_snapshot()?;
+        if snapshot.components.len() != 5
+            || snapshot
+                .components
+                .iter()
+                .enumerate()
+                .any(|(index, value)| value.component != StateComponentId::new((index + 1) as u32))
+        {
+            return Err(Error::InferenceError(
+                "Parakeet physical predictor snapshot has non-canonical components".into(),
+            ));
+        }
+        let mut state = ParakeetPredictorBatchState {
+            h0: snapshot.components[0].tensor.clone(),
+            c0: snapshot.components[1].tensor.clone(),
+            h1: snapshot.components[2].tensor.clone(),
+            c1: snapshot.components[3].tensor.clone(),
+        };
+        let output = self.step(label, &mut state, device)?;
+        commit_parakeet_predictor_state(lease, snapshot.absolute_cursor, &state, &output)?;
+        Ok(output)
+    }
+}
+
+fn commit_parakeet_predictor_state(
+    lease: &mut InvocationTensorLease,
+    expected_cursor: u64,
+    state: &ParakeetPredictorBatchState,
+    output: &Tensor,
+) -> Result<()> {
+    let target_cursor = expected_cursor
+        .checked_add(1)
+        .ok_or_else(|| Error::InferenceError("Parakeet predictor cursor overflow".into()))?;
+    let tensors = [
+        state.h0.clone(),
+        state.c0.clone(),
+        state.h1.clone(),
+        state.c1.clone(),
+        output.clone(),
+    ];
+    let components = tensors
+        .into_iter()
+        .enumerate()
+        .map(|(index, tensor)| InvocationTensorComponentValue {
+            component: StateComponentId::new((index + 1) as u32),
+            tensor,
+        })
+        .collect::<Vec<_>>();
+    let declared = components
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let dimensions = if index < 4 {
+                vec![
+                    ShapeDimensionValue {
+                        axis: ShapeAxis::Batch,
+                        units: 1,
+                    },
+                    ShapeDimensionValue {
+                        axis: ShapeAxis::Hidden,
+                        units: PRED_HIDDEN as u64,
+                    },
+                ]
+            } else {
+                vec![
+                    ShapeDimensionValue {
+                        axis: ShapeAxis::Batch,
+                        units: 1,
+                    },
+                    ShapeDimensionValue {
+                        axis: ShapeAxis::Sequence,
+                        units: 1,
+                    },
+                    ShapeDimensionValue {
+                        axis: ShapeAxis::Hidden,
+                        units: PRED_HIDDEN as u64,
+                    },
+                ]
+            };
+            ComponentShapeInstantiation {
+                component: value.component,
+                dimensions,
+            }
+        })
+        .collect();
+    lease.apply_intent(
+        &DomainStepIntent {
+            domain: physical::PARAKEET_PREDICTOR_STATE_DOMAIN,
+            expected_cursor,
+            target_cursor,
+            update: StateUpdateKind::TensorReplace {
+                components: declared,
+            },
+        },
+        InvocationTensorUpdateV2::TensorReplace { components },
+    )
 }
 
 struct LstmCell {
@@ -1180,6 +1992,24 @@ impl Joint {
             .forward(&inp)
             .map_err(|e| Error::InferenceError(e.to_string()))
     }
+
+    fn joint_batch_rows(&self, encoded_rows: &Tensor, predictor_rows: &Tensor) -> Result<Tensor> {
+        let (batch, _) = encoded_rows.dims2().map_err(|_| {
+            Error::InvalidInput("Parakeet batched joint encoder rows must be [B,D]".into())
+        })?;
+        let (predictor_batch, predictor_steps, _) = predictor_rows.dims3().map_err(|_| {
+            Error::InvalidInput("Parakeet batched joint predictor rows must be [B,1,D]".into())
+        })?;
+        if batch == 0 || predictor_batch != batch || predictor_steps != 1 {
+            return Err(Error::InvalidInput(
+                "Parakeet batched joint rows have incompatible batch geometry".into(),
+            ));
+        }
+        self.joint_after_projection(&encoded_rows.unsqueeze(1)?, predictor_rows)?
+            .squeeze(2)?
+            .squeeze(1)
+            .map_err(Error::from)
+    }
 }
 
 fn build_rel_positional_embedding(len: usize, d_model: usize, device: &Device) -> Result<Tensor> {
@@ -1217,16 +2047,23 @@ fn swish(x: &Tensor) -> Result<Tensor> {
 }
 
 fn argmax_1d(x: &Tensor) -> Result<usize> {
-    let v = x.to_vec1::<f32>()?;
-    let mut best_idx = 0usize;
-    let mut best_val = f32::NEG_INFINITY;
-    for (i, &val) in v.iter().enumerate() {
-        if val > best_val {
-            best_val = val;
-            best_idx = i;
-        }
+    let width = x.dims1()?;
+    if width == 0 {
+        return Err(Error::InferenceError(
+            "Parakeet argmax received empty logits".to_string(),
+        ));
     }
-    Ok(best_idx)
+    let idx = x.argmax(D::Minus1)?;
+    let idx = if idx.rank() == 0 {
+        idx
+    } else {
+        idx.squeeze(0)?
+    };
+    crate::models::shared::telemetry::record_dtype_cast();
+    crate::models::shared::telemetry::record_host_read(DType::U32, 1);
+    let idx = idx.to_dtype(DType::U32)?.to_scalar::<u32>()?;
+    usize::try_from(idx)
+        .map_err(|_| Error::InferenceError(format!("Parakeet argmax index exceeds usize: {idx}")))
 }
 
 fn resample_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
@@ -1247,4 +2084,171 @@ fn resample_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
         out.push(sample);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{argmax_1d, Joint, LstmCell, Predictor, PRED_HIDDEN};
+    use candle_core::{DType, Device, Tensor};
+    use candle_nn::Linear;
+
+    fn zero_lstm(device: &Device) -> LstmCell {
+        LstmCell {
+            w_ih: Tensor::zeros((PRED_HIDDEN * 4, PRED_HIDDEN), DType::F32, device).unwrap(),
+            w_hh: Tensor::zeros((PRED_HIDDEN * 4, PRED_HIDDEN), DType::F32, device).unwrap(),
+            b_ih: Tensor::zeros(PRED_HIDDEN * 4, DType::F32, device).unwrap(),
+            b_hh: Tensor::zeros(PRED_HIDDEN * 4, DType::F32, device).unwrap(),
+        }
+    }
+
+    fn zero_predictor(device: &Device) -> Predictor {
+        Predictor {
+            embed: Tensor::zeros((3, PRED_HIDDEN), DType::F32, device).unwrap(),
+            lstm_l0: zero_lstm(device),
+            lstm_l1: zero_lstm(device),
+            blank_idx: 2,
+        }
+    }
+
+    #[test]
+    fn parakeet_argmax_selects_half_logits_on_device() {
+        let device = Device::Cpu;
+        let logits = Tensor::from_vec(vec![0.1f32, -0.3, 0.8, 0.2], (4,), &device)
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap();
+
+        assert_eq!(argmax_1d(&logits).unwrap(), 2);
+    }
+
+    #[test]
+    fn parakeet_argmax_rejects_empty_logits() {
+        let device = Device::Cpu;
+        let logits = Tensor::from_vec(Vec::<f32>::new(), (0,), &device).unwrap();
+        let err = argmax_1d(&logits).expect_err("empty logits should be rejected");
+
+        assert!(format!("{err}").contains("Parakeet argmax received empty logits"));
+    }
+
+    #[test]
+    fn predictor_native_batch_matches_independent_scalar_rows() {
+        let device = Device::Cpu;
+        let predictor = zero_predictor(&device);
+        let labels = [0usize, predictor.blank_idx];
+        let mut batch_state = predictor.initial_state(labels.len(), &device).unwrap();
+        let batch = predictor
+            .step_batch(&labels, &mut batch_state, &device)
+            .unwrap();
+
+        let mut scalar_outputs = Vec::new();
+        let mut scalar_states = Vec::new();
+        for label in labels {
+            let mut state = predictor.initial_state(1, &device).unwrap();
+            scalar_outputs.push(predictor.step(label, &mut state, &device).unwrap());
+            scalar_states.push(state);
+        }
+        let output_refs = scalar_outputs.iter().collect::<Vec<_>>();
+        let expected = Tensor::cat(&output_refs, 0).unwrap();
+        assert_eq!(
+            batch.to_vec3::<f32>().unwrap(),
+            expected.to_vec3::<f32>().unwrap()
+        );
+        for (batched, scalar_component) in [
+            (
+                &batch_state.h0,
+                scalar_states
+                    .iter()
+                    .map(|state| &state.h0)
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                &batch_state.c0,
+                scalar_states
+                    .iter()
+                    .map(|state| &state.c0)
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                &batch_state.h1,
+                scalar_states
+                    .iter()
+                    .map(|state| &state.h1)
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                &batch_state.c1,
+                scalar_states
+                    .iter()
+                    .map(|state| &state.c1)
+                    .collect::<Vec<_>>(),
+            ),
+        ] {
+            let expected = Tensor::cat(&scalar_component, 0).unwrap();
+            assert_eq!(
+                batched.to_vec2::<f32>().unwrap(),
+                expected.to_vec2::<f32>().unwrap()
+            );
+        }
+
+        let scalar_refs = scalar_states.iter().collect::<Vec<_>>();
+        let gathered = super::ParakeetPredictorBatchState::gather_rows(&scalar_refs).unwrap();
+        assert_eq!(gathered.h0.dims(), batch_state.h0.dims());
+        let mut scattered = [
+            predictor.initial_state(1, &device).unwrap(),
+            predictor.initial_state(1, &device).unwrap(),
+        ];
+        let mut targets = scattered.iter_mut().collect::<Vec<_>>();
+        gathered.scatter_rows(&mut targets).unwrap();
+        assert_eq!(
+            scattered[0].h0.to_vec2::<f32>().unwrap(),
+            scalar_states[0].h0.to_vec2::<f32>().unwrap()
+        );
+        let before = scattered[0].h0.to_vec2::<f32>().unwrap();
+        let mut short_targets = vec![&mut scattered[0]];
+        assert!(gathered.scatter_rows(&mut short_targets).is_err());
+        assert_eq!(scattered[0].h0.to_vec2::<f32>().unwrap(), before);
+    }
+
+    #[test]
+    fn joint_native_batch_matches_independent_scalar_rows() {
+        let device = Device::Cpu;
+        let enc_hidden = 3usize;
+        let output_dim = 5usize;
+        let joint = Joint {
+            pred: Linear::new(
+                Tensor::zeros((PRED_HIDDEN, PRED_HIDDEN), DType::F32, &device).unwrap(),
+                None,
+            ),
+            enc: Linear::new(
+                Tensor::zeros((PRED_HIDDEN, enc_hidden), DType::F32, &device).unwrap(),
+                None,
+            ),
+            out: Linear::new(
+                Tensor::zeros((output_dim, PRED_HIDDEN), DType::F32, &device).unwrap(),
+                Some(Tensor::arange(0f32, output_dim as f32, &device).unwrap()),
+            ),
+            num_classes_with_blank: 3,
+            num_durations: 2,
+        };
+        let encoded = Tensor::zeros((2, enc_hidden), DType::F32, &device).unwrap();
+        let predictor = Tensor::zeros((2, 1, PRED_HIDDEN), DType::F32, &device).unwrap();
+        let batch = joint.joint_batch_rows(&encoded, &predictor).unwrap();
+        let mut scalar = Vec::new();
+        for row in 0..2 {
+            scalar.push(
+                joint
+                    .joint_batch_rows(
+                        &encoded.narrow(0, row, 1).unwrap(),
+                        &predictor.narrow(0, row, 1).unwrap(),
+                    )
+                    .unwrap(),
+            );
+        }
+        let refs = scalar.iter().collect::<Vec<_>>();
+        let expected = Tensor::cat(&refs, 0).unwrap();
+        assert_eq!(
+            batch.to_vec2::<f32>().unwrap(),
+            expected.to_vec2::<f32>().unwrap()
+        );
+    }
 }

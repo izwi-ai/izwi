@@ -44,16 +44,38 @@ resolve_build_backend() {
     local requested=$(echo "$BUILD_BACKEND" | tr '[:upper:]' '[:lower:]')
     local os=$(uname -s | tr '[:upper:]' '[:lower:]')
     local arch=$(uname -m)
+    local macos_major=0
+
+    if [[ "$os" == "darwin" ]]; then
+        macos_major=$(sw_vers -productVersion | cut -d. -f1)
+    fi
+
+    resolve_build_backend_for "$requested" "$os" "$arch" "$macos_major"
+}
+
+resolve_build_backend_for() {
+    local requested=$1
+    local os=$2
+    local arch=$3
+    local macos_major=$4
 
     case "$requested" in
         ""|auto)
-            if [[ "$os" == "darwin" && ( "$arch" == "arm64" || "$arch" == "aarch64" ) ]]; then
+            if [[ "$os" == "darwin" && "$macos_major" -ge 15 && ( "$arch" == "arm64" || "$arch" == "aarch64" ) ]]; then
                 echo "metal"
             else
                 echo "cpu"
             fi
             ;;
-        cpu|metal|cuda)
+        metal)
+            if [[ "$os" == "darwin" && "$macos_major" -lt 15 ]]; then
+                echo "Metal acceleration requires macOS 15 or later; selecting CPU." >&2
+                echo "cpu"
+            else
+                echo "metal"
+            fi
+            ;;
+        cpu|cuda)
             echo "$requested"
             ;;
         *)
@@ -111,6 +133,7 @@ install_from_source() {
     case "$SELECTED_BUILD_BACKEND" in
         metal)
             cli_feature_args=(--features metal)
+            server_feature_args=(--features metal)
             ;;
         cuda)
             local cuda_features="${IZWI_CUDA_FEATURES:-cuda}"
@@ -214,5 +237,6 @@ main() {
     print_usage
 }
 
-# Run main function
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

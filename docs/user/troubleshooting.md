@@ -138,6 +138,31 @@ free -h
 
 Try a smaller model or close other applications.
 
+For `Qwen3.8-27B-FP8` on CUDA, inspect the loaded entry returned by
+`/v1/health`. A successful compressed load reports
+`family_diagnostics.resident_representation` as
+`q8_0_requantized_projections_with_dense_bf16` and
+`fp8_execution_mode` as `q8_0_compressed_fallback`. This is intended for
+40/48 GB-class devices with a resource-fitted context, but admission can still
+fail when free VRAM or allocator headroom is insufficient. It is not a native
+FP8 mode; see the [support matrix](/support-matrix#qwen38-cuda-weight-residency).
+
+For long-context requests, inspect `runtime_metrics.kv_cache.models` in the
+health/admin diagnostics. `single_sequence_token_capacity` is the largest
+sequence the fitted pools can retain, while `full_context_sequence_capacity`
+is how many such sequences fit concurrently. Each arena also reports
+`token_capacity`, full-request page claims, and workspace budget/high-water
+bytes. Izwi reserves the exact prompt plus requested maximum output logically
+before dispatch; reduce `max_tokens` or concurrency when that complete demand
+does not fit. It does not evict arbitrary tokens from an active full-attention
+sequence.
+
+`CUDA_ERROR_OUT_OF_MEMORY` should not be returned for ordinary managed-capacity
+pressure. If it appears after this version, capture the exact Git SHA, loaded
+model diagnostics, the managed-KV snapshots before/after the request, and the
+CUDA driver/device profile; treat it as an allocator/runtime defect rather than
+raising the advertised context limit.
+
 **Corrupted model:**
 ```bash
 izwi rm <model-name>
@@ -266,13 +291,16 @@ uname -m  # Should show "arm64"
 
 **Check macOS version:**
 ```bash
-sw_vers  # Should be 12.0+
+sw_vers  # Should be 15.0+ for Metal
 ```
 
 **Enable Metal:**
 ```bash
 izwi serve --backend metal
 ```
+
+Metal requires macOS 15 or later. On macOS 12-14, Izwi keeps running on CPU
+and an explicit Metal request reports a CPU fallback.
 
 ### CUDA not detected (Linux/Windows)
 
@@ -341,7 +369,7 @@ Ensure required models are loaded:
 |---------|---------------------|
 | TTS | `*-tts-*` |
 | Transcription | `Parakeet-*`, `Whisper-*`, `Qwen3-ASR-*`, `Granite-Speech-*`, or `LFM2.5-Audio-*` |
-| Chat | `Qwen3-*`, `Qwen3.5-*`, `LFM2.5-1.2B-*`, or `Gemma-3-1b-it` |
+| Chat | `Qwen3-*`, `Qwen3.5-*`, `Qwen3.8-*`, `LFM2.5-1.2B-*`, or `Gemma-3-1b-it` |
 | Voice Cloning | `Qwen3-TTS-12Hz-*-Base*` |
 | Voice Design | `Qwen3-TTS-12Hz-1.7B-VoiceDesign*` |
 

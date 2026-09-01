@@ -416,11 +416,13 @@ export function RouteModelModal({
 
                                         {model.status === "loading" && (
                                           <button
-                                            className="flex items-center gap-1.5 rounded-md border border-[var(--border-muted)] bg-[var(--bg-surface-2)] px-3 py-1.5 text-xs font-medium text-[var(--text-muted)]"
-                                            disabled
+                                            onClick={() =>
+                                              onUnload(model.variant)
+                                            }
+                                            className="flex items-center gap-1.5 rounded-md border border-[var(--danger-border)] bg-[var(--danger-bg)] px-3 py-1.5 text-xs font-medium text-[var(--danger-text)] transition-colors hover:bg-[var(--danger-bg-hover)]"
                                           >
-                                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                                            Loading
+                                            <X className="h-3.5 w-3.5" />
+                                            Cancel load
                                           </button>
                                         )}
 

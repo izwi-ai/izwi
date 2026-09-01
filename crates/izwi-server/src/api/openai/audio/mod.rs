@@ -4,9 +4,9 @@ pub mod align;
 pub mod speech;
 pub mod transcriptions;
 
-use axum::{Router, extract::DefaultBodyLimit, routing::post};
+use axum::{extract::DefaultBodyLimit, routing::post, Router};
 
-use crate::api::openai::compat::{OpenAiCompatibilityProfile, compatibility_profile};
+use crate::api::openai::compat::{compatibility_profile, OpenAiCompatibilityProfile};
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -40,5 +40,9 @@ pub fn resolve_audio_upload_limit_bytes() -> usize {
 }
 
 fn default_audio_upload_limit_mb(profile: OpenAiCompatibilityProfile) -> usize {
-    if profile.is_relaxed() { 64 } else { 25 }
+    if profile.is_relaxed() {
+        64
+    } else {
+        25
+    }
 }

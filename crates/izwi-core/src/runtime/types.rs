@@ -191,9 +191,11 @@ fn default_streaming() -> bool {
 
 impl Default for GenerationConfig {
     fn default() -> Self {
-        let mut options = InferenceOptions::default();
         // Preserve runtime API behavior where max_tokens=0 means "auto".
-        options.max_tokens = 0;
+        let options = InferenceOptions {
+            max_tokens: 0,
+            ..Default::default()
+        };
 
         Self {
             options,

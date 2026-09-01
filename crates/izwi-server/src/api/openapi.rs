@@ -60,6 +60,8 @@ use crate::api::openai::audio::align::{
         ChatCompletionRequest,
         ChatCompletionResponse,
         ChatCompletionStreamOptions,
+        ChatReasoningEffort,
+        ChatTemplateKwargs,
         CursorPagination,
         CursorPaginationQuery,
         LiveResponse,
@@ -1986,10 +1988,33 @@ pub struct ChatCompletionRequest {
     pub stream_options: Option<ChatCompletionStreamOptions>,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
+    pub top_k: Option<usize>,
+    pub repetition_penalty: Option<f32>,
+    pub presence_penalty: Option<f32>,
     pub stop: Option<serde_json::Value>,
     pub tools: Option<Vec<serde_json::Value>>,
     pub tool_choice: Option<serde_json::Value>,
     pub enable_thinking: Option<bool>,
+    pub reasoning_effort: Option<ChatReasoningEffort>,
+    pub preserve_thinking: Option<bool>,
+    pub chat_template_kwargs: Option<ChatTemplateKwargs>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatReasoningEffort {
+    Xhigh,
+    Medium,
+    Low,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ChatTemplateKwargs {
+    pub enable_thinking: Option<bool>,
+    pub reasoning_effort: Option<ChatReasoningEffort>,
+    pub preserve_thinking: Option<bool>,
 }
 
 #[allow(dead_code)]
@@ -2173,10 +2198,16 @@ pub struct ResponsesCreateRequest {
     pub user: Option<String>,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
+    pub top_k: Option<usize>,
+    pub repetition_penalty: Option<f32>,
+    pub presence_penalty: Option<f32>,
     pub store: Option<bool>,
     pub tools: Option<Vec<serde_json::Value>>,
     pub tool_choice: Option<serde_json::Value>,
     pub enable_thinking: Option<bool>,
+    pub reasoning_effort: Option<ChatReasoningEffort>,
+    pub preserve_thinking: Option<bool>,
+    pub chat_template_kwargs: Option<ChatTemplateKwargs>,
 }
 
 #[allow(dead_code)]

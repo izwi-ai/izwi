@@ -145,11 +145,7 @@ impl ModelResidency {
         variant: ModelVariant,
         model_instance_id: ModelInstanceId,
     ) -> ModelResidencyLease {
-        ModelResidencyLease::new(
-            variant,
-            Some(model_instance_id),
-            self.lease_counts.clone(),
-        )
+        ModelResidencyLease::new(variant, Some(model_instance_id), self.lease_counts.clone())
     }
 
     pub fn active_leases(&self, variant: ModelVariant) -> usize {

@@ -1,4 +1,5 @@
 mod nemo;
+mod physical;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -13,13 +14,20 @@ use izwi_vad::{speech_mask_for_frames_f32, VadRegionConfig};
 use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
 
+use crate::backends::state::{InvocationTensorComponentValue, InvocationTensorUpdateV2};
 use crate::backends::{DeviceKind, DeviceProfile};
+use crate::engine::{InvocationTensorLease, StageDescriptor};
 use crate::error::{Error, Result};
+use crate::kv::v2::{
+    ComponentShapeInstantiation, DomainStepIntent, ShapeAxis, ShapeDimensionValue,
+    StateComponentId, StateUpdateKind,
+};
 use crate::model::ModelVariant;
 use crate::models::shared::weights::mlx;
 use crate::runtime::{DiarizationConfig, DiarizationResult, DiarizationSegment};
 
 use nemo::{ensure_sortformer_artifacts, SortformerArtifacts};
+pub(crate) use physical::SortformerPhysicalStateSpec;
 
 const TARGET_SAMPLE_RATE: u32 = 16_000;
 const MAX_SUPPORTED_SPEAKERS: usize = 4;
@@ -409,6 +417,203 @@ impl SortformerStreamingState {
     }
 }
 
+fn commit_sortformer_streaming_state(
+    lease: &mut InvocationTensorLease,
+    cfg: SortformerStreamingConfig,
+    state: &SortformerStreamingState,
+    device: &Device,
+) -> Result<()> {
+    if state.spkcache.len() > cfg.spkcache_len
+        || state.fifo.len() > cfg.fifo_len
+        || state
+            .spkcache_preds
+            .as_ref()
+            .is_some_and(|preds| preds.len() != state.spkcache.len())
+        || state.fifo_preds.len() != state.fifo.len()
+        || state.mean_sil_emb.len() != cfg.fc_d_model
+    {
+        return Err(Error::InferenceError(
+            "Sortformer streaming state exceeds its physical geometry".into(),
+        ));
+    }
+    let expected_cursor = lease.arena()?.absolute_cursor();
+    let target_cursor = expected_cursor
+        .checked_add(1)
+        .ok_or_else(|| Error::InferenceError("Sortformer state cursor overflow".into()))?;
+    let speaker_embeddings =
+        padded_embedding_tensor(&state.spkcache, cfg.spkcache_len, cfg.fc_d_model, device)?;
+    let speaker_predictions = padded_prediction_tensor(
+        state.spkcache_preds.as_deref().unwrap_or_default(),
+        cfg.spkcache_len,
+        device,
+    )?;
+    let silence_mean = Tensor::from_vec(state.mean_sil_emb.clone(), cfg.fc_d_model, device)?;
+    let control = Tensor::from_vec(
+        vec![
+            state.spkcache.len() as f32,
+            state.fifo.len() as f32,
+            f32::from(state.spkcache_preds.is_some()),
+            state.n_sil_frames as f32,
+        ],
+        4,
+        device,
+    )?;
+    let mut components = vec![
+        InvocationTensorComponentValue {
+            component: StateComponentId::new(1),
+            tensor: speaker_embeddings,
+        },
+        InvocationTensorComponentValue {
+            component: StateComponentId::new(2),
+            tensor: speaker_predictions,
+        },
+        InvocationTensorComponentValue {
+            component: StateComponentId::new(5),
+            tensor: silence_mean,
+        },
+        InvocationTensorComponentValue {
+            component: StateComponentId::new(6),
+            tensor: control,
+        },
+    ];
+    let mut declared = vec![
+        ComponentShapeInstantiation {
+            component: StateComponentId::new(1),
+            dimensions: vec![
+                ShapeDimensionValue {
+                    axis: ShapeAxis::Frames,
+                    units: cfg.spkcache_len as u64,
+                },
+                ShapeDimensionValue {
+                    axis: ShapeAxis::Hidden,
+                    units: cfg.fc_d_model as u64,
+                },
+            ],
+        },
+        ComponentShapeInstantiation {
+            component: StateComponentId::new(2),
+            dimensions: vec![
+                ShapeDimensionValue {
+                    axis: ShapeAxis::Frames,
+                    units: cfg.spkcache_len as u64,
+                },
+                ShapeDimensionValue {
+                    axis: ShapeAxis::Custom("speakers".into()),
+                    units: MAX_SUPPORTED_SPEAKERS as u64,
+                },
+            ],
+        },
+        ComponentShapeInstantiation {
+            component: StateComponentId::new(5),
+            dimensions: vec![ShapeDimensionValue {
+                axis: ShapeAxis::Hidden,
+                units: cfg.fc_d_model as u64,
+            }],
+        },
+        ComponentShapeInstantiation {
+            component: StateComponentId::new(6),
+            dimensions: vec![ShapeDimensionValue {
+                axis: ShapeAxis::Custom("control".into()),
+                units: 4,
+            }],
+        },
+    ];
+    if cfg.fifo_len > 0 {
+        let fifo_embeddings =
+            padded_embedding_tensor(&state.fifo, cfg.fifo_len, cfg.fc_d_model, device)?;
+        let fifo_predictions = padded_prediction_tensor(&state.fifo_preds, cfg.fifo_len, device)?;
+        components.insert(
+            2,
+            InvocationTensorComponentValue {
+                component: StateComponentId::new(3),
+                tensor: fifo_embeddings,
+            },
+        );
+        components.insert(
+            3,
+            InvocationTensorComponentValue {
+                component: StateComponentId::new(4),
+                tensor: fifo_predictions,
+            },
+        );
+        declared.insert(
+            2,
+            ComponentShapeInstantiation {
+                component: StateComponentId::new(3),
+                dimensions: vec![
+                    ShapeDimensionValue {
+                        axis: ShapeAxis::Frames,
+                        units: cfg.fifo_len as u64,
+                    },
+                    ShapeDimensionValue {
+                        axis: ShapeAxis::Hidden,
+                        units: cfg.fc_d_model as u64,
+                    },
+                ],
+            },
+        );
+        declared.insert(
+            3,
+            ComponentShapeInstantiation {
+                component: StateComponentId::new(4),
+                dimensions: vec![
+                    ShapeDimensionValue {
+                        axis: ShapeAxis::Frames,
+                        units: cfg.fifo_len as u64,
+                    },
+                    ShapeDimensionValue {
+                        axis: ShapeAxis::Custom("speakers".into()),
+                        units: MAX_SUPPORTED_SPEAKERS as u64,
+                    },
+                ],
+            },
+        );
+    }
+    lease.apply_intent(
+        &DomainStepIntent {
+            domain: physical::SORTFORMER_STREAMING_STATE_DOMAIN,
+            expected_cursor,
+            target_cursor,
+            update: StateUpdateKind::TensorReplace {
+                components: declared,
+            },
+        },
+        InvocationTensorUpdateV2::TensorReplace { components },
+    )
+}
+
+fn padded_embedding_tensor(
+    rows: &[Vec<f32>],
+    capacity: usize,
+    hidden: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    let mut flat = vec![0.0_f32; capacity.saturating_mul(hidden)];
+    for (index, row) in rows.iter().enumerate() {
+        if row.len() != hidden {
+            return Err(Error::InferenceError(format!(
+                "Sortformer embedding row has width {}; expected {hidden}",
+                row.len()
+            )));
+        }
+        flat[index * hidden..(index + 1) * hidden].copy_from_slice(row);
+    }
+    Tensor::from_vec(flat, (capacity, hidden), device).map_err(Error::from)
+}
+
+fn padded_prediction_tensor(
+    rows: &[[f32; MAX_SUPPORTED_SPEAKERS]],
+    capacity: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    let mut flat = vec![0.0_f32; capacity.saturating_mul(MAX_SUPPORTED_SPEAKERS)];
+    for (index, row) in rows.iter().enumerate() {
+        flat[index * MAX_SUPPORTED_SPEAKERS..(index + 1) * MAX_SUPPORTED_SPEAKERS]
+            .copy_from_slice(row);
+    }
+    Tensor::from_vec(flat, (capacity, MAX_SUPPORTED_SPEAKERS), device).map_err(Error::from)
+}
+
 #[derive(Debug, Clone)]
 struct SortformerCacheCandidate {
     flat_index: usize,
@@ -416,7 +621,7 @@ struct SortformerCacheCandidate {
     score: f32,
 }
 
-const SORTFORMER_SCORE_BOOST_DELTA: f32 = 0.693_147_2;
+const SORTFORMER_SCORE_BOOST_DELTA: f32 = std::f32::consts::LN_2;
 
 pub struct SortformerDiarizerModel {
     variant: ModelVariant,
@@ -426,6 +631,18 @@ pub struct SortformerDiarizerModel {
 }
 
 impl SortformerDiarizerModel {
+    pub(crate) fn physical_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<SortformerPhysicalStateSpec> {
+        let cfg = self.model.streaming.ok_or_else(|| {
+            Error::ModelLoadError(
+                "Sortformer physical state requires the bounded streaming profile".into(),
+            )
+        })?;
+        physical::sortformer_physical_state_spec(cfg, stage_graphs)
+    }
+
     pub fn load(
         model_dir: &Path,
         variant: ModelVariant,
@@ -547,6 +764,39 @@ impl SortformerDiarizerModel {
         audio: &[f32],
         sample_rate: u32,
         config: &DiarizationConfig,
+        observer: F,
+    ) -> Result<DiarizationResult>
+    where
+        F: FnMut(SortformerWorkspaceEvent) -> Result<()>,
+    {
+        self.diarize_with_workspace_observer_impl(audio, sample_rate, config, None, observer)
+    }
+
+    pub(crate) fn diarize_with_workspace_observer_physical<F>(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        config: &DiarizationConfig,
+        state: &mut InvocationTensorLease,
+        observer: F,
+    ) -> Result<DiarizationResult>
+    where
+        F: FnMut(SortformerWorkspaceEvent) -> Result<()>,
+    {
+        if state.domain() != physical::SORTFORMER_STREAMING_STATE_DOMAIN {
+            return Err(Error::InferenceError(
+                "Sortformer received a foreign physical streaming domain".into(),
+            ));
+        }
+        self.diarize_with_workspace_observer_impl(audio, sample_rate, config, Some(state), observer)
+    }
+
+    fn diarize_with_workspace_observer_impl<F>(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        config: &DiarizationConfig,
+        physical_state: Option<&mut InvocationTensorLease>,
         mut observer: F,
     ) -> Result<DiarizationResult>
     where
@@ -578,8 +828,12 @@ impl SortformerDiarizerModel {
         let workspace_estimate = self.model.workspace_estimate(samples.len())?;
         let workspace = SortformerWorkspaceGuard::new(&mut observer, workspace_estimate)?;
 
-        let (speaker_probs, frame_stride_samples) =
-            self.model.infer_speaker_probabilities(samples)?;
+        let (speaker_probs, frame_stride_samples) = match physical_state {
+            Some(state) => self
+                .model
+                .infer_speaker_probabilities_physical(samples, state)?,
+            None => self.model.infer_speaker_probabilities(samples)?,
+        };
         if speaker_probs.is_empty() {
             let result = DiarizationResult {
                 segments: Vec::new(),
@@ -624,7 +878,7 @@ impl SortformerDiarizerModel {
         let mut gated_probs = speaker_probs;
         let frame_count = gated_probs.len();
         let vad_mask = sortformer_vad_frame_mask(
-            &samples,
+            samples,
             frame_count,
             frame_stride_samples,
             min_speech_ms,
@@ -1008,9 +1262,41 @@ impl SortformerInferenceModel {
                 "offline Sortformer reached the bounded production path".to_string(),
             )
         })?;
-        let out =
-            self.infer_speaker_probabilities_streaming(samples, feature_frames, streaming_cfg)?;
+        let out = self.infer_speaker_probabilities_streaming(
+            samples,
+            feature_frames,
+            streaming_cfg,
+            None,
+        )?;
 
+        Ok((out, self.encoder.frame_stride_samples()))
+    }
+
+    fn infer_speaker_probabilities_physical(
+        &self,
+        samples: &[f32],
+        state: &mut InvocationTensorLease,
+    ) -> Result<(Vec<[f32; MAX_SUPPORTED_SPEAKERS]>, usize)> {
+        let feature_frames = self.preprocessor.feature_frame_count(samples.len());
+        if feature_frames == 0 {
+            return Ok((Vec::new(), self.encoder.frame_stride_samples()));
+        }
+        let streaming_cfg = self.streaming.ok_or_else(|| {
+            Error::InferenceError(
+                "Sortformer physical state requires the bounded streaming path".into(),
+            )
+        })?;
+        if state.arena()?.absolute_cursor() != 0 {
+            return Err(Error::InferenceError(
+                "Sortformer invocation state was not reset before inference".into(),
+            ));
+        }
+        let out = self.infer_speaker_probabilities_streaming(
+            samples,
+            feature_frames,
+            streaming_cfg,
+            Some(state),
+        )?;
         Ok((out, self.encoder.frame_stride_samples()))
     }
 
@@ -1032,6 +1318,7 @@ impl SortformerInferenceModel {
         samples: &[f32],
         feature_frames: usize,
         cfg: SortformerStreamingConfig,
+        mut physical_state: Option<&mut InvocationTensorLease>,
     ) -> Result<Vec<[f32; MAX_SUPPORTED_SPEAKERS]>> {
         let mut state = SortformerStreamingState::new(cfg.fc_d_model);
         let mut total_preds = Vec::new();
@@ -1077,7 +1364,12 @@ impl SortformerInferenceModel {
                 pre_encoded_right_offset(plan.right_offset, cfg.subsampling_factor),
                 cfg,
             )?;
-            state = updated_state;
+            state = if let Some(lease) = physical_state.as_deref_mut() {
+                commit_sortformer_streaming_state(lease, cfg, &updated_state, &self.device)?;
+                updated_state
+            } else {
+                updated_state
+            };
             total_preds.extend(chunk_preds);
         }
 
@@ -1213,6 +1505,7 @@ fn tensor_to_embedding_rows(tensor: &Tensor, row_count: usize) -> Result<Vec<Vec
 
     let view = tensor.i((0, ..row_count, ..))?;
     let (_, emb_dim) = view.dims2()?;
+    crate::models::shared::telemetry::record_host_read(DType::F32, row_count * emb_dim);
     let values = view.flatten_all()?.to_vec1::<f32>()?;
     Ok(values
         .chunks(emb_dim)
@@ -1236,6 +1529,10 @@ fn tensor_to_probability_rows(
             speaker_dim, MAX_SUPPORTED_SPEAKERS
         )));
     }
+    crate::models::shared::telemetry::record_host_read(
+        DType::F32,
+        row_count * MAX_SUPPORTED_SPEAKERS,
+    );
     let values = view.flatten_all()?.to_vec1::<f32>()?;
     Ok(values
         .chunks(MAX_SUPPORTED_SPEAKERS)
@@ -1426,7 +1723,7 @@ fn compress_spkcache(
         .into_iter()
         .take(cfg.spkcache_len)
         .collect::<Vec<_>>();
-    selected.sort_by(|a, b| a.flat_index.cmp(&b.flat_index));
+    selected.sort_by_key(|a| a.flat_index);
 
     let mut spkcache = Vec::with_capacity(cfg.spkcache_len);
     let mut spkcache_preds = Vec::with_capacity(cfg.spkcache_len);
@@ -1707,9 +2004,9 @@ impl SortformerPreprocessor {
 
         let center_pad = self.n_fft / 2;
         let mut padded = Vec::with_capacity(x.len() + center_pad * 2);
-        padded.extend(std::iter::repeat(0.0).take(center_pad));
+        padded.extend(std::iter::repeat_n(0.0, center_pad));
         padded.extend_from_slice(&x);
-        padded.extend(std::iter::repeat(0.0).take(center_pad));
+        padded.extend(std::iter::repeat_n(0.0, center_pad));
 
         let frame_count = if padded.len() >= self.n_fft {
             (padded.len() - self.n_fft) / self.hop_length + 1

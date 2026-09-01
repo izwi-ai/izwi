@@ -3,6 +3,9 @@ use std::cmp::Ordering;
 use candle_core::{DType, IndexOp, Tensor, D};
 
 use crate::error::{Error, Result};
+use crate::models::shared::sampling::{
+    bounded_device_sampling_candidates, device_candidates_cover_top_p, sample_device_candidates,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Lfm25SamplingConfig {
@@ -73,6 +76,25 @@ pub fn sample_from_logits(
 
     if config.temperature <= 1e-5 {
         return greedy_from_logits_row(&logits, vocab_limit);
+    }
+
+    if let Some(candidates) = bounded_device_sampling_candidates(
+        &logits,
+        vocab_limit,
+        config.top_k,
+        config.temperature,
+        &[],
+        1.0,
+        0.0,
+        None,
+    )? {
+        if device_candidates_cover_top_p(&candidates, config.top_p) {
+            if let Some(sampled) =
+                sample_device_candidates(&candidates, config.top_p, rng.next_f32())
+            {
+                return Ok(sampled);
+            }
+        }
     }
 
     let mut values = logits_to_vec(&logits.narrow(0, 0, vocab_limit)?)?;
@@ -190,11 +212,9 @@ fn logits_row(logits: &Tensor) -> Result<Tensor> {
             }
             Ok(logits.i(0)?)
         }
-        rank => {
-            return Err(Error::InferenceError(format!(
-                "Unexpected LFM2.5 Audio logits rank for sampling: {rank}"
-            )));
-        }
+        rank => Err(Error::InferenceError(format!(
+            "Unexpected LFM2.5 Audio logits rank for sampling: {rank}"
+        ))),
     }
 }
 

@@ -5,6 +5,7 @@ import {
   defaultThinkingEnabledForModel,
   displayThreadTitle,
   isQwen35ThinkingModel,
+  isQwen38ThinkingModel,
   parseAssistantContent,
   parseUserMessageDisplayFromContentParts,
   supportsImageAttachmentsForModel,
@@ -29,6 +30,7 @@ describe("chat playground support", () => {
       true,
     );
     expect(supportsImplicitOpenThinkTagParsing("Qwen3.5-4B")).toBe(true);
+    expect(supportsImplicitOpenThinkTagParsing("Qwen3.8-27B-FP8")).toBe(true);
     expect(
       parseAssistantContent("reasoning first</think>final answer", {
         implicitOpenThinkTag: true,
@@ -47,9 +49,18 @@ describe("chat playground support", () => {
     expect(defaultThinkingEnabledForModel("Qwen3.5-2B")).toBe(false);
     expect(defaultThinkingEnabledForModel("Qwen3.5-4B")).toBe(true);
     expect(defaultThinkingEnabledForModel("Qwen3.5-9B")).toBe(true);
+    expect(defaultThinkingEnabledForModel("Qwen3.8-27B-FP8")).toBe(true);
     expect(defaultThinkingEnabledForModel("LFM2.5-1.2B-thinking-gguf")).toBe(
       true,
     );
+  });
+
+  it("uses Qwen3.8 thinking behavior without enabling image input", () => {
+    expect(isQwen38ThinkingModel("Qwen3.8-27B-FP8")).toBe(true);
+    expect(systemPromptForModel("Qwen3.8-27B-FP8", true)).toBe(
+      "You are a helpful assistant.",
+    );
+    expect(supportsImageAttachmentsForModel("Qwen3.8-27B-FP8")).toBe(false);
   });
 
   it("uses the neutral system prompt for Qwen3.5 thinking control", () => {

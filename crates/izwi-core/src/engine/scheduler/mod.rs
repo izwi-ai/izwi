@@ -5,7 +5,7 @@
 //! - Waiting queue (new requests awaiting processing)
 //! - Running queue (requests currently being processed)
 //! - Token budget management
-//! - KV cache allocation coordination
+//! - Capability-aware execution admission
 
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -14,22 +14,28 @@ use std::time::{Duration, Instant};
 use tracing::debug;
 
 use super::config::EngineCoreConfig;
-use super::execution::{CacheMode, ExecutionProfile, NativeBatchMode, PrefillMode};
-use super::kv_cache::{CacheResidency, KVCacheManager};
+use super::execution::{
+    CacheMode, ExecutionProfile, NativeBatchMode, PrefillMode, RealtimePreparationMode,
+    RealtimeStageOutcome, RealtimeSubphase,
+};
 use super::request::{EngineCoreRequest, RequestStatus, WorkloadClass};
-use super::types::{BlockId, Priority, RequestId, SequenceId, TaskType};
-use super::{InputRange, PlanId, SequencePhase, SessionKey, WorkUnit};
+use super::types::{Priority, RequestId, SequenceId, TaskType};
+use super::{InputRange, PlanId, RealtimeOperationId, SequencePhase, SessionKey, WorkUnit};
 use crate::model::ModelVariant;
+
+pub(super) const MAX_DECODE_ONLY_STEPS_WITH_WAITING_FULL_PREFILL: usize = 8;
+pub(super) const MAX_DECODE_ONLY_STEPS_WITH_WAITING_INCREMENTAL_PREFILL: usize = 8;
+pub(super) const MAX_REALTIME_ONLY_STEPS_WITH_READY_DECODE: usize = 8;
 
 /// Scheduling policy for the engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum SchedulingPolicy {
-    /// First-come, first-served (default)
-    #[default]
+    /// First-come, first-served.
     FCFS,
     /// Priority-based scheduling (higher priority first)
     Priority,
     /// Weighted workload-class service with priority ordering inside each class.
+    #[default]
     WeightedFair,
 }
 
@@ -44,11 +50,9 @@ pub struct SchedulerConfig {
     pub policy: SchedulingPolicy,
     /// Enable chunked prefill
     pub enable_chunked_prefill: bool,
-    /// Enable prefix reuse backed by an executor-owned physical cache.
-    pub enable_prefix_caching: bool,
     /// Threshold for chunked prefill
     pub chunked_prefill_threshold: usize,
-    /// Enable preemption when KV cache is full
+    /// Defer lower-priority decode while a higher-priority request is waiting.
     pub enable_preemption: bool,
     /// Enable VAD-triggered preemption (for audio interruption handling)
     pub enable_vad_preemption: bool,
@@ -82,21 +86,6 @@ pub struct SchedulerConfig {
     pub enable_decode_quanta: bool,
     /// Maximum decode tokens per request in one scheduler step.
     pub max_decode_tokens_per_request: usize,
-    /// Enable KV residency tiering hints (GPU <-> CPU residency).
-    pub enable_kv_tiering: bool,
-}
-
-/// Preemption reason - why a request was preempted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PreemptionReason {
-    /// Memory pressure - KV cache is full
-    MemoryPressure,
-    /// VAD detected user speech during AI output (interruption)
-    VadInterruption,
-    /// Manual abort by user
-    UserAbort,
-    /// Timeout
-    Timeout,
 }
 
 /// VAD preemption event - signals that user started speaking.
@@ -115,9 +104,8 @@ impl Default for SchedulerConfig {
         Self {
             max_batch_size: 8,
             max_tokens_per_step: 384,
-            policy: SchedulingPolicy::FCFS,
+            policy: SchedulingPolicy::WeightedFair,
             enable_chunked_prefill: false,
-            enable_prefix_caching: false,
             chunked_prefill_threshold: 192,
             enable_preemption: false,
             enable_vad_preemption: true,
@@ -136,7 +124,6 @@ impl Default for SchedulerConfig {
             power_save_mode: false,
             enable_decode_quanta: false,
             max_decode_tokens_per_request: 2,
-            enable_kv_tiering: false,
         }
     }
 }
@@ -148,7 +135,6 @@ impl From<&EngineCoreConfig> for SchedulerConfig {
             max_tokens_per_step: config.max_tokens_per_step,
             policy: config.scheduling_policy,
             enable_chunked_prefill: config.enable_chunked_prefill,
-            enable_prefix_caching: config.enable_prefix_caching,
             chunked_prefill_threshold: config.chunked_prefill_threshold,
             enable_preemption: config.enable_preemption,
             enable_vad_preemption: true, // Default to enabled for audio apps
@@ -167,7 +153,6 @@ impl From<&EngineCoreConfig> for SchedulerConfig {
             power_save_mode: config.power_save_mode,
             enable_decode_quanta: config.enable_decode_quanta,
             max_decode_tokens_per_request: config.max_decode_tokens_per_request,
-            enable_kv_tiering: config.enable_kv_tiering,
         }
     }
 }
@@ -217,14 +202,10 @@ pub struct ScheduleResult {
     pub decode_requests: Vec<ScheduledRequest>,
     /// Requests scheduled for prefill (new requests)
     pub prefill_requests: Vec<ScheduledRequest>,
-    /// Requests that were preempted to make room
-    pub preempted_requests: Vec<SessionKey>,
     /// Requests rejected before execution because their caller deadline elapsed.
     pub expired_requests: Vec<ExpiredRequest>,
     /// Total tokens to process this step
     pub total_tokens: usize,
-    /// Number of blocks allocated
-    pub blocks_allocated: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,8 +220,6 @@ pub(crate) enum TerminalReleaseCause {
     Failed,
     Cancelled,
     TimedOut,
-    PreemptionCleanupFailed,
-    PreemptionCommitRejected,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -272,10 +251,8 @@ impl ScheduleResult {
         Self {
             decode_requests: Vec::new(),
             prefill_requests: Vec::new(),
-            preempted_requests: Vec::new(),
             expired_requests: Vec::new(),
             total_tokens: 0,
-            blocks_allocated: 0,
         }
     }
 
@@ -314,8 +291,6 @@ pub struct ScheduledRequest {
     pub num_tokens: usize,
     /// Whether this is a prefill (first pass) or decode (continuation)
     pub is_prefill: bool,
-    /// KV cache blocks allocated to this request
-    pub block_ids: Vec<BlockId>,
     /// Number of tokens already computed (for chunked prefill)
     pub num_computed_tokens: usize,
     /// Authoritative bounded unit of work for the executor.
@@ -384,6 +359,9 @@ pub struct Scheduler {
     running: HashMap<RequestId, RunningRequest>,
     /// Request metadata
     requests: HashMap<RequestId, RequestMetadata>,
+    /// FIFO ingress for engine-owned realtime sessions. These sessions never
+    /// enter the ordinary prompt/decode queues.
+    realtime_sessions: HashMap<RequestId, RealtimeSchedulerState>,
     /// Terminal sessions whose executor-owned cache has not yet been proven
     /// released, or whose terminal event has not yet been delivered. Logical
     /// blocks and the public request ID remain fenced until both conditions are
@@ -393,12 +371,139 @@ pub struct Scheduler {
     next_sequence_id: SequenceId,
     /// Next execution plan identity.
     next_plan_id: PlanId,
+    /// Monotonic fair-service clock for realtime session rotation.
+    next_realtime_service_clock: u64,
     /// Monotonic scheduling cycle used for one-cycle preemption resume fences.
-    schedule_generation: u64,
     /// Adaptive scheduling telemetry.
     telemetry: SchedulerTelemetry,
     /// Completed scheduling quanta by workload class for weighted service.
     class_service: HashMap<WorkloadClass, u64>,
+    /// Decode-only transactions observed while an indivisible full prefill was
+    /// waiting. This bounds starvation without pretending that a Full adapter
+    /// can safely resume a scheduler-authored chunk.
+    decode_only_steps_with_waiting_full_prefill: usize,
+    /// Decode-bearing transactions observed while a resumable prefill had no
+    /// scheduler slot. Unlike a full prefill, one incremental span can share
+    /// the transaction once this bounded wait expires.
+    decode_only_steps_with_waiting_incremental_prefill: usize,
+    /// Transactions in which realtime rows consumed every decode slot while an
+    /// ordinary decode row was ready. One ordinary slot is reserved once this
+    /// bounded debt is reached.
+    realtime_only_steps_with_ready_decode: usize,
+}
+
+#[derive(Debug, Clone)]
+struct RealtimePendingOperation {
+    id: RealtimeOperationId,
+    external: RealtimeExternalOperation,
+    phase: RealtimeSubphase,
+    remaining_output_steps: usize,
+    committed_cache_append: usize,
+}
+
+#[derive(Debug, Clone)]
+enum RealtimeExternalOperation {
+    Push {
+        input: InputRange,
+        max_cache_append: usize,
+    },
+    Finish {
+        max_cache_append: usize,
+    },
+}
+
+impl RealtimePendingOperation {
+    fn max_cache_append(&self) -> usize {
+        match self.external {
+            RealtimeExternalOperation::Push {
+                max_cache_append, ..
+            }
+            | RealtimeExternalOperation::Finish { max_cache_append } => max_cache_append,
+        }
+    }
+
+    fn work(&self, committed_input_samples: usize, committed_decode_steps: usize) -> WorkUnit {
+        match self.phase {
+            RealtimeSubphase::Preparation => {
+                let (mode, input) = match self.external {
+                    RealtimeExternalOperation::Push { input, .. } => {
+                        (RealtimePreparationMode::Push, input)
+                    }
+                    RealtimeExternalOperation::Finish { .. } => (
+                        RealtimePreparationMode::Finish,
+                        InputRange {
+                            start: committed_input_samples,
+                            end: committed_input_samples,
+                        },
+                    ),
+                };
+                WorkUnit::RealtimePreparation {
+                    operation_id: self.id,
+                    mode,
+                    input,
+                    max_output_steps: self.remaining_output_steps,
+                    max_cache_append: self.max_cache_append(),
+                    retained_state_input: InputRange {
+                        start: self.id.get().saturating_sub(1) as usize,
+                        end: self.id.get() as usize,
+                    },
+                    auxiliary_state: None,
+                }
+            }
+            RealtimeSubphase::PromptPrefill { cache_append } => WorkUnit::RealtimePromptPrefill {
+                operation_id: self.id,
+                max_output_steps: self.remaining_output_steps,
+                cache_append,
+            },
+            RealtimeSubphase::DecodeContinuation => WorkUnit::RealtimeDecodeContinuation {
+                operation_id: self.id,
+                max_output_steps: self.remaining_output_steps,
+                max_cache_append: 1,
+                retained_state_input: InputRange {
+                    start: committed_decode_steps,
+                    end: committed_decode_steps.saturating_add(1),
+                },
+                auxiliary_state: None,
+            },
+            RealtimeSubphase::Completion => WorkUnit::RealtimeCompletion {
+                operation_id: self.id,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RealtimeSchedulerState {
+    sequence_id: SequenceId,
+    committed_input_samples: usize,
+    committed_decode_steps: usize,
+    enqueued_input_samples: usize,
+    next_operation_id: u64,
+    pending: VecDeque<RealtimePendingOperation>,
+    in_flight: Option<RealtimeInFlight>,
+    last_service_clock: u64,
+    finish_enqueued: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RealtimeInFlight {
+    plan_id: PlanId,
+    operation_id: RealtimeOperationId,
+    subphase: RealtimeSubphase,
+}
+
+/// A scheduler-authenticated realtime transition whose publication contains no
+/// remaining fallible work. The scheduler must not be mutated between prepare
+/// and publish; the engine core owns that serialized boundary.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PreparedRealtimeStageOutcome {
+    session_epoch: SequenceId,
+    outcome: RealtimeStageOutcome,
+    remaining_output_steps: usize,
+    committed_cache_append: usize,
+    committed_input_samples: usize,
+    committed_decode_steps: usize,
+    final_stage: bool,
 }
 
 /// Metadata for a request in the scheduler.
@@ -415,7 +520,6 @@ struct RequestMetadata {
     hard_deadline: Option<Instant>,
     total_prompt_tokens: usize,
     max_tokens: usize,
-    prompt_prefix_tokens: Vec<u32>,
     cache_policy: RequestCachePolicy,
     retry_not_before: Option<Instant>,
 }
@@ -427,35 +531,25 @@ struct RequestCachePolicy {
     decode_batch: NativeBatchMode,
     recompute_safe: bool,
     cache_release_safe: bool,
-    prefix_reuse_safe: bool,
+    preferred_decode_tokens: usize,
 }
 
 impl Default for RequestCachePolicy {
     fn default() -> Self {
         Self {
             mode: None,
-            prefill: PrefillMode::Incremental,
+            // Fail closed until the loaded adapter explicitly proves resumable
+            // incremental-prefill safe points.
+            prefill: PrefillMode::Full,
             decode_batch: NativeBatchMode::None,
             recompute_safe: false,
             cache_release_safe: false,
-            prefix_reuse_safe: false,
+            preferred_decode_tokens: 1,
         }
     }
 }
 
-impl RequestCachePolicy {
-    fn allows_recompute_preemption(&self) -> bool {
-        self.recompute_safe && self.cache_release_safe
-    }
-
-    fn allows_external_prefix_reuse(&self) -> bool {
-        self.mode == Some(CacheMode::ExternalPaged) && self.prefix_reuse_safe
-    }
-
-    fn has_external_physical_cache(&self) -> bool {
-        self.mode == Some(CacheMode::ExternalPaged)
-    }
-}
+impl RequestCachePolicy {}
 
 /// State for a running request.
 #[derive(Debug, Clone)]
@@ -466,12 +560,16 @@ struct RunningRequest {
     num_tokens_processed: usize,
     /// Number of tokens generated so far
     num_tokens_generated: usize,
-    /// KV cache blocks allocated
-    block_ids: Vec<BlockId>,
     /// Whether prefill is complete
     prefill_complete: bool,
     /// Whether a prefill quantum has been scheduled but not yet committed.
     prefill_in_flight: bool,
+    /// A committed decoder quantum requested a distinct terminal model stage.
+    finalize_pending: bool,
+    /// The exact finalization quantum has been planned but not yet committed.
+    finalize_in_flight: bool,
+    /// Scheduler-visible incremental-prefill quanta committed for this request.
+    incremental_prefill_quanta_committed: usize,
     /// Priority of this request
     priority: Priority,
     /// Coarse latency/throughput class for this request.
@@ -480,19 +578,6 @@ struct RunningRequest {
     first_token_emitted: bool,
     /// Whether this request is temporarily paused due to preemption.
     paused: bool,
-    /// Whether the scheduler has selected this session for two-phase
-    /// preemption and is waiting for executor cache cleanup confirmation.
-    preemption_pending: bool,
-    /// Scheduling generation in which this preempted victim must remain paused
-    /// so the request that caused preemption gets the first chance to allocate.
-    preemption_defer_generation: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct PrefillAllocationPlan {
-    total_blocks_needed: usize,
-    reusable_blocks: usize,
-    additional_blocks: usize,
 }
 
 impl Scheduler {
@@ -507,13 +592,48 @@ impl Scheduler {
             waiting_members: HashSet::new(),
             running: HashMap::new(),
             requests: HashMap::new(),
+            realtime_sessions: HashMap::new(),
             pending_releases: HashMap::new(),
             next_sequence_id: 0,
             next_plan_id: 1,
-            schedule_generation: 0,
+            next_realtime_service_clock: 1,
             telemetry,
             class_service: HashMap::new(),
+            decode_only_steps_with_waiting_full_prefill: 0,
+            decode_only_steps_with_waiting_incremental_prefill: 0,
+            realtime_only_steps_with_ready_decode: 0,
         }
+    }
+
+    fn ensure_realtime_service_clock_capacity(&mut self, quanta: usize) {
+        let required = u64::try_from(quanta).unwrap_or(u64::MAX);
+        if self
+            .next_realtime_service_clock
+            .checked_add(required)
+            .is_some()
+        {
+            return;
+        }
+        let mut order = self
+            .realtime_sessions
+            .iter()
+            .map(|(request_id, state)| {
+                (
+                    state.last_service_clock,
+                    state.sequence_id,
+                    request_id.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        order.sort_unstable();
+        for (rank, (_, _, request_id)) in order.into_iter().enumerate() {
+            if let Some(state) = self.realtime_sessions.get_mut(&request_id) {
+                state.last_service_clock = u64::try_from(rank).unwrap_or(u64::MAX - 1);
+            }
+        }
+        self.next_realtime_service_clock = u64::try_from(self.realtime_sessions.len())
+            .unwrap_or(u64::MAX - 1)
+            .saturating_add(1);
     }
 
     /// Add a request to the waiting queue.
@@ -553,7 +673,6 @@ impl Scheduler {
             // For other task types, guard against zero-budget stalls if upstream
             // validation is ever bypassed.
             max_tokens,
-            prompt_prefix_tokens: request.prompt_tokens.clone(),
             cache_policy: RequestCachePolicy::default(),
             retry_not_before: None,
         };
@@ -571,6 +690,158 @@ impl Scheduler {
         true
     }
 
+    pub(crate) fn add_realtime_session(&mut self, request: &EngineCoreRequest) -> bool {
+        if !request.is_realtime_asr_session()
+            || self.requests.contains_key(&request.id)
+            || self.pending_releases.contains_key(&request.id)
+        {
+            return false;
+        }
+        let sequence_id = self.next_sequence_id;
+        self.next_sequence_id = self.next_sequence_id.saturating_add(1);
+        let arrival_time = request.arrival_time;
+        let deadline_at = request.deadline.unwrap_or_else(|| {
+            arrival_time + self.deadline_for_request(request.priority, request.workload_class)
+        });
+        self.requests.insert(
+            request.id.clone(),
+            RequestMetadata {
+                request_id: request.id.clone(),
+                sequence_id,
+                task_type: request.task_type,
+                model_variant: request.model_variant,
+                priority: request.priority,
+                workload_class: request.workload_class,
+                arrival_time,
+                deadline_at,
+                hard_deadline: request.deadline,
+                total_prompt_tokens: 0,
+                max_tokens: usize::MAX,
+                cache_policy: RequestCachePolicy::default(),
+                retry_not_before: None,
+            },
+        );
+        self.running.insert(
+            request.id.clone(),
+            RunningRequest {
+                request_id: request.id.clone(),
+                sequence_id,
+                num_tokens_processed: 0,
+                num_tokens_generated: 0,
+                prefill_complete: true,
+                prefill_in_flight: false,
+                finalize_pending: false,
+                finalize_in_flight: false,
+                incremental_prefill_quanta_committed: 0,
+                priority: request.priority,
+                workload_class: request.workload_class,
+                first_token_emitted: false,
+                paused: false,
+            },
+        );
+        let initial_service_clock = self.next_realtime_service_clock.saturating_sub(1);
+        self.realtime_sessions.insert(
+            request.id.clone(),
+            RealtimeSchedulerState {
+                sequence_id,
+                committed_input_samples: 0,
+                committed_decode_steps: 0,
+                enqueued_input_samples: 0,
+                next_operation_id: 1,
+                pending: VecDeque::new(),
+                in_flight: None,
+                last_service_clock: initial_service_clock,
+                finish_enqueued: false,
+            },
+        );
+        true
+    }
+
+    pub(crate) fn enqueue_realtime_push(
+        &mut self,
+        session: &SessionKey,
+        sample_count: usize,
+        max_output_steps: usize,
+        max_cache_append: usize,
+    ) -> crate::error::Result<(RealtimeOperationId, InputRange)> {
+        if sample_count == 0 || max_cache_append == 0 {
+            return Err(crate::error::Error::InvalidInput(
+                "realtime push requires non-empty samples and a cache append ceiling".into(),
+            ));
+        }
+        let state = self
+            .realtime_sessions
+            .get_mut(&session.request_id)
+            .ok_or_else(|| {
+                crate::error::Error::InvalidInput("realtime session is not active".into())
+            })?;
+        if state.sequence_id != session.epoch || state.finish_enqueued {
+            return Err(crate::error::Error::InvalidInput(
+                "realtime push crossed its session fence or followed finish".into(),
+            ));
+        }
+        let end = state
+            .enqueued_input_samples
+            .checked_add(sample_count)
+            .ok_or_else(|| {
+                crate::error::Error::InvalidInput("realtime sample cursor overflow".into())
+            })?;
+        let input = InputRange::new(state.enqueued_input_samples, end)?;
+        let id = RealtimeOperationId::new(state.next_operation_id);
+        state.next_operation_id = state.next_operation_id.checked_add(1).ok_or_else(|| {
+            crate::error::Error::InferenceError("realtime operation identity overflow".into())
+        })?;
+        state.enqueued_input_samples = end;
+        state.pending.push_back(RealtimePendingOperation {
+            id,
+            external: RealtimeExternalOperation::Push {
+                input,
+                max_cache_append,
+            },
+            phase: RealtimeSubphase::Preparation,
+            remaining_output_steps: max_output_steps,
+            committed_cache_append: 0,
+        });
+        Ok((id, input))
+    }
+
+    pub(crate) fn enqueue_realtime_finish(
+        &mut self,
+        session: &SessionKey,
+        max_output_steps: usize,
+        max_cache_append: usize,
+    ) -> crate::error::Result<RealtimeOperationId> {
+        if max_cache_append == 0 {
+            return Err(crate::error::Error::InvalidInput(
+                "realtime finish requires a cache append ceiling".into(),
+            ));
+        }
+        let state = self
+            .realtime_sessions
+            .get_mut(&session.request_id)
+            .ok_or_else(|| {
+                crate::error::Error::InvalidInput("realtime session is not active".into())
+            })?;
+        if state.sequence_id != session.epoch || state.finish_enqueued {
+            return Err(crate::error::Error::InvalidInput(
+                "realtime finish crossed its session fence or was already queued".into(),
+            ));
+        }
+        let id = RealtimeOperationId::new(state.next_operation_id);
+        state.next_operation_id = state.next_operation_id.checked_add(1).ok_or_else(|| {
+            crate::error::Error::InferenceError("realtime operation identity overflow".into())
+        })?;
+        state.finish_enqueued = true;
+        state.pending.push_back(RealtimePendingOperation {
+            id,
+            external: RealtimeExternalOperation::Finish { max_cache_append },
+            phase: RealtimeSubphase::Preparation,
+            remaining_output_steps: max_output_steps,
+            committed_cache_append: 0,
+        });
+        Ok(id)
+    }
+
     /// Install the loaded executor's cache contract for one exact scheduler
     /// incarnation. Stale profiles cannot mutate a reused public request ID.
     pub fn update_execution_profile(
@@ -586,19 +857,24 @@ impl Scheduler {
         }
         metadata.cache_policy = RequestCachePolicy {
             mode: Some(profile.cache_mode),
-            prefill: profile.prefill,
+            // Only an explicit incremental contract is scheduler-resumable.
+            // `None` is not a weaker form of incremental prefill; for a
+            // sequence with prompt tokens it must fail closed as indivisible.
+            prefill: if profile.prefill == PrefillMode::Incremental {
+                PrefillMode::Incremental
+            } else {
+                PrefillMode::Full
+            },
             decode_batch: profile.decode_batch,
             recompute_safe: profile.recompute_safe,
             cache_release_safe: profile.cache_release_safe,
-            prefix_reuse_safe: profile.prefix_reuse_safe,
+            preferred_decode_tokens: profile.preferred_decode_tokens.max(1),
         };
         true
     }
 
     /// Schedule requests for the next step.
-    pub fn schedule(&mut self, kv_cache: &mut KVCacheManager) -> ScheduleResult {
-        self.schedule_generation = self.schedule_generation.wrapping_add(1);
-        let schedule_generation = self.schedule_generation;
+    pub fn schedule(&mut self) -> ScheduleResult {
         let mut result = ScheduleResult::empty();
         result.expired_requests = self.expire_deadlines();
         let scheduling_now = Instant::now();
@@ -606,23 +882,19 @@ impl Scheduler {
         self.refresh_queue_age_sample();
         self.update_dynamic_budget();
 
-        let mut total_budget = self.current_token_budget();
+        let total_budget = self.current_token_budget();
+        let waiting_full_prefill = self.has_eligible_full_prefill(scheduling_now);
+        let force_full_prefill_service = waiting_full_prefill
+            && self.decode_only_steps_with_waiting_full_prefill
+                >= MAX_DECODE_ONLY_STEPS_WITH_WAITING_FULL_PREFILL;
+        let waiting_incremental_prefill = self.has_eligible_incremental_prefill(scheduling_now);
+        let force_incremental_prefill_service = !force_full_prefill_service
+            && waiting_incremental_prefill
+            && self.decode_only_steps_with_waiting_incremental_prefill
+                >= MAX_DECODE_ONLY_STEPS_WITH_WAITING_INCREMENTAL_PREFILL;
         let latency_sensitive_waiting = self.has_latency_sensitive_waiting();
         let throughput_waiting_only =
             !latency_sensitive_waiting && self.has_throughput_or_background_waiting();
-        let kv_stats = kv_cache.stats();
-        let kv_utilization = if kv_stats.soft_max_blocks > 0 {
-            kv_stats.allocated_blocks as f64 / kv_stats.soft_max_blocks as f64
-        } else {
-            0.0
-        };
-        if kv_utilization > 0.95 {
-            total_budget = (total_budget.saturating_mul(45) / 100).max(1);
-        } else if kv_utilization > 0.90 {
-            total_budget = (total_budget.saturating_mul(65) / 100).max(1);
-        } else if kv_utilization > 0.80 {
-            total_budget = (total_budget.saturating_mul(80) / 100).max(1);
-        }
         let mut decode_budget = total_budget;
         let mut reserved_prefill_budget = 0;
         if self.config.enable_adaptive_batching && total_budget > 0 {
@@ -650,20 +922,165 @@ impl Scheduler {
             && !self.waiting_members.is_empty()
             && total_budget > 0
         {
-            reserved_prefill_budget = total_budget.min(32).max(1);
+            reserved_prefill_budget = total_budget.clamp(1, 32);
+            decode_budget = total_budget.saturating_sub(reserved_prefill_budget);
+        }
+        if force_full_prefill_service {
+            // Full-prefill adapters expose no resumable scheduler safe point.
+            // Give one such prompt an isolated transaction after a bounded
+            // number of decode-only commits instead of mixing it behind live
+            // decode output or pretending it can honor a token chunk.
+            decode_budget = 0;
+            reserved_prefill_budget = total_budget;
+        } else if force_incremental_prefill_service {
+            // Preserve both a token budget and a physical row for one
+            // resumable span. The remaining rows/tokens can continue decode.
+            let forced_prefill_budget = if total_budget > 1 {
+                self.config
+                    .chunked_prefill_threshold
+                    .max(1)
+                    .min(total_budget - 1)
+            } else {
+                total_budget
+            };
+            reserved_prefill_budget = reserved_prefill_budget.max(forced_prefill_budget);
             decode_budget = total_budget.saturating_sub(reserved_prefill_budget);
         }
         let mut remaining_decode_budget = decode_budget;
+
+        let ordinary_decode_ready = self.running.iter().any(|(request_id, running)| {
+            if !running.prefill_complete || self.realtime_sessions.contains_key(request_id) {
+                return false;
+            }
+            self.requests.get(request_id).is_some_and(|metadata| {
+                metadata
+                    .retry_not_before
+                    .is_none_or(|not_before| not_before <= scheduling_now)
+                    && metadata.max_tokens > running.num_tokens_generated
+            })
+        });
+        let reserve_ordinary_decode = ordinary_decode_ready
+            && self.realtime_only_steps_with_ready_decode
+                >= MAX_REALTIME_ONLY_STEPS_WITH_READY_DECODE;
+
+        // Realtime operations are already admitted, session-fenced quanta.
+        // Schedule at most one FIFO head per session and keep their source
+        // sample clock independent from token-prefill/decode accounting.
+        self.ensure_realtime_service_clock_capacity(self.realtime_sessions.len());
+        let mut realtime_candidates = self
+            .realtime_sessions
+            .iter()
+            .filter_map(|(request_id, state)| {
+                (state.in_flight.is_none() && !state.pending.is_empty()).then_some((
+                    state.last_service_clock,
+                    state.sequence_id,
+                    request_id.clone(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        realtime_candidates.sort_unstable();
+        for (_, _, request_id) in realtime_candidates {
+            if remaining_batch == 0 || remaining_decode_budget == 0 {
+                break;
+            }
+            if reserve_ordinary_decode && (remaining_batch <= 1 || remaining_decode_budget <= 1) {
+                break;
+            }
+            let Some(state) = self.realtime_sessions.get_mut(&request_id) else {
+                continue;
+            };
+            let Some(operation) = state.pending.front().cloned() else {
+                continue;
+            };
+            let plan_id = self.next_plan_id;
+            self.next_plan_id = self.next_plan_id.saturating_add(1);
+            state.in_flight = Some(RealtimeInFlight {
+                plan_id,
+                operation_id: operation.id,
+                subphase: operation.phase,
+            });
+            state.last_service_clock = self.next_realtime_service_clock;
+            self.next_realtime_service_clock = self
+                .next_realtime_service_clock
+                .checked_add(1)
+                .expect("realtime service clock capacity was reserved");
+            let num_computed_tokens = state.committed_input_samples;
+            let work = operation.work(state.committed_input_samples, state.committed_decode_steps);
+            result.decode_requests.push(ScheduledRequest {
+                plan_id,
+                request_id,
+                sequence_id: state.sequence_id,
+                num_tokens: 1,
+                is_prefill: false,
+                num_computed_tokens,
+                work,
+            });
+            remaining_decode_budget = remaining_decode_budget.saturating_sub(1);
+            remaining_batch -= 1;
+            result.total_tokens = result.total_tokens.saturating_add(1);
+        }
+
+        // Finalization is a distinct, cache-free model stage. Schedule it
+        // ahead of ordinary decode so a completed acoustic row cannot consume
+        // another decoder quantum or be stranded by its output-token ceiling.
+        let mut finalize_candidates = self
+            .running
+            .iter()
+            .filter(|(id, running)| {
+                running.finalize_pending
+                    && !running.finalize_in_flight
+                    && !self.realtime_sessions.contains_key(*id)
+            })
+            .filter_map(|(id, running)| {
+                let metadata = self.requests.get(id)?;
+                if metadata
+                    .retry_not_before
+                    .is_some_and(|not_before| not_before > scheduling_now)
+                {
+                    return None;
+                }
+                Some((
+                    id.clone(),
+                    running.sequence_id,
+                    running.priority,
+                    running.num_tokens_processed,
+                ))
+            })
+            .collect::<Vec<_>>();
+        finalize_candidates
+            .sort_by(|left, right| right.2.cmp(&left.2).then_with(|| left.1.cmp(&right.1)));
+        for (request_id, sequence_id, _priority, num_computed_tokens) in finalize_candidates {
+            if remaining_batch == 0 || remaining_decode_budget == 0 {
+                break;
+            }
+            let plan_id = self.next_plan_id;
+            self.next_plan_id = self.next_plan_id.saturating_add(1);
+            if let Some(running) = self.running.get_mut(&request_id) {
+                running.finalize_in_flight = true;
+            }
+            result.decode_requests.push(ScheduledRequest {
+                plan_id,
+                request_id,
+                sequence_id,
+                num_tokens: 1,
+                is_prefill: false,
+                num_computed_tokens,
+                work: WorkUnit::SequenceFinalize {
+                    max_output_steps: 1,
+                },
+            });
+            remaining_decode_budget = remaining_decode_budget.saturating_sub(1);
+            remaining_batch -= 1;
+            result.total_tokens = result.total_tokens.saturating_add(1);
+        }
 
         // Phase 1: schedule decode requests (already running prefill-complete requests).
         let mut decode_candidates: Vec<_> = self
             .running
             .iter()
-            .filter(|(_, r)| r.prefill_complete)
+            .filter(|(_, r)| r.prefill_complete && !r.finalize_pending)
+            .filter(|(id, _)| !self.realtime_sessions.contains_key(*id))
             .filter_map(|(id, r)| {
-                if r.preemption_pending {
-                    return None;
-                }
                 let metadata = self.requests.get(id)?;
                 if metadata
                     .retry_not_before
@@ -681,7 +1098,6 @@ impl Scheduler {
                     id.clone(),
                     r.sequence_id,
                     r.priority,
-                    r.block_ids.clone(),
                     r.num_tokens_processed,
                     remaining_decode_tokens,
                     r.num_tokens_generated,
@@ -689,6 +1105,7 @@ impl Scheduler {
                     metadata.workload_class,
                     overdue_ms,
                     metadata.cache_policy.decode_batch == NativeBatchMode::Continuous,
+                    metadata.cache_policy.preferred_decode_tokens,
                 ))
             })
             .collect();
@@ -698,17 +1115,17 @@ impl Scheduler {
         {
             // Favor overdue requests first, then requests close to completion.
             decode_candidates.sort_by(|a, b| {
-                b.9.partial_cmp(&a.9)
+                b.8.partial_cmp(&a.8)
                     .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| b.7.cmp(&a.7))
+                    .then_with(|| b.6.cmp(&a.6))
                     .then_with(|| {
-                        b.8.adaptive_score_boost()
-                            .partial_cmp(&a.8.adaptive_score_boost())
+                        b.7.adaptive_score_boost()
+                            .partial_cmp(&a.7.adaptive_score_boost())
                             .unwrap_or(std::cmp::Ordering::Equal)
                     })
-                    .then_with(|| a.5.cmp(&b.5))
+                    .then_with(|| a.4.cmp(&b.4))
                     .then_with(|| b.2.cmp(&a.2))
-                    .then_with(|| a.6.cmp(&b.6))
+                    .then_with(|| a.5.cmp(&b.5))
             });
         } else if self.config.policy == SchedulingPolicy::WeightedFair {
             let mut simulated_service = self.class_service.clone();
@@ -718,21 +1135,21 @@ impl Scheduler {
                     .min_by(|left, right| {
                         let a = &decode_candidates[*left];
                         let b = &decode_candidates[*right];
-                        Self::compare_class_service_with(&simulated_service, a.8, b.8)
+                        Self::compare_class_service_with(&simulated_service, a.7, b.7)
                             .then_with(|| b.2.cmp(&a.2))
                             .then_with(|| {
-                                b.9.partial_cmp(&a.9).unwrap_or(std::cmp::Ordering::Equal)
+                                b.8.partial_cmp(&a.8).unwrap_or(std::cmp::Ordering::Equal)
                             })
                             .then_with(|| a.1.cmp(&b.1))
                     })
                     .unwrap_or(0);
                 let candidate = decode_candidates.remove(next_index);
                 let next_service = simulated_service
-                    .get(&candidate.8)
+                    .get(&candidate.7)
                     .copied()
                     .unwrap_or_default()
                     .saturating_add(1);
-                simulated_service.insert(candidate.8, next_service);
+                simulated_service.insert(candidate.7, next_service);
                 fair_order.push(candidate);
             }
             decode_candidates = fair_order;
@@ -750,13 +1167,12 @@ impl Scheduler {
             .filter_map(|request_id| self.requests.get(request_id).map(|m| m.priority))
             .max();
         let effective_prefill_chunk_threshold =
-            self.effective_prefill_chunk_threshold(kv_utilization, has_decode_demand);
+            self.effective_prefill_chunk_threshold(has_decode_demand);
 
         for (
             request_id,
             sequence_id,
             priority,
-            mut block_ids,
             num_computed,
             remaining_decode_tokens,
             _generated_tokens,
@@ -764,6 +1180,7 @@ impl Scheduler {
             workload_class,
             overdue_ms,
             continuous_decode,
+            preferred_decode_tokens,
         ) in decode_candidates
         {
             if self.config.enable_preemption
@@ -774,6 +1191,9 @@ impl Scheduler {
             if remaining_batch == 0 || remaining_decode_budget == 0 {
                 break;
             }
+            if force_incremental_prefill_service && remaining_batch <= 1 {
+                break;
+            }
             if self.config.policy == SchedulingPolicy::WeightedFair
                 && !self.waiting_members.is_empty()
                 && remaining_batch <= 1
@@ -781,101 +1201,21 @@ impl Scheduler {
                 break;
             }
 
-            let mut num_tokens = self.decode_token_quanta(
+            let num_tokens = self.decode_token_quanta(
                 remaining_decode_budget,
                 remaining_decode_tokens,
                 self.waiting_count() > 0,
-                kv_utilization,
                 overdue_ms,
                 workload_class,
+                preferred_decode_tokens,
+                continuous_decode,
             );
-            if continuous_decode {
-                // Membership can change only between committed model quanta.
-                // Keep each scheduler transaction to one decode token so new
-                // rows may join and finished/cancelled rows may leave promptly.
-                num_tokens = num_tokens.min(1);
-            }
             if num_tokens == 0 {
                 continue;
-            }
-
-            // Decode quanta are opportunistic: if KV pressure cannot satisfy the
-            // selected chunk size, progressively back off before skipping.
-            loop {
-                let total_tokens = num_computed.saturating_add(num_tokens);
-                let blocks_needed = kv_cache.blocks_for_tokens(total_tokens);
-                let additional_blocks = blocks_needed.saturating_sub(block_ids.len());
-
-                if additional_blocks > 0 && !kv_cache.can_allocate(additional_blocks) {
-                    // Try preemption if enabled
-                    if self.config.enable_preemption {
-                        let protected = result.all_request_ids().into_iter().collect();
-                        let preempted = self.try_preempt_for_blocks(
-                            additional_blocks,
-                            priority,
-                            &protected,
-                            kv_cache,
-                        );
-                        if !preempted.is_empty() {
-                            result.preempted_requests.extend(preempted);
-                        }
-                    }
-                }
-
-                if additional_blocks == 0 || kv_cache.can_allocate(additional_blocks) {
-                    break;
-                }
-
-                if num_tokens <= 1 {
-                    num_tokens = 0;
-                    break;
-                }
-                num_tokens = (num_tokens / 2).max(1);
-            }
-            if num_tokens == 0 {
-                continue;
-            }
-
-            let total_tokens = num_computed.saturating_add(num_tokens);
-            let blocks_needed = kv_cache.blocks_for_tokens(total_tokens);
-            let additional_blocks = blocks_needed.saturating_sub(block_ids.len());
-
-            // Check if we need to allocate more blocks
-            if additional_blocks > 0 {
-                if !kv_cache.can_allocate(additional_blocks) {
-                    continue;
-                }
-
-                let extended_blocks = kv_cache.extend(&request_id, additional_blocks);
-                if extended_blocks.len() < additional_blocks {
-                    kv_cache.free(&request_id);
-                    continue;
-                }
-                block_ids.extend(extended_blocks);
-                result.blocks_allocated += additional_blocks;
-            }
-
-            // Shared-prefix blocks must be detached before appending decode tokens.
-            if !block_ids.is_empty() && kv_cache.ensure_writable_last_block(&request_id).is_none() {
-                if self.config.enable_preemption {
-                    let protected = result.all_request_ids().into_iter().collect();
-                    let preempted = self.try_preempt_for_blocks(1, priority, &protected, kv_cache);
-                    if !preempted.is_empty() {
-                        result.preempted_requests.extend(preempted);
-                    }
-                }
-                if kv_cache.ensure_writable_last_block(&request_id).is_none() {
-                    continue;
-                }
-            }
-
-            if let Some(updated_blocks) = kv_cache.get_block_table(&request_id) {
-                block_ids = updated_blocks.to_vec();
             }
 
             if let Some(running) = self.running.get_mut(&request_id) {
                 running.paused = false;
-                running.block_ids = block_ids.clone();
             }
 
             let plan_id = self.next_plan_id;
@@ -886,7 +1226,6 @@ impl Scheduler {
                 sequence_id,
                 num_tokens,
                 is_prefill: false,
-                block_ids,
                 num_computed_tokens: num_computed,
                 work: WorkUnit::SequenceStep {
                     phase: SequencePhase::Decode,
@@ -895,6 +1234,7 @@ impl Scheduler {
                         end: num_computed.saturating_add(num_tokens),
                     },
                     max_output_steps: num_tokens,
+                    auxiliary_state: None,
                 },
             });
 
@@ -904,22 +1244,47 @@ impl Scheduler {
             self.record_class_service(workload_class, num_tokens);
         }
 
+        let served_realtime = result.decode_requests.iter().any(|row| {
+            matches!(
+                &row.work,
+                WorkUnit::RealtimePush { .. }
+                    | WorkUnit::RealtimeFinish { .. }
+                    | WorkUnit::RealtimePreparation { .. }
+                    | WorkUnit::RealtimePromptPrefill { .. }
+                    | WorkUnit::RealtimeDecodeContinuation { .. }
+                    | WorkUnit::RealtimeCompletion { .. }
+            )
+        });
+        let served_ordinary_decode = result.decode_requests.iter().any(|row| {
+            matches!(
+                &row.work,
+                WorkUnit::SequenceStep {
+                    phase: SequencePhase::Decode,
+                    ..
+                }
+            )
+        });
+        if !ordinary_decode_ready || served_ordinary_decode {
+            self.realtime_only_steps_with_ready_decode = 0;
+        } else if served_realtime {
+            self.realtime_only_steps_with_ready_decode =
+                self.realtime_only_steps_with_ready_decode.saturating_add(1);
+        }
+
         // Phase 2: schedule prefill requests.
-        let mut remaining_prefill_budget = if self.config.enable_adaptive_batching
-            || self.config.policy == SchedulingPolicy::WeightedFair
-        {
-            reserved_prefill_budget.saturating_add(remaining_decode_budget)
-        } else {
-            remaining_decode_budget
-        };
-        let prefill_admission_cap = if has_decode_demand && kv_utilization > 0.90 {
-            1
-        } else if has_decode_demand && kv_utilization > 0.80 {
-            2
-        } else {
-            usize::MAX
-        };
+        let mut remaining_prefill_budget =
+            if force_full_prefill_service || force_incremental_prefill_service {
+                reserved_prefill_budget
+            } else if self.config.enable_adaptive_batching
+                || self.config.policy == SchedulingPolicy::WeightedFair
+            {
+                reserved_prefill_budget.saturating_add(remaining_decode_budget)
+            } else {
+                remaining_decode_budget
+            };
+        let prefill_admission_cap = usize::MAX;
         let mut prefill_admissions = 0usize;
+        let mut scheduling_full_prefill_batch = false;
 
         // Phase 2a: continue incomplete prefills before admitting new waiting requests.
         // An in-flight quantum is excluded until update_after_step commits its
@@ -927,11 +1292,8 @@ impl Scheduler {
         let mut incomplete_prefill_candidates: Vec<_> = self
             .running
             .iter()
-            .filter(|(_, r)| !r.prefill_complete && !r.prefill_in_flight && !r.preemption_pending)
+            .filter(|(_, r)| !r.prefill_complete && !r.prefill_in_flight)
             .filter_map(|(id, r)| {
-                if r.preemption_defer_generation == Some(schedule_generation) {
-                    return None;
-                }
                 let metadata = self.requests.get(id)?;
                 if metadata
                     .retry_not_before
@@ -949,7 +1311,7 @@ impl Scheduler {
             .collect();
         incomplete_prefill_candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.3.cmp(&b.3)));
 
-        for (request_id, priority, sequence_id, num_computed) in incomplete_prefill_candidates {
+        for (request_id, _priority, sequence_id, num_computed) in incomplete_prefill_candidates {
             if remaining_batch == 0 || remaining_prefill_budget == 0 {
                 break;
             }
@@ -970,6 +1332,15 @@ impl Scheduler {
             }
 
             let full_prefill = metadata.cache_policy.prefill == PrefillMode::Full;
+            if force_full_prefill_service && !full_prefill {
+                continue;
+            }
+            if force_incremental_prefill_service && full_prefill {
+                continue;
+            }
+            if !full_prefill && scheduling_full_prefill_batch {
+                continue;
+            }
             let mut target_tokens = remaining_prompt;
             if !full_prefill
                 && self.config.enable_chunked_prefill
@@ -978,9 +1349,12 @@ impl Scheduler {
                 target_tokens = effective_prefill_chunk_threshold;
             }
             if full_prefill {
-                if target_tokens > remaining_prefill_budget && result.has_execution_work() {
+                if !result.decode_requests.is_empty()
+                    || (!result.prefill_requests.is_empty() && !scheduling_full_prefill_batch)
+                {
                     continue;
                 }
+                scheduling_full_prefill_batch = true;
             } else {
                 target_tokens = target_tokens.min(remaining_prefill_budget);
             }
@@ -988,113 +1362,13 @@ impl Scheduler {
                 continue;
             }
 
-            let existing_blocks = self
-                .running
-                .get(&request_id)
-                .map(|r| r.block_ids.len())
-                .unwrap_or(0);
             let original_target_tokens = target_tokens;
-            let mut num_tokens = target_tokens;
-            let mut selected_blocks = None;
-            let mut fresh_allocated_blocks = 0usize;
-
-            while num_tokens > 0 {
-                let total_tokens_after = num_computed.saturating_add(num_tokens);
-                let plan = self.prefill_allocation_plan(
-                    kv_cache,
-                    &metadata.prompt_prefix_tokens,
-                    total_tokens_after,
-                    existing_blocks,
-                    self.pending_releases.is_empty()
-                        && metadata.cache_policy.allows_external_prefix_reuse(),
-                );
-
-                if plan.additional_blocks > 0 && !kv_cache.can_allocate(plan.additional_blocks) {
-                    if self.config.enable_preemption {
-                        let protected = result.all_request_ids().into_iter().collect();
-                        let preempted = self.try_preempt_for_blocks(
-                            plan.additional_blocks,
-                            priority,
-                            &protected,
-                            kv_cache,
-                        );
-                        if !preempted.is_empty() {
-                            result.preempted_requests.extend(preempted);
-                        }
-                    }
-                }
-
-                if plan.additional_blocks > 0 && !kv_cache.can_allocate(plan.additional_blocks) {
-                    if !full_prefill && self.should_backoff_prefill_chunk(num_tokens) {
-                        num_tokens = Self::halve_prefill_chunk(num_tokens);
-                        continue;
-                    }
-                    break;
-                }
-
-                let (block_ids, fresh_blocks) = if existing_blocks == 0 {
-                    let block_ids = if self.pending_releases.is_empty()
-                        && self.config.enable_prefix_caching
-                        && metadata.cache_policy.allows_external_prefix_reuse()
-                    {
-                        kv_cache.allocate_with_prefix_tokens(
-                            &request_id,
-                            plan.total_blocks_needed,
-                            &metadata.prompt_prefix_tokens,
-                        )
-                    } else {
-                        kv_cache.allocate(&request_id, plan.total_blocks_needed)
-                    };
-                    if block_ids.len() < plan.total_blocks_needed {
-                        kv_cache.free(&request_id);
-                        if !full_prefill && self.should_backoff_prefill_chunk(num_tokens) {
-                            num_tokens = Self::halve_prefill_chunk(num_tokens);
-                            continue;
-                        }
-                        break;
-                    }
-                    (
-                        block_ids,
-                        plan.total_blocks_needed
-                            .saturating_sub(plan.reusable_blocks),
-                    )
-                } else {
-                    if plan.additional_blocks > 0 {
-                        let extended_blocks = kv_cache.extend(&request_id, plan.additional_blocks);
-                        if extended_blocks.len() < plan.additional_blocks {
-                            kv_cache.free(&request_id);
-                            if !full_prefill && self.should_backoff_prefill_chunk(num_tokens) {
-                                num_tokens = Self::halve_prefill_chunk(num_tokens);
-                                continue;
-                            }
-                            break;
-                        }
-                    }
-                    (
-                        kv_cache
-                            .get_block_table(&request_id)
-                            .map(|ids| ids.to_vec())
-                            .unwrap_or_default(),
-                        plan.additional_blocks,
-                    )
-                };
-
-                selected_blocks = Some(block_ids);
-                fresh_allocated_blocks = fresh_blocks;
-                break;
-            }
-
-            let Some(block_ids) = selected_blocks else {
-                self.record_prefill_backoff(original_target_tokens, 0);
-                continue;
-            };
+            let num_tokens = target_tokens;
             self.record_prefill_backoff(original_target_tokens, num_tokens);
 
             if let Some(running) = self.running.get_mut(&request_id) {
                 running.prefill_in_flight = true;
                 running.paused = false;
-                running.preemption_defer_generation = None;
-                running.block_ids = block_ids.clone();
             }
 
             let plan_id = self.next_plan_id;
@@ -1105,7 +1379,6 @@ impl Scheduler {
                 sequence_id,
                 num_tokens,
                 is_prefill: true,
-                block_ids,
                 num_computed_tokens: num_computed,
                 work: WorkUnit::SequenceStep {
                     phase: SequencePhase::Prefill,
@@ -1114,12 +1387,16 @@ impl Scheduler {
                         end: num_computed.saturating_add(num_tokens),
                     },
                     max_output_steps: num_tokens.max(1),
+                    auxiliary_state: None,
                 },
             });
 
-            result.blocks_allocated += fresh_allocated_blocks;
-            remaining_prefill_budget = remaining_prefill_budget.saturating_sub(num_tokens);
-            remaining_batch -= 1;
+            if full_prefill {
+                remaining_batch -= 1;
+            } else {
+                remaining_prefill_budget = remaining_prefill_budget.saturating_sub(num_tokens);
+                remaining_batch -= 1;
+            }
             result.total_tokens += num_tokens;
             self.record_class_service(metadata.workload_class, num_tokens);
         }
@@ -1151,6 +1428,18 @@ impl Scheduler {
 
             // Calculate tokens for this prefill.
             let full_prefill = metadata.cache_policy.prefill == PrefillMode::Full;
+            if force_full_prefill_service && !full_prefill {
+                deferred_waiting.push(request_id);
+                continue;
+            }
+            if force_incremental_prefill_service && full_prefill {
+                deferred_waiting.push(request_id);
+                continue;
+            }
+            if !full_prefill && scheduling_full_prefill_batch {
+                deferred_waiting.push(request_id);
+                continue;
+            }
             let mut target_tokens = metadata.total_prompt_tokens;
 
             // Apply chunked prefill if enabled and prompt is long
@@ -1162,12 +1451,15 @@ impl Scheduler {
             }
 
             // Full-prefill executors cannot honor a scheduler chunk. Permit one
-            // indivisible over-budget prompt only in an otherwise empty step.
+            // indivisible prompt only in an otherwise empty transaction.
             if full_prefill {
-                if target_tokens > remaining_prefill_budget && result.has_execution_work() {
+                if !result.decode_requests.is_empty()
+                    || (!result.prefill_requests.is_empty() && !scheduling_full_prefill_batch)
+                {
                     deferred_waiting.push(request_id);
                     continue;
                 }
+                scheduling_full_prefill_batch = true;
             } else {
                 target_tokens = target_tokens.min(remaining_prefill_budget);
             }
@@ -1176,76 +1468,7 @@ impl Scheduler {
             }
 
             let original_target_tokens = target_tokens;
-            let mut num_tokens = target_tokens;
-            let mut selected = None;
-            let mut fresh_allocated_blocks = 0usize;
-
-            while num_tokens > 0 {
-                let plan = self.prefill_allocation_plan(
-                    kv_cache,
-                    &metadata.prompt_prefix_tokens,
-                    num_tokens,
-                    0,
-                    self.pending_releases.is_empty()
-                        && metadata.cache_policy.allows_external_prefix_reuse(),
-                );
-
-                if plan.additional_blocks > 0 && !kv_cache.can_allocate(plan.additional_blocks) {
-                    if self.config.enable_preemption {
-                        let preempted = self.try_preempt_for_blocks(
-                            plan.additional_blocks,
-                            metadata.priority,
-                            &result.all_request_ids().into_iter().collect(),
-                            kv_cache,
-                        );
-                        if !preempted.is_empty() {
-                            result.preempted_requests.extend(preempted);
-                        }
-                    }
-                }
-
-                if plan.additional_blocks > 0 && !kv_cache.can_allocate(plan.additional_blocks) {
-                    if !full_prefill && self.should_backoff_prefill_chunk(num_tokens) {
-                        num_tokens = Self::halve_prefill_chunk(num_tokens);
-                        continue;
-                    }
-                    break;
-                }
-
-                let block_ids = if self.pending_releases.is_empty()
-                    && self.config.enable_prefix_caching
-                    && metadata.cache_policy.allows_external_prefix_reuse()
-                {
-                    kv_cache.allocate_with_prefix_tokens(
-                        &request_id,
-                        plan.total_blocks_needed,
-                        &metadata.prompt_prefix_tokens,
-                    )
-                } else {
-                    kv_cache.allocate(&request_id, plan.total_blocks_needed)
-                };
-                if block_ids.len() < plan.total_blocks_needed {
-                    debug!("Failed to allocate required blocks for {}", request_id);
-                    kv_cache.free(&request_id);
-                    if !full_prefill && self.should_backoff_prefill_chunk(num_tokens) {
-                        num_tokens = Self::halve_prefill_chunk(num_tokens);
-                        continue;
-                    }
-                    break;
-                }
-
-                fresh_allocated_blocks = plan
-                    .total_blocks_needed
-                    .saturating_sub(plan.reusable_blocks);
-                selected = Some(block_ids);
-                break;
-            }
-
-            let Some(block_ids) = selected else {
-                self.record_prefill_backoff(original_target_tokens, 0);
-                deferred_waiting.push(request_id);
-                continue;
-            };
+            let num_tokens = target_tokens;
             self.record_prefill_backoff(original_target_tokens, num_tokens);
 
             // Create running state
@@ -1254,18 +1477,18 @@ impl Scheduler {
                 sequence_id: metadata.sequence_id,
                 num_tokens_processed: 0,
                 num_tokens_generated: 0,
-                block_ids: block_ids.clone(),
                 // Scheduling is not a commit. A failed/retryable prefill must
                 // remain a prefill until update_after_step confirms that the
                 // complete prompt was actually consumed.
                 prefill_complete: false,
                 prefill_in_flight: true,
+                finalize_pending: false,
+                finalize_in_flight: false,
+                incremental_prefill_quanta_committed: 0,
                 priority: metadata.priority,
                 workload_class: metadata.workload_class,
                 first_token_emitted: false,
                 paused: false,
-                preemption_pending: false,
-                preemption_defer_generation: None,
             };
 
             let plan_id = self.next_plan_id;
@@ -1276,7 +1499,6 @@ impl Scheduler {
                 sequence_id: metadata.sequence_id,
                 num_tokens,
                 is_prefill: true,
-                block_ids,
                 num_computed_tokens: 0,
                 work: WorkUnit::SequenceStep {
                     phase: SequencePhase::Prefill,
@@ -1285,14 +1507,18 @@ impl Scheduler {
                         end: num_tokens,
                     },
                     max_output_steps: num_tokens.max(1),
+                    auxiliary_state: None,
                 },
             });
 
             self.running.insert(request_id.clone(), running);
 
-            result.blocks_allocated += fresh_allocated_blocks;
-            remaining_prefill_budget = remaining_prefill_budget.saturating_sub(num_tokens);
-            remaining_batch -= 1;
+            if full_prefill {
+                remaining_batch -= 1;
+            } else {
+                remaining_prefill_budget = remaining_prefill_budget.saturating_sub(num_tokens);
+                remaining_batch -= 1;
+            }
             prefill_admissions = prefill_admissions.saturating_add(1);
             result.total_tokens += num_tokens;
             self.record_class_service(metadata.workload_class, num_tokens);
@@ -1300,31 +1526,6 @@ impl Scheduler {
 
         for request_id in deferred_waiting {
             self.enqueue_waiting_request(request_id);
-        }
-
-        if self.config.enable_kv_tiering {
-            let mut hot = HashSet::new();
-            for req in result
-                .decode_requests
-                .iter()
-                .chain(result.prefill_requests.iter())
-            {
-                hot.insert(req.request_id.clone());
-            }
-            for request_id in self.running.keys() {
-                let physical = self
-                    .requests
-                    .get(request_id)
-                    .is_some_and(|metadata| metadata.cache_policy.has_external_physical_cache());
-                if !physical {
-                    continue;
-                }
-                if hot.contains(request_id) {
-                    kv_cache.set_request_residency(request_id, CacheResidency::Gpu);
-                } else {
-                    kv_cache.set_request_residency(request_id, CacheResidency::Cpu);
-                }
-            }
         }
 
         result
@@ -1336,7 +1537,6 @@ impl Scheduler {
         request_id: &RequestId,
         tokens_processed: usize,
         tokens_generated: usize,
-        new_block_ids: Vec<BlockId>,
         step_time_ms: f64,
     ) {
         if tokens_processed > 0 || tokens_generated > 0 {
@@ -1344,12 +1544,26 @@ impl Scheduler {
                 metadata.retry_not_before = None;
             }
         }
+        let incremental_prefill = self
+            .requests
+            .get(request_id)
+            .is_some_and(|metadata| metadata.cache_policy.prefill == PrefillMode::Incremental);
         if let Some(running) = self.running.get_mut(request_id) {
+            let committed_incremental_prefill =
+                incremental_prefill && !running.prefill_complete && tokens_processed > 0;
             running.prefill_in_flight = false;
             running.paused = false;
             running.num_tokens_processed += tokens_processed;
             running.num_tokens_generated += tokens_generated;
-            running.block_ids.extend(new_block_ids);
+            if committed_incremental_prefill {
+                running.incremental_prefill_quanta_committed = running
+                    .incremental_prefill_quanta_committed
+                    .saturating_add(1);
+                crate::engine::metrics::record_engine_incremental_prefill_commit(
+                    tokens_processed,
+                    running.incremental_prefill_quanta_committed == 2,
+                );
+            }
 
             // Check if prefill is now complete
             if let Some(metadata) = self.requests.get(request_id) {
@@ -1376,8 +1590,326 @@ impl Scheduler {
         self.update_dynamic_budget();
     }
 
+    /// Move one committed retained sequence onto its load-sealed finalization
+    /// stage. This is deliberately independent of generated-token capacity:
+    /// the final decoder frame may consume the request's last output token.
+    pub fn request_sequence_finalize(
+        &mut self,
+        request_id: &RequestId,
+    ) -> crate::error::Result<()> {
+        let running = self.running.get_mut(request_id).ok_or_else(|| {
+            crate::error::Error::InferenceError(
+                "cannot finalize a request that is not running".into(),
+            )
+        })?;
+        if !running.prefill_complete || running.prefill_in_flight {
+            return Err(crate::error::Error::InferenceError(
+                "cannot finalize a sequence before committed prefill".into(),
+            ));
+        }
+        running.finalize_pending = true;
+        running.finalize_in_flight = false;
+        running.paused = false;
+        Ok(())
+    }
+
+    pub(crate) fn prepare_realtime_stage_outcome(
+        &self,
+        session: &SessionKey,
+        outcome: RealtimeStageOutcome,
+    ) -> crate::error::Result<PreparedRealtimeStageOutcome> {
+        let state = self
+            .realtime_sessions
+            .get(&session.request_id)
+            .ok_or_else(|| {
+                crate::error::Error::InferenceError("committed realtime session is missing".into())
+            })?;
+        let head = state.pending.front().ok_or_else(|| {
+            crate::error::Error::InferenceError(
+                "committed realtime operation queue is empty".into(),
+            )
+        })?;
+        if state.sequence_id != session.epoch
+            || state.in_flight
+                != Some(RealtimeInFlight {
+                    plan_id: outcome.plan_id,
+                    operation_id: outcome.operation_id,
+                    subphase: outcome.completed,
+                })
+            || head.id != outcome.operation_id
+            || head.phase != outcome.completed
+        {
+            return Err(crate::error::Error::InferenceError(
+                "realtime operation commit crossed its FIFO session fence".into(),
+            ));
+        }
+        let transition_valid = matches!(
+            (head.phase, outcome.next),
+            (
+                RealtimeSubphase::Preparation,
+                Some(
+                    RealtimeSubphase::PromptPrefill { .. }
+                        | RealtimeSubphase::DecodeContinuation
+                        | RealtimeSubphase::Completion
+                )
+            ) | (
+                RealtimeSubphase::PromptPrefill { .. },
+                Some(RealtimeSubphase::DecodeContinuation | RealtimeSubphase::Completion)
+            ) | (
+                RealtimeSubphase::DecodeContinuation,
+                Some(RealtimeSubphase::DecodeContinuation | RealtimeSubphase::Completion)
+            ) | (RealtimeSubphase::Completion, None)
+        ) || (outcome.next.is_none()
+            && !matches!(head.phase, RealtimeSubphase::Completion));
+        if !transition_valid {
+            return Err(crate::error::Error::InferenceError(
+                "realtime stage outcome requested an invalid subphase transition".into(),
+            ));
+        }
+        if matches!(
+            head.phase,
+            RealtimeSubphase::Preparation | RealtimeSubphase::Completion
+        ) && (outcome.output_steps != 0 || outcome.cache_append != 0)
+        {
+            return Err(crate::error::Error::InferenceError(
+                "realtime preparation/completion cannot report decoder progress".into(),
+            ));
+        }
+        match head.phase {
+            RealtimeSubphase::PromptPrefill { cache_append }
+                if cache_append == 0
+                    || outcome.cache_append != cache_append
+                    || outcome.output_steps != 1 =>
+            {
+                return Err(crate::error::Error::InferenceError(
+                    "realtime prompt prefill did not append its exact KV span".into(),
+                ));
+            }
+            RealtimeSubphase::DecodeContinuation
+                if outcome.cache_append != 1 || outcome.output_steps != 1 =>
+            {
+                return Err(crate::error::Error::InferenceError(
+                    "realtime decode continuation must append exactly one KV token".into(),
+                ));
+            }
+            _ => {}
+        }
+        if outcome.output_steps > head.remaining_output_steps
+            || outcome.output_steps
+                > usize::from(matches!(
+                    head.phase,
+                    RealtimeSubphase::PromptPrefill { .. } | RealtimeSubphase::DecodeContinuation
+                ))
+        {
+            return Err(crate::error::Error::InferenceError(
+                "realtime stage exceeded its remaining output-step bound".into(),
+            ));
+        }
+        let committed_cache_append = head
+            .committed_cache_append
+            .checked_add(outcome.cache_append)
+            .ok_or_else(|| {
+                crate::error::Error::InferenceError("realtime KV append clock overflow".into())
+            })?;
+        if committed_cache_append > head.max_cache_append() {
+            return Err(crate::error::Error::InferenceError(
+                "realtime stage exceeded its operation KV append ceiling".into(),
+            ));
+        }
+        if let Some(RealtimeSubphase::PromptPrefill { cache_append }) = outcome.next {
+            if cache_append == 0
+                || committed_cache_append
+                    .checked_add(cache_append)
+                    .is_none_or(|total| total > head.max_cache_append())
+            {
+                return Err(crate::error::Error::InferenceError(
+                    "realtime prompt prefill exceeds its operation KV append ceiling".into(),
+                ));
+            }
+        }
+        let remaining_output_steps = head.remaining_output_steps - outcome.output_steps;
+        if outcome.next.is_some()
+            && remaining_output_steps == 0
+            && !matches!(outcome.next, Some(RealtimeSubphase::Completion))
+        {
+            return Err(crate::error::Error::InferenceError(
+                "realtime stage cannot continue after exhausting its output-step bound".into(),
+            ));
+        }
+
+        let final_stage = outcome.next.is_none();
+        if !final_stage && outcome.input_consumed != 0 {
+            return Err(crate::error::Error::InferenceError(
+                "intermediate realtime stages cannot commit source input".into(),
+            ));
+        }
+        if final_stage {
+            match head.external {
+                RealtimeExternalOperation::Push { input, .. } => {
+                    if input.start != state.committed_input_samples
+                        || outcome.input_consumed != input.len()
+                    {
+                        return Err(crate::error::Error::InferenceError(
+                            "realtime push completion did not consume its exact sample interval"
+                                .into(),
+                        ));
+                    }
+                }
+                RealtimeExternalOperation::Finish { .. } if outcome.input_consumed != 0 => {
+                    return Err(crate::error::Error::InferenceError(
+                        "realtime finish cannot consume source samples".into(),
+                    ));
+                }
+                RealtimeExternalOperation::Finish { .. } => {}
+            }
+        }
+        let committed_input_samples = if final_stage {
+            match head.external {
+                RealtimeExternalOperation::Push { input, .. } => input.end,
+                RealtimeExternalOperation::Finish { .. } => state.committed_input_samples,
+            }
+        } else {
+            state.committed_input_samples
+        };
+        let committed_decode_steps = state
+            .committed_decode_steps
+            .checked_add(outcome.output_steps)
+            .ok_or_else(|| {
+                crate::error::Error::InferenceError(
+                    "realtime retained decode clock overflow".into(),
+                )
+            })?;
+        Ok(PreparedRealtimeStageOutcome {
+            session_epoch: session.epoch,
+            outcome,
+            remaining_output_steps,
+            committed_cache_append,
+            committed_input_samples,
+            committed_decode_steps,
+            final_stage,
+        })
+    }
+
+    /// Publishes a previously prepared transition. All validation and checked
+    /// arithmetic happened in `prepare_realtime_stage_outcome`; violating the
+    /// serialized prepare/publish boundary is an engine invariant failure.
+    pub(crate) fn publish_prepared_realtime_stage_outcome(
+        &mut self,
+        session: &SessionKey,
+        prepared: PreparedRealtimeStageOutcome,
+    ) {
+        assert_eq!(session.epoch, prepared.session_epoch);
+        let state = self
+            .realtime_sessions
+            .get_mut(&session.request_id)
+            .expect("prepared realtime session remains present until publication");
+        assert_eq!(state.sequence_id, prepared.session_epoch);
+        assert_eq!(
+            state.in_flight,
+            Some(RealtimeInFlight {
+                plan_id: prepared.outcome.plan_id,
+                operation_id: prepared.outcome.operation_id,
+                subphase: prepared.outcome.completed,
+            })
+        );
+        let head = state
+            .pending
+            .front_mut()
+            .expect("prepared realtime FIFO head remains present until publication");
+        assert_eq!(head.id, prepared.outcome.operation_id);
+        assert_eq!(head.phase, prepared.outcome.completed);
+        head.remaining_output_steps = prepared.remaining_output_steps;
+        head.committed_cache_append = prepared.committed_cache_append;
+        state.committed_decode_steps = prepared.committed_decode_steps;
+        if prepared.final_stage {
+            state.committed_input_samples = prepared.committed_input_samples;
+            state.pending.pop_front();
+        } else {
+            head.phase = prepared
+                .outcome
+                .next
+                .expect("prepared non-final transition has a next phase");
+        }
+        state.in_flight = None;
+    }
+
+    pub(crate) fn commit_realtime_stage_outcome(
+        &mut self,
+        session: &SessionKey,
+        outcome: RealtimeStageOutcome,
+    ) -> crate::error::Result<()> {
+        let prepared = self.prepare_realtime_stage_outcome(session, outcome)?;
+        self.publish_prepared_realtime_stage_outcome(session, prepared);
+        Ok(())
+    }
+
+    pub(crate) fn release_realtime_operation_for_retry(
+        &mut self,
+        session: &SessionKey,
+        plan_id: PlanId,
+        operation_id: RealtimeOperationId,
+        subphase: RealtimeSubphase,
+    ) -> bool {
+        let Some(state) = self.realtime_sessions.get_mut(&session.request_id) else {
+            return false;
+        };
+        if state.sequence_id != session.epoch
+            || state.in_flight
+                != Some(RealtimeInFlight {
+                    plan_id,
+                    operation_id,
+                    subphase,
+                })
+            || state.pending.front().map(|operation| operation.id) != Some(operation_id)
+            || state.pending.front().map(|operation| operation.phase) != Some(subphase)
+        {
+            return false;
+        }
+        state.in_flight = None;
+        true
+    }
+
+    /// Advance starvation debt once per successfully committed physical
+    /// transaction. Scheduler polling, retry deferral, and rolled-back model
+    /// work must not mutate this service clock.
+    pub(crate) fn record_committed_batch_service(
+        &mut self,
+        committed_requests: &[RequestId],
+        decode_transaction: bool,
+    ) {
+        if committed_requests.is_empty() {
+            return;
+        }
+        let served_full_prefill = !decode_transaction
+            && committed_requests.iter().any(|request_id| {
+                self.requests
+                    .get(request_id)
+                    .is_some_and(|metadata| metadata.cache_policy.prefill == PrefillMode::Full)
+            });
+        let served_incremental_prefill = !decode_transaction
+            && committed_requests.iter().any(|request_id| {
+                self.requests.get(request_id).is_some_and(|metadata| {
+                    metadata.cache_policy.prefill == PrefillMode::Incremental
+                })
+            });
+        if served_full_prefill || !self.has_pending_full_prefill() {
+            self.decode_only_steps_with_waiting_full_prefill = 0;
+        } else if decode_transaction {
+            self.decode_only_steps_with_waiting_full_prefill = self
+                .decode_only_steps_with_waiting_full_prefill
+                .saturating_add(1);
+        }
+        if served_incremental_prefill || !self.has_pending_incremental_prefill() {
+            self.decode_only_steps_with_waiting_incremental_prefill = 0;
+        } else if decode_transaction {
+            self.decode_only_steps_with_waiting_incremental_prefill = self
+                .decode_only_steps_with_waiting_incremental_prefill
+                .saturating_add(1);
+        }
+    }
+
     /// Release an uncommitted prefill quantum so the exact request session can
-    /// retry it without changing committed scheduler or logical-cache state.
+    /// retry it without changing committed scheduler progress.
     pub fn release_execution_quantum_for_retry(&mut self, session: &SessionKey) -> bool {
         let Some(metadata) = self.requests.get(&session.request_id) else {
             return false;
@@ -1394,7 +1926,34 @@ impl Scheduler {
         }
 
         running.prefill_in_flight = false;
+        running.finalize_in_flight = false;
         running.prefill_complete = running.num_tokens_processed >= metadata.total_prompt_tokens;
+        true
+    }
+
+    /// Remove service charged when a scheduled quantum never reached
+    /// execution. The engine calls this exactly once while removing the
+    /// corresponding active plan, so capacity retries cannot lose weighted
+    /// fair-share merely by being selected.
+    pub(crate) fn refund_unexecuted_service(
+        &mut self,
+        session: &SessionKey,
+        scheduled_tokens: usize,
+    ) -> bool {
+        if self.config.policy != SchedulingPolicy::WeightedFair {
+            return true;
+        }
+        let Some(metadata) = self.requests.get(&session.request_id) else {
+            return false;
+        };
+        if metadata.sequence_id != session.epoch {
+            return false;
+        }
+        let service = self
+            .class_service
+            .entry(metadata.workload_class)
+            .or_default();
+        *service = service.saturating_sub(scheduled_tokens.max(1) as u64);
         true
     }
 
@@ -1414,7 +1973,7 @@ impl Scheduler {
         let Some(running) = self.running.get_mut(&session.request_id) else {
             return false;
         };
-        if running.sequence_id != session.epoch || running.preemption_pending {
+        if running.sequence_id != session.epoch {
             return false;
         }
         running.prefill_in_flight = false;
@@ -1424,11 +1983,7 @@ impl Scheduler {
 
     /// Restart an exact running request incarnation from prefill after an
     /// executor reports that its session must be recomputed.
-    pub fn restart_request_for_recompute(
-        &mut self,
-        session: &SessionKey,
-        kv_cache: &mut KVCacheManager,
-    ) -> bool {
+    pub fn restart_request_for_recompute(&mut self, session: &SessionKey) -> bool {
         let Some(metadata) = self.requests.get(&session.request_id) else {
             return false;
         };
@@ -1443,35 +1998,63 @@ impl Scheduler {
             return false;
         }
 
-        kv_cache.free(&session.request_id);
-        running.block_ids.clear();
         running.num_tokens_processed = 0;
+        running.incremental_prefill_quanta_committed = 0;
         running.num_tokens_generated = 0;
         running.prefill_complete = false;
         running.prefill_in_flight = false;
+        running.finalize_pending = false;
+        running.finalize_in_flight = false;
         running.first_token_emitted = false;
         running.paused = true;
         true
     }
 
-    /// Mark a request as finished and remove it.
-    pub fn finish_request(&mut self, request_id: &RequestId, kv_cache: &mut KVCacheManager) {
-        self.remove_from_waiting(request_id);
-        if let Some(running) = self.running.remove(request_id) {
-            // Free KV cache blocks
-            kv_cache.free(&running.request_id);
-            debug!(
-                "Finished request {}, freed {} blocks",
-                request_id,
-                running.block_ids.len()
-            );
+    /// Select the cheapest lower-priority capacity owner that can be replayed
+    /// without changing client-visible output. Once a token has been emitted,
+    /// generated-token history would be required for lossless recomputation;
+    /// those sessions therefore remain protected.
+    pub(crate) fn capacity_preemption_candidate(
+        &self,
+        candidates: impl IntoIterator<Item = SessionKey>,
+        blocked_priority: Priority,
+    ) -> Option<SessionKey> {
+        if !self.config.enable_preemption {
+            return None;
         }
-        self.requests.remove(request_id);
+        candidates
+            .into_iter()
+            .filter_map(|session| {
+                let metadata = self.requests.get(&session.request_id)?;
+                let running = self.running.get(&session.request_id)?;
+                (metadata.sequence_id == session.epoch
+                    && running.sequence_id == session.epoch
+                    && metadata.priority < blocked_priority
+                    && metadata.cache_policy.recompute_safe
+                    && metadata.cache_policy.cache_release_safe
+                    && !running.first_token_emitted)
+                    .then_some((metadata.priority, running.num_tokens_processed, session))
+            })
+            .min_by(|left, right| {
+                left.0
+                    .cmp(&right.0)
+                    .then_with(|| left.1.cmp(&right.1))
+                    .then_with(|| left.2.request_id.cmp(&right.2.request_id))
+            })
+            .map(|(_, _, session)| session)
     }
 
-    /// Move an exact active session into terminal quarantine without releasing
-    /// its logical cache. The request ID remains fenced until cleanup is
-    /// confirmed and its terminal event has been delivered.
+    /// Mark a request as finished and remove it.
+    pub fn finish_request(&mut self, request_id: &RequestId) {
+        self.remove_from_waiting(request_id);
+        self.running.remove(request_id);
+        self.requests.remove(request_id);
+        self.realtime_sessions.remove(request_id);
+    }
+
+    /// Move an exact active session into terminal quarantine. The request ID
+    /// remains fenced until capability-authoritative cleanup is confirmed and
+    /// its terminal event has been delivered.
     pub(crate) fn begin_terminal_release(
         &mut self,
         session: &SessionKey,
@@ -1506,6 +2089,7 @@ impl Scheduler {
             return BeginTerminalRelease::StaleOrMissing;
         }
         self.requests.remove(&session.request_id);
+        self.realtime_sessions.remove(&session.request_id);
 
         let confirmation_required =
             running.is_some() && metadata.cache_policy.mode != Some(CacheMode::None);
@@ -1526,13 +2110,8 @@ impl Scheduler {
         }
     }
 
-    /// Release logical cache for an exact terminal session only after the core
-    /// has established that physical cleanup is complete or not required.
-    pub(crate) fn confirm_session_release(
-        &mut self,
-        session: &SessionKey,
-        kv_cache: &mut KVCacheManager,
-    ) -> bool {
+    /// Confirm capability-authoritative cleanup for an exact terminal session.
+    pub(crate) fn confirm_session_release(&mut self, session: &SessionKey) -> bool {
         let remove = {
             let Some(pending) = self.pending_releases.get_mut(&session.request_id) else {
                 return false;
@@ -1541,7 +2120,6 @@ impl Scheduler {
                 return false;
             }
             if !pending.cleanup_confirmed {
-                kv_cache.free(&session.request_id);
                 pending.cleanup_confirmed = true;
                 debug!(
                     request_id = %session.request_id,
@@ -1630,24 +2208,14 @@ impl Scheduler {
         })
     }
 
-    pub(crate) fn force_release_all_after_executor_shutdown(
-        &mut self,
-        kv_cache: &mut KVCacheManager,
-    ) {
-        for request_id in self.pending_releases.keys() {
-            kv_cache.free(request_id);
-        }
+    pub(crate) fn force_release_all_after_executor_shutdown(&mut self) {
         self.pending_releases.clear();
     }
 
     /// Compatibility helper retained for scheduler-level tests. Core runtime
     /// paths use the generalized exact-session release protocol above.
-    pub fn confirm_expired_session_cleanup(
-        &mut self,
-        session: &SessionKey,
-        kv_cache: &mut KVCacheManager,
-    ) -> bool {
-        let confirmed = self.confirm_session_release(session, kv_cache);
+    pub fn confirm_expired_session_cleanup(&mut self, session: &SessionKey) -> bool {
+        let confirmed = self.confirm_session_release(session);
         if confirmed {
             self.mark_terminal_delivered(session);
         }
@@ -1667,12 +2235,11 @@ impl Scheduler {
     }
 
     /// Abort a request.
-    pub fn abort_request(&mut self, request_id: &RequestId, kv_cache: &mut KVCacheManager) -> bool {
+    pub fn abort_request(&mut self, request_id: &RequestId) -> bool {
         self.remove_from_waiting(request_id);
 
         // Remove from running
-        if let Some(running) = self.running.remove(request_id) {
-            kv_cache.free(&running.request_id);
+        if self.running.remove(request_id).is_some() {
             self.requests.remove(request_id);
             return true;
         }
@@ -1709,7 +2276,15 @@ impl Scheduler {
 
     /// Check if there's pending work.
     pub fn has_pending_work(&self) -> bool {
-        self.waiting_count() > 0 || self.running_count() > 0
+        self.waiting_count() > 0
+            || self
+                .running
+                .keys()
+                .any(|request_id| !self.realtime_sessions.contains_key(request_id))
+            || self
+                .realtime_sessions
+                .values()
+                .any(|state| state.in_flight.is_some() || !state.pending.is_empty())
     }
 
     /// Get running request info.
@@ -1993,63 +2568,53 @@ impl Scheduler {
         }
     }
 
-    fn should_backoff_prefill_chunk(&self, num_tokens: usize) -> bool {
-        self.config.enable_chunked_prefill && num_tokens > 1
-    }
-
-    fn halve_prefill_chunk(num_tokens: usize) -> usize {
-        num_tokens.saturating_sub(num_tokens / 2)
-    }
-
-    fn prefill_allocation_plan(
-        &self,
-        kv_cache: &KVCacheManager,
-        prompt_tokens: &[u32],
-        total_tokens_after: usize,
-        existing_blocks: usize,
-        allow_prefix_reuse: bool,
-    ) -> PrefillAllocationPlan {
-        let total_blocks_needed = kv_cache.blocks_for_tokens(total_tokens_after);
-        let reusable_blocks =
-            if self.config.enable_prefix_caching && allow_prefix_reuse && existing_blocks == 0 {
-                kv_cache.estimate_prefix_reuse_blocks(prompt_tokens, total_blocks_needed)
-            } else {
-                0
-            };
-        let additional_blocks =
-            total_blocks_needed.saturating_sub(existing_blocks.saturating_add(reusable_blocks));
-        PrefillAllocationPlan {
-            total_blocks_needed,
-            reusable_blocks,
-            additional_blocks,
-        }
-    }
-
     fn decode_token_quanta(
         &self,
         remaining_decode_budget: usize,
         remaining_request_tokens: usize,
         has_waiting_work: bool,
-        kv_utilization: f64,
         overdue_ms: f64,
         workload_class: WorkloadClass,
+        preferred_decode_tokens: usize,
+        continuous_decode: bool,
     ) -> usize {
         let base = remaining_decode_budget.min(remaining_request_tokens).max(1);
-        if !self.config.enable_decode_quanta {
+        let preferred_decode_tokens = preferred_decode_tokens.max(1);
+        if continuous_decode {
+            let exact_solo = self.running.len() == 1
+                && self
+                    .running
+                    .values()
+                    .filter(|request| request.prefill_complete)
+                    .count()
+                    == 1
+                && !has_waiting_work
+                && overdue_ms <= 0.0;
+            if exact_solo && preferred_decode_tokens > 1 {
+                return preferred_decode_tokens.min(base).max(1);
+            }
+            return 1.min(base);
+        }
+        if !self.config.enable_decode_quanta && preferred_decode_tokens == 1 {
             return 1.min(base);
         }
         if workload_class.prefers_single_token_decode() {
             return 1.min(base);
         }
         let active_decode_requests = self.running.values().filter(|r| r.prefill_complete).count();
-        if has_waiting_work || overdue_ms > 0.0 || kv_utilization > 0.80 {
+        if has_waiting_work || overdue_ms > 0.0 {
             return 1.min(base);
         }
         if active_decode_requests > 1 {
             return 1.min(base);
         }
 
-        let mut max_quanta = self.config.max_decode_tokens_per_request.max(1).min(base);
+        let mut max_quanta = if preferred_decode_tokens > 1 {
+            preferred_decode_tokens
+        } else {
+            self.config.max_decode_tokens_per_request.max(1)
+        }
+        .min(base);
 
         if self.config.enable_power_adaptive && self.config.power_save_mode {
             max_quanta = max_quanta.min(2);
@@ -2108,6 +2673,69 @@ impl Scheduler {
         })
     }
 
+    fn has_eligible_full_prefill(&self, now: Instant) -> bool {
+        let running_full = self.running.iter().any(|(request_id, running)| {
+            !running.prefill_complete
+                && !running.prefill_in_flight
+                && self.requests.get(request_id).is_some_and(|metadata| {
+                    metadata.cache_policy.prefill == PrefillMode::Full
+                        && metadata.retry_not_before.is_none_or(|retry| retry <= now)
+                })
+        });
+        running_full
+            || self.waiting_members.iter().any(|request_id| {
+                self.requests.get(request_id).is_some_and(|metadata| {
+                    metadata.cache_policy.prefill == PrefillMode::Full
+                        && metadata.retry_not_before.is_none_or(|retry| retry <= now)
+                })
+            })
+    }
+
+    fn has_pending_full_prefill(&self) -> bool {
+        self.running.iter().any(|(request_id, running)| {
+            !running.prefill_complete
+                && self
+                    .requests
+                    .get(request_id)
+                    .is_some_and(|metadata| metadata.cache_policy.prefill == PrefillMode::Full)
+        }) || self.waiting_members.iter().any(|request_id| {
+            self.requests
+                .get(request_id)
+                .is_some_and(|metadata| metadata.cache_policy.prefill == PrefillMode::Full)
+        })
+    }
+
+    fn has_eligible_incremental_prefill(&self, now: Instant) -> bool {
+        let running_incremental = self.running.iter().any(|(request_id, running)| {
+            !running.prefill_complete
+                && !running.prefill_in_flight
+                && self.requests.get(request_id).is_some_and(|metadata| {
+                    metadata.cache_policy.prefill == PrefillMode::Incremental
+                        && metadata.retry_not_before.is_none_or(|retry| retry <= now)
+                })
+        });
+        running_incremental
+            || self.waiting_members.iter().any(|request_id| {
+                self.requests.get(request_id).is_some_and(|metadata| {
+                    metadata.cache_policy.prefill == PrefillMode::Incremental
+                        && metadata.retry_not_before.is_none_or(|retry| retry <= now)
+                })
+            })
+    }
+
+    fn has_pending_incremental_prefill(&self) -> bool {
+        self.running.iter().any(|(request_id, running)| {
+            !running.prefill_complete
+                && self.requests.get(request_id).is_some_and(|metadata| {
+                    metadata.cache_policy.prefill == PrefillMode::Incremental
+                })
+        }) || self.waiting_members.iter().any(|request_id| {
+            self.requests
+                .get(request_id)
+                .is_some_and(|metadata| metadata.cache_policy.prefill == PrefillMode::Incremental)
+        })
+    }
+
     fn refresh_queue_age_sample(&mut self) {
         let (sum_ms, count) = self
             .requests
@@ -2147,11 +2775,7 @@ impl Scheduler {
         }
     }
 
-    fn effective_prefill_chunk_threshold(
-        &self,
-        kv_utilization: f64,
-        has_decode_demand: bool,
-    ) -> usize {
+    fn effective_prefill_chunk_threshold(&self, has_decode_demand: bool) -> usize {
         let base = if self.config.enable_adaptive_batching {
             self.telemetry.dynamic_prefill_chunk_threshold.max(32)
         } else {
@@ -2159,20 +2783,13 @@ impl Scheduler {
         };
         let mut threshold = base;
 
-        // Under memory pressure, shrink prefill chunks to avoid large transient spikes.
-        if kv_utilization > 0.95 {
-            threshold = threshold.min((base / 4).max(32));
-        } else if kv_utilization > 0.85 {
-            threshold = threshold.min((base / 2).max(64));
-        }
-
         // If decode is already active, avoid over-investing in prefill this step.
         if has_decode_demand {
             threshold = threshold.min((base / 2).max(64));
         }
 
-        // Favor throughput for single-request, low-pressure execution.
-        if self.waiting_count() <= 1 && self.running.len() <= 1 && kv_utilization < 0.50 {
+        // Favor throughput for single-request execution.
+        if self.waiting_count() <= 1 && self.running.len() <= 1 {
             threshold = threshold.max(base).min(base.saturating_mul(2));
         }
 
@@ -2263,210 +2880,6 @@ impl Scheduler {
 
         self.telemetry.dynamic_prefill_chunk_threshold = current.max(min_chunk);
     }
-
-    /// Try to preempt running requests to free up the required number of blocks.
-    /// Only preempts requests with lower priority than the requesting priority.
-    /// Returns exact preempted scheduler incarnations.
-    fn try_preempt_for_blocks(
-        &mut self,
-        blocks_needed: usize,
-        requesting_priority: Priority,
-        protected_requests: &HashSet<RequestId>,
-        kv_cache: &mut KVCacheManager,
-    ) -> Vec<SessionKey> {
-        // A prepared victim must be reconciled with the executor before the
-        // scheduler prepares another preemption plan or reuses its blocks.
-        if self
-            .running
-            .values()
-            .any(|running| running.preemption_pending)
-        {
-            return Vec::new();
-        }
-        // Collect candidates for preemption and score them by expected user impact.
-        let mut candidates: Vec<_> =
-            self.running
-                .iter()
-                .filter(|(_, r)| {
-                    r.priority < requesting_priority
-                        && !r.paused
-                        && !r.preemption_pending
-                        && !r.first_token_emitted
-                        && !r.block_ids.is_empty()
-                        && !protected_requests.contains(&r.request_id)
-                        && self.requests.get(&r.request_id).is_some_and(|metadata| {
-                            metadata.cache_policy.allows_recompute_preemption()
-                        })
-                })
-                .map(|(id, r)| {
-                    let (overdue_ms, age_ms, remaining_decode) =
-                        if let Some(metadata) = self.requests.get(id) {
-                            (
-                                self.request_overdue_ms(metadata),
-                                metadata.arrival_time.elapsed().as_secs_f64() * 1000.0,
-                                metadata.max_tokens.saturating_sub(r.num_tokens_generated),
-                            )
-                        } else {
-                            (0.0, 0.0, usize::MAX)
-                        };
-                    (
-                        id.clone(),
-                        r.priority,
-                        kv_cache.reclaimable_blocks(id),
-                        r.num_tokens_generated,
-                        r.first_token_emitted,
-                        overdue_ms,
-                        age_ms,
-                        remaining_decode,
-                    )
-                })
-                .collect();
-        candidates.retain(|candidate| candidate.2 > 0);
-
-        // Order by:
-        // 1) lowest priority first
-        // 2) not overdue first (preserve deadline-sensitive requests)
-        // 3) no user-visible token yet first
-        // 4) least wasted work first
-        // 5) youngest first (fairness guardrail)
-        // 6) most remaining decode first
-        // 7) biggest block footprint first (frees memory faster)
-        candidates.sort_by(|a, b| {
-            a.1.cmp(&b.1)
-                .then_with(|| a.5.partial_cmp(&b.5).unwrap_or(std::cmp::Ordering::Equal))
-                .then_with(|| a.4.cmp(&b.4))
-                .then_with(|| a.3.cmp(&b.3))
-                .then_with(|| a.6.partial_cmp(&b.6).unwrap_or(std::cmp::Ordering::Equal))
-                .then_with(|| b.7.cmp(&a.7))
-                .then_with(|| b.2.cmp(&a.2))
-        });
-
-        let mut selected = Vec::new();
-        let mut reclaimable = 0usize;
-        for candidate in candidates {
-            reclaimable = reclaimable.saturating_add(candidate.2);
-            selected.push(candidate);
-            if reclaimable >= blocks_needed {
-                break;
-            }
-        }
-        if reclaimable < blocks_needed {
-            debug!(
-                "Preemption plan rejected transactionally: reclaimable {} but needed {}",
-                reclaimable, blocks_needed
-            );
-            return Vec::new();
-        }
-
-        let mut preempted = Vec::with_capacity(selected.len());
-        for (request_id, _priority, _reclaimable, ..) in selected {
-            let running_epoch = self
-                .running
-                .get(&request_id)
-                .map(|running| running.sequence_id)
-                .expect("selected preemption victim must still be running");
-            if let Some(running) = self.running.get_mut(&request_id) {
-                running.prefill_in_flight = false;
-                running.paused = true;
-                running.preemption_pending = true;
-            }
-            preempted.push(SessionKey::new(request_id, running_epoch));
-        }
-        preempted
-    }
-
-    /// Commit a prepared preemption only after executor cleanup confirms that
-    /// the exact session no longer owns physical cache state.
-    pub(crate) fn confirm_preemption(
-        &mut self,
-        session: &SessionKey,
-        kv_cache: &mut KVCacheManager,
-    ) -> bool {
-        let Some(metadata) = self.requests.get_mut(&session.request_id) else {
-            return false;
-        };
-        if metadata.sequence_id != session.epoch {
-            return false;
-        }
-        let Some(running) = self.running.get_mut(&session.request_id) else {
-            return false;
-        };
-        if running.sequence_id != session.epoch || !running.preemption_pending {
-            return false;
-        }
-
-        let freed = kv_cache.free_for_preemption(&session.request_id);
-        debug_assert!(freed > 0, "confirmed preemption reclaimed no blocks");
-        running.block_ids.clear();
-        running.num_tokens_processed = 0;
-        running.num_tokens_generated = 0;
-        running.prefill_complete = false;
-        running.prefill_in_flight = false;
-        running.first_token_emitted = false;
-        running.paused = true;
-        running.preemption_pending = false;
-        running.preemption_defer_generation = Some(self.schedule_generation.wrapping_add(1));
-        metadata.retry_not_before = None;
-        true
-    }
-
-    /// Fail closed after the executor has already confirmed physical cleanup
-    /// but the scheduler can no longer commit the prepared preemption.
-    ///
-    /// The exact session is terminally quarantined with logical cache released
-    /// and its public ID fenced until the outer terminal event is delivered.
-    /// This path intentionally does not resume the victim: its physical cache
-    /// no longer exists.
-    pub(crate) fn quarantine_rejected_confirmed_preemption(
-        &mut self,
-        session: &SessionKey,
-        kv_cache: &mut KVCacheManager,
-    ) -> bool {
-        if let Some(pending) = self.pending_releases.get(&session.request_id) {
-            return pending.session == *session;
-        }
-        if self
-            .requests
-            .get(&session.request_id)
-            .is_some_and(|metadata| metadata.sequence_id != session.epoch)
-        {
-            return false;
-        }
-        let owns_pending_preemption =
-            self.running
-                .get(&session.request_id)
-                .is_some_and(|running| {
-                    running.sequence_id == session.epoch && running.preemption_pending
-                });
-        if !owns_pending_preemption {
-            return false;
-        }
-
-        self.remove_from_waiting(&session.request_id);
-        self.running.remove(&session.request_id);
-        self.requests.remove(&session.request_id);
-        kv_cache.free(&session.request_id);
-        self.pending_releases.insert(
-            session.request_id.clone(),
-            PendingRelease {
-                session: session.clone(),
-                cause: TerminalReleaseCause::PreemptionCommitRejected,
-                confirmation_required: false,
-                cleanup_confirmed: true,
-                terminal_delivered: false,
-                cleanup_attempts: 0,
-                retry_at: Instant::now(),
-            },
-        );
-        true
-    }
-
-    pub(crate) fn quarantine_failed_preemption(&mut self, session: &SessionKey) -> bool {
-        matches!(
-            self.begin_terminal_release(session, TerminalReleaseCause::PreemptionCleanupFailed),
-            BeginTerminalRelease::Started { .. } | BeginTerminalRelease::AlreadyPending { .. }
-        )
-    }
 }
 
 #[cfg(test)]
@@ -2478,24 +2891,17 @@ mod tests {
     use crate::models::shared::chat::{ChatMessage, ChatRole};
     use std::time::Duration;
 
-    fn tiny_preemption_scheduler() -> (Scheduler, KVCacheManager) {
+    fn small_scheduler() -> Scheduler {
         let config = SchedulerConfig {
             max_batch_size: 2,
             max_tokens_per_step: 8,
             min_tokens_per_step: 1,
             policy: SchedulingPolicy::Priority,
             enable_chunked_prefill: false,
-            enable_preemption: true,
             enable_adaptive_batching: false,
             ..Default::default()
         };
-        let scheduler = Scheduler::new(config);
-        let kv_cache = KVCacheManager::new(super::super::kv_cache::KVCacheConfig {
-            max_blocks: 1,
-            block_size: 2,
-            ..Default::default()
-        });
-        (scheduler, kv_cache)
+        Scheduler::new(config)
     }
 
     fn build_request(task_type: TaskType, id: &str, priority: Priority) -> EngineCoreRequest {
@@ -2527,14 +2933,356 @@ mod tests {
             .update_execution_profile(&SessionKey::new(request_id.to_string(), epoch), &profile,));
     }
 
-    fn allow_external_prefix_reuse(scheduler: &mut Scheduler, request_id: &str) {
+    fn allow_external_paged(scheduler: &mut Scheduler, request_id: &str) {
         let epoch = scheduler
             .get_sequence_id(&request_id.to_string())
             .expect("request epoch");
         let mut profile =
             ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
         profile.cache_mode = CacheMode::ExternalPaged;
-        profile.prefix_reuse_safe = true;
+        assert!(scheduler
+            .update_execution_profile(&SessionKey::new(request_id.to_string(), epoch), &profile));
+    }
+
+    #[test]
+    fn realtime_session_preserves_fifo_sample_clock_finish_fence_and_retry_head() {
+        let mut scheduler = small_scheduler();
+        let mut request = build_request(TaskType::ASR, "realtime", Priority::High);
+        request
+            .enable_realtime_asr_ingress()
+            .expect("ASR realtime ingress");
+        assert!(scheduler.add_realtime_session(&request));
+        let session = SessionKey::new(
+            request.id.clone(),
+            scheduler
+                .get_sequence_id(&request.id)
+                .expect("session epoch"),
+        );
+
+        let (first_id, first_input) = scheduler
+            .enqueue_realtime_push(&session, 160, 2, 4)
+            .expect("first push");
+        let (second_id, second_input) = scheduler
+            .enqueue_realtime_push(&session, 80, 1, 3)
+            .expect("second push");
+        let finish_id = scheduler
+            .enqueue_realtime_finish(&session, 4, 5)
+            .expect("finish");
+        assert_eq!(first_input, InputRange::new(0, 160).unwrap());
+        assert_eq!(second_input, InputRange::new(160, 240).unwrap());
+        assert!(scheduler.enqueue_realtime_push(&session, 1, 1, 1).is_err());
+        assert!(scheduler.enqueue_realtime_finish(&session, 1, 1).is_err());
+
+        let first = scheduler.schedule();
+        assert_eq!(first.decode_requests.len(), 1);
+        assert!(matches!(
+            &first.decode_requests[0].work,
+            WorkUnit::RealtimePreparation {
+                operation_id,
+                mode: RealtimePreparationMode::Push,
+                input,
+                retained_state_input,
+                ..
+            } if *operation_id == first_id
+                && *input == first_input
+                && *retained_state_input == InputRange::new(0, 1).unwrap()
+        ));
+        assert!(scheduler.release_realtime_operation_for_retry(
+            &session,
+            first.decode_requests[0].plan_id,
+            first_id,
+            RealtimeSubphase::Preparation,
+        ));
+        let retried = scheduler.schedule();
+        assert!(matches!(
+            &retried.decode_requests[0].work,
+            WorkUnit::RealtimePreparation { operation_id, .. } if *operation_id == first_id
+        ));
+        assert!(!scheduler.release_realtime_operation_for_retry(
+            &session,
+            first.decode_requests[0].plan_id,
+            first_id,
+            RealtimeSubphase::Preparation,
+        ));
+        assert!(scheduler
+            .commit_realtime_stage_outcome(
+                &session,
+                RealtimeStageOutcome {
+                    plan_id: first.decode_requests[0].plan_id,
+                    operation_id: first_id,
+                    completed: RealtimeSubphase::Preparation,
+                    next: Some(RealtimeSubphase::PromptPrefill { cache_append: 2 }),
+                    input_consumed: 0,
+                    output_steps: 0,
+                    cache_append: 0,
+                },
+            )
+            .is_err());
+        assert!(scheduler.schedule().decode_requests.is_empty());
+        let prepared = scheduler
+            .prepare_realtime_stage_outcome(
+                &session,
+                RealtimeStageOutcome {
+                    plan_id: retried.decode_requests[0].plan_id,
+                    operation_id: first_id,
+                    completed: RealtimeSubphase::Preparation,
+                    next: Some(RealtimeSubphase::PromptPrefill { cache_append: 2 }),
+                    input_consumed: 0,
+                    output_steps: 0,
+                    cache_append: 0,
+                },
+            )
+            .expect("prospective preparation transition");
+        assert_eq!(
+            scheduler.realtime_sessions[&session.request_id]
+                .pending
+                .front()
+                .expect("FIFO head")
+                .phase,
+            RealtimeSubphase::Preparation
+        );
+        assert!(scheduler.schedule().decode_requests.is_empty());
+        scheduler.publish_prepared_realtime_stage_outcome(&session, prepared);
+        let prompt = scheduler.schedule();
+        assert!(matches!(
+            &prompt.decode_requests[0].work,
+            WorkUnit::RealtimePromptPrefill {
+                operation_id,
+                cache_append: 2,
+                ..
+            } if *operation_id == first_id
+        ));
+        scheduler
+            .commit_realtime_stage_outcome(
+                &session,
+                RealtimeStageOutcome {
+                    plan_id: prompt.decode_requests[0].plan_id,
+                    operation_id: first_id,
+                    completed: RealtimeSubphase::PromptPrefill { cache_append: 2 },
+                    next: Some(RealtimeSubphase::DecodeContinuation),
+                    input_consumed: 0,
+                    output_steps: 1,
+                    cache_append: 2,
+                },
+            )
+            .expect("prompt transition");
+        let decode = scheduler.schedule();
+        assert!(matches!(
+            &decode.decode_requests[0].work,
+            WorkUnit::RealtimeDecodeContinuation {
+                operation_id,
+                retained_state_input,
+                ..
+            } if *operation_id == first_id
+                && *retained_state_input == InputRange::new(1, 2).unwrap()
+        ));
+        scheduler
+            .commit_realtime_stage_outcome(
+                &session,
+                RealtimeStageOutcome {
+                    plan_id: decode.decode_requests[0].plan_id,
+                    operation_id: first_id,
+                    completed: RealtimeSubphase::DecodeContinuation,
+                    next: None,
+                    input_consumed: first_input.len(),
+                    output_steps: 1,
+                    cache_append: 1,
+                },
+            )
+            .expect("exact first completion");
+
+        let second = scheduler.schedule();
+        assert!(matches!(
+            &second.decode_requests[0].work,
+            WorkUnit::RealtimePreparation { operation_id, .. } if *operation_id == second_id
+        ));
+        assert!(scheduler
+            .commit_realtime_stage_outcome(
+                &session,
+                RealtimeStageOutcome {
+                    plan_id: second.decode_requests[0].plan_id,
+                    operation_id: second_id,
+                    completed: RealtimeSubphase::Preparation,
+                    next: None,
+                    input_consumed: 79,
+                    output_steps: 0,
+                    cache_append: 0,
+                },
+            )
+            .is_err());
+        scheduler
+            .commit_realtime_stage_outcome(
+                &session,
+                RealtimeStageOutcome {
+                    plan_id: second.decode_requests[0].plan_id,
+                    operation_id: second_id,
+                    completed: RealtimeSubphase::Preparation,
+                    next: None,
+                    input_consumed: second_input.len(),
+                    output_steps: 0,
+                    cache_append: 0,
+                },
+            )
+            .expect("exact second commit");
+
+        let finish = scheduler.schedule();
+        assert!(matches!(
+            &finish.decode_requests[0].work,
+            WorkUnit::RealtimePreparation {
+                operation_id,
+                mode: RealtimePreparationMode::Finish,
+                input,
+                ..
+            } if *operation_id == finish_id && input.is_empty()
+        ));
+        scheduler
+            .commit_realtime_stage_outcome(
+                &session,
+                RealtimeStageOutcome {
+                    plan_id: finish.decode_requests[0].plan_id,
+                    operation_id: finish_id,
+                    completed: RealtimeSubphase::Preparation,
+                    next: Some(RealtimeSubphase::Completion),
+                    input_consumed: 0,
+                    output_steps: 0,
+                    cache_append: 0,
+                },
+            )
+            .expect("finish preparation");
+        let completion = scheduler.schedule();
+        assert!(matches!(
+            &completion.decode_requests[0].work,
+            WorkUnit::RealtimeCompletion { operation_id } if *operation_id == finish_id
+        ));
+        scheduler
+            .commit_realtime_stage_outcome(
+                &session,
+                RealtimeStageOutcome {
+                    plan_id: completion.decode_requests[0].plan_id,
+                    operation_id: finish_id,
+                    completed: RealtimeSubphase::Completion,
+                    next: None,
+                    input_consumed: 0,
+                    output_steps: 0,
+                    cache_append: 0,
+                },
+            )
+            .expect("finish commit");
+        assert!(!scheduler.has_pending_work());
+    }
+
+    #[test]
+    fn realtime_width_one_rotates_before_serving_an_older_session_continuation() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 1,
+            max_tokens_per_step: 1,
+            min_tokens_per_step: 1,
+            policy: SchedulingPolicy::Priority,
+            enable_adaptive_batching: false,
+            ..Default::default()
+        });
+        let mut older = build_request(TaskType::ASR, "realtime-older", Priority::High);
+        let mut newer = build_request(TaskType::ASR, "realtime-newer", Priority::High);
+        older
+            .enable_realtime_asr_ingress()
+            .expect("older realtime ingress");
+        newer
+            .enable_realtime_asr_ingress()
+            .expect("newer realtime ingress");
+        assert!(scheduler.add_realtime_session(&older));
+        assert!(scheduler.add_realtime_session(&newer));
+        let older_session = SessionKey::new(
+            older.id.clone(),
+            scheduler.get_sequence_id(&older.id).expect("older epoch"),
+        );
+        let newer_session = SessionKey::new(
+            newer.id.clone(),
+            scheduler.get_sequence_id(&newer.id).expect("newer epoch"),
+        );
+        let (older_operation, _) = scheduler
+            .enqueue_realtime_push(&older_session, 80, 1, 2)
+            .expect("older push");
+        let (newer_operation, _) = scheduler
+            .enqueue_realtime_push(&newer_session, 80, 1, 2)
+            .expect("newer push");
+
+        let first = scheduler.schedule();
+        assert_eq!(first.decode_requests[0].request_id, older.id);
+        scheduler
+            .commit_realtime_stage_outcome(
+                &older_session,
+                RealtimeStageOutcome {
+                    plan_id: first.decode_requests[0].plan_id,
+                    operation_id: older_operation,
+                    completed: RealtimeSubphase::Preparation,
+                    next: Some(RealtimeSubphase::Completion),
+                    input_consumed: 0,
+                    output_steps: 0,
+                    cache_append: 0,
+                },
+            )
+            .expect("older preparation continuation");
+
+        let second = scheduler.schedule();
+        assert_eq!(second.decode_requests.len(), 1);
+        assert_eq!(second.decode_requests[0].request_id, newer.id);
+        assert!(matches!(
+            &second.decode_requests[0].work,
+            WorkUnit::RealtimePreparation { operation_id, .. }
+                if *operation_id == newer_operation
+        ));
+    }
+
+    #[test]
+    fn ready_ordinary_decode_receives_bounded_service_amid_realtime_demand() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 1,
+            max_tokens_per_step: 1,
+            min_tokens_per_step: 1,
+            policy: SchedulingPolicy::Priority,
+            enable_adaptive_batching: false,
+            ..Default::default()
+        });
+        let ordinary = build_request(TaskType::Chat, "ordinary-decode", Priority::Normal);
+        scheduler.add_request(&ordinary);
+        let prefill = scheduler.schedule();
+        assert_eq!(prefill.prefill_requests.len(), 1);
+        scheduler.update_after_step(&ordinary.id, 1, 0, 1.0);
+
+        let mut realtime = build_request(TaskType::ASR, "fair-realtime", Priority::High);
+        realtime
+            .enable_realtime_asr_ingress()
+            .expect("realtime ingress");
+        assert!(scheduler.add_realtime_session(&realtime));
+        let session = SessionKey::new(
+            realtime.id.clone(),
+            scheduler.get_sequence_id(&realtime.id).expect("epoch"),
+        );
+        scheduler
+            .enqueue_realtime_push(&session, 80, 1, 2)
+            .expect("realtime push");
+        scheduler.realtime_only_steps_with_ready_decode = MAX_REALTIME_ONLY_STEPS_WITH_READY_DECODE;
+
+        let scheduled = scheduler.schedule();
+        assert_eq!(scheduled.decode_requests.len(), 1);
+        assert_eq!(scheduled.decode_requests[0].request_id, ordinary.id);
+        assert!(matches!(
+            scheduled.decode_requests[0].work,
+            WorkUnit::SequenceStep {
+                phase: SequencePhase::Decode,
+                ..
+            }
+        ));
+        assert_eq!(scheduler.realtime_only_steps_with_ready_decode, 0);
+    }
+
+    fn allow_incremental_prefill(scheduler: &mut Scheduler, request_id: &str) {
+        let epoch = scheduler
+            .get_sequence_id(&request_id.to_string())
+            .expect("request epoch");
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        profile.prefill = PrefillMode::Incremental;
         assert!(scheduler
             .update_execution_profile(&SessionKey::new(request_id.to_string(), epoch), &profile,));
     }
@@ -2554,11 +3302,6 @@ mod tests {
             max_tokens_per_step: 8,
             ..Default::default()
         });
-        let mut kv_cache = KVCacheManager::new(super::super::kv_cache::KVCacheConfig {
-            max_blocks: 16,
-            block_size: 16,
-            ..Default::default()
-        });
         let request_id = "reused-id".to_string();
 
         scheduler.add_request(&build_request(
@@ -2566,16 +3309,16 @@ mod tests {
             &request_id,
             Priority::Normal,
         ));
-        let first = scheduler.schedule(&mut kv_cache).prefill_requests.remove(0);
+        let first = scheduler.schedule().prefill_requests.remove(0);
         let first_session = first.session_key();
-        scheduler.finish_request(&request_id, &mut kv_cache);
+        scheduler.finish_request(&request_id);
 
         scheduler.add_request(&build_request(
             TaskType::Chat,
             &request_id,
             Priority::Normal,
         ));
-        let second = scheduler.schedule(&mut kv_cache).prefill_requests.remove(0);
+        let second = scheduler.schedule().prefill_requests.remove(0);
         let second_session = second.session_key();
 
         assert_eq!(first_session.request_id, second_session.request_id);
@@ -2591,11 +3334,6 @@ mod tests {
             enable_adaptive_batching: false,
             ..Default::default()
         });
-        let mut kv_cache = KVCacheManager::new(super::super::kv_cache::KVCacheConfig {
-            max_blocks: 16,
-            block_size: 4,
-            ..Default::default()
-        });
         let request_id = "recompute-current-session".to_string();
         let mut request = build_request(TaskType::Chat, &request_id, Priority::High)
             .with_workload_class(WorkloadClass::Batch)
@@ -2604,13 +3342,15 @@ mod tests {
         scheduler.add_request(&request);
         allow_recompute(&mut scheduler, &request_id);
 
-        let scheduled = scheduler.schedule(&mut kv_cache);
+        let scheduled = scheduler.schedule();
         let session = scheduled.prefill_requests[0].session_key();
-        scheduler.update_after_step(&request_id, 4, 2, Vec::new(), 1.0);
+        scheduler.update_after_step(&request_id, 4, 2, 1.0);
+        scheduler
+            .request_sequence_finalize(&request_id)
+            .expect("committed decode can request finalization");
         let metadata_before = scheduler.requests[&request_id].clone();
-        assert!(kv_cache.get_block_table(&request_id).is_some());
 
-        assert!(scheduler.restart_request_for_recompute(&session, &mut kv_cache));
+        assert!(scheduler.restart_request_for_recompute(&session));
 
         let metadata_after = &scheduler.requests[&request_id];
         assert_eq!(metadata_after.sequence_id, metadata_before.sequence_id);
@@ -2638,26 +3378,46 @@ mod tests {
             metadata_after.cache_policy.cache_release_safe,
             metadata_before.cache_policy.cache_release_safe
         );
-        assert_eq!(
-            metadata_after.cache_policy.prefix_reuse_safe,
-            metadata_before.cache_policy.prefix_reuse_safe
-        );
-
         let running = &scheduler.running[&request_id];
         assert_eq!(running.sequence_id, session.epoch);
         assert_eq!(running.num_tokens_processed, 0);
         assert_eq!(running.num_tokens_generated, 0);
-        assert!(running.block_ids.is_empty());
         assert!(!running.prefill_complete);
         assert!(!running.prefill_in_flight);
+        assert!(!running.finalize_pending);
         assert!(!running.first_token_emitted);
         assert!(running.paused);
-        assert!(kv_cache.get_block_table(&request_id).is_none());
 
-        let restarted = scheduler.schedule(&mut kv_cache);
+        let restarted = scheduler.schedule();
         assert_eq!(restarted.prefill_requests.len(), 1);
         assert_eq!(restarted.prefill_requests[0].session_key(), session);
         assert_eq!(restarted.prefill_requests[0].num_computed_tokens, 0);
+    }
+
+    #[test]
+    fn capacity_preemption_protects_sessions_after_their_first_visible_token() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            enable_preemption: true,
+            max_batch_size: 1,
+            max_tokens_per_step: 4,
+            ..Default::default()
+        });
+        let request_id = "capacity-preemption-owner".to_string();
+        scheduler.add_request(&build_request(TaskType::Chat, &request_id, Priority::Low));
+        allow_recompute(&mut scheduler, &request_id);
+        let session = scheduler.schedule().prefill_requests[0].session_key();
+        scheduler.update_after_step(&request_id, 1, 0, 1.0);
+
+        assert_eq!(
+            scheduler.capacity_preemption_candidate([session.clone()], Priority::High),
+            Some(session.clone())
+        );
+
+        scheduler.update_after_step(&request_id, 1, 1, 1.0);
+        assert_eq!(
+            scheduler.capacity_preemption_candidate([session], Priority::High),
+            None
+        );
     }
 
     #[test]
@@ -2668,40 +3428,25 @@ mod tests {
             enable_adaptive_batching: false,
             ..Default::default()
         });
-        let mut kv_cache = KVCacheManager::new(super::super::kv_cache::KVCacheConfig {
-            max_blocks: 16,
-            block_size: 4,
-            ..Default::default()
-        });
         let request_id = "recompute-stale-session".to_string();
         let mut request = build_request(TaskType::Chat, &request_id, Priority::Normal);
         request.prompt_tokens = vec![1, 2, 3, 4];
         scheduler.add_request(&request);
 
-        let scheduled = scheduler.schedule(&mut kv_cache);
+        let scheduled = scheduler.schedule();
         let current = scheduled.prefill_requests[0].session_key();
         let stale = SessionKey::new(request_id.clone(), current.epoch.saturating_add(1));
-        let blocks_before = kv_cache
-            .get_block_table(&request_id)
-            .expect("scheduled request block table")
-            .to_vec();
-
-        assert!(!scheduler.restart_request_for_recompute(
-            &SessionKey::new("missing-recompute-session".to_string(), current.epoch),
-            &mut kv_cache,
-        ));
-        assert!(!scheduler.restart_request_for_recompute(&stale, &mut kv_cache));
+        assert!(!scheduler.restart_request_for_recompute(&SessionKey::new(
+            "missing-recompute-session".to_string(),
+            current.epoch
+        ),));
+        assert!(!scheduler.restart_request_for_recompute(&stale));
 
         let running = &scheduler.running[&request_id];
         assert_eq!(running.sequence_id, current.epoch);
-        assert_eq!(running.block_ids, blocks_before);
         assert!(!running.prefill_complete);
         assert!(running.prefill_in_flight);
         assert!(!running.paused);
-        assert_eq!(
-            kv_cache.get_block_table(&request_id),
-            Some(blocks_before.as_slice())
-        );
     }
 
     #[test]
@@ -2710,11 +3455,6 @@ mod tests {
             max_batch_size: 1,
             max_tokens_per_step: 4,
             enable_adaptive_batching: false,
-            ..Default::default()
-        });
-        let mut kv_cache = KVCacheManager::new(super::super::kv_cache::KVCacheConfig {
-            max_blocks: 16,
-            block_size: 4,
             ..Default::default()
         });
         let request_id = "retry-current-session".to_string();
@@ -2733,10 +3473,9 @@ mod tests {
         assert!(scheduler
             .update_execution_profile(&SessionKey::new(request_id.clone(), epoch), &profile,));
 
-        let first = scheduler.schedule(&mut kv_cache);
+        let first = scheduler.schedule();
         let session = first.prefill_requests[0].session_key();
         assert_eq!(first.prefill_requests[0].num_tokens, 8);
-        let blocks_before = first.prefill_requests[0].block_ids.clone();
         assert!(scheduler.running[&request_id].prefill_in_flight);
 
         assert!(scheduler.release_execution_quantum_for_retry(&session));
@@ -2746,14 +3485,44 @@ mod tests {
         assert!(!running.prefill_complete);
         assert_eq!(running.num_tokens_processed, 0);
         assert_eq!(running.num_tokens_generated, 0);
-        assert_eq!(running.block_ids, blocks_before);
         assert!(!running.paused);
 
-        let retry = scheduler.schedule(&mut kv_cache);
+        let retry = scheduler.schedule();
         assert_eq!(retry.prefill_requests.len(), 1);
         assert_eq!(retry.prefill_requests[0].session_key(), session);
         assert_eq!(retry.prefill_requests[0].num_computed_tokens, 0);
         assert_eq!(retry.prefill_requests[0].num_tokens, 8);
+    }
+
+    #[test]
+    fn unexecuted_quantum_refunds_weighted_service_before_retry() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 1,
+            max_tokens_per_step: 8,
+            policy: SchedulingPolicy::WeightedFair,
+            enable_adaptive_batching: false,
+            ..Default::default()
+        });
+        let request_id = "capacity-service-refund".to_string();
+        let mut request = build_request(TaskType::Chat, &request_id, Priority::Normal);
+        request.prompt_tokens = vec![1; 8];
+        request.workload_class = WorkloadClass::Background;
+        scheduler.add_request(&request);
+
+        let scheduled = scheduler.schedule();
+        let quantum = &scheduled.prefill_requests[0];
+        let session = quantum.session_key();
+        let tokens = quantum.num_tokens;
+        assert_eq!(
+            scheduler.class_service[&WorkloadClass::Background],
+            tokens as u64
+        );
+        assert!(scheduler.refund_unexecuted_service(&session, tokens));
+        assert_eq!(scheduler.class_service[&WorkloadClass::Background], 0);
+
+        let stale = SessionKey::new(request_id, session.epoch.saturating_add(1));
+        assert!(!scheduler.refund_unexecuted_service(&stale, tokens));
+        assert_eq!(scheduler.class_service[&WorkloadClass::Background], 0);
     }
 
     #[test]
@@ -2764,19 +3533,13 @@ mod tests {
             enable_adaptive_batching: false,
             ..Default::default()
         });
-        let mut kv_cache = KVCacheManager::new(super::super::kv_cache::KVCacheConfig {
-            max_blocks: 16,
-            block_size: 4,
-            ..Default::default()
-        });
         let request_id = "retry-stale-session".to_string();
         let mut request = build_request(TaskType::Chat, &request_id, Priority::Normal);
         request.prompt_tokens = vec![1; 8];
         scheduler.add_request(&request);
 
-        let first = scheduler.schedule(&mut kv_cache);
+        let first = scheduler.schedule();
         let current = first.prefill_requests[0].session_key();
-        let blocks_before = first.prefill_requests[0].block_ids.clone();
         let stale = SessionKey::new(request_id.clone(), current.epoch.saturating_add(1));
 
         assert!(!scheduler.release_execution_quantum_for_retry(&stale));
@@ -2785,7 +3548,6 @@ mod tests {
         assert!(running.prefill_in_flight);
         assert_eq!(running.num_tokens_processed, 0);
         assert_eq!(running.num_tokens_generated, 0);
-        assert_eq!(running.block_ids, blocks_before);
         assert!(!running.paused);
     }
 
@@ -2797,17 +3559,16 @@ mod tests {
             enable_adaptive_batching: false,
             ..Default::default()
         });
-        let mut kv_cache = KVCacheManager::new(Default::default());
         let request = build_request(TaskType::Chat, "deferred-retry", Priority::Normal);
         assert!(scheduler.add_request(&request));
-        let first = scheduler.schedule(&mut kv_cache).prefill_requests.remove(0);
+        let first = scheduler.schedule().prefill_requests.remove(0);
         let session = first.session_key();
 
         assert!(scheduler.defer_execution_retry(&session, Instant::now() + Duration::from_secs(1),));
-        assert!(!scheduler.schedule(&mut kv_cache).has_execution_work());
+        assert!(!scheduler.schedule().has_execution_work());
 
         assert!(scheduler.defer_execution_retry(&session, Instant::now()));
-        let retry = scheduler.schedule(&mut kv_cache);
+        let retry = scheduler.schedule();
         assert_eq!(retry.prefill_requests.len(), 1);
         assert_eq!(retry.prefill_requests[0].session_key(), session);
     }
@@ -2823,11 +3584,6 @@ mod tests {
             ..Default::default()
         };
         let mut scheduler = Scheduler::new(config);
-        let mut kv_cache = KVCacheManager::new(super::super::kv_cache::KVCacheConfig {
-            max_blocks: 128,
-            block_size: 16,
-            ..Default::default()
-        });
 
         let old_id = "old-low".to_string();
         let fresh_id = "fresh-high".to_string();
@@ -2850,7 +3606,7 @@ mod tests {
             meta.arrival_time = Instant::now() - Duration::from_secs(3);
         }
 
-        let scheduled = scheduler.schedule(&mut kv_cache);
+        let scheduled = scheduler.schedule();
         assert_eq!(scheduled.prefill_requests.len(), 1);
         assert_eq!(scheduled.prefill_requests[0].request_id, old_id);
     }
@@ -2866,11 +3622,6 @@ mod tests {
             ..Default::default()
         };
         let mut scheduler = Scheduler::new(config);
-        let mut kv_cache = KVCacheManager::new(super::super::kv_cache::KVCacheConfig {
-            max_blocks: 128,
-            block_size: 16,
-            ..Default::default()
-        });
 
         let mut online = EngineCoreRequest::chat(vec![ChatMessage {
             role: ChatRole::User,
@@ -2890,7 +3641,7 @@ mod tests {
         scheduler.add_request(&online);
         scheduler.add_request(&realtime);
 
-        let scheduled = scheduler.schedule(&mut kv_cache);
+        let scheduled = scheduler.schedule();
         assert_eq!(scheduled.prefill_requests.len(), 1);
         assert_eq!(scheduled.prefill_requests[0].request_id, "realtime-normal");
     }
@@ -2911,11 +3662,6 @@ mod tests {
                 ..Default::default()
             };
             let mut scheduler = Scheduler::new(config);
-            let mut kv_cache = KVCacheManager::new(super::super::kv_cache::KVCacheConfig {
-                max_blocks: 128,
-                block_size: 16,
-                ..Default::default()
-            });
 
             let mut request = EngineCoreRequest::chat(vec![ChatMessage {
                 role: ChatRole::User,
@@ -2927,11 +3673,11 @@ mod tests {
             request.params.max_tokens = 16;
 
             scheduler.add_request(&request);
-            let first = scheduler.schedule(&mut kv_cache);
+            let first = scheduler.schedule();
             assert_eq!(first.prefill_requests.len(), 1);
-            scheduler.update_after_step(&request.id, 1, 1, Vec::new(), 1.0);
+            scheduler.update_after_step(&request.id, 1, 1, 1.0);
 
-            let second = scheduler.schedule(&mut kv_cache);
+            let second = scheduler.schedule();
             assert_eq!(second.decode_requests.len(), 1);
             second.decode_requests[0].num_tokens
         }
@@ -2939,203 +3685,6 @@ mod tests {
         assert_eq!(schedule_decode_for(WorkloadClass::Realtime), 1);
         assert_eq!(schedule_decode_for(WorkloadClass::Streaming), 1);
         assert_eq!(schedule_decode_for(WorkloadClass::Batch), 4);
-    }
-
-    #[test]
-    fn test_preemption_requeue_across_task_types() {
-        let task_types = [
-            TaskType::TTS,
-            TaskType::ASR,
-            TaskType::Chat,
-            TaskType::SpeechToSpeech,
-        ];
-
-        for task_type in task_types {
-            let (mut scheduler, mut kv_cache) = tiny_preemption_scheduler();
-            let low_id = format!("low-{task_type:?}");
-            let high_id = format!("high-{task_type:?}");
-            let low = build_request(task_type, &low_id, Priority::Low);
-            scheduler.add_request(&low);
-            allow_recompute(&mut scheduler, &low_id);
-
-            let first = scheduler.schedule(&mut kv_cache);
-            assert_eq!(
-                first.prefill_requests.len(),
-                1,
-                "expected initial prefill for {task_type:?}"
-            );
-            assert_eq!(first.prefill_requests[0].request_id, low_id);
-            scheduler.update_after_step(&low_id, 1, 0, Vec::new(), 1.0);
-
-            let high = build_request(task_type, &high_id, Priority::High);
-            scheduler.add_request(&high);
-
-            let second = scheduler.schedule(&mut kv_cache);
-            assert!(
-                second
-                    .preempted_requests
-                    .iter()
-                    .any(|session| session.request_id == low_id),
-                "expected low-priority {task_type:?} request to be preempted"
-            );
-            assert_eq!(
-                scheduler.get_status(&low_id),
-                Some(RequestStatus::Running),
-                "preempted {task_type:?} request should remain tracked for resume"
-            );
-            assert_eq!(
-                scheduler.get_status(&high_id),
-                Some(RequestStatus::Waiting),
-                "high-priority {task_type:?} request must wait for physical cleanup"
-            );
-
-            let preempted = second
-                .preempted_requests
-                .iter()
-                .find(|session| session.request_id == low_id)
-                .unwrap();
-            assert!(scheduler.confirm_preemption(preempted, &mut kv_cache));
-
-            let third = scheduler.schedule(&mut kv_cache);
-            assert_eq!(third.prefill_requests.len(), 1);
-            assert_eq!(third.prefill_requests[0].request_id, high_id);
-            scheduler.finish_request(&high_id, &mut kv_cache);
-
-            let fourth = scheduler.schedule(&mut kv_cache);
-            assert_eq!(
-                fourth.prefill_requests.len(),
-                1,
-                "preempted {task_type:?} request should restart from prefill"
-            );
-            assert_eq!(fourth.prefill_requests[0].request_id, low_id);
-            assert!(fourth.prefill_requests[0].is_prefill);
-            assert_eq!(fourth.prefill_requests[0].num_computed_tokens, 0);
-        }
-    }
-
-    #[test]
-    fn preemption_does_not_reuse_blocks_before_exact_cleanup_confirmation() {
-        let (mut scheduler, mut kv_cache) = tiny_preemption_scheduler();
-        let low = build_request(TaskType::Chat, "preempt-low", Priority::Low);
-        assert!(scheduler.add_request(&low));
-        allow_recompute(&mut scheduler, &low.id);
-        assert_eq!(scheduler.schedule(&mut kv_cache).prefill_requests.len(), 1);
-        scheduler.update_after_step(&low.id, 1, 0, Vec::new(), 1.0);
-        let allocated_before = kv_cache.stats().allocated_blocks;
-
-        let high = build_request(TaskType::Chat, "preempt-high", Priority::High);
-        assert!(scheduler.add_request(&high));
-        let prepared = scheduler.schedule(&mut kv_cache);
-        let victim = prepared.preempted_requests[0].clone();
-        assert_eq!(scheduler.get_status(&high.id), Some(RequestStatus::Waiting));
-        assert_eq!(kv_cache.stats().allocated_blocks, allocated_before);
-
-        let still_blocked = scheduler.schedule(&mut kv_cache);
-        assert!(!still_blocked.has_execution_work());
-        assert_eq!(kv_cache.stats().allocated_blocks, allocated_before);
-        let stale = SessionKey::new(victim.request_id.clone(), victim.epoch + 1);
-        assert!(!scheduler.confirm_preemption(&stale, &mut kv_cache));
-        assert_eq!(kv_cache.stats().allocated_blocks, allocated_before);
-
-        assert!(scheduler.confirm_preemption(&victim, &mut kv_cache));
-        assert_eq!(kv_cache.stats().allocated_blocks, 0);
-        let admitted = scheduler.schedule(&mut kv_cache);
-        assert_eq!(admitted.prefill_requests.len(), 1);
-        assert_eq!(admitted.prefill_requests[0].request_id, high.id);
-    }
-
-    #[test]
-    fn rejected_confirmed_preemption_terminally_quarantines_the_victim() {
-        let (mut scheduler, mut kv_cache) = tiny_preemption_scheduler();
-        let low = build_request(TaskType::Chat, "rejected-preempt", Priority::Low);
-        assert!(scheduler.add_request(&low));
-        allow_recompute(&mut scheduler, &low.id);
-        assert_eq!(scheduler.schedule(&mut kv_cache).prefill_requests.len(), 1);
-        scheduler.update_after_step(&low.id, 1, 0, Vec::new(), 1.0);
-
-        let high = build_request(TaskType::Chat, "preemptor", Priority::High);
-        assert!(scheduler.add_request(&high));
-        let prepared = scheduler.schedule(&mut kv_cache);
-        let victim = prepared.preempted_requests[0].clone();
-        assert!(scheduler
-            .running
-            .get(&victim.request_id)
-            .is_some_and(|running| running.preemption_pending));
-
-        // Inject the only state split that can reject a prepared exact-session
-        // commit after the executor has already released physical cache.
-        scheduler.requests.remove(&victim.request_id);
-        assert!(!scheduler.confirm_preemption(&victim, &mut kv_cache));
-        assert!(scheduler.quarantine_rejected_confirmed_preemption(&victim, &mut kv_cache));
-
-        assert_eq!(kv_cache.stats().allocated_blocks, 0);
-        assert!(!scheduler.running.contains_key(&victim.request_id));
-        assert_eq!(
-            scheduler.pending_release_confirmation_required(&victim),
-            Some(false)
-        );
-        assert!(!scheduler.add_request(&low));
-        assert!(scheduler.mark_terminal_delivered(&victim));
-        assert!(scheduler.add_request(&low));
-    }
-
-    #[test]
-    fn preemption_is_transactional_when_victims_cannot_satisfy_demand() {
-        let config = SchedulerConfig {
-            max_batch_size: 2,
-            max_tokens_per_step: 8,
-            policy: SchedulingPolicy::Priority,
-            enable_preemption: true,
-            ..Default::default()
-        };
-        let mut scheduler = Scheduler::new(config);
-        let mut kv_cache = KVCacheManager::new(super::super::kv_cache::KVCacheConfig {
-            max_blocks: 2,
-            block_size: 1,
-            ..Default::default()
-        });
-        for id in ["low-a", "low-b"] {
-            let mut request = EngineCoreRequest::tts(id).with_priority(Priority::Low);
-            request.id = id.to_string();
-            request.prompt_tokens = vec![1];
-            scheduler.add_request(&request);
-        }
-        let first = scheduler.schedule(&mut kv_cache);
-        assert_eq!(first.prefill_requests.len(), 2);
-        for id in ["low-a", "low-b"] {
-            scheduler.update_after_step(&id.to_string(), 1, 0, Vec::new(), 1.0);
-        }
-        let mut high = EngineCoreRequest::tts("high").with_priority(Priority::High);
-        high.id = "high".to_string();
-        high.prompt_tokens = vec![2, 2, 2];
-        scheduler.add_request(&high);
-
-        let second = scheduler.schedule(&mut kv_cache);
-        assert!(second.preempted_requests.is_empty());
-        assert_eq!(kv_cache.stats().allocated_blocks, 2);
-        assert!(kv_cache.get_block_table(&"low-a".to_string()).is_some());
-        assert!(kv_cache.get_block_table(&"low-b".to_string()).is_some());
-    }
-
-    #[test]
-    fn preemption_never_discards_user_visible_output() {
-        let (mut scheduler, mut kv_cache) = tiny_preemption_scheduler();
-        let low_id = "visible-low".to_string();
-        let mut low = EngineCoreRequest::tts("low").with_priority(Priority::Low);
-        low.id = low_id.clone();
-        low.prompt_tokens = vec![1];
-        scheduler.add_request(&low);
-        assert_eq!(scheduler.schedule(&mut kv_cache).prefill_requests.len(), 1);
-        scheduler.update_after_step(&low_id, 1, 1, Vec::new(), 1.0);
-
-        let mut high = EngineCoreRequest::tts("high").with_priority(Priority::High);
-        high.id = "visible-high".to_string();
-        high.prompt_tokens = vec![2];
-        scheduler.add_request(&high);
-        let result = scheduler.schedule(&mut kv_cache);
-
-        assert!(result.preempted_requests.is_empty());
-        assert!(kv_cache.get_block_table(&low_id).is_some());
     }
 
     #[test]
@@ -3148,12 +3697,12 @@ mod tests {
         ];
 
         for task_type in task_types {
-            let (mut scheduler, mut kv_cache) = tiny_preemption_scheduler();
+            let mut scheduler = small_scheduler();
             let request_id = format!("abort-{task_type:?}");
             let request = build_request(task_type, &request_id, Priority::Normal);
             scheduler.add_request(&request);
 
-            let scheduled = scheduler.schedule(&mut kv_cache);
+            let scheduled = scheduler.schedule();
             assert_eq!(
                 scheduled.prefill_requests.len(),
                 1,
@@ -3165,7 +3714,7 @@ mod tests {
             );
 
             assert!(
-                scheduler.abort_request(&request_id, &mut kv_cache),
+                scheduler.abort_request(&request_id),
                 "abort should report running request removal for {task_type:?}"
             );
             assert!(
@@ -3178,7 +3727,7 @@ mod tests {
                 "aborted {task_type:?} request must not remain queued/running"
             );
 
-            let after_abort = scheduler.schedule(&mut kv_cache);
+            let after_abort = scheduler.schedule();
             assert!(
                 !after_abort.has_work(),
                 "no work should remain after aborting sole {task_type:?} request"
@@ -3199,11 +3748,6 @@ mod tests {
             ..Default::default()
         };
         let mut scheduler = Scheduler::new(config);
-        let mut kv_cache = KVCacheManager::new(super::super::kv_cache::KVCacheConfig {
-            max_blocks: 32,
-            block_size: 16,
-            ..Default::default()
-        });
 
         let request_id = "tts-auto-max".to_string();
         let mut request = EngineCoreRequest::tts("hello world");
@@ -3212,12 +3756,12 @@ mod tests {
         request.params.max_tokens = 0;
         scheduler.add_request(&request);
 
-        let first = scheduler.schedule(&mut kv_cache);
+        let first = scheduler.schedule();
         assert_eq!(first.prefill_requests.len(), 1);
         assert_eq!(first.prefill_requests[0].request_id, request_id);
-        scheduler.update_after_step(&request_id, 1, 1, Vec::new(), 1.0);
+        scheduler.update_after_step(&request_id, 1, 1, 1.0);
 
-        let second = scheduler.schedule(&mut kv_cache);
+        let second = scheduler.schedule();
         assert_eq!(
             second.decode_requests.len(),
             1,
@@ -3239,11 +3783,6 @@ mod tests {
             ..Default::default()
         };
         let mut scheduler = Scheduler::new(config);
-        let mut kv_cache = KVCacheManager::new(super::super::kv_cache::KVCacheConfig {
-            max_blocks: 32,
-            block_size: 16,
-            ..Default::default()
-        });
 
         let request_id = "chat-zero-max".to_string();
         let mut request = EngineCoreRequest::chat(vec![ChatMessage {
@@ -3255,12 +3794,12 @@ mod tests {
         request.params.max_tokens = 0;
         scheduler.add_request(&request);
 
-        let first = scheduler.schedule(&mut kv_cache);
+        let first = scheduler.schedule();
         assert_eq!(first.prefill_requests.len(), 1);
         assert_eq!(first.prefill_requests[0].request_id, request_id);
-        scheduler.update_after_step(&request_id, 1, 1, Vec::new(), 1.0);
+        scheduler.update_after_step(&request_id, 1, 1, 1.0);
 
-        let second = scheduler.schedule(&mut kv_cache);
+        let second = scheduler.schedule();
         assert_eq!(
             second.decode_requests.len(),
             1,
@@ -3270,7 +3809,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prefill_chunk_backoff_when_kv_is_tight() {
+    fn configured_prefill_chunk_threshold_is_respected() {
         let config = SchedulerConfig {
             max_batch_size: 1,
             max_tokens_per_step: 16,
@@ -3283,29 +3822,26 @@ mod tests {
             ..Default::default()
         };
         let mut scheduler = Scheduler::new(config);
-        let mut kv_cache = KVCacheManager::new(super::super::kv_cache::KVCacheConfig {
-            max_blocks: 1,
-            block_size: 4,
-            ..Default::default()
-        });
 
         let request_id = "backoff-prefill".to_string();
         let mut request = EngineCoreRequest::tts("long prompt");
         request.id = request_id.clone();
         request.prompt_tokens = vec![7; 8];
         scheduler.add_request(&request);
+        allow_incremental_prefill(&mut scheduler, &request_id);
 
-        let scheduled = scheduler.schedule(&mut kv_cache);
+        let scheduled = scheduler.schedule();
         assert_eq!(scheduled.prefill_requests.len(), 1);
         assert_eq!(scheduled.prefill_requests[0].request_id, request_id);
         assert_eq!(
-            scheduled.prefill_requests[0].num_tokens, 4,
-            "Scheduler should back off prefill chunk to fit KV capacity"
+            scheduled.prefill_requests[0].num_tokens, 8,
+            "scheduler should use its configured token chunk without fake KV pressure"
         );
     }
 
     #[test]
     fn incremental_prefill_continues_after_committed_partial_step() {
+        let telemetry_before = crate::engine::metrics::engine_batch_metrics_snapshot();
         let config = SchedulerConfig {
             max_batch_size: 1,
             max_tokens_per_step: 4,
@@ -3317,33 +3853,28 @@ mod tests {
             ..Default::default()
         };
         let mut scheduler = Scheduler::new(config);
-        let mut kv_cache = KVCacheManager::new(super::super::kv_cache::KVCacheConfig {
-            max_blocks: 8,
-            block_size: 4,
-            ..Default::default()
-        });
 
         let request_id = "incremental-prefill".to_string();
         let mut request = EngineCoreRequest::tts("incremental prompt");
         request.id = request_id.clone();
         request.prompt_tokens = vec![7; 8];
         scheduler.add_request(&request);
+        allow_incremental_prefill(&mut scheduler, &request_id);
 
-        let first = scheduler.schedule(&mut kv_cache);
+        let first = scheduler.schedule();
         assert_eq!(first.prefill_requests.len(), 1);
         assert_eq!(first.prefill_requests[0].num_tokens, 4);
         assert_eq!(first.prefill_requests[0].num_computed_tokens, 0);
 
-        let duplicate = scheduler.schedule(&mut kv_cache);
+        let duplicate = scheduler.schedule();
         assert!(
             !duplicate.has_work(),
             "an in-flight prefill quantum must not be scheduled twice"
         );
 
-        scheduler.update_after_step(&request_id, 4, 0, Vec::new(), 1.0);
+        scheduler.update_after_step(&request_id, 4, 0, 1.0);
 
-        let second = scheduler.schedule(&mut kv_cache);
-        assert!(second.preempted_requests.is_empty());
+        let second = scheduler.schedule();
         assert_eq!(second.prefill_requests.len(), 1);
         assert_eq!(second.prefill_requests[0].request_id, request_id);
         assert_eq!(second.prefill_requests[0].num_computed_tokens, 4);
@@ -3354,12 +3885,27 @@ mod tests {
                 phase: SequencePhase::Prefill,
                 input: InputRange { start: 4, end: 8 },
                 max_output_steps: 4,
+                auxiliary_state: None,
             }
+        );
+        scheduler.update_after_step(&request_id, 4, 0, 1.0);
+        let telemetry_after = crate::engine::metrics::engine_batch_metrics_snapshot();
+        assert!(
+            telemetry_after.incremental_prefill_quanta_committed_total
+                >= telemetry_before.incremental_prefill_quanta_committed_total + 2
+        );
+        assert!(
+            telemetry_after.incremental_prefill_tokens_committed_total
+                >= telemetry_before.incremental_prefill_tokens_committed_total + 8
+        );
+        assert!(
+            telemetry_after.multispan_prefill_requests_total
+                > telemetry_before.multispan_prefill_requests_total
         );
     }
 
     #[test]
-    fn full_prefill_profile_schedules_the_entire_prompt_and_logical_cache() {
+    fn unproven_prefill_profile_fails_closed_to_an_isolated_full_prompt() {
         let config = SchedulerConfig {
             max_batch_size: 1,
             max_tokens_per_step: 4,
@@ -3372,11 +3918,6 @@ mod tests {
             ..Default::default()
         };
         let mut scheduler = Scheduler::new(config);
-        let mut kv_cache = KVCacheManager::new(super::super::kv_cache::KVCacheConfig {
-            max_blocks: 8,
-            block_size: 4,
-            ..Default::default()
-        });
 
         let request_id = "full-prefill".to_string();
         let mut request = EngineCoreRequest::tts("full prompt");
@@ -3388,18 +3929,11 @@ mod tests {
             .get_sequence_id(&request_id)
             .expect("request epoch");
         let session = SessionKey::new(request_id.clone(), epoch);
-        let mut profile =
-            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
-        profile.prefill = PrefillMode::Full;
-        assert!(scheduler.update_execution_profile(&session, &profile));
-
-        let scheduled = scheduler.schedule(&mut kv_cache);
+        let scheduled = scheduler.schedule();
 
         assert_eq!(scheduled.prefill_requests.len(), 1);
         assert_eq!(scheduled.prefill_requests[0].session_key(), session);
         assert_eq!(scheduled.prefill_requests[0].num_tokens, 8);
-        assert_eq!(scheduled.prefill_requests[0].block_ids.len(), 2);
-        assert_eq!(scheduled.blocks_allocated, 2);
         assert_eq!(scheduled.total_tokens, 8);
         assert_eq!(
             scheduled.prefill_requests[0].work,
@@ -3407,7 +3941,213 @@ mod tests {
                 phase: SequencePhase::Prefill,
                 input: InputRange { start: 0, end: 8 },
                 max_output_steps: 8,
+                auxiliary_state: None,
             }
+        );
+    }
+
+    #[test]
+    fn full_prefill_is_isolated_from_live_decode() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 2,
+            max_tokens_per_step: 16,
+            min_tokens_per_step: 1,
+            policy: SchedulingPolicy::FCFS,
+            enable_adaptive_batching: false,
+            ..Default::default()
+        });
+
+        let decode_id = "live-decode".to_string();
+        let decode = build_request(TaskType::Chat, &decode_id, Priority::Normal);
+        assert!(scheduler.add_request(&decode));
+        let prefill = scheduler.schedule();
+        assert_eq!(prefill.prefill_requests.len(), 1);
+        scheduler.update_after_step(&decode_id, decode.num_prompt_tokens(), 1, 1.0);
+
+        let full_id = "waiting-full-prefill".to_string();
+        let mut full = build_request(TaskType::Chat, &full_id, Priority::Normal);
+        full.prompt_tokens = vec![7; 4];
+        assert!(scheduler.add_request(&full));
+
+        let scheduled = scheduler.schedule();
+        assert_eq!(scheduled.decode_requests.len(), 1);
+        assert!(scheduled.prefill_requests.is_empty());
+    }
+
+    #[test]
+    fn compatible_full_prefills_remain_logically_batchable() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 2,
+            max_tokens_per_step: 4,
+            min_tokens_per_step: 1,
+            policy: SchedulingPolicy::FCFS,
+            enable_adaptive_batching: false,
+            ..Default::default()
+        });
+        for request_id in ["full-a", "full-b"] {
+            let mut request = build_request(TaskType::Chat, request_id, Priority::Normal);
+            request.prompt_tokens = vec![1; 8];
+            assert!(scheduler.add_request(&request));
+        }
+
+        let scheduled = scheduler.schedule();
+        assert_eq!(scheduled.prefill_requests.len(), 2);
+        assert!(scheduled.decode_requests.is_empty());
+        assert_eq!(scheduled.total_tokens, 16);
+    }
+
+    #[test]
+    fn waiting_full_prefill_gets_bounded_service_among_decode_steps() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 2,
+            max_tokens_per_step: 16,
+            min_tokens_per_step: 1,
+            policy: SchedulingPolicy::FCFS,
+            enable_adaptive_batching: false,
+            ..Default::default()
+        });
+
+        let decode_id = "persistent-decode".to_string();
+        let mut decode = build_request(TaskType::Chat, &decode_id, Priority::Normal);
+        decode.params.max_tokens = 64;
+        assert!(scheduler.add_request(&decode));
+        let prefill = scheduler.schedule();
+        assert_eq!(prefill.prefill_requests.len(), 1);
+        scheduler.update_after_step(&decode_id, decode.num_prompt_tokens(), 1, 1.0);
+
+        let full_id = "bounded-full-prefill".to_string();
+        let full = build_request(TaskType::Chat, &full_id, Priority::Normal);
+        assert!(scheduler.add_request(&full));
+
+        for step in 0..=MAX_DECODE_ONLY_STEPS_WITH_WAITING_FULL_PREFILL {
+            let scheduled = scheduler.schedule();
+            if !scheduled.prefill_requests.is_empty() {
+                assert_eq!(scheduled.prefill_requests.len(), 1);
+                assert_eq!(scheduled.prefill_requests[0].request_id, full_id);
+                assert!(scheduled.decode_requests.is_empty());
+                assert_eq!(step, MAX_DECODE_ONLY_STEPS_WITH_WAITING_FULL_PREFILL);
+                return;
+            }
+            assert_eq!(
+                scheduled.decode_requests.len(),
+                1,
+                "decode unexpectedly absent at bounded-service step {step}: {scheduled:?}"
+            );
+            scheduler.update_after_step(&decode_id, 1, 1, 1.0);
+            scheduler.record_committed_batch_service(std::slice::from_ref(&decode_id), true);
+        }
+        panic!("full prefill was starved beyond the bounded decode-only window");
+    }
+
+    #[test]
+    fn waiting_incremental_prefill_gets_a_bounded_shared_slot() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 2,
+            max_tokens_per_step: 16,
+            min_tokens_per_step: 1,
+            policy: SchedulingPolicy::FCFS,
+            enable_chunked_prefill: true,
+            chunked_prefill_threshold: 32,
+            enable_adaptive_batching: false,
+            ..Default::default()
+        });
+
+        let decode_ids = ["persistent-decode-a", "persistent-decode-b"];
+        let mut decode_requests = Vec::new();
+        for request_id in decode_ids {
+            let mut request = build_request(TaskType::Chat, request_id, Priority::Normal);
+            request.params.max_tokens = 64;
+            assert!(scheduler.add_request(&request));
+            decode_requests.push(request);
+        }
+        let initial = scheduler.schedule();
+        assert_eq!(initial.prefill_requests.len(), 2);
+        for request in &decode_requests {
+            scheduler.update_after_step(&request.id, request.num_prompt_tokens(), 1, 1.0);
+        }
+
+        let incremental_id = "bounded-incremental-prefill".to_string();
+        let mut incremental = build_request(TaskType::Chat, &incremental_id, Priority::Normal);
+        incremental.prompt_tokens = vec![7; 64];
+        assert!(scheduler.add_request(&incremental));
+        let epoch = scheduler.get_sequence_id(&incremental_id).unwrap();
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        profile.prefill = PrefillMode::Incremental;
+        assert!(scheduler
+            .update_execution_profile(&SessionKey::new(incremental_id.clone(), epoch), &profile,));
+
+        for step in 0..=MAX_DECODE_ONLY_STEPS_WITH_WAITING_INCREMENTAL_PREFILL {
+            let debt_before = scheduler.decode_only_steps_with_waiting_incremental_prefill;
+            let scheduled = scheduler.schedule();
+            assert_eq!(
+                scheduler.decode_only_steps_with_waiting_incremental_prefill, debt_before,
+                "scheduler polling changed committed-service debt"
+            );
+            if let Some(prefill) = scheduled.prefill_requests.first() {
+                assert_eq!(prefill.request_id, incremental_id);
+                assert_eq!(scheduled.decode_requests.len(), 1);
+                assert_eq!(step, MAX_DECODE_ONLY_STEPS_WITH_WAITING_INCREMENTAL_PREFILL);
+                return;
+            }
+            assert_eq!(
+                scheduled.decode_requests.len(),
+                2,
+                "decode rows disappeared before the bounded service step {step}: {scheduled:?}"
+            );
+            for request in &decode_requests {
+                scheduler.update_after_step(&request.id, 1, 1, 1.0);
+            }
+            scheduler.record_committed_batch_service(
+                &decode_requests
+                    .iter()
+                    .map(|request| request.id.clone())
+                    .collect::<Vec<_>>(),
+                true,
+            );
+        }
+        panic!("incremental prefill was starved beyond the bounded decode-only window");
+    }
+
+    #[test]
+    fn prefill_none_contract_cannot_be_misclassified_as_resumable() {
+        let mut scheduler = Scheduler::new(SchedulerConfig::default());
+        let request_id = "none-is-not-resumable".to_string();
+        let request = build_request(TaskType::Chat, &request_id, Priority::Normal);
+        assert!(scheduler.add_request(&request));
+        let epoch = scheduler.get_sequence_id(&request_id).unwrap();
+        let profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        assert_eq!(profile.prefill, PrefillMode::None);
+        assert!(scheduler
+            .update_execution_profile(&SessionKey::new(request_id.clone(), epoch), &profile,));
+
+        assert_eq!(
+            scheduler.requests[&request_id].cache_policy.prefill,
+            PrefillMode::Full
+        );
+    }
+
+    #[test]
+    fn retry_backoff_prefill_is_not_force_service_eligible() {
+        let mut scheduler = Scheduler::new(SchedulerConfig::default());
+        let request_id = "incremental-retry-backoff".to_string();
+        let request = build_request(TaskType::Chat, &request_id, Priority::Normal);
+        assert!(scheduler.add_request(&request));
+        allow_incremental_prefill(&mut scheduler, &request_id);
+        scheduler
+            .requests
+            .get_mut(&request_id)
+            .unwrap()
+            .retry_not_before = Some(Instant::now() + Duration::from_secs(60));
+        scheduler.decode_only_steps_with_waiting_incremental_prefill =
+            MAX_DECODE_ONLY_STEPS_WITH_WAITING_INCREMENTAL_PREFILL - 1;
+        scheduler.record_committed_batch_service(&["decode-row".to_string()], true);
+
+        assert!(!scheduler.has_eligible_incremental_prefill(Instant::now()));
+        assert_eq!(
+            scheduler.decode_only_steps_with_waiting_incremental_prefill,
+            MAX_DECODE_ONLY_STEPS_WITH_WAITING_INCREMENTAL_PREFILL
         );
     }
 
@@ -3424,13 +4164,9 @@ mod tests {
             ..Default::default()
         };
         let mut scheduler = Scheduler::new(config);
-        let mut kv_cache = KVCacheManager::new(super::super::kv_cache::KVCacheConfig {
-            max_blocks: 16,
-            block_size: 4,
-            ..Default::default()
-        });
         let request_id = "continuous-decode".to_string();
-        let request = build_request(TaskType::Chat, &request_id, Priority::Normal);
+        let mut request = build_request(TaskType::Chat, &request_id, Priority::Normal);
+        request.workload_class = WorkloadClass::Streaming;
         assert!(scheduler.add_request(&request));
         let epoch = scheduler.get_sequence_id(&request_id).unwrap();
         let mut profile =
@@ -3441,10 +4177,10 @@ mod tests {
         assert!(scheduler
             .update_execution_profile(&SessionKey::new(request_id.clone(), epoch), &profile,));
 
-        let prefill = scheduler.schedule(&mut kv_cache);
+        let prefill = scheduler.schedule();
         assert_eq!(prefill.prefill_requests.len(), 1);
-        scheduler.update_after_step(&request_id, request.num_prompt_tokens(), 1, Vec::new(), 1.0);
-        let decode = scheduler.schedule(&mut kv_cache);
+        scheduler.update_after_step(&request_id, request.num_prompt_tokens(), 1, 1.0);
+        let decode = scheduler.schedule();
 
         assert_eq!(decode.decode_requests.len(), 1);
         assert_eq!(decode.decode_requests[0].num_tokens, 1);
@@ -3457,12 +4193,50 @@ mod tests {
                     end: request.num_prompt_tokens() + 1,
                 },
                 max_output_steps: 1,
+                auxiliary_state: None,
             }
         );
     }
 
     #[test]
-    fn test_prefill_defer_skips_oversized_head_request() {
+    fn continuous_decode_preserves_an_isolated_model_preferred_quantum() {
+        let config = SchedulerConfig {
+            max_batch_size: 2,
+            max_tokens_per_step: 8,
+            min_tokens_per_step: 1,
+            policy: SchedulingPolicy::FCFS,
+            enable_chunked_prefill: false,
+            enable_preemption: false,
+            enable_adaptive_batching: false,
+            enable_decode_quanta: false,
+            ..Default::default()
+        };
+        let mut scheduler = Scheduler::new(config);
+        let request_id = "continuous-solo-quantum".to_string();
+        let mut request = build_request(TaskType::Chat, &request_id, Priority::Normal);
+        request.workload_class = WorkloadClass::Streaming;
+        assert!(scheduler.add_request(&request));
+        let epoch = scheduler.get_sequence_id(&request_id).unwrap();
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        profile.prefill = PrefillMode::Full;
+        profile.incremental_decode = true;
+        profile.decode_batch = NativeBatchMode::Continuous;
+        profile.preferred_decode_tokens = 4;
+        assert!(scheduler
+            .update_execution_profile(&SessionKey::new(request_id.clone(), epoch), &profile));
+
+        let prefill = scheduler.schedule();
+        assert_eq!(prefill.prefill_requests.len(), 1);
+        scheduler.update_after_step(&request_id, request.num_prompt_tokens(), 1, 1.0);
+
+        let decode = scheduler.schedule();
+        assert_eq!(decode.decode_requests.len(), 1);
+        assert_eq!(decode.decode_requests[0].num_tokens, 4);
+    }
+
+    #[test]
+    fn fcfs_prefill_preserves_head_order_without_fake_capacity_pressure() {
         let config = SchedulerConfig {
             max_batch_size: 1,
             max_tokens_per_step: 32,
@@ -3474,11 +4248,6 @@ mod tests {
             ..Default::default()
         };
         let mut scheduler = Scheduler::new(config);
-        let mut kv_cache = KVCacheManager::new(super::super::kv_cache::KVCacheConfig {
-            max_blocks: 2,
-            block_size: 4,
-            ..Default::default()
-        });
 
         let big_id = "big-head".to_string();
         let mut big = EngineCoreRequest::tts("big prompt");
@@ -3492,64 +4261,109 @@ mod tests {
         small.prompt_tokens = vec![2; 4];
         scheduler.add_request(&small);
 
-        let scheduled = scheduler.schedule(&mut kv_cache);
+        let scheduled = scheduler.schedule();
         assert_eq!(scheduled.prefill_requests.len(), 1);
         assert_eq!(
-            scheduled.prefill_requests[0].request_id, small_id,
-            "Oversized head request should be deferred instead of blocking all admissions"
+            scheduled.prefill_requests[0].request_id, big_id,
+            "FCFS must not skip the queue head based on disconnected KV capacity"
         );
-        assert_eq!(scheduler.get_status(&big_id), Some(RequestStatus::Waiting));
+        assert_eq!(
+            scheduler.get_status(&small_id),
+            Some(RequestStatus::Waiting)
+        );
     }
 
     #[test]
-    fn test_prefix_reuse_allows_prefill_when_free_blocks_are_zero() {
+    fn external_paged_decode_uses_capability_authoritative_state() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 1,
+            max_tokens_per_step: 8,
+            enable_adaptive_batching: false,
+            ..Default::default()
+        });
+        let request = build_request(TaskType::Chat, "managed-decode", Priority::Normal);
+        let request_id = request.id.clone();
+        assert!(scheduler.add_request(&request));
+        let epoch = scheduler.get_sequence_id(&request_id).expect("epoch");
+        let session = SessionKey::new(request_id.clone(), epoch);
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        profile.cache_mode = CacheMode::ExternalPaged;
+        assert!(scheduler.update_execution_profile(&session, &profile));
+
+        let prefill = scheduler.schedule();
+        assert_eq!(prefill.prefill_requests.len(), 1);
+        scheduler.update_after_step(&request_id, 1, 0, 1.0);
+
+        let decode = scheduler.schedule();
+        assert_eq!(decode.decode_requests.len(), 1);
+    }
+
+    #[test]
+    fn cacheless_sequences_schedule_without_block_projection() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 1,
+            max_tokens_per_step: 8,
+            enable_adaptive_batching: false,
+            ..Default::default()
+        });
+        let request_id = "cacheless-capability-cache".to_string();
+        let request = build_request(TaskType::Chat, &request_id, Priority::Normal);
+        assert!(scheduler.add_request(&request));
+        let epoch = scheduler.get_sequence_id(&request_id).expect("epoch");
+        let session = SessionKey::new(request_id.clone(), epoch);
+        let profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        assert!(scheduler.update_execution_profile(&session, &profile));
+
+        let prefill = scheduler.schedule();
+        assert_eq!(prefill.prefill_requests.len(), 1);
+        scheduler.update_after_step(&request_id, 1, 0, 1.0);
+
+        let decode = scheduler.schedule();
+        assert_eq!(decode.decode_requests.len(), 1);
+    }
+
+    #[test]
+    fn external_paged_prefill_admission_is_scheduler_metadata_only() {
         let config = SchedulerConfig {
             max_batch_size: 2,
             max_tokens_per_step: 32,
             min_tokens_per_step: 1,
             policy: SchedulingPolicy::FCFS,
             enable_chunked_prefill: false,
-            enable_prefix_caching: true,
             enable_preemption: false,
             enable_adaptive_batching: false,
             ..Default::default()
         };
         let mut scheduler = Scheduler::new(config);
-        let mut kv_cache = KVCacheManager::new(super::super::kv_cache::KVCacheConfig {
-            max_blocks: 2,
-            block_size: 2,
-            ..Default::default()
-        });
 
         let req1_id = "prefix-source".to_string();
         let mut req1 = EngineCoreRequest::tts("prefix source");
         req1.id = req1_id.clone();
         req1.prompt_tokens = vec![10, 11, 12, 13];
         scheduler.add_request(&req1);
-        allow_external_prefix_reuse(&mut scheduler, &req1_id);
+        allow_external_paged(&mut scheduler, &req1_id);
 
-        let first = scheduler.schedule(&mut kv_cache);
+        let first = scheduler.schedule();
         assert_eq!(first.prefill_requests.len(), 1);
-        scheduler.update_after_step(&req1_id, 4, 0, Vec::new(), 1.0);
+        scheduler.update_after_step(&req1_id, 4, 0, 1.0);
+        scheduler.finish_request(&req1_id);
 
         let req2_id = "prefix-reuser".to_string();
         let mut req2 = EngineCoreRequest::tts("prefix reuser");
         req2.id = req2_id.clone();
         req2.prompt_tokens = vec![10, 11, 12, 13];
         scheduler.add_request(&req2);
-        allow_external_prefix_reuse(&mut scheduler, &req2_id);
+        allow_external_paged(&mut scheduler, &req2_id);
 
-        let second = scheduler.schedule(&mut kv_cache);
+        let second = scheduler.schedule();
         assert!(
             second
                 .prefill_requests
                 .iter()
                 .any(|entry| entry.request_id == req2_id),
-            "Second request should be admitted via shared-prefix block reuse"
-        );
-        assert_eq!(
-            second.blocks_allocated, 0,
-            "Prefix-reused prefill should avoid fresh KV block allocation"
+            "managed prefill admission must not depend on a scheduler cache projection"
         );
     }
 
@@ -3568,11 +4382,6 @@ mod tests {
             ..Default::default()
         };
         let mut scheduler = Scheduler::new(config);
-        let mut kv_cache = KVCacheManager::new(super::super::kv_cache::KVCacheConfig {
-            max_blocks: 32,
-            block_size: 8,
-            ..Default::default()
-        });
 
         let request_id = "decode-quanta".to_string();
         let mut request = EngineCoreRequest::tts("hello");
@@ -3580,16 +4389,47 @@ mod tests {
         request.prompt_tokens = vec![1];
         scheduler.add_request(&request);
 
-        let first = scheduler.schedule(&mut kv_cache);
+        let first = scheduler.schedule();
         assert_eq!(first.prefill_requests.len(), 1);
-        scheduler.update_after_step(&request_id, 1, 1, Vec::new(), 1.0);
+        scheduler.update_after_step(&request_id, 1, 1, 1.0);
 
-        let second = scheduler.schedule(&mut kv_cache);
+        let second = scheduler.schedule();
         assert_eq!(second.decode_requests.len(), 1);
         assert_eq!(
             second.decode_requests[0].num_tokens, 4,
             "decode quanta should grant multi-token decode when queue pressure is low"
         );
+    }
+
+    #[test]
+    fn model_preferred_decode_quantum_works_with_global_quanta_disabled() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 1,
+            max_tokens_per_step: 8,
+            min_tokens_per_step: 1,
+            enable_adaptive_batching: false,
+            enable_decode_quanta: false,
+            ..Default::default()
+        });
+        let request_id = "model-preferred-decode-quantum".to_string();
+        let mut request = EngineCoreRequest::tts("hello");
+        request.id = request_id.clone();
+        request.prompt_tokens = vec![1];
+        assert!(scheduler.add_request(&request));
+        let epoch = scheduler.get_sequence_id(&request_id).expect("epoch");
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        profile.preferred_decode_tokens = 4;
+        assert!(scheduler
+            .update_execution_profile(&SessionKey::new(request_id.clone(), epoch), &profile));
+
+        let prefill = scheduler.schedule();
+        assert_eq!(prefill.prefill_requests.len(), 1);
+        scheduler.update_after_step(&request_id, 1, 1, 1.0);
+
+        let decode = scheduler.schedule();
+        assert_eq!(decode.decode_requests.len(), 1);
+        assert_eq!(decode.decode_requests[0].num_tokens, 4);
     }
 
     #[test]
@@ -3607,26 +4447,22 @@ mod tests {
             ..Default::default()
         };
         let mut scheduler = Scheduler::new(config);
-        let mut kv_cache = KVCacheManager::new(super::super::kv_cache::KVCacheConfig {
-            max_blocks: 32,
-            block_size: 8,
-            ..Default::default()
-        });
 
         for request_id in ["decode-a", "decode-b"] {
             let mut request = EngineCoreRequest::tts("hello");
             request.id = request_id.to_string();
             request.prompt_tokens = vec![1];
             scheduler.add_request(&request);
+            allow_incremental_prefill(&mut scheduler, request_id);
         }
 
-        let first = scheduler.schedule(&mut kv_cache);
+        let first = scheduler.schedule();
         assert_eq!(first.prefill_requests.len(), 2);
         for request_id in ["decode-a", "decode-b"] {
-            scheduler.update_after_step(&request_id.to_string(), 1, 1, Vec::new(), 1.0);
+            scheduler.update_after_step(&request_id.to_string(), 1, 1, 1.0);
         }
 
-        let second = scheduler.schedule(&mut kv_cache);
+        let second = scheduler.schedule();
         assert_eq!(second.decode_requests.len(), 2);
         assert!(second
             .decode_requests
@@ -3642,7 +4478,6 @@ mod tests {
             ..Default::default()
         };
         let mut scheduler = Scheduler::new(config);
-        let mut kv_cache = KVCacheManager::new(Default::default());
 
         for index in 0..256 {
             let mut request = EngineCoreRequest::tts("same workload");
@@ -3655,7 +4490,7 @@ mod tests {
             Some("request-000")
         );
         for index in 0..256 {
-            scheduler.abort_request(&format!("request-{index:03}"), &mut kv_cache);
+            scheduler.abort_request(&format!("request-{index:03}"));
         }
         assert!(scheduler.waiting_members.is_empty());
         assert!(scheduler.waiting_fcfs.is_empty());
@@ -3676,7 +4511,6 @@ mod tests {
     #[test]
     fn hard_deadlines_expire_in_sequence_order_without_execution() {
         let mut scheduler = Scheduler::new(SchedulerConfig::default());
-        let mut kv_cache = KVCacheManager::new(Default::default());
         for id in ["expired-a", "expired-b"] {
             let mut request = EngineCoreRequest::tts(id)
                 .with_deadline(Some(Instant::now() - Duration::from_millis(1)));
@@ -3684,7 +4518,7 @@ mod tests {
             scheduler.add_request(&request);
         }
 
-        let result = scheduler.schedule(&mut kv_cache);
+        let result = scheduler.schedule();
 
         assert_eq!(
             result
@@ -3702,7 +4536,6 @@ mod tests {
     #[test]
     fn synthetic_sla_is_a_soft_priority_signal_not_a_hard_deadline() {
         let mut scheduler = Scheduler::new(SchedulerConfig::default());
-        let mut kv_cache = KVCacheManager::new(Default::default());
         let mut request = EngineCoreRequest::tts("soft-sla");
         request.id = "soft-sla".to_string();
         request.prompt_tokens = vec![1];
@@ -3710,32 +4543,29 @@ mod tests {
         scheduler.requests.get_mut(&request.id).unwrap().deadline_at =
             Instant::now() - Duration::from_secs(1);
 
-        let result = scheduler.schedule(&mut kv_cache);
+        let result = scheduler.schedule();
 
         assert!(result.expired_requests.is_empty());
         assert_eq!(result.prefill_requests.len(), 1);
     }
 
     #[test]
-    fn expiring_running_request_waits_for_exact_cleanup_before_releasing_blocks() {
+    fn expiring_running_request_waits_for_exact_cleanup_before_id_reuse() {
         let mut scheduler = Scheduler::new(SchedulerConfig::default());
-        let mut kv_cache = KVCacheManager::new(Default::default());
         let mut request = EngineCoreRequest::tts("running-deadline");
         request.id = "running-deadline".to_string();
         request.prompt_tokens = vec![1];
         scheduler.add_request(&request);
-        assert_eq!(scheduler.schedule(&mut kv_cache).prefill_requests.len(), 1);
-        assert!(kv_cache.stats().allocated_blocks > 0);
+        assert_eq!(scheduler.schedule().prefill_requests.len(), 1);
         scheduler
             .requests
             .get_mut(&request.id)
             .unwrap()
             .hard_deadline = Some(Instant::now() - Duration::from_millis(1));
 
-        let result = scheduler.schedule(&mut kv_cache);
+        let result = scheduler.schedule();
 
         assert_eq!(result.expired_requests.len(), 1);
-        assert!(kv_cache.stats().allocated_blocks > 0);
         assert_eq!(scheduler.running_count(), 0);
         let session = result.expired_requests[0].session_key();
         assert_eq!(
@@ -3743,12 +4573,10 @@ mod tests {
             vec![session.clone()]
         );
         let stale = SessionKey::new(session.request_id.clone(), session.epoch + 1);
-        assert!(!scheduler.confirm_expired_session_cleanup(&stale, &mut kv_cache));
-        assert!(kv_cache.stats().allocated_blocks > 0);
+        assert!(!scheduler.confirm_expired_session_cleanup(&stale));
         assert!(!scheduler.add_request(&request));
 
-        assert!(scheduler.confirm_expired_session_cleanup(&session, &mut kv_cache));
-        assert_eq!(kv_cache.stats().allocated_blocks, 0);
+        assert!(scheduler.confirm_expired_session_cleanup(&session));
         assert!(scheduler.pending_expired_cleanup_sessions().is_empty());
         assert!(scheduler.add_request(&request));
     }
@@ -3756,7 +4584,6 @@ mod tests {
     #[test]
     fn terminal_release_requires_exact_cleanup_and_delivery_before_id_reuse() {
         let mut scheduler = Scheduler::new(SchedulerConfig::default());
-        let mut kv_cache = KVCacheManager::new(Default::default());
         let request = build_request(TaskType::Chat, "terminal-fence", Priority::Normal);
         assert!(scheduler.add_request(&request));
         let epoch = scheduler.get_sequence_id(&request.id).unwrap();
@@ -3766,9 +4593,8 @@ mod tests {
         profile.cache_mode = CacheMode::ExternalPaged;
         profile.cache_release_safe = true;
         assert!(scheduler.update_execution_profile(&session, &profile));
-        assert_eq!(scheduler.schedule(&mut kv_cache).prefill_requests.len(), 1);
-        let allocated = kv_cache.stats().allocated_blocks;
-        assert!(allocated > 0);
+        let scheduled = scheduler.schedule();
+        assert_eq!(scheduled.prefill_requests.len(), 1);
 
         assert_eq!(
             scheduler.begin_terminal_release(&session, TerminalReleaseCause::Completed),
@@ -3778,15 +4604,12 @@ mod tests {
         );
         assert!(!scheduler.add_request(&request));
         let stale = SessionKey::new(request.id.clone(), session.epoch + 1);
-        assert!(!scheduler.confirm_session_release(&stale, &mut kv_cache));
+        assert!(!scheduler.confirm_session_release(&stale));
         assert!(!scheduler.mark_terminal_delivered(&stale));
-        assert_eq!(kv_cache.stats().allocated_blocks, allocated);
 
         assert!(scheduler.mark_terminal_delivered(&session));
-        assert_eq!(kv_cache.stats().allocated_blocks, allocated);
         assert!(!scheduler.add_request(&request));
-        assert!(scheduler.confirm_session_release(&session, &mut kv_cache));
-        assert_eq!(kv_cache.stats().allocated_blocks, 0);
+        assert!(scheduler.confirm_session_release(&session));
         assert!(scheduler.add_request(&request));
     }
 
@@ -3798,7 +4621,6 @@ mod tests {
             policy: SchedulingPolicy::WeightedFair,
             ..Default::default()
         });
-        let mut kv_cache = KVCacheManager::new(Default::default());
         for index in 0..8 {
             let mut request = EngineCoreRequest::tts("realtime");
             request.id = format!("realtime-{index}");
@@ -3814,10 +4636,10 @@ mod tests {
 
         let mut selected = Vec::new();
         for _ in 0..3 {
-            let result = scheduler.schedule(&mut kv_cache);
+            let result = scheduler.schedule();
             let request_id = result.prefill_requests[0].request_id.clone();
             selected.push(request_id.clone());
-            scheduler.finish_request(&request_id, &mut kv_cache);
+            scheduler.finish_request(&request_id);
         }
 
         assert!(selected.iter().any(|id| id == "background"));
@@ -3826,12 +4648,54 @@ mod tests {
     #[test]
     fn production_defaults_only_enable_physically_enforced_features() {
         let config = SchedulerConfig::default();
-        assert_eq!(config.policy, SchedulingPolicy::FCFS);
+        assert_eq!(config.policy, SchedulingPolicy::WeightedFair);
         assert!(!config.enable_chunked_prefill);
         assert!(!config.enable_preemption);
         assert!(!config.enable_adaptive_batching);
         assert!(!config.enable_power_adaptive);
         assert!(!config.enable_decode_quanta);
-        assert!(!config.enable_kv_tiering);
+    }
+
+    #[test]
+    fn committed_sequence_finalization_is_scheduled_as_a_distinct_cache_free_stage() {
+        let mut scheduler = small_scheduler();
+        let request = build_request(TaskType::TTS, "tts-finalize", Priority::Normal);
+        assert!(scheduler.add_request(&request));
+        let prefill = scheduler.schedule();
+        assert_eq!(prefill.prefill_requests.len(), 1);
+        scheduler.update_after_step(&request.id, request.num_prompt_tokens(), 0, 1.0);
+        scheduler
+            .request_sequence_finalize(&request.id)
+            .expect("committed sequence can finalize");
+
+        let scheduled = scheduler.schedule();
+        assert_eq!(scheduled.decode_requests.len(), 1);
+        let row = &scheduled.decode_requests[0];
+        assert_eq!(row.request_id, request.id);
+        assert_eq!(row.num_tokens, 1);
+        assert!(matches!(
+            row.work,
+            WorkUnit::SequenceFinalize {
+                max_output_steps: 1
+            }
+        ));
+        assert!(scheduler.schedule().decode_requests.is_empty());
+
+        let session = row.session_key();
+        assert!(scheduler.release_execution_quantum_for_retry(&session));
+        let retry = scheduler.schedule();
+        assert_eq!(retry.decode_requests.len(), 1);
+        assert!(matches!(
+            retry.decode_requests[0].work,
+            WorkUnit::SequenceFinalize { .. }
+        ));
+    }
+
+    #[test]
+    fn sequence_finalization_cannot_bypass_uncommitted_prefill() {
+        let mut scheduler = small_scheduler();
+        let request = build_request(TaskType::TTS, "tts-finalize-early", Priority::Normal);
+        assert!(scheduler.add_request(&request));
+        assert!(scheduler.request_sequence_finalize(&request.id).is_err());
     }
 }

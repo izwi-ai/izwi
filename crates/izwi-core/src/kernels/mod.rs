@@ -41,7 +41,7 @@ pub fn fused_kernels_available_for_device(device: &Device) -> bool {
 }
 
 fn metal_fused_kernels_available() -> bool {
-    cfg!(target_os = "macos")
+    crate::backends::metal_runtime_supported()
 }
 
 /// Whether to use fused kernels (can be disabled via environment).
@@ -119,6 +119,10 @@ pub fn try_fused_qk_rms_norm(
         return None;
     }
 
+    if q.device().is_cuda() {
+        return cuda::try_fused_qk_rms_norm(q, k, qk_weight, eps);
+    }
+
     if q.device().is_metal() {
         return metal::try_fused_qk_rms_norm(q, k, qk_weight, eps);
     }
@@ -140,6 +144,35 @@ pub fn try_fused_l2_norm(input: &Tensor, eps: f64) -> Option<Tensor> {
     }
 
     None
+}
+
+/// Try the Qwen3.8-specific CUDA SiLU-mul decode epilogue.
+pub fn try_qwen38_silu_mul_decode(gate: &Tensor, up: &Tensor) -> Option<Tensor> {
+    if !use_fused_kernels_for_device(gate.device()) || !gate.device().is_cuda() {
+        return None;
+    }
+    cuda::try_qwen38_silu_mul_decode(gate, up)
+}
+
+/// Try the Qwen3.8-specific CUDA L2-normalization decode epilogue.
+pub fn try_qwen38_l2_norm_decode(input: &Tensor, eps: f64) -> Option<Tensor> {
+    if !use_fused_kernels_for_device(input.device()) || !input.device().is_cuda() {
+        return None;
+    }
+    cuda::try_qwen38_l2_norm_decode(input, eps)
+}
+
+/// Try the Qwen3.8-specific CUDA gated-RMSNorm decode epilogue.
+pub fn try_qwen38_gated_rms_norm_decode(
+    hidden: &Tensor,
+    gate: &Tensor,
+    weight: &Tensor,
+    eps: f64,
+) -> Option<Tensor> {
+    if !use_fused_kernels_for_device(hidden.device()) || !hidden.device().is_cuda() {
+        return None;
+    }
+    cuda::try_qwen38_gated_rms_norm_decode(hidden, gate, weight, eps)
 }
 
 pub fn try_fused_rms_norm(input: &Tensor, weight: &Tensor, eps: f64) -> Option<Tensor> {
@@ -167,6 +200,10 @@ pub fn try_fused_rope_pair_bshd(
         return None;
     }
 
+    if q.device().is_cuda() {
+        return cuda::try_fused_rope_pair_bshd(q, k, cos_sin);
+    }
+
     if q.device().is_metal() {
         return metal::try_fused_rope_pair_bshd(q, k, cos_sin);
     }
@@ -185,6 +222,18 @@ pub fn try_fused_decode_gqa_attention(
 ) -> Option<Tensor> {
     if !use_fused_kernels_for_device(q.device()) {
         return None;
+    }
+
+    if q.device().is_cuda() {
+        return cuda::try_fused_decode_gqa_attention(
+            q,
+            k,
+            v,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+        );
     }
 
     if q.device().is_metal() {
@@ -216,6 +265,19 @@ pub fn try_fused_decode_gqa_attention_with_kv_len(
         return None;
     }
 
+    if q.device().is_cuda() {
+        return cuda::try_fused_decode_gqa_attention_with_kv_len(
+            q,
+            k,
+            v,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            kv_len,
+            scale,
+        );
+    }
+
     if q.device().is_metal() {
         return metal::try_fused_decode_gqa_attention_with_kv_len(
             q,
@@ -237,6 +299,10 @@ pub fn try_lfm_shortconv_decode3(cache: &Tensor, bx: &Tensor, conv: &Tensor) -> 
         return None;
     }
 
+    if cache.device().is_cuda() {
+        return cuda::try_lfm_shortconv_decode3(cache, bx, conv);
+    }
+
     if cache.device().is_metal() {
         return metal::try_lfm_shortconv_decode3(cache, bx, conv);
     }
@@ -247,6 +313,10 @@ pub fn try_lfm_shortconv_decode3(cache: &Tensor, bx: &Tensor, conv: &Tensor) -> 
 pub fn try_lfm_shortconv_update3(cache: &Tensor, bx: &Tensor) -> Option<Tensor> {
     if !use_fused_kernels_for_device(cache.device()) {
         return None;
+    }
+
+    if cache.device().is_cuda() {
+        return cuda::try_lfm_shortconv_update3(cache, bx);
     }
 
     if cache.device().is_metal() {
@@ -261,8 +331,46 @@ pub fn try_lfm_shortconv_sequence3(bx: &Tensor, conv: &Tensor) -> Option<Tensor>
         return None;
     }
 
+    if bx.device().is_cuda() {
+        return cuda::try_lfm_shortconv_sequence3(bx, conv);
+    }
+
     if bx.device().is_metal() {
         return metal::try_lfm_shortconv_sequence3(bx, conv);
+    }
+
+    None
+}
+
+pub fn try_lfm_shortconv_ring_sequence(
+    ring: &Tensor,
+    input: &Tensor,
+    weight: &Tensor,
+    expected_cursor: u64,
+    valid_length: u64,
+) -> Option<Tensor> {
+    if !use_fused_kernels_for_device(ring.device()) {
+        return None;
+    }
+
+    if ring.device().is_cuda() {
+        return cuda::try_lfm_shortconv_ring_sequence(
+            ring,
+            input,
+            weight,
+            expected_cursor,
+            valid_length,
+        );
+    }
+
+    if ring.device().is_metal() {
+        return metal::try_lfm_shortconv_ring_sequence(
+            ring,
+            input,
+            weight,
+            expected_cursor,
+            valid_length,
+        );
     }
 
     None
@@ -286,6 +394,38 @@ pub fn try_qwen35_causal_conv_sequence(
     }
 
     None
+}
+
+pub fn try_qwen38_causal_conv_sequence(
+    input: &Tensor,
+    weight: &Tensor,
+    history: &Tensor,
+) -> Option<(Tensor, Tensor)> {
+    if !use_fused_kernels_for_device(input.device()) {
+        return None;
+    }
+
+    if input.device().is_cuda() {
+        return cuda::try_qwen38_causal_conv_sequence(input, weight, history);
+    }
+
+    if input.device().is_metal() {
+        return metal::try_qwen38_causal_conv_sequence(input, weight, history);
+    }
+
+    None
+}
+
+pub fn try_qwen38_causal_conv_decode(
+    input: &Tensor,
+    weight: &Tensor,
+    history: &Tensor,
+) -> Option<(Tensor, Tensor)> {
+    if !use_fused_kernels_for_device(input.device()) || !input.device().is_cuda() {
+        return None;
+    }
+
+    cuda::try_qwen38_causal_conv_decode(input, weight, history)
 }
 
 pub fn try_fused_gated_rms_norm(
@@ -370,6 +510,36 @@ pub fn try_tiled_deltanet_recurrence(
     }
 
     None
+}
+
+/// Qwen3.8-only CUDA single-token DeltaNet recurrence candidate.
+///
+/// Unsupported devices and geometries return `None`, keeping the model's
+/// portable recurrence as the authoritative fallback.
+pub fn try_qwen38_deltanet_decode(
+    mixed_qkv: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    initial_state: &Tensor,
+    key_heads: usize,
+    value_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+) -> Option<(Tensor, Tensor)> {
+    if !use_fused_kernels_for_device(mixed_qkv.device()) || !mixed_qkv.device().is_cuda() {
+        return None;
+    }
+
+    cuda::try_qwen38_deltanet_decode(
+        mixed_qkv,
+        g,
+        beta,
+        initial_state,
+        key_heads,
+        value_heads,
+        key_dim,
+        value_dim,
+    )
 }
 
 /// Result type for fused kernel operations.

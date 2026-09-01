@@ -13,11 +13,13 @@ use crate::engine::{
     PrefillMode, TaskType,
 };
 use crate::error::{Error, Result};
-use crate::runtime::rollout::{ExecutionRolloutMode, ExecutionRolloutPolicy};
 
 mod loaded;
 
-pub(crate) use loaded::{LoadedExecutionContract, LoadedModelBundle, StreamingRequirements};
+pub(crate) use loaded::{
+    LoadedCapabilityBinding, LoadedExecutionContract, LoadedModelBundle, LoadedModelBundleDraft,
+    LoadedStatePublication, StreamingRequirements,
+};
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -96,6 +98,111 @@ pub(crate) enum SequenceExecutionMode {
     StreamingOnly,
 }
 
+/// Capability-authored lifetime truth for mutable inference data. This is
+/// independent of whether the current scalar execution profile happens
+/// to expose a scheduler cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum InferenceStateRequirement {
+    Stateless,
+    Invocation,
+    Retained,
+    RetainedAndInvocation,
+}
+
+impl InferenceStateRequirement {
+    pub(crate) const fn requires_retained(self) -> bool {
+        matches!(self, Self::Retained | Self::RetainedAndInvocation)
+    }
+
+    pub(crate) const fn requires_invocation(self) -> bool {
+        matches!(self, Self::Invocation | Self::RetainedAndInvocation)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FamilyInferenceStatePolicy {
+    tts: InferenceStateRequirement,
+    streaming_tts: InferenceStateRequirement,
+    asr: InferenceStateRequirement,
+    chat: InferenceStateRequirement,
+}
+
+impl FamilyInferenceStatePolicy {
+    const STATELESS: Self = Self {
+        tts: InferenceStateRequirement::Stateless,
+        streaming_tts: InferenceStateRequirement::Stateless,
+        asr: InferenceStateRequirement::Stateless,
+        chat: InferenceStateRequirement::Stateless,
+    };
+}
+
+/// Exhaustive family-level inference-state truth.
+///
+/// Keeping this match exhaustive is intentional: adding a model family must
+/// include an explicit state-lifetime decision before its adapters can compile.
+const fn family_inference_state_policy(family: ModelFamily) -> FamilyInferenceStatePolicy {
+    use InferenceStateRequirement::{Invocation, Retained, RetainedAndInvocation};
+    use ModelFamily::*;
+
+    match family {
+        Qwen3Tts => FamilyInferenceStatePolicy {
+            tts: RetainedAndInvocation,
+            streaming_tts: RetainedAndInvocation,
+            ..FamilyInferenceStatePolicy::STATELESS
+        },
+        KokoroTts => FamilyInferenceStatePolicy::STATELESS,
+        VibeVoiceTts => FamilyInferenceStatePolicy {
+            tts: RetainedAndInvocation,
+            ..FamilyInferenceStatePolicy::STATELESS
+        },
+        VoxtralTts => FamilyInferenceStatePolicy {
+            tts: Invocation,
+            ..FamilyInferenceStatePolicy::STATELESS
+        },
+        FishS2Tts => FamilyInferenceStatePolicy {
+            tts: RetainedAndInvocation,
+            ..FamilyInferenceStatePolicy::STATELESS
+        },
+        ParakeetAsr => FamilyInferenceStatePolicy {
+            asr: RetainedAndInvocation,
+            ..FamilyInferenceStatePolicy::STATELESS
+        },
+        NemotronAsr | Voxtral => FamilyInferenceStatePolicy {
+            asr: Invocation,
+            ..FamilyInferenceStatePolicy::STATELESS
+        },
+        GraniteSpeechAsr => FamilyInferenceStatePolicy {
+            asr: RetainedAndInvocation,
+            ..FamilyInferenceStatePolicy::STATELESS
+        },
+        VibeVoiceAsr => FamilyInferenceStatePolicy {
+            asr: RetainedAndInvocation,
+            ..FamilyInferenceStatePolicy::STATELESS
+        },
+        WhisperAsr => FamilyInferenceStatePolicy {
+            asr: RetainedAndInvocation,
+            ..FamilyInferenceStatePolicy::STATELESS
+        },
+        Qwen3Asr => FamilyInferenceStatePolicy {
+            asr: RetainedAndInvocation,
+            ..FamilyInferenceStatePolicy::STATELESS
+        },
+        Qwen3Chat | Qwen35Chat | Qwen38Chat | Gemma3Chat | Lfm2Chat => FamilyInferenceStatePolicy {
+            chat: Retained,
+            ..FamilyInferenceStatePolicy::STATELESS
+        },
+        Lfm25Audio => FamilyInferenceStatePolicy {
+            tts: RetainedAndInvocation,
+            asr: RetainedAndInvocation,
+            ..FamilyInferenceStatePolicy::STATELESS
+        },
+        SortformerDiarization | Qwen3ForcedAligner | Tokenizer => {
+            FamilyInferenceStatePolicy::STATELESS
+        }
+    }
+}
+
 impl SequenceExecutionMode {
     const fn enabled(self, streaming_required: bool) -> bool {
         match self {
@@ -115,6 +222,7 @@ pub(crate) struct AdapterMetadata {
     pub(crate) streaming_mode: StreamingMode,
     pub(crate) execution_target: ExecutionTargetKind,
     pub(crate) sequence_execution: SequenceExecutionMode,
+    pub(crate) state_requirement: InferenceStateRequirement,
 }
 
 pub(crate) trait ModelCapabilityAdapter {
@@ -124,45 +232,23 @@ pub(crate) trait ModelCapabilityAdapter {
 #[derive(Debug)]
 pub(crate) struct RuntimeAdapterRegistry {
     adapters: HashMap<(CapabilityKind, ModelVariant), AdapterMetadata>,
-    execution_rollout: ExecutionRolloutPolicy,
     max_tensor_batch_size: usize,
     request_parallelism: usize,
     loaded_adapter_factories: Vec<Arc<dyn loaded::LoadedExecutionAdapterFactory>>,
 }
 
-impl Default for RuntimeAdapterRegistry {
-    fn default() -> Self {
-        Self {
-            adapters: HashMap::new(),
-            execution_rollout: ExecutionRolloutPolicy::default(),
-            max_tensor_batch_size: 1,
-            request_parallelism: 1,
-            loaded_adapter_factories: loaded::built_in_loaded_adapter_factories(),
-        }
-    }
-}
-
 impl RuntimeAdapterRegistry {
     pub(crate) fn built_in() -> Self {
-        Self::built_in_with_rollout(ExecutionRolloutPolicy::default(), 1)
-            .expect("the fail-closed built-in adapter registry must be valid")
-    }
-
-    pub(crate) fn built_in_with_rollout(
-        execution_rollout: ExecutionRolloutPolicy,
-        max_tensor_batch_size: usize,
-    ) -> Result<Self> {
-        Self::built_in_with_execution_limits(execution_rollout, max_tensor_batch_size, 1)
+        Self::built_in_with_execution_limits(1, 1)
+            .expect("the built-in native adapter registry must be unambiguous")
     }
 
     pub(crate) fn built_in_with_execution_limits(
-        execution_rollout: ExecutionRolloutPolicy,
         max_tensor_batch_size: usize,
         request_parallelism: usize,
     ) -> Result<Self> {
         let mut registry = Self {
             adapters: HashMap::new(),
-            execution_rollout,
             max_tensor_batch_size: max_tensor_batch_size.max(1),
             request_parallelism: request_parallelism.max(1),
             loaded_adapter_factories: loaded::built_in_loaded_adapter_factories(),
@@ -178,7 +264,7 @@ impl RuntimeAdapterRegistry {
         registry.register_adapter(DiarizationCapabilityAdapter);
         registry.register_adapter(ForcedAlignmentCapabilityAdapter);
         registry.register_adapter(TokenizerCapabilityAdapter);
-        registry.validate_execution_rollout()?;
+        registry.validate_loaded_adapter_factories()?;
         Ok(registry)
     }
 
@@ -206,14 +292,6 @@ impl RuntimeAdapterRegistry {
             })
     }
 
-    pub(crate) fn execution_mode_for(
-        &self,
-        model_variant: ModelVariant,
-        backend_kind: BackendKind,
-    ) -> ExecutionRolloutMode {
-        self.execution_rollout.mode_for(model_variant, backend_kind)
-    }
-
     pub(crate) fn max_tensor_batch_size(&self) -> usize {
         self.max_tensor_batch_size
     }
@@ -226,38 +304,23 @@ impl RuntimeAdapterRegistry {
         &self,
         backend_kind: BackendKind,
     ) -> HashSet<ModelVariant> {
-        self.loaded_rollout_variants(backend_kind, ExecutionRolloutMode::Static)
+        self.loaded_native_variants(backend_kind, NativeBatchMode::Static)
     }
 
     pub(crate) fn continuous_tensor_batch_variants(
         &self,
         backend_kind: BackendKind,
     ) -> HashSet<ModelVariant> {
-        self.loaded_rollout_variants(backend_kind, ExecutionRolloutMode::Continuous)
+        self.loaded_native_variants(backend_kind, NativeBatchMode::Continuous)
     }
 
-    fn validate_execution_rollout(&self) -> Result<()> {
+    fn validate_loaded_adapter_factories(&self) -> Result<()> {
         const BACKENDS: [BackendKind; 3] =
             [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda];
 
-        for model_variant in ModelVariant::all().iter().copied() {
+        for metadata in self.adapters.values().copied() {
             for backend_kind in BACKENDS {
-                match self.execution_mode_for(model_variant, backend_kind) {
-                    ExecutionRolloutMode::Off => {}
-                    mode @ (ExecutionRolloutMode::Static | ExecutionRolloutMode::Continuous)
-                        if self.supports_loaded_rollout(model_variant, backend_kind, mode)? => {}
-                    mode @ (ExecutionRolloutMode::Static | ExecutionRolloutMode::Continuous) => {
-                        let adapter_kind = match mode {
-                            ExecutionRolloutMode::Static => "static tensor",
-                            ExecutionRolloutMode::Continuous => "continuous tensor",
-                            ExecutionRolloutMode::Off => unreachable!("guarded rollout mode"),
-                        };
-                        return Err(Error::InvalidInput(format!(
-                            "Model {model_variant} has no {adapter_kind} adapter on {}",
-                            backend_kind.as_str()
-                        )));
-                    }
-                }
+                self.loaded_adapter_factory(metadata, backend_kind)?;
             }
         }
         Ok(())
@@ -276,7 +339,7 @@ impl RuntimeAdapterRegistry {
     }
 }
 
-pub(crate) fn compatibility_execution_profile(
+pub(crate) fn scalar_execution_profile(
     metadata: AdapterMetadata,
     backend_kind: BackendKind,
     streaming_required: bool,
@@ -299,7 +362,7 @@ pub(crate) fn compatibility_execution_profile(
     if sequence {
         profile.prefill = PrefillMode::Full;
         profile.incremental_decode = true;
-        profile.cache_mode = CacheMode::OpaqueModelOwned;
+        profile.cache_mode = CacheMode::ExternalPaged;
     }
     if metadata.capability == CapabilityKind::Asr {
         profile.cancellation = CancellationGranularity::OperationBoundary;
@@ -309,28 +372,31 @@ pub(crate) fn compatibility_execution_profile(
     profile.max_batch_size = 1;
     profile.compute_dtype = "loaded_model_default".to_string();
     profile.kv_dtype = if sequence {
-        "loaded_model_default".to_string()
+        "state_v2_resolved".to_string()
     } else {
         "none".to_string()
     };
     profile.cache_namespace =
-        sequence.then(|| format!("{}:{}:opaque", variant, backend_kind.as_str()));
+        sequence.then(|| format!("{}:{}:state-v2", variant, backend_kind.as_str()));
     profile
 }
 
 fn tts_execution_target(model_variant: ModelVariant) -> ExecutionTargetKind {
-    if model_variant.is_kokoro()
-        || model_variant.is_lfm25_audio_gguf()
-        || matches!(
-            model_variant.family(),
-            crate::catalog::ModelFamily::VoxtralTts
-                | crate::catalog::ModelFamily::VibeVoiceTts
-                | crate::catalog::ModelFamily::FishS2Tts
-        )
-    {
+    if matches!(
+        model_variant.family(),
+        crate::catalog::ModelFamily::VoxtralTts
+    ) {
         ExecutionTargetKind::DirectModel
     } else {
         ExecutionTargetKind::TokenEngine
+    }
+}
+
+fn streaming_tts_execution_target(model_variant: ModelVariant) -> ExecutionTargetKind {
+    if model_variant.is_kokoro() {
+        ExecutionTargetKind::DirectModel
+    } else {
+        tts_execution_target(model_variant)
     }
 }
 
@@ -354,7 +420,9 @@ fn tts_streaming_mode(model_variant: ModelVariant) -> StreamingMode {
 }
 
 fn asr_execution_target(model_variant: ModelVariant) -> ExecutionTargetKind {
-    if model_variant.is_audio_chat() {
+    if model_variant.is_audio_chat()
+        && model_variant.family() != crate::catalog::ModelFamily::Lfm25Audio
+    {
         ExecutionTargetKind::DirectModel
     } else {
         ExecutionTargetKind::TokenEngine
@@ -362,15 +430,14 @@ fn asr_execution_target(model_variant: ModelVariant) -> ExecutionTargetKind {
 }
 
 fn chat_sequence_execution(model_variant: ModelVariant) -> SequenceExecutionMode {
-    if matches!(model_variant.family(), ModelFamily::Qwen35Chat)
-        || matches!(
-            model_variant,
-            ModelVariant::Qwen306B
-                | ModelVariant::Qwen306B4Bit
-                | ModelVariant::Qwen317B
-                | ModelVariant::Qwen317B4Bit
-        )
-    {
+    if matches!(
+        model_variant.family(),
+        ModelFamily::Qwen3Chat
+            | ModelFamily::Qwen35Chat
+            | ModelFamily::Qwen38Chat
+            | ModelFamily::Gemma3Chat
+            | ModelFamily::Lfm2Chat
+    ) {
         SequenceExecutionMode::Always
     } else {
         SequenceExecutionMode::None
@@ -394,6 +461,7 @@ impl ModelCapabilityAdapter for TtsCapabilityAdapter {
             } else {
                 SequenceExecutionMode::None
             },
+            state_requirement: family_inference_state_policy(model_variant.family()).tts,
         })
     }
 }
@@ -409,12 +477,13 @@ impl ModelCapabilityAdapter for StreamingTtsCapabilityAdapter {
             capability: CapabilityKind::StreamingTts,
             model_variant,
             streaming_mode: StreamingMode::Chunked,
-            execution_target: tts_execution_target(model_variant),
+            execution_target: streaming_tts_execution_target(model_variant),
             sequence_execution: if model_variant.family() == ModelFamily::Qwen3Tts {
                 SequenceExecutionMode::Always
             } else {
                 SequenceExecutionMode::None
             },
+            state_requirement: family_inference_state_policy(model_variant.family()).streaming_tts,
         })
     }
 }
@@ -438,11 +507,19 @@ impl ModelCapabilityAdapter for AsrCapabilityAdapter {
                     StreamingMode::None
                 },
                 execution_target: asr_execution_target(model_variant),
-                sequence_execution: if model_variant.family() == ModelFamily::Qwen3Asr {
-                    SequenceExecutionMode::StreamingOnly
+                sequence_execution: if matches!(
+                    model_variant.family(),
+                    ModelFamily::Qwen3Asr
+                        | ModelFamily::WhisperAsr
+                        | ModelFamily::VibeVoiceAsr
+                        | ModelFamily::GraniteSpeechAsr
+                        | ModelFamily::Lfm25Audio
+                ) {
+                    SequenceExecutionMode::Always
                 } else {
                     SequenceExecutionMode::None
                 },
+                state_requirement: family_inference_state_policy(model_variant.family()).asr,
             })
     }
 }
@@ -461,6 +538,7 @@ impl ModelCapabilityAdapter for SpeakerAttributedAsrCapabilityAdapter {
                 streaming_mode: StreamingMode::None,
                 execution_target: ExecutionTargetKind::PipelineRunner,
                 sequence_execution: SequenceExecutionMode::None,
+                state_requirement: InferenceStateRequirement::Invocation,
             })
     }
 }
@@ -470,13 +548,18 @@ struct RealtimeAsrCapabilityAdapter;
 
 impl ModelCapabilityAdapter for RealtimeAsrCapabilityAdapter {
     fn metadata_for(&self, model_variant: ModelVariant) -> Option<AdapterMetadata> {
-        (model_variant == ModelVariant::Nemotron35AsrStreaming06B).then_some(AdapterMetadata {
+        matches!(
+            model_variant,
+            ModelVariant::Nemotron35AsrStreaming06B | ModelVariant::VoxtralMini4BRealtime2602
+        )
+        .then_some(AdapterMetadata {
             id: "builtin.realtime_asr",
             capability: CapabilityKind::RealtimeAsr,
             model_variant,
             streaming_mode: StreamingMode::Realtime,
             execution_target: ExecutionTargetKind::RealtimeRunner,
             sequence_execution: SequenceExecutionMode::None,
+            state_requirement: InferenceStateRequirement::RetainedAndInvocation,
         })
     }
 }
@@ -493,6 +576,7 @@ impl ModelCapabilityAdapter for ChatCapabilityAdapter {
             streaming_mode: StreamingMode::Chunked,
             execution_target: ExecutionTargetKind::TokenEngine,
             sequence_execution: chat_sequence_execution(model_variant),
+            state_requirement: family_inference_state_policy(model_variant.family()).chat,
         })
     }
 }
@@ -509,6 +593,7 @@ impl ModelCapabilityAdapter for AudioChatCapabilityAdapter {
             streaming_mode: StreamingMode::Chunked,
             execution_target: ExecutionTargetKind::TokenEngine,
             sequence_execution: SequenceExecutionMode::None,
+            state_requirement: InferenceStateRequirement::Invocation,
         })
     }
 }
@@ -525,6 +610,7 @@ impl ModelCapabilityAdapter for SpeechToSpeechCapabilityAdapter {
             streaming_mode: StreamingMode::Chunked,
             execution_target: ExecutionTargetKind::TokenEngine,
             sequence_execution: SequenceExecutionMode::None,
+            state_requirement: InferenceStateRequirement::Invocation,
         })
     }
 }
@@ -543,6 +629,7 @@ impl ModelCapabilityAdapter for DiarizationCapabilityAdapter {
                 streaming_mode: StreamingMode::None,
                 execution_target: ExecutionTargetKind::PipelineRunner,
                 sequence_execution: SequenceExecutionMode::None,
+                state_requirement: InferenceStateRequirement::Invocation,
             })
     }
 }
@@ -561,6 +648,7 @@ impl ModelCapabilityAdapter for ForcedAlignmentCapabilityAdapter {
                 streaming_mode: StreamingMode::None,
                 execution_target: ExecutionTargetKind::BatchRunner,
                 sequence_execution: SequenceExecutionMode::None,
+                state_requirement: InferenceStateRequirement::Stateless,
             })
     }
 }
@@ -577,6 +665,7 @@ impl ModelCapabilityAdapter for TokenizerCapabilityAdapter {
             streaming_mode: StreamingMode::None,
             execution_target: ExecutionTargetKind::Artifact,
             sequence_execution: SequenceExecutionMode::None,
+            state_requirement: InferenceStateRequirement::Stateless,
         })
     }
 }
@@ -604,7 +693,10 @@ mod tests {
         if model_variant.supports_speaker_attributed_asr() {
             expected.insert(CapabilityKind::SpeakerAttributedAsr);
         }
-        if model_variant == ModelVariant::Nemotron35AsrStreaming06B {
+        if matches!(
+            model_variant,
+            ModelVariant::Nemotron35AsrStreaming06B | ModelVariant::VoxtralMini4BRealtime2602
+        ) {
             expected.insert(CapabilityKind::RealtimeAsr);
         }
         if model_variant.is_chat() {
@@ -649,11 +741,23 @@ mod tests {
         assert_eq!(qwen.streaming_mode, StreamingMode::Chunked);
         assert_eq!(qwen.execution_target, ExecutionTargetKind::TokenEngine);
 
+        let kokoro = registry
+            .require(CapabilityKind::Tts, ModelVariant::Kokoro82M)
+            .expect("Kokoro TTS adapter");
+        assert_eq!(kokoro.execution_target, ExecutionTargetKind::TokenEngine);
+        let kokoro_streaming = registry
+            .require(CapabilityKind::StreamingTts, ModelVariant::Kokoro82M)
+            .expect("Kokoro streaming TTS adapter");
+        assert_eq!(
+            kokoro_streaming.execution_target,
+            ExecutionTargetKind::DirectModel
+        );
+
         let lfm = registry
             .require(CapabilityKind::Tts, ModelVariant::Lfm25Audio15BGguf)
             .expect("lfm audio tts adapter");
         assert_eq!(lfm.streaming_mode, StreamingMode::FinalOnly);
-        assert_eq!(lfm.execution_target, ExecutionTargetKind::DirectModel);
+        assert_eq!(lfm.execution_target, ExecutionTargetKind::TokenEngine);
     }
 
     #[test]
@@ -670,7 +774,7 @@ mod tests {
     }
 
     #[test]
-    fn capability_metadata_owns_compatibility_sequence_semantics() {
+    fn capability_metadata_owns_scalar_sequence_semantics() {
         let registry = RuntimeAdapterRegistry::built_in();
         let qwen_chat = *registry
             .require(CapabilityKind::Chat, ModelVariant::Qwen306B)
@@ -678,99 +782,115 @@ mod tests {
         let gemma_chat = *registry
             .require(CapabilityKind::Chat, ModelVariant::Gemma31BIt)
             .unwrap();
+        let lfm_chat = *registry
+            .require(CapabilityKind::Chat, ModelVariant::Lfm2512BInstructGguf)
+            .unwrap();
         let qwen_tts = *registry
             .require(CapabilityKind::Tts, ModelVariant::Qwen3Tts12Hz06BBase)
             .unwrap();
         let qwen_asr = *registry
             .require(CapabilityKind::Asr, ModelVariant::Qwen3Asr06BGguf)
             .unwrap();
+        let whisper_asr = *registry
+            .require(CapabilityKind::Asr, ModelVariant::WhisperLargeV3Turbo)
+            .unwrap();
 
         assert_eq!(qwen_chat.sequence_execution, SequenceExecutionMode::Always);
+        assert_eq!(gemma_chat.sequence_execution, SequenceExecutionMode::Always);
+        assert_eq!(
+            gemma_chat.state_requirement,
+            InferenceStateRequirement::Retained
+        );
         assert_eq!(qwen_tts.sequence_execution, SequenceExecutionMode::Always);
+        assert_eq!(qwen_asr.sequence_execution, SequenceExecutionMode::Always);
         assert_eq!(
-            qwen_asr.sequence_execution,
-            SequenceExecutionMode::StreamingOnly
-        );
-        assert_eq!(gemma_chat.sequence_execution, SequenceExecutionMode::None);
-        assert_eq!(
-            compatibility_execution_profile(qwen_asr, BackendKind::Cpu, false).mode,
-            ExecutionMode::Atomic
+            qwen_asr.state_requirement,
+            InferenceStateRequirement::RetainedAndInvocation
         );
         assert_eq!(
-            compatibility_execution_profile(qwen_asr, BackendKind::Cpu, true).mode,
+            whisper_asr.sequence_execution,
+            SequenceExecutionMode::Always
+        );
+        assert_eq!(
+            whisper_asr.state_requirement,
+            InferenceStateRequirement::RetainedAndInvocation
+        );
+        assert_eq!(lfm_chat.sequence_execution, SequenceExecutionMode::Always);
+        assert_eq!(
+            lfm_chat.state_requirement,
+            InferenceStateRequirement::Retained
+        );
+        assert_eq!(
+            scalar_execution_profile(qwen_asr, BackendKind::Cpu, false).mode,
+            ExecutionMode::Sequence
+        );
+        assert_eq!(
+            scalar_execution_profile(qwen_asr, BackendKind::Cpu, true).mode,
             ExecutionMode::Sequence
         );
     }
 
     #[test]
-    fn exact_static_rollout_only_publishes_proven_native_variants() {
+    fn physical_qwen_tts_factory_does_not_publish_the_removed_static_route() {
         let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
-        let override_value = format!("{}@metal=static", variant);
-        let rollout =
-            ExecutionRolloutPolicy::try_from_raw(Some("off"), Some(&override_value)).unwrap();
-        let registry = RuntimeAdapterRegistry::built_in_with_rollout(rollout, 4).unwrap();
+        let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(4, 1).unwrap();
 
         assert_eq!(registry.max_tensor_batch_size(), 4);
-        assert_eq!(
-            registry.static_tensor_batch_variants(BackendKind::Metal),
-            HashSet::from([variant])
-        );
-        assert!(registry
-            .static_tensor_batch_variants(BackendKind::Cpu)
-            .is_empty());
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            let variants = registry.static_tensor_batch_variants(backend);
+            assert!(!variants.contains(&variant));
+            assert!(!variants.contains(&ModelVariant::Qwen306B));
+        }
     }
 
     #[test]
-    fn rollout_cannot_advertise_a_missing_static_adapter() {
-        let variant = ModelVariant::Qwen306B;
-        let override_value = format!("{}@metal=static", variant);
-        let rollout =
-            ExecutionRolloutPolicy::try_from_raw(Some("off"), Some(&override_value)).unwrap();
-        let error = RuntimeAdapterRegistry::built_in_with_rollout(rollout, 4)
-            .expect_err("chat has no static tensor adapter");
+    fn native_continuous_factories_publish_supported_variants_on_every_backend() {
+        let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(8, 1).unwrap();
 
-        assert!(error.to_string().contains("no static tensor adapter"));
-    }
-
-    #[test]
-    fn exact_continuous_rollout_only_publishes_proven_native_variants() {
-        let variant = ModelVariant::Qwen306B;
-        let override_value = format!("{}@cuda=continuous", variant);
-        let rollout =
-            ExecutionRolloutPolicy::try_from_raw(Some("off"), Some(&override_value)).unwrap();
-        let registry = RuntimeAdapterRegistry::built_in_with_rollout(rollout, 8).unwrap();
-
-        assert_eq!(
-            registry.continuous_tensor_batch_variants(BackendKind::Cuda),
-            HashSet::from([variant])
-        );
-        assert!(registry
-            .continuous_tensor_batch_variants(BackendKind::Metal)
-            .is_empty());
-    }
-
-    #[test]
-    fn rollout_cannot_advertise_a_missing_continuous_adapter() {
-        let variant = ModelVariant::Qwen3508BGguf;
-        let override_value = format!("{}@metal=continuous", variant);
-        let rollout =
-            ExecutionRolloutPolicy::try_from_raw(Some("off"), Some(&override_value)).unwrap();
-        let error = RuntimeAdapterRegistry::built_in_with_rollout(rollout, 4)
-            .expect_err("Qwen3.5 has no continuous tensor adapter");
-
-        assert!(error.to_string().contains("no continuous tensor adapter"));
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            let variants = registry.continuous_tensor_batch_variants(backend);
+            assert!(variants.contains(&ModelVariant::Qwen306B));
+            assert!(variants.contains(&ModelVariant::Qwen306BGguf));
+            assert!(variants.contains(&ModelVariant::Gemma31BIt));
+            assert!(variants.contains(&ModelVariant::Gemma34BIt));
+            assert!(variants.contains(&ModelVariant::Qwen3508BGguf));
+            assert!(variants.contains(&ModelVariant::Qwen3Asr06BGguf));
+            assert!(variants.contains(&ModelVariant::Qwen3Asr17BGguf));
+        }
     }
 
     #[test]
     fn built_in_registry_resolves_non_tts_capabilities() {
         let registry = RuntimeAdapterRegistry::built_in();
 
+        let whisper = registry
+            .require(CapabilityKind::Asr, ModelVariant::WhisperLargeV3Turbo)
+            .expect("whisper asr adapter");
+        assert_eq!(whisper.execution_target, ExecutionTargetKind::TokenEngine);
+        assert_eq!(
+            whisper.state_requirement,
+            InferenceStateRequirement::RetainedAndInvocation
+        );
         assert_eq!(
             registry
-                .require(CapabilityKind::Asr, ModelVariant::WhisperLargeV3Turbo)
-                .expect("whisper asr adapter")
-                .execution_target,
-            ExecutionTargetKind::TokenEngine
+                .require(CapabilityKind::Asr, ModelVariant::VibeVoiceAsr)
+                .expect("VibeVoice ASR adapter")
+                .state_requirement,
+            InferenceStateRequirement::RetainedAndInvocation
+        );
+        assert_eq!(
+            registry
+                .require(CapabilityKind::Asr, ModelVariant::ParakeetTdt06BV3)
+                .expect("parakeet asr adapter")
+                .state_requirement,
+            InferenceStateRequirement::RetainedAndInvocation
+        );
+        assert_eq!(
+            registry
+                .require(CapabilityKind::Asr, ModelVariant::Nemotron35AsrStreaming06B)
+                .expect("nemotron offline asr adapter")
+                .state_requirement,
+            InferenceStateRequirement::Invocation
         );
         assert_eq!(
             registry
@@ -802,6 +922,16 @@ mod tests {
         assert_eq!(
             registry
                 .require(
+                    CapabilityKind::Diarization,
+                    ModelVariant::DiarStreamingSortformer4SpkV21
+                )
+                .expect("sortformer diarization adapter")
+                .state_requirement,
+            InferenceStateRequirement::Invocation
+        );
+        assert_eq!(
+            registry
+                .require(
                     CapabilityKind::ForcedAlignment,
                     ModelVariant::Qwen3ForcedAligner06B
                 )
@@ -820,7 +950,7 @@ mod tests {
                 .require(CapabilityKind::Asr, ModelVariant::Lfm25Audio15BGguf)
                 .expect("lfm audio asr adapter")
                 .execution_target,
-            ExecutionTargetKind::DirectModel
+            ExecutionTargetKind::TokenEngine
         );
         assert_eq!(
             registry
@@ -836,6 +966,30 @@ mod tests {
                 .execution_target,
             ExecutionTargetKind::TokenEngine
         );
+        let asr = registry
+            .require(CapabilityKind::Asr, ModelVariant::Lfm25Audio15BGguf)
+            .expect("lfm audio asr capability");
+        assert_eq!(asr.sequence_execution, SequenceExecutionMode::Always);
+        assert_eq!(
+            asr.state_requirement,
+            InferenceStateRequirement::RetainedAndInvocation
+        );
+        assert_eq!(
+            registry
+                .require(CapabilityKind::Tts, ModelVariant::Lfm25Audio15BGguf)
+                .expect("lfm audio TTS capability")
+                .state_requirement,
+            InferenceStateRequirement::RetainedAndInvocation
+        );
+        for capability in [CapabilityKind::AudioChat, CapabilityKind::SpeechToSpeech] {
+            assert_eq!(
+                registry
+                    .require(capability, ModelVariant::Lfm25Audio15BGguf)
+                    .expect("lfm audio capability")
+                    .state_requirement,
+                InferenceStateRequirement::Invocation
+            );
+        }
     }
 
     #[test]
@@ -857,9 +1011,29 @@ mod tests {
                 .streaming_mode,
             StreamingMode::Chunked
         );
-        assert!(registry
+        assert_eq!(
+            registry
+                .require(CapabilityKind::Asr, variant)
+                .expect("voxtral asr adapter")
+                .state_requirement,
+            InferenceStateRequirement::Invocation
+        );
+        let realtime = registry
             .require(CapabilityKind::RealtimeAsr, variant)
-            .is_err());
+            .expect("Voxtral retained realtime adapter");
+        assert_eq!(
+            realtime.execution_target,
+            ExecutionTargetKind::RealtimeRunner
+        );
+        assert_eq!(realtime.streaming_mode, StreamingMode::Realtime);
+        assert_eq!(
+            realtime.state_requirement,
+            InferenceStateRequirement::RetainedAndInvocation
+        );
+        assert_eq!(
+            registry_capabilities(&registry, variant),
+            BTreeSet::from([CapabilityKind::Asr, CapabilityKind::RealtimeAsr])
+        );
         assert!(registry
             .require(CapabilityKind::AudioChat, variant)
             .is_err());
@@ -879,11 +1053,20 @@ mod tests {
         assert_eq!(adapter.execution_target, ExecutionTargetKind::TokenEngine);
         assert_eq!(adapter.streaming_mode, StreamingMode::None);
         assert_eq!(
-            registry
-                .require(CapabilityKind::SpeakerAttributedAsr, variant)
-                .expect("granite speaker-attributed ASR adapter")
-                .execution_target,
+            adapter.state_requirement,
+            InferenceStateRequirement::RetainedAndInvocation
+        );
+        assert_eq!(adapter.sequence_execution, SequenceExecutionMode::Always);
+        let attributed = registry
+            .require(CapabilityKind::SpeakerAttributedAsr, variant)
+            .expect("granite speaker-attributed ASR adapter");
+        assert_eq!(
+            attributed.execution_target,
             ExecutionTargetKind::PipelineRunner
+        );
+        assert_eq!(
+            attributed.state_requirement,
+            InferenceStateRequirement::Invocation
         );
         assert!(registry
             .require(CapabilityKind::Diarization, variant)
@@ -906,36 +1089,48 @@ mod tests {
             .expect("voxtral tts adapter");
         assert_eq!(adapter.execution_target, ExecutionTargetKind::DirectModel);
         assert_eq!(adapter.streaming_mode, StreamingMode::FinalOnly);
+        assert_eq!(
+            adapter.state_requirement,
+            InferenceStateRequirement::Invocation
+        );
         assert!(registry
             .require(CapabilityKind::StreamingTts, variant)
             .is_err());
     }
 
     #[test]
-    fn built_in_registry_marks_vibevoice_tts_as_direct_tts_with_final_only_streaming() {
+    fn built_in_registry_marks_vibevoice_tts_as_retained_token_engine() {
         let registry = RuntimeAdapterRegistry::built_in();
         let variant = ModelVariant::VibeVoice15BTts;
 
         let adapter = registry
             .require(CapabilityKind::Tts, variant)
             .expect("vibevoice tts adapter");
-        assert_eq!(adapter.execution_target, ExecutionTargetKind::DirectModel);
+        assert_eq!(adapter.execution_target, ExecutionTargetKind::TokenEngine);
         assert_eq!(adapter.streaming_mode, StreamingMode::FinalOnly);
+        assert_eq!(
+            adapter.state_requirement,
+            InferenceStateRequirement::RetainedAndInvocation
+        );
         assert!(registry
             .require(CapabilityKind::StreamingTts, variant)
             .is_err());
     }
 
     #[test]
-    fn built_in_registry_marks_fish_s2_as_direct_final_only_tts() {
+    fn built_in_registry_marks_fish_s2_as_retained_final_only_tts() {
         let registry = RuntimeAdapterRegistry::built_in();
         let variant = ModelVariant::FishAudioS2Pro;
 
         let adapter = registry
             .require(CapabilityKind::Tts, variant)
             .expect("Fish S2 TTS adapter");
-        assert_eq!(adapter.execution_target, ExecutionTargetKind::DirectModel);
+        assert_eq!(adapter.execution_target, ExecutionTargetKind::TokenEngine);
         assert_eq!(adapter.streaming_mode, StreamingMode::FinalOnly);
+        assert_eq!(
+            adapter.state_requirement,
+            InferenceStateRequirement::RetainedAndInvocation
+        );
     }
 
     #[test]
@@ -949,3 +1144,7 @@ mod tests {
         assert!(matches!(err, Error::InvalidInput(_)));
     }
 }
+
+#[cfg(test)]
+#[path = "adapters/state_topology_certification.rs"]
+mod state_topology_certification;

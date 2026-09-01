@@ -191,7 +191,9 @@ impl OutputProcessor {
         generation_time: Duration,
     ) -> EngineOutput {
         let finish_reason = match disposition {
-            ExecutionDisposition::Progress | ExecutionDisposition::Yielded(_) => {
+            ExecutionDisposition::Progress
+            | ExecutionDisposition::Yielded(_)
+            | ExecutionDisposition::RestartSequence(_) => {
                 executor_output.finished = false;
                 executor_output.error = None;
                 None

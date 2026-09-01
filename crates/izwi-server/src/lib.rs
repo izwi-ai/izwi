@@ -1,13 +1,28 @@
 //! Izwi TTS Server - HTTP API for Qwen3-TTS inference
 
+// HTTP orchestration boundaries intentionally carry the complete request/job
+// context, and realtime alignment uses explicit word-coordinate indexing.
+#![allow(
+    clippy::needless_range_loop,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
+// Async tests hold a process-wide environment lock across awaits so parallel
+// tests cannot observe transient environment overrides. Production code keeps
+// the stricter lint enabled.
+#![cfg_attr(test, allow(clippy::await_holding_lock))]
+
+use anyhow::Context;
 use clap::{Parser, ValueEnum};
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 use tokio::signal;
 use tokio::sync::oneshot;
 use tracing::{info, warn};
+
+const DESKTOP_OWNER_PIPE_ENV: &str = "IZWI_DESKTOP_OWNER_PIPE";
 
 mod api;
 mod app;
@@ -70,6 +85,18 @@ struct ServerArgs {
     #[arg(long, value_enum, env = "IZWI_BACKEND")]
     backend: Option<BackendArg>,
 
+    /// Physical launch rollout mode (`serial`, `shadow`, `concurrent`)
+    #[arg(long, value_name = "MODE")]
+    physical_execution_mode: Option<izwi_core::PhysicalExecutionMode>,
+
+    /// Maximum candidate physical launches in flight
+    #[arg(long, value_name = "COUNT")]
+    max_physical_in_flight: Option<izwi_core::PhysicalInFlightLimit>,
+
+    /// Portable context length (`auto` or a positive token count)
+    #[arg(long, value_name = "AUTO_OR_TOKENS")]
+    max_sequence_length: Option<izwi_core::ContextLengthPreference>,
+
     /// Log output format (`text`, `json`)
     #[arg(long, value_enum, env = "IZWI_LOG_FORMAT", default_value = "text")]
     log_format: LogFormat,
@@ -126,6 +153,12 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
     );
 
     let serve_config = resolve_serve_runtime_config(&args);
+    let effective_runtime_config = serde_json::to_string(&serve_config)
+        .context("failed to serialize effective server runtime configuration")?;
+    info!(
+        build_git_sha = option_env!("IZWI_BUILD_GIT_SHA").unwrap_or("unknown"),
+        effective_runtime_config, "Resolved effective server runtime configuration"
+    );
     let config = serve_config.engine_config();
     info!("Models directory: {:?}", config.models_dir);
 
@@ -157,7 +190,30 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
         enterprise_hooks,
         persistence,
     )?;
-    let mut startup_warnings = preload_configured_models(&state).await;
+    let mut startup_warnings = Vec::new();
+    if let Err(err) = state
+        .batch_runtime_store
+        .reconcile_inconsistent_states()
+        .await
+    {
+        startup_warnings.push(format!(
+            "Failed to reconcile durable runtime jobs during startup: {err}"
+        ));
+    }
+    match state
+        .speech_history_store
+        .reconcile_stale_processing_records()
+        .await
+    {
+        Ok(reconciled) if reconciled > 0 => {
+            info!(reconciled, "Reconciled stale speech history records");
+        }
+        Ok(_) => {}
+        Err(err) => startup_warnings.push(format!(
+            "Failed to reconcile speech history records during startup: {err}"
+        )),
+    }
+    startup_warnings.extend(preload_configured_models(&state).await);
     startup_warnings.extend(warmup_preloaded_asr_models(&state).await);
     if !startup_warnings.is_empty() {
         state
@@ -434,6 +490,9 @@ fn resolve_serve_runtime_config(args: &ServerArgs) -> ServeRuntimeConfig {
         host: args.host.clone(),
         port: args.port,
         backend: args.backend.as_ref().map(BackendArg::as_preference),
+        physical_execution_mode: args.physical_execution_mode,
+        max_physical_in_flight: args.max_physical_in_flight,
+        max_sequence_length: args.max_sequence_length,
         ..ServeRuntimeConfigOverrides::default()
     };
     let env = ServeRuntimeConfigOverrides::from_env();
@@ -619,12 +678,17 @@ async fn shutdown_signal(
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
 
+    let desktop_owner_exit = desktop_owner_exit_signal();
+
     tokio::select! {
         _ = ctrl_c => {
             info!("Received Ctrl+C, shutting down...");
         },
         _ = terminate => {
             info!("Received SIGTERM, shutting down...");
+        },
+        _ = desktop_owner_exit => {
+            info!("Desktop owner pipe closed, shutting down...");
         },
     }
 
@@ -634,6 +698,32 @@ async fn shutdown_signal(
     let _ = shutdown_started.send(());
 
     drop(state);
+}
+
+async fn desktop_owner_exit_signal() {
+    if std::env::var_os(DESKTOP_OWNER_PIPE_ENV).as_deref() != Some(std::ffi::OsStr::new("1")) {
+        std::future::pending::<()>().await;
+        return;
+    }
+
+    if let Err(err) = tokio::task::spawn_blocking(|| {
+        let stdin = std::io::stdin();
+        wait_for_owner_pipe_close(stdin.lock())
+    })
+    .await
+    {
+        warn!("Desktop owner-pipe monitor failed: {err}");
+    }
+}
+
+fn wait_for_owner_pipe_close(mut reader: impl Read) {
+    let mut buffer = [0_u8; 1];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+    }
 }
 
 async fn await_http_server_shutdown<F>(
@@ -704,6 +794,11 @@ mod tests {
     use crate::test_support::env_lock;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn desktop_owner_pipe_monitor_returns_at_eof() {
+        wait_for_owner_pipe_close(std::io::Cursor::new(Vec::<u8>::new()));
+    }
 
     #[tokio::test]
     async fn worker_shutdown_failure_still_runs_runtime_cleanup() {
@@ -812,6 +907,12 @@ mod tests {
         std::env::remove_var("IZWI_BACKEND");
         std::env::remove_var("IZWI_LOG_FORMAT");
         std::env::remove_var("IZWI_MAX_BATCH_SIZE");
+        std::env::remove_var("IZWI_MAX_SCHEDULER_BATCH_SIZE");
+        std::env::remove_var("IZWI_MAX_RETAINED_SEQUENCES");
+        std::env::remove_var("IZWI_MAX_STAGED_TRANSACTIONS");
+        std::env::remove_var("IZWI_MAX_QUEUED_REQUESTS");
+        std::env::remove_var("IZWI_PHYSICAL_EXECUTION_MODE");
+        std::env::remove_var("IZWI_MAX_PHYSICAL_IN_FLIGHT");
         std::env::remove_var("IZWI_NUM_THREADS");
         std::env::remove_var("IZWI_MAX_CONCURRENT");
         std::env::remove_var("IZWI_TIMEOUT");
@@ -907,6 +1008,30 @@ mod tests {
             result.is_err(),
             "invalid backend should fail argument parsing"
         );
+    }
+
+    #[test]
+    fn physical_execution_flags_override_environment() {
+        let _guard = env_lock();
+        clear_bind_env();
+        std::env::set_var("IZWI_PHYSICAL_EXECUTION_MODE", "concurrent");
+        std::env::set_var("IZWI_MAX_PHYSICAL_IN_FLIGHT", "4");
+
+        let args = parse(&[
+            "izwi-server",
+            "--physical-execution-mode",
+            "shadow",
+            "--max-physical-in-flight",
+            "3",
+        ]);
+        let resolved = resolve_serve_runtime_config(&args);
+
+        assert_eq!(
+            resolved.physical_execution_mode,
+            izwi_core::PhysicalExecutionMode::Shadow
+        );
+        assert_eq!(resolved.max_physical_in_flight.get(), 3);
+        clear_bind_env();
     }
 
     #[test]
@@ -1011,7 +1136,15 @@ mod tests {
 
         assert_eq!(resolved.host, "0.0.0.0");
         assert_eq!(resolved.port, 8080);
-        assert_eq!(resolved.max_batch_size, 8);
+        assert_eq!(
+            resolved.max_batch_size,
+            izwi_core::BatchSizePreference::Auto
+        );
+        assert_eq!(
+            resolved.physical_execution_mode,
+            izwi_core::PhysicalExecutionMode::Serial
+        );
+        assert_eq!(resolved.max_physical_in_flight.get(), 1);
         assert!(resolved.num_threads >= 1);
         clear_bind_env();
     }
@@ -1039,7 +1172,7 @@ mod tests {
 
         let resolved = resolve_serve_runtime_config(&parse(&["izwi-server"]));
 
-        assert_eq!(resolved.max_batch_size, 16);
+        assert_eq!(resolved.max_batch_size.fixed_rows(), Some(16));
         assert_eq!(resolved.num_threads, 6);
         assert_eq!(resolved.max_concurrent_requests, 44);
         assert_eq!(resolved.request_timeout_secs, 720);

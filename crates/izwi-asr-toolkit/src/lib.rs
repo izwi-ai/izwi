@@ -956,10 +956,12 @@ mod tests {
 
     #[test]
     fn assembler_trims_long_replayed_context_prefix() {
-        let mut cfg = AsrLongFormConfig::default();
-        cfg.max_word_overlap = 3;
-        cfg.min_context_replay_words = 6;
-        cfg.max_context_replay_words = 32;
+        let cfg = AsrLongFormConfig {
+            max_word_overlap: 3,
+            min_context_replay_words: 6,
+            max_context_replay_words: 32,
+            ..Default::default()
+        };
         let mut assembler = TranscriptAssembler::new(cfg);
 
         let first = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu";
@@ -977,9 +979,11 @@ mod tests {
 
     #[test]
     fn assembler_does_not_trim_short_repeated_phrase_as_context_replay() {
-        let mut cfg = AsrLongFormConfig::default();
-        cfg.max_word_overlap = 2;
-        cfg.min_context_replay_words = 6;
+        let cfg = AsrLongFormConfig {
+            max_word_overlap: 2,
+            min_context_replay_words: 6,
+            ..Default::default()
+        };
         let mut assembler = TranscriptAssembler::new(cfg);
 
         assembler.push_chunk_text("call and response happens here");
@@ -994,8 +998,10 @@ mod tests {
 
     #[test]
     fn assembler_trims_excessive_char_repetition() {
-        let mut cfg = AsrLongFormConfig::default();
-        cfg.max_repeated_chars = 3;
+        let cfg = AsrLongFormConfig {
+            max_repeated_chars: 3,
+            ..Default::default()
+        };
         let mut assembler = TranscriptAssembler::new(cfg);
         let delta = assembler.push_chunk_text("heyyyyyyyy there");
         assert_eq!(delta, "heyyy there");

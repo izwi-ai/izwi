@@ -4,7 +4,8 @@ description: "Install Izwi on macOS with the DMG, optional CLI tools, and Apple 
 sidebarTitle: "macOS"
 icon: "apple"
 ---
-Izwi is optimized for macOS with native Apple Silicon (M1/M2/M3/M4) acceleration via Metal.
+Izwi supports macOS 12 and later. Apple Silicon Macs use Metal acceleration on
+macOS 15+; macOS 12-14 remain supported with the CPU backend.
 
 ---
 
@@ -84,7 +85,7 @@ If you only need the CLI tools without the desktop app:
 git clone https://github.com/izwi-ai/izwi.git
 cd izwi
 
-# Build and install with Metal support
+# Build and install (Metal on macOS 15+, CPU fallback on macOS 12-14)
 IZWI_BUILD_BACKEND=metal ./scripts/install-cli.sh
 ```
 
@@ -94,7 +95,8 @@ This installs `izwi`, `izwi-server`, and `izwi-desktop` to `~/.local/bin`.
 
 ## Apple Silicon Optimization
 
-Izwi automatically selects the best backend on Apple Silicon Macs. To explicitly force Metal:
+Izwi automatically selects CPU on macOS 12-14 and Metal on Apple Silicon with
+macOS 15+. On macOS 15+, you can explicitly request Metal:
 
 ```bash
 izwi serve --backend metal
@@ -200,7 +202,7 @@ espeak-ng --version
 
 ### Metal acceleration not working
 
-Ensure you're on Apple Silicon and running macOS 12.0+:
+Ensure you're on Apple Silicon and running macOS 15.0+:
 
 ```bash
 # Check your chip

@@ -344,7 +344,10 @@ impl FishS2DownsampleResidualVectorQuantizer {
             vb.pp("quantizer"),
         )?;
         let dims = std::iter::once(config.latent_dim)
-            .chain(std::iter::repeat(config.latent_dim).take(config.downsample_factors.len()))
+            .chain(std::iter::repeat_n(
+                config.latent_dim,
+                config.downsample_factors.len(),
+            ))
             .collect::<Vec<_>>();
         let mut downsample = Vec::with_capacity(config.downsample_factors.len());
         for (idx, factor) in config.downsample_factors.iter().copied().enumerate() {
@@ -437,8 +440,8 @@ impl FishS2DownsampleResidualVectorQuantizer {
 
         let semantic_codes = codes.narrow(1, 0, 1)?;
         let residual_codes = codes.narrow(1, 1, config.residual_codebooks)?;
-        let semantic = self.semantic_quantizer.from_codes(&semantic_codes)?;
-        let residual = self.residual_quantizer.from_codes(&residual_codes)?;
+        let semantic = self.semantic_quantizer.decode_codes(&semantic_codes)?;
+        let residual = self.residual_quantizer.decode_codes(&residual_codes)?;
         let mut z = semantic.broadcast_add(&residual)?;
         z = self.post_module.forward(&z)?;
         for block in &self.upsample {
@@ -469,7 +472,7 @@ impl FishS2ResidualVectorQuantizer {
         Ok(Self { quantizers })
     }
 
-    fn from_codes(&self, codes: &Tensor) -> Result<Tensor> {
+    fn decode_codes(&self, codes: &Tensor) -> Result<Tensor> {
         let mut sum: Option<Tensor> = None;
         for (idx, quantizer) in self.quantizers.iter().enumerate() {
             let z_p = quantizer.decode_code(&codes.i((.., idx, ..))?)?;

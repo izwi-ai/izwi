@@ -111,7 +111,7 @@ impl AudioConfig {
     /// Compute number of audio tokens for a given raw audio length.
     pub fn num_audio_tokens(&self, audio_length: usize) -> usize {
         let samples_per_frame = self.sampling_rate / self.frame_rate as usize;
-        (audio_length + samples_per_frame - 1) / samples_per_frame
+        audio_length.div_ceil(samples_per_frame)
     }
 
     pub fn raw_audio_length_per_tok(&self) -> usize {
@@ -166,6 +166,17 @@ impl VoxtralTokenizer {
 
     pub fn vocab_size(&self) -> usize {
         self.inner.vocab_size()
+    }
+
+    pub(crate) fn max_decoded_token_bytes(&self) -> Result<usize> {
+        self.inner
+            .vocab()
+            .iter()
+            .map(String::len)
+            .max()
+            .ok_or_else(|| {
+                Error::TokenizationError("Voxtral tokenizer has an empty vocabulary".into())
+            })
     }
 
     /// Build the Mistral streaming transcription prefix:

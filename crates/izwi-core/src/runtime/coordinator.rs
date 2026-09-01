@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -14,15 +14,17 @@ use serde::Serialize;
 
 use crate::backends::{BackendKind, DeviceKind, DeviceProfile};
 use crate::engine::{
-    BatchId, BatchWorkspaceLease, CapacitySource, ExecutionDomain, ExecutionGroupId,
-    NativeBatchMode, PhysicalCapacityProvider, PhysicalCapacitySnapshot, Priority,
-    ReservationClass, ReservationOwner, ResourceAmount, ResourceAuthority, ResourceEstimate,
-    ResourceLease, ResourceVector, WorkUnit, WorkloadClass,
+    AdapterBindingKey, BatchId, BatchWorkspaceLease, CapacitySource, ExecutionDomain,
+    ExecutionGroupId, ModelInstanceId, NativeBatchMode, PhysicalCapacityProvider,
+    PhysicalCapacitySnapshot, PhysicalLaunchPolicy, Priority, ReservationClass, ReservationOwner,
+    ResourceAmount, ResourceAuthority, ResourceEstimate, ResourceLease, ResourceVector,
+    StageShapePolicy, WorkCost, WorkUnit, WorkloadClass,
 };
 use crate::error::{Error, Result};
-use crate::runtime::adapters::LoadedExecutionContract;
+use crate::runtime::adapters::{LoadedCapabilityBinding, LoadedExecutionContract};
 
 static NEXT_EXECUTION_GROUP_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_DIRECT_BATCH_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CoordinatorLane {
@@ -40,6 +42,76 @@ pub struct JobSpec {
     pub workload_class: WorkloadClass,
     pub deadline: Option<Instant>,
     pub resources: ResourceEstimate,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PreparationCancellation {
+    state: Arc<AtomicU8>,
+}
+
+impl PreparationCancellation {
+    pub(crate) fn cancel(&self) -> bool {
+        self.state
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.state.load(Ordering::Acquire) == 1
+    }
+
+    fn begin_commit(&self) -> bool {
+        self.state
+            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn finish_commit(&self) {
+        self.state.store(3, Ordering::Release);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparationBatchRow {
+    job: JobLease,
+    seal: PreparationRowSeal,
+    cost: WorkCost,
+    materialized_tensor_elements: u64,
+    cancellation: PreparationCancellation,
+}
+
+#[derive(Debug, Clone)]
+struct PreparationRowSeal {
+    job: Weak<JobLeaseInner>,
+    binding: AdapterBindingKey,
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparationArtifact<T> {
+    pub(crate) value: T,
+    pub(crate) retained: JobResourceObservation,
+}
+
+#[derive(Debug)]
+pub(crate) enum PreparationRowOutcome<T> {
+    Committed {
+        artifact: PreparationArtifact<T>,
+        bridge: PreparationAdmissionBridge,
+    },
+    Cancelled,
+    TimedOut,
+    Failed(Error),
+}
+
+#[derive(Debug)]
+enum PreparationPhysicalOutcome<T> {
+    Committed {
+        artifact: PreparationArtifact<T>,
+        job: JobLease,
+    },
+    Cancelled,
+    TimedOut,
+    Failed(Error),
 }
 
 /// Physical memory currently owned by an admitted direct job. Host and
@@ -68,6 +140,7 @@ impl JobResourceObservation {
 pub struct CoordinatorSnapshot {
     pub capacity: usize,
     pub active_jobs: usize,
+    pub active_preparation_bridges: usize,
     pub active_model_loads: usize,
     pub active_executions: usize,
     /// Total physical memory reserved across every backend memory domain.
@@ -79,6 +152,395 @@ pub struct CoordinatorSnapshot {
     pub rejected_total: u64,
     pub expired_total: u64,
     pub draining: bool,
+    pub poisoned: bool,
+}
+
+/// Cloneable handle to the one fair physical-launch semaphore shared by the
+/// scheduler executor and direct runtime jobs.
+#[derive(Debug, Clone)]
+pub(crate) struct PhysicalExecutionAdmission {
+    inner: Arc<PhysicalExecutionAdmissionInner>,
+}
+
+#[derive(Debug)]
+struct PhysicalExecutionAdmissionInner {
+    execution_group: Option<ExecutionGroupId>,
+    capacity: usize,
+    permits: Arc<Semaphore>,
+    groups: Mutex<HashMap<ExecutionGroupId, Weak<GroupPhysicalAdmission>>>,
+    models: Mutex<HashMap<(ExecutionGroupId, ModelInstanceId), Weak<ModelPhysicalAdmission>>>,
+    active: AtomicUsize,
+    idle: Arc<Notify>,
+    poison_reason: Mutex<Option<String>>,
+}
+
+#[derive(Debug)]
+struct GroupPhysicalAdmission {
+    permits: Arc<Semaphore>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelAdmissionPolicy {
+    Exclusive,
+    Concurrent { max_in_flight: usize },
+}
+
+#[derive(Debug)]
+struct ModelPhysicalAdmission {
+    policy: ModelAdmissionPolicy,
+    permits: Arc<Semaphore>,
+}
+
+struct PhysicalPermitWaitMetric {
+    started: Instant,
+}
+
+impl Drop for PhysicalPermitWaitMetric {
+    fn drop(&mut self) {
+        crate::engine::metrics::record_engine_physical_permit_wait(self.started.elapsed());
+    }
+}
+
+impl PhysicalExecutionAdmission {
+    pub(crate) fn standalone(capacity: usize) -> Self {
+        Self::with_idle(None, capacity, Arc::new(Notify::new()))
+    }
+
+    fn with_idle(
+        execution_group: Option<ExecutionGroupId>,
+        capacity: usize,
+        idle: Arc<Notify>,
+    ) -> Self {
+        let capacity = capacity.max(1);
+        Self {
+            inner: Arc::new(PhysicalExecutionAdmissionInner {
+                execution_group,
+                capacity,
+                permits: Arc::new(Semaphore::new(capacity)),
+                groups: Mutex::new(HashMap::new()),
+                models: Mutex::new(HashMap::new()),
+                active: AtomicUsize::new(0),
+                idle,
+                poison_reason: Mutex::new(None),
+            }),
+        }
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.inner.capacity
+    }
+
+    pub(crate) fn active(&self) -> usize {
+        self.inner.active.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn poison_reason(&self) -> Option<String> {
+        self.inner
+            .poison_reason
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn ensure_healthy(&self) -> Result<()> {
+        if let Some(reason) = self.poison_reason() {
+            return Err(Error::Overloaded(format!(
+                "physical inference runtime is poisoned and must be recreated: {reason}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn poison(&self, reason: impl Into<String>) {
+        let inserted = {
+            let mut poison_reason = self
+                .inner
+                .poison_reason
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if poison_reason.is_some() {
+                false
+            } else {
+                *poison_reason = Some(reason.into());
+                true
+            }
+        };
+        if !inserted {
+            return;
+        }
+
+        self.inner.permits.close();
+        for admission in self
+            .inner
+            .groups
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .values()
+            .filter_map(Weak::upgrade)
+        {
+            admission.permits.close();
+        }
+        for admission in self
+            .inner
+            .models
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .values()
+            .filter_map(Weak::upgrade)
+        {
+            admission.permits.close();
+        }
+        self.inner.idle.notify_waiters();
+    }
+
+    fn required_units(
+        &self,
+        launch_policy: PhysicalLaunchPolicy,
+        batch_mode: NativeBatchMode,
+        row_width: usize,
+    ) -> Result<usize> {
+        if row_width == 0 {
+            return Err(Error::InvalidInput(
+                "physical dispatch row width must be greater than zero".to_string(),
+            ));
+        }
+        if matches!(launch_policy, PhysicalLaunchPolicy::Concurrent { .. })
+            && batch_mode == NativeBatchMode::None
+            && row_width > self.inner.capacity
+        {
+            return Err(Error::InvalidInput(format!(
+                "request-parallel width {row_width} exceeds coordinator capacity {}",
+                self.inner.capacity
+            )));
+        }
+        Ok(match launch_policy {
+            PhysicalLaunchPolicy::ExecutionGroupExclusive
+            | PhysicalLaunchPolicy::ModelExclusive => 1,
+            PhysicalLaunchPolicy::Concurrent { .. } if batch_mode == NativeBatchMode::None => {
+                row_width
+            }
+            PhysicalLaunchPolicy::Concurrent { .. } => 1,
+        })
+    }
+
+    pub(crate) async fn acquire_dispatch(
+        &self,
+        execution_group: ExecutionGroupId,
+        model_instance: ModelInstanceId,
+        launch_policy: PhysicalLaunchPolicy,
+        batch_mode: NativeBatchMode,
+        row_width: usize,
+        deadline: Option<Instant>,
+    ) -> Result<PhysicalExecutionLease> {
+        self.ensure_healthy()?;
+        if self
+            .inner
+            .execution_group
+            .is_some_and(|expected| expected != execution_group)
+        {
+            return Err(Error::InvalidInput(
+                "physical dispatch belongs to a different execution group".to_string(),
+            ));
+        }
+        let units = self.required_units(launch_policy, batch_mode, row_width)?;
+        let _permit_wait_metric = PhysicalPermitWaitMetric {
+            started: Instant::now(),
+        };
+        let model = self.model_admission(execution_group, model_instance, launch_policy)?;
+        let model_permit = match model.as_ref() {
+            Some(model) => {
+                let model_units = match model.policy {
+                    ModelAdmissionPolicy::Exclusive => 1,
+                    ModelAdmissionPolicy::Concurrent { .. } => units,
+                };
+                Some(
+                    Self::acquire_from(model.permits.clone(), model_units, deadline, "model")
+                        .await?,
+                )
+            }
+            None => None,
+        };
+        let group = self.group_admission(execution_group);
+        let group_units = if launch_policy == PhysicalLaunchPolicy::ExecutionGroupExclusive {
+            self.inner.capacity
+        } else {
+            units
+        };
+        let group_permit = Self::acquire_from(
+            group.permits.clone(),
+            group_units,
+            deadline,
+            "execution-group",
+        )
+        .await?;
+        self.acquire_units(
+            units,
+            deadline,
+            Some(group),
+            Some(group_permit),
+            model,
+            model_permit,
+        )
+        .await
+    }
+
+    async fn acquire_units(
+        &self,
+        units: usize,
+        deadline: Option<Instant>,
+        group: Option<Arc<GroupPhysicalAdmission>>,
+        group_permit: Option<OwnedSemaphorePermit>,
+        model: Option<Arc<ModelPhysicalAdmission>>,
+        model_permit: Option<OwnedSemaphorePermit>,
+    ) -> Result<PhysicalExecutionLease> {
+        self.ensure_healthy()?;
+        if units == 0 {
+            return Err(Error::InvalidInput(
+                "execution units must be greater than zero".to_string(),
+            ));
+        }
+        if units > self.inner.capacity {
+            return Err(Error::InvalidInput(format!(
+                "requested {units} execution units exceeds coordinator capacity {}",
+                self.inner.capacity
+            )));
+        }
+        let permit =
+            Self::acquire_from(self.inner.permits.clone(), units, deadline, "device").await?;
+        self.ensure_healthy()?;
+        self.inner.active.fetch_add(1, Ordering::AcqRel);
+        Ok(PhysicalExecutionLease {
+            admission: self.clone(),
+            _group: group,
+            _group_permit: group_permit,
+            _model: model,
+            _model_permit: model_permit,
+            _permit: permit,
+        })
+    }
+
+    fn group_admission(&self, execution_group: ExecutionGroupId) -> Arc<GroupPhysicalAdmission> {
+        let mut groups = self
+            .inner
+            .groups
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(active) = groups.get(&execution_group).and_then(Weak::upgrade) {
+            return active;
+        }
+        groups.retain(|_, admission| admission.strong_count() > 0);
+        let admission = Arc::new(GroupPhysicalAdmission {
+            permits: Arc::new(Semaphore::new(self.inner.capacity)),
+        });
+        groups.insert(execution_group, Arc::downgrade(&admission));
+        admission
+    }
+
+    async fn acquire_from(
+        permits: Arc<Semaphore>,
+        units: usize,
+        deadline: Option<Instant>,
+        scope: &'static str,
+    ) -> Result<OwnedSemaphorePermit> {
+        if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+            crate::engine::metrics::record_engine_physical_defer(
+                crate::engine::metrics::EnginePhysicalDeferReason::ExecutionCapacity,
+            );
+            return Err(Error::Timeout(format!("{scope} execution capacity")));
+        }
+        let units = u32::try_from(units).map_err(|_| {
+            Error::InvalidInput("execution unit request exceeds supported range".to_string())
+        })?;
+        let acquire = permits.acquire_many_owned(units);
+        let permit = match deadline {
+            Some(deadline) => match tokio::time::timeout_at(deadline.into(), acquire).await {
+                Ok(acquired) => {
+                    acquired.map_err(|_| Error::Overloaded("coordinator closed".to_string()))
+                }
+                Err(_) => Err(Error::Timeout(format!("{scope} execution capacity"))),
+            },
+            None => acquire
+                .await
+                .map_err(|_| Error::Overloaded("coordinator closed".to_string())),
+        };
+        let permit = match permit {
+            Ok(permit) => permit,
+            Err(error) => {
+                crate::engine::metrics::record_engine_physical_defer(
+                    crate::engine::metrics::EnginePhysicalDeferReason::ExecutionCapacity,
+                );
+                return Err(error);
+            }
+        };
+        if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+            drop(permit);
+            crate::engine::metrics::record_engine_physical_defer(
+                crate::engine::metrics::EnginePhysicalDeferReason::ExecutionCapacity,
+            );
+            return Err(Error::Timeout(format!("{scope} execution capacity")));
+        }
+        Ok(permit)
+    }
+
+    fn model_admission(
+        &self,
+        execution_group: ExecutionGroupId,
+        model_instance: ModelInstanceId,
+        launch_policy: PhysicalLaunchPolicy,
+    ) -> Result<Option<Arc<ModelPhysicalAdmission>>> {
+        let policy = match launch_policy {
+            PhysicalLaunchPolicy::ExecutionGroupExclusive => return Ok(None),
+            PhysicalLaunchPolicy::ModelExclusive => ModelAdmissionPolicy::Exclusive,
+            PhysicalLaunchPolicy::Concurrent {
+                max_in_flight_per_model,
+            } => ModelAdmissionPolicy::Concurrent {
+                max_in_flight: max_in_flight_per_model.get().min(self.inner.capacity),
+            },
+        };
+        let key = (execution_group, model_instance);
+        let mut models = self
+            .inner
+            .models
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(active) = models.get(&key).and_then(Weak::upgrade) {
+            if active.policy != policy {
+                return Err(Error::InvalidInput(
+                    "physical launch policy changed for an active model instance".to_string(),
+                ));
+            }
+            return Ok(Some(active));
+        }
+        models.retain(|_, admission| admission.strong_count() > 0);
+        let capacity = match policy {
+            ModelAdmissionPolicy::Exclusive => 1,
+            ModelAdmissionPolicy::Concurrent { max_in_flight } => max_in_flight,
+        };
+        let admission = Arc::new(ModelPhysicalAdmission {
+            policy,
+            permits: Arc::new(Semaphore::new(capacity)),
+        });
+        models.insert(key, Arc::downgrade(&admission));
+        Ok(Some(admission))
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PhysicalExecutionLease {
+    admission: PhysicalExecutionAdmission,
+    _group_permit: Option<OwnedSemaphorePermit>,
+    _group: Option<Arc<GroupPhysicalAdmission>>,
+    _model_permit: Option<OwnedSemaphorePermit>,
+    _model: Option<Arc<ModelPhysicalAdmission>>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Drop for PhysicalExecutionLease {
+    fn drop(&mut self) {
+        if self.admission.inner.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.admission.inner.idle.notify_waiters();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -88,13 +550,13 @@ pub struct InferenceCoordinator {
     backend: BackendKind,
     jobs: Arc<Semaphore>,
     host_work: Arc<Semaphore>,
-    execution: Arc<Semaphore>,
+    execution: PhysicalExecutionAdmission,
     resources: Arc<ResourceAuthority>,
     admission_gate: Mutex<()>,
-    idle: Notify,
+    idle: Arc<Notify>,
     active_jobs: AtomicUsize,
+    active_preparation_bridges: AtomicUsize,
     active_model_loads: AtomicUsize,
-    active_executions: AtomicUsize,
     admitted_total: AtomicU64,
     rejected_total: AtomicU64,
     expired_total: AtomicU64,
@@ -105,11 +567,15 @@ impl InferenceCoordinator {
     #[cfg(test)]
     pub fn new(backend: BackendKind, execution_parallelism: usize, max_queued_jobs: usize) -> Self {
         let provider = Arc::new(DeviceCapacityProvider::for_tests(backend));
+        let authority = match backend {
+            BackendKind::Cpu | BackendKind::Metal => ResourceAuthority::new_advisory(provider),
+            BackendKind::Cuda => ResourceAuthority::new(provider),
+        };
         Self::with_resource_authority(
             backend,
             execution_parallelism,
             max_queued_jobs,
-            Arc::new(ResourceAuthority::new(provider)),
+            Arc::new(authority),
         )
     }
 
@@ -137,24 +603,31 @@ impl InferenceCoordinator {
         resources: Arc<ResourceAuthority>,
     ) -> Self {
         let capacity = match backend {
-            BackendKind::Metal => 1,
-            BackendKind::Cpu | BackendKind::Cuda => execution_parallelism.max(1),
+            // Accelerator overlap needs backend/device-stream certification;
+            // current certificates cover CPU scalar execution only.
+            BackendKind::Metal | BackendKind::Cuda => 1,
+            BackendKind::Cpu => execution_parallelism.max(1),
         };
+        let execution_group_id =
+            ExecutionGroupId::new(NEXT_EXECUTION_GROUP_ID.fetch_add(1, Ordering::Relaxed));
+        let idle = Arc::new(Notify::new());
         Self {
-            execution_group_id: ExecutionGroupId::new(
-                NEXT_EXECUTION_GROUP_ID.fetch_add(1, Ordering::Relaxed),
-            ),
+            execution_group_id,
             capacity,
             backend,
             jobs: Arc::new(Semaphore::new(max_queued_jobs.max(capacity).max(1))),
             host_work: Arc::new(Semaphore::new(capacity)),
-            execution: Arc::new(Semaphore::new(capacity)),
+            execution: PhysicalExecutionAdmission::with_idle(
+                Some(execution_group_id),
+                capacity,
+                idle.clone(),
+            ),
             resources,
             admission_gate: Mutex::new(()),
-            idle: Notify::new(),
+            idle,
             active_jobs: AtomicUsize::new(0),
+            active_preparation_bridges: AtomicUsize::new(0),
             active_model_loads: AtomicUsize::new(0),
-            active_executions: AtomicUsize::new(0),
             admitted_total: AtomicU64::new(0),
             rejected_total: AtomicU64::new(0),
             expired_total: AtomicU64::new(0),
@@ -170,19 +643,34 @@ impl InferenceCoordinator {
         self.execution_group_id
     }
 
+    pub(crate) fn physical_execution_admission(&self) -> PhysicalExecutionAdmission {
+        self.execution.clone()
+    }
+
     pub fn snapshot(&self) -> CoordinatorSnapshot {
         let reserved = self.resources.snapshot().reserved;
-        let reserved_host_memory_bytes = known_memory_bytes(reserved.host_bytes);
+        let shared_host_unified = known_memory_bytes(reserved.host_bytes)
+            .saturating_add(known_memory_bytes(reserved.unified_bytes));
+        let reserved_host_memory_bytes = match self.backend {
+            BackendKind::Cpu => shared_host_unified,
+            BackendKind::Metal => 0,
+            BackendKind::Cuda => known_memory_bytes(reserved.host_bytes),
+        };
         let reserved_device_memory_bytes = known_memory_bytes(reserved.device_bytes);
-        let reserved_unified_memory_bytes = known_memory_bytes(reserved.unified_bytes);
+        let reserved_unified_memory_bytes = match self.backend {
+            BackendKind::Metal => shared_host_unified,
+            BackendKind::Cpu => 0,
+            BackendKind::Cuda => known_memory_bytes(reserved.unified_bytes),
+        };
         let reserved_memory_bytes = reserved_host_memory_bytes
             .saturating_add(reserved_device_memory_bytes)
             .saturating_add(reserved_unified_memory_bytes);
         CoordinatorSnapshot {
             capacity: self.capacity,
             active_jobs: self.active_jobs.load(Ordering::Relaxed),
+            active_preparation_bridges: self.active_preparation_bridges.load(Ordering::Relaxed),
             active_model_loads: self.active_model_loads.load(Ordering::Relaxed),
-            active_executions: self.active_executions.load(Ordering::Relaxed),
+            active_executions: self.execution.active(),
             reserved_memory_bytes,
             reserved_host_memory_bytes,
             reserved_device_memory_bytes,
@@ -191,6 +679,7 @@ impl InferenceCoordinator {
             rejected_total: self.rejected_total.load(Ordering::Relaxed),
             expired_total: self.expired_total.load(Ordering::Relaxed),
             draining: self.draining.load(Ordering::Acquire),
+            poisoned: self.execution.poison_reason().is_some(),
         }
     }
 
@@ -210,8 +699,9 @@ impl InferenceCoordinator {
         loop {
             let notified = self.idle.notified();
             if self.active_jobs.load(Ordering::Acquire) == 0
+                && self.active_preparation_bridges.load(Ordering::Acquire) == 0
                 && self.active_model_loads.load(Ordering::Acquire) == 0
-                && self.active_executions.load(Ordering::Acquire) == 0
+                && self.execution.active() == 0
             {
                 return Ok(());
             }
@@ -236,6 +726,142 @@ impl InferenceCoordinator {
         self.admit_with_initial_observation(spec, Some(observation))
     }
 
+    /// Remove preparation lane eligibility while retaining its resource
+    /// authorization. The returned bridge owns no queue permit and cannot run
+    /// work; its reservation remains live until a fresh admission adopts it or
+    /// the bridge is dropped.
+    pub(crate) fn bridge_preparation_admission(
+        self: &Arc<Self>,
+        preparation: JobLease,
+    ) -> Result<PreparationAdmissionBridge> {
+        if Arc::strong_count(&preparation._inner) != 1 {
+            return Err(Error::InferenceError(
+                "preparation handoff cannot proceed while cloned admission leases remain"
+                    .to_string(),
+            ));
+        }
+        let JobLease { _inner, spec } = preparation;
+        let inner = Arc::try_unwrap(_inner).map_err(|_| {
+            Error::InferenceError("preparation admission became shared during handoff".to_string())
+        })?;
+        let JobLeaseInner {
+            coordinator,
+            _permit,
+            reservation,
+            active,
+        } = inner;
+        if !Arc::ptr_eq(self, &coordinator) {
+            return Err(Error::InferenceError(
+                "preparation admission belongs to a different coordinator".to_string(),
+            ));
+        }
+        drop(_permit);
+        self.active_preparation_bridges
+            .fetch_add(1, Ordering::AcqRel);
+        drop(active);
+        Ok(PreparationAdmissionBridge {
+            coordinator,
+            preparation_spec: spec,
+            reservation: Some(reservation),
+        })
+    }
+
+    /// Compete fairly for a fresh job permit, then atomically exchange the
+    /// bridge's retained resource authorization into the resolved admission.
+    // Failure returns the bridge so its retained authorization remains recoverable.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn admit_observed_from_preparation(
+        self: &Arc<Self>,
+        mut bridge: PreparationAdmissionBridge,
+        execution: JobSpec,
+        observation: JobResourceObservation,
+    ) -> std::result::Result<JobLease, PreparationAdmissionFailure> {
+        macro_rules! fail {
+            ($error:expr) => {
+                return Err(PreparationAdmissionFailure {
+                    error: $error,
+                    bridge,
+                })
+            };
+        }
+        if !Arc::ptr_eq(self, &bridge.coordinator) {
+            fail!(Error::InvalidInput(
+                "preparation bridge belongs to a different coordinator".to_string(),
+            ));
+        }
+        if bridge.preparation_spec.request_id != execution.request_id
+            || bridge.preparation_spec.priority != execution.priority
+            || bridge.preparation_spec.workload_class != execution.workload_class
+            || bridge.preparation_spec.deadline != execution.deadline
+        {
+            fail!(Error::InvalidInput(
+                "preparation handoff changed immutable request admission identity".to_string(),
+            ));
+        }
+        let _gate = self
+            .admission_gate
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if self.draining.load(Ordering::Acquire) {
+            self.rejected_total.fetch_add(1, Ordering::Relaxed);
+            fail!(Error::Overloaded("runtime is draining".to_string()));
+        }
+        if let Err(error) = self.execution.ensure_healthy() {
+            fail!(error);
+        }
+        if execution
+            .deadline
+            .is_some_and(|deadline| deadline <= Instant::now())
+        {
+            self.expired_total.fetch_add(1, Ordering::Relaxed);
+            fail!(Error::Timeout(execution.request_id));
+        }
+        let permit = match self.jobs.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.rejected_total.fetch_add(1, Ordering::Relaxed);
+                fail!(Error::Overloaded(
+                    "global inference queue is full".to_string()
+                ));
+            }
+        };
+        let resources = match effective_resources(execution.resources, self.backend) {
+            Ok(resources) => resources,
+            Err(error) => fail!(error),
+        };
+        let materialized = match observed_resources(observation, self.backend) {
+            Ok(materialized) => materialized,
+            Err(error) => fail!(error),
+        };
+        let mut reservation = match bridge.reservation.take() {
+            Some(reservation) => reservation,
+            None => fail!(Error::InferenceError(
+                "preparation bridge reservation was already consumed".to_string(),
+            )),
+        };
+        if let Err(error) = reservation.resize(resources) {
+            bridge.reservation = Some(reservation);
+            fail!(error);
+        }
+        if let Err(error) = reservation.record_materialized_usage(materialized) {
+            bridge.reservation = Some(reservation);
+            fail!(error);
+        }
+        self.active_jobs.fetch_add(1, Ordering::Relaxed);
+        self.admitted_total.fetch_add(1, Ordering::Relaxed);
+        Ok(JobLease {
+            _inner: Arc::new(JobLeaseInner {
+                coordinator: self.clone(),
+                _permit: permit,
+                reservation,
+                active: ActiveJobGuard {
+                    coordinator: self.clone(),
+                },
+            }),
+            spec: execution,
+        })
+    }
+
     fn admit_with_initial_observation(
         self: &Arc<Self>,
         spec: JobSpec,
@@ -248,6 +874,10 @@ impl InferenceCoordinator {
         if self.draining.load(Ordering::Acquire) {
             self.rejected_total.fetch_add(1, Ordering::Relaxed);
             return Err(Error::Overloaded("runtime is draining".to_string()));
+        }
+        if let Err(error) = self.execution.ensure_healthy() {
+            self.rejected_total.fetch_add(1, Ordering::Relaxed);
+            return Err(error);
         }
         if spec
             .deadline
@@ -273,9 +903,8 @@ impl InferenceCoordinator {
                 ),
                 None => self.resources.reserve(owner, effective_resources),
             })
-            .map_err(|err| {
+            .inspect_err(|_err| {
                 self.rejected_total.fetch_add(1, Ordering::Relaxed);
-                err
             })?;
         self.active_jobs.fetch_add(1, Ordering::Relaxed);
         self.admitted_total.fetch_add(1, Ordering::Relaxed);
@@ -284,6 +913,9 @@ impl InferenceCoordinator {
                 coordinator: self.clone(),
                 _permit: permit,
                 reservation,
+                active: ActiveJobGuard {
+                    coordinator: self.clone(),
+                },
             }),
             spec,
         })
@@ -304,6 +936,10 @@ impl InferenceCoordinator {
             self.rejected_total.fetch_add(1, Ordering::Relaxed);
             return Err(Error::Overloaded("runtime is draining".to_string()));
         }
+        if let Err(error) = self.execution.ensure_healthy() {
+            self.rejected_total.fetch_add(1, Ordering::Relaxed);
+            return Err(error);
+        }
         self.active_model_loads.fetch_add(1, Ordering::AcqRel);
         Ok(ModelLoadLease {
             coordinator: self.clone(),
@@ -314,28 +950,8 @@ impl InferenceCoordinator {
     async fn acquire_execution(
         self: &Arc<Self>,
         deadline: Option<Instant>,
-    ) -> Result<ExecutionLease> {
+    ) -> Result<PhysicalExecutionLease> {
         self.acquire_execution_units(1, deadline).await
-    }
-
-    /// Reserve the complete backend execution budget for one scheduler step.
-    /// A CPU or CUDA step may fan out across `request_parallelism` worker threads, so
-    /// holding a single permit would allow unrelated direct work to exceed the
-    /// configured backend concurrency. Metal remains strictly singleton.
-    async fn acquire_engine_step(self: &Arc<Self>) -> Result<ExecutionLease> {
-        self.acquire_execution_units(self.capacity, None).await
-    }
-
-    /// Run one scheduler step while exclusively owning this backend's complete
-    /// execution budget. Callers provide work, but never receive or retain a
-    /// raw device permit; all model-forward routes therefore share this one
-    /// coordinator-owned execution boundary.
-    pub(crate) async fn run_engine_step<T, F>(self: &Arc<Self>, future: F) -> Result<T>
-    where
-        F: Future<Output = Result<T>>,
-    {
-        let _execution = self.acquire_engine_step().await?;
-        future.await
     }
 
     /// Reserve scratch memory for one physical tensor dispatch. This does not
@@ -361,39 +977,42 @@ impl InferenceCoordinator {
         self: &Arc<Self>,
         units: usize,
         deadline: Option<Instant>,
-    ) -> Result<ExecutionLease> {
-        if units == 0 {
-            return Err(Error::InvalidInput(
-                "execution units must be greater than zero".to_string(),
-            ));
+    ) -> Result<PhysicalExecutionLease> {
+        self.count_execution_timeout(
+            self.execution
+                .acquire_units(units, deadline, None, None, None, None)
+                .await,
+        )
+    }
+
+    async fn acquire_physical_dispatch(
+        self: &Arc<Self>,
+        execution_group: ExecutionGroupId,
+        model_instance: ModelInstanceId,
+        launch_policy: PhysicalLaunchPolicy,
+        batch_mode: NativeBatchMode,
+        row_width: usize,
+        deadline: Option<Instant>,
+    ) -> Result<PhysicalExecutionLease> {
+        self.count_execution_timeout(
+            self.execution
+                .acquire_dispatch(
+                    execution_group,
+                    model_instance,
+                    launch_policy,
+                    batch_mode,
+                    row_width,
+                    deadline,
+                )
+                .await,
+        )
+    }
+
+    fn count_execution_timeout<T>(&self, result: Result<T>) -> Result<T> {
+        if matches!(result, Err(Error::Timeout(_))) {
+            self.expired_total.fetch_add(1, Ordering::Relaxed);
         }
-        if units > self.capacity {
-            return Err(Error::InvalidInput(format!(
-                "requested {units} execution units exceeds coordinator capacity {}",
-                self.capacity
-            )));
-        }
-        let units = u32::try_from(units).map_err(|_| {
-            Error::InvalidInput("execution unit request exceeds supported range".to_string())
-        })?;
-        let acquire = self.execution.clone().acquire_many_owned(units);
-        let permit = match deadline {
-            Some(deadline) => tokio::time::timeout_at(deadline.into(), acquire)
-                .await
-                .map_err(|_| {
-                    self.expired_total.fetch_add(1, Ordering::Relaxed);
-                    Error::Timeout("device execution capacity".to_string())
-                })?
-                .map_err(|_| Error::Overloaded("coordinator closed".to_string()))?,
-            None => acquire
-                .await
-                .map_err(|_| Error::Overloaded("coordinator closed".to_string()))?,
-        };
-        self.active_executions.fetch_add(1, Ordering::Relaxed);
-        Ok(ExecutionLease {
-            coordinator: self.clone(),
-            _permit: permit,
-        })
+        result
     }
 
     /// Admit a request before invoking its potentially expensive preparation
@@ -464,7 +1083,16 @@ impl InferenceCoordinator {
         F: Future<Output = Result<T>>,
     {
         let deadline = job.spec.deadline;
-        let _execution = self.acquire_execution(deadline).await?;
+        let _execution = self
+            .acquire_physical_dispatch(
+                self.execution_group_id,
+                ModelInstanceId::new(0),
+                PhysicalLaunchPolicy::ExecutionGroupExclusive,
+                NativeBatchMode::None,
+                1,
+                deadline,
+            )
+            .await?;
         let result = future.await;
         if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
             self.expired_total.fetch_add(1, Ordering::Relaxed);
@@ -538,7 +1166,9 @@ impl InferenceCoordinator {
             .await
     }
 
-    /// Execute one non-batched model stage through an exact loaded adapter.
+    /// Execute one independently scheduled scalar row through an exact loaded
+    /// adapter. `max_batch_size` bounds concurrent rows for scalar adapters; it
+    /// does not imply that this call receives a native tensor batch.
     /// Direct, realtime, and pipeline runners use this compatibility boundary
     /// until their model stage gains a proven native tensor adapter.
     pub(crate) async fn run_loaded_blocking_stage<T, F>(
@@ -552,6 +1182,384 @@ impl InferenceCoordinator {
         T: Send + 'static,
         F: FnOnce() -> Result<T> + Send + 'static,
     {
+        let binding = self.validate_loaded_execution_contract(&contract)?;
+        let stage = binding.stage_for_work(&work)?;
+        if stage.domain != ExecutionDomain::ExecutionGroup {
+            return Err(Error::InvalidInput(
+                "host-only adapter stage cannot enter device execution".to_string(),
+            ));
+        }
+        if stage.batch_mode != NativeBatchMode::None {
+            return Err(Error::InvalidInput(
+                "runtime scalar runner cannot execute a native tensor stage".to_string(),
+            ));
+        }
+        let launch_policy = stage.physical_launch_policy;
+
+        self.run_blocking_stage_inner_with_policy(
+            job,
+            binding.execution_group_id,
+            binding.model_instance_id,
+            launch_policy,
+            move || {
+                let _contract = contract;
+                let _work = work;
+                operation()
+            },
+        )
+        .await
+    }
+
+    /// Seal one admitted request to the exact loaded preparation stage. The
+    /// returned row cannot be constructed by sibling runtime modules and its
+    /// seal is bound to this precise `JobLeaseInner` allocation.
+    pub(crate) fn seal_preparation_row(
+        self: &Arc<Self>,
+        job: JobLease,
+        contract: &LoadedExecutionContract,
+        work: &WorkUnit,
+        cost: WorkCost,
+        materialized_tensor_elements: u64,
+        cancellation: PreparationCancellation,
+    ) -> Result<PreparationBatchRow> {
+        if !Arc::ptr_eq(&job._inner.coordinator, self) {
+            return Err(Error::InvalidInput(
+                "preparation job belongs to a different coordinator".to_string(),
+            ));
+        }
+        let binding = self.validate_loaded_execution_contract(contract)?;
+        let stage = binding.stage_for_work(work)?;
+        if stage.selector != crate::engine::StageWorkSelector::PreSequencePreparation {
+            return Err(Error::InvalidInput(
+                "preparation row requires an exact pre-sequence stage".to_string(),
+            ));
+        }
+        Ok(PreparationBatchRow {
+            seal: PreparationRowSeal {
+                job: Arc::downgrade(&job._inner),
+                binding: binding.key_for_stage(stage.id)?,
+            },
+            job,
+            cost,
+            materialized_tensor_elements,
+            cancellation,
+        })
+    }
+
+    /// Execute one model-native, pre-sequence preparation batch against an
+    /// exact loaded adapter generation. Batch formation remains the caller's
+    /// responsibility; this boundary authenticates the stage, holds every row
+    /// admission, reserves its exact transient workspace, and enters the
+    /// physical model once at the declared native width.
+    pub(crate) async fn run_loaded_native_preparation_batch<T, F>(
+        self: &Arc<Self>,
+        rows: Vec<PreparationBatchRow>,
+        contract: LoadedExecutionContract,
+        work: WorkUnit,
+        operation: F,
+    ) -> Result<Vec<PreparationRowOutcome<T>>>
+    where
+        T: Send + 'static,
+        F: FnOnce(&[usize]) -> Result<Vec<Result<PreparationArtifact<T>>>> + Send + 'static,
+    {
+        if rows.is_empty() {
+            return Err(Error::InvalidInput(
+                "native preparation batch has no admitted rows".to_string(),
+            ));
+        }
+        if !matches!(work, WorkUnit::PreSequencePreparation { .. }) {
+            return Err(Error::InvalidInput(
+                "native preparation runner requires pre-sequence preparation work".to_string(),
+            ));
+        }
+        let binding = self.validate_loaded_execution_contract(&contract)?;
+        let stage = binding.stage_for_work(&work)?;
+        let native_batch = stage.batch_mode != NativeBatchMode::None
+            && stage.concurrency == crate::engine::ConcurrencyClass::Batchable;
+        let authenticated_scalar = stage.batch_mode == NativeBatchMode::None
+            && stage.concurrency == crate::engine::ConcurrencyClass::Exclusive
+            && stage.max_batch_size == 1
+            && rows.len() == 1;
+        if stage.selector != crate::engine::StageWorkSelector::PreSequencePreparation
+            || stage.domain != ExecutionDomain::ExecutionGroup
+            || (!native_batch && !authenticated_scalar)
+        {
+            return Err(Error::InvalidInput(
+                "loaded adapter has no exact native or width-one pre-sequence preparation stage"
+                    .to_string(),
+            ));
+        }
+        let expected_binding = binding.key_for_stage(stage.id)?;
+        let mut request_ids = std::collections::HashSet::with_capacity(rows.len());
+        for row in &rows {
+            if !Arc::ptr_eq(self, &row.job._inner.coordinator)
+                || row.seal.binding != expected_binding
+                || !row
+                    .seal
+                    .job
+                    .upgrade()
+                    .is_some_and(|sealed| Arc::ptr_eq(&sealed, &row.job._inner))
+                || !request_ids.insert(row.job.spec.request_id.clone())
+            {
+                return Err(Error::InvalidInput(
+                    "native preparation row crossed coordinator or loaded adapter identity"
+                        .to_string(),
+                ));
+            }
+        }
+        let mut outcomes: Vec<Option<PreparationPhysicalOutcome<T>>> =
+            (0..rows.len()).map(|_| None).collect();
+        let now = Instant::now();
+        let mut live = Vec::with_capacity(rows.len());
+        for (index, row) in rows.iter().enumerate() {
+            if row.cancellation.is_cancelled() {
+                outcomes[index] = Some(PreparationPhysicalOutcome::Cancelled);
+            } else if row
+                .job
+                .spec
+                .deadline
+                .is_some_and(|deadline| deadline <= now)
+            {
+                outcomes[index] = Some(PreparationPhysicalOutcome::TimedOut);
+            } else {
+                live.push(index);
+            }
+        }
+        if live.is_empty() {
+            return Ok(outcomes
+                .into_iter()
+                .map(
+                    |outcome| match outcome.expect("non-live row has a terminal outcome") {
+                        PreparationPhysicalOutcome::Cancelled => PreparationRowOutcome::Cancelled,
+                        PreparationPhysicalOutcome::TimedOut => PreparationRowOutcome::TimedOut,
+                        PreparationPhysicalOutcome::Failed(error) => {
+                            PreparationRowOutcome::Failed(error)
+                        }
+                        PreparationPhysicalOutcome::Committed { .. } => {
+                            unreachable!("no model call can commit an empty live batch")
+                        }
+                    },
+                )
+                .collect());
+        }
+        if live.len() > stage.max_batch_size {
+            return Err(Error::Overloaded(format!(
+                "native preparation width {} exceeds loaded stage maximum {}",
+                live.len(),
+                stage.max_batch_size
+            )));
+        }
+        let mut aggregate = WorkCost::default();
+        let mut materialized_tensor_elements = 0u64;
+        for index in &live {
+            aggregate = aggregate.checked_add(rows[*index].cost).ok_or_else(|| {
+                Error::Overloaded("native preparation work accounting overflow".to_string())
+            })?;
+            materialized_tensor_elements = materialized_tensor_elements
+                .checked_add(rows[*index].materialized_tensor_elements)
+                .ok_or_else(|| {
+                    Error::Overloaded(
+                        "native preparation materialized work accounting overflow".to_string(),
+                    )
+                })?;
+        }
+        if aggregate.logical_units == 0 || aggregate.logical_units > stage.max_work_units {
+            return Err(Error::Overloaded(format!(
+                "native preparation work {} exceeds loaded stage maximum {}",
+                aggregate.logical_units, stage.max_work_units
+            )));
+        }
+        let useful = aggregate.tensor_elements;
+        if materialized_tensor_elements < useful {
+            return Err(Error::InvalidInput(
+                "native preparation materialized tensor work is below useful work".to_string(),
+            ));
+        }
+        match stage.shape_policy {
+            StageShapePolicy::Independent => {
+                return Err(Error::InvalidInput(
+                    "native preparation stage cannot declare independent scalar shapes".to_string(),
+                ));
+            }
+            StageShapePolicy::Exact => {
+                let first = rows[live[0]].cost.tensor_elements;
+                if live
+                    .iter()
+                    .any(|index| rows[*index].cost.tensor_elements != first)
+                    || materialized_tensor_elements != useful
+                {
+                    return Err(Error::InvalidInput(
+                        "exact native preparation batch contains unequal or padded rows"
+                            .to_string(),
+                    ));
+                }
+            }
+            StageShapePolicy::Ragged => {
+                if materialized_tensor_elements != useful {
+                    return Err(Error::InvalidInput(
+                        "ragged native preparation batch cannot claim padding".to_string(),
+                    ));
+                }
+            }
+            StageShapePolicy::Padded | StageShapePolicy::Bucketed => {
+                let padding = materialized_tensor_elements.saturating_sub(useful);
+                if useful == 0
+                    || padding.saturating_mul(10_000)
+                        > useful.saturating_mul(u64::from(stage.max_padding_basis_points))
+                {
+                    return Err(Error::Overloaded(
+                        "native preparation padding exceeds loaded stage budget".to_string(),
+                    ));
+                }
+            }
+        }
+        let rows_u64 = u64::try_from(live.len()).map_err(|_| {
+            Error::Overloaded("native preparation width exceeds work accounting".to_string())
+        })?;
+        let fixed_workspace = stage
+            .workspace_per_row_bytes
+            .checked_mul(rows_u64)
+            .and_then(|bytes| {
+                stage
+                    .workspace_per_work_unit_bytes
+                    .checked_mul(aggregate.logical_units)
+                    .and_then(|units| bytes.checked_add(units))
+            })
+            .and_then(|bytes| bytes.checked_add(stage.workspace_base_bytes))
+            .ok_or_else(|| {
+                Error::Overloaded("native preparation workspace accounting overflow".to_string())
+            })?;
+        let workspace = aggregate
+            .workspace
+            .checked_add(ResourceVector::temporary_workspace(fixed_workspace))?;
+        let workspace_bytes = workspace.workspace_bytes()?;
+        if workspace_bytes > stage.max_workspace_bytes {
+            return Err(Error::Overloaded(format!(
+                "native preparation workspace {workspace_bytes} exceeds loaded stage maximum {}",
+                stage.max_workspace_bytes
+            )));
+        }
+        let deadline = live
+            .iter()
+            .all(|index| rows[*index].job.spec.deadline.is_some())
+            .then(|| {
+                live.iter()
+                    .filter_map(|index| rows[*index].job.spec.deadline)
+                    .max()
+                    .expect("nonempty live rows have finite deadlines")
+            });
+        let execution = self
+            .acquire_physical_dispatch(
+                binding.execution_group_id,
+                binding.model_instance_id,
+                stage.physical_launch_policy,
+                stage.batch_mode,
+                live.len(),
+                deadline,
+            )
+            .await?;
+        let batch_id = BatchId::new(NEXT_DIRECT_BATCH_ID.fetch_add(1, Ordering::Relaxed));
+        let workspace =
+            self.reserve_batch_workspace(binding.execution_group_id, batch_id, workspace)?;
+        let first = rows[live[0]].job.clone();
+        let physical = self
+            .run_blocking_task_with_deadline(
+                &first,
+                deadline,
+                (execution, workspace),
+                "inference",
+                move || {
+                    let _contract = contract;
+                    let _work = work;
+                    let physical = match operation(&live) {
+                        Ok(outputs) if outputs.len() == live.len() => outputs,
+                        Ok(_) => {
+                            return Err(Error::InferenceError(
+                                "native preparation output width does not match live row width"
+                                    .to_string(),
+                            ));
+                        }
+                        Err(error) => {
+                            let message = error.to_string();
+                            for index in &live {
+                                outcomes[*index] = Some(PreparationPhysicalOutcome::Failed(
+                                    Error::InferenceError(message.clone()),
+                                ));
+                            }
+                            return Ok(outcomes
+                                .into_iter()
+                                .map(Option::unwrap)
+                                .collect::<Vec<_>>());
+                        }
+                    };
+                    let mut rows: Vec<Option<PreparationBatchRow>> =
+                        rows.into_iter().map(Some).collect();
+                    for (index, output) in live.into_iter().zip(physical) {
+                        let row = rows[index]
+                            .take()
+                            .expect("live preparation row is consumed exactly once");
+                        let outcome = match output {
+                            Err(error) => PreparationPhysicalOutcome::Failed(error),
+                            Ok(_artifact)
+                                if row
+                                    .job
+                                    .spec
+                                    .deadline
+                                    .is_some_and(|deadline| deadline <= Instant::now()) =>
+                            {
+                                PreparationPhysicalOutcome::TimedOut
+                            }
+                            Ok(artifact) => {
+                                if !row.cancellation.begin_commit() {
+                                    PreparationPhysicalOutcome::Cancelled
+                                } else {
+                                    let committed = row
+                                        .job
+                                        .record_materialized_usage(artifact.retained)
+                                        .map(|()| PreparationPhysicalOutcome::Committed {
+                                            artifact,
+                                            job: row.job,
+                                        })
+                                        .unwrap_or_else(PreparationPhysicalOutcome::Failed);
+                                    row.cancellation.finish_commit();
+                                    committed
+                                }
+                            }
+                        };
+                        outcomes[index] = Some(outcome);
+                    }
+                    Ok(outcomes.into_iter().map(Option::unwrap).collect())
+                },
+            )
+            .await?;
+        // The blocking helper and its retained task clone are gone after the
+        // await; drop our deadline-anchor clone before requiring unique row
+        // ownership for the admission bridge.
+        drop(first);
+        physical
+            .into_iter()
+            .map(|outcome| {
+                Ok(match outcome {
+                    PreparationPhysicalOutcome::Committed { artifact, job } => {
+                        match self.bridge_preparation_admission(job) {
+                            Ok(bridge) => PreparationRowOutcome::Committed { artifact, bridge },
+                            Err(error) => PreparationRowOutcome::Failed(error),
+                        }
+                    }
+                    PreparationPhysicalOutcome::Cancelled => PreparationRowOutcome::Cancelled,
+                    PreparationPhysicalOutcome::TimedOut => PreparationRowOutcome::TimedOut,
+                    PreparationPhysicalOutcome::Failed(error) => {
+                        PreparationRowOutcome::Failed(error)
+                    }
+                })
+            })
+            .collect()
+    }
+
+    fn validate_loaded_execution_contract(
+        &self,
+        contract: &LoadedExecutionContract,
+    ) -> Result<crate::engine::ExecutionAdapterBinding> {
         if !contract.execution_profile.resolved_from_loaded_model {
             return Err(Error::InferenceError(
                 "runtime execution contract was not resolved from a loaded model".to_string(),
@@ -567,24 +1575,113 @@ impl InferenceCoordinator {
                 "runtime execution contract belongs to a different backend".to_string(),
             ));
         }
-        let binding = contract.adapter_binding()?;
-        let stage = binding.stage_for_work(&work)?;
-        if stage.domain != ExecutionDomain::ExecutionGroup {
-            return Err(Error::InvalidInput(
-                "host-only adapter stage cannot enter device execution".to_string(),
-            ));
-        }
-        if stage.batch_mode != NativeBatchMode::None || stage.max_batch_size != 1 {
-            return Err(Error::InvalidInput(
-                "runtime width-one runner cannot execute a native tensor stage".to_string(),
-            ));
-        }
+        contract.adapter_binding()
+    }
 
-        self.run_blocking_stage_inner(job, move || {
-            let _contract = contract;
-            let _work = work;
-            operation()
-        })
+    /// Execute a scalar stage with the complete typed invocation workspace
+    /// sealed into its loaded capability binding. Paged attention, recurrent,
+    /// append, ring, and static state are acquired and completed atomically.
+    pub(crate) async fn run_loaded_blocking_stage_with_invocation_workspace<T, F>(
+        self: &Arc<Self>,
+        job: &JobLease,
+        contract: LoadedExecutionContract,
+        capability: LoadedCapabilityBinding,
+        work: WorkUnit,
+        operation: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut crate::kv::v2::InvocationWorkspaceLeaseSetV2) -> Result<T> + Send + 'static,
+    {
+        let binding = self.validate_loaded_execution_contract(&contract)?;
+        if capability.execution != binding {
+            return Err(Error::InferenceError(
+                "direct invocation state belongs to a different loaded execution adapter"
+                    .to_string(),
+            ));
+        }
+        capability
+            .state
+            .validate_against(self.backend, &capability.execution)?;
+        let stage = binding.stage_for_work(&work)?;
+        if stage.domain != ExecutionDomain::ExecutionGroup
+            || stage.batch_mode != NativeBatchMode::None
+        {
+            return Err(Error::InvalidInput(
+                "direct invocation state requires a scalar execution-group stage".to_string(),
+            ));
+        }
+        let stage_id = stage.id;
+        let launch_policy = stage.physical_launch_policy;
+        self.run_blocking_stage_inner_with_policy(
+            job,
+            binding.execution_group_id,
+            binding.model_instance_id,
+            launch_policy,
+            move || {
+                let _contract = contract;
+                let _work = work;
+                let mut leases = capability
+                    .state
+                    .lease_complete_invocation_workspace_set(stage_id)?;
+                let output = operation(&mut leases)?;
+                let _completions = leases.release()?;
+                Ok(output)
+            },
+        )
+        .await
+    }
+
+    /// Execute a scalar stage with the complete invocation-paged domain set
+    /// sealed into its loaded capability binding.
+    pub(crate) async fn run_loaded_blocking_stage_with_invocation_paged<T, F>(
+        self: &Arc<Self>,
+        job: &JobLease,
+        contract: LoadedExecutionContract,
+        capability: LoadedCapabilityBinding,
+        work: WorkUnit,
+        operation: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut crate::kv::v2::InvocationPagedLeaseSetV2) -> Result<T> + Send + 'static,
+    {
+        let binding = self.validate_loaded_execution_contract(&contract)?;
+        if capability.execution != binding {
+            return Err(Error::InferenceError(
+                "direct invocation state belongs to a different loaded execution adapter"
+                    .to_string(),
+            ));
+        }
+        capability
+            .state
+            .validate_against(self.backend, &capability.execution)?;
+        let stage = binding.stage_for_work(&work)?;
+        if stage.domain != ExecutionDomain::ExecutionGroup
+            || stage.batch_mode != NativeBatchMode::None
+        {
+            return Err(Error::InvalidInput(
+                "direct invocation paging requires a scalar execution-group stage".to_string(),
+            ));
+        }
+        let stage_id = stage.id;
+        let launch_policy = stage.physical_launch_policy;
+        self.run_blocking_stage_inner_with_policy(
+            job,
+            binding.execution_group_id,
+            binding.model_instance_id,
+            launch_policy,
+            move || {
+                let _contract = contract;
+                let _work = work;
+                let mut leases = capability
+                    .state
+                    .lease_complete_invocation_paged_set(stage_id)?;
+                let output = operation(&mut leases)?;
+                let _completions = leases.release()?;
+                Ok(output)
+            },
+        )
         .await
     }
 
@@ -597,8 +1694,40 @@ impl InferenceCoordinator {
         T: Send + 'static,
         F: FnOnce() -> Result<T> + Send + 'static,
     {
+        self.run_blocking_stage_inner_with_policy(
+            job,
+            self.execution_group_id,
+            ModelInstanceId::new(0),
+            PhysicalLaunchPolicy::ExecutionGroupExclusive,
+            operation,
+        )
+        .await
+    }
+
+    async fn run_blocking_stage_inner_with_policy<T, F>(
+        self: &Arc<Self>,
+        job: &JobLease,
+        execution_group: ExecutionGroupId,
+        model_instance: ModelInstanceId,
+        launch_policy: PhysicalLaunchPolicy,
+        operation: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T> + Send + 'static,
+    {
         let deadline = job.spec.deadline;
-        let execution = self.acquire_execution(deadline).await?;
+        let execution = self
+            .acquire_physical_dispatch(
+                execution_group,
+                model_instance,
+                launch_policy,
+                NativeBatchMode::None,
+                1,
+                deadline,
+            )
+            .await?;
+        self.execution.ensure_healthy()?;
         self.run_blocking_task(job, execution, "inference", operation)
             .await
     }
@@ -615,15 +1744,46 @@ impl InferenceCoordinator {
         F: FnOnce() -> Result<T> + Send + 'static,
         G: Send + 'static,
     {
-        let deadline = job.spec.deadline;
+        self.run_blocking_task_with_deadline(job, job.spec.deadline, guard, task_kind, operation)
+            .await
+    }
+
+    async fn run_blocking_task_with_deadline<T, F, G>(
+        self: &Arc<Self>,
+        job: &JobLease,
+        deadline: Option<Instant>,
+        guard: G,
+        task_kind: &'static str,
+        operation: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T> + Send + 'static,
+        G: Send + 'static,
+    {
         let request_id = job.spec.request_id.clone();
         let retained_job = job.clone();
         let blocking_request_id = request_id.clone();
+        let poison_admission = self.execution.clone();
+        let poison_resources = self.resources.clone();
         let handle = tokio::task::spawn_blocking(move || {
             let _guard = guard;
             let _job = retained_job;
             if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
                 return Err(Error::Timeout(blocking_request_id));
+            }
+            let _physical_dispatch = (task_kind == "inference")
+                .then(crate::engine::metrics::begin_engine_physical_dispatch);
+            if task_kind == "inference" {
+                return match std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)) {
+                    Ok(result) => result,
+                    Err(payload) => {
+                        let reason = "blocking inference task panicked after entry";
+                        poison_admission.poison(reason);
+                        poison_resources.poison(reason);
+                        std::panic::resume_unwind(payload)
+                    }
+                };
             }
             operation()
         });
@@ -636,9 +1796,14 @@ impl InferenceCoordinator {
                 })?,
             None => handle.await,
         };
-        let result = joined.map_err(|err| {
-            Error::InferenceError(format!("blocking {task_kind} task failed: {err}"))
-        })?;
+        let result = match joined {
+            Ok(result) => result,
+            Err(err) => {
+                return Err(Error::InferenceError(format!(
+                    "blocking {task_kind} task failed: {err}"
+                )));
+            }
+        };
         if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
             self.expired_total.fetch_add(1, Ordering::Relaxed);
             return Err(Error::Timeout(request_id));
@@ -677,7 +1842,126 @@ fn validate_device_identity_parts(
 
 #[derive(Debug, Default)]
 struct ResourceAuthorityRegistry {
-    authorities: Mutex<HashMap<DeviceLocation, Weak<ResourceAuthority>>>,
+    state: Mutex<ResourceAuthorityRegistryState>,
+}
+
+#[derive(Debug, Default)]
+struct ResourceAuthorityRegistryState {
+    host_unified: Option<SharedAuthorityRegistration>,
+    exclusive_devices: HashMap<DeviceLocation, Weak<ResourceAuthority>>,
+}
+
+#[derive(Debug)]
+struct SharedAuthorityRegistration {
+    authority: Weak<ResourceAuthority>,
+    provider: Arc<SharedHostUnifiedCapacityProvider>,
+}
+
+#[derive(Debug, Default)]
+struct SharedHostUnifiedCapacityProvider {
+    providers: Mutex<HashMap<DeviceLocation, Arc<dyn PhysicalCapacityProvider>>>,
+}
+
+impl SharedHostUnifiedCapacityProvider {
+    fn register(&self, location: DeviceLocation, provider: Arc<dyn PhysicalCapacityProvider>) {
+        self.providers
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .entry(location)
+            .or_insert(provider);
+    }
+}
+
+impl PhysicalCapacityProvider for SharedHostUnifiedCapacityProvider {
+    fn snapshot(&self) -> PhysicalCapacitySnapshot {
+        self.combined_snapshot(false)
+    }
+
+    fn configured_budget(&self) -> Option<ResourceVector> {
+        let providers = self
+            .providers
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let budget = providers
+            .values()
+            .filter_map(|provider| provider.configured_budget())
+            .map(shared_host_unified_amount)
+            .try_fold(None, |minimum, amount| match amount {
+                ResourceAmount::Known(amount) => Ok(Some(
+                    minimum.map_or(amount, |current: u64| current.min(amount)),
+                )),
+                ResourceAmount::Unknown => Err(()),
+            })
+            .ok()
+            .flatten()?;
+        Some(shared_host_unified_vector(ResourceAmount::Known(budget)))
+    }
+
+    fn refresh_after_release(&self) -> PhysicalCapacitySnapshot {
+        self.combined_snapshot(true)
+    }
+}
+
+impl SharedHostUnifiedCapacityProvider {
+    fn combined_snapshot(&self, refresh_after_release: bool) -> PhysicalCapacitySnapshot {
+        let providers = self
+            .providers
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut snapshots = providers.values().map(|provider| {
+            if refresh_after_release {
+                provider.refresh_after_release()
+            } else {
+                provider.snapshot()
+            }
+        });
+        let Some(first) = snapshots.next() else {
+            return PhysicalCapacitySnapshot {
+                capacity: shared_host_unified_vector(ResourceAmount::Unknown),
+                available: shared_host_unified_vector(ResourceAmount::Unknown),
+                source: CapacitySource::Unavailable,
+            };
+        };
+        let mut capacity = shared_host_unified_amount(first.capacity);
+        let mut available = shared_host_unified_amount(first.available);
+        for snapshot in snapshots {
+            capacity =
+                minimum_known_amount(capacity, shared_host_unified_amount(snapshot.capacity));
+            available =
+                minimum_known_amount(available, shared_host_unified_amount(snapshot.available));
+        }
+        PhysicalCapacitySnapshot {
+            capacity: shared_host_unified_vector(capacity),
+            available: shared_host_unified_vector(available),
+            source: first.source,
+        }
+    }
+}
+
+fn shared_host_unified_amount(resources: ResourceVector) -> ResourceAmount {
+    match (resources.host_bytes, resources.unified_bytes) {
+        (ResourceAmount::Known(host), ResourceAmount::Known(unified)) => host
+            .checked_add(unified)
+            .map(ResourceAmount::Known)
+            .unwrap_or(ResourceAmount::Unknown),
+        _ => ResourceAmount::Unknown,
+    }
+}
+
+fn shared_host_unified_vector(amount: ResourceAmount) -> ResourceVector {
+    ResourceVector {
+        unified_bytes: amount,
+        ..ResourceVector::zero()
+    }
+}
+
+fn minimum_known_amount(left: ResourceAmount, right: ResourceAmount) -> ResourceAmount {
+    match (left, right) {
+        (ResourceAmount::Known(left), ResourceAmount::Known(right)) => {
+            ResourceAmount::Known(left.min(right))
+        }
+        _ => ResourceAmount::Unknown,
+    }
 }
 
 impl ResourceAuthorityRegistry {
@@ -686,37 +1970,86 @@ impl ResourceAuthorityRegistry {
         location: DeviceLocation,
         provider: Arc<dyn PhysicalCapacityProvider>,
     ) -> Result<Arc<ResourceAuthority>> {
-        let mut authorities = self
-            .authorities
+        let mut state = self
+            .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        authorities.retain(|_, authority| authority.strong_count() > 0);
-        if let Some(authority) = authorities.get(&location).and_then(Weak::upgrade) {
-            return Ok(authority);
+        state
+            .exclusive_devices
+            .retain(|_, authority| authority.strong_count() > 0);
+        if state
+            .host_unified
+            .as_ref()
+            .is_some_and(|registration| registration.authority.strong_count() == 0)
+        {
+            state.host_unified = None;
         }
-        let conflicting_location = authorities
-            .iter()
-            .find_map(|(candidate, authority)| authority.upgrade().map(|_| *candidate));
-        if let Some(conflicting_location) = conflicting_location {
-            return Err(Error::ConfigError(format!(
-                "simultaneous physical device locations are unsupported: {conflicting_location:?} is already active and {location:?} cannot be registered because the shared host-memory domain is not yet split from per-device accounting"
-            )));
+
+        match location {
+            DeviceLocation::Cpu | DeviceLocation::Metal { .. } => {
+                if let Some(conflicting_location) = state.exclusive_devices.keys().next().copied() {
+                    return Err(resource_authority_conflict(conflicting_location, location));
+                }
+                if let Some(registration) = state.host_unified.as_ref() {
+                    if let Some(authority) = registration.authority.upgrade() {
+                        registration.provider.register(location, provider);
+                        return Ok(authority);
+                    }
+                }
+                let shared_provider = Arc::new(SharedHostUnifiedCapacityProvider::default());
+                shared_provider.register(location, provider);
+                let authority = Arc::new(ResourceAuthority::new_advisory_shared_host_unified(
+                    shared_provider.clone(),
+                ));
+                state.host_unified = Some(SharedAuthorityRegistration {
+                    authority: Arc::downgrade(&authority),
+                    provider: shared_provider,
+                });
+                Ok(authority)
+            }
+            DeviceLocation::Cuda { .. } => {
+                if state
+                    .host_unified
+                    .as_ref()
+                    .and_then(|registration| registration.authority.upgrade())
+                    .is_some()
+                {
+                    return Err(resource_authority_conflict(DeviceLocation::Cpu, location));
+                }
+                if let Some(authority) = state
+                    .exclusive_devices
+                    .get(&location)
+                    .and_then(Weak::upgrade)
+                {
+                    return Ok(authority);
+                }
+                if let Some(conflicting_location) = state.exclusive_devices.keys().next().copied() {
+                    return Err(resource_authority_conflict(conflicting_location, location));
+                }
+                let authority = Arc::new(ResourceAuthority::new(provider));
+                state
+                    .exclusive_devices
+                    .insert(location, Arc::downgrade(&authority));
+                Ok(authority)
+            }
         }
-        let authority = Arc::new(ResourceAuthority::new(provider));
-        authorities.insert(location, Arc::downgrade(&authority));
-        Ok(authority)
     }
+}
+
+fn resource_authority_conflict(active: DeviceLocation, requested: DeviceLocation) -> Error {
+    Error::ConfigError(format!(
+        "simultaneous physical device locations are unsupported: {active:?} is already active and {requested:?} cannot be registered because the shared host-memory domain for CUDA is not yet split from per-device accounting"
+    ))
 }
 
 fn shared_resource_authority(
     location: DeviceLocation,
     provider: Arc<dyn PhysicalCapacityProvider>,
 ) -> Result<Arc<ResourceAuthority>> {
-    // DeviceLocation correctly identifies accelerator capacity, but each
-    // provider also exposes process-wide host headroom. Until reservations are
-    // composite (one shared host domain plus one per-device domain), distinct
-    // simultaneous physical locations must fail closed instead of each
-    // spending the full host budget. The normal selector exposes one location.
+    // CPU host allocations and Metal unified allocations spend one physical
+    // pool on Apple Silicon, so they share a canonical authority even when
+    // workers use distinct DeviceLocation identities. CUDA remains exclusive
+    // until its shared host claim and per-device claim become composite.
     static AUTHORITIES: OnceLock<ResourceAuthorityRegistry> = OnceLock::new();
     AUTHORITIES
         .get_or_init(ResourceAuthorityRegistry::default)
@@ -777,14 +2110,46 @@ struct JobLeaseInner {
     coordinator: Arc<InferenceCoordinator>,
     _permit: OwnedSemaphorePermit,
     reservation: ResourceLease,
+    active: ActiveJobGuard,
 }
 
-impl Drop for JobLeaseInner {
+#[derive(Debug)]
+struct ActiveJobGuard {
+    coordinator: Arc<InferenceCoordinator>,
+}
+
+impl Drop for ActiveJobGuard {
     fn drop(&mut self) {
         if self.coordinator.active_jobs.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.coordinator.idle.notify_waiters();
         }
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparationAdmissionBridge {
+    coordinator: Arc<InferenceCoordinator>,
+    preparation_spec: JobSpec,
+    reservation: Option<ResourceLease>,
+}
+
+impl Drop for PreparationAdmissionBridge {
+    fn drop(&mut self) {
+        if self
+            .coordinator
+            .active_preparation_bridges
+            .fetch_sub(1, Ordering::AcqRel)
+            == 1
+        {
+            self.coordinator.idle.notify_waiters();
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparationAdmissionFailure {
+    pub(crate) error: Error,
+    pub(crate) bridge: PreparationAdmissionBridge,
 }
 
 fn effective_resources(requested: ResourceVector, backend: BackendKind) -> Result<ResourceVector> {
@@ -995,13 +2360,33 @@ impl CapacitySampleCache {
             .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        if let Some(snapshot) = snapshot {
+        if let Some(snapshot) =
+            snapshot.filter(|_| state.sample.is_none_or(|current| now >= current.sampled_at))
+        {
             state.sample = Some(CachedCapacitySample {
                 snapshot,
                 sampled_at: now,
             });
         }
         state.refresh_in_flight = false;
+        drop(state);
+        self.refreshed.notify_all();
+    }
+
+    fn publish_sample(&self, snapshot: PhysicalCapacitySnapshot, sampled_at: Instant) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let should_publish = state
+            .sample
+            .is_none_or(|current| sampled_at >= current.sampled_at);
+        if should_publish {
+            state.sample = Some(CachedCapacitySample {
+                snapshot,
+                sampled_at,
+            });
+        }
         drop(state);
         self.refreshed.notify_all();
     }
@@ -1061,7 +2446,11 @@ struct DeviceCapacityProbe {
 impl DeviceCapacityProbe {
     fn apply_cap(&self, total: u64, available: u64) -> (u64, u64) {
         match self.configured_cap {
-            Some(cap) => (total.min(cap), available.min(cap)),
+            Some(cap) => {
+                let effective_total = total.min(cap);
+                let used = total.saturating_sub(available.min(total));
+                (effective_total, effective_total.saturating_sub(used))
+            }
             None => (total, available),
         }
     }
@@ -1191,8 +2580,9 @@ impl DeviceCapacityProvider {
             .name(format!("izwi-capacity-{:?}", probe.backend).to_lowercase())
             .spawn(move || {
                 while requests.recv().is_ok() {
+                    let sampled_at = Instant::now();
                     let sample = guarded_capacity_sample(|| refresh_probe.sample());
-                    refresh_cache.finish_refresh(sample, Instant::now());
+                    refresh_cache.finish_refresh(sample, sampled_at);
                 }
             })
             .map_err(|err| {
@@ -1231,6 +2621,20 @@ impl PhysicalCapacityProvider for DeviceCapacityProvider {
             .snapshot
             .or_else(|| self.cache.wait_for_refresh(CAPACITY_REFRESH_WAIT))
             .unwrap_or_else(|| self.probe.unavailable_snapshot())
+    }
+
+    fn configured_budget(&self) -> Option<ResourceVector> {
+        self.probe
+            .configured_cap
+            .map(|capacity| self.probe.vector(ResourceAmount::Known(capacity)))
+    }
+
+    fn refresh_after_release(&self) -> PhysicalCapacitySnapshot {
+        let sampled_at = Instant::now();
+        let snapshot = guarded_capacity_sample(|| self.probe.sample())
+            .unwrap_or_else(|| self.probe.unavailable_snapshot());
+        self.cache.publish_sample(snapshot, sampled_at);
+        snapshot
     }
 }
 
@@ -1390,25 +2794,6 @@ fn cuda_memory_snapshot(_device: &DeviceProfile) -> Option<(u64, u64, CapacitySo
     None
 }
 
-#[derive(Debug)]
-struct ExecutionLease {
-    coordinator: Arc<InferenceCoordinator>,
-    _permit: OwnedSemaphorePermit,
-}
-
-impl Drop for ExecutionLease {
-    fn drop(&mut self) {
-        if self
-            .coordinator
-            .active_executions
-            .fetch_sub(1, Ordering::AcqRel)
-            == 1
-        {
-            self.coordinator.idle.notify_waiters();
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1420,6 +2805,7 @@ mod tests {
     struct MutableCapacityProvider {
         capacity: ResourceVector,
         available: Mutex<ResourceVector>,
+        configured_budget: Option<ResourceVector>,
     }
 
     impl MutableCapacityProvider {
@@ -1427,7 +2813,13 @@ mod tests {
             Self {
                 capacity,
                 available: Mutex::new(capacity),
+                configured_budget: None,
             }
+        }
+
+        fn with_configured_budget(mut self, configured_budget: ResourceVector) -> Self {
+            self.configured_budget = Some(configured_budget);
+            self
         }
 
         fn set_available(&self, available: ResourceVector) {
@@ -1449,6 +2841,10 @@ mod tests {
                 source: CapacitySource::Test,
             }
         }
+
+        fn configured_budget(&self) -> Option<ResourceVector> {
+            self.configured_budget
+        }
     }
 
     fn resources_for_location(location: DeviceLocation, bytes: u64) -> ResourceVector {
@@ -1465,6 +2861,15 @@ mod tests {
         Arc::new(MutableCapacityProvider::new(resources_for_location(
             location, bytes,
         )))
+    }
+
+    fn authority_resources_for_location(location: DeviceLocation, bytes: u64) -> ResourceVector {
+        match location {
+            DeviceLocation::Cpu | DeviceLocation::Metal { .. } => {
+                shared_host_unified_vector(ResourceAmount::Known(bytes))
+            }
+            DeviceLocation::Cuda { .. } => resources_for_location(location, bytes),
+        }
     }
 
     fn cuda_resources(host_bytes: u64, device_bytes: u64) -> ResourceVector {
@@ -1596,7 +3001,7 @@ mod tests {
     }
 
     #[test]
-    fn same_physical_device_identity_shares_authority_and_reservations() {
+    fn shared_authority_applies_backend_capacity_policy() {
         for (index, location) in [
             DeviceLocation::Cpu,
             DeviceLocation::Metal { gpu_id: 7 },
@@ -1623,38 +3028,179 @@ mod tests {
                     resources_for_location(location, 60),
                 )
                 .unwrap();
-            assert!(matches!(
-                second.reserve(
-                    ReservationOwner::new(
-                        ReservationClass::Request,
-                        format!("shared-device-second-{index}"),
-                    ),
-                    resources_for_location(location, 50),
+            let second_reservation = second.reserve(
+                ReservationOwner::new(
+                    ReservationClass::Request,
+                    format!("shared-device-second-{index}"),
                 ),
-                Err(Error::Overloaded(_))
-            ));
+                resources_for_location(location, 50),
+            );
+            match location {
+                DeviceLocation::Cpu | DeviceLocation::Metal { .. } => {
+                    let _second = second_reservation
+                        .expect("shared host/unified physical capacity is advisory");
+                    assert_eq!(
+                        second.snapshot().reserved,
+                        authority_resources_for_location(location, 110)
+                    );
+                }
+                DeviceLocation::Cuda { .. } => {
+                    assert!(matches!(second_reservation, Err(Error::Overloaded(_))));
+                    assert_eq!(
+                        second.snapshot().reserved,
+                        authority_resources_for_location(location, 60)
+                    );
+                }
+            }
             assert_eq!(
                 second.snapshot().physical.capacity,
-                resources_for_location(location, 100),
+                authority_resources_for_location(location, 100),
                 "the first provider remains authoritative for a shared identity"
             );
         }
     }
 
     #[test]
-    fn simultaneous_distinct_physical_locations_fail_closed() {
-        let locations = [
-            DeviceLocation::Cpu,
-            DeviceLocation::Metal { gpu_id: 0 },
-            DeviceLocation::Metal { gpu_id: 1 },
-            DeviceLocation::Cuda { gpu_id: 0 },
-            DeviceLocation::Cuda { gpu_id: 1 },
-        ];
-        for first_location in locations {
-            for second_location in locations {
-                if first_location == second_location {
-                    continue;
-                }
+    fn cpu_and_metal_locations_share_one_host_unified_authority() {
+        let registry = ResourceAuthorityRegistry::default();
+        let cpu = registry
+            .authority_for(
+                DeviceLocation::Cpu,
+                provider_for_location(DeviceLocation::Cpu, 100),
+            )
+            .unwrap();
+        let metal = registry
+            .authority_for(
+                DeviceLocation::Metal { gpu_id: 0 },
+                provider_for_location(DeviceLocation::Metal { gpu_id: 0 }, 80),
+            )
+            .unwrap();
+        let other_metal = registry
+            .authority_for(
+                DeviceLocation::Metal { gpu_id: 1 },
+                provider_for_location(DeviceLocation::Metal { gpu_id: 1 }, 90),
+            )
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&cpu, &metal));
+        assert!(Arc::ptr_eq(&cpu, &other_metal));
+        assert_eq!(
+            cpu.snapshot().physical.capacity,
+            shared_host_unified_vector(ResourceAmount::Known(80)),
+            "the most conservative live provider controls the shared pool"
+        );
+        let _cpu_lease = cpu
+            .reserve(
+                ReservationOwner::new(ReservationClass::Request, "shared-cpu"),
+                resources_for_location(DeviceLocation::Cpu, 60),
+            )
+            .unwrap();
+        let _metal_lease = metal
+            .reserve(
+                ReservationOwner::new(ReservationClass::Request, "shared-metal"),
+                resources_for_location(DeviceLocation::Metal { gpu_id: 0 }, 30),
+            )
+            .expect("shared host/unified physical capacity is advisory");
+        assert_eq!(
+            metal.snapshot().reserved,
+            shared_host_unified_vector(ResourceAmount::Known(90))
+        );
+    }
+
+    #[test]
+    fn shared_cpu_and_metal_claims_jointly_observe_the_smallest_explicit_budget() {
+        let registry = ResourceAuthorityRegistry::default();
+        let cpu_provider = Arc::new(
+            MutableCapacityProvider::new(resources_for_location(DeviceLocation::Cpu, 1_000))
+                .with_configured_budget(resources_for_location(DeviceLocation::Cpu, 100)),
+        );
+        let metal_location = DeviceLocation::Metal { gpu_id: 0 };
+        let metal_provider = Arc::new(
+            MutableCapacityProvider::new(resources_for_location(metal_location, 1_000))
+                .with_configured_budget(resources_for_location(metal_location, 80)),
+        );
+        let cpu = registry
+            .authority_for(DeviceLocation::Cpu, cpu_provider)
+            .unwrap();
+        let metal = registry
+            .authority_for(metal_location, metal_provider)
+            .unwrap();
+        assert!(Arc::ptr_eq(&cpu, &metal));
+
+        let _cpu = cpu
+            .reserve(
+                ReservationOwner::new(ReservationClass::Model, "budgeted-cpu"),
+                resources_for_location(DeviceLocation::Cpu, 60),
+            )
+            .unwrap();
+        assert!(matches!(
+            metal.reserve(
+                ReservationOwner::new(ReservationClass::Request, "over-shared-budget"),
+                resources_for_location(metal_location, 21),
+            ),
+            Err(Error::Overloaded(_))
+        ));
+        let _metal = metal
+            .reserve(
+                ReservationOwner::new(ReservationClass::Request, "within-shared-budget"),
+                resources_for_location(metal_location, 20),
+            )
+            .unwrap();
+        assert_eq!(
+            metal.snapshot().reserved,
+            shared_host_unified_vector(ResourceAmount::Known(80))
+        );
+    }
+
+    #[test]
+    fn shared_authority_telemetry_projects_usage_into_each_backend_domain() {
+        let registry = ResourceAuthorityRegistry::default();
+        let authority = registry
+            .authority_for(
+                DeviceLocation::Cpu,
+                provider_for_location(DeviceLocation::Cpu, 100),
+            )
+            .unwrap();
+        registry
+            .authority_for(
+                DeviceLocation::Metal { gpu_id: 0 },
+                provider_for_location(DeviceLocation::Metal { gpu_id: 0 }, 100),
+            )
+            .unwrap();
+        let cpu = InferenceCoordinator::with_resource_authority(
+            BackendKind::Cpu,
+            1,
+            1,
+            authority.clone(),
+        );
+        let metal = InferenceCoordinator::with_resource_authority(
+            BackendKind::Metal,
+            1,
+            1,
+            authority.clone(),
+        );
+        let _lease = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Request, "telemetry-alias"),
+                resources_for_location(DeviceLocation::Cpu, 40),
+            )
+            .unwrap();
+
+        let cpu_snapshot = cpu.snapshot();
+        assert_eq!(cpu_snapshot.reserved_host_memory_bytes, 40);
+        assert_eq!(cpu_snapshot.reserved_unified_memory_bytes, 0);
+        let metal_snapshot = metal.snapshot();
+        assert_eq!(metal_snapshot.reserved_host_memory_bytes, 0);
+        assert_eq!(metal_snapshot.reserved_unified_memory_bytes, 40);
+    }
+
+    #[test]
+    fn cuda_and_shared_host_unified_locations_remain_exclusive() {
+        for shared_location in [DeviceLocation::Cpu, DeviceLocation::Metal { gpu_id: 0 }] {
+            for (first_location, second_location) in [
+                (shared_location, DeviceLocation::Cuda { gpu_id: 0 }),
+                (DeviceLocation::Cuda { gpu_id: 0 }, shared_location),
+            ] {
                 let registry = ResourceAuthorityRegistry::default();
                 let first = registry
                     .authority_for(first_location, provider_for_location(first_location, 100))
@@ -1662,22 +3208,15 @@ mod tests {
                 assert!(matches!(
                     registry.authority_for(
                         second_location,
-                        provider_for_location(second_location, 200),
+                        provider_for_location(second_location, 100),
                     ),
                     Err(Error::ConfigError(message))
                         if message.contains("shared host-memory domain")
                 ));
-
-                // Once the first physical-device authority is no longer
-                // active, a different location may establish a fresh provider.
                 drop(first);
-                let second = registry
-                    .authority_for(second_location, provider_for_location(second_location, 200))
-                    .unwrap();
-                assert_eq!(
-                    second.snapshot().physical.capacity,
-                    resources_for_location(second_location, 200)
-                );
+                registry
+                    .authority_for(second_location, provider_for_location(second_location, 100))
+                    .expect("a new domain may register after the active authority expires");
             }
         }
     }
@@ -1708,7 +3247,7 @@ mod tests {
         ));
         assert_eq!(
             cpu.snapshot().reserved,
-            resources_for_location(DeviceLocation::Cpu, 60)
+            shared_host_unified_vector(ResourceAmount::Known(60))
         );
     }
 
@@ -1755,7 +3294,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 recreated.snapshot().physical.capacity,
-                resources_for_location(location, 200)
+                authority_resources_for_location(location, 200)
             );
         }
     }
@@ -1859,6 +3398,27 @@ Pages free: 10.\n";
     }
 
     #[test]
+    fn older_async_refresh_cannot_overwrite_post_release_sample() {
+        let started = Instant::now();
+        let initial = host_capacity_snapshot(10);
+        let stale_worker_sample = host_capacity_snapshot(20);
+        let released = host_capacity_snapshot(100);
+        let cache = CapacitySampleCache::new(Some(initial), started);
+        let stale_worker_started = started + Duration::from_millis(1);
+        let release_sampled_at = started + Duration::from_millis(2);
+
+        cache.publish_sample(released, release_sampled_at);
+        cache.finish_refresh(Some(stale_worker_sample), stale_worker_started);
+
+        assert_eq!(
+            cache
+                .decision(release_sampled_at + Duration::from_millis(1))
+                .snapshot,
+            Some(released)
+        );
+    }
+
+    #[test]
     fn capacity_cache_waits_for_successful_refresh_after_hard_stale_expiry() {
         let now = Instant::now();
         let started = now
@@ -1951,6 +3511,20 @@ Pages free: 10.\n";
         let decision = cache.decision(refresh_at + Duration::from_millis(2));
         assert_eq!(decision.snapshot, Some(refreshed));
         assert!(!decision.request_refresh);
+    }
+
+    #[test]
+    fn configured_device_cap_subtracts_memory_already_in_use() {
+        let probe = DeviceCapacityProbe {
+            backend: BackendKind::Cuda,
+            device: None,
+            configured_cap: Some(80),
+            test_capacity: None,
+        };
+
+        assert_eq!(probe.apply_cap(100, 70), (80, 50));
+        assert_eq!(probe.apply_cap(100, 10), (80, 0));
+        assert_eq!(probe.apply_cap(64, 40), (64, 40));
     }
 
     #[test]
@@ -2089,7 +3663,7 @@ Pages free: 10.\n";
     }
 
     #[tokio::test]
-    async fn cpu_and_cuda_use_configured_capacity_while_metal_serializes() {
+    async fn cpu_uses_configured_capacity_while_accelerators_serialize() {
         assert_eq!(
             InferenceCoordinator::new(BackendKind::Cpu, 8, 8).capacity,
             8
@@ -2100,7 +3674,7 @@ Pages free: 10.\n";
         );
         assert_eq!(
             InferenceCoordinator::new(BackendKind::Cuda, 4, 8).capacity,
-            4
+            1
         );
     }
 
@@ -2176,19 +3750,17 @@ Pages free: 10.\n";
     }
 
     #[tokio::test]
-    async fn cuda_execution_uses_configured_concurrency() {
+    async fn cuda_execution_remains_serial_without_a_backend_certificate() {
         let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cuda, 3, 4));
         let first = coordinator.acquire_execution(None).await.unwrap();
-        let second = coordinator.acquire_execution(None).await.unwrap();
-        let third = coordinator.acquire_execution(None).await.unwrap();
 
-        assert_eq!(coordinator.snapshot().active_executions, 3);
+        assert_eq!(coordinator.snapshot().active_executions, 1);
         let blocked = coordinator
             .acquire_execution(Some(Instant::now() + std::time::Duration::from_millis(5)))
             .await;
         assert!(matches!(blocked, Err(Error::Timeout(_))));
 
-        drop((first, second, third));
+        drop(first);
         assert_eq!(coordinator.snapshot().active_executions, 0);
     }
 
@@ -2214,45 +3786,368 @@ Pages free: 10.\n";
         ));
 
         let cuda = Arc::new(InferenceCoordinator::new(BackendKind::Cuda, 4, 8));
-        let lease = cuda.acquire_execution_units(4, None).await.unwrap();
-        assert_eq!(cuda.snapshot().active_executions, 1);
-        drop(lease);
-        assert_eq!(cuda.snapshot().active_executions, 0);
+        assert!(matches!(
+            cuda.acquire_execution_units(2, None).await,
+            Err(Error::InvalidInput(_))
+        ));
     }
 
     #[tokio::test]
-    async fn engine_step_reserves_all_cuda_execution_units() {
-        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cuda, 4, 8));
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        let runner_coordinator = coordinator.clone();
-        let runner = tokio::spawn(async move {
-            runner_coordinator
-                .run_engine_step(async move {
-                    release_rx.await.unwrap();
+    async fn physical_dispatch_admission_is_weighted_and_fifo_fair() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 4, 8));
+        let admission = coordinator.physical_execution_admission();
+        let execution_group = coordinator.execution_group_id();
+        let model_instance = ModelInstanceId::new(7);
+        let concurrent = PhysicalLaunchPolicy::concurrent(4).unwrap();
+        assert_eq!(
+            admission
+                .required_units(concurrent, NativeBatchMode::Static, 4)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            admission
+                .required_units(concurrent, NativeBatchMode::None, 3)
+                .unwrap(),
+            3
+        );
+        assert!(matches!(
+            admission.required_units(concurrent, NativeBatchMode::None, 8),
+            Err(Error::InvalidInput(_))
+        ));
+        assert_eq!(
+            admission
+                .required_units(
+                    PhysicalLaunchPolicy::ExecutionGroupExclusive,
+                    NativeBatchMode::None,
+                    1,
+                )
+                .unwrap(),
+            1
+        );
+
+        let held = admission
+            .acquire_dispatch(
+                execution_group,
+                model_instance,
+                concurrent,
+                NativeBatchMode::None,
+                3,
+                None,
+            )
+            .await
+            .unwrap();
+        let exclusive_admission = admission.clone();
+        let exclusive = tokio::spawn(async move {
+            exclusive_admission
+                .acquire_dispatch(
+                    execution_group,
+                    ModelInstanceId::new(8),
+                    PhysicalLaunchPolicy::ExecutionGroupExclusive,
+                    NativeBatchMode::None,
+                    1,
+                    None,
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        let scalar_admission = admission.clone();
+        let scalar = tokio::spawn(async move {
+            scalar_admission
+                .acquire_dispatch(
+                    execution_group,
+                    model_instance,
+                    concurrent,
+                    NativeBatchMode::None,
+                    1,
+                    None,
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !scalar.is_finished(),
+            "a small request must not bypass the queued exclusive waiter"
+        );
+
+        drop(held);
+        let exclusive = tokio::time::timeout(Duration::from_secs(1), exclusive)
+            .await
+            .expect("exclusive waiter")
+            .unwrap()
+            .unwrap();
+        assert_eq!(coordinator.snapshot().active_executions, 1);
+        assert!(!scalar.is_finished());
+        drop(exclusive);
+        let scalar = tokio::time::timeout(Duration::from_secs(1), scalar).await;
+        scalar.expect("scalar waiter").unwrap().unwrap();
+        assert_eq!(coordinator.snapshot().active_executions, 0);
+    }
+
+    #[tokio::test]
+    async fn physical_dispatch_admission_enforces_exact_same_model_limit() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 4, 8));
+        let admission = coordinator.physical_execution_admission();
+        let group = coordinator.execution_group_id();
+        let model = ModelInstanceId::new(31);
+        let concurrent = PhysicalLaunchPolicy::concurrent(2).unwrap();
+
+        let first = admission
+            .acquire_dispatch(group, model, concurrent, NativeBatchMode::Static, 1, None)
+            .await
+            .unwrap();
+        let second = admission
+            .acquire_dispatch(group, model, concurrent, NativeBatchMode::Static, 1, None)
+            .await
+            .unwrap();
+        let blocked = admission
+            .acquire_dispatch(
+                group,
+                model,
+                concurrent,
+                NativeBatchMode::Static,
+                1,
+                Some(Instant::now() + Duration::from_millis(5)),
+            )
+            .await;
+        assert!(matches!(blocked, Err(Error::Timeout(_))));
+
+        let other_model = admission
+            .acquire_dispatch(
+                group,
+                ModelInstanceId::new(32),
+                concurrent,
+                NativeBatchMode::Static,
+                1,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(coordinator.snapshot().active_executions, 3);
+        drop((first, second, other_model));
+    }
+
+    #[tokio::test]
+    async fn physical_broker_records_wait_observations_and_capacity_defers() {
+        let before = crate::engine::engine_physical_execution_metrics_snapshot();
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 8));
+        let admission = coordinator.physical_execution_admission();
+        let group = coordinator.execution_group_id();
+        let model = ModelInstanceId::new(35);
+        let held = admission
+            .acquire_dispatch(
+                group,
+                model,
+                PhysicalLaunchPolicy::ModelExclusive,
+                NativeBatchMode::None,
+                1,
+                None,
+            )
+            .await
+            .unwrap();
+        let rejected = admission
+            .acquire_dispatch(
+                group,
+                model,
+                PhysicalLaunchPolicy::ModelExclusive,
+                NativeBatchMode::None,
+                1,
+                Some(Instant::now() + Duration::from_millis(5)),
+            )
+            .await;
+        assert!(matches!(rejected, Err(Error::Timeout(_))));
+        drop(held);
+
+        let after = crate::engine::engine_physical_execution_metrics_snapshot();
+        assert!(
+            after.permit_wait.observations_total
+                >= before.permit_wait.observations_total.saturating_add(2)
+        );
+        assert!(
+            after.defers.execution_capacity >= before.defers.execution_capacity.saturating_add(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn model_exclusive_is_model_scoped_and_group_exclusive_blocks_every_model() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 2, 8));
+        let admission = coordinator.physical_execution_admission();
+        let group = coordinator.execution_group_id();
+        let first_model = ModelInstanceId::new(41);
+        let second_model = ModelInstanceId::new(42);
+
+        let first = admission
+            .acquire_dispatch(
+                group,
+                first_model,
+                PhysicalLaunchPolicy::ModelExclusive,
+                NativeBatchMode::None,
+                1,
+                None,
+            )
+            .await
+            .unwrap();
+        let same_model = admission
+            .acquire_dispatch(
+                group,
+                first_model,
+                PhysicalLaunchPolicy::ModelExclusive,
+                NativeBatchMode::None,
+                1,
+                Some(Instant::now() + Duration::from_millis(5)),
+            )
+            .await;
+        assert!(matches!(same_model, Err(Error::Timeout(_))));
+        let second = admission
+            .acquire_dispatch(
+                group,
+                second_model,
+                PhysicalLaunchPolicy::ModelExclusive,
+                NativeBatchMode::None,
+                1,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(coordinator.snapshot().active_executions, 2);
+
+        drop((first, second));
+        let group_exclusive = admission
+            .acquire_dispatch(
+                group,
+                first_model,
+                PhysicalLaunchPolicy::ExecutionGroupExclusive,
+                NativeBatchMode::None,
+                1,
+                None,
+            )
+            .await
+            .unwrap();
+        let blocked_other = admission
+            .acquire_dispatch(
+                group,
+                second_model,
+                PhysicalLaunchPolicy::ModelExclusive,
+                NativeBatchMode::None,
+                1,
+                Some(Instant::now() + Duration::from_millis(5)),
+            )
+            .await;
+        assert!(matches!(blocked_other, Err(Error::Timeout(_))));
+        drop(group_exclusive);
+    }
+
+    #[tokio::test]
+    async fn group_exclusive_allows_a_distinct_execution_group_to_overlap() {
+        let admission = PhysicalExecutionAdmission::standalone(2);
+        let first_group = ExecutionGroupId::new(71);
+        let second_group = ExecutionGroupId::new(72);
+        let first = admission
+            .acquire_dispatch(
+                first_group,
+                ModelInstanceId::new(1),
+                PhysicalLaunchPolicy::ExecutionGroupExclusive,
+                NativeBatchMode::None,
+                1,
+                None,
+            )
+            .await
+            .unwrap();
+        let second = admission
+            .acquire_dispatch(
+                second_group,
+                ModelInstanceId::new(1),
+                PhysicalLaunchPolicy::ExecutionGroupExclusive,
+                NativeBatchMode::None,
+                1,
+                Some(Instant::now() + Duration::from_millis(50)),
+            )
+            .await
+            .expect("distinct execution groups retain independent exclusive scopes");
+        drop((first, second));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn direct_and_engine_admission_share_the_exact_model_limit() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 4, 8));
+        let job = coordinator.admit(job("mixed-model-limit")).await.unwrap();
+        let group = coordinator.execution_group_id();
+        let model = ModelInstanceId::new(51);
+        let policy = PhysicalLaunchPolicy::concurrent(2).unwrap();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let task_release = release.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task_coordinator = coordinator.clone();
+        let direct = tokio::spawn(async move {
+            task_coordinator
+                .run_blocking_stage_inner_with_policy(&job, group, model, policy, move || {
+                    let _ = started_tx.send(());
+                    let (lock, wake) = &*task_release;
+                    let mut released = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+                    while !*released {
+                        released = wake
+                            .wait(released)
+                            .unwrap_or_else(|poison| poison.into_inner());
+                    }
                     Ok(())
                 })
                 .await
         });
-        while coordinator.snapshot().active_executions == 0 {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(coordinator.snapshot().active_executions, 1);
+        started_rx.await.unwrap();
 
-        let competing = coordinator
-            .acquire_execution(Some(Instant::now() + std::time::Duration::from_millis(5)))
+        let engine = coordinator
+            .physical_execution_admission()
+            .acquire_dispatch(group, model, policy, NativeBatchMode::None, 1, None)
+            .await
+            .unwrap();
+        let third = coordinator
+            .physical_execution_admission()
+            .acquire_dispatch(
+                group,
+                model,
+                policy,
+                NativeBatchMode::None,
+                1,
+                Some(Instant::now() + Duration::from_millis(5)),
+            )
             .await;
-        assert!(matches!(competing, Err(Error::Timeout(_))));
+        assert!(matches!(third, Err(Error::Timeout(_))));
 
-        release_tx.send(()).unwrap();
-        runner.await.unwrap().unwrap();
-        coordinator.acquire_execution(None).await.unwrap();
+        drop(engine);
+        let (lock, wake) = &*release;
+        *lock.lock().unwrap_or_else(|poison| poison.into_inner()) = true;
+        wake.notify_all();
+        direct.await.unwrap().unwrap();
     }
 
     #[tokio::test]
-    async fn loaded_width_one_stage_rejects_cross_group_execution_before_model_work() {
+    async fn direct_inference_records_physical_dispatch_lifetime() {
+        let before = crate::engine::engine_physical_execution_metrics_snapshot();
         let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 4));
-        let job = coordinator.admit(job("loaded-width-one")).await.unwrap();
-        let adapters = RuntimeAdapterRegistry::built_in();
+        let job = coordinator
+            .admit(job("direct-physical-metrics"))
+            .await
+            .unwrap();
+
+        coordinator
+            .run_blocking_stage_inner(&job, || Ok(()))
+            .await
+            .unwrap();
+
+        let after = crate::engine::engine_physical_execution_metrics_snapshot();
+        assert!(
+            after.dispatches_started_total >= before.dispatches_started_total.saturating_add(1)
+        );
+        assert!(
+            after.dispatches_completed_total >= before.dispatches_completed_total.saturating_add(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn loaded_scalar_stage_uses_certified_width_and_rejects_cross_group_work() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 4));
+        let job = coordinator.admit(job("loaded-scalar")).await.unwrap();
+        let adapters = RuntimeAdapterRegistry::built_in_with_execution_limits(1, 4).unwrap();
         let bundle = LoadedModelBundle::bind(
             &adapters,
             coordinator.execution_group_id(),
@@ -2261,7 +4156,11 @@ Pages free: 10.\n";
             BackendKind::Cpu,
         )
         .unwrap();
-        let contract = bundle.contract(CapabilityKind::Tts, false).unwrap();
+        let contract = bundle
+            .contract(CapabilityKind::StreamingTts, false)
+            .unwrap();
+        assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::None);
+        assert_eq!(contract.stages[0].max_batch_size, 1);
         let calls = Arc::new(AtomicUsize::new(0));
         let task_calls = calls.clone();
 
@@ -2290,7 +4189,9 @@ Pages free: 10.\n";
             BackendKind::Cpu,
         )
         .unwrap();
-        let contract = wrong_group.contract(CapabilityKind::Tts, false).unwrap();
+        let contract = wrong_group
+            .contract(CapabilityKind::StreamingTts, false)
+            .unwrap();
         let task_calls = calls.clone();
         let error = coordinator
             .run_loaded_blocking_stage(
@@ -2310,6 +4211,594 @@ Pages free: 10.\n";
         assert!(error.to_string().contains("different execution group"));
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(coordinator.snapshot().active_executions, 0);
+    }
+
+    fn native_preparation_contract(
+        coordinator: &InferenceCoordinator,
+        max_batch_size: usize,
+        max_workspace_bytes: u64,
+    ) -> LoadedExecutionContract {
+        let adapters =
+            RuntimeAdapterRegistry::built_in_with_execution_limits(1, max_batch_size).unwrap();
+        let bundle = LoadedModelBundle::bind(
+            &adapters,
+            coordinator.execution_group_id(),
+            ModelInstanceId::new(41),
+            ModelVariant::Kokoro82M,
+            BackendKind::Cpu,
+        )
+        .unwrap();
+        let mut contract = bundle.contract(CapabilityKind::Tts, false).unwrap();
+        let mut stage = crate::engine::StageDescriptor::from_execution_profile(
+            crate::engine::StageId::new(9),
+            "asr.encoder.audio",
+            &contract.execution_profile,
+            NativeBatchMode::Static,
+        );
+        stage.selector = crate::engine::StageWorkSelector::PreSequencePreparation;
+        stage.progress = crate::engine::StageProgressKind::Atomic;
+        stage.concurrency = crate::engine::ConcurrencyClass::Batchable;
+        stage.max_batch_size = max_batch_size;
+        stage.max_work_units = u64::try_from(max_batch_size).unwrap();
+        stage.max_workspace_bytes = max_workspace_bytes;
+        stage.shape_policy = crate::engine::StageShapePolicy::Ragged;
+        stage.max_padding_basis_points = 0;
+        stage.membership_safe_point = crate::engine::MembershipSafePoint::OperationBoundary;
+        stage.validate().unwrap();
+        contract.stages = Arc::from([stage]);
+        contract
+    }
+
+    fn sealed_preparation_row(
+        coordinator: &Arc<InferenceCoordinator>,
+        contract: &LoadedExecutionContract,
+        job: JobLease,
+        cost: WorkCost,
+        materialized_tensor_elements: u64,
+        cancellation: PreparationCancellation,
+    ) -> PreparationBatchRow {
+        coordinator
+            .seal_preparation_row(
+                job,
+                contract,
+                &WorkUnit::PreSequencePreparation {
+                    kind: "asr.encoder.audio".to_string(),
+                },
+                cost,
+                materialized_tensor_elements,
+                cancellation,
+            )
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn native_preparation_dispatch_authenticates_width_and_releases_workspace() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 4, 4));
+        let first = coordinator.admit(job("native-prep-first")).await.unwrap();
+        let second = coordinator.admit(job("native-prep-second")).await.unwrap();
+        let contract = native_preparation_contract(&coordinator, 2, 64);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let task_calls = calls.clone();
+        let task_coordinator = coordinator.clone();
+        let row = |job| {
+            sealed_preparation_row(
+                &coordinator,
+                &contract,
+                job,
+                WorkCost::new(1, 4, 16),
+                4,
+                PreparationCancellation::default(),
+            )
+        };
+
+        let output = coordinator
+            .run_loaded_native_preparation_batch(
+                vec![row(first), row(second)],
+                contract,
+                WorkUnit::PreSequencePreparation {
+                    kind: "asr.encoder.audio".to_string(),
+                },
+                move |live| {
+                    assert_eq!(live, &[0, 1]);
+                    task_calls.fetch_add(1, Ordering::Relaxed);
+                    let snapshot = task_coordinator.snapshot();
+                    assert_eq!(snapshot.active_jobs, 2);
+                    assert_eq!(snapshot.reserved_memory_bytes, 2 * 64 * 1024 * 1024 + 32);
+                    Ok(vec![
+                        Ok(PreparationArtifact {
+                            value: 11usize,
+                            retained: JobResourceObservation::host(1),
+                        }),
+                        Ok(PreparationArtifact {
+                            value: 12usize,
+                            retained: JobResourceObservation::host(1),
+                        }),
+                    ])
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            &output[0],
+            PreparationRowOutcome::Committed {
+                artifact: PreparationArtifact { value: 11, .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            &output[1],
+            PreparationRowOutcome::Committed {
+                artifact: PreparationArtifact { value: 12, .. },
+                ..
+            }
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(coordinator.snapshot().active_executions, 0);
+        assert_eq!(coordinator.snapshot().active_preparation_bridges, 2);
+        assert_eq!(
+            coordinator.snapshot().reserved_memory_bytes,
+            2 * 64 * 1024 * 1024
+        );
+        drop(output);
+        assert_eq!(coordinator.snapshot().reserved_memory_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn scalar_preparation_dispatch_uses_the_authenticated_bridge_path_at_width_one() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 2, 2));
+        let job = coordinator.admit(job("scalar-prep")).await.unwrap();
+        let mut contract = native_preparation_contract(&coordinator, 1, 64);
+        let mut stage = contract.stages[0].clone();
+        stage.batch_mode = NativeBatchMode::None;
+        stage.concurrency = crate::engine::ConcurrencyClass::Exclusive;
+        stage.shape_policy = StageShapePolicy::Exact;
+        stage.max_batch_size = 1;
+        stage.validate().unwrap();
+        contract.stages = Arc::from([stage]);
+        let row = sealed_preparation_row(
+            &coordinator,
+            &contract,
+            job,
+            WorkCost::new(1, 4, 16),
+            4,
+            PreparationCancellation::default(),
+        );
+
+        let outcomes = coordinator
+            .run_loaded_native_preparation_batch(
+                vec![row],
+                contract,
+                WorkUnit::PreSequencePreparation {
+                    kind: "asr.encoder.audio".into(),
+                },
+                |live| {
+                    assert_eq!(live, &[0]);
+                    Ok(vec![Ok(PreparationArtifact {
+                        value: 7usize,
+                        retained: JobResourceObservation::host(8),
+                    })])
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            &outcomes[0],
+            PreparationRowOutcome::Committed {
+                artifact: PreparationArtifact { value: 7, .. },
+                ..
+            }
+        ));
+        assert_eq!(coordinator.snapshot().active_preparation_bridges, 1);
+        drop(outcomes);
+        assert_eq!(coordinator.snapshot().active_preparation_bridges, 0);
+    }
+
+    #[tokio::test]
+    async fn preparation_bridge_retains_resources_then_readmits_a_fresh_resolved_lane() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 1));
+        let preparation = coordinator.admit(job("handoff")).await.unwrap();
+        let mut execution = job("handoff");
+        execution.lane = CoordinatorLane::Resumable;
+        let admitted_before = coordinator.snapshot().admitted_total;
+
+        let bridge = coordinator
+            .bridge_preparation_admission(preparation)
+            .expect("unique preparation admission becomes a bridge");
+        let bridged = coordinator.snapshot();
+        assert_eq!(bridged.active_jobs, 0);
+        assert_eq!(bridged.reserved_memory_bytes, 64 * 1024 * 1024);
+
+        let execution = coordinator
+            .admit_observed_from_preparation(bridge, execution, JobResourceObservation::host(32))
+            .await
+            .expect("fresh execution admission must reuse capacity released by preparation");
+
+        assert_eq!(execution.spec.lane, CoordinatorLane::Resumable);
+        let snapshot = coordinator.snapshot();
+        assert_eq!(snapshot.active_jobs, 1);
+        assert_eq!(snapshot.admitted_total, admitted_before + 1);
+        drop(execution);
+        assert_eq!(coordinator.snapshot().active_jobs, 0);
+    }
+
+    #[tokio::test]
+    async fn preparation_handoff_fails_closed_while_a_cloned_lease_exists() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 2, 2));
+        let preparation = coordinator.admit(job("cloned-handoff")).await.unwrap();
+        let retained = preparation.clone();
+        let error = coordinator
+            .bridge_preparation_admission(preparation)
+            .expect_err("a live preparation clone must prevent double admission");
+
+        assert!(error.to_string().contains("cloned admission leases"));
+        assert_eq!(coordinator.snapshot().active_jobs, 1);
+        drop(retained);
+        assert_eq!(coordinator.snapshot().active_jobs, 0);
+    }
+
+    #[tokio::test]
+    async fn preparation_bridge_keeps_resources_reserved_when_final_queue_is_full() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 1));
+        let preparation = coordinator.admit(job("bridge-pressure")).await.unwrap();
+        let bridge = coordinator
+            .bridge_preparation_admission(preparation)
+            .expect("unique preparation bridge");
+        assert_eq!(
+            coordinator.snapshot().reserved_memory_bytes,
+            64 * 1024 * 1024
+        );
+        let blocker = coordinator.admit(job("bridge-blocker")).await.unwrap();
+        assert_eq!(
+            coordinator.snapshot().reserved_memory_bytes,
+            128 * 1024 * 1024
+        );
+        let mut execution = job("bridge-pressure");
+        execution.lane = CoordinatorLane::Resumable;
+
+        let failure = coordinator
+            .admit_observed_from_preparation(bridge, execution, JobResourceObservation::host(1))
+            .await
+            .expect_err("fresh execution admission must compete for the queue permit");
+
+        assert!(matches!(failure.error, Error::Overloaded(_)));
+        assert_eq!(
+            coordinator.snapshot().reserved_memory_bytes,
+            128 * 1024 * 1024
+        );
+        assert_eq!(coordinator.snapshot().active_preparation_bridges, 1);
+        drop(failure.bridge);
+        assert_eq!(
+            coordinator.snapshot().reserved_memory_bytes,
+            64 * 1024 * 1024
+        );
+        drop(blocker);
+        assert_eq!(coordinator.snapshot().reserved_memory_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn draining_keeps_bridge_live_until_explicit_drop_and_blocks_idle() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 1));
+        let preparation = coordinator.admit(job("bridge-drain")).await.unwrap();
+        let bridge = coordinator
+            .bridge_preparation_admission(preparation)
+            .expect("unique preparation bridge");
+        coordinator.begin_drain();
+        let mut execution = job("bridge-drain");
+        execution.lane = CoordinatorLane::Resumable;
+
+        let failure = coordinator
+            .admit_observed_from_preparation(bridge, execution, JobResourceObservation::host(1))
+            .await
+            .expect_err("draining must reject the fresh admission without dropping its bridge");
+
+        assert!(matches!(failure.error, Error::Overloaded(_)));
+        assert_eq!(coordinator.snapshot().active_preparation_bridges, 1);
+        assert!(matches!(
+            coordinator
+                .wait_for_idle(Instant::now() + Duration::from_millis(5))
+                .await,
+            Err(Error::Timeout(_))
+        ));
+        drop(failure.bridge);
+        coordinator
+            .wait_for_idle(Instant::now() + Duration::from_millis(50))
+            .await
+            .expect("dropping the bridge completes coordinator drain");
+    }
+
+    #[tokio::test]
+    async fn resize_failure_returns_live_bridge_until_explicit_drop() {
+        let capacity = 80 * 1024 * 1024;
+        let authority = Arc::new(ResourceAuthority::new(provider_for_location(
+            DeviceLocation::Cpu,
+            capacity,
+        )));
+        let coordinator = Arc::new(InferenceCoordinator::with_resource_authority(
+            BackendKind::Cpu,
+            1,
+            1,
+            authority,
+        ));
+        let preparation = coordinator.admit(job("bridge-resize")).await.unwrap();
+        let bridge = coordinator
+            .bridge_preparation_admission(preparation)
+            .expect("unique preparation bridge");
+        let mut execution = job("bridge-resize");
+        execution.lane = CoordinatorLane::Resumable;
+        execution.resources.host_bytes = ResourceAmount::Known(96 * 1024 * 1024);
+
+        let failure = coordinator
+            .admit_observed_from_preparation(bridge, execution, JobResourceObservation::host(1))
+            .await
+            .expect_err("bridge growth beyond physical capacity must fail");
+
+        assert!(matches!(failure.error, Error::Overloaded(_)));
+        assert_eq!(coordinator.snapshot().active_preparation_bridges, 1);
+        assert_eq!(
+            coordinator.snapshot().reserved_memory_bytes,
+            64 * 1024 * 1024
+        );
+        drop(failure.bridge);
+        assert_eq!(coordinator.snapshot().reserved_memory_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn native_preparation_commit_fence_isolates_late_cancel_and_deadline_rows() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 4, 4));
+        let first = coordinator.admit(job("mixed-live")).await.unwrap();
+        let second = coordinator.admit(job("mixed-cancel")).await.unwrap();
+        let mut timed_spec = job("mixed-timeout");
+        timed_spec.deadline = Some(Instant::now() + Duration::from_millis(50));
+        let third = coordinator.admit(timed_spec).await.unwrap();
+        let contract = native_preparation_contract(&coordinator, 3, 64);
+        let cancellation = PreparationCancellation::default();
+        let late_cancel = cancellation.clone();
+        let row = |job, cancellation| {
+            sealed_preparation_row(
+                &coordinator,
+                &contract,
+                job,
+                WorkCost::new(1, 2, 8),
+                2,
+                cancellation,
+            )
+        };
+
+        let output = coordinator
+            .run_loaded_native_preparation_batch(
+                vec![
+                    row(first, PreparationCancellation::default()),
+                    row(second, cancellation),
+                    row(third, PreparationCancellation::default()),
+                ],
+                contract,
+                WorkUnit::PreSequencePreparation {
+                    kind: "asr.encoder.audio".to_string(),
+                },
+                move |live| {
+                    assert_eq!(live, &[0, 1, 2]);
+                    std::thread::sleep(Duration::from_millis(100));
+                    assert!(late_cancel.cancel());
+                    Ok((0..3)
+                        .map(|value| {
+                            Ok(PreparationArtifact {
+                                value,
+                                retained: JobResourceObservation::host(1),
+                            })
+                        })
+                        .collect())
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            &output[0],
+            PreparationRowOutcome::Committed { .. }
+        ));
+        assert!(matches!(&output[1], PreparationRowOutcome::Cancelled));
+        assert!(matches!(&output[2], PreparationRowOutcome::TimedOut));
+    }
+
+    #[tokio::test]
+    async fn native_preparation_rejects_foreign_identity_and_work_before_model_entry() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 2, 4));
+        let contract = native_preparation_contract(&coordinator, 2, 64);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let task_calls = calls.clone();
+        let sealed = sealed_preparation_row(
+            &coordinator,
+            &contract,
+            coordinator.admit(job("sealed-owner")).await.unwrap(),
+            WorkCost::new(1, 1, 0),
+            1,
+            PreparationCancellation::default(),
+        );
+        let PreparationBatchRow {
+            seal,
+            cost,
+            materialized_tensor_elements,
+            cancellation,
+            ..
+        } = sealed;
+        let row = PreparationBatchRow {
+            job: coordinator.admit(job("foreign-prep-row")).await.unwrap(),
+            seal,
+            cost,
+            materialized_tensor_elements,
+            cancellation,
+        };
+
+        let error = coordinator
+            .run_loaded_native_preparation_batch(
+                vec![row],
+                contract.clone(),
+                WorkUnit::PreSequencePreparation {
+                    kind: "asr.encoder.audio".to_string(),
+                },
+                move |_| {
+                    task_calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(Vec::<Result<PreparationArtifact<usize>>>::new())
+                },
+            )
+            .await
+            .expect_err("foreign row identity must fail before model entry");
+
+        assert!(error.to_string().contains("adapter identity"));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+        let overflow = sealed_preparation_row(
+            &coordinator,
+            &contract,
+            coordinator.admit(job("overflow-prep-row")).await.unwrap(),
+            WorkCost::new(3, 1, 0),
+            1,
+            PreparationCancellation::default(),
+        );
+        let error = coordinator
+            .run_loaded_native_preparation_batch(
+                vec![overflow],
+                contract,
+                WorkUnit::PreSequencePreparation {
+                    kind: "asr.encoder.audio".to_string(),
+                },
+                move |_| Ok(Vec::<Result<PreparationArtifact<usize>>>::new()),
+            )
+            .await
+            .expect_err("work beyond the stage maximum must fail before model entry");
+        assert!(error.to_string().contains("work 3 exceeds"));
+    }
+
+    #[tokio::test]
+    async fn invocation_runners_reject_a_foreign_execution_group_before_dispatch() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 2, 4));
+        let job = coordinator.admit(job("foreign-invocation")).await.unwrap();
+        let adapters = RuntimeAdapterRegistry::built_in_with_execution_limits(1, 2).unwrap();
+        let foreign_group = ExecutionGroupId::new(coordinator.execution_group_id().get() + 1);
+        let bundle = LoadedModelBundle::bind(
+            &adapters,
+            foreign_group,
+            ModelInstanceId::new(61),
+            ModelVariant::Kokoro82M,
+            BackendKind::Cpu,
+        )
+        .unwrap();
+        let contract = bundle.contract(CapabilityKind::Tts, false).unwrap();
+        let capability = bundle
+            .capability_binding_for_streaming(
+                CapabilityKind::Tts,
+                crate::runtime::adapters::StreamingRequirements::NONE,
+            )
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let task_calls = calls.clone();
+        let error = coordinator
+            .run_loaded_blocking_stage_with_invocation_workspace(
+                &job,
+                contract,
+                capability,
+                WorkUnit::AtomicJob {
+                    kind: "tts".to_string(),
+                },
+                move |_workspace| {
+                    task_calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                },
+            )
+            .await
+            .expect_err("foreign invocation contract must fail closed");
+
+        assert!(error.to_string().contains("different execution group"));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert_eq!(coordinator.snapshot().active_executions, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn direct_loaded_stage_and_engine_dispatch_share_physical_capacity() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 2, 4));
+        let job = coordinator
+            .admit(job("shared-physical-capacity"))
+            .await
+            .unwrap();
+        let adapters = RuntimeAdapterRegistry::built_in_with_execution_limits(1, 2).unwrap();
+        let bundle = LoadedModelBundle::bind(
+            &adapters,
+            coordinator.execution_group_id(),
+            crate::engine::ModelInstanceId::new(11),
+            ModelVariant::Kokoro82M,
+            BackendKind::Cpu,
+        )
+        .unwrap();
+        let contract = bundle
+            .contract(CapabilityKind::StreamingTts, false)
+            .unwrap();
+        assert_eq!(
+            contract.execution_profile.physical_launch_policy,
+            PhysicalLaunchPolicy::ExecutionGroupExclusive
+        );
+
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let task_release = release.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task_coordinator = coordinator.clone();
+        let direct = tokio::spawn(async move {
+            task_coordinator
+                .run_loaded_blocking_stage(
+                    &job,
+                    contract,
+                    WorkUnit::AtomicJob {
+                        kind: "tts".to_string(),
+                    },
+                    move || {
+                        let _ = started_tx.send(());
+                        let (lock, wake) = &*task_release;
+                        let mut released = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+                        while !*released {
+                            released = wake
+                                .wait(released)
+                                .unwrap_or_else(|poison| poison.into_inner());
+                        }
+                        Ok(())
+                    },
+                )
+                .await
+        });
+        started_rx.await.unwrap();
+        assert_eq!(coordinator.snapshot().active_executions, 1);
+
+        let engine_concurrent = coordinator
+            .acquire_physical_dispatch(
+                coordinator.execution_group_id(),
+                ModelInstanceId::new(12),
+                PhysicalLaunchPolicy::concurrent(2).unwrap(),
+                NativeBatchMode::Static,
+                2,
+                Some(Instant::now() + Duration::from_millis(5)),
+            )
+            .await;
+        assert!(matches!(engine_concurrent, Err(Error::Timeout(_))));
+
+        let (lock, wake) = &*release;
+        *lock.lock().unwrap_or_else(|poison| poison.into_inner()) = true;
+        wake.notify_all();
+        direct.await.unwrap().unwrap();
+        assert_eq!(coordinator.snapshot().active_executions, 0);
+
+        let engine_concurrent = coordinator
+            .physical_execution_admission()
+            .acquire_dispatch(
+                coordinator.execution_group_id(),
+                ModelInstanceId::new(12),
+                PhysicalLaunchPolicy::concurrent(2).unwrap(),
+                NativeBatchMode::Static,
+                2,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(coordinator.snapshot().active_executions, 1);
+        drop(engine_concurrent);
     }
 
     #[tokio::test]
@@ -2672,10 +5161,10 @@ Pages free: 10.\n";
     #[tokio::test]
     async fn blocking_stage_maps_worker_panics_and_releases_execution() {
         let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 4));
-        let job = coordinator.admit(job("blocking-panic")).await.unwrap();
+        let admitted = coordinator.admit(job("blocking-panic")).await.unwrap();
 
         let result = coordinator
-            .run_blocking_stage::<(), _>(&job, || panic!("test blocking panic"))
+            .run_blocking_stage::<(), _>(&admitted, || panic!("test blocking panic"))
             .await;
 
         assert!(matches!(
@@ -2684,8 +5173,41 @@ Pages free: 10.\n";
                 if message.contains("blocking inference task failed")
         ));
         assert_eq!(coordinator.snapshot().active_executions, 0);
-        drop(job);
+        assert!(coordinator.snapshot().poisoned);
+        drop(admitted);
         assert_eq!(coordinator.snapshot().active_jobs, 0);
+        assert!(matches!(
+            coordinator.admit(job("after-blocking-panic")).await,
+            Err(Error::Overloaded(message)) if message.contains("poisoned")
+        ));
+    }
+
+    #[tokio::test]
+    async fn timed_out_blocking_panic_still_poisons_the_detached_runtime() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 4));
+        let mut spec = job("detached-blocking-panic");
+        spec.deadline = Some(Instant::now() + Duration::from_millis(5));
+        let admitted = coordinator.admit(spec).await.unwrap();
+
+        let result = coordinator
+            .run_blocking_stage::<(), _>(&admitted, || {
+                std::thread::sleep(Duration::from_millis(25));
+                panic!("detached blocking panic")
+            })
+            .await;
+        assert!(matches!(result, Err(Error::Timeout(_))));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !coordinator.snapshot().poisoned {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached post-entry panic did not poison the runtime");
+        assert!(matches!(
+            coordinator.admit(job("after-detached-panic")).await,
+            Err(Error::Overloaded(message)) if message.contains("poisoned")
+        ));
     }
 
     #[tokio::test]
@@ -2728,12 +5250,82 @@ Pages free: 10.\n";
     }
 
     #[tokio::test]
-    async fn resource_rejection_is_counted() {
-        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 4));
-        let mut oversized = job("oversized");
-        oversized.resources.host_bytes = ResourceAmount::Known(u64::MAX);
+    async fn observed_request_capacity_policy_is_backend_aware() {
+        const PHYSICAL_CAPACITY: u64 = 12_713_115_648;
+        const AUTHORIZATION: u64 = 67_112_288;
+        const INPUT_BYTES: u64 = 428;
+        const EXPECTED_PENDING: u64 = 67_111_860;
 
-        assert!(coordinator.admit(oversized).await.is_err());
-        assert_eq!(coordinator.snapshot().rejected_total, 1);
+        let guarded_metal_provider =
+            provider_for_location(DeviceLocation::Metal { gpu_id: 99 }, PHYSICAL_CAPACITY);
+        guarded_metal_provider.set_available(resources_for_location(
+            DeviceLocation::Metal { gpu_id: 99 },
+            0,
+        ));
+        let guarded_metal = Arc::new(InferenceCoordinator::with_resource_authority(
+            BackendKind::Metal,
+            1,
+            4,
+            Arc::new(ResourceAuthority::new(guarded_metal_provider)),
+        ));
+        let guarded_error = guarded_metal
+            .admit_observed(
+                JobSpec {
+                    resources: resources_for_location(
+                        DeviceLocation::Metal { gpu_id: 99 },
+                        AUTHORIZATION,
+                    ),
+                    ..job("reported-arithmetic-control")
+                },
+                JobResourceObservation::host(INPUT_BYTES),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(guarded_error.contains(&format!("unified_bytes: Known({EXPECTED_PENDING})")));
+
+        for (backend, location) in [
+            (BackendKind::Cpu, DeviceLocation::Cpu),
+            (BackendKind::Metal, DeviceLocation::Metal { gpu_id: 0 }),
+            (BackendKind::Cuda, DeviceLocation::Cuda { gpu_id: 0 }),
+        ] {
+            let provider = provider_for_location(location, PHYSICAL_CAPACITY);
+            provider.set_available(resources_for_location(location, 0));
+            let registry = ResourceAuthorityRegistry::default();
+            let authority = registry.authority_for(location, provider).unwrap();
+            let coordinator = Arc::new(InferenceCoordinator::with_resource_authority(
+                backend, 1, 4, authority,
+            ));
+            let mut resources = resources_for_location(location, AUTHORIZATION);
+            if backend == BackendKind::Cuda {
+                resources.host_bytes = ResourceAmount::Known(INPUT_BYTES);
+            }
+            let spec = JobSpec {
+                resources,
+                ..job("reported-capacity-regression")
+            };
+            let result = coordinator
+                .admit_observed(spec, JobResourceObservation::host(INPUT_BYTES))
+                .await;
+
+            match backend {
+                BackendKind::Cpu | BackendKind::Metal => {
+                    let lease = result.expect("shared-memory live capacity is advisory");
+                    assert_eq!(coordinator.snapshot().reserved_memory_bytes, AUTHORIZATION);
+                    assert_eq!(coordinator.snapshot().rejected_total, 0);
+                    drop(lease);
+                    assert_eq!(coordinator.snapshot().reserved_memory_bytes, 0);
+                }
+                BackendKind::Cuda => {
+                    let error = result.unwrap_err().to_string();
+                    assert!(
+                        error.contains(&format!("device_bytes: Known({AUTHORIZATION})")),
+                        "unexpected CUDA rejection: {error}"
+                    );
+                    assert_eq!(coordinator.snapshot().rejected_total, 1);
+                    assert_eq!(coordinator.snapshot().reserved_memory_bytes, 0);
+                }
+            }
+        }
     }
 }

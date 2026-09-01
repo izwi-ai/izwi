@@ -6,27 +6,39 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
+use crate::backends::state::{PhysicalStateSequenceId, PhysicalStateTransactionId};
 use crate::backends::BackendKind;
 use crate::catalog::{parse_model_variant, resolve_asr_model_variant, ModelFamily};
 use crate::engine::{
-    AsrProgress, AsrProgressPhase, ResourceAmount, ResourceVector, TaskType, WorkUnit,
+    AsrProgress, AsrProgressPhase, EngineCoreRequest, RealtimeAsrSessionHandle, ResourceAmount,
+    ResourceVector, RetainedTensorStateRuntimeV2, StreamingOutput, TaskType, WorkCost, WorkUnit,
 };
 use crate::error::{Error, Result};
 use crate::model::{ModelResidencyLease, ModelVariant};
 use crate::models::architectures::granite_speech::asr::{
     parse_granite_speech_output, GraniteSpeechTask,
 };
-use crate::models::registry::{
-    NativeAsrGenerationOptions, NativeAsrModel, NativeAsrRealtimeEvent,
-    NativeAsrRealtimeResourceReservation, NativeAsrRealtimeState, NativeAsrTranscription,
+use crate::models::architectures::voxtral::realtime::{
+    VoxtralRealtimePreparationBatchGeometry, VoxtralRealtimePreparationGeometry,
+    VoxtralRealtimePreparationMode, VoxtralRealtimePreparationStageSeal,
+    VoxtralRealtimePreparedResourceUsage,
 };
-use crate::runtime::adapters::{CapabilityKind, ExecutionTargetKind, LoadedExecutionContract};
+use crate::models::registry::{
+    AsrModelLease, NativeAsrGenerationOptions, NativeAsrModel, NativeAsrRealtimeEvent,
+    NativeAsrRealtimeResourceReservation, NativeAsrRealtimeState, NativeAsrTranscription,
+    VoxtralModelLease,
+};
+use crate::runtime::adapters::{
+    CapabilityKind, ExecutionTargetKind, LoadedCapabilityBinding, LoadedExecutionContract,
+};
 use crate::runtime::audio_io::{
     base64_decode, decode_audio_bytes, validate_base64_audio_retained_size,
     validate_base64_audio_source_size, MAX_AUDIO_SOURCE_BYTES,
 };
 use crate::runtime::coordinator::{InferenceCoordinator, JobLease, JobResourceObservation};
 use crate::runtime::request::AsrRuntimeRequest;
+#[cfg(test)]
+use crate::runtime::service::retained_engine_request_input_bytes;
 use crate::runtime::service::{
     copy_optional_preparation_string, copy_preparation_bytes, copy_preparation_string,
     AdmittedEngineRequest, RuntimeService,
@@ -62,7 +74,7 @@ impl AsrAudioInput<'_> {
             Self::Base64(audio) => {
                 validate_base64_audio_retained_size(audio.len(), MAX_AUDIO_SOURCE_BYTES)
             }
-            Self::Bytes(audio) if audio.is_empty() => Err(Error::InvalidInput(
+            Self::Bytes([]) => Err(Error::InvalidInput(
                 "ASR request missing audio bytes".to_string(),
             )),
             Self::Bytes(audio) if audio.len() > MAX_AUDIO_SOURCE_BYTES => {
@@ -174,7 +186,11 @@ impl GraniteSaaPrefixMode {
 
 fn resolve_asr_realtime_stream_variant(model_id: Option<&str>) -> Option<ModelVariant> {
     let variant = resolve_asr_model_variant(model_id);
-    (variant.family() == ModelFamily::NemotronAsr).then_some(variant)
+    matches!(
+        variant.family(),
+        ModelFamily::NemotronAsr | ModelFamily::Voxtral
+    )
+    .then_some(variant)
 }
 
 pub(crate) fn granite_auto_asr_max_tokens_for_duration(audio_seconds: f32) -> usize {
@@ -253,6 +269,14 @@ impl RealtimeAsrSessionPolicy {
         })
     }
 
+    pub(super) fn retained_sequence_capacity(&self) -> Result<u32> {
+        u32::try_from(self.limits.max_sessions).map_err(|_| {
+            Error::ConfigError(
+                "realtime ASR session quota exceeds physical sequence capacity".into(),
+            )
+        })
+    }
+
     fn try_acquire(&self) -> Result<Arc<RealtimeAsrSessionLease>> {
         let permit = self
             .permits
@@ -297,13 +321,154 @@ fn positive_u64_env_or_default(name: &str, default: u64) -> Result<u64> {
     }
 }
 
+struct RealtimeAsrPhysicalSession {
+    runtime: Arc<RetainedTensorStateRuntimeV2>,
+    sequence: PhysicalStateSequenceId,
+    active_transaction: Option<PhysicalStateTransactionId>,
+    revision: u64,
+}
+
+impl RealtimeAsrPhysicalSession {
+    fn new(runtime: Arc<RetainedTensorStateRuntimeV2>) -> Result<Self> {
+        let sequence = runtime.register_sequence()?;
+        Ok(Self {
+            runtime,
+            sequence,
+            active_transaction: None,
+            revision: 0,
+        })
+    }
+
+    fn begin(&mut self) -> Result<PhysicalStateTransactionId> {
+        if self.active_transaction.is_some() {
+            return Err(Error::InferenceError(
+                "realtime ASR physical transaction is already active".into(),
+            ));
+        }
+        let transaction = self.runtime.begin_transaction(self.sequence)?;
+        self.active_transaction = Some(transaction);
+        Ok(transaction)
+    }
+
+    fn commit(&mut self, transaction: PhysicalStateTransactionId, revision: u64) -> Result<()> {
+        if self.active_transaction != Some(transaction) {
+            return Err(Error::InferenceError(
+                "realtime ASR physical transaction identity changed".into(),
+            ));
+        }
+        self.runtime.commit_transaction(transaction, revision)?;
+        self.active_transaction = None;
+        self.revision = revision;
+        Ok(())
+    }
+
+    fn abort(&mut self) {
+        if let Some(transaction) = self.active_transaction.take() {
+            let _ = self.runtime.abort_transaction(transaction);
+        }
+    }
+}
+
+impl Drop for RealtimeAsrPhysicalSession {
+    fn drop(&mut self) {
+        self.abort();
+        if let Err(error) = self.runtime.release_sequence(self.sequence) {
+            tracing::error!(
+                sequence = self.sequence.get(),
+                error = %error,
+                "failed to release realtime ASR physical sequence"
+            );
+        }
+    }
+}
+
+struct RuntimeAsrRealtimeState {
+    native: NativeAsrRealtimeState,
+    physical: RealtimeAsrPhysicalSession,
+}
+
+impl RuntimeAsrRealtimeState {
+    fn new(
+        model: &NativeAsrModel,
+        native: NativeAsrRealtimeState,
+        runtime: Arc<RetainedTensorStateRuntimeV2>,
+    ) -> Result<Self> {
+        let mut owner = Self {
+            native,
+            physical: RealtimeAsrPhysicalSession::new(runtime)?,
+        };
+        let transaction = owner.physical.begin()?;
+        let revision = 1;
+        let result = model.stage_realtime_physical_state(
+            &mut owner.native,
+            &owner.physical.runtime,
+            transaction,
+            revision,
+        );
+        if let Err(error) = result {
+            owner.physical.abort();
+            return Err(error);
+        }
+        if let Err(error) = owner.physical.commit(transaction, revision) {
+            owner.physical.abort();
+            return Err(error);
+        }
+        Ok(owner)
+    }
+
+    fn transact<T>(
+        &mut self,
+        model: &NativeAsrModel,
+        operation: impl FnOnce(&mut NativeAsrRealtimeState) -> Result<T>,
+    ) -> Result<T> {
+        let checkpoint = match &self.native {
+            NativeAsrRealtimeState::Nemotron(state) => {
+                NativeAsrRealtimeState::Nemotron(state.clone())
+            }
+        };
+        let transaction = self.physical.begin()?;
+        let result = (|| {
+            model.hydrate_realtime_physical_state(
+                &mut self.native,
+                &self.physical.runtime,
+                transaction,
+            )?;
+            let output = operation(&mut self.native)?;
+            let revision = self.physical.revision.checked_add(1).ok_or_else(|| {
+                Error::InferenceError("realtime ASR physical revision overflowed".into())
+            })?;
+            model.stage_realtime_physical_state(
+                &mut self.native,
+                &self.physical.runtime,
+                transaction,
+                revision,
+            )?;
+            self.physical.commit(transaction, revision)?;
+            Ok(output)
+        })();
+        if result.is_err() {
+            self.native = checkpoint;
+            if let Err(error) = model.clear_realtime_tensor_handles(&mut self.native) {
+                tracing::error!(
+                    error = %error,
+                    "failed to drain Nemotron tensor handles after aborted operation"
+                );
+            }
+            self.physical.abort();
+        }
+        result
+    }
+}
+
 struct RuntimeAsrRealtimeResources {
     model: Option<Arc<NativeAsrModel>>,
-    state: Option<Arc<StdMutex<NativeAsrRealtimeState>>>,
+    state: Option<Arc<StdMutex<RuntimeAsrRealtimeState>>>,
     execution_contract: Option<LoadedExecutionContract>,
     residency_lease: Option<ModelResidencyLease>,
     job: Option<JobLease>,
     session_lease: Option<Arc<RealtimeAsrSessionLease>>,
+    engine_session: Option<RuntimeEngineRealtimeSession>,
+    voxtral_model: Option<VoxtralModelLease>,
     absolute_deadline: Instant,
     idle_timeout: Duration,
     last_activity: Instant,
@@ -351,6 +516,8 @@ impl RuntimeAsrRealtimeResources {
             residency_lease: self.residency_lease.take(),
             job: self.job.take(),
             session_lease: self.session_lease.take(),
+            engine_session: self.engine_session.take(),
+            voxtral_model: self.voxtral_model.take(),
         })
     }
 
@@ -368,12 +535,14 @@ impl RuntimeAsrRealtimeResources {
 }
 
 struct RealtimeAsrDetachedResources {
-    state: Option<Arc<StdMutex<NativeAsrRealtimeState>>>,
+    state: Option<Arc<StdMutex<RuntimeAsrRealtimeState>>>,
     model: Option<Arc<NativeAsrModel>>,
     execution_contract: Option<LoadedExecutionContract>,
     residency_lease: Option<ModelResidencyLease>,
     job: Option<JobLease>,
     session_lease: Option<Arc<RealtimeAsrSessionLease>>,
+    engine_session: Option<RuntimeEngineRealtimeSession>,
+    voxtral_model: Option<VoxtralModelLease>,
 }
 
 impl RealtimeAsrDetachedResources {
@@ -386,13 +555,118 @@ impl RealtimeAsrDetachedResources {
         self.residency_lease.take();
         self.job.take();
         self.session_lease.take();
+        self.engine_session.take();
+        self.voxtral_model.take();
+    }
+}
+
+/// Fail-closed owner for detached Runtime and Engine authorities. If the
+/// asynchronous cleanup future is cancelled or its runtime is torn down,
+/// dropping this guard deliberately retains every authority. Only an exact
+/// Engine cleanup confirmation may disarm it.
+struct RealtimeAsrCleanupGuard {
+    cleanup: Option<RealtimeAsrDetachedResources>,
+    engine_session: Option<RuntimeEngineRealtimeSession>,
+    disarmed: bool,
+}
+
+impl RealtimeAsrCleanupGuard {
+    fn new(
+        cleanup: RealtimeAsrDetachedResources,
+        engine_session: RuntimeEngineRealtimeSession,
+    ) -> Self {
+        Self {
+            cleanup: Some(cleanup),
+            engine_session: Some(engine_session),
+            disarmed: false,
+        }
+    }
+
+    fn engine_session(&self) -> &RuntimeEngineRealtimeSession {
+        self.engine_session
+            .as_ref()
+            .expect("armed realtime cleanup guard must retain its Engine session")
+    }
+
+    #[cfg(test)]
+    fn for_test(cleanup: RealtimeAsrDetachedResources) -> Self {
+        Self {
+            cleanup: Some(cleanup),
+            engine_session: None,
+            disarmed: false,
+        }
+    }
+
+    fn release_confirmed(mut self) {
+        self.disarmed = true;
+        self.engine_session.take();
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup.release();
+        }
+    }
+}
+
+impl Drop for RealtimeAsrCleanupGuard {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        if let Some(engine_session) = self.engine_session.take() {
+            std::mem::forget(engine_session);
+        }
+        if let Some(cleanup) = self.cleanup.take() {
+            std::mem::forget(cleanup);
+        }
     }
 }
 
 fn schedule_realtime_asr_cleanup(cleanup: Option<RealtimeAsrDetachedResources>) {
-    let Some(cleanup) = cleanup else {
+    let Some(mut cleanup) = cleanup else {
         return;
     };
+    if let Some(engine_session) = cleanup.engine_session.take() {
+        let guard = RealtimeAsrCleanupGuard::new(cleanup, engine_session);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let cleanup_receipt = match guard
+                    .engine_session()
+                    .engine
+                    .cleanup_realtime_asr_session(&guard.engine_session().handle)
+                    .await
+                {
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        tracing::error!(
+                            request_id = %guard.engine_session().handle.request_id(),
+                            error = %error,
+                            "Engine realtime ASR cleanup receipt could not be created; retaining authorities"
+                        );
+                        return;
+                    }
+                };
+                if let Err(error) = cleanup_receipt.confirmed().await {
+                    tracing::error!(
+                        request_id = %guard.engine_session().handle.request_id(),
+                        error = %error,
+                        "Engine realtime ASR cleanup was not confirmed; retaining authorities"
+                    );
+                    return;
+                }
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    runtime.spawn_blocking(move || guard.release_confirmed());
+                } else {
+                    guard.release_confirmed();
+                }
+            });
+            return;
+        }
+        tracing::error!(
+            request_id = %guard.engine_session().handle.request_id(),
+            "cannot asynchronously abort Engine realtime ASR session without a Tokio runtime"
+        );
+        drop(guard);
+        return;
+    }
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle.spawn_blocking(move || cleanup.release());
     } else {
@@ -402,8 +676,121 @@ fn schedule_realtime_asr_cleanup(cleanup: Option<RealtimeAsrDetachedResources>) 
 
 struct RealtimeAsrOperationHandles {
     model: Arc<NativeAsrModel>,
-    state: Arc<StdMutex<NativeAsrRealtimeState>>,
+    state: Arc<StdMutex<RuntimeAsrRealtimeState>>,
     execution_contract: LoadedExecutionContract,
+    job: JobLease,
+    session_lease: Arc<RealtimeAsrSessionLease>,
+    _guard: RealtimeAsrOperationGuard,
+}
+
+#[derive(Clone)]
+struct RuntimeEngineRealtimeSession {
+    engine: Arc<crate::engine::Engine>,
+    handle: RealtimeAsrSessionHandle,
+    model: RuntimeRealtimeEngineModel,
+    retained_metadata_bytes: u64,
+    max_output_steps: usize,
+    max_cache_append: usize,
+}
+
+#[derive(Clone)]
+enum RuntimeRealtimeEngineModel {
+    Voxtral(VoxtralModelLease),
+    Nemotron {
+        _lease: AsrModelLease,
+        reservation: NativeAsrRealtimeResourceReservation,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RealtimeAsrExecutionPath {
+    Engine,
+    Direct,
+}
+
+fn realtime_asr_execution_path(variant: ModelVariant) -> RealtimeAsrExecutionPath {
+    match variant.family() {
+        ModelFamily::Voxtral | ModelFamily::NemotronAsr => RealtimeAsrExecutionPath::Engine,
+        _ => RealtimeAsrExecutionPath::Direct,
+    }
+}
+
+fn realtime_preparation_work_samples(
+    family: ModelFamily,
+    mode: VoxtralRealtimePreparationMode,
+    appended_samples: usize,
+    total_samples: usize,
+) -> Result<usize> {
+    match family {
+        // Voxtral recomputes preparation geometry over the committed prefix.
+        ModelFamily::Voxtral => Ok(total_samples),
+        // Nemotron preparation is incremental. Finish has no new samples but
+        // still consumes the adapter's bounded one-unit completion quantum.
+        ModelFamily::NemotronAsr => Ok(match mode {
+            VoxtralRealtimePreparationMode::Push => appended_samples,
+            VoxtralRealtimePreparationMode::Finish => 0,
+        }),
+        _ => Err(Error::InvalidInput(
+            "unsupported Engine realtime ASR preparation family".into(),
+        )),
+    }
+}
+
+impl RuntimeRealtimeEngineModel {
+    fn preparation_cost(
+        &self,
+        appended_samples: usize,
+        total_samples: usize,
+        sample_rate: u32,
+        mode: VoxtralRealtimePreparationMode,
+    ) -> Result<WorkCost> {
+        let family = match self {
+            Self::Voxtral(_) => ModelFamily::Voxtral,
+            Self::Nemotron { .. } => ModelFamily::NemotronAsr,
+        };
+        let source_samples =
+            realtime_preparation_work_samples(family, mode, appended_samples, total_samples)?;
+        match self {
+            Self::Voxtral(model) => {
+                let geometry = model.realtime_preparation_geometry_for_source_samples(
+                    source_samples,
+                    sample_rate,
+                    mode,
+                )?;
+                voxtral_realtime_preparation_cost(model, geometry)
+            }
+            Self::Nemotron { .. } => Ok(WorkCost::new(
+                u64::try_from(source_samples)
+                    .map_err(|_| Error::Overloaded("Nemotron realtime work overflowed".into()))?
+                    .max(1),
+                0,
+                crate::models::architectures::nemotron::asr::NEMOTRON_REALTIME_STAGE_WORKSPACE_BYTES,
+            )),
+        }
+    }
+
+    fn committed_observation(
+        &self,
+        retained_metadata_bytes: u64,
+    ) -> Result<JobResourceObservation> {
+        match self {
+            Self::Voxtral(_) => Err(Error::InferenceError(
+                "Voxtral committed observation requires prepared geometry".into(),
+            )),
+            Self::Nemotron { reservation, .. } => Ok(JobResourceObservation::new(
+                retained_metadata_bytes
+                    .checked_add(reservation.host_bytes())
+                    .ok_or_else(|| {
+                        Error::Overloaded("Nemotron retained host usage overflowed".into())
+                    })?,
+                reservation.tensor_bytes(),
+            )),
+        }
+    }
+}
+
+struct RealtimeAsrEngineOperationHandles {
+    session: RuntimeEngineRealtimeSession,
     job: JobLease,
     session_lease: Arc<RealtimeAsrSessionLease>,
     _guard: RealtimeAsrOperationGuard,
@@ -432,9 +819,85 @@ pub struct RuntimeAsrRealtimeStream {
     activity: Arc<Notify>,
     operation_gate: Arc<tokio::sync::Mutex<()>>,
     max_samples: usize,
+    committed_samples: usize,
+    engine_sample_rate: Option<u32>,
+    engine_text: String,
+    engine_chunk_index: usize,
 }
 
 impl RuntimeAsrRealtimeStream {
+    fn execution_path(&self) -> RealtimeAsrExecutionPath {
+        realtime_asr_execution_path(self.variant)
+    }
+
+    fn begin_engine_operation(
+        &mut self,
+        refresh_activity: bool,
+    ) -> Result<RealtimeAsrEngineOperationHandles> {
+        let now = Instant::now();
+        let mut resources = self.resources.lock().map_err(|_| {
+            Error::InferenceError("realtime ASR resource mutex poisoned".to_string())
+        })?;
+        if resources.closed {
+            return Err(resources.closed_error());
+        }
+        if let Some(reason) = resources.expiration(now) {
+            let cleanup = resources.detach_expired(reason);
+            drop(resources);
+            schedule_realtime_asr_cleanup(cleanup);
+            return Err(Error::Timeout(reason.to_string()));
+        }
+        let session = resources.engine_session.as_ref().cloned().ok_or_else(|| {
+            Error::InferenceError("Engine realtime ASR session is unavailable".into())
+        })?;
+        let job = resources.job.as_ref().cloned().ok_or_else(|| {
+            Error::InferenceError("realtime ASR stream job is unavailable".into())
+        })?;
+        let session_lease = resources.session_lease.as_ref().cloned().ok_or_else(|| {
+            Error::InferenceError("realtime ASR session lease is unavailable".into())
+        })?;
+        resources.active_operations = resources
+            .active_operations
+            .checked_add(1)
+            .ok_or_else(|| Error::Overloaded("realtime ASR operation count overflowed".into()))?;
+        if refresh_activity {
+            resources.last_activity = now;
+        }
+        drop(resources);
+        if refresh_activity {
+            self.activity.notify_one();
+        }
+        Ok(RealtimeAsrEngineOperationHandles {
+            session,
+            job,
+            session_lease,
+            _guard: RealtimeAsrOperationGuard {
+                resources: self.resources.clone(),
+                activity: self.activity.clone(),
+            },
+        })
+    }
+
+    fn map_engine_outputs(
+        &mut self,
+        outputs: Vec<StreamingOutput>,
+    ) -> Vec<RuntimeAsrRealtimeEvent> {
+        outputs
+            .into_iter()
+            .map(|output| {
+                let delta = output.text.unwrap_or_default();
+                self.engine_text.push_str(&delta);
+                let chunk_index = self.engine_chunk_index;
+                self.engine_chunk_index = self.engine_chunk_index.saturating_add(1);
+                RuntimeAsrRealtimeEvent {
+                    delta,
+                    text: self.engine_text.clone(),
+                    is_final: output.is_final,
+                    chunk_index,
+                }
+            })
+            .collect()
+    }
     fn begin_operation(&mut self, refresh_activity: bool) -> Result<RealtimeAsrOperationHandles> {
         let now = Instant::now();
         let mut resources = self.resources.lock().map_err(|_| {
@@ -483,7 +946,7 @@ impl RuntimeAsrRealtimeStream {
             self.activity.notify_one();
         }
         Ok(RealtimeAsrOperationHandles {
-            model,
+            model: model.clone(),
             state,
             execution_contract,
             job,
@@ -764,6 +1227,50 @@ fn realtime_stream_resource_vector(
     Ok(resources)
 }
 
+fn voxtral_realtime_preparation_cost(
+    model: &VoxtralModelLease,
+    geometry: VoxtralRealtimePreparationGeometry,
+) -> Result<WorkCost> {
+    let batch = model.realtime_preparation_batch_geometry(&[geometry])?;
+    let seal = model.realtime_preparation_stage_seal()?;
+    voxtral_realtime_preparation_cost_from_geometry(geometry, batch, seal)
+}
+
+fn voxtral_realtime_preparation_cost_from_geometry(
+    geometry: VoxtralRealtimePreparationGeometry,
+    batch: VoxtralRealtimePreparationBatchGeometry,
+    seal: VoxtralRealtimePreparationStageSeal,
+) -> Result<WorkCost> {
+    if batch.materialized_tensor_elements_per_row > seal.max_materialized_tensor_elements_per_row
+        || batch.workspace_per_row_bytes > seal.max_workspace_bytes
+    {
+        return Err(Error::InferenceError(
+            "Voxtral preparation geometry exceeds its loaded stage seal".into(),
+        ));
+    }
+    Ok(WorkCost::new(
+        u64::try_from(geometry.source_samples)
+            .map_err(|_| Error::Overloaded("Voxtral preparation work overflowed".into()))?
+            .max(1),
+        batch.materialized_tensor_elements_per_row,
+        batch.workspace_per_row_bytes,
+    ))
+}
+
+fn voxtral_realtime_committed_observation(
+    retained_metadata_bytes: u64,
+    usage: VoxtralRealtimePreparedResourceUsage,
+) -> Result<JobResourceObservation> {
+    Ok(JobResourceObservation::new(
+        retained_metadata_bytes
+            .checked_mul(2)
+            .ok_or_else(|| Error::Overloaded("Voxtral retained metadata overflowed".into()))?
+            .checked_add(usage.host_bytes)
+            .ok_or_else(|| Error::Overloaded("Voxtral retained host usage overflowed".into()))?,
+        usage.tensor_bytes,
+    ))
+}
+
 fn add_realtime_stream_reservation(
     base: ResourceVector,
     backend: BackendKind,
@@ -772,11 +1279,217 @@ fn add_realtime_stream_reservation(
     base.checked_add(realtime_stream_resource_vector(
         backend,
         reservation.host_bytes(),
-        reservation.tensor_bytes(),
+        crate::models::architectures::nemotron::asr::NEMOTRON_REALTIME_STAGE_WORKSPACE_BYTES,
     )?)
 }
 
 impl RuntimeService {
+    async fn start_engine_realtime_stream(
+        &self,
+        variant: ModelVariant,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        context: RuntimeRequestContext,
+        metadata_bytes: usize,
+        session_lease: Arc<RealtimeAsrSessionLease>,
+        absolute_deadline: Instant,
+        idle_timeout: Duration,
+    ) -> Result<RuntimeAsrRealtimeStream> {
+        if variant.family() == ModelFamily::Voxtral
+            && prompt.is_some_and(|prompt| !prompt.trim().is_empty())
+        {
+            return Err(Error::InvalidInput(
+                "Voxtral realtime ASR does not support an initial text prompt".into(),
+            ));
+        }
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let initial_spec = self.coordinator_job_for_input(
+            request_id.clone(),
+            CoordinatorLane::Realtime,
+            context,
+            metadata_bytes,
+        );
+        let initial_job = self
+            .coordinator
+            .admit_observed(initial_spec, host_input_observation(metadata_bytes)?)
+            .await?;
+        let (residency_lease, execution_contract, state_binding) = self
+            .load_capability_with_state_for_job(
+                &initial_job,
+                variant,
+                CapabilityKind::RealtimeAsr,
+                true,
+                ExecutionTargetKind::RealtimeRunner,
+            )
+            .await?;
+        let (
+            model,
+            max_samples,
+            max_host_bytes,
+            max_tensor_bytes,
+            max_output_steps,
+            max_cache_append,
+            voxtral_model,
+        ) = match variant.family() {
+            ModelFamily::Voxtral => {
+                let model = self
+                    .model_registry
+                    .get_voxtral_lease(variant)
+                    .await
+                    .ok_or_else(|| {
+                        Error::ModelNotFound(format!("Voxtral model {variant} is not loaded"))
+                    })?;
+                let peak = model.realtime_stream_peak_reservation()?;
+                let max_output_steps = model.realtime_max_output_steps()?;
+                let max_cache_append = state_binding
+                    .state
+                    .managed_kv_runtime()
+                    .map(|runtime| runtime.logical_token_reach())
+                    .filter(|tokens| *tokens > 0)
+                    .and_then(|tokens| usize::try_from(tokens).ok())
+                    .ok_or_else(|| {
+                        Error::ModelLoadError(
+                            "Voxtral realtime state has no finite physical KV-token ceiling".into(),
+                        )
+                    })?;
+                (
+                    RuntimeRealtimeEngineModel::Voxtral(model.clone()),
+                    peak.max_source_samples,
+                    peak.max_host_bytes,
+                    peak.max_tensor_bytes,
+                    max_output_steps,
+                    max_cache_append,
+                    Some(model),
+                )
+            }
+            ModelFamily::NemotronAsr => {
+                let lease = self
+                    .model_registry
+                    .get_asr_lease(variant)
+                    .await
+                    .ok_or_else(|| {
+                        Error::ModelNotFound(format!("Nemotron model {variant} is not loaded"))
+                    })?;
+                let reservation =
+                    lease.realtime_stream_resource_reservation(language, prompt, None)?;
+                let max_samples = reservation.max_samples();
+                let max_steps = max_samples.div_ceil(1_280).saturating_add(2).max(1);
+                (
+                    RuntimeRealtimeEngineModel::Nemotron {
+                        _lease: lease,
+                        reservation,
+                    },
+                    max_samples,
+                    reservation.host_bytes(),
+                    reservation.tensor_bytes(),
+                    max_steps,
+                    max_steps,
+                    None,
+                )
+            }
+            _ => {
+                return Err(Error::InvalidInput(
+                    "unsupported Engine realtime ASR family".into(),
+                ))
+            }
+        };
+        let stream_resources = realtime_stream_resource_vector(
+            self.backend_context().backend_kind,
+            max_host_bytes
+                .checked_add(u64::try_from(metadata_bytes).map_err(|_| {
+                    Error::Overloaded("realtime ASR retained metadata usage exceeds u64".into())
+                })?)
+                .ok_or_else(|| {
+                    Error::Overloaded(
+                        "realtime ASR transactional host reservation overflowed".into(),
+                    )
+                })?,
+            max_tensor_bytes,
+        )?;
+        let mut execution_spec = initial_job.spec.clone();
+        let bridge = self.coordinator.bridge_preparation_admission(initial_job)?;
+        execution_spec.resources = execution_spec.resources.checked_add(stream_resources)?;
+        let job = match self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                execution_spec,
+                host_input_observation(metadata_bytes)?,
+            )
+            .await
+        {
+            Ok(job) => job,
+            Err(failure) => {
+                let error = failure.error;
+                drop(failure.bridge);
+                return Err(error);
+            }
+        };
+
+        let mut request = EngineCoreRequest::asr_bytes(Vec::new()).with_model_variant(variant);
+        if let Some(language) = language {
+            request = request.with_language(language);
+        }
+        if let Some(prompt) = prompt {
+            request = request.with_asr_prompt(prompt);
+        }
+        request.id = request_id;
+        request.workload_class = context.workload_class;
+        request.priority = context.priority;
+        request.admission_ms = context.admission_ms;
+        request.deadline = Some(absolute_deadline);
+        request.params.max_tokens = max_cache_append;
+        request.bind_execution_adapter(state_binding.execution.clone())?;
+        request.bind_v2_state_runtime(
+            state_binding.state.clone(),
+            state_binding.state.state_fingerprint,
+            self.backend_context().backend_kind,
+        )?;
+        let admission = self.core_engine.start_realtime_asr_session(request);
+        let handle = tokio::time::timeout_at(absolute_deadline.into(), admission)
+            .await
+            .map_err(|_| Error::Timeout("realtime ASR Engine admission".into()))??;
+        let engine_session = RuntimeEngineRealtimeSession {
+            engine: self.core_engine.clone(),
+            handle,
+            model,
+            retained_metadata_bytes: u64::try_from(metadata_bytes).map_err(|_| {
+                Error::Overloaded("realtime ASR retained metadata usage exceeds u64".into())
+            })?,
+            max_output_steps,
+            max_cache_append,
+        };
+        let resources = Arc::new(StdMutex::new(RuntimeAsrRealtimeResources {
+            model: None,
+            state: None,
+            execution_contract: Some(execution_contract),
+            residency_lease: Some(residency_lease),
+            job: Some(job),
+            session_lease: Some(session_lease),
+            engine_session: Some(engine_session),
+            voxtral_model,
+            absolute_deadline,
+            idle_timeout,
+            last_activity: Instant::now(),
+            active_operations: 0,
+            closed: false,
+            timeout_reason: None,
+        }));
+        let activity = Arc::new(Notify::new());
+        spawn_realtime_asr_watchdog(&resources, activity.clone());
+        Ok(RuntimeAsrRealtimeStream {
+            variant,
+            resources,
+            activity,
+            operation_gate: Arc::new(tokio::sync::Mutex::new(())),
+            max_samples,
+            committed_samples: 0,
+            engine_sample_rate: None,
+            engine_text: String::new(),
+            engine_chunk_index: 0,
+        })
+    }
+
     pub async fn try_start_asr_realtime_stream(
         &self,
         model_id: Option<&str>,
@@ -798,6 +1511,21 @@ impl RuntimeService {
             .with_deadline(absolute_deadline);
         let metadata_bytes =
             language.map(str::len).unwrap_or_default() + prompt.map(str::len).unwrap_or_default();
+        if realtime_asr_execution_path(variant) == RealtimeAsrExecutionPath::Engine {
+            return self
+                .start_engine_realtime_stream(
+                    variant,
+                    language,
+                    prompt,
+                    context,
+                    metadata_bytes,
+                    session_lease,
+                    absolute_deadline,
+                    limits.idle_timeout,
+                )
+                .await
+                .map(Some);
+        }
         let reservation = NativeAsrModel::conservative_realtime_stream_resource_reservation(
             variant, language, prompt, None,
         )?;
@@ -816,8 +1544,8 @@ impl RuntimeService {
             .coordinator
             .admit_observed(job_spec, host_input_observation(metadata_bytes)?)
             .await?;
-        let (lease, execution_contract) = self
-            .load_capability_for_job(
+        let (lease, execution_contract, state_binding) = self
+            .load_capability_with_state_for_job(
                 &job,
                 variant,
                 CapabilityKind::RealtimeAsr,
@@ -825,6 +1553,14 @@ impl RuntimeService {
                 ExecutionTargetKind::RealtimeRunner,
             )
             .await?;
+        let physical_runtime = state_binding
+            .state
+            .retained_tensor_state_runtime()
+            .ok_or_else(|| {
+                Error::ModelLoadError(
+                    "realtime ASR did not bind its retained tensor runtime".into(),
+                )
+            })?;
         let model =
             self.model_registry.get_asr(variant).await.ok_or_else(|| {
                 Error::ModelNotFound(format!("ASR model {variant} is not loaded"))
@@ -860,17 +1596,22 @@ impl RuntimeService {
                 move || {
                     let _operation_lease = operation_lease;
                     let _session_lease = task_session_lease;
-                    let state = task_model.start_realtime_stream_state_with_reservation(
+                    let native = task_model.start_realtime_stream_state_with_reservation(
                         language.as_deref(),
                         prompt.as_deref(),
                         None,
                         reservation,
                     )?;
+                    let state = RuntimeAsrRealtimeState::new(
+                        task_model.as_ref(),
+                        native,
+                        physical_runtime,
+                    )?;
                     Ok((state, language, prompt))
                 },
             )
             .await?;
-        let steady_usage = realtime_state_observation(&state)?;
+        let steady_usage = realtime_state_observation(&state.native)?;
         job.record_materialized_usage(add_retained_host_bytes(
             steady_usage,
             retained_metadata_bytes,
@@ -885,6 +1626,8 @@ impl RuntimeService {
             residency_lease: Some(lease),
             job: Some(job),
             session_lease: Some(session_lease),
+            engine_session: None,
+            voxtral_model: None,
             absolute_deadline,
             idle_timeout: limits.idle_timeout,
             last_activity: Instant::now(),
@@ -901,6 +1644,10 @@ impl RuntimeService {
             activity,
             operation_gate: Arc::new(tokio::sync::Mutex::new(())),
             max_samples: reservation.max_samples(),
+            committed_samples: 0,
+            engine_sample_rate: None,
+            engine_text: String::new(),
+            engine_chunk_index: 0,
         }))
     }
 
@@ -916,6 +1663,122 @@ impl RuntimeService {
         if samples.is_empty() {
             stream.ensure_open()?;
             return Ok(Vec::new());
+        }
+        if stream.execution_path() == RealtimeAsrExecutionPath::Engine {
+            let total_samples = stream
+                .committed_samples
+                .checked_add(samples.len())
+                .ok_or_else(|| Error::Overloaded("realtime ASR sample clock overflowed".into()))?;
+            validate_realtime_input_copy(total_samples, stream.max_samples)?;
+            let handles = stream.begin_engine_operation(true)?;
+            let operation_lease = self
+                .model_lifecycle
+                .try_acquire_ready_lease(stream.variant)
+                .ok_or_else(|| {
+                    Error::ModelNotFound(format!("ASR model {} is not resident", stream.variant))
+                });
+            let operation_lease = match operation_lease {
+                Ok(lease) => lease,
+                Err(error) => {
+                    stream.close();
+                    return Err(error);
+                }
+            };
+            let RealtimeAsrEngineOperationHandles {
+                session,
+                job,
+                session_lease,
+                _guard: operation_guard,
+            } = handles;
+            if stream
+                .engine_sample_rate
+                .is_some_and(|established| established != sample_rate)
+            {
+                drop((operation_lease, session_lease, operation_guard));
+                return Err(Error::InvalidInput(
+                    "realtime ASR sample rate changed within one stream".into(),
+                ));
+            }
+            let preparation_cost = session.model.preparation_cost(
+                samples.len(),
+                total_samples,
+                sample_rate,
+                VoxtralRealtimePreparationMode::Push,
+            )?;
+            let committed_observation = match &session.model {
+                RuntimeRealtimeEngineModel::Voxtral(model) => {
+                    let geometry = model.realtime_preparation_geometry_for_source_samples(
+                        total_samples,
+                        sample_rate,
+                        VoxtralRealtimePreparationMode::Push,
+                    )?;
+                    voxtral_realtime_committed_observation(
+                        session.retained_metadata_bytes,
+                        model.realtime_prepared_resource_usage(geometry)?,
+                    )?
+                }
+                RuntimeRealtimeEngineModel::Nemotron { .. } => session
+                    .model
+                    .committed_observation(session.retained_metadata_bytes)?,
+            };
+            let ordering = match self
+                .coordinator
+                .acquire_job_ordering(&job, stream.operation_gate.clone())
+                .await
+            {
+                Ok(ordering) => ordering,
+                Err(error) => {
+                    drop((operation_lease, session_lease, operation_guard));
+                    if matches!(error, Error::Timeout(_)) {
+                        stream.close_due_to_timeout();
+                    } else {
+                        stream.close();
+                    }
+                    return Err(error);
+                }
+            };
+            let operation = session
+                .engine
+                .push_realtime_asr_samples_with_outputs_and_cost(
+                    &session.handle,
+                    samples.to_vec(),
+                    sample_rate,
+                    session.max_output_steps,
+                    session.max_cache_append,
+                    preparation_cost,
+                );
+            let result = match job.spec.deadline {
+                Some(deadline) => match tokio::time::timeout_at(deadline.into(), operation).await {
+                    Ok(result) => result,
+                    Err(_) => Err(Error::Timeout("realtime ASR Engine push".into())),
+                },
+                None => operation.await,
+            };
+            drop((ordering, operation_lease, session_lease, operation_guard));
+            let (ack, outputs) = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    if matches!(error, Error::Timeout(_)) {
+                        stream.close_due_to_timeout();
+                    } else {
+                        stream.close();
+                    }
+                    return Err(error);
+                }
+            };
+            if ack.accepted_samples() != samples.len() {
+                stream.close();
+                return Err(Error::InferenceError(
+                    "realtime ASR Engine acknowledgement reported the wrong sample span".into(),
+                ));
+            }
+            if let Err(error) = job.record_materialized_usage(committed_observation) {
+                stream.close();
+                return Err(error);
+            }
+            stream.committed_samples = total_samples;
+            stream.engine_sample_rate = Some(sample_rate);
+            return Ok(stream.map_engine_outputs(outputs));
         }
         let handles = stream.begin_operation(true)?;
         let operation_lease = self
@@ -964,12 +1827,13 @@ impl RuntimeService {
                     // cannot be observed as unclaimed headroom.
                     observation_job
                         .prepare_materialized_release(JobResourceObservation::default())?;
-                    let events =
-                        model.push_realtime_stream_samples(&mut state, &samples, sample_rate);
+                    let events = state.transact(model.as_ref(), |native| {
+                        model.push_realtime_stream_samples(native, &samples, sample_rate)
+                    });
                     observation_job.record_materialized_usage(
-                        realtime_state_with_input_observation(&state, samples.capacity())?,
+                        realtime_state_with_input_observation(&state.native, samples.capacity())?,
                     )?;
-                    let steady_usage = realtime_state_observation(&state)?;
+                    let steady_usage = realtime_state_observation(&state.native)?;
                     observation_job.prepare_materialized_release(steady_usage)?;
                     drop(samples);
                     events
@@ -992,6 +1856,102 @@ impl RuntimeService {
         &self,
         stream: &mut RuntimeAsrRealtimeStream,
     ) -> Result<Vec<RuntimeAsrRealtimeEvent>> {
+        if stream.execution_path() == RealtimeAsrExecutionPath::Engine {
+            let handles = stream.begin_engine_operation(false)?;
+            let operation_lease = self
+                .model_lifecycle
+                .try_acquire_ready_lease(stream.variant)
+                .ok_or_else(|| {
+                    Error::ModelNotFound(format!("ASR model {} is not resident", stream.variant))
+                });
+            let operation_lease = match operation_lease {
+                Ok(lease) => lease,
+                Err(error) => {
+                    stream.close();
+                    return Err(error);
+                }
+            };
+            let RealtimeAsrEngineOperationHandles {
+                session,
+                job,
+                session_lease,
+                _guard: operation_guard,
+            } = handles;
+            let sample_rate = stream.engine_sample_rate.ok_or_else(|| {
+                Error::InvalidInput("realtime ASR finish requires committed audio".into())
+            })?;
+            let preparation_cost = session.model.preparation_cost(
+                0,
+                stream.committed_samples,
+                sample_rate,
+                VoxtralRealtimePreparationMode::Finish,
+            )?;
+            let committed_observation = match &session.model {
+                RuntimeRealtimeEngineModel::Voxtral(model) => {
+                    let geometry = model.realtime_preparation_geometry_for_source_samples(
+                        stream.committed_samples,
+                        sample_rate,
+                        VoxtralRealtimePreparationMode::Finish,
+                    )?;
+                    voxtral_realtime_committed_observation(
+                        session.retained_metadata_bytes,
+                        model.realtime_prepared_resource_usage(geometry)?,
+                    )?
+                }
+                RuntimeRealtimeEngineModel::Nemotron { .. } => session
+                    .model
+                    .committed_observation(session.retained_metadata_bytes)?,
+            };
+            let ordering = match self
+                .coordinator
+                .acquire_job_ordering(&job, stream.operation_gate.clone())
+                .await
+            {
+                Ok(ordering) => ordering,
+                Err(error) => {
+                    drop((operation_lease, session_lease, operation_guard));
+                    if matches!(error, Error::Timeout(_)) {
+                        stream.close_due_to_timeout();
+                    } else {
+                        stream.close();
+                    }
+                    return Err(error);
+                }
+            };
+            let operation = session
+                .engine
+                .finish_realtime_asr_session_with_outputs_and_cost(
+                    &session.handle,
+                    session.max_output_steps,
+                    session.max_cache_append,
+                    preparation_cost,
+                );
+            let result = match job.spec.deadline {
+                Some(deadline) => match tokio::time::timeout_at(deadline.into(), operation).await {
+                    Ok(result) => result,
+                    Err(_) => Err(Error::Timeout("realtime ASR Engine finish".into())),
+                },
+                None => operation.await,
+            };
+            drop((ordering, operation_lease, session_lease, operation_guard));
+            let (_ack, outputs) = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    if matches!(error, Error::Timeout(_)) {
+                        stream.close_due_to_timeout();
+                    } else {
+                        stream.close();
+                    }
+                    return Err(error);
+                }
+            };
+            if let Err(error) = job.record_materialized_usage(committed_observation) {
+                stream.close();
+                return Err(error);
+            }
+            stream.close();
+            return Ok(stream.map_engine_outputs(outputs));
+        }
         let handles = stream.begin_operation(false)?;
         let operation_lease = self
             .model_lifecycle
@@ -1032,7 +1992,9 @@ impl RuntimeService {
                     })?;
                     observation_job
                         .prepare_materialized_release(JobResourceObservation::default())?;
-                    model.finish_realtime_stream(&mut state)
+                    state.transact(model.as_ref(), |native| {
+                        model.finish_realtime_stream(native)
+                    })
                 })
             },
         )
@@ -1090,8 +2052,8 @@ impl RuntimeService {
             audio_input.retained_bytes(),
         ])?)?;
 
-        let (residency_lease, execution_contract) = self
-            .load_capability_for_job(
+        let (residency_lease, execution_contract, state_binding) = self
+            .load_capability_with_state_for_job(
                 &job,
                 variant,
                 CapabilityKind::Asr,
@@ -1108,13 +2070,14 @@ impl RuntimeService {
             })?;
         let observation_job = job.clone();
         self.coordinator
-            .run_loaded_blocking_stage(
+            .run_loaded_blocking_stage_with_invocation_workspace(
                 &job,
                 execution_contract,
+                state_binding,
                 WorkUnit::AtomicJob {
                     kind: "asr.audio_chat".to_string(),
                 },
-                move || {
+                move |leases| {
                     let _residency_lease = residency_lease;
                     let retained_audio_bytes = audio_input.retained_bytes();
                     let (samples, sample_rate) = audio_input.decode()?;
@@ -1136,12 +2099,14 @@ impl RuntimeService {
                             on_delta(delta.to_string());
                         }
                     };
-                    let output = model.transcribe_with_callback_and_max_tokens(
-                        &samples,
-                        sample_rate,
-                        max_tokens,
-                        &mut delta_sink,
-                    )?;
+                    let output = model
+                        .transcribe_with_callback_and_max_tokens_from_invocation_workspace(
+                            &samples,
+                            sample_rate,
+                            max_tokens,
+                            leases,
+                            &mut delta_sink,
+                        )?;
 
                     Ok(AsrTranscription {
                         text: output.text,
@@ -1166,12 +2131,12 @@ impl RuntimeService {
         streaming: bool,
     ) -> Result<AdmittedEngineRequest> {
         let audio_bytes = match audio_input {
-            AsrAudioInput::Base64(audio) if audio.is_empty() => {
+            AsrAudioInput::Base64("") => {
                 return Err(Error::InvalidInput(
                     "ASR request missing audio input".to_string(),
                 ));
             }
-            AsrAudioInput::Bytes(audio) if audio.is_empty() => {
+            AsrAudioInput::Bytes([]) => {
                 return Err(Error::InvalidInput(
                     "ASR request missing audio bytes".to_string(),
                 ));
@@ -1299,7 +2264,7 @@ impl RuntimeService {
         max_tokens: Option<usize>,
         correlation_id: Option<&str>,
     ) -> Result<AsrTranscription> {
-        if variant.is_audio_chat() {
+        if variant.is_audio_chat() && variant.family() != ModelFamily::Lfm25Audio {
             self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), false)?;
             let context = RuntimeRequestContext::default();
             return self
@@ -1399,7 +2364,7 @@ impl RuntimeService {
     where
         F: FnMut(String) + Send + 'static,
     {
-        if variant.is_audio_chat() {
+        if variant.is_audio_chat() && variant.family() != ModelFamily::Lfm25Audio {
             self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), true)?;
             let context = RuntimeRequestContext::new(crate::engine::WorkloadClass::Streaming);
             return self
@@ -1519,7 +2484,7 @@ impl RuntimeService {
         correlation_id: Option<&str>,
         runtime_context: RuntimeRequestContext,
     ) -> Result<AsrTranscription> {
-        if variant.is_audio_chat() {
+        if variant.is_audio_chat() && variant.family() != ModelFamily::Lfm25Audio {
             self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), false)?;
             return self
                 .asr_transcribe_audio_chat(
@@ -1683,7 +2648,7 @@ impl RuntimeService {
         F: FnMut(String) + Send + 'static,
         P: FnMut(AsrProgress) + Send + 'static,
     {
-        if variant.is_audio_chat() {
+        if variant.is_audio_chat() && variant.family() != ModelFamily::Lfm25Audio {
             self.observe_broker_capability_request(
                 CapabilityKind::Asr,
                 Some(variant),
@@ -2374,8 +3339,8 @@ impl RuntimeService {
             owned_audio.retained_bytes(),
             language_bytes,
         ])?)?;
-        let (residency_lease, execution_contract) = self
-            .load_capability_for_job(
+        let (residency_lease, execution_contract, state_binding) = self
+            .load_capability_with_state_for_job(
                 &job,
                 variant,
                 CapabilityKind::SpeakerAttributedAsr,
@@ -2429,14 +3394,15 @@ impl RuntimeService {
             let observation_job = job.clone();
             let transcription =
                 self.coordinator
-                    .run_loaded_blocking_stage(
+                    .run_loaded_blocking_stage_with_invocation_paged(
                         &job,
                         execution_contract,
+                        state_binding,
                         WorkUnit::PipelineStage {
                             name: "asr.speaker_attributed.decode".to_string(),
                             ordinal: 0,
                         },
-                        move || {
+                        move |leases| {
                             let _residency_lease = residency_lease;
                             observation_job.record_materialized_usage(
                                 decoded_audio_observation(retained_input_bytes, samples.len())?,
@@ -2448,6 +3414,7 @@ impl RuntimeService {
                                 task_language.as_deref(),
                                 None,
                                 max_new_tokens,
+                                granite_saa_single_invocation_cache(leases)?,
                             )
                         },
                     )
@@ -2468,6 +3435,7 @@ impl RuntimeService {
             &job,
             model,
             execution_contract,
+            state_binding,
             samples,
             sample_rate,
             language_owned.as_deref(),
@@ -2890,16 +3858,18 @@ fn granite_saa_should_use_single_pass(duration_secs: f32, model_limit_secs: Opti
 }
 
 fn granite_saa_long_form_config(model_limit_secs: Option<f32>) -> AsrLongFormConfig {
-    let mut cfg = AsrLongFormConfig::default();
-    cfg.target_chunk_secs = GRANITE_SAA_TARGET_CHUNK_SECS;
-    cfg.hard_max_chunk_secs = GRANITE_SAA_HARD_MAX_CHUNK_SECS;
-    cfg.overlap_secs = GRANITE_SAA_OVERLAP_SECS;
-    cfg.min_chunk_secs = GRANITE_SAA_MIN_CHUNK_SECS;
-    cfg.silence_search_secs = GRANITE_SAA_SILENCE_SEARCH_SECS;
-    cfg.min_word_overlap = GRANITE_SAA_MIN_OVERLAP_WORDS;
-    cfg.max_word_overlap = GRANITE_SAA_MAX_OVERLAP_WORDS;
-    cfg.min_context_replay_words = GRANITE_SAA_MIN_OVERLAP_WORDS;
-    cfg.max_context_replay_words = GRANITE_SAA_MAX_OVERLAP_WORDS;
+    let mut cfg = AsrLongFormConfig {
+        target_chunk_secs: GRANITE_SAA_TARGET_CHUNK_SECS,
+        hard_max_chunk_secs: GRANITE_SAA_HARD_MAX_CHUNK_SECS,
+        overlap_secs: GRANITE_SAA_OVERLAP_SECS,
+        min_chunk_secs: GRANITE_SAA_MIN_CHUNK_SECS,
+        silence_search_secs: GRANITE_SAA_SILENCE_SEARCH_SECS,
+        min_word_overlap: GRANITE_SAA_MIN_OVERLAP_WORDS,
+        max_word_overlap: GRANITE_SAA_MAX_OVERLAP_WORDS,
+        min_context_replay_words: GRANITE_SAA_MIN_OVERLAP_WORDS,
+        max_context_replay_words: GRANITE_SAA_MAX_OVERLAP_WORDS,
+        ..Default::default()
+    };
 
     if let Some(limit) = model_limit_secs.filter(|value| value.is_finite() && *value > 0.0) {
         cfg.hard_max_chunk_secs = cfg.hard_max_chunk_secs.min(limit * 0.95);
@@ -3043,6 +4013,7 @@ async fn granite_saa_long_form_transcribe<P>(
     job: &JobLease,
     model: Arc<NativeAsrModel>,
     execution_contract: LoadedExecutionContract,
+    state_binding: LoadedCapabilityBinding,
     samples: Arc<[f32]>,
     sample_rate: u32,
     language: Option<&str>,
@@ -3107,6 +4078,7 @@ where
         let task_model = model.clone();
         let task_samples = samples.clone();
         let observation_job = job.clone();
+        let task_state_binding = state_binding.clone();
         let language_owned = language.map(ToOwned::to_owned);
         let prefix_mode = GraniteSaaPrefixMode::from_env();
         let prefix_text = granite_saa_chunk_prefix_text(&assembler, prefix_mode);
@@ -3131,14 +4103,15 @@ where
         );
         let chunk_started = Instant::now();
         let (returned_lease, transcription) = coordinator
-            .run_loaded_blocking_stage(
+            .run_loaded_blocking_stage_with_invocation_paged(
                 job,
                 execution_contract.clone(),
+                task_state_binding,
                 WorkUnit::PipelineStage {
                     name: "asr.speaker_attributed.chunk".to_string(),
                     ordinal: idx,
                 },
-                move || {
+                move |leases| {
                     let chunk_audio = task_samples[chunk_start..chunk_end].to_vec();
                     observation_job.record_materialized_usage(
                         decoded_audio_with_scratch_observation(
@@ -3154,6 +4127,7 @@ where
                         language_owned.as_deref(),
                         prefix_text.as_deref(),
                         max_new_tokens,
+                        granite_saa_single_invocation_cache(leases)?,
                     );
                     let steady_usage =
                         decoded_audio_observation(retained_input_bytes, task_samples.len())?;
@@ -3224,8 +4198,9 @@ fn granite_saa_transcribe_chunk(
     language: Option<&str>,
     prefix_text: Option<&str>,
     max_new_tokens: usize,
+    cache: &mut crate::models::shared::attention::physical::PhysicalPagedKvCache,
 ) -> Result<NativeAsrTranscription> {
-    model.transcribe_with_granite_speech_task_and_options(
+    model.transcribe_granite_speech_task_and_options_physical(
         audio,
         sample_rate,
         language,
@@ -3235,7 +4210,21 @@ fn granite_saa_transcribe_chunk(
             max_new_tokens,
             ..NativeAsrGenerationOptions::default()
         },
+        cache,
     )
+}
+
+fn granite_saa_single_invocation_cache(
+    leases: &mut crate::kv::v2::InvocationPagedLeaseSetV2,
+) -> Result<&mut crate::models::shared::attention::physical::PhysicalPagedKvCache> {
+    let domains = leases.domains().collect::<Vec<_>>();
+    let [domain] = domains.as_slice() else {
+        return Err(Error::InferenceError(format!(
+            "Granite speaker-attributed ASR requires one invocation KV domain, found {}",
+            domains.len()
+        )));
+    };
+    leases.cache_mut(*domain)
 }
 
 fn granite_saa_processing_progress(chunks: &[AudioChunk], sample_rate: u32) -> AsrProgress {
@@ -3509,8 +4498,8 @@ mod tests {
     use super::*;
     use crate::backends::BackendPreference;
     use crate::config::EngineConfig;
-    use crate::engine::{ModelInstanceId, Priority, WorkloadClass};
-    use crate::runtime::adapters::{LoadedModelBundle, RuntimeAdapterRegistry};
+    use crate::engine::{EngineCoreRequest, ModelInstanceId, Priority, WorkloadClass};
+    use crate::runtime::adapters::{LoadedModelBundleDraft, RuntimeAdapterRegistry};
     use crate::runtime::coordinator::JobSpec;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex, OnceLock};
@@ -3522,7 +4511,7 @@ mod tests {
     }
 
     #[test]
-    fn realtime_stream_variant_resolves_only_nemotron_asr() {
+    fn realtime_stream_variant_resolves_both_engine_backed_families() {
         assert_eq!(
             resolve_asr_realtime_stream_variant(Some("nvidia/nemotron-3.5-asr-streaming-0.6b",)),
             Some(ModelVariant::Nemotron35AsrStreaming06B)
@@ -3530,6 +4519,22 @@ mod tests {
         assert_eq!(
             resolve_asr_realtime_stream_variant(Some("Nemotron 3.5 ASR Streaming 0.6B")),
             Some(ModelVariant::Nemotron35AsrStreaming06B)
+        );
+        assert_eq!(
+            resolve_asr_realtime_stream_variant(Some("Voxtral-Mini-4B-Realtime-2602")),
+            Some(ModelVariant::VoxtralMini4BRealtime2602)
+        );
+        assert_eq!(
+            realtime_asr_execution_path(ModelVariant::Nemotron35AsrStreaming06B),
+            RealtimeAsrExecutionPath::Engine
+        );
+        assert_eq!(
+            realtime_asr_execution_path(ModelVariant::VoxtralMini4BRealtime2602),
+            RealtimeAsrExecutionPath::Engine
+        );
+        assert_eq!(
+            realtime_asr_execution_path(ModelVariant::WhisperLargeV3Turbo),
+            RealtimeAsrExecutionPath::Direct
         );
 
         assert_eq!(resolve_asr_realtime_stream_variant(None), None);
@@ -3552,6 +4557,98 @@ mod tests {
     }
 
     #[test]
+    fn realtime_preparation_work_is_prefix_based_for_voxtral_and_incremental_for_nemotron() {
+        let packet_samples = 160;
+        let total_samples = 480;
+
+        assert_eq!(
+            realtime_preparation_work_samples(
+                ModelFamily::Voxtral,
+                VoxtralRealtimePreparationMode::Push,
+                packet_samples,
+                total_samples,
+            )
+            .unwrap(),
+            total_samples
+        );
+        assert_eq!(
+            realtime_preparation_work_samples(
+                ModelFamily::NemotronAsr,
+                VoxtralRealtimePreparationMode::Push,
+                packet_samples,
+                total_samples,
+            )
+            .unwrap(),
+            packet_samples
+        );
+        assert_eq!(
+            realtime_preparation_work_samples(
+                ModelFamily::NemotronAsr,
+                VoxtralRealtimePreparationMode::Finish,
+                0,
+                total_samples,
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn nemotron_public_push_and_finish_select_the_engine_session_path() {
+        let runtime = RuntimeService::new(EngineConfig {
+            backend: BackendPreference::Cpu,
+            ..Default::default()
+        })
+        .unwrap();
+        let now = Instant::now();
+        let resources = Arc::new(StdMutex::new(RuntimeAsrRealtimeResources {
+            model: None,
+            state: None,
+            execution_contract: None,
+            residency_lease: None,
+            job: None,
+            session_lease: None,
+            engine_session: None,
+            voxtral_model: None,
+            absolute_deadline: now + Duration::from_secs(60),
+            idle_timeout: Duration::from_secs(60),
+            last_activity: now,
+            active_operations: 0,
+            closed: false,
+            timeout_reason: None,
+        }));
+        let mut stream = RuntimeAsrRealtimeStream {
+            variant: ModelVariant::Nemotron35AsrStreaming06B,
+            resources,
+            activity: Arc::new(Notify::new()),
+            operation_gate: Arc::new(tokio::sync::Mutex::new(())),
+            max_samples: 16,
+            committed_samples: 0,
+            engine_sample_rate: None,
+            engine_text: String::new(),
+            engine_chunk_index: 0,
+        };
+
+        let push = runtime
+            .push_asr_realtime_samples(&mut stream, &[0.0], 16_000)
+            .await
+            .expect_err("fixture intentionally omits the Engine session");
+        assert!(push
+            .to_string()
+            .contains("Engine realtime ASR session is unavailable"));
+        assert!(!push.to_string().contains("model is unavailable"));
+
+        let finish = runtime
+            .finish_asr_realtime_stream(&mut stream)
+            .await
+            .expect_err("fixture intentionally omits the Engine session");
+        assert!(finish
+            .to_string()
+            .contains("Engine realtime ASR session is unavailable"));
+        assert!(!finish.to_string().contains("model is unavailable"));
+    }
+
+    #[test]
     fn realtime_stream_reservation_routes_to_backend_memory_domains() {
         let cpu = realtime_stream_resource_vector(BackendKind::Cpu, 11, 29).unwrap();
         let metal = realtime_stream_resource_vector(BackendKind::Metal, 11, 29).unwrap();
@@ -3566,6 +4663,64 @@ mod tests {
         assert_eq!(cuda.host_bytes, ResourceAmount::Known(11));
         assert_eq!(cuda.device_bytes, ResourceAmount::Known(29));
         assert_eq!(cuda.unified_bytes, ResourceAmount::Known(0));
+    }
+
+    #[test]
+    fn voxtral_operation_cost_uses_preparation_geometry_not_raw_samples() {
+        let geometry = VoxtralRealtimePreparationGeometry {
+            source_samples: 160,
+            resampled_samples: 160,
+            padded_samples: 320,
+            mel_frames: 8,
+            conv1_frames: 4,
+            conv2_frames: 2,
+            pooled_frames: 1,
+            stable_frames: 1,
+            embedding_elements: 32,
+        };
+        let batch = VoxtralRealtimePreparationBatchGeometry {
+            width: 1,
+            padded_mel_frames: 8,
+            padded_conv_frames: 2,
+            materialized_tensor_elements_per_row: 704,
+            workspace_per_row_bytes: 4096,
+        };
+        let seal = VoxtralRealtimePreparationStageSeal {
+            max_source_samples: 1_600,
+            max_work_units: 1_600,
+            max_materialized_tensor_elements_per_row: 1_024,
+            max_workspace_bytes: 8192,
+        };
+
+        let cost = voxtral_realtime_preparation_cost_from_geometry(geometry, batch, seal).unwrap();
+
+        assert_eq!(cost.logical_units, 160);
+        assert_eq!(cost.tensor_elements, 704);
+        assert_eq!(cost.workspace.temporary_bytes, ResourceAmount::Known(4096));
+        assert_ne!(cost.tensor_elements, geometry.source_samples as u64);
+
+        let undersized_seal = VoxtralRealtimePreparationStageSeal {
+            max_materialized_tensor_elements_per_row: 703,
+            ..seal
+        };
+        assert!(
+            voxtral_realtime_preparation_cost_from_geometry(geometry, batch, undersized_seal)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn voxtral_committed_observation_excludes_transient_workspace() {
+        let observed = voxtral_realtime_committed_observation(
+            11,
+            VoxtralRealtimePreparedResourceUsage {
+                host_bytes: 40,
+                tensor_bytes: 96,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(observed, JobResourceObservation::new(62, 96));
     }
 
     #[test]
@@ -3634,6 +4789,8 @@ mod tests {
             residency_lease: None,
             job: None,
             session_lease: Some(session_lease),
+            engine_session: None,
+            voxtral_model: None,
             absolute_deadline: now + Duration::from_secs(60),
             idle_timeout: Duration::from_millis(1),
             last_activity: now - Duration::from_secs(1),
@@ -3666,6 +4823,88 @@ mod tests {
         assert!(policy.try_acquire().is_ok());
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn realtime_stream_drop_releases_detached_session_quota() {
+        let policy = RealtimeAsrSessionPolicy::new(RealtimeAsrSessionLimits {
+            max_sessions: 1,
+            max_lifetime: Duration::from_secs(60),
+            idle_timeout: Duration::from_secs(60),
+        })
+        .expect("session policy");
+        let session_lease = policy.try_acquire().expect("first session");
+        let now = Instant::now();
+        let resources = Arc::new(StdMutex::new(RuntimeAsrRealtimeResources {
+            model: None,
+            state: None,
+            execution_contract: None,
+            residency_lease: None,
+            job: None,
+            session_lease: Some(session_lease),
+            engine_session: None,
+            voxtral_model: None,
+            absolute_deadline: now + Duration::from_secs(60),
+            idle_timeout: Duration::from_secs(60),
+            last_activity: now,
+            active_operations: 0,
+            closed: false,
+            timeout_reason: None,
+        }));
+        let stream = RuntimeAsrRealtimeStream {
+            variant: ModelVariant::VoxtralMini4BRealtime2602,
+            resources,
+            activity: Arc::new(Notify::new()),
+            operation_gate: Arc::new(tokio::sync::Mutex::new(())),
+            max_samples: 1,
+            committed_samples: 0,
+            engine_sample_rate: None,
+            engine_text: String::new(),
+            engine_chunk_index: 0,
+        };
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while policy.permits.available_permits() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("drop cleanup");
+        assert!(policy.try_acquire().is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn aborted_cleanup_task_retains_detached_authorities_fail_closed() {
+        let policy = RealtimeAsrSessionPolicy::new(RealtimeAsrSessionLimits {
+            max_sessions: 1,
+            max_lifetime: Duration::from_secs(60),
+            idle_timeout: Duration::from_secs(60),
+        })
+        .expect("session policy");
+        let session_lease = policy.try_acquire().expect("first session");
+        let cleanup = RealtimeAsrDetachedResources {
+            state: None,
+            model: None,
+            execution_contract: None,
+            residency_lease: None,
+            job: None,
+            session_lease: Some(session_lease),
+            engine_session: None,
+            voxtral_model: None,
+        };
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _guard = RealtimeAsrCleanupGuard::for_test(cleanup);
+            let _ = entered_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        entered_rx.await.expect("cleanup task entered");
+
+        task.abort();
+        let _ = task.await;
+        assert_eq!(policy.permits.available_permits(), 0);
+        assert!(policy.try_acquire().is_err());
+    }
+
     fn realtime_test_job(id: &str, backend: BackendKind, deadline: Option<Instant>) -> JobSpec {
         let mut resources = ResourceVector::zero();
         match backend {
@@ -3690,27 +4929,29 @@ mod tests {
         coordinator: &InferenceCoordinator,
         backend: BackendKind,
     ) -> LoadedExecutionContract {
-        let bundle = LoadedModelBundle::bind(
+        let draft = LoadedModelBundleDraft::build(
             &RuntimeAdapterRegistry::built_in(),
             coordinator.execution_group_id(),
             ModelInstanceId::new(1),
             ModelVariant::Nemotron35AsrStreaming06B,
             backend,
         )
-        .expect("realtime test bundle");
-        bundle
-            .contract(CapabilityKind::RealtimeAsr, true)
-            .expect("realtime test contract")
+        .expect("realtime test bundle draft");
+        draft
+            .execution_contracts(CapabilityKind::RealtimeAsr)
+            .expect("realtime test contracts")
+            .into_iter()
+            .next()
+            .expect("realtime adapter publishes a contract")
     }
 
     #[test]
     fn oversized_realtime_packet_is_rejected_before_copy_or_model_work() {
         let side_effects = AtomicUsize::new(0);
-        let result = validate_realtime_input_copy(4_801, 4_800).and_then(|()| {
+        let result = validate_realtime_input_copy(4_801, 4_800).map(|()| {
             side_effects.fetch_add(1, Ordering::Relaxed);
             let _owned = vec![0.0_f32; 4_801];
             side_effects.fetch_add(1, Ordering::Relaxed);
-            Ok(())
         });
 
         assert!(matches!(result, Err(Error::InvalidInput(_))));
@@ -4215,6 +5456,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn qwen_asr_build_route_accounts_retained_prepared_audio_once() {
+        let variant = ModelVariant::Qwen3Asr06BGguf;
+        let mut request =
+            EngineCoreRequest::asr_bytes(vec![1, 2, 3, 4]).with_model_variant(variant);
+        let source_only = retained_engine_request_input_bytes(&request).unwrap();
+        request
+            .install_prepared_asr_audio(variant, vec![0.0; 513], 16_000)
+            .unwrap();
+        request
+            .install_prepared_sequence_input_tokens(48, 4096)
+            .unwrap();
+        let retained = retained_engine_request_input_bytes(&request).unwrap();
+        assert_eq!(retained - source_only, 513 * std::mem::size_of::<f32>());
+        assert_eq!(
+            retained_host_observation(&[retained]).unwrap().host_bytes,
+            retained as u64
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn cancelled_offline_asr_stage_retains_job_and_execution_until_physical_exit() {
         let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 4));
@@ -4271,6 +5532,9 @@ mod tests {
     }
 
     #[tokio::test]
+    // The guard intentionally serializes process-global environment access for
+    // the complete asynchronous load attempt in this test.
+    #[allow(clippy::await_holding_lock)]
     async fn parakeet_load_rejects_invalid_nemo_archive() {
         let _guard = env_lock().lock().expect("env lock poisoned");
 
@@ -4279,9 +5543,11 @@ mod tests {
         std::fs::create_dir_all(&model_dir).unwrap();
         std::fs::write(model_dir.join("parakeet-tdt-0.6b-v3.nemo"), b"mock-nemo").unwrap();
 
-        let mut config = EngineConfig::default();
-        config.models_dir = root.clone();
-        config.backend = BackendPreference::Cpu;
+        let config = EngineConfig {
+            models_dir: root.clone(),
+            backend: BackendPreference::Cpu,
+            ..Default::default()
+        };
 
         let engine = RuntimeService::new(config).unwrap();
         let err = engine

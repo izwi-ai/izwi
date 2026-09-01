@@ -10,6 +10,10 @@ describe("VIEW_CONFIGS.chat.modelFilter", () => {
     expect(VIEW_CONFIGS.chat.modelFilter("Qwen3.5-9B")).toBe(true);
   });
 
+  it("includes Qwen3.8 text chat", () => {
+    expect(VIEW_CONFIGS.chat.modelFilter("Qwen3.8-27B-FP8")).toBe(true);
+  });
+
   it("continues to reject non-chat variants", () => {
     expect(VIEW_CONFIGS.chat.modelFilter("Parakeet-TDT-0.6B-v3")).toBe(false);
     expect(VIEW_CONFIGS.chat.modelFilter("Qwen3-TTS-12Hz-0.6B-Base")).toBe(

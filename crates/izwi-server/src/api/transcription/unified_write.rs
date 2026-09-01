@@ -1,7 +1,7 @@
 use axum::{
-    Json,
     extract::{Extension, Path, Query, Request, State},
     response::{IntoResponse, Response},
+    Json,
 };
 use serde::Deserialize;
 

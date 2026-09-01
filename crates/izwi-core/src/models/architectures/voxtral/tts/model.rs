@@ -1,22 +1,34 @@
 //! High-level Voxtral TTS model contract.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{Embedding, Module, VarBuilder};
 use tracing::{info, warn};
 
-use crate::backends::{DeviceKind, DeviceProfile};
-use crate::catalog::ModelFamily;
+use crate::backends::{BackendKind, DeviceProfile};
+use crate::catalog::{ModelFamily, ModelVariant};
+use crate::engine::StageDescriptor;
 use crate::error::{Error, Result};
-use crate::models::architectures::qwen3::core::Qwen3Cache;
+use crate::kv::CacheDomainId;
 use crate::models::architectures::voxtral::lm::VoxtralLM;
-use crate::models::shared::attention::paged::{KvCacheQuantization, DEFAULT_KV_PAGE_SIZE};
+use crate::models::architectures::voxtral::{
+    voxtral_invocation_contract, voxtral_physical_state_spec, VoxtralPhysicalStateSpec,
+};
+use crate::models::shared::attention::paged::default_kv_page_size;
+use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 
 use super::acoustic::{AudioSpecialToken, FlowMatchingAudioTransformer, AUDIO_SPECIAL_TOKEN_COUNT};
 use super::codec::{VoxtralCodecConfig, VoxtralCodecDecoder, VoxtralCodecTimeline};
 use super::config::VoxtralTtsConfig;
+use super::retained::{
+    validate_acoustic_cohort, voxtral_tts_stage_resource_envelope, VoxtralTtsDecodeBatch,
+    VoxtralTtsDecodeStep, VoxtralTtsPrefillBatch, VoxtralTtsPrefillStep,
+    VoxtralTtsPreparedArtifact, VoxtralTtsQuantumCheckpoint, VoxtralTtsRetainedPhase,
+    VoxtralTtsRetainedState, VoxtralTtsStageCeiling, VoxtralTtsStageResourceEnvelope,
+};
 use super::sampling::VoxtralTtsGenerationParams;
 use super::tokenizer::VoxtralTtsTokenizer;
 use super::voice::{voice_embedding_path, VoxtralVoiceCatalog, VoxtralVoiceEmbeddingLibrary};
@@ -60,7 +72,6 @@ struct VoxtralTtsPipeline {
     codec_decoder: VoxtralCodecDecoder,
     audio_embeddings: VoxtralAudioTokenEmbeddings,
     device: Device,
-    device_kind: DeviceKind,
 }
 
 struct VoxtralAudioTokenEmbeddings {
@@ -153,7 +164,6 @@ impl VoxtralTtsModel {
             codec_decoder,
             audio_embeddings,
             device: device.device.clone(),
-            device_kind: device.kind,
         });
         Ok(model)
     }
@@ -189,11 +199,46 @@ impl VoxtralTtsModel {
         self.voices.names_by_id()
     }
 
+    pub(crate) fn physical_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<VoxtralPhysicalStateSpec> {
+        let pipeline = self.pipeline.as_ref().ok_or_else(|| {
+            Error::ModelLoadError(
+                "Voxtral TTS physical state requires the full model loader".into(),
+            )
+        })?;
+        let invocation = voxtral_invocation_contract(
+            &pipeline.language_model,
+            self.dtype_plan.language_model,
+            default_kv_page_size(),
+            &[CacheDomainId::new(1)],
+        )?;
+        let max_context_tokens = pipeline
+            .language_model
+            .physical_context_limit()
+            .ok_or_else(|| Error::ModelLoadError("Voxtral TTS has no context limit".into()))?;
+        voxtral_physical_state_spec(stage_graphs, invocation, max_context_tokens)
+    }
+
     pub fn generate_with_voice(
         &self,
         text: &str,
         voice: &str,
         params: VoxtralTtsGenerationParams,
+    ) -> Result<VoxtralTtsOutput> {
+        let _ = (text, voice, params);
+        Err(Error::InferenceError(
+            "Voxtral TTS requires a lifecycle-owned physical invocation cache".into(),
+        ))
+    }
+
+    pub(crate) fn generate_with_voice_physical(
+        &self,
+        text: &str,
+        voice: &str,
+        params: VoxtralTtsGenerationParams,
+        cache: &mut PhysicalPagedKvCache,
     ) -> Result<VoxtralTtsOutput> {
         self.voices.resolve(voice)?;
         let pipeline = self.pipeline.as_ref().ok_or_else(|| {
@@ -202,7 +247,532 @@ impl VoxtralTtsModel {
                     .to_string(),
             )
         })?;
-        pipeline.generate(text, voice, params, self)
+        pipeline.generate(text, voice, params, self, cache)
+    }
+
+    pub(crate) fn prepare_retained_artifact(
+        &self,
+        text: &str,
+        voice: &str,
+    ) -> Result<Arc<VoxtralTtsPreparedArtifact>> {
+        if text.trim().is_empty() {
+            return Err(Error::InvalidInput(
+                "Voxtral TTS text input cannot be empty".into(),
+            ));
+        }
+        self.voices.resolve(voice)?;
+        let pipeline = self.pipeline.as_ref().ok_or_else(|| {
+            Error::InferenceError("Voxtral TTS retained preparation requires loaded weights".into())
+        })?;
+        let voice_embedding = self.voice_embeddings.load(voice)?;
+        let prompt = pipeline
+            .tokenizer
+            .build_speech_prompt(text, voice_embedding.dim(1)?)?;
+        let prompt_embeddings = pipeline.prompt_embeddings(
+            &prompt.input_ids,
+            &voice_embedding,
+            prompt.voice_token_range.as_ref(),
+        )?;
+        let retained_resident_bytes = u64::try_from(prompt_embeddings.elem_count())
+            .ok()
+            .and_then(|elements| {
+                elements.checked_mul(u64::try_from(prompt_embeddings.dtype().size_in_bytes()).ok()?)
+            })
+            .ok_or_else(|| Error::InvalidInput("Voxtral TTS prompt bytes overflowed".into()))?;
+        Ok(Arc::new(VoxtralTtsPreparedArtifact {
+            prompt_embeddings,
+            prompt_tokens: prompt.input_ids.len(),
+            source_text: Arc::from(text.trim()),
+            voice: Arc::from(voice),
+            retained_resident_bytes,
+        }))
+    }
+
+    pub(crate) fn new_retained_state(
+        &self,
+        artifact: Arc<VoxtralTtsPreparedArtifact>,
+        params: VoxtralTtsGenerationParams,
+    ) -> Result<VoxtralTtsRetainedState> {
+        let context = self
+            .pipeline
+            .as_ref()
+            .and_then(|pipeline| pipeline.language_model.model_context_limit())
+            .ok_or_else(|| Error::ModelLoadError("Voxtral TTS has no context limit".into()))?;
+        VoxtralTtsRetainedState::new(artifact, params, context)
+    }
+
+    pub(crate) fn retained_stage_ceiling(&self) -> Result<VoxtralTtsStageCeiling> {
+        let max_prompt_tokens = self
+            .pipeline
+            .as_ref()
+            .and_then(|pipeline| pipeline.language_model.model_context_limit())
+            .ok_or_else(|| Error::ModelLoadError("Voxtral TTS has no context limit".into()))?;
+        Ok(VoxtralTtsStageCeiling {
+            max_prompt_tokens,
+            max_frames: ModelVariant::VOXTRAL_TTS_MAX_OUTPUT_FRAMES,
+            hidden_size: self.config.text_dim,
+            num_codebooks: self.config.num_codebooks(),
+        })
+    }
+
+    pub(crate) fn retained_prefill_resource_envelope(
+        &self,
+        backend: BackendKind,
+        start: usize,
+        tokens: usize,
+        prompt_tokens: usize,
+    ) -> Result<VoxtralTtsStageResourceEnvelope> {
+        let ceiling = self.retained_stage_ceiling()?;
+        let end = start
+            .checked_add(tokens)
+            .ok_or_else(|| Error::InvalidInput("Voxtral TTS prefill span overflowed".into()))?;
+        if tokens == 0 || end > prompt_tokens || prompt_tokens > ceiling.max_prompt_tokens {
+            return Err(Error::InvalidInput(
+                "Voxtral TTS prefill span exceeds its stage ceiling".into(),
+            ));
+        }
+        let elements = u64::try_from(tokens)
+            .ok()
+            .and_then(|tokens| tokens.checked_mul(u64::try_from(ceiling.hidden_size).ok()?))
+            .ok_or_else(|| {
+                Error::InvalidInput("Voxtral TTS prefill workspace overflowed".into())
+            })?;
+        let workspace = elements.checked_mul(4).ok_or_else(|| {
+            Error::InvalidInput("Voxtral TTS prefill workspace bytes overflowed".into())
+        })?;
+        voxtral_tts_stage_resource_envelope(backend, tokens, elements, workspace)
+    }
+
+    pub(crate) fn retained_decode_resource_envelope(
+        &self,
+        backend: BackendKind,
+        batch_width: usize,
+        decoding_steps: usize,
+    ) -> Result<VoxtralTtsStageResourceEnvelope> {
+        let ceiling = self.retained_stage_ceiling()?;
+        if batch_width == 0 || decoding_steps == 0 {
+            return Err(Error::InvalidInput(
+                "Voxtral TTS decode resource shape cannot be empty".into(),
+            ));
+        }
+        let work_units = batch_width
+            .checked_mul(decoding_steps.saturating_add(1))
+            .ok_or_else(|| Error::InvalidInput("Voxtral TTS decode work overflowed".into()))?;
+        let row_elements = ceiling
+            .hidden_size
+            .checked_add(ceiling.num_codebooks)
+            .ok_or_else(|| Error::InvalidInput("Voxtral TTS decode shape overflowed".into()))?;
+        let elements = u64::try_from(batch_width)
+            .ok()
+            .and_then(|width| width.checked_mul(u64::try_from(row_elements).ok()?))
+            .ok_or_else(|| Error::InvalidInput("Voxtral TTS decode workspace overflowed".into()))?;
+        let workspace = elements.checked_mul(4).ok_or_else(|| {
+            Error::InvalidInput("Voxtral TTS decode workspace bytes overflowed".into())
+        })?;
+        voxtral_tts_stage_resource_envelope(backend, work_units, elements, workspace)
+    }
+
+    pub(crate) fn retained_codec_resource_envelope(
+        &self,
+        backend: BackendKind,
+        frames: usize,
+    ) -> Result<VoxtralTtsStageResourceEnvelope> {
+        let ceiling = self.retained_stage_ceiling()?;
+        if frames == 0 || frames > ceiling.max_frames {
+            return Err(Error::InvalidInput(
+                "Voxtral TTS codec frames exceed its stage ceiling".into(),
+            ));
+        }
+        let elements = u64::try_from(frames)
+            .ok()
+            .and_then(|frames| frames.checked_mul(u64::try_from(ceiling.num_codebooks).ok()?))
+            .ok_or_else(|| Error::InvalidInput("Voxtral TTS codec workspace overflowed".into()))?;
+        let workspace = elements.checked_mul(4).ok_or_else(|| {
+            Error::InvalidInput("Voxtral TTS codec workspace bytes overflowed".into())
+        })?;
+        voxtral_tts_stage_resource_envelope(backend, frames, elements, workspace)
+    }
+
+    pub(crate) fn retained_prefill_step(
+        &self,
+        state: &mut VoxtralTtsRetainedState,
+        cache: &mut PhysicalPagedKvCache,
+        _checkpoint: &VoxtralTtsQuantumCheckpoint,
+        max_tokens: usize,
+    ) -> Result<VoxtralTtsPrefillStep> {
+        let pipeline = self.pipeline.as_ref().ok_or_else(|| {
+            Error::InferenceError("Voxtral TTS retained prefill requires loaded weights".into())
+        })?;
+        if state.phase != VoxtralTtsRetainedPhase::Prefill || max_tokens == 0 {
+            return Err(Error::InvalidInput(
+                "Voxtral TTS retained prefill quantum is invalid".into(),
+            ));
+        }
+        let consumed = max_tokens.min(state.artifact.prompt_tokens - state.prefill_cursor);
+        let input = state
+            .artifact
+            .prompt_embeddings
+            .narrow(1, state.prefill_cursor, consumed)?;
+        let hidden = pipeline.language_model.forward_managed_hidden_with_embeds(
+            &input,
+            state.lm_position,
+            cache,
+            None,
+            None,
+        )?;
+        state.prefill_cursor += consumed;
+        state.lm_position += consumed;
+        if state.prefill_cursor == state.artifact.prompt_tokens {
+            state.last_hidden = Some(last_sequence_hidden(
+                &hidden,
+                "Voxtral TTS retained prefill",
+            )?);
+            state.phase = VoxtralTtsRetainedPhase::Decode;
+        }
+        Ok(VoxtralTtsPrefillStep {
+            consumed_tokens: consumed,
+            prefill_cursor: state.prefill_cursor,
+            prompt_tokens: state.artifact.prompt_tokens,
+            complete: state.phase == VoxtralTtsRetainedPhase::Decode,
+        })
+    }
+
+    /// Advance a ragged retained prompt cohort in one-token wavefronts. Each
+    /// wave with more than one active row is one physical paged LM launch.
+    pub(crate) fn retained_prefill_batch(
+        &self,
+        states: &mut [&mut VoxtralTtsRetainedState],
+        caches: &mut [&mut PhysicalPagedKvCache],
+        checkpoints: &[&VoxtralTtsQuantumCheckpoint],
+        max_tokens: &[usize],
+    ) -> Result<VoxtralTtsPrefillBatch> {
+        if states.is_empty()
+            || states.len() != caches.len()
+            || states.len() != checkpoints.len()
+            || max_tokens.len() != states.len()
+            || max_tokens.contains(&0)
+        {
+            return Err(Error::InvalidInput(
+                "Voxtral TTS retained prefill batch widths are invalid".into(),
+            ));
+        }
+        if states
+            .iter()
+            .any(|state| state.phase != VoxtralTtsRetainedPhase::Prefill)
+        {
+            return Err(Error::InvalidInput(
+                "Voxtral TTS retained prefill cohort contains a non-prefill row".into(),
+            ));
+        }
+        let pipeline = self.pipeline.as_ref().ok_or_else(|| {
+            Error::InferenceError("Voxtral TTS retained prefill requires loaded weights".into())
+        })?;
+        let mut consumed = vec![0usize; states.len()];
+        let mut lm_launch_widths = Vec::new();
+        let mut max_lm_launch_width = 0usize;
+        let mut scalar_lm_launches = 0usize;
+        loop {
+            let active = states
+                .iter()
+                .enumerate()
+                .filter_map(|(row, state)| {
+                    (consumed[row] < max_tokens[row]
+                        && state.prefill_cursor < state.artifact.prompt_tokens)
+                        .then_some(row)
+                })
+                .collect::<Vec<_>>();
+            if active.is_empty() {
+                break;
+            }
+            let embeddings = active
+                .iter()
+                .map(|&row| {
+                    states[row]
+                        .artifact
+                        .prompt_embeddings
+                        .narrow(1, states[row].prefill_cursor, 1)
+                })
+                .collect::<candle_core::Result<Vec<_>>>()?;
+            let embeds = Tensor::cat(&embeddings.iter().collect::<Vec<_>>(), 0)?;
+            let positions = active
+                .iter()
+                .map(|&row| states[row].lm_position)
+                .collect::<Vec<_>>();
+            let mut cache_refs = caches
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(row, cache)| active.contains(&row).then_some(&mut **cache))
+                .collect::<Vec<_>>();
+            let hidden = pipeline
+                .language_model
+                .forward_managed_decode_batch_hidden_with_embeds(
+                    &embeds,
+                    &positions,
+                    &mut cache_refs,
+                    None,
+                )?;
+            max_lm_launch_width = max_lm_launch_width.max(active.len());
+            scalar_lm_launches += usize::from(active.len() == 1);
+            lm_launch_widths.push(active.len());
+            for (wave_row, &state_row) in active.iter().enumerate() {
+                let state = &mut states[state_row];
+                state.prefill_cursor += 1;
+                state.lm_position += 1;
+                consumed[state_row] += 1;
+                state.last_hidden = Some(last_sequence_hidden(
+                    &hidden.narrow(0, wave_row, 1)?,
+                    "Voxtral TTS retained batched prefill",
+                )?);
+                if state.prefill_cursor == state.artifact.prompt_tokens {
+                    state.phase = VoxtralTtsRetainedPhase::Decode;
+                }
+            }
+        }
+        let steps = states
+            .iter()
+            .enumerate()
+            .map(|(row, state)| VoxtralTtsPrefillStep {
+                consumed_tokens: consumed[row],
+                prefill_cursor: state.prefill_cursor,
+                prompt_tokens: state.artifact.prompt_tokens,
+                complete: state.phase == VoxtralTtsRetainedPhase::Decode,
+            })
+            .collect();
+        Ok(VoxtralTtsPrefillBatch {
+            steps,
+            lm_launch_widths,
+            max_lm_launch_width,
+            scalar_lm_launches,
+        })
+    }
+
+    pub(crate) fn retained_decode_step(
+        &self,
+        state: &mut VoxtralTtsRetainedState,
+        cache: &mut PhysicalPagedKvCache,
+        _checkpoint: &VoxtralTtsQuantumCheckpoint,
+    ) -> Result<VoxtralTtsDecodeStep> {
+        let pipeline = self.pipeline.as_ref().ok_or_else(|| {
+            Error::InferenceError("Voxtral TTS retained decode requires loaded weights".into())
+        })?;
+        if state.phase != VoxtralTtsRetainedPhase::Decode {
+            return Err(Error::InvalidInput(
+                "Voxtral TTS retained decode is not active".into(),
+            ));
+        }
+        let hidden = state.last_hidden.as_ref().ok_or_else(|| {
+            Error::InferenceError("Voxtral TTS retained decode has no hidden state".into())
+        })?;
+        let generated = pipeline
+            .acoustic_transformer
+            .forward_audio_codes_with_feedback_tensor(
+                hidden,
+                state.params.cfg_alpha,
+                state.params.n_decoding_steps,
+                !state.frames.is_empty(),
+            )?;
+        let feedback_tensor = generated.shifted_code_tensor;
+        let frame = generated.frames.into_iter().next().ok_or_else(|| {
+            Error::InferenceError("Voxtral TTS acoustic decode returned no frame".into())
+        })?;
+        if frame.first().copied() == Some(AudioSpecialToken::End.id()) {
+            state.phase = VoxtralTtsRetainedPhase::Codec;
+            return Ok(VoxtralTtsDecodeStep {
+                frame: None,
+                frames_generated: state.frames.len(),
+                finished: true,
+            });
+        }
+        state.frames.push(frame.clone());
+        if state.frames.len() >= state.params.max_frames {
+            state.phase = VoxtralTtsRetainedPhase::Codec;
+            return Ok(VoxtralTtsDecodeStep {
+                frame: Some(frame),
+                frames_generated: state.frames.len(),
+                finished: true,
+            });
+        }
+        let next_embed = match feedback_tensor.as_ref() {
+            Some(codes) => pipeline
+                .audio_embeddings
+                .embedding_for_shifted_code_tensor(codes)?,
+            None => pipeline
+                .audio_embeddings
+                .embedding_for_shifted_codes(&frame)?,
+        };
+        let hidden = pipeline.language_model.forward_managed_hidden_with_embeds(
+            &next_embed,
+            state.lm_position,
+            cache,
+            None,
+            None,
+        )?;
+        state.lm_position += 1;
+        state.last_hidden = Some(last_sequence_hidden(
+            &hidden,
+            "Voxtral TTS retained decode",
+        )?);
+        Ok(VoxtralTtsDecodeStep {
+            frame: Some(frame),
+            frames_generated: state.frames.len(),
+            finished: false,
+        })
+    }
+
+    /// Decode one acoustic frame for a compatible retained cohort.
+    ///
+    /// Both the acoustic transformer and non-terminal LM feedback cohort are
+    /// genuinely invoked at `B > 1`; width-one cohorts retain the scalar path.
+    pub(crate) fn retained_decode_batch(
+        &self,
+        states: &mut [&mut VoxtralTtsRetainedState],
+        caches: &mut [&mut PhysicalPagedKvCache],
+        _checkpoints: &[&VoxtralTtsQuantumCheckpoint],
+    ) -> Result<VoxtralTtsDecodeBatch> {
+        if states.len() != caches.len() || states.len() != _checkpoints.len() {
+            return Err(Error::InvalidInput(
+                "Voxtral TTS retained decode batch widths do not match".into(),
+            ));
+        }
+        validate_acoustic_cohort(states)?;
+        if states.len() == 1 {
+            let step = self.retained_decode_step(states[0], caches[0], _checkpoints[0])?;
+            let scalar_lm_rows = usize::from(!step.finished);
+            return Ok(VoxtralTtsDecodeBatch {
+                steps: vec![step],
+                acoustic_launch_width: 1,
+                lm_launch_width: scalar_lm_rows,
+                scalar_lm_launches: scalar_lm_rows,
+            });
+        }
+        let pipeline = self.pipeline.as_ref().ok_or_else(|| {
+            Error::InferenceError("Voxtral TTS retained decode requires loaded weights".into())
+        })?;
+        let hidden_rows = states
+            .iter()
+            .map(|state| {
+                state.last_hidden.as_ref().ok_or_else(|| {
+                    Error::InferenceError("Voxtral TTS retained decode has no hidden state".into())
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let hidden = Tensor::cat(&hidden_rows, 0)?;
+        let first = &states[0];
+        let generated = pipeline
+            .acoustic_transformer
+            .forward_audio_codes_with_feedback_tensor(
+                &hidden,
+                first.params.cfg_alpha,
+                first.params.n_decoding_steps,
+                !first.frames.is_empty(),
+            )?;
+        if generated.frames.len() != states.len() {
+            return Err(Error::InferenceError(format!(
+                "Voxtral TTS acoustic batch returned {} rows for width {}",
+                generated.frames.len(),
+                states.len()
+            )));
+        }
+
+        let mut steps = Vec::with_capacity(states.len());
+        let mut feedback_rows = Vec::new();
+        let mut feedback_embeddings = Vec::new();
+        for (row, state) in states.iter_mut().enumerate() {
+            let frame = generated.frames[row].clone();
+            if frame.first().copied() == Some(AudioSpecialToken::End.id()) {
+                state.phase = VoxtralTtsRetainedPhase::Codec;
+                steps.push(VoxtralTtsDecodeStep {
+                    frame: None,
+                    frames_generated: state.frames.len(),
+                    finished: true,
+                });
+                continue;
+            }
+            state.frames.push(frame.clone());
+            if state.frames.len() >= state.params.max_frames {
+                state.phase = VoxtralTtsRetainedPhase::Codec;
+                steps.push(VoxtralTtsDecodeStep {
+                    frame: Some(frame),
+                    frames_generated: state.frames.len(),
+                    finished: true,
+                });
+                continue;
+            }
+            let next_embed = match generated.shifted_code_tensor.as_ref() {
+                Some(codes) => pipeline
+                    .audio_embeddings
+                    .embedding_for_shifted_code_tensor(&codes.narrow(0, row, 1)?)?,
+                None => pipeline
+                    .audio_embeddings
+                    .embedding_for_shifted_codes(&frame)?,
+            };
+            feedback_rows.push(row);
+            feedback_embeddings.push(next_embed);
+            steps.push(VoxtralTtsDecodeStep {
+                frame: Some(frame),
+                frames_generated: state.frames.len(),
+                finished: false,
+            });
+        }
+        let lm_launch_width = feedback_rows.len();
+        let scalar_lm_launches = usize::from(lm_launch_width == 1);
+        if !feedback_rows.is_empty() {
+            let embeds = Tensor::cat(&feedback_embeddings.iter().collect::<Vec<_>>(), 0)?;
+            let positions = feedback_rows
+                .iter()
+                .map(|&row| states[row].lm_position)
+                .collect::<Vec<_>>();
+            let mut cache_refs = caches
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(row, cache)| feedback_rows.contains(&row).then_some(&mut **cache))
+                .collect::<Vec<_>>();
+            let hidden = pipeline
+                .language_model
+                .forward_managed_decode_batch_hidden_with_embeds(
+                    &embeds,
+                    &positions,
+                    &mut cache_refs,
+                    None,
+                )?;
+            for (batch_row, &state_row) in feedback_rows.iter().enumerate() {
+                let state = &mut states[state_row];
+                state.lm_position += 1;
+                state.last_hidden = Some(last_sequence_hidden(
+                    &hidden.narrow(0, batch_row, 1)?,
+                    "Voxtral TTS retained batched decode",
+                )?);
+            }
+        }
+        Ok(VoxtralTtsDecodeBatch {
+            steps,
+            acoustic_launch_width: states.len(),
+            lm_launch_width,
+            scalar_lm_launches,
+        })
+    }
+
+    pub(crate) fn retained_codec_finalize(
+        &self,
+        state: &mut VoxtralTtsRetainedState,
+    ) -> Result<VoxtralTtsOutput> {
+        let pipeline = self.pipeline.as_ref().ok_or_else(|| {
+            Error::InferenceError("Voxtral TTS retained codec requires loaded weights".into())
+        })?;
+        if state.phase != VoxtralTtsRetainedPhase::Codec || state.frames.is_empty() {
+            return Err(Error::InvalidInput(
+                "Voxtral TTS retained codec is not ready".into(),
+            ));
+        }
+        let frames_generated = state.frames.len();
+        let timeline = VoxtralCodecTimeline::new(frames_to_codebooks(state.frames.clone())?)?;
+        let samples = pipeline.codec_decoder.decode_timeline(&timeline)?;
+        state.phase = VoxtralTtsRetainedPhase::Finished;
+        Ok(VoxtralTtsOutput {
+            samples,
+            sample_rate: self.codec_config.sample_rate,
+            frames_generated,
+        })
     }
 }
 
@@ -213,6 +783,7 @@ impl VoxtralTtsPipeline {
         voice: &str,
         params: VoxtralTtsGenerationParams,
         model: &VoxtralTtsModel,
+        cache: &mut PhysicalPagedKvCache,
     ) -> Result<VoxtralTtsOutput> {
         if text.trim().is_empty() {
             return Err(Error::InvalidInput(
@@ -235,21 +806,30 @@ impl VoxtralTtsPipeline {
             })?;
         let prompt_duration = prompt_start.elapsed();
         let max_frames = params.max_frames.max(1);
-        let dense_decode_tokens = prompt.input_ids.len().saturating_add(max_frames);
-        let mut cache = build_voxtral_tts_decode_cache(
-            self.language_model.num_layers(),
-            self.device_kind,
-            dense_decode_tokens,
-        );
+        let required_cache_tokens = prompt
+            .input_ids
+            .len()
+            .checked_add(max_frames.saturating_sub(1))
+            .ok_or_else(|| Error::InvalidInput("Voxtral TTS cache length overflow".into()))?;
+        if cache.context_len() != 0 {
+            return Err(Error::InvalidInput(
+                "Voxtral TTS invocation cache must start empty".into(),
+            ));
+        }
+        if required_cache_tokens > cache.capacity_tokens() {
+            return Err(Error::InvalidInput(format!(
+                "Voxtral TTS needs {required_cache_tokens} cache tokens, but its invocation lease has capacity {}",
+                cache.capacity_tokens()
+            )));
+        }
         let lm_prefill_start = Instant::now();
         let prefill_hidden = self
             .language_model
-            .forward_hidden_with_embeds(&prompt_embeds, 0, Some(&mut cache), None, None)
+            .forward_managed_hidden_with_embeds(&prompt_embeds, 0, cache, None, None)
             .map_err(|err| {
                 Error::InferenceError(format!("Voxtral TTS LM prefill failed: {err}"))
             })?;
         let lm_prefill_duration = lm_prefill_start.elapsed();
-        let mut pos = prompt.input_ids.len();
         let mut last_hidden = last_sequence_hidden(&prefill_hidden, "Voxtral TTS LM prefill")?;
         let mut frames = Vec::new();
         let mut acoustic_duration = Duration::ZERO;
@@ -257,7 +837,7 @@ impl VoxtralTtsPipeline {
         let mut tensor_feedback_frames = 0usize;
         let mut host_feedback_frames = 0usize;
 
-        for frame_idx in 0..max_frames {
+        for (pos, frame_idx) in (prompt.input_ids.len()..).zip(0..max_frames) {
             let acoustic_start = Instant::now();
             let generated = self
                 .acoustic_transformer
@@ -310,12 +890,11 @@ impl VoxtralTtsPipeline {
             let lm_decode_start = Instant::now();
             let hidden = self
                 .language_model
-                .forward_hidden_with_embeds(&next_embed, pos, Some(&mut cache), None, None)
+                .forward_managed_hidden_with_embeds(&next_embed, pos, cache, None, None)
                 .map_err(|err| {
                     Error::InferenceError(format!("Voxtral TTS LM decode failed: {err}"))
                 })?;
             lm_decode_duration += lm_decode_start.elapsed();
-            pos += 1;
             last_hidden = last_sequence_hidden(&hidden, "Voxtral TTS LM decode")?;
         }
 
@@ -347,7 +926,7 @@ impl VoxtralTtsPipeline {
             "Voxtral TTS timings: frames={}, samples={}, dense_decode_tokens={}, tensor_feedback_frames={}, host_feedback_frames={}, prompt={:.2}ms, lm_prefill={:.2}ms, acoustic={:.2}ms, lm_decode={:.2}ms, codec={:.2}ms, total={:.2}ms",
             frames_generated,
             samples.len(),
-            cache.dense_decode_max_tokens(),
+            0,
             tensor_feedback_frames,
             host_feedback_frames,
             duration_ms(prompt_duration),
@@ -565,7 +1144,10 @@ fn voxtral_audio_embedding_codebook_sizes(config: &VoxtralTtsConfig) -> Result<V
         .ok_or_else(|| {
             Error::ConfigError("Voxtral acoustic codebook size overflowed".to_string())
         })? as u32;
-    sizes.extend(std::iter::repeat(acoustic_size).take(config.n_acoustic_codebooks()));
+    sizes.extend(std::iter::repeat_n(
+        acoustic_size,
+        config.n_acoustic_codebooks(),
+    ));
     Ok(sizes)
 }
 
@@ -591,27 +1173,6 @@ fn load_voxtral_tts_weights<'a>(
         VarBuilder::from_mmaped_safetensors(&[weights_path], dtype, &device.device).map_err(|err| {
             Error::ModelLoadError(format!("Failed to load Voxtral TTS weights: {err}"))
         })
-    }
-}
-
-fn build_voxtral_tts_decode_cache(
-    num_layers: usize,
-    device_kind: DeviceKind,
-    max_decode_tokens: usize,
-) -> Qwen3Cache {
-    Qwen3Cache::with_page_size_quantization_and_dense_decode_tokens(
-        num_layers,
-        DEFAULT_KV_PAGE_SIZE,
-        KvCacheQuantization::None,
-        voxtral_tts_dense_decode_max_tokens(device_kind, max_decode_tokens),
-    )
-}
-
-fn voxtral_tts_dense_decode_max_tokens(device_kind: DeviceKind, max_decode_tokens: usize) -> usize {
-    if device_kind.is_cuda() {
-        max_decode_tokens.max(1)
-    } else {
-        0
     }
 }
 
@@ -713,28 +1274,6 @@ mod tests {
         assert_eq!(cuda_plan.language_model, DType::BF16);
         assert_eq!(cuda_plan.acoustic_transformer, DType::BF16);
         assert_eq!(cuda_plan.codec, DType::BF16);
-    }
-
-    #[test]
-    fn tts_dense_decode_cache_is_cuda_only() {
-        assert_eq!(voxtral_tts_dense_decode_max_tokens(DeviceKind::Cpu, 128), 0);
-        assert_eq!(
-            voxtral_tts_dense_decode_max_tokens(DeviceKind::Metal, 128),
-            0
-        );
-        assert_eq!(
-            voxtral_tts_dense_decode_max_tokens(DeviceKind::Cuda, 128),
-            128
-        );
-
-        let cpu_cache = build_voxtral_tts_decode_cache(2, DeviceKind::Cpu, 128);
-        assert_eq!(cpu_cache.dense_decode_max_tokens(), 0);
-
-        let metal_cache = build_voxtral_tts_decode_cache(2, DeviceKind::Metal, 128);
-        assert_eq!(metal_cache.dense_decode_max_tokens(), 0);
-
-        let cuda_cache = build_voxtral_tts_decode_cache(2, DeviceKind::Cuda, 128);
-        assert_eq!(cuda_cache.dense_decode_max_tokens(), 128);
     }
 
     #[test]

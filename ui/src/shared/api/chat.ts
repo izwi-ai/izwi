@@ -3,6 +3,7 @@ import {
   consumeDataStream,
   isAbortError,
 } from "@/shared/api/http";
+import type { ChatReasoningEffort } from "@/shared/api/models";
 
 const DEFAULT_CHAT_MODEL = "Qwen3-8B-GGUF";
 const CHAT_STREAM_TRUNCATED_ERROR =
@@ -118,6 +119,16 @@ export interface ChatThreadSendMessageRequest {
   max_tokens?: number;
   system_prompt?: string;
   enable_thinking?: boolean;
+  reasoning_effort?: ChatReasoningEffort;
+  preserve_thinking?: boolean;
+  chat_template_kwargs?: {
+    enable_thinking?: boolean;
+    reasoning_effort?: ChatReasoningEffort;
+    preserve_thinking?: boolean;
+  };
+  top_k?: number;
+  repetition_penalty?: number;
+  presence_penalty?: number;
 }
 
 export interface ChatThreadSendMessageResponse {
@@ -413,6 +424,12 @@ export class ChatApiClient {
           stream: false,
           system_prompt: request.system_prompt,
           enable_thinking: request.enable_thinking,
+          reasoning_effort: request.reasoning_effort,
+          preserve_thinking: request.preserve_thinking,
+          chat_template_kwargs: request.chat_template_kwargs,
+          top_k: request.top_k,
+          repetition_penalty: request.repetition_penalty,
+          presence_penalty: request.presence_penalty,
         }),
       },
     );
@@ -445,6 +462,12 @@ export class ChatApiClient {
               stream: true,
               system_prompt: request.system_prompt,
               enable_thinking: request.enable_thinking,
+              reasoning_effort: request.reasoning_effort,
+              preserve_thinking: request.preserve_thinking,
+              chat_template_kwargs: request.chat_template_kwargs,
+              top_k: request.top_k,
+              repetition_penalty: request.repetition_penalty,
+              presence_penalty: request.presence_penalty,
             }),
             signal: abortController.signal,
           },

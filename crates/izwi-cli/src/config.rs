@@ -1,6 +1,9 @@
 use anyhow::{anyhow, Result};
 use izwi_core::backends::BackendPreference;
-use izwi_core::{ServeRuntimeConfig, ServeRuntimeConfigOverrides};
+use izwi_core::{
+    BatchSizePreference, ContextLengthPreference, PhysicalExecutionMode, PhysicalInFlightLimit,
+    ServeRuntimeConfig, ServeRuntimeConfigOverrides,
+};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -56,7 +59,33 @@ pub struct RuntimeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<BackendPreference>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_batch_size: Option<usize>,
+    pub max_batch_size: Option<BatchSizePreference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_execution_mode: Option<PhysicalExecutionMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_physical_in_flight: Option<PhysicalInFlightLimit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_scheduler_batch_size: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_loaded_models: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_prefix_caching: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_prefix_cache_salt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_prefix_cache_pages: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_chunked_prefill: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunked_prefill_threshold: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retained_sequences: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_staged_transactions: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_queued_requests: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_sequence_length: Option<ContextLengthPreference>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threads: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -69,6 +98,19 @@ impl RuntimeConfig {
     fn is_empty(&self) -> bool {
         self.backend.is_none()
             && self.max_batch_size.is_none()
+            && self.physical_execution_mode.is_none()
+            && self.max_physical_in_flight.is_none()
+            && self.max_scheduler_batch_size.is_none()
+            && self.max_loaded_models.is_none()
+            && self.enable_prefix_caching.is_none()
+            && self.managed_prefix_cache_salt.is_none()
+            && self.max_prefix_cache_pages.is_none()
+            && self.enable_chunked_prefill.is_none()
+            && self.chunked_prefill_threshold.is_none()
+            && self.max_retained_sequences.is_none()
+            && self.max_staged_transactions.is_none()
+            && self.max_queued_requests.is_none()
+            && self.max_sequence_length.is_none()
             && self.threads.is_none()
             && self.max_concurrent.is_none()
             && self.timeout.is_none()
@@ -145,6 +187,19 @@ impl Config {
             runtime: RuntimeConfig {
                 backend: Some(defaults.backend),
                 max_batch_size: Some(defaults.max_batch_size),
+                physical_execution_mode: Some(defaults.physical_execution_mode),
+                max_physical_in_flight: Some(defaults.max_physical_in_flight),
+                max_scheduler_batch_size: Some(defaults.max_scheduler_batch_size),
+                max_loaded_models: Some(defaults.max_loaded_models),
+                enable_prefix_caching: Some(defaults.enable_prefix_caching),
+                managed_prefix_cache_salt: defaults.managed_prefix_cache_salt.clone(),
+                max_prefix_cache_pages: Some(defaults.max_prefix_cache_pages),
+                enable_chunked_prefill: Some(defaults.enable_chunked_prefill),
+                chunked_prefill_threshold: Some(defaults.chunked_prefill_threshold),
+                max_retained_sequences: Some(defaults.max_retained_sequences),
+                max_staged_transactions: Some(defaults.max_staged_transactions),
+                max_queued_requests: Some(defaults.max_queued_requests),
+                max_sequence_length: Some(defaults.max_sequence_length),
                 threads: Some(defaults.num_threads),
                 max_concurrent: Some(defaults.max_concurrent_requests),
                 timeout: Some(defaults.request_timeout_secs),
@@ -171,6 +226,19 @@ impl Config {
             models_dir: self.models.dir.clone(),
             backend: self.runtime.backend,
             max_batch_size: self.runtime.max_batch_size,
+            physical_execution_mode: self.runtime.physical_execution_mode,
+            max_physical_in_flight: self.runtime.max_physical_in_flight,
+            max_scheduler_batch_size: self.runtime.max_scheduler_batch_size,
+            max_loaded_models: self.runtime.max_loaded_models,
+            enable_prefix_caching: self.runtime.enable_prefix_caching,
+            managed_prefix_cache_salt: self.runtime.managed_prefix_cache_salt.clone(),
+            max_prefix_cache_pages: self.runtime.max_prefix_cache_pages,
+            enable_chunked_prefill: self.runtime.enable_chunked_prefill,
+            chunked_prefill_threshold: self.runtime.chunked_prefill_threshold,
+            max_retained_sequences: self.runtime.max_retained_sequences,
+            max_staged_transactions: self.runtime.max_staged_transactions,
+            max_queued_requests: self.runtime.max_queued_requests,
+            max_sequence_length: self.runtime.max_sequence_length,
             num_threads: self.runtime.threads,
             max_concurrent_requests: self.runtime.max_concurrent,
             request_timeout_secs: self.runtime.timeout,
@@ -189,7 +257,64 @@ impl Config {
             "server.cors_origins" => self.server.cors_origins = Some(parse_string_list(value)?),
             "models.dir" => self.models.dir = Some(parse_path(value)?),
             "runtime.backend" => self.runtime.backend = Some(parse_backend(value)?),
-            "runtime.max_batch_size" => self.runtime.max_batch_size = Some(parse_usize(value)?),
+            "runtime.max_batch_size" => {
+                self.runtime.max_batch_size = Some(
+                    value
+                        .parse::<BatchSizePreference>()
+                        .map_err(|error| anyhow!(error.to_string()))?,
+                )
+            }
+            "runtime.physical_execution_mode" => {
+                self.runtime.physical_execution_mode = Some(
+                    value
+                        .parse::<PhysicalExecutionMode>()
+                        .map_err(|error| anyhow!(error.to_string()))?,
+                )
+            }
+            "runtime.max_physical_in_flight" => {
+                self.runtime.max_physical_in_flight = Some(
+                    value
+                        .parse::<PhysicalInFlightLimit>()
+                        .map_err(|error| anyhow!(error.to_string()))?,
+                )
+            }
+            "runtime.max_scheduler_batch_size" => {
+                self.runtime.max_scheduler_batch_size = Some(parse_usize(value)?)
+            }
+            "runtime.max_loaded_models" => {
+                self.runtime.max_loaded_models = Some(parse_usize(value)?)
+            }
+            "runtime.enable_prefix_caching" => {
+                self.runtime.enable_prefix_caching = Some(parse_bool(value)?)
+            }
+            "runtime.managed_prefix_cache_salt" => {
+                self.runtime.managed_prefix_cache_salt = Some(parse_string(value)?)
+            }
+            "runtime.max_prefix_cache_pages" => {
+                self.runtime.max_prefix_cache_pages = Some(parse_usize(value)?)
+            }
+            "runtime.enable_chunked_prefill" => {
+                self.runtime.enable_chunked_prefill = Some(parse_bool(value)?)
+            }
+            "runtime.chunked_prefill_threshold" => {
+                self.runtime.chunked_prefill_threshold = Some(parse_usize(value)?)
+            }
+            "runtime.max_retained_sequences" => {
+                self.runtime.max_retained_sequences = Some(parse_usize(value)?)
+            }
+            "runtime.max_staged_transactions" => {
+                self.runtime.max_staged_transactions = Some(parse_usize(value)?)
+            }
+            "runtime.max_queued_requests" => {
+                self.runtime.max_queued_requests = Some(parse_usize(value)?)
+            }
+            "runtime.max_sequence_length" => {
+                self.runtime.max_sequence_length = Some(
+                    value
+                        .parse::<ContextLengthPreference>()
+                        .map_err(|error| anyhow!(error.to_string()))?,
+                )
+            }
             "runtime.threads" => self.runtime.threads = Some(parse_usize(value)?),
             "runtime.max_concurrent" => self.runtime.max_concurrent = Some(parse_usize(value)?),
             "runtime.timeout" => self.runtime.timeout = Some(parse_u64(value)?),
@@ -212,7 +337,11 @@ impl Config {
                 .port
                 .map(|value| toml::Value::Integer(value.into())),
             "server.cors" => self.server.cors.map(toml::Value::Boolean),
-            "server.cors_origins" => self.server.cors_origins.as_ref().map(string_array_value),
+            "server.cors_origins" => self
+                .server
+                .cors_origins
+                .as_ref()
+                .map(|values| string_array_value(values)),
             "models.dir" => self
                 .models
                 .dir
@@ -222,10 +351,66 @@ impl Config {
                 .runtime
                 .backend
                 .map(|value| toml::Value::String(value.as_str().to_string())),
-            "runtime.max_batch_size" => self
+            "runtime.max_batch_size" => self.runtime.max_batch_size.map(|value| {
+                value.fixed_rows().map_or_else(
+                    || toml::Value::String("auto".to_string()),
+                    |rows| toml::Value::Integer(rows as i64),
+                )
+            }),
+            "runtime.physical_execution_mode" => self
                 .runtime
-                .max_batch_size
+                .physical_execution_mode
+                .map(|value| toml::Value::String(value.to_string())),
+            "runtime.max_physical_in_flight" => self
+                .runtime
+                .max_physical_in_flight
+                .map(|value| toml::Value::Integer(value.get() as i64)),
+            "runtime.max_scheduler_batch_size" => self
+                .runtime
+                .max_scheduler_batch_size
                 .map(|value| toml::Value::Integer(value as i64)),
+            "runtime.max_loaded_models" => self
+                .runtime
+                .max_loaded_models
+                .map(|value| toml::Value::Integer(value as i64)),
+            "runtime.enable_prefix_caching" => {
+                self.runtime.enable_prefix_caching.map(toml::Value::Boolean)
+            }
+            "runtime.managed_prefix_cache_salt" => self
+                .runtime
+                .managed_prefix_cache_salt
+                .clone()
+                .map(toml::Value::String),
+            "runtime.max_prefix_cache_pages" => self
+                .runtime
+                .max_prefix_cache_pages
+                .map(|value| toml::Value::Integer(value as i64)),
+            "runtime.enable_chunked_prefill" => self
+                .runtime
+                .enable_chunked_prefill
+                .map(toml::Value::Boolean),
+            "runtime.chunked_prefill_threshold" => self
+                .runtime
+                .chunked_prefill_threshold
+                .map(|value| toml::Value::Integer(value as i64)),
+            "runtime.max_retained_sequences" => self
+                .runtime
+                .max_retained_sequences
+                .map(|value| toml::Value::Integer(value as i64)),
+            "runtime.max_staged_transactions" => self
+                .runtime
+                .max_staged_transactions
+                .map(|value| toml::Value::Integer(value as i64)),
+            "runtime.max_queued_requests" => self
+                .runtime
+                .max_queued_requests
+                .map(|value| toml::Value::Integer(value as i64)),
+            "runtime.max_sequence_length" => self.runtime.max_sequence_length.map(|value| {
+                value.explicit_tokens().map_or_else(
+                    || toml::Value::String("auto".to_string()),
+                    |tokens| toml::Value::Integer(tokens as i64),
+                )
+            }),
             "runtime.threads" => self
                 .runtime
                 .threads
@@ -345,7 +530,7 @@ fn parse_string_list(value: &str) -> Result<Vec<String>> {
     }
 }
 
-fn string_array_value(values: &Vec<String>) -> toml::Value {
+fn string_array_value(values: &[String]) -> toml::Value {
     toml::Value::Array(values.iter().cloned().map(toml::Value::String).collect())
 }
 
@@ -368,7 +553,20 @@ mod tests {
             },
             runtime: RuntimeConfig {
                 backend: Some(BackendPreference::Cpu),
-                max_batch_size: Some(12),
+                max_batch_size: Some(BatchSizePreference::fixed(12).unwrap()),
+                physical_execution_mode: Some(PhysicalExecutionMode::Shadow),
+                max_physical_in_flight: Some(PhysicalInFlightLimit::new(4).unwrap()),
+                max_scheduler_batch_size: Some(9),
+                max_loaded_models: Some(1),
+                enable_prefix_caching: Some(true),
+                managed_prefix_cache_salt: Some("tenant-a".to_string()),
+                max_prefix_cache_pages: Some(64),
+                enable_chunked_prefill: Some(true),
+                chunked_prefill_threshold: Some(256),
+                max_retained_sequences: Some(11),
+                max_staged_transactions: Some(3),
+                max_queued_requests: Some(91),
+                max_sequence_length: Some(ContextLengthPreference::Auto),
                 threads: Some(6),
                 max_concurrent: Some(48),
                 timeout: Some(720),
@@ -386,7 +584,33 @@ mod tests {
         assert_eq!(overrides.port, Some(9090));
         assert_eq!(overrides.models_dir, Some(PathBuf::from("/tmp/models")));
         assert_eq!(overrides.backend, Some(BackendPreference::Cpu));
-        assert_eq!(overrides.max_batch_size, Some(12));
+        assert_eq!(
+            overrides
+                .max_batch_size
+                .and_then(BatchSizePreference::fixed_rows),
+            Some(12)
+        );
+        assert_eq!(
+            overrides.physical_execution_mode,
+            Some(PhysicalExecutionMode::Shadow)
+        );
+        assert_eq!(
+            overrides.max_physical_in_flight.map(|limit| limit.get()),
+            Some(4)
+        );
+        assert_eq!(overrides.max_scheduler_batch_size, Some(9));
+        assert_eq!(overrides.max_loaded_models, Some(1));
+        assert_eq!(overrides.enable_prefix_caching, Some(true));
+        assert_eq!(
+            overrides.managed_prefix_cache_salt.as_deref(),
+            Some("tenant-a")
+        );
+        assert_eq!(overrides.max_prefix_cache_pages, Some(64));
+        assert_eq!(overrides.enable_chunked_prefill, Some(true));
+        assert_eq!(overrides.chunked_prefill_threshold, Some(256));
+        assert_eq!(overrides.max_retained_sequences, Some(11));
+        assert_eq!(overrides.max_staged_transactions, Some(3));
+        assert_eq!(overrides.max_queued_requests, Some(91));
         assert_eq!(overrides.num_threads, Some(6));
         assert_eq!(overrides.max_concurrent_requests, Some(48));
         assert_eq!(overrides.request_timeout_secs, Some(720));
@@ -410,6 +634,21 @@ mod tests {
             .set_value("runtime.backend", "cuda")
             .expect("backend should parse");
         config
+            .set_value("runtime.max_batch_size", "auto")
+            .expect("automatic physical batch size should parse");
+        config
+            .set_value("runtime.physical_execution_mode", "concurrent")
+            .expect("physical execution mode should parse");
+        config
+            .set_value("runtime.max_physical_in_flight", "3")
+            .expect("physical execution limit should parse");
+        config
+            .set_value("runtime.max_scheduler_batch_size", "13")
+            .expect("scheduler capacity should parse");
+        config
+            .set_value("runtime.max_loaded_models", "2")
+            .expect("model residency limit should parse");
+        config
             .set_value(
                 "server.cors_origins",
                 "http://localhost:3000,https://example.com",
@@ -421,6 +660,31 @@ mod tests {
 
         assert_eq!(config.server.port, Some(9000));
         assert_eq!(config.runtime.backend, Some(BackendPreference::Cuda));
+        assert_eq!(
+            config.runtime.max_batch_size,
+            Some(BatchSizePreference::Auto)
+        );
+        assert_eq!(
+            config.runtime.physical_execution_mode,
+            Some(PhysicalExecutionMode::Concurrent)
+        );
+        assert_eq!(
+            config
+                .runtime
+                .max_physical_in_flight
+                .map(|limit| limit.get()),
+            Some(3)
+        );
+        assert_eq!(
+            config.get_value("runtime.physical_execution_mode"),
+            Some(toml::Value::String("concurrent".to_string()))
+        );
+        assert_eq!(
+            config.get_value("runtime.max_physical_in_flight"),
+            Some(toml::Value::Integer(3))
+        );
+        assert_eq!(config.runtime.max_scheduler_batch_size, Some(13));
+        assert_eq!(config.runtime.max_loaded_models, Some(2));
         assert_eq!(
             config.server.cors_origins,
             Some(vec![
@@ -442,6 +706,14 @@ mod tests {
 
         assert_eq!(loaded.server.host, config.server.host);
         assert_eq!(loaded.runtime.max_batch_size, config.runtime.max_batch_size);
+        assert_eq!(
+            loaded.runtime.physical_execution_mode,
+            config.runtime.physical_execution_mode
+        );
+        assert_eq!(
+            loaded.runtime.max_physical_in_flight,
+            config.runtime.max_physical_in_flight
+        );
         assert_eq!(loaded.ui.enabled, config.ui.enabled);
     }
 }

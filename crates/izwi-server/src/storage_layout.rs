@@ -1,6 +1,6 @@
 //! Shared storage layout and filesystem helpers for server persistence.
 
-use anyhow::{Context, anyhow};
+use anyhow::{anyhow, Context};
 use std::path::{Component, Path, PathBuf};
 
 const APP_NAME_DIR: &str = "izwi";

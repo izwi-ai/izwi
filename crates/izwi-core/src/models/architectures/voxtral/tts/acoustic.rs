@@ -4,7 +4,8 @@ use candle_core::{DType, IndexOp, Tensor, D};
 use candle_nn::{ops, Linear, Module, RmsNorm, VarBuilder};
 
 use crate::error::{Error, Result};
-use crate::models::architectures::qwen3::core::repeat_kv;
+use crate::models::shared::attention::flash::try_fused_self_attention;
+use crate::models::shared::attention::gqa::compact_gqa_sdpa_bhsd;
 
 use super::super::layers::linear_forward_last_dim;
 use super::config::{
@@ -467,22 +468,16 @@ impl BidirectionalAttention {
             self.n_kv_heads,
             self.head_dim,
         ))?;
-        let k = repeat_kv(&k, self.n_heads, self.n_kv_heads)?;
-        let v = repeat_kv(&v, self.n_heads, self.n_kv_heads)?;
         let q = q.transpose(1, 2)?;
         let k = k.transpose(1, 2)?;
         let v = v.transpose(1, 2)?;
-        let q = q.reshape((batch * self.n_heads, seq_len, self.head_dim))?;
-        let k = k.reshape((batch * self.n_heads, seq_len, self.head_dim))?;
-        let v = v.reshape((batch * self.n_heads, seq_len, self.head_dim))?;
-        let mut attn = q.matmul(&k.transpose(1, 2)?)?;
-        let scale = Tensor::from_vec(vec![(self.head_dim as f32).sqrt()], (1,), attn.device())?
-            .to_dtype(attn.dtype())?;
-        attn = attn.broadcast_div(&scale)?;
-        let attn = ops::softmax(&attn, D::Minus1)?;
-        let out = attn.matmul(&v)?;
-        let out = out
-            .reshape((batch, self.n_heads, seq_len, self.head_dim))?
+        if let Some(out) = try_fused_self_attention(&q, &k, &v, None, self.head_dim, false)? {
+            let out =
+                out.transpose(1, 2)?
+                    .reshape((batch, seq_len, self.n_heads * self.head_dim))?;
+            return linear_forward_last_dim(&self.wo, &out);
+        }
+        let out = compact_gqa_sdpa_bhsd(&q, &k, &v, None, 1.0 / (self.head_dim as f64).sqrt())?
             .transpose(1, 2)?
             .reshape((batch, seq_len, self.n_heads * self.head_dim))?;
         linear_forward_last_dim(&self.wo, &out)

@@ -21,6 +21,10 @@ use crate::runtime::types::{AudioChunk, GenerationRequest, GenerationResult};
 const KOKORO_STREAM_TARGET_CHARS: usize = 180;
 const KOKORO_STREAM_MIN_CHARS: usize = 64;
 
+fn kokoro_streaming_capability() -> CapabilityKind {
+    CapabilityKind::StreamingTts
+}
+
 impl RuntimeService {
     fn default_kokoro_variant() -> ModelVariant {
         ModelVariant::Kokoro82M
@@ -122,12 +126,13 @@ impl RuntimeService {
         let output_budget = kokoro_output_budget(&request.text, request.config.options.speed)?;
         let request_id = request.id.clone();
         let variant = self.resolve_kokoro_variant_for_request(&request).await;
-        self.observe_broker_capability_request(CapabilityKind::Tts, Some(variant), true)?;
+        let capability = kokoro_streaming_capability();
+        self.observe_broker_capability_request(capability, Some(variant), true)?;
         let (residency_lease, execution_contract) = self
             .load_capability_for_job(
                 job,
                 variant,
-                CapabilityKind::Tts,
+                capability,
                 true,
                 ExecutionTargetKind::DirectModel,
             )
@@ -155,7 +160,7 @@ impl RuntimeService {
                 job,
                 execution_contract.clone(),
                 WorkUnit::AtomicJob {
-                    kind: CapabilityKind::Tts.as_str().to_string(),
+                    kind: capability.as_str().to_string(),
                 },
                 move || {
                     let stream_chunks = plan_kokoro_streaming_chunks(
@@ -190,7 +195,7 @@ impl RuntimeService {
                     job,
                     execution_contract.clone(),
                     WorkUnit::AtomicJob {
-                        kind: CapabilityKind::Tts.as_str().to_string(),
+                        kind: capability.as_str().to_string(),
                     },
                     move || {
                         let synthesis = synthesize_kokoro_with_fallback(
@@ -421,8 +426,7 @@ fn generate_chunked_kokoro(
             })?;
 
         let pause_samples = if idx + 1 < chunks.len() {
-            let pause_samples = ((current_sample_rate as f32) * 0.04).round() as usize;
-            pause_samples
+            ((current_sample_rate as f32) * 0.04).round() as usize
         } else {
             0
         };
@@ -699,18 +703,20 @@ fn pick_readable_split_point(text: &str, max_chars: usize) -> usize {
     }
 
     let preferred_min = (max_chars * 2) / 3;
-    for candidate in [last_sentence_break, last_clause_break, last_whitespace] {
-        if let Some(pos) = candidate {
-            if pos >= preferred_min && pos <= max_chars {
-                return pos;
-            }
+    for pos in [last_sentence_break, last_clause_break, last_whitespace]
+        .into_iter()
+        .flatten()
+    {
+        if pos >= preferred_min && pos <= max_chars {
+            return pos;
         }
     }
-    for candidate in [last_sentence_break, last_clause_break, last_whitespace] {
-        if let Some(pos) = candidate {
-            if pos > 0 && pos <= max_chars {
-                return pos;
-            }
+    for pos in [last_sentence_break, last_clause_break, last_whitespace]
+        .into_iter()
+        .flatten()
+    {
+        if pos > 0 && pos <= max_chars {
+            return pos;
         }
     }
     max_chars
@@ -731,6 +737,36 @@ fn split_at_char_index(s: &str, n: usize) -> (&str, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::BackendKind;
+    use crate::engine::{ExecutionGroupId, ModelInstanceId};
+    use crate::runtime::adapters::{LoadedModelBundle, RuntimeAdapterRegistry};
+
+    #[test]
+    fn kokoro_routes_streaming_requests_through_the_published_streaming_capability() {
+        let registry = RuntimeAdapterRegistry::built_in();
+
+        let streaming = registry
+            .require(kokoro_streaming_capability(), ModelVariant::Kokoro82M)
+            .expect("Kokoro streaming TTS capability");
+        assert_eq!(streaming.capability, CapabilityKind::StreamingTts);
+        assert_eq!(streaming.execution_target, ExecutionTargetKind::DirectModel);
+
+        let bundle = LoadedModelBundle::bind(
+            &registry,
+            ExecutionGroupId::new(1),
+            ModelInstanceId::new(1),
+            ModelVariant::Kokoro82M,
+            BackendKind::Cpu,
+        )
+        .expect("loaded Kokoro bundle");
+        let contract = bundle
+            .contract(kokoro_streaming_capability(), true)
+            .expect("loaded Kokoro streaming contract");
+        assert_eq!(
+            contract.metadata.execution_target,
+            ExecutionTargetKind::DirectModel
+        );
+    }
 
     #[test]
     fn split_text_for_streaming_keeps_short_text_single_chunk() {

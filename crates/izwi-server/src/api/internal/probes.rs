@@ -95,11 +95,15 @@ async fn readiness_response(state: &AppState) -> ReadyResponse {
         },
         ProbeCheck {
             name: "runtime_accepting_work",
-            ok: !telemetry.coordinator.draining,
-            message: telemetry
-                .coordinator
-                .draining
-                .then(|| "runtime inference coordinator is draining".to_string()),
+            ok: !telemetry.coordinator.draining && !telemetry.coordinator.poisoned,
+            message: if telemetry.coordinator.poisoned {
+                Some("runtime inference coordinator is poisoned and must be recreated".to_string())
+            } else {
+                telemetry
+                    .coordinator
+                    .draining
+                    .then(|| "runtime inference coordinator is draining".to_string())
+            },
         },
         ProbeCheck {
             name: "preload_complete",

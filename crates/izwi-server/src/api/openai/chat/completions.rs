@@ -16,7 +16,8 @@ use crate::api::openai::compat::{
 };
 use crate::api::request_context::RequestContext;
 use crate::app::chat::{
-    generate_chat, parse_chat_model, spawn_chat_stream, ChatExecutionRequest, ChatStreamEvent,
+    generate_chat, parse_chat_model, resolve_chat_request_config, spawn_chat_stream,
+    ChatExecutionRequest, ChatStreamEvent,
 };
 use crate::app::chat_content::{
     flatten_content_parts, validate_media_inputs_for_variant, FlattenedMultimodalContent,
@@ -24,7 +25,9 @@ use crate::app::chat_content::{
 use crate::error::ApiError;
 use crate::ids::new_uuid;
 use crate::state::AppState;
-use izwi_core::{ChatMediaInput, ChatMessage, ChatRequestConfig, ChatRole, ModelVariant};
+use izwi_core::{
+    ChatMediaInput, ChatMessage, ChatReasoningEffort, ChatRole, ChatTemplateKwargs, ModelVariant,
+};
 
 const CHAT_STREAM_INTERRUPTED_ERROR: &str = "Chat stream ended before a terminal event";
 
@@ -62,6 +65,10 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub top_p: Option<f32>,
     #[serde(default)]
+    pub top_k: Option<usize>,
+    #[serde(default)]
+    pub repetition_penalty: Option<f32>,
+    #[serde(default)]
     pub frequency_penalty: Option<f32>,
     #[serde(default)]
     pub presence_penalty: Option<f32>,
@@ -75,6 +82,12 @@ pub struct ChatCompletionRequest {
     pub tool_choice: Option<serde_json::Value>,
     #[serde(default)]
     pub enable_thinking: Option<bool>,
+    #[serde(default)]
+    pub reasoning_effort: Option<ChatReasoningEffort>,
+    #[serde(default)]
+    pub preserve_thinking: Option<bool>,
+    #[serde(default)]
+    pub chat_template_kwargs: Option<ChatTemplateKwargs>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -633,6 +646,14 @@ pub async fn completions(
             "Chat request must include at least one message",
         ));
     }
+    let chat_config = resolve_chat_request_config(
+        req.enable_thinking,
+        req.reasoning_effort,
+        req.preserve_thinking,
+        req.chat_template_kwargs.as_ref(),
+        req.tools.clone().unwrap_or_default(),
+        media_inputs,
+    )?;
     let execution_request = ChatExecutionRequest {
         variant,
         messages,
@@ -640,17 +661,16 @@ pub async fn completions(
         max_tokens: req.max_tokens,
         temperature: req.temperature,
         top_p: req.top_p,
+        top_k: req.top_k,
+        repetition_penalty: req.repetition_penalty,
         presence_penalty: req.presence_penalty,
-        chat_config: ChatRequestConfig {
-            enable_thinking: req.enable_thinking,
-            tools: req.tools.clone().unwrap_or_default(),
-            media_inputs,
-        },
+        chat_config,
         correlation_id: Some(ctx.correlation_id),
     };
 
     if req.stream.unwrap_or(false) {
-        let stream_response = complete_stream(state, req, execution_request, compat_profile).await?;
+        let stream_response =
+            complete_stream(state, req, execution_request, compat_profile).await?;
         return Ok(stream_response.into_response());
     }
 
@@ -1044,6 +1064,8 @@ mod tests {
             n: Some(1),
             temperature: None,
             top_p: None,
+            top_k: None,
+            repetition_penalty: None,
             frequency_penalty: Some(0.5),
             presence_penalty: None,
             stop: None,
@@ -1051,6 +1073,9 @@ mod tests {
             tools: None,
             tool_choice: None,
             enable_thinking: None,
+            reasoning_effort: None,
+            preserve_thinking: None,
+            chat_template_kwargs: None,
         };
 
         let err = validate_chat_request_compatibility(&req, OpenAiCompatibilityProfile::Strict)
@@ -1074,6 +1099,8 @@ mod tests {
             n: Some(1),
             temperature: None,
             top_p: None,
+            top_k: None,
+            repetition_penalty: None,
             frequency_penalty: None,
             presence_penalty: None,
             stop: Some(json!(["END"])),
@@ -1081,6 +1108,9 @@ mod tests {
             tools: None,
             tool_choice: None,
             enable_thinking: None,
+            reasoning_effort: None,
+            preserve_thinking: None,
+            chat_template_kwargs: None,
         };
 
         let err = validate_chat_request_compatibility(&req, OpenAiCompatibilityProfile::Strict)
@@ -1104,6 +1134,8 @@ mod tests {
             n: Some(1),
             temperature: None,
             top_p: None,
+            top_k: None,
+            repetition_penalty: None,
             frequency_penalty: Some(1.0),
             presence_penalty: None,
             stop: Some(json!(["END"])),
@@ -1111,6 +1143,9 @@ mod tests {
             tools: None,
             tool_choice: None,
             enable_thinking: None,
+            reasoning_effort: None,
+            preserve_thinking: None,
+            chat_template_kwargs: None,
         };
 
         validate_chat_request_compatibility(&req, OpenAiCompatibilityProfile::Relaxed)
@@ -1140,12 +1175,10 @@ mod tests {
                 .and_then(|function| function.name.as_deref()),
             Some("get_weather")
         );
-        assert!(
-            deltas[0]
-                .function
-                .as_ref()
-                .and_then(|function| function.arguments.as_deref())
-                .is_some_and(|args| args.contains("Harare"))
-        );
+        assert!(deltas[0]
+            .function
+            .as_ref()
+            .and_then(|function| function.arguments.as_deref())
+            .is_some_and(|args| args.contains("Harare")));
     }
 }

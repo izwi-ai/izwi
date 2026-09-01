@@ -22,6 +22,7 @@ pub(crate) mod speech_text_upload;
 pub mod studio;
 pub mod transcription;
 pub(crate) mod tts_long_form;
+pub(crate) mod tts_policy;
 pub mod voice;
 pub mod voice_realtime;
 

@@ -108,12 +108,12 @@ impl RuntimeService {
         streaming: bool,
     ) -> Result<AdmittedEngineRequest> {
         let audio_bytes = match audio_input {
-            SpeechAudioInput::Base64(audio) if audio.is_empty() => {
+            SpeechAudioInput::Base64("") => {
                 return Err(Error::InvalidInput(
                     "speech-to-speech request missing audio input".to_string(),
                 ));
             }
-            SpeechAudioInput::Bytes(audio) if audio.is_empty() => {
+            SpeechAudioInput::Bytes([]) => {
                 return Err(Error::InvalidInput(
                     "speech-to-speech request missing audio bytes".to_string(),
                 ));

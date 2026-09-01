@@ -85,7 +85,7 @@ Izwi is a **multi-modal audio inference server** built in Rust. Its inference en
 │  │              Engine Core (engine/)                      │    │
 │  │                                                         │    │
 │  │  RequestProcessor → Scheduler → UnifiedExecutor         │    │
-│  │                              ↘ KVCacheManager           │    │
+│  │                              ↘ ManagedKvCacheManager    │    │
 │  │                    OutputProcessor ←────────────────────│    │
 │  └──────────────────────┬──────────────────────────────────┘    │
 │                         │                                       │
@@ -113,8 +113,7 @@ crates/izwi-core/src/
 │   ├── config.rs            # EngineCoreConfig
 │   ├── scheduler.rs         # Scheduler, SchedulingPolicy
 │   ├── executor.rs          # UnifiedExecutor, NativeExecutor, ModelExecutor trait
-│   ├── kv_cache.rs          # KVCacheManager, KVBlock, paged attention
-│   ├── metal_kv_cache.rs    # MetalKVCacheManager, memory pressure handling
+│   ├── cache/               # Physical arenas, transactions, prefix/window tables
 │   ├── request_processor.rs # Tokenisation, prompt validation
 │   ├── output_processor.rs  # Token sampling, streaming output assembly
 │   └── signal_frontend.rs   # Audio pre-processing, VAD
@@ -134,7 +133,8 @@ crates/izwi-core/src/
 ├── catalog/
 │   └── variant.rs           # ModelVariant, ModelFamily, ModelTask, InferenceBackendHint
 ├── backends/
-│   └── mod.rs               # ExecutionBackend, BackendRouter
+│   ├── mod.rs               # ExecutionBackend, BackendRouter
+│   └── kv/                  # CPU reference and Metal/CUDA direct-page runtimes
 ├── families/
 │   └── …                    # Per-family model loading helpers
 ├── models/
@@ -242,20 +242,18 @@ Engine
 
 ```
 EngineCore::step()
-  1. Scheduler::schedule()          → produces ScheduledBatch
-  2. UnifiedExecutor::execute()     → runs model forward pass
-  3. KVCacheManager::commit()       → updates block table
-  4. OutputProcessor::process()     → samples tokens, emits chunks
+  1. Scheduler::schedule()             → produces model-neutral work
+  2. ManagedKvCacheManager::prepare()  → reserves physical pages and slot maps
+  3. UnifiedExecutor::execute()        → writes/attends directly over pages
+  4. ManagedKvCacheManager::finalize() → commits or aborts the transaction
+  5. OutputProcessor::process()        → samples tokens, emits chunks
 ```
 
-`EngineCore` also owns the `KvCacheBackend` enum, which dynamically selects between the standard and Metal KV-cache managers:
-
-```rust
-enum KvCacheBackend {
-    Standard(KVCacheManager),
-    Metal(MetalKVCacheManager),
-}
-```
+`EngineCore` owns one managed cache coordinator. A loaded adapter publishes an
+ABI-v2 `InferenceStateCapability`: `Managed` binds backend-owned physical state,
+while `Stateless` declares that no mutable state survives the invocation.
+Managed negotiation is mandatory; there is no managed-to-model-owned fallback.
+See [ADR 0001](./adr/0001-inference-state-abi-v2.md) for the ownership contract.
 
 **Metal execution note:** On MPS devices the step loop runs decode and prefill **sequentially** (not in parallel) to avoid Metal command-buffer contention.
 
@@ -268,12 +266,13 @@ Handles the ingestion side:
 
 ### 5.4 Scheduler
 
-`Scheduler` (`engine/scheduler.rs`) implements a **continuous-batching** scheduler with two policies:
+`Scheduler` (`engine/scheduler/mod.rs`) implements a **continuous-batching** scheduler with three policies:
 
 ```rust
 pub enum SchedulingPolicy {
-    Fcfs,      // First-come, first-served (default)
-    Priority,  // Priority queue with preemption
+    Fcfs,         // First-come, first-served
+    Priority,     // Priority queue with preemption
+    WeightedFair, // Workload-class weighted fairness (default)
 }
 ```
 
@@ -281,13 +280,14 @@ Key `SchedulerConfig` parameters (all tunable via `EngineCoreConfig`):
 
 | Parameter | Default | Description |
 |---|---|---|
-| `max_num_seqs` | 256 | Maximum concurrent sequences |
-| `max_num_batched_tokens` | 8192 | Token budget per step |
-| `max_model_len` | model-dependent | Maximum sequence length |
-| `enable_chunked_prefill` | true | Split long prefills across steps |
-| `preemption_mode` | Recompute | How to handle KV eviction |
-
-**Preemption:** When KV blocks are exhausted the scheduler can preempt lower-priority sequences via `PreemptionReason`. VAD-triggered preemption (`VadPreemptionEvent`) allows the signal frontend to interrupt sequences when silence is detected.
+| `max_batch_size` | 8 | Maximum logical rows scheduled per step |
+| `max_tokens_per_step` | 384 | Token budget per scheduler step |
+| `max_seq_len` | model-dependent | Maximum sequence length |
+| `enable_chunked_prefill` | false | Split long chat prefills across scheduler steps (opt-in) |
+Physical managed-cache capacity is enforced during transactional batch
+preparation. Work that cannot reserve its pages is deferred without creating a
+second scheduler-side block table. VAD-triggered interruption remains separate
+from KV ownership.
 
 ### 5.5 Executor — `UnifiedExecutor` / `NativeExecutor`
 
@@ -296,6 +296,18 @@ UnifiedExecutor
   └── Arc<RwLock<Box<dyn ModelExecutor>>>
         └── NativeExecutor   (current concrete implementation)
 ```
+
+**Continuous chat decode semantics.** Qwen3, Qwen3.5, Qwen3.8, LFM2, and
+Gemma3 expose retained scheduler-owned state and a tensor-continuous adapter.
+Dense families share stacked projections and ragged paged attention. Hybrid
+families additionally partition recurrent state per row while sharing their
+compatible projections, MLPs, and attention calls. Sampling policy and RNG
+remain request-owned after the shared tensor forward. Qwen3.8 MTP remains a
+solo-row optimization; a multi-row transaction uses the target model's batched
+decode path. `tensor_continuous_multirow_batches_total` proves physical
+multi-row dispatch, while model call counters distinguish true model batching
+from scalar-envelope fallback. Retained exact-SHA evidence is still required
+before making backend-specific throughput claims.
 
 `UnifiedExecutor` provides an async-safe wrapper around any `ModelExecutor` implementation. `NativeExecutor` is the current concrete backend and manages per-task decode state:
 
@@ -309,47 +321,23 @@ UnifiedExecutor
 
 **Parallel execution (CPU):** `NativeExecutor::execute_requests_parallel` uses `thread::scope` to fan out requests across CPU threads. This path is disabled on MPS (`can_parallelize_requests` returns `false`), keeping Metal execution serial.
 
-### 5.6 KV Cache Manager
+### 5.6 Physical KV Cache and Paged Attention
 
-The KV cache uses **paged attention** — memory is allocated in fixed-size blocks rather than contiguously per sequence.
+Managed models publish their layer/head/dtype/window requirements through a
+typed cache contract. Backend negotiation resolves page geometry and creates
+the physical arenas. The coordinator owns generation-safe page references,
+request tables, prefix references, sliding-window offsets, execution pins, and
+reserve/prepare/finalize transactions.
 
-#### Standard KV Cache (`kv_cache.rs`)
+CPU is the reference implementation. Metal uses native MSL slot-write and
+block-table-aware attention kernels. CUDA uses device page operations plus
+FlashAttention's paged variable-length path. All three consume packed tables
+and slot mappings directly; they do not reconstruct model-level cache pages or
+expand GQA KV heads with `repeat_kv`.
 
-```rust
-pub struct KVCacheConfig {
-    pub block_size: usize,          // tokens per block (default 16)
-    pub num_cpu_blocks: usize,
-    pub num_gpu_blocks: usize,
-    pub dtype: DType,
-    pub enable_quantization: bool,  // Int8 KV quantization
-}
-
-pub struct KVBlock {
-    pub block_id: u32,
-    pub ref_count: AtomicU32,       // reference-counted sharing
-    pub residency: CacheResidency,  // Gpu | Cpu | Pinned
-}
-```
-
-`PinnedBlockHandle` enables zero-copy CPU↔GPU transfers for block swapping during preemption.
-
-#### Metal KV Cache (`metal_kv_cache.rs`)
-
-`MetalKVCacheManager` extends the standard manager with Apple Silicon-specific features:
-
-```rust
-pub struct MetalKVCacheConfig {
-    pub base: KVCacheConfig,
-    pub unified_memory_fraction: f32,  // fraction of unified memory to use
-    pub optimal_block_size: usize,     // tuned for Metal page size
-}
-
-pub enum MemoryPressure { Normal, Warning, Critical }
-```
-
-Automatic responses to memory pressure:
-- **Warning** — reduce batch size, increase eviction aggressiveness
-- **Critical** — suspend new prefills, aggressively evict cold blocks
+Prefix reuse publishes only committed full pages and performs physical
+copy-on-write when a shared tail must diverge. Runtime telemetry is derived
+from the same physical arenas and coordinator counters.
 
 ### 5.7 Output Processor
 
@@ -410,7 +398,13 @@ Each decode step:
 
 ### 6.3 Chunked Prefill
 
-When `enable_chunked_prefill = true`, long prompts are split into chunks of at most `max_num_batched_tokens` tokens. This allows the scheduler to interleave prefill chunks with decode steps, reducing time-to-first-token for concurrent requests.
+When `enable_chunked_prefill = true`, long prompts for chat models with an
+explicit span-resumable contract (Qwen3, Qwen3.5, Qwen3.8, LFM2, and Gemma3)
+are split into chunks of at most `chunked_prefill_threshold` tokens (adaptive
+under decode demand). This
+allows the scheduler to interleave prefill chunks with decode steps, reducing
+time-to-first-token for concurrent requests. The flag is exposed to operators
+via TOML/env (`IZWI_ENABLE_CHUNKED_PREFILL`, `IZWI_CHUNKED_PREFILL_THRESHOLD`).
 
 ---
 
@@ -438,31 +432,26 @@ Izwi is designed with Apple Silicon as the primary target. Several subsystems ha
 
 ### Unified Memory Awareness
 
-`MetalKVCacheManager` is aware that CPU and GPU share the same physical memory on Apple Silicon. `unified_memory_fraction` controls how much of the total unified memory budget is reserved for KV blocks, avoiding over-commitment that would trigger OS memory pressure.
+Metal managed arenas allocate their real K/V backing on the selected Candle
+device and account it through the shared physical resource authority. There is
+no separate logical Metal cache manager.
 
-### Memory Pressure Handling
+### Page and Layout Negotiation
 
-The engine subscribes to macOS memory pressure notifications. Responses are tiered:
-
-| Pressure Level | Engine Response |
-|---|---|
-| `Normal` | Standard operation |
-| `Warning` | Reduce active batch size; increase block eviction rate |
-| `Critical` | Halt new prefills; aggressively evict cold KV blocks |
-
-### Optimal Block Sizing
-
-`MetalKVCacheConfig::optimal_block_size` is tuned to align KV blocks with Metal's internal page size, reducing fragmentation and improving GPU cache utilisation.
+Page size, storage dtype, head geometry, and layout are negotiated from the
+loaded model contract and Metal kernel capabilities rather than selected from
+an engine-wide hard-coded geometry.
 
 ### Serial Execution on MPS
 
 Because Metal command buffers are not thread-safe, `NativeExecutor::can_parallelize_requests` returns `false` for MPS devices. The `EngineCore::step()` loop runs decode and prefill sequentially on Metal, avoiding command-buffer races at the cost of reduced CPU parallelism.
 
-### `KvCacheBackend` Selection
+### Backend Selection
 
-At startup, `EngineCore` inspects the configured device and selects:
-- `KvCacheBackend::Metal(MetalKVCacheManager)` — when Metal is enabled
-- `KvCacheBackend::Standard(KVCacheManager)` — for CPU / other backends
+CPU managed KV is always compiled. macOS CLI/server builds include Metal by
+default. CUDA product features include the direct paged FlashAttention runtime.
+A managed capability fails closed at model load or request admission when the
+selected build cannot provide its direct-page runtime.
 
 ### VibeVoice ASR Verification Status
 
@@ -482,20 +471,20 @@ All engine parameters are centralised in `EngineCoreConfig` (`engine/config.rs`)
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `model_type` | `ModelVariant` | — | Model to load |
-| `model_path` | `PathBuf` | — | Path to weights directory |
-| `max_num_seqs` | `usize` | 256 | Max concurrent sequences |
-| `max_num_batched_tokens` | `usize` | 8192 | Token budget per step |
-| `max_model_len` | `usize` | model-dep. | Max sequence length |
-| `block_size` | `usize` | 16 | KV block size in tokens |
-| `num_cpu_blocks` | `usize` | auto | CPU KV block count |
-| `num_gpu_blocks` | `usize` | auto | GPU KV block count |
-| `enable_chunked_prefill` | `bool` | `true` | Chunked prefill |
+| `models_dir` | `PathBuf` | platform data directory | Model weights directory |
+| `max_batch_size` | `usize` | 8 | Maximum inference batch size |
+| `max_seq_len` | `usize` | 4096 | Maximum sequence length |
+| `max_tokens_per_step` | `usize` | 384 | Scheduler token budget per step |
+| `block_size` | `usize` | 64 | Requested KV page size in tokens |
+| `kv_cache_dtype` | `String` | `float16` | Requested dense KV dtype; Int8/Q4 fail before readiness |
+| `max_blocks` | `usize` | 1024 | Aggregate physical page capacity |
+| `enable_prefix_caching` | `bool` | `false` | Opt in to committed prefix reuse |
+| `managed_prefix_cache_salt` | `Option<String>` | `None` | Required isolation namespace when prefix reuse is enabled |
+| `max_prefix_cache_pages` | `usize` | 128 | Prefix page bound, clamped to preserve request capacity |
+| `enable_chunked_prefill` | `bool` | `false` | Split long prefills across scheduler steps |
+| `chunked_prefill_threshold` | `usize` | 192 | Prompt threshold for chunked prefill |
 | `backend` | `enum` | `auto` | Backend preference (`auto`, `cpu`, `metal`, `cuda`) |
-| `unified_memory_fraction` | `f32` | 0.85 | Metal memory budget |
 | `scheduling_policy` | `SchedulingPolicy` | `Fcfs` | Scheduler policy |
-| `enable_kv_quantization` | `bool` | `false` | Int8 KV quantization |
-| `streaming_chunk_tokens` | `usize` | 1 | Tokens per stream chunk |
 
 `WorkerConfig` is derived from `EngineCoreConfig` and passed to `NativeExecutor` at construction time.
 
@@ -655,11 +644,11 @@ The following features are scaffolded or partially implemented but not yet activ
 | Feature | Status | Notes |
 |---|---|---|
 | **Speculative Decoding** | Stub only | Draft model infrastructure not wired |
-| **KV Cache Quantization (Int8)** | Config flag exists | Quantization kernel not yet applied |
-| **Flash Attention** | Planned | Standard attention used; Flash Attention would reduce memory bandwidth |
-| **Prefix Caching** | Planned | Block sharing infrastructure exists; hash-based prefix lookup not implemented |
+| **KV Cache Quantization (Int8/Q4)** | Unsupported | Legacy values parse for diagnostics, then fail before readiness; dense fallback is forbidden |
+| **Paged FlashAttention** | Conditional | CUDA `flash-attn` builds promote only compatible, certified resolved cells; other cells use Portable |
+| **Prefix Caching** | Opt-in | Namespaced committed-page reuse with copy-on-write and an independent capacity bound |
 | **Beam Search** | Planned | Sampling infrastructure supports it; beam expansion logic pending |
-| **CUDA Backend Parity** | Partial | CUDA routing and execution exist, but packaging truth, CI coverage, and kernel parity are still behind CPU/Metal |
+| **CUDA hardware certification** | Partial | CUDA routing, native paged operations, and conditional FlashAttention exist; device numerical/model/soak evidence remains a release gate |
 | **ROCm Backend** | Planned | No active ROCm execution path is wired yet |
 
 ---
@@ -696,8 +685,6 @@ The following features are scaffolded or partially implemented but not yet activ
 
 | Opportunity | Expected Gain |
 |---|---|
-| **Flash Attention** | 2–4× memory bandwidth reduction during decode; lower latency |
-| **Prefix Caching** | Eliminate redundant prefill for shared prompt prefixes (e.g., system prompts) |
 | **KV Int8 Quantization** | ~50% KV memory reduction; enable larger batches |
 | **VAD Calibration** | Tune Earshot score thresholds and endpoint durations against production speech/noise captures |
 
@@ -712,6 +699,9 @@ The following features are scaffolded or partially implemented but not yet activ
 ### Architecture Recommendations
 
 - **Separate prefill and decode workers** — vLLM's "disaggregated prefill" pattern can further reduce head-of-line blocking for long prompts.
-- **Block-level prefix hashing** — implement a `HashMap<BlockHash, BlockId>` in `KVCacheManager` to enable automatic prefix block reuse.
-- **Async KV swap** — use Metal's async blit encoder to overlap CPU↔GPU block swaps with the next decode step.
+- **Quantized managed pages** — extend backend negotiation and direct kernels
+  with validated Int8/FP8 layouts without reintroducing model-owned page
+  materialization.
+- **Async KV tiering** — add a physical transfer/residency contract with fences;
+  do not model host/device movement with scheduler-only labels.
 - **Metrics exposure** — expose `RuntimeTelemetrySnapshot` via a Prometheus-compatible `/metrics` endpoint for production observability.

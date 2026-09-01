@@ -39,7 +39,7 @@ impl NativeExecutor {
     pub(super) fn audio_chat_request(
         &self,
         request: &EngineCoreRequest,
-        _scheduled: &ScheduledRequest,
+        scheduled: &ScheduledRequest,
     ) -> Result<ModelSessionResult> {
         let variant = Self::resolve_variant(request)?;
         let stream_tx = Self::stream_sender(request);
@@ -65,9 +65,17 @@ impl NativeExecutor {
                 Error::ModelNotFound(format!("Audio-chat model {variant} is not loaded"))
             })
         })?;
+        let mut leases =
+            super::invocation_workspace_leases_for_atomic_scalar_row(request, scheduled)?;
 
         let input_transcription = Self::run_blocking(|| {
-            model.transcribe_long_form_with_callback(&samples, sample_rate, None, &mut |_delta| {})
+            model.transcribe_long_form_with_callback_from_invocation_workspace(
+                &samples,
+                sample_rate,
+                None,
+                &mut leases,
+                &mut |_delta| {},
+            )
         })?;
         let output = Self::run_blocking(|| {
             if let Some(tx) = stream_tx.as_ref() {
@@ -115,17 +123,19 @@ impl NativeExecutor {
                         }
                     }
                 };
-                let mut output = model.generate_interleaved_with_config_and_callback(
-                    history_messages,
-                    &samples,
-                    sample_rate,
-                    max_new_tokens,
-                    Some(system_prompt.as_str()),
-                    &generation_config,
-                    &stream_config,
-                    &mut emit_text,
-                    &mut emit_audio,
-                )?;
+                let mut output = model
+                    .generate_interleaved_with_config_and_callback_from_invocation_workspace(
+                        history_messages,
+                        &samples,
+                        sample_rate,
+                        max_new_tokens,
+                        Some(system_prompt.as_str()),
+                        &generation_config,
+                        &stream_config,
+                        &mut leases,
+                        &mut emit_text,
+                        &mut emit_audio,
+                    )?;
                 if let Some(err) = stream_err.into_inner() {
                     return Err(err);
                 }
@@ -144,7 +154,7 @@ impl NativeExecutor {
             } else {
                 let mut no_text = |_delta: &str| {};
                 let mut no_audio = |_samples: &[f32]| {};
-                model.generate_interleaved_with_config_and_callback(
+                model.generate_interleaved_with_config_and_callback_from_invocation_workspace(
                     history_messages,
                     &samples,
                     sample_rate,
@@ -152,11 +162,18 @@ impl NativeExecutor {
                     Some(system_prompt.as_str()),
                     &generation_config,
                     &stream_config,
+                    &mut leases,
                     &mut no_text,
                     &mut no_audio,
                 )
             }
         })?;
+        let completions = leases.release()?;
+        if completions.len() != 3 {
+            return Err(Error::InferenceError(
+                "LFM2.5 Audio chat returned an incomplete physical-state completion set".into(),
+            ));
+        }
 
         Ok(ModelSessionResult::atomic(ExecutorOutput {
             request_id: request.id.clone(),

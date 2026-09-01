@@ -14,7 +14,9 @@ For `v0.1.0-alpha-1`, update these files before tagging:
    - Set `"version": "0.1.0-alpha-1"`.
 3. `ui/package.json`
    - Set `"version": "0.1.0-alpha-1"` to keep frontend package metadata aligned.
-4. `crates/izwi-core/src/model/download.rs` (recommended)
+4. `ui/package-lock.json`
+   - Update the root package version to the same release identifier.
+5. `crates/izwi-core/src/artifacts/downloader.rs` (recommended)
    - Update the hardcoded `User-Agent` version string (`izwi/...`) to match.
 
 ## Release steps (example: v0.1.0-alpha-1)
@@ -31,7 +33,7 @@ npm --prefix ui run build
 3. Commit the release prep changes:
 
 ```bash
-git add Cargo.toml crates/izwi-desktop/tauri.conf.json ui/package.json crates/izwi-core/src/model/download.rs
+git add Cargo.toml Cargo.lock crates/izwi-desktop/tauri.conf.json ui/package.json ui/package-lock.json crates/izwi-core/src/artifacts/downloader.rs
 git commit -m "Prepare release v0.1.0-alpha-1"
 ```
 
@@ -71,7 +73,8 @@ For each OS runner, the workflow builds:
 
 GitHub Releases currently publish:
 
-1. macOS assets as the Metal-capable path for Apple Silicon hosts.
+1. macOS assets as the Metal-capable path on Apple Silicon with macOS 15+;
+   those same assets fall back to CPU on macOS 12-14.
 2. Linux and Windows assets as CPU-only native artifacts with CPU-safe public entrypoints.
 
 Linux and Windows public binary names must remain unchanged:

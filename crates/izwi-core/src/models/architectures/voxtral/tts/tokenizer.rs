@@ -174,7 +174,7 @@ fn build_speech_prompt_ids(
     input_ids.push(specials.bos);
     input_ids.push(specials.begin_audio);
     let voice_start = input_ids.len();
-    input_ids.extend(std::iter::repeat(specials.audio).take(voice_frames));
+    input_ids.extend(std::iter::repeat_n(specials.audio, voice_frames));
     let voice_end = input_ids.len();
     input_ids.push(next_audio_text);
     input_ids.extend(text_tokens.iter().copied());
@@ -190,7 +190,7 @@ fn build_speech_prompt_ids(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::architectures::voxtral::tts::config::{VoxtralTtsConfig, fixture_json};
+    use crate::models::architectures::voxtral::tts::config::{fixture_json, VoxtralTtsConfig};
 
     #[test]
     fn special_tokens_come_from_params_without_tekken() {

@@ -103,7 +103,10 @@ impl VibeVoicePromptTokenizer {
             input_ids.extend(self.encode_text(&format!(" {voice_speaker}:"))?);
             input_ids.push(self.specials.speech_start);
             let start = input_ids.len();
-            input_ids.extend(std::iter::repeat(self.specials.speech_pad).take(reference_frames));
+            input_ids.extend(std::iter::repeat_n(
+                self.specials.speech_pad,
+                reference_frames,
+            ));
             let end = input_ids.len();
             input_ids.push(self.specials.speech_end);
             input_ids.extend(self.encode_text("\n")?);
@@ -140,7 +143,10 @@ impl VibeVoicePromptTokenizer {
 
         input_ids.push(self.specials.object_ref_start);
         let start = input_ids.len();
-        input_ids.extend(std::iter::repeat(self.specials.box_start).take(acoustic_frames));
+        input_ids.extend(std::iter::repeat_n(
+            self.specials.box_start,
+            acoustic_frames,
+        ));
         let end = input_ids.len();
         input_ids.push(self.specials.object_ref_end);
         input_ids.extend(self.encode_text(&format!(

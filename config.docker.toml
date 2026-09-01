@@ -5,8 +5,8 @@
 # Models directory (mounted volume in Docker)
 models_dir = "/app/models"
 
-# Maximum batch size for inference
-max_batch_size = 8
+# Physical tensor batch width: auto selects CPU/Metal=1 and CUDA=8
+max_batch_size = "auto"
 
 # Maximum sequence length (tokens)
 max_sequence_length = 4096

@@ -281,7 +281,7 @@ impl CustomOp3 for DepthwiseConv1dBiasSwishOp {
         encoder.set_bytes(10, &(self.stride as u32));
         encoder.set_bytes(11, &(self.dilation as u32));
 
-        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().min(256).max(1);
+        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().clamp(1, 256);
         encoder.dispatch_threads(
             objc2_metal::MTLSize {
                 width: elem_count,
@@ -388,7 +388,7 @@ impl CustomOp2 for DepthwiseConv1dOp {
         encoder.set_bytes(9, &(self.stride as u32));
         encoder.set_bytes(10, &(self.dilation as u32));
 
-        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().min(256).max(1);
+        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().clamp(1, 256);
         encoder.dispatch_threads(
             objc2_metal::MTLSize {
                 width: elem_count,
@@ -506,7 +506,7 @@ impl CustomOp2 for DepthwiseConv2dOp {
         encoder.set_bytes(12, &(self.stride as u32));
         encoder.set_bytes(13, &(self.dilation as u32));
 
-        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().min(256).max(1);
+        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().clamp(1, 256);
         encoder.dispatch_threads(
             objc2_metal::MTLSize {
                 width: elem_count,
@@ -930,9 +930,8 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn depthwise_conv1d_metal_matches_candle_reference() -> candle_core::Result<()> {
-        let device = match std::panic::catch_unwind(|| Device::new_metal(0)) {
-            Ok(Ok(device)) => device,
-            _ => return Ok(()),
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            return Ok(());
         };
 
         let input_values: Vec<f32> = (0..40).map(|idx| (idx as f32 - 11.0) * 0.125).collect();
@@ -963,9 +962,8 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn depthwise_conv2d_metal_matches_candle_reference() -> candle_core::Result<()> {
-        let device = match std::panic::catch_unwind(|| Device::new_metal(0)) {
-            Ok(Ok(device)) => device,
-            _ => return Ok(()),
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            return Ok(());
         };
 
         let input_values: Vec<f32> = (0..150).map(|idx| (idx as f32 - 21.0) * 0.03125).collect();
@@ -992,9 +990,8 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn depthwise_conv1d_bias_swish_metal_matches_reference() -> candle_core::Result<()> {
-        let device = match std::panic::catch_unwind(|| Device::new_metal(0)) {
-            Ok(Ok(device)) => device,
-            _ => return Ok(()),
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            return Ok(());
         };
 
         let input_values: Vec<f32> = (0..40).map(|idx| (idx as f32 - 13.0) * 0.1).collect();

@@ -1,0 +1,39 @@
+# Exact-SHA CUDA multi-span prefill certification workload for every chat
+# runtime family. Start the server with chunked prefill enabled and a threshold
+# below this prompt's token count, then use --require-resumable-prefill-evidence.
+
+[[benchmarks]]
+name = "chat-resumable-prefill"
+command = "chat"
+iterations = 2
+concurrent = 1
+warmup = true
+prompt = """
+Explain how a production inference server balances latency, throughput, fairness, memory safety,
+request admission, cancellation, scheduling, prefix reuse, paged attention, and chunked prefill.
+Discuss continuous batching, mixed prompt lengths, decode interleaving, cache ownership, transaction
+boundaries, rollback, deterministic sampling, tensor shapes, attention masks, rotary positions, model
+state, recurrent layers, sliding windows, device synchronization, host readbacks, kernel dispatch,
+workspace reuse, metadata caching, numerical parity, observability, capacity planning, and overload.
+Describe how CPU workers, Apple Metal devices, and NVIDIA CUDA devices differ in parallelism,
+memory topology, launch overhead, supported dtypes, and profiling tools. Include practical advice for
+measuring time to first token, inter-token latency, completion throughput, tail latency, resident
+memory, cache hit rate, batch width, padding waste, and failed admissions. Explain why a scheduler
+must never claim resumability unless the model exposes an exact checkpoint and continuation
+contract. Cover long prompts, short prompts, concurrent users, cancellation during prefill,
+cancellation during decode, page generation checks, stale handles, shared prefixes, private state,
+sampling seeds, stop tokens, Unicode output, and streaming backpressure. Finally, propose a release
+gate that binds all measurements to an exact source revision, checkpoint revision, backend, device,
+dtype, page geometry, workload manifest, and clean worktree. The answer should remain concise while
+showing how each mechanism contributes to responsive multi-user serving under sustained load.
+"""
+max_tokens = 32
+
+[benchmarks.matrix]
+model = [
+  "Qwen3-0.6B-GGUF",
+  "Qwen3.5-0.8B",
+  "Qwen3.8-27B-FP8",
+  "LFM2.5-1.2B-Instruct-GGUF",
+  "Gemma-3-1b-it",
+]

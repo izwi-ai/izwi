@@ -329,7 +329,7 @@ impl MediaIngestService {
         let source_bytes = prepared
             .as_ref()
             .map(|prepared| prepared.source_bytes.as_slice())
-            .or_else(|| opaque_bytes.as_deref())
+            .or(opaque_bytes.as_deref())
             .expect("media ingest must retain either prepared or opaque source bytes");
         let source_size_bytes = source_bytes.len() as u64;
         let source_namespace = format!("media/{namespace}");

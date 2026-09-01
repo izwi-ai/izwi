@@ -6,8 +6,11 @@
 
 pub mod downloader;
 
-pub use downloader::{DownloadProgress, DownloadState, ModelDownloader};
 pub use crate::model::{
     ModelArtifactState, ModelLifecycleSnapshot, ModelManager, ModelResidency, ModelResidencyState,
     ModelWeights,
+};
+pub use downloader::{
+    read_artifact_manifest, ArtifactManifest, DownloadProgress, DownloadState, ModelDownloader,
+    ARTIFACT_MANIFEST_FILE,
 };

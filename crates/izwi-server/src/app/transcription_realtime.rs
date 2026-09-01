@@ -1270,10 +1270,10 @@ fn ingest_audio_frame(
             MAX_FRAME_BYTES
         ));
     }
-    if payload.len() % 2 != 0 {
+    if !payload.len().is_multiple_of(2) {
         return Err("PCM16 payload length must be even".to_string());
     }
-    if sample_rate < 8_000 || sample_rate > 192_000 {
+    if !(8_000..=192_000).contains(&sample_rate) {
         return Err(format!("Invalid input sample_rate {sample_rate}"));
     }
 
@@ -1909,12 +1909,8 @@ fn collapse_unstable_repetition(text: &str) -> String {
         collapsed = concat_transcript(left, right);
     }
 
-    loop {
-        let Some((remove_start, remove_end)) = find_near_duplicate_span_range(collapsed.as_str())
-        else {
-            break;
-        };
-
+    while let Some((remove_start, remove_end)) = find_near_duplicate_span_range(collapsed.as_str())
+    {
         let left = collapsed[..remove_start].trim_end();
         let right = collapsed[remove_end..].trim_start();
         collapsed = concat_transcript(left, right);
@@ -2057,7 +2053,7 @@ fn parse_binary_message(data: &[u8]) -> Result<BinaryMessageKind, String> {
 
 fn pcm16_bytes_to_i16(bytes: &[u8]) -> Vec<i16> {
     let mut out = Vec::with_capacity(bytes.len() / 2);
-    for chunk in bytes.chunks_exact(2) {
+    for chunk in bytes.as_chunks::<2>().0 {
         out.push(i16::from_le_bytes([chunk[0], chunk[1]]));
     }
     out

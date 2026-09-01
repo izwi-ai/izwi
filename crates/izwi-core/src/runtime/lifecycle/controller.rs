@@ -14,7 +14,10 @@ use crate::config::EngineConfig;
 use crate::engine::{Engine as CoreEngine, ModelInstanceId, ResourceLease, ResourceVector};
 use crate::error::{Error, Result};
 use crate::model::{ModelResidencyLease, ModelVariant};
-use crate::runtime::adapters::{LoadedModelBundle, RuntimeAdapterRegistry};
+use crate::runtime::adapters::{
+    CapabilityKind, LoadedModelBundle, LoadedModelBundleDraft, LoadedStatePublication,
+    RuntimeAdapterRegistry,
+};
 use crate::runtime::coordinator::InferenceCoordinator;
 use crate::runtime_models::ModelRegistry;
 use crate::tokenizer::Tokenizer;
@@ -130,6 +133,7 @@ pub(crate) struct ModelLifecycleController {
     pub(super) tokenizer: Arc<RwLock<Option<Tokenizer>>>,
     pub(super) codec: Arc<RwLock<AudioCodec>>,
     pub(super) loaded_tts_variant: Arc<RwLock<Option<ModelVariant>>>,
+    pub(super) realtime_asr_sequence_capacity: u32,
     pub(super) model_last_used: Mutex<HashMap<ModelVariant, u64>>,
     pub(super) mutation_gate: Mutex<()>,
     state: StdMutex<LifecycleState>,
@@ -154,6 +158,7 @@ impl ModelLifecycleController {
         tokenizer: Arc<RwLock<Option<Tokenizer>>>,
         codec: Arc<RwLock<AudioCodec>>,
         loaded_tts_variant: Arc<RwLock<Option<ModelVariant>>>,
+        realtime_asr_sequence_capacity: u32,
     ) -> Self {
         Self {
             config,
@@ -166,6 +171,7 @@ impl ModelLifecycleController {
             tokenizer,
             codec,
             loaded_tts_variant,
+            realtime_asr_sequence_capacity,
             model_last_used: Mutex::new(HashMap::new()),
             mutation_gate: Mutex::new(()),
             state: StdMutex::new(LifecycleState::default()),
@@ -196,14 +202,20 @@ impl ModelLifecycleController {
         })
     }
 
-    pub(super) fn resident_instance_id(
-        &self,
-        variant: ModelVariant,
-    ) -> Option<ModelInstanceId> {
+    pub(super) fn resident_instance_id(&self, variant: ModelVariant) -> Option<ModelInstanceId> {
         self.state()
             .residents
             .get(&variant)
             .map(|slot| slot.model_instance_id)
+    }
+
+    pub(super) fn resident_variant_for_instance(
+        &self,
+        model_instance_id: ModelInstanceId,
+    ) -> Option<ModelVariant> {
+        self.state().residents.iter().find_map(|(variant, slot)| {
+            (slot.model_instance_id == model_instance_id).then_some(*variant)
+        })
     }
 
     pub(crate) fn try_get_ready_bundle(
@@ -283,13 +295,69 @@ impl ModelLifecycleController {
         variant: ModelVariant,
         model_instance_id: ModelInstanceId,
     ) -> Result<Arc<LoadedModelBundle>> {
-        let bundle = Arc::new(LoadedModelBundle::bind(
+        self.bind_loaded_model_bundle_with_state_publications(
+            variant,
+            model_instance_id,
+            HashMap::new(),
+        )
+    }
+
+    pub(super) fn bind_loaded_model_bundle_with_state_publications(
+        &self,
+        variant: ModelVariant,
+        model_instance_id: ModelInstanceId,
+        state_publications: HashMap<CapabilityKind, LoadedStatePublication>,
+    ) -> Result<Arc<LoadedModelBundle>> {
+        let draft = self.draft_loaded_model_bundle(variant, model_instance_id)?;
+        self.bind_loaded_model_bundle_draft(draft, variant, model_instance_id, state_publications)
+    }
+
+    /// Freeze the exact adapter instances and every selectable stage graph
+    /// before model-derived physical state is planned or allocated.
+    pub(super) fn draft_loaded_model_bundle(
+        &self,
+        variant: ModelVariant,
+        model_instance_id: ModelInstanceId,
+    ) -> Result<LoadedModelBundleDraft> {
+        let state = self.state();
+        let slot = state.residents.get(&variant).ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "model {variant} lost its resource lease before adapter drafting"
+            ))
+        })?;
+        if slot.phase != ResidentPhase::Loading || slot.model_instance_id != model_instance_id {
+            return Err(Error::ModelLoadError(format!(
+                "model {variant} changed lifecycle identity before adapter drafting"
+            )));
+        }
+        if slot.bundle.is_some() {
+            return Err(Error::ModelLoadError(format!(
+                "model {variant} already has a loaded execution bundle"
+            )));
+        }
+        drop(state);
+        LoadedModelBundleDraft::build(
             &self.adapter_registry,
             self.coordinator.execution_group_id(),
             model_instance_id,
             variant,
             self.backend_router.context().backend_kind,
-        )?);
+        )
+    }
+
+    pub(super) fn bind_loaded_model_bundle_draft(
+        &self,
+        draft: LoadedModelBundleDraft,
+        variant: ModelVariant,
+        model_instance_id: ModelInstanceId,
+        state_publications: HashMap<CapabilityKind, LoadedStatePublication>,
+    ) -> Result<Arc<LoadedModelBundle>> {
+        let bundle = Arc::new(draft.seal(state_publications)?);
+        if bundle.model_instance_id() != model_instance_id || bundle.model_variant() != variant {
+            return Err(Error::ModelLoadError(format!(
+                "model {variant} draft sealed a different lifecycle identity"
+            )));
+        }
         let mut state = self.state();
         let slot = state.residents.get_mut(&variant).ok_or_else(|| {
             Error::ModelLoadError(format!(
@@ -389,6 +457,43 @@ impl ModelLifecycleController {
             }
             ResidentPhase::Unloading => Ok(true),
         }
+    }
+
+    /// Remove the immutable execution/state bundle before physical arenas are
+    /// drained. Retiring the publication first prevents new adapter selection
+    /// from racing teardown and drops any publication-owned state handles
+    /// before their authoritative managers perform ownership checks.
+    pub(super) fn retire_loaded_model_bundle(
+        &self,
+        variant: ModelVariant,
+        model_instance_id: ModelInstanceId,
+    ) -> Result<bool> {
+        let bundle = {
+            let mut state = self.state();
+            let slot = state.residents.get_mut(&variant).ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "model {variant} lost its lifecycle slot before physical-state retirement"
+                ))
+            })?;
+            if slot.model_instance_id != model_instance_id {
+                return Err(Error::ModelLoadError(format!(
+                    "model {variant} changed generation before physical-state retirement"
+                )));
+            }
+            if !matches!(
+                slot.phase,
+                ResidentPhase::Loading | ResidentPhase::Unloading | ResidentPhase::CleanupRequired
+            ) {
+                return Err(Error::ModelLoadError(format!(
+                    "model {variant} cannot retire its execution bundle while {:?}",
+                    slot.phase
+                )));
+            }
+            slot.bundle.take()
+        };
+        let retired = bundle.is_some();
+        drop(bundle);
+        Ok(retired)
     }
 
     pub(super) fn remove_resident_slot(&self, variant: ModelVariant) -> bool {
@@ -593,15 +698,19 @@ mod tests {
     #[tokio::test]
     async fn concurrent_waiters_join_the_same_generation() {
         let (first_tx, first_rx) = watch::channel(None);
-        let mut state = LifecycleState::default();
-        state.next_generation = 7;
-        state.loads.insert(
+        let mut loads = HashMap::new();
+        loads.insert(
             ModelVariant::Kokoro82M,
             InFlightLoad {
                 generation: 7,
                 completion: first_tx.clone(),
             },
         );
+        let state = LifecycleState {
+            next_generation: 7,
+            loads,
+            ..Default::default()
+        };
         let first = LoadWaiter {
             completion: first_rx,
         };

@@ -97,7 +97,9 @@ impl GraniteSpeechPreprocessor {
 
 fn stack_adjacent_mel_frames(log_mel: &[Vec<f32>]) -> Vec<Vec<f32>> {
     log_mel
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let mut frame = Vec::with_capacity(pair[0].len() + pair[1].len());
             frame.extend_from_slice(&pair[0]);

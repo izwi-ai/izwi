@@ -7,10 +7,15 @@ use tracing::info;
 
 use crate::backends::BackendKind;
 use crate::catalog::ModelFamily;
-use crate::engine::{GenerationParams as CoreGenParams, ResourceAmount, ResourceVector, WorkUnit};
+use crate::engine::{
+    tts_explicit_output_limit, GenerationParams as CoreGenParams, ResourceAmount, ResourceVector,
+    WorkUnit,
+};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
-use crate::models::architectures::fish_s2::{FishS2GenerationParams, FishS2Reference};
+use crate::models::architectures::fish_s2::{
+    FishS2GenerationParams, FishS2Reference, FISH_S2_FAST_STATE_DOMAIN, FISH_S2_SLOW_STATE_DOMAIN,
+};
 use crate::models::architectures::kokoro::{kokoro_output_budget, kokoro_peak_workspace};
 use crate::models::architectures::lfm25_audio::lfm25_audio_tts_system_prompt;
 use crate::models::architectures::qwen3::tts::qwen_tts_cuda_chunked_codec_stream_enabled;
@@ -52,6 +57,7 @@ struct DirectTtsGenerationShape {
 }
 
 fn direct_tts_generation_shape(
+    backend: BackendKind,
     request: &GenerationRequest,
     variant: ModelVariant,
     max_sequence_length: usize,
@@ -82,7 +88,11 @@ fn direct_tts_generation_shape(
             if explicit == 0 {
                 LFM25_AUDIO_DEFAULT_MAX_NEW_TOKENS.min(max_sequence_length.max(1))
             } else {
-                explicit.min(max_sequence_length.max(1))
+                explicit.min(tts_explicit_output_limit(
+                    backend,
+                    variant,
+                    max_sequence_length,
+                ))
             },
             1_920,
             false,
@@ -91,7 +101,11 @@ fn direct_tts_generation_shape(
             if explicit == 0 {
                 voxtral_tts_auto_max_frames_for_text(&request.text)
             } else {
-                explicit.min(ModelVariant::VOXTRAL_TTS_MAX_OUTPUT_FRAMES)
+                explicit.min(tts_explicit_output_limit(
+                    backend,
+                    variant,
+                    max_sequence_length,
+                ))
             },
             1_920,
             false,
@@ -109,9 +123,13 @@ fn direct_tts_generation_shape(
             if explicit == 0 {
                 ModelVariant::FISH_S2_PRO_MAX_OUTPUT_FRAMES
             } else {
-                explicit.min(ModelVariant::FISH_S2_PRO_MAX_OUTPUT_FRAMES)
+                explicit.min(tts_explicit_output_limit(
+                    backend,
+                    variant,
+                    max_sequence_length,
+                ))
             },
-            2_052,
+            2_048,
             true,
         ),
         _ => {
@@ -134,7 +152,7 @@ fn direct_tts_generation_shape(
     })
 }
 
-fn direct_tts_physical_resources(
+pub(super) fn direct_tts_physical_resources(
     backend: BackendKind,
     host_bytes: u64,
     cpu_tensor_bytes: u64,
@@ -194,7 +212,7 @@ fn direct_tts_additional_resources(
         }
     }
 
-    let shape = direct_tts_generation_shape(request, variant, max_sequence_length)?;
+    let shape = direct_tts_generation_shape(backend, request, variant, max_sequence_length)?;
     let output_bytes = shape
         .max_output_samples
         .checked_mul(std::mem::size_of::<f32>() as u64)
@@ -269,14 +287,11 @@ impl DirectTtsObservationContext {
 }
 
 fn uses_direct_tts_runtime(variant: ModelVariant) -> bool {
-    matches!(
-        variant.family(),
-        ModelFamily::KokoroTts
-            | ModelFamily::Lfm25Audio
-            | ModelFamily::VoxtralTts
-            | ModelFamily::VibeVoiceTts
-            | ModelFamily::FishS2Tts
-    )
+    matches!(variant.family(), ModelFamily::VoxtralTts)
+}
+
+fn uses_direct_streaming_tts_runtime(variant: ModelVariant) -> bool {
+    uses_direct_tts_runtime(variant) || matches!(variant.family(), ModelFamily::KokoroTts)
 }
 
 pub(super) fn direct_tts_retained_input_bytes(request: &GenerationRequest) -> Result<usize> {
@@ -501,8 +516,8 @@ impl RuntimeService {
             Some(variant),
             streaming_required,
         )?;
-        let (residency_lease, execution_contract) = self
-            .load_capability_for_job(
+        let (residency_lease, execution_contract, state_binding) = self
+            .load_capability_with_state_for_job(
                 job,
                 variant,
                 CapabilityKind::Tts,
@@ -521,14 +536,22 @@ impl RuntimeService {
             .get_audio_chat(variant)
             .await
             .ok_or_else(|| Error::InferenceError("No LFM2.5 Audio model loaded".to_string()))?;
+        let context_limit = self
+            .model_registry
+            .effective_context(variant)
+            .unwrap_or_else(|| self.config.portable_context_ceiling());
         let max_new_tokens = if request.config.options.max_tokens == 0 {
-            LFM25_AUDIO_DEFAULT_MAX_NEW_TOKENS.min(self.config.max_sequence_length.max(1))
+            LFM25_AUDIO_DEFAULT_MAX_NEW_TOKENS.min(context_limit.max(1))
         } else {
             request
                 .config
                 .options
                 .max_tokens
-                .min(self.config.max_sequence_length.max(1))
+                .min(tts_explicit_output_limit(
+                    self.backend_router.context().backend_kind,
+                    variant,
+                    context_limit,
+                ))
         };
         let requested_speaker = request
             .config
@@ -538,19 +561,23 @@ impl RuntimeService {
             .or_else(|| request.config.options.voice.clone());
         let request_id = request.id;
         self.coordinator
-            .run_loaded_blocking_stage(
+            .run_loaded_blocking_stage_with_invocation_workspace(
                 job,
                 execution_contract,
+                state_binding,
                 WorkUnit::AtomicJob {
                     kind: CapabilityKind::Tts.as_str().to_string(),
                 },
-                move || {
+                move |leases| {
                     let _residency_lease = residency_lease;
                     let started = Instant::now();
-                    let output = model.generate_sequential(
-                        &lfm25_audio_prompt_messages(&text, requested_speaker.as_deref()),
-                        max_new_tokens,
-                    )?;
+                    let output = model
+                        .generate_sequential_with_callback_from_invocation_workspace(
+                            &lfm25_audio_prompt_messages(&text, requested_speaker.as_deref()),
+                            max_new_tokens,
+                            leases,
+                            &mut |_delta| {},
+                        )?;
                     let total_time_ms = started.elapsed().as_secs_f32() * 1000.0;
 
                     Ok(GenerationResult {
@@ -594,8 +621,8 @@ impl RuntimeService {
             Some(variant),
             streaming_required,
         )?;
-        let (residency_lease, execution_contract) = self
-            .load_capability_for_job(
+        let (residency_lease, execution_contract, state_binding) = self
+            .load_capability_with_state_for_job(
                 job,
                 variant,
                 CapabilityKind::Tts,
@@ -614,16 +641,26 @@ impl RuntimeService {
             .get_voxtral_tts(variant)
             .await
             .ok_or_else(|| Error::InferenceError("No Voxtral TTS model loaded".to_string()))?;
+        let context_limit = self
+            .model_registry
+            .effective_context(variant)
+            .unwrap_or_else(|| self.config.portable_context_ceiling());
+        let explicit_max_frames = tts_explicit_output_limit(
+            self.backend_router.context().backend_kind,
+            variant,
+            context_limit,
+        );
         let request_id = request.id;
         let config = request.config;
         self.coordinator
-            .run_loaded_blocking_stage(
+            .run_loaded_blocking_stage_with_invocation_paged(
                 job,
                 execution_contract,
+                state_binding,
                 WorkUnit::AtomicJob {
                     kind: CapabilityKind::Tts.as_str().to_string(),
                 },
-                move || {
+                move |leases| {
                     let _residency_lease = residency_lease;
                     let voice = config
                         .options
@@ -637,9 +674,25 @@ impl RuntimeService {
                             )
                         })?;
                     let params =
-                        VoxtralTtsGenerationParams::from_generation_config_for_text(&config, &text);
+                        VoxtralTtsGenerationParams::from_generation_config_for_text_with_limit(
+                            &config,
+                            &text,
+                            explicit_max_frames,
+                        );
                     let started = Instant::now();
-                    let output = model.generate_with_voice(&text, &voice, params)?;
+                    let domains = leases.domains().collect::<Vec<_>>();
+                    let [domain] = domains.as_slice() else {
+                        return Err(Error::InferenceError(format!(
+                            "Voxtral TTS requires one invocation KV domain, found {}",
+                            domains.len()
+                        )));
+                    };
+                    let output = model.generate_with_voice_physical(
+                        &text,
+                        &voice,
+                        params,
+                        leases.cache_mut(*domain)?,
+                    )?;
                     let total_time_ms = started.elapsed().as_secs_f32() * 1000.0;
                     let sample_rate = u32::try_from(output.sample_rate).map_err(|_| {
                         Error::InferenceError(format!(
@@ -696,8 +749,8 @@ impl RuntimeService {
             Some(variant),
             streaming_required,
         )?;
-        let (residency_lease, execution_contract) = self
-            .load_capability_for_job(
+        let (residency_lease, execution_contract, state_binding) = self
+            .load_capability_with_state_for_job(
                 job,
                 variant,
                 CapabilityKind::Tts,
@@ -717,13 +770,14 @@ impl RuntimeService {
             .await
             .ok_or_else(|| Error::InferenceError("No VibeVoice TTS model loaded".to_string()))?;
         self.coordinator
-            .run_loaded_blocking_stage(
+            .run_loaded_blocking_stage_with_invocation_workspace(
                 job,
                 execution_contract,
+                state_binding,
                 WorkUnit::AtomicJob {
                     kind: CapabilityKind::Tts.as_str().to_string(),
                 },
-                move || {
+                move |leases| {
                     let _residency_lease = residency_lease;
                     let reference = vibevoice_reference_from_request(&request)?;
                     let requested_speaker = request.config.options.speaker.as_deref().or(request
@@ -737,11 +791,12 @@ impl RuntimeService {
                         model.default_diffusion_steps(),
                     );
                     let started = Instant::now();
-                    let output = model.generate_with_reference(
+                    let output = model.generate_with_reference_physical(
                         &text,
                         &reference,
                         requested_speaker,
                         params,
+                        leases,
                     )?;
                     let total_time_ms = started.elapsed().as_secs_f32() * 1000.0;
 
@@ -793,8 +848,8 @@ impl RuntimeService {
             Some(variant),
             streaming_required,
         )?;
-        let (residency_lease, execution_contract) = self
-            .load_capability_for_job(
+        let (residency_lease, execution_contract, state_binding) = self
+            .load_capability_with_state_for_job(
                 job,
                 variant,
                 CapabilityKind::Tts,
@@ -813,29 +868,40 @@ impl RuntimeService {
             .get_fish_s2_tts(variant)
             .await
             .ok_or_else(|| Error::InferenceError("No Fish S2 TTS model loaded".to_string()))?;
+        let context_limit = self
+            .model_registry
+            .effective_context(variant)
+            .unwrap_or_else(|| self.config.portable_context_ceiling());
+        let explicit_max_frames = tts_explicit_output_limit(
+            self.backend_router.context().backend_kind,
+            variant,
+            context_limit,
+        );
         self.coordinator
-            .run_loaded_blocking_stage(
+            .run_loaded_blocking_stage_with_invocation_paged(
                 job,
                 execution_contract,
+                state_binding,
                 WorkUnit::AtomicJob {
                     kind: CapabilityKind::Tts.as_str().to_string(),
                 },
-                move || {
+                move |leases| {
                     let _residency_lease = residency_lease;
                     let reference = fish_s2_reference_from_request(&request)?;
                     let mut params = FishS2GenerationParams::default();
                     if request.config.options.max_tokens > 0 {
-                        params.max_frames = request
-                            .config
-                            .options
-                            .max_tokens
-                            .min(ModelVariant::FISH_S2_PRO_MAX_OUTPUT_FRAMES);
+                        params.max_frames =
+                            request.config.options.max_tokens.min(explicit_max_frames);
                     }
                     params.temperature = request.config.options.temperature;
                     params.top_p = request.config.options.top_p;
 
                     let started = Instant::now();
-                    let output = model.generate_with_reference(&text, reference, params)?;
+                    let (slow_cache, fast_cache) = leases
+                        .cache_pair_mut(FISH_S2_SLOW_STATE_DOMAIN, FISH_S2_FAST_STATE_DOMAIN)?;
+                    let output = model.generate_with_reference_physical(
+                        &text, reference, params, slow_cache, fast_cache,
+                    )?;
                     let total_time_ms = started.elapsed().as_secs_f32() * 1000.0;
 
                     Ok(GenerationResult {
@@ -934,7 +1000,7 @@ impl RuntimeService {
                 self.backend_router.context().backend_kind,
                 &request,
                 resolved_variant,
-                self.config.max_sequence_length,
+                self.config.portable_context_ceiling(),
             )?)?;
             let job = self
                 .coordinator
@@ -999,7 +1065,7 @@ impl RuntimeService {
         chunk_tx: mpsc::Sender<AudioChunk>,
     ) -> Result<()> {
         let resolved_variant = self.resolve_tts_variant_for_request(&request).await?;
-        if uses_direct_tts_runtime(resolved_variant) {
+        if uses_direct_streaming_tts_runtime(resolved_variant) {
             let observation = DirectTtsObservationContext::new(&request, resolved_variant, true);
             let retained_input_bytes = direct_tts_retained_input_bytes(&request)?;
             let observed_input_bytes = u64::try_from(retained_input_bytes).map_err(|_| {
@@ -1015,7 +1081,7 @@ impl RuntimeService {
                 self.backend_router.context().backend_kind,
                 &request,
                 resolved_variant,
-                self.config.max_sequence_length,
+                self.config.portable_context_ceiling(),
             )?)?;
             let job = self
                 .coordinator
@@ -1101,6 +1167,12 @@ fn core_params_from_generation(config: &GenerationConfig) -> CoreGenParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kokoro_uses_engine_for_atomic_generation_and_direct_native_streaming() {
+        assert!(!uses_direct_tts_runtime(ModelVariant::Kokoro82M));
+        assert!(uses_direct_streaming_tts_runtime(ModelVariant::Kokoro82M));
+    }
     use crate::backends::BackendKind;
     use crate::engine::{Priority, ResourceAmount, ResourceVector, WorkloadClass};
     use crate::runtime::coordinator::{InferenceCoordinator, JobSpec};
@@ -1218,8 +1290,13 @@ mod tests {
     fn direct_lfm_tts_caps_untrusted_output_budget_to_runtime_sequence_limit() {
         let mut request = GenerationRequest::new("bounded LFM output");
         request.config.options.max_tokens = usize::MAX;
-        let shape =
-            direct_tts_generation_shape(&request, ModelVariant::Lfm25Audio15BGguf, 4096).unwrap();
+        let shape = direct_tts_generation_shape(
+            BackendKind::Cpu,
+            &request,
+            ModelVariant::Lfm25Audio15BGguf,
+            4096,
+        )
+        .unwrap();
 
         assert_eq!(shape.units, 4096);
         assert_eq!(shape.max_output_samples, 4096 * 1_920);
@@ -1227,10 +1304,40 @@ mod tests {
     }
 
     #[test]
+    fn direct_cuda_tts_reserves_unlocked_explicit_context() {
+        let mut request = GenerationRequest::new("long CUDA output");
+        request.config.options.max_tokens = 5000;
+
+        let lfm = direct_tts_generation_shape(
+            BackendKind::Cuda,
+            &request,
+            ModelVariant::Lfm25Audio15BGguf,
+            4096,
+        )
+        .unwrap();
+        let fish = direct_tts_generation_shape(
+            BackendKind::Cuda,
+            &request,
+            ModelVariant::FishAudioS2Pro,
+            4096,
+        )
+        .unwrap();
+
+        assert_eq!(lfm.units, 5000);
+        assert_eq!(fish.units, 5000);
+        assert_eq!(fish.max_output_samples, 5000 * 2048);
+    }
+
+    #[test]
     fn direct_lfm_tts_caps_default_output_budget_to_runtime_sequence_limit() {
         let request = GenerationRequest::new("bounded LFM default output");
-        let shape =
-            direct_tts_generation_shape(&request, ModelVariant::Lfm25Audio15BGguf, 64).unwrap();
+        let shape = direct_tts_generation_shape(
+            BackendKind::Cpu,
+            &request,
+            ModelVariant::Lfm25Audio15BGguf,
+            64,
+        )
+        .unwrap();
 
         assert_eq!(shape.units, 64);
     }
@@ -1242,9 +1349,13 @@ mod tests {
         let mut request = GenerationRequest::new("x".repeat(max_text_chars));
         request.config.options.speed = 0.5;
         let budget = kokoro_output_budget(&request.text, request.config.options.speed).unwrap();
-        let shape =
-            direct_tts_generation_shape(&request, ModelVariant::Kokoro82M, max_sequence_length)
-                .unwrap();
+        let shape = direct_tts_generation_shape(
+            BackendKind::Cpu,
+            &request,
+            ModelVariant::Kokoro82M,
+            max_sequence_length,
+        )
+        .unwrap();
 
         let expected_frames = budget
             .max_model_tokens

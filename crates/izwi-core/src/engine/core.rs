@@ -6,41 +6,51 @@
 //! - KV cache management
 //! - Output processing
 
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
+use super::cache::composite::{
+    allocate_composite_retained_state, project_composite_paged_contract,
+    unload_composite_retained_state, CompositeRetainedStateRuntimeV2,
+};
+use super::cache::managed::{ManagedKvCacheManager, ManagedStateCapacityRequest};
+use super::cache::physical::{InvocationPhysicalKey, PhysicalStateManager};
 use super::config::EngineCoreConfig;
+#[cfg(test)]
+use super::execution::CacheMode;
 use super::execution::{
     AdapterAbiRevision, AdapterInstanceId, BatchBudget, BatchDispatch, BatchId, BatchKey,
-    BatchLaneKey, CacheMode, ConcurrencyClass, DeadlinePhase, DispatchState, ExecutionDisposition,
-    ExecutionFailure, ExecutionGroupId, ExecutionMode, ExecutionPlan, ExecutionProfile,
-    ExecutionReport, ExecutionState, ExecutionTracker, FailureOrigin,
+    BatchLaneKey, ClockedStateSpan, ConcurrencyClass, DeadlinePhase, DispatchState,
+    ExecutionDisposition, ExecutionFailure, ExecutionGroupId, ExecutionMode, ExecutionPlan,
+    ExecutionProfile, ExecutionReport, ExecutionState, ExecutionTracker, FailureOrigin,
     FinishReason as ExecutionFinishReason, ModelInstanceId, NativeBatchMode, OutcomeProvenance,
-    OutputVisibility, PhysicalBatch, PrefillMode, ReadyQuantum, RetryDisposition, StageId,
+    OutputVisibility, PhysicalBatch, PhysicalLaunchPolicy, PrefillMode, ReadyQuantum,
+    RealtimeStageOutcome, RealtimeSubphase, RetryDisposition, SequencePhase, StageId,
     StageShapePolicy, WorkCost, WorkUnit,
 };
 use super::execution_group::{
     ExecutedEngineStep, ExecutionGroupRunner, ExecutionPhase, PreparedEngineStep,
-    PreparedExecutionBatch,
+    PreparedPhysicalDispatch, PreparedStepRecovery,
 };
 use super::executor::REQUEST_DEADLINE_EXCEEDED;
 use super::executor::{
     deliver_committed_streams, CacheReleaseReport, CommittedStreamDelivery, ExecutorOutput,
-    ExecutorStepResult, IncrementalStreamDeliveryWorkers, StreamDeliveryFailure,
-    StreamDeliveryFailureKind, UnifiedExecutor, WorkerConfig,
+    ExecutorStepResult, IncrementalStreamDeliveryWorkers, PendingQuantumDecision,
+    PendingQuantumFinalizeStatus, StreamDeliveryFailure, StreamDeliveryFailureKind,
+    UnifiedExecutor, WorkerConfig,
 };
-use super::kv_cache::{KVCacheConfig, KVCacheManager, KVCacheStats};
-use super::metal_kv_cache::{MetalKVCacheConfig, MetalKVCacheManager};
 use super::metrics::{
     record_engine_execution_outcome, record_engine_physical_batch,
     record_engine_stream_checkpoint_committed, record_engine_stream_checkpoint_rejection,
 };
 use super::output::OutputProcessor;
 use super::request::{
-    EngineCoreRequest, FencedStreamProgress, RequestStatus, StreamProgressBudget,
+    EngineCoreRequest, FencedStreamProgress, RealtimeAsrOperationPayload,
+    RealtimeAsrOperationWaiter, RealtimeAsrTerminalOutcome, RequestStatus, StreamProgressBudget,
     STREAM_PROGRESS_MAX_BUFFERED_BYTES, STREAM_PROGRESS_QUEUE_CAPACITY,
 };
 use super::scheduler::{BeginTerminalRelease, Scheduler, SchedulerConfig, TerminalReleaseCause};
@@ -48,73 +58,9 @@ use super::types::{
     AudioOutput, EngineOutput, FinishReason as OutputFinishReason, LatencyBreakdown, RequestId,
 };
 use super::{ResourceAmount, ResourceVector};
-use crate::backends::{kv_dtype_bytes, BackendKind, BackendRouter, BackendSelectionSource};
+use crate::backends::BackendKind;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
-
-enum KvCacheBackend {
-    Standard(KVCacheManager),
-    Metal(MetalKVCacheManager),
-}
-
-impl KvCacheBackend {
-    fn new(config: &EngineCoreConfig) -> Result<Self> {
-        let backend_context =
-            BackendRouter::resolve_context_for_kind(config.backend, BackendSelectionSource::Config);
-        let is_metal = backend_context.backend_kind == BackendKind::Metal;
-        // Keep Metal KV manager on its tuned F32 layout unless explicit int8 KV is requested.
-        let dtype_bytes = kv_dtype_bytes(&config.kv_cache_dtype, is_metal);
-        let kv_config = KVCacheConfig {
-            num_layers: 24,
-            num_heads: 16,
-            head_dim: 64,
-            block_size: config.block_size,
-            max_blocks: config.max_blocks,
-            dtype_bytes,
-        };
-
-        if is_metal && kv_config.dtype_bytes == 4 {
-            let profile = backend_context.device.clone();
-            if profile.kind.is_metal() {
-                let mut metal_config = MetalKVCacheConfig::default();
-                metal_config.base_config = kv_config.clone();
-                let manager = MetalKVCacheManager::new(metal_config, profile)?;
-                return Ok(Self::Metal(manager));
-            }
-        }
-
-        Ok(Self::Standard(KVCacheManager::new(kv_config)))
-    }
-
-    fn inner(&self) -> &KVCacheManager {
-        match self {
-            Self::Standard(manager) => manager,
-            Self::Metal(manager) => &manager.inner,
-        }
-    }
-
-    fn inner_mut(&mut self) -> &mut KVCacheManager {
-        match self {
-            Self::Standard(manager) => manager,
-            Self::Metal(manager) => &mut manager.inner,
-        }
-    }
-
-    fn maintenance(&mut self) -> Result<()> {
-        if let Self::Metal(manager) = self {
-            manager.maintenance()?;
-        }
-        Ok(())
-    }
-
-    fn compact_shared_prefixes(&mut self) {
-        self.inner_mut().compact_shared_prefixes();
-    }
-
-    fn stats(&self) -> KVCacheStats {
-        self.inner().stats()
-    }
-}
 
 #[derive(Debug, Clone, Default)]
 struct RequestPhaseTiming {
@@ -191,13 +137,117 @@ struct PhysicalBatchAssembly {
     output_visibility: super::OutputVisibility,
     shape_policy: StageShapePolicy,
     workspace_base_bytes: u64,
+    launch_policy: PhysicalLaunchPolicy,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ActiveStreamBatch {
     lane: BatchLaneKey,
     output_visibility: OutputVisibility,
     rows: HashMap<u64, super::SessionKey>,
+}
+
+/// Core-owned identity snapshot for one physical ticket that has left the
+/// core lock but has not yet committed or rolled back.
+#[derive(Debug, Clone)]
+struct InFlightPhysicalDispatch {
+    phase: ExecutionPhase,
+    physical_batch: PhysicalBatch,
+    scheduled: Vec<super::scheduler::ScheduledRequest>,
+    output_visibility: OutputVisibility,
+    managed_cache_reservations: Vec<super::ManagedCacheReservation>,
+    launch_policy: PhysicalLaunchPolicy,
+}
+
+impl InFlightPhysicalDispatch {
+    fn from_prepared(dispatch: &PreparedPhysicalDispatch) -> Self {
+        Self {
+            phase: dispatch.phase(),
+            physical_batch: dispatch.physical_batch().clone(),
+            scheduled: dispatch.scheduled().to_vec(),
+            output_visibility: dispatch.output_visibility(),
+            managed_cache_reservations: dispatch.managed_cache_reservations().to_vec(),
+            launch_policy: dispatch.launch_policy(),
+        }
+    }
+
+    fn contains_session(&self, session: &super::SessionKey) -> bool {
+        self.physical_batch
+            .rows
+            .iter()
+            .any(|row| &row.session == session)
+    }
+
+    fn contains_plan(&self, plan_id: u64) -> bool {
+        self.physical_batch
+            .rows
+            .iter()
+            .any(|row| row.plan_id == plan_id)
+    }
+
+    fn stream_fence(&self) -> Option<ActiveStreamBatch> {
+        (self.output_visibility == OutputVisibility::IncrementalCommitted).then(|| {
+            ActiveStreamBatch {
+                lane: self.physical_batch.lane.clone(),
+                output_visibility: self.output_visibility,
+                rows: self
+                    .physical_batch
+                    .rows
+                    .iter()
+                    .map(|row| (row.plan_id, row.session.clone()))
+                    .collect(),
+            }
+        })
+    }
+
+    fn validate_completion(
+        &self,
+        completed: &super::execution_group::ExecutedPhysicalBatch,
+    ) -> Result<()> {
+        if self.phase != completed.phase
+            || self.physical_batch != completed.physical_batch
+            || self.managed_cache_reservations != completed.managed_cache_reservations
+        {
+            return Err(Error::InferenceError(
+                "physical completion does not match its registered dispatch ticket".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn resolve_managed_token_reach(
+    backend: BackendKind,
+    configured_context: usize,
+    loaded_context: Option<usize>,
+) -> Result<Option<u64>> {
+    let Some(loaded_context) = loaded_context else {
+        if backend == BackendKind::Cuda {
+            return Err(Error::ModelLoadError(
+                "CUDA managed state requires a positive loaded-model context limit".into(),
+            ));
+        }
+        return Ok(None);
+    };
+    let effective = loaded_context.min(configured_context);
+    if effective == 0 {
+        let backend = if backend == BackendKind::Cuda {
+            "CUDA"
+        } else {
+            "portable"
+        };
+        return Err(Error::ModelLoadError(format!(
+            "{backend} managed state resolved a zero loaded-model context limit"
+        )));
+    }
+    u64::try_from(effective).map(Some).map_err(|_| {
+        let backend = if backend == BackendKind::Cuda {
+            "CUDA"
+        } else {
+            "portable"
+        };
+        Error::ModelLoadError(format!("{backend} model context exceeds u64"))
+    })
 }
 
 impl PhysicalBatchAssembly {
@@ -217,16 +267,40 @@ impl PhysicalBatchAssembly {
 
     fn workspace_resources(
         backend: BackendKind,
+        shape_policy: StageShapePolicy,
         base_bytes: u64,
         rows: &[ReadyQuantum],
     ) -> Option<ResourceVector> {
-        let generic = rows.iter().try_fold(
+        let generic = if shape_policy == StageShapePolicy::Padded {
+            let width = u64::try_from(rows.len()).ok()?;
+            let maximum = |select: fn(ResourceVector) -> ResourceAmount| {
+                rows.iter()
+                    .map(|row| match select(row.cost.workspace) {
+                        ResourceAmount::Known(value) => Some(value),
+                        ResourceAmount::Unknown => None,
+                    })
+                    .try_fold(0u64, |maximum, value| Some(maximum.max(value?)))?
+                    .checked_mul(width)
+            };
             ResourceVector {
-                temporary_bytes: ResourceAmount::Known(base_bytes),
-                ..ResourceVector::zero()
-            },
-            |total, row| total.checked_add(row.cost.workspace).ok(),
-        )?;
+                host_bytes: ResourceAmount::Known(maximum(|value| value.host_bytes)?),
+                device_bytes: ResourceAmount::Known(maximum(|value| value.device_bytes)?),
+                unified_bytes: ResourceAmount::Known(maximum(|value| value.unified_bytes)?),
+                kv_bytes: ResourceAmount::Known(maximum(|value| value.kv_bytes)?),
+                temporary_bytes: ResourceAmount::Known(
+                    base_bytes.checked_add(maximum(|value| value.temporary_bytes)?)?,
+                ),
+                compute_slots: ResourceAmount::Known(maximum(|value| value.compute_slots)?),
+            }
+        } else {
+            rows.iter().try_fold(
+                ResourceVector {
+                    temporary_bytes: ResourceAmount::Known(base_bytes),
+                    ..ResourceVector::zero()
+                },
+                |total, row| total.checked_add(row.cost.workspace).ok(),
+            )?
+        };
         if generic.kv_bytes != ResourceAmount::Known(0)
             || generic.compute_slots != ResourceAmount::Known(0)
         {
@@ -262,6 +336,20 @@ impl PhysicalBatchAssembly {
         scheduled: super::scheduler::ScheduledRequest,
         row: ReadyQuantum,
     ) -> bool {
+        if self.physical_batch.mode == NativeBatchMode::Continuous
+            && !self.physical_batch.rows.is_empty()
+            && (row.cost.logical_units > 1
+                || self
+                    .physical_batch
+                    .rows
+                    .iter()
+                    .any(|existing| existing.cost.logical_units > 1))
+        {
+            // Shared continuous envelopes are N rows by exactly one token.
+            // Model-authored multi-token quanta are isolated so membership can
+            // change only after their bounded transaction commits.
+            return false;
+        }
         let mut candidate = self.physical_batch.clone();
         candidate.rows.push(row);
         let Some(materialized) =
@@ -271,6 +359,7 @@ impl PhysicalBatchAssembly {
         };
         let Some(workspace) = Self::workspace_resources(
             candidate.lane.backend,
+            self.shape_policy,
             self.workspace_base_bytes,
             &candidate.rows,
         ) else {
@@ -343,8 +432,12 @@ pub struct EngineCore {
     config: EngineCoreConfig,
     /// Request scheduler
     scheduler: Scheduler,
-    /// KV cache manager
-    kv_cache: KvCacheBackend,
+    /// Physical managed-cache arenas and transactional block tables.
+    managed_kv_cache: ManagedKvCacheManager,
+    /// Lifecycle owner for invocation-scoped physical state arenas.
+    physical_state: PhysicalStateManager,
+    /// Strong load-generation identity for composite retained backings.
+    composite_retained_state: HashMap<ModelInstanceId, Arc<CompositeRetainedStateRuntimeV2>>,
     /// Model executor
     executor: UnifiedExecutor,
     /// Output processor
@@ -359,6 +452,17 @@ pub struct EngineCore {
     execution_trackers: HashMap<RequestId, ExecutionTracker>,
     /// Plans prepared under the core lock and awaiting one validated result.
     active_plans: HashMap<u64, ExecutionPlan>,
+    /// Exact physical tickets currently owned outside the core lock.
+    in_flight_dispatches: HashMap<BatchId, InFlightPhysicalDispatch>,
+    /// Recovery left armed if a borrowed low-level step future is cancelled.
+    pending_runner_recovery: Option<PreparedStepRecovery>,
+    /// Prepared physical KV transactions keyed by their exact execution plan.
+    active_managed_cache: HashMap<u64, super::ManagedCacheReservation>,
+    /// Terminal sessions whose table release waits for an in-flight row.
+    pending_managed_releases: HashSet<super::SessionKey>,
+    /// Exact cleanup confirmations registered by retained Runtime owners.
+    /// Senders remain armed across executor/managed cleanup retries.
+    cleanup_confirmation_waiters: HashMap<super::SessionKey, Vec<oneshot::Sender<Result<()>>>>,
     /// Exact physical envelopes allowed to publish pre-quantum progress.
     active_stream_batches: HashMap<BatchId, ActiveStreamBatch>,
     /// Next sequence number accepted for each exact streaming session.
@@ -372,21 +476,80 @@ pub struct EngineCore {
     /// Consecutive retryable executor failures for each exact session.
     execution_retry_attempts: HashMap<super::SessionKey, u32>,
     retry_policy: LifecycleRetryPolicy,
+    #[cfg(test)]
+    restart_after_reset_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Phase preferred when decode and prefill compete for a single physical
+    /// candidate slot. It advances only after the preferred phase actually
+    /// owns a ticket, so blocked work does not waste the device opportunity.
+    next_single_candidate_phase: ExecutionPhase,
     /// Whether the engine has been initialized
     initialized: bool,
     /// Step counter for periodic cache housekeeping.
-    maintenance_steps: u64,
     /// Monotonic identity for physical dispatch envelopes.
     next_batch_id: u64,
 }
 
 impl EngineCore {
+    pub(crate) fn synchronize_worker_device(&self) -> Result<()> {
+        self.managed_kv_cache.synchronize_worker()
+    }
     fn force_scalar_execution(mut profile: ExecutionProfile) -> ExecutionProfile {
         profile.prefill_batch = NativeBatchMode::None;
         profile.decode_batch = NativeBatchMode::None;
         profile.max_batch_size = 1;
         profile.concurrency = ConcurrencyClass::Exclusive;
         profile
+    }
+
+    fn candidate_phase_quotas(
+        capacity: usize,
+        decode_work: usize,
+        prefill_work: usize,
+        single_slot_preference: ExecutionPhase,
+    ) -> (usize, usize) {
+        let capacity = capacity.max(1);
+        match (decode_work > 0, prefill_work > 0) {
+            (false, false) => (0, 0),
+            (true, false) => (capacity, 0),
+            (false, true) => (0, capacity),
+            (true, true) if capacity == 1 => match single_slot_preference {
+                ExecutionPhase::Decode => (1, 0),
+                ExecutionPhase::Prefill => (0, 1),
+            },
+            (true, true) => {
+                // Reserve enough candidate slots for the scheduler's decode
+                // selection while preserving at least one prefill slot. Prefill
+                // forms first, so any unused reservation is immediately
+                // available to decode formation below.
+                let decode = decode_work.min(capacity - 1).max(1);
+                let prefill = prefill_work.min(capacity - decode).max(1);
+                (decode, prefill)
+            }
+        }
+    }
+
+    fn alternate_candidate_phase(phase: ExecutionPhase) -> ExecutionPhase {
+        match phase {
+            ExecutionPhase::Decode => ExecutionPhase::Prefill,
+            ExecutionPhase::Prefill => ExecutionPhase::Decode,
+        }
+    }
+
+    fn next_candidate_preference(
+        current: ExecutionPhase,
+        both_phases: bool,
+        decode_admitted: bool,
+        prefill_admitted: bool,
+    ) -> ExecutionPhase {
+        let preferred_admitted = match current {
+            ExecutionPhase::Decode => decode_admitted,
+            ExecutionPhase::Prefill => prefill_admitted,
+        };
+        if both_phases && preferred_admitted {
+            Self::alternate_candidate_phase(current)
+        } else {
+            current
+        }
     }
 
     fn apply_adapter_execution_contract(
@@ -401,11 +564,13 @@ impl EngineCore {
             phase: super::SequencePhase::Prefill,
             input: super::InputRange { start: 0, end: 0 },
             max_output_steps: 1,
+            auxiliary_state: None,
         };
         let decode_work = WorkUnit::SequenceStep {
             phase: super::SequencePhase::Decode,
             input: super::InputRange { start: 0, end: 0 },
             max_output_steps: 1,
+            auxiliary_state: None,
         };
         let atomic_work = WorkUnit::AtomicJob {
             kind: format!("{:?}", request.task_type).to_ascii_lowercase(),
@@ -515,6 +680,21 @@ impl EngineCore {
         &mut self,
         scheduled: &super::scheduler::ScheduledRequest,
     ) -> Result<()> {
+        let session = scheduled.session_key();
+        if self.active_plans.contains_key(&scheduled.plan_id)
+            || self
+                .active_plans
+                .values()
+                .any(|plan| plan.session == session)
+            || self.in_flight_dispatches.values().any(|dispatch| {
+                dispatch.contains_plan(scheduled.plan_id) || dispatch.contains_session(&session)
+            })
+        {
+            return Err(Error::InferenceError(format!(
+                "execution plan {} duplicates an active session or plan quantum",
+                scheduled.plan_id
+            )));
+        }
         let request = self
             .requests
             .get(&scheduled.request_id)
@@ -538,7 +718,7 @@ impl EngineCore {
             });
         let profile = Self::apply_adapter_execution_contract(&request, raw_profile)?;
         if scheduled.is_prefill
-            && profile.prefill == PrefillMode::Full
+            && profile.prefill != PrefillMode::Incremental
             && (scheduled.num_computed_tokens != 0
                 || scheduled.num_tokens < request.num_prompt_tokens())
         {
@@ -547,7 +727,7 @@ impl EngineCore {
                 scheduled.request_id
             )));
         }
-        let work = match profile.mode {
+        let mut work = match profile.mode {
             ExecutionMode::Sequence | ExecutionMode::Realtime
                 if scheduled.is_prefill && profile.prefill == PrefillMode::Full =>
             {
@@ -558,6 +738,7 @@ impl EngineCore {
                         end: request.num_prompt_tokens(),
                     },
                     max_output_steps: 1,
+                    auxiliary_state: None,
                 }
             }
             ExecutionMode::Sequence | ExecutionMode::Realtime => scheduled.work.clone(),
@@ -569,31 +750,126 @@ impl EngineCore {
                 ordinal: 0,
             },
         };
-        let work_kind = match &work {
-            WorkUnit::SequenceStep { phase, .. } => format!("{phase:?}").to_ascii_lowercase(),
-            WorkUnit::AtomicJob { kind } => kind.clone(),
-            WorkUnit::PipelineStage { name, ordinal } => format!("{name}:{ordinal}"),
-        };
-        let estimate = if profile.cache_mode == CacheMode::None {
-            ResourceVector::zero()
-        } else {
-            let bytes_per_block =
-                self.config.kv_cache_memory_bytes() / self.config.max_blocks.max(1);
-            let estimated_bytes = scheduled
-                .block_ids
-                .len()
-                .checked_mul(bytes_per_block)
-                .and_then(|bytes| u64::try_from(bytes).ok())
-                .ok_or_else(|| Error::Overloaded("cache plan estimate overflow".to_string()))?;
-            ResourceVector {
-                kv_bytes: ResourceAmount::Known(estimated_bytes),
-                ..ResourceVector::zero()
-            }
-        };
+        // Managed arenas are registered once at model scope, while opaque
+        // caches are authorized and reconciled from executor-owned tensors.
+        // A row therefore never reserves either physical allocation again.
+        let estimate = ResourceVector::zero();
         let bound_stage = request
             .execution_adapter_binding()
             .map(|binding| binding.stage_for_work(&work).cloned())
             .transpose()?;
+        if let WorkUnit::SequenceStep {
+            input,
+            auxiliary_state,
+            ..
+        } = &mut work
+        {
+            if auxiliary_state.is_some() {
+                return Err(Error::InferenceError(
+                    "scheduler attempted to author retained auxiliary state".into(),
+                ));
+            }
+            if let Some(stage) = bound_stage.as_ref() {
+                let projected = request.project_auxiliary_state_spans(stage, *input)?;
+                if let Some(spans) = projected.as_deref().filter(|spans| !spans.is_empty()) {
+                    let runtime = request.managed_cache_runtime().ok_or_else(|| {
+                        Error::InferenceError(
+                            "clocked retained-state stage has no exact managed runtime".into(),
+                        )
+                    })?;
+                    let tensor = runtime.tensor_state().ok_or_else(|| {
+                        Error::InferenceError(
+                            "clocked retained-state stage has no tensor-state arena".into(),
+                        )
+                    })?;
+                    let mut previous_group = None;
+                    for span in spans {
+                        if span.input().is_empty()
+                            || previous_group.is_some_and(|previous| previous >= span.group().get())
+                        {
+                            return Err(Error::InferenceError(
+                                "projected clocked-state spans are not canonical and unique".into(),
+                            ));
+                        }
+                        tensor.validate_group_clock(span.group(), span.clock())?;
+                        previous_group = Some(span.group().get());
+                    }
+                }
+                *auxiliary_state = projected;
+            }
+        }
+        let realtime_state = match &mut work {
+            WorkUnit::RealtimePreparation {
+                retained_state_input,
+                auxiliary_state,
+                ..
+            }
+            | WorkUnit::RealtimeDecodeContinuation {
+                retained_state_input,
+                auxiliary_state,
+                ..
+            } => Some((*retained_state_input, auxiliary_state)),
+            _ => None,
+        };
+        if let Some((state_input, auxiliary_state)) = realtime_state {
+            if auxiliary_state.is_some() {
+                return Err(Error::InferenceError(
+                    "scheduler attempted to author retained realtime state".into(),
+                ));
+            }
+            if let Some(selections) = bound_stage
+                .as_ref()
+                .and_then(|stage| stage.retained_state_selections.as_deref())
+            {
+                let runtime = request.managed_cache_runtime().ok_or_else(|| {
+                    Error::InferenceError(
+                        "retained realtime stage has no exact managed runtime".into(),
+                    )
+                })?;
+                let tensor = runtime.tensor_state().ok_or_else(|| {
+                    Error::InferenceError(
+                        "retained realtime stage has no tensor-state arena".into(),
+                    )
+                })?;
+                let mut spans = Vec::with_capacity(selections.len());
+                let mut previous_group = None;
+                for selection in selections {
+                    if previous_group.is_some_and(|previous| previous >= selection.group().get()) {
+                        return Err(Error::InferenceError(
+                            "retained realtime selections are not canonical and unique".into(),
+                        ));
+                    }
+                    tensor.validate_group_clock(selection.group(), selection.clock())?;
+                    spans.push(ClockedStateSpan::new(
+                        selection.group(),
+                        selection.clock().clone(),
+                        state_input,
+                    )?);
+                    previous_group = Some(selection.group().get());
+                }
+                *auxiliary_state = Some(Arc::from(spans));
+            }
+        }
+        let work_kind = match &work {
+            WorkUnit::PreSequencePreparation { kind } => kind.clone(),
+            WorkUnit::SequenceStep { phase, .. } => format!("{phase:?}").to_ascii_lowercase(),
+            WorkUnit::SequenceFinalize { .. } => "sequence_finalize".to_string(),
+            WorkUnit::RealtimePush { .. } => "realtime_push".to_string(),
+            WorkUnit::RealtimeFinish { .. } => "realtime_finish".to_string(),
+            WorkUnit::RealtimePreparation { mode, .. } => {
+                format!(
+                    "realtime_{}_preparation",
+                    format!("{mode:?}").to_ascii_lowercase()
+                )
+            }
+            WorkUnit::RealtimePromptPrefill { .. } => "realtime_prompt_prefill".to_string(),
+            WorkUnit::RealtimeDecodeContinuation { .. } => {
+                "realtime_decode_continuation".to_string()
+            }
+            WorkUnit::RealtimeCompletion { .. } => "realtime_completion".to_string(),
+            WorkUnit::AtomicJob { kind } => kind.clone(),
+            WorkUnit::PipelineStage { name, ordinal } => format!("{name}:{ordinal}"),
+        };
         let bound_adapter = request
             .execution_adapter_binding()
             .zip(bound_stage.as_ref())
@@ -645,6 +921,11 @@ impl EngineCore {
             tracker.transition(ExecutionState::Admitted)?;
         }
         let running_state = match plan.work {
+            WorkUnit::PreSequencePreparation { .. } => {
+                return Err(Error::InferenceError(
+                    "pre-sequence preparation cannot enter EngineCore execution".to_string(),
+                ));
+            }
             WorkUnit::SequenceStep {
                 phase: super::SequencePhase::Prefill,
                 ..
@@ -653,6 +934,26 @@ impl EngineCore {
                 phase: super::SequencePhase::Decode,
                 ..
             } => ExecutionState::Decoding,
+            WorkUnit::SequenceFinalize { .. } => ExecutionState::Decoding,
+            WorkUnit::RealtimePush { .. } => ExecutionState::RealtimeRunning,
+            WorkUnit::RealtimeFinish { .. } => ExecutionState::RealtimeFinishing,
+            WorkUnit::RealtimePreparation {
+                mode: super::execution::RealtimePreparationMode::Push,
+                ..
+            } => ExecutionState::RealtimeRunning,
+            WorkUnit::RealtimePreparation {
+                mode: super::execution::RealtimePreparationMode::Finish,
+                ..
+            } => ExecutionState::RealtimeFinishing,
+            WorkUnit::RealtimePromptPrefill { .. }
+            | WorkUnit::RealtimeDecodeContinuation { .. }
+            | WorkUnit::RealtimeCompletion { .. } => {
+                if tracker.state() == ExecutionState::RealtimeFinishing {
+                    ExecutionState::RealtimeFinishing
+                } else {
+                    ExecutionState::RealtimeRunning
+                }
+            }
             WorkUnit::AtomicJob { .. } => ExecutionState::AtomicRunning,
             WorkUnit::PipelineStage { .. } => ExecutionState::PipelineRunning,
         };
@@ -660,34 +961,95 @@ impl EngineCore {
             tracker.transition(running_state)?;
         }
         tracker.begin_plan(&plan)?;
-        if self.active_plans.insert(plan.plan_id, plan).is_some() {
-            return Err(Error::InferenceError(format!(
-                "execution plan {} was prepared twice",
-                scheduled.plan_id
-            )));
-        }
+        let replaced = self.active_plans.insert(plan.plan_id, plan);
+        debug_assert!(
+            replaced.is_none(),
+            "active plan was preflight-checked above"
+        );
         Ok(())
     }
 
     fn rollback_unexecuted_schedule(&mut self, scheduled: &[super::scheduler::ScheduledRequest]) {
-        let rolled_back_plans = scheduled
+        let requested_plans = scheduled
             .iter()
             .map(|scheduled| scheduled.plan_id)
             .collect::<HashSet<_>>();
+        let registered_batches = self
+            .in_flight_dispatches
+            .iter()
+            .filter(|(_, dispatch)| {
+                dispatch
+                    .physical_batch
+                    .rows
+                    .iter()
+                    .any(|row| requested_plans.contains(&row.plan_id))
+            })
+            .map(|(batch_id, _)| *batch_id)
+            .collect::<Vec<_>>();
+        let mut exact_schedule = scheduled.to_vec();
+        let mut exact_plans = requested_plans;
+        for batch_id in registered_batches {
+            let Some(dispatch) = self.in_flight_dispatches.remove(&batch_id) else {
+                continue;
+            };
+            self.active_stream_batches.remove(&batch_id);
+            for row in dispatch.scheduled {
+                if exact_plans.insert(row.plan_id) {
+                    exact_schedule.push(row);
+                }
+            }
+        }
+
+        let rolled_back_plans = exact_plans;
         self.active_stream_batches.retain(|_, batch| {
             !batch
                 .rows
                 .keys()
                 .any(|plan_id| rolled_back_plans.contains(plan_id))
         });
-        for scheduled in scheduled {
+        self.rollback_schedule_state(&exact_schedule);
+    }
+
+    fn rollback_schedule_state(&mut self, exact_schedule: &[super::scheduler::ScheduledRequest]) {
+        for scheduled in exact_schedule {
             let session = scheduled.session_key();
+            if let Err(error) = self.executor.finalize_pending_quantum(
+                scheduled.plan_id,
+                &session,
+                PendingQuantumDecision::Abort,
+            ) {
+                warn!(
+                    plan_id = scheduled.plan_id,
+                    request_id = %scheduled.request_id,
+                    error = %error,
+                    "Failed to abort executor pending quantum during schedule rollback"
+                );
+            }
+            if let Some(reservation) = self.active_managed_cache.remove(&scheduled.plan_id) {
+                if let Err(error) = self.managed_kv_cache.finalize(&reservation, None, false) {
+                    warn!(
+                        plan_id = scheduled.plan_id,
+                        error = %error,
+                        "Failed to abort an unexecuted managed KV transaction"
+                    );
+                }
+            }
             if let Some(plan) = self.active_plans.remove(&scheduled.plan_id) {
                 if plan.session != session {
                     warn!(
                         plan_id = scheduled.plan_id,
                         request_id = %scheduled.request_id,
                         "Unexecuted plan rollback found a mismatched session fence"
+                    );
+                }
+                if !self
+                    .scheduler
+                    .refund_unexecuted_service(&session, scheduled.num_tokens)
+                {
+                    warn!(
+                        plan_id = scheduled.plan_id,
+                        request_id = %scheduled.request_id,
+                        "Scheduler rejected unexecuted weighted-service refund"
                     );
                 }
             }
@@ -697,7 +1059,128 @@ impl EngineCore {
                 }
             }
             self.scheduler.release_execution_quantum_for_retry(&session);
+            self.release_managed_session_if_ready(&session);
         }
+    }
+
+    /// Roll back every registered physical ticket. The main engine driver uses
+    /// this hook when a prepared dispatch can no longer produce a completion
+    /// (for example, a cancelled/join-failed runner task).
+    pub(super) fn rollback_all_in_flight_dispatches(&mut self) -> usize {
+        let batch_ids = self
+            .in_flight_dispatches
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        self.rollback_in_flight_dispatches(&batch_ids)
+    }
+
+    /// Roll back only the exact physical tickets owned by one abandoned
+    /// prepared step. Later tickets may already be present by the time recovery
+    /// acquires the core lock and must remain untouched.
+    pub(super) fn rollback_in_flight_dispatches(&mut self, batch_ids: &[BatchId]) -> usize {
+        let mut scheduled = Vec::new();
+        let mut removed = 0;
+        for batch_id in batch_ids.iter().copied().collect::<HashSet<_>>() {
+            let Some(dispatch) = self.in_flight_dispatches.remove(&batch_id) else {
+                continue;
+            };
+            removed += 1;
+            self.active_stream_batches.remove(&batch_id);
+            scheduled.extend(dispatch.scheduled);
+        }
+        self.rollback_schedule_state(&scheduled);
+        removed
+    }
+
+    fn defer_unexecuted_schedule_for_capacity(
+        &mut self,
+        scheduled: &[super::scheduler::ScheduledRequest],
+    ) {
+        self.rollback_unexecuted_schedule(scheduled);
+        let retry_at = Instant::now() + self.retry_policy.execution_delay(1);
+        for scheduled in scheduled {
+            let session = scheduled.session_key();
+            if !self.scheduler.defer_execution_retry(&session, retry_at) {
+                warn!(
+                    request_id = %session.request_id,
+                    session_epoch = session.epoch,
+                    "Scheduler rejected managed KV capacity backpressure"
+                );
+            }
+        }
+    }
+
+    async fn preempt_unpublished_session_for_capacity(
+        &mut self,
+        blocked: &[super::scheduler::ScheduledRequest],
+    ) -> Result<bool> {
+        let Some((blocked_request, blocked_model)) = blocked
+            .iter()
+            .filter_map(|scheduled| {
+                let request = self.requests.get(&scheduled.request_id)?.clone();
+                let model = request.managed_cache_runtime()?.plan().model_instance;
+                Some((request, model))
+            })
+            .max_by_key(|(request, _)| request.priority)
+        else {
+            return Ok(false);
+        };
+        let candidates = self
+            .managed_kv_cache
+            .capacity_claim_sessions(blocked_model)
+            .into_iter()
+            .filter(|session| session.request_id != blocked_request.id)
+            .filter(|session| {
+                !self
+                    .active_plans
+                    .values()
+                    .any(|plan| &plan.session == session)
+                    && !self
+                        .active_managed_cache
+                        .values()
+                        .any(|reservation| &reservation.session == session)
+            });
+        let Some(victim) = self
+            .scheduler
+            .capacity_preemption_candidate(candidates, blocked_request.priority)
+        else {
+            return Ok(false);
+        };
+
+        let release = self.executor.cleanup_session(&victim).await;
+        if !release.confirmed {
+            warn!(
+                request_id = %victim.request_id,
+                session_epoch = victim.epoch,
+                "Executor could not confirm capacity-preemption cleanup"
+            );
+            return Ok(false);
+        }
+        self.managed_kv_cache.release_session(&victim)?;
+        if !self.scheduler.restart_request_for_recompute(&victim) {
+            return Err(Error::InferenceError(
+                "scheduler rejected a validated capacity-preemption restart".into(),
+            ));
+        }
+        self.clear_exact_execution_state(&victim);
+        let retry_at = Instant::now()
+            + self
+                .retry_policy
+                .execution_delay(2)
+                .max(Duration::from_millis(1));
+        if !self.scheduler.defer_execution_retry(&victim, retry_at) {
+            return Err(Error::InferenceError(
+                "scheduler rejected a capacity-preemption retry fence".into(),
+            ));
+        }
+        debug!(
+            request_id = %victim.request_id,
+            session_epoch = victim.epoch,
+            blocked_request_id = %blocked_request.id,
+            "Released an unpublished lower-priority session for managed KV capacity"
+        );
+        Ok(true)
     }
 
     fn report_from_result(result: &ExecutorStepResult) -> ExecutionReport {
@@ -716,6 +1199,84 @@ impl EngineCore {
             output_finished: output.finished,
             output_has_error: output.error.is_some(),
         }
+    }
+
+    fn realtime_work_identity(
+        work: &WorkUnit,
+    ) -> Option<(super::RealtimeOperationId, RealtimeSubphase)> {
+        match work {
+            WorkUnit::RealtimePreparation { operation_id, .. } => {
+                Some((*operation_id, RealtimeSubphase::Preparation))
+            }
+            WorkUnit::RealtimePromptPrefill {
+                operation_id,
+                cache_append,
+                ..
+            } => Some((
+                *operation_id,
+                RealtimeSubphase::PromptPrefill {
+                    cache_append: *cache_append,
+                },
+            )),
+            WorkUnit::RealtimeDecodeContinuation { operation_id, .. } => {
+                Some((*operation_id, RealtimeSubphase::DecodeContinuation))
+            }
+            WorkUnit::RealtimeCompletion { operation_id } => {
+                Some((*operation_id, RealtimeSubphase::Completion))
+            }
+            _ => None,
+        }
+    }
+
+    fn authenticate_realtime_stage_outcome(
+        plan: &ExecutionPlan,
+        outcome: Option<&RealtimeStageOutcome>,
+        authoritative_commit: bool,
+    ) -> Result<()> {
+        match (Self::realtime_work_identity(&plan.work), outcome) {
+            (None, None) => Ok(()),
+            (None, Some(_)) => Err(Error::InferenceError(
+                "non-realtime executor result carried a realtime stage outcome".into(),
+            )),
+            (Some(_), None) if !authoritative_commit => Ok(()),
+            (Some(_), None) => Err(Error::InferenceError(
+                "authoritative realtime executor result omitted its stage outcome".into(),
+            )),
+            (Some((operation_id, subphase)), Some(outcome))
+                if outcome.plan_id == plan.plan_id
+                    && outcome.operation_id == operation_id
+                    && outcome.completed == subphase =>
+            {
+                Ok(())
+            }
+            (Some(_), Some(_)) => Err(Error::InferenceError(
+                "realtime stage outcome crossed its exact plan/operation/subphase fence".into(),
+            )),
+        }
+    }
+
+    fn replace_active_result_with_terminal(
+        &mut self,
+        plan: &ExecutionPlan,
+        result: &mut ExecutorStepResult,
+        output: ExecutorOutput,
+        disposition: ExecutionDisposition,
+        provenance: OutcomeProvenance,
+    ) -> Result<()> {
+        result.output = output;
+        result.disposition = disposition;
+        result.safe_point = true;
+        result.provenance = provenance;
+        result.staged_stream_outputs.clear();
+        result.managed_cache = None;
+        result.managed_cache_completions.clear();
+        let report = Self::report_from_result(result);
+        self.execution_trackers
+            .get_mut(&plan.session.request_id)
+            .ok_or_else(|| {
+                Error::InferenceError("execution tracker is missing for active plan".into())
+            })?
+            .commit(plan, &report)
     }
 
     fn canonical_failure_dispatch(
@@ -754,6 +1315,22 @@ impl EngineCore {
         step_time_ms: f64,
     ) -> Option<CommittedExecutorOutput> {
         let Some(plan) = self.active_plans.remove(&result.plan_id) else {
+            if let Err(error) = self.executor.finalize_pending_quantum(
+                result.plan_id,
+                &result.session,
+                PendingQuantumDecision::Abort,
+            ) {
+                warn!(
+                    plan_id = result.plan_id,
+                    request_id = %result.session.request_id,
+                    error = %error,
+                    "Failed to abort executor state for an inactive result"
+                );
+            }
+            if let Some(reservation) = self.active_managed_cache.remove(&result.plan_id) {
+                let _ = self.managed_kv_cache.finalize(&reservation, None, false);
+                self.release_managed_session_if_ready(&reservation.session);
+            }
             warn!(
                 plan_id = result.plan_id,
                 request_id = %result.session.request_id,
@@ -763,9 +1340,27 @@ impl EngineCore {
             return None;
         };
 
+        if self
+            .executor
+            .has_pending_quantum(plan.plan_id, &plan.session)
+            && self
+                .requests
+                .get(&plan.session.request_id)
+                .is_some_and(|request| request.is_cancelled())
+        {
+            result.output = ExecutorOutput::cancelled(plan.session.request_id.clone());
+            result.disposition = ExecutionDisposition::Finished(ExecutionFinishReason::Cancelled);
+            result.safe_point = true;
+            result.staged_stream_outputs.clear();
+            result.managed_cache = None;
+            result.managed_cache_completions.clear();
+        }
+
         if self.incremental_stream_sessions.contains(&plan.session) {
-            if let ExecutionDisposition::Failed(failure) = &mut result.disposition {
-                if failure.retry != RetryDisposition::Never {
+            match &mut result.disposition {
+                ExecutionDisposition::Failed(failure)
+                    if failure.retry != RetryDisposition::Never =>
+                {
                     let message = format!(
                         "executor failed after committed stream progress; retry is unsafe: {}",
                         failure.message
@@ -776,7 +1371,47 @@ impl EngineCore {
                     result.output.error = Some(message);
                     result.staged_stream_outputs.clear();
                 }
+                ExecutionDisposition::RestartSequence(_) => {
+                    let message =
+                        "sequence restart is unsafe after committed incremental stream output";
+                    result.output = ExecutorOutput::error(plan.session.request_id.clone(), message);
+                    result.disposition =
+                        ExecutionDisposition::Failed(ExecutionFailure::invalid_output(message));
+                    result.safe_point = true;
+                    result.provenance = OutcomeProvenance::failure(
+                        FailureOrigin::ExecutorValidation,
+                        result.provenance.dispatch_state,
+                    );
+                    result.staged_stream_outputs.clear();
+                    result.managed_cache_completions.clear();
+                }
+                _ => {}
             }
+        }
+
+        if matches!(result.disposition, ExecutionDisposition::RestartSequence(_))
+            && (!result.staged_stream_outputs.is_empty()
+                || result.managed_cache.is_some()
+                || !result.managed_cache_completions.is_empty()
+                || result.output.audio.is_some()
+                || result.output.text.is_some()
+                || result.output.input_transcription.is_some()
+                || result.output.phase_timing_override.is_some()
+                || result.output.asr_diagnostics.is_some())
+        {
+            let message =
+                "sequence restart cannot publish output or managed-cache completion state";
+            result.output = ExecutorOutput::error(plan.session.request_id.clone(), message);
+            result.disposition =
+                ExecutionDisposition::Failed(ExecutionFailure::invalid_output(message));
+            result.safe_point = true;
+            result.provenance = OutcomeProvenance::failure(
+                FailureOrigin::ExecutorValidation,
+                result.provenance.dispatch_state,
+            );
+            result.staged_stream_outputs.clear();
+            result.managed_cache_completions.clear();
+            result.managed_cache = None;
         }
 
         let staged_next_sequence = match self
@@ -825,59 +1460,405 @@ impl EngineCore {
                 None
             }
         };
+        let prospective_authoritative_commit = matches!(
+            result.disposition,
+            ExecutionDisposition::Progress
+                | ExecutionDisposition::Yielded(_)
+                | ExecutionDisposition::Finished(ExecutionFinishReason::Completed)
+        );
+        if let Err(error) = Self::authenticate_realtime_stage_outcome(
+            &plan,
+            result.realtime_stage_outcome.as_ref(),
+            prospective_authoritative_commit,
+        ) {
+            let message = error.to_string();
+            result.output = ExecutorOutput::error(plan.session.request_id.clone(), message.clone());
+            result.disposition =
+                ExecutionDisposition::Failed(ExecutionFailure::invalid_output(message));
+            result.safe_point = true;
+            result.provenance = OutcomeProvenance::failure(
+                FailureOrigin::ExecutorValidation,
+                result.provenance.dispatch_state,
+            );
+            result.staged_stream_outputs.clear();
+            result.managed_cache_completions.clear();
+            result.realtime_stage_outcome = None;
+        }
+        let realtime_stage_outcome = result.realtime_stage_outcome;
+        let managed_reservation = self.active_managed_cache.remove(&plan.plan_id);
         let report = Self::report_from_result(&result);
-        let commit_result = self
+        // Validate the execution transition on a clone before publishing the
+        // physical cache table. This keeps invalid/duplicate reports from
+        // advancing KV state, while the serialized core lock guarantees that
+        // installing the validated tracker cannot race another row commit.
+        let prospective_state = self
             .execution_trackers
-            .get_mut(&plan.session.request_id)
+            .get(&plan.session.request_id)
+            .cloned()
             .ok_or_else(|| {
                 Error::InferenceError("execution tracker is missing for active plan".to_string())
             })
-            .and_then(|tracker| tracker.commit(&plan, &report));
+            .and_then(|mut tracker| {
+                tracker.commit(&plan, &report)?;
+                let prepared_realtime = match realtime_stage_outcome {
+                    Some(outcome) if prospective_authoritative_commit => {
+                        let prepared = self
+                            .scheduler
+                            .prepare_realtime_stage_outcome(&plan.session, outcome)?;
+                        if outcome.next.is_none() {
+                            self.requests
+                                .get(&plan.session.request_id)
+                                .ok_or_else(|| {
+                                    Error::InferenceError(
+                                        "committed realtime operation lost its request mailbox"
+                                            .into(),
+                                    )
+                                })?
+                                .realtime_asr_operation(outcome.operation_id)?;
+                        }
+                        Some(prepared)
+                    }
+                    _ => None,
+                };
+                Ok((tracker, prepared_realtime))
+            });
 
-        if let Err(err) = commit_result {
-            let (failure_dispatch, failure_dispatch_state) =
-                Self::canonical_failure_dispatch(&plan, &result);
-            let failure_report = ExecutionReport {
-                plan_id: plan.plan_id,
-                session: plan.session.clone(),
-                input_consumed: 0,
-                output_produced: 0,
-                observed_resources: ResourceVector::zero(),
-                dispatch: failure_dispatch,
-                provenance: OutcomeProvenance::failure(
-                    FailureOrigin::StateCommit,
-                    failure_dispatch_state,
+        let (prospective_tracker, prepared_realtime) = match prospective_state {
+            Ok(state) => state,
+            Err(err) => {
+                if let Err(abort_error) = self.executor.finalize_pending_quantum(
+                    plan.plan_id,
+                    &plan.session,
+                    PendingQuantumDecision::Abort,
+                ) {
+                    warn!(
+                        plan_id = plan.plan_id,
+                        request_id = %plan.session.request_id,
+                        error = %abort_error,
+                        "Failed to abort executor state after result validation rejection"
+                    );
+                }
+                if let Some(reservation) = managed_reservation.as_ref() {
+                    let _ = self.managed_kv_cache.finalize(reservation, None, false);
+                }
+                self.release_managed_session_if_ready(&plan.session);
+                let (failure_dispatch, failure_dispatch_state) =
+                    Self::canonical_failure_dispatch(&plan, &result);
+                let failure_report = ExecutionReport {
+                    plan_id: plan.plan_id,
+                    session: plan.session.clone(),
+                    input_consumed: 0,
+                    output_produced: 0,
+                    observed_resources: ResourceVector::zero(),
+                    dispatch: failure_dispatch,
+                    provenance: OutcomeProvenance::failure(
+                        FailureOrigin::StateCommit,
+                        failure_dispatch_state,
+                    ),
+                    elapsed: std::time::Duration::ZERO,
+                    safe_point: true,
+                    disposition: ExecutionDisposition::Failed(ExecutionFailure::invalid_output(
+                        err.to_string(),
+                    )),
+                    output_finished: true,
+                    output_has_error: true,
+                };
+                if let Some(tracker) = self.execution_trackers.get_mut(&plan.session.request_id) {
+                    let _ = tracker.commit(&plan, &failure_report);
+                }
+                let message = format!("invalid executor result: {err}");
+                return Some(CommittedExecutorOutput {
+                    session: plan.session.clone(),
+                    output: ExecutorOutput::error(plan.session.request_id, message.clone()),
+                    disposition: ExecutionDisposition::Failed(ExecutionFailure::invalid_output(
+                        message,
+                    )),
+                    provenance: OutcomeProvenance::failure(
+                        FailureOrigin::StateCommit,
+                        failure_dispatch_state,
+                    ),
+                    staged_stream_outputs: Vec::new(),
+                });
+            }
+        };
+
+        // Completed terminal quanta commit their final append before normal
+        // terminal cleanup releases the managed sequence. The executor's host
+        // transaction and the managed table must use this exact same decision.
+        let authoritative_commit = matches!(
+            result.disposition,
+            ExecutionDisposition::Progress
+                | ExecutionDisposition::Yielded(_)
+                | ExecutionDisposition::Finished(ExecutionFinishReason::Completed)
+        );
+        let pending_decision = if authoritative_commit {
+            PendingQuantumDecision::Commit
+        } else {
+            PendingQuantumDecision::Abort
+        };
+        let prepared =
+            self.executor
+                .prepare_pending_quantum(plan.plan_id, &plan.session, pending_decision);
+        let pending_was_prepared = matches!(&prepared, Ok(PendingQuantumFinalizeStatus::Finalized));
+        let pending_auth = match prepared {
+            Ok(PendingQuantumFinalizeStatus::Finalized) if result.pending_quantum_required => {
+                Ok(())
+            }
+            Ok(PendingQuantumFinalizeStatus::NotFound) if !result.pending_quantum_required => {
+                Ok(())
+            }
+            Ok(PendingQuantumFinalizeStatus::NotFound) => Err(Error::InferenceError(
+                "executor result requires a pending quantum, but none was registered".to_string(),
+            )),
+            Ok(PendingQuantumFinalizeStatus::Finalized) => Err(Error::InferenceError(
+                "executor registered a pending quantum without authenticating it in the result"
+                    .to_string(),
+            )),
+            Err(error) => Err(error),
+        };
+        let mut finalize_managed = |commit| match managed_reservation.as_ref() {
+            Some(reservation) => {
+                self.managed_kv_cache
+                    .finalize(reservation, result.managed_cache.as_ref(), commit)
+            }
+            None if result.managed_cache.is_some() => Err(Error::InferenceError(
+                "executor returned an unplanned managed KV receipt".to_string(),
+            )),
+            None => Ok(()),
+        };
+        let managed_result = match pending_auth {
+            Ok(()) => finalize_managed(authoritative_commit),
+            Err(error) => match finalize_managed(false) {
+                Ok(()) => Err(error),
+                Err(abort_error) => Err(Error::InferenceError(format!(
+                    "{error}; managed KV abort also failed: {abort_error}"
+                ))),
+            },
+        };
+        let pending_result = if pending_was_prepared {
+            if managed_result.is_ok() {
+                match self
+                    .executor
+                    .publish_pending_quantum(plan.plan_id, &plan.session)
+                {
+                    Ok(PendingQuantumFinalizeStatus::Finalized) => Ok(()),
+                    Ok(PendingQuantumFinalizeStatus::NotFound) => Err(Error::InferenceError(
+                        "prepared executor quantum disappeared before publication".to_string(),
+                    )),
+                    Err(error) => Err(error),
+                }
+            } else {
+                self.executor
+                    .discard_prepared_quantum(plan.plan_id, &plan.session);
+                Ok(())
+            }
+        } else {
+            Ok(())
+        };
+        if let Err(error) = managed_result {
+            let message = match pending_result.as_ref() {
+                Ok(_) => format!("managed KV commit failed: {error}"),
+                Err(abort_error) => format!(
+                    "managed KV commit failed: {error}; executor pending-quantum abort also failed: {abort_error}"
                 ),
-                elapsed: std::time::Duration::ZERO,
-                safe_point: true,
-                disposition: ExecutionDisposition::Failed(ExecutionFailure::invalid_output(
-                    err.to_string(),
-                )),
-                output_finished: true,
-                output_has_error: true,
             };
+            result.output = ExecutorOutput::error(plan.session.request_id.clone(), message.clone());
+            result.disposition =
+                ExecutionDisposition::Failed(ExecutionFailure::invalid_output(message));
+            result.safe_point = true;
+            result.provenance = OutcomeProvenance::failure(
+                FailureOrigin::StateCommit,
+                result.provenance.dispatch_state,
+            );
+            result.staged_stream_outputs.clear();
+            let failure_report = Self::report_from_result(&result);
             if let Some(tracker) = self.execution_trackers.get_mut(&plan.session.request_id) {
                 let _ = tracker.commit(&plan, &failure_report);
             }
-            let message = format!("invalid executor result: {err}");
-            return Some(CommittedExecutorOutput {
-                session: plan.session.clone(),
-                output: ExecutorOutput::error(plan.session.request_id, message.clone()),
-                disposition: ExecutionDisposition::Failed(ExecutionFailure::invalid_output(
-                    message,
-                )),
-                provenance: OutcomeProvenance::failure(
-                    FailureOrigin::StateCommit,
-                    failure_dispatch_state,
-                ),
-                staged_stream_outputs: Vec::new(),
-            });
+        } else if let Err(error) = pending_result {
+            let message = format!("executor pending-quantum finalization failed: {error}");
+            result.output = ExecutorOutput::error(plan.session.request_id.clone(), message.clone());
+            result.disposition =
+                ExecutionDisposition::Failed(ExecutionFailure::invalid_output(message));
+            result.safe_point = true;
+            result.provenance = OutcomeProvenance::failure(
+                FailureOrigin::StateCommit,
+                result.provenance.dispatch_state,
+            );
+            result.staged_stream_outputs.clear();
+            result.managed_cache_completions.clear();
+            let failure_report = Self::report_from_result(&result);
+            if let Some(tracker) = self.execution_trackers.get_mut(&plan.session.request_id) {
+                let _ = tracker.commit(&plan, &failure_report);
+            }
+        } else if authoritative_commit {
+            if let Some(prepared) = prepared_realtime {
+                if let Some(outcome) =
+                    realtime_stage_outcome.filter(|outcome| outcome.next.is_none())
+                {
+                    self.requests
+                        .get(&plan.session.request_id)
+                        .expect("prepared realtime mailbox remains present until publication")
+                        .complete_realtime_asr_operation(outcome.operation_id)
+                        .expect("prepared realtime operation remains present until publication");
+                }
+                self.scheduler
+                    .publish_prepared_realtime_stage_outcome(&plan.session, prepared);
+            }
+            if !matches!(result.disposition, ExecutionDisposition::RestartSequence(_)) {
+                self.execution_trackers
+                    .insert(plan.session.request_id.clone(), prospective_tracker);
+            }
+        } else if !matches!(result.disposition, ExecutionDisposition::RestartSequence(_)) {
+            self.execution_trackers
+                .insert(plan.session.request_id.clone(), prospective_tracker);
         }
+        if matches!(result.disposition, ExecutionDisposition::RestartSequence(_)) {
+            let restart_failure = if let Some(reservation) = managed_reservation.as_ref() {
+                let request = self.requests.get(&plan.session.request_id).cloned();
+                if request
+                    .as_ref()
+                    .is_some_and(|request| request.is_cancelled())
+                {
+                    if let Err(error) = self.replace_active_result_with_terminal(
+                        &plan,
+                        &mut result,
+                        ExecutorOutput::cancelled(plan.session.request_id.clone()),
+                        ExecutionDisposition::Finished(ExecutionFinishReason::Cancelled),
+                        OutcomeProvenance::started(),
+                    ) {
+                        Some(format!(
+                            "sequence restart cancellation commit failed: {error}"
+                        ))
+                    } else {
+                        self.release_managed_session_if_ready(&plan.session);
+                        result.output.request_id = plan.session.request_id.clone();
+                        return Some(CommittedExecutorOutput {
+                            session: plan.session,
+                            output: result.output,
+                            disposition: result.disposition,
+                            provenance: result.provenance,
+                            staged_stream_outputs: Vec::new(),
+                        });
+                    }
+                } else if let Some(request) = request {
+                    if let Some(runtime) = request.managed_cache_runtime().cloned() {
+                        match self.managed_kv_cache.reset_session_generation(
+                            &runtime,
+                            &plan.session,
+                            reservation.session_generation,
+                        ) {
+                            Ok(_) => {
+                                #[cfg(test)]
+                                if let Some(hook) = self.restart_after_reset_hook.as_ref() {
+                                    hook();
+                                }
+                                if request.is_cancelled() {
+                                    if let Err(error) = self.replace_active_result_with_terminal(
+                                        &plan,
+                                        &mut result,
+                                        ExecutorOutput::cancelled(plan.session.request_id.clone()),
+                                        ExecutionDisposition::Finished(
+                                            ExecutionFinishReason::Cancelled,
+                                        ),
+                                        OutcomeProvenance::started(),
+                                    ) {
+                                        Some(format!(
+                                            "post-reset cancellation commit failed: {error}"
+                                        ))
+                                    } else {
+                                        self.release_managed_session_if_ready(&plan.session);
+                                        result.output.request_id = plan.session.request_id.clone();
+                                        return Some(CommittedExecutorOutput {
+                                            session: plan.session,
+                                            output: result.output,
+                                            disposition: result.disposition,
+                                            provenance: result.provenance,
+                                            staged_stream_outputs: Vec::new(),
+                                        });
+                                    }
+                                } else if self
+                                    .scheduler
+                                    .restart_request_for_recompute(&plan.session)
+                                {
+                                    self.execution_trackers.insert(
+                                        plan.session.request_id.clone(),
+                                        ExecutionTracker::new(plan.session.clone()),
+                                    );
+                                    self.execution_retry_attempts.remove(&plan.session);
+                                    return None;
+                                } else {
+                                    Some(
+                                        "scheduler rejected a managed sequence restart".to_string(),
+                                    )
+                                }
+                            }
+                            Err(error) => Some(format!("managed sequence reset failed: {error}")),
+                        }
+                    } else {
+                        Some("sequence restart request lost its managed-cache runtime".to_string())
+                    }
+                } else {
+                    Some("sequence restart request is no longer active".to_string())
+                }
+            } else {
+                Some("sequence restart requires a managed-cache reservation".to_string())
+            };
+
+            let message =
+                restart_failure.unwrap_or_else(|| "managed sequence restart failed".to_string());
+            let dispatch_state = result.provenance.dispatch_state;
+            if let Err(error) = self.replace_active_result_with_terminal(
+                &plan,
+                &mut result,
+                ExecutorOutput::error(plan.session.request_id.clone(), message.clone()),
+                ExecutionDisposition::Failed(ExecutionFailure::invalid_output(message)),
+                OutcomeProvenance::failure(FailureOrigin::StateCommit, dispatch_state),
+            ) {
+                result.output = ExecutorOutput::error(
+                    plan.session.request_id.clone(),
+                    format!("sequence restart failure commit failed: {error}"),
+                );
+                result.disposition =
+                    ExecutionDisposition::Failed(ExecutionFailure::invalid_output(
+                        "sequence restart failure could not be committed",
+                    ));
+                result.provenance =
+                    OutcomeProvenance::failure(FailureOrigin::StateCommit, dispatch_state);
+            }
+        }
+        self.release_managed_session_if_ready(&plan.session);
 
         match &result.disposition {
             ExecutionDisposition::Failed(failure)
                 if failure.retry == RetryDisposition::RetrySameSession =>
             {
+                if let Some((operation_id, subphase)) = Self::realtime_work_identity(&plan.work) {
+                    if self.scheduler.release_realtime_operation_for_retry(
+                        &plan.session,
+                        plan.plan_id,
+                        operation_id,
+                        subphase,
+                    ) {
+                        return None;
+                    }
+                    let message = "scheduler rejected an exact realtime stage retry";
+                    return Some(CommittedExecutorOutput {
+                        session: plan.session.clone(),
+                        output: ExecutorOutput::error(
+                            plan.session.request_id.clone(),
+                            message.to_string(),
+                        ),
+                        disposition: ExecutionDisposition::Failed(
+                            ExecutionFailure::invalid_output(message),
+                        ),
+                        provenance: OutcomeProvenance::failure(
+                            FailureOrigin::StateCommit,
+                            result.provenance.dispatch_state,
+                        ),
+                        staged_stream_outputs: Vec::new(),
+                    });
+                }
                 let attempt = retry_attempt.unwrap_or(1);
                 let retry_at = Instant::now() + self.retry_policy.execution_delay(attempt);
                 if self
@@ -907,10 +1888,10 @@ impl EngineCore {
                 if failure.retry == RetryDisposition::Recompute =>
             {
                 let release = self.executor.cleanup_session(&plan.session).await;
-                if release.confirmed
-                    && self
-                        .scheduler
-                        .restart_request_for_recompute(&plan.session, self.kv_cache.inner_mut())
+                if release.confirmed {
+                    self.request_managed_session_release(&plan.session);
+                }
+                if release.confirmed && self.scheduler.restart_request_for_recompute(&plan.session)
                 {
                     let attempt = retry_attempt.unwrap_or(1);
                     let retry_at = Instant::now() + self.retry_policy.execution_delay(attempt);
@@ -964,14 +1945,48 @@ impl EngineCore {
             }
             ExecutionDisposition::Progress
             | ExecutionDisposition::Yielded(_)
+            | ExecutionDisposition::RestartSequence(_)
             | ExecutionDisposition::Finished(_) => {
-                self.scheduler.update_after_step(
-                    &plan.session.request_id,
-                    result.output.tokens_processed,
-                    result.output.tokens_generated,
-                    Vec::new(),
-                    step_time_ms,
-                );
+                if Self::realtime_work_identity(&plan.work).is_none() {
+                    self.scheduler.update_after_step(
+                        &plan.session.request_id,
+                        result.output.tokens_processed,
+                        result.output.tokens_generated,
+                        step_time_ms,
+                    );
+                    if matches!(
+                        result.disposition,
+                        ExecutionDisposition::Yielded(super::YieldReason::AwaitingFinalization)
+                    ) {
+                        if let Err(error) = self
+                            .scheduler
+                            .request_sequence_finalize(&plan.session.request_id)
+                        {
+                            warn!(
+                                request_id = %plan.session.request_id,
+                                error = %error,
+                                "Committed sequence could not enter finalization"
+                            );
+                            return Some(CommittedExecutorOutput {
+                                session: plan.session,
+                                output: ExecutorOutput::error(
+                                    result.output.request_id,
+                                    format!("sequence finalization transition failed: {error}"),
+                                ),
+                                disposition: ExecutionDisposition::Failed(
+                                    ExecutionFailure::invalid_output(
+                                        "sequence finalization transition failed",
+                                    ),
+                                ),
+                                provenance: OutcomeProvenance::failure(
+                                    FailureOrigin::StateCommit,
+                                    result.provenance.dispatch_state,
+                                ),
+                                staged_stream_outputs: Vec::new(),
+                            });
+                        }
+                    }
+                }
             }
             ExecutionDisposition::Failed(_) => {}
         }
@@ -996,10 +2011,43 @@ impl EngineCore {
         work: &WorkUnit,
         stage: Option<&super::StageDescriptor>,
     ) -> Result<WorkCost> {
+        if let WorkUnit::RealtimePreparation { operation_id, .. } = work {
+            return request.realtime_asr_preparation_cost(*operation_id);
+        }
         if let Some(prepared) = stage.and_then(|stage| request.prepared_stage_cost(stage.id)) {
+            if stage.is_some_and(|stage| stage.batch_mode == NativeBatchMode::Continuous) {
+                if let WorkUnit::SequenceStep {
+                    phase: SequencePhase::Decode,
+                    input,
+                    ..
+                } = work
+                {
+                    let input_units = u64::try_from(input.len()).map_err(|_| {
+                        Error::Overloaded(
+                            "continuous decode input exceeds work accounting".to_string(),
+                        )
+                    })?;
+                    if input_units > 1 {
+                        let tensor_elements = prepared
+                            .tensor_elements
+                            .checked_mul(input_units)
+                            .ok_or_else(|| {
+                                Error::Overloaded(
+                                    "continuous decode tensor cost overflowed".to_string(),
+                                )
+                            })?;
+                        return Ok(WorkCost::with_workspace(
+                            input_units,
+                            tensor_elements,
+                            prepared.workspace,
+                        ));
+                    }
+                }
+            }
             return Ok(prepared);
         }
         let logical_units = match work {
+            WorkUnit::PreSequencePreparation { .. } => 1,
             WorkUnit::SequenceStep {
                 input,
                 max_output_steps,
@@ -1013,6 +2061,66 @@ impl EngineCore {
                 })?;
                 input.max(output).max(1)
             }
+            WorkUnit::SequenceFinalize { max_output_steps } => u64::try_from(*max_output_steps)
+                .map_err(|_| {
+                    Error::Overloaded(
+                        "sequence finalization output bound exceeds work accounting".into(),
+                    )
+                })?
+                .max(1),
+            WorkUnit::RealtimePush {
+                input,
+                max_output_steps,
+                max_cache_append,
+                ..
+            } => {
+                let input = u64::try_from(input.len()).map_err(|_| {
+                    Error::Overloaded("realtime input length exceeds work accounting".to_string())
+                })?;
+                let output = u64::try_from(*max_output_steps).map_err(|_| {
+                    Error::Overloaded("realtime output bound exceeds work accounting".to_string())
+                })?;
+                let cache_append = u64::try_from(*max_cache_append).map_err(|_| {
+                    Error::Overloaded(
+                        "realtime cache append bound exceeds work accounting".to_string(),
+                    )
+                })?;
+                input.max(output).max(cache_append).max(1)
+            }
+            WorkUnit::RealtimeFinish {
+                max_output_steps,
+                max_cache_append,
+                ..
+            } => {
+                let output = u64::try_from(*max_output_steps).map_err(|_| {
+                    Error::Overloaded(
+                        "realtime finish output bound exceeds work accounting".to_string(),
+                    )
+                })?;
+                let cache_append = u64::try_from(*max_cache_append).map_err(|_| {
+                    Error::Overloaded(
+                        "realtime cache append bound exceeds work accounting".to_string(),
+                    )
+                })?;
+                output.max(cache_append).max(1)
+            }
+            WorkUnit::RealtimePreparation { input, .. } => u64::try_from(input.len())
+                .map_err(|_| {
+                    Error::Overloaded(
+                        "realtime preparation input exceeds work accounting".to_string(),
+                    )
+                })?
+                .max(1),
+            WorkUnit::RealtimePromptPrefill {
+                max_output_steps,
+                cache_append,
+                ..
+            } => u64::try_from((*max_output_steps).max(*cache_append))
+                .map_err(|_| {
+                    Error::Overloaded("realtime prompt prefill exceeds work accounting".to_string())
+                })?
+                .max(1),
+            WorkUnit::RealtimeDecodeContinuation { .. } | WorkUnit::RealtimeCompletion { .. } => 1,
             WorkUnit::AtomicJob { .. } | WorkUnit::PipelineStage { .. } => 1,
         };
         let workspace_bytes = stage.map_or(Ok(0), |stage| {
@@ -1040,7 +2148,14 @@ impl EngineCore {
                     .checked_next_power_of_two()
                     .unwrap_or(u64::MAX)
             ),
-            StageShapePolicy::Padded => "padded".to_string(),
+            StageShapePolicy::Padded => match &plan.work {
+                WorkUnit::SequenceStep {
+                    auxiliary_state: Some(spans),
+                    ..
+                } if !spans.is_empty() => "padded.auxiliary".to_string(),
+                WorkUnit::SequenceStep { .. } => "padded.primary".to_string(),
+                _ => "padded".to_string(),
+            },
             StageShapePolicy::Ragged => "ragged".to_string(),
         };
         BatchLaneKey {
@@ -1113,11 +2228,93 @@ impl EngineCore {
         Ok(batch_id)
     }
 
+    fn register_prepared_physical_dispatch(
+        &mut self,
+        dispatch: &PreparedPhysicalDispatch,
+    ) -> Result<()> {
+        let in_flight = InFlightPhysicalDispatch::from_prepared(dispatch);
+        let batch_id = in_flight.physical_batch.batch_id;
+        let candidate_limit = self
+            .config
+            .resolved_physical_execution_capacity()
+            .candidate_dispatch_limit
+            .get();
+        if self.in_flight_dispatches.len() >= candidate_limit {
+            return Err(Error::InferenceError(
+                "physical dispatch candidate limit is already fully owned".to_string(),
+            ));
+        }
+        if self.in_flight_dispatches.contains_key(&batch_id) {
+            return Err(Error::InferenceError(
+                "physical dispatch batch identity was registered twice".to_string(),
+            ));
+        }
+
+        for row in &in_flight.physical_batch.rows {
+            let plan = self.active_plans.get(&row.plan_id).ok_or_else(|| {
+                Error::InferenceError(
+                    "physical dispatch row has no active execution plan".to_string(),
+                )
+            })?;
+            if plan.session != row.session || plan.work != row.work {
+                return Err(Error::InferenceError(
+                    "physical dispatch row crossed its active plan fence".to_string(),
+                ));
+            }
+            let sealed_launch_policy = plan
+                .stage
+                .as_ref()
+                .map(|stage| stage.physical_launch_policy)
+                .unwrap_or(PhysicalLaunchPolicy::ExecutionGroupExclusive);
+            if sealed_launch_policy != in_flight.launch_policy {
+                return Err(Error::InferenceError(
+                    "physical dispatch launch policy differs from its sealed stage contract"
+                        .to_string(),
+                ));
+            }
+            if self.in_flight_dispatches.values().any(|active| {
+                active.contains_plan(row.plan_id) || active.contains_session(&row.session)
+            }) {
+                return Err(Error::InferenceError(
+                    "physical dispatch duplicated an in-flight session or plan quantum".to_string(),
+                ));
+            }
+            match (
+                row.managed_cache.as_ref(),
+                self.active_managed_cache.get(&row.plan_id),
+            ) {
+                (None, None) => {}
+                (Some(row), Some(active)) if row == active => {}
+                _ => {
+                    return Err(Error::InferenceError(
+                        "physical dispatch row crossed its active managed-cache fence".to_string(),
+                    ));
+                }
+            }
+        }
+
+        let stream_fence = in_flight.stream_fence();
+        if stream_fence.is_some() && self.active_stream_batches.contains_key(&batch_id) {
+            return Err(Error::InferenceError(
+                "physical stream batch identity was registered twice".to_string(),
+            ));
+        }
+        self.in_flight_dispatches.insert(batch_id, in_flight);
+        if let Some(stream_fence) = stream_fence {
+            self.active_stream_batches.insert(batch_id, stream_fence);
+        }
+        Ok(())
+    }
+
     fn form_physical_batches(
         &mut self,
+        phase: ExecutionPhase,
         requests: &[Arc<EngineCoreRequest>],
         scheduled: &[super::scheduler::ScheduledRequest],
-    ) -> Result<Vec<PreparedExecutionBatch>> {
+        max_candidates: usize,
+        capacity_blocked: &mut Vec<super::scheduler::ScheduledRequest>,
+        transaction_deferred: &mut Vec<super::scheduler::ScheduledRequest>,
+    ) -> Result<Vec<PreparedPhysicalDispatch>> {
         let available = requests
             .iter()
             .map(|request| request.id.clone())
@@ -1150,20 +2347,80 @@ impl EngineCore {
                 })?;
             let cost = Self::work_cost(&request, &plan.work, plan.stage.as_ref())?;
             let lane = Self::batch_lane(&plan, cost);
-            let (budget, shape_policy) = Self::batch_budget(&plan)?;
+            let (mut budget, shape_policy) = Self::batch_budget(&plan)?;
             let output_visibility = plan
                 .stage
                 .as_ref()
                 .map_or(super::OutputVisibility::AfterQuantumCommit, |stage| {
                     stage.output_visibility
                 });
+            let launch_policy = plan
+                .stage
+                .as_ref()
+                .map(|stage| stage.physical_launch_policy)
+                .unwrap_or(PhysicalLaunchPolicy::ExecutionGroupExclusive);
+            if plan.batch_mode == NativeBatchMode::None {
+                if self.config.physical_execution_mode
+                    == crate::config::PhysicalExecutionMode::Concurrent
+                    && matches!(launch_policy, PhysicalLaunchPolicy::Concurrent { .. })
+                {
+                    let launch_limit = self
+                        .config
+                        .resolved_physical_execution_capacity()
+                        .physical_launch_limit;
+                    budget.max_rows = budget
+                        .max_rows
+                        .min(launch_policy.effective_max_in_flight_per_model(launch_limit));
+                } else {
+                    // Physical serial/shadow modes are authoritative for
+                    // scalar calls. Native B>1 tensor stages remain one model
+                    // entry and are governed by their independent rollout.
+                    budget.max_rows = 1;
+                }
+            }
             let planned_work = plan.work.clone();
+            let managed_cache = match request.managed_cache_runtime().map(|runtime| {
+                self.managed_kv_cache.prepare(
+                    runtime,
+                    plan.plan_id,
+                    &plan.session,
+                    &planned_work,
+                    Some(&request),
+                )
+            }) {
+                Some(Ok(reservation)) => reservation,
+                None => None,
+                Some(Err(Error::Backpressure(reason))) => {
+                    capacity_blocked.push(scheduled.clone());
+                    debug!(
+                        request_id = %scheduled.request_id,
+                        plan_id = scheduled.plan_id,
+                        reason = %reason,
+                        "Withholding only the row blocked by managed KV capacity"
+                    );
+                    continue;
+                }
+                Some(Err(error)) => return Err(error),
+            };
+            if let Some(reservation) = managed_cache.as_ref() {
+                if self
+                    .active_managed_cache
+                    .insert(plan.plan_id, reservation.clone())
+                    .is_some()
+                {
+                    let _ = self.managed_kv_cache.finalize(reservation, None, false);
+                    return Err(Error::InferenceError(
+                        "managed KV transaction was prepared twice".to_string(),
+                    ));
+                }
+            }
             let row = ReadyQuantum {
                 plan_id: plan.plan_id,
                 session: plan.session.clone(),
                 lane: lane.clone(),
                 work: planned_work.clone(),
                 cost,
+                managed_cache,
             };
             let mut executable = scheduled.clone();
             executable.work = planned_work;
@@ -1176,6 +2433,7 @@ impl EngineCore {
                         || assembly.physical_batch.budget != budget
                         || assembly.output_visibility != output_visibility
                         || assembly.shape_policy != shape_policy
+                        || assembly.launch_policy != launch_policy
                     {
                         continue;
                     }
@@ -1198,6 +2456,7 @@ impl EngineCore {
                     .unwrap_or(0);
                 let workspace = PhysicalBatchAssembly::workspace_resources(
                     lane.backend,
+                    shape_policy,
                     workspace_base_bytes,
                     std::slice::from_ref(&row),
                 )
@@ -1221,40 +2480,42 @@ impl EngineCore {
                     output_visibility,
                     shape_policy,
                     workspace_base_bytes,
+                    launch_policy,
                 });
             }
         }
 
-        let mut prepared = Vec::with_capacity(assemblies.len());
-        for assembly in assemblies {
-            if assembly.output_visibility == OutputVisibility::IncrementalCommitted {
-                let rows = assembly
-                    .physical_batch
-                    .rows
-                    .iter()
-                    .map(|row| (row.plan_id, row.session.clone()))
-                    .collect();
-                let fence = ActiveStreamBatch {
-                    lane: assembly.physical_batch.lane.clone(),
-                    output_visibility: assembly.output_visibility,
-                    rows,
-                };
-                if self
-                    .active_stream_batches
-                    .insert(assembly.physical_batch.batch_id, fence)
-                    .is_some()
-                {
-                    return Err(Error::InferenceError(
-                        "physical stream batch identity was registered twice".to_string(),
-                    ));
-                }
+        let candidate_limit = self
+            .config
+            .resolved_physical_execution_capacity()
+            .candidate_dispatch_limit
+            .get();
+        let available_candidates = candidate_limit
+            .saturating_sub(self.in_flight_dispatches.len())
+            .min(max_candidates);
+        let mut prepared = Vec::with_capacity(assemblies.len().min(available_candidates));
+        for (index, assembly) in assemblies.into_iter().enumerate() {
+            if index >= available_candidates {
+                transaction_deferred.extend(assembly.scheduled);
+                continue;
             }
-            prepared.push(PreparedExecutionBatch::new(
+            let reservations = assembly
+                .physical_batch
+                .rows
+                .iter()
+                .filter_map(|row| row.managed_cache.clone())
+                .collect();
+            let dispatch = PreparedPhysicalDispatch::new(
+                phase,
                 assembly.physical_batch,
                 assembly.requests,
                 assembly.scheduled,
                 assembly.output_visibility,
-            ));
+                reservations,
+                assembly.launch_policy,
+            )?;
+            self.register_prepared_physical_dispatch(&dispatch)?;
+            prepared.push(dispatch);
         }
         Ok(prepared)
     }
@@ -1364,26 +2625,75 @@ impl EngineCore {
     pub fn new_with_worker(config: EngineCoreConfig, worker_config: WorkerConfig) -> Result<Self> {
         info!("Creating engine core");
 
+        let managed_resource_authority = worker_config.resource_authority.clone();
+        let managed_worker_backend = worker_config.backend_context.backend_kind;
+        let managed_worker_device = worker_config.backend_context.device.device.clone();
         let executor = UnifiedExecutor::new_native(worker_config);
-        Self::new_with_executor(config, executor)
+        Self::new_with_executor_and_managed_authority(
+            config,
+            executor,
+            managed_resource_authority,
+            Some((managed_worker_backend, managed_worker_device)),
+        )
     }
 
     fn new_with_executor(config: EngineCoreConfig, executor: UnifiedExecutor) -> Result<Self> {
+        Self::new_with_executor_and_managed_authority(config, executor, None, None)
+    }
+
+    fn new_with_executor_and_managed_authority(
+        config: EngineCoreConfig,
+        executor: UnifiedExecutor,
+        managed_resource_authority: Option<Arc<super::ResourceAuthority>>,
+        managed_worker: Option<(BackendKind, candle_core::Device)>,
+    ) -> Result<Self> {
+        // Direct EngineCore users must cross the same fail-closed cache-policy
+        // boundary as RuntimeService users before workers or arenas start.
+        let cache_policy = config.resolved_kv_cache_policy()?;
         // Create scheduler
         let scheduler_config = SchedulerConfig::from(&config);
         let scheduler = Scheduler::new(scheduler_config);
 
-        // Create KV cache manager
-        let kv_cache = KvCacheBackend::new(&config)?;
-
         // Create output processor
         let output_processor =
             OutputProcessor::new(config.sample_rate).with_chunk_size(config.streaming_chunk_size);
+        let managed_prefix_salt = config
+            .enable_prefix_caching
+            .then_some(config.managed_prefix_cache_salt.as_deref())
+            .flatten()
+            .map(|salt| Sha256::digest(salt.as_bytes()).into());
+        let max_prefix_cache_pages = match cache_policy.effective.prefix {
+            crate::config::PrefixCachePolicy::Disabled => 0,
+            crate::config::PrefixCachePolicy::Namespaced { max_pages, .. } => max_pages,
+        };
+
+        let (managed_kv_cache, physical_state) = match managed_worker {
+            Some((backend, device)) => (
+                ManagedKvCacheManager::for_worker_with_prefix_cache_policy(
+                    managed_resource_authority.clone(),
+                    managed_prefix_salt,
+                    max_prefix_cache_pages,
+                    backend,
+                    device.clone(),
+                ),
+                PhysicalStateManager::for_worker(managed_resource_authority, backend, device),
+            ),
+            None => (
+                ManagedKvCacheManager::with_prefix_cache_policy(
+                    managed_resource_authority.clone(),
+                    managed_prefix_salt,
+                    max_prefix_cache_pages,
+                ),
+                PhysicalStateManager::cpu(managed_resource_authority),
+            ),
+        };
 
         Ok(Self {
             config,
             scheduler,
-            kv_cache,
+            managed_kv_cache,
+            physical_state,
+            composite_retained_state: HashMap::new(),
             executor,
             output_processor,
             requests: HashMap::new(),
@@ -1391,14 +2701,21 @@ impl EngineCore {
             request_phase_timings: HashMap::new(),
             execution_trackers: HashMap::new(),
             active_plans: HashMap::new(),
+            in_flight_dispatches: HashMap::new(),
+            pending_runner_recovery: None,
+            active_managed_cache: HashMap::new(),
+            pending_managed_releases: HashSet::new(),
+            cleanup_confirmation_waiters: HashMap::new(),
             active_stream_batches: HashMap::new(),
             stream_sequence_cursors: HashMap::new(),
             incremental_stream_sessions: HashSet::new(),
             pending_terminal_outputs: VecDeque::new(),
             execution_retry_attempts: HashMap::new(),
             retry_policy: LifecycleRetryPolicy::default(),
+            #[cfg(test)]
+            restart_after_reset_hook: None,
+            next_single_candidate_phase: ExecutionPhase::Decode,
             initialized: false,
-            maintenance_steps: 0,
             next_batch_id: 1,
         })
     }
@@ -1445,9 +2762,28 @@ impl EngineCore {
         request.seal_execution_preparation()?;
         request.enforce_chat_context_window(self.config.max_seq_len)?;
 
+        if let Some(model_instance) = request.model_instance_id() {
+            if request.v2_state_descriptor().is_some() {
+                let runtime = request.v2_state_runtime().ok_or_else(|| {
+                    Error::InferenceError(format!(
+                        "model instance {} published state ABI v2 before a resolved v2 runtime was installed",
+                        model_instance.get()
+                    ))
+                })?;
+                let execution = request.execution_adapter_binding().ok_or_else(|| {
+                    Error::InferenceError(
+                        "state ABI v2 runtime has no bound execution adapter".to_string(),
+                    )
+                })?;
+                runtime.validate_against(self.managed_kv_cache.worker_backend(), execution)?;
+                if let Some(physical) = runtime.managed_kv_runtime() {
+                    request.install_managed_cache_runtime(physical)?;
+                }
+            }
+        }
+
         // Add to scheduler. A public ID remains unavailable while an expired
-        // incarnation has logical cache quarantined behind unconfirmed
-        // executor cleanup.
+        // incarnation awaits capability-authoritative executor cleanup.
         if !self.scheduler.add_request(&request) {
             return Err(Error::InvalidInput(format!(
                 "Request {} already exists or is awaiting cache cleanup",
@@ -1469,6 +2805,238 @@ impl EngineCore {
         );
 
         Ok(())
+    }
+
+    /// Atomically admit an already-authenticated realtime ASR request into its
+    /// dedicated FIFO scheduler state. This route deliberately bypasses normal
+    /// one-shot audio preprocessing; audio enters only through operation rows.
+    pub(crate) fn add_realtime_asr_session(
+        &mut self,
+        mut request: EngineCoreRequest,
+    ) -> Result<super::SessionKey> {
+        let request_id = request.id.clone();
+        if request.task_type != super::TaskType::ASR
+            || !request.is_realtime_asr_session()
+            || request.model_variant.is_none_or(|variant| {
+                !matches!(
+                    variant.family(),
+                    crate::catalog::ModelFamily::Voxtral | crate::catalog::ModelFamily::NemotronAsr
+                )
+            })
+        {
+            return Err(Error::InvalidInput(
+                "realtime ASR admission requires an ingress-enabled authenticated ASR request"
+                    .into(),
+            ));
+        }
+        if self.requests.contains_key(&request_id) {
+            return Err(Error::InvalidInput(format!(
+                "Request {request_id} already exists"
+            )));
+        }
+        request.seal_execution_preparation()?;
+        let model_instance = request.model_instance_id().ok_or_else(|| {
+            Error::InvalidInput(
+                "realtime ASR admission requires an exact loaded model instance".into(),
+            )
+        })?;
+        let execution = request.execution_adapter_binding().ok_or_else(|| {
+            Error::InvalidInput(
+                "realtime ASR admission requires a loaded execution adapter binding".into(),
+            )
+        })?;
+        match request.model_variant.expect("validated realtime variant").family() {
+            crate::catalog::ModelFamily::Voxtral => crate::models::architectures::voxtral::authenticate_voxtral_realtime_execution_binding(execution)?,
+            crate::catalog::ModelFamily::NemotronAsr => crate::models::architectures::nemotron::asr::authenticate_realtime_execution_binding(execution)?,
+            _ => unreachable!("validated realtime family"),
+        }
+        if execution.model_instance_id != model_instance {
+            return Err(Error::InvalidInput(
+                "realtime ASR execution binding crossed its loaded model instance".into(),
+            ));
+        }
+        let descriptor = request.v2_state_descriptor().ok_or_else(|| {
+            Error::InvalidInput("realtime ASR admission requires a state ABI v2 descriptor".into())
+        })?;
+        let runtime = request.v2_state_runtime().ok_or_else(|| {
+            Error::InvalidInput(
+                "realtime ASR admission requires a resolved state ABI v2 runtime".into(),
+            )
+        })?;
+        if descriptor != &runtime.descriptor {
+            return Err(Error::InvalidInput(
+                "realtime ASR state descriptor differs from its resolved runtime".into(),
+            ));
+        }
+        runtime.validate_against(self.managed_kv_cache.worker_backend(), execution)?;
+        let physical = runtime.managed_kv_runtime().ok_or_else(|| {
+            Error::InvalidInput(
+                "realtime ASR admission requires a physical managed state runtime".into(),
+            )
+        })?;
+        if physical.plan().model_instance != model_instance {
+            return Err(Error::InvalidInput(
+                "realtime ASR managed runtime crossed its loaded model instance".into(),
+            ));
+        }
+        request.install_managed_cache_runtime(physical)?;
+        if !self.scheduler.add_realtime_session(&request) {
+            return Err(Error::InvalidInput(format!(
+                "Request {request_id} already exists or is awaiting cache cleanup"
+            )));
+        }
+        let session = self.get_session_key(&request_id).ok_or_else(|| {
+            Error::InferenceError(format!(
+                "realtime request {request_id} lost its scheduler session"
+            ))
+        })?;
+        self.requests.insert(request_id.clone(), Arc::new(request));
+        self.request_start_times
+            .insert(request_id.clone(), Instant::now());
+        self.request_phase_timings
+            .insert(request_id, RequestPhaseTiming::default());
+        Ok(session)
+    }
+
+    pub(crate) async fn enqueue_realtime_asr_push(
+        &mut self,
+        session: &super::SessionKey,
+        samples: Arc<[f32]>,
+        sample_rate: u32,
+        max_output_steps: usize,
+        max_cache_append: usize,
+    ) -> Result<(super::RealtimeOperationId, RealtimeAsrOperationWaiter)> {
+        let logical_units = u64::try_from(samples.len()).unwrap_or(u64::MAX).max(1);
+        self.enqueue_realtime_asr_push_with_cost(
+            session,
+            samples,
+            sample_rate,
+            max_output_steps,
+            max_cache_append,
+            WorkCost::new(logical_units, logical_units, 0),
+        )
+        .await
+    }
+
+    pub(crate) async fn enqueue_realtime_asr_push_with_cost(
+        &mut self,
+        session: &super::SessionKey,
+        samples: Arc<[f32]>,
+        sample_rate: u32,
+        max_output_steps: usize,
+        max_cache_append: usize,
+        preparation_cost: WorkCost,
+    ) -> Result<(super::RealtimeOperationId, RealtimeAsrOperationWaiter)> {
+        if samples.is_empty() || sample_rate == 0 || max_output_steps == 0 {
+            return Err(Error::InvalidInput(
+                "realtime ASR push requires samples, a sample rate, and an output-step bound"
+                    .into(),
+            ));
+        }
+        let request = self
+            .requests
+            .get(&session.request_id)
+            .filter(|_| self.get_session_key(&session.request_id).as_ref() == Some(session))
+            .cloned()
+            .ok_or_else(|| {
+                Error::InvalidInput("realtime ASR session is stale or missing".into())
+            })?;
+        let (operation_id, input) = self.scheduler.enqueue_realtime_push(
+            session,
+            samples.len(),
+            max_output_steps,
+            max_cache_append,
+        )?;
+        debug_assert_eq!(input.len(), samples.len());
+        match request.install_realtime_asr_operation_with_cost(
+            operation_id,
+            RealtimeAsrOperationPayload::Push {
+                samples,
+                sample_rate,
+            },
+            preparation_cost,
+        ) {
+            Ok(waiter) => Ok((operation_id, waiter)),
+            Err(error) => {
+                let message = error.to_string();
+                let _ = self
+                    .terminate_request_session(
+                        session,
+                        ExecutorOutput::error(session.request_id.clone(), message.clone()),
+                        ExecutionDisposition::Failed(ExecutionFailure::invalid_output(
+                            message.clone(),
+                        )),
+                        OutcomeProvenance::not_started(),
+                    )
+                    .await;
+                Err(Error::InferenceError(format!(
+                    "realtime ASR payload installation failed; session rolled back: {message}"
+                )))
+            }
+        }
+    }
+
+    pub(crate) async fn enqueue_realtime_asr_finish(
+        &mut self,
+        session: &super::SessionKey,
+        max_output_steps: usize,
+        max_cache_append: usize,
+    ) -> Result<(super::RealtimeOperationId, RealtimeAsrOperationWaiter)> {
+        self.enqueue_realtime_asr_finish_with_cost(
+            session,
+            max_output_steps,
+            max_cache_append,
+            WorkCost::new(1, 1, 0),
+        )
+        .await
+    }
+
+    pub(crate) async fn enqueue_realtime_asr_finish_with_cost(
+        &mut self,
+        session: &super::SessionKey,
+        max_output_steps: usize,
+        max_cache_append: usize,
+        preparation_cost: WorkCost,
+    ) -> Result<(super::RealtimeOperationId, RealtimeAsrOperationWaiter)> {
+        if max_output_steps == 0 {
+            return Err(Error::InvalidInput(
+                "realtime ASR finish requires an output-step bound".into(),
+            ));
+        }
+        let request = self
+            .requests
+            .get(&session.request_id)
+            .filter(|_| self.get_session_key(&session.request_id).as_ref() == Some(session))
+            .cloned()
+            .ok_or_else(|| {
+                Error::InvalidInput("realtime ASR session is stale or missing".into())
+            })?;
+        let operation_id =
+            self.scheduler
+                .enqueue_realtime_finish(session, max_output_steps, max_cache_append)?;
+        match request.install_realtime_asr_operation_with_cost(
+            operation_id,
+            RealtimeAsrOperationPayload::Finish,
+            preparation_cost,
+        ) {
+            Ok(waiter) => Ok((operation_id, waiter)),
+            Err(error) => {
+                let message = error.to_string();
+                let _ = self
+                    .terminate_request_session(
+                        session,
+                        ExecutorOutput::error(session.request_id.clone(), message.clone()),
+                        ExecutionDisposition::Failed(ExecutionFailure::invalid_output(
+                            message.clone(),
+                        )),
+                        OutcomeProvenance::not_started(),
+                    )
+                    .await;
+                Err(Error::InferenceError(format!(
+                    "realtime ASR payload installation failed; session rolled back: {message}"
+                )))
+            }
+        }
     }
 
     fn terminal_release_cause(disposition: &ExecutionDisposition) -> Option<TerminalReleaseCause> {
@@ -1493,6 +3061,13 @@ impl EngineCore {
 
     fn clear_exact_execution_state(&mut self, session: &super::SessionKey) {
         if self
+            .in_flight_dispatches
+            .values()
+            .any(|dispatch| dispatch.contains_session(session))
+        {
+            return;
+        }
+        if self
             .execution_trackers
             .get(&session.request_id)
             .is_some_and(|tracker| tracker.session() == session)
@@ -1505,6 +3080,97 @@ impl EngineCore {
         self.execution_retry_attempts.remove(session);
         self.stream_sequence_cursors.remove(session);
         self.incremental_stream_sessions.remove(session);
+    }
+
+    fn request_managed_session_release(&mut self, session: &super::SessionKey) -> bool {
+        if self
+            .active_managed_cache
+            .values()
+            .any(|reservation| &reservation.session == session)
+        {
+            self.pending_managed_releases.insert(session.clone());
+            return false;
+        }
+        match self.managed_kv_cache.release_session(session) {
+            Ok(()) => {
+                self.pending_managed_releases.remove(session);
+                true
+            }
+            Err(error) => {
+                self.pending_managed_releases.insert(session.clone());
+                warn!(
+                    request_id = %session.request_id,
+                    session_epoch = session.epoch,
+                    error = %error,
+                    "Failed to release a managed KV session table; retaining cleanup quarantine"
+                );
+                false
+            }
+        }
+    }
+
+    fn release_managed_session_if_ready(&mut self, session: &super::SessionKey) {
+        if self.pending_managed_releases.contains(session)
+            && !self
+                .active_managed_cache
+                .values()
+                .any(|reservation| &reservation.session == session)
+        {
+            let _ = self.request_managed_session_release(session);
+        }
+    }
+
+    fn exact_session_cleanup_absent(&self, session: &super::SessionKey) -> bool {
+        self.scheduler.get_sequence_id(&session.request_id) != Some(session.epoch)
+            && self
+                .scheduler
+                .pending_release_confirmation_required(session)
+                .is_none()
+            && !self.pending_managed_releases.contains(session)
+            && !self
+                .active_managed_cache
+                .values()
+                .any(|reservation| &reservation.session == session)
+    }
+
+    pub(crate) fn register_cleanup_confirmation(
+        &mut self,
+        session: &super::SessionKey,
+    ) -> oneshot::Receiver<Result<()>> {
+        let (sender, receiver) = oneshot::channel();
+        if self.exact_session_cleanup_absent(session) {
+            let _ = sender.send(Ok(()));
+        } else {
+            self.cleanup_confirmation_waiters
+                .entry(session.clone())
+                .or_default()
+                .push(sender);
+        }
+        receiver
+    }
+
+    fn resolve_cleanup_waiters(&mut self, session: &super::SessionKey) {
+        if let Some(waiters) = self.cleanup_confirmation_waiters.remove(session) {
+            for waiter in waiters {
+                let _ = waiter.send(Ok(()));
+            }
+        }
+    }
+
+    fn resolve_all_cleanup_waiters(&mut self) {
+        for (_, waiters) in self.cleanup_confirmation_waiters.drain() {
+            for waiter in waiters {
+                let _ = waiter.send(Ok(()));
+            }
+        }
+    }
+
+    fn fail_all_cleanup_waiters(&mut self, message: &str) {
+        for (_, waiters) in self.cleanup_confirmation_waiters.drain() {
+            for waiter in waiters {
+                let _ = waiter.send(Err(Error::InferenceError(message.to_string())));
+            }
+        }
     }
 
     fn validate_staged_stream_outputs(
@@ -1558,6 +3224,27 @@ impl EngineCore {
         {
             return Err(StreamProgressRejection::invalid(
                 "stream progress is not authorized by the active adapter stage",
+            ));
+        }
+
+        let dispatch = self
+            .in_flight_dispatches
+            .get(&progress.batch_id)
+            .ok_or_else(|| {
+                StreamProgressRejection::invalid(
+                    "stream progress references an inactive physical batch",
+                )
+            })?;
+        if dispatch.output_visibility != OutputVisibility::IncrementalCommitted
+            || dispatch.physical_batch.lane != progress.lane
+            || !dispatch
+                .physical_batch
+                .rows
+                .iter()
+                .any(|row| row.plan_id == progress.plan_id && row.session == progress.session)
+        {
+            return Err(StreamProgressRejection::invalid(
+                "stream progress physical batch fence does not match its in-flight dispatch ticket",
             ));
         }
 
@@ -1676,12 +3363,17 @@ impl EngineCore {
             .scheduler
             .pending_release_confirmation_required(session)
         else {
+            if self.exact_session_cleanup_absent(session) {
+                self.resolve_cleanup_waiters(session);
+            }
             return;
         };
         let release = self.executor.cleanup_session(session).await;
-        if release.confirmed || !confirmation_required {
-            self.scheduler
-                .confirm_session_release(session, self.kv_cache.inner_mut());
+        if (release.confirmed || !confirmation_required)
+            && self.request_managed_session_release(session)
+        {
+            self.scheduler.confirm_session_release(session);
+            self.resolve_cleanup_waiters(session);
         } else {
             self.record_unconfirmed_cleanup(session);
         }
@@ -1692,13 +3384,34 @@ impl EngineCore {
         session: &super::SessionKey,
         cause: TerminalReleaseCause,
     ) {
+        if let Some(request) = self
+            .requests
+            .get(&session.request_id)
+            .filter(|_| self.scheduler.get_sequence_id(&session.request_id) == Some(session.epoch))
+        {
+            let terminal = match cause {
+                TerminalReleaseCause::Completed => RealtimeAsrTerminalOutcome::Completed,
+                TerminalReleaseCause::Cancelled => RealtimeAsrTerminalOutcome::Cancelled,
+                TerminalReleaseCause::TimedOut => RealtimeAsrTerminalOutcome::TimedOut,
+                TerminalReleaseCause::Failed => {
+                    RealtimeAsrTerminalOutcome::Failed(Arc::from("realtime ASR session failed"))
+                }
+            };
+            if request.is_realtime_asr_session() {
+                let _ = request.terminate_realtime_asr_ingress(terminal);
+            }
+        }
         if matches!(
             self.scheduler.begin_terminal_release(session, cause),
             BeginTerminalRelease::Started { .. }
         ) {
             self.attempt_pending_release_cleanup(session).await;
         }
+        let _ = self.request_managed_session_release(session);
         self.clear_exact_execution_state(session);
+        if self.exact_session_cleanup_absent(session) {
+            self.resolve_cleanup_waiters(session);
+        }
     }
 
     async fn reconcile_due_cleanup(&mut self) {
@@ -1720,7 +3433,181 @@ impl EngineCore {
         let Some(prepared) = self.prepare_step().await? else {
             return Ok(Vec::new());
         };
-        let executed = self.execute_prepared_with_progress(prepared).await?;
+        self.execute_and_commit_prepared_with_progress(prepared)
+            .await
+    }
+
+    async fn execute_and_commit_prepared_with_progress(
+        &mut self,
+        prepared: PreparedEngineStep,
+    ) -> Result<Vec<EngineOutput>> {
+        let (progress_tx, mut progress_rx) = mpsc::channel(STREAM_PROGRESS_QUEUE_CAPACITY);
+        let (completion_tx, mut completion_rx) = mpsc::unbounded_channel();
+        let progress_budget = StreamProgressBudget::new(STREAM_PROGRESS_MAX_BUFFERED_BYTES);
+        let recovery = prepared.recovery();
+        debug_assert!(self.pending_runner_recovery.is_none());
+        self.pending_runner_recovery = Some(recovery.clone());
+        let runner_registration = recovery.register_runner();
+        let mut runner = tokio::spawn(async move {
+            ExecutionGroupRunner::execute(
+                prepared,
+                runner_registration,
+                progress_tx,
+                progress_budget,
+                Some(completion_tx),
+            )
+            .await
+        });
+        let (mut deliveries, mut delivery_failures) = IncrementalStreamDeliveryWorkers::new();
+        let mut failures = HashMap::new();
+        let mut progress_closed = false;
+        let mut completion_closed = false;
+        let mut delivery_failures_closed = false;
+        let mut runner_finished = false;
+        let mut fallback_batches = Vec::new();
+        let mut completed_outputs = HashMap::<BatchId, Vec<EngineOutput>>::new();
+
+        while !runner_finished || !completion_closed {
+            tokio::select! {
+                result = &mut runner, if !runner_finished => {
+                    match result {
+                        Ok(executed) => fallback_batches.extend(executed.batches),
+                        Err(error) if error.is_panic() => {
+                            recovery.wait_for_task_drain().await;
+                            self.rollback_in_flight_dispatches(recovery.batch_ids());
+                            self.pending_runner_recovery = None;
+                            std::panic::resume_unwind(error.into_panic())
+                        }
+                        Err(error) => {
+                            recovery.wait_for_task_drain().await;
+                            self.rollback_in_flight_dispatches(recovery.batch_ids());
+                            self.pending_runner_recovery = None;
+                            return Err(Error::InferenceError(format!(
+                                "execution group task was cancelled: {error}"
+                            )));
+                        }
+                    }
+                    runner_finished = true;
+                }
+                progress = progress_rx.recv(), if !progress_closed => {
+                    match progress {
+                        Some(progress) => self.enqueue_incremental_progress(
+                            progress,
+                            &mut failures,
+                            &mut deliveries,
+                        ),
+                        None => progress_closed = true,
+                    }
+                }
+                completion = completion_rx.recv(), if !completion_closed => {
+                    match completion {
+                        Some(batch) => {
+                            let batch_id = batch.physical_batch.batch_id;
+                            let outputs = self.commit_completed_dispatch_with_progress(
+                                batch,
+                                &mut progress_rx,
+                                &mut delivery_failures,
+                                &mut failures,
+                                &mut deliveries,
+                            ).await?;
+                            completed_outputs.insert(batch_id, outputs);
+                        }
+                        None => completion_closed = true,
+                    }
+                }
+                failure = delivery_failures.recv(), if !delivery_failures_closed => {
+                    match failure {
+                        Some(failure) => self.record_stream_failure(
+                            failure,
+                            &mut failures,
+                            &mut deliveries,
+                        ),
+                        None => delivery_failures_closed = true,
+                    }
+                }
+            }
+        }
+
+        for batch in fallback_batches {
+            let batch_id = batch.physical_batch.batch_id;
+            let outputs = self
+                .commit_completed_dispatch_with_progress(
+                    batch,
+                    &mut progress_rx,
+                    &mut delivery_failures,
+                    &mut failures,
+                    &mut deliveries,
+                )
+                .await?;
+            completed_outputs.insert(batch_id, outputs);
+        }
+        while let Some(progress) = progress_rx.recv().await {
+            self.enqueue_incremental_progress(progress, &mut failures, &mut deliveries);
+        }
+        for failure in deliveries.finish().await {
+            self.cancel_failed_stream(&failure);
+            failures.entry(failure.session.clone()).or_insert(failure);
+        }
+        while let Ok(failure) = delivery_failures.try_recv() {
+            self.cancel_failed_stream(&failure);
+            failures.entry(failure.session.clone()).or_insert(failure);
+        }
+
+        let tail = self
+            .commit_step(ExecutedEngineStep {
+                batches: Vec::new(),
+            })
+            .await?;
+        let mut tail_outputs = tail.outputs;
+        let failed_streams = deliver_committed_streams(tail.stream_deliveries).await;
+        self.reconcile_stream_delivery_failures(&mut tail_outputs, failed_streams)
+            .await;
+
+        let mut outputs = Vec::new();
+        for batch_id in recovery.batch_ids() {
+            if let Some(mut batch_outputs) = completed_outputs.remove(batch_id) {
+                outputs.append(&mut batch_outputs);
+            }
+        }
+        for mut unordered in completed_outputs.into_values() {
+            outputs.append(&mut unordered);
+        }
+        outputs.append(&mut tail_outputs);
+        self.pending_runner_recovery = None;
+        Ok(outputs)
+    }
+
+    async fn commit_completed_dispatch_with_progress(
+        &mut self,
+        batch: super::execution_group::ExecutedPhysicalBatch,
+        progress_rx: &mut mpsc::Receiver<FencedStreamProgress>,
+        delivery_failures: &mut mpsc::UnboundedReceiver<StreamDeliveryFailure>,
+        failures: &mut HashMap<super::SessionKey, StreamDeliveryFailure>,
+        deliveries: &mut IncrementalStreamDeliveryWorkers,
+    ) -> Result<Vec<EngineOutput>> {
+        while let Ok(progress) = progress_rx.try_recv() {
+            self.enqueue_incremental_progress(progress, failures, deliveries);
+        }
+        let sessions = batch
+            .results
+            .iter()
+            .map(|result| result.session.clone())
+            .collect::<HashSet<_>>();
+        for failure in deliveries.finish_sessions(&sessions).await {
+            self.record_stream_failure(failure, failures, deliveries);
+        }
+        while let Ok(failure) = delivery_failures.try_recv() {
+            self.record_stream_failure(failure, failures, deliveries);
+        }
+        let dispatch_failures = failures
+            .values()
+            .filter(|failure| sessions.contains(&failure.session))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut executed = ExecutedEngineStep {
+            batches: vec![batch],
+        };
+        executed.apply_stream_delivery_failures(&dispatch_failures);
         let committed = self.commit_step(executed).await?;
         let mut outputs = committed.outputs;
         let failed_streams = deliver_committed_streams(committed.stream_deliveries).await;
@@ -1729,17 +3616,25 @@ impl EngineCore {
         Ok(outputs)
     }
 
+    #[cfg(test)]
     async fn execute_prepared_with_progress(
         &mut self,
         prepared: PreparedEngineStep,
     ) -> Result<ExecutedEngineStep> {
         let (progress_tx, mut progress_rx) = mpsc::channel(STREAM_PROGRESS_QUEUE_CAPACITY);
         let progress_budget = StreamProgressBudget::new(STREAM_PROGRESS_MAX_BUFFERED_BYTES);
-        let mut runner = tokio::spawn(ExecutionGroupRunner::execute(
-            prepared,
-            progress_tx,
-            progress_budget,
-        ));
+        let recovery = prepared.recovery();
+        let runner_registration = recovery.register_runner();
+        let mut runner = tokio::spawn(async move {
+            ExecutionGroupRunner::execute(
+                prepared,
+                runner_registration,
+                progress_tx,
+                progress_budget,
+                None,
+            )
+            .await
+        });
         let (mut deliveries, mut delivery_failures) = IncrementalStreamDeliveryWorkers::new();
         let mut failures = HashMap::new();
         let mut progress_closed = false;
@@ -1751,9 +3646,13 @@ impl EngineCore {
                     break match result {
                         Ok(executed) => executed,
                         Err(error) if error.is_panic() => {
+                            recovery.wait_for_task_drain().await;
+                            self.rollback_in_flight_dispatches(recovery.batch_ids());
                             std::panic::resume_unwind(error.into_panic())
                         }
                         Err(error) => {
+                            recovery.wait_for_task_drain().await;
+                            self.rollback_in_flight_dispatches(recovery.batch_ids());
                             return Err(Error::InferenceError(format!(
                                 "execution group task was cancelled: {error}"
                             )));
@@ -1867,88 +3766,32 @@ impl EngineCore {
 
     /// Prepare an immutable execution transaction under the engine state lock.
     pub(super) async fn prepare_step(&mut self) -> Result<Option<PreparedEngineStep>> {
+        if let Some(recovery) = self.pending_runner_recovery.take() {
+            recovery.wait_for_task_drain().await;
+            self.rollback_in_flight_dispatches(recovery.batch_ids());
+        }
         // Ensure initialized
         if !self.initialized {
             self.initialize().await?;
         }
 
+        // Decode and prefill share one physical-quantum ownership fence. The
+        // current rollout remains strictly serial, so do not poll the
+        // scheduler again until the registered ticket commits or rolls back.
+        if !self.in_flight_dispatches.is_empty() {
+            return Ok(None);
+        }
+
         // Phase 1: Schedule
         self.refresh_scheduler_execution_profiles().await;
-        self.kv_cache.maintenance()?;
-        self.maintenance_steps = self.maintenance_steps.saturating_add(1);
-        if self.maintenance_steps % 64 == 0 {
-            self.kv_cache.compact_shared_prefixes();
-        }
         self.reconcile_due_cleanup().await;
-        let schedule_result = self.scheduler.schedule(self.kv_cache.inner_mut());
+        let schedule_result = self.scheduler.schedule();
 
-        // Deadline expiry removes a request from runnable scheduler state but
-        // deliberately retains its logical cache allocation. Reconcile the
-        // exact executor session before any newly scheduled work can execute;
-        // only a confirmed physical cleanup permits logical block reuse.
+        // Reconcile capability-authoritative state for expired sessions before
+        // newly scheduled work executes.
         for expired in &schedule_result.expired_requests {
             let session = expired.session_key();
             self.attempt_pending_release_cleanup(&session).await;
-        }
-
-        for session in &schedule_result.preempted_requests {
-            let release = self.executor.cleanup_session(session).await;
-            if release.confirmed {
-                if !self
-                    .scheduler
-                    .confirm_preemption(session, self.kv_cache.inner_mut())
-                {
-                    let quarantined = self.scheduler.quarantine_rejected_confirmed_preemption(
-                        session,
-                        self.kv_cache.inner_mut(),
-                    );
-                    warn!(
-                        request_id = %session.request_id,
-                        session_epoch = session.epoch,
-                        quarantined,
-                        "Scheduler rejected confirmed preemption"
-                    );
-                    if quarantined {
-                        self.requests.remove(&session.request_id);
-                        let message = "scheduler could not commit an executor-confirmed preemption";
-                        self.pending_terminal_outputs
-                            .push_back(CommittedExecutorOutput {
-                                session: session.clone(),
-                                output: ExecutorOutput::error(session.request_id.clone(), message),
-                                disposition: ExecutionDisposition::Failed(
-                                    ExecutionFailure::invalid_output(message),
-                                ),
-                                provenance: OutcomeProvenance::failure(
-                                    FailureOrigin::Cleanup,
-                                    DispatchState::NotStarted,
-                                ),
-                                staged_stream_outputs: Vec::new(),
-                            });
-                    }
-                }
-            } else {
-                self.scheduler.quarantine_failed_preemption(session);
-                self.record_unconfirmed_cleanup(session);
-                self.requests.remove(&session.request_id);
-                let message = "executor could not confirm physical cache release during preemption";
-                self.pending_terminal_outputs
-                    .push_back(CommittedExecutorOutput {
-                        session: session.clone(),
-                        output: ExecutorOutput::error(session.request_id.clone(), message),
-                        disposition: ExecutionDisposition::Failed(
-                            ExecutionFailure::invalid_output(message),
-                        ),
-                        provenance: OutcomeProvenance::failure(
-                            FailureOrigin::Cleanup,
-                            DispatchState::NotStarted,
-                        ),
-                        staged_stream_outputs: Vec::new(),
-                    });
-            }
-            self.clear_exact_execution_state(session);
-            self.request_phase_timings
-                .entry(session.request_id.clone())
-                .and_modify(|timing| *timing = RequestPhaseTiming::default());
         }
 
         for request in &schedule_result.expired_requests {
@@ -2021,26 +3864,167 @@ impl EngineCore {
             return Ok(None);
         }
 
-        let decode_batches = match self.form_physical_batches(&decode_requests, &decode_scheduled) {
-            Ok(batches) => batches,
-            Err(error) => {
-                self.rollback_unexecuted_schedule(&all_scheduled);
-                return Err(error);
-            }
-        };
-        let prefill_batches =
-            match self.form_physical_batches(&prefill_requests, &prefill_scheduled) {
+        let mut capacity_blocked = Vec::new();
+        let mut transaction_deferred = Vec::new();
+        let candidate_capacity = self
+            .config
+            .resolved_physical_execution_capacity()
+            .candidate_dispatch_limit
+            .get();
+        let both_phases = !decode_scheduled.is_empty() && !prefill_scheduled.is_empty();
+        let (decode_quota, prefill_quota) = Self::candidate_phase_quotas(
+            candidate_capacity,
+            decode_scheduled.len(),
+            prefill_scheduled.len(),
+            self.next_single_candidate_phase,
+        );
+        let mut decode_batches = Vec::new();
+        let mut prefill_batches = Vec::new();
+
+        // With multiple candidate slots, form the reserved prefill service
+        // first. Decode then consumes every unused slot, preserving utilization
+        // without allowing its larger runnable population to erase prefill.
+        if prefill_quota > 0 {
+            prefill_batches = match self.form_physical_batches(
+                ExecutionPhase::Prefill,
+                &prefill_requests,
+                &prefill_scheduled,
+                prefill_quota,
+                &mut capacity_blocked,
+                &mut transaction_deferred,
+            ) {
                 Ok(batches) => batches,
+                Err(Error::Backpressure(reason)) => {
+                    self.defer_unexecuted_schedule_for_capacity(&all_scheduled);
+                    debug!(reason = %reason, "Deferring scheduled work for managed KV capacity");
+                    return Ok(None);
+                }
                 Err(error) => {
                     self.rollback_unexecuted_schedule(&all_scheduled);
                     return Err(error);
                 }
             };
+        }
 
-        Ok(Some(PreparedEngineStep::new(
+        let decode_limit = candidate_capacity.saturating_sub(self.in_flight_dispatches.len());
+        if decode_quota > 0 && decode_limit > 0 {
+            decode_batches = match self.form_physical_batches(
+                ExecutionPhase::Decode,
+                &decode_requests,
+                &decode_scheduled,
+                decode_limit,
+                &mut capacity_blocked,
+                &mut transaction_deferred,
+            ) {
+                Ok(batches) => batches,
+                Err(Error::Backpressure(reason)) => {
+                    self.defer_unexecuted_schedule_for_capacity(&all_scheduled);
+                    debug!(reason = %reason, "Deferring scheduled work for managed KV capacity");
+                    return Ok(None);
+                }
+                Err(error) => {
+                    self.rollback_unexecuted_schedule(&all_scheduled);
+                    return Err(error);
+                }
+            };
+        } else if !(decode_scheduled.is_empty() || candidate_capacity == 1 && both_phases) {
+            transaction_deferred.extend(decode_scheduled.iter().cloned());
+        }
+
+        // A single candidate alternates only while both phases are runnable.
+        // If the preferred phase cannot form a ticket, immediately offer the
+        // slot to its peer rather than idling the physical lane.
+        if candidate_capacity == 1 {
+            let preferred_admitted = match self.next_single_candidate_phase {
+                ExecutionPhase::Decode => !decode_batches.is_empty(),
+                ExecutionPhase::Prefill => !prefill_batches.is_empty(),
+            };
+            if both_phases && !preferred_admitted && self.in_flight_dispatches.is_empty() {
+                match self.next_single_candidate_phase {
+                    ExecutionPhase::Decode => {
+                        prefill_batches = match self.form_physical_batches(
+                            ExecutionPhase::Prefill,
+                            &prefill_requests,
+                            &prefill_scheduled,
+                            1,
+                            &mut capacity_blocked,
+                            &mut transaction_deferred,
+                        ) {
+                            Ok(batches) => batches,
+                            Err(Error::Backpressure(reason)) => {
+                                self.defer_unexecuted_schedule_for_capacity(&all_scheduled);
+                                debug!(reason = %reason, "Deferring scheduled work for managed KV capacity");
+                                return Ok(None);
+                            }
+                            Err(error) => {
+                                self.rollback_unexecuted_schedule(&all_scheduled);
+                                return Err(error);
+                            }
+                        };
+                    }
+                    ExecutionPhase::Prefill => {
+                        decode_batches = match self.form_physical_batches(
+                            ExecutionPhase::Decode,
+                            &decode_requests,
+                            &decode_scheduled,
+                            1,
+                            &mut capacity_blocked,
+                            &mut transaction_deferred,
+                        ) {
+                            Ok(batches) => batches,
+                            Err(Error::Backpressure(reason)) => {
+                                self.defer_unexecuted_schedule_for_capacity(&all_scheduled);
+                                debug!(reason = %reason, "Deferring scheduled work for managed KV capacity");
+                                return Ok(None);
+                            }
+                            Err(error) => {
+                                self.rollback_unexecuted_schedule(&all_scheduled);
+                                return Err(error);
+                            }
+                        };
+                    }
+                }
+            }
+
+            self.next_single_candidate_phase = Self::next_candidate_preference(
+                self.next_single_candidate_phase,
+                both_phases,
+                !decode_batches.is_empty(),
+                !prefill_batches.is_empty(),
+            );
+        }
+
+        if prefill_quota == 0 && !prefill_scheduled.is_empty() && prefill_batches.is_empty() {
+            transaction_deferred.extend(prefill_scheduled.iter().cloned());
+        }
+        if decode_quota == 0 && !decode_scheduled.is_empty() && decode_batches.is_empty() {
+            transaction_deferred.extend(decode_scheduled.iter().cloned());
+        }
+        self.rollback_unexecuted_schedule(&transaction_deferred);
+        self.defer_unexecuted_schedule_for_capacity(&capacity_blocked);
+        if decode_batches.is_empty()
+            && prefill_batches.is_empty()
+            && self
+                .preempt_unpublished_session_for_capacity(&capacity_blocked)
+                .await?
+        {
+            return Ok(None);
+        }
+        if decode_batches.is_empty()
+            && prefill_batches.is_empty()
+            && self.pending_terminal_outputs.is_empty()
+        {
+            return Ok(None);
+        }
+
+        let mut dispatches = decode_batches;
+        dispatches.extend(prefill_batches);
+        let capacity = self.config.resolved_physical_execution_capacity();
+        Ok(Some(PreparedEngineStep::with_execution_policy(
             self.executor.clone(),
-            decode_batches,
-            prefill_batches,
+            dispatches,
+            self.config.physical_execution_mode,
+            capacity.physical_launch_limit,
         )))
     }
 
@@ -2059,11 +4043,49 @@ impl EngineCore {
             Vec::with_capacity(result_capacity + self.pending_terminal_outputs.len());
         let mut stream_deliveries = Vec::new();
         for mut batch in batches {
-            self.active_stream_batches
-                .remove(&batch.physical_batch.batch_id);
+            let batch_id = batch.physical_batch.batch_id;
+            let Some(in_flight) = self.in_flight_dispatches.remove(&batch_id) else {
+                for result in &batch.results {
+                    if let Err(error) = self.executor.finalize_pending_quantum(
+                        result.plan_id,
+                        &result.session,
+                        PendingQuantumDecision::Abort,
+                    ) {
+                        warn!(
+                            plan_id = result.plan_id,
+                            request_id = %result.session.request_id,
+                            error = %error,
+                            "Failed to abort executor state for a stale physical completion"
+                        );
+                    }
+                }
+                warn!(
+                    batch_id = batch_id.get(),
+                    "Ignoring a stale or duplicate physical completion"
+                );
+                continue;
+            };
+            let active_stream_fence = self.active_stream_batches.remove(&batch_id);
+            if let Err(error) = in_flight.validate_completion(&batch) {
+                warn!(
+                    batch_id = batch_id.get(),
+                    error = %error,
+                    "Rolling back a physical completion that crossed its dispatch ticket"
+                );
+                self.rollback_unexecuted_schedule(&in_flight.scheduled);
+                continue;
+            }
+            if active_stream_fence != in_flight.stream_fence() {
+                warn!(
+                    batch_id = batch_id.get(),
+                    "Rolling back a physical completion with a mismatched progress fence"
+                );
+                self.rollback_unexecuted_schedule(&in_flight.scheduled);
+                continue;
+            }
             if let Err(error) = batch
                 .report
-                .validate_against(&batch.physical_batch, &self.active_plans)
+                .validate_against(&in_flight.physical_batch, &self.active_plans)
             {
                 warn!(
                     batch_id = batch.physical_batch.batch_id.get(),
@@ -2094,11 +4116,14 @@ impl EngineCore {
                         OutcomeProvenance::failure(FailureOrigin::StateCommit, dispatch_state);
                     result.observed_resources = ResourceVector::zero();
                     result.staged_stream_outputs.clear();
+                    result.managed_cache = None;
                 }
             } else {
                 record_engine_physical_batch(&batch.physical_batch, batch.report.dispatch);
             }
 
+            let decode_transaction = batch.phase == ExecutionPhase::Decode;
+            let mut committed_service_requests = Vec::new();
             for result in batch.results {
                 let provenance = result.provenance;
                 let entered_model = result.provenance.dispatch_state != DispatchState::NotStarted;
@@ -2125,10 +4150,25 @@ impl EngineCore {
                     }
                 }
                 match self.commit_executor_result(result, step_time_ms).await {
-                    Some(committed) => executor_outputs.push(committed),
+                    Some(committed) => {
+                        if (committed.output.tokens_processed > 0
+                            || committed.output.tokens_generated > 0)
+                            && matches!(
+                                committed.disposition,
+                                ExecutionDisposition::Progress
+                                    | ExecutionDisposition::Yielded(_)
+                                    | ExecutionDisposition::Finished(_)
+                            )
+                        {
+                            committed_service_requests.push(committed.session.request_id.clone());
+                        }
+                        executor_outputs.push(committed);
+                    }
                     None => record_engine_execution_outcome(provenance),
                 }
             }
+            self.scheduler
+                .record_committed_batch_service(&committed_service_requests, decode_transaction);
         }
         // Terminal events are a durable outbox until all fallible work for the
         // step has completed. Draining earlier can lose an abort/deadline event
@@ -2318,6 +4358,19 @@ impl EngineCore {
         self.scheduler
             .pending_cleanup_attempts(session)
             .map(|attempt| self.retry_policy.cleanup_delay(attempt.max(1)))
+    }
+
+    /// Arm an exact cleanup confirmation before cancellation and drive the
+    /// same idempotent quarantine cleanup path for active, terminal, and
+    /// already-confirmed sessions.
+    pub(crate) async fn begin_confirmed_session_cleanup(
+        &mut self,
+        session: &super::SessionKey,
+    ) -> oneshot::Receiver<Result<()>> {
+        let confirmation = self.register_cleanup_confirmation(session);
+        let _ = self.abort_request_session(session).await;
+        self.attempt_pending_release_cleanup(session).await;
+        confirmation
     }
 
     pub(crate) fn abandoned_session_cleanup_delay(
@@ -2576,6 +4629,12 @@ impl EngineCore {
 
         let mut aborted = Vec::with_capacity(request_ids.len());
         for request_id in request_ids {
+            if let Some(request) = self.requests.get(&request_id) {
+                if request.is_realtime_asr_session() {
+                    let _ = request
+                        .terminate_realtime_asr_ingress(RealtimeAsrTerminalOutcome::Unloaded);
+                }
+            }
             if self.abort_request(&request_id).await {
                 aborted.push(request_id);
             }
@@ -2586,6 +4645,333 @@ impl EngineCore {
     /// Purge reusable executor cache state owned by one model variant.
     pub async fn purge_model_cache(&mut self, variant: ModelVariant) -> CacheReleaseReport {
         self.executor.purge_model_cache(variant).await
+    }
+
+    /// Allocate and admit physical KV backing while the authoritative model
+    /// generation is still Loading. Ready publication happens only after this
+    /// succeeds, and request admission performs lookup only.
+    pub(crate) fn load_managed_model_cache(
+        &mut self,
+        model_instance: super::ModelInstanceId,
+        capability: &crate::kv::InferenceStateCapability,
+        logical_context_tokens: Option<usize>,
+    ) -> Result<Option<Arc<super::ManagedKvModelRuntime>>> {
+        self.load_managed_model_cache_with_capacity_policy(
+            model_instance,
+            capability,
+            logical_context_tokens,
+            None,
+            false,
+        )
+    }
+
+    /// Load managed state while allowing a model lifecycle to distinguish the
+    /// scheduler's retained-session capacity from its simultaneously staged
+    /// transaction width. `None` preserves the engine-wide legacy behavior.
+    pub(crate) fn load_managed_model_cache_with_capacity_policy(
+        &mut self,
+        model_instance: super::ModelInstanceId,
+        capability: &crate::kv::InferenceStateCapability,
+        logical_context_tokens: Option<usize>,
+        staged_transaction_rows: Option<u32>,
+        fit_cuda_resident_context: bool,
+    ) -> Result<Option<Arc<super::ManagedKvModelRuntime>>> {
+        let Some(contract) = capability.managed_contract() else {
+            return Ok(None);
+        };
+        let backend = self.managed_kv_cache.worker_backend();
+        let retained_sequence_rows = u32::try_from(self.config.max_retained_sequences)
+            .map_err(|_| Error::InvalidInput("managed state sequence limit exceeds u32".into()))?;
+        let fit_cuda_resident_context = backend == BackendKind::Cuda && fit_cuda_resident_context;
+        let staged_transaction_rows = staged_transaction_rows.unwrap_or(
+            u32::try_from(self.config.max_staged_transactions).map_err(|_| {
+                Error::InvalidInput("managed state transaction limit exceeds u32".into())
+            })?,
+        );
+        let logical_token_reach = if fit_cuda_resident_context {
+            let maximum_tokens = logical_context_tokens.ok_or_else(|| {
+                Error::ModelLoadError(
+                    "CUDA managed state requires a positive loaded-model context limit".into(),
+                )
+            })?;
+            Some(
+                self.managed_kv_cache
+                    .fit_cuda_resident_logical_token_reach(
+                        model_instance,
+                        contract,
+                        u64::try_from(maximum_tokens).map_err(|_| {
+                            Error::ModelLoadError("model context exceeds u64".into())
+                        })?,
+                        self.config.portable_context_reserve_bytes,
+                        self.config.block_size,
+                        retained_sequence_rows,
+                        staged_transaction_rows,
+                    )?,
+            )
+        } else {
+            self.resolve_managed_token_reach_for_contract(
+                backend,
+                model_instance,
+                contract,
+                logical_context_tokens,
+                1,
+            )?
+        };
+        let runtime = self
+            .managed_kv_cache
+            .bind_request_with_capacity_policy(
+                model_instance,
+                backend,
+                ManagedStateCapacityRequest {
+                    total_paged_pages: u32::try_from(self.config.max_blocks).map_err(|_| {
+                        Error::InvalidInput("managed KV page budget exceeds u32".into())
+                    })?,
+                    logical_token_reach,
+                    retained_sequence_rows,
+                    staged_transaction_rows,
+                },
+                self.config.block_size,
+                capability,
+                fit_cuda_resident_context,
+            )?
+            .ok_or_else(|| {
+                Error::InferenceError(
+                    "managed KV load did not install a physical runtime".to_string(),
+                )
+            })?;
+        runtime.synchronize_backing()?;
+        Ok(Some(runtime))
+    }
+
+    pub(crate) fn load_managed_model_state(
+        &mut self,
+        model_instance: super::ModelInstanceId,
+        retained_state: &crate::kv::v2::InferenceStateContract,
+        logical_context_tokens: Option<usize>,
+    ) -> Result<Arc<super::ManagedKvModelRuntime>> {
+        self.load_managed_model_state_with_portable_copies(
+            model_instance,
+            retained_state,
+            logical_context_tokens,
+            1,
+        )
+    }
+
+    pub(crate) fn load_managed_model_state_with_portable_copies(
+        &mut self,
+        model_instance: super::ModelInstanceId,
+        retained_state: &crate::kv::v2::InferenceStateContract,
+        logical_context_tokens: Option<usize>,
+        portable_state_copies: u32,
+    ) -> Result<Arc<super::ManagedKvModelRuntime>> {
+        let backend = self.managed_kv_cache.worker_backend();
+        let logical_token_reach = self.resolve_managed_token_reach_for_contract(
+            backend,
+            model_instance,
+            retained_state,
+            logical_context_tokens,
+            portable_state_copies,
+        )?;
+        let runtime = self.managed_kv_cache.bind_model_state_with_capacity(
+            model_instance,
+            backend,
+            ManagedStateCapacityRequest {
+                total_paged_pages: u32::try_from(self.config.max_blocks).map_err(|_| {
+                    Error::InvalidInput("managed KV page budget exceeds u32".into())
+                })?,
+                logical_token_reach,
+                retained_sequence_rows: u32::try_from(self.config.max_retained_sequences).map_err(
+                    |_| Error::InvalidInput("managed state sequence limit exceeds u32".into()),
+                )?,
+                staged_transaction_rows: u32::try_from(self.config.max_staged_transactions)
+                    .map_err(|_| {
+                        Error::InvalidInput("managed state transaction limit exceeds u32".into())
+                    })?,
+            },
+            self.config.block_size,
+            retained_state,
+        )?;
+        runtime.synchronize_backing()?;
+        Ok(runtime)
+    }
+
+    pub(crate) fn load_composite_retained_state(
+        &mut self,
+        model_instance: super::ModelInstanceId,
+        full_contract: &crate::kv::v2::InferenceStateContract,
+        static_domain: crate::kv::v2::StateDomainId,
+        logical_context_tokens: Option<usize>,
+    ) -> Result<Arc<CompositeRetainedStateRuntimeV2>> {
+        if self.composite_retained_state.contains_key(&model_instance) {
+            return Err(Error::InvalidInput(
+                "composite retained state already owns this model generation".into(),
+            ));
+        }
+        let backend = self.managed_kv_cache.worker_backend();
+        let logical_token_reach = self.resolve_managed_token_reach_for_contract(
+            backend,
+            model_instance,
+            &project_composite_paged_contract(full_contract, static_domain)?,
+            logical_context_tokens,
+            1,
+        )?;
+        let sequence_capacity = u32::try_from(self.config.max_retained_sequences)
+            .map_err(|_| Error::InvalidInput("managed state sequence limit exceeds u32".into()))?;
+        let runtime = allocate_composite_retained_state(
+            &mut self.managed_kv_cache,
+            &mut self.physical_state,
+            model_instance,
+            backend,
+            ManagedStateCapacityRequest {
+                total_paged_pages: u32::try_from(self.config.max_blocks).map_err(|_| {
+                    Error::InvalidInput("managed KV page budget exceeds u32".into())
+                })?,
+                logical_token_reach,
+                retained_sequence_rows: sequence_capacity,
+                staged_transaction_rows: u32::try_from(self.config.max_staged_transactions)
+                    .map_err(|_| {
+                        Error::InvalidInput("managed state transaction limit exceeds u32".into())
+                    })?,
+            },
+            self.config.block_size,
+            full_contract,
+            static_domain,
+        )?;
+        let replaced = self
+            .composite_retained_state
+            .insert(model_instance, runtime.clone())
+            .is_some();
+        debug_assert!(!replaced, "fresh composite generation replaced an owner");
+        Ok(runtime)
+    }
+
+    fn resolve_managed_token_reach_for_contract(
+        &self,
+        backend: BackendKind,
+        model_instance: super::ModelInstanceId,
+        contract: &crate::kv::v2::InferenceStateContract,
+        loaded_context: Option<usize>,
+        portable_state_copies: u32,
+    ) -> Result<Option<u64>> {
+        if !self.config.portable_context_auto
+            && backend != BackendKind::Cuda
+            && loaded_context.is_none()
+        {
+            return Ok(None);
+        }
+        let loaded_context = loaded_context.ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "{backend:?} managed state requires a positive loaded-model context limit"
+            ))
+        })?;
+        if self.config.portable_context_auto && backend != BackendKind::Cuda {
+            let maximum_tokens = u64::try_from(loaded_context)
+                .map_err(|_| Error::ModelLoadError("model context exceeds u64".into()))?;
+            return self
+                .managed_kv_cache
+                .fit_portable_logical_token_reach(
+                    model_instance,
+                    contract,
+                    maximum_tokens,
+                    self.config.portable_context_reserve_bytes,
+                    self.config.block_size,
+                    u32::try_from(self.config.max_retained_sequences).map_err(|_| {
+                        Error::InvalidInput("managed state sequence limit exceeds u32".into())
+                    })?,
+                    u32::try_from(self.config.max_staged_transactions).map_err(|_| {
+                        Error::InvalidInput("managed state transaction limit exceeds u32".into())
+                    })?,
+                    portable_state_copies,
+                )
+                .map(Some);
+        }
+        resolve_managed_token_reach(backend, self.config.max_seq_len, Some(loaded_context))
+    }
+
+    pub(crate) fn load_retained_tensor_state(
+        &mut self,
+        model_instance: super::ModelInstanceId,
+        contract: &crate::kv::v2::InferenceStateContract,
+        sequence_capacity: u32,
+    ) -> Result<Arc<super::RetainedTensorStateRuntimeV2>> {
+        self.physical_state
+            .allocate_retained_tensor(model_instance, contract, sequence_capacity)
+    }
+
+    pub(crate) fn resolve_and_load_invocation_workspace(
+        &mut self,
+        model_instance: super::ModelInstanceId,
+        adapter_instance: super::AdapterInstanceId,
+        stage_graph: [u8; 32],
+        stage: super::StageId,
+        contract: &crate::kv::v2::InferenceStateContract,
+        domain: &crate::kv::v2::InvocationWorkspaceDomain,
+        slot_count: u32,
+    ) -> Result<Arc<dyn crate::kv::v2::InvocationWorkspaceBackingV2>> {
+        self.physical_state
+            .resolve_and_allocate_invocation_workspace(
+                model_instance,
+                InvocationPhysicalKey {
+                    adapter_instance,
+                    stage_graph,
+                    stage,
+                    domain: domain.id(),
+                },
+                contract,
+                domain,
+                slot_count,
+            )
+    }
+
+    /// Retire physical managed-KV state for one exact loaded-model instance.
+    /// Variant-only purge is insufficient because an unload/reload may publish
+    /// a different generation of the same variant.
+    pub fn unload_managed_model_cache(
+        &mut self,
+        model_instance: super::ModelInstanceId,
+    ) -> Result<bool> {
+        if let Some(runtime) = self.composite_retained_state.get(&model_instance) {
+            if Arc::strong_count(runtime) != 1 {
+                return Err(Error::InferenceError(format!(
+                    "composite retained model {} still has live publication/request handles",
+                    model_instance.get()
+                )));
+            }
+            let physical_prepared = self
+                .physical_state
+                .prepare_unload_model_with_static_runtime_owners(model_instance, 2);
+            let paged_prepared = self
+                .managed_kv_cache
+                .prepare_unload_model_with_runtime_owners(model_instance, 2);
+            let (physical_present, paged_present) =
+                match (physical_prepared, paged_prepared) {
+                    (Ok(physical), Ok(paged)) => (physical, paged),
+                    (physical, paged) => {
+                        return Err(Error::InferenceError(format!(
+                            "composite unload did not fence every backing: physical={physical:?}; paged={paged:?}"
+                        )))
+                    }
+                };
+            drop(
+                self.composite_retained_state
+                    .remove(&model_instance)
+                    .expect("composite runtime was authenticated above"),
+            );
+            let physical_removed = physical_present
+                && self
+                    .physical_state
+                    .commit_prepared_unload_model(model_instance);
+            let paged_removed = paged_present
+                && self
+                    .managed_kv_cache
+                    .commit_prepared_unload_model(model_instance);
+            return Ok(physical_removed || paged_removed);
+        }
+        unload_composite_retained_state(
+            &mut self.managed_kv_cache,
+            &mut self.physical_state,
+            model_instance,
+        )
     }
 
     /// Abort every request tracked by the core and release executor state.
@@ -2610,9 +4996,9 @@ impl EngineCore {
         self.scheduler.running_count()
     }
 
-    /// Get KV cache statistics.
-    pub fn kv_cache_stats(&self) -> super::kv_cache::KVCacheStats {
-        self.kv_cache.stats()
+    /// Exact physical managed-arena state.
+    pub fn managed_kv_runtime_snapshot(&self) -> super::ManagedKvRuntimeSnapshot {
+        self.managed_kv_cache.runtime_snapshot()
     }
 
     /// Get configuration.
@@ -2630,25 +5016,70 @@ impl EngineCore {
             self.abort_request(&id).await;
         }
 
-        // Shutdown executor
-        self.executor.shutdown().await?;
+        // Executor shutdown is the final model-owned physical-state fence.
+        // Settle every registered receipt explicitly if that fence fails;
+        // dropping the Core must never be the notification mechanism.
+        if let Err(error) = self.executor.shutdown().await {
+            self.fail_all_cleanup_waiters(&format!(
+                "Engine executor shutdown failed before realtime cleanup confirmation: {error}"
+            ));
+            return Err(error);
+        }
 
-        // A successful executor shutdown is the final physical-release fence:
-        // no backend session can still reference the quarantined logical cache.
-        self.scheduler
-            .force_release_all_after_executor_shutdown(self.kv_cache.inner_mut());
+        // Abort any managed transactions that were still owned by prepared
+        // plans, then release the exact session tables named by cleanup
+        // receipts. Executor shutdown has already guaranteed that no model
+        // kernel can publish another completion into these transactions.
+        let mut managed_release_errors = Vec::new();
+        for (_, reservation) in std::mem::take(&mut self.active_managed_cache) {
+            if let Err(error) = self.managed_kv_cache.finalize(&reservation, None, false) {
+                managed_release_errors.push(format!(
+                    "{}:{} transaction abort failed: {error}",
+                    reservation.session.request_id, reservation.session.epoch
+                ));
+            }
+        }
+        let cleanup_sessions = self
+            .cleanup_confirmation_waiters
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for session in &cleanup_sessions {
+            if let Err(error) = self.managed_kv_cache.release_session(session) {
+                managed_release_errors.push(format!(
+                    "{}:{} managed release failed: {error}",
+                    session.request_id, session.epoch
+                ));
+            }
+        }
+
+        // A successful executor shutdown is the final physical-release fence.
+        self.scheduler.force_release_all_after_executor_shutdown();
+        self.pending_managed_releases.clear();
         self.requests.clear();
         self.request_start_times.clear();
         self.request_phase_timings.clear();
         self.execution_trackers.clear();
         self.active_plans.clear();
+        self.in_flight_dispatches.clear();
         self.active_stream_batches.clear();
         self.stream_sequence_cursors.clear();
         self.incremental_stream_sessions.clear();
         self.pending_terminal_outputs.clear();
         self.execution_retry_attempts.clear();
-
         self.initialized = false;
+
+        if managed_release_errors.is_empty() {
+            self.resolve_all_cleanup_waiters();
+        } else {
+            let message = format!(
+                "Engine shutdown could not confirm managed realtime cleanup: {}",
+                managed_release_errors.join("; ")
+            );
+            self.fail_all_cleanup_waiters(&message);
+            return Err(Error::InferenceError(message));
+        }
+
         info!("Engine core shutdown complete");
 
         Ok(())
@@ -2667,15 +5098,110 @@ impl Drop for EngineCore {
 #[cfg(test)]
 mod tests {
     use super::super::executor::{
-        ExecutorOutput, ExecutorPhaseTiming, ExecutorStepResult, ModelExecutor,
+        ExecutorOutput, ExecutorPhaseTiming, ExecutorStepResult, ModelExecutor, ModelSessionResult,
     };
     use super::super::scheduler::ScheduledRequest;
-    use super::super::types::{AudioOutput, Priority, TaskType};
+    use super::super::types::{AudioOutput, TaskType};
     use super::*;
+    use crate::engine::{ClockedStateSpan, InputRange, SessionKey};
+    use crate::kv::v2::{StateClock, StateGroupId};
     use crate::model::ModelVariant;
     use crate::models::shared::chat::{ChatMessage, ChatRole};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn single_candidate_admission_alternates_under_sustained_decode_and_prefill() {
+        let mut preference = ExecutionPhase::Decode;
+        let mut admitted = Vec::new();
+
+        for _ in 0..6 {
+            let (decode, prefill) = EngineCore::candidate_phase_quotas(1, 32, 32, preference);
+            let phase = match (decode, prefill) {
+                (1, 0) => ExecutionPhase::Decode,
+                (0, 1) => ExecutionPhase::Prefill,
+                other => panic!("single candidate produced invalid phase quotas {other:?}"),
+            };
+            admitted.push(phase);
+            preference = EngineCore::next_candidate_preference(
+                preference,
+                true,
+                phase == ExecutionPhase::Decode,
+                phase == ExecutionPhase::Prefill,
+            );
+        }
+
+        assert_eq!(
+            admitted,
+            vec![
+                ExecutionPhase::Decode,
+                ExecutionPhase::Prefill,
+                ExecutionPhase::Decode,
+                ExecutionPhase::Prefill,
+                ExecutionPhase::Decode,
+                ExecutionPhase::Prefill,
+            ]
+        );
+    }
+
+    #[test]
+    fn multi_candidate_admission_reserves_both_phases_without_wasting_width() {
+        for (decode_work, prefill_work, expected) in
+            [(32, 32, (3, 1)), (1, 32, (1, 3)), (32, 1, (3, 1))]
+        {
+            let quotas = EngineCore::candidate_phase_quotas(
+                4,
+                decode_work,
+                prefill_work,
+                ExecutionPhase::Decode,
+            );
+            assert_eq!(quotas, expected);
+            assert!(quotas.0 > 0, "decode lost reserved service");
+            assert!(quotas.1 > 0, "prefill lost reserved service");
+            assert_eq!(quotas.0 + quotas.1, 4, "candidate width was wasted");
+        }
+    }
+
+    #[test]
+    fn blocked_single_slot_preference_does_not_advance_or_idle_its_peer() {
+        let preference = ExecutionPhase::Decode;
+        assert_eq!(
+            EngineCore::next_candidate_preference(preference, true, false, true),
+            ExecutionPhase::Decode,
+            "a blocked preferred phase must retain its next service opportunity"
+        );
+        assert_eq!(
+            EngineCore::candidate_phase_quotas(1, 8, 8, ExecutionPhase::Prefill),
+            (0, 1),
+            "the peer phase must remain eligible for the current physical slot"
+        );
+    }
+
+    #[test]
+    fn managed_token_reach_honors_portable_context_and_preserves_cuda_ceiling() {
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            assert_eq!(
+                resolve_managed_token_reach(backend, 4_096, Some(40_960)).unwrap(),
+                Some(4_096)
+            );
+            assert_eq!(
+                resolve_managed_token_reach(backend, 262_144, Some(40_960)).unwrap(),
+                Some(40_960)
+            );
+        }
+    }
+
+    #[test]
+    fn managed_token_reach_rejects_zero_and_cuda_requires_model_context() {
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            assert!(resolve_managed_token_reach(backend, 4_096, Some(0)).is_err());
+        }
+        assert_eq!(
+            resolve_managed_token_reach(BackendKind::Cpu, 4_096, None).unwrap(),
+            None
+        );
+        assert!(resolve_managed_token_reach(BackendKind::Cuda, 4_096, None).is_err());
+    }
 
     fn scheduled_prefill(request_id: &str, sequence_id: u64) -> ScheduledRequest {
         ScheduledRequest {
@@ -2684,12 +5210,12 @@ mod tests {
             sequence_id,
             num_tokens: 1,
             is_prefill: true,
-            block_ids: Vec::new(),
             num_computed_tokens: 0,
             work: crate::engine::WorkUnit::SequenceStep {
                 phase: crate::engine::SequencePhase::Prefill,
                 input: crate::engine::InputRange { start: 0, end: 1 },
                 max_output_steps: 1,
+                auxiliary_state: None,
             },
         }
     }
@@ -2701,12 +5227,12 @@ mod tests {
             sequence_id,
             num_tokens: 1,
             is_prefill: false,
-            block_ids: Vec::new(),
             num_computed_tokens: 1,
             work: crate::engine::WorkUnit::SequenceStep {
                 phase: crate::engine::SequencePhase::Decode,
                 input: crate::engine::InputRange { start: 1, end: 2 },
                 max_output_steps: 1,
+                auxiliary_state: None,
             },
         }
     }
@@ -2819,6 +5345,180 @@ mod tests {
         }
     }
 
+    struct ManagedReceiptExecutor;
+
+    impl ModelExecutor for ManagedReceiptExecutor {
+        fn execution_profile(&self, request: &EngineCoreRequest) -> Option<ExecutionProfile> {
+            let mut profile = ExecutionProfile::fail_closed(
+                BackendKind::Cpu,
+                request.model_variant,
+                ExecutionMode::Sequence,
+            );
+            profile.prefill = PrefillMode::Full;
+            profile.cache_mode = CacheMode::ExternalPaged;
+            profile.cache_release_safe = true;
+            profile.recompute_safe = true;
+            Some(profile)
+        }
+
+        fn cleanup_session(
+            &self,
+            _session: &super::super::SessionKey,
+        ) -> super::super::executor::CacheReleaseReport {
+            super::super::executor::CacheReleaseReport::confirmed(1)
+        }
+
+        fn execute_physical_batch(
+            &self,
+            execution: super::super::executor::PhysicalBatchExecution<'_>,
+        ) -> super::super::executor::PhysicalDispatchResult {
+            let dispatch = execution.expected_dispatch();
+            Ok(execution
+                .scheduled
+                .iter()
+                .zip(&execution.batch.rows)
+                .map(|(scheduled, row)| {
+                    let mut result = ExecutorStepResult::new(
+                        scheduled,
+                        ExecutorOutput {
+                            request_id: scheduled.request_id.clone(),
+                            audio: None,
+                            text: None,
+                            input_transcription: None,
+                            tokens_processed: scheduled.num_tokens,
+                            tokens_generated: 0,
+                            finished: false,
+                            phase_timing_override: None,
+                            asr_diagnostics: None,
+                            error: None,
+                        },
+                    );
+                    result.dispatch = dispatch;
+                    if let Some(reservation) = &row.managed_cache {
+                        result.managed_cache = Some(reservation.completed_write_receipt_for_test());
+                    }
+                    result
+                })
+                .collect())
+        }
+
+        fn execute_prefill(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            unreachable!("physical dispatch is overridden")
+        }
+
+        fn execute_decode(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            unreachable!("physical dispatch is overridden")
+        }
+
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        fn initialize(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn cleanup_request(&self, _request_id: &str) -> CacheReleaseReport {
+            CacheReleaseReport::confirmed(0)
+        }
+    }
+
+    struct RestartSequenceExecutor {
+        cancel_during_dispatch: bool,
+        cleanup_calls: Arc<AtomicUsize>,
+    }
+
+    impl ModelExecutor for RestartSequenceExecutor {
+        fn execution_profile(&self, request: &EngineCoreRequest) -> Option<ExecutionProfile> {
+            let mut profile = ExecutionProfile::fail_closed(
+                BackendKind::Cpu,
+                request.model_variant,
+                ExecutionMode::Sequence,
+            );
+            profile.prefill = PrefillMode::Full;
+            profile.cache_mode = CacheMode::ExternalPaged;
+            profile.cache_release_safe = true;
+            profile.recompute_safe = true;
+            Some(profile)
+        }
+
+        fn cleanup_session(
+            &self,
+            _session: &super::super::SessionKey,
+        ) -> super::super::executor::CacheReleaseReport {
+            self.cleanup_calls.fetch_add(1, Ordering::AcqRel);
+            super::super::executor::CacheReleaseReport::confirmed(1)
+        }
+
+        fn execute_physical_batch(
+            &self,
+            execution: super::super::executor::PhysicalBatchExecution<'_>,
+        ) -> super::super::executor::PhysicalDispatchResult {
+            if self.cancel_during_dispatch {
+                for request in execution.requests {
+                    if let Some(cancellation) = request.cancellation.as_ref() {
+                        cancellation.store(true, Ordering::Release);
+                    }
+                }
+            }
+            let dispatch = execution.expected_dispatch();
+            Ok(execution
+                .scheduled
+                .iter()
+                .map(|scheduled| {
+                    ExecutorStepResult::from_session(
+                        scheduled,
+                        ModelSessionResult::restart_sequence(
+                            scheduled.request_id.clone(),
+                            super::super::SequenceRestartReason::ModelFallback,
+                        ),
+                    )
+                    .with_dispatch(dispatch)
+                })
+                .collect())
+        }
+
+        fn execute_prefill(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            unreachable!("physical dispatch is overridden")
+        }
+
+        fn execute_decode(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            unreachable!("physical dispatch is overridden")
+        }
+
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        fn initialize(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
     struct DeadlineCleanupExecutor {
         events: Arc<Mutex<Vec<String>>>,
         confirm_cleanup: bool,
@@ -2871,6 +5571,8 @@ mod tests {
                 ExecutionMode::Sequence,
             );
             profile.prefill = PrefillMode::Full;
+            // This synthetic executor stands in for an external physical
+            // runtime whose exact-session cleanup must be confirmed.
             profile.cache_mode = super::super::execution::CacheMode::ExternalPaged;
             profile.cache_release_safe = true;
             profile.prefix_reuse_safe = true;
@@ -3122,6 +5824,86 @@ mod tests {
         }
     }
 
+    fn bind_managed_test_state(
+        core: &mut EngineCore,
+        request: &mut EngineCoreRequest,
+        model_instance: ModelInstanceId,
+    ) {
+        let variant = request.model_variant.expect("managed test model");
+        let state_contract = crate::kv::test_contract();
+        let capability = crate::kv::InferenceStateCapability::Managed(state_contract.clone());
+        let physical = core
+            .load_managed_model_cache(model_instance, &capability, None)
+            .expect("load managed state")
+            .expect("physical managed state");
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, Some(variant), ExecutionMode::Sequence);
+        profile.prefill = PrefillMode::Full;
+        profile.incremental_decode = true;
+        profile.cache_mode = CacheMode::ExternalPaged;
+        profile.cache_namespace = Some("core-test-state-v2".to_string());
+        profile.kv_dtype = "state_v2_resolved".to_string();
+        profile.resolved_from_loaded_model = true;
+        let stage = super::super::StageDescriptor::from_execution_profile(
+            super::super::StageId::new(1),
+            "chat.test.physical",
+            &profile,
+            NativeBatchMode::None,
+        );
+        let execution = super::super::ExecutionAdapterBinding {
+            execution_group_id: super::super::ExecutionGroupId::new(1),
+            model_instance_id: model_instance,
+            adapter_instance_id: super::super::AdapterInstanceId::new(model_instance.get()),
+            adapter_abi_revision: super::super::AdapterAbiRevision::new(1),
+            model_variant: variant,
+            capability_id: "chat".to_string(),
+            stages: Arc::from([stage]),
+        };
+        let descriptor = crate::kv::v2::CapabilityStateDescriptorV2::managed_for_stages_test(
+            state_contract,
+            &execution.stages,
+        );
+        let runtime = Arc::new(crate::kv::v2::CapabilityStateRuntimeV2::managed(
+            crate::kv::v2::ManagedCapabilityRuntimeV2::seal(
+                BackendKind::Cpu,
+                &execution,
+                descriptor,
+                physical,
+                crate::kv::v2::RetainedStateUseV2::ExternalPaged,
+            )
+            .expect("seal managed test runtime"),
+        ));
+        request
+            .bind_execution_adapter(execution)
+            .expect("bind test execution");
+        request
+            .bind_v2_state_runtime(runtime.clone(), runtime.state_fingerprint, BackendKind::Cpu)
+            .expect("bind managed test state");
+    }
+
+    fn managed_test_request(
+        core: &mut EngineCore,
+        model_instance: ModelInstanceId,
+        id: &str,
+        tokens: Vec<u32>,
+    ) -> EngineCoreRequest {
+        let mut request = EngineCoreRequest::chat(vec![ChatMessage {
+            role: ChatRole::User,
+            content: id.to_string(),
+        }])
+        .with_model_variant(ModelVariant::Qwen306B);
+        request.id = id.to_string();
+        request.params.max_tokens = 1;
+        request
+            .install_chat_execution_preparation(ModelVariant::Qwen306B, tokens, None, 4096)
+            .expect("prepare prompt");
+        request
+            .bind_model_instance(model_instance)
+            .expect("model instance");
+        bind_managed_test_state(core, &mut request, model_instance);
+        request
+    }
+
     #[test]
     fn test_engine_core_creation() {
         let config = EngineCoreConfig::default();
@@ -3141,49 +5923,109 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_step_clears_executor_state_for_recompute_preemption() {
-        let cleanup_calls = Arc::new(Mutex::new(Vec::new()));
-        let executor =
-            UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(cleanup_calls.clone())));
+    async fn realtime_session_admission_rejects_an_unbound_voxtral_request() {
+        let mut core = EngineCore::new(EngineCoreConfig::default()).unwrap();
+        let mut request = EngineCoreRequest::asr_bytes(Vec::new())
+            .with_model_variant(ModelVariant::VoxtralMini4BRealtime2602);
+        request
+            .enable_realtime_asr_ingress()
+            .expect("realtime ingress");
+        let error = core
+            .add_realtime_asr_session(request)
+            .expect_err("unbound realtime requests must fail before scheduler insertion");
+        assert!(error.to_string().contains("loaded model instance"));
+        assert_eq!(core.pending_request_count(), 0);
+    }
 
-        let config = EngineCoreConfig {
-            max_batch_size: 2,
-            max_tokens_per_step: 8,
-            min_tokens_per_step: 1,
-            block_size: 1,
-            max_blocks: 1,
-            scheduling_policy: super::super::scheduler::SchedulingPolicy::Priority,
-            enable_chunked_prefill: false,
-            enable_preemption: true,
-            enable_adaptive_batching: false,
+    #[test]
+    fn v2_state_publication_fails_closed_until_runtime_is_resolved() {
+        let mut core = EngineCore::new(EngineCoreConfig::default()).unwrap();
+        let mut request = EngineCoreRequest::tts("v2");
+        request
+            .bind_model_instance(ModelInstanceId::new(101))
+            .unwrap();
+        request
+            .bind_v2_state_descriptor(
+                crate::kv::v2::CapabilityStateDescriptorV2::stateless_for_test(),
+                [7; 32],
+            )
+            .unwrap();
+
+        let error = core
+            .add_request(request)
+            .expect_err("v2 must never fall back to model-owned execution");
+        assert!(error.to_string().contains("resolved v2 runtime"));
+        assert_eq!(core.pending_request_count(), 0);
+    }
+
+    #[test]
+    fn load_sealed_stateless_v2_runtime_enters_the_engine() {
+        let mut core = EngineCore::new(EngineCoreConfig {
             backend: BackendKind::Cpu,
-            ..Default::default()
+            ..EngineCoreConfig::default()
+        })
+        .unwrap();
+        let variant = ModelVariant::Kokoro82M;
+        let instance = ModelInstanceId::new(102);
+        let profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, Some(variant), ExecutionMode::Atomic);
+        let stage = super::super::StageDescriptor::from_execution_profile(
+            super::super::StageId::new(0),
+            "tts.compatibility",
+            &profile,
+            NativeBatchMode::None,
+        );
+        let execution = super::super::ExecutionAdapterBinding {
+            execution_group_id: super::super::ExecutionGroupId::new(1),
+            model_instance_id: instance,
+            adapter_instance_id: super::super::AdapterInstanceId::new(3),
+            adapter_abi_revision: super::super::AdapterAbiRevision::new(1),
+            model_variant: variant,
+            capability_id: "tts".to_string(),
+            stages: Arc::from([stage]),
         };
-        let mut core = EngineCore::new_with_unified_executor(config, executor).unwrap();
-
-        let mut low = EngineCoreRequest::tts("low-priority");
-        low.id = "low-priority".to_string();
-        low.prompt_tokens = vec![1];
-        low.priority = Priority::Low;
-        core.add_request(low).unwrap();
-        let _ = core.step().await.unwrap();
-
-        let mut high = EngineCoreRequest::tts("high-priority");
-        high.id = "high-priority".to_string();
-        high.prompt_tokens = vec![1];
-        high.priority = Priority::High;
-        core.add_request(high).unwrap();
-        let _ = core.step().await.unwrap();
-
-        let calls = cleanup_calls.lock().unwrap().clone();
-        assert!(
-            calls.iter().any(|id| id == "low-priority"),
-            "recompute preemption must clear stale executor decode state"
+        let descriptor = crate::kv::v2::CapabilityStateDescriptorV2::stateless_for_stages_test(
+            &execution.stages,
         );
-        assert_eq!(
-            core.get_request_status(&"low-priority".to_string()),
-            Some(RequestStatus::Running)
+        let runtime = Arc::new(crate::kv::v2::CapabilityStateRuntimeV2::stateless(
+            crate::kv::v2::StatelessCapabilityRuntimeV2::seal(
+                BackendKind::Cpu,
+                &execution,
+                descriptor,
+            )
+            .unwrap(),
+        ));
+        let mut request = EngineCoreRequest::tts("v2 stateless").with_model_variant(variant);
+        request.bind_execution_adapter(execution.clone()).unwrap();
+        request
+            .bind_v2_state_runtime(runtime.clone(), runtime.state_fingerprint, BackendKind::Cpu)
+            .unwrap();
+
+        core.add_request(request).unwrap();
+        assert_eq!(core.pending_request_count(), 1);
+
+        let cuda_descriptor = crate::kv::v2::CapabilityStateDescriptorV2::stateless_for_stages_test(
+            &execution.stages,
         );
+        let cuda_runtime = Arc::new(crate::kv::v2::CapabilityStateRuntimeV2::stateless(
+            crate::kv::v2::StatelessCapabilityRuntimeV2::seal(
+                BackendKind::Cuda,
+                &execution,
+                cuda_descriptor,
+            )
+            .unwrap(),
+        ));
+        let mut mismatched = EngineCoreRequest::tts("wrong backend").with_model_variant(variant);
+        mismatched.bind_execution_adapter(execution).unwrap();
+        mismatched
+            .bind_v2_state_runtime(
+                cuda_runtime.clone(),
+                cuda_runtime.state_fingerprint,
+                BackendKind::Cuda,
+            )
+            .unwrap();
+        assert!(core.add_request(mismatched).is_err());
+        assert_eq!(core.pending_request_count(), 1);
     }
 
     #[tokio::test]
@@ -3423,8 +6265,113 @@ mod tests {
             .filter(|event| event.starts_with("cleanup:cleanup-fence:"))
             .count();
         assert!(cleanup_attempts >= 2, "cleanup was not retried");
-        assert_eq!(core.kv_cache_stats().allocated_blocks, 1);
         assert!(core.add_request(request).is_err());
+    }
+
+    #[tokio::test]
+    async fn cleanup_confirmation_does_not_resolve_on_cancellation_acceptance() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let executor =
+            UnifiedExecutor::new_for_test(Box::new(DeadlineCleanupExecutor::new(events, false)));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                max_batch_size: 1,
+                max_tokens_per_step: 1,
+                block_size: 1,
+                max_blocks: 1,
+                enable_adaptive_batching: false,
+                ..Default::default()
+            },
+            executor,
+        )
+        .unwrap();
+
+        let mut request = EngineCoreRequest::tts("cleanup receipt");
+        request.id = "cleanup-receipt-pending".to_string();
+        request.prompt_tokens = vec![1];
+        core.add_request(request).unwrap();
+        core.step().await.unwrap();
+        let session = core
+            .get_session_key(&"cleanup-receipt-pending".to_string())
+            .unwrap();
+        let mut confirmation = core.begin_confirmed_session_cleanup(&session).await;
+
+        assert!(matches!(
+            confirmation.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cleanup_confirmation_resolves_for_an_already_terminal_session() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let executor =
+            UnifiedExecutor::new_for_test(Box::new(DeadlineCleanupExecutor::new(events, true)));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                max_batch_size: 1,
+                max_tokens_per_step: 1,
+                block_size: 1,
+                max_blocks: 1,
+                enable_adaptive_batching: false,
+                ..Default::default()
+            },
+            executor,
+        )
+        .unwrap();
+
+        let mut request = EngineCoreRequest::tts("finished cleanup receipt");
+        request.id = "cleanup-receipt-terminal".to_string();
+        request.prompt_tokens = vec![1];
+        core.add_request(request).unwrap();
+        core.step().await.unwrap();
+        let session = core
+            .get_session_key(&"cleanup-receipt-terminal".to_string())
+            .unwrap();
+        assert!(core.abort_request_session(&session).await);
+
+        let confirmation = core.begin_confirmed_session_cleanup(&session).await;
+        confirmation
+            .await
+            .expect("already-terminal cleanup sender must remain armed")
+            .expect("already-terminal cleanup must be confirmed");
+    }
+
+    #[tokio::test]
+    async fn orderly_shutdown_settles_a_pending_cleanup_receipt() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let executor =
+            UnifiedExecutor::new_for_test(Box::new(DeadlineCleanupExecutor::new(events, false)));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                max_batch_size: 1,
+                max_tokens_per_step: 1,
+                block_size: 1,
+                max_blocks: 1,
+                enable_adaptive_batching: false,
+                ..Default::default()
+            },
+            executor,
+        )
+        .unwrap();
+
+        let mut request = EngineCoreRequest::tts("shutdown cleanup receipt");
+        request.id = "cleanup-receipt-shutdown".to_string();
+        request.prompt_tokens = vec![1];
+        core.add_request(request).unwrap();
+        core.step().await.unwrap();
+        let session = core
+            .get_session_key(&"cleanup-receipt-shutdown".to_string())
+            .unwrap();
+        let confirmation = core.begin_confirmed_session_cleanup(&session).await;
+
+        core.shutdown().await.expect("orderly shutdown");
+        confirmation
+            .await
+            .expect("shutdown must explicitly settle the receipt")
+            .expect("successful shutdown is a final cleanup fence");
+        assert!(core.cleanup_confirmation_waiters.is_empty());
+        assert!(core.pending_managed_releases.is_empty());
     }
 
     #[tokio::test]
@@ -3453,11 +6400,9 @@ mod tests {
         aborted.prompt_tokens = vec![1];
         core.add_request(aborted.clone()).unwrap();
         core.step().await.unwrap();
-        assert_eq!(core.kv_cache_stats().allocated_blocks, 1);
 
         let aborted_session = core.get_session_key(&aborted.id).unwrap();
         assert!(core.abort_request_session(&aborted_session).await);
-        assert_eq!(core.kv_cache_stats().allocated_blocks, 0);
         assert!(core.has_pending_terminal_output(&aborted.id));
         assert!(core.add_request(aborted.clone()).is_err());
 
@@ -3643,6 +6588,9 @@ mod tests {
     }
 
     #[test]
+    // Explicitly dropping the closure releases its captured request Arc before
+    // the test asserts unique ownership through Arc::get_mut.
+    #[allow(clippy::drop_non_drop)]
     fn incremental_progress_requires_exact_batch_plan_session_lane_and_sequence() {
         let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
             Mutex::new(Vec::new()),
@@ -3701,15 +6649,42 @@ mod tests {
 
         let lane = EngineCore::batch_lane(&plan, WorkCost::new(1, 1, 0));
         let batch_id = BatchId::new(81);
-        core.active_stream_batches.insert(
-            batch_id,
-            ActiveStreamBatch {
-                lane: lane.clone(),
-                output_visibility: OutputVisibility::IncrementalCommitted,
-                rows: HashMap::from([(plan_id, session.clone())]),
-            },
-        );
         let request = core.requests.get(&request_id).unwrap().clone();
+        let scheduled = ScheduledRequest {
+            plan_id,
+            request_id: request_id.clone(),
+            sequence_id: session.epoch,
+            num_tokens: 1,
+            is_prefill: true,
+            num_computed_tokens: 0,
+            work: plan.work.clone(),
+        };
+        let dispatch = PreparedPhysicalDispatch::new(
+            ExecutionPhase::Prefill,
+            PhysicalBatch {
+                batch_id,
+                lane: lane.clone(),
+                mode: NativeBatchMode::None,
+                budget: BatchBudget::width_one(),
+                rows: vec![ReadyQuantum {
+                    plan_id,
+                    session: session.clone(),
+                    lane: lane.clone(),
+                    work: plan.work.clone(),
+                    cost: WorkCost::new(1, 1, 0),
+                    managed_cache: None,
+                }],
+                materialized_tensor_elements: 1,
+                workspace: ResourceVector::zero(),
+            },
+            vec![request.clone()],
+            vec![scheduled],
+            OutputVisibility::IncrementalCommitted,
+            Vec::new(),
+            PhysicalLaunchPolicy::ExecutionGroupExclusive,
+        )
+        .unwrap();
+        core.register_prepared_physical_dispatch(&dispatch).unwrap();
         let staging = request.stream_staging_buffer();
         let (progress_tx, mut progress_rx) = mpsc::channel(8);
         let binding = request
@@ -3793,6 +6768,7 @@ mod tests {
 
         drop(next_progress);
         drop(binding);
+        drop(dispatch);
         drop(request);
         Arc::get_mut(core.requests.get_mut(&request_id).expect("active request"))
             .expect("core owns the last request reference")
@@ -3893,7 +6869,17 @@ mod tests {
             .map(|item| core.requests.get(&item.request_id).unwrap().clone())
             .collect::<Vec<_>>();
 
-        let joined = core.form_physical_batches(&requests, &scheduled).unwrap();
+        let active_plans = core.active_plans.clone();
+        let joined = core
+            .form_physical_batches(
+                ExecutionPhase::Prefill,
+                &requests,
+                &scheduled,
+                usize::MAX,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+            .unwrap();
         assert_eq!(joined.len(), 1);
         assert_eq!(joined[0].physical_batch().rows.len(), 2);
         assert_eq!(
@@ -3907,6 +6893,8 @@ mod tests {
             joined[0].physical_batch().lane.model_instance,
             super::super::ModelInstanceId::new(2)
         );
+        assert_eq!(core.rollback_all_in_flight_dispatches(), 1);
+        core.active_plans.extend(active_plans);
 
         core.active_plans
             .get_mut(&scheduled[1].plan_id)
@@ -3916,11 +6904,21 @@ mod tests {
             .as_mut()
             .unwrap()
             .model_instance_id = super::super::ModelInstanceId::new(9);
-        let split = core.form_physical_batches(&requests, &scheduled).unwrap();
-        assert_eq!(split.len(), 2);
-        assert!(split
-            .iter()
-            .all(|batch| batch.physical_batch().rows.len() == 1));
+        let mut deferred = Vec::new();
+        let split = core
+            .form_physical_batches(
+                ExecutionPhase::Prefill,
+                &requests,
+                &scheduled,
+                usize::MAX,
+                &mut Vec::new(),
+                &mut deferred,
+            )
+            .unwrap();
+        assert_eq!(split.len(), 1);
+        assert_eq!(split[0].physical_batch().rows.len(), 1);
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deferred[0].plan_id, scheduled[1].plan_id);
     }
 
     #[test]
@@ -3951,6 +6949,7 @@ mod tests {
                 phase: super::super::SequencePhase::Decode,
                 input: super::super::InputRange { start: 1, end: 2 },
                 max_output_steps: 1,
+                auxiliary_state: None,
             },
             cost: WorkCost::with_workspace(
                 1,
@@ -3961,11 +6960,13 @@ mod tests {
                     ..ResourceVector::zero()
                 },
             ),
+            managed_cache: None,
         };
 
         assert_eq!(
             PhysicalBatchAssembly::workspace_resources(
                 BackendKind::Cuda,
+                StageShapePolicy::Ragged,
                 16,
                 std::slice::from_ref(&row),
             ),
@@ -3978,12 +6979,69 @@ mod tests {
     }
 
     #[test]
-    fn independent_compatibility_rows_form_bounded_parallel_batches() {
+    fn padded_batch_charges_every_row_at_cohort_maximum() {
+        let lane = BatchLaneKey {
+            execution_group: super::super::ExecutionGroupId::new(1),
+            model_instance: super::super::ModelInstanceId::new(2),
+            adapter_instance: super::super::AdapterInstanceId::new(3),
+            adapter_abi: super::super::AdapterAbiRevision::new(1),
+            capability_id: "asr".to_string(),
+            stage_id: super::super::StageId::new(4),
+            backend: BackendKind::Cuda,
+            device_ordinal: None,
+            compute_dtype: "f16".to_string(),
+            state_dtype: "f16".to_string(),
+            tensor_layout: "padded".to_string(),
+            quantization: "none".to_string(),
+            state_schema: "test".to_string(),
+            kernel_mode: "static".to_string(),
+            semantic_mode: "preparation".to_string(),
+            shape_bucket: "padded".to_string(),
+        };
+        let row = |id, elements, workspace| ReadyQuantum {
+            plan_id: id,
+            session: super::super::SessionKey::new(format!("padded-{id}"), 1),
+            lane: lane.clone(),
+            work: WorkUnit::AtomicJob {
+                kind: "padded".into(),
+            },
+            cost: WorkCost::new(1, elements, workspace),
+            managed_cache: None,
+        };
+        let rows = [row(1, 100, 1_000), row(2, 400, 4_000)];
+
+        assert_eq!(
+            PhysicalBatchAssembly::materialized_tensor_elements(StageShapePolicy::Padded, &rows),
+            Some(800)
+        );
+        assert_eq!(
+            PhysicalBatchAssembly::workspace_resources(
+                BackendKind::Cuda,
+                StageShapePolicy::Padded,
+                16,
+                &rows,
+            ),
+            Some(ResourceVector {
+                device_bytes: ResourceAmount::Known(8_016),
+                ..ResourceVector::zero()
+            })
+        );
+    }
+
+    #[test]
+    fn certified_independent_rows_form_bounded_scalar_candidates() {
         let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
             Mutex::new(Vec::new()),
         ))));
-        let mut core = EngineCore::new_with_unified_executor(EngineCoreConfig::default(), executor)
-            .expect("core");
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                physical_execution_mode: crate::config::PhysicalExecutionMode::Concurrent,
+                max_physical_in_flight: crate::config::PhysicalInFlightLimit::new(2).unwrap(),
+                ..EngineCoreConfig::default()
+            },
+            executor,
+        )
+        .expect("core");
         let ids = [
             "parallel-a",
             "parallel-b",
@@ -4006,6 +7064,7 @@ mod tests {
         let mut profile =
             ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
         profile.concurrency = ConcurrencyClass::Batchable;
+        profile.physical_launch_policy = PhysicalLaunchPolicy::concurrent(2).unwrap();
         profile.max_batch_size = 2;
         let stage = super::super::StageDescriptor::from_execution_profile(
             super::super::StageId::new(6),
@@ -4050,18 +7109,89 @@ mod tests {
             .map(|item| core.requests.get(&item.request_id).unwrap().clone())
             .collect::<Vec<_>>();
 
-        let batches = core.form_physical_batches(&requests, &scheduled).unwrap();
+        let mut deferred = Vec::new();
+        let batches = core
+            .form_physical_batches(
+                ExecutionPhase::Prefill,
+                &requests,
+                &scheduled,
+                usize::MAX,
+                &mut Vec::new(),
+                &mut deferred,
+            )
+            .unwrap();
         let widths = batches
             .iter()
             .map(|batch| batch.physical_batch().rows.len())
             .collect::<Vec<_>>();
-        assert_eq!(widths, vec![2, 2, 1]);
+        assert_eq!(widths, vec![1, 1]);
+        assert_eq!(deferred.len(), 3);
         assert!(batches
             .iter()
             .all(|batch| batch.physical_batch().mode == NativeBatchMode::None));
         assert!(batches
             .iter()
             .all(|batch| { batch.physical_batch().lane.shape_bucket == "independent" }));
+    }
+
+    #[test]
+    fn padded_sequence_lanes_separate_auxiliary_and_primary_only_rows() {
+        let mut profile = ExecutionProfile::fail_closed(
+            BackendKind::Cpu,
+            Some(ModelVariant::VibeVoiceAsr),
+            ExecutionMode::Sequence,
+        );
+        profile.prefill_batch = NativeBatchMode::Static;
+        profile.max_batch_size = 2;
+        let stage = super::super::StageDescriptor::from_execution_profile(
+            StageId::new(19),
+            "asr.prefill.tensor_static",
+            &profile,
+            NativeBatchMode::Static,
+        );
+        let base = ExecutionPlan {
+            plan_id: 1,
+            session: SessionKey::new("padded-lane".into(), 1),
+            work: WorkUnit::SequenceStep {
+                phase: SequencePhase::Prefill,
+                input: InputRange::new(0, 1).unwrap(),
+                max_output_steps: 1,
+                auxiliary_state: Some(Arc::from([])),
+            },
+            batch_key: BatchKey {
+                backend: BackendKind::Cpu,
+                model_variant: Some(ModelVariant::VibeVoiceAsr),
+                task_type: TaskType::ASR,
+                work_kind: "prefill".into(),
+                compute_dtype: "f32".into(),
+                kv_dtype: "state_v2".into(),
+                cache_namespace: "test".into(),
+                adapter: None,
+            },
+            batch_mode: NativeBatchMode::Static,
+            max_batch_size: 2,
+            estimate: ResourceVector::zero(),
+            stage: Some(stage),
+        };
+        let mut auxiliary = base.clone();
+        auxiliary.work = WorkUnit::SequenceStep {
+            phase: SequencePhase::Prefill,
+            input: InputRange::new(0, 1).unwrap(),
+            max_output_steps: 1,
+            auxiliary_state: Some(Arc::from([ClockedStateSpan::new(
+                StateGroupId::new(2),
+                StateClock::AudioSamples,
+                InputRange::new(0, 3_200).unwrap(),
+            )
+            .unwrap()])),
+        };
+
+        let primary_lane = EngineCore::batch_lane(&base, WorkCost::new(1, 1, 0));
+        let auxiliary_lane = EngineCore::batch_lane(&auxiliary, WorkCost::new(1, 1, 0));
+
+        assert_eq!(primary_lane.shape_bucket, "padded.primary");
+        assert_eq!(auxiliary_lane.shape_bucket, "padded.auxiliary");
+        assert_ne!(primary_lane, auxiliary_lane);
     }
 
     #[test]
@@ -4148,8 +7278,19 @@ mod tests {
             .map(|item| core.requests.get(&item.request_id).unwrap().clone())
             .collect::<Vec<_>>();
 
-        let batches = core.form_physical_batches(&requests, &scheduled).unwrap();
-        assert_eq!(batches.len(), 2);
+        let mut deferred = Vec::new();
+        let batches = core
+            .form_physical_batches(
+                ExecutionPhase::Prefill,
+                &requests,
+                &scheduled,
+                usize::MAX,
+                &mut Vec::new(),
+                &mut deferred,
+            )
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(deferred.len(), 1);
         assert!(batches
             .iter()
             .all(|batch| batch.physical_batch().rows.len() == 1));
@@ -4161,14 +7302,7 @@ mod tests {
                 .unwrap(),
             8
         );
-        assert_eq!(
-            batches[1]
-                .physical_batch()
-                .workspace
-                .workspace_bytes()
-                .unwrap(),
-            9
-        );
+        assert_eq!(deferred[0].plan_id, scheduled[1].plan_id);
     }
 
     #[test]
@@ -4237,7 +7371,16 @@ mod tests {
             .map(|item| core.requests.get(&item.request_id).unwrap().clone())
             .collect::<Vec<_>>();
 
-        let batches = core.form_physical_batches(&requests, &scheduled).unwrap();
+        let batches = core
+            .form_physical_batches(
+                ExecutionPhase::Decode,
+                &requests,
+                &scheduled,
+                usize::MAX,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+            .unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(
             batches[0].physical_batch().mode,
@@ -4245,6 +7388,191 @@ mod tests {
         );
         assert_eq!(batches[0].physical_batch().rows.len(), 2);
         assert_eq!(batches[0].physical_batch().budget.max_logical_units, 2);
+    }
+
+    #[test]
+    fn prepared_continuous_cost_scales_an_isolated_multi_token_quantum() {
+        let variant = ModelVariant::Qwen306BGguf;
+        let mut request = EngineCoreRequest::chat(vec![ChatMessage {
+            role: ChatRole::User,
+            content: "continuous cost fixture".to_string(),
+        }])
+        .with_model_variant(variant);
+        let profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, Some(variant), ExecutionMode::Sequence);
+        let mut stage = super::super::StageDescriptor::from_execution_profile(
+            super::super::StageId::new(17),
+            "chat.decode.tensor_continuous",
+            &profile,
+            NativeBatchMode::Continuous,
+        );
+        stage.max_workspace_bytes = 32;
+        request
+            .bind_execution_adapter(super::super::ExecutionAdapterBinding {
+                execution_group_id: ExecutionGroupId::new(1),
+                model_instance_id: ModelInstanceId::new(2),
+                adapter_instance_id: AdapterInstanceId::new(3),
+                adapter_abi_revision: AdapterAbiRevision::new(1),
+                model_variant: variant,
+                capability_id: "chat".to_string(),
+                stages: Arc::from([stage.clone()]),
+            })
+            .unwrap();
+        request
+            .install_prepared_stage_cost(stage.id, WorkCost::new(1, 128, 32))
+            .unwrap();
+        let work = WorkUnit::SequenceStep {
+            phase: SequencePhase::Decode,
+            input: super::super::InputRange { start: 9, end: 13 },
+            max_output_steps: 4,
+            auxiliary_state: None,
+        };
+
+        let cost = EngineCore::work_cost(&request, &work, Some(&stage)).unwrap();
+        assert_eq!(cost.logical_units, 4);
+        assert_eq!(cost.tensor_elements, 512);
+        assert_eq!(cost.workspace.workspace_bytes().unwrap(), 32);
+    }
+
+    #[test]
+    fn realtime_work_cost_accounts_for_bounded_input_and_output() {
+        let request = EngineCoreRequest::asr("");
+        let push = EngineCore::work_cost(
+            &request,
+            &WorkUnit::RealtimePush {
+                operation_id: crate::engine::RealtimeOperationId::new(1),
+                input: super::super::InputRange::new(40, 200).unwrap(),
+                max_output_steps: 4,
+                max_cache_append: 8,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(push, WorkCost::new(160, 160, 0));
+
+        let finish = EngineCore::work_cost(
+            &request,
+            &WorkUnit::RealtimeFinish {
+                operation_id: crate::engine::RealtimeOperationId::new(2),
+                max_output_steps: 7,
+                max_cache_append: 8,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(finish, WorkCost::new(8, 8, 0));
+    }
+
+    #[test]
+    fn realtime_preparation_uses_authenticated_operation_cost() {
+        let operation_id = crate::engine::RealtimeOperationId::new(7);
+        let mut request = EngineCoreRequest::asr("");
+        request.enable_realtime_asr_ingress().unwrap();
+        let exact = WorkCost::new(160, 704, 4096);
+        let _waiter = request
+            .install_realtime_asr_operation_with_cost(
+                operation_id,
+                RealtimeAsrOperationPayload::Push {
+                    samples: Arc::from(vec![0.0; 160]),
+                    sample_rate: 16_000,
+                },
+                exact,
+            )
+            .unwrap();
+
+        let cost = EngineCore::work_cost(
+            &request,
+            &WorkUnit::RealtimePreparation {
+                operation_id,
+                mode: super::super::RealtimePreparationMode::Push,
+                input: super::super::InputRange::new(0, 160).unwrap(),
+                max_output_steps: 8,
+                max_cache_append: 32,
+                retained_state_input: super::super::InputRange::new(0, 1).unwrap(),
+                auxiliary_state: None,
+            },
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(cost, exact);
+    }
+
+    #[test]
+    fn multi_token_continuous_quantum_cannot_join_another_row() {
+        let lane = BatchLaneKey {
+            execution_group: ExecutionGroupId::new(1),
+            model_instance: ModelInstanceId::new(2),
+            adapter_instance: AdapterInstanceId::new(3),
+            adapter_abi: AdapterAbiRevision::new(1),
+            capability_id: "chat".to_string(),
+            stage_id: StageId::new(4),
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            compute_dtype: "f32".to_string(),
+            state_dtype: "f32".to_string(),
+            tensor_layout: "ragged".to_string(),
+            quantization: "none".to_string(),
+            state_schema: "test.v1".to_string(),
+            kernel_mode: "test".to_string(),
+            semantic_mode: "greedy".to_string(),
+            shape_bucket: "ragged".to_string(),
+        };
+        let first_scheduled = scheduled_decode("solo-quantum", 1);
+        let first_row = ReadyQuantum {
+            plan_id: first_scheduled.plan_id,
+            session: first_scheduled.session_key(),
+            lane: lane.clone(),
+            work: WorkUnit::SequenceStep {
+                phase: SequencePhase::Decode,
+                input: super::super::InputRange { start: 1, end: 5 },
+                max_output_steps: 4,
+                auxiliary_state: None,
+            },
+            cost: WorkCost::new(4, 4, 0),
+            managed_cache: None,
+        };
+        let first_request = Arc::new(EngineCoreRequest::tts("solo quantum"));
+        let mut assembly = PhysicalBatchAssembly {
+            physical_batch: PhysicalBatch {
+                batch_id: BatchId::new(1),
+                lane: lane.clone(),
+                mode: NativeBatchMode::Continuous,
+                budget: BatchBudget {
+                    max_rows: 2,
+                    max_logical_units: 5,
+                    max_tensor_elements: 5,
+                    max_workspace_bytes: 0,
+                    max_padding_basis_points: 0,
+                    max_formation_delay: Duration::ZERO,
+                },
+                rows: vec![first_row],
+                materialized_tensor_elements: 4,
+                workspace: ResourceVector::zero(),
+            },
+            requests: vec![first_request],
+            scheduled: vec![first_scheduled],
+            output_visibility: OutputVisibility::AfterQuantumCommit,
+            shape_policy: StageShapePolicy::Ragged,
+            workspace_base_bytes: 0,
+            launch_policy: PhysicalLaunchPolicy::ExecutionGroupExclusive,
+        };
+        let second_scheduled = scheduled_decode("shared-row", 2);
+        let second_row = ReadyQuantum {
+            plan_id: second_scheduled.plan_id,
+            session: second_scheduled.session_key(),
+            lane,
+            work: second_scheduled.work.clone(),
+            cost: WorkCost::new(1, 1, 0),
+            managed_cache: None,
+        };
+
+        assert!(!assembly.try_push(
+            Arc::new(EngineCoreRequest::tts("shared row")),
+            second_scheduled,
+            second_row,
+        ));
+        assert_eq!(assembly.physical_batch.rows.len(), 1);
     }
 
     #[tokio::test]
@@ -4264,11 +7592,7 @@ mod tests {
         request.id = "transaction".to_string();
         request.prompt_tokens = vec![1];
         core.add_request(request).unwrap();
-        let scheduled = core
-            .scheduler
-            .schedule(core.kv_cache.inner_mut())
-            .prefill_requests
-            .remove(0);
+        let scheduled = core.scheduler.schedule().prefill_requests.remove(0);
         core.begin_execution_plan(&scheduled).await.unwrap();
 
         let mut invalid = ExecutorStepResult::new(
@@ -4337,6 +7661,11 @@ mod tests {
                     DispatchState::Started,
                 ),
                 staged_stream_outputs: Vec::new(),
+                managed_cache_completions: Vec::new(),
+                managed_cache_append: None,
+                realtime_stage_outcome: None,
+                pending_quantum_required: false,
+                clocked_state_completion: None,
             },
         )
     }
@@ -4362,11 +7691,7 @@ mod tests {
         request.prompt_tokens = vec![1];
         core.add_request(request).unwrap();
         core.refresh_scheduler_execution_profiles().await;
-        let scheduled = core
-            .scheduler
-            .schedule(core.kv_cache.inner_mut())
-            .prefill_requests
-            .remove(0);
+        let scheduled = core.scheduler.schedule().prefill_requests.remove(0);
         let session = scheduled.session_key();
         core.begin_execution_plan(&scheduled).await.unwrap();
 
@@ -4385,7 +7710,7 @@ mod tests {
             Some((0, 0))
         );
 
-        let mut retry_schedule = core.scheduler.schedule(core.kv_cache.inner_mut());
+        let mut retry_schedule = core.scheduler.schedule();
         assert_eq!(
             retry_schedule.prefill_requests.len(),
             1,
@@ -4421,11 +7746,7 @@ mod tests {
             request.prompt_tokens = vec![1];
             core.add_request(request).unwrap();
             core.refresh_scheduler_execution_profiles().await;
-            let scheduled = core
-                .scheduler
-                .schedule(core.kv_cache.inner_mut())
-                .prefill_requests
-                .remove(0);
+            let scheduled = core.scheduler.schedule().prefill_requests.remove(0);
             let session = scheduled.session_key();
             core.begin_execution_plan(&scheduled).await.unwrap();
             core.incremental_stream_sessions.insert(session.clone());
@@ -4447,7 +7768,7 @@ mod tests {
                     ..
                 })
             ));
-            let retry_schedule = core.scheduler.schedule(core.kv_cache.inner_mut());
+            let retry_schedule = core.scheduler.schedule();
             assert!(retry_schedule.prefill_requests.is_empty());
             assert!(retry_schedule.decode_requests.is_empty());
         }
@@ -4476,11 +7797,7 @@ mod tests {
         core.add_request(request).unwrap();
         core.refresh_scheduler_execution_profiles().await;
 
-        let mut scheduled = core
-            .scheduler
-            .schedule(core.kv_cache.inner_mut())
-            .prefill_requests
-            .remove(0);
+        let mut scheduled = core.scheduler.schedule().prefill_requests.remove(0);
         let session = scheduled.session_key();
         for attempt in 1..=3 {
             core.begin_execution_plan(&scheduled).await.unwrap();
@@ -4492,11 +7809,7 @@ mod tests {
                 .await;
             if attempt <= 2 {
                 assert!(committed.is_none());
-                scheduled = core
-                    .scheduler
-                    .schedule(core.kv_cache.inner_mut())
-                    .prefill_requests
-                    .remove(0);
+                scheduled = core.scheduler.schedule().prefill_requests.remove(0);
                 assert_eq!(scheduled.session_key(), session);
             } else {
                 let committed = committed.expect("retry budget must terminalize");
@@ -4518,7 +7831,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recompute_retry_releases_physical_and_logical_session_state() {
+    async fn recompute_retry_releases_capability_authoritative_session_state() {
         let cleanup_calls = Arc::new(Mutex::new(Vec::new()));
         let executor =
             UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(cleanup_calls.clone())));
@@ -4539,11 +7852,7 @@ mod tests {
         core.add_request(request).unwrap();
         core.refresh_scheduler_execution_profiles().await;
 
-        let prefill = core
-            .scheduler
-            .schedule(core.kv_cache.inner_mut())
-            .prefill_requests
-            .remove(0);
+        let prefill = core.scheduler.schedule().prefill_requests.remove(0);
         let session = prefill.session_key();
         core.begin_execution_plan(&prefill).await.unwrap();
         core.commit_executor_result(
@@ -4556,11 +7865,7 @@ mod tests {
         .await
         .expect("prefill progress must be emitted");
 
-        let decode = core
-            .scheduler
-            .schedule(core.kv_cache.inner_mut())
-            .decode_requests
-            .remove(0);
+        let decode = core.scheduler.schedule().decode_requests.remove(0);
         core.begin_execution_plan(&decode).await.unwrap();
         let emitted = core
             .commit_executor_result(
@@ -4583,11 +7888,7 @@ mod tests {
         );
         assert!(!core.execution_trackers.contains_key(&decode.request_id));
 
-        let retry = core
-            .scheduler
-            .schedule(core.kv_cache.inner_mut())
-            .prefill_requests
-            .remove(0);
+        let retry = core.scheduler.schedule().prefill_requests.remove(0);
         assert_eq!(retry.session_key(), session);
         assert_ne!(retry.plan_id, decode.plan_id);
     }
@@ -4611,17 +7912,9 @@ mod tests {
         request.prompt_tokens = (0..16).collect();
         core.add_request(request).unwrap();
         core.refresh_scheduler_execution_profiles().await;
-        let scheduled = core
-            .scheduler
-            .schedule(core.kv_cache.inner_mut())
-            .prefill_requests
-            .remove(0);
+        let scheduled = core.scheduler.schedule().prefill_requests.remove(0);
         assert_eq!(scheduled.num_computed_tokens, 0);
         assert_eq!(scheduled.num_tokens, 16);
-        assert_eq!(
-            scheduled.block_ids.len(),
-            core.kv_cache.inner().blocks_for_tokens(16)
-        );
         let mut partial = scheduled.clone();
         partial.num_tokens = 4;
         assert!(core.begin_execution_plan(&partial).await.is_err());
@@ -4684,16 +7977,13 @@ mod tests {
         request.prompt_tokens = vec![1, 2];
         core.add_request(request).unwrap();
         core.refresh_scheduler_execution_profiles().await;
-        let scheduled = core
-            .scheduler
-            .schedule(core.kv_cache.inner_mut())
-            .prefill_requests
-            .remove(0);
+        let scheduled = core.scheduler.schedule().prefill_requests.remove(0);
         core.begin_execution_plan(&scheduled).await.unwrap();
-        assert!(matches!(
+        assert_eq!(
             core.active_plans[&scheduled.plan_id].estimate.kv_bytes,
-            ResourceAmount::Known(bytes) if bytes > 0
-        ));
+            ResourceAmount::Known(0),
+            "opaque executor caches must not inherit fabricated scheduler KV geometry"
+        );
 
         let observed = ResourceVector {
             kv_bytes: ResourceAmount::Known(123),
@@ -4736,11 +8026,7 @@ mod tests {
         request.id = "valid-transaction".to_string();
         request.prompt_tokens = vec![1];
         core.add_request(request).unwrap();
-        let scheduled = core
-            .scheduler
-            .schedule(core.kv_cache.inner_mut())
-            .prefill_requests
-            .remove(0);
+        let scheduled = core.scheduler.schedule().prefill_requests.remove(0);
         core.begin_execution_plan(&scheduled).await.unwrap();
         let result = ExecutorStepResult::new(
             &scheduled,
@@ -4781,11 +8067,7 @@ mod tests {
         request.id = "atomic".to_string();
         request.prompt_tokens = vec![1];
         core.add_request(request).unwrap();
-        let scheduled = core
-            .scheduler
-            .schedule(core.kv_cache.inner_mut())
-            .prefill_requests
-            .remove(0);
+        let scheduled = core.scheduler.schedule().prefill_requests.remove(0);
         core.begin_execution_plan(&scheduled).await.unwrap();
         assert!(matches!(
             core.active_plans
@@ -4847,7 +8129,9 @@ mod tests {
         core.add_request(bad).unwrap();
         core.add_request(good).unwrap();
 
-        let outputs = core.step().await.unwrap();
+        let mut outputs = core.step().await.unwrap();
+        assert_eq!(outputs.len(), 1);
+        outputs.extend(core.step().await.unwrap());
 
         assert_eq!(outputs.len(), 2);
         assert!(outputs
@@ -4887,12 +8171,11 @@ mod tests {
         );
         let metrics_after = crate::engine::engine_batch_metrics_snapshot();
         assert!(
-            metrics_after.dispatch_states.not_started
-                >= metrics_before.dispatch_states.not_started + 1
+            metrics_after.dispatch_states.not_started > metrics_before.dispatch_states.not_started
         );
         assert!(
             metrics_after.deadline_phases.scheduler_queue
-                >= metrics_before.deadline_phases.scheduler_queue + 1
+                > metrics_before.deadline_phases.scheduler_queue
         );
         assert!(!core.has_request(&"expired".to_string()));
         assert_eq!(
@@ -4970,7 +8253,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unconfirmed_deadline_cleanup_quarantines_scarce_logical_block() {
+    async fn unconfirmed_deadline_cleanup_fences_id_without_blocking_unrelated_work() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let executor = UnifiedExecutor::new_for_test(Box::new(DeadlineCleanupExecutor::new(
             events.clone(),
@@ -4984,7 +8267,7 @@ mod tests {
                 block_size: 1,
                 max_blocks: 1,
                 enable_chunked_prefill: false,
-                enable_prefix_caching: true,
+                enable_prefix_caching: false,
                 enable_adaptive_batching: false,
                 backend: BackendKind::Cpu,
                 ..Default::default()
@@ -4993,18 +8276,17 @@ mod tests {
         )
         .unwrap();
 
-        let mut expired = EngineCoreRequest::tts("owns the only block");
+        let mut expired = EngineCoreRequest::tts("expires with model-owned state");
         expired.id = "expired-running".to_string();
         expired.prompt_tokens = vec![1];
         core.add_request(expired).unwrap();
         core.step().await.unwrap();
-        assert_eq!(core.kv_cache_stats().allocated_blocks, 1);
         assert!(core.scheduler.set_hard_deadline_for_test(
             &"expired-running".to_string(),
             Instant::now() - std::time::Duration::from_millis(1),
         ));
 
-        let mut waiting = EngineCoreRequest::tts("waits for capacity");
+        let mut waiting = EngineCoreRequest::tts("independent work");
         waiting.id = "waiting".to_string();
         waiting.prompt_tokens = vec![1];
         core.add_request(waiting).unwrap();
@@ -5014,14 +8296,11 @@ mod tests {
             output.request_id == "expired-running"
                 && output.error.as_deref() == Some(REQUEST_DEADLINE_EXCEEDED)
         }));
-        assert_eq!(core.kv_cache_stats().allocated_blocks, 1);
-        assert_eq!(core.pending_request_count(), 1);
-        assert!(core.step().await.unwrap().is_empty());
         assert!(events
             .lock()
             .unwrap()
             .iter()
-            .all(|event| event != "execute-prefill:waiting"));
+            .any(|event| event == "execute-prefill:waiting"));
 
         let mut reused = EngineCoreRequest::tts("must remain fenced");
         reused.id = "expired-running".to_string();
@@ -5047,7 +8326,12 @@ mod tests {
         request.id = "chat-req".to_string();
         request.model_variant = Some(ModelVariant::Qwen306B);
         request
-            .install_chat_execution_preparation(ModelVariant::Qwen306B, vec![11, 22, 33, 44], None)
+            .install_chat_execution_preparation(
+                ModelVariant::Qwen306B,
+                vec![11, 22, 33, 44],
+                None,
+                4096,
+            )
             .unwrap();
 
         core.add_request(request).unwrap();
@@ -5061,6 +8345,620 @@ mod tests {
             .expect("latency breakdown");
         assert!(latency.ttft_ms.is_some());
         assert!(latency.ttft_ms.unwrap() >= 0.0);
+    }
+
+    #[tokio::test]
+    async fn managed_kv_transaction_follows_live_prepare_commit_and_cancel_lifecycle() {
+        let model_instance = ModelInstanceId::new(91);
+        let executor = UnifiedExecutor::new_for_test(Box::new(ManagedReceiptExecutor));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                enable_chunked_prefill: false,
+                block_size: 16,
+                max_blocks: 4,
+                backend: BackendKind::Cpu,
+                ..Default::default()
+            },
+            executor,
+        )
+        .expect("core");
+        let mut request = EngineCoreRequest::chat(vec![ChatMessage {
+            role: ChatRole::User,
+            content: "managed".to_string(),
+        }])
+        .with_model_variant(ModelVariant::Qwen306B);
+        request.id = "managed-core".to_string();
+        request.params.max_tokens = 1;
+        request
+            .install_chat_execution_preparation(
+                ModelVariant::Qwen306B,
+                vec![11, 12, 13, 14],
+                None,
+                4096,
+            )
+            .expect("prepare prompt");
+        request
+            .bind_model_instance(model_instance)
+            .expect("model instance");
+        bind_managed_test_state(&mut core, &mut request, model_instance);
+        core.add_request(request).expect("add request");
+        let session = core
+            .get_session_key(&"managed-core".to_string())
+            .expect("session");
+
+        core.step().await.expect("managed step");
+        let snapshot = core
+            .managed_kv_cache
+            .snapshot(model_instance, &session, crate::kv::CacheDomainId::new(1))
+            .expect("committed table");
+        assert_eq!(snapshot.committed_tokens, 4);
+        assert_eq!(snapshot.version, 1);
+
+        assert!(core.abort_request_session(&session).await);
+        assert!(core
+            .managed_kv_cache
+            .snapshot(model_instance, &session, crate::kv::CacheDomainId::new(1))
+            .is_none());
+        let released = core.managed_kv_cache.runtime_snapshot();
+        assert_eq!(released.totals.registered_sessions, 0);
+        assert_eq!(released.totals.coordinator.admission_claimed_pages, 0);
+        assert_eq!(released.totals.coordinator.active_transactions, 0);
+    }
+
+    fn restart_test_core(cancel_during_dispatch: bool) -> (EngineCore, Arc<AtomicUsize>) {
+        let cleanup_calls = Arc::new(AtomicUsize::new(0));
+        let executor = UnifiedExecutor::new_for_test(Box::new(RestartSequenceExecutor {
+            cancel_during_dispatch,
+            cleanup_calls: cleanup_calls.clone(),
+        }));
+        let core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                enable_chunked_prefill: false,
+                block_size: 16,
+                max_blocks: 4,
+                max_batch_size: 1,
+                backend: BackendKind::Cpu,
+                ..Default::default()
+            },
+            executor,
+        )
+        .expect("restart test core");
+        (core, cleanup_calls)
+    }
+
+    #[tokio::test]
+    async fn managed_sequence_restart_preserves_epoch_and_requeues_context_zero() {
+        let model = ModelInstanceId::new(915);
+        let (mut core, cleanup_calls) = restart_test_core(false);
+        let request = managed_test_request(&mut core, model, "managed-restart", vec![1, 2, 3, 4]);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let request = request.with_deadline(Some(deadline));
+        core.add_request(request).unwrap();
+        let session = core
+            .get_session_key(&"managed-restart".to_string())
+            .unwrap();
+        core.execution_retry_attempts.insert(session.clone(), 3);
+        let first = core.prepare_step().await.unwrap().expect("initial prefill");
+        let claim_before = core
+            .managed_kv_cache
+            .runtime_snapshot()
+            .totals
+            .coordinator
+            .admission_claimed_pages;
+        assert!(claim_before > 0);
+        let executed = core.execute_prepared_with_progress(first).await.unwrap();
+        let committed = core.commit_step(executed).await.unwrap();
+        assert!(committed.outputs.is_empty());
+        assert_eq!(cleanup_calls.load(Ordering::Acquire), 0);
+        assert!(!core.execution_retry_attempts.contains_key(&session));
+        assert_eq!(
+            core.get_session_key(&"managed-restart".to_string()),
+            Some(session.clone())
+        );
+        assert_eq!(core.requests["managed-restart"].deadline, Some(deadline));
+        assert_eq!(
+            core.execution_trackers["managed-restart"].state(),
+            ExecutionState::Queued
+        );
+        assert_eq!(
+            core.scheduler.get_running_info(&session.request_id),
+            Some((0, 0))
+        );
+        let reset = core
+            .managed_kv_cache
+            .snapshot(model, &session, crate::kv::CacheDomainId::new(1))
+            .unwrap();
+        assert_eq!(reset.committed_tokens, 0);
+        assert!(reset.groups.is_empty());
+        assert_eq!(
+            core.managed_kv_cache
+                .runtime_snapshot()
+                .totals
+                .coordinator
+                .admission_claimed_pages,
+            claim_before
+        );
+
+        let prepared = core
+            .prepare_step()
+            .await
+            .unwrap()
+            .expect("restarted prefill");
+        assert_eq!(
+            core.get_session_key(&session.request_id),
+            Some(session.clone()),
+            "semantic restart must preserve the scheduler epoch"
+        );
+        let plan = core.active_plans.values().next().unwrap();
+        let WorkUnit::SequenceStep { input, .. } = &plan.work else {
+            panic!("restart must schedule sequence prefill")
+        };
+        assert_eq!(input.start, 0);
+        let reservation = core.active_managed_cache.values().next().unwrap();
+        assert_eq!(reservation.session_generation.get(), 2);
+        assert!(reservation
+            .domains
+            .iter()
+            .all(|domain| domain.execution_start_tokens == 0));
+        assert_eq!(core.rollback_all_in_flight_dispatches(), 1);
+        drop(prepared);
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_restart_wins_and_releases_managed_session() {
+        let model = ModelInstanceId::new(916);
+        let (mut core, cleanup_calls) = restart_test_core(false);
+        let mut request =
+            managed_test_request(&mut core, model, "managed-restart-cancel", vec![1, 2]);
+        let cancellation = Arc::new(AtomicBool::new(false));
+        request.cancellation = Some(cancellation.clone());
+        core.restart_after_reset_hook = Some(Arc::new(move || {
+            cancellation.store(true, Ordering::Release);
+        }));
+        core.add_request(request).unwrap();
+        let session = core
+            .get_session_key(&"managed-restart-cancel".to_string())
+            .unwrap();
+
+        let outputs = core.step().await.unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(
+            outputs[0].finish_reason,
+            Some(super::super::types::FinishReason::Aborted)
+        );
+        assert_eq!(cleanup_calls.load(Ordering::Acquire), 1);
+        assert!(core
+            .managed_kv_cache
+            .snapshot(model, &session, crate::kv::CacheDomainId::new(1))
+            .is_none());
+        assert_eq!(
+            core.managed_kv_cache
+                .runtime_snapshot()
+                .totals
+                .coordinator
+                .admission_claimed_pages,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_restart_generation_fails_terminally_without_requeue() {
+        let model = ModelInstanceId::new(917);
+        let (mut core, _cleanup_calls) = restart_test_core(false);
+        let request = managed_test_request(&mut core, model, "managed-restart-stale", vec![1, 2]);
+        core.add_request(request).unwrap();
+        let session = core
+            .get_session_key(&"managed-restart-stale".to_string())
+            .unwrap();
+        let prepared = core
+            .prepare_step()
+            .await
+            .unwrap()
+            .expect("prepared restart");
+        core.active_managed_cache
+            .values_mut()
+            .next()
+            .unwrap()
+            .session_generation = super::super::ManagedSessionGeneration::for_test(2);
+
+        let executed = core.execute_prepared_with_progress(prepared).await.unwrap();
+        let committed = core.commit_step(executed).await.unwrap();
+        assert_eq!(committed.outputs.len(), 1);
+        assert!(committed.outputs[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("managed sequence reset failed")));
+        assert!(core
+            .managed_kv_cache
+            .snapshot(model, &session, crate::kv::CacheDomainId::new(1))
+            .is_none());
+        assert!(!core.has_request(&session.request_id));
+    }
+
+    #[tokio::test]
+    async fn scheduler_restart_rejection_fails_terminally_after_cache_reset() {
+        let model = ModelInstanceId::new(918);
+        let (mut core, _cleanup_calls) = restart_test_core(false);
+        let request =
+            managed_test_request(&mut core, model, "managed-restart-rejected", vec![1, 2]);
+        core.add_request(request).unwrap();
+        let session = core
+            .get_session_key(&"managed-restart-rejected".to_string())
+            .unwrap();
+        let prepared = core
+            .prepare_step()
+            .await
+            .unwrap()
+            .expect("prepared restart");
+        let executed = core.execute_prepared_with_progress(prepared).await.unwrap();
+        core.scheduler.finish_request(&session.request_id);
+
+        let committed = core.commit_step(executed).await.unwrap();
+        assert_eq!(committed.outputs.len(), 1);
+        assert!(committed.outputs[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("scheduler rejected a managed sequence restart")));
+        assert!(core
+            .managed_kv_cache
+            .snapshot(model, &session, crate::kv::CacheDomainId::new(1))
+            .is_none());
+        assert!(!core.has_request(&session.request_id));
+    }
+
+    #[tokio::test]
+    async fn managed_kv_capacity_defers_without_failing_or_sticking_prefill() {
+        let model_instance = ModelInstanceId::new(92);
+        let executor = UnifiedExecutor::new_for_test(Box::new(ManagedReceiptExecutor));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                enable_chunked_prefill: false,
+                block_size: 16,
+                max_blocks: 1,
+                max_batch_size: 1,
+                backend: BackendKind::Cpu,
+                ..Default::default()
+            },
+            executor,
+        )
+        .expect("core");
+        core.retry_policy.execution_backoff_base = Duration::ZERO;
+        core.retry_policy.execution_backoff_max = Duration::ZERO;
+        let owner = managed_test_request(
+            &mut core,
+            model_instance,
+            "capacity-owner",
+            vec![1, 2, 3, 4],
+        );
+        core.add_request(owner).expect("add owner");
+        core.step().await.expect("commit owner prefill");
+        let owner_session = core
+            .get_session_key(&"capacity-owner".to_string())
+            .expect("owner session");
+        core.scheduler.finish_request(&"capacity-owner".to_string());
+
+        let waiter = managed_test_request(
+            &mut core,
+            model_instance,
+            "capacity-waiter",
+            vec![5, 6, 7, 8],
+        );
+        core.add_request(waiter).expect("add waiter");
+        assert!(core
+            .prepare_step()
+            .await
+            .expect("capacity is scheduler backpressure")
+            .is_none());
+        assert!(core.active_plans.is_empty());
+        assert!(core.active_managed_cache.is_empty());
+
+        core.managed_kv_cache
+            .release_session(&owner_session)
+            .expect("release owner capacity");
+        core.step()
+            .await
+            .expect("waiter retries after capacity release");
+        let waiter_session = core
+            .get_session_key(&"capacity-waiter".to_string())
+            .expect("waiter session");
+        let snapshot = core
+            .managed_kv_cache
+            .snapshot(
+                model_instance,
+                &waiter_session,
+                crate::kv::CacheDomainId::new(1),
+            )
+            .expect("waiter committed table");
+        assert_eq!(snapshot.committed_tokens, 4);
+    }
+
+    #[tokio::test]
+    async fn managed_capacity_preemption_reclaims_only_unpublished_recompute_safe_owner() {
+        let model_instance = ModelInstanceId::new(921);
+        let executor = UnifiedExecutor::new_for_test(Box::new(ManagedReceiptExecutor));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                enable_chunked_prefill: false,
+                enable_preemption: true,
+                scheduling_policy: super::super::scheduler::SchedulingPolicy::Priority,
+                block_size: 16,
+                max_blocks: 1,
+                max_batch_size: 1,
+                backend: BackendKind::Cpu,
+                ..Default::default()
+            },
+            executor,
+        )
+        .expect("core");
+        core.retry_policy.execution_backoff_base = Duration::ZERO;
+        core.retry_policy.execution_backoff_max = Duration::ZERO;
+        let mut owner = managed_test_request(
+            &mut core,
+            model_instance,
+            "preemptible-capacity-owner",
+            vec![1, 2, 3, 4],
+        );
+        owner.priority = super::super::Priority::Low;
+        core.add_request(owner).expect("add owner");
+        core.step().await.expect("commit owner prefill");
+        let owner_session = core
+            .get_session_key(&"preemptible-capacity-owner".to_string())
+            .expect("owner session");
+
+        let mut waiter = managed_test_request(
+            &mut core,
+            model_instance,
+            "priority-capacity-waiter",
+            vec![5, 6, 7, 8],
+        );
+        waiter.priority = super::super::Priority::High;
+        core.add_request(waiter).expect("add waiter");
+        assert!(core
+            .prepare_step()
+            .await
+            .expect("preemption is controlled backpressure")
+            .is_none());
+        assert!(core
+            .managed_kv_cache
+            .snapshot(
+                model_instance,
+                &owner_session,
+                crate::kv::CacheDomainId::new(1),
+            )
+            .is_none());
+        assert_eq!(
+            core.managed_kv_cache
+                .runtime_snapshot()
+                .totals
+                .coordinator
+                .admission_claimed_pages,
+            0
+        );
+
+        core.step().await.expect("higher priority waiter runs next");
+        let waiter_session = core
+            .get_session_key(&"priority-capacity-waiter".to_string())
+            .expect("waiter session");
+        assert!(core
+            .managed_kv_cache
+            .snapshot(
+                model_instance,
+                &waiter_session,
+                crate::kv::CacheDomainId::new(1),
+            )
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn managed_kv_backpressure_defers_only_the_blocked_row() {
+        let blocked_model = ModelInstanceId::new(93);
+        let runnable_model = ModelInstanceId::new(94);
+        let executor = UnifiedExecutor::new_for_test(Box::new(ManagedReceiptExecutor));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                enable_chunked_prefill: false,
+                block_size: 16,
+                max_blocks: 1,
+                max_batch_size: 2,
+                backend: BackendKind::Cpu,
+                ..Default::default()
+            },
+            executor,
+        )
+        .expect("core");
+        core.retry_policy.execution_backoff_base = Duration::ZERO;
+        core.retry_policy.execution_backoff_max = Duration::ZERO;
+
+        let owner = managed_test_request(
+            &mut core,
+            blocked_model,
+            "isolated-capacity-owner",
+            vec![1, 2, 3, 4],
+        );
+        core.add_request(owner).expect("add capacity owner");
+        core.step().await.expect("commit capacity owner");
+        core.scheduler
+            .finish_request(&"isolated-capacity-owner".to_string());
+
+        let blocked = managed_test_request(
+            &mut core,
+            blocked_model,
+            "isolated-capacity-blocked",
+            vec![5, 6, 7, 8],
+        );
+        let runnable = managed_test_request(
+            &mut core,
+            runnable_model,
+            "isolated-capacity-runnable",
+            vec![9, 10, 11, 12],
+        );
+        core.add_request(blocked).expect("add blocked row");
+        core.add_request(runnable).expect("add runnable row");
+
+        core.step().await.expect("execute independent runnable row");
+        let runnable_session = core
+            .get_session_key(&"isolated-capacity-runnable".to_string())
+            .expect("runnable session");
+        assert!(core
+            .managed_kv_cache
+            .snapshot(
+                runnable_model,
+                &runnable_session,
+                crate::kv::CacheDomainId::new(1),
+            )
+            .is_some());
+        let blocked_session = core
+            .get_session_key(&"isolated-capacity-blocked".to_string())
+            .expect("blocked session");
+        assert!(
+            core.managed_kv_cache
+                .snapshot(
+                    blocked_model,
+                    &blocked_session,
+                    crate::kv::CacheDomainId::new(1),
+                )
+                .is_none(),
+            "full-request admission must not register a table for a blocked row"
+        );
+        assert!(core
+            .active_plans
+            .values()
+            .all(|plan| plan.session != blocked_session));
+    }
+
+    #[tokio::test]
+    async fn blocked_prefill_does_not_discard_an_already_prepared_decode() {
+        let saturated_model = ModelInstanceId::new(95);
+        let decode_model = ModelInstanceId::new(96);
+        let executor = UnifiedExecutor::new_for_test(Box::new(ManagedReceiptExecutor));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                enable_chunked_prefill: false,
+                block_size: 16,
+                max_blocks: 1,
+                max_batch_size: 2,
+                backend: BackendKind::Cpu,
+                ..Default::default()
+            },
+            executor,
+        )
+        .expect("core");
+        core.retry_policy.execution_backoff_base = Duration::ZERO;
+        core.retry_policy.execution_backoff_max = Duration::ZERO;
+
+        let owner = managed_test_request(
+            &mut core,
+            saturated_model,
+            "decode-isolation-owner",
+            vec![1, 2, 3, 4],
+        );
+        let decoder = managed_test_request(
+            &mut core,
+            decode_model,
+            "decode-isolation-runnable",
+            vec![5, 6, 7, 8],
+        );
+        core.add_request(owner).expect("add capacity owner");
+        core.add_request(decoder).expect("add decoder");
+        core.step().await.expect("commit first prefill quantum");
+        core.scheduler
+            .finish_request(&"decode-isolation-owner".to_string());
+        core.step().await.expect("commit second prefill quantum");
+
+        let blocked = managed_test_request(
+            &mut core,
+            saturated_model,
+            "decode-isolation-blocked",
+            vec![9, 10, 11, 12],
+        );
+        core.add_request(blocked).expect("add blocked prefill");
+        core.step()
+            .await
+            .expect("commit decode despite later blocked prefill");
+
+        let decode_session = core
+            .get_session_key(&"decode-isolation-runnable".to_string())
+            .expect("decode session");
+        assert_eq!(
+            core.managed_kv_cache
+                .snapshot(
+                    decode_model,
+                    &decode_session,
+                    crate::kv::CacheDomainId::new(1),
+                )
+                .expect("decode snapshot")
+                .committed_tokens,
+            5
+        );
+        let blocked_session = core
+            .get_session_key(&"decode-isolation-blocked".to_string())
+            .expect("blocked session");
+        assert!(
+            core.managed_kv_cache
+                .snapshot(
+                    saturated_model,
+                    &blocked_session,
+                    crate::kv::CacheDomainId::new(1),
+                )
+                .is_none(),
+            "phase isolation must defer the blocked prefill before staging KV state"
+        );
+        assert_eq!(
+            core.scheduler
+                .get_status(&"decode-isolation-blocked".to_string()),
+            Some(RequestStatus::Waiting)
+        );
+    }
+
+    #[test]
+    fn unbound_request_does_not_allocate_managed_cache() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(ImmediateFinishExecutor));
+        let mut core =
+            EngineCore::new_with_unified_executor(EngineCoreConfig::default(), executor).unwrap();
+        let mut request = EngineCoreRequest::chat(vec![ChatMessage {
+            role: ChatRole::User,
+            content: "unbound".to_string(),
+        }])
+        .with_model_variant(ModelVariant::Qwen306B);
+        request
+            .install_chat_execution_preparation(ModelVariant::Qwen306B, vec![1], None, 4096)
+            .unwrap();
+        request
+            .bind_model_instance(ModelInstanceId::new(43))
+            .unwrap();
+
+        core.add_request(request).unwrap();
+        assert_eq!(core.managed_kv_cache.model_count(), 0);
+        assert!(core
+            .requests
+            .values()
+            .next()
+            .unwrap()
+            .managed_cache_runtime()
+            .is_none());
+    }
+
+    #[test]
+    fn managed_model_cannot_publish_ready_after_failed_load_time_negotiation() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(ImmediateFinishExecutor));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                max_blocks: 0,
+                ..Default::default()
+            },
+            executor,
+        )
+        .unwrap();
+        let error = core
+            .load_managed_model_cache(
+                ModelInstanceId::new(44),
+                &crate::kv::InferenceStateCapability::Managed(crate::kv::test_contract()),
+                None,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("capacity"));
+        assert!(core.requests.is_empty());
+        assert_eq!(core.managed_kv_cache.model_count(), 0);
     }
 
     #[test]
@@ -5088,7 +8986,7 @@ mod tests {
         }])
         .with_model_variant(ModelVariant::Qwen306B);
         mismatched
-            .install_chat_execution_preparation(ModelVariant::Qwen306B, vec![11, 22], None)
+            .install_chat_execution_preparation(ModelVariant::Qwen306B, vec![11, 22], None, 4096)
             .unwrap();
         mismatched.prompt_tokens[0] = 99;
         let error = core
@@ -5116,7 +9014,7 @@ mod tests {
             content: "full".to_string(),
         }])
         .with_model_variant(ModelVariant::Qwen306B);
-        full.install_chat_execution_preparation(ModelVariant::Qwen306B, vec![1, 2, 3, 4], None)
+        full.install_chat_execution_preparation(ModelVariant::Qwen306B, vec![1, 2, 3, 4], None, 4)
             .unwrap();
         assert!(core
             .add_request(full)
@@ -5132,14 +9030,14 @@ mod tests {
         bounded.id = "bounded-context".to_string();
         bounded.params.max_tokens = 100;
         bounded
-            .install_chat_execution_preparation(ModelVariant::Qwen306B, vec![1, 2], None)
+            .install_chat_execution_preparation(ModelVariant::Qwen306B, vec![1, 2], None, 4)
             .unwrap();
         core.add_request(bounded).unwrap();
         assert_eq!(core.requests["bounded-context"].params.max_tokens, 2);
     }
 
     #[tokio::test]
-    async fn serialized_physical_batches_only_charge_each_request_its_own_elapsed_time() {
+    async fn incompatible_physical_batches_commit_in_separate_engine_steps() {
         let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
             Mutex::new(Vec::new()),
         ))));
@@ -5161,14 +9059,16 @@ mod tests {
             core.add_request(request).unwrap();
         }
 
-        let prepared = core
-            .prepare_step()
-            .await
-            .unwrap()
-            .expect("prepared physical batches");
-        let mut executed = core.execute_prepared_with_progress(prepared).await.unwrap();
-        assert_eq!(executed.batches.len(), 2);
-        for batch in &mut executed.batches {
+        let mut prefill_ms = HashMap::new();
+        for _ in 0..=super::super::scheduler::MAX_DECODE_ONLY_STEPS_WITH_WAITING_FULL_PREFILL + 1 {
+            let prepared = core
+                .prepare_step()
+                .await
+                .unwrap()
+                .expect("prepared physical batch");
+            let mut executed = core.execute_prepared_with_progress(prepared).await.unwrap();
+            assert_eq!(executed.batches.len(), 1);
+            let batch = &mut executed.batches[0];
             let request_id = batch.results[0].session.request_id.as_str();
             let elapsed = match request_id {
                 "fast-batch" => Duration::from_millis(7),
@@ -5179,26 +9079,323 @@ mod tests {
             for row in &mut batch.report.rows {
                 row.execution.elapsed = elapsed;
             }
-        }
-
-        let committed = core.commit_step(executed).await.unwrap();
-        let prefill_ms = committed
-            .outputs
-            .iter()
-            .map(|output| {
-                (
-                    output.request_id.as_str(),
+            let committed = core.commit_step(executed).await.unwrap();
+            for output in &committed.outputs {
+                prefill_ms.insert(
+                    output.request_id.clone(),
                     output
                         .latency_breakdown
                         .as_ref()
                         .expect("latency breakdown")
                         .prefill_ms,
-                )
-            })
-            .collect::<HashMap<_, _>>();
+                );
+            }
+            if prefill_ms.contains_key("slow-batch") {
+                break;
+            }
+        }
 
         assert!((prefill_ms["fast-batch"] - 7.0).abs() < 0.001);
         assert!((prefill_ms["slow-batch"] - 31.0).abs() < 0.001);
+    }
+
+    #[tokio::test]
+    async fn shadow_mode_owns_multiple_candidate_tickets_but_executes_them_serially() {
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct ShadowExecutor {
+            active: Arc<std::sync::atomic::AtomicUsize>,
+            max_active: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl ModelExecutor for ShadowExecutor {
+            fn execute_physical_batch(
+                &self,
+                execution: super::super::PhysicalBatchExecution<'_>,
+            ) -> super::super::PhysicalDispatchResult {
+                let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_active.fetch_max(active, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(10));
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                Ok(execution
+                    .scheduled
+                    .iter()
+                    .map(|scheduled| {
+                        ExecutorStepResult::new(
+                            scheduled,
+                            ExecutorOutput::terminal(scheduled.request_id.clone()),
+                        )
+                        .with_dispatch(execution.expected_dispatch())
+                    })
+                    .collect())
+            }
+
+            fn execute_prefill(
+                &self,
+                _requests: &[&EngineCoreRequest],
+                _scheduled: &[super::super::scheduler::ScheduledRequest],
+            ) -> Result<Vec<ExecutorStepResult>> {
+                unreachable!("physical boundary must own dispatch")
+            }
+
+            fn execute_decode(
+                &self,
+                _requests: &[&EngineCoreRequest],
+                _scheduled: &[super::super::scheduler::ScheduledRequest],
+            ) -> Result<Vec<ExecutorStepResult>> {
+                unreachable!("physical boundary must own dispatch")
+            }
+
+            fn is_ready(&self) -> bool {
+                true
+            }
+
+            fn initialize(&mut self) -> Result<()> {
+                Ok(())
+            }
+
+            fn shutdown(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let executor = UnifiedExecutor::new_for_test(Box::new(ShadowExecutor {
+            active,
+            max_active: max_active.clone(),
+        }));
+        let config = EngineCoreConfig {
+            max_batch_size: 2,
+            max_tokens_per_step: 2,
+            min_tokens_per_step: 1,
+            enable_chunked_prefill: false,
+            enable_adaptive_batching: false,
+            block_size: 1,
+            max_blocks: 8,
+            physical_execution_mode: crate::config::PhysicalExecutionMode::Shadow,
+            max_physical_in_flight: crate::config::PhysicalInFlightLimit::new(2).unwrap(),
+            ..Default::default()
+        };
+        let mut core = EngineCore::new_with_unified_executor(config, executor).unwrap();
+        for request_id in ["shadow-a", "shadow-b"] {
+            let mut request = EngineCoreRequest::tts(request_id);
+            request.id = request_id.to_string();
+            request.prompt_tokens = vec![1];
+            core.add_request(request).unwrap();
+        }
+
+        let prepared = core
+            .prepare_step()
+            .await
+            .unwrap()
+            .expect("shadow candidate tickets");
+        assert_eq!(core.in_flight_dispatches.len(), 2);
+        let executed = core.execute_prepared_with_progress(prepared).await.unwrap();
+        assert_eq!(executed.batches.len(), 2);
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
+        core.commit_step(executed).await.unwrap();
+        assert!(core.in_flight_dispatches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn in_flight_quantum_blocks_duplicate_preparation_and_clears_on_commit_and_rollback() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
+            Mutex::new(Vec::new()),
+        ))));
+        let config = EngineCoreConfig {
+            max_batch_size: 1,
+            max_tokens_per_step: 1,
+            min_tokens_per_step: 1,
+            enable_chunked_prefill: false,
+            enable_adaptive_batching: false,
+            block_size: 1,
+            max_blocks: 8,
+            ..Default::default()
+        };
+        let mut core = EngineCore::new_with_unified_executor(config, executor).unwrap();
+        let mut request = EngineCoreRequest::tts("one physical quantum at a time");
+        request.id = "ticket-serial".to_string();
+        request.prompt_tokens = vec![1];
+        core.add_request(request).unwrap();
+
+        let prefill = core
+            .prepare_step()
+            .await
+            .unwrap()
+            .expect("prefill dispatch");
+        assert_eq!(core.in_flight_dispatches.len(), 1);
+        assert_eq!(core.active_plans.len(), 1);
+        assert_eq!(
+            core.in_flight_dispatches.values().next().unwrap().phase,
+            ExecutionPhase::Prefill
+        );
+        assert!(core.prepare_step().await.unwrap().is_none());
+        assert_eq!(core.in_flight_dispatches.len(), 1);
+        assert_eq!(core.active_plans.len(), 1);
+
+        let executed = core.execute_prepared_with_progress(prefill).await.unwrap();
+        core.commit_step(executed).await.unwrap();
+        assert!(core.in_flight_dispatches.is_empty());
+        assert!(core.active_plans.is_empty());
+        assert!(core.active_stream_batches.is_empty());
+
+        let decode = core.prepare_step().await.unwrap().expect("decode dispatch");
+        assert_eq!(core.in_flight_dispatches.len(), 1);
+        assert_eq!(core.active_plans.len(), 1);
+        assert_eq!(
+            core.in_flight_dispatches.values().next().unwrap().phase,
+            ExecutionPhase::Decode
+        );
+        assert!(core.prepare_step().await.unwrap().is_none());
+        assert_eq!(core.in_flight_dispatches.len(), 1);
+        assert_eq!(core.active_plans.len(), 1);
+
+        assert_eq!(core.rollback_all_in_flight_dispatches(), 1);
+        assert!(core.in_flight_dispatches.is_empty());
+        assert!(core.active_plans.is_empty());
+        assert!(core.active_managed_cache.is_empty());
+        assert!(core.active_stream_batches.is_empty());
+        drop(decode);
+    }
+
+    #[tokio::test]
+    async fn exact_prepared_recovery_rolls_back_only_its_cache_plan_and_ticket() {
+        let model_instance = ModelInstanceId::new(992);
+        let executor = UnifiedExecutor::new_for_test(Box::new(ManagedReceiptExecutor));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                max_batch_size: 1,
+                max_tokens_per_step: 1,
+                min_tokens_per_step: 1,
+                enable_chunked_prefill: false,
+                enable_adaptive_batching: false,
+                block_size: 16,
+                max_blocks: 8,
+                backend: BackendKind::Cpu,
+                ..Default::default()
+            },
+            executor,
+        )
+        .expect("core");
+        for (id, token) in [("recovery-first", 11), ("recovery-later", 22)] {
+            let request = managed_test_request(&mut core, model_instance, id, vec![token]);
+            core.add_request(request).expect("add managed request");
+        }
+
+        let first = core
+            .prepare_step()
+            .await
+            .expect("prepare first")
+            .expect("first ticket");
+        let first_recovery = first.recovery();
+        assert_eq!(first_recovery.batch_ids().len(), 1);
+        let first_batch_id = first_recovery.batch_ids()[0];
+        let first_ticket = core
+            .in_flight_dispatches
+            .remove(&first_batch_id)
+            .expect("first ticket registration");
+        let first_plan_id = first_ticket.scheduled[0].plan_id;
+
+        // Simulate recovery reacquiring the core after another prepared step
+        // has registered a newer ticket.
+        let later = core
+            .prepare_step()
+            .await
+            .expect("prepare later")
+            .expect("later ticket");
+        let later_recovery = later.recovery();
+        assert_eq!(later_recovery.batch_ids().len(), 1);
+        let later_batch_id = later_recovery.batch_ids()[0];
+        let later_plan_id = core.in_flight_dispatches[&later_batch_id].scheduled[0].plan_id;
+        core.in_flight_dispatches
+            .insert(first_batch_id, first_ticket);
+
+        assert_eq!(core.in_flight_dispatches.len(), 2);
+        assert_eq!(core.active_plans.len(), 2);
+        assert_eq!(core.active_managed_cache.len(), 2);
+        assert_eq!(
+            core.managed_kv_cache
+                .runtime_snapshot()
+                .totals
+                .coordinator
+                .active_transactions,
+            2
+        );
+
+        assert_eq!(
+            core.rollback_in_flight_dispatches(first_recovery.batch_ids()),
+            1
+        );
+        assert!(!core.in_flight_dispatches.contains_key(&first_batch_id));
+        assert!(!core.active_plans.contains_key(&first_plan_id));
+        assert!(!core.active_managed_cache.contains_key(&first_plan_id));
+        assert!(core.in_flight_dispatches.contains_key(&later_batch_id));
+        assert!(core.active_plans.contains_key(&later_plan_id));
+        assert!(core.active_managed_cache.contains_key(&later_plan_id));
+        assert_eq!(
+            core.managed_kv_cache
+                .runtime_snapshot()
+                .totals
+                .coordinator
+                .active_transactions,
+            1,
+            "exact recovery must leave the later managed transaction active"
+        );
+
+        assert_eq!(
+            core.rollback_in_flight_dispatches(later_recovery.batch_ids()),
+            1
+        );
+        assert!(core.in_flight_dispatches.is_empty());
+        assert!(core.active_plans.is_empty());
+        assert!(core.active_managed_cache.is_empty());
+        drop((first, later));
+    }
+
+    #[tokio::test]
+    async fn stale_and_duplicate_physical_completion_cannot_cross_the_dispatch_registry() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
+            Mutex::new(Vec::new()),
+        ))));
+        let config = EngineCoreConfig {
+            max_batch_size: 1,
+            max_tokens_per_step: 1,
+            min_tokens_per_step: 1,
+            enable_chunked_prefill: false,
+            enable_adaptive_batching: false,
+            block_size: 1,
+            max_blocks: 8,
+            ..Default::default()
+        };
+        let mut core = EngineCore::new_with_unified_executor(config, executor).unwrap();
+        let mut request = EngineCoreRequest::tts("completion identity fence");
+        request.id = "ticket-completion".to_string();
+        request.prompt_tokens = vec![1];
+        core.add_request(request).unwrap();
+
+        let prepared = core
+            .prepare_step()
+            .await
+            .unwrap()
+            .expect("registered dispatch");
+        let registered_batch_id = *core.in_flight_dispatches.keys().next().unwrap();
+        let exact = core.execute_prepared_with_progress(prepared).await.unwrap();
+        let duplicate = exact.clone();
+        let mut stale = exact.clone();
+        stale.batches[0].physical_batch.batch_id = BatchId::new(u64::MAX);
+        stale.batches[0].report.batch_id = BatchId::new(u64::MAX);
+
+        let stale_commit = core.commit_step(stale).await.unwrap();
+        assert!(stale_commit.outputs.is_empty());
+        assert!(core.in_flight_dispatches.contains_key(&registered_batch_id));
+        assert_eq!(core.active_plans.len(), 1);
+
+        core.commit_step(exact).await.unwrap();
+        assert!(core.in_flight_dispatches.is_empty());
+        assert!(core.active_plans.is_empty());
+
+        let duplicate_commit = core.commit_step(duplicate).await.unwrap();
+        assert!(duplicate_commit.outputs.is_empty());
+        assert!(core.in_flight_dispatches.is_empty());
+        assert!(core.active_plans.is_empty());
     }
 
     #[tokio::test]
@@ -5230,5 +9427,38 @@ mod tests {
             "scheduler prefill timing remains available"
         );
         assert_eq!(latency.decode_ms, 0.0);
+    }
+
+    #[test]
+    fn load_owned_composite_survives_weak_request_upgrade_until_ordered_unload() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
+            Mutex::new(Vec::new()),
+        ))));
+        let config = EngineCoreConfig {
+            block_size: 16,
+            max_blocks: 8,
+            max_retained_sequences: 2,
+            max_staged_transactions: 2,
+            ..Default::default()
+        };
+        let mut core = EngineCore::new_with_unified_executor(config, executor).unwrap();
+        let model = ModelInstanceId::new(76);
+        let loaded = core
+            .load_composite_retained_state(
+                model,
+                &crate::engine::cache::composite::tests::contract(),
+                crate::kv::v2::StateDomainId::new(2),
+                Some(32),
+            )
+            .unwrap();
+        let request_weak = Arc::downgrade(&loaded);
+        drop(loaded);
+        let request_upgrade = request_weak
+            .upgrade()
+            .expect("Core load owner keeps weak request identity live");
+        assert!(core.unload_managed_model_cache(model).is_err());
+        drop(request_upgrade);
+        assert!(core.unload_managed_model_cache(model).unwrap());
+        assert!(request_weak.upgrade().is_none());
     }
 }

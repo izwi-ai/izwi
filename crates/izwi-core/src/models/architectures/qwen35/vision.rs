@@ -807,7 +807,7 @@ impl Qwen35VisionModel {
         }
 
         let mut frames = vec![frame];
-        while frames.len() % self.config.temporal_patch_size != 0 {
+        while !frames.len().is_multiple_of(self.config.temporal_patch_size) {
             let last = frames.last().cloned().ok_or_else(|| {
                 Error::InvalidInput("Qwen3.5 image preprocessing produced no frames".to_string())
             })?;
@@ -1308,7 +1308,7 @@ fn bounded_media_dns_resolver() -> std::io::Result<&'static BoundedMediaDnsResol
     RESOLVER
         .get_or_init(BoundedMediaDnsResolver::start)
         .as_ref()
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error.clone()))
+        .map_err(|error| std::io::Error::other(error.clone()))
 }
 
 fn resolve_media_host(host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
@@ -1336,6 +1336,7 @@ fn is_public_media_ip(address: IpAddr) -> bool {
     }
 }
 
+#[allow(clippy::nonminimal_bool)]
 fn is_public_media_ipv4([first, second, third, _fourth]: [u8; 4]) -> bool {
     if first == 0
         || first == 10
@@ -1364,6 +1365,7 @@ fn is_public_media_ipv4([first, second, third, _fourth]: [u8; 4]) -> bool {
     true
 }
 
+#[allow(clippy::nonminimal_bool)]
 fn is_public_media_ipv6(segments: [u16; 8]) -> bool {
     let first = segments[0];
     let second = segments[1];

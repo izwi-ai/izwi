@@ -4,24 +4,161 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::Instant;
 
-use candle_core::quantized::gguf_file;
 use candle_core::{DType, IndexOp, Tensor, D};
-use candle_transformers::models::quantized_lfm2::ModelWeights as QuantizedLfm2Model;
 use serde::Deserialize;
 use tracing::info;
 
-use crate::backends::DeviceProfile;
-use crate::backends::{open_gguf_reader, BackendKind};
-use crate::error::{Error, Result};
-use crate::model::ModelVariant;
-use crate::models::shared::chat::{ChatMessage, ChatRole};
-use crate::models::shared::telemetry::{
-    record_prefill_sequence_span, record_prefill_token_mode_step,
+use crate::backends::state::{
+    PhysicalStateSequenceId, PhysicalStateTransactionId, TensorStateArena,
 };
+use crate::backends::BackendKind;
+use crate::backends::DeviceProfile;
+use crate::engine::{InvocationTensorLease, StageDescriptor};
+use crate::error::{Error, Result};
+use crate::kv::{InferenceStateCapability, InferenceStateContractProvider};
+use crate::model::ModelVariant;
+use crate::models::shared::attention::physical::PhysicalPagedKvCache;
+use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
+use crate::models::shared::telemetry::record_prefill_sequence_span;
+use crate::models::shared::weights::gguf::GgufLoader;
 use crate::tokenizer::Tokenizer;
+
+use super::backbone::{Lfm2ShortConvRuntimeState, QuantizedLfm2Backbone};
+use super::config::{parse_lfm2_backbone_config, Lfm2BackboneConfig};
+use super::physical::{
+    lfm2_managed_cache_contract, lfm2_physical_state_spec, Lfm2PhysicalStateSpec,
+};
+
+pub struct ChatDecodeState {
+    shortconv: Lfm2ShortConvRuntimeState,
+    physical_kv: PhysicalPagedKvCache,
+    physical_tensor_sequence: Option<PhysicalStateSequenceId>,
+    unconsumed_output: Option<Tensor>,
+    pending_token: Option<u32>,
+    generated_ids: Vec<u32>,
+    assembled: String,
+    max_new_tokens: usize,
+    finished: bool,
+    position: usize,
+    prefill_progress: usize,
+}
+
+pub(crate) struct Lfm2ChatDecodeCheckpoint {
+    shortconv: Lfm2ShortConvRuntimeState,
+    physical_kv: PhysicalPagedKvCache,
+    unconsumed_output: Option<Tensor>,
+    pending_token: Option<u32>,
+    generated_ids: Vec<u32>,
+    assembled: String,
+    finished: bool,
+    position: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatDecodeStep {
+    pub delta: String,
+    pub text: String,
+    pub tokens_generated: usize,
+    pub input_tokens_committed: usize,
+    pub finished: bool,
+}
+
+impl ChatDecodeState {
+    pub(crate) fn prefill_progress(&self) -> usize {
+        self.prefill_progress
+    }
+
+    pub(crate) fn begin_managed_quantum(
+        &mut self,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<Lfm2ChatDecodeCheckpoint> {
+        if cache.arena().id() != self.physical_kv.arena().id()
+            || cache.context_len() != self.physical_kv.context_len()
+        {
+            return Err(Error::InferenceError(
+                "LFM2 managed reservation does not continue the session".into(),
+            ));
+        }
+        Ok(Lfm2ChatDecodeCheckpoint {
+            shortconv: self.shortconv.clone(),
+            physical_kv: std::mem::replace(&mut self.physical_kv, cache),
+            unconsumed_output: self.unconsumed_output.clone(),
+            pending_token: self.pending_token,
+            generated_ids: self.generated_ids.clone(),
+            assembled: self.assembled.clone(),
+            finished: self.finished,
+            position: self.position,
+        })
+    }
+
+    pub(crate) fn install_managed_reservation(
+        &mut self,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<()> {
+        if cache.arena().id() != self.physical_kv.arena().id()
+            || cache.context_len() != self.physical_kv.context_len()
+        {
+            return Err(Error::InferenceError(
+                "LFM2 managed reservation does not continue the session".into(),
+            ));
+        }
+        self.physical_kv = cache;
+        Ok(())
+    }
+
+    pub(crate) fn rollback_managed_quantum(&mut self, checkpoint: Lfm2ChatDecodeCheckpoint) {
+        self.shortconv = checkpoint.shortconv;
+        self.physical_kv = checkpoint.physical_kv;
+        self.unconsumed_output = checkpoint.unconsumed_output;
+        self.pending_token = checkpoint.pending_token;
+        self.generated_ids = checkpoint.generated_ids;
+        self.assembled = checkpoint.assembled;
+        self.finished = checkpoint.finished;
+        self.position = checkpoint.position;
+    }
+
+    pub(crate) fn bind_tensor_sequence(&mut self, sequence: u64) -> Result<()> {
+        let sequence = PhysicalStateSequenceId::new(sequence)?;
+        if self
+            .physical_tensor_sequence
+            .is_some_and(|current| current != sequence)
+        {
+            return Err(Error::InferenceError(
+                "LFM2 tensor-state sequence identity changed".into(),
+            ));
+        }
+        self.physical_tensor_sequence = Some(sequence);
+        Ok(())
+    }
+
+    pub(crate) fn restore_tensor_state(&mut self, arena: &TensorStateArena) -> Result<()> {
+        let sequence = self.physical_tensor_sequence.ok_or_else(|| {
+            Error::InferenceError("LFM2 physical state has no tensor sequence".into())
+        })?;
+        self.shortconv.restore(arena, sequence)
+    }
+
+    pub(crate) fn stage_tensor_state(
+        &mut self,
+        arena: &TensorStateArena,
+        transaction: u64,
+    ) -> Result<()> {
+        self.shortconv.stage(
+            arena,
+            PhysicalStateTransactionId::new(transaction)?,
+            self.physical_kv.context_len() as u64,
+        )
+    }
+
+    pub(crate) fn take_physical_write_completions(
+        &mut self,
+    ) -> Vec<std::sync::Arc<crate::backends::kv::KvWriteBatchCompletion>> {
+        self.physical_kv.take_completed_writes()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ChatGenerationOutput {
@@ -87,14 +224,12 @@ impl Lfm2PrefillMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lfm2PrefillExecution {
     Full,
-    Token,
 }
 
 impl Lfm2PrefillExecution {
     fn as_str(self) -> &'static str {
         match self {
             Self::Full => "full",
-            Self::Token => "token",
         }
     }
 }
@@ -108,18 +243,12 @@ struct Lfm2PrefillConfig {
 impl Lfm2PrefillConfig {
     const DEFAULT_TOKEN_THRESHOLD: usize = 64;
 
-    fn resolve(self, prompt_tokens: usize) -> Lfm2PrefillExecution {
-        match self.mode {
-            Lfm2PrefillMode::Full => Lfm2PrefillExecution::Full,
-            Lfm2PrefillMode::Token => Lfm2PrefillExecution::Token,
-            Lfm2PrefillMode::Auto => {
-                if prompt_tokens <= self.token_prompt_threshold {
-                    Lfm2PrefillExecution::Token
-                } else {
-                    Lfm2PrefillExecution::Full
-                }
-            }
-        }
+    fn resolve(self, _prompt_tokens: usize) -> Lfm2PrefillExecution {
+        // Candle's quantized LFM2 ShortConv cache ignores `index_pos` for
+        // one-token calls, so token prefill can reuse state from a previous
+        // request. A full prompt pass replaces both attention and ShortConv
+        // state deterministically at the request boundary.
+        Lfm2PrefillExecution::Full
     }
 }
 
@@ -190,21 +319,24 @@ fn should_prepend_default_system(
     messages: &[ChatMessage],
     policy: Lfm2DefaultSystemPolicy,
 ) -> bool {
-    if matches!(messages.first().map(|message| &message.role), Some(ChatRole::System)) {
+    if matches!(
+        messages.first().map(|message| &message.role),
+        Some(ChatRole::System)
+    ) {
         return false;
     }
     match policy {
         Lfm2DefaultSystemPolicy::Always => true,
         Lfm2DefaultSystemPolicy::Never => false,
         Lfm2DefaultSystemPolicy::Auto => {
-            !(messages.len() == 1 && matches!(messages.first().map(|m| &m.role), Some(ChatRole::User)))
+            !(messages.len() == 1
+                && matches!(messages.first().map(|m| &m.role), Some(ChatRole::User)))
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lfm2PromptStylePolicy {
-    Auto,
     Standard,
     Aggressive,
 }
@@ -212,7 +344,6 @@ enum Lfm2PromptStylePolicy {
 impl Lfm2PromptStylePolicy {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Auto => "auto",
             Self::Standard => "standard",
             Self::Aggressive => "aggressive",
         }
@@ -221,9 +352,8 @@ impl Lfm2PromptStylePolicy {
 
 fn parse_lfm2_prompt_style_policy(raw: Option<&str>) -> Lfm2PromptStylePolicy {
     match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-        Some("standard" | "safe" | "chat") => Lfm2PromptStylePolicy::Standard,
         Some("aggressive" | "compact" | "lean") => Lfm2PromptStylePolicy::Aggressive,
-        _ => Lfm2PromptStylePolicy::Auto,
+        _ => Lfm2PromptStylePolicy::Standard,
     }
 }
 
@@ -246,12 +376,15 @@ fn should_use_aggressive_single_turn_prompt(
     if prepend_default_system {
         return false;
     }
-    let single_user_turn =
-        messages.len() == 1 && matches!(messages.first().map(|message| &message.role), Some(ChatRole::User));
+    let single_user_turn = messages.len() == 1
+        && matches!(
+            messages.first().map(|message| &message.role),
+            Some(ChatRole::User)
+        );
     if !single_user_turn {
         return false;
     }
-    !matches!(style_policy, Lfm2PromptStylePolicy::Standard)
+    matches!(style_policy, Lfm2PromptStylePolicy::Aggressive)
 }
 
 impl PromptScaffoldTokens {
@@ -356,10 +489,20 @@ pub struct Lfm2ChatModel {
     device: DeviceProfile,
     tokenizer: ChatTokenizer,
     prompt_scaffold: PromptScaffoldTokens,
-    text_model: Mutex<QuantizedLfm2Model>,
+    config: Lfm2BackboneConfig,
+    text_model: QuantizedLfm2Backbone,
 }
 
 impl Lfm2ChatModel {
+    pub fn max_context_tokens(&self) -> Result<usize> {
+        if self.config.context_length == 0 {
+            return Err(Error::ModelLoadError(
+                "LFM2 checkpoint has a zero context length".into(),
+            ));
+        }
+        Ok(self.config.context_length)
+    }
+
     pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
         let gguf_name = match variant {
             ModelVariant::Lfm2512BInstructGguf => "LFM2.5-1.2B-Instruct-Q4_K_M.gguf",
@@ -379,11 +522,10 @@ impl Lfm2ChatModel {
         }
 
         let tokenizer = ChatTokenizer::load(model_dir)?;
-        let mut reader = open_gguf_reader(&gguf_path, BackendKind::from(device.kind))?;
-        let content = gguf_file::Content::read(&mut reader)
-            .map_err(|e| Error::ModelLoadError(format!("Failed to parse GGUF header: {e}")))?;
-        let text_model = QuantizedLfm2Model::from_gguf(content, &mut reader, &device.device)
-            .map_err(|e| Error::ModelLoadError(format!("Failed to load LFM2 GGUF model: {e}")))?;
+        let loader =
+            GgufLoader::from_path_with_backend(&gguf_path, BackendKind::from(device.kind))?;
+        let config = parse_lfm2_backbone_config(&loader)?;
+        let text_model = QuantizedLfm2Backbone::load(&loader, config.clone(), &device.device)?;
         let prompt_scaffold = PromptScaffoldTokens::load(&tokenizer)?;
 
         info!(
@@ -410,44 +552,280 @@ impl Lfm2ChatModel {
             device,
             tokenizer,
             prompt_scaffold,
-            text_model: Mutex::new(text_model),
+            config,
+            text_model,
         })
     }
 
     pub fn supports_incremental_decode(&self) -> bool {
-        false
+        true
     }
 
-    pub fn generate(
+    pub fn supports_continuous_decode_batch(&self) -> bool {
+        true
+    }
+
+    pub fn continuous_decode_batch_workspace_per_row_bytes(&self) -> Result<u64> {
+        u64::try_from(self.config.embedding_length)
+            .ok()
+            .and_then(|hidden| hidden.checked_mul(4))
+            .ok_or_else(|| Error::InvalidInput("LFM2 decode workspace overflow".into()))
+    }
+
+    pub fn device_kind(&self) -> BackendKind {
+        BackendKind::from(self.device.kind)
+    }
+
+    pub(crate) fn begin_resumable_prefill_state_managed(
+        &self,
+        prompt_ids: &[u32],
+        max_new_tokens: usize,
+        _config: &ChatGenerationConfig,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<ChatDecodeState> {
+        if prompt_ids.is_empty() || cache.context_len() != 0 {
+            return Err(Error::InvalidInput(
+                "LFM2 managed prefill requires a non-empty prompt and empty cache".into(),
+            ));
+        }
+        Ok(ChatDecodeState {
+            shortconv: self.text_model.new_shortconv_state(),
+            physical_kv: cache,
+            physical_tensor_sequence: None,
+            unconsumed_output: None,
+            pending_token: None,
+            generated_ids: Vec::with_capacity(max_new_tokens.max(1)),
+            assembled: String::new(),
+            max_new_tokens: max_new_tokens.max(1),
+            finished: false,
+            position: 0,
+            prefill_progress: 0,
+        })
+    }
+
+    pub(crate) fn continue_resumable_prefill_managed(
+        &self,
+        state: &mut ChatDecodeState,
+        prompt_ids: &[u32],
+        span_start: usize,
+        span_end: usize,
+    ) -> Result<bool> {
+        if state.prefill_progress != span_start
+            || span_start >= span_end
+            || span_end > prompt_ids.len()
+            || state.physical_kv.context_len() != span_start
+            || state.shortconv.cursor() != span_start as u64
+            || state.unconsumed_output.is_some()
+            || state.pending_token.is_some()
+            || state.finished
+        {
+            return Err(Error::InvalidInput(
+                "LFM2 resumable prefill span does not match its retained state".into(),
+            ));
+        }
+        record_prefill_sequence_span(span_end - span_start);
+        let input = Tensor::from_slice(
+            &prompt_ids[span_start..span_end],
+            (1, span_end - span_start),
+            &self.device.device,
+        )?;
+        let complete = span_end == prompt_ids.len();
+        let logits = self.text_model.forward_tokens_retained(
+            &input,
+            span_start,
+            &mut state.physical_kv,
+            &mut state.shortconv,
+            complete,
+        )?;
+        state.prefill_progress = span_end;
+        state.position = span_end;
+        if complete {
+            state.unconsumed_output = Some(logits.ok_or_else(|| {
+                Error::InferenceError("LFM2 final prefill span produced no logits".into())
+            })?);
+        }
+        Ok(complete)
+    }
+
+    pub fn decode_step(&self, state: &mut ChatDecodeState) -> Result<ChatDecodeStep> {
+        if state.finished || state.generated_ids.len() >= state.max_new_tokens {
+            state.finished = true;
+            return Ok(ChatDecodeStep {
+                delta: String::new(),
+                text: state.assembled.trim().to_string(),
+                tokens_generated: state.generated_ids.len(),
+                input_tokens_committed: 0,
+                finished: true,
+            });
+        }
+        let mut committed = 0usize;
+        if let Some(pending) = state.pending_token.take() {
+            let input = Tensor::from_slice(&[pending], (1, 1), &self.device.device)?;
+            state.unconsumed_output = self.text_model.forward_tokens_retained(
+                &input,
+                state.position,
+                &mut state.physical_kv,
+                &mut state.shortconv,
+                true,
+            )?;
+            state.position = state.position.saturating_add(1);
+            committed = 1;
+        }
+        let logits = state.unconsumed_output.take().ok_or_else(|| {
+            Error::InferenceError("LFM2 decode state has no sampleable output".into())
+        })?;
+        let next = argmax(&logits)?;
+        let is_stop = next == self.tokenizer.specials.im_end
+            || next == self.tokenizer.specials.eos
+            || self.tokenizer.specials.eos_alt == Some(next);
+        let delta = if is_stop {
+            state.finished = true;
+            String::new()
+        } else {
+            let delta = self.tokenizer.decode_token_piece(next)?.to_string();
+            state.generated_ids.push(next);
+            state.assembled.push_str(&delta);
+            if (should_check_repetition_loop(state.generated_ids.len())
+                && has_token_repetition_loop(&state.generated_ids))
+                || state.generated_ids.len() >= state.max_new_tokens
+            {
+                state.finished = true;
+            } else {
+                state.pending_token = Some(next);
+            }
+            delta
+        };
+        Ok(ChatDecodeStep {
+            delta,
+            text: if state.finished {
+                state.assembled.trim().to_string()
+            } else {
+                String::new()
+            },
+            tokens_generated: state.generated_ids.len(),
+            input_tokens_committed: committed,
+            finished: state.finished,
+        })
+    }
+
+    pub fn decode_step_batch(
+        &self,
+        states: &mut [&mut ChatDecodeState],
+    ) -> Result<Vec<ChatDecodeStep>> {
+        if states.is_empty() {
+            return Ok(Vec::new());
+        }
+        for state in states.iter() {
+            if state.finished
+                || state.generated_ids.len() >= state.max_new_tokens
+                || state.unconsumed_output.is_some()
+                || state.pending_token.is_none()
+                || state.physical_kv.context_len() != state.position
+                || state.shortconv.cursor() != state.position as u64
+            {
+                return Err(Error::InvalidInput(
+                    "continuous LFM2 batch contains a non-decodable state".into(),
+                ));
+            }
+        }
+        let mut tokens = Vec::with_capacity(states.len());
+        let mut positions = Vec::with_capacity(states.len());
+        let mut shortconv = Vec::with_capacity(states.len());
+        let mut caches = Vec::with_capacity(states.len());
+        for state in states.iter_mut() {
+            tokens.push(state.pending_token.take().expect("pending token checked"));
+            positions.push(state.position);
+            shortconv.push(&mut state.shortconv);
+            caches.push(&mut state.physical_kv);
+        }
+        let logits = self.text_model.forward_token_ids_retained_batch(
+            &tokens,
+            &positions,
+            &mut shortconv,
+            &mut caches,
+        )?;
+        drop(shortconv);
+        drop(caches);
+        let mut next_tokens = Vec::with_capacity(states.len());
+        for row in 0..states.len() {
+            next_tokens.push(argmax(&logits.i(row)?)?);
+        }
+        let mut steps = Vec::with_capacity(states.len());
+        for (state, next) in states.iter_mut().zip(next_tokens) {
+            state.position = state.position.saturating_add(1);
+            let is_stop = next == self.tokenizer.specials.im_end
+                || next == self.tokenizer.specials.eos
+                || self.tokenizer.specials.eos_alt == Some(next);
+            let delta = if is_stop {
+                state.finished = true;
+                String::new()
+            } else {
+                let delta = self.tokenizer.decode_token_piece(next)?.to_string();
+                state.generated_ids.push(next);
+                state.assembled.push_str(&delta);
+                if should_check_repetition_loop(state.generated_ids.len())
+                    && has_token_repetition_loop(&state.generated_ids)
+                    || state.generated_ids.len() >= state.max_new_tokens
+                {
+                    state.finished = true;
+                } else {
+                    state.pending_token = Some(next);
+                }
+                delta
+            };
+            steps.push(ChatDecodeStep {
+                delta,
+                text: if state.finished {
+                    state.assembled.trim().to_string()
+                } else {
+                    String::new()
+                },
+                tokens_generated: state.generated_ids.len(),
+                input_tokens_committed: 1,
+                finished: state.finished,
+            });
+        }
+        Ok(steps)
+    }
+
+    pub(crate) fn physical_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<Lfm2PhysicalStateSpec> {
+        lfm2_physical_state_spec(&self.config, stage_graphs)
+    }
+
+    pub(crate) fn generate_with_callback_physical(
         &self,
         messages: &[ChatMessage],
         max_new_tokens: usize,
+        cache: &mut PhysicalPagedKvCache,
+        shortconv: &mut InvocationTensorLease,
+        on_delta: &mut dyn FnMut(&str),
     ) -> Result<ChatGenerationOutput> {
-        let mut no_op = |_delta: &str| {};
-        self.generate_with_callback(messages, max_new_tokens, &mut no_op)
+        self.generate_with_callback_state(messages, max_new_tokens, on_delta, cache, shortconv)
     }
 
-    pub fn generate_with_callback(
+    fn generate_with_callback_state(
         &self,
         messages: &[ChatMessage],
         max_new_tokens: usize,
         on_delta: &mut dyn FnMut(&str),
+        cache: &mut PhysicalPagedKvCache,
+        shortconv: &mut InvocationTensorLease,
     ) -> Result<ChatGenerationOutput> {
         let total_started = Instant::now();
         let prompt_build_started = Instant::now();
         let prompt_ids = self.build_prompt(messages)?;
         let prompt_build_ms = prompt_build_started.elapsed().as_secs_f64() * 1000.0;
-        let mut model = self
-            .text_model
-            .lock()
-            .map_err(|_| Error::InferenceError("LFM2 GGUF model mutex poisoned".to_string()))?;
+        let model = &self.text_model;
 
         let prompt_len = prompt_ids.len();
         let prefill_started = Instant::now();
         let prefill_cfg = *lfm2_prefill_config();
         let prefill_exec = prefill_cfg.resolve(prompt_len);
         let (mut logits, mut position, prefill_steps) =
-            self.prefill_prompt(&mut model, prompt_ids.as_slice(), prefill_exec)?;
+            self.prefill_prompt(model, prompt_ids.as_slice(), prefill_exec, cache, shortconv)?;
         let prefill_forward_ms = prefill_started.elapsed().as_secs_f64() * 1000.0;
 
         let max_new_tokens = max_new_tokens.max(1);
@@ -483,7 +861,7 @@ impl Lfm2ChatModel {
 
             let next_tensor = Tensor::from_slice(&[next], (1, 1), &self.device.device)?;
             logits = model
-                .forward(&next_tensor, position)
+                .forward_tokens_physical(&next_tensor, position, cache, shortconv)
                 .map_err(|e| Error::InferenceError(format!("LFM2 GGUF decode failed: {e}")))?;
             position += 1;
         }
@@ -621,9 +999,11 @@ impl Lfm2ChatModel {
 
     fn prefill_prompt(
         &self,
-        model: &mut QuantizedLfm2Model,
+        model: &QuantizedLfm2Backbone,
         prompt_ids: &[u32],
         exec: Lfm2PrefillExecution,
+        cache: &mut PhysicalPagedKvCache,
+        shortconv: &mut InvocationTensorLease,
     ) -> Result<(Tensor, usize, usize)> {
         if prompt_ids.is_empty() {
             return Err(Error::InvalidInput(
@@ -637,29 +1017,19 @@ impl Lfm2ChatModel {
                 let input_ids =
                     Tensor::from_slice(prompt_ids, (1, prompt_ids.len()), &self.device.device)?;
                 let logits = model
-                    .forward(&input_ids, 0)
+                    .forward_tokens_physical(&input_ids, 0, cache, shortconv)
                     .map_err(|e| Error::InferenceError(format!("LFM2 GGUF forward failed: {e}")))?;
                 Ok((logits, prompt_ids.len(), 1))
             }
-            Lfm2PrefillExecution::Token => {
-                let mut position = 0usize;
-                let mut logits: Option<Tensor> = None;
-                for &token in prompt_ids {
-                    record_prefill_token_mode_step();
-                    let token_ids = Tensor::from_slice(&[token], (1, 1), &self.device.device)?;
-                    logits = Some(model.forward(&token_ids, position).map_err(|e| {
-                        Error::InferenceError(format!("LFM2 GGUF token prefill failed: {e}"))
-                    })?);
-                    position += 1;
-                }
-                let logits = logits.ok_or_else(|| {
-                    Error::InferenceError(
-                        "LFM2 chat token prefill did not produce logits".to_string(),
-                    )
-                })?;
-                Ok((logits, position, prompt_ids.len()))
-            }
         }
+    }
+}
+
+impl InferenceStateContractProvider for Lfm2ChatModel {
+    fn inference_state_contract(&self) -> Result<InferenceStateCapability> {
+        Ok(InferenceStateCapability::Managed(
+            lfm2_managed_cache_contract(&self.config)?,
+        ))
     }
 }
 
@@ -713,7 +1083,7 @@ fn has_suffix_repeat(ids: &[u32], span: usize, repeats: usize) -> bool {
 }
 
 fn should_check_repetition_loop(len: usize) -> bool {
-    len >= 48 && len % 4 == 0
+    len >= 48 && len.is_multiple_of(4)
 }
 
 fn has_token_repetition_loop(ids: &[u32]) -> bool {
@@ -731,12 +1101,11 @@ fn has_token_repetition_loop(ids: &[u32]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        has_token_repetition_loop, parse_lfm2_default_system_policy,
-        parse_lfm2_prefill_mode, parse_lfm2_prefill_threshold, parse_lfm2_prompt_style_policy,
-        should_check_repetition_loop, should_prepend_default_system,
-        should_use_aggressive_single_turn_prompt, strip_past_assistant_thinking,
-        Lfm2DefaultSystemPolicy, Lfm2PrefillConfig, Lfm2PrefillExecution, Lfm2PrefillMode,
-        Lfm2PromptStylePolicy,
+        has_token_repetition_loop, parse_lfm2_default_system_policy, parse_lfm2_prefill_mode,
+        parse_lfm2_prefill_threshold, parse_lfm2_prompt_style_policy, should_check_repetition_loop,
+        should_prepend_default_system, should_use_aggressive_single_turn_prompt,
+        strip_past_assistant_thinking, Lfm2DefaultSystemPolicy, Lfm2PrefillConfig,
+        Lfm2PrefillExecution, Lfm2PrefillMode, Lfm2PromptStylePolicy,
     };
     use crate::models::shared::chat::{ChatMessage, ChatRole};
 
@@ -758,7 +1127,7 @@ mod tests {
     #[test]
     fn detects_token_repetition_loop() {
         let mut ids = Vec::new();
-        let phrase = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let phrase = [1, 2, 3, 4, 5, 6, 7, 8];
         for _ in 0..5 {
             ids.extend(phrase.iter().copied());
         }
@@ -808,14 +1177,20 @@ mod tests {
     }
 
     #[test]
-    fn prefill_auto_policy_uses_token_mode_for_short_prompts() {
+    fn prefill_policy_forces_request_isolated_full_passes() {
         let config = Lfm2PrefillConfig {
             mode: Lfm2PrefillMode::Auto,
             token_prompt_threshold: 64,
         };
-        assert_eq!(config.resolve(16), Lfm2PrefillExecution::Token);
-        assert_eq!(config.resolve(64), Lfm2PrefillExecution::Token);
+        assert_eq!(config.resolve(16), Lfm2PrefillExecution::Full);
+        assert_eq!(config.resolve(64), Lfm2PrefillExecution::Full);
         assert_eq!(config.resolve(65), Lfm2PrefillExecution::Full);
+
+        let explicitly_unsafe = Lfm2PrefillConfig {
+            mode: Lfm2PrefillMode::Token,
+            token_prompt_threshold: usize::MAX,
+        };
+        assert_eq!(explicitly_unsafe.resolve(1), Lfm2PrefillExecution::Full);
     }
 
     #[test]
@@ -866,14 +1241,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_prompt_style_policy_defaults_to_auto_for_unknown_values() {
+    fn parse_prompt_style_policy_defaults_to_standard_for_unknown_values() {
         assert_eq!(
             parse_lfm2_prompt_style_policy(None),
-            Lfm2PromptStylePolicy::Auto
+            Lfm2PromptStylePolicy::Standard
         );
         assert_eq!(
             parse_lfm2_prompt_style_policy(Some("unsupported")),
-            Lfm2PromptStylePolicy::Auto
+            Lfm2PromptStylePolicy::Standard
         );
         assert_eq!(
             parse_lfm2_prompt_style_policy(Some("standard")),
@@ -891,15 +1266,15 @@ mod tests {
             role: ChatRole::User,
             content: "hello".to_string(),
         }];
-        assert!(should_use_aggressive_single_turn_prompt(
-            &single_user_turn,
-            false,
-            Lfm2PromptStylePolicy::Auto
-        ));
         assert!(!should_use_aggressive_single_turn_prompt(
             &single_user_turn,
             false,
             Lfm2PromptStylePolicy::Standard
+        ));
+        assert!(should_use_aggressive_single_turn_prompt(
+            &single_user_turn,
+            false,
+            Lfm2PromptStylePolicy::Aggressive
         ));
         assert!(!should_use_aggressive_single_turn_prompt(
             &single_user_turn,
