@@ -78,6 +78,7 @@ fn prefix_request(model: ModelInstanceId, tokens: Vec<u32>) -> EngineCoreRequest
     }])
     .with_model_variant(variant);
     request.prompt_tokens = tokens;
+    request.params.max_tokens = 1;
     request
         .bind_execution_adapter(ExecutionAdapterBinding {
             execution_group_id: ExecutionGroupId::new(1),
@@ -267,11 +268,22 @@ fn exercise_saturation_and_generation_reuse(
     manager
         .finalize(&first_lease, None, false)
         .expect("abort first generation");
-    let second_lease = manager
-        .prepare(runtime, *next_txn, &reuse, &sequence_work(0, 1), None)
-        .expect("prepare reused generation")
-        .expect("reused generation reservation");
-    *next_txn += 1;
+    let mut second_lease = None;
+    for _ in 0..=capacity {
+        let candidate = manager
+            .prepare(runtime, *next_txn, &reuse, &sequence_work(0, 1), None)
+            .expect("prepare reused generation")
+            .expect("reused generation reservation");
+        *next_txn += 1;
+        if candidate.domains[0].writable_blocks[0].index == old.index {
+            second_lease = Some(candidate);
+            break;
+        }
+        manager
+            .finalize(&candidate, None, false)
+            .expect("abort intervening generation");
+    }
+    let second_lease = second_lease.expect("allocator must eventually reuse the released slot");
     let new = second_lease.domains[0].writable_blocks[0];
     assert_eq!(old.index, new.index);
     assert!(new.slot_generation > old.slot_generation);
