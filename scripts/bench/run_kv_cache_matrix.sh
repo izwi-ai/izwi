@@ -215,7 +215,7 @@ run_case() {
   fi
   local expected_provider
   case "$backend:$provider" in
-    cpu:*) expected_provider=portable ;;
+    cpu:*) expected_provider=cpu_reference ;;
     metal:*) expected_provider=metal_native ;;
     cuda:optimized) expected_provider=cuda_flash_attention ;;
     cuda:*) expected_provider=cuda_native ;;
@@ -233,7 +233,7 @@ run_case() {
     --argjson page "$page" '
       length == 5 and
       all(.[];
-        .schema == "izwi.kv-cache-matrix.v2" and
+        .schema == "izwi.kv-cache-bench.v2" and
         .status == "measured" and
         .backend == $backend and
         .dtype == $dtype and
@@ -255,7 +255,8 @@ run_case() {
   fi
   while IFS= read -r record; do
     if [[ -n "$record" ]]; then
-      record=$(jq -c --arg git_sha "$git_sha" '. + {git_sha: $git_sha}' <<<"$record")
+      record=$(jq -c --arg git_sha "$git_sha" \
+        '. + {schema: "izwi.kv-cache-matrix.v2", git_sha: $git_sha}' <<<"$record")
       write_record "$record"
     fi
   done <<<"$result"
