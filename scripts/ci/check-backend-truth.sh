@@ -412,12 +412,12 @@ run_hygiene() {
     require_command cargo
     require_command rg
 
-    # Tauri validates bundle resources from platform overlays during build-script
-    # execution, even though Clippy/check do not create an application bundle.
-    # Release builds still use the real configuration and bundle the prebuilt CLI
-    # and server; hygiene clears only those resource entries so a clean checkout
-    # can lint the desktop crate without synthetic release binaries.
-    local tauri_check_config='{"bundle":{"resources":null,"linux":{"deb":{"files":{}}}}}'
+    # Tauri validates the generated frontend and bundle resources during
+    # build-script execution, even though Clippy/check do not create an
+    # application bundle. Release builds still use the real configuration;
+    # hygiene clears only those generated inputs so a clean checkout can lint
+    # the desktop crate without building the UI or synthetic release binaries.
+    local tauri_check_config='{"build":{"frontendDist":null},"bundle":{"resources":null,"linux":{"deb":{"files":{}}}}}'
 
     git diff --check
     local unguarded_metal_constructors
