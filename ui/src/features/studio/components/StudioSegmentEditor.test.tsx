@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { StudioProjectRecord } from "@/api";
 import { StudioSegmentEditor } from "@/features/studio/components/StudioSegmentEditor";
@@ -90,5 +90,105 @@ describe("StudioSegmentEditor responsive structure", () => {
         }),
       ).toBeVisible();
     }
+  });
+
+  it("keeps newer server text until the user explicitly resolves a stale draft", () => {
+    const project = buildProject(1);
+    const segment = project.segments[0];
+    const onRestoreSegmentDraftConflict = vi.fn();
+    const onDiscardSegmentDraftConflict = vi.fn();
+
+    render(
+      <StudioSegmentEditor
+        project={project}
+        segmentDrafts={{}}
+        segmentDraftConflicts={{
+          [segment.id]: {
+            segmentId: segment.id,
+            baseText: "Old server text",
+            draftText: "Unsaved local narration",
+            serverText: segment.text,
+          },
+        }}
+        segmentSelections={{}}
+        selectedSegmentIdSet={new Set()}
+        selectedSegmentCount={0}
+        queuedSegmentIdSet={new Set()}
+        savingSegmentId={null}
+        renderingSegmentId={null}
+        addingSegmentAfterSegmentId={null}
+        focusSegmentId={null}
+        onToggleSelectAll={vi.fn()}
+        onRenderSelected={vi.fn()}
+        onDeleteSelected={vi.fn()}
+        onAddSegment={vi.fn(async () => true)}
+        onToggleSegmentSelection={vi.fn()}
+        onSaveSegment={vi.fn()}
+        onMoveSegment={vi.fn()}
+        onMergeSegmentWithNext={vi.fn()}
+        onSplitSegment={vi.fn()}
+        onRenderSegment={vi.fn()}
+        onDeleteSegment={vi.fn()}
+        onOpenSegmentSettings={vi.fn()}
+        onChangeSegmentDraft={vi.fn()}
+        onRestoreSegmentDraftConflict={onRestoreSegmentDraftConflict}
+        onDiscardSegmentDraftConflict={onDiscardSegmentDraftConflict}
+        onChangeSegmentCursor={vi.fn()}
+        onFocusSegmentHandled={vi.fn()}
+        audioUrlForRecordId={(recordId) => `/audio/${recordId}`}
+      />,
+    );
+
+    expect(screen.getByRole("textbox")).toHaveValue(segment.text);
+    expect(screen.getByRole("textbox")).toBeDisabled();
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "This segment changed after your local draft was saved",
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Restore local draft" }));
+    expect(onRestoreSegmentDraftConflict).toHaveBeenCalledWith(segment.id);
+
+    fireEvent.click(screen.getByRole("button", { name: "Keep server text" }));
+    expect(onDiscardSegmentDraftConflict).toHaveBeenCalledWith(segment.id);
+  });
+
+  it("requires an explicit draft save before rendering edited text", () => {
+    const project = buildProject(1);
+    const segment = project.segments[0];
+
+    render(
+      <StudioSegmentEditor
+        project={project}
+        segmentDrafts={{ [segment.id]: "Edited narration" }}
+        segmentSelections={{}}
+        selectedSegmentIdSet={new Set()}
+        selectedSegmentCount={0}
+        queuedSegmentIdSet={new Set()}
+        savingSegmentId={null}
+        renderingSegmentId={null}
+        addingSegmentAfterSegmentId={null}
+        focusSegmentId={null}
+        onToggleSelectAll={vi.fn()}
+        onRenderSelected={vi.fn()}
+        onDeleteSelected={vi.fn()}
+        onAddSegment={vi.fn(async () => true)}
+        onToggleSegmentSelection={vi.fn()}
+        onSaveSegment={vi.fn()}
+        onMoveSegment={vi.fn()}
+        onMergeSegmentWithNext={vi.fn()}
+        onSplitSegment={vi.fn()}
+        onRenderSegment={vi.fn()}
+        onDeleteSegment={vi.fn()}
+        onOpenSegmentSettings={vi.fn()}
+        onChangeSegmentDraft={vi.fn()}
+        onChangeSegmentCursor={vi.fn()}
+        onFocusSegmentHandled={vi.fn()}
+        audioUrlForRecordId={(recordId) => `/audio/${recordId}`}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Save draft" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Save draft first" })).toBeDisabled();
+    expect(screen.getByText(/Save the draft explicitly before rendering/i)).toBeVisible();
   });
 });

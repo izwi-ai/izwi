@@ -14,6 +14,7 @@ import {
   X,
 } from "lucide-react";
 import type { StudioProjectRecord, StudioProjectSegmentRecord } from "@/api";
+import type { StudioSegmentDraftConflict } from "@/features/studio/segmentDrafts";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import {
@@ -31,6 +32,7 @@ const INSERT_END_TARGET = "__end__";
 interface StudioSegmentEditorProps {
   project: StudioProjectRecord;
   segmentDrafts: Record<string, string>;
+  segmentDraftConflicts?: Record<string, StudioSegmentDraftConflict>;
   segmentSelections: Record<string, number | null>;
   selectedSegmentIdSet: ReadonlySet<string>;
   selectedSegmentCount: number;
@@ -52,6 +54,8 @@ interface StudioSegmentEditorProps {
   onDeleteSegment: (segmentId: string) => void;
   onOpenSegmentSettings: (segmentId: string) => void;
   onChangeSegmentDraft: (segmentId: string, value: string) => void;
+  onRestoreSegmentDraftConflict?: (segmentId: string) => void;
+  onDiscardSegmentDraftConflict?: (segmentId: string) => void;
   onChangeSegmentCursor: (segmentId: string, cursor: number | null) => void;
   onFocusSegmentHandled: (segmentId: string) => void;
   audioUrlForRecordId: (recordId: string) => string;
@@ -212,6 +216,7 @@ function InsertSegmentControls({
 export function StudioSegmentEditor({
   project,
   segmentDrafts,
+  segmentDraftConflicts = {},
   segmentSelections,
   selectedSegmentIdSet,
   selectedSegmentCount,
@@ -233,6 +238,8 @@ export function StudioSegmentEditor({
   onDeleteSegment,
   onOpenSegmentSettings,
   onChangeSegmentDraft,
+  onRestoreSegmentDraftConflict,
+  onDiscardSegmentDraftConflict,
   onChangeSegmentCursor,
   onFocusSegmentHandled,
   audioUrlForRecordId,
@@ -366,6 +373,7 @@ export function StudioSegmentEditor({
       <div className="mt-5 space-y-4">
         {project.segments.map((segment, index) => {
           const draft = segmentDrafts[segment.id] ?? segment.text;
+          const draftConflict = segmentDraftConflicts[segment.id];
           const segmentDirty = draft !== segment.text;
           const segmentNeedsRender = segmentDirty || !segment.speech_record_id;
           const isSaving = savingSegmentId === segment.id;
@@ -381,7 +389,7 @@ export function StudioSegmentEditor({
           const renderButtonLabel = segmentQueued
             ? "Queued"
             : segmentDirty
-              ? "Save & render"
+              ? "Save draft first"
               : segmentNeedsRender
                 ? "Render block"
                 : "Re-render";
@@ -454,7 +462,7 @@ export function StudioSegmentEditor({
                     <Button
                       size="sm"
                       onClick={() => onRenderSegment(segment.id)}
-                      disabled={isRendering || segmentQueued}
+                      disabled={segmentDirty || isRendering || segmentQueued}
                       className="min-w-[8rem] flex-1 justify-center"
                     >
                       {isRendering ? (
@@ -489,9 +497,48 @@ export function StudioSegmentEditor({
                   </div>
                 </div>
 
+                {draftConflict ? (
+                  <div
+                    className="mt-4 rounded-xl border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-3 py-3 text-xs text-[var(--status-warning-text)]"
+                    role="alert"
+                  >
+                    <p className="font-semibold">Saved draft needs review</p>
+                    <p className="mt-1 leading-5">
+                      This segment changed after your local draft was saved, so the
+                      newer server text is shown. Restore your local draft only if
+                      you still want it.
+                    </p>
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      {onRestoreSegmentDraftConflict ? (
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="h-7 bg-[var(--bg-surface-0)]"
+                          onClick={() => onRestoreSegmentDraftConflict(segment.id)}
+                        >
+                          Restore local draft
+                        </Button>
+                      ) : null}
+                      {onDiscardSegmentDraftConflict ? (
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          className="h-7"
+                          onClick={() => onDiscardSegmentDraftConflict(segment.id)}
+                        >
+                          Keep server text
+                        </Button>
+                      ) : null}
+                    </div>
+                  </div>
+                ) : null}
+
                 <Textarea
                   className="mt-4 border-[var(--border-muted)] bg-[var(--bg-surface-0)]"
                   value={draft}
+                  disabled={Boolean(draftConflict)}
                   ref={(node) => {
                     textareaRefs.current[segment.id] = node;
                   }}
@@ -509,8 +556,8 @@ export function StudioSegmentEditor({
 
                 {segmentDirty ? (
                   <div className="mt-4 rounded-xl border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-3 py-2 text-xs text-[var(--status-warning-text)]">
-                    This block has local edits. Rendering will save the latest text first
-                    and then refresh the audio.
+                    This block has local edits. Save the draft explicitly before
+                    rendering new audio.
                   </div>
                 ) : null}
 
