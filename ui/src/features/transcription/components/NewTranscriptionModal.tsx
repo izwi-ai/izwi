@@ -884,7 +884,7 @@ export function NewTranscriptionModal({
       }}
     >
       <DialogContent
-        className="max-w-[46rem] overflow-hidden border-[var(--border-strong)] bg-[var(--bg-surface-0)] p-0"
+        className="max-w-[46rem] border-[var(--border-strong)] bg-[var(--bg-surface-0)] p-0"
         onEscapeKeyDown={(event) => {
           if (blockOutsideDismiss || isSubmitting) {
             event.preventDefault();

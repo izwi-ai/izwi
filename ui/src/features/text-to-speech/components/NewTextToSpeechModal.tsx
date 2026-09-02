@@ -424,7 +424,7 @@ export function NewTextToSpeechModal({
       onOpenChange={(open) => !open && onClose()}
     >
       <DialogContent
-        className="max-w-[52rem] overflow-hidden border-[var(--border-strong)] bg-[var(--bg-surface-0)] p-0"
+        className="max-w-[52rem] border-[var(--border-strong)] bg-[var(--bg-surface-0)] p-0"
         onEscapeKeyDown={(event) => {
           if (isModelManagerOpen) {
             event.preventDefault();

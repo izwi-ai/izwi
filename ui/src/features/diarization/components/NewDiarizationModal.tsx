@@ -783,7 +783,7 @@ export function NewDiarizationModal({
         }
       }}
     >
-      <DialogContent className="max-w-[52rem] overflow-hidden border-[var(--border-strong)] bg-[var(--bg-surface-0)] p-0">
+      <DialogContent className="max-w-[52rem] border-[var(--border-strong)] bg-[var(--bg-surface-0)] p-0">
         {modalBody}
       </DialogContent>
     </Dialog>
