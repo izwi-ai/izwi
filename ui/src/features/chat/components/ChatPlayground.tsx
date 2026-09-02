@@ -76,6 +76,21 @@ import {
 import { MarkdownContent } from "@/components/ui/MarkdownContent";
 import { RouteModelSelect } from "@/components/RouteModelSelect";
 
+const NEW_CHAT_DRAFT_KEY = "__new_chat__";
+
+interface ChatComposerDraft {
+  input: string;
+  pendingImages: PendingImageAttachment[];
+}
+
+function draftKeyForThread(threadId: string | null): string {
+  return threadId ?? NEW_CHAT_DRAFT_KEY;
+}
+
+function isEmptyDraft(draft: ChatComposerDraft): boolean {
+  return draft.input.length === 0 && draft.pendingImages.length === 0;
+}
+
 export function ChatPlayground({
   selectedModel,
   selectedModelReady,
@@ -95,7 +110,11 @@ export function ChatPlayground({
   const [expandedThoughts, setExpandedThoughts] = useState<
     Record<string, boolean>
   >({});
-  const [input, setInput] = useState("");
+  // Drafts intentionally live only for this mounted session. Durable persistence
+  // is out of scope; the thread key prevents in-session cross-conversation leaks.
+  const [composerDrafts, setComposerDrafts] = useState<
+    Record<string, ChatComposerDraft>
+  >({});
   const [isThinkingEnabled, setIsThinkingEnabled] = useState(() =>
     chatCapabilities?.default_thinking_enabled ??
       defaultThinkingEnabledForModel(selectedModel),
@@ -121,9 +140,6 @@ export function ChatPlayground({
   const [imagePreview, setImagePreview] = useState<ImagePreviewState | null>(
     null,
   );
-  const [pendingImages, setPendingImages] = useState<PendingImageAttachment[]>(
-    [],
-  );
   const [isReadingImages, setIsReadingImages] = useState(false);
   const [isHistoryDrawerOpen, setIsHistoryDrawerOpen] = useState(false);
   const [deleteTargetThreadId, setDeleteTargetThreadId] = useState<
@@ -146,6 +162,73 @@ export function ChatPlayground({
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
   const pendingImageSeqRef = useRef(0);
+  const composerDraftsRef = useRef<Record<string, ChatComposerDraft>>({});
+  const revokedPreviewUrlsRef = useRef<Set<string>>(new Set());
+  const isMountedRef = useRef(true);
+  const deletedDraftKeysRef = useRef<Set<string>>(new Set());
+
+  const activeDraftKey = draftKeyForThread(activeThreadId);
+  const activeDraft = composerDrafts[activeDraftKey];
+  const input = activeDraft?.input ?? "";
+  const pendingImages = activeDraft?.pendingImages ?? [];
+
+  composerDraftsRef.current = composerDrafts;
+
+  const revokeImagePreviews = useCallback(
+    (images: PendingImageAttachment[]) => {
+      for (const image of images) {
+        if (
+          !image.previewUrl ||
+          revokedPreviewUrlsRef.current.has(image.previewUrl) ||
+          typeof URL.revokeObjectURL !== "function"
+        ) {
+          continue;
+        }
+        URL.revokeObjectURL(image.previewUrl);
+        revokedPreviewUrlsRef.current.add(image.previewUrl);
+      }
+    },
+    [],
+  );
+
+  const updateComposerDraft = useCallback(
+    (
+      draftKey: string,
+      update: (draft: ChatComposerDraft) => ChatComposerDraft,
+    ) => {
+      setComposerDrafts((previous) => {
+        const nextDraft = update(
+          previous[draftKey] ?? { input: "", pendingImages: [] },
+        );
+        if (isEmptyDraft(nextDraft)) {
+          if (!(draftKey in previous)) {
+            return previous;
+          }
+          const next = { ...previous };
+          delete next[draftKey];
+          return next;
+        }
+        return { ...previous, [draftKey]: nextDraft };
+      });
+    },
+    [],
+  );
+
+  const clearComposerDraft = useCallback(
+    (draftKey: string) => {
+      setComposerDrafts((previous) => {
+        const removedDraft = previous[draftKey];
+        if (!removedDraft) {
+          return previous;
+        }
+        revokeImagePreviews(removedDraft.pendingImages);
+        const next = { ...previous };
+        delete next[draftKey];
+        return next;
+      });
+    },
+    [revokeImagePreviews],
+  );
 
   const activeThread = useMemo(
     () => threads.find((thread) => thread.id === activeThreadId) ?? null,
@@ -181,6 +264,8 @@ export function ChatPlayground({
   const firstSupportedReasoningEffort = supportedReasoningEfforts[0];
   const supportsImageAttachments =
     supportsImageAttachmentsForModel(selectedModel);
+  const supportsImageAttachmentsRef = useRef(supportsImageAttachments);
+  supportsImageAttachmentsRef.current = supportsImageAttachments;
   const renderModelId = activeThread?.model_id ?? selectedModel;
   const implicitOpenThinkTagModel =
     supportsImplicitOpenThinkTagParsing(renderModelId);
@@ -233,11 +318,27 @@ export function ChatPlayground({
     if (supportsImageAttachments) {
       return;
     }
-    setPendingImages([]);
+    updateComposerDraft(activeDraftKey, (draft) => {
+      if (draft.pendingImages.length === 0) {
+        return draft;
+      }
+      revokeImagePreviews(draft.pendingImages);
+      return { ...draft, pendingImages: [] };
+    });
+    setImagePreview(null);
     if (imageInputRef.current) {
       imageInputRef.current.value = "";
     }
-  }, [supportsImageAttachments]);
+  }, [
+    activeDraftKey,
+    revokeImagePreviews,
+    supportsImageAttachments,
+    updateComposerDraft,
+  ]);
+
+  useEffect(() => {
+    setImagePreview(null);
+  }, [activeDraftKey]);
 
   const refreshThreadList = useCallback(
     async (preferredThreadId?: string | null) => {
@@ -350,12 +451,17 @@ export function ChatPlayground({
   }, [threads]);
 
   useEffect(() => {
+    isMountedRef.current = true;
     return () => {
+      isMountedRef.current = false;
       if (streamAbortRef.current) {
         streamAbortRef.current.abort();
       }
+      for (const draft of Object.values(composerDraftsRef.current)) {
+        revokeImagePreviews(draft.pendingImages);
+      }
     };
-  }, []);
+  }, [revokeImagePreviews]);
 
   useLayoutEffect(() => {
     if (followingOutputThreadRef.current !== activeThreadId) {
@@ -560,8 +666,6 @@ export function ChatPlayground({
       setExpandedThoughts({});
       setStats(null);
       setError(null);
-      setInput("");
-      setPendingImages([]);
     } catch (createError) {
       setError(getErrorMessage(createError, "Failed to create a new chat."));
     }
@@ -570,7 +674,6 @@ export function ChatPlayground({
     isPreparingThread,
     isStreaming,
     selectedModel,
-    setPendingImages,
     setActiveThreadInUrl,
   ]);
 
@@ -597,6 +700,9 @@ export function ChatPlayground({
         setThreads((previous) =>
           previous.filter((thread) => thread.id !== threadId),
         );
+        const deletedDraftKey = draftKeyForThread(threadId);
+        deletedDraftKeysRef.current.add(deletedDraftKey);
+        clearComposerDraft(deletedDraftKey);
         setDeleteTargetThreadId(null);
 
         if (activeThreadIdRef.current === threadId) {
@@ -611,7 +717,13 @@ export function ChatPlayground({
         setDeleteThreadPending(false);
       }
     },
-    [deleteThreadPending, isPreparingThread, isStreaming, setActiveThreadInUrl],
+    [
+      clearComposerDraft,
+      deleteThreadPending,
+      isPreparingThread,
+      isStreaming,
+      setActiveThreadInUrl,
+    ],
   );
 
   const confirmDeleteThread = useCallback(() => {
@@ -632,10 +744,17 @@ export function ChatPlayground({
   );
 
   const removePendingImage = useCallback((imageId: string) => {
-    setPendingImages((previous) =>
-      previous.filter((image) => image.id !== imageId),
-    );
-  }, []);
+    updateComposerDraft(activeDraftKey, (draft) => {
+      const removedImages = draft.pendingImages.filter(
+        (image) => image.id === imageId,
+      );
+      revokeImagePreviews(removedImages);
+      return {
+        ...draft,
+        pendingImages: draft.pendingImages.filter((image) => image.id !== imageId),
+      };
+    });
+  }, [activeDraftKey, revokeImagePreviews, updateComposerDraft]);
 
   const handleComposerImageChange = useCallback(
     async (event: ChangeEvent<HTMLInputElement>) => {
@@ -653,19 +772,38 @@ export function ChatPlayground({
 
       setError(null);
       setIsReadingImages(true);
+      const targetDraftKey = activeDraftKey;
       try {
         const nextImages = await Promise.all(
           files.map(async (file) => {
             pendingImageSeqRef.current += 1;
+            const sequence = pendingImageSeqRef.current;
+            const source = await readImageFileAsDataUrl(file);
             return {
-              id: `image-${pendingImageSeqRef.current}`,
-              source: await readImageFileAsDataUrl(file),
-              label: file.name || `image-${pendingImageSeqRef.current}.png`,
+              id: `image-${sequence}`,
+              source,
+              label: file.name || `image-${sequence}.png`,
+              previewUrl:
+                typeof URL.createObjectURL === "function"
+                  ? URL.createObjectURL(file)
+                  : undefined,
             } satisfies PendingImageAttachment;
           }),
         );
 
-        setPendingImages((previous) => [...previous, ...nextImages]);
+        if (
+          !isMountedRef.current ||
+          !supportsImageAttachmentsRef.current ||
+          deletedDraftKeysRef.current.has(targetDraftKey)
+        ) {
+          revokeImagePreviews(nextImages);
+          return;
+        }
+
+        updateComposerDraft(targetDraftKey, (draft) => ({
+          ...draft,
+          pendingImages: [...draft.pendingImages, ...nextImages],
+        }));
       } catch (imageError) {
         setError(
           getErrorMessage(imageError, "Failed to read the selected image."),
@@ -675,7 +813,7 @@ export function ChatPlayground({
         event.target.value = "";
       }
     },
-    [],
+    [activeDraftKey, revokeImagePreviews, updateComposerDraft],
   );
 
   const openImagePicker = useCallback(() => {
@@ -683,8 +821,17 @@ export function ChatPlayground({
   }, []);
 
   const sendMessage = async () => {
-    const text = input.trim();
-    if ((text.length === 0 && pendingImages.length === 0) || isStreaming || isPreparingThread) {
+    const submittedDraftKey = activeDraftKey;
+    const submittedDraft = composerDrafts[submittedDraftKey] ?? {
+      input: "",
+      pendingImages: [],
+    };
+    const text = submittedDraft.input.trim();
+    if (
+      (text.length === 0 && submittedDraft.pendingImages.length === 0) ||
+      isStreaming ||
+      isPreparingThread
+    ) {
       return;
     }
 
@@ -694,6 +841,7 @@ export function ChatPlayground({
     }
 
     let targetThreadId = activeThreadId;
+    let targetDraftKey = submittedDraftKey;
     if (!targetThreadId) {
       setIsPreparingThread(true);
       try {
@@ -706,6 +854,12 @@ export function ChatPlayground({
         setExpandedThoughts({});
         setStats(null);
         targetThreadId = createdThread.id;
+        targetDraftKey = draftKeyForThread(createdThread.id);
+        setComposerDrafts((previous) => {
+          const next = { ...previous, [targetDraftKey]: submittedDraft };
+          delete next[submittedDraftKey];
+          return next;
+        });
       } catch (threadError) {
         setError(getErrorMessage(threadError, "Failed to create a new chat."));
         setIsPreparingThread(false);
@@ -723,7 +877,7 @@ export function ChatPlayground({
 
     const requestPayload = buildChatThreadMessagePayload({
       text,
-      images: pendingImages,
+      images: submittedDraft.pendingImages,
     });
 
     const isFirstTurn =
@@ -779,135 +933,147 @@ export function ChatPlayground({
     ]);
     followingOutputRef.current = true;
     followingStreamingThinkingRef.current = true;
-    setInput("");
-    setPendingImages([]);
     setIsStreaming(true);
     setStreamingThreadId(targetThreadId);
 
-    streamAbortRef.current = api.sendChatThreadMessageStream(
-      targetThreadId,
-      {
-        model_id: selectedModel,
-        content: requestPayload.content,
-        content_parts: requestPayload.contentParts,
-        system_prompt: systemPrompt,
-        enable_thinking: enableThinking,
-        reasoning_effort: selectedReasoningEffort,
-      },
-      {
-        onStart: ({ userMessage }) => {
-          setMessages((previous) => {
-            let replaced = false;
-            const updated = previous.map((message) => {
-              if (message.id === userTempId) {
-                replaced = true;
-                return userMessage;
+    try {
+      streamAbortRef.current = api.sendChatThreadMessageStream(
+        targetThreadId,
+        {
+          model_id: selectedModel,
+          content: requestPayload.content,
+          content_parts: requestPayload.contentParts,
+          system_prompt: systemPrompt,
+          enable_thinking: enableThinking,
+          reasoning_effort: selectedReasoningEffort,
+        },
+        {
+          onStart: ({ userMessage }) => {
+            setMessages((previous) => {
+              let replaced = false;
+              const updated = previous.map((message) => {
+                if (message.id === userTempId) {
+                  replaced = true;
+                  return userMessage;
+                }
+                return message;
+              });
+
+              if (
+                replaced ||
+                updated.some((message) => message.id === userMessage.id)
+              ) {
+                return updated;
               }
-              return message;
+
+              return [...updated, userMessage];
             });
+          },
+          onDelta: (delta) => {
+            setMessages((previous) => {
+              let updatedAssistant = false;
+              const updated = previous.map((message) => {
+                if (message.id === assistantTempId) {
+                  updatedAssistant = true;
+                  return { ...message, content: `${message.content}${delta}` };
+                }
+                return message;
+              });
 
-            if (
-              replaced ||
-              updated.some((message) => message.id === userMessage.id)
-            ) {
-              return updated;
-            }
-
-            return [...updated, userMessage];
-          });
-        },
-        onDelta: (delta) => {
-          setMessages((previous) => {
-            let updatedAssistant = false;
-            const updated = previous.map((message) => {
-              if (message.id === assistantTempId) {
-                updatedAssistant = true;
-                return { ...message, content: `${message.content}${delta}` };
+              if (updatedAssistant) {
+                return updated;
               }
-              return message;
-            });
 
-            if (updatedAssistant) {
-              return updated;
-            }
-
-            if (
-              updated.some(
-                (message) => message.id === optimisticAssistantMessage.id,
-              )
-            ) {
-              return updated;
-            }
-
-            return [
-              ...updated,
-              { ...optimisticAssistantMessage, content: delta },
-            ];
-          });
-        },
-        onDone: ({ assistantMessage, stats: streamStats, modelId }) => {
-          setMessages((previous) => {
-            let replaced = false;
-            const updated = previous.map((message) => {
-              if (message.id === assistantTempId) {
-                replaced = true;
-                return assistantMessage;
+              if (
+                updated.some(
+                  (message) => message.id === optimisticAssistantMessage.id,
+                )
+              ) {
+                return updated;
               }
-              return message;
+
+              return [
+                ...updated,
+                { ...optimisticAssistantMessage, content: delta },
+              ];
             });
+          },
+          onDone: ({ assistantMessage, stats: streamStats, modelId }) => {
+            setMessages((previous) => {
+              let replaced = false;
+              const updated = previous.map((message) => {
+                if (message.id === assistantTempId) {
+                  replaced = true;
+                  return assistantMessage;
+                }
+                return message;
+              });
 
-            if (
-              replaced ||
-              updated.some((message) => message.id === assistantMessage.id)
-            ) {
-              return updated;
-            }
-
-            return [...updated, assistantMessage];
-          });
-          setStats(streamStats);
-
-          if (isFirstTurn) {
-            void maybeGenerateThreadTitle({
-              threadId: targetThreadId,
-              userContent: requestPayload.content,
-              assistantContent: assistantMessage.content,
-              modelId,
-            });
-          }
-        },
-        onError: (message) => {
-          setError(message);
-          setMessages((previous) =>
-            previous.filter(
-              (entry) =>
-                !(
-                  entry.id === assistantTempId &&
-                  entry.content.trim().length === 0
-                ),
-            ),
-          );
-        },
-        onClose: () => {
-          setIsStreaming(false);
-          setStreamingThreadId(null);
-          streamAbortRef.current = null;
-          void refreshThreadList(targetThreadId);
-          void api
-            .getChatThread(targetThreadId)
-            .then((detail) => {
-              if (activeThreadIdRef.current !== targetThreadId) {
-                return;
+              if (
+                replaced ||
+                updated.some((message) => message.id === assistantMessage.id)
+              ) {
+                return updated;
               }
-              setMessages(detail.messages);
-              setStats(extractLatestStats(detail.messages));
-            })
-            .catch(() => {
-              // Ignore follow-up sync failures after stream close.
+
+              return [...updated, assistantMessage];
             });
+            setStats(streamStats);
+
+            if (isFirstTurn) {
+              void maybeGenerateThreadTitle({
+                threadId: targetThreadId,
+                userContent: requestPayload.content,
+                assistantContent: assistantMessage.content,
+                modelId,
+              });
+            }
+          },
+          onError: (message) => {
+            setError(message);
+            setMessages((previous) =>
+              previous.filter(
+                (entry) =>
+                  !(
+                    entry.id === assistantTempId &&
+                    entry.content.trim().length === 0
+                  ),
+              ),
+            );
+          },
+          onClose: () => {
+            setIsStreaming(false);
+            setStreamingThreadId(null);
+            streamAbortRef.current = null;
+            void refreshThreadList(targetThreadId);
+            void api
+              .getChatThread(targetThreadId)
+              .then((detail) => {
+                if (activeThreadIdRef.current !== targetThreadId) {
+                  return;
+                }
+                setMessages(detail.messages);
+                setStats(extractLatestStats(detail.messages));
+              })
+              .catch(() => {
+                // Ignore follow-up sync failures after stream close.
+              });
+          },
         },
-      },
-    );
+      );
+      clearComposerDraft(targetDraftKey);
+      setImagePreview(null);
+    } catch (sendError) {
+      setMessages((previous) =>
+        previous.filter(
+          (message) =>
+            message.id !== userTempId && message.id !== assistantTempId,
+        ),
+      );
+      setIsStreaming(false);
+      setStreamingThreadId(null);
+      setError(getErrorMessage(sendError, "Failed to send this message."));
+    }
   };
 
   const handleOpenModels = () => {
@@ -949,7 +1115,7 @@ export function ChatPlayground({
                 type="button"
                 onClick={() =>
                   setImagePreview({
-                    source: image.source,
+                    source: image.previewUrl ?? image.source,
                     label: image.label,
                   })
                 }
@@ -982,7 +1148,13 @@ export function ChatPlayground({
       <textarea
         ref={textareaRef}
         value={input}
-        onChange={(event) => setInput(event.target.value)}
+        onChange={(event) => {
+          const value = event.target.value;
+          updateComposerDraft(activeDraftKey, (draft) => ({
+            ...draft,
+            input: value,
+          }));
+        }}
         onKeyDown={(event) => {
           if (event.key === "Enter" && !event.shiftKey) {
             event.preventDefault();
