@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import {
   api,
   type DiarizationRecord,
@@ -83,6 +83,7 @@ export function TranscriptionPage({
 }: TranscriptionPageProps) {
   const { recordId } = useParams<{ recordId: string }>();
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
   const [isNewTranscriptionModalOpen, setIsNewTranscriptionModalOpen] =
     useState(false);
   const [newSpeechTextMode, setNewSpeechTextMode] =
@@ -486,7 +487,21 @@ export function TranscriptionPage({
   }, []);
   const handleCloseNewTranscriptionModal = useCallback(() => {
     setIsNewTranscriptionModalOpen(false);
-  }, []);
+    if (searchParams.has("create")) {
+      const nextSearchParams = new URLSearchParams(searchParams);
+      nextSearchParams.delete("create");
+      setSearchParams(nextSearchParams, { replace: true });
+    }
+  }, [searchParams, setSearchParams]);
+
+  useEffect(() => {
+    if (recordId || searchParams.get("create") !== "diarization") {
+      return;
+    }
+
+    setNewSpeechTextMode("diarization");
+    setIsNewTranscriptionModalOpen(true);
+  }, [recordId, searchParams]);
   const handleLoadAllDiarizationManagedModels = useCallback(() => {
     for (const model of diarizationManagedModels) {
       if (model.status === "downloaded") {

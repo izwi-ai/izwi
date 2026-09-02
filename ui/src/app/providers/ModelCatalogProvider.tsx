@@ -23,6 +23,7 @@ interface ModelCatalogContextValue {
   selectedModel: string | null;
   loading: boolean;
   error: string | null;
+  catalogError: string | null;
   downloadProgress: ModelDownloadProgressMap;
   readyModelsCount: number;
   selectModel: (variant: string | null) => void;
@@ -54,6 +55,7 @@ export function ModelCatalogProvider({
   const [selectedModel, setSelectedModelState] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [catalogError, setCatalogError] = useState<string | null>(null);
   const [downloadProgress, setDownloadProgress] = useState<ModelDownloadProgressMap>(
     {},
   );
@@ -119,6 +121,7 @@ export function ModelCatalogProvider({
       });
 
       setModels(mergedModels);
+      setCatalogError(null);
       setSelectedModelState((current) => {
         if (
           current &&
@@ -132,6 +135,12 @@ export function ModelCatalogProvider({
       });
     } catch (err) {
       console.error("Failed to load models:", err);
+      setCatalogError(
+        modelActionError(
+          err,
+          "Izwi could not reach the local model service. Please try again.",
+        ),
+      );
     }
   }, []);
 
@@ -684,6 +693,7 @@ export function ModelCatalogProvider({
       selectedModel,
       loading,
       error,
+      catalogError,
       downloadProgress,
       readyModelsCount: models.filter((model) => model.status === "ready").length,
       selectModel,
@@ -703,6 +713,7 @@ export function ModelCatalogProvider({
       downloadModel,
       downloadProgress,
       error,
+      catalogError,
       loadModel,
       loading,
       models,

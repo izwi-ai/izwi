@@ -6,6 +6,7 @@ import {
   Loader2,
   MessageSquare,
   Sparkles,
+  TriangleAlert,
 } from "lucide-react";
 
 import { api, type ModelInfo } from "@/api";
@@ -25,6 +26,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { StatePanel } from "@/components/ui/state-panel";
 import { Switch } from "@/components/ui/switch";
 import {
   MODEL_DETAILS,
@@ -204,7 +206,8 @@ function resolveCategory(
 }
 
 export function FirstRunOnboarding() {
-  const { models, loading, downloadModel } = useModelCatalog();
+  const { models, loading, catalogError, downloadModel, refreshModels } =
+    useModelCatalog();
   const { notify } = useNotifications();
   const [isOpen, setIsOpen] = useState(false);
   const [step, setStep] = useState(0);
@@ -498,6 +501,27 @@ export function FirstRunOnboarding() {
           </div>
 
           <div className="space-y-6 px-6 py-6 sm:px-8 sm:py-8">
+            {catalogError ? (
+              <div role="alert">
+                <StatePanel
+                  title="Model service unavailable"
+                  description={catalogError}
+                  icon={TriangleAlert}
+                  tone="danger"
+                  actions={
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={loading}
+                      onClick={() => void refreshModels()}
+                    >
+                      Retry models
+                    </Button>
+                  }
+                />
+              </div>
+            ) : null}
             {step === 0 ? (
               <div className="grid gap-6 lg:grid-cols-[1.2fr_0.8fr]">
                 <div className="space-y-4">
