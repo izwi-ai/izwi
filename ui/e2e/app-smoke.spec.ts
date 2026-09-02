@@ -1,22 +1,5 @@
-import { expect, test, type Page } from "@playwright/test";
-
-async function stubBootstrapRequests(page: Page) {
-  await page.route("**/v1/admin/models", async (route) => {
-    await route.fulfill({ json: { models: [] } });
-  });
-  await page.route("**/v1/onboarding", async (route) => {
-    await route.fulfill({
-      json: {
-        completed: true,
-        completed_at: 1,
-        analytics_opt_in: false,
-      },
-    });
-  });
-  await page.route("**/v1/preferences", async (route) => {
-    await route.fulfill({ json: { analytics_opt_in: false } });
-  });
-}
+import { expect, test } from "@playwright/test";
+import { stubBootstrapRequests } from "./support/api";
 
 test.beforeEach(async ({ page }) => {
   await stubBootstrapRequests(page);

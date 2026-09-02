@@ -2347,8 +2347,8 @@ export function VoicePage({
             className={cn(
               "inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-medium transition-colors",
               hasRunnableConfig
-                ? "bg-green-500/10 text-green-500 border border-green-500/20"
-                : "bg-yellow-500/10 text-yellow-500 border border-yellow-500/20",
+                ? "border border-[var(--status-positive-border)] bg-[var(--status-positive-bg)] text-[var(--status-positive-text)]"
+                : "border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] text-[var(--status-warning-text)]",
             )}
           >
             {hasRunnableConfig ? "Ready" : "Models Required"}

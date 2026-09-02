@@ -569,6 +569,9 @@ describe("TextToSpeechPage", () => {
       await screen.findByRole("heading", { name: "New text-to-speech job" }),
     ).toBeInTheDocument();
     expect(screen.getByText("Saved voice")).toBeInTheDocument();
+    expect(
+      screen.getByRole("combobox", { name: "Saved voice" }),
+    ).toBeInTheDocument();
     expect(screen.getByText("Select saved voice")).toBeInTheDocument();
     expect(screen.queryByText("Built-in voice")).not.toBeInTheDocument();
     expect(screen.queryByText("Voice direction")).not.toBeInTheDocument();
@@ -606,6 +609,9 @@ describe("TextToSpeechPage", () => {
       await screen.findByRole("heading", { name: "New text-to-speech job" }),
     ).toBeInTheDocument();
 
+    expect(
+      screen.getByRole("combobox", { name: "Built-in voice" }),
+    ).toBeInTheDocument();
     expect(screen.getByText("Alice")).toBeInTheDocument();
     expect(screen.queryByText("bf_alice")).not.toBeInTheDocument();
   });

@@ -558,7 +558,10 @@ export function NewTextToSpeechModal({
                     onValueChange={setSpeaker}
                     disabled={isSubmitting}
                   >
-                    <SelectTrigger className="h-10 w-full rounded-2xl border-[var(--border-muted)] bg-[var(--bg-surface-0)] text-sm">
+                    <SelectTrigger
+                      aria-label="Built-in voice"
+                      className="h-10 w-full rounded-2xl border-[var(--border-muted)] bg-[var(--bg-surface-0)] text-sm"
+                    >
                       <SelectValue placeholder="Select built-in voice" />
                     </SelectTrigger>
                     <SelectContent>
@@ -583,7 +586,10 @@ export function NewTextToSpeechModal({
                       onValueChange={setSavedVoiceId}
                       disabled={isSubmitting || savedVoicesLoading}
                     >
-                      <SelectTrigger className="h-10 w-full rounded-2xl border-[var(--border-muted)] bg-[var(--bg-surface-0)] text-sm">
+                      <SelectTrigger
+                        aria-label="Saved voice"
+                        className="h-10 w-full rounded-2xl border-[var(--border-muted)] bg-[var(--bg-surface-0)] text-sm"
+                      >
                         <SelectValue placeholder="Select saved voice" />
                       </SelectTrigger>
                       <SelectContent>
