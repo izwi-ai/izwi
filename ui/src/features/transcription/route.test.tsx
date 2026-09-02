@@ -470,7 +470,9 @@ describe("TranscriptionPage detail route", () => {
     const view = renderRoute("/transcription");
 
     try {
-      expect(await screen.findByText("Still transcribing...")).toBeInTheDocument();
+      expect(
+        await screen.findByText("Transcription is in progress."),
+      ).toBeInTheDocument();
 
       await waitFor(() => expect(setIntervalSpy).toHaveBeenCalled());
       if (intervalCallbacks.length === 0) {
@@ -483,7 +485,9 @@ describe("TranscriptionPage detail route", () => {
         expect(apiMocks.listTranscriptionRecords).toHaveBeenCalledTimes(2),
       );
 
-      expect(screen.getByText("Still transcribing...")).toBeInTheDocument();
+      expect(
+        screen.getByText("Transcription is in progress."),
+      ).toBeInTheDocument();
       expect(
         screen.queryByText("Loading speech-text history..."),
       ).not.toBeInTheDocument();
