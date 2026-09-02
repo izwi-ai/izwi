@@ -25,7 +25,7 @@ concurrency:
 
 jobs:
   quality:
-    name: Typecheck, Lint, Test, and Build
+    name: Typecheck, Lint, Test, Build, and Browser Smoke
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -54,3 +54,9 @@ jobs:
 
       - name: Build
         run: npm --prefix ui run build
+
+      - name: Install browser
+        run: npx --prefix ui playwright install --with-deps --no-shell chromium
+
+      - name: Browser smoke
+        run: npm --prefix ui run test:e2e
