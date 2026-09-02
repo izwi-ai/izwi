@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Mic,
@@ -139,6 +146,11 @@ export function VoicePage({
     useState(false);
 
   const streamRef = useRef<MediaStream | null>(null);
+  const configPanelRef = useRef<HTMLDivElement | null>(null);
+  const configReturnFocusRef = useRef<HTMLElement | null>(null);
+  const readinessGuidanceId = useId();
+  const configTitleId = useId();
+  const configDescriptionId = useId();
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const streamingProcessorRef = useRef<ScriptProcessorNode | null>(null);
@@ -1479,9 +1491,29 @@ export function VoicePage({
   }, [onError]);
 
   const openConfig = useCallback((tab: VoiceConfigTab = "setup") => {
+    if (document.activeElement instanceof HTMLElement) {
+      configReturnFocusRef.current = document.activeElement;
+    }
     setConfigTab(tab);
     setIsConfigOpen(true);
   }, []);
+
+  const closeConfig = useCallback(() => {
+    setIsConfigOpen(false);
+    window.requestAnimationFrame(() => {
+      configReturnFocusRef.current?.focus();
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!isConfigOpen) {
+      return;
+    }
+    const frame = window.requestAnimationFrame(() => {
+      configPanelRef.current?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [isConfigOpen]);
 
   const startSession = useCallback(async () => {
     if (!selectedAsrModel || !selectedTextModel || !selectedTtsModel) {
@@ -1640,6 +1672,14 @@ export function VoicePage({
         return;
       }
 
+      if (isConfigOpen) {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          closeConfig();
+        }
+        return;
+      }
+
       if (event.code === "Space") {
         event.preventDefault();
         toggleSession();
@@ -1662,7 +1702,7 @@ export function VoicePage({
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [runtimeStatus, stopSession, toggleSession]);
+  }, [closeConfig, isConfigOpen, runtimeStatus, stopSession, toggleSession]);
 
   const statusLabel = {
     idle: "Idle",
@@ -2274,6 +2314,14 @@ export function VoicePage({
       ? !selectedUnifiedModel
       : !selectedAsrModel || !selectedTextModel || !selectedTtsModel) ||
     !hasRunnableConfig;
+  const readinessGuidance =
+    voiceMode === "unified"
+      ? selectedUnifiedModel
+        ? "Load the unified voice model before starting a conversation."
+        : "Add a compatible unified voice model before starting a conversation."
+      : hasRequiredModularModels
+        ? "Load the ASR, text, and TTS models before starting a conversation."
+        : "Add the required ASR, text, and TTS models before starting a conversation.";
   const showTranscriptPanel = runtimeStatus !== "idle" || transcript.length > 0;
 
   if (loading) {
@@ -2393,6 +2441,9 @@ export function VoicePage({
                 <button
                   onClick={toggleSession}
                   disabled={startDisabled}
+                  aria-describedby={
+                    startDisabled ? readinessGuidanceId : undefined
+                  }
                   className="w-full h-full rounded-full flex flex-col items-center justify-center gap-3 group hover:bg-[var(--bg-surface-2)] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   <div className="w-16 h-16 rounded-full bg-[var(--bg-surface-3)] flex items-center justify-center group-hover:scale-110 transition-transform">
@@ -2452,6 +2503,24 @@ export function VoicePage({
               </p>
             )}
           </div>
+          {startDisabled ? (
+            <div className="mt-3 flex max-w-md flex-col items-center gap-3 px-4 text-center">
+              <p
+                id={readinessGuidanceId}
+                className="text-sm leading-relaxed text-[var(--text-muted)]"
+              >
+                {readinessGuidance}
+              </p>
+              <Button
+                type="button"
+                size="sm"
+                onClick={() => openConfig("models")}
+                className="rounded-full px-4"
+              >
+                Set up voice models
+              </Button>
+            </div>
+          ) : null}
         </div>
 
         {showTranscriptPanel && (
@@ -2553,9 +2622,15 @@ export function VoicePage({
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            onClick={() => setIsConfigOpen(false)}
+            onClick={closeConfig}
           >
             <motion.div
+              ref={configPanelRef}
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby={configTitleId}
+              aria-describedby={configDescriptionId}
+              tabIndex={-1}
               initial={{ y: 16, opacity: 0, scale: 0.98 }}
               animate={{ y: 0, opacity: 1, scale: 1 }}
               exit={{ y: 16, opacity: 0, scale: 0.98 }}
@@ -2569,10 +2644,16 @@ export function VoicePage({
                     <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-[var(--text-subtle)]">
                       Realtime voice controls
                     </p>
-                    <h2 className="mt-2 text-[1.75rem] font-semibold tracking-[-0.03em] text-[var(--text-primary)]">
+                    <h2
+                      id={configTitleId}
+                      className="mt-2 text-[1.75rem] font-semibold tracking-[-0.03em] text-[var(--text-primary)]"
+                    >
                       Voice configuration
                     </h2>
-                    <p className="mt-2 max-w-2xl text-sm leading-relaxed text-[var(--text-muted)]">
+                    <p
+                      id={configDescriptionId}
+                      className="mt-2 max-w-2xl text-sm leading-relaxed text-[var(--text-muted)]"
+                    >
                       Keep the workspace ready to run with a clean model stack,
                       grounded assistant behavior, and reusable voice settings.
                     </p>
@@ -2596,7 +2677,7 @@ export function VoicePage({
                       variant="ghost"
                       size="sm"
                       className="h-8 gap-2 rounded-full px-3"
-                      onClick={() => setIsConfigOpen(false)}
+                      onClick={closeConfig}
                     >
                       <X className="w-3.5 h-3.5" />
                       Close
