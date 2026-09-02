@@ -42,6 +42,7 @@ export function useSpeechTextRecord<TRecord extends SpeechTextRecordBase>(
   const [loading, setLoading] = useState(Boolean(recordId));
   const [error, setError] = useState<string | null>(null);
   const recordRef = useRef<TRecord | null>(null);
+  const requestSequenceRef = useRef(0);
 
   useEffect(() => {
     recordRef.current = record;
@@ -49,10 +50,14 @@ export function useSpeechTextRecord<TRecord extends SpeechTextRecordBase>(
 
   const loadRecord = useCallback(
     async (background = false) => {
+      const requestSequence = ++requestSequenceRef.current;
+
       if (!recordId) {
-        setRecord(null);
-        setLoading(false);
-        setError(null);
+        if (requestSequence === requestSequenceRef.current) {
+          setRecord(null);
+          setLoading(false);
+          setError(null);
+        }
         return;
       }
 
@@ -64,15 +69,23 @@ export function useSpeechTextRecord<TRecord extends SpeechTextRecordBase>(
 
       try {
         const nextRecord = await getRecord(recordId);
+        if (requestSequence !== requestSequenceRef.current) {
+          return;
+        }
         setRecord(nextRecord);
         setError(null);
       } catch (err) {
+        if (requestSequence !== requestSequenceRef.current) {
+          return;
+        }
         if (!background || !hasVisibleRecord) {
           setRecord(null);
         }
         setError(err instanceof Error ? err.message : loadErrorMessage);
       } finally {
-        setLoading(false);
+        if (requestSequence === requestSequenceRef.current) {
+          setLoading(false);
+        }
       }
     },
     [getRecord, loadErrorMessage, recordId],
@@ -88,6 +101,10 @@ export function useSpeechTextRecord<TRecord extends SpeechTextRecordBase>(
     setLoading(Boolean(recordId));
     setError(null);
     void loadRecord(false);
+
+    return () => {
+      requestSequenceRef.current += 1;
+    };
   }, [loadRecord, recordId]);
 
   const pollingRequired = useMemo(

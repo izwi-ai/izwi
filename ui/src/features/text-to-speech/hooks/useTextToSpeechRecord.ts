@@ -17,6 +17,7 @@ export function useTextToSpeechRecord(
   const [loading, setLoading] = useState(Boolean(recordId));
   const [error, setError] = useState<string | null>(null);
   const recordRef = useRef<SpeechHistoryRecord | null>(null);
+  const requestSequenceRef = useRef(0);
 
   useEffect(() => {
     recordRef.current = record;
@@ -24,10 +25,14 @@ export function useTextToSpeechRecord(
 
   const loadRecord = useCallback(
     async (background = false) => {
+      const requestSequence = ++requestSequenceRef.current;
+
       if (!recordId) {
-        setRecord(null);
-        setLoading(false);
-        setError(null);
+        if (requestSequence === requestSequenceRef.current) {
+          setRecord(null);
+          setLoading(false);
+          setError(null);
+        }
         return;
       }
 
@@ -39,9 +44,15 @@ export function useTextToSpeechRecord(
 
       try {
         const nextRecord = await api.getTextToSpeechRecord(recordId);
+        if (requestSequence !== requestSequenceRef.current) {
+          return;
+        }
         setRecord(nextRecord);
         setError(null);
       } catch (err) {
+        if (requestSequence !== requestSequenceRef.current) {
+          return;
+        }
         if (!background || !hasVisibleRecord) {
           setRecord(null);
         }
@@ -51,7 +62,9 @@ export function useTextToSpeechRecord(
             : "Failed to load text-to-speech record.",
         );
       } finally {
-        setLoading(false);
+        if (requestSequence === requestSequenceRef.current) {
+          setLoading(false);
+        }
       }
     },
     [recordId],
@@ -67,6 +80,10 @@ export function useTextToSpeechRecord(
     setLoading(Boolean(recordId));
     setError(null);
     void loadRecord(false);
+
+    return () => {
+      requestSequenceRef.current += 1;
+    };
   }, [loadRecord, recordId]);
 
   const pollingRequired = useMemo(() => {
