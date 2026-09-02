@@ -389,9 +389,12 @@ export function StudioSegmentEditor({
           return (
             <div key={segment.id} className="space-y-4">
               <article className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4 sm:p-5">
-                <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-start">
+                <div className="space-y-3">
                   <div className="min-w-0 space-y-1.5">
-                    <div className="flex flex-wrap items-center gap-2 sm:flex-nowrap">
+                    <div
+                      data-testid={`studio-segment-metadata-${segment.id}`}
+                      className="flex flex-wrap items-center gap-2"
+                    >
                       <div className="inline-flex items-center">
                         <Switch
                           checked={isSelected}
@@ -430,13 +433,16 @@ export function StudioSegmentEditor({
                     </div>
                   </div>
 
-                  <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto sm:flex-nowrap sm:justify-end sm:gap-1.5 md:gap-2">
+                  <div
+                    data-testid={`studio-segment-actions-${segment.id}`}
+                    className="flex w-full flex-wrap items-center gap-2"
+                  >
                     <Button
                       variant="outline"
                       size="sm"
                       onClick={() => onSaveSegment(segment.id)}
                       disabled={!segmentDirty || isSaving}
-                      className="min-w-0 flex-1 basis-[calc(50%-0.25rem)] justify-center bg-[var(--bg-surface-0)] sm:basis-auto sm:flex-none"
+                      className="min-w-[8rem] flex-1 justify-center bg-[var(--bg-surface-0)]"
                     >
                       {isSaving ? (
                         <Loader2 className="h-4 w-4 animate-spin" />
@@ -449,7 +455,7 @@ export function StudioSegmentEditor({
                       size="sm"
                       onClick={() => onRenderSegment(segment.id)}
                       disabled={isRendering || segmentQueued}
-                      className="min-w-0 flex-1 basis-[calc(50%-0.25rem)] justify-center sm:basis-auto sm:flex-none"
+                      className="min-w-[8rem] flex-1 justify-center"
                     >
                       {isRendering ? (
                         <Loader2 className="h-4 w-4 animate-spin" />
@@ -462,12 +468,12 @@ export function StudioSegmentEditor({
                       variant="outline"
                       size="icon"
                       onClick={() => onOpenSegmentSettings(segment.id)}
-                      className="order-2 ml-auto h-9 w-9 bg-[var(--bg-surface-0)] sm:order-none sm:ml-0"
+                      className="ml-auto h-9 w-9 bg-[var(--bg-surface-0)]"
                       aria-label={`Open settings for segment ${segment.position + 1}`}
                     >
                       <Settings className="h-4 w-4" />
                     </Button>
-                    <div className="order-2 sm:order-none">
+                    <div>
                       <SegmentActionsMenu
                         segment={segment}
                         isFirst={isFirst}

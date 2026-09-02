@@ -2854,7 +2854,7 @@ export function StudioWorkspace({
                     {queuedRenderCount} queued · {failedRenderCount} failed
                   </div>
 
-                  <div className="space-y-2 xl:max-h-[320px] xl:overflow-y-auto xl:pr-1">
+                  <div className="space-y-2 min-[1800px]:max-h-[320px] min-[1800px]:overflow-y-auto min-[1800px]:pr-1">
                     {activeProjectQueueItems.length === 0 ? (
                       <div className="rounded-xl border border-dashed border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-xs text-[var(--text-muted)]">
                         No queued renders for this project.
