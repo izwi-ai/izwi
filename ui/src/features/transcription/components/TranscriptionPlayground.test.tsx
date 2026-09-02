@@ -429,7 +429,7 @@ describe("TranscriptionPlayground history", () => {
 
     expect(screen.queryByText("Latest input")).not.toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: /Qwen3 ASR 0.6B/i }),
+      screen.getByRole("combobox", { name: /Qwen3 ASR 0.6B/i }),
     ).toHaveClass("bg-[var(--bg-surface-0)]");
 
     fireEvent.click(screen.getByRole("button", { name: /History/i }));

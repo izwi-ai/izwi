@@ -1,16 +1,19 @@
-import { useEffect, useMemo, useRef, useState, type ComponentProps } from "react";
-import { AnimatePresence, motion } from "framer-motion";
+import { useId, useMemo, type ComponentProps } from "react";
+import * as SelectPrimitive from "@radix-ui/react-select";
 import {
   AlertTriangle,
   ArrowDownToLine,
   Check,
   CheckCircle2,
-  ChevronDown,
   CircleDashed,
   Loader2,
 } from "lucide-react";
 
-import { Button } from "@/components/ui/button";
+import {
+  Select,
+  SelectContent,
+  SelectTrigger,
+} from "@/components/ui/select";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { cn } from "@/lib/utils";
 
@@ -19,6 +22,7 @@ interface RouteModelSelectOption {
   label: string;
   statusLabel: string;
   isReady: boolean;
+  disabled?: boolean;
 }
 
 interface RouteModelSelectProps {
@@ -30,6 +34,8 @@ interface RouteModelSelectProps {
   triggerClassName?: string;
   disabled?: boolean;
   menuPlacement?: "top" | "bottom";
+  "aria-label"?: string;
+  description?: string;
 }
 
 function getStatusTone(
@@ -101,9 +107,10 @@ export function RouteModelSelect({
   triggerClassName,
   disabled = false,
   menuPlacement = "bottom",
+  "aria-label": ariaLabel,
+  description,
 }: RouteModelSelectProps) {
-  const [isOpen, setIsOpen] = useState(false);
-  const containerRef = useRef<HTMLDivElement>(null);
+  const descriptionId = useId();
 
   const selectedOption = useMemo(
     () => options.find((option) => option.value === value) ?? null,
@@ -113,135 +120,121 @@ export function RouteModelSelect({
     ? getStatusPresentation(selectedOption)
     : null;
 
-  useEffect(() => {
-    const handlePointerDown = (event: MouseEvent) => {
-      if (
-        containerRef.current &&
-        event.target instanceof Node &&
-        !containerRef.current.contains(event.target)
-      ) {
-        setIsOpen(false);
-      }
-    };
-
-    window.addEventListener("mousedown", handlePointerDown);
-    return () => window.removeEventListener("mousedown", handlePointerDown);
-  }, []);
+  const accessibleDescription =
+    description ??
+    (selectedOption
+      ? `${selectedOption.label}. Status: ${selectedOption.statusLabel}.`
+      : `${placeholder}.`);
 
   return (
-    <div ref={containerRef} className={cn("relative", className)}>
-      <Button
-        type="button"
-        variant="outline"
-        onClick={() => {
-          if (!disabled && options.length > 0) {
-            setIsOpen((current) => !current);
-          }
-        }}
+    <div className={cn("relative", className)}>
+      <Select
+        value={value ?? ""}
+        onValueChange={(nextValue) => onSelect?.(nextValue)}
         disabled={disabled || options.length === 0}
-        className={cn(
-          "w-full justify-between rounded-[var(--radius-md)] border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3.5 font-normal text-[var(--text-primary)] shadow-[var(--shadow-soft)] transition-[border-color,background-color,box-shadow] hover:border-[var(--border-strong)] hover:bg-[var(--bg-surface-1)]",
-          triggerClassName ?? "h-10",
-          isOpen && "border-ring/50 ring-2 ring-ring/35",
-        )}
       >
-        <div className="min-w-0 flex flex-1 items-center gap-2">
-          {selectedStatus ? (
-            <selectedStatus.icon
-              className={cn(
-                "h-3.5 w-3.5 shrink-0",
-                selectedStatus.className,
-                selectedOption?.statusLabel.toLowerCase().includes("loading") &&
-                  "animate-spin",
-              )}
-            />
-          ) : null}
-          <span
-            className="min-w-0 flex-1 truncate text-left text-sm font-medium text-[var(--text-primary)]"
-            title={selectedOption?.label || placeholder}
-          >
-            {selectedOption?.label || placeholder}
-          </span>
-        </div>
-        <ChevronDown
+        <SelectTrigger
+          aria-label={ariaLabel ?? selectedOption?.label ?? placeholder}
+          aria-describedby={descriptionId}
           className={cn(
-            "h-3.5 w-3.5 shrink-0 text-[var(--text-muted)] transition-transform",
-            isOpen && "rotate-180",
+            "w-full rounded-[var(--radius-md)] border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3.5 font-normal text-[var(--text-primary)] shadow-[var(--shadow-soft)] transition-[border-color,background-color,box-shadow] hover:border-[var(--border-strong)] hover:bg-[var(--bg-surface-1)] data-[state=open]:border-ring/50 data-[state=open]:ring-2 data-[state=open]:ring-ring/35",
+            triggerClassName ?? "h-10",
           )}
-        />
-      </Button>
+        >
+          <div className="min-w-0 flex flex-1 items-center gap-2">
+            {selectedStatus ? (
+              <selectedStatus.icon
+                aria-hidden="true"
+                className={cn(
+                  "h-3.5 w-3.5 shrink-0",
+                  selectedStatus.className,
+                  selectedOption?.statusLabel.toLowerCase().includes("loading") &&
+                    "animate-spin",
+                )}
+              />
+            ) : null}
+            <span
+              className="min-w-0 flex-1 truncate text-left text-sm font-medium text-[var(--text-primary)]"
+              title={selectedOption?.label || placeholder}
+            >
+              {selectedOption?.label || placeholder}
+            </span>
+          </div>
+        </SelectTrigger>
 
-      <AnimatePresence>
-        {isOpen ? (
-          <motion.div
-            initial={{ opacity: 0, y: 6, scale: 0.98 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, y: 6, scale: 0.98 }}
-            transition={{ duration: 0.16 }}
-            className={cn(
-              "absolute left-0 z-[90] min-w-full max-w-[min(36rem,calc(100vw-2rem))] rounded-[var(--radius-lg)] border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-1.5 shadow-[var(--shadow-overlay)]",
-              menuPlacement === "top" ? "bottom-[calc(100%+8px)]" : "top-[calc(100%+8px)]",
-            )}
-          >
-            <div className="max-h-72 overflow-y-auto">
-              {options.map((option) => (
-                <button
-                  key={option.value}
-                  type="button"
-                  onClick={() => {
-                    onSelect?.(option.value);
-                    setIsOpen(false);
-                  }}
-                  className={cn(
-                    "relative flex min-w-[18rem] items-start gap-3 rounded-[var(--radius-sm)] px-3 py-2.5 text-left transition-colors hover:bg-[var(--bg-surface-1)]",
-                    selectedOption?.value === option.value &&
-                      "bg-[var(--bg-surface-1)]",
-                  )}
-                  title={option.label}
-                >
-                  <div className="flex min-w-0 flex-1 items-start gap-2.5">
-                    <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)]">
-                      {(() => {
-                        const status = getStatusPresentation(option);
-                        const StatusIcon = status.icon;
-                        return (
-                          <StatusIcon
-                            className={cn(
-                              "h-4 w-4",
-                              status.className,
-                              option.statusLabel.toLowerCase().includes("loading") &&
-                                "animate-spin",
-                            )}
-                          />
-                        );
-                      })()}
+        <SelectContent
+          position="popper"
+          side={menuPlacement}
+          sideOffset={8}
+          className="z-[90] max-h-72 min-w-[18rem] max-w-[min(36rem,calc(100vw-2rem))] p-1.5"
+        >
+          {options.map((option) => (
+            <SelectPrimitive.Item
+              key={option.value}
+              value={option.value}
+              disabled={option.disabled}
+              textValue={option.label}
+              className={cn(
+                "relative flex min-w-[18rem] cursor-default select-none items-start rounded-[var(--radius-sm)] py-2.5 pl-3 pr-9 text-left outline-none transition-colors focus:bg-[var(--bg-surface-1)] focus:text-[var(--text-primary)] data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
+                selectedOption?.value === option.value &&
+                  "bg-[var(--bg-surface-1)]",
+              )}
+              title={option.label}
+            >
+              <SelectPrimitive.ItemText>
+                <span className="sr-only">
+                  {option.label}. Status: {option.statusLabel}.
+                </span>
+              </SelectPrimitive.ItemText>
+              <div aria-hidden="true" className="flex w-full min-w-0 items-start gap-3">
+                <div className="flex min-w-0 flex-1 items-start gap-2.5">
+                  <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)]">
+                    {(() => {
+                      const status = getStatusPresentation(option);
+                      const StatusIcon = status.icon;
+                      return (
+                        <StatusIcon
+                          aria-hidden="true"
+                          className={cn(
+                            "h-4 w-4",
+                            status.className,
+                            option.statusLabel.toLowerCase().includes("loading") &&
+                              "animate-spin",
+                          )}
+                        />
+                      );
+                    })()}
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="text-sm font-medium leading-5 text-[var(--text-primary)] break-words">
+                      {option.label}
                     </div>
-                    <div className="min-w-0 flex-1">
-                      <div className="text-sm font-medium leading-5 text-[var(--text-primary)] break-words">
-                        {option.label}
-                      </div>
-                      <div className="mt-1 text-xs text-[var(--text-muted)]">
-                        {option.statusLabel}
-                      </div>
+                    <div className="mt-1 text-xs text-[var(--text-muted)]">
+                      {option.statusLabel}
                     </div>
                   </div>
-                  {selectedOption?.value === option.value ? (
-                    <div className="flex shrink-0 items-center gap-2 pl-2">
-                      <StatusBadge
-                        tone={getStatusTone(option)}
-                        className="px-2 py-0.5 text-[9px] tracking-[0.14em]"
-                      >
-                        Current
-                      </StatusBadge>
-                      <Check className="h-3.5 w-3.5 shrink-0 text-[var(--text-primary)]" />
-                    </div>
-                  ) : null}
-                </button>
-              ))}
-            </div>
-          </motion.div>
-        ) : null}
-      </AnimatePresence>
+                </div>
+                {selectedOption?.value === option.value ? (
+                  <div aria-hidden="true" className="flex shrink-0 items-center gap-2 pl-2">
+                    <StatusBadge
+                      tone={getStatusTone(option)}
+                      className="px-2 py-0.5 text-[9px] tracking-[0.14em]"
+                    >
+                      Current
+                    </StatusBadge>
+                  </div>
+                ) : null}
+              </div>
+              <SelectPrimitive.ItemIndicator className="absolute right-3 top-3.5">
+                <Check aria-hidden="true" className="h-4 w-4" />
+              </SelectPrimitive.ItemIndicator>
+            </SelectPrimitive.Item>
+          ))}
+        </SelectContent>
+      </Select>
+      <span id={descriptionId} className="sr-only">
+        {accessibleDescription}
+      </span>
     </div>
   );
 }

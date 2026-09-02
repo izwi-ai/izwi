@@ -79,10 +79,17 @@ describe("ChatPlayground", () => {
     await waitFor(() => expect(apiMocks.listChatThreads).toHaveBeenCalled());
 
     fireEvent.click(
-      screen.getByRole("button", { name: "Qwen3 0.6B GGUF (Q8_0)" }),
+      screen.getByRole("combobox", { name: "Qwen3 0.6B GGUF (Q8_0)" }),
     );
 
-    expect(await screen.findByText("Gemma 3 1B")).toBeInTheDocument();
+    const gemmaOption = await screen.findByRole("option", {
+      name: /Gemma 3 1B/,
+    });
+    expect(gemmaOption).toBeInTheDocument();
+    fireEvent.keyDown(document.activeElement ?? gemmaOption, { key: "Escape" });
+    await waitFor(() =>
+      expect(screen.queryByRole("listbox")).not.toBeInTheDocument(),
+    );
 
     const sendButton = screen.getByRole("button", { name: "Send message" });
     expect(sendButton).toBeInTheDocument();
