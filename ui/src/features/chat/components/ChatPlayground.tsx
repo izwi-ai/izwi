@@ -1484,7 +1484,12 @@ export function ChatPlayground({
                 {renderComposer(true)}
               </motion.div>
 
-              <div className="mt-4 text-center text-xs text-muted-foreground min-h-[18px]">
+              <div
+                className="mt-4 text-center text-xs text-muted-foreground min-h-[18px]"
+                role="status"
+                aria-live="polite"
+                aria-atomic="true"
+              >
                 {!activeThreadId ? (
                   <span>
                     No active chat selected. Start typing and send to create a
@@ -1508,6 +1513,9 @@ export function ChatPlayground({
               <AnimatePresence>
                 {error && (
                   <motion.div
+                    role="alert"
+                    aria-live="assertive"
+                    aria-atomic="true"
                     initial={{ opacity: 0, height: 0 }}
                     animate={{ opacity: 1, height: "auto" }}
                     exit={{ opacity: 0, height: 0 }}
@@ -1529,7 +1537,11 @@ export function ChatPlayground({
                 className="h-full overflow-y-auto px-4 sm:px-6 pb-48 pt-3 scrollbar-thin"
               >
                 {messagesLoading ? (
-                  <div className="max-w-4xl mx-auto p-4 text-center text-xs text-muted-foreground flex items-center justify-center gap-2">
+                  <div
+                    className="max-w-4xl mx-auto p-4 text-center text-xs text-muted-foreground flex items-center justify-center gap-2"
+                    role="status"
+                    aria-live="polite"
+                  >
                     <Loader2 className="w-4 h-4 animate-spin" />
                     Loading conversation...
                   </div>
@@ -1775,6 +1787,9 @@ export function ChatPlayground({
                   <AnimatePresence>
                     {error && (
                       <motion.div
+                        role="alert"
+                        aria-live="assertive"
+                        aria-atomic="true"
                         initial={{ opacity: 0, height: 0, y: 10 }}
                         animate={{ opacity: 1, height: "auto", y: 0 }}
                         exit={{ opacity: 0, height: 0, y: 10 }}

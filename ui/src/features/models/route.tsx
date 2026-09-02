@@ -479,7 +479,14 @@ export function MyModelsPage({
 
                       <div className="flex items-center justify-between mt-auto pt-3 border-t border-[var(--border-muted)]/50">
                         <div className="text-xs font-medium">
-                          <span className={getStatusTextClass(model.status)}>
+                          <span
+                            className={getStatusTextClass(model.status)}
+                            role={model.status === "error" ? "alert" : "status"}
+                            aria-live={
+                              model.status === "error" ? "assertive" : "polite"
+                            }
+                            aria-atomic="true"
+                          >
                             {model.status === "not_downloaded"
                               ? "Not downloaded"
                               : model.status === "downloading"
