@@ -51,6 +51,18 @@ function revokeObjectUrlIfNeeded(url: string | null): void {
   }
 }
 
+interface ActiveRecording {
+  generation: number;
+  recorder: MediaRecorder;
+  stream: MediaStream;
+  chunks: Blob[];
+  submitOnStop: boolean;
+}
+
+function stopMediaStream(stream: MediaStream): void {
+  stream.getTracks().forEach((track) => track.stop());
+}
+
 interface DiarizationPlaygroundProps {
   selectedModel: string | null;
   selectedModelReady?: boolean;
@@ -120,9 +132,37 @@ export function DiarizationPlayground({
   const [minSpeechMs, setMinSpeechMs] = useState("240");
   const [minSilenceMs, setMinSilenceMs] = useState("200");
 
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const audioChunksRef = useRef<Blob[]>([]);
+  const activeRecordingRef = useRef<ActiveRecording | null>(null);
+  const recordingGenerationRef = useRef(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const discardActiveRecording = useCallback(() => {
+    recordingGenerationRef.current += 1;
+    const activeRecording = activeRecordingRef.current;
+    if (!activeRecording) {
+      return;
+    }
+
+    activeRecordingRef.current = null;
+    activeRecording.submitOnStop = false;
+    activeRecording.recorder.ondataavailable = null;
+    activeRecording.recorder.onstop = null;
+    try {
+      if (activeRecording.recorder.state !== "inactive") {
+        activeRecording.recorder.stop();
+      }
+    } catch {
+      // The stream still needs to be released if the recorder is already closed.
+    }
+    stopMediaStream(activeRecording.stream);
+  }, []);
+
+  useEffect(
+    () => () => {
+      discardActiveRecording();
+    },
+    [discardActiveRecording],
+  );
 
   const requireReadyModel = useCallback(() => {
     if (!selectedModel || !selectedModelReady) {
@@ -306,15 +346,22 @@ export function DiarizationPlayground({
     setLatestRecord(null);
     setSpeakerTranscript("");
     setWorkspaceTab("transcript");
-      setSpeakerUpdateError(null);
-      setRerunError(null);
-      setSummaryRefreshError(null);
-      setSummaryRefreshPendingId(null);
-      setCopied(false);
-      setError(null);
+    setSpeakerUpdateError(null);
+    setRerunError(null);
+    setSummaryRefreshError(null);
+    setSummaryRefreshPendingId(null);
+    setCopied(false);
+    setError(null);
+    const recordingGeneration = ++recordingGenerationRef.current;
+    let stream: MediaStream | null = null;
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (recordingGeneration !== recordingGenerationRef.current) {
+        stopMediaStream(stream);
+        return;
+      }
+
       let mediaRecorder: MediaRecorder | null = null;
       const mimeCandidates = [
         "audio/webm;codecs=opus",
@@ -330,41 +377,79 @@ export function DiarizationPlayground({
       if (!mediaRecorder) {
         mediaRecorder = new MediaRecorder(stream);
       }
-      mediaRecorderRef.current = mediaRecorder;
-      audioChunksRef.current = [];
+
+      const activeRecording: ActiveRecording = {
+        generation: recordingGeneration,
+        recorder: mediaRecorder,
+        stream,
+        chunks: [],
+        submitOnStop: true,
+      };
+      activeRecordingRef.current = activeRecording;
 
       mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          audioChunksRef.current.push(event.data);
+        if (
+          activeRecordingRef.current === activeRecording &&
+          event.data.size > 0
+        ) {
+          activeRecording.chunks.push(event.data);
         }
       };
 
       mediaRecorder.onstop = async () => {
-        const audioBlob = new Blob(audioChunksRef.current, {
-          type: mediaRecorder?.mimeType || "audio/webm",
+        if (
+          activeRecordingRef.current !== activeRecording ||
+          !activeRecording.submitOnStop
+        ) {
+          return;
+        }
+
+        activeRecordingRef.current = null;
+        mediaRecorder.ondataavailable = null;
+        mediaRecorder.onstop = null;
+        stopMediaStream(activeRecording.stream);
+        setIsRecording(false);
+        const audioBlob = new Blob(activeRecording.chunks, {
+          type: mediaRecorder.mimeType || "audio/webm",
         });
-        stream.getTracks().forEach((track) => track.stop());
         await processAudio(audioBlob);
       };
 
       mediaRecorder.start();
       setIsRecording(true);
     } catch {
-      setError("Could not access microphone. Please grant permission.");
+      const shouldReportError =
+        recordingGeneration === recordingGenerationRef.current;
+      const activeRecording = activeRecordingRef.current;
+      if (activeRecording?.generation === recordingGeneration) {
+        discardActiveRecording();
+      } else if (stream) {
+        stopMediaStream(stream);
+      }
+      if (shouldReportError) {
+        setError("Could not access microphone. Please grant permission.");
+      }
     }
   }, [
     audioUrl,
+    discardActiveRecording,
     processAudio,
     requireReadyModel,
     requireReadyPipelineModels,
   ]);
 
   const stopRecording = useCallback(() => {
-    if (mediaRecorderRef.current && isRecording) {
-      mediaRecorderRef.current.stop();
+    const activeRecording = activeRecordingRef.current;
+    if (activeRecording && isRecording) {
+      try {
+        activeRecording.recorder.stop();
+      } catch {
+        discardActiveRecording();
+        setError("Could not finish the microphone recording. Please try again.");
+      }
       setIsRecording(false);
     }
-  }, [isRecording]);
+  }, [discardActiveRecording, isRecording]);
 
   const handleFileUpload = async (
     event: React.ChangeEvent<HTMLInputElement>,
@@ -392,6 +477,8 @@ export function DiarizationPlayground({
   }, [requireReadyModel, requireReadyPipelineModels]);
 
   const handleReset = () => {
+    discardActiveRecording();
+    setIsRecording(false);
     revokeObjectUrlIfNeeded(audioUrl);
     setSpeakerTranscript("");
     setIsDiarizationSessionActive(false);

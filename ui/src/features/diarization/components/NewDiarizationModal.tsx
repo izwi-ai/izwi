@@ -68,6 +68,18 @@ interface SubmitAudioOptions {
   filename?: string;
 }
 
+interface ActiveRecording {
+  generation: number;
+  recorder: MediaRecorder;
+  stream: MediaStream;
+  chunks: Blob[];
+  submitOnStop: boolean;
+}
+
+function stopMediaStream(stream: MediaStream): void {
+  stream.getTracks().forEach((track) => track.stop());
+}
+
 const DIARIZATION_MODEL_REQUIRED_ERROR =
   "Select and load a diarization model before creating a run.";
 const CLASSIC_PIPELINE_REQUIRED_ERROR =
@@ -99,8 +111,8 @@ export function NewDiarizationModal({
   onCreated,
 }: NewDiarizationModalProps) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const audioChunksRef = useRef<Blob[]>([]);
+  const activeRecordingRef = useRef<ActiveRecording | null>(null);
+  const recordingGenerationRef = useRef(0);
   const uploadAbortRef = useRef<AbortController | null>(null);
 
   const [minSpeakers, setMinSpeakers] = useState("1");
@@ -114,6 +126,41 @@ export function NewDiarizationModal({
   const [uploadState, setUploadState] =
     useState<SpeechTextUploadState | null>(null);
   const isGranitePipeline = pipelineMode === "granite";
+
+  const discardActiveRecording = useCallback(() => {
+    recordingGenerationRef.current += 1;
+    const activeRecording = activeRecordingRef.current;
+    if (!activeRecording) {
+      return;
+    }
+
+    activeRecordingRef.current = null;
+    activeRecording.submitOnStop = false;
+    activeRecording.recorder.ondataavailable = null;
+    activeRecording.recorder.onstop = null;
+    try {
+      if (activeRecording.recorder.state !== "inactive") {
+        activeRecording.recorder.stop();
+      }
+    } catch {
+      // The stream still needs to be released if the recorder is already closed.
+    }
+    stopMediaStream(activeRecording.stream);
+  }, []);
+
+  useEffect(() => {
+    if (!isOpen) {
+      discardActiveRecording();
+      setIsRecording(false);
+    }
+  }, [discardActiveRecording, isOpen]);
+
+  useEffect(
+    () => () => {
+      discardActiveRecording();
+    },
+    [discardActiveRecording],
+  );
 
   const updateUploadProgress = useCallback((progress: UploadProgressInfo) => {
     setUploadState((current) => {
@@ -135,6 +182,8 @@ export function NewDiarizationModal({
   }, []);
 
   const handleCancelUpload = useCallback(() => {
+    discardActiveRecording();
+    setIsRecording(false);
     uploadAbortRef.current?.abort();
     uploadAbortRef.current = null;
     setUploadState((current) =>
@@ -147,7 +196,7 @@ export function NewDiarizationModal({
         : current,
     );
     setIsSubmitting(false);
-  }, []);
+  }, [discardActiveRecording]);
 
   const requireReadyModel = useCallback(() => {
     if (!selectedModel || !selectedModelReady) {
@@ -393,9 +442,16 @@ export function NewDiarizationModal({
     }
 
     setError(null);
+    const recordingGeneration = ++recordingGenerationRef.current;
+    let stream: MediaStream | null = null;
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (recordingGeneration !== recordingGenerationRef.current) {
+        stopMediaStream(stream);
+        return;
+      }
+
       let mediaRecorder: MediaRecorder | null = null;
       const mimeCandidates = [
         "audio/webm;codecs=opus",
@@ -411,36 +467,78 @@ export function NewDiarizationModal({
       if (!mediaRecorder) {
         mediaRecorder = new MediaRecorder(stream);
       }
-      mediaRecorderRef.current = mediaRecorder;
-      audioChunksRef.current = [];
+
+      const activeRecording: ActiveRecording = {
+        generation: recordingGeneration,
+        recorder: mediaRecorder,
+        stream,
+        chunks: [],
+        submitOnStop: true,
+      };
+      activeRecordingRef.current = activeRecording;
 
       mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          audioChunksRef.current.push(event.data);
+        if (
+          activeRecordingRef.current === activeRecording &&
+          event.data.size > 0
+        ) {
+          activeRecording.chunks.push(event.data);
         }
       };
 
       mediaRecorder.onstop = async () => {
-        const audioBlob = new Blob(audioChunksRef.current, {
-          type: mediaRecorder?.mimeType || "audio/webm",
+        if (
+          activeRecordingRef.current !== activeRecording ||
+          !activeRecording.submitOnStop
+        ) {
+          return;
+        }
+
+        activeRecordingRef.current = null;
+        mediaRecorder.ondataavailable = null;
+        mediaRecorder.onstop = null;
+        stopMediaStream(activeRecording.stream);
+        setIsRecording(false);
+        const audioBlob = new Blob(activeRecording.chunks, {
+          type: mediaRecorder.mimeType || "audio/webm",
         });
-        stream.getTracks().forEach((track) => track.stop());
         await submitAudio(audioBlob);
       };
 
       mediaRecorder.start();
       setIsRecording(true);
     } catch {
-      setError("Could not access microphone. Please grant permission.");
+      const shouldReportError =
+        recordingGeneration === recordingGenerationRef.current;
+      const activeRecording = activeRecordingRef.current;
+      if (activeRecording?.generation === recordingGeneration) {
+        discardActiveRecording();
+      } else if (stream) {
+        stopMediaStream(stream);
+      }
+      if (shouldReportError) {
+        setError("Could not access microphone. Please grant permission.");
+      }
     }
-  }, [requireReadyModel, requireReadyPipelineModels, submitAudio]);
+  }, [
+    discardActiveRecording,
+    requireReadyModel,
+    requireReadyPipelineModels,
+    submitAudio,
+  ]);
 
   const handleStopRecording = useCallback(() => {
-    if (mediaRecorderRef.current && isRecording) {
-      mediaRecorderRef.current.stop();
+    const activeRecording = activeRecordingRef.current;
+    if (activeRecording && isRecording) {
+      try {
+        activeRecording.recorder.stop();
+      } catch {
+        discardActiveRecording();
+        setError("Could not finish the microphone recording. Please try again.");
+      }
       setIsRecording(false);
     }
-  }, [isRecording]);
+  }, [discardActiveRecording, isRecording]);
 
   const allManagedModelsReady =
     managedModelCount > 0 && readyManagedModelCount === managedModelCount;

@@ -776,4 +776,73 @@ describe("DiarizationPlayground speaker corrections", () => {
       });
     }
   });
+
+  it("releases microphone capture on unmount and ignores a late onstop", async () => {
+    class LifecycleMediaRecorder {
+      static instance: LifecycleMediaRecorder | null = null;
+
+      static isTypeSupported(mimeType: string): boolean {
+        return mimeType.startsWith("audio/webm");
+      }
+
+      readonly mimeType = "audio/webm";
+      state: RecordingState = "inactive";
+      ondataavailable: ((event: { data: Blob }) => void) | null = null;
+      onstop: (() => void | Promise<void>) | null = null;
+      stop = vi.fn(() => {
+        this.state = "inactive";
+        void this.onstop?.();
+      });
+
+      constructor() {
+        LifecycleMediaRecorder.instance = this;
+      }
+
+      start(): void {
+        this.state = "recording";
+      }
+    }
+
+    const stopTrack = vi.fn();
+    const getUserMediaMock = vi.fn(async () => ({
+      getTracks: () => [{ stop: stopTrack }],
+    }) as unknown as MediaStream);
+    const originalMediaDevices = navigator.mediaDevices;
+
+    vi.stubGlobal("MediaRecorder", LifecycleMediaRecorder);
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: { getUserMedia: getUserMediaMock },
+    });
+
+    try {
+      const view = render(
+        <DiarizationPlayground
+          selectedModel="diar_streaming_sortformer_4spk-v2.1"
+          selectedModelReady
+          onModelRequired={vi.fn()}
+          pipelineAsrModelId="Parakeet-TDT-0.6B-v3"
+          pipelineAlignerModelId="Qwen3-ForcedAligner-0.6B"
+          pipelineModelsReady
+        />,
+      );
+
+      fireEvent.click(screen.getByRole("button", { name: /record audio/i }));
+      await waitFor(() => expect(LifecycleMediaRecorder.instance).not.toBeNull());
+      const recorder = LifecycleMediaRecorder.instance!;
+      const lateOnStop = recorder.onstop;
+
+      view.unmount();
+
+      expect(recorder.stop).toHaveBeenCalledTimes(1);
+      expect(stopTrack).toHaveBeenCalledTimes(1);
+      await lateOnStop?.();
+      expect(apiMocks.createDiarizationRecord).not.toHaveBeenCalled();
+    } finally {
+      Object.defineProperty(navigator, "mediaDevices", {
+        configurable: true,
+        value: originalMediaDevices,
+      });
+    }
+  });
 });
