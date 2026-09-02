@@ -113,6 +113,12 @@ jobs:
       - name: Install UI dependencies (for Tauri beforeBuildCommand)
         run: npm ci --prefix ui
 
+      - name: Lint UI
+        run: npm --prefix ui run lint
+
+      - name: Test UI
+        run: npm --prefix ui test
+
       - name: Build UI dist (required by izwi-desktop compile-time Tauri config)
         run: npm --prefix ui run build
 

@@ -138,17 +138,14 @@ export function TranscriptionReviewWorkspace({
     () => summaryModelGuidance?.trim() || null,
     [summaryModelGuidance],
   );
-  const summaryUpdatedLabel = useMemo(() => {
-    if (!record?.summary_updated_at) {
-      return null;
-    }
-    return new Date(record.summary_updated_at).toLocaleString([], {
-      month: "short",
-      day: "numeric",
-      hour: "numeric",
-      minute: "2-digit",
-    });
-  }, [record?.summary_updated_at]);
+  const summaryUpdatedLabel = record?.summary_updated_at
+    ? new Date(record.summary_updated_at).toLocaleString([], {
+        month: "short",
+        day: "numeric",
+        hour: "numeric",
+        minute: "2-digit",
+      })
+    : null;
 
   const viewerDuration = useMemo(() => {
     const transcriptDuration = transcriptEntries.reduce(

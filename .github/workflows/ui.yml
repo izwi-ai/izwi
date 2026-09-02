@@ -1,0 +1,56 @@
+name: UI Quality
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/ui.yml"
+      - ".github/workflows/release.yml"
+      - "ui/**"
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - ".github/workflows/ui.yml"
+      - ".github/workflows/release.yml"
+      - "ui/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ui-quality-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Typecheck, Lint, Test, and Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --prefix ui
+
+      - name: Typecheck
+        run: npm --prefix ui run typecheck
+
+      - name: Lint
+        run: npm --prefix ui run lint
+
+      - name: Test
+        run: npm --prefix ui test
+
+      - name: Build
+        run: npm --prefix ui run build
