@@ -195,13 +195,20 @@ export function TextToSpeechRecordDetail({
       </div>
 
       {error ? (
-        <Card className="border-[var(--danger-border)] bg-[var(--danger-bg)] p-4 text-sm text-[var(--danger-text)]">
+        <Card
+          className="border-[var(--danger-border)] bg-[var(--danger-bg)] p-4 text-sm text-[var(--danger-text)]"
+          role="alert"
+          aria-live="assertive"
+        >
           {error}
         </Card>
       ) : null}
 
       {statusMessage ? (
         <Card
+          role={processingStatus === "failed" ? "alert" : "status"}
+          aria-live={processingStatus === "failed" ? "assertive" : "polite"}
+          aria-atomic="true"
           className={
             processingStatus === "failed"
               ? "border-[var(--danger-border)] bg-[var(--danger-bg)] p-4 text-sm text-[var(--danger-text)]"
@@ -224,7 +231,13 @@ export function TextToSpeechRecordDetail({
           Audio
         </h3>
         {loading ? (
-          <p className="mt-3 text-sm text-[var(--text-muted)]">Loading record...</p>
+          <p
+            className="mt-3 text-sm text-[var(--text-muted)]"
+            role="status"
+            aria-live="polite"
+          >
+            Loading record...
+          </p>
         ) : hasAudio ? (
           <audio src={audioUrl || undefined} className="mt-3 h-11 w-full" controls />
         ) : (
@@ -304,7 +317,11 @@ export function TextToSpeechRecordDetail({
           </div>
 
           {deleteError ? (
-            <div className="mt-4 rounded-md border border-[var(--danger-border)] bg-[var(--danger-bg)] px-3 py-2 text-xs text-[var(--danger-text)]">
+            <div
+              className="mt-4 rounded-md border border-[var(--danger-border)] bg-[var(--danger-bg)] px-3 py-2 text-xs text-[var(--danger-text)]"
+              role="alert"
+              aria-live="assertive"
+            >
               {deleteError}
             </div>
           ) : null}

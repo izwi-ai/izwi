@@ -1,5 +1,5 @@
-import { useEffect, useState, type CSSProperties } from "react";
-import { NavLink, Outlet } from "react-router-dom";
+import { useEffect, useRef, useState, type CSSProperties } from "react";
+import { NavLink, Outlet, useLocation } from "react-router-dom";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   Mic,
@@ -18,6 +18,7 @@ import {
   Settings,
   Download,
   RotateCcw,
+  TriangleAlert,
   X,
 } from "lucide-react";
 import {
@@ -27,19 +28,34 @@ import {
 } from "@/shared/config/runtime";
 import { trackThemePreferenceChanged } from "@/app/analytics/events";
 import { useAppUpdates } from "@/app/providers/AppUpdateProvider";
+import { RouteErrorBoundary } from "@/app/router/RouteErrorBoundary";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { StatePanel } from "@/components/ui/state-panel";
 import { FirstRunOnboarding } from "@/app/onboarding/FirstRunOnboarding";
 
 const appIconUrl = APP_ICON_URL;
 const APP_VERSION_LABEL = `v${APP_VERSION}`;
+const DESKTOP_NAVIGATION_QUERY = "(min-width: 1024px)";
+
+function isDesktopNavigationLayout() {
+  if (typeof window === "undefined") {
+    return true;
+  }
+  if (typeof window.matchMedia === "function") {
+    return window.matchMedia(DESKTOP_NAVIGATION_QUERY).matches;
+  }
+  return window.innerWidth >= 1024;
+}
 
 interface LayoutProps {
   readyModelsCount: number;
   selectedModelLabel: string | null;
+  catalogError: string | null;
   resolvedTheme: "light" | "dark";
   themePreference: "system" | "light" | "dark";
   onThemePreferenceChange: (preference: "system" | "light" | "dark") => void;
+  onRetryModelCatalog: () => Promise<void>;
 }
 
 interface NavItem {
@@ -156,11 +172,20 @@ const BOTTOM_NAV_ITEMS: NavItem[] = [
 export function AppLayout({
   readyModelsCount,
   selectedModelLabel,
+  catalogError,
   resolvedTheme,
   themePreference,
   onThemePreferenceChange,
+  onRetryModelCatalog,
 }: LayoutProps) {
+  const location = useLocation();
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [isDesktopNavigation, setIsDesktopNavigation] = useState(
+    isDesktopNavigationLayout,
+  );
+  const [isRetryingModelCatalog, setIsRetryingModelCatalog] = useState(false);
+  const mobileMenuTriggerRef = useRef<HTMLButtonElement>(null);
+  const sidebarRef = useRef<HTMLElement>(null);
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(() => {
     if (typeof window === "undefined") {
       return false;
@@ -174,6 +199,49 @@ export function AppLayout({
       isSidebarCollapsed ? "1" : "0",
     );
   }, [isSidebarCollapsed]);
+
+  useEffect(() => {
+    if (typeof window.matchMedia !== "function") {
+      return;
+    }
+
+    const mediaQuery = window.matchMedia(DESKTOP_NAVIGATION_QUERY);
+    const handleLayoutChange = (event: MediaQueryListEvent) => {
+      setIsDesktopNavigation(event.matches);
+      if (event.matches) {
+        setMobileMenuOpen(false);
+      }
+    };
+
+    setIsDesktopNavigation(mediaQuery.matches);
+    mediaQuery.addEventListener("change", handleLayoutChange);
+    return () => mediaQuery.removeEventListener("change", handleLayoutChange);
+  }, []);
+
+  const sidebarInteractive = isDesktopNavigation || mobileMenuOpen;
+
+  useEffect(() => {
+    const sidebar = sidebarRef.current;
+    if (!sidebar) {
+      return;
+    }
+
+    if (sidebarInteractive) {
+      sidebar.removeAttribute("inert");
+    } else {
+      sidebar.setAttribute("inert", "");
+    }
+  }, [sidebarInteractive]);
+
+  useEffect(() => {
+    if (!mobileMenuOpen || isDesktopNavigation) {
+      return;
+    }
+
+    sidebarRef.current
+      ?.querySelector<HTMLElement>("[data-app-nav-link]")
+      ?.focus();
+  }, [isDesktopNavigation, mobileMenuOpen]);
 
   const loadedText =
     readyModelsCount > 0
@@ -197,14 +265,70 @@ export function AppLayout({
     restartToApply,
   } = useAppUpdates();
 
-  const handleNavClick = (path: string) => {
+  const closeMobileMenu = () => {
     setMobileMenuOpen(false);
+    mobileMenuTriggerRef.current?.focus();
+  };
+
+  const handleNavClick = (path: string) => {
+    if (isDesktopNavigation) {
+      setMobileMenuOpen(false);
+    } else {
+      closeMobileMenu();
+    }
     if (
       path === "/chat" &&
       typeof window !== "undefined" &&
       window.innerWidth >= 1024
     ) {
       setIsSidebarCollapsed(true);
+    }
+  };
+
+  const handleSidebarKeyDown = (event: React.KeyboardEvent<HTMLElement>) => {
+    if (isDesktopNavigation || !mobileMenuOpen) {
+      return;
+    }
+
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeMobileMenu();
+      return;
+    }
+
+    if (event.key !== "Tab") {
+      return;
+    }
+
+    const focusableElements = Array.from(
+      sidebarRef.current?.querySelectorAll<HTMLElement>(
+        'a[href], button:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      ) ?? [],
+    ).filter((element) => element.tabIndex >= 0);
+    const firstFocusable = focusableElements[0];
+    const lastFocusable = focusableElements[focusableElements.length - 1];
+
+    if (!firstFocusable || !lastFocusable) {
+      return;
+    }
+    if (event.shiftKey && document.activeElement === firstFocusable) {
+      event.preventDefault();
+      lastFocusable.focus();
+    } else if (!event.shiftKey && document.activeElement === lastFocusable) {
+      event.preventDefault();
+      firstFocusable.focus();
+    }
+  };
+
+  const handleRetryModelCatalog = async () => {
+    if (isRetryingModelCatalog) {
+      return;
+    }
+    setIsRetryingModelCatalog(true);
+    try {
+      await onRetryModelCatalog();
+    } finally {
+      setIsRetryingModelCatalog(false);
     }
   };
 
@@ -234,6 +358,12 @@ export function AppLayout({
               variant="outline"
               size="icon"
               onClick={switchTheme}
+              aria-label={
+                resolvedTheme === "dark"
+                  ? "Switch to light mode"
+                  : "Switch to dark mode"
+              }
+              data-testid="mobile-theme-toggle"
               className="h-8 w-8 rounded-lg"
               title={
                 resolvedTheme === "dark"
@@ -248,9 +378,18 @@ export function AppLayout({
               )}
             </Button>
             <Button
+              ref={mobileMenuTriggerRef}
               variant="ghost"
               size="icon"
-              onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
+              onClick={() =>
+                mobileMenuOpen ? closeMobileMenu() : setMobileMenuOpen(true)
+              }
+              aria-label={
+                mobileMenuOpen ? "Close navigation" : "Open navigation"
+              }
+              aria-expanded={mobileMenuOpen}
+              aria-controls="app-sidebar-navigation"
+              data-testid="mobile-navigation-trigger"
               className="h-8 w-8 rounded-lg"
             >
               <Menu className="w-5 h-5 text-foreground" />
@@ -266,7 +405,8 @@ export function AppLayout({
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            onClick={() => setMobileMenuOpen(false)}
+            onClick={closeMobileMenu}
+            aria-hidden="true"
             className="lg:hidden fixed inset-0 bg-background/68 backdrop-blur-sm z-40"
           />
         )}
@@ -274,6 +414,13 @@ export function AppLayout({
 
       {/* Sidebar */}
       <aside
+        ref={sidebarRef}
+        aria-hidden={sidebarInteractive ? undefined : true}
+        aria-label={!isDesktopNavigation && mobileMenuOpen ? "Main navigation" : undefined}
+        aria-modal={!isDesktopNavigation && mobileMenuOpen ? true : undefined}
+        role={!isDesktopNavigation && mobileMenuOpen ? "dialog" : undefined}
+        onKeyDown={handleSidebarKeyDown}
+        data-testid="app-sidebar"
         className={cn(
           "w-[16rem] border-r border-border/40 flex flex-col fixed h-full z-50 bg-background/95 backdrop-blur-xl transition-all duration-300",
           "lg:translate-x-0",
@@ -322,6 +469,11 @@ export function AppLayout({
             variant="ghost"
             size="icon"
             onClick={() => setIsSidebarCollapsed((collapsed) => !collapsed)}
+            aria-label={isSidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+            aria-expanded={!isSidebarCollapsed}
+            aria-controls="app-sidebar-navigation"
+            data-testid="sidebar-collapse-toggle"
+            tabIndex={isDesktopNavigation ? undefined : -1}
             className="h-8 w-8 rounded-md text-muted-foreground hover:text-foreground"
             title={isSidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
           >
@@ -330,7 +482,11 @@ export function AppLayout({
         </div>
 
         {/* Navigation */}
-        <nav className="flex-1 px-3 py-4 overflow-y-auto flex flex-col scrollbar-thin gap-6">
+        <nav
+          id="app-sidebar-navigation"
+          aria-label="Primary"
+          className="flex-1 px-3 py-4 overflow-y-auto flex flex-col scrollbar-thin gap-6"
+        >
           <div className="space-y-1">
             <h4
               className={cn(
@@ -346,6 +502,8 @@ export function AppLayout({
                 to={item.path}
                 title={isSidebarCollapsed ? item.label : undefined}
                 onClick={() => handleNavClick(item.path)}
+                data-app-nav-link
+                tabIndex={sidebarInteractive ? undefined : -1}
                 className={({ isActive }) =>
                   cn(
                     "sidebar-link flex items-center rounded-lg border transition-all group",
@@ -408,6 +566,8 @@ export function AppLayout({
                 to={item.path}
                 title={isSidebarCollapsed ? item.label : undefined}
                 onClick={() => handleNavClick(item.path)}
+                data-app-nav-link
+                tabIndex={sidebarInteractive ? undefined : -1}
                 className={({ isActive }) =>
                   cn(
                     "sidebar-link flex items-center rounded-lg border transition-all group",
@@ -463,6 +623,8 @@ export function AppLayout({
                 to={item.path}
                 title={isSidebarCollapsed ? item.label : undefined}
                 onClick={() => handleNavClick(item.path)}
+                data-app-nav-link
+                tabIndex={sidebarInteractive ? undefined : -1}
                 className={({ isActive }) =>
                   cn(
                     "sidebar-link flex items-center rounded-lg border transition-all group",
@@ -586,6 +748,8 @@ export function AppLayout({
                 href="https://github.com/izwi-ai/izwi"
                 target="_blank"
                 rel="noopener noreferrer"
+                aria-label="Izwi on GitHub"
+                tabIndex={sidebarInteractive ? undefined : -1}
                 className="rounded-md p-1 text-muted-foreground hover:text-foreground transition-colors hover:bg-accent"
                 title="Izwi on GitHub"
               >
@@ -616,6 +780,12 @@ export function AppLayout({
                 variant="outline"
                 size="sm"
                 onClick={switchTheme}
+                aria-label={
+                  resolvedTheme === "dark"
+                    ? "Switch to light mode"
+                    : "Switch to dark mode"
+                }
+                data-testid="desktop-theme-toggle"
                 className="gap-2 rounded-full px-4 bg-card/65 backdrop-blur-sm"
                 title={
                   resolvedTheme === "dark"
@@ -646,7 +816,30 @@ export function AppLayout({
 
         {/* Page content */}
         <main className="flex-1 overflow-y-auto w-full p-6 sm:p-8 lg:px-12 lg:pb-12 lg:pt-8 flex flex-col">
-          <Outlet />
+          {catalogError ? (
+            <div role="alert" className="mb-5 shrink-0">
+              <StatePanel
+                title="Model service unavailable"
+                description={catalogError}
+                icon={TriangleAlert}
+                tone="danger"
+                actions={
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    disabled={isRetryingModelCatalog}
+                    onClick={() => void handleRetryModelCatalog()}
+                  >
+                    {isRetryingModelCatalog ? "Retrying…" : "Retry models"}
+                  </Button>
+                }
+              />
+            </div>
+          ) : null}
+          <RouteErrorBoundary key={location.pathname}>
+            <Outlet />
+          </RouteErrorBoundary>
         </main>
       </div>
       {isPromptOpen && availableUpdate ? (

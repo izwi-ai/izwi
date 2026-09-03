@@ -1,5 +1,4 @@
 import clsx from "clsx";
-import { AnimatePresence, motion } from "framer-motion";
 import {
   AlertTriangle,
   CheckCircle2,
@@ -10,8 +9,14 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ModelInfo } from "@/api";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import {
   getModelProviderLabel,
   PROVIDER_ORDER,
@@ -146,6 +151,9 @@ function requiresManualDownload(variant: string): boolean {
   return variant === "Gemma-3-1b-it";
 }
 
+const MANUAL_GEMMA_DOWNLOAD_GUIDE =
+  "https://github.com/izwi-ai/izwi/blob/main/docs/user/models/manual-gemma-3-1b-download.md";
+
 export function RouteModelModal({
   isOpen,
   onClose,
@@ -172,6 +180,8 @@ export function RouteModelModal({
   const [deleteTargetVariant, setDeleteTargetVariant] = useState<string | null>(
     null,
   );
+  const returnFocusRef = useRef<HTMLElement | null>(null);
+  const deleteReturnFocusRef = useRef<HTMLButtonElement | null>(null);
 
   useEffect(() => {
     if (!isOpen) {
@@ -213,45 +223,44 @@ export function RouteModelModal({
   };
 
   return (
-    <AnimatePresence>
-      {isOpen && (
-        <motion.div
-          className={clsx(
-            "fixed inset-0 pointer-events-auto bg-black/70 p-4 backdrop-blur-sm sm:p-6",
-            zIndexClassName,
-          )}
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          exit={{ opacity: 0 }}
-          onClick={onClose}
-        >
-          <motion.div
-            initial={{ y: 16, opacity: 0, scale: 0.98 }}
-            animate={{ y: 0, opacity: 1, scale: 1 }}
-            exit={{ y: 16, opacity: 0, scale: 0.98 }}
-            transition={{ duration: 0.2 }}
-            className="mx-auto flex max-h-[90vh] max-w-4xl flex-col overflow-hidden rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)]"
-            onClick={(event) => event.stopPropagation()}
-          >
-            <div className="flex items-center justify-between gap-3 border-b border-[var(--border-muted)] px-4 py-4 sm:px-5">
-              <div>
-                <h2 className="text-base font-semibold text-[var(--text-primary)]">
-                  {title}
-                </h2>
-                <p className="mt-1 text-xs text-[var(--text-muted)]">
-                  {description}
-                </p>
-              </div>
-              <button
-                className="flex items-center gap-1 rounded-md border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-2.5 py-1.5 text-xs text-[var(--text-muted)] transition-colors hover:text-[var(--text-primary)]"
-                onClick={onClose}
-              >
-                <X className="h-3.5 w-3.5" />
-                Close
-              </button>
-            </div>
+    <Dialog
+      open={isOpen}
+      onOpenChange={(open) => {
+        if (!open) {
+          onClose();
+        }
+      }}
+    >
+      <DialogContent
+        onOpenAutoFocus={() => {
+          returnFocusRef.current =
+            document.activeElement instanceof HTMLElement
+              ? document.activeElement
+              : null;
+        }}
+        onCloseAutoFocus={(event) => {
+          if (!returnFocusRef.current) {
+            return;
+          }
+          event.preventDefault();
+          returnFocusRef.current.focus();
+          returnFocusRef.current = null;
+        }}
+        className={clsx(
+          "flex max-w-4xl flex-col gap-0 overflow-hidden border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-0",
+          zIndexClassName,
+        )}
+      >
+        <div className="border-b border-[var(--border-muted)] px-4 py-4 pr-14 sm:px-5 sm:pr-14">
+          <DialogTitle className="text-base text-[var(--text-primary)]">
+            {title}
+          </DialogTitle>
+          <DialogDescription className="mt-1 text-xs text-[var(--text-muted)]">
+            {description}
+          </DialogDescription>
+        </div>
 
-            <div className="max-h-[calc(90vh-88px)] overflow-y-auto px-4 py-4 sm:px-5">
+            <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4 sm:px-5">
               {loading ? (
                 <div className="flex items-center gap-2 py-4 text-sm text-[var(--text-muted)]">
                   <Loader2 className="h-4 w-4 animate-spin" />
@@ -329,6 +338,8 @@ export function RouteModelModal({
                                   <div
                                     key={model.variant}
                                     data-testid={`route-model-row-${model.variant}`}
+                                    role="group"
+                                    aria-label={`${modelLabel}. Status: ${model.status.replace(/_/g, " ")}.`}
                                     className={clsx(
                                       "rounded-xl border px-3 py-2.5 transition-colors",
                                       isIntent
@@ -369,12 +380,13 @@ export function RouteModelModal({
                                         {model.status === "downloading" &&
                                           onCancelDownload && (
                                             <button
+                                              type="button"
                                               onClick={() =>
                                                 onCancelDownload(model.variant)
                                               }
                                               className="flex items-center gap-1 rounded-md border border-[var(--danger-border)] bg-[var(--danger-bg)] px-2.5 py-1.5 text-xs font-medium text-[var(--danger-text)] transition-colors hover:bg-[var(--danger-bg-hover)]"
                                             >
-                                              <X className="h-3.5 w-3.5" />
+                                              <X aria-hidden="true" className="h-3.5 w-3.5" />
                                               Cancel
                                             </button>
                                           )}
@@ -384,44 +396,49 @@ export function RouteModelModal({
                                           (requiresManualDownload(
                                             model.variant,
                                           ) ? (
-                                            <button
-                                              className="flex items-center gap-1.5 rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface-2)] px-3 py-1.5 text-xs font-medium text-[var(--text-muted)] disabled:cursor-not-allowed disabled:opacity-60"
-                                              disabled
-                                              title="Manual download required. See docs/user/manual-gemma-3-1b-download.md."
+                                            <a
+                                              href={MANUAL_GEMMA_DOWNLOAD_GUIDE}
+                                              target="_blank"
+                                              rel="noreferrer"
+                                              className="flex items-center gap-1.5 rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface-2)] px-3 py-1.5 text-xs font-medium text-[var(--text-muted)]"
+                                              aria-label={`Open manual download guide for ${modelLabel}`}
                                             >
-                                              <Download className="h-3.5 w-3.5" />
-                                              Manual download
-                                            </button>
+                                              <Download aria-hidden="true" className="h-3.5 w-3.5" />
+                                              Manual download guide
+                                            </a>
                                           ) : (
                                             <button
+                                              type="button"
                                               onClick={() =>
                                                 onDownload(model.variant)
                                               }
                                               className="flex items-center gap-1.5 rounded-md bg-[var(--accent-solid)] px-3 py-1.5 text-xs font-medium text-[var(--text-on-accent)] transition-opacity hover:opacity-90"
                                             >
-                                              <Download className="h-3.5 w-3.5" />
+                                              <Download aria-hidden="true" className="h-3.5 w-3.5" />
                                               Download
                                             </button>
                                           ))}
 
                                         {model.status === "downloaded" && (
                                           <button
+                                            type="button"
                                             onClick={() => onLoad(model.variant)}
                                             className="flex items-center gap-1.5 rounded-md bg-[var(--accent-solid)] px-3 py-1.5 text-xs font-medium text-[var(--text-on-accent)] transition-opacity hover:opacity-90"
                                           >
-                                            <Play className="h-3.5 w-3.5" />
+                                            <Play aria-hidden="true" className="h-3.5 w-3.5" />
                                             Load
                                           </button>
                                         )}
 
                                         {model.status === "loading" && (
                                           <button
+                                            type="button"
                                             onClick={() =>
                                               onUnload(model.variant)
                                             }
                                             className="flex items-center gap-1.5 rounded-md border border-[var(--danger-border)] bg-[var(--danger-bg)] px-3 py-1.5 text-xs font-medium text-[var(--danger-text)] transition-colors hover:bg-[var(--danger-bg-hover)]"
                                           >
-                                            <X className="h-3.5 w-3.5" />
+                                            <X aria-hidden="true" className="h-3.5 w-3.5" />
                                             Cancel load
                                           </button>
                                         )}
@@ -431,33 +448,36 @@ export function RouteModelModal({
                                           canSelect &&
                                           (isSelected ? (
                                             <button
+                                              type="button"
                                               className="flex items-center gap-1.5 rounded-md border border-[var(--border-muted)] bg-[var(--bg-surface-2)] px-3 py-1.5 text-xs font-medium text-[var(--text-muted)]"
                                               disabled
                                             >
-                                              <CheckCircle2 className="h-3.5 w-3.5" />
+                                              <CheckCircle2 aria-hidden="true" className="h-3.5 w-3.5" />
                                               Selected
                                             </button>
                                           ) : (
                                             <button
+                                              type="button"
                                               onClick={() => {
                                                 onUseModel(model.variant);
                                                 onClose();
                                               }}
                                               className="flex items-center gap-1.5 rounded-md bg-[var(--accent-solid)] px-3 py-1.5 text-xs font-medium text-[var(--text-on-accent)] transition-opacity hover:opacity-90"
                                             >
-                                              <CheckCircle2 className="h-3.5 w-3.5" />
+                                              <CheckCircle2 aria-hidden="true" className="h-3.5 w-3.5" />
                                               Use model
                                             </button>
                                           ))}
 
                                         {model.status === "ready" && (
                                           <button
+                                            type="button"
                                             onClick={() =>
                                               onUnload(model.variant)
                                             }
                                             className="flex items-center gap-1.5 rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface-2)] px-3 py-1.5 text-xs font-medium text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-surface-3)]"
                                           >
-                                            <Square className="h-3.5 w-3.5" />
+                                            <Square aria-hidden="true" className="h-3.5 w-3.5" />
                                             Unload
                                           </button>
                                         )}
@@ -465,11 +485,14 @@ export function RouteModelModal({
                                         {(model.status === "downloaded" ||
                                           model.status === "ready") && (
                                           <button
-                                            onClick={() =>
+                                            type="button"
+                                            onClick={(event) => {
+                                              deleteReturnFocusRef.current =
+                                                event.currentTarget;
                                               setDeleteTargetVariant(
                                                 model.variant,
-                                              )
-                                            }
+                                              );
+                                            }}
                                             className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-[var(--danger-border)] bg-[var(--danger-bg)] text-[var(--danger-text)] transition-colors hover:bg-[var(--danger-bg-hover)]"
                                             title="Delete model"
                                             aria-label={`Delete ${modelLabel}`}
@@ -491,40 +514,41 @@ export function RouteModelModal({
                 </div>
               )}
             </div>
-          </motion.div>
-
-          <AnimatePresence>
-            {deleteTargetModel && (
-              <motion.div
-                className="fixed inset-0 z-[60] bg-black/75 p-4 backdrop-blur-sm"
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                exit={{ opacity: 0 }}
-                onClick={() => setDeleteTargetVariant(null)}
-              >
-                <motion.div
-                  initial={{ y: 10, opacity: 0, scale: 0.98 }}
-                  animate={{ y: 0, opacity: 1, scale: 1 }}
-                  exit={{ y: 10, opacity: 0, scale: 0.98 }}
-                  transition={{ duration: 0.16 }}
-                  className="mx-auto mt-[18vh] max-w-md rounded-xl border border-[var(--border-strong)] bg-[var(--bg-surface-1)] p-5"
-                  onClick={(event) => event.stopPropagation()}
-                >
+        <Dialog
+          open={Boolean(deleteTargetModel)}
+          onOpenChange={(open) => {
+            if (!open) {
+              setDeleteTargetVariant(null);
+            }
+          }}
+        >
+          {deleteTargetModel ? (
+            <DialogContent
+              onCloseAutoFocus={(event) => {
+                if (!deleteReturnFocusRef.current?.isConnected) {
+                  return;
+                }
+                event.preventDefault();
+                deleteReturnFocusRef.current.focus();
+                deleteReturnFocusRef.current = null;
+              }}
+              className="z-[80] max-w-md gap-0 border-[var(--border-strong)] bg-[var(--bg-surface-1)] p-5"
+            >
                   <div className="flex items-start gap-3">
                     <div className="mt-0.5 rounded-full border border-[var(--danger-border)] bg-[var(--danger-bg)] p-2 text-[var(--danger-text)]">
-                      <AlertTriangle className="h-4 w-4" />
+                      <AlertTriangle aria-hidden="true" className="h-4 w-4" />
                     </div>
                     <div className="min-w-0 flex-1">
-                      <h3 className="text-sm font-semibold text-[var(--text-primary)]">
+                      <DialogTitle className="text-sm text-[var(--text-primary)]">
                         Delete model?
-                      </h3>
-                      <p className="mt-1 text-sm text-[var(--text-muted)]">
-                        This removes
+                      </DialogTitle>
+                      <DialogDescription className="mt-1 text-sm text-[var(--text-muted)]">
+                        This removes{" "}
                         <span className="mx-1 font-medium text-[var(--text-primary)]">
                           {resolveModelLabel(deleteTargetModel.variant)}
                         </span>
-                        from local storage.
-                      </p>
+                        {" "}from local storage.
+                      </DialogDescription>
                       <p className="mt-2 truncate text-xs text-[var(--text-subtle)]">
                         {deleteTargetModel.variant}
                       </p>
@@ -533,25 +557,25 @@ export function RouteModelModal({
 
                   <div className="mt-5 flex items-center justify-end gap-2">
                     <button
+                      type="button"
                       onClick={() => setDeleteTargetVariant(null)}
                       className="rounded-md border border-[var(--border-muted)] bg-[var(--bg-surface-2)] px-3 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-surface-3)]"
                     >
                       Cancel
                     </button>
                     <button
+                      type="button"
                       onClick={handleConfirmDelete}
                       className="flex items-center gap-1.5 rounded-md border border-[var(--danger-border)] bg-[var(--danger-bg)] px-3 py-1.5 text-xs font-medium text-[var(--danger-text)] transition-colors hover:bg-[var(--danger-bg-hover)]"
                     >
-                      <Trash2 className="h-3.5 w-3.5" />
+                      <Trash2 aria-hidden="true" className="h-3.5 w-3.5" />
                       Delete model
                     </button>
                   </div>
-                </motion.div>
-              </motion.div>
-            )}
-          </AnimatePresence>
-        </motion.div>
-      )}
-    </AnimatePresence>
+            </DialogContent>
+          ) : null}
+        </Dialog>
+      </DialogContent>
+    </Dialog>
   );
 }

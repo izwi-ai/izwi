@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ComponentProps } from "react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { NotificationProvider } from "@/app/providers/NotificationProvider";
@@ -106,6 +106,11 @@ const baseProps: TranscriptionPageTestProps = {
   onError: vi.fn(),
 };
 
+function LocationSearchProbe() {
+  const location = useLocation();
+  return <div data-testid="location-search">{location.search}</div>;
+}
+
 function renderRouteElement(
   initialEntry: string,
   props: TranscriptionPageTestProps = baseProps,
@@ -113,6 +118,7 @@ function renderRouteElement(
   return (
     <NotificationProvider>
       <MemoryRouter initialEntries={[initialEntry]}>
+        <LocationSearchProbe />
         <Routes>
           <Route
             path="/transcription"
@@ -464,7 +470,9 @@ describe("TranscriptionPage detail route", () => {
     const view = renderRoute("/transcription");
 
     try {
-      expect(await screen.findByText("Still transcribing...")).toBeInTheDocument();
+      expect(
+        await screen.findByText("Transcription is in progress."),
+      ).toBeInTheDocument();
 
       await waitFor(() => expect(setIntervalSpy).toHaveBeenCalled());
       if (intervalCallbacks.length === 0) {
@@ -477,7 +485,9 @@ describe("TranscriptionPage detail route", () => {
         expect(apiMocks.listTranscriptionRecords).toHaveBeenCalledTimes(2),
       );
 
-      expect(screen.getByText("Still transcribing...")).toBeInTheDocument();
+      expect(
+        screen.getByText("Transcription is in progress."),
+      ).toBeInTheDocument();
       expect(
         screen.queryByText("Loading speech-text history..."),
       ).not.toBeInTheDocument();
@@ -593,6 +603,23 @@ describe("TranscriptionPage detail route", () => {
     expect(screen.getByRole("radio", { name: "Diarization" })).toBeChecked();
     expect(screen.getByText("Choose how to start")).toBeInTheDocument();
     expect(screen.getByText("Model readiness")).toBeInTheDocument();
+  });
+
+  it("opens diarization creation directly from a deep-link intent", async () => {
+    renderRoute("/transcription?create=diarization");
+
+    expect(
+      await screen.findByRole("heading", { name: "New diarization" }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: "Diarization" })).toBeChecked();
+    expect(screen.getByTestId("location-search")).toHaveTextContent(
+      "?create=diarization",
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    await waitFor(() =>
+      expect(screen.getByTestId("location-search")).toBeEmptyDOMElement(),
+    );
   });
 
   it("shows NOT LOADED readiness state in transcription mode when required models are not ready", async () => {

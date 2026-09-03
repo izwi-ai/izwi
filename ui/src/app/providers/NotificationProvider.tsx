@@ -138,9 +138,13 @@ export function NotificationProvider({
           {notifications.map((notification) => {
             const config = toneConfig[notification.tone];
             const Icon = config.icon;
+            const isAssertive = notification.tone === "danger";
             return (
               <motion.div
                 key={notification.id}
+                role={isAssertive ? "alert" : "status"}
+                aria-live={isAssertive ? "assertive" : "polite"}
+                aria-atomic="true"
                 initial={{ opacity: 0, y: -8, scale: 0.98 }}
                 animate={{ opacity: 1, y: 0, scale: 1 }}
                 exit={{ opacity: 0, y: -8, scale: 0.98 }}
@@ -170,6 +174,7 @@ export function NotificationProvider({
                     size="icon"
                     className="h-8 w-8 shrink-0 rounded-full"
                     onClick={() => dismiss(notification.id)}
+                    aria-label={`Dismiss ${notification.title} notification`}
                   >
                     <X className="h-4 w-4" />
                   </Button>

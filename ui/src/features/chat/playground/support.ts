@@ -77,6 +77,7 @@ export interface PendingImageAttachment {
   id: string;
   source: string;
   label: string;
+  previewUrl?: string;
 }
 
 export interface GenerateTitleArgs {

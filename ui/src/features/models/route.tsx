@@ -139,6 +139,9 @@ function requiresManualDownload(variant: string): boolean {
   return variant === "Gemma-3-1b-it";
 }
 
+const MANUAL_GEMMA_DOWNLOAD_GUIDE =
+  "https://github.com/izwi-ai/izwi/blob/main/docs/user/models/manual-gemma-3-1b-download.md";
+
 export function MyModelsPage({
   models,
   loading,
@@ -476,7 +479,14 @@ export function MyModelsPage({
 
                       <div className="flex items-center justify-between mt-auto pt-3 border-t border-[var(--border-muted)]/50">
                         <div className="text-xs font-medium">
-                          <span className={getStatusTextClass(model.status)}>
+                          <span
+                            className={getStatusTextClass(model.status)}
+                            role={model.status === "error" ? "alert" : "status"}
+                            aria-live={
+                              model.status === "error" ? "assertive" : "polite"
+                            }
+                            aria-atomic="true"
+                          >
                             {model.status === "not_downloaded"
                               ? "Not downloaded"
                               : model.status === "downloading"
@@ -495,14 +505,16 @@ export function MyModelsPage({
                         <div className="flex items-center gap-2">
                           {model.status === "not_downloaded" &&
                             (requiresManualDownload(model.variant) ? (
-                              <button
-                                className="flex items-center gap-1.5 rounded-lg border border-[var(--border-strong)] bg-[var(--bg-surface-2)] px-3 py-1.5 text-xs font-medium text-[var(--text-muted)] disabled:cursor-not-allowed disabled:opacity-60"
-                                disabled
-                                title="Manual download required. See docs/user/manual-gemma-3-1b-download.md."
+                              <a
+                                href={MANUAL_GEMMA_DOWNLOAD_GUIDE}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="flex items-center gap-1.5 rounded-lg border border-[var(--border-strong)] bg-[var(--bg-surface-2)] px-3 py-1.5 text-xs font-medium text-[var(--text-muted)]"
+                                aria-label={`Open manual download guide for ${displayName}`}
                               >
-                                <Download className="h-3.5 w-3.5" />
-                                Manual DL
-                              </button>
+                                <Download aria-hidden="true" className="h-3.5 w-3.5" />
+                                Manual download guide
+                              </a>
                             ) : (
                               <button
                                 onClick={() => onDownload(model.variant)}

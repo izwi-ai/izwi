@@ -110,7 +110,12 @@ function ProcessingProgressCard({
   const detail = progressDetailLabel(progress);
 
   return (
-    <Card className="border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] p-4 text-sm text-[var(--status-warning-text)]">
+    <Card
+      className="border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] p-4 text-sm text-[var(--status-warning-text)]"
+      role="status"
+      aria-live="polite"
+      aria-atomic="true"
+    >
       <div className="flex items-start gap-3">
         <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin" />
         <div className="min-w-0 flex-1">
@@ -297,7 +302,11 @@ export function TranscriptionRecordDetail({
       alerts={
         <>
           {error ? (
-            <Card className="border-[var(--danger-border)] bg-[var(--danger-bg)] p-4 text-sm text-[var(--danger-text)]">
+            <Card
+              className="border-[var(--danger-border)] bg-[var(--danger-bg)] p-4 text-sm text-[var(--danger-text)]"
+              role="alert"
+              aria-live="assertive"
+            >
               {error}
             </Card>
           ) : null}
@@ -307,7 +316,11 @@ export function TranscriptionRecordDetail({
           ) : null}
 
           {statusMessage ? (
-            <Card className="border-[var(--danger-border)] bg-[var(--danger-bg)] p-4 text-sm text-[var(--danger-text)]">
+            <Card
+              className="border-[var(--danger-border)] bg-[var(--danger-bg)] p-4 text-sm text-[var(--danger-text)]"
+              role="alert"
+              aria-live="assertive"
+            >
               <div className="flex items-start gap-3">
                 <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
                 <p>{statusMessage}</p>
@@ -316,7 +329,11 @@ export function TranscriptionRecordDetail({
           ) : null}
 
           {saaWarning ? (
-            <Card className="border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] p-4 text-sm text-[var(--status-warning-text)]">
+            <Card
+              className="border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] p-4 text-sm text-[var(--status-warning-text)]"
+              role="status"
+              aria-live="polite"
+            >
               <div className="flex items-start gap-3">
                 <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
                 <p>{saaWarning}</p>
@@ -325,7 +342,11 @@ export function TranscriptionRecordDetail({
           ) : null}
 
           {summaryRefreshError ? (
-            <Card className="border-[var(--danger-border)] bg-[var(--danger-bg)] p-4 text-sm text-[var(--danger-text)]">
+            <Card
+              className="border-[var(--danger-border)] bg-[var(--danger-bg)] p-4 text-sm text-[var(--danger-text)]"
+              role="alert"
+              aria-live="assertive"
+            >
               {summaryRefreshError}
             </Card>
           ) : null}
@@ -375,7 +396,11 @@ export function TranscriptionRecordDetail({
           </div>
 
           {deleteError ? (
-            <div className="mt-4 rounded-md border border-[var(--danger-border)] bg-[var(--danger-bg)] px-3 py-2 text-xs text-[var(--danger-text)]">
+            <div
+              className="mt-4 rounded-md border border-[var(--danger-border)] bg-[var(--danger-bg)] px-3 py-2 text-xs text-[var(--danger-text)]"
+              role="alert"
+              aria-live="assertive"
+            >
               {deleteError}
             </div>
           ) : null}

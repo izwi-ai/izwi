@@ -37,6 +37,12 @@ export type UpdateStatus =
   | "downloaded"
   | "error";
 
+export type UpdaterCapabilityStatus =
+  | "unsupported"
+  | "loading"
+  | "ready"
+  | "error";
+
 interface AppUpdateContextValue {
   availableUpdate: AppUpdateMetadata | null;
   status: UpdateStatus;
@@ -45,6 +51,9 @@ interface AppUpdateContextValue {
   isPromptOpen: boolean;
   progressPercent: number | null;
   health: UpdaterHealthStatus | null;
+  updaterSupported: boolean;
+  capabilityStatus: UpdaterCapabilityStatus;
+  refreshUpdaterCapability: () => Promise<boolean>;
   checkForUpdates: (manual?: boolean) => Promise<void>;
   installUpdate: () => Promise<void>;
   restartToApply: () => Promise<void>;
@@ -60,6 +69,7 @@ interface AppUpdateProviderProps {
 
 export function AppUpdateProvider({ children }: AppUpdateProviderProps) {
   const { notify } = useNotifications();
+  const updaterSupported = isTauri();
   const [availableUpdate, setAvailableUpdate] = useState<AppUpdateMetadata | null>(
     null,
   );
@@ -69,6 +79,10 @@ export function AppUpdateProvider({ children }: AppUpdateProviderProps) {
   const [isPromptOpen, setIsPromptOpen] = useState(false);
   const [progressPercent, setProgressPercent] = useState<number | null>(null);
   const [health, setHealth] = useState<UpdaterHealthStatus | null>(null);
+  const [capabilityStatus, setCapabilityStatus] =
+    useState<UpdaterCapabilityStatus>(
+      updaterSupported ? "loading" : "unsupported",
+    );
   const statusRef = useRef<UpdateStatus>("idle");
   const healthRef = useRef<UpdaterHealthStatus | null>(null);
 
@@ -80,9 +94,38 @@ export function AppUpdateProvider({ children }: AppUpdateProviderProps) {
     healthRef.current = health;
   }, [health]);
 
+  const refreshUpdaterCapability = useCallback(async () => {
+    if (!updaterSupported) {
+      healthRef.current = null;
+      setHealth(null);
+      setCapabilityStatus("unsupported");
+      return false;
+    }
+
+    setCapabilityStatus("loading");
+    try {
+      const snapshot = await getUpdaterHealthSnapshot();
+      if (!snapshot) {
+        healthRef.current = null;
+        setHealth(null);
+        setCapabilityStatus("error");
+        return false;
+      }
+      healthRef.current = snapshot;
+      setHealth(snapshot);
+      setCapabilityStatus("ready");
+      return true;
+    } catch {
+      healthRef.current = null;
+      setHealth(null);
+      setCapabilityStatus("error");
+      return false;
+    }
+  }, [updaterSupported]);
+
   const checkForUpdates = useCallback(
     async (manual = false) => {
-      if (!isTauri()) {
+      if (!updaterSupported) {
         return;
       }
       const currentHealth = healthRef.current;
@@ -159,17 +202,18 @@ export function AppUpdateProvider({ children }: AppUpdateProviderProps) {
         }
       }
     },
-    [notify],
+    [notify, updaterSupported],
   );
 
   const installUpdate = useCallback(async () => {
-    if (!availableUpdate || !isTauri()) {
+    if (!availableUpdate || !updaterSupported) {
       return;
     }
-    if (status === "downloading") {
+    if (statusRef.current === "downloading") {
       return;
     }
 
+    statusRef.current = "downloading";
     setStatus("downloading");
     setErrorMessage(null);
     setProgressPercent(0);
@@ -213,6 +257,7 @@ export function AppUpdateProvider({ children }: AppUpdateProviderProps) {
       }
 
       setStatus("downloaded");
+      statusRef.current = "downloaded";
       setIsPromptOpen(true);
       notify({
         title: "Update installed",
@@ -222,6 +267,7 @@ export function AppUpdateProvider({ children }: AppUpdateProviderProps) {
     } catch (error) {
       const message =
         error instanceof Error ? error.message : "Unknown update-install error.";
+      statusRef.current = "available";
       setStatus("available");
       setErrorMessage(message);
       void trackUpdateInstallFailed(message);
@@ -231,7 +277,7 @@ export function AppUpdateProvider({ children }: AppUpdateProviderProps) {
         tone: "warning",
       });
     }
-  }, [availableUpdate, notify, status]);
+  }, [availableUpdate, notify, updaterSupported]);
 
   const restartToApply = useCallback(async () => {
     await relaunchAfterUpdate();
@@ -249,21 +295,15 @@ export function AppUpdateProvider({ children }: AppUpdateProviderProps) {
   }, []);
 
   useEffect(() => {
-    if (!isTauri()) {
+    if (!updaterSupported) {
       return;
     }
 
-    getUpdaterHealthSnapshot()
-      .then((snapshot) => {
-        healthRef.current = snapshot;
-        setHealth(snapshot);
-      })
-      .catch(() => {
-        healthRef.current = null;
-        setHealth(null);
-      });
-
-    void checkForUpdates(false);
+    void refreshUpdaterCapability().then((available) => {
+      if (available) {
+        void checkForUpdates(false);
+      }
+    });
     const timer = window.setInterval(() => {
       void checkForUpdates(false);
     }, UPDATE_CHECK_INTERVAL_MS);
@@ -271,7 +311,7 @@ export function AppUpdateProvider({ children }: AppUpdateProviderProps) {
     return () => {
       window.clearInterval(timer);
     };
-  }, [checkForUpdates]);
+  }, [checkForUpdates, refreshUpdaterCapability, updaterSupported]);
 
   const value = useMemo<AppUpdateContextValue>(
     () => ({
@@ -282,6 +322,9 @@ export function AppUpdateProvider({ children }: AppUpdateProviderProps) {
       isPromptOpen,
       progressPercent,
       health,
+      updaterSupported,
+      capabilityStatus,
+      refreshUpdaterCapability,
       checkForUpdates,
       installUpdate,
       restartToApply,
@@ -296,6 +339,9 @@ export function AppUpdateProvider({ children }: AppUpdateProviderProps) {
       isPromptOpen,
       progressPercent,
       health,
+      updaterSupported,
+      capabilityStatus,
+      refreshUpdaterCapability,
       checkForUpdates,
       installUpdate,
       restartToApply,

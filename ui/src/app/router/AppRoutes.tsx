@@ -4,11 +4,15 @@ import {
   Route,
   Routes,
   useLocation,
+  useParams,
 } from "react-router-dom";
 import { routeIdFromPathname, trackRouteViewed } from "@/app/analytics/events";
 import { AppLayout } from "@/app/layouts/AppLayout";
 import { useModelCatalog } from "@/app/providers/ModelCatalogProvider";
 import { useTheme } from "@/app/providers/ThemeProvider";
+import { DocumentTitle } from "@/app/router/DocumentTitle";
+import { NotFoundPage } from "@/app/router/NotFoundPage";
+import { legacyDiarizationTarget } from "@/app/router/routePresentation";
 import type {
   ModelsRouteProps,
   SharedPageProps,
@@ -83,6 +87,18 @@ function withSuspense(children: ReactNode) {
   return <Suspense fallback={<RouteLoadingFallback />}>{children}</Suspense>;
 }
 
+function LegacyDiarizationRedirect() {
+  const { recordId } = useParams<{ recordId?: string }>();
+  const location = useLocation();
+
+  return (
+    <Navigate
+      to={legacyDiarizationTarget(recordId, location.search)}
+      replace
+    />
+  );
+}
+
 export function AppRoutes() {
   const location = useLocation();
   const hasTrackedInitialRouteRef = useRef(false);
@@ -91,6 +107,7 @@ export function AppRoutes() {
     models,
     selectedModel,
     loading,
+    catalogError,
     downloadProgress,
     readyModelsCount,
     selectModel,
@@ -144,7 +161,6 @@ export function AppRoutes() {
   const selectedModelLabel =
     models.find((model) => model.variant === selectedModel)?.variant ??
     selectedModel;
-
   useEffect(() => {
     if (!hasTrackedInitialRouteRef.current) {
       hasTrackedInitialRouteRef.current = true;
@@ -158,87 +174,103 @@ export function AppRoutes() {
   }, [location.pathname]);
 
   return (
-    <Routes>
-      <Route
-        element={
-          <AppLayout
-            readyModelsCount={readyModelsCount}
-            selectedModelLabel={selectedModelLabel}
-            resolvedTheme={resolvedTheme}
-            themePreference={themePreference}
-            onThemePreferenceChange={setThemePreference}
+    <>
+      <DocumentTitle />
+      <Routes>
+        <Route
+          element={
+            <AppLayout
+              readyModelsCount={readyModelsCount}
+              selectedModelLabel={selectedModelLabel}
+              catalogError={catalogError}
+              resolvedTheme={resolvedTheme}
+              themePreference={themePreference}
+              onThemePreferenceChange={setThemePreference}
+              onRetryModelCatalog={refreshModels}
+            />
+          }
+        >
+          <Route
+            path="/text-to-speech"
+            element={withSuspense(<TextToSpeechPage {...pageProps} />)}
           />
-        }
-      >
-        <Route
-          path="/text-to-speech"
-          element={withSuspense(<TextToSpeechPage {...pageProps} />)}
-        />
-        <Route
-          path="/text-to-speech/:recordId"
-          element={withSuspense(<TextToSpeechPage {...pageProps} />)}
-        />
-        <Route
-          path="/studio"
-          element={withSuspense(<StudioPage {...pageProps} />)}
-        />
-        <Route
-          path="/studio/:projectId"
-          element={withSuspense(<StudioPage {...pageProps} />)}
-        />
-        {VOICE_STUDIO_ENABLED ? (
-          <>
-            <Route
-              path="/voices"
-              element={withSuspense(<VoiceStudioPage {...pageProps} />)}
-            />
-            <Route
-              path="/voice-cloning"
-              element={<Navigate to="/voices?tab=clone" replace />}
-            />
-            <Route
-              path="/voice-design"
-              element={<Navigate to="/voices?tab=design" replace />}
-            />
-          </>
-        ) : (
-          <>
-            <Route
-              path="/voice-cloning"
-              element={withSuspense(<VoiceCloningPage {...pageProps} />)}
-            />
-            <Route
-              path="/voice-design"
-              element={withSuspense(<VoiceDesignPage {...pageProps} />)}
-            />
-            <Route
-              path="/voices"
-              element={withSuspense(<VoicesPage {...pageProps} />)}
-            />
-          </>
-        )}
-        <Route
-          path="/transcription"
-          element={withSuspense(<SpeechTextPage {...pageProps} />)}
-        />
-        <Route
-          path="/transcription/:recordId"
-          element={withSuspense(<SpeechTextPage {...pageProps} />)}
-        />
-        <Route path="/chat" element={withSuspense(<ChatPage {...pageProps} />)} />
-        <Route
-          path="/voice"
-          element={withSuspense(<VoicePage {...voicePageProps} />)}
-        />
-        <Route
-          path="/models"
-          element={withSuspense(<MyModelsPage {...modelsPageProps} />)}
-        />
-        <Route path="/settings" element={withSuspense(<SettingsPage />)} />
-        <Route path="/my-models" element={<Navigate to="/models" replace />} />
-        <Route path="/" element={<Navigate to="/voice" replace />} />
-        <Route path="*" element={<Navigate to="/voice" replace />} />
-      </Route>
-    </Routes>
+          <Route
+            path="/text-to-speech/:recordId"
+            element={withSuspense(<TextToSpeechPage {...pageProps} />)}
+          />
+          <Route
+            path="/studio"
+            element={withSuspense(<StudioPage {...pageProps} />)}
+          />
+          <Route
+            path="/studio/:projectId"
+            element={withSuspense(<StudioPage {...pageProps} />)}
+          />
+          {VOICE_STUDIO_ENABLED ? (
+            <>
+              <Route
+                path="/voices"
+                element={withSuspense(<VoiceStudioPage {...pageProps} />)}
+              />
+              <Route
+                path="/voice-cloning"
+                element={<Navigate to="/voices?tab=clone" replace />}
+              />
+              <Route
+                path="/voice-design"
+                element={<Navigate to="/voices?tab=design" replace />}
+              />
+            </>
+          ) : (
+            <>
+              <Route
+                path="/voice-cloning"
+                element={withSuspense(<VoiceCloningPage {...pageProps} />)}
+              />
+              <Route
+                path="/voice-design"
+                element={withSuspense(<VoiceDesignPage {...pageProps} />)}
+              />
+              <Route
+                path="/voices"
+                element={withSuspense(<VoicesPage {...pageProps} />)}
+              />
+            </>
+          )}
+          <Route
+            path="/transcription"
+            element={withSuspense(<SpeechTextPage {...pageProps} />)}
+          />
+          <Route
+            path="/transcription/:recordId"
+            element={withSuspense(<SpeechTextPage {...pageProps} />)}
+          />
+          <Route path="/diarization" element={<LegacyDiarizationRedirect />} />
+          <Route
+            path="/diarization/:recordId"
+            element={<LegacyDiarizationRedirect />}
+          />
+          <Route
+            path="/chat"
+            element={withSuspense(<ChatPage {...pageProps} />)}
+          />
+          <Route
+            path="/voice"
+            element={withSuspense(<VoicePage {...voicePageProps} />)}
+          />
+          <Route
+            path="/models"
+            element={withSuspense(<MyModelsPage {...modelsPageProps} />)}
+          />
+          <Route
+            path="/settings"
+            element={withSuspense(<SettingsPage />)}
+          />
+          <Route path="/my-models" element={<Navigate to="/models" replace />} />
+          <Route path="/" element={<Navigate to="/voice" replace />} />
+          <Route path="*" element={<NotFoundPage />} />
+        </Route>
+      </Routes>
+    </>
   );
 }

@@ -20,6 +20,9 @@ const apiMocks = vi.hoisted(() => ({
   sendChatThreadMessageStream: vi.fn(),
 }));
 
+const createObjectUrlMock = vi.fn<(file: File) => string>();
+const revokeObjectUrlMock = vi.fn<(url: string) => void>();
+
 vi.mock("@/api", () => ({
   api: {
     listChatThreads: apiMocks.listChatThreads,
@@ -41,6 +44,17 @@ describe("ChatPlayground", () => {
     apiMocks.createChatThread.mockReset();
     apiMocks.deleteChatThread.mockReset();
     apiMocks.sendChatThreadMessageStream.mockReset();
+    createObjectUrlMock.mockReset();
+    revokeObjectUrlMock.mockReset();
+    createObjectUrlMock.mockImplementation((file) => `blob:preview-${file.name}`);
+    Object.defineProperty(URL, "createObjectURL", {
+      configurable: true,
+      value: createObjectUrlMock,
+    });
+    Object.defineProperty(URL, "revokeObjectURL", {
+      configurable: true,
+      value: revokeObjectUrlMock,
+    });
 
     apiMocks.listChatThreads.mockResolvedValue([]);
 
@@ -79,10 +93,17 @@ describe("ChatPlayground", () => {
     await waitFor(() => expect(apiMocks.listChatThreads).toHaveBeenCalled());
 
     fireEvent.click(
-      screen.getByRole("button", { name: "Qwen3 0.6B GGUF (Q8_0)" }),
+      screen.getByRole("combobox", { name: "Qwen3 0.6B GGUF (Q8_0)" }),
     );
 
-    expect(await screen.findByText("Gemma 3 1B")).toBeInTheDocument();
+    const gemmaOption = await screen.findByRole("option", {
+      name: /Gemma 3 1B/,
+    });
+    expect(gemmaOption).toBeInTheDocument();
+    fireEvent.keyDown(document.activeElement ?? gemmaOption, { key: "Escape" });
+    await waitFor(() =>
+      expect(screen.queryByRole("listbox")).not.toBeInTheDocument(),
+    );
 
     const sendButton = screen.getByRole("button", { name: "Send message" });
     expect(sendButton).toBeInTheDocument();
@@ -504,6 +525,7 @@ describe("ChatPlayground", () => {
       }),
       expect.any(Object),
     );
+    expect(revokeObjectUrlMock).toHaveBeenCalledWith("blob:preview-sample.png");
   });
 
   it("allows attachment-only Qwen3.5 turns and sends a preview summary", async () => {
@@ -586,6 +608,206 @@ describe("ChatPlayground", () => {
       }),
       expect.any(Object),
     );
+  });
+
+  it("isolates and restores text and image drafts when switching threads", async () => {
+    const threads = [
+      {
+        id: "thread-a",
+        title: "Thread A",
+        model_id: "Qwen3.5-4B",
+        created_at: 1,
+        updated_at: 2,
+        last_message_preview: "Earlier A message",
+        message_count: 1,
+      },
+      {
+        id: "thread-b",
+        title: "Thread B",
+        model_id: "Qwen3.5-4B",
+        created_at: 1,
+        updated_at: 2,
+        last_message_preview: "Earlier B message",
+        message_count: 1,
+      },
+    ];
+    let streamCallbacks: { onClose: () => void } | null = null;
+
+    apiMocks.listChatThreads.mockResolvedValue(threads);
+    apiMocks.getChatThread.mockImplementation(async (threadId: string) => ({
+      thread: threads.find((thread) => thread.id === threadId),
+      messages: [
+        {
+          id: `message-${threadId}`,
+          thread_id: threadId,
+          role: "user",
+          content: `Earlier ${threadId} message`,
+          created_at: 1,
+          tokens_generated: null,
+          generation_time_ms: null,
+        },
+      ],
+    }));
+    apiMocks.sendChatThreadMessageStream.mockImplementation(
+      (_threadId, _request, callbacks) => {
+        streamCallbacks = callbacks;
+        return new AbortController();
+      },
+    );
+
+    render(
+      <MemoryRouter initialEntries={["/chat?threadId=thread-a"]}>
+        <ChatPlayground
+          selectedModel="Qwen3.5-4B"
+          selectedModelReady={true}
+          supportsThinking={true}
+          modelLabel="Qwen3.5 4B"
+          modelOptions={[
+            {
+              value: "Qwen3.5-4B",
+              label: "Qwen3.5 4B",
+              statusLabel: "Ready",
+              isReady: true,
+            },
+          ]}
+          onSelectModel={vi.fn()}
+          onOpenModelManager={vi.fn()}
+          onModelRequired={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() =>
+      expect(apiMocks.getChatThread).toHaveBeenCalledWith("thread-a"),
+    );
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "Draft intended only for A" },
+    });
+    fireEvent.change(screen.getByTestId("chat-image-input"), {
+      target: {
+        files: [new File(["image-a"], "a.png", { type: "image/png" })],
+      },
+    });
+    expect(
+      await screen.findByRole("button", { name: "Remove a.png" }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /History/ }));
+    let drawer = await screen.findByRole("dialog", { name: "Chat History" });
+    fireEvent.click(within(drawer).getByText("Thread B").closest('[role="button"]')!);
+
+    await waitFor(() => expect(screen.getByRole("textbox")).toHaveValue(""));
+    expect(
+      screen.queryByRole("button", { name: "Remove a.png" }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "Draft intended only for B" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() =>
+      expect(apiMocks.sendChatThreadMessageStream).toHaveBeenCalledWith(
+        "thread-b",
+        expect.objectContaining({
+          content: "Draft intended only for B",
+          content_parts: undefined,
+        }),
+        expect.any(Object),
+      ),
+    );
+    expect(screen.getByRole("textbox")).toHaveValue("");
+
+    act(() => streamCallbacks?.onClose());
+    fireEvent.click(screen.getByRole("button", { name: /History/ }));
+    drawer = await screen.findByRole("dialog", { name: "Chat History" });
+    fireEvent.click(within(drawer).getByText("Thread A").closest('[role="button"]')!);
+
+    await waitFor(() =>
+      expect(screen.getByRole("textbox")).toHaveValue(
+        "Draft intended only for A",
+      ),
+    );
+    expect(
+      screen.getByRole("button", { name: "Remove a.png" }),
+    ).toBeInTheDocument();
+  });
+
+  it("transfers a new-chat draft to its created thread and revokes its preview on unmount", async () => {
+    const createdThread = {
+      id: "created-thread",
+      title: "New chat",
+      model_id: "Qwen3.5-4B",
+      created_at: 1,
+      updated_at: 1,
+      last_message_preview: null,
+      message_count: 0,
+    };
+
+    apiMocks.createChatThread.mockResolvedValue(createdThread);
+    apiMocks.getChatThread.mockResolvedValue({
+      thread: createdThread,
+      messages: [],
+    });
+    apiMocks.sendChatThreadMessageStream.mockImplementation(() => {
+      throw new Error("Stream setup failed");
+    });
+
+    const view = render(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <ChatPlayground
+          selectedModel="Qwen3.5-4B"
+          selectedModelReady={true}
+          supportsThinking={true}
+          modelLabel="Qwen3.5 4B"
+          modelOptions={[
+            {
+              value: "Qwen3.5-4B",
+              label: "Qwen3.5 4B",
+              statusLabel: "Ready",
+              isReady: true,
+            },
+          ]}
+          onSelectModel={vi.fn()}
+          onOpenModelManager={vi.fn()}
+          onModelRequired={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(apiMocks.listChatThreads).toHaveBeenCalled());
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "Keep this if stream setup fails" },
+    });
+    fireEvent.change(screen.getByTestId("chat-image-input"), {
+      target: {
+        files: [new File(["image"], "draft.png", { type: "image/png" })],
+      },
+    });
+    expect(
+      await screen.findByRole("button", { name: "Remove draft.png" }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() =>
+      expect(apiMocks.sendChatThreadMessageStream).toHaveBeenCalledWith(
+        "created-thread",
+        expect.objectContaining({ content: "Keep this if stream setup fails" }),
+        expect.any(Object),
+      ),
+    );
+    expect(screen.getByRole("textbox")).toHaveValue(
+      "Keep this if stream setup fails",
+    );
+    expect(
+      screen.getByRole("button", { name: "Remove draft.png" }),
+    ).toBeInTheDocument();
+    expect(revokeObjectUrlMock).not.toHaveBeenCalled();
+
+    view.unmount();
+    expect(revokeObjectUrlMock).toHaveBeenCalledTimes(1);
+    expect(revokeObjectUrlMock).toHaveBeenCalledWith("blob:preview-draft.png");
   });
 
   it("uses Qwen3.5 variant defaults and forwards enable_thinking from the toggle", async () => {

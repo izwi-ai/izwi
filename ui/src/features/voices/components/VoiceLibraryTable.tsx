@@ -303,14 +303,14 @@ export function VoiceLibraryTable({
         className,
       )}
     >
-      <div className="overflow-x-auto">
+      <div className="overflow-hidden 2xl:overflow-x-auto">
         <table
           className={cn(
-            "w-full border-collapse text-sm",
-            compact ? "min-w-[64rem]" : "min-w-[72rem]",
+            "block w-full border-collapse text-sm 2xl:table",
+            compact ? "2xl:min-w-[64rem]" : "2xl:min-w-[72rem]",
           )}
         >
-          <thead className="sticky top-0 z-[1] bg-[var(--bg-surface-1)] text-left text-xs uppercase tracking-[0.14em] text-[var(--text-muted)]">
+          <thead className="sticky top-0 z-[1] hidden bg-[var(--bg-surface-1)] text-left text-xs uppercase tracking-[0.14em] text-[var(--text-muted)] 2xl:table-header-group">
             <tr>
               <th className="whitespace-nowrap px-4 py-2.5 font-semibold">Voice</th>
               <th className="whitespace-nowrap px-4 py-2.5 font-semibold">Type</th>
@@ -319,7 +319,7 @@ export function VoiceLibraryTable({
               <th className="whitespace-nowrap px-4 py-2.5 font-semibold text-right">Actions</th>
             </tr>
           </thead>
-          <tbody>
+          <tbody className="block 2xl:table-row-group">
             {items.map((item) => {
               const handleRowKeyDown = (event: KeyboardEvent<HTMLTableRowElement>) => {
                 if (!item.onSelect) {
@@ -339,13 +339,13 @@ export function VoiceLibraryTable({
                   onKeyDown={handleRowKeyDown}
                   data-testid={`voice-row-${item.id}`}
                   className={cn(
-                    "border-t border-[var(--border-muted)] align-top transition-colors hover:bg-[var(--bg-surface-1)]/60",
+                    "grid grid-cols-1 gap-x-5 gap-y-3 border-t border-[var(--border-muted)] px-4 py-4 align-top transition-colors hover:bg-[var(--bg-surface-1)]/60 sm:grid-cols-[minmax(0,1fr)_auto] 2xl:table-row 2xl:px-0 2xl:py-0",
                     item.onSelect &&
                       "cursor-pointer focus-visible:bg-[var(--bg-surface-1)] focus-visible:outline-none",
                   )}
                 >
-                  <td className="px-4 py-3.5">
-                    <div className="font-semibold text-[var(--text-primary)]">
+                  <td className="block min-w-0 sm:col-start-1 sm:row-start-1 2xl:table-cell 2xl:px-4 2xl:py-3.5">
+                    <div className="break-words font-semibold text-[var(--text-primary)]">
                       {item.name}
                     </div>
                     {item.secondaryLabel ? (
@@ -354,28 +354,40 @@ export function VoiceLibraryTable({
                       </p>
                     ) : null}
                   </td>
-                  <td className="px-4 py-3.5">
+                  <td className="block sm:col-start-1 sm:row-start-2 2xl:table-cell 2xl:px-4 2xl:py-3.5">
+                    <span className="mb-1 block text-[10px] font-semibold uppercase tracking-[0.14em] text-[var(--text-subtle)] 2xl:hidden">
+                      Type
+                    </span>
                     <span className="text-xs font-semibold uppercase tracking-[0.12em] text-[var(--text-secondary)]">
                       {item.categoryLabel}
                     </span>
                   </td>
-                  <td className="px-4 py-3.5 text-[var(--text-secondary)]">
+                  <td className="block min-w-0 sm:col-span-2 sm:row-start-3 2xl:table-cell 2xl:px-4 2xl:py-3.5 text-[var(--text-secondary)]">
+                    <span className="mb-1 block text-[10px] font-semibold uppercase tracking-[0.14em] text-[var(--text-subtle)] 2xl:hidden">
+                      Notes
+                    </span>
                     <p className="line-clamp-2">
                       {item.description ||
                         "No reference notes were saved for this voice yet."}
                     </p>
                   </td>
-                  <td className="px-4 py-3.5">
+                  <td className="block min-w-0 sm:col-span-2 sm:row-start-4 2xl:table-cell 2xl:px-4 2xl:py-3.5">
+                    <span className="mb-1 block text-[10px] font-semibold uppercase tracking-[0.14em] text-[var(--text-subtle)] 2xl:hidden">
+                      Preview
+                    </span>
                     <TablePreviewPlayer
                       item={item}
                       activePreviewId={activePreviewId}
                       onActivePreviewChange={setActivePreviewId}
                     />
                   </td>
-                  <td className="px-4 py-3.5">
+                  <td className="block sm:col-start-2 sm:row-start-1 2xl:table-cell 2xl:px-4 2xl:py-3.5">
                     <div
-                      className="flex flex-wrap justify-start gap-2 lg:justify-end"
+                      className="flex flex-wrap justify-start gap-2 sm:justify-end"
                       onClick={(event) => event.stopPropagation()}
+                      role="group"
+                      aria-label={`Actions for ${item.name}`}
+                      data-testid={`voice-actions-${item.id}`}
                     >
                       {item.actions}
                     </div>

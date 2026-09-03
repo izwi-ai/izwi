@@ -21,6 +21,7 @@ const apiMocks = vi.hoisted(() => ({
   listTranscriptionRecords: vi.fn(),
   listSpeechTextJobPage: vi.fn(),
   getTranscriptionRecord: vi.fn(),
+  getSpeakerAttributedAsrRecord: vi.fn(),
   deleteTranscriptionRecord: vi.fn(),
   transcriptionRecordAudioUrl: vi.fn(),
   listStudioProjects: vi.fn(),
@@ -43,6 +44,7 @@ vi.mock("@/api", () => ({
     listTranscriptionRecords: apiMocks.listTranscriptionRecords,
     listSpeechTextJobPage: apiMocks.listSpeechTextJobPage,
     getTranscriptionRecord: apiMocks.getTranscriptionRecord,
+    getSpeakerAttributedAsrRecord: apiMocks.getSpeakerAttributedAsrRecord,
     deleteTranscriptionRecord: apiMocks.deleteTranscriptionRecord,
     transcriptionRecordAudioUrl: apiMocks.transcriptionRecordAudioUrl,
     listStudioProjects: apiMocks.listStudioProjects,
@@ -65,6 +67,7 @@ vi.mock("../api", () => ({
     listTranscriptionRecords: apiMocks.listTranscriptionRecords,
     listSpeechTextJobPage: apiMocks.listSpeechTextJobPage,
     getTranscriptionRecord: apiMocks.getTranscriptionRecord,
+    getSpeakerAttributedAsrRecord: apiMocks.getSpeakerAttributedAsrRecord,
     deleteTranscriptionRecord: apiMocks.deleteTranscriptionRecord,
     transcriptionRecordAudioUrl: apiMocks.transcriptionRecordAudioUrl,
     listStudioProjects: apiMocks.listStudioProjects,
@@ -88,6 +91,7 @@ describe("Page header history buttons", () => {
     apiMocks.listTranscriptionRecords.mockReset();
     apiMocks.listSpeechTextJobPage.mockReset();
     apiMocks.getTranscriptionRecord.mockReset();
+    apiMocks.getSpeakerAttributedAsrRecord.mockReset();
     apiMocks.deleteTranscriptionRecord.mockReset();
     apiMocks.transcriptionRecordAudioUrl.mockReset();
     apiMocks.listStudioProjects.mockReset();

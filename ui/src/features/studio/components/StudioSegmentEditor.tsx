@@ -14,6 +14,7 @@ import {
   X,
 } from "lucide-react";
 import type { StudioProjectRecord, StudioProjectSegmentRecord } from "@/api";
+import type { StudioSegmentDraftConflict } from "@/features/studio/segmentDrafts";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import {
@@ -31,6 +32,7 @@ const INSERT_END_TARGET = "__end__";
 interface StudioSegmentEditorProps {
   project: StudioProjectRecord;
   segmentDrafts: Record<string, string>;
+  segmentDraftConflicts?: Record<string, StudioSegmentDraftConflict>;
   segmentSelections: Record<string, number | null>;
   selectedSegmentIdSet: ReadonlySet<string>;
   selectedSegmentCount: number;
@@ -52,6 +54,8 @@ interface StudioSegmentEditorProps {
   onDeleteSegment: (segmentId: string) => void;
   onOpenSegmentSettings: (segmentId: string) => void;
   onChangeSegmentDraft: (segmentId: string, value: string) => void;
+  onRestoreSegmentDraftConflict?: (segmentId: string) => void;
+  onDiscardSegmentDraftConflict?: (segmentId: string) => void;
   onChangeSegmentCursor: (segmentId: string, cursor: number | null) => void;
   onFocusSegmentHandled: (segmentId: string) => void;
   audioUrlForRecordId: (recordId: string) => string;
@@ -212,6 +216,7 @@ function InsertSegmentControls({
 export function StudioSegmentEditor({
   project,
   segmentDrafts,
+  segmentDraftConflicts = {},
   segmentSelections,
   selectedSegmentIdSet,
   selectedSegmentCount,
@@ -233,6 +238,8 @@ export function StudioSegmentEditor({
   onDeleteSegment,
   onOpenSegmentSettings,
   onChangeSegmentDraft,
+  onRestoreSegmentDraftConflict,
+  onDiscardSegmentDraftConflict,
   onChangeSegmentCursor,
   onFocusSegmentHandled,
   audioUrlForRecordId,
@@ -366,6 +373,7 @@ export function StudioSegmentEditor({
       <div className="mt-5 space-y-4">
         {project.segments.map((segment, index) => {
           const draft = segmentDrafts[segment.id] ?? segment.text;
+          const draftConflict = segmentDraftConflicts[segment.id];
           const segmentDirty = draft !== segment.text;
           const segmentNeedsRender = segmentDirty || !segment.speech_record_id;
           const isSaving = savingSegmentId === segment.id;
@@ -381,7 +389,7 @@ export function StudioSegmentEditor({
           const renderButtonLabel = segmentQueued
             ? "Queued"
             : segmentDirty
-              ? "Save & render"
+              ? "Save draft first"
               : segmentNeedsRender
                 ? "Render block"
                 : "Re-render";
@@ -389,9 +397,12 @@ export function StudioSegmentEditor({
           return (
             <div key={segment.id} className="space-y-4">
               <article className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4 sm:p-5">
-                <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-start">
+                <div className="space-y-3">
                   <div className="min-w-0 space-y-1.5">
-                    <div className="flex flex-wrap items-center gap-2 sm:flex-nowrap">
+                    <div
+                      data-testid={`studio-segment-metadata-${segment.id}`}
+                      className="flex flex-wrap items-center gap-2"
+                    >
                       <div className="inline-flex items-center">
                         <Switch
                           checked={isSelected}
@@ -430,13 +441,16 @@ export function StudioSegmentEditor({
                     </div>
                   </div>
 
-                  <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto sm:flex-nowrap sm:justify-end sm:gap-1.5 md:gap-2">
+                  <div
+                    data-testid={`studio-segment-actions-${segment.id}`}
+                    className="flex w-full flex-wrap items-center gap-2"
+                  >
                     <Button
                       variant="outline"
                       size="sm"
                       onClick={() => onSaveSegment(segment.id)}
                       disabled={!segmentDirty || isSaving}
-                      className="min-w-0 flex-1 basis-[calc(50%-0.25rem)] justify-center bg-[var(--bg-surface-0)] sm:basis-auto sm:flex-none"
+                      className="min-w-[8rem] flex-1 justify-center bg-[var(--bg-surface-0)]"
                     >
                       {isSaving ? (
                         <Loader2 className="h-4 w-4 animate-spin" />
@@ -448,8 +462,8 @@ export function StudioSegmentEditor({
                     <Button
                       size="sm"
                       onClick={() => onRenderSegment(segment.id)}
-                      disabled={isRendering || segmentQueued}
-                      className="min-w-0 flex-1 basis-[calc(50%-0.25rem)] justify-center sm:basis-auto sm:flex-none"
+                      disabled={segmentDirty || isRendering || segmentQueued}
+                      className="min-w-[8rem] flex-1 justify-center"
                     >
                       {isRendering ? (
                         <Loader2 className="h-4 w-4 animate-spin" />
@@ -462,12 +476,12 @@ export function StudioSegmentEditor({
                       variant="outline"
                       size="icon"
                       onClick={() => onOpenSegmentSettings(segment.id)}
-                      className="order-2 ml-auto h-9 w-9 bg-[var(--bg-surface-0)] sm:order-none sm:ml-0"
+                      className="ml-auto h-9 w-9 bg-[var(--bg-surface-0)]"
                       aria-label={`Open settings for segment ${segment.position + 1}`}
                     >
                       <Settings className="h-4 w-4" />
                     </Button>
-                    <div className="order-2 sm:order-none">
+                    <div>
                       <SegmentActionsMenu
                         segment={segment}
                         isFirst={isFirst}
@@ -483,9 +497,48 @@ export function StudioSegmentEditor({
                   </div>
                 </div>
 
+                {draftConflict ? (
+                  <div
+                    className="mt-4 rounded-xl border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-3 py-3 text-xs text-[var(--status-warning-text)]"
+                    role="alert"
+                  >
+                    <p className="font-semibold">Saved draft needs review</p>
+                    <p className="mt-1 leading-5">
+                      This segment changed after your local draft was saved, so the
+                      newer server text is shown. Restore your local draft only if
+                      you still want it.
+                    </p>
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      {onRestoreSegmentDraftConflict ? (
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="h-7 bg-[var(--bg-surface-0)]"
+                          onClick={() => onRestoreSegmentDraftConflict(segment.id)}
+                        >
+                          Restore local draft
+                        </Button>
+                      ) : null}
+                      {onDiscardSegmentDraftConflict ? (
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          className="h-7"
+                          onClick={() => onDiscardSegmentDraftConflict(segment.id)}
+                        >
+                          Keep server text
+                        </Button>
+                      ) : null}
+                    </div>
+                  </div>
+                ) : null}
+
                 <Textarea
                   className="mt-4 border-[var(--border-muted)] bg-[var(--bg-surface-0)]"
                   value={draft}
+                  disabled={Boolean(draftConflict)}
                   ref={(node) => {
                     textareaRefs.current[segment.id] = node;
                   }}
@@ -503,8 +556,8 @@ export function StudioSegmentEditor({
 
                 {segmentDirty ? (
                   <div className="mt-4 rounded-xl border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-3 py-2 text-xs text-[var(--status-warning-text)]">
-                    This block has local edits. Rendering will save the latest text first
-                    and then refresh the audio.
+                    This block has local edits. Save the draft explicitly before
+                    rendering new audio.
                   </div>
                 ) : null}
 

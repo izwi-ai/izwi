@@ -77,6 +77,14 @@ import {
 import { StudioSegmentEditor } from "@/features/studio/components/StudioSegmentEditor";
 import { StudioProjectHistoryTable } from "@/features/studio/components/StudioProjectHistoryTable";
 import { StudioWorkspaceScaffold } from "@/features/studio/components/StudioWorkspaceScaffold";
+import {
+  clearStudioProjectDrafts,
+  removeStudioSegmentDraft,
+  removeStudioSegmentDrafts,
+  restoreStudioSegmentDrafts,
+  storeStudioSegmentDraft,
+  type StudioSegmentDraftConflict,
+} from "@/features/studio/segmentDrafts";
 import { useDownloadIndicator } from "@/utils/useDownloadIndicator";
 import { getSpeakerProfilesForVariant } from "@/types";
 
@@ -239,6 +247,9 @@ export function StudioWorkspace({
   } | null>(null);
   const [deleteSegmentError, setDeleteSegmentError] = useState<string | null>(null);
   const [segmentDrafts, setSegmentDrafts] = useState<Record<string, string>>({});
+  const [segmentDraftConflicts, setSegmentDraftConflicts] = useState<
+    Record<string, StudioSegmentDraftConflict>
+  >({});
   const [segmentSelections, setSegmentSelections] = useState<
     Record<string, number | null>
   >({});
@@ -550,6 +561,7 @@ export function StudioWorkspace({
       setProjectSavedVoiceId("");
       setProjectSpeed(1);
       setSegmentDrafts({});
+      setSegmentDraftConflicts({});
       setSegmentSelections({});
       setSelectedSegmentIds([]);
       setAddingSegmentAfterSegmentId(null);
@@ -568,11 +580,17 @@ export function StudioWorkspace({
     setProjectSpeaker(selectedProject.speaker ?? "Vivian");
     setProjectSavedVoiceId(selectedProject.saved_voice_id ?? "");
     setProjectSpeed(selectedProject.speed ?? 1);
-    setSegmentDrafts(
-      Object.fromEntries(
+    const restoredDrafts = restoreStudioSegmentDrafts(
+      selectedProject.id,
+      selectedProject.segments,
+    );
+    setSegmentDrafts({
+      ...Object.fromEntries(
         selectedProject.segments.map((segment) => [segment.id, segment.text]),
       ),
-    );
+      ...restoredDrafts.drafts,
+    });
+    setSegmentDraftConflicts(restoredDrafts.conflicts);
     setSegmentSelections({});
     setSelectedSegmentIds([]);
   }, [selectedProject]);
@@ -1164,6 +1182,12 @@ export function StudioWorkspace({
       const updated = await api.updateStudioProjectSegment(project.id, segmentId, {
         text,
       });
+      removeStudioSegmentDraft(project.id, segmentId);
+      setSegmentDraftConflicts((current) => {
+        const next = { ...current };
+        delete next[segmentId];
+        return next;
+      });
       setSelectedProject(updated);
       return updated;
     },
@@ -1495,6 +1519,7 @@ export function StudioWorkspace({
     if (!project) {
       return;
     }
+    removeStudioSegmentDraft(selectedProject.id, segmentId);
     setSelectedProject(project);
     setWorkspaceStatus({
       tone: "success",
@@ -1563,6 +1588,7 @@ export function StudioWorkspace({
         selectedProject.id,
         deleteSegmentTarget.id,
       );
+      removeStudioSegmentDraft(selectedProject.id, deleteSegmentTarget.id);
       setSelectedProject(project);
       setWorkspaceStatus({
         tone: "success",
@@ -1806,6 +1832,16 @@ export function StudioWorkspace({
     if (!selectedProject) {
       return;
     }
+    const segmentIndex = selectedProject.segments.findIndex(
+      (segment) => segment.id === segmentId,
+    );
+    if (segmentIndex < 0 || segmentIndex >= selectedProject.segments.length - 1) {
+      return;
+    }
+    const mergedSegmentIds = [
+      segmentId,
+      selectedProject.segments[segmentIndex + 1]?.id,
+    ].filter((id): id is string => Boolean(id));
     const project = await runProjectMutation(
       () => api.mergeStudioProjectSegmentWithNext(selectedProject.id, segmentId),
       "Failed to merge project segments.",
@@ -1813,6 +1849,7 @@ export function StudioWorkspace({
     if (!project) {
       return;
     }
+    removeStudioSegmentDrafts(selectedProject.id, mergedSegmentIds);
     setSelectedProject(project);
     setWorkspaceStatus({
       tone: "success",
@@ -1878,6 +1915,7 @@ export function StudioWorkspace({
     if (!project) {
       return;
     }
+    removeStudioSegmentDrafts(selectedProject.id, selectedSegmentIds);
     setSelectedProject(project);
     setSelectedSegmentIds([]);
     setWorkspaceStatus({
@@ -1899,30 +1937,29 @@ export function StudioWorkspace({
       return null;
     }
 
-    let currentProject = project;
-    let syncedDraftCount = 0;
-    for (const segmentId of segmentIds) {
-      const currentSegment = currentProject.segments.find(
+    const dirtySegmentCount = segmentIds.filter((segmentId) => {
+      const currentSegment = project.segments.find(
         (segment) => segment.id === segmentId,
       );
       if (!currentSegment) {
-        continue;
+        return false;
       }
-      const segmentDirty =
-        (segmentDrafts[segmentId] ?? currentSegment.text) !== currentSegment.text;
-      if (!segmentDirty) {
-        continue;
-      }
-      const synced = await persistSegmentDraft(currentProject, segmentId);
-      if (!synced) {
-        return null;
-      }
-      currentProject = synced;
-      syncedDraftCount += 1;
+      return (
+        (segmentDrafts[segmentId] ?? currentSegment.text) !== currentSegment.text
+      );
+    }).length;
+    if (dirtySegmentCount > 0) {
+      const message =
+        dirtySegmentCount === 1
+          ? "Save the edited segment before rendering."
+          : `Save the ${dirtySegmentCount} edited segments before rendering.`;
+      setWorkspaceError(message);
+      onError(message);
+      return null;
     }
 
-    const queuedCount = await queueSegmentsForRender(currentProject, segmentIds);
-    return { queuedCount, syncedDraftCount };
+    const queuedCount = await queueSegmentsForRender(project, segmentIds);
+    return { queuedCount, syncedDraftCount: 0 };
   };
 
   const handleRenderSelectedSegments = async () => {
@@ -2042,6 +2079,7 @@ export function StudioWorkspace({
         setDeletingProject(true);
         setDeleteProjectError(null);
         await api.deleteStudioProject(projectId);
+        clearStudioProjectDrafts(projectId);
         setWorkspaceStatus({
           tone: "success",
           message: `Deleted project "${projectName}".`,
@@ -2854,7 +2892,7 @@ export function StudioWorkspace({
                     {queuedRenderCount} queued · {failedRenderCount} failed
                   </div>
 
-                  <div className="space-y-2 xl:max-h-[320px] xl:overflow-y-auto xl:pr-1">
+                  <div className="space-y-2 min-[1800px]:max-h-[320px] min-[1800px]:overflow-y-auto min-[1800px]:pr-1">
                     {activeProjectQueueItems.length === 0 ? (
                       <div className="rounded-xl border border-dashed border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-xs text-[var(--text-muted)]">
                         No queued renders for this project.
@@ -2913,6 +2951,7 @@ export function StudioWorkspace({
               <StudioSegmentEditor
                 project={selectedProject}
                 segmentDrafts={segmentDrafts}
+                segmentDraftConflicts={segmentDraftConflicts}
                 segmentSelections={segmentSelections}
                 selectedSegmentIdSet={selectedSegmentIdSet}
                 selectedSegmentCount={selectedSegmentCount}
@@ -2954,12 +2993,62 @@ export function StudioWorkspace({
                 onOpenSegmentSettings={(segmentId) =>
                   openSegmentSettingsDrawer(segmentId)
                 }
-                onChangeSegmentDraft={(segmentId, value) =>
+                onChangeSegmentDraft={(segmentId, value) => {
+                  const segment = selectedProject.segments.find(
+                    (candidate) => candidate.id === segmentId,
+                  );
+                  if (segment) {
+                    storeStudioSegmentDraft(selectedProject.id, {
+                      segmentId,
+                      baseText: segment.text,
+                      draftText: value,
+                    });
+                  }
                   setSegmentDrafts((current) => ({
                     ...current,
                     [segmentId]: value,
-                  }))
-                }
+                  }));
+                }}
+                onRestoreSegmentDraftConflict={(segmentId) => {
+                  const conflict = segmentDraftConflicts[segmentId];
+                  const segment = selectedProject.segments.find(
+                    (candidate) => candidate.id === segmentId,
+                  );
+                  if (!conflict || !segment) {
+                    return;
+                  }
+                  storeStudioSegmentDraft(selectedProject.id, {
+                    segmentId,
+                    baseText: segment.text,
+                    draftText: conflict.draftText,
+                  });
+                  setSegmentDrafts((current) => ({
+                    ...current,
+                    [segmentId]: conflict.draftText,
+                  }));
+                  setSegmentDraftConflicts((current) => {
+                    const next = { ...current };
+                    delete next[segmentId];
+                    return next;
+                  });
+                }}
+                onDiscardSegmentDraftConflict={(segmentId) => {
+                  removeStudioSegmentDraft(selectedProject.id, segmentId);
+                  const segment = selectedProject.segments.find(
+                    (candidate) => candidate.id === segmentId,
+                  );
+                  if (segment) {
+                    setSegmentDrafts((current) => ({
+                      ...current,
+                      [segmentId]: segment.text,
+                    }));
+                  }
+                  setSegmentDraftConflicts((current) => {
+                    const next = { ...current };
+                    delete next[segmentId];
+                    return next;
+                  });
+                }}
                 onChangeSegmentCursor={(segmentId, cursor) =>
                   setSegmentSelections((current) => ({
                     ...current,

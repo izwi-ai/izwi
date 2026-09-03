@@ -7,7 +7,14 @@ import {
   Sun,
   SunMoon,
 } from "lucide-react";
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 
 import { api } from "@/api";
@@ -25,6 +32,8 @@ import { StatusBadge } from "@/components/ui/status-badge";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
 import { APP_VERSION } from "@/shared/config/runtime";
+
+type SettingReadStatus = "loading" | "ready" | "error" | "unsupported";
 
 const THEME_OPTIONS: Array<{
   id: "system" | "light" | "dark";
@@ -68,7 +77,21 @@ function getUpdateBadge(
   status: UpdateStatus,
   hasAvailableUpdate: boolean,
   updatesEnabled: boolean,
+  updaterSupported: boolean,
+  capabilityStatus: "unsupported" | "loading" | "ready" | "error",
 ): { label: string; tone: "neutral" | "info" | "success" | "warning" } {
+  if (!updaterSupported || capabilityStatus === "unsupported") {
+    return { label: "Desktop Only", tone: "neutral" };
+  }
+
+  if (capabilityStatus === "loading") {
+    return { label: "Checking Support", tone: "info" };
+  }
+
+  if (capabilityStatus === "error") {
+    return { label: "Support Unknown", tone: "warning" };
+  }
+
   if (!updatesEnabled) {
     return { label: "Updates Off", tone: "warning" };
   }
@@ -209,24 +232,49 @@ export function SettingsPage() {
     lastCheckedAt,
     health: updaterHealth,
     errorMessage: updateErrorMessage,
+    updaterSupported,
+    capabilityStatus: updaterCapabilityStatus,
+    refreshUpdaterCapability,
     openPrompt: openUpdatePrompt,
     checkForUpdates,
   } = useAppUpdates();
   const { themePreference, setThemePreference, resolvedTheme } = useTheme();
-  const [analyticsOptIn, setAnalyticsOptIn] = useState(false);
-  const [isLoadingPreferences, setIsLoadingPreferences] = useState(true);
+  const [analyticsOptIn, setAnalyticsOptIn] = useState<boolean | null>(null);
+  const [preferencesReadStatus, setPreferencesReadStatus] =
+    useState<SettingReadStatus>("loading");
   const [isSavingPreference, setIsSavingPreference] = useState(false);
-  const [trayIconVisible, setTrayIconVisible] = useState(true);
-  const [isLoadingTrayIconVisibility, setIsLoadingTrayIconVisibility] = useState(desktopRuntime);
+  const [trayIconVisible, setTrayIconVisible] = useState<boolean | null>(null);
+  const [trayIconReadStatus, setTrayIconReadStatus] = useState<SettingReadStatus>(
+    desktopRuntime ? "loading" : "unsupported",
+  );
   const [isSavingTrayIconVisibility, setIsSavingTrayIconVisibility] = useState(false);
-  const [launchAtLoginEnabled, setLaunchAtLoginEnabled] = useState(false);
-  const [isLoadingLaunchAtLogin, setIsLoadingLaunchAtLogin] = useState(desktopRuntime);
+  const [launchAtLoginEnabled, setLaunchAtLoginEnabled] = useState<
+    boolean | null
+  >(null);
+  const [launchAtLoginReadStatus, setLaunchAtLoginReadStatus] =
+    useState<SettingReadStatus>(desktopRuntime ? "loading" : "unsupported");
   const [isSavingLaunchAtLogin, setIsSavingLaunchAtLogin] = useState(false);
+  const preferencesRequestRef = useRef(0);
+  const trayIconRequestRef = useRef(0);
+  const launchAtLoginRequestRef = useRef(0);
 
-  const updatesEnabled = updaterHealth?.enabled ?? true;
+  const updatesEnabled = updaterHealth?.enabled === true;
   const updateBadge = useMemo(
-    () => getUpdateBadge(updateStatus, Boolean(availableUpdate), updatesEnabled),
-    [availableUpdate, updateStatus, updatesEnabled],
+    () =>
+      getUpdateBadge(
+        updateStatus,
+        Boolean(availableUpdate),
+        updatesEnabled,
+        updaterSupported,
+        updaterCapabilityStatus,
+      ),
+    [
+      availableUpdate,
+      updateStatus,
+      updatesEnabled,
+      updaterSupported,
+      updaterCapabilityStatus,
+    ],
   );
 
   const handleThemePreferenceChange = (
@@ -240,117 +288,122 @@ export function SettingsPage() {
     void trackThemePreferenceChanged(nextPreference);
   };
 
-  useEffect(() => {
-    let active = true;
-
-    api
-      .getPreferences()
-      .then((preferences) => {
-        if (!active) {
-          return;
-        }
-        setAnalyticsOptIn(preferences.analytics_opt_in);
-        setAnalyticsEnabled(preferences.analytics_opt_in);
-      })
-      .catch((error) => {
-        console.error("Failed to load user preferences:", error);
-        if (!active) {
-          return;
-        }
-        notify({
-          title: "Could not load settings",
-          description:
-            "Some settings may not reflect your latest saved preferences.",
-          tone: "warning",
-        });
-      })
-      .finally(() => {
-        if (active) {
-          setIsLoadingPreferences(false);
-        }
+  const loadPreferences = useCallback(async () => {
+    const requestId = ++preferencesRequestRef.current;
+    setAnalyticsOptIn(null);
+    setPreferencesReadStatus("loading");
+    try {
+      const preferences = await api.getPreferences();
+      if (requestId !== preferencesRequestRef.current) {
+        return;
+      }
+      setAnalyticsOptIn(preferences.analytics_opt_in);
+      setAnalyticsEnabled(preferences.analytics_opt_in);
+      setPreferencesReadStatus("ready");
+    } catch (error) {
+      console.error("Failed to load user preferences:", error);
+      if (requestId !== preferencesRequestRef.current) {
+        return;
+      }
+      setAnalyticsOptIn(null);
+      setPreferencesReadStatus("error");
+      notify({
+        title: "Could not load settings",
+        description: "Retry to confirm your saved analytics preference.",
+        tone: "warning",
       });
-
-    return () => {
-      active = false;
-    };
+    }
   }, [notify]);
 
-  useEffect(() => {
+  const loadLaunchAtLogin = useCallback(async () => {
     if (!desktopRuntime) {
-      setIsLoadingLaunchAtLogin(false);
+      setLaunchAtLoginEnabled(null);
+      setLaunchAtLoginReadStatus("unsupported");
       return;
     }
-
-    let active = true;
-
-    invoke<boolean>("launch_at_login_enabled")
-      .then((enabled) => {
-        if (!active) {
-          return;
-        }
-        setLaunchAtLoginEnabled(enabled);
-      })
-      .catch((error) => {
-        console.error("Failed to load launch-at-login preference:", error);
-        if (!active) {
-          return;
-        }
-        notify({
-          title: "Could not load startup preference",
-          description: "Launch at login may not reflect the current OS setting.",
-          tone: "warning",
-        });
-      })
-      .finally(() => {
-        if (active) {
-          setIsLoadingLaunchAtLogin(false);
-        }
+    const requestId = ++launchAtLoginRequestRef.current;
+    setLaunchAtLoginEnabled(null);
+    setLaunchAtLoginReadStatus("loading");
+    try {
+      const enabled = await invoke<boolean>("launch_at_login_enabled");
+      if (requestId !== launchAtLoginRequestRef.current) {
+        return;
+      }
+      setLaunchAtLoginEnabled(enabled);
+      setLaunchAtLoginReadStatus("ready");
+    } catch (error) {
+      console.error("Failed to load launch-at-login preference:", error);
+      if (requestId !== launchAtLoginRequestRef.current) {
+        return;
+      }
+      setLaunchAtLoginEnabled(null);
+      setLaunchAtLoginReadStatus("error");
+      notify({
+        title: "Could not load startup preference",
+        description: "Retry to confirm the current OS setting.",
+        tone: "warning",
       });
+    }
+  }, [desktopRuntime, notify]);
 
-    return () => {
-      active = false;
-    };
+  const loadTrayIconVisibility = useCallback(async () => {
+    if (!desktopRuntime) {
+      setTrayIconVisible(null);
+      setTrayIconReadStatus("unsupported");
+      return;
+    }
+    const requestId = ++trayIconRequestRef.current;
+    setTrayIconVisible(null);
+    setTrayIconReadStatus("loading");
+    try {
+      const visible = await invoke<boolean>("tray_icon_visible");
+      if (requestId !== trayIconRequestRef.current) {
+        return;
+      }
+      setTrayIconVisible(visible);
+      setTrayIconReadStatus("ready");
+    } catch (error) {
+      console.error("Failed to load tray icon visibility:", error);
+      if (requestId !== trayIconRequestRef.current) {
+        return;
+      }
+      setTrayIconVisible(null);
+      setTrayIconReadStatus("error");
+      notify({
+        title: "Could not load tray visibility",
+        description: "Retry to confirm the current desktop setting.",
+        tone: "warning",
+      });
+    }
   }, [desktopRuntime, notify]);
 
   useEffect(() => {
-    if (!desktopRuntime) {
-      setIsLoadingTrayIconVisibility(false);
-      return;
-    }
-
-    let active = true;
-
-    invoke<boolean>("tray_icon_visible")
-      .then((visible) => {
-        if (!active) {
-          return;
-        }
-        setTrayIconVisible(visible);
-      })
-      .catch((error) => {
-        console.error("Failed to load tray icon visibility:", error);
-        if (!active) {
-          return;
-        }
-        notify({
-          title: "Could not load tray visibility",
-          description: "Tray icon visibility may not reflect the current app state.",
-          tone: "warning",
-        });
-      })
-      .finally(() => {
-        if (active) {
-          setIsLoadingTrayIconVisibility(false);
-        }
-      });
-
+    void loadPreferences();
     return () => {
-      active = false;
+      preferencesRequestRef.current += 1;
     };
-  }, [desktopRuntime, notify]);
+  }, [loadPreferences]);
+
+  useEffect(() => {
+    void loadLaunchAtLogin();
+    return () => {
+      launchAtLoginRequestRef.current += 1;
+    };
+  }, [loadLaunchAtLogin]);
+
+  useEffect(() => {
+    void loadTrayIconVisibility();
+    return () => {
+      trayIconRequestRef.current += 1;
+    };
+  }, [loadTrayIconVisibility]);
 
   const handleAnalyticsToggle = async (nextValue: boolean) => {
-    if (isSavingPreference) {
+    if (
+      preferencesReadStatus !== "ready" ||
+      analyticsOptIn === null ||
+      isSavingPreference
+    ) {
       return;
     }
 
@@ -386,7 +439,12 @@ export function SettingsPage() {
   };
 
   const handleLaunchAtLoginToggle = async (nextValue: boolean) => {
-    if (!desktopRuntime || isLoadingLaunchAtLogin || isSavingLaunchAtLogin) {
+    if (
+      !desktopRuntime ||
+      launchAtLoginReadStatus !== "ready" ||
+      launchAtLoginEnabled === null ||
+      isSavingLaunchAtLogin
+    ) {
       return;
     }
 
@@ -416,7 +474,8 @@ export function SettingsPage() {
   const handleTrayIconVisibilityToggle = async (nextValue: boolean) => {
     if (
       !desktopRuntime ||
-      isLoadingTrayIconVisibility ||
+      trayIconReadStatus !== "ready" ||
+      trayIconVisible === null ||
       isSavingTrayIconVisibility
     ) {
       return;
@@ -515,7 +574,13 @@ export function SettingsPage() {
           >
             <SettingsRow
               description={
-                availableUpdate ? (
+                !updaterSupported ? (
+                  "Update checks and installation are available in the packaged desktop app."
+                ) : updaterCapabilityStatus === "loading" ? (
+                  "Checking update support for this installation..."
+                ) : updaterCapabilityStatus === "error" ? (
+                  "Izwi could not confirm whether updates are supported."
+                ) : availableUpdate ? (
                   <>
                     Version{" "}
                     <span className="font-medium text-[var(--text-secondary)]">
@@ -536,19 +601,33 @@ export function SettingsPage() {
                     </span>
                   </span>
                   <StatusBadge tone={updateBadge.tone}>{updateBadge.label}</StatusBadge>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    onClick={() => void checkForUpdates(true)}
-                    disabled={
-                      updateStatus === "checking" ||
-                      updateStatus === "downloading"
-                    }
-                  >
-                    {updateStatus === "checking" ? "Checking..." : "Check now"}
-                  </Button>
-                  {availableUpdate ? (
+                  {updaterSupported &&
+                  updaterCapabilityStatus === "ready" &&
+                  updatesEnabled ? (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => void checkForUpdates(true)}
+                      disabled={
+                        updateStatus === "checking" ||
+                        updateStatus === "downloading"
+                      }
+                    >
+                      {updateStatus === "checking" ? "Checking..." : "Check now"}
+                    </Button>
+                  ) : null}
+                  {updaterSupported && updaterCapabilityStatus === "error" ? (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => void refreshUpdaterCapability()}
+                    >
+                      Retry update support
+                    </Button>
+                  ) : null}
+                  {updaterSupported && availableUpdate ? (
                     <Button
                       type="button"
                       size="sm"
@@ -560,7 +639,9 @@ export function SettingsPage() {
                 </div>
               }
             >
-              {!updatesEnabled ? (
+              {updaterSupported &&
+              updaterCapabilityStatus === "ready" &&
+              !updatesEnabled ? (
                 <p className="text-sm leading-6 text-[var(--status-warning-text)]">
                   {updaterHealth?.disableReason ?? "Updates are disabled."}
                 </p>
@@ -581,11 +662,13 @@ export function SettingsPage() {
             <SettingsRow
               title="Anonymous analytics"
               description={
-                isLoadingPreferences ? (
+                preferencesReadStatus === "loading" ? (
                   <span className="inline-flex items-center gap-2">
                     <Loader2 className="h-4 w-4 animate-spin" />
                     Loading saved preference...
                   </span>
+                ) : preferencesReadStatus === "error" ? (
+                  "Izwi could not confirm your saved analytics preference."
                 ) : analyticsOptIn ? (
                   "Enabled. Prompts, transcripts, audio, and personal identifiers are never sent."
                 ) : (
@@ -595,17 +678,33 @@ export function SettingsPage() {
               action={
                 <div className="flex items-center gap-3">
                   <span className="text-sm font-medium text-[var(--text-secondary)]">
-                    {analyticsOptIn ? "On" : "Off"}
+                    {preferencesReadStatus === "ready"
+                      ? analyticsOptIn
+                        ? "On"
+                        : "Off"
+                      : "Unknown"}
                   </span>
                   <Switch
-                    checked={analyticsOptIn}
-                    disabled={isLoadingPreferences || isSavingPreference}
+                    checked={analyticsOptIn ?? false}
+                    disabled={
+                      preferencesReadStatus !== "ready" || isSavingPreference
+                    }
                     onCheckedChange={(checked) => void handleAnalyticsToggle(checked)}
                     aria-label="Share anonymous usage data"
                   />
                 </div>
               }
             >
+              {preferencesReadStatus === "error" ? (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  onClick={() => void loadPreferences()}
+                >
+                  Retry analytics preference
+                </Button>
+              ) : null}
               {isSavingPreference ? (
                 <p className="text-sm text-[var(--text-muted)]">
                   Saving your preference...
@@ -619,91 +718,126 @@ export function SettingsPage() {
             title="System"
             description="Startup behavior for this device."
           >
-            <SettingsRow
-              title="Show tray icon"
-              description={
-                !desktopRuntime ? (
-                  "Available only in the desktop app."
-                ) : isLoadingTrayIconVisibility ? (
+            {!desktopRuntime ? (
+              <SettingsRow
+                title="Desktop controls"
+                description="Tray behavior and launch-at-login settings are available in the packaged desktop app."
+              />
+            ) : (
+              <>
+                <SettingsRow
+                  title="Show tray icon"
+                  description={
+                    trayIconReadStatus === "loading" ? (
                   <span className="inline-flex items-center gap-2">
                     <Loader2 className="h-4 w-4 animate-spin" />
                     Loading tray visibility...
                   </span>
-                ) : trayIconVisible ? (
-                  "Enabled. Closing the window keeps Izwi running in the tray."
-                ) : (
-                  "Disabled. Closing the window exits Izwi."
-                )
-              }
-              action={
-                <div className="flex items-center gap-3">
-                  <span className="text-sm font-medium text-[var(--text-secondary)]">
-                    {trayIconVisible ? "On" : "Off"}
-                  </span>
-                  <Switch
-                    checked={trayIconVisible}
-                    disabled={
-                      !desktopRuntime ||
-                      isLoadingTrayIconVisibility ||
-                      isSavingTrayIconVisibility
-                    }
-                    onCheckedChange={(checked) =>
-                      void handleTrayIconVisibilityToggle(checked)
-                    }
-                    aria-label="Show tray icon"
-                  />
-                </div>
-              }
-            >
-              {isSavingTrayIconVisibility ? (
-                <p className="text-sm text-[var(--text-muted)]">
-                  Saving tray visibility...
-                </p>
-              ) : null}
-            </SettingsRow>
+                    ) : trayIconReadStatus === "error" ? (
+                      "Izwi could not confirm the current tray setting."
+                    ) : trayIconVisible ? (
+                      "Enabled. Closing the window keeps Izwi running in the tray."
+                    ) : (
+                      "Disabled. Closing the window exits Izwi."
+                    )
+                  }
+                  action={
+                    <div className="flex items-center gap-3">
+                      <span className="text-sm font-medium text-[var(--text-secondary)]">
+                        {trayIconReadStatus === "ready"
+                          ? trayIconVisible
+                            ? "On"
+                            : "Off"
+                          : "Unknown"}
+                      </span>
+                      <Switch
+                        checked={trayIconVisible ?? false}
+                        disabled={
+                          trayIconReadStatus !== "ready" ||
+                          isSavingTrayIconVisibility
+                        }
+                        onCheckedChange={(checked) =>
+                          void handleTrayIconVisibilityToggle(checked)
+                        }
+                        aria-label="Show tray icon"
+                      />
+                    </div>
+                  }
+                >
+                  {trayIconReadStatus === "error" ? (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={() => void loadTrayIconVisibility()}
+                    >
+                      Retry tray setting
+                    </Button>
+                  ) : null}
+                  {isSavingTrayIconVisibility ? (
+                    <p className="text-sm text-[var(--text-muted)]">
+                      Saving tray visibility...
+                    </p>
+                  ) : null}
+                </SettingsRow>
 
-            <SettingsRow
-              title="Launch at login"
-              description={
-                !desktopRuntime ? (
-                  "Available only in the desktop app."
-                ) : isLoadingLaunchAtLogin ? (
-                  <span className="inline-flex items-center gap-2">
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                    Loading startup preference...
-                  </span>
-                ) : launchAtLoginEnabled ? (
-                  "Izwi opens automatically when you sign in."
-                ) : (
-                  "Izwi only opens when launched manually."
-                )
-              }
-              action={
-                <div className="flex items-center gap-3">
-                  <span className="text-sm font-medium text-[var(--text-secondary)]">
-                    {launchAtLoginEnabled ? "On" : "Off"}
-                  </span>
-                  <Switch
-                    checked={launchAtLoginEnabled}
-                    disabled={
-                      !desktopRuntime ||
-                      isLoadingLaunchAtLogin ||
-                      isSavingLaunchAtLogin
-                    }
-                    onCheckedChange={(checked) =>
-                      void handleLaunchAtLoginToggle(checked)
-                    }
-                    aria-label="Launch Izwi when signing in"
-                  />
-                </div>
-              }
-            >
-              {isSavingLaunchAtLogin ? (
-                <p className="text-sm text-[var(--text-muted)]">
-                  Saving startup preference...
-                </p>
-              ) : null}
-            </SettingsRow>
+                <SettingsRow
+                  title="Launch at login"
+                  description={
+                    launchAtLoginReadStatus === "loading" ? (
+                      <span className="inline-flex items-center gap-2">
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                        Loading startup preference...
+                      </span>
+                    ) : launchAtLoginReadStatus === "error" ? (
+                      "Izwi could not confirm the current startup setting."
+                    ) : launchAtLoginEnabled ? (
+                      "Izwi opens automatically when you sign in."
+                    ) : (
+                      "Izwi only opens when launched manually."
+                    )
+                  }
+                  action={
+                    <div className="flex items-center gap-3">
+                      <span className="text-sm font-medium text-[var(--text-secondary)]">
+                        {launchAtLoginReadStatus === "ready"
+                          ? launchAtLoginEnabled
+                            ? "On"
+                            : "Off"
+                          : "Unknown"}
+                      </span>
+                      <Switch
+                        checked={launchAtLoginEnabled ?? false}
+                        disabled={
+                          launchAtLoginReadStatus !== "ready" ||
+                          isSavingLaunchAtLogin
+                        }
+                        onCheckedChange={(checked) =>
+                          void handleLaunchAtLoginToggle(checked)
+                        }
+                        aria-label="Launch Izwi when signing in"
+                      />
+                    </div>
+                  }
+                >
+                  {launchAtLoginReadStatus === "error" ? (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={() => void loadLaunchAtLogin()}
+                    >
+                      Retry startup setting
+                    </Button>
+                  ) : null}
+                  {isSavingLaunchAtLogin ? (
+                    <p className="text-sm text-[var(--text-muted)]">
+                      Saving startup preference...
+                    </p>
+                  ) : null}
+                </SettingsRow>
+              </>
+            )}
           </SettingsSection>
         </div>
       </div>

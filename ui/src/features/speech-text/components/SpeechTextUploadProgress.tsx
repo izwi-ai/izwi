@@ -165,9 +165,15 @@ export function SpeechTextUploadProgress({
               "mt-2 flex items-center justify-between gap-3 text-xs",
               isFailed ? "text-[var(--danger-text)]" : "text-[var(--text-muted)]",
             )}
-            aria-live="polite"
           >
-            <span className="min-w-0 truncate">{statusText}</span>
+            <span
+              className="min-w-0 truncate"
+              role={isFailed ? "alert" : "status"}
+              aria-live={isFailed ? "assertive" : "polite"}
+              aria-atomic="true"
+            >
+              {statusText}
+            </span>
             <span className="shrink-0 font-medium">
               {progressDetail({ loadedBytes, percent, totalBytes })}
             </span>

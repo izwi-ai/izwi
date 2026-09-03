@@ -21,7 +21,7 @@
   --text-primary: #fafafa;
   --text-secondary: #e7e5e4;
   --text-muted: #a1a1aa;
-  --text-subtle: #71717a;
+  --text-subtle: #85858f;
   --accent-solid: #f5f5f4;
   --accent-soft: rgba(255, 255, 255, 0.08);
   --accent-strong: rgba(255, 255, 255, 0.14);
@@ -105,8 +105,8 @@ html.theme-light {
   --border-strong: #d4d4d8;
   --text-primary: #09090b;
   --text-secondary: #27272a;
-  --text-muted: #71717a;
-  --text-subtle: #a1a1aa;
+  --text-muted: #65656d;
+  --text-subtle: #686870;
   --accent-solid: #09090b;
   --accent-soft: rgba(9, 9, 11, 0.05);
   --accent-strong: rgba(9, 9, 11, 0.1);
@@ -114,11 +114,11 @@ html.theme-light {
   --danger-bg: rgba(239, 68, 68, 0.08);
   --danger-bg-hover: rgba(239, 68, 68, 0.12);
   --danger-border: rgba(220, 38, 38, 0.18);
-  --danger-text: #dc2626;
+  --danger-text: #b91c1c;
   --status-positive-bg: rgba(34, 197, 94, 0.1);
   --status-positive-border: rgba(22, 163, 74, 0.18);
-  --status-positive-text: #15803d;
-  --status-positive-solid: #16a34a;
+  --status-positive-text: #166534;
+  --status-positive-solid: #15803d;
   --status-warning-bg: rgba(234, 179, 8, 0.1);
   --status-warning-border: rgba(202, 138, 4, 0.18);
   --status-warning-text: #a16207;
@@ -180,6 +180,22 @@ body {
   @apply antialiased;
   min-height: 100vh;
   transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html:focus-within {
+    scroll-behavior: auto;
+  }
+
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-delay: 0ms !important;
+    transition-duration: 0.01ms !important;
+  }
 }
 
 ::selection {

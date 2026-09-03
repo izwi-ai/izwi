@@ -43,12 +43,25 @@ const model: ModelInfo = {
 };
 
 function CatalogProbe() {
-  const { error, loading, loadModel, unloadModel } = useModelCatalog();
+  const {
+    models,
+    error,
+    catalogError,
+    loading,
+    refreshModels,
+    loadModel,
+    unloadModel,
+  } = useModelCatalog();
 
   return (
     <div>
       <span>{loading ? "loading" : "ready"}</span>
+      <span data-testid="model-count">{models.length}</span>
       <span data-testid="catalog-error">{error}</span>
+      <span data-testid="catalog-load-error">{catalogError}</span>
+      <button type="button" onClick={() => void refreshModels()}>
+        Retry catalog
+      </button>
       <button type="button" onClick={() => void loadModel(model.variant)}>
         Load
       </button>
@@ -101,6 +114,38 @@ describe("ModelCatalogProvider model action errors", () => {
     expect(
       screen.getAllByText("Metal allocation failed: requested 8192 MiB"),
     ).toHaveLength(2);
+  });
+
+  it("surfaces an initial catalog failure and clears it after retry", async () => {
+    apiMocks.listModels
+      .mockRejectedValueOnce(new Error("Local model service is offline"))
+      .mockResolvedValueOnce({ models: [model] });
+
+    renderCatalog();
+
+    await screen.findByText("ready");
+    expect(screen.getByTestId("model-count")).toHaveTextContent("0");
+    expect(screen.getByTestId("catalog-load-error")).toHaveTextContent(
+      "Local model service is offline",
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry catalog" }));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("model-count")).toHaveTextContent("1"),
+    );
+    expect(screen.getByTestId("catalog-load-error")).toBeEmptyDOMElement();
+    expect(apiMocks.listModels).toHaveBeenCalledTimes(2);
+  });
+
+  it("treats an empty catalog response as loaded rather than failed", async () => {
+    apiMocks.listModels.mockResolvedValueOnce({ models: [] });
+
+    renderCatalog();
+
+    await screen.findByText("ready");
+    expect(screen.getByTestId("model-count")).toHaveTextContent("0");
+    expect(screen.getByTestId("catalog-load-error")).toBeEmptyDOMElement();
   });
 
   it("surfaces the exact backend model unload error", async () => {

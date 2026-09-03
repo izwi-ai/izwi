@@ -33,11 +33,13 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { TranscriptionExportDialog } from "@/features/transcription/components/TranscriptionExportDialog";
+import { presentSpeechTextHistoryStatus } from "@/features/transcription/historyStatus";
 import {
   formatAudioDuration,
   formatCreatedAt,
 } from "@/features/transcription/playground/support";
 import { formatTranscriptionText } from "@/features/transcription/transcript";
+import { StatusBadge } from "@/components/ui/status-badge";
 import { formattedTranscriptFromRecord } from "@/utils/diarizationTranscript";
 import type { ExportableTranscriptionRecord } from "@/utils/transcriptionExport";
 
@@ -318,6 +320,7 @@ export function TranscriptionHistoryTable({
                 <th className="px-4 py-3 font-semibold">Type</th>
                 <th className="px-4 py-3 font-semibold">File</th>
                 <th className="px-4 py-3 font-semibold">Duration</th>
+                <th className="px-4 py-3 font-semibold">Status</th>
                 <th className="px-4 py-3 font-semibold">Preview</th>
                 <th className="w-[56px] px-3 py-3 text-right font-semibold sm:px-4">
                   <span className="sr-only">Actions</span>
@@ -331,6 +334,17 @@ export function TranscriptionHistoryTable({
                 const speakerCount = isDiarizationSummary(record)
                   ? (record.corrected_speaker_count ?? record.speaker_count)
                   : null;
+                const statusPresentation = presentSpeechTextHistoryStatus(
+                  record.processing_status,
+                  record.processing_error,
+                  record.kind,
+                );
+                const outputReady = statusPresentation.status === "ready";
+                const statusMessage =
+                  statusPresentation.status === "failed"
+                    ? record.processing_error?.trim() ||
+                      statusPresentation.description
+                    : statusPresentation.description;
 
                 return (
                   <tr
@@ -368,19 +382,41 @@ export function TranscriptionHistoryTable({
                     <td className="px-4 py-3 align-top text-[var(--text-secondary)]">
                       {formatAudioDuration(record.duration_secs)}
                     </td>
+                    <td className="px-4 py-3 align-top">
+                      <StatusBadge tone={statusPresentation.tone}>
+                        {statusPresentation.label}
+                      </StatusBadge>
+                    </td>
                     <td className="px-4 py-3 align-top text-[var(--text-secondary)]">
                       <div className="max-w-[34rem]">
-                        <div className="line-clamp-2 text-[var(--text-primary)]">
-                          {rowPreview(record) || "No transcript preview yet."}
+                        <div
+                          className={
+                            statusPresentation.status === "failed"
+                              ? "break-words whitespace-pre-wrap text-[var(--text-primary)]"
+                              : "line-clamp-2 text-[var(--text-primary)]"
+                          }
+                        >
+                          {outputReady
+                            ? rowPreview(record) || "No transcript preview available."
+                            : statusMessage}
                         </div>
-                        {speakerCount != null ? (
+                        {(statusPresentation.status === "queued" ||
+                          statusPresentation.status === "processing") &&
+                        rowPreview(record) ? (
+                          <div className="mt-1 line-clamp-1 text-xs text-[var(--text-muted)]">
+                            Latest output: <span>{rowPreview(record)}</span>
+                          </div>
+                        ) : null}
+                        {outputReady && speakerCount != null ? (
                           <div className="mt-1 line-clamp-1 text-xs text-[var(--text-muted)]">
                             Speakers: {speakerCount}
                           </div>
                         ) : null}
-                        <div className="mt-1 line-clamp-1 text-xs text-[var(--text-muted)]">
-                          {rowSummaryLabel(record)}
-                        </div>
+                        {outputReady ? (
+                          <div className="mt-1 line-clamp-1 text-xs text-[var(--text-muted)]">
+                            {rowSummaryLabel(record)}
+                          </div>
+                        ) : null}
                       </div>
                     </td>
                     <td className="px-3 py-2 align-top text-right sm:px-4">
@@ -413,14 +449,14 @@ export function TranscriptionHistoryTable({
                             Open record
                           </DropdownMenuItem>
                           <DropdownMenuItem
-                            disabled={isBusy || deletePending}
+                            disabled={isBusy || deletePending || !outputReady}
                             onSelect={() => void handleCopy(record)}
                           >
                             <Copy className="mr-2 h-4 w-4" />
                             Copy transcript
                           </DropdownMenuItem>
                           <DropdownMenuItem
-                            disabled={isBusy || deletePending}
+                            disabled={isBusy || deletePending || !outputReady}
                             onSelect={() => void handleExport(record)}
                           >
                             <Download className="mr-2 h-4 w-4" />
