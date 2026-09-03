@@ -243,28 +243,6 @@ export function TranscriptionHistoryTable({
     }
   }
 
-  async function handleCopyError(record: SpeechTextJobSummary): Promise<void> {
-    const technicalError = record.processing_error?.trim();
-    if (!technicalError) {
-      return;
-    }
-
-    try {
-      await navigator.clipboard.writeText(technicalError);
-      notify({
-        title: "Error details copied",
-        description: rowLabel(record),
-        tone: "success",
-      });
-    } catch {
-      notify({
-        title: "Could not copy error details",
-        description: "Select the technical details and copy them manually.",
-        tone: "warning",
-      });
-    }
-  }
-
   async function handleConfirmDelete(): Promise<void> {
     if (!deleteTarget || !onDeleteRecord || deletePending) {
       return;
@@ -362,6 +340,11 @@ export function TranscriptionHistoryTable({
                   record.kind,
                 );
                 const outputReady = statusPresentation.status === "ready";
+                const statusMessage =
+                  statusPresentation.status === "failed"
+                    ? record.processing_error?.trim() ||
+                      statusPresentation.description
+                    : statusPresentation.description;
 
                 return (
                   <tr
@@ -406,10 +389,16 @@ export function TranscriptionHistoryTable({
                     </td>
                     <td className="px-4 py-3 align-top text-[var(--text-secondary)]">
                       <div className="max-w-[34rem]">
-                        <div className="line-clamp-2 text-[var(--text-primary)]">
+                        <div
+                          className={
+                            statusPresentation.status === "failed"
+                              ? "break-words whitespace-pre-wrap text-[var(--text-primary)]"
+                              : "line-clamp-2 text-[var(--text-primary)]"
+                          }
+                        >
                           {outputReady
                             ? rowPreview(record) || "No transcript preview available."
-                            : statusPresentation.description}
+                            : statusMessage}
                         </div>
                         {(statusPresentation.status === "queued" ||
                           statusPresentation.status === "processing") &&
@@ -426,49 +415,6 @@ export function TranscriptionHistoryTable({
                         {outputReady ? (
                           <div className="mt-1 line-clamp-1 text-xs text-[var(--text-muted)]">
                             {rowSummaryLabel(record)}
-                          </div>
-                        ) : null}
-                        {statusPresentation.status === "failed" ? (
-                          <div
-                            className="mt-2 flex flex-wrap items-center gap-2"
-                            data-row-action
-                            onClick={(event) => event.stopPropagation()}
-                            onKeyDown={(event) => event.stopPropagation()}
-                          >
-                            <Button
-                              type="button"
-                              variant="outline"
-                              size="sm"
-                              className="h-7"
-                              onClick={() => onOpenRecord(record)}
-                            >
-                              {record.kind === "diarization"
-                                ? "Review and retry"
-                                : "View details"}
-                            </Button>
-                            {record.processing_error?.trim() ? (
-                              <details className="text-xs text-[var(--text-muted)]">
-                                <summary className="cursor-pointer rounded-sm font-medium text-[var(--text-secondary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/45">
-                                  Error details
-                                </summary>
-                                <div className="mt-2 max-w-[30rem] rounded-lg border border-[var(--danger-border)] bg-[var(--danger-bg)] p-3 text-[var(--danger-text)]">
-                                  <p className="break-words whitespace-pre-wrap">
-                                    {record.processing_error}
-                                  </p>
-                                  <Button
-                                    type="button"
-                                    variant="outline"
-                                    size="sm"
-                                    className="mt-2 h-7"
-                                    aria-label={`Copy error details for ${rowLabel(record)}`}
-                                    onClick={() => void handleCopyError(record)}
-                                  >
-                                    <Copy className="mr-1.5 h-3.5 w-3.5" />
-                                    Copy error
-                                  </Button>
-                                </div>
-                              </details>
-                            ) : null}
                           </div>
                         ) : null}
                       </div>

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type {
@@ -11,7 +11,6 @@ import { TranscriptionHistoryTable } from "@/features/transcription/components/T
 
 const mocks = vi.hoisted(() => ({
   notify: vi.fn(),
-  writeText: vi.fn(),
 }));
 
 vi.mock("@/app/providers/NotificationProvider", () => ({
@@ -92,11 +91,6 @@ function diarization(
 describe("TranscriptionHistoryTable job status", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    Object.defineProperty(navigator, "clipboard", {
-      configurable: true,
-      value: { writeText: mocks.writeText },
-    });
-    mocks.writeText.mockResolvedValue(undefined);
   });
 
   it("shows status before output and preserves a successful transcript preview", () => {
@@ -118,10 +112,9 @@ describe("TranscriptionHistoryTable job status", () => {
     expect(screen.getAllByText("Speaker 1: Welcome.")).toHaveLength(2);
   });
 
-  it("keeps raw engine failures behind details and offers an explicit recovery path", async () => {
+  it("shows the error message directly without inline error actions", () => {
     const technicalError =
       "CUDA_ERROR_OUT_OF_MEMORY: allocation 0x7f9 failed in engine::execute";
-    const onOpenRecord = vi.fn();
     const record = diarization({
       processing_status: "failed",
       processing_error: technicalError,
@@ -131,33 +124,19 @@ describe("TranscriptionHistoryTable job status", () => {
     render(
       <TranscriptionHistoryTable
         records={[record]}
-        onOpenRecord={onOpenRecord}
+        onOpenRecord={vi.fn()}
       />,
     );
 
     expect(screen.getByText("Failed")).toBeVisible();
-    expect(
-      screen.getByText(
-        "Diarization failed. Review the error, then retry when you’re ready.",
-      ),
-    ).toBeVisible();
-    expect(screen.getByText(technicalError)).not.toBeVisible();
-
-    const errorDetailsDisclosure = screen.getByText("Error details");
-    errorDetailsDisclosure.focus();
-    expect(errorDetailsDisclosure).toHaveFocus();
-    fireEvent.click(errorDetailsDisclosure);
     expect(screen.getByText(technicalError)).toBeVisible();
-
-    fireEvent.click(
-      screen.getByRole("button", {
-        name: "Copy error details for meeting.wav",
-      }),
-    );
-    await waitFor(() => expect(mocks.writeText).toHaveBeenCalledWith(technicalError));
-
-    fireEvent.click(screen.getByRole("button", { name: "Review and retry" }));
-    expect(onOpenRecord).toHaveBeenCalledWith(record);
+    expect(screen.queryByText("Error details")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Review and retry" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /Copy error details/i }),
+    ).not.toBeInTheDocument();
   });
 
   it("does not present an unknown backend state as a completed transcript", () => {
