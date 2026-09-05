@@ -12,7 +12,11 @@ use crate::models::architectures::fish_s2::codec::fuse_weight_norm_dim0;
 use crate::models::architectures::fish_s2::contracts::FishS2DacContract;
 use crate::models::architectures::fish_s2::rotary::FishS2RotaryCache;
 use crate::models::architectures::fish_s2::tokenizer::FishS2VqCodes;
-use crate::models::architectures::qwen3::core::{causal_mask, repeat_kv};
+use crate::models::architectures::qwen3::core::repeat_kv;
+
+pub(crate) const ATTENTION_QUERY_BLOCK: usize = 64;
+
+type CancelCheck<'a> = &'a dyn Fn() -> Result<()>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FishS2DacConfig {
@@ -186,6 +190,8 @@ impl FishS2DacConfig {
     /// Position capacities saved in the public S2 Pro codec checkpoint.
     pub const MAX_ENCODER_FRAMES: usize = 16_384;
     pub const MAX_QUANTIZER_FRAMES: usize = 4_096;
+    /// Reference resampling is bounded to supported audio sample rates.
+    pub const MAX_REFERENCE_SAMPLE_RATE: u32 = 384_000;
 
     pub fn current() -> Self {
         let contract = FishS2DacContract::CURRENT;
@@ -249,10 +255,11 @@ impl FishS2DacConfig {
 
     /// Validates the resampled length before allocating a resampling or encoder buffer.
     pub fn reference_frame_count(&self, input_samples: usize, sample_rate: u32) -> Result<usize> {
-        if sample_rate == 0 || input_samples == 0 {
-            return Err(Error::InvalidInput(
-                "Fish S2 reference audio requires samples and a nonzero sample rate".into(),
-            ));
+        if sample_rate == 0 || sample_rate > Self::MAX_REFERENCE_SAMPLE_RATE || input_samples == 0 {
+            return Err(Error::InvalidInput(format!(
+                "Fish S2 reference audio requires samples and a sample rate between 1 and {} Hz",
+                Self::MAX_REFERENCE_SAMPLE_RATE
+            )));
         }
         let samples_per_frame = self.samples_per_frame()?.max(1);
         let resampled_samples = (input_samples as u128 * u128::from(self.sample_rate)
@@ -358,18 +365,42 @@ impl FishS2DacDecoder {
     }
 
     pub fn decode_vq_codes(&self, codes: &FishS2VqCodes) -> Result<Vec<f32>> {
-        let audio = self.decode_codebooks(&codes.codebooks)?;
-        audio
+        self.decode_vq_codes_with_cancel(codes, &|| Ok(()))
+    }
+
+    pub fn decode_vq_codes_with_cancel(
+        &self,
+        codes: &FishS2VqCodes,
+        check_cancelled: CancelCheck<'_>,
+    ) -> Result<Vec<f32>> {
+        let audio = self.decode_codebooks_with_cancel(&codes.codebooks, check_cancelled)?;
+        check_cancelled()?;
+        let samples = audio
             .to_dtype(DType::F32)?
             .flatten_all()?
-            .to_vec1::<f32>()
-            .map_err(Error::from)
+            .to_vec1::<f32>()?;
+        check_cancelled()?;
+        Ok(samples)
     }
 
     pub fn decode_codebooks(&self, codebooks: &[Vec<u32>]) -> Result<Tensor> {
+        self.decode_codebooks_with_cancel(codebooks, &|| Ok(()))
+    }
+
+    fn decode_codebooks_with_cancel(
+        &self,
+        codebooks: &[Vec<u32>],
+        check_cancelled: CancelCheck<'_>,
+    ) -> Result<Tensor> {
+        check_cancelled()?;
         let codes = codebooks_to_tensor(codebooks, &self.config, self.decoder_device()?)?;
-        let latents = self.quantizer.decode(&codes, &self.config)?;
-        self.decoder.forward(&latents)?.tanh().map_err(Error::from)
+        let latents = self
+            .quantizer
+            .decode(&codes, &self.config, check_cancelled)?;
+        check_cancelled()?;
+        let audio = self.decoder.forward(&latents, check_cancelled)?.tanh()?;
+        check_cancelled()?;
+        Ok(audio)
     }
 
     pub fn encode_reference_audio(
@@ -377,15 +408,38 @@ impl FishS2DacDecoder {
         samples: &[f32],
         sample_rate: u32,
     ) -> Result<FishS2VqCodes> {
+        self.encode_reference_audio_with_cancel(samples, sample_rate, &|| Ok(()))
+    }
+
+    pub fn encode_reference_audio_with_cancel(
+        &self,
+        samples: &[f32],
+        sample_rate: u32,
+        check_cancelled: CancelCheck<'_>,
+    ) -> Result<FishS2VqCodes> {
+        check_cancelled()?;
         let prepared = prepare_reference_samples(samples, sample_rate, &self.config)?;
+        check_cancelled()?;
         let device = self.encoder_device()?;
         let frames = prepared.len();
         let audio = Tensor::from_vec(prepared, (1, 1, frames), device)?;
-        let codes = self.encode_tensor(&audio)?;
-        tensor_to_vq_codes(&codes, &self.config)
+        let codes = self.encode_tensor_with_cancel(&audio, check_cancelled)?;
+        check_cancelled()?;
+        let codes = tensor_to_vq_codes(&codes, &self.config)?;
+        check_cancelled()?;
+        Ok(codes)
     }
 
     pub fn encode_tensor(&self, audio: &Tensor) -> Result<Tensor> {
+        self.encode_tensor_with_cancel(audio, &|| Ok(()))
+    }
+
+    fn encode_tensor_with_cancel(
+        &self,
+        audio: &Tensor,
+        check_cancelled: CancelCheck<'_>,
+    ) -> Result<Tensor> {
+        check_cancelled()?;
         if audio.rank() != 3 || audio.dim(1)? != 1 {
             return Err(Error::AudioError(format!(
                 "Fish S2 DAC encoder expects audio shape [B, 1, T], got {:?}",
@@ -397,8 +451,8 @@ impl FishS2DacDecoder {
                 "Fish S2 DAC encoder input exceeds the codec position capacity".into(),
             ));
         }
-        let z = self.encoder.forward(audio)?;
-        self.quantizer.encode(&z, &self.config)
+        let z = self.encoder.forward(audio, check_cancelled)?;
+        self.quantizer.encode(&z, &self.config, check_cancelled)
     }
 
     fn decoder_device(&self) -> Result<&candle_core::Device> {
@@ -484,15 +538,25 @@ impl FishS2DownsampleResidualVectorQuantizer {
         })
     }
 
-    fn encode(&self, z: &Tensor, config: &FishS2DacConfig) -> Result<Tensor> {
+    fn encode(
+        &self,
+        z: &Tensor,
+        config: &FishS2DacConfig,
+        check_cancelled: CancelCheck<'_>,
+    ) -> Result<Tensor> {
         let mut hidden = z.clone();
         for block in &self.downsample {
+            check_cancelled()?;
             hidden = block.forward(&hidden)?;
         }
-        hidden = self.pre_module.forward(&hidden)?;
-        let (semantic_z, semantic_codes) = self.semantic_quantizer.encode(&hidden)?;
+        hidden = self.pre_module.forward(&hidden, check_cancelled)?;
+        let (semantic_z, semantic_codes) =
+            self.semantic_quantizer.encode(&hidden, check_cancelled)?;
         let residual_input = hidden.broadcast_sub(&semantic_z)?;
-        let (_residual_z, residual_codes) = self.residual_quantizer.encode(&residual_input)?;
+        let (_residual_z, residual_codes) = self
+            .residual_quantizer
+            .encode(&residual_input, check_cancelled)?;
+        check_cancelled()?;
         if semantic_codes.len() != 1 || residual_codes.len() != config.residual_codebooks {
             return Err(Error::InferenceError(
                 "Fish S2 DAC quantizer produced an unexpected codebook count".to_string(),
@@ -506,7 +570,12 @@ impl FishS2DownsampleResidualVectorQuantizer {
         Tensor::cat(&code_tensors, 1).map_err(Error::from)
     }
 
-    fn decode(&self, codes: &Tensor, config: &FishS2DacConfig) -> Result<Tensor> {
+    fn decode(
+        &self,
+        codes: &Tensor,
+        config: &FishS2DacConfig,
+        check_cancelled: CancelCheck<'_>,
+    ) -> Result<Tensor> {
         if codes.rank() != 3 {
             return Err(Error::AudioError(format!(
                 "Fish S2 DAC codes must have shape [B, K, T], got rank {}",
@@ -523,13 +592,19 @@ impl FishS2DownsampleResidualVectorQuantizer {
 
         let semantic_codes = codes.narrow(1, 0, 1)?;
         let residual_codes = codes.narrow(1, 1, config.residual_codebooks)?;
-        let semantic = self.semantic_quantizer.decode_codes(&semantic_codes)?;
-        let residual = self.residual_quantizer.decode_codes(&residual_codes)?;
+        let semantic = self
+            .semantic_quantizer
+            .decode_codes(&semantic_codes, check_cancelled)?;
+        let residual = self
+            .residual_quantizer
+            .decode_codes(&residual_codes, check_cancelled)?;
         let mut z = semantic.broadcast_add(&residual)?;
-        z = self.post_module.forward(&z)?;
+        z = self.post_module.forward(&z, check_cancelled)?;
         for block in &self.upsample {
+            check_cancelled()?;
             z = block.forward(&z)?;
         }
+        check_cancelled()?;
         Ok(z)
     }
 }
@@ -555,9 +630,10 @@ impl FishS2ResidualVectorQuantizer {
         Ok(Self { quantizers })
     }
 
-    fn decode_codes(&self, codes: &Tensor) -> Result<Tensor> {
+    fn decode_codes(&self, codes: &Tensor, check_cancelled: CancelCheck<'_>) -> Result<Tensor> {
         let mut sum: Option<Tensor> = None;
         for (idx, quantizer) in self.quantizers.iter().enumerate() {
+            check_cancelled()?;
             let z_p = quantizer.decode_code(&codes.i((.., idx, ..))?)?;
             let z_q = quantizer.out_proj.forward(&z_p)?;
             sum = Some(match sum {
@@ -568,11 +644,16 @@ impl FishS2ResidualVectorQuantizer {
         sum.ok_or_else(|| Error::AudioError("Fish S2 DAC has no quantizers".to_string()))
     }
 
-    fn encode(&self, z: &Tensor) -> Result<(Tensor, Vec<Tensor>)> {
+    fn encode(
+        &self,
+        z: &Tensor,
+        check_cancelled: CancelCheck<'_>,
+    ) -> Result<(Tensor, Vec<Tensor>)> {
         let mut residual = z.clone();
         let mut sum: Option<Tensor> = None;
         let mut codes = Vec::with_capacity(self.quantizers.len());
         for quantizer in &self.quantizers {
+            check_cancelled()?;
             let (z_q_i, indices_i) = quantizer.encode(&residual)?;
             sum = Some(match sum {
                 Some(current) => current.broadcast_add(&z_q_i)?,
@@ -744,11 +825,13 @@ impl FishS2DacAudioEncoder {
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, check_cancelled: CancelCheck<'_>) -> Result<Tensor> {
+        check_cancelled()?;
         let mut hidden = self.first.forward(x)?;
         for block in &self.blocks {
-            hidden = block.forward(&hidden)?;
+            hidden = block.forward(&hidden, check_cancelled)?;
         }
+        check_cancelled()?;
         self.final_conv.forward(&self.final_snake.forward(&hidden)?)
     }
 }
@@ -797,14 +880,16 @@ impl FishS2EncoderBlock {
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, check_cancelled: CancelCheck<'_>) -> Result<Tensor> {
         let mut hidden = x.clone();
         for residual in &self.residuals {
+            check_cancelled()?;
             hidden = residual.forward(&hidden)?;
         }
+        check_cancelled()?;
         hidden = self.conv.forward(&self.snake.forward(&hidden)?)?;
         if let Some(transformer) = &self.transformer {
-            hidden = transformer.forward(&hidden)?;
+            hidden = transformer.forward(&hidden, check_cancelled)?;
         }
         Ok(hidden)
     }
@@ -838,11 +923,13 @@ impl FishS2DacAudioDecoder {
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, check_cancelled: CancelCheck<'_>) -> Result<Tensor> {
+        check_cancelled()?;
         let mut hidden = self.first.forward(x)?;
         for block in &self.blocks {
-            hidden = block.forward(&hidden)?;
+            hidden = block.forward(&hidden, check_cancelled)?;
         }
+        check_cancelled()?;
         self.final_conv.forward(&self.final_snake.forward(&hidden)?)
     }
 }
@@ -867,9 +954,11 @@ impl FishS2DecoderBlock {
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, check_cancelled: CancelCheck<'_>) -> Result<Tensor> {
+        check_cancelled()?;
         let mut hidden = self.transposed.forward(&self.snake.forward(x)?)?;
         for residual in &self.residuals {
+            check_cancelled()?;
             hidden = residual.forward(&hidden)?;
         }
         Ok(hidden)
@@ -966,6 +1055,10 @@ impl FishS2CausalConv1d {
             stride,
             dilation,
             groups,
+            // Keep cuDNN scratch bounded by the portable workspace estimate. Profile
+            // faster algorithms against an explicit workspace budget before changing it.
+            #[cfg(feature = "cudnn")]
+            cudnn_fwd_algo: Some(candle_core::conv::CudnnFwdAlgo::ImplicitGemm),
             ..Default::default()
         };
         let conv_vb = conv_weight_vb(&vb);
@@ -1071,7 +1164,8 @@ impl FishS2WindowLimitedTransformer {
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, check_cancelled: CancelCheck<'_>) -> Result<Tensor> {
+        check_cancelled()?;
         let mut hidden = if self.channels_first {
             x.transpose(1, 2)?
         } else {
@@ -1081,7 +1175,7 @@ impl FishS2WindowLimitedTransformer {
             hidden = input_proj.forward(&hidden)?;
         }
         for layer in &self.layers {
-            hidden = layer.forward(&hidden)?;
+            hidden = layer.forward(&hidden, check_cancelled)?;
         }
         hidden = self.norm.forward(&hidden)?;
         if let Some(output_proj) = &self.output_proj {
@@ -1112,16 +1206,18 @@ impl FishS2DacTransformerBlock {
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, check_cancelled: CancelCheck<'_>) -> Result<Tensor> {
+        check_cancelled()?;
         let attn = self
             .attention
-            .forward(&self.attention_norm.forward(x)?)?
+            .forward(&self.attention_norm.forward(x)?, check_cancelled)?
             .broadcast_mul(&self.attention_scale.reshape((
                 1,
                 1,
                 self.attention_scale.dim(0)?,
             ))?)?;
         let hidden = x.broadcast_add(&attn)?;
+        check_cancelled()?;
         let ff = self
             .feed_forward
             .forward(&self.ffn_norm.forward(&hidden)?)?
@@ -1150,7 +1246,8 @@ impl FishS2DacAttention {
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, check_cancelled: CancelCheck<'_>) -> Result<Tensor> {
+        check_cancelled()?;
         let bsz = x.dim(0)?;
         let seq_len = x.dim(1)?;
         let q_dim = self.num_heads * self.head_dim;
@@ -1180,14 +1277,7 @@ impl FishS2DacAttention {
         let k = k.reshape((bsz * self.num_heads, seq_len, self.head_dim))?;
         let v = v.reshape((bsz * self.num_heads, seq_len, self.head_dim))?;
 
-        let mut att = q.matmul(&k.transpose(1, 2)?)?;
-        let scale =
-            Tensor::new((self.head_dim as f32).sqrt(), att.device())?.to_dtype(att.dtype())?;
-        att = att.broadcast_div(&scale)?;
-        let mask = windowed_causal_mask(seq_len, self.window_size, att.device(), att.dtype())?;
-        att = att.broadcast_add(&mask)?;
-        let att = ops::softmax(&att, D::Minus1)?;
-        let out = att.matmul(&v)?;
+        let out = windowed_attention(&q, &k, &v, self.window_size, check_cancelled)?;
         let out = out
             .reshape((bsz, self.num_heads, seq_len, self.head_dim))?
             .transpose(1, 2)?
@@ -1419,26 +1509,57 @@ fn load_conv_transpose1d_weight(
     Ok(ConvTranspose1d::new(weight, bias, cfg))
 }
 
-fn windowed_causal_mask(
-    seq_len: usize,
+fn windowed_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
     window_size: usize,
-    device: &candle_core::Device,
-    dtype: DType,
+    check_cancelled: CancelCheck<'_>,
 ) -> Result<Tensor> {
-    if window_size >= seq_len {
-        return causal_mask(seq_len, seq_len, 0, device, dtype);
+    let (_, seq_len, head_dim) = q.dims3()?;
+    if seq_len == 0 || window_size == 0 || q.dims() != k.dims() || k.dims() != v.dims() {
+        return Err(Error::InferenceError(
+            "Fish S2 codec attention requires matching nonempty Q/K/V and a positive window".into(),
+        ));
     }
-    let mut values = Vec::with_capacity(seq_len * seq_len);
-    for row in 0..seq_len {
-        let min_col = row.saturating_add(1).saturating_sub(window_size);
-        for col in 0..seq_len {
-            let allowed = col <= row && col >= min_col;
-            values.push(if allowed { 0.0 } else { f32::NEG_INFINITY });
+    let scale = (head_dim as f64).sqrt().recip();
+    let mut blocks = Vec::with_capacity(seq_len.div_ceil(ATTENTION_QUERY_BLOCK));
+    for query_start in (0..seq_len).step_by(ATTENTION_QUERY_BLOCK) {
+        check_cancelled()?;
+        let query_len = ATTENTION_QUERY_BLOCK.min(seq_len - query_start);
+        let key_start = query_start.saturating_sub(window_size - 1);
+        let key_len = query_start + query_len - key_start;
+        let query = q.narrow(1, query_start, query_len)?.contiguous()?;
+        let key = k.narrow(1, key_start, key_len)?.contiguous()?;
+        let value = v.narrow(1, key_start, key_len)?.contiguous()?;
+        let att = (query.matmul(&key.transpose(1, 2)?)? * scale)?;
+        #[cfg(test)]
+        ATTENTION_SCORE_ALLOCATIONS.with(|allocations| {
+            allocations.borrow_mut().push(att.elem_count());
+        });
+        let mut mask = Vec::with_capacity(query_len * key_len);
+        for row in query_start..query_start + query_len {
+            let first = (row + 1).saturating_sub(window_size);
+            for col in key_start..key_start + key_len {
+                mask.push(if col <= row && col >= first {
+                    0.0f32
+                } else {
+                    f32::NEG_INFINITY
+                });
+            }
         }
+        let mask =
+            Tensor::from_vec(mask, (1, query_len, key_len), q.device())?.to_dtype(q.dtype())?;
+        let att = ops::softmax_last_dim(&att.broadcast_add(&mask)?)?;
+        blocks.push(att.matmul(&value)?);
+        check_cancelled()?;
     }
-    Tensor::from_vec(values, (1, seq_len, seq_len), device)?
-        .to_dtype(dtype)
-        .map_err(Error::from)
+    Tensor::cat(&blocks, 1).map_err(Error::from)
+}
+
+#[cfg(test)]
+thread_local! {
+    static ATTENTION_SCORE_ALLOCATIONS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
@@ -1844,7 +1965,7 @@ mod tests {
             -0.04114733,
         ];
         let actual = attention
-            .forward(&input)
+            .forward(&input, &|| Ok(()))
             .unwrap()
             .flatten_all()
             .unwrap()
@@ -1932,5 +2053,165 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("capacity"));
+    }
+
+    fn dense_attention_oracle(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        heads: usize,
+        frames: usize,
+        dim: usize,
+        window: usize,
+    ) -> Vec<f32> {
+        let mut output = vec![0.0f32; q.len()];
+        for head in 0..heads {
+            for row in 0..frames {
+                let first = (row + 1).saturating_sub(window);
+                let mut logits = Vec::new();
+                for col in first..=row {
+                    let score = (0..dim)
+                        .map(|channel| {
+                            f64::from(q[(head * frames + row) * dim + channel])
+                                * f64::from(k[(head * frames + col) * dim + channel])
+                        })
+                        .sum::<f64>()
+                        / (dim as f64).sqrt();
+                    logits.push(score);
+                }
+                let max = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let sum = logits.iter().map(|score| (score - max).exp()).sum::<f64>();
+                for channel in 0..dim {
+                    output[(head * frames + row) * dim + channel] = logits
+                        .iter()
+                        .enumerate()
+                        .map(|(offset, score)| {
+                            (score - max).exp() / sum
+                                * f64::from(v[(head * frames + first + offset) * dim + channel])
+                        })
+                        .sum::<f64>()
+                        as f32;
+                }
+            }
+        }
+        output
+    }
+
+    #[test]
+    fn blocked_attention_matches_dense_oracle_across_windows_and_block_edges() {
+        let device = Device::Cpu;
+        for frames in [1usize, 63, 64, 65, 129] {
+            let (heads, dim) = (2, 4);
+            let q = (0..heads * frames * dim)
+                .map(|i| (i as f32 * 0.13).sin())
+                .collect::<Vec<_>>();
+            let k = (0..q.len())
+                .map(|i| (i as f32 * 0.17).cos())
+                .collect::<Vec<_>>();
+            let v = (0..q.len())
+                .map(|i| (i as f32 * 0.19).sin())
+                .collect::<Vec<_>>();
+            let query = Tensor::from_vec(q.clone(), (heads, frames, dim), &device).unwrap();
+            let key = Tensor::from_vec(k.clone(), (heads, frames, dim), &device).unwrap();
+            let value = Tensor::from_vec(v.clone(), (heads, frames, dim), &device).unwrap();
+            for window in [1usize, 7, 64, 128] {
+                let expected = dense_attention_oracle(&q, &k, &v, heads, frames, dim, window);
+                let actual = windowed_attention(&query, &key, &value, window, &|| Ok(()))
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+                    assert!(
+                        (actual - expected).abs() < 2e-6,
+                        "frames={frames}, window={window}, element={index}: {actual} != {expected}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn actual_attention_score_allocations_stay_bounded_when_sequence_doubles() {
+        let (heads, window) = (2usize, 128usize);
+        let mut maxima = Vec::new();
+        for frames in [1024usize, 2048] {
+            ATTENTION_SCORE_ALLOCATIONS.with(|allocations| allocations.borrow_mut().clear());
+            let x = Tensor::zeros((heads, frames, 2), DType::F32, &Device::Cpu).unwrap();
+            let output = windowed_attention(&x, &x, &x, window, &|| Ok(())).unwrap();
+            assert_eq!(output.dims(), &[heads, frames, 2]);
+            let allocations =
+                ATTENTION_SCORE_ALLOCATIONS.with(|allocations| allocations.borrow().clone());
+            assert_eq!(allocations.len(), frames.div_ceil(ATTENTION_QUERY_BLOCK));
+            let max = allocations.into_iter().max().unwrap();
+            assert!(max <= heads * ATTENTION_QUERY_BLOCK * (window + ATTENTION_QUERY_BLOCK - 1));
+            assert!(max < heads * frames * frames / 16);
+            maxima.push(max);
+        }
+        assert_eq!(maxima[0], maxima[1]);
+    }
+
+    #[test]
+    fn attention_cancellation_stops_before_the_next_score_allocation() {
+        let calls = std::cell::Cell::new(0usize);
+        let cancel = || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 3 {
+                Err(Error::Cancelled("test".into()))
+            } else {
+                Ok(())
+            }
+        };
+        ATTENTION_SCORE_ALLOCATIONS.with(|allocations| allocations.borrow_mut().clear());
+        let x = Tensor::zeros((1, 129, 4), DType::F32, &Device::Cpu).unwrap();
+        assert!(matches!(
+            windowed_attention(&x, &x, &x, 7, &cancel),
+            Err(Error::Cancelled(_))
+        ));
+        assert_eq!(calls.get(), 3);
+        ATTENTION_SCORE_ALLOCATIONS.with(|allocations| assert_eq!(allocations.borrow().len(), 1));
+    }
+
+    #[test]
+    fn codec_cancellation_propagates_and_leaves_the_next_request_usable() {
+        let codec = tiny_decoder(&Device::Cpu);
+        let cancel_now = || Err(Error::Cancelled("test".into()));
+        assert!(matches!(
+            codec.encode_reference_audio_with_cancel(&[], 0, &cancel_now),
+            Err(Error::Cancelled(_))
+        ));
+        let calls = std::cell::Cell::new(0usize);
+        let cancel_during_encode = || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 8 {
+                Err(Error::Cancelled("test".into()))
+            } else {
+                Ok(())
+            }
+        };
+        assert!(matches!(
+            codec.encode_reference_audio_with_cancel(&[0.0, 0.2, -0.2], 100, &cancel_during_encode),
+            Err(Error::Cancelled(_))
+        ));
+        let codes = codec
+            .encode_reference_audio(&[0.0, 0.2, -0.2], 100)
+            .unwrap();
+        calls.set(0);
+        let cancel_during_decode = || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 4 {
+                Err(Error::Cancelled("test".into()))
+            } else {
+                Ok(())
+            }
+        };
+        assert!(matches!(
+            codec.decode_vq_codes_with_cancel(&codes, &cancel_during_decode),
+            Err(Error::Cancelled(_))
+        ));
+        let audio = codec.decode_vq_codes(&codes).unwrap();
+        assert_eq!(audio.len(), 3);
+        assert!(audio.iter().all(|sample| sample.is_finite()));
     }
 }
