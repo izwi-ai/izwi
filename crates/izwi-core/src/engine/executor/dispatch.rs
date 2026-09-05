@@ -168,6 +168,22 @@ impl NativeExecutor {
                 }
                 return self.voxtral_tts_finalize_request(request, scheduled_req);
             }
+            if request.task_type == TaskType::TTS
+                && request.model_variant.is_some_and(|variant| {
+                    variant.family() == crate::catalog::ModelFamily::FishS2Tts
+                })
+                && matches!(
+                    scheduled_req.work,
+                    crate::engine::WorkUnit::SequenceFinalize { .. }
+                )
+            {
+                if managed_cache.is_some() {
+                    return Err(Error::InferenceError(
+                        "Fish S2 codec unexpectedly received managed KV state".into(),
+                    ));
+                }
+                return self.fish_s2_tts_finalize_request(request, scheduled_req);
+            }
             match managed_cache {
                 Some(reservation) if request.task_type == TaskType::Chat => {
                     if request.model_variant.is_some_and(|variant| {

@@ -394,17 +394,17 @@ mod tests {
 
     #[cfg(feature = "metal")]
     #[test]
-    fn metal_rotation_matches_frozen_upstream_oracles_if_available() {
-        if let Some(device) = crate::backends::metal_device_if_available(0) {
-            check_oracles(&device);
-        }
+    #[ignore = "requires an available Metal device; never falls back to CPU"]
+    fn metal_rotation_matches_frozen_upstream_oracles() {
+        let device = Device::new_metal(0).expect("Metal device");
+        check_oracles(&device);
     }
 
     #[cfg(feature = "cuda")]
     #[test]
-    fn cuda_rotation_matches_frozen_upstream_oracles_if_available() {
-        if let Ok(device) = Device::new_cuda(0) {
-            check_oracles(&device);
-        }
+    #[ignore = "requires an available CUDA device; never falls back to CPU"]
+    fn cuda_rotation_matches_frozen_upstream_oracles() {
+        let device = Device::new_cuda(0).expect("CUDA device");
+        check_oracles(&device);
     }
 }

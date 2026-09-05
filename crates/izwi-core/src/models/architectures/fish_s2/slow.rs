@@ -5,7 +5,6 @@ use candle_nn::{ops, Embedding, Linear, Module, RmsNorm, VarBuilder};
 
 use crate::error::{Error, Result};
 use crate::models::architectures::fish_s2::config::FishS2Config;
-use crate::models::architectures::fish_s2::contracts::build_semantic_allowed_mask;
 use crate::models::architectures::fish_s2::rotary::FishS2RotaryCache;
 use crate::models::architectures::fish_s2::tokenizer::FishS2ConditioningPrompt;
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
@@ -326,47 +325,18 @@ impl FishS2SlowTransformer {
     }
 
     pub fn semantic_allowed_mask(&self, im_end_token_id: u32) -> Result<Vec<bool>> {
-        let config = FishS2Config {
-            architectures: vec!["DualARTransformer".to_string()],
-            model_type: "fish_qwen3_omni".to_string(),
-            torch_dtype: None,
-            text_config: crate::models::architectures::fish_s2::config::FishS2TextConfig {
-                hidden_size: self.cfg.hidden_size,
-                num_hidden_layers: self.cfg.num_hidden_layers,
-                num_attention_heads: self.cfg.num_attention_heads,
-                num_key_value_heads: self.cfg.num_key_value_heads,
-                head_dim: Some(self.cfg.head_dim),
-                vocab_size: self.cfg.vocab_size,
-                max_seq_len: self.cfg.max_seq_len,
-                rope_theta: Some(self.cfg.rope_theta),
-                rms_norm_eps: Some(self.cfg.rms_norm_eps),
-                intermediate_size: Some(self.cfg.intermediate_size),
-                hidden_act: None,
-            },
-            audio_decoder_config:
-                crate::models::architectures::fish_s2::config::FishS2AudioDecoderConfig {
-                    hidden_size: self.cfg.hidden_size,
-                    num_hidden_layers: 1,
-                    num_attention_heads: self.cfg.num_attention_heads,
-                    num_key_value_heads: self.cfg.num_key_value_heads,
-                    head_dim: Some(self.cfg.head_dim),
-                    intermediate_size: Some(self.cfg.intermediate_size),
-                    max_seq_len: Some(self.cfg.num_codebooks + 1),
-                    num_codebooks: Some(self.cfg.num_codebooks),
-                    vocab_size: Some(self.cfg.codebook_size),
-                },
-            num_codebooks: self.cfg.num_codebooks,
-            codebook_size: self.cfg.codebook_size,
-            max_seq_len: self.cfg.max_seq_len,
-            bos_token_id: 0,
-            eos_token_id: im_end_token_id,
-            pad_token_id: 0,
-            audio_pad_token_id: 0,
-            semantic_start_token_id: self.cfg.semantic_start_token_id,
-            semantic_end_token_id: self.cfg.semantic_end_token_id,
-            sample_rate: None,
-        };
-        build_semantic_allowed_mask(self.cfg.vocab_size, &config, im_end_token_id)
+        if self.cfg.semantic_end_token_id as usize >= self.cfg.vocab_size
+            || im_end_token_id as usize >= self.cfg.vocab_size
+        {
+            return Err(Error::ModelLoadError(
+                "Fish S2 semantic tokens exceed vocabulary".into(),
+            ));
+        }
+        let mut mask = vec![false; self.cfg.vocab_size];
+        mask[self.cfg.semantic_start_token_id as usize..=self.cfg.semantic_end_token_id as usize]
+            .fill(true);
+        mask[im_end_token_id as usize] = true;
+        Ok(mask)
     }
 }
 
@@ -416,6 +386,11 @@ impl FishS2SlowLayer {
 impl FishS2PackedAttention {
     fn load(cfg: &FishS2SlowConfig, rotary: &FishS2RotaryCache, vb: VarBuilder) -> Result<Self> {
         let total = cfg.q_size() + 2 * cfg.kv_size();
+        if !vb.contains_tensor("q_norm.weight") || !vb.contains_tensor("k_norm.weight") {
+            return Err(Error::ModelLoadError(
+                "Fish S2 slow attention requires Q/K normalization weights".into(),
+            ));
+        }
         Ok(Self {
             qkv_proj: candle_nn::linear_no_bias(cfg.hidden_size, total, vb.pp("qkv_proj"))?,
             o_proj: candle_nn::linear_no_bias(cfg.q_size(), cfg.hidden_size, vb.pp("o_proj"))?,

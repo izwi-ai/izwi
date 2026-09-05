@@ -13,9 +13,6 @@ use crate::engine::{
 };
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
-use crate::models::architectures::fish_s2::{
-    FishS2GenerationParams, FishS2Reference, FISH_S2_FAST_STATE_DOMAIN, FISH_S2_SLOW_STATE_DOMAIN,
-};
 use crate::models::architectures::kokoro::{kokoro_output_budget, kokoro_peak_workspace};
 use crate::models::architectures::lfm25_audio::lfm25_audio_tts_system_prompt;
 use crate::models::architectures::qwen3::tts::qwen_tts_cuda_chunked_codec_stream_enabled;
@@ -365,30 +362,6 @@ fn vibevoice_reference_from_request(
     }
     let (audio_samples, sample_rate) = decode_reference_audio_base64(ref_audio)?;
     Ok(VibeVoiceSpeakerReference {
-        audio_samples,
-        sample_rate,
-        text: ref_text.to_string(),
-    })
-}
-
-fn fish_s2_reference_from_request(request: &GenerationRequest) -> Result<FishS2Reference> {
-    let ref_audio = request.reference_audio.as_deref().ok_or_else(|| {
-        Error::InvalidInput(
-            "FishAudio-S2-Pro TTS requires `reference_audio` and `reference_text`".to_string(),
-        )
-    })?;
-    let ref_text = request.reference_text.as_deref().ok_or_else(|| {
-        Error::InvalidInput(
-            "FishAudio-S2-Pro TTS requires `reference_audio` and `reference_text`".to_string(),
-        )
-    })?;
-    if ref_text.trim().is_empty() {
-        return Err(Error::InvalidInput(
-            "FishAudio-S2-Pro reference_text cannot be empty".to_string(),
-        ));
-    }
-    let (audio_samples, sample_rate) = decode_reference_audio_base64(ref_audio)?;
-    Ok(FishS2Reference {
         audio_samples,
         sample_rate,
         text: ref_text.to_string(),
@@ -836,110 +809,6 @@ impl RuntimeService {
         send_direct_tts_chunk(job, &chunk_tx, chunk).await
     }
 
-    async fn fish_s2_tts_generate(
-        &self,
-        job: &JobLease,
-        request: GenerationRequest,
-        variant: ModelVariant,
-        streaming_required: bool,
-    ) -> Result<GenerationResult> {
-        self.observe_broker_capability_request(
-            CapabilityKind::Tts,
-            Some(variant),
-            streaming_required,
-        )?;
-        let (residency_lease, execution_contract, state_binding) = self
-            .load_capability_with_state_for_job(
-                job,
-                variant,
-                CapabilityKind::Tts,
-                streaming_required,
-                ExecutionTargetKind::DirectModel,
-            )
-            .await?;
-
-        let text = request.text.trim().to_string();
-        if text.is_empty() {
-            return Err(Error::InvalidInput("TTS request missing text".to_string()));
-        }
-
-        let model = self
-            .model_registry
-            .get_fish_s2_tts(variant)
-            .await
-            .ok_or_else(|| Error::InferenceError("No Fish S2 TTS model loaded".to_string()))?;
-        let context_limit = self
-            .model_registry
-            .effective_context(variant)
-            .unwrap_or_else(|| self.config.portable_context_ceiling());
-        let explicit_max_frames = tts_explicit_output_limit(
-            self.backend_router.context().backend_kind,
-            variant,
-            context_limit,
-        );
-        self.coordinator
-            .run_loaded_blocking_stage_with_invocation_paged(
-                job,
-                execution_contract,
-                state_binding,
-                WorkUnit::AtomicJob {
-                    kind: CapabilityKind::Tts.as_str().to_string(),
-                },
-                move |leases| {
-                    let _residency_lease = residency_lease;
-                    let reference = fish_s2_reference_from_request(&request)?;
-                    let mut params = FishS2GenerationParams::default();
-                    if request.config.options.max_tokens > 0 {
-                        params.max_frames =
-                            request.config.options.max_tokens.min(explicit_max_frames);
-                    }
-                    params.temperature = request.config.options.temperature;
-                    params.top_p = request.config.options.top_p;
-
-                    let started = Instant::now();
-                    let (slow_cache, fast_cache) = leases
-                        .cache_pair_mut(FISH_S2_SLOW_STATE_DOMAIN, FISH_S2_FAST_STATE_DOMAIN)?;
-                    let output = model.generate_with_reference_physical(
-                        &text, reference, params, slow_cache, fast_cache,
-                    )?;
-                    let total_time_ms = started.elapsed().as_secs_f32() * 1000.0;
-
-                    Ok(GenerationResult {
-                        request_id: request.id,
-                        samples: output.samples,
-                        sample_rate: output.sample_rate,
-                        total_tokens: output.frames_generated,
-                        total_time_ms,
-                        diagnostics: serde_json::to_value(output.diagnostics).ok(),
-                    })
-                },
-            )
-            .await
-    }
-
-    async fn fish_s2_tts_generate_streaming(
-        &self,
-        job: &JobLease,
-        request: GenerationRequest,
-        variant: ModelVariant,
-        chunk_tx: mpsc::Sender<AudioChunk>,
-    ) -> Result<()> {
-        let result = self
-            .fish_s2_tts_generate(job, request, variant, true)
-            .await?;
-        let generation_time_ms = result.total_time_ms;
-        let tokens_generated = result.total_tokens;
-        let rtf = result.rtf();
-        let mut chunk = AudioChunk::final_chunk(result.request_id.clone(), 0, result.samples)
-            .with_sample_rate(result.sample_rate);
-        chunk.stats = Some(ChunkStats {
-            generation_time_ms,
-            tokens_generated,
-            rtf,
-        });
-        send_direct_tts_chunk(job, &chunk_tx, chunk).await
-    }
-
     async fn qwen_tts_final_only_streaming(
         &self,
         mut request: GenerationRequest,
@@ -1018,10 +887,6 @@ impl RuntimeService {
                 }
                 ModelFamily::VibeVoiceTts => {
                     self.vibevoice_tts_generate(&job, request, resolved_variant, false)
-                        .await
-                }
-                ModelFamily::FishS2Tts => {
-                    self.fish_s2_tts_generate(&job, request, resolved_variant, false)
                         .await
                 }
                 _ => unreachable!("direct TTS family checked above"),
@@ -1109,10 +974,6 @@ impl RuntimeService {
                     self.vibevoice_tts_generate_streaming(&job, request, resolved_variant, chunk_tx)
                         .await
                 }
-                ModelFamily::FishS2Tts => {
-                    self.fish_s2_tts_generate_streaming(&job, request, resolved_variant, chunk_tx)
-                        .await
-                }
                 _ => unreachable!("direct TTS family checked above"),
             };
             self.record_direct_tts_observation(observation, result.as_ref().map(|_| None));
@@ -1167,6 +1028,14 @@ fn core_params_from_generation(config: &GenerationConfig) -> CoreGenParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fish_s2_public_tts_routes_always_use_retained_execution() {
+        assert!(!uses_direct_tts_runtime(ModelVariant::FishAudioS2Pro));
+        assert!(!uses_direct_streaming_tts_runtime(
+            ModelVariant::FishAudioS2Pro
+        ));
+    }
 
     #[test]
     fn kokoro_uses_engine_for_atomic_generation_and_direct_native_streaming() {

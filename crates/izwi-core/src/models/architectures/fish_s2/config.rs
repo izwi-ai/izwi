@@ -57,6 +57,20 @@ struct FishS2RawConfig {
 pub struct FishS2TextConfig {
     #[serde(alias = "hidden_size", alias = "dim")]
     pub hidden_size: usize,
+    #[serde(default)]
+    pub attention_bias: bool,
+    #[serde(default)]
+    pub attention_qkv_bias: bool,
+    #[serde(default)]
+    pub attention_o_bias: bool,
+    #[serde(default)]
+    pub use_moe: bool,
+    #[serde(default)]
+    pub mlp_bias: bool,
+    #[serde(default)]
+    pub attention_qk_norm: Option<bool>,
+    #[serde(default)]
+    pub tie_word_embeddings: Option<bool>,
     #[serde(alias = "num_hidden_layers", alias = "n_layer", alias = "n_layers")]
     pub num_hidden_layers: usize,
     #[serde(alias = "num_attention_heads", alias = "n_head", alias = "n_heads")]
@@ -86,6 +100,20 @@ pub struct FishS2TextConfig {
 pub struct FishS2AudioDecoderConfig {
     #[serde(alias = "hidden_size", alias = "dim")]
     pub hidden_size: usize,
+    #[serde(default)]
+    pub attention_bias: bool,
+    #[serde(default)]
+    pub attention_qkv_bias: bool,
+    #[serde(default)]
+    pub attention_o_bias: bool,
+    #[serde(default)]
+    pub use_moe: bool,
+    #[serde(default)]
+    pub mlp_bias: bool,
+    #[serde(default)]
+    pub attention_qk_norm: Option<bool>,
+    #[serde(default)]
+    pub tie_word_embeddings: Option<bool>,
     #[serde(alias = "num_hidden_layers", alias = "n_layer", alias = "n_layers")]
     pub num_hidden_layers: usize,
     #[serde(alias = "num_attention_heads", alias = "n_head", alias = "n_heads")]
@@ -106,6 +134,10 @@ pub struct FishS2AudioDecoderConfig {
     pub num_codebooks: Option<usize>,
     #[serde(default)]
     pub vocab_size: Option<usize>,
+    #[serde(default, alias = "rope_base")]
+    pub rope_theta: Option<f64>,
+    #[serde(default, alias = "norm_eps")]
+    pub rms_norm_eps: Option<f64>,
 }
 
 impl<'de> Deserialize<'de> for FishS2Config {
@@ -190,9 +222,12 @@ impl FishS2Config {
                 "Fish S2 config must advertise DualARTransformer".to_string(),
             ));
         }
-        if self.num_codebooks == 0 || self.codebook_size == 0 {
+        if self.num_codebooks != 10
+            || self.codebook_size != 4096
+            || self.sample_rate.is_some_and(|rate| rate != 44_100)
+        {
             return Err(Error::ModelLoadError(
-                "Fish S2 codebook dimensions must be non-zero".to_string(),
+                "Fish S2 Pro requires ten 4096-logit codebooks and a 44100 Hz codec".to_string(),
             ));
         }
         if self.semantic_end_token_id <= self.semantic_start_token_id {
@@ -210,6 +245,59 @@ impl FishS2Config {
         if self.audio_pad_token_id == self.semantic_start_token_id {
             return Err(Error::ModelLoadError(
                 "Fish S2 audio pad token must differ from semantic start token".to_string(),
+            ));
+        }
+        if self.max_seq_len == 0
+            || self.max_seq_len > self.text_config.max_seq_len
+            || self
+                .audio_decoder_config
+                .max_seq_len
+                .is_some_and(|n| n < self.num_codebooks)
+            || self
+                .audio_decoder_config
+                .num_codebooks
+                .is_some_and(|n| n != self.num_codebooks)
+            || self
+                .audio_decoder_config
+                .vocab_size
+                .is_some_and(|n| n != self.codebook_size)
+            || self.semantic_end_token_id as usize >= self.text_config.vocab_size
+            || [
+                self.eos_token_id,
+                self.pad_token_id,
+                self.audio_pad_token_id,
+            ]
+            .iter()
+            .any(|id| *id as usize >= self.text_config.vocab_size)
+            || (self.semantic_start_token_id..=self.semantic_end_token_id)
+                .contains(&self.eos_token_id)
+        {
+            return Err(Error::ModelLoadError(
+                "Fish S2 nested context, vocabulary or codebook contracts disagree".into(),
+            ));
+        }
+        if self.text_config.attention_bias
+            || self.text_config.mlp_bias
+            || self.text_config.attention_qkv_bias
+            || self.text_config.attention_o_bias
+            || self.text_config.use_moe
+            || self.audio_decoder_config.attention_qkv_bias
+            || self.audio_decoder_config.attention_o_bias
+            || self.audio_decoder_config.use_moe
+            || self.audio_decoder_config.attention_bias
+            || self.audio_decoder_config.mlp_bias
+            || self.text_config.attention_qk_norm == Some(false)
+            || self.audio_decoder_config.attention_qk_norm == Some(true)
+            || self.text_config.tie_word_embeddings == Some(false)
+            || self.audio_decoder_config.tie_word_embeddings == Some(true)
+            || self
+                .text_config
+                .hidden_act
+                .as_deref()
+                .is_some_and(|act| act != "silu")
+        {
+            return Err(Error::ModelLoadError(
+                "Unsupported Fish S2 bias, normalization, embedding or activation contract".into(),
             ));
         }
         self.text_config.validate("text_config")?;
@@ -243,6 +331,14 @@ impl FishS2TextConfig {
                 "Fish S2 {label} attention heads must be divisible by KV heads"
             )));
         }
+        validate_attention_geometry(
+            self.hidden_size,
+            self.num_attention_heads,
+            self.head_dim,
+            self.rope_theta,
+            self.rms_norm_eps,
+            self.intermediate_size,
+        )?;
         Ok(())
     }
 }
@@ -266,8 +362,39 @@ impl FishS2AudioDecoderConfig {
                 "Fish S2 {label} attention heads must be divisible by KV heads"
             )));
         }
+        validate_attention_geometry(
+            self.hidden_size,
+            self.num_attention_heads,
+            self.head_dim,
+            self.rope_theta,
+            self.rms_norm_eps,
+            self.intermediate_size,
+        )?;
         Ok(())
     }
+}
+
+fn validate_attention_geometry(
+    dim: usize,
+    heads: usize,
+    explicit: Option<usize>,
+    rope: Option<f64>,
+    eps: Option<f64>,
+    intermediate: Option<usize>,
+) -> Result<()> {
+    let head = explicit.unwrap_or(dim / heads);
+    if head == 0
+        || !head.is_multiple_of(2)
+        || (explicit.is_none() && !dim.is_multiple_of(heads))
+        || rope.is_some_and(|v| !v.is_finite() || v <= 0.0)
+        || eps.is_some_and(|v| !v.is_finite() || v <= 0.0)
+        || intermediate == Some(0)
+    {
+        return Err(Error::ModelLoadError(
+            "Fish S2 attention geometry, RoPE and normalization must be valid and finite".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -384,6 +511,35 @@ mod tests {
         assert_eq!(config.max_seq_len, 32768);
         assert_eq!(config.audio_decoder_config.hidden_size, 2560);
         assert_eq!(config.audio_decoder_config.num_hidden_layers, 4);
+    }
+
+    #[test]
+    fn rejects_unsupported_architecture_and_inconsistent_geometry() {
+        let base = current_config();
+        let mut config = base.clone();
+        config.text_config.attention_qk_norm = Some(false);
+        assert!(config.validate().is_err());
+        let mut config = base.clone();
+        config.audio_decoder_config.use_moe = true;
+        assert!(config.validate().is_err());
+        let mut config = base.clone();
+        config.audio_decoder_config.attention_o_bias = true;
+        assert!(config.validate().is_err());
+        let mut config = base.clone();
+        config.text_config.head_dim = Some(3);
+        assert!(config.validate().is_err());
+        let mut config = base.clone();
+        config.audio_decoder_config.rms_norm_eps = Some(f64::NAN);
+        assert!(config.validate().is_err());
+        let mut config = base.clone();
+        config.audio_decoder_config.num_codebooks = Some(11);
+        assert!(config.validate().is_err());
+        let mut config = base.clone();
+        config.eos_token_id = config.semantic_start_token_id;
+        assert!(config.validate().is_err());
+        let mut config = base;
+        config.max_seq_len = config.text_config.max_seq_len + 1;
+        assert!(config.validate().is_err());
     }
 
     #[test]

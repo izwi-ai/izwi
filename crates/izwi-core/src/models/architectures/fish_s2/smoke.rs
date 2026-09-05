@@ -12,6 +12,20 @@ use crate::error::{Error, Result};
 use super::{FishS2DacConfig, FishS2TtsModel};
 
 #[test]
+#[ignore = "requires the pinned local Fish S2 bundle; reads metadata only"]
+fn fish_s2_real_artifact_metadata_contracts() -> Result<()> {
+    let dir = required_env_path("IZWI_FISH_S2_MODEL_DIR")?;
+    let config = super::FishS2Config::load(&dir)?;
+    let _tokenizer = super::FishS2PromptTokenizer::load(&dir, &config)?;
+    let device = DeviceSelector::detect_for_preference(BackendPreference::Cpu)?;
+    let memory = super::weights::fish_s2_model_memory(&dir, &device)?;
+    assert!(memory.resident_bytes > 18 * 1024 * 1024 * 1024);
+    assert!(memory.load_peak_bytes >= memory.resident_bytes);
+    eprintln!("Pinned Fish CPU metadata: {memory:?}");
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires local fishaudio/s2-pro artifacts"]
 fn fish_s2_real_artifacts_load_native_modules() -> Result<()> {
     let model_dir = required_env_path("IZWI_FISH_S2_MODEL_DIR")?;

@@ -1,18 +1,14 @@
 //! Fast codebook decoder for Fish S2 DualAR generation.
 
-use candle_core::{DType, IndexOp, Tensor, D};
+use candle_core::{DType, IndexOp, Tensor};
 use candle_nn::{ops, Embedding, Linear, Module, RmsNorm, VarBuilder};
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
 
+pub use super::sampling::FishS2Sampler;
+use super::sampling::FishS2SamplingDistribution;
 use crate::error::{Error, Result};
 use crate::models::architectures::fish_s2::config::FishS2Config;
-use crate::models::architectures::fish_s2::contracts::semantic_code_from_token_id;
 use crate::models::architectures::fish_s2::rotary::FishS2RotaryCache;
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
-use crate::models::shared::sampling::{
-    bounded_device_sampling_candidates, device_candidates_cover_top_p, sample_device_candidates,
-};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FishS2FastConfig {
@@ -35,13 +31,6 @@ pub struct FishS2FastConfig {
 pub struct FishS2GeneratedFrame {
     pub semantic_token_id: u32,
     pub codebooks: Vec<u32>,
-}
-
-#[derive(Debug, Clone)]
-pub struct FishS2Sampler {
-    pub temperature: f32,
-    pub top_p: f32,
-    rng: StdRng,
 }
 
 pub struct FishS2FastDecoder {
@@ -104,8 +93,8 @@ impl FishS2FastConfig {
             num_codebooks: config.num_codebooks,
             semantic_start_token_id: config.semantic_start_token_id,
             semantic_end_token_id: config.semantic_end_token_id,
-            rope_theta: text.rope_theta.unwrap_or(1_000_000.0),
-            rms_norm_eps: text.rms_norm_eps.unwrap_or(1e-6),
+            rope_theta: audio.rope_theta.unwrap_or(1_000_000.0),
+            rms_norm_eps: audio.rms_norm_eps.unwrap_or(1e-6),
         })
     }
 
@@ -115,16 +104,6 @@ impl FishS2FastConfig {
 
     fn kv_size(&self) -> usize {
         self.num_key_value_heads * self.head_dim
-    }
-}
-
-impl FishS2Sampler {
-    pub fn new(temperature: f32, top_p: f32, seed: u64) -> Self {
-        Self {
-            temperature: temperature.max(0.0),
-            top_p: top_p.clamp(0.0, 1.0),
-            rng: StdRng::seed_from_u64(seed),
-        }
     }
 }
 
@@ -323,6 +302,11 @@ impl FishS2FastLayer {
 impl FishS2FastAttention {
     fn load(cfg: &FishS2FastConfig, rotary: &FishS2RotaryCache, vb: VarBuilder) -> Result<Self> {
         let total = cfg.q_size() + 2 * cfg.kv_size();
+        if vb.contains_tensor("q_norm.weight") || vb.contains_tensor("k_norm.weight") {
+            return Err(Error::ModelLoadError(
+                "Fish S2 fast attention does not use Q/K normalization".into(),
+            ));
+        }
         Ok(Self {
             qkv_proj: candle_nn::linear_no_bias(cfg.hidden_size, total, vb.pp("qkv_proj"))?,
             o_proj: candle_nn::linear_no_bias(cfg.q_size(), cfg.hidden_size, vb.pp("o_proj"))?,
@@ -433,145 +417,22 @@ impl FishS2FastMlp {
 }
 
 pub(crate) fn sample_logits(row: &Tensor, sampler: &mut FishS2Sampler) -> Result<u32> {
-    if row.dims1()? == 0 {
-        return Err(Error::InferenceError(
-            "Fish S2 fast sampler received empty logits".to_string(),
-        ));
-    }
-    if sampler.temperature <= 1e-5 || sampler.top_p <= 0.0 {
-        let idx = row.argmax(D::Minus1)?;
-        let idx = if idx.rank() == 0 {
-            idx
-        } else {
-            idx.squeeze(0)?
-        };
-        crate::models::shared::telemetry::record_dtype_cast();
-        crate::models::shared::telemetry::record_host_read(candle_core::DType::U32, 1);
-        return idx
-            .to_dtype(candle_core::DType::U32)?
-            .to_scalar::<u32>()
-            .map_err(Error::from);
-    }
-
-    if let Some(candidates) = bounded_device_sampling_candidates(
-        row,
-        row.dim(0)?,
-        0,
-        sampler.temperature,
-        &[],
-        1.0,
-        0.0,
-        None,
-    )? {
-        if device_candidates_cover_top_p(&candidates, sampler.top_p) {
-            if let Some(sampled) =
-                sample_device_candidates(&candidates, sampler.top_p, sampler.rng.r#gen::<f32>())
-            {
-                return Ok(sampled);
-            }
-        }
-    }
-
-    let values = row.to_dtype(candle_core::DType::F32)?.to_vec1::<f32>()?;
-
-    let temp = sampler.temperature.max(1e-5);
-    let max = values
-        .iter()
-        .copied()
-        .fold(f32::NEG_INFINITY, |acc, value| acc.max(value / temp));
-    let mut probs = values
-        .iter()
-        .enumerate()
-        .map(|(idx, value)| (idx, ((*value / temp) - max).exp()))
-        .collect::<Vec<_>>();
-    let sum: f32 = probs.iter().map(|(_, p)| *p).sum();
-    if !sum.is_finite() || sum <= 0.0 {
-        return argmax_values(&values);
-    }
-    for (_, prob) in &mut probs {
-        *prob /= sum;
-    }
-    probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    let mut cumulative = 0.0f32;
-    let mut kept = Vec::new();
-    for item in probs {
-        cumulative += item.1;
-        kept.push(item);
-        if cumulative >= sampler.top_p.max(1e-6) {
-            break;
-        }
-    }
-    let kept_sum: f32 = kept.iter().map(|(_, p)| *p).sum();
-    let mut draw = sampler.rng.r#gen::<f32>() * kept_sum;
-    for (idx, prob) in kept {
-        if draw <= prob {
-            return u32::try_from(idx).map_err(|_| {
-                Error::InferenceError("Fish S2 sampled index overflowed".to_string())
-            });
-        }
-        draw -= prob;
-    }
-    argmax_values(&values)
-}
-
-fn argmax_values(values: &[f32]) -> Result<u32> {
-    let mut best_idx = 0usize;
-    let mut best = f32::NEG_INFINITY;
-    for (idx, value) in values.iter().copied().enumerate() {
-        if value > best {
-            best = value;
-            best_idx = idx;
-        }
-    }
-    u32::try_from(best_idx)
-        .map_err(|_| Error::InferenceError("Fish S2 argmax index overflowed".to_string()))
+    super::sampling::validate_policy(sampler.temperature, sampler.top_p)?;
+    let distribution =
+        FishS2SamplingDistribution::from_logits(row, None, sampler.top_k, sampler.top_p, "fast")?;
+    sampler.sample(&distribution)
 }
 
 fn semantic_code_from_token_id_from_fast_config(
     cfg: &FishS2FastConfig,
     token_id: u32,
 ) -> Result<u32> {
-    let config = FishS2Config {
-        architectures: vec!["DualARTransformer".to_string()],
-        model_type: "fish_qwen3_omni".to_string(),
-        torch_dtype: None,
-        text_config: crate::models::architectures::fish_s2::config::FishS2TextConfig {
-            hidden_size: cfg.input_hidden_size,
-            num_hidden_layers: 1,
-            num_attention_heads: cfg.num_attention_heads,
-            num_key_value_heads: cfg.num_key_value_heads,
-            head_dim: Some(cfg.head_dim),
-            vocab_size: cfg.semantic_end_token_id as usize + 1,
-            max_seq_len: 16,
-            rope_theta: Some(cfg.rope_theta),
-            rms_norm_eps: Some(cfg.rms_norm_eps),
-            intermediate_size: Some(cfg.intermediate_size),
-            hidden_act: None,
-        },
-        audio_decoder_config:
-            crate::models::architectures::fish_s2::config::FishS2AudioDecoderConfig {
-                hidden_size: cfg.hidden_size,
-                num_hidden_layers: cfg.num_hidden_layers,
-                num_attention_heads: cfg.num_attention_heads,
-                num_key_value_heads: cfg.num_key_value_heads,
-                head_dim: Some(cfg.head_dim),
-                intermediate_size: Some(cfg.intermediate_size),
-                max_seq_len: Some(cfg.num_codebooks + 1),
-                num_codebooks: Some(cfg.num_codebooks),
-                vocab_size: Some(cfg.codebook_size),
-            },
-        num_codebooks: cfg.num_codebooks,
-        codebook_size: cfg.codebook_size,
-        max_seq_len: 16,
-        bos_token_id: 0,
-        eos_token_id: 0,
-        pad_token_id: 0,
-        audio_pad_token_id: 0,
-        semantic_start_token_id: cfg.semantic_start_token_id,
-        semantic_end_token_id: cfg.semantic_end_token_id,
-        sample_rate: None,
-    };
-    semantic_code_from_token_id(&config, token_id)
+    if !(cfg.semantic_start_token_id..=cfg.semantic_end_token_id).contains(&token_id) {
+        return Err(Error::InvalidInput(format!(
+            "Fish S2 token {token_id} is outside the semantic range"
+        )));
+    }
+    Ok(token_id - cfg.semantic_start_token_id)
 }
 
 fn load_rms_norm_alias(dim: usize, eps: f64, vb: &VarBuilder, aliases: &[&str]) -> Result<RmsNorm> {

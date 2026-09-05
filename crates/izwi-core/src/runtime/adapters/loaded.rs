@@ -38,7 +38,7 @@ const GRANITE_SPEECH_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::n
 const LFM25_AUDIO_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(23);
 const LFM25_AUDIO_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(24);
 const VIBEVOICE_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(26);
-const FISH_S2_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(27);
+const FISH_S2_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(28);
 const VOXTRAL_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(28);
 const PARAKEET_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(28);
 pub(crate) const VOXTRAL_REALTIME_ADAPTER_ABI: AdapterAbiRevision =
@@ -407,7 +407,7 @@ fn loaded_execution_contracts(
     if metadata.capability == CapabilityKind::Tts
         && matches!(
             metadata.model_variant.family(),
-            crate::catalog::ModelFamily::VibeVoiceTts | crate::catalog::ModelFamily::FishS2Tts
+            crate::catalog::ModelFamily::VibeVoiceTts
         )
     {
         let atomic = requirements
@@ -2649,35 +2649,13 @@ impl LoadedExecutionAdapter for FishS2TtsExecutionAdapter {
 
     fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
         use crate::models::architectures::fish_s2::{
-            FISH_S2_FAST_STATE_GROUP, FISH_S2_SLOW_STATE_GROUP, FISH_S2_TTS_DECODE_STAGE,
-            FISH_S2_TTS_LEGACY_STAGE, FISH_S2_TTS_PREFILL_STAGE, FISH_S2_TTS_PREPARATION_STAGE,
+            FISH_S2_SLOW_STATE_GROUP, FISH_S2_TTS_DECODE_STAGE, FISH_S2_TTS_PREFILL_STAGE,
+            FISH_S2_TTS_PREPARATION_STAGE,
         };
         if streaming.asr_long_form {
-            let mut profile = scalar_execution_profile(self.metadata, self.backend_kind, false);
-            profile.mode = ExecutionMode::Atomic;
-            profile.cache_mode = CacheMode::None;
-            profile.cache_namespace = None;
-            profile.kv_dtype = "none".into();
-            profile.max_batch_size = 1;
-            profile.resolved_from_loaded_model = true;
-            let mut stage = StageDescriptor::from_execution_profile(
-                StageId::new(0),
-                FISH_S2_TTS_LEGACY_STAGE,
-                &profile,
-                NativeBatchMode::None,
-            );
-            stage.selector = StageWorkSelector::Atomic;
-            stage.shape_policy = StageShapePolicy::Exact;
-            stage.validate()?;
-            return Ok(LoadedExecutionContract {
-                execution_group_id: self.execution_group_id,
-                model_instance_id: self.model_instance_id,
-                adapter_instance_id: self.adapter_instance_id,
-                adapter_abi_revision: self.adapter_abi_revision(),
-                metadata: self.metadata,
-                execution_profile: profile,
-                stages: Arc::from([stage]),
-            });
+            return Err(Error::InvalidInput(
+                "Fish S2 supports retained TTS execution only".into(),
+            ));
         }
 
         let mut profile = scalar_execution_profile(self.metadata, self.backend_kind, false);
@@ -2711,8 +2689,9 @@ impl LoadedExecutionAdapter for FishS2TtsExecutionAdapter {
         preparation.progress = StageProgressKind::Atomic;
         preparation.concurrency = ConcurrencyClass::Exclusive;
         preparation.shape_policy = StageShapePolicy::Exact;
-        preparation.max_work_units = 16_384;
-        preparation.max_workspace_bytes = 512 * 1024 * 1024;
+        preparation.max_work_units = ModelVariant::FISH_S2_PRO_NATIVE_CONTEXT_TOKENS as u64;
+        preparation.max_workspace_bytes =
+            crate::models::architectures::fish_s2::codec::maximum_preparation_workspace_bytes()?;
 
         let mut prefill = StageDescriptor::from_execution_profile(
             StageId::new(1),
@@ -2723,7 +2702,7 @@ impl LoadedExecutionAdapter for FishS2TtsExecutionAdapter {
         prefill.selector = StageWorkSelector::SequencePrefill;
         prefill.concurrency = ConcurrencyClass::Exclusive;
         prefill.shape_policy = StageShapePolicy::Exact;
-        prefill.max_work_units = 16_384;
+        prefill.max_work_units = ModelVariant::FISH_S2_PRO_NATIVE_CONTEXT_TOKENS as u64;
         prefill.max_workspace_bytes = 512 * 1024 * 1024;
         prefill.retained_state_selections = Some(vec![ClockedStateSelection::new(
             FISH_S2_SLOW_STATE_GROUP,
@@ -2741,13 +2720,28 @@ impl LoadedExecutionAdapter for FishS2TtsExecutionAdapter {
         decode.shape_policy = StageShapePolicy::Exact;
         decode.max_work_units = 1;
         decode.max_workspace_bytes = 512 * 1024 * 1024;
-        decode.retained_state_selections = Some(vec![
-            ClockedStateSelection::new(FISH_S2_SLOW_STATE_GROUP, StateClock::DecoderTokens)?,
-            ClockedStateSelection::new(FISH_S2_FAST_STATE_GROUP, StateClock::CodebookSteps)?,
-        ]);
-        preparation.validate()?;
-        prefill.validate()?;
-        decode.validate()?;
+        decode.retained_state_selections = Some(vec![ClockedStateSelection::new(
+            FISH_S2_SLOW_STATE_GROUP,
+            StateClock::DecoderTokens,
+        )?]);
+        let mut finalize = StageDescriptor::from_execution_profile(
+            StageId::new(3),
+            "tts.codec.fish_s2.scalar",
+            &profile,
+            NativeBatchMode::None,
+        );
+        finalize.selector = StageWorkSelector::SequenceFinalize;
+        finalize.progress = StageProgressKind::Atomic;
+        finalize.shape_policy = StageShapePolicy::Exact;
+        finalize.max_batch_size = 1;
+        finalize.concurrency = ConcurrencyClass::Exclusive;
+        finalize.max_work_units = 1;
+        finalize.max_workspace_bytes =
+            crate::models::architectures::fish_s2::codec::maximum_decode_workspace_bytes()?;
+        for stage in [&mut preparation, &mut prefill, &mut decode, &mut finalize] {
+            stage.output_visibility = OutputVisibility::AfterQuantumCommit;
+            stage.validate()?;
+        }
         Ok(LoadedExecutionContract {
             execution_group_id: self.execution_group_id,
             model_instance_id: self.model_instance_id,
@@ -2755,7 +2749,7 @@ impl LoadedExecutionAdapter for FishS2TtsExecutionAdapter {
             adapter_abi_revision: self.adapter_abi_revision(),
             metadata: self.metadata,
             execution_profile: profile,
-            stages: Arc::from([preparation, prefill, decode]),
+            stages: Arc::from([preparation, prefill, decode, finalize]),
         })
     }
 }
@@ -6696,7 +6690,7 @@ mod tests {
     }
 
     #[test]
-    fn fish_s2_loaded_contracts_enumerate_retained_and_atomic_state_graphs() {
+    fn fish_s2_loaded_contracts_have_only_retained_state_and_codec_finalization() {
         let registry = RuntimeAdapterRegistry::built_in();
         let metadata = *registry
             .require(CapabilityKind::Tts, ModelVariant::FishAudioS2Pro)
@@ -6714,7 +6708,27 @@ mod tests {
             .any(|contract| contract.execution_profile.mode == ExecutionMode::Sequence));
         assert!(contracts
             .iter()
-            .any(|contract| contract.execution_profile.mode == ExecutionMode::Atomic));
+            .all(|contract| contract.execution_profile.mode != ExecutionMode::Atomic));
+        let retained = contracts
+            .iter()
+            .find(|contract| contract.execution_profile.mode == ExecutionMode::Sequence)
+            .unwrap();
+        assert_eq!(retained.stages.len(), 4);
+        let finalize = retained
+            .stages
+            .iter()
+            .find(|stage| stage.selector == StageWorkSelector::SequenceFinalize)
+            .unwrap();
+        assert_eq!(finalize.id, StageId::new(3));
+        assert_eq!(finalize.max_batch_size, 1);
+        assert_eq!(
+            finalize.output_visibility,
+            OutputVisibility::AfterQuantumCommit
+        );
+        assert!(finalize
+            .retained_state_selections
+            .as_ref()
+            .is_none_or(Vec::is_empty));
     }
 
     #[test]

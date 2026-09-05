@@ -27,8 +27,8 @@ pub(crate) const FISH_S2_FAST_STATE_GROUP: StateGroupId = StateGroupId::new(2);
 #[derive(Debug, Clone)]
 pub(crate) struct FishS2PhysicalStateSpec {
     pub(crate) descriptor: CapabilityStateDescriptorV2,
-    /// Transactional slow/fast state for staged sequence graphs. Atomic
-    /// compatibility graphs continue to use invocation-owned copies.
+    /// Slow decoder state persists between complete semantic frames. Fast
+    /// codebook state is scoped to one decode invocation and resets each frame.
     pub(crate) retained: Option<InferenceStateContract>,
     pub(crate) invocation: InferenceStateContract,
 }
@@ -47,12 +47,10 @@ pub(crate) fn fish_s2_physical_state_spec(
     let page_tokens = u32::try_from(default_kv_page_size())
         .map_err(|_| Error::ModelLoadError("Fish S2 KV page size exceeds u32".into()))?;
     let state_dtype = fish_s2_state_dtype(dtype)?;
-    let slow_capacity = u64::try_from(config.max_seq_len)
-        .map_err(|_| Error::ModelLoadError("Fish S2 slow context exceeds u64".into()))?;
     let fast_capacity = u64::try_from(config.num_codebooks)
         .map_err(|_| Error::ModelLoadError("Fish S2 codebook count exceeds u64".into()))?;
     let invocation = fish_s2_invocation_contract(config, state_dtype, page_tokens)?;
-    let retained = fish_s2_retained_contract(invocation.clone())?;
+    let retained = fish_s2_retained_contract(config, state_dtype, page_tokens)?;
     let max_domain_id = invocation
         .domains
         .iter()
@@ -67,36 +65,30 @@ pub(crate) fn fish_s2_physical_state_spec(
         ordered.sort_unstable_by_key(|stage| stage.id);
         let mut invocation_stages = Vec::with_capacity(ordered.len());
         for (index, stage) in ordered.into_iter().enumerate() {
-            let uses_invocation_state = stage.selector == crate::engine::StageWorkSelector::Atomic;
+            if stage.selector == crate::engine::StageWorkSelector::Atomic {
+                return Err(Error::ModelLoadError(
+                    "Fish S2 requires its retained sequence execution graph".into(),
+                ));
+            }
+            let uses_invocation_state =
+                stage.selector == crate::engine::StageWorkSelector::SequenceDecode;
             let mut domains = if uses_invocation_state {
                 invocation
                     .domains
                     .iter()
                     .cloned()
                     .map(|state| {
-                        let max_tokens = match state.id() {
-                            FISH_S2_SLOW_STATE_DOMAIN => slow_capacity,
-                            FISH_S2_FAST_STATE_DOMAIN => fast_capacity,
-                            _ => {
-                                return Err(Error::ModelLoadError(
-                                    "Fish S2 invocation contract has an unknown domain".into(),
-                                ))
-                            }
-                        };
-                        let capacity = if state.id() == FISH_S2_SLOW_STATE_DOMAIN {
-                            InvocationStateCapacity::decoder_context(max_tokens)?
-                        } else {
-                            InvocationStateCapacity::PagedTokens { max_tokens }
-                        };
                         Ok(InvocationWorkspaceDomain::State {
                             placement: state.header().placement,
                             formula: WorkspaceFormula {
-                                fixed_bytes: fish_s2_paged_invocation_bytes(&state, max_tokens)?,
+                                fixed_bytes: fish_s2_paged_invocation_bytes(&state, fast_capacity)?,
                                 dimensions: vec![],
                                 terms: vec![],
                             },
                             state,
-                            capacity,
+                            capacity: InvocationStateCapacity::PagedTokens {
+                                max_tokens: fast_capacity,
+                            },
                         })
                     })
                     .collect::<Result<Vec<_>>>()?
@@ -184,28 +176,11 @@ pub(crate) fn fish_s2_physical_state_spec(
 }
 
 fn fish_s2_retained_contract(
-    mut contract: InferenceStateContract,
-) -> Result<InferenceStateContract> {
-    for domain in &mut contract.domains {
-        let StateDomainSpec::PagedAttention(domain) = domain else {
-            return Err(Error::ModelLoadError(
-                "Fish S2 retained state must be paged attention".into(),
-            ));
-        };
-        domain.header.scope = StateScope::Retained;
-        domain.header.prefix = PrefixPolicy::Disabled;
-        domain.header.checkpoint = CheckpointPolicy::Transactional;
-    }
-    contract.validate()?;
-    Ok(contract)
-}
-
-fn fish_s2_invocation_contract(
     config: &FishS2Config,
     dtype: StateDType,
     page_tokens: u32,
 ) -> Result<InferenceStateContract> {
-    let slow = fish_s2_paged_domain(
+    let mut slow = fish_s2_paged_domain(
         FISH_S2_SLOW_STATE_DOMAIN,
         StateClock::DecoderTokens,
         config.text_config.num_hidden_layers,
@@ -218,6 +193,29 @@ fn fish_s2_invocation_contract(
         dtype,
         page_tokens,
     )?;
+    let StateDomainSpec::PagedAttention(domain) = &mut slow else {
+        unreachable!("Fish S2 slow state is paged attention");
+    };
+    domain.header.scope = StateScope::Retained;
+    domain.header.checkpoint = CheckpointPolicy::Transactional;
+    let contract = InferenceStateContract {
+        abi: CURRENT_INFERENCE_STATE_ABI,
+        domains: vec![slow],
+        groups: vec![StateGroupSpec {
+            id: FISH_S2_SLOW_STATE_GROUP,
+            domains: vec![FISH_S2_SLOW_STATE_DOMAIN],
+            prefix_shareable: false,
+        }],
+    };
+    contract.validate()?;
+    Ok(contract)
+}
+
+fn fish_s2_invocation_contract(
+    config: &FishS2Config,
+    dtype: StateDType,
+    page_tokens: u32,
+) -> Result<InferenceStateContract> {
     let audio = &config.audio_decoder_config;
     let fast = fish_s2_paged_domain(
         FISH_S2_FAST_STATE_DOMAIN,
@@ -233,19 +231,12 @@ fn fish_s2_invocation_contract(
     )?;
     let contract = InferenceStateContract {
         abi: CURRENT_INFERENCE_STATE_ABI,
-        domains: vec![slow, fast],
-        groups: vec![
-            StateGroupSpec {
-                id: FISH_S2_SLOW_STATE_GROUP,
-                domains: vec![FISH_S2_SLOW_STATE_DOMAIN],
-                prefix_shareable: false,
-            },
-            StateGroupSpec {
-                id: FISH_S2_FAST_STATE_GROUP,
-                domains: vec![FISH_S2_FAST_STATE_DOMAIN],
-                prefix_shareable: false,
-            },
-        ],
+        domains: vec![fast],
+        groups: vec![StateGroupSpec {
+            id: FISH_S2_FAST_STATE_GROUP,
+            domains: vec![FISH_S2_FAST_STATE_DOMAIN],
+            prefix_shareable: false,
+        }],
     };
     contract.validate()?;
     Ok(contract)
@@ -462,167 +453,58 @@ mod tests {
         stage.concurrency = ConcurrencyClass::Exclusive;
         stage.shape_policy = StageShapePolicy::Exact;
         stage.retained_state_selections = Some(vec![ClockedStateSelection::new(
-            FISH_S2_FAST_STATE_GROUP,
-            StateClock::CodebookSteps,
+            FISH_S2_SLOW_STATE_GROUP,
+            StateClock::DecoderTokens,
         )
-        .expect("fast state selection")]);
+        .expect("slow state selection")]);
         stage
     }
 
     #[test]
-    fn staged_graph_publishes_transactional_slow_and_fast_retained_domains() {
+    fn staged_graph_retains_only_slow_and_leases_one_fast_frame() {
         let config = current_config();
         let stages = [
             retained_stage(1, StageWorkSelector::SequencePrefill),
             retained_stage(2, StageWorkSelector::SequenceDecode),
         ];
-        let spec = fish_s2_physical_state_spec(&config, DType::F16, &[&stages])
-            .expect("retained physical state");
-        let retained = spec.retained.as_ref().expect("retained contract");
-        assert_eq!(retained.domains.len(), 2);
-        assert_eq!(retained.groups.len(), 2);
-        for domain in &retained.domains {
-            assert_eq!(domain.header().scope, StateScope::Retained);
-            assert_eq!(domain.header().checkpoint, CheckpointPolicy::Transactional);
-        }
-        let StateDomainSpec::PagedAttention(slow) = &retained.domains[0] else {
-            panic!("slow retained domain must be paged attention");
-        };
-        let StateDomainSpec::PagedAttention(fast) = &retained.domains[1] else {
-            panic!("fast retained domain must be paged attention");
-        };
-        assert_eq!(slow.header.clock, StateClock::DecoderTokens);
-        assert_eq!(fast.header.clock, StateClock::CodebookSteps);
-
-        let InvocationWorkspaceSet::None {
-            stage_graph_fingerprints,
-        } = &spec.descriptor.invocation
-        else {
-            panic!("staged graph must not duplicate retained pages as invocation state");
-        };
-        assert_eq!(stage_graph_fingerprints.len(), 1);
-    }
-
-    #[test]
-    fn atomic_graph_preserves_invocation_owned_slow_and_fast_pages() {
-        let execution = stage();
-        let spec = fish_s2_physical_state_spec(
-            &current_config(),
-            DType::F16,
-            &[std::slice::from_ref(&execution)],
-        )
-        .expect("atomic physical state");
-        assert!(spec.retained.is_none());
-        assert!(matches!(
-            spec.descriptor.retained,
-            RetainedStateCapability::Stateless
-        ));
-    }
-
-    #[test]
-    fn retained_and_atomic_graphs_publish_both_state_lifetimes() {
-        let retained = [
-            retained_stage(1, StageWorkSelector::SequencePrefill),
-            retained_stage(2, StageWorkSelector::SequenceDecode),
-        ];
-        let atomic = stage();
-        let spec = fish_s2_physical_state_spec(
-            &current_config(),
-            DType::F16,
-            &[&retained, std::slice::from_ref(&atomic)],
-        )
-        .expect("mixed physical state");
-
-        assert!(spec.retained.is_some());
+        let spec = fish_s2_physical_state_spec(&config, DType::F16, &[&stages]).unwrap();
+        let retained = spec.retained.as_ref().unwrap();
+        assert_eq!(retained.domains.len(), 1);
+        assert_eq!(retained.groups.len(), 1);
+        let slow = &retained.domains[0];
+        assert_eq!(slow.id(), FISH_S2_SLOW_STATE_DOMAIN);
+        assert_eq!(slow.header().clock, StateClock::DecoderTokens);
+        assert_eq!(slow.header().scope, StateScope::Retained);
+        assert_eq!(slow.header().checkpoint, CheckpointPolicy::Transactional);
         let InvocationWorkspaceSet::Bounded { profiles } = &spec.descriptor.invocation else {
-            panic!("atomic compatibility graph must publish invocation pages");
+            panic!("bounded fast cache");
         };
-        assert_eq!(profiles.len(), 2);
-        assert!(profiles.iter().any(|profile| {
-            profile
-                .stages
-                .iter()
-                .flat_map(|workspace| &workspace.domains)
-                .any(|domain| matches!(domain, InvocationWorkspaceDomain::State { .. }))
-        }));
+        assert_eq!(profiles.len(), 1);
+        assert!(profiles[0].stages[0].domains.is_empty());
+        let decode = &profiles[0].stages[1];
+        assert_eq!(decode.domains.len(), 1);
+        let InvocationWorkspaceDomain::State {
+            state,
+            capacity,
+            formula,
+            ..
+        } = &decode.domains[0]
+        else {
+            panic!("fast state");
+        };
+        assert_eq!(state.id(), FISH_S2_FAST_STATE_DOMAIN);
+        assert_eq!(state.header().clock, StateClock::CodebookSteps);
+        assert_eq!(capacity.paged_max_tokens(), Some(10));
+        assert_eq!(
+            formula.fixed_bytes,
+            fish_s2_paged_invocation_bytes(state, 10).unwrap()
+        );
+        assert_eq!(formula.fixed_bytes, 1024 * 1024); // one 64-slot half-precision page
+        spec.descriptor.validate_against_stages(&stages).unwrap();
     }
 
     #[test]
-    fn dual_ar_contract_has_distinct_slow_and_fast_clocks_and_geometry() {
-        let config = current_config();
-        let contract = fish_s2_invocation_contract(&config, StateDType::F16, 64).expect("contract");
-        assert_eq!(contract.domains.len(), 2);
-        assert_eq!(contract.groups.len(), 2);
-
-        let StateDomainSpec::PagedAttention(slow) = &contract.domains[0] else {
-            panic!("slow domain must be paged attention");
-        };
-        assert_eq!(slow.header.id, FISH_S2_SLOW_STATE_DOMAIN);
-        assert_eq!(slow.header.clock, StateClock::DecoderTokens);
-        assert_eq!(slow.layers.len(), config.text_config.num_hidden_layers);
-        assert_eq!(
-            slow.layers[0].kv_heads as usize,
-            config.text_config.num_key_value_heads
-        );
-
-        let StateDomainSpec::PagedAttention(fast) = &contract.domains[1] else {
-            panic!("fast domain must be paged attention");
-        };
-        assert_eq!(fast.header.id, FISH_S2_FAST_STATE_DOMAIN);
-        assert_eq!(fast.header.clock, StateClock::CodebookSteps);
-        assert_eq!(
-            fast.layers.len(),
-            config.audio_decoder_config.num_hidden_layers
-        );
-        assert_eq!(
-            fast.layers[0].kv_heads as usize,
-            config.audio_decoder_config.num_key_value_heads
-        );
-    }
-
-    #[test]
-    fn descriptor_leases_slow_context_and_one_fast_codebook_frame() {
-        let config = current_config();
-        let execution = stage();
-        let spec =
-            fish_s2_physical_state_spec(&config, DType::F16, &[std::slice::from_ref(&execution)])
-                .expect("physical state");
-        let InvocationWorkspaceSet::Bounded { profiles } = &spec.descriptor.invocation else {
-            panic!("Fish S2 invocation pages must be bounded");
-        };
-        let workspace = &profiles[0].stages[0];
-        assert_eq!(workspace.groups.len(), 2);
-        assert_eq!(workspace.domains.len(), 2);
-        let InvocationWorkspaceDomain::State {
-            state: slow,
-            capacity: slow_capacity,
-            formula: slow_formula,
-            ..
-        } = &workspace.domains[0]
-        else {
-            panic!("slow workspace must have the full semantic capacity");
-        };
-        assert_eq!(slow_capacity.paged_max_tokens(), Some(4096));
-        assert_eq!(
-            slow_formula.fixed_bytes,
-            fish_s2_paged_invocation_bytes(slow, 4096).expect("slow bytes")
-        );
-        let InvocationWorkspaceDomain::State {
-            state: fast,
-            capacity: InvocationStateCapacity::PagedTokens { max_tokens: 10 },
-            formula: fast_formula,
-            ..
-        } = &workspace.domains[1]
-        else {
-            panic!("fast workspace must have one codebook-frame capacity");
-        };
-        assert_eq!(
-            fast_formula.fixed_bytes,
-            fish_s2_paged_invocation_bytes(fast, 10).expect("fast bytes")
-        );
-        assert_eq!(spec.invocation.domains.len(), 2);
-        spec.descriptor
-            .validate_against_stages(&[execution])
-            .expect("descriptor");
+    fn rejects_unreachable_atomic_graph_instead_of_allocating_duplicate_slow_cache() {
+        assert!(fish_s2_physical_state_spec(&current_config(), DType::F16, &[&[stage()]]).is_err());
     }
 }
