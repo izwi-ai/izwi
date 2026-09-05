@@ -331,11 +331,11 @@ fn load_qwen38_chat_model(
     model_dir: &Path,
     variant: ModelVariant,
     device: DeviceProfile,
-    _performance: &crate::performance::PerformanceConfig,
+    performance: &crate::performance::PerformanceConfig,
 ) -> Result<NativeChatModel> {
-    Ok(NativeChatModel::Qwen38(Qwen38ChatModel::load(
-        model_dir, variant, device,
-    )?))
+    Ok(NativeChatModel::Qwen38(
+        Qwen38ChatModel::load_with_performance(model_dir, variant, device, performance)?,
+    ))
 }
 
 fn load_lfm25_audio_model(

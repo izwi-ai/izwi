@@ -168,6 +168,12 @@ impl PhysicalPagedKvCache {
         self.view_id
     }
 
+    /// Changes whenever a logical rollback or page rotation invalidates a
+    /// previously prepared/verified view, including a same-length rewrite.
+    pub(crate) fn logical_generation(&self) -> u64 {
+        u64::from(self.logical_generation)
+    }
+
     pub(crate) fn sequence_authority(&self) -> PhysicalPagedKvSequenceAuthority {
         PhysicalPagedKvSequenceAuthority {
             arena: self.arena.id(),
@@ -223,6 +229,55 @@ impl PhysicalPagedKvCache {
         self.context_len = checkpoint.context_len;
         self.completed_writes
             .truncate(checkpoint.completed_write_count);
+        Ok(())
+    }
+
+    /// Retain an accepted prefix of an already verified append. Every receipt
+    /// was sealed (and its backend work waited) before entering this cache.
+    /// Project those proofs onto the retained rows so the executor can validate
+    /// exact slot coverage without acknowledging discarded or rewritten rows.
+    pub(crate) fn truncate_verified_prefix(&mut self, context_len: usize) -> Result<()> {
+        if context_len < self.window_start || context_len > self.context_len {
+            return Err(Error::InvalidInput(
+                "verified prefix falls outside the physical cache context".into(),
+            ));
+        }
+        let generation = self
+            .logical_generation
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidInput("physical prefix generation overflow".into()))?;
+        let page_tokens = self.arena.config().page_tokens as usize;
+        let first_page_start = (self.window_start / page_tokens) * page_tokens;
+        let visible = |slot: &KvSlotRef| {
+            self.blocks
+                .iter()
+                .position(|block| *block == slot.block)
+                .is_some_and(|page| {
+                    let position = first_page_start + page * page_tokens + slot.offset as usize;
+                    position >= self.window_start && position < context_len
+                })
+        };
+        let mut retained = Vec::with_capacity(self.completed_writes.len());
+        for completion in &self.completed_writes {
+            let slots = completion.slots();
+            let mut index = 0;
+            while index < slots.len() {
+                if !visible(&slots[index]) {
+                    index += 1;
+                    continue;
+                }
+                let start = index;
+                while index < slots.len() && visible(&slots[index]) {
+                    index += 1;
+                }
+                retained.push(Arc::new(
+                    completion.project_slot_range(start, index - start)?,
+                ));
+            }
+        }
+        self.context_len = context_len;
+        self.logical_generation = generation;
+        self.completed_writes = retained;
         Ok(())
     }
 
@@ -1208,6 +1263,50 @@ mod tests {
 
         let foreign = prefix_test_cache(23).logical_checkpoint();
         assert!(cache.restore_logical_checkpoint(foreign).is_err());
+    }
+
+    #[test]
+    fn verified_prefix_retains_write_authority_and_invalidates_preparations() {
+        let mut cache = prefix_test_cache(24);
+        let verified = fully_written_append(&cache, 3);
+        let slots = verified.slots.logical_slots().to_vec();
+        cache.commit_prepared(verified).unwrap();
+        let stale = fully_written_append(&cache, 1);
+        cache.truncate_verified_prefix(1).unwrap();
+        assert_eq!(cache.context_len(), 1);
+        assert_eq!(cache.completed_writes[0].slots(), &slots[..1]);
+        assert_eq!(cache.slots_for_append(1, 1).unwrap()[0], slots[1]);
+        assert!(cache.commit_prepared(stale).is_err());
+        assert!(cache.truncate_verified_prefix(2).is_err());
+        assert_eq!(cache.context_len(), 1);
+        assert_eq!(cache.completed_writes.len(), 1);
+        let rewritten = fully_written_append(&cache, 1);
+        cache.commit_prepared(rewritten).unwrap();
+        assert_eq!(cache.context_len(), 2);
+        let writes = cache.take_completed_writes();
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[0].slots(), &slots[..1]);
+        assert_eq!(writes[1].slots(), &slots[1..2]);
+    }
+
+    #[test]
+    fn verified_prefix_projects_every_acceptance_length_without_suffix_authority() {
+        for accepted in 0..=3 {
+            let mut cache = prefix_test_cache(30 + accepted as u32);
+            let verified = fully_written_append(&cache, 3);
+            let slots = verified.slots.logical_slots().to_vec();
+            cache.commit_prepared(verified).unwrap();
+            let old_generation = cache.logical_generation();
+            cache.truncate_verified_prefix(accepted).unwrap();
+            assert!(cache.logical_generation() > old_generation);
+            assert_eq!(cache.context_len(), accepted);
+            let writes = cache.take_completed_writes();
+            let observed = writes
+                .iter()
+                .flat_map(|write| write.slots().iter().copied())
+                .collect::<Vec<_>>();
+            assert_eq!(observed, slots[..accepted]);
+        }
     }
 
     #[test]
