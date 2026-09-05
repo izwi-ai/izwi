@@ -273,14 +273,17 @@ impl FishS2TtsModel {
         let slow = state.slow_output.as_ref().ok_or_else(|| {
             Error::InferenceError("Fish S2 retained state has no slow output".into())
         })?;
-        let semantic = sample_semantic_token(
+        let semantic_index = sample_semantic_token(
             &slow.logits,
             &runtime.semantic_allowed_mask,
-            runtime.tokenizer.specials().eos,
+            runtime
+                .slow
+                .eos_logit_index(runtime.tokenizer.specials().eos),
             state.frames_generated() > 0,
             &state.recent_semantic_tokens,
             &mut state.semantic_sampler,
         )?;
+        let semantic = runtime.slow.token_id_from_logit(semantic_index)?;
         if semantic == runtime.tokenizer.specials().eos {
             // Complete the slow-token append authorized for this quantum even
             // when EOS terminates generation; every committed row needs its KV receipt.
@@ -313,7 +316,7 @@ impl FishS2TtsModel {
             fast_cache,
         )?;
         append_generated_frame(&mut state.generated_codebooks, &frame)?;
-        state.recent_semantic_tokens.push(semantic);
+        state.recent_semantic_tokens.push(semantic_index);
         if state.recent_semantic_tokens.len() > RAS_WIN_SIZE {
             state.recent_semantic_tokens.remove(0);
         }

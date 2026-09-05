@@ -41,6 +41,7 @@ pub struct FishS2SlowTransformer {
     layers: Vec<FishS2SlowLayer>,
     norm: RmsNorm,
     lm_head: Linear,
+    semantic_head: Option<(Linear, u32)>,
 }
 
 struct FishS2SlowLayer {
@@ -150,7 +151,72 @@ impl FishS2SlowTransformer {
             layers,
             norm,
             lm_head,
+            semantic_head: None,
         })
+    }
+
+    /// Gather the only output rows Fish samples: EOS followed by the semantic
+    /// vocabulary. Input embeddings remain the complete checkpoint matrix.
+    pub(crate) fn configure_semantic_head(&mut self, eos: u32) -> Result<()> {
+        if eos as usize >= self.cfg.vocab_size
+            || (self.cfg.semantic_start_token_id..=self.cfg.semantic_end_token_id).contains(&eos)
+        {
+            return Err(Error::ModelLoadError(
+                "Fish S2 EOS must be outside its semantic vocabulary".into(),
+            ));
+        }
+        let weight = self.lm_head.weight();
+        let eos_weight = weight.narrow(0, eos as usize, 1)?;
+        let semantic_weight = weight.narrow(
+            0,
+            self.cfg.semantic_start_token_id as usize,
+            (self.cfg.semantic_end_token_id - self.cfg.semantic_start_token_id + 1) as usize,
+        )?;
+        self.semantic_head = Some((
+            Linear::new(Tensor::cat(&[&eos_weight, &semantic_weight], 0)?, None),
+            eos,
+        ));
+        Ok(())
+    }
+
+    pub(crate) fn eos_logit_index(&self, eos: u32) -> u32 {
+        if self.semantic_head.is_some() {
+            0
+        } else {
+            eos
+        }
+    }
+
+    pub(crate) fn token_id_from_logit(&self, index: u32) -> Result<u32> {
+        if let Some((_, eos)) = &self.semantic_head {
+            if index == 0 {
+                return Ok(*eos);
+            }
+            let token = self
+                .cfg
+                .semantic_start_token_id
+                .checked_add(index - 1)
+                .filter(|id| *id <= self.cfg.semantic_end_token_id)
+                .ok_or_else(|| {
+                    Error::InferenceError("Fish S2 compact head index is out of range".into())
+                })?;
+            Ok(token)
+        } else if (index as usize) < self.cfg.vocab_size {
+            Ok(index)
+        } else {
+            Err(Error::InferenceError(
+                "Fish S2 head index is out of range".into(),
+            ))
+        }
+    }
+
+    fn project_logits(&self, input: &Tensor) -> Result<Tensor> {
+        self.semantic_head
+            .as_ref()
+            .map(|(head, _)| head)
+            .unwrap_or(&self.lm_head)
+            .forward(input)
+            .map_err(Error::from)
     }
 
     pub fn config(&self) -> &FishS2SlowConfig {
@@ -299,7 +365,7 @@ impl FishS2SlowTransformer {
             let seq_len = hidden_for_fast.dim(1)?;
             hidden_for_fast.narrow(1, seq_len - 1, 1)?
         };
-        let logits = self.lm_head.forward(&logits_input)?;
+        let logits = self.project_logits(&logits_input)?;
         let hidden_states = if return_all {
             hidden_for_fast
         } else {
@@ -325,6 +391,14 @@ impl FishS2SlowTransformer {
     }
 
     pub fn semantic_allowed_mask(&self, im_end_token_id: u32) -> Result<Vec<bool>> {
+        if let Some((head, eos)) = &self.semantic_head {
+            if *eos != im_end_token_id {
+                return Err(Error::ModelLoadError(
+                    "Fish S2 compact EOS changed after load".into(),
+                ));
+            }
+            return Ok(vec![true; head.weight().dim(0)?]);
+        }
         if self.cfg.semantic_end_token_id as usize >= self.cfg.vocab_size
             || im_end_token_id as usize >= self.cfg.vocab_size
         {
@@ -602,6 +676,72 @@ mod tests {
         );
         let vb = VarBuilder::from_tensors(tensors, DType::F32, device);
         FishS2SlowTransformer::load(cfg, vb).unwrap()
+    }
+
+    fn check_compact_head(device: &Device) {
+        let mut model = tiny_model(device);
+        let cfg = model.cfg.clone();
+        let weights: Vec<f32> = (0..cfg.vocab_size * cfg.hidden_size)
+            .map(|i| ((i as f32 + 0.3) * 0.17).sin())
+            .collect();
+        model.lm_head = Linear::new(
+            Tensor::from_vec(weights, (cfg.vocab_size, cfg.hidden_size), device).unwrap(),
+            None,
+        );
+        let input = Tensor::from_vec(
+            vec![0.2f32, -0.7, 1.3, 0.4, -1.2, 0.3, 0.7, 1.1],
+            (1, 2, 4),
+            device,
+        )
+        .unwrap();
+        let full = model.project_logits(&input).unwrap();
+        let expected = Tensor::cat(
+            &[
+                &full.narrow(2, 1, 1).unwrap(),
+                &full.narrow(2, 20, 8).unwrap(),
+            ],
+            2,
+        )
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+        model.configure_semantic_head(1).unwrap();
+        let compact = model.project_logits(&input).unwrap();
+        assert_eq!(compact.dims(), &[1, 2, 9]);
+        let actual = compact.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!((actual - expected).abs() < 2e-5, "{actual} != {expected}");
+        }
+        assert_eq!(model.token_id_from_logit(0).unwrap(), 1);
+        assert_eq!(model.token_id_from_logit(1).unwrap(), 20);
+        assert_eq!(model.token_id_from_logit(8).unwrap(), 27);
+        assert!(model.token_id_from_logit(9).is_err());
+        assert_eq!(model.semantic_allowed_mask(1).unwrap(), vec![true; 9]);
+        assert_eq!(
+            model.embeddings.embeddings().dims(),
+            &[cfg.vocab_size, cfg.hidden_size]
+        );
+    }
+
+    #[test]
+    fn compact_head_matches_gathered_full_logits_and_preserves_token_ids() {
+        check_compact_head(&Device::Cpu);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "requires an available Metal device; never falls back to CPU"]
+    fn metal_compact_head_matches_full_projection() {
+        check_compact_head(&Device::new_metal(0).expect("Metal device"));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires an available CUDA device; never falls back to CPU"]
+    fn cuda_compact_head_matches_full_projection() {
+        check_compact_head(&Device::new_cuda(0).expect("CUDA device"));
     }
 
     #[test]

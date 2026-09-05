@@ -280,10 +280,11 @@ impl FishS2NativeRuntime {
         let dtype_override = std::env::var(FISH_S2_DTYPE_ENV).ok();
         let weights = FishS2Weights::load(model_dir, device, dtype_override.as_deref())?;
         let dtype = weights.dtype();
-        let slow = FishS2SlowTransformer::load(
+        let mut slow = FishS2SlowTransformer::load(
             FishS2SlowConfig::from_config(config)?,
             weights.var_builder(),
         )?;
+        slow.configure_semantic_head(tokenizer.specials().eos)?;
         let fast = FishS2FastDecoder::load(
             FishS2FastConfig::from_config(config)?,
             weights.var_builder(),
@@ -387,14 +388,15 @@ impl FishS2NativeRuntime {
                 .first()
                 .map(|codebook| !codebook.is_empty())
                 .unwrap_or(false);
-            let semantic_token_id = sample_semantic_token(
+            let semantic_index = sample_semantic_token(
                 &slow_output.logits,
                 &self.semantic_allowed_mask,
-                im_end_token_id,
+                self.slow.eos_logit_index(im_end_token_id),
                 allow_im_end,
                 &recent_semantic_tokens,
                 &mut semantic_sampler,
             )?;
+            let semantic_token_id = self.slow.token_id_from_logit(semantic_index)?;
             if semantic_token_id == im_end_token_id {
                 stop_reason = "im_end".to_string();
                 break;
@@ -408,7 +410,7 @@ impl FishS2NativeRuntime {
             )?;
             append_generated_frame(&mut generated_codebooks, &frame)?;
 
-            recent_semantic_tokens.push(semantic_token_id);
+            recent_semantic_tokens.push(semantic_index);
             if recent_semantic_tokens.len() > RAS_WIN_SIZE {
                 recent_semantic_tokens.remove(0);
             }

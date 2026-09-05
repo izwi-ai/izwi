@@ -377,12 +377,17 @@ pub(crate) fn fish_s2_model_memory(
     let codec = fish_s2_codec_memory(&codec.specs())?;
     let slow = FishS2SlowConfig::from_config(&config)?;
     let fast = FishS2FastConfig::from_config(&config)?;
-    let rotary_bytes = checked_memory_sum(&[
+    let auxiliary_bytes = checked_memory_sum(&[
         rotary_cache_bytes(slow.max_seq_len, slow.head_dim)?,
         rotary_cache_bytes(fast.num_codebooks, fast.head_dim)?,
         FishS2DacConfig::current().rotary_cache_bytes()?,
+        // The compact output projection is gathered once; input embeddings stay full size.
+        (config.codebook_size as u64 + 1)
+            .checked_mul(config.text_config.hidden_size as u64)
+            .and_then(|elements| elements.checked_mul(dtype.size_in_bytes() as u64))
+            .ok_or_else(|| Error::ModelLoadError("Fish S2 compact head size overflow".into()))?,
     ])?;
-    fish_s2_memory_from_inventory(transformer, codec, rotary_bytes)
+    fish_s2_memory_from_inventory(transformer, codec, auxiliary_bytes)
 }
 
 fn rotary_cache_bytes(positions: usize, head_dim: usize) -> Result<u64> {
@@ -396,12 +401,12 @@ fn rotary_cache_bytes(positions: usize, head_dim: usize) -> Result<u64> {
 fn fish_s2_memory_from_inventory(
     transformer: FishS2TensorMemory,
     codec: FishS2CodecMemory,
-    rotary_bytes: u64,
+    auxiliary_bytes: u64,
 ) -> Result<FishS2ModelMemory> {
     let resident_bytes = checked_memory_sum(&[
         transformer.resident_bytes,
         codec.resident_parameter_bytes,
-        rotary_bytes,
+        auxiliary_bytes,
     ])?;
     // Candle safetensors conversion may temporarily retain both representations
     // of one tensor. The codec is read eagerly, then normalized; its raw map and
@@ -414,7 +419,7 @@ fn fish_s2_memory_from_inventory(
     ])?;
     let codec_peak = checked_memory_sum(&[
         transformer.resident_bytes,
-        rotary_bytes,
+        auxiliary_bytes,
         codec.raw_load_bytes,
         codec.fused_load_bytes,
         codec.largest_source_tensor_bytes,
@@ -436,7 +441,7 @@ fn fish_s2_memory_from_inventory(
         transformer
             .largest_source_tensor_bytes
             .max(codec_host_scratch_bytes),
-        rotary_bytes,
+        auxiliary_bytes,
     ])?;
     Ok(FishS2ModelMemory {
         resident_bytes,
@@ -728,7 +733,7 @@ mod tests {
             largest_source_tensor_bytes: 75_497_472,
             largest_target_tensor_bytes: 75_497_472,
         };
-        let rotary_bytes = checked_memory_sum(&[
+        let auxiliary_bytes = checked_memory_sum(&[
             rotary_cache_bytes(32_768, 128).unwrap(),
             rotary_cache_bytes(10, 128).unwrap(),
             6_291_456,
@@ -743,7 +748,7 @@ mod tests {
                     largest_target_tensor_bytes: LARGEST_SOURCE_TENSOR / 2 * bytes_per_element,
                 },
                 codec,
-                rotary_bytes,
+                auxiliary_bytes,
             )
             .unwrap()
         };
@@ -769,7 +774,7 @@ mod tests {
                 ..Default::default()
             },
             codec,
-            rotary_bytes,
+            auxiliary_bytes,
         )
         .is_err());
     }

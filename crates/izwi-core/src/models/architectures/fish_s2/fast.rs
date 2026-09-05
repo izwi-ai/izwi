@@ -196,6 +196,16 @@ impl FishS2FastDecoder {
         input_pos: usize,
         cache: &mut PhysicalPagedKvCache,
     ) -> Result<Tensor> {
+        self.forward_step_inner(x, input_pos, cache, true)
+    }
+
+    fn forward_step_inner(
+        &self,
+        x: &Tensor,
+        input_pos: usize,
+        cache: &mut PhysicalPagedKvCache,
+        project_logits: bool,
+    ) -> Result<Tensor> {
         let (batch_size, sequence_len, hidden_size) = x.dims3()?;
         if batch_size != 1 || sequence_len != 1 || hidden_size != self.cfg.hidden_size {
             return Err(Error::InvalidInput(format!(
@@ -221,8 +231,11 @@ impl FishS2FastDecoder {
         for (idx, layer) in self.layers.iter().enumerate() {
             hidden = layer.forward(&hidden, input_pos, cache, &mut prepared, idx)?;
         }
-        let out = self.norm.forward(&hidden)?;
-        let logits = self.output.forward(&out)?;
+        let logits = if project_logits {
+            self.output.forward(&self.norm.forward(&hidden)?)?
+        } else {
+            hidden
+        };
         cache.commit_prepared(prepared)?;
         Ok(logits)
     }
@@ -238,7 +251,7 @@ impl FishS2FastDecoder {
             semantic_code_from_token_id_from_fast_config(&self.cfg, semantic_token_id)?;
         cache.reset_invocation()?;
         let hidden = self.project_slow_hidden(slow_hidden)?;
-        let _ = self.forward_step(&hidden, 0, cache)?;
+        let _ = self.forward_step_inner(&hidden, 0, cache, false)?;
 
         let mut codebooks = vec![semantic_code];
         let mut current = self.codebook_embedding(semantic_code)?;
@@ -247,7 +260,9 @@ impl FishS2FastDecoder {
             let row = logits.i((0, 0))?;
             let code = sample_logits(&row, sampler)?;
             codebooks.push(code);
-            current = self.codebook_embedding(code)?;
+            if codebook_idx + 1 < self.cfg.num_codebooks {
+                current = self.codebook_embedding(code)?;
+            }
         }
         Ok(FishS2GeneratedFrame {
             semantic_token_id,
