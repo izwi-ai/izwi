@@ -283,6 +283,61 @@ mod tests {
         FishS2SamplingDistribution::from_values(&logits, None).unwrap()
     }
 
+    #[cfg(any(feature = "metal", feature = "cuda"))]
+    fn check_device_distribution(device: &candle_core::Device) {
+        let values: Vec<f32> = (0..4097)
+            .map(|index| (index as f32 * 0.371).sin() * 3.0)
+            .collect();
+        let cpu = Tensor::new(values.as_slice(), &candle_core::Device::Cpu).unwrap();
+        let accelerator = Tensor::new(values.as_slice(), device).unwrap();
+        let allowed = vec![true; values.len()];
+        let expected =
+            FishS2SamplingDistribution::from_logits(&cpu, Some(&allowed), 30, 0.9, "oracle")
+                .unwrap()
+                .probabilities(0.8, 0.8, 30)
+                .unwrap();
+        let actual = FishS2SamplingDistribution::from_logits(
+            &accelerator,
+            Some(&allowed),
+            30,
+            0.9,
+            "device",
+        )
+        .unwrap()
+        .probabilities(0.8, 0.8, 30)
+        .unwrap();
+        assert_eq!(actual.len(), expected.len());
+        for ((token, probability), (expected_token, expected_probability)) in
+            actual.iter().zip(expected)
+        {
+            assert_eq!(*token, expected_token);
+            assert!((probability - expected_probability).abs() < 2e-5);
+        }
+        let bad = Tensor::new(&[f32::NAN, 1.0f32], device).unwrap();
+        assert!(FishS2SamplingDistribution::from_logits(
+            &bad,
+            Some(&[false, true]),
+            30,
+            1.0,
+            "raw"
+        )
+        .is_err());
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "requires an available Metal device; never falls back to CPU"]
+    fn metal_sampling_matches_cpu_policy_and_rejects_raw_nan() {
+        check_device_distribution(&candle_core::Device::new_metal(0).expect("Metal device"));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires an available CUDA device; never falls back to CPU"]
+    fn cuda_sampling_matches_cpu_policy_and_rejects_raw_nan() {
+        check_device_distribution(&candle_core::Device::new_cuda(0).expect("CUDA device"));
+    }
+
     #[test]
     fn upstream_nucleus_excludes_crossing_token_before_temperature() {
         let values = distribution(&[0.45, 0.30, 0.15, 0.10]);
@@ -396,12 +451,14 @@ mod tests {
 
     #[test]
     #[cfg(feature = "metal")]
+    #[ignore = "requires an available Metal device; never falls back to CPU"]
     fn fish_s2_sampling_metal_matches_host() {
         assert_accelerator_matches_host(Device::new_metal(0).expect("Metal device required"));
     }
 
     #[test]
     #[cfg(feature = "cuda")]
+    #[ignore = "requires an available CUDA device; never falls back to CPU"]
     fn fish_s2_sampling_cuda_matches_host() {
         assert_accelerator_matches_host(Device::new_cuda(0).expect("CUDA device required"));
     }

@@ -2097,9 +2097,7 @@ mod tests {
         output
     }
 
-    #[test]
-    fn blocked_attention_matches_dense_oracle_across_windows_and_block_edges() {
-        let device = Device::Cpu;
+    fn check_blocked_attention(device: &Device) {
         for frames in [1usize, 63, 64, 65, 129] {
             let (heads, dim) = (2, 4);
             let q = (0..heads * frames * dim)
@@ -2130,6 +2128,25 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn blocked_attention_matches_dense_oracle_across_windows_and_block_edges() {
+        check_blocked_attention(&Device::Cpu);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "requires an available Metal device; never falls back to CPU"]
+    fn metal_codec_attention_matches_dense_oracle() {
+        check_blocked_attention(&Device::new_metal(0).expect("Metal device"));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires an available CUDA device; never falls back to CPU"]
+    fn cuda_codec_attention_matches_dense_oracle() {
+        check_blocked_attention(&Device::new_cuda(0).expect("CUDA device"));
     }
 
     #[test]
