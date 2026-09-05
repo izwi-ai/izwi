@@ -7,6 +7,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/kernels/cuda/qwen35.cu");
     println!("cargo:rerun-if-changed=src/kernels/cuda/qwen38.cu");
+    println!("cargo:rerun-if-changed=src/kernels/cuda/fp8.cu");
+    println!("cargo:rerun-if-changed=src/kernels/cuda/sampling.cu");
     println!("cargo:rerun-if-changed=src/kernels/cuda/physical_state.cu");
 
     if env::var_os("CARGO_FEATURE_CUDA").is_none() {
@@ -27,6 +29,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .source_files(vec![
             "src/kernels/cuda/qwen35.cu",
             "src/kernels/cuda/qwen38.cu",
+            "src/kernels/cuda/fp8.cu",
+            "src/kernels/cuda/sampling.cu",
             "src/kernels/cuda/physical_state.cu",
         ])
         .arg("-std=c++17")
