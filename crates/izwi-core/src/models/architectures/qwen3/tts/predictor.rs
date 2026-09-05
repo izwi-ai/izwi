@@ -356,7 +356,11 @@ impl CodePredictor {
                 ));
             }
             let hidden = self.forward_physical_hidden_batch_committed(&hidden, 0, caches)?;
-            let last_hidden = hidden.i((.., CODE_PREDICTOR_PHYSICAL_PREFILL_TOKENS - 1, ..))?;
+            // Selecting the last token leaves a gap between batch rows. BLAS
+            // providers require compact rows at the vocabulary projection.
+            let last_hidden = hidden
+                .i((.., CODE_PREDICTOR_PHYSICAL_PREFILL_TOKENS - 1, ..))?
+                .contiguous()?;
             let num_acoustic = self.lm_heads.len();
             if num_acoustic == 0 {
                 return Ok(vec![Vec::new(); batch_size]);
