@@ -734,7 +734,7 @@ mod tests {
     #[test]
     #[ignore = "requires an available Metal device; never falls back to CPU"]
     fn metal_compact_head_matches_full_projection() {
-        check_compact_head(&Device::new_metal(0).expect("Metal device"));
+        check_compact_head(&crate::backends::metal_device_if_available(0).expect("Metal device"));
     }
 
     #[cfg(feature = "cuda")]

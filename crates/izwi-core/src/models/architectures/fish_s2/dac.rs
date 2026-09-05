@@ -1955,7 +1955,7 @@ mod tests {
             -0.7,
             1.2,
             0.3,
-            -0.0083854375,
+            -0.008_385_438,
             0.38902783,
             0.042907927,
             0.8445139,
@@ -2109,9 +2109,9 @@ mod tests {
             let v = (0..q.len())
                 .map(|i| (i as f32 * 0.19).sin())
                 .collect::<Vec<_>>();
-            let query = Tensor::from_vec(q.clone(), (heads, frames, dim), &device).unwrap();
-            let key = Tensor::from_vec(k.clone(), (heads, frames, dim), &device).unwrap();
-            let value = Tensor::from_vec(v.clone(), (heads, frames, dim), &device).unwrap();
+            let query = Tensor::from_vec(q.clone(), (heads, frames, dim), device).unwrap();
+            let key = Tensor::from_vec(k.clone(), (heads, frames, dim), device).unwrap();
+            let value = Tensor::from_vec(v.clone(), (heads, frames, dim), device).unwrap();
             for window in [1usize, 7, 64, 128] {
                 let expected = dense_attention_oracle(&q, &k, &v, heads, frames, dim, window);
                 let actual = windowed_attention(&query, &key, &value, window, &|| Ok(()))
@@ -2139,7 +2139,9 @@ mod tests {
     #[test]
     #[ignore = "requires an available Metal device; never falls back to CPU"]
     fn metal_codec_attention_matches_dense_oracle() {
-        check_blocked_attention(&Device::new_metal(0).expect("Metal device"));
+        check_blocked_attention(
+            &crate::backends::metal_device_if_available(0).expect("Metal device"),
+        );
     }
 
     #[cfg(feature = "cuda")]

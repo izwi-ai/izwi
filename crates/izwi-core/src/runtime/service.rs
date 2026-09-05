@@ -3263,8 +3263,7 @@ impl RuntimeService {
             let frames = request
                 .params
                 .max_tokens
-                .min(ModelVariant::FISH_S2_PRO_MAX_OUTPUT_FRAMES)
-                .max(1);
+                .clamp(1, ModelVariant::FISH_S2_PRO_MAX_OUTPUT_FRAMES);
             let output_bytes = (frames as u64)
                 .checked_mul(2048 * 4)
                 .ok_or_else(|| Error::Overloaded("Fish S2 output reservation overflow".into()))?;
@@ -5233,8 +5232,7 @@ impl RuntimeService {
                     .params
                     .max_tokens
                     .min(context_limit.saturating_sub(1))
-                    .min(ModelVariant::FISH_S2_PRO_MAX_OUTPUT_FRAMES)
-                    .max(1)
+                    .clamp(1, ModelVariant::FISH_S2_PRO_MAX_OUTPUT_FRAMES)
             },
             temperature: request.params.temperature,
             top_p: request.params.top_p,

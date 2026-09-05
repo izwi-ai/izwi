@@ -328,7 +328,9 @@ mod tests {
     #[test]
     #[ignore = "requires an available Metal device; never falls back to CPU"]
     fn metal_sampling_matches_cpu_policy_and_rejects_raw_nan() {
-        check_device_distribution(&candle_core::Device::new_metal(0).expect("Metal device"));
+        check_device_distribution(
+            &crate::backends::metal_device_if_available(0).expect("Metal device"),
+        );
     }
 
     #[cfg(feature = "cuda")]
@@ -453,7 +455,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[ignore = "requires an available Metal device; never falls back to CPU"]
     fn fish_s2_sampling_metal_matches_host() {
-        assert_accelerator_matches_host(Device::new_metal(0).expect("Metal device required"));
+        assert_accelerator_matches_host(
+            crate::backends::metal_device_if_available(0).expect("Metal device required"),
+        );
     }
 
     #[test]
