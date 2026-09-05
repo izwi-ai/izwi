@@ -279,6 +279,8 @@ impl ModelVariant {
     pub const VOXTRAL_TTS_FRAME_RATE_HZ: f32 = 12.5;
     pub const VIBEVOICE_TTS_MAX_OUTPUT_FRAMES: usize = 40_500;
     pub const VIBEVOICE_TTS_FRAME_RATE_HZ: f32 = 7.5;
+    pub const FISH_S2_PRO_ARTIFACT_REVISION: &'static str =
+        "1de9996b6be38b745688de084d87a5633f714e4e";
     pub const FISH_S2_PRO_MAX_OUTPUT_FRAMES: usize = 4096;
     pub const FISH_S2_PRO_NATIVE_CONTEXT_TOKENS: usize = 32_768;
     pub const LFM25_AUDIO_NATIVE_CONTEXT_TOKENS: usize = 32_768;
@@ -306,6 +308,7 @@ impl ModelVariant {
     pub fn artifact_revision(self) -> Option<&'static str> {
         match self {
             Self::Qwen3827BFp8 => Some(Self::QWEN38_27B_FP8_ARTIFACT_REVISION),
+            Self::FishAudioS2Pro => Some(Self::FISH_S2_PRO_ARTIFACT_REVISION),
             _ => None,
         }
     }

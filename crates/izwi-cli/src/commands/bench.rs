@@ -6733,6 +6733,43 @@ concurrent = [1, 2]
     }
 
     #[test]
+    fn fish_s2_backend_manifests_provide_a_matching_reference_fixture() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/manifests");
+        for name in [
+            "cuda-family-api.toml",
+            "cpu-audio-concurrency.toml",
+            "metal-audio-concurrency.toml",
+            "cuda-audio-concurrency.toml",
+        ] {
+            let manifest: BenchmarkManifest =
+                toml::from_str(&std::fs::read_to_string(root.join(name)).expect("manifest"))
+                    .expect("valid manifest");
+            let cases = expand_manifest_cases(&manifest).expect("expanded cases");
+            let fish: Vec<_> = cases
+                .iter()
+                .filter(|case| case.model.as_deref() == Some("FishAudio-S2-Pro"))
+                .collect();
+            assert!(!fish.is_empty(), "{name}");
+            for case in fish {
+                assert_eq!(
+                    case.reference_audio.as_deref(),
+                    Some("../../data/fox.wav"),
+                    "{name}"
+                );
+                assert_eq!(
+                    case.reference_text_file.as_deref(),
+                    Some("../../data/fox.md"),
+                    "{name}"
+                );
+                assert!(root.join(case.reference_audio.as_ref().unwrap()).is_file());
+                assert!(root
+                    .join(case.reference_text_file.as_ref().unwrap())
+                    .is_file());
+            }
+        }
+    }
+
+    #[test]
     fn manifest_matrix_rejects_duplicate_expanded_names() {
         let manifest: BenchmarkManifest = toml::from_str(
             r#"
