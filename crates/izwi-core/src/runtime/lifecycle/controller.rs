@@ -414,11 +414,26 @@ impl ModelLifecycleController {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn finalize_slot_materialization(
         &self,
         variant: ModelVariant,
         resident_resources: ResourceVector,
     ) -> Result<()> {
+        self.finalize_slot_materialization_with_pending(
+            variant,
+            resident_resources,
+            ResourceVector::zero(),
+        )
+    }
+
+    pub(super) fn finalize_slot_materialization_with_pending(
+        &self,
+        variant: ModelVariant,
+        resident_resources: ResourceVector,
+        deferred_resources: ResourceVector,
+    ) -> Result<()> {
+        let materialized = resident_resources.checked_sub(deferred_resources)?;
         let mut state = self.state();
         let slot = state.residents.get_mut(&variant).ok_or_else(|| {
             Error::ModelLoadError(format!(
@@ -428,8 +443,7 @@ impl ModelLifecycleController {
         // Allocation was authorized by the immutable peak reservation before
         // instantiation. Record the retained physical residency first, then
         // shed only authorization that was transient to model construction.
-        slot.resource_lease
-            .reconcile_materialized(resident_resources)?;
+        slot.resource_lease.reconcile_materialized(materialized)?;
         if slot.resource_lease.resources() != resident_resources {
             slot.resource_lease.resize(resident_resources)?;
         }
