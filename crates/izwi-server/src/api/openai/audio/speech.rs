@@ -960,7 +960,8 @@ mod tests {
         };
 
         let timeout = resolve_speech_timeout_secs(1, ModelVariant::FishAudioS2Pro, &req);
-        assert_eq!(timeout, 66);
+        // The automatic Fish budget includes two seconds for pauses and EOS.
+        assert_eq!(timeout, 71);
 
         let generation = build_generation_request(
             &req,
