@@ -288,7 +288,7 @@ pub(crate) fn validate_acoustic_cohort(states: &[&mut VoxtralTtsRetainedState]) 
             || state.last_hidden.is_none()
             || state.params.cfg_alpha.to_bits() != cfg_alpha
             || state.params.n_decoding_steps != decoding_steps
-            || !state.frames.is_empty() != allow_end_audio
+            || state.frames.is_empty() == allow_end_audio
         {
             return Err(Error::InvalidInput(format!(
                 "Voxtral TTS acoustic cohort row {row} is not shape/config compatible"

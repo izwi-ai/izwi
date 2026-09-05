@@ -3257,6 +3257,25 @@ impl RuntimeService {
             }
             spec.resources = spec.resources.checked_add(output)?;
         }
+        if request.task_type == TaskType::TTS
+            && request.model_variant == Some(ModelVariant::FishAudioS2Pro)
+        {
+            let frames = request
+                .params
+                .max_tokens
+                .clamp(1, ModelVariant::FISH_S2_PRO_MAX_OUTPUT_FRAMES);
+            let output_bytes = (frames as u64)
+                .checked_mul(2048 * 4)
+                .ok_or_else(|| Error::Overloaded("Fish S2 output reservation overflow".into()))?;
+            let mut output = ResourceVector::zero();
+            match self.backend_router.context().backend_kind {
+                BackendKind::Metal => output.unified_bytes = ResourceAmount::Known(output_bytes),
+                BackendKind::Cpu | BackendKind::Cuda => {
+                    output.host_bytes = ResourceAmount::Known(output_bytes)
+                }
+            }
+            spec.resources = spec.resources.checked_add(output)?;
+        }
         if request.task_type == TaskType::Chat && !request.chat_config.media_inputs.is_empty() {
             if !request
                 .model_variant
@@ -5213,10 +5232,28 @@ impl RuntimeService {
                     .params
                     .max_tokens
                     .min(context_limit.saturating_sub(1))
-                    .max(1)
+                    .clamp(1, ModelVariant::FISH_S2_PRO_MAX_OUTPUT_FRAMES)
             },
+            temperature: request.params.temperature,
+            top_p: request.params.top_p,
+            top_k: request
+                .params
+                .audio_top_k
+                .or_else(|| (request.params.top_k > 0).then_some(request.params.top_k))
+                .unwrap_or(FishS2GenerationParams::default().top_k),
+            seed: EngineCoreRequest::chat_request_seed(&request.id),
             ..FishS2GenerationParams::default()
         };
+        params.validate()?;
+        let codec_workspace =
+            crate::models::architectures::fish_s2::codec::preparation_workspace_bytes(
+                reference.audio_samples.len(),
+                reference.sample_rate,
+            )?;
+        let decode_workspace =
+            crate::models::architectures::fish_s2::codec::decode_workspace_bytes(
+                params.max_frames,
+            )?;
         let retained_request_bytes = u64::try_from(retained_engine_request_input_bytes(&request)?)
             .map_err(|_| Error::Overloaded("Fish S2 TTS retained request exceeds u64".into()))?;
         job.record_materialized_usage(JobResourceObservation::host(retained_request_bytes))?;
@@ -5230,7 +5267,7 @@ impl RuntimeService {
             resources: asr_encoder_retained_resources(
                 self.backend_router.context().backend_kind,
                 retained_request_bytes,
-                512 * 1024 * 1024,
+                codec_workspace,
             )?,
         };
         let preparation_job = match self
@@ -5254,7 +5291,7 @@ impl RuntimeService {
             u64::try_from(context_limit).unwrap_or(u64::MAX),
             lfm25_audio_tts_preparation_workspace(
                 self.backend_router.context().backend_kind,
-                512 * 1024 * 1024,
+                codec_workspace,
             ),
         );
         let cancellation = PreparationCancellation::default();
@@ -5267,6 +5304,9 @@ impl RuntimeService {
             cancellation.clone(),
         )?;
         let model_for_preparation = model.clone();
+        let cancellation_for_codec = cancellation.clone();
+        let codec_request_id = request.id.clone();
+        let codec_deadline = request.deadline;
         let mut cancellation_guard = PreparationCancellationGuard {
             cancellation,
             armed: true,
@@ -5279,7 +5319,19 @@ impl RuntimeService {
                         "Fish S2 TTS preparation must remain scalar".into(),
                     ));
                 }
-                let artifact = model_for_preparation.prepare_retained_artifact(&text, reference)?;
+                let artifact = model_for_preparation.prepare_retained_artifact_with_cancel(
+                    &text,
+                    reference,
+                    &|| {
+                        if cancellation_for_codec.is_cancelled() {
+                            return Err(Error::Cancelled(codec_request_id.clone()));
+                        }
+                        if codec_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                            return Err(Error::Timeout(codec_request_id.clone()));
+                        }
+                        Ok(())
+                    },
+                )?;
                 let retained_host_bytes = retained_request_bytes
                     .checked_add(artifact.retained_bytes()?)
                     .ok_or_else(|| Error::Overloaded("Fish S2 retained bytes overflow".into()))?;
@@ -5306,6 +5358,17 @@ impl RuntimeService {
             artifact.value,
             params,
             context_limit,
+        )?;
+        prepared.install_prepared_stage_cost(
+            crate::engine::StageId::new(3),
+            crate::engine::WorkCost::with_workspace(
+                1,
+                1,
+                lfm25_audio_tts_preparation_workspace(
+                    self.backend_router.context().backend_kind,
+                    decode_workspace,
+                ),
+            ),
         )?;
         let (execution, _) = self.coordinator_job_for_request(&prepared)?;
         match self

@@ -5,18 +5,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use candle_core::{DType, IndexOp, Tensor};
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
 use serde::Serialize;
+
+use sampling::FishS2SamplingDistribution;
 
 use crate::backends::DeviceProfile;
 use crate::catalog::ModelVariant;
 use crate::engine::StageDescriptor;
 use crate::error::{Error, Result};
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
-use crate::models::shared::sampling::{
-    bounded_device_sampling_candidates, device_candidates_cover_top_p, sample_device_candidates,
-};
 
 pub mod artifacts;
 pub mod codec;
@@ -26,6 +23,8 @@ pub mod dac;
 pub mod fast;
 mod physical;
 mod retained;
+mod rotary;
+mod sampling;
 pub mod slow;
 pub mod tokenizer;
 pub mod weights;
@@ -39,10 +38,7 @@ pub use contracts::{
 };
 pub use dac::{FishS2DacConfig, FishS2DacDecoder};
 pub use fast::{FishS2FastConfig, FishS2FastDecoder, FishS2GeneratedFrame, FishS2Sampler};
-pub(crate) use physical::{
-    FishS2PhysicalStateSpec, FISH_S2_FAST_STATE_DOMAIN, FISH_S2_FAST_STATE_GROUP,
-    FISH_S2_SLOW_STATE_DOMAIN, FISH_S2_SLOW_STATE_GROUP,
-};
+pub(crate) use physical::{FishS2PhysicalStateSpec, FISH_S2_SLOW_STATE_GROUP};
 #[allow(unused_imports)]
 pub(crate) use retained::{
     FishS2PreparedArtifact, FishS2RetainedCheckpoint, FishS2RetainedState, FishS2RetainedStep,
@@ -56,7 +52,7 @@ pub use weights::{FishS2TensorSpec, FishS2WeightIndex, FishS2Weights};
 pub(crate) const FISH_S2_TTS_PREPARATION_STAGE: &str = "tts.prepare.fish_s2";
 pub(crate) const FISH_S2_TTS_PREFILL_STAGE: &str = "tts.prefill.fish_s2";
 pub(crate) const FISH_S2_TTS_DECODE_STAGE: &str = "tts.decode.fish_s2";
-pub(crate) const FISH_S2_TTS_LEGACY_STAGE: &str = "tts.scalar";
+pub(crate) const FISH_S2_TTS_FINALIZE_STAGE: &str = "tts.codec.fish_s2.scalar";
 
 pub struct FishS2TtsModel {
     model_identity: u64,
@@ -88,6 +84,13 @@ pub struct FishS2GenerationParams {
     pub max_frames: usize,
     pub temperature: f32,
     pub top_p: f32,
+    /// Zero disables the top-k cap. The upstream serving default is 30.
+    pub top_k: usize,
+    /// Reproducible Rust sampling seed; fast-codebook sampling uses seed + 1.
+    pub seed: u64,
+    /// Retry recent semantic repeats using the upstream high-temperature policy.
+    /// A zero temperature remains greedy and bypasses this retry.
+    pub repetition_aware: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +123,11 @@ pub struct FishS2TtsGenerationDiagnostics {
     pub max_frames: usize,
     pub frames_generated: usize,
     pub stop_reason: String,
+    pub temperature: f32,
+    pub top_p: f32,
+    pub top_k: usize,
+    pub seed: u64,
+    pub repetition_aware: bool,
     pub reference_encode_ms: f32,
     pub prompt_build_ms: f32,
     pub slow_prefill_ms: f32,
@@ -128,8 +136,6 @@ pub struct FishS2TtsGenerationDiagnostics {
     pub total_model_ms: f32,
 }
 
-const FISH_S2_SEMANTIC_SAMPLER_SEED: u64 = 0;
-const FISH_S2_FAST_SAMPLER_SEED: u64 = 1;
 const FISH_S2_DTYPE_ENV: &str = "IZWI_FISH_S2_DTYPE";
 const RAS_WIN_SIZE: usize = 10;
 const RAS_HIGH_TEMP: f32 = 1.0;
@@ -274,10 +280,11 @@ impl FishS2NativeRuntime {
         let dtype_override = std::env::var(FISH_S2_DTYPE_ENV).ok();
         let weights = FishS2Weights::load(model_dir, device, dtype_override.as_deref())?;
         let dtype = weights.dtype();
-        let slow = FishS2SlowTransformer::load(
+        let mut slow = FishS2SlowTransformer::load(
             FishS2SlowConfig::from_config(config)?,
             weights.var_builder(),
         )?;
+        slow.configure_semantic_head(tokenizer.specials().eos)?;
         let fast = FishS2FastDecoder::load(
             FishS2FastConfig::from_config(config)?,
             weights.var_builder(),
@@ -322,11 +329,7 @@ impl FishS2NativeRuntime {
                 "Fish S2 TTS reference_audio cannot be empty".to_string(),
             ));
         }
-        if params.max_frames == 0 {
-            return Err(Error::InvalidInput(
-                "Fish S2 TTS max_frames must be greater than zero".to_string(),
-            ));
-        }
+        params.validate()?;
 
         let total_started = Instant::now();
         let started = Instant::now();
@@ -350,20 +353,20 @@ impl FishS2NativeRuntime {
             )));
         }
 
-        let max_frames = params
-            .max_frames
-            .min(config.max_seq_len - prompt.prompt_length);
-        if max_frames == 0 {
-            return Err(Error::InvalidInput(
-                "Fish S2 prompt leaves no room for generated audio frames".to_string(),
-            ));
-        }
+        let max_frames = effective_frame_budget(
+            prompt.prompt_length,
+            config.max_seq_len,
+            slow_cache.capacity_tokens(),
+            params.max_frames,
+        )?;
 
-        let temperature = sanitize_temperature(params.temperature);
-        let top_p = sanitize_top_p(params.top_p);
-        let mut semantic_sampler =
-            FishS2SemanticSampler::new(temperature, top_p, FISH_S2_SEMANTIC_SAMPLER_SEED);
-        let mut fast_sampler = FishS2Sampler::new(temperature, top_p, FISH_S2_FAST_SAMPLER_SEED);
+        let mut semantic_sampler = FishS2SemanticSampler::from_params(&params);
+        let mut fast_sampler = FishS2Sampler::with_top_k(
+            params.temperature,
+            params.top_p,
+            params.top_k,
+            params.seed.wrapping_add(1),
+        );
         let im_end_token_id = self.tokenizer.specials().eos;
 
         if slow_cache.context_len() != 0 {
@@ -380,19 +383,20 @@ impl FishS2NativeRuntime {
         let mut stop_reason = "max_frames".to_string();
 
         let started = Instant::now();
-        for _ in 0..max_frames {
+        for frame_index in 0..max_frames {
             let allow_im_end = generated_codebooks
                 .first()
                 .map(|codebook| !codebook.is_empty())
                 .unwrap_or(false);
-            let semantic_token_id = sample_semantic_token(
+            let semantic_index = sample_semantic_token(
                 &slow_output.logits,
                 &self.semantic_allowed_mask,
-                im_end_token_id,
+                self.slow.eos_logit_index(im_end_token_id),
                 allow_im_end,
                 &recent_semantic_tokens,
                 &mut semantic_sampler,
             )?;
+            let semantic_token_id = self.slow.token_id_from_logit(semantic_index)?;
             if semantic_token_id == im_end_token_id {
                 stop_reason = "im_end".to_string();
                 break;
@@ -406,11 +410,14 @@ impl FishS2NativeRuntime {
             )?;
             append_generated_frame(&mut generated_codebooks, &frame)?;
 
-            recent_semantic_tokens.push(semantic_token_id);
+            recent_semantic_tokens.push(semantic_index);
             if recent_semantic_tokens.len() > RAS_WIN_SIZE {
                 recent_semantic_tokens.remove(0);
             }
 
+            if frame_index + 1 == max_frames {
+                break;
+            }
             let frame_prompt = generated_frame_prompt(config.num_codebooks, &frame)?;
             let frame_embeds = self.slow.embed_prompt(&frame_prompt)?;
             let start_pos = slow_cache.context_len();
@@ -450,6 +457,11 @@ impl FishS2NativeRuntime {
                 max_frames,
                 frames_generated,
                 stop_reason,
+                temperature: params.temperature,
+                top_p: params.top_p,
+                top_k: params.top_k,
+                seed: params.seed,
+                repetition_aware: params.repetition_aware,
                 reference_encode_ms,
                 prompt_build_ms,
                 slow_prefill_ms,
@@ -467,24 +479,51 @@ impl Default for FishS2GenerationParams {
             max_frames: ModelVariant::FISH_S2_PRO_MAX_OUTPUT_FRAMES,
             temperature: 0.8,
             top_p: 0.8,
+            top_k: 30,
+            seed: 0,
+            repetition_aware: true,
         }
+    }
+}
+
+impl FishS2GenerationParams {
+    pub fn validate(&self) -> Result<()> {
+        if self.max_frames == 0 {
+            return Err(Error::InvalidInput(
+                "Fish S2 max_frames must be greater than zero".into(),
+            ));
+        }
+        sampling::validate_policy(self.temperature, self.top_p)
     }
 }
 
 #[derive(Clone)]
 struct FishS2SemanticSampler {
-    temperature: f32,
-    top_p: f32,
-    rng: StdRng,
+    sampler: FishS2Sampler,
+    repetition_aware: bool,
 }
 
 impl FishS2SemanticSampler {
-    fn new(temperature: f32, top_p: f32, seed: u64) -> Self {
+    fn from_params(params: &FishS2GenerationParams) -> Self {
         Self {
+            sampler: FishS2Sampler::with_top_k(
+                params.temperature,
+                params.top_p,
+                params.top_k,
+                params.seed,
+            ),
+            repetition_aware: params.repetition_aware,
+        }
+    }
+
+    #[cfg(test)]
+    fn new(temperature: f32, top_p: f32, seed: u64) -> Self {
+        Self::from_params(&FishS2GenerationParams {
             temperature,
             top_p,
-            rng: StdRng::seed_from_u64(seed),
-        }
+            seed,
+            ..Default::default()
+        })
     }
 }
 
@@ -496,15 +535,15 @@ fn sample_semantic_token(
     previous_semantic_tokens: &[u32],
     sampler: &mut FishS2SemanticSampler,
 ) -> Result<u32> {
+    sampling::validate_policy(sampler.sampler.temperature, sampler.sampler.top_p)?;
     let row = last_logits_row(logits)?;
     if row.dim(0)? != allowed_mask.len() {
         return Err(Error::InferenceError(format!(
             "Fish S2 semantic mask length {} does not match logits length {}",
             allowed_mask.len(),
-            row.dim(0)?
+            row.dim(0)?,
         )));
     }
-
     let mut first_frame_mask;
     let sampling_mask = if allow_im_end {
         allowed_mask
@@ -515,96 +554,47 @@ fn sample_semantic_token(
         }
         &first_frame_mask
     };
-
-    if let Some(candidates) = bounded_device_sampling_candidates(
+    let use_ras = sampler.repetition_aware && sampler.sampler.temperature > 0.0;
+    let required_top_p = if use_ras {
+        sampler.sampler.top_p.max(RAS_HIGH_TOP_P)
+    } else {
+        sampler.sampler.top_p
+    };
+    let distribution = FishS2SamplingDistribution::from_logits(
         &row,
-        row.dim(0)?,
-        0,
-        sampler.temperature,
-        &[],
-        1.0,
-        0.0,
         Some(sampling_mask),
-    )? {
-        if device_candidates_cover_top_p(&candidates, sampler.top_p) {
-            if let Some(mut sampled) =
-                sample_device_candidates(&candidates, sampler.top_p, sampler.rng.r#gen::<f32>())
-            {
-                if sampled != im_end_token_id
-                    && previous_semantic_tokens.contains(&sampled)
-                    && sampling_mask
-                        .get(sampled as usize)
-                        .copied()
-                        .unwrap_or(false)
-                {
-                    let retry = bounded_device_sampling_candidates(
-                        &row,
-                        row.dim(0)?,
-                        0,
-                        RAS_HIGH_TEMP,
-                        &[],
-                        1.0,
-                        0.0,
-                        Some(sampling_mask),
-                    )?;
-                    let retry_sample = retry.as_ref().and_then(|retry| {
-                        device_candidates_cover_top_p(retry, RAS_HIGH_TOP_P).then(|| {
-                            sample_device_candidates(
-                                retry,
-                                RAS_HIGH_TOP_P,
-                                sampler.rng.r#gen::<f32>(),
-                            )
-                        })?
-                    });
-                    if let Some(retry_sample) = retry_sample {
-                        sampled = retry_sample;
-                    } else {
-                        let values = row.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-                        return sample_masked_values(
-                            &values,
-                            sampling_mask,
-                            RAS_HIGH_TEMP,
-                            RAS_HIGH_TOP_P,
-                            &mut sampler.rng,
-                        );
-                    }
-                }
-                return Ok(sampled);
-            }
+        sampler.sampler.top_k,
+        required_top_p,
+        "semantic",
+    )?;
+    let normal = sampler.sampler.sample(&distribution)?;
+    if use_ras {
+        // Upstream draws both policies each frame, then chooses the retry only
+        // when a semantic token repeats in the last ten frames. RNG algorithms
+        // differ from Torch; this records and replays the native Rust policy.
+        let high =
+            sampler
+                .sampler
+                .sample_with_policy(&distribution, RAS_HIGH_TEMP, RAS_HIGH_TOP_P)?;
+        let recent = &previous_semantic_tokens
+            [previous_semantic_tokens.len().saturating_sub(RAS_WIN_SIZE)..];
+        if normal != im_end_token_id && recent.contains(&normal) {
+            return Ok(high);
         }
     }
-
-    let values = row.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-
-    let mut sampled = sample_masked_values(
-        &values,
-        sampling_mask,
-        sampler.temperature,
-        sampler.top_p,
-        &mut sampler.rng,
-    )?;
-    if sampled != im_end_token_id
-        && previous_semantic_tokens.contains(&sampled)
-        && sampling_mask
-            .get(sampled as usize)
-            .copied()
-            .unwrap_or(false)
-    {
-        sampled = sample_masked_values(
-            &values,
-            sampling_mask,
-            RAS_HIGH_TEMP,
-            RAS_HIGH_TOP_P,
-            &mut sampler.rng,
-        )?;
-    }
-    Ok(sampled)
+    Ok(normal)
 }
 
 fn last_logits_row(logits: &Tensor) -> Result<Tensor> {
     match logits.rank() {
         3 => {
-            let seq_len = logits.dim(1)?;
+            let (batch, seq_len, _) = logits.dims3()?;
+            if batch != 1 || seq_len == 0 {
+                return Err(Error::InferenceError(format!(
+                    "Fish S2 semantic logits require one non-empty sequence, got {:?}",
+                    logits.dims()
+                )));
+            }
             logits.i((0, seq_len - 1)).map_err(Error::from)
         }
         2 => logits.i(0).map_err(Error::from),
@@ -614,101 +604,6 @@ fn last_logits_row(logits: &Tensor) -> Result<Tensor> {
             logits.dims()
         ))),
     }
-}
-
-fn sample_masked_values(
-    values: &[f32],
-    allowed_mask: &[bool],
-    temperature: f32,
-    top_p: f32,
-    rng: &mut StdRng,
-) -> Result<u32> {
-    if values.is_empty() {
-        return Err(Error::InferenceError(
-            "Fish S2 semantic sampler received empty logits".to_string(),
-        ));
-    }
-    if temperature <= 1e-5 || top_p <= 0.0 {
-        return argmax_masked_values(values, allowed_mask);
-    }
-
-    let temp = temperature.max(1e-5);
-    let max = values
-        .iter()
-        .zip(allowed_mask)
-        .filter_map(|(value, allowed)| {
-            if *allowed && value.is_finite() {
-                Some(*value / temp)
-            } else {
-                None
-            }
-        })
-        .fold(f32::NEG_INFINITY, f32::max);
-    if !max.is_finite() {
-        return argmax_masked_values(values, allowed_mask);
-    }
-
-    let mut probs = values
-        .iter()
-        .zip(allowed_mask)
-        .enumerate()
-        .filter_map(|(idx, (value, allowed))| {
-            if *allowed && value.is_finite() {
-                Some((idx, ((*value / temp) - max).exp()))
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-    let sum: f32 = probs.iter().map(|(_, prob)| *prob).sum();
-    if !sum.is_finite() || sum <= 0.0 {
-        return argmax_masked_values(values, allowed_mask);
-    }
-    for (_, prob) in &mut probs {
-        *prob /= sum;
-    }
-
-    probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    let mut cumulative = 0.0f32;
-    let mut kept = Vec::new();
-    for item in probs {
-        cumulative += item.1;
-        kept.push(item);
-        if cumulative >= top_p.max(1e-6) {
-            break;
-        }
-    }
-    let kept_sum: f32 = kept.iter().map(|(_, prob)| *prob).sum();
-    if !kept_sum.is_finite() || kept_sum <= 0.0 {
-        return argmax_masked_values(values, allowed_mask);
-    }
-
-    let mut draw = rng.r#gen::<f32>() * kept_sum;
-    for (idx, prob) in kept {
-        if draw <= prob {
-            return u32::try_from(idx).map_err(|_| {
-                Error::InferenceError("Fish S2 sampled semantic index overflowed".to_string())
-            });
-        }
-        draw -= prob;
-    }
-    argmax_masked_values(values, allowed_mask)
-}
-
-fn argmax_masked_values(values: &[f32], allowed_mask: &[bool]) -> Result<u32> {
-    let mut best_idx = None;
-    let mut best = f32::NEG_INFINITY;
-    for (idx, (value, allowed)) in values.iter().zip(allowed_mask).enumerate() {
-        if *allowed && value.is_finite() && *value > best {
-            best = *value;
-            best_idx = Some(idx);
-        }
-    }
-    let best_idx = best_idx.ok_or_else(|| {
-        Error::InferenceError("Fish S2 semantic sampler had no allowed finite logits".to_string())
-    })?;
-    u32::try_from(best_idx)
-        .map_err(|_| Error::InferenceError("Fish S2 argmax semantic index overflowed".to_string()))
 }
 
 fn append_generated_frame(
@@ -750,20 +645,18 @@ fn generated_frame_prompt(
     })
 }
 
-fn sanitize_temperature(value: f32) -> f32 {
-    if value.is_finite() {
-        value.max(0.0)
-    } else {
-        FishS2GenerationParams::default().temperature
-    }
-}
-
-fn sanitize_top_p(value: f32) -> f32 {
-    if value.is_finite() {
-        value.clamp(0.0, 1.0)
-    } else {
-        FishS2GenerationParams::default().top_p
-    }
+fn effective_frame_budget(
+    prompt_tokens: usize,
+    model_context: usize,
+    cache_capacity: usize,
+    requested: usize,
+) -> Result<usize> {
+    let context = model_context.min(cache_capacity);
+    let available = context.checked_sub(prompt_tokens).filter(|available| *available > 0)
+        .ok_or_else(|| Error::InvalidInput(format!(
+            "Fish S2 prompt length {prompt_tokens} leaves no output room in effective context {context}",
+        )))?;
+    Ok(requested.min(available))
 }
 
 fn elapsed_ms(started: Instant) -> f32 {

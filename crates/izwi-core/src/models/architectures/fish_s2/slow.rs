@@ -1,13 +1,12 @@
 //! Slow semantic transformer for Fish S2 DualAR generation.
 
-use candle_core::Tensor;
+use candle_core::{DType, Tensor};
 use candle_nn::{ops, Embedding, Linear, Module, RmsNorm, VarBuilder};
 
 use crate::error::{Error, Result};
 use crate::models::architectures::fish_s2::config::FishS2Config;
-use crate::models::architectures::fish_s2::contracts::build_semantic_allowed_mask;
+use crate::models::architectures::fish_s2::rotary::FishS2RotaryCache;
 use crate::models::architectures::fish_s2::tokenizer::FishS2ConditioningPrompt;
-use crate::models::architectures::qwen3::core::build_rope_cache;
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -42,6 +41,7 @@ pub struct FishS2SlowTransformer {
     layers: Vec<FishS2SlowLayer>,
     norm: RmsNorm,
     lm_head: Linear,
+    semantic_head: Option<(Linear, u32)>,
 }
 
 struct FishS2SlowLayer {
@@ -59,7 +59,7 @@ struct FishS2PackedAttention {
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
-    rope_theta: f64,
+    rotary: FishS2RotaryCache,
 }
 
 struct FishS2Mlp {
@@ -111,6 +111,13 @@ impl FishS2SlowConfig {
 
 impl FishS2SlowTransformer {
     pub fn load(cfg: FishS2SlowConfig, vb: VarBuilder) -> Result<Self> {
+        let rotary = FishS2RotaryCache::new(
+            cfg.max_seq_len,
+            cfg.head_dim,
+            cfg.rope_theta,
+            DType::BF16,
+            vb.device(),
+        )?;
         let embeddings =
             candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("embed_tokens"))?;
         let codebook_embeddings = candle_nn::embedding(
@@ -120,7 +127,11 @@ impl FishS2SlowTransformer {
         )?;
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for idx in 0..cfg.num_hidden_layers {
-            layers.push(FishS2SlowLayer::load(&cfg, vb.pp(format!("layers.{idx}")))?);
+            layers.push(FishS2SlowLayer::load(
+                &cfg,
+                &rotary,
+                vb.pp(format!("layers.{idx}")),
+            )?);
         }
         let norm = load_rms_norm_alias(
             cfg.hidden_size,
@@ -140,11 +151,84 @@ impl FishS2SlowTransformer {
             layers,
             norm,
             lm_head,
+            semantic_head: None,
         })
+    }
+
+    /// Gather the only output rows Fish samples: EOS followed by the semantic
+    /// vocabulary. Input embeddings remain the complete checkpoint matrix.
+    pub(crate) fn configure_semantic_head(&mut self, eos: u32) -> Result<()> {
+        if eos as usize >= self.cfg.vocab_size
+            || (self.cfg.semantic_start_token_id..=self.cfg.semantic_end_token_id).contains(&eos)
+        {
+            return Err(Error::ModelLoadError(
+                "Fish S2 EOS must be outside its semantic vocabulary".into(),
+            ));
+        }
+        let weight = self.lm_head.weight();
+        let eos_weight = weight.narrow(0, eos as usize, 1)?;
+        let semantic_weight = weight.narrow(
+            0,
+            self.cfg.semantic_start_token_id as usize,
+            (self.cfg.semantic_end_token_id - self.cfg.semantic_start_token_id + 1) as usize,
+        )?;
+        self.semantic_head = Some((
+            Linear::new(Tensor::cat(&[&eos_weight, &semantic_weight], 0)?, None),
+            eos,
+        ));
+        Ok(())
+    }
+
+    pub(crate) fn eos_logit_index(&self, eos: u32) -> u32 {
+        if self.semantic_head.is_some() {
+            0
+        } else {
+            eos
+        }
+    }
+
+    pub(crate) fn token_id_from_logit(&self, index: u32) -> Result<u32> {
+        if let Some((_, eos)) = &self.semantic_head {
+            if index == 0 {
+                return Ok(*eos);
+            }
+            let token = self
+                .cfg
+                .semantic_start_token_id
+                .checked_add(index - 1)
+                .filter(|id| *id <= self.cfg.semantic_end_token_id)
+                .ok_or_else(|| {
+                    Error::InferenceError("Fish S2 compact head index is out of range".into())
+                })?;
+            Ok(token)
+        } else if (index as usize) < self.cfg.vocab_size {
+            Ok(index)
+        } else {
+            Err(Error::InferenceError(
+                "Fish S2 head index is out of range".into(),
+            ))
+        }
+    }
+
+    fn project_logits(&self, input: &Tensor) -> Result<Tensor> {
+        self.semantic_head
+            .as_ref()
+            .map(|(head, _)| head)
+            .unwrap_or(&self.lm_head)
+            .forward(input)
+            .map_err(Error::from)
     }
 
     pub fn config(&self) -> &FishS2SlowConfig {
         &self.cfg
+    }
+
+    /// Persistent RoPE table bytes, shared by every slow layer.
+    pub fn rotary_cache_bytes(&self) -> u64 {
+        self.layers
+            .first()
+            .map(|layer| layer.self_attn.rotary.storage_bytes())
+            .unwrap_or(0)
     }
 
     pub fn embed_prompt(&self, prompt: &FishS2ConditioningPrompt) -> Result<Tensor> {
@@ -281,7 +365,7 @@ impl FishS2SlowTransformer {
             let seq_len = hidden_for_fast.dim(1)?;
             hidden_for_fast.narrow(1, seq_len - 1, 1)?
         };
-        let logits = self.lm_head.forward(&logits_input)?;
+        let logits = self.project_logits(&logits_input)?;
         let hidden_states = if return_all {
             hidden_for_fast
         } else {
@@ -307,59 +391,38 @@ impl FishS2SlowTransformer {
     }
 
     pub fn semantic_allowed_mask(&self, im_end_token_id: u32) -> Result<Vec<bool>> {
-        let config = FishS2Config {
-            architectures: vec!["DualARTransformer".to_string()],
-            model_type: "fish_qwen3_omni".to_string(),
-            torch_dtype: None,
-            text_config: crate::models::architectures::fish_s2::config::FishS2TextConfig {
-                hidden_size: self.cfg.hidden_size,
-                num_hidden_layers: self.cfg.num_hidden_layers,
-                num_attention_heads: self.cfg.num_attention_heads,
-                num_key_value_heads: self.cfg.num_key_value_heads,
-                head_dim: Some(self.cfg.head_dim),
-                vocab_size: self.cfg.vocab_size,
-                max_seq_len: self.cfg.max_seq_len,
-                rope_theta: Some(self.cfg.rope_theta),
-                rms_norm_eps: Some(self.cfg.rms_norm_eps),
-                intermediate_size: Some(self.cfg.intermediate_size),
-                hidden_act: None,
-            },
-            audio_decoder_config:
-                crate::models::architectures::fish_s2::config::FishS2AudioDecoderConfig {
-                    hidden_size: self.cfg.hidden_size,
-                    num_hidden_layers: 1,
-                    num_attention_heads: self.cfg.num_attention_heads,
-                    num_key_value_heads: self.cfg.num_key_value_heads,
-                    head_dim: Some(self.cfg.head_dim),
-                    intermediate_size: Some(self.cfg.intermediate_size),
-                    max_seq_len: Some(self.cfg.num_codebooks + 1),
-                    num_codebooks: Some(self.cfg.num_codebooks),
-                    vocab_size: Some(self.cfg.codebook_size),
-                },
-            num_codebooks: self.cfg.num_codebooks,
-            codebook_size: self.cfg.codebook_size,
-            max_seq_len: self.cfg.max_seq_len,
-            bos_token_id: 0,
-            eos_token_id: im_end_token_id,
-            pad_token_id: 0,
-            audio_pad_token_id: 0,
-            semantic_start_token_id: self.cfg.semantic_start_token_id,
-            semantic_end_token_id: self.cfg.semantic_end_token_id,
-            sample_rate: None,
-        };
-        build_semantic_allowed_mask(self.cfg.vocab_size, &config, im_end_token_id)
+        if let Some((head, eos)) = &self.semantic_head {
+            if *eos != im_end_token_id {
+                return Err(Error::ModelLoadError(
+                    "Fish S2 compact EOS changed after load".into(),
+                ));
+            }
+            return Ok(vec![true; head.weight().dim(0)?]);
+        }
+        if self.cfg.semantic_end_token_id as usize >= self.cfg.vocab_size
+            || im_end_token_id as usize >= self.cfg.vocab_size
+        {
+            return Err(Error::ModelLoadError(
+                "Fish S2 semantic tokens exceed vocabulary".into(),
+            ));
+        }
+        let mut mask = vec![false; self.cfg.vocab_size];
+        mask[self.cfg.semantic_start_token_id as usize..=self.cfg.semantic_end_token_id as usize]
+            .fill(true);
+        mask[im_end_token_id as usize] = true;
+        Ok(mask)
     }
 }
 
 impl FishS2SlowLayer {
-    fn load(cfg: &FishS2SlowConfig, vb: VarBuilder) -> Result<Self> {
+    fn load(cfg: &FishS2SlowConfig, rotary: &FishS2RotaryCache, vb: VarBuilder) -> Result<Self> {
         let input_layernorm = load_rms_norm_alias(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             &vb,
             &["input_layernorm", "attention_norm"],
         )?;
-        let self_attn = FishS2PackedAttention::load(cfg, vb.pp("self_attn"))?;
+        let self_attn = FishS2PackedAttention::load(cfg, rotary, vb.pp("self_attn"))?;
         let post_attention_layernorm = load_rms_norm_alias(
             cfg.hidden_size,
             cfg.rms_norm_eps,
@@ -395,8 +458,13 @@ impl FishS2SlowLayer {
 }
 
 impl FishS2PackedAttention {
-    fn load(cfg: &FishS2SlowConfig, vb: VarBuilder) -> Result<Self> {
+    fn load(cfg: &FishS2SlowConfig, rotary: &FishS2RotaryCache, vb: VarBuilder) -> Result<Self> {
         let total = cfg.q_size() + 2 * cfg.kv_size();
+        if !vb.contains_tensor("q_norm.weight") || !vb.contains_tensor("k_norm.weight") {
+            return Err(Error::ModelLoadError(
+                "Fish S2 slow attention requires Q/K normalization weights".into(),
+            ));
+        }
         Ok(Self {
             qkv_proj: candle_nn::linear_no_bias(cfg.hidden_size, total, vb.pp("qkv_proj"))?,
             o_proj: candle_nn::linear_no_bias(cfg.q_size(), cfg.hidden_size, vb.pp("o_proj"))?,
@@ -421,7 +489,7 @@ impl FishS2PackedAttention {
             num_heads: cfg.num_attention_heads,
             num_kv_heads: cfg.num_key_value_heads,
             head_dim: cfg.head_dim,
-            rope_theta: cfg.rope_theta,
+            rotary: rotary.clone(),
         })
     }
 
@@ -467,16 +535,8 @@ impl FishS2PackedAttention {
             None => k,
         };
 
-        let (cos, sin) = build_rope_cache(
-            seq_len,
-            self.head_dim,
-            start_pos,
-            self.rope_theta,
-            x.device(),
-            x.dtype(),
-        )?;
-        let q = apply_rope(&q, &cos, &sin)?;
-        let k = apply_rope(&k, &cos, &sin)?;
+        let q = self.rotary.apply(&q, start_pos)?;
+        let k = self.rotary.apply(&k, start_pos)?;
         let q = q.squeeze(0)?;
         let k = k.squeeze(0)?;
         let v = v.squeeze(0)?;
@@ -514,21 +574,6 @@ impl FishS2Mlp {
         let hidden = ops::silu(&gate)?.broadcast_mul(&up)?;
         self.down_proj.forward(&hidden).map_err(Error::from)
     }
-}
-
-fn apply_rope(x: &Tensor, cos_half: &Tensor, sin_half: &Tensor) -> Result<Tensor> {
-    let half_dim = x.dim(3)? / 2;
-    let x1 = x.narrow(3, 0, half_dim)?;
-    let x2 = x.narrow(3, half_dim, half_dim)?;
-    let cos = cos_half.unsqueeze(0)?.unsqueeze(2)?;
-    let sin = sin_half.unsqueeze(0)?.unsqueeze(2)?;
-    let out_first = x1
-        .broadcast_mul(&cos)?
-        .broadcast_sub(&x2.broadcast_mul(&sin)?)?;
-    let out_second = x1
-        .broadcast_mul(&sin)?
-        .broadcast_add(&x2.broadcast_mul(&cos)?)?;
-    Tensor::cat(&[&out_first, &out_second], 3).map_err(Error::from)
 }
 
 fn load_rms_norm_alias(dim: usize, eps: f64, vb: &VarBuilder, aliases: &[&str]) -> Result<RmsNorm> {
@@ -631,6 +676,72 @@ mod tests {
         );
         let vb = VarBuilder::from_tensors(tensors, DType::F32, device);
         FishS2SlowTransformer::load(cfg, vb).unwrap()
+    }
+
+    fn check_compact_head(device: &Device) {
+        let mut model = tiny_model(device);
+        let cfg = model.cfg.clone();
+        let weights: Vec<f32> = (0..cfg.vocab_size * cfg.hidden_size)
+            .map(|i| ((i as f32 + 0.3) * 0.17).sin())
+            .collect();
+        model.lm_head = Linear::new(
+            Tensor::from_vec(weights, (cfg.vocab_size, cfg.hidden_size), device).unwrap(),
+            None,
+        );
+        let input = Tensor::from_vec(
+            vec![0.2f32, -0.7, 1.3, 0.4, -1.2, 0.3, 0.7, 1.1],
+            (1, 2, 4),
+            device,
+        )
+        .unwrap();
+        let full = model.project_logits(&input).unwrap();
+        let expected = Tensor::cat(
+            &[
+                &full.narrow(2, 1, 1).unwrap(),
+                &full.narrow(2, 20, 8).unwrap(),
+            ],
+            2,
+        )
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+        model.configure_semantic_head(1).unwrap();
+        let compact = model.project_logits(&input).unwrap();
+        assert_eq!(compact.dims(), &[1, 2, 9]);
+        let actual = compact.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!((actual - expected).abs() < 2e-5, "{actual} != {expected}");
+        }
+        assert_eq!(model.token_id_from_logit(0).unwrap(), 1);
+        assert_eq!(model.token_id_from_logit(1).unwrap(), 20);
+        assert_eq!(model.token_id_from_logit(8).unwrap(), 27);
+        assert!(model.token_id_from_logit(9).is_err());
+        assert_eq!(model.semantic_allowed_mask(1).unwrap(), vec![true; 9]);
+        assert_eq!(
+            model.embeddings.embeddings().dims(),
+            &[cfg.vocab_size, cfg.hidden_size]
+        );
+    }
+
+    #[test]
+    fn compact_head_matches_gathered_full_logits_and_preserves_token_ids() {
+        check_compact_head(&Device::Cpu);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "requires an available Metal device; never falls back to CPU"]
+    fn metal_compact_head_matches_full_projection() {
+        check_compact_head(&crate::backends::metal_device_if_available(0).expect("Metal device"));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires an available CUDA device; never falls back to CPU"]
+    fn cuda_compact_head_matches_full_projection() {
+        check_compact_head(&Device::new_cuda(0).expect("CUDA device"));
     }
 
     #[test]

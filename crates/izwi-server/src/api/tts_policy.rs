@@ -52,8 +52,24 @@ pub(crate) fn qwen_tts_auto_max_frames_for_text(text: &str) -> usize {
 }
 
 fn fish_s2_tts_auto_max_frames_for_text(text: &str) -> usize {
-    let word_count = text.split_whitespace().count().max(1);
-    let estimated_secs = ((word_count as f32) / 2.6).clamp(4.0, 120.0);
+    // Whitespace alone treats an entire CJK paragraph as one word. Include a
+    // character estimate and count CJK syllabic characters separately; leave
+    // time for pauses and EOS rather than truncating at the speaking estimate.
+    let non_space = text.chars().filter(|ch| !ch.is_whitespace()).count();
+    let cjk = text
+        .chars()
+        .filter(|ch| {
+            matches!(*ch as u32,
+                0x3040..=0x30ff | 0x3400..=0x4dbf | 0x4e00..=0x9fff |
+                0xac00..=0xd7af | 0x20000..=0x3134f
+            )
+        })
+        .count();
+    let estimated_words = text
+        .split_whitespace()
+        .count()
+        .max(non_space.saturating_sub(cjk).div_ceil(5));
+    let estimated_secs = (estimated_words as f32 / 2.6 + cjk as f32 / 4.0 + 2.0).clamp(4.0, 120.0);
     let frames = (estimated_secs * ModelVariant::FISH_S2_PRO_FRAME_RATE_HZ).ceil() as usize;
     frames.clamp(96, ModelVariant::FISH_S2_PRO_MAX_OUTPUT_FRAMES)
 }
@@ -77,6 +93,33 @@ mod tests {
         assert!(short < ModelVariant::QWEN3_TTS_MAX_OUTPUT_FRAMES);
         assert!(longer > short);
         assert!(longer <= ModelVariant::QWEN3_TTS_MAX_OUTPUT_FRAMES);
+    }
+
+    #[test]
+    fn fish_s2_auto_budget_handles_unspaced_multilingual_text() {
+        let short = fish_s2_tts_auto_max_frames_for_text("Hello");
+        for text in [
+            "你好世界".repeat(30),
+            "こんにちは世界".repeat(20),
+            "안녕하세요".repeat(24),
+            "longunspacedtext".repeat(20),
+        ] {
+            let budget = fish_s2_tts_auto_max_frames_for_text(&text);
+            assert!(budget > short, "{text}");
+            assert!(budget <= ModelVariant::FISH_S2_PRO_MAX_OUTPUT_FRAMES);
+        }
+        assert_eq!(
+            resolve_tts_output_frames(ModelVariant::FishAudioS2Pro, "你好", Some(10)),
+            Some(10)
+        );
+        assert_eq!(
+            resolve_tts_output_frames(ModelVariant::FishAudioS2Pro, "你好", Some(usize::MAX)),
+            Some(ModelVariant::FISH_S2_PRO_MAX_OUTPUT_FRAMES)
+        );
+        assert_eq!(
+            resolve_tts_output_frames(ModelVariant::FishAudioS2Pro, "你好", Some(0)),
+            resolve_tts_output_frames(ModelVariant::FishAudioS2Pro, "你好", None)
+        );
     }
 
     #[test]

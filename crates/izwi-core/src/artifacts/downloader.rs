@@ -2642,6 +2642,9 @@ mod tests {
         assert!(specs
             .iter()
             .all(|spec| spec.source_repo == "fishaudio/s2-pro"));
+        assert!(specs
+            .iter()
+            .all(|spec| spec.source_revision == ModelVariant::FISH_S2_PRO_ARTIFACT_REVISION));
 
         std::fs::remove_dir_all(temp_dir).ok();
     }

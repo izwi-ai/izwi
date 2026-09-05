@@ -72,6 +72,8 @@ command = "tts"
 model = "FishAudio-S2-Pro"
 iterations = 1
 text = "CUDA model evidence."
+reference_audio = "../../data/fox.wav"
+reference_text_file = "../../data/fox.md"
 
 [[benchmarks]]
 name = "lfm25-audio-tts-cuda"

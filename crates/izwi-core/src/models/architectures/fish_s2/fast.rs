@@ -1,18 +1,14 @@
 //! Fast codebook decoder for Fish S2 DualAR generation.
 
-use candle_core::{IndexOp, Tensor, D};
+use candle_core::{DType, IndexOp, Tensor};
 use candle_nn::{ops, Embedding, Linear, Module, RmsNorm, VarBuilder};
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
 
+pub use super::sampling::FishS2Sampler;
+use super::sampling::FishS2SamplingDistribution;
 use crate::error::{Error, Result};
 use crate::models::architectures::fish_s2::config::FishS2Config;
-use crate::models::architectures::fish_s2::contracts::semantic_code_from_token_id;
-use crate::models::architectures::qwen3::core::build_rope_cache;
+use crate::models::architectures::fish_s2::rotary::FishS2RotaryCache;
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
-use crate::models::shared::sampling::{
-    bounded_device_sampling_candidates, device_candidates_cover_top_p, sample_device_candidates,
-};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FishS2FastConfig {
@@ -35,13 +31,6 @@ pub struct FishS2FastConfig {
 pub struct FishS2GeneratedFrame {
     pub semantic_token_id: u32,
     pub codebooks: Vec<u32>,
-}
-
-#[derive(Debug, Clone)]
-pub struct FishS2Sampler {
-    pub temperature: f32,
-    pub top_p: f32,
-    rng: StdRng,
 }
 
 pub struct FishS2FastDecoder {
@@ -73,7 +62,7 @@ struct FishS2FastAttention {
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
-    rope_theta: f64,
+    rotary: FishS2RotaryCache,
 }
 
 struct FishS2FastMlp {
@@ -104,8 +93,8 @@ impl FishS2FastConfig {
             num_codebooks: config.num_codebooks,
             semantic_start_token_id: config.semantic_start_token_id,
             semantic_end_token_id: config.semantic_end_token_id,
-            rope_theta: text.rope_theta.unwrap_or(1_000_000.0),
-            rms_norm_eps: text.rms_norm_eps.unwrap_or(1e-6),
+            rope_theta: audio.rope_theta.unwrap_or(1_000_000.0),
+            rms_norm_eps: audio.rms_norm_eps.unwrap_or(1e-6),
         })
     }
 
@@ -118,18 +107,15 @@ impl FishS2FastConfig {
     }
 }
 
-impl FishS2Sampler {
-    pub fn new(temperature: f32, top_p: f32, seed: u64) -> Self {
-        Self {
-            temperature: temperature.max(0.0),
-            top_p: top_p.clamp(0.0, 1.0),
-            rng: StdRng::seed_from_u64(seed),
-        }
-    }
-}
-
 impl FishS2FastDecoder {
     pub fn load(cfg: FishS2FastConfig, vb: VarBuilder) -> Result<Self> {
+        let rotary = FishS2RotaryCache::new(
+            cfg.num_codebooks,
+            cfg.head_dim,
+            cfg.rope_theta,
+            DType::BF16,
+            vb.device(),
+        )?;
         let project_in = if cfg.input_hidden_size == cfg.hidden_size {
             FishS2FastProjectIn::Identity
         } else {
@@ -152,6 +138,7 @@ impl FishS2FastDecoder {
         for idx in 0..cfg.num_hidden_layers {
             layers.push(FishS2FastLayer::load(
                 &cfg,
+                &rotary,
                 vb.pp(format!("fast_layers.{idx}")),
             )?);
         }
@@ -175,6 +162,14 @@ impl FishS2FastDecoder {
 
     pub fn config(&self) -> &FishS2FastConfig {
         &self.cfg
+    }
+
+    /// Persistent RoPE table bytes, shared by every fast layer.
+    pub fn rotary_cache_bytes(&self) -> u64 {
+        self.layers
+            .first()
+            .map(|layer| layer.self_attn.rotary.storage_bytes())
+            .unwrap_or(0)
     }
 
     pub fn project_slow_hidden(&self, hidden: &Tensor) -> Result<Tensor> {
@@ -201,6 +196,16 @@ impl FishS2FastDecoder {
         input_pos: usize,
         cache: &mut PhysicalPagedKvCache,
     ) -> Result<Tensor> {
+        self.forward_step_inner(x, input_pos, cache, true)
+    }
+
+    fn forward_step_inner(
+        &self,
+        x: &Tensor,
+        input_pos: usize,
+        cache: &mut PhysicalPagedKvCache,
+        project_logits: bool,
+    ) -> Result<Tensor> {
         let (batch_size, sequence_len, hidden_size) = x.dims3()?;
         if batch_size != 1 || sequence_len != 1 || hidden_size != self.cfg.hidden_size {
             return Err(Error::InvalidInput(format!(
@@ -226,8 +231,11 @@ impl FishS2FastDecoder {
         for (idx, layer) in self.layers.iter().enumerate() {
             hidden = layer.forward(&hidden, input_pos, cache, &mut prepared, idx)?;
         }
-        let out = self.norm.forward(&hidden)?;
-        let logits = self.output.forward(&out)?;
+        let logits = if project_logits {
+            self.output.forward(&self.norm.forward(&hidden)?)?
+        } else {
+            hidden
+        };
         cache.commit_prepared(prepared)?;
         Ok(logits)
     }
@@ -243,7 +251,7 @@ impl FishS2FastDecoder {
             semantic_code_from_token_id_from_fast_config(&self.cfg, semantic_token_id)?;
         cache.reset_invocation()?;
         let hidden = self.project_slow_hidden(slow_hidden)?;
-        let _ = self.forward_step(&hidden, 0, cache)?;
+        let _ = self.forward_step_inner(&hidden, 0, cache, false)?;
 
         let mut codebooks = vec![semantic_code];
         let mut current = self.codebook_embedding(semantic_code)?;
@@ -252,7 +260,9 @@ impl FishS2FastDecoder {
             let row = logits.i((0, 0))?;
             let code = sample_logits(&row, sampler)?;
             codebooks.push(code);
-            current = self.codebook_embedding(code)?;
+            if codebook_idx + 1 < self.cfg.num_codebooks {
+                current = self.codebook_embedding(code)?;
+            }
         }
         Ok(FishS2GeneratedFrame {
             semantic_token_id,
@@ -262,14 +272,14 @@ impl FishS2FastDecoder {
 }
 
 impl FishS2FastLayer {
-    fn load(cfg: &FishS2FastConfig, vb: VarBuilder) -> Result<Self> {
+    fn load(cfg: &FishS2FastConfig, rotary: &FishS2RotaryCache, vb: VarBuilder) -> Result<Self> {
         let input_layernorm = load_rms_norm_alias(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             &vb,
             &["input_layernorm", "attention_norm"],
         )?;
-        let self_attn = FishS2FastAttention::load(cfg, vb.pp("self_attn"))?;
+        let self_attn = FishS2FastAttention::load(cfg, rotary, vb.pp("self_attn"))?;
         let post_attention_layernorm = load_rms_norm_alias(
             cfg.hidden_size,
             cfg.rms_norm_eps,
@@ -305,8 +315,13 @@ impl FishS2FastLayer {
 }
 
 impl FishS2FastAttention {
-    fn load(cfg: &FishS2FastConfig, vb: VarBuilder) -> Result<Self> {
+    fn load(cfg: &FishS2FastConfig, rotary: &FishS2RotaryCache, vb: VarBuilder) -> Result<Self> {
         let total = cfg.q_size() + 2 * cfg.kv_size();
+        if vb.contains_tensor("q_norm.weight") || vb.contains_tensor("k_norm.weight") {
+            return Err(Error::ModelLoadError(
+                "Fish S2 fast attention does not use Q/K normalization".into(),
+            ));
+        }
         Ok(Self {
             qkv_proj: candle_nn::linear_no_bias(cfg.hidden_size, total, vb.pp("qkv_proj"))?,
             o_proj: candle_nn::linear_no_bias(cfg.q_size(), cfg.hidden_size, vb.pp("o_proj"))?,
@@ -331,7 +346,7 @@ impl FishS2FastAttention {
             num_heads: cfg.num_attention_heads,
             num_kv_heads: cfg.num_key_value_heads,
             head_dim: cfg.head_dim,
-            rope_theta: cfg.rope_theta,
+            rotary: rotary.clone(),
         })
     }
 
@@ -377,16 +392,8 @@ impl FishS2FastAttention {
             None => k,
         };
 
-        let (cos, sin) = build_rope_cache(
-            seq_len,
-            self.head_dim,
-            input_pos,
-            self.rope_theta,
-            x.device(),
-            x.dtype(),
-        )?;
-        let q = apply_rope(&q, &cos, &sin)?.squeeze(0)?;
-        let k = apply_rope(&k, &cos, &sin)?.squeeze(0)?;
+        let q = self.rotary.apply(&q, input_pos)?.squeeze(0)?;
+        let k = self.rotary.apply(&k, input_pos)?.squeeze(0)?;
         let v = v.squeeze(0)?;
         let scale = 1.0f32 / (self.head_dim as f32).sqrt();
         let out = cache.write_and_attend(layer_idx, prepared, &q, &k, &v, scale)?;
@@ -425,160 +432,22 @@ impl FishS2FastMlp {
 }
 
 pub(crate) fn sample_logits(row: &Tensor, sampler: &mut FishS2Sampler) -> Result<u32> {
-    if row.dims1()? == 0 {
-        return Err(Error::InferenceError(
-            "Fish S2 fast sampler received empty logits".to_string(),
-        ));
-    }
-    if sampler.temperature <= 1e-5 || sampler.top_p <= 0.0 {
-        let idx = row.argmax(D::Minus1)?;
-        let idx = if idx.rank() == 0 {
-            idx
-        } else {
-            idx.squeeze(0)?
-        };
-        crate::models::shared::telemetry::record_dtype_cast();
-        crate::models::shared::telemetry::record_host_read(candle_core::DType::U32, 1);
-        return idx
-            .to_dtype(candle_core::DType::U32)?
-            .to_scalar::<u32>()
-            .map_err(Error::from);
-    }
-
-    if let Some(candidates) = bounded_device_sampling_candidates(
-        row,
-        row.dim(0)?,
-        0,
-        sampler.temperature,
-        &[],
-        1.0,
-        0.0,
-        None,
-    )? {
-        if device_candidates_cover_top_p(&candidates, sampler.top_p) {
-            if let Some(sampled) =
-                sample_device_candidates(&candidates, sampler.top_p, sampler.rng.r#gen::<f32>())
-            {
-                return Ok(sampled);
-            }
-        }
-    }
-
-    let values = row.to_dtype(candle_core::DType::F32)?.to_vec1::<f32>()?;
-
-    let temp = sampler.temperature.max(1e-5);
-    let max = values
-        .iter()
-        .copied()
-        .fold(f32::NEG_INFINITY, |acc, value| acc.max(value / temp));
-    let mut probs = values
-        .iter()
-        .enumerate()
-        .map(|(idx, value)| (idx, ((*value / temp) - max).exp()))
-        .collect::<Vec<_>>();
-    let sum: f32 = probs.iter().map(|(_, p)| *p).sum();
-    if !sum.is_finite() || sum <= 0.0 {
-        return argmax_values(&values);
-    }
-    for (_, prob) in &mut probs {
-        *prob /= sum;
-    }
-    probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    let mut cumulative = 0.0f32;
-    let mut kept = Vec::new();
-    for item in probs {
-        cumulative += item.1;
-        kept.push(item);
-        if cumulative >= sampler.top_p.max(1e-6) {
-            break;
-        }
-    }
-    let kept_sum: f32 = kept.iter().map(|(_, p)| *p).sum();
-    let mut draw = sampler.rng.r#gen::<f32>() * kept_sum;
-    for (idx, prob) in kept {
-        if draw <= prob {
-            return u32::try_from(idx).map_err(|_| {
-                Error::InferenceError("Fish S2 sampled index overflowed".to_string())
-            });
-        }
-        draw -= prob;
-    }
-    argmax_values(&values)
-}
-
-fn argmax_values(values: &[f32]) -> Result<u32> {
-    let mut best_idx = 0usize;
-    let mut best = f32::NEG_INFINITY;
-    for (idx, value) in values.iter().copied().enumerate() {
-        if value > best {
-            best = value;
-            best_idx = idx;
-        }
-    }
-    u32::try_from(best_idx)
-        .map_err(|_| Error::InferenceError("Fish S2 argmax index overflowed".to_string()))
+    super::sampling::validate_policy(sampler.temperature, sampler.top_p)?;
+    let distribution =
+        FishS2SamplingDistribution::from_logits(row, None, sampler.top_k, sampler.top_p, "fast")?;
+    sampler.sample(&distribution)
 }
 
 fn semantic_code_from_token_id_from_fast_config(
     cfg: &FishS2FastConfig,
     token_id: u32,
 ) -> Result<u32> {
-    let config = FishS2Config {
-        architectures: vec!["DualARTransformer".to_string()],
-        model_type: "fish_qwen3_omni".to_string(),
-        torch_dtype: None,
-        text_config: crate::models::architectures::fish_s2::config::FishS2TextConfig {
-            hidden_size: cfg.input_hidden_size,
-            num_hidden_layers: 1,
-            num_attention_heads: cfg.num_attention_heads,
-            num_key_value_heads: cfg.num_key_value_heads,
-            head_dim: Some(cfg.head_dim),
-            vocab_size: cfg.semantic_end_token_id as usize + 1,
-            max_seq_len: 16,
-            rope_theta: Some(cfg.rope_theta),
-            rms_norm_eps: Some(cfg.rms_norm_eps),
-            intermediate_size: Some(cfg.intermediate_size),
-            hidden_act: None,
-        },
-        audio_decoder_config:
-            crate::models::architectures::fish_s2::config::FishS2AudioDecoderConfig {
-                hidden_size: cfg.hidden_size,
-                num_hidden_layers: cfg.num_hidden_layers,
-                num_attention_heads: cfg.num_attention_heads,
-                num_key_value_heads: cfg.num_key_value_heads,
-                head_dim: Some(cfg.head_dim),
-                intermediate_size: Some(cfg.intermediate_size),
-                max_seq_len: Some(cfg.num_codebooks + 1),
-                num_codebooks: Some(cfg.num_codebooks),
-                vocab_size: Some(cfg.codebook_size),
-            },
-        num_codebooks: cfg.num_codebooks,
-        codebook_size: cfg.codebook_size,
-        max_seq_len: 16,
-        bos_token_id: 0,
-        eos_token_id: 0,
-        pad_token_id: 0,
-        audio_pad_token_id: 0,
-        semantic_start_token_id: cfg.semantic_start_token_id,
-        semantic_end_token_id: cfg.semantic_end_token_id,
-        sample_rate: None,
-    };
-    semantic_code_from_token_id(&config, token_id)
-}
-
-fn apply_rope(x: &Tensor, cos_half: &Tensor, sin_half: &Tensor) -> Result<Tensor> {
-    let half_dim = x.dim(3)? / 2;
-    let x1 = x.narrow(3, 0, half_dim)?;
-    let x2 = x.narrow(3, half_dim, half_dim)?;
-    let cos = cos_half.unsqueeze(0)?.unsqueeze(2)?;
-    let sin = sin_half.unsqueeze(0)?.unsqueeze(2)?;
-    let out_first = x1
-        .broadcast_mul(&cos)?
-        .broadcast_sub(&x2.broadcast_mul(&sin)?)?;
-    let out_second = x1
-        .broadcast_mul(&sin)?
-        .broadcast_add(&x2.broadcast_mul(&cos)?)?;
-    Tensor::cat(&[&out_first, &out_second], 3).map_err(Error::from)
+    if !(cfg.semantic_start_token_id..=cfg.semantic_end_token_id).contains(&token_id) {
+        return Err(Error::InvalidInput(format!(
+            "Fish S2 token {token_id} is outside the semantic range"
+        )));
+    }
+    Ok(token_id - cfg.semantic_start_token_id)
 }
 
 fn load_rms_norm_alias(dim: usize, eps: f64, vb: &VarBuilder, aliases: &[&str]) -> Result<RmsNorm> {

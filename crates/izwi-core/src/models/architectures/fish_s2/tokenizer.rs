@@ -71,6 +71,33 @@ impl FishS2PromptTokenizer {
             model_dir,
             Some(config.text_config.vocab_size),
         )?;
+        for (token, expected) in [
+            (IM_END_TOKEN, config.eos_token_id),
+            ("<|pad|>", config.pad_token_id),
+            ("<|audio_pad|>", config.audio_pad_token_id),
+        ] {
+            if tokenizer.token_to_id(token) != Some(expected) {
+                return Err(Error::ModelLoadError(format!(
+                    "Fish S2 tokenizer {token} must map to {expected}"
+                )));
+            }
+        }
+        for token in ["<|im_start|>", MODALITY_VOICE_TOKEN] {
+            if tokenizer.token_to_id(token).is_none() {
+                return Err(Error::ModelLoadError(format!(
+                    "Fish S2 tokenizer is missing {token}"
+                )));
+            }
+        }
+        for code in 0..config.codebook_size {
+            let token = format!("<|semantic:{code}|>");
+            let expected = config.semantic_start_token_id + code as u32;
+            if tokenizer.token_to_id(&token) != Some(expected) {
+                return Err(Error::ModelLoadError(format!(
+                    "Fish S2 tokenizer {token} must map to {expected}"
+                )));
+            }
+        }
         let chat_template_path = model_dir.join("chat_template.jinja");
         let chat_template = fs::read_to_string(&chat_template_path).map_err(|err| {
             Error::ModelLoadError(format!(

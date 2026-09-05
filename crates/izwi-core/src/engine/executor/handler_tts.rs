@@ -1475,9 +1475,6 @@ impl NativeExecutor {
         let slow = retained
             .take_paged_domain(crate::kv::CacheDomainId::new(1), true)?
             .expect("required Fish S2 slow cache");
-        let fast = retained
-            .take_paged_domain(crate::kv::CacheDomainId::new(2), true)?
-            .expect("required Fish S2 fast cache");
         retained.ensure_all_paged_consumed()?;
         let mut lease = ExecutorStateLease::checkout(
             &self.fish_s2_tts_decode_states,
@@ -1504,7 +1501,7 @@ impl NativeExecutor {
                 .fish_s2_tts_generation_params_for_executor()?
                 .ok_or_else(|| Error::InferenceError("Fish S2 TTS lost geometry".into()))?;
             let (state, checkpoint) =
-                model.new_retained_state_in_quantum(artifact, params, slow, fast)?;
+                model.new_retained_state_in_quantum(artifact, params, slow)?;
             lease.install_state(ActiveFishS2TtsDecode {
                 variant,
                 model: model.clone(),
@@ -1517,7 +1514,7 @@ impl NativeExecutor {
             lease
                 .require_state_mut()?
                 .state
-                .begin_managed_quantum(slow, fast)?
+                .begin_managed_quantum(slow)?
         };
         lease.mark_dirty();
         let result = (|| {
@@ -1535,7 +1532,12 @@ impl NativeExecutor {
                 }
                 Some(step)
             } else {
-                Some(model.retained_decode_step(&mut active.state)?)
+                {
+                    let mut fast = super::invocation_paged_lease_for_row(request, scheduled)?;
+                    let step = model.retained_decode_step(&mut active.state, fast.cache_mut())?;
+                    let _ = fast.release()?;
+                    Some(step)
+                }
             };
             if request.is_cancelled() {
                 return Err(Error::Cancelled(request.id.clone()));
@@ -1588,35 +1590,96 @@ impl NativeExecutor {
         let frames_generated = active.state.frames_generated();
         let generated = frames_generated.saturating_sub(active.last_frames_generated);
         active.last_frames_generated = frames_generated;
-        let finished = matches!(step, Some(FishS2RetainedStep::Finished { .. }));
-        let (samples, sample_rate) = if finished {
-            let output = model.finalize_retained_state(&active.state)?;
-            (output.samples, output.sample_rate)
-        } else {
-            (Vec::new(), model.diagnostics().sample_rate)
-        };
-        if generated > 0 {
-            active.stream_sequence = active.stream_sequence.saturating_add(1);
-        }
+        let codec_ready = matches!(step, Some(FishS2RetainedStep::Finished { .. }));
+        let sample_rate = model.diagnostics().sample_rate;
         lease.mark_clean();
-        if finished {
-            lease.release()?;
-        } else {
-            lease.restore()?;
-        }
-        Ok(ModelSessionResult::sequence(ExecutorOutput {
+        lease.restore()?;
+        let output = ExecutorOutput {
             request_id: request.id.clone(),
-            audio: Some(AudioOutput::new(samples, sample_rate)),
+            audio: Some(AudioOutput::new(Vec::new(), sample_rate)),
             text: None,
             input_transcription: None,
             tokens_processed: scheduled.num_tokens,
             tokens_generated: generated,
-            finished,
+            finished: false,
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
-        })
-        .with_managed_cache_completions(completions))
+        };
+        let result = if codec_ready {
+            ModelSessionResult::yielded(output, crate::engine::YieldReason::AwaitingFinalization)
+        } else {
+            ModelSessionResult::sequence(output)
+        };
+        Ok(result.with_managed_cache_completions(completions))
+    }
+
+    pub(super) fn fish_s2_tts_finalize_request(
+        &self,
+        request: &EngineCoreRequest,
+        scheduled: &ScheduledRequest,
+    ) -> Result<ModelSessionResult> {
+        if !matches!(
+            scheduled.work,
+            crate::engine::WorkUnit::SequenceFinalize {
+                max_output_steps: 1
+            }
+        ) || scheduled.is_prefill
+        {
+            return Err(Error::InvalidInput(
+                "Fish S2 codec requires an exact sequence-finalize quantum".into(),
+            ));
+        }
+        let variant = Self::resolve_variant(request)?;
+        if variant.family() != ModelFamily::FishS2Tts {
+            return Err(Error::InvalidInput("foreign Fish S2 codec request".into()));
+        }
+        let model = request
+            .prepared_fish_s2_tts_model_lease_for_executor()?
+            .ok_or_else(|| Error::InferenceError("Fish S2 codec lost model residency".into()))?;
+        let mut lease = ExecutorStateLease::checkout(
+            &self.fish_s2_tts_decode_states,
+            scheduled.session_key(),
+            variant,
+            "Fish S2 codec",
+        )?;
+        let active = lease.require_state_mut()?;
+        if active.variant != variant || !Arc::ptr_eq(&active.model.model_arc(), &model.model_arc())
+        {
+            return Err(Error::InferenceError(
+                "Fish S2 codec crossed its model fence".into(),
+            ));
+        }
+        // Decoding is read-only with respect to committed AR state, so a failed
+        // or cancelled codec quantum cannot publish or partially mutate it.
+        let output = model.finalize_retained_state_with_cancel(&active.state, &|| {
+            if request.is_cancelled() {
+                return Err(Error::Cancelled(request.id.clone()));
+            }
+            if request
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                return Err(Error::Timeout(request.id.clone()));
+            }
+            Ok(())
+        })?;
+        if request.is_cancelled() {
+            return Err(Error::Cancelled(request.id.clone()));
+        }
+        lease.release()?;
+        Ok(ModelSessionResult::sequence(ExecutorOutput {
+            request_id: request.id.clone(),
+            audio: Some(AudioOutput::new(output.samples, output.sample_rate)),
+            text: None,
+            input_transcription: None,
+            tokens_processed: 0,
+            tokens_generated: 0,
+            finished: true,
+            phase_timing_override: None,
+            asr_diagnostics: None,
+            error: None,
+        }))
     }
 
     pub(super) fn lfm25_audio_tts_request_with_managed_cache(

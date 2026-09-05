@@ -37,7 +37,6 @@ model = [
   "Qwen3-TTS-12Hz-0.6B-Base",
   "Kokoro-82M",
   "Voxtral-4B-TTS-2603",
-  "FishAudio-S2-Pro",
   "LFM2.5-Audio-1.5B-GGUF",
 ]
 concurrent = [1, 2, 4, 8]
@@ -46,6 +45,21 @@ concurrent = [1, 2, 4, 8]
 name = "vibevoice-tts-cpu-concurrency"
 command = "tts"
 model = "VibeVoice-1.5B"
+iterations = 8
+warmup = true
+stream = true
+text = "Continuous audio batching should remain responsive and clear."
+reference_audio = "../../data/fox.wav"
+reference_text_file = "../../data/fox.md"
+
+[benchmarks.matrix]
+concurrent = [1, 2, 4, 8]
+
+# Fish requires a matching reference voice/transcript for every request.
+[[benchmarks]]
+name = "fish-s2-tts-cpu-concurrency"
+command = "tts"
+model = "FishAudio-S2-Pro"
 iterations = 8
 warmup = true
 stream = true
