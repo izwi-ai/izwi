@@ -1,6 +1,6 @@
 //! Fast codebook decoder for Fish S2 DualAR generation.
 
-use candle_core::{IndexOp, Tensor, D};
+use candle_core::{DType, IndexOp, Tensor, D};
 use candle_nn::{ops, Embedding, Linear, Module, RmsNorm, VarBuilder};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -8,7 +8,7 @@ use rand::{Rng, SeedableRng};
 use crate::error::{Error, Result};
 use crate::models::architectures::fish_s2::config::FishS2Config;
 use crate::models::architectures::fish_s2::contracts::semantic_code_from_token_id;
-use crate::models::architectures::qwen3::core::build_rope_cache;
+use crate::models::architectures::fish_s2::rotary::FishS2RotaryCache;
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
 use crate::models::shared::sampling::{
     bounded_device_sampling_candidates, device_candidates_cover_top_p, sample_device_candidates,
@@ -73,7 +73,7 @@ struct FishS2FastAttention {
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
-    rope_theta: f64,
+    rotary: FishS2RotaryCache,
 }
 
 struct FishS2FastMlp {
@@ -130,6 +130,13 @@ impl FishS2Sampler {
 
 impl FishS2FastDecoder {
     pub fn load(cfg: FishS2FastConfig, vb: VarBuilder) -> Result<Self> {
+        let rotary = FishS2RotaryCache::new(
+            cfg.num_codebooks,
+            cfg.head_dim,
+            cfg.rope_theta,
+            DType::BF16,
+            vb.device(),
+        )?;
         let project_in = if cfg.input_hidden_size == cfg.hidden_size {
             FishS2FastProjectIn::Identity
         } else {
@@ -152,6 +159,7 @@ impl FishS2FastDecoder {
         for idx in 0..cfg.num_hidden_layers {
             layers.push(FishS2FastLayer::load(
                 &cfg,
+                &rotary,
                 vb.pp(format!("fast_layers.{idx}")),
             )?);
         }
@@ -175,6 +183,14 @@ impl FishS2FastDecoder {
 
     pub fn config(&self) -> &FishS2FastConfig {
         &self.cfg
+    }
+
+    /// Persistent RoPE table bytes, shared by every fast layer.
+    pub fn rotary_cache_bytes(&self) -> u64 {
+        self.layers
+            .first()
+            .map(|layer| layer.self_attn.rotary.storage_bytes())
+            .unwrap_or(0)
     }
 
     pub fn project_slow_hidden(&self, hidden: &Tensor) -> Result<Tensor> {
@@ -262,14 +278,14 @@ impl FishS2FastDecoder {
 }
 
 impl FishS2FastLayer {
-    fn load(cfg: &FishS2FastConfig, vb: VarBuilder) -> Result<Self> {
+    fn load(cfg: &FishS2FastConfig, rotary: &FishS2RotaryCache, vb: VarBuilder) -> Result<Self> {
         let input_layernorm = load_rms_norm_alias(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             &vb,
             &["input_layernorm", "attention_norm"],
         )?;
-        let self_attn = FishS2FastAttention::load(cfg, vb.pp("self_attn"))?;
+        let self_attn = FishS2FastAttention::load(cfg, rotary, vb.pp("self_attn"))?;
         let post_attention_layernorm = load_rms_norm_alias(
             cfg.hidden_size,
             cfg.rms_norm_eps,
@@ -305,7 +321,7 @@ impl FishS2FastLayer {
 }
 
 impl FishS2FastAttention {
-    fn load(cfg: &FishS2FastConfig, vb: VarBuilder) -> Result<Self> {
+    fn load(cfg: &FishS2FastConfig, rotary: &FishS2RotaryCache, vb: VarBuilder) -> Result<Self> {
         let total = cfg.q_size() + 2 * cfg.kv_size();
         Ok(Self {
             qkv_proj: candle_nn::linear_no_bias(cfg.hidden_size, total, vb.pp("qkv_proj"))?,
@@ -331,7 +347,7 @@ impl FishS2FastAttention {
             num_heads: cfg.num_attention_heads,
             num_kv_heads: cfg.num_key_value_heads,
             head_dim: cfg.head_dim,
-            rope_theta: cfg.rope_theta,
+            rotary: rotary.clone(),
         })
     }
 
@@ -377,16 +393,8 @@ impl FishS2FastAttention {
             None => k,
         };
 
-        let (cos, sin) = build_rope_cache(
-            seq_len,
-            self.head_dim,
-            input_pos,
-            self.rope_theta,
-            x.device(),
-            x.dtype(),
-        )?;
-        let q = apply_rope(&q, &cos, &sin)?.squeeze(0)?;
-        let k = apply_rope(&k, &cos, &sin)?.squeeze(0)?;
+        let q = self.rotary.apply(&q, input_pos)?.squeeze(0)?;
+        let k = self.rotary.apply(&k, input_pos)?.squeeze(0)?;
         let v = v.squeeze(0)?;
         let scale = 1.0f32 / (self.head_dim as f32).sqrt();
         let out = cache.write_and_attend(layer_idx, prepared, &q, &k, &v, scale)?;
@@ -564,21 +572,6 @@ fn semantic_code_from_token_id_from_fast_config(
         sample_rate: None,
     };
     semantic_code_from_token_id(&config, token_id)
-}
-
-fn apply_rope(x: &Tensor, cos_half: &Tensor, sin_half: &Tensor) -> Result<Tensor> {
-    let half_dim = x.dim(3)? / 2;
-    let x1 = x.narrow(3, 0, half_dim)?;
-    let x2 = x.narrow(3, half_dim, half_dim)?;
-    let cos = cos_half.unsqueeze(0)?.unsqueeze(2)?;
-    let sin = sin_half.unsqueeze(0)?.unsqueeze(2)?;
-    let out_first = x1
-        .broadcast_mul(&cos)?
-        .broadcast_sub(&x2.broadcast_mul(&sin)?)?;
-    let out_second = x1
-        .broadcast_mul(&sin)?
-        .broadcast_add(&x2.broadcast_mul(&cos)?)?;
-    Tensor::cat(&[&out_first, &out_second], 3).map_err(Error::from)
 }
 
 fn load_rms_norm_alias(dim: usize, eps: f64, vb: &VarBuilder, aliases: &[&str]) -> Result<RmsNorm> {

@@ -26,6 +26,7 @@ pub mod dac;
 pub mod fast;
 mod physical;
 mod retained;
+mod rotary;
 pub mod slow;
 pub mod tokenizer;
 pub mod weights;

@@ -6,12 +6,13 @@ use candle_nn::{
     Linear, Module, RmsNorm, VarBuilder,
 };
 
-use crate::audio::resample_mono_high_quality;
+use crate::audio::{resample_mono_high_quality, target_sample_count};
 use crate::error::{Error, Result};
 use crate::models::architectures::fish_s2::codec::fuse_weight_norm_dim0;
 use crate::models::architectures::fish_s2::contracts::FishS2DacContract;
+use crate::models::architectures::fish_s2::rotary::FishS2RotaryCache;
 use crate::models::architectures::fish_s2::tokenizer::FishS2VqCodes;
-use crate::models::architectures::qwen3::core::{build_rope_cache, causal_mask, repeat_kv};
+use crate::models::architectures::qwen3::core::{causal_mask, repeat_kv};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FishS2DacConfig {
@@ -157,7 +158,7 @@ struct FishS2DacAttention {
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
-    rope_theta: f64,
+    rotary: FishS2RotaryCache,
     window_size: usize,
 }
 
@@ -175,12 +176,17 @@ struct FishS2DacTransformerParams {
     kv_heads: usize,
     head_dim: usize,
     intermediate: usize,
+    max_seq_len: usize,
     window_size: usize,
     rope_theta: f64,
     rms_norm_eps: f64,
 }
 
 impl FishS2DacConfig {
+    /// Position capacities saved in the public S2 Pro codec checkpoint.
+    pub const MAX_ENCODER_FRAMES: usize = 16_384;
+    pub const MAX_QUANTIZER_FRAMES: usize = 4_096;
+
     pub fn current() -> Self {
         let contract = FishS2DacContract::CURRENT;
         Self {
@@ -224,6 +230,76 @@ impl FishS2DacConfig {
             })?;
         Ok(upsample)
     }
+
+    pub fn maximum_reference_samples(&self) -> Result<usize> {
+        let encoder_stride = self.encoder_rates.iter().try_fold(1usize, |stride, rate| {
+            stride
+                .checked_mul(*rate)
+                .ok_or_else(|| Error::ConfigError("Fish S2 DAC encoder stride overflowed".into()))
+        })?;
+        let encoder_limit = encoder_stride
+            .checked_mul(Self::MAX_ENCODER_FRAMES)
+            .ok_or_else(|| Error::ConfigError("Fish S2 DAC reference limit overflowed".into()))?;
+        let quantizer_limit = self
+            .samples_per_frame()?
+            .checked_mul(Self::MAX_QUANTIZER_FRAMES)
+            .ok_or_else(|| Error::ConfigError("Fish S2 DAC reference limit overflowed".into()))?;
+        Ok(encoder_limit.min(quantizer_limit))
+    }
+
+    /// Validates the resampled length before allocating a resampling or encoder buffer.
+    pub fn reference_frame_count(&self, input_samples: usize, sample_rate: u32) -> Result<usize> {
+        if sample_rate == 0 || input_samples == 0 {
+            return Err(Error::InvalidInput(
+                "Fish S2 reference audio requires samples and a nonzero sample rate".into(),
+            ));
+        }
+        let samples_per_frame = self.samples_per_frame()?.max(1);
+        let resampled_samples = (input_samples as u128 * u128::from(self.sample_rate)
+            + u128::from(sample_rate / 2))
+            / u128::from(sample_rate);
+        let maximum_samples = self.maximum_reference_samples()?;
+        if resampled_samples > maximum_samples as u128 {
+            return Err(Error::InvalidInput(format!(
+                "Fish S2 reference audio exceeds the codec capacity of {maximum_samples} samples at {} Hz",
+                self.sample_rate
+            )));
+        }
+        let frames = target_sample_count(input_samples, sample_rate, self.sample_rate)
+            .div_ceil(samples_per_frame)
+            .max(1);
+        let prepared_samples = frames.checked_mul(samples_per_frame).ok_or_else(|| {
+            Error::InvalidInput("Fish S2 reference audio length overflowed".into())
+        })?;
+        if prepared_samples > maximum_samples {
+            return Err(Error::InvalidInput(format!(
+                "Fish S2 reference audio exceeds the codec capacity of {} samples at {} Hz",
+                maximum_samples, self.sample_rate
+            )));
+        }
+        Ok(frames)
+    }
+
+    /// One shared pair of F32 tables per transformer, after BF16 frequency rounding.
+    pub fn rotary_cache_bytes(&self) -> Result<u64> {
+        let encoder_count = self
+            .encoder_transformer_layers
+            .iter()
+            .filter(|layers| **layers > 0)
+            .count();
+        let quantizer_count: usize = if self.transformer_layers > 0 { 2 } else { 0 };
+        encoder_count
+            .checked_mul(Self::MAX_ENCODER_FRAMES)
+            .and_then(|positions| {
+                quantizer_count
+                    .checked_mul(Self::MAX_QUANTIZER_FRAMES)
+                    .and_then(|quantizer_positions| positions.checked_add(quantizer_positions))
+            })
+            .and_then(|positions| positions.checked_mul(self.transformer_head_dim))
+            .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()))
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| Error::ConfigError("Fish S2 DAC rotary cache size overflowed".into()))
+    }
 }
 
 impl FishS2DacTransformerParams {
@@ -235,6 +311,7 @@ impl FishS2DacTransformerParams {
             kv_heads: config.transformer_kv_heads,
             head_dim: config.transformer_head_dim,
             intermediate: config.transformer_intermediate,
+            max_seq_len: FishS2DacConfig::MAX_QUANTIZER_FRAMES,
             window_size: config.transformer_window_size,
             rope_theta: config.rope_theta,
             rms_norm_eps: config.rms_norm_eps,
@@ -255,6 +332,7 @@ impl FishS2DacTransformerParams {
             kv_heads: heads,
             head_dim: config.transformer_head_dim,
             intermediate: dim * 3,
+            max_seq_len: FishS2DacConfig::MAX_ENCODER_FRAMES,
             window_size,
             rope_theta: config.rope_theta,
             rms_norm_eps: config.rms_norm_eps,
@@ -313,6 +391,11 @@ impl FishS2DacDecoder {
                 "Fish S2 DAC encoder expects audio shape [B, 1, T], got {:?}",
                 audio.dims()
             )));
+        }
+        if audio.dim(2)? > self.config.maximum_reference_samples()? {
+            return Err(Error::AudioError(
+                "Fish S2 DAC encoder input exceeds the codec position capacity".into(),
+            ));
         }
         let z = self.encoder.forward(audio)?;
         self.quantizer.encode(&z, &self.config)
@@ -603,7 +686,7 @@ impl FishS2ConvNeXtBlock {
         let residual = x.clone();
         let mut hidden = self.dwconv.forward(x)?.transpose(1, 2)?;
         hidden = self.norm.forward(&hidden)?;
-        hidden = self.pwconv1.forward(&hidden)?.gelu()?;
+        hidden = self.pwconv1.forward(&hidden)?.gelu_erf()?;
         hidden = self.pwconv2.forward(&hidden)?;
         if let Some(gamma) = &self.gamma {
             hidden = hidden.broadcast_mul(&gamma.reshape((1, 1, gamma.dim(0)?))?)?;
@@ -958,10 +1041,18 @@ impl FishS2WindowLimitedTransformer {
         } else {
             None
         };
+        let rotary = FishS2RotaryCache::new(
+            params.max_seq_len,
+            params.head_dim,
+            params.rope_theta,
+            DType::BF16,
+            vb.device(),
+        )?;
         let mut layers = Vec::with_capacity(params.layers);
         for idx in 0..params.layers {
             layers.push(FishS2DacTransformerBlock::load(
                 params,
+                rotary.clone(),
                 vb.pp(format!("layers.{idx}")),
             )?);
         }
@@ -1005,10 +1096,14 @@ impl FishS2WindowLimitedTransformer {
 }
 
 impl FishS2DacTransformerBlock {
-    fn load(params: &FishS2DacTransformerParams, vb: VarBuilder) -> Result<Self> {
+    fn load(
+        params: &FishS2DacTransformerParams,
+        rotary: FishS2RotaryCache,
+        vb: VarBuilder,
+    ) -> Result<Self> {
         let dim = params.dim;
         Ok(Self {
-            attention: FishS2DacAttention::load(params, vb.pp("attention"))?,
+            attention: FishS2DacAttention::load(params, rotary, vb.pp("attention"))?,
             feed_forward: FishS2DacFeedForward::load(params, vb.pp("feed_forward"))?,
             attention_norm: candle_nn::rms_norm(dim, params.rms_norm_eps, vb.pp("attention_norm"))?,
             ffn_norm: candle_nn::rms_norm(dim, params.rms_norm_eps, vb.pp("ffn_norm"))?,
@@ -1036,7 +1131,11 @@ impl FishS2DacTransformerBlock {
 }
 
 impl FishS2DacAttention {
-    fn load(params: &FishS2DacTransformerParams, vb: VarBuilder) -> Result<Self> {
+    fn load(
+        params: &FishS2DacTransformerParams,
+        rotary: FishS2RotaryCache,
+        vb: VarBuilder,
+    ) -> Result<Self> {
         let q_dim = params.heads * params.head_dim;
         let kv_dim = params.kv_heads * params.head_dim;
         let total = q_dim + 2 * kv_dim;
@@ -1046,7 +1145,7 @@ impl FishS2DacAttention {
             num_heads: params.heads,
             num_kv_heads: params.kv_heads,
             head_dim: params.head_dim,
-            rope_theta: params.rope_theta,
+            rotary,
             window_size: params.window_size.max(1),
         })
     }
@@ -1072,16 +1171,8 @@ impl FishS2DacAttention {
             self.num_kv_heads,
             self.head_dim,
         ))?;
-        let (cos, sin) = build_rope_cache(
-            seq_len,
-            self.head_dim,
-            0,
-            self.rope_theta,
-            x.device(),
-            x.dtype(),
-        )?;
-        let q = apply_rope(&q, &cos, &sin)?.transpose(1, 2)?;
-        let k = apply_rope(&k, &cos, &sin)?.transpose(1, 2)?;
+        let q = self.rotary.apply(&q, 0)?.transpose(1, 2)?;
+        let k = self.rotary.apply(&k, 0)?.transpose(1, 2)?;
         let v = v.transpose(1, 2)?;
         let k = repeat_kv(&k, self.num_heads, self.num_kv_heads)?;
         let v = repeat_kv(&v, self.num_heads, self.num_kv_heads)?;
@@ -1140,6 +1231,12 @@ fn codebooks_to_tensor(
         return Err(Error::AudioError(
             "Fish S2 DAC cannot decode empty codebooks".to_string(),
         ));
+    }
+    if frames > FishS2DacConfig::MAX_QUANTIZER_FRAMES {
+        return Err(Error::AudioError(format!(
+            "Fish S2 DAC codebooks exceed the codec capacity of {} frames",
+            FishS2DacConfig::MAX_QUANTIZER_FRAMES
+        )));
     }
     if codebooks.iter().any(|row| row.len() != frames) {
         return Err(Error::AudioError(
@@ -1201,6 +1298,7 @@ fn prepare_reference_samples(
             "Fish S2 reference audio cannot be empty".to_string(),
         ));
     }
+    let frames = config.reference_frame_count(samples.len(), sample_rate)?;
     let mut prepared = resample_mono_high_quality(samples, sample_rate, config.sample_rate)?;
     for sample in &mut prepared {
         if !sample.is_finite() {
@@ -1208,15 +1306,14 @@ fn prepare_reference_samples(
         }
     }
     let frame = config.samples_per_frame()?.max(1);
-    let target_len = prepared.len().div_ceil(frame) * frame;
+    let target_len = frames * frame;
     prepared.resize(target_len.max(frame), 0.0);
     Ok(prepared)
 }
 
 fn l2_normalize_last_dim(x: &Tensor) -> Result<Tensor> {
     let norm = x.sqr()?.sum_keepdim(D::Minus1)?.sqrt()?;
-    let eps = Tensor::new(1e-12f32, x.device())?.to_dtype(x.dtype())?;
-    x.broadcast_div(&norm.broadcast_add(&eps)?)
+    x.broadcast_div(&norm.maximum(1e-12f32)?)
         .map_err(Error::from)
 }
 
@@ -1320,21 +1417,6 @@ fn load_conv_transpose1d_weight(
         None
     };
     Ok(ConvTranspose1d::new(weight, bias, cfg))
-}
-
-fn apply_rope(x: &Tensor, cos_half: &Tensor, sin_half: &Tensor) -> Result<Tensor> {
-    let half_dim = x.dim(3)? / 2;
-    let x1 = x.narrow(3, 0, half_dim)?;
-    let x2 = x.narrow(3, half_dim, half_dim)?;
-    let cos = cos_half.unsqueeze(0)?.unsqueeze(2)?;
-    let sin = sin_half.unsqueeze(0)?.unsqueeze(2)?;
-    let out_first = x1
-        .broadcast_mul(&cos)?
-        .broadcast_sub(&x2.broadcast_mul(&sin)?)?;
-    let out_second = x1
-        .broadcast_mul(&sin)?
-        .broadcast_add(&x2.broadcast_mul(&cos)?)?;
-    Tensor::cat(&[&out_first, &out_second], 3).map_err(Error::from)
 }
 
 fn windowed_causal_mask(
@@ -1698,5 +1780,157 @@ mod tests {
             FishS2DacContract::CURRENT.frame_length().unwrap()
         );
         assert_eq!(config.sample_rate, FishS2DacContract::CURRENT.sample_rate);
+    }
+
+    #[test]
+    fn dac_attention_matches_adjacent_pair_reference() {
+        let device = Device::Cpu;
+        let params = FishS2DacTransformerParams {
+            dim: 4,
+            layers: 1,
+            heads: 1,
+            kv_heads: 1,
+            head_dim: 4,
+            intermediate: 8,
+            max_seq_len: 3,
+            window_size: 3,
+            rope_theta: 10_000.0,
+            rms_norm_eps: 1e-5,
+        };
+        let mut qkv = vec![0.0f32; 12 * 4];
+        for column in 0..4 {
+            qkv[column * 4 + column] = 1.0;
+            qkv[(column + 4) * 4 + column] = [0.5, 1.1, -0.7, 0.9][column];
+            qkv[(column + 8) * 4 + column] = 1.0;
+        }
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "wqkv.weight".into(),
+            Tensor::from_vec(qkv, (12, 4), &device).unwrap(),
+        );
+        tensors.insert(
+            "wo.weight".into(),
+            Tensor::eye(4, DType::F32, &device).unwrap(),
+        );
+        let rotary = FishS2RotaryCache::new(3, 4, 10_000.0, DType::BF16, &device).unwrap();
+        let attention = FishS2DacAttention::load(
+            &params,
+            rotary,
+            VarBuilder::from_tensors(tensors, DType::F32, &device),
+        )
+        .unwrap();
+        let input = Tensor::from_vec(
+            vec![
+                0.4f32, -0.7, 1.2, 0.3, -0.2, 0.9, -0.5, 1.1, 1.3, 0.1, 0.2, -0.8,
+            ],
+            (1, 3, 4),
+            &device,
+        )
+        .unwrap();
+        // Independent scalar oracle: published DAC adjacent-pair rotation with
+        // BF16-rounded cos/sin, q=x, k=x*[.5,1.1,-.7,.9], v=x, causal softmax.
+        let expected = [
+            0.4f32,
+            -0.7,
+            1.2,
+            0.3,
+            -0.0083854375,
+            0.38902783,
+            0.042907927,
+            0.8445139,
+            0.6966825,
+            0.25058666,
+            0.1083576,
+            -0.04114733,
+        ];
+        let actual = attention
+            .forward(&input)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (actual - expected).abs() < 1e-6,
+                "element {index}: {actual} != {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn convnext_uses_exact_gelu() {
+        let device = Device::Cpu;
+        let mut tensors = HashMap::new();
+        insert_convnext(&mut tensors, &device, "block", 2);
+        tensors.insert(
+            "block.pwconv1.bias".into(),
+            Tensor::from_vec(
+                vec![-3.0f32, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                (8,),
+                &device,
+            )
+            .unwrap(),
+        );
+        let mut projection = vec![0.0f32; 16];
+        projection[0] = 1.0;
+        projection[9] = 1.0;
+        tensors.insert(
+            "block.pwconv2.weight".into(),
+            Tensor::from_vec(projection, (2, 8), &device).unwrap(),
+        );
+        let block = FishS2ConvNeXtBlock::load(
+            2,
+            VarBuilder::from_tensors(tensors, DType::F32, &device).pp("block"),
+        )
+        .unwrap();
+        let output = block
+            .forward(&Tensor::zeros((1, 2, 1), DType::F32, &device).unwrap())
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        // x/2 * (1 + erf(x/sqrt(2))); the tanh approximation differs by 4.1e-4.
+        assert!((output[0] - -0.004049694f32).abs() < 1e-6);
+        assert!((output[1] - 2.9959503f32).abs() < 1e-6);
+    }
+
+    #[test]
+    fn quantizer_normalization_clamps_small_norms() {
+        let input = Tensor::from_vec(
+            vec![3.0f32, 4.0, 3e-13, 4e-13, 0.0, 0.0],
+            (3, 2),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let actual = l2_normalize_last_dim(&input)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        for (row, expected) in actual.iter().zip([[0.6f32, 0.8], [0.3, 0.4], [0.0, 0.0]]) {
+            for (actual, expected) in row.iter().zip(expected) {
+                assert!((actual - expected).abs() < 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn codec_position_limits_are_checked_before_allocation() {
+        let config = FishS2DacConfig::current();
+        assert_eq!(config.maximum_reference_samples().unwrap(), 8_388_608);
+        assert_eq!(config.rotary_cache_bytes().unwrap(), 6_291_456);
+        assert_eq!(config.reference_frame_count(16_000, 16_000).unwrap(), 22);
+        assert_eq!(
+            config.reference_frame_count(8_388_608, 44_100).unwrap(),
+            4_096
+        );
+        assert!(config.reference_frame_count(8_388_609, 44_100).is_err());
+        assert!(config.reference_frame_count(usize::MAX, 1).is_err());
+        let rows = vec![vec![0; 4_097]; config.num_codebooks()];
+        assert!(codebooks_to_tensor(&rows, &config, &Device::Cpu)
+            .unwrap_err()
+            .to_string()
+            .contains("capacity"));
     }
 }

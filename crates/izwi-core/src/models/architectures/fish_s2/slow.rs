@@ -1,13 +1,13 @@
 //! Slow semantic transformer for Fish S2 DualAR generation.
 
-use candle_core::Tensor;
+use candle_core::{DType, Tensor};
 use candle_nn::{ops, Embedding, Linear, Module, RmsNorm, VarBuilder};
 
 use crate::error::{Error, Result};
 use crate::models::architectures::fish_s2::config::FishS2Config;
 use crate::models::architectures::fish_s2::contracts::build_semantic_allowed_mask;
+use crate::models::architectures::fish_s2::rotary::FishS2RotaryCache;
 use crate::models::architectures::fish_s2::tokenizer::FishS2ConditioningPrompt;
-use crate::models::architectures::qwen3::core::build_rope_cache;
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -59,7 +59,7 @@ struct FishS2PackedAttention {
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
-    rope_theta: f64,
+    rotary: FishS2RotaryCache,
 }
 
 struct FishS2Mlp {
@@ -111,6 +111,13 @@ impl FishS2SlowConfig {
 
 impl FishS2SlowTransformer {
     pub fn load(cfg: FishS2SlowConfig, vb: VarBuilder) -> Result<Self> {
+        let rotary = FishS2RotaryCache::new(
+            cfg.max_seq_len,
+            cfg.head_dim,
+            cfg.rope_theta,
+            DType::BF16,
+            vb.device(),
+        )?;
         let embeddings =
             candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("embed_tokens"))?;
         let codebook_embeddings = candle_nn::embedding(
@@ -120,7 +127,11 @@ impl FishS2SlowTransformer {
         )?;
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for idx in 0..cfg.num_hidden_layers {
-            layers.push(FishS2SlowLayer::load(&cfg, vb.pp(format!("layers.{idx}")))?);
+            layers.push(FishS2SlowLayer::load(
+                &cfg,
+                &rotary,
+                vb.pp(format!("layers.{idx}")),
+            )?);
         }
         let norm = load_rms_norm_alias(
             cfg.hidden_size,
@@ -145,6 +156,14 @@ impl FishS2SlowTransformer {
 
     pub fn config(&self) -> &FishS2SlowConfig {
         &self.cfg
+    }
+
+    /// Persistent RoPE table bytes, shared by every slow layer.
+    pub fn rotary_cache_bytes(&self) -> u64 {
+        self.layers
+            .first()
+            .map(|layer| layer.self_attn.rotary.storage_bytes())
+            .unwrap_or(0)
     }
 
     pub fn embed_prompt(&self, prompt: &FishS2ConditioningPrompt) -> Result<Tensor> {
@@ -352,14 +371,14 @@ impl FishS2SlowTransformer {
 }
 
 impl FishS2SlowLayer {
-    fn load(cfg: &FishS2SlowConfig, vb: VarBuilder) -> Result<Self> {
+    fn load(cfg: &FishS2SlowConfig, rotary: &FishS2RotaryCache, vb: VarBuilder) -> Result<Self> {
         let input_layernorm = load_rms_norm_alias(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             &vb,
             &["input_layernorm", "attention_norm"],
         )?;
-        let self_attn = FishS2PackedAttention::load(cfg, vb.pp("self_attn"))?;
+        let self_attn = FishS2PackedAttention::load(cfg, rotary, vb.pp("self_attn"))?;
         let post_attention_layernorm = load_rms_norm_alias(
             cfg.hidden_size,
             cfg.rms_norm_eps,
@@ -395,7 +414,7 @@ impl FishS2SlowLayer {
 }
 
 impl FishS2PackedAttention {
-    fn load(cfg: &FishS2SlowConfig, vb: VarBuilder) -> Result<Self> {
+    fn load(cfg: &FishS2SlowConfig, rotary: &FishS2RotaryCache, vb: VarBuilder) -> Result<Self> {
         let total = cfg.q_size() + 2 * cfg.kv_size();
         Ok(Self {
             qkv_proj: candle_nn::linear_no_bias(cfg.hidden_size, total, vb.pp("qkv_proj"))?,
@@ -421,7 +440,7 @@ impl FishS2PackedAttention {
             num_heads: cfg.num_attention_heads,
             num_kv_heads: cfg.num_key_value_heads,
             head_dim: cfg.head_dim,
-            rope_theta: cfg.rope_theta,
+            rotary: rotary.clone(),
         })
     }
 
@@ -467,16 +486,8 @@ impl FishS2PackedAttention {
             None => k,
         };
 
-        let (cos, sin) = build_rope_cache(
-            seq_len,
-            self.head_dim,
-            start_pos,
-            self.rope_theta,
-            x.device(),
-            x.dtype(),
-        )?;
-        let q = apply_rope(&q, &cos, &sin)?;
-        let k = apply_rope(&k, &cos, &sin)?;
+        let q = self.rotary.apply(&q, start_pos)?;
+        let k = self.rotary.apply(&k, start_pos)?;
         let q = q.squeeze(0)?;
         let k = k.squeeze(0)?;
         let v = v.squeeze(0)?;
@@ -514,21 +525,6 @@ impl FishS2Mlp {
         let hidden = ops::silu(&gate)?.broadcast_mul(&up)?;
         self.down_proj.forward(&hidden).map_err(Error::from)
     }
-}
-
-fn apply_rope(x: &Tensor, cos_half: &Tensor, sin_half: &Tensor) -> Result<Tensor> {
-    let half_dim = x.dim(3)? / 2;
-    let x1 = x.narrow(3, 0, half_dim)?;
-    let x2 = x.narrow(3, half_dim, half_dim)?;
-    let cos = cos_half.unsqueeze(0)?.unsqueeze(2)?;
-    let sin = sin_half.unsqueeze(0)?.unsqueeze(2)?;
-    let out_first = x1
-        .broadcast_mul(&cos)?
-        .broadcast_sub(&x2.broadcast_mul(&sin)?)?;
-    let out_second = x1
-        .broadcast_mul(&sin)?
-        .broadcast_add(&x2.broadcast_mul(&cos)?)?;
-    Tensor::cat(&[&out_first, &out_second], 3).map_err(Error::from)
 }
 
 fn load_rms_norm_alias(dim: usize, eps: f64, vb: &VarBuilder, aliases: &[&str]) -> Result<RmsNorm> {
