@@ -33,6 +33,99 @@ pub struct FishS2CodecWeights {
     dtype: DType,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FishS2CodecMemory {
+    pub(crate) resident_parameter_bytes: u64,
+    pub(crate) raw_load_bytes: u64,
+    pub(crate) fused_load_bytes: u64,
+    pub(crate) largest_source_tensor_bytes: u64,
+    pub(crate) largest_target_tensor_bytes: u64,
+}
+
+/// Prices the current F32 codec loader from tensor metadata, without reading payloads.
+pub(crate) fn fish_s2_codec_memory(specs: &[PthTensorSpec]) -> Result<FishS2CodecMemory> {
+    let mut memory = FishS2CodecMemory {
+        resident_parameter_bytes: 0,
+        raw_load_bytes: 0,
+        fused_load_bytes: 0,
+        largest_source_tensor_bytes: 0,
+        largest_target_tensor_bytes: 0,
+    };
+    let has_generator = specs.iter().any(|spec| spec.name.contains("generator."));
+    let mut normalized = BTreeMap::new();
+    for spec in specs {
+        let source_bytes = codec_spec_bytes(spec, spec.dtype)?;
+        let target_bytes = codec_spec_bytes(spec, DType::F32)?;
+        // read_all precedes generator selection and normalization in the loader.
+        memory.raw_load_bytes = checked_codec_bytes(memory.raw_load_bytes, target_bytes)?;
+        memory.largest_source_tensor_bytes = memory.largest_source_tensor_bytes.max(source_bytes);
+        memory.largest_target_tensor_bytes = memory.largest_target_tensor_bytes.max(target_bytes);
+        if !has_generator || spec.name.contains("generator.") {
+            normalized.insert(normalize_codec_key(&spec.name, has_generator), spec);
+        }
+    }
+
+    let mut weight_norm =
+        BTreeMap::<String, (Option<&PthTensorSpec>, Option<&PthTensorSpec>)>::new();
+    for (name, spec) in &normalized {
+        if name.ends_with(".freqs_cis") || name.ends_with(".causal_mask") {
+            // The native codec regenerates its immutable positional state.
+            continue;
+        }
+        if let Some(base) = name.strip_suffix(".parametrizations.weight.original0") {
+            weight_norm.entry(base.to_owned()).or_default().0 = Some(spec);
+        } else if let Some(base) = name.strip_suffix(".parametrizations.weight.original1") {
+            weight_norm.entry(base.to_owned()).or_default().1 = Some(spec);
+        } else if let Some(base) = name.strip_suffix(".weight_g") {
+            weight_norm
+                .entry(base.to_owned())
+                .or_default()
+                .0
+                .get_or_insert(spec);
+        } else if let Some(base) = name.strip_suffix(".weight_v") {
+            weight_norm
+                .entry(base.to_owned())
+                .or_default()
+                .1
+                .get_or_insert(spec);
+        } else {
+            memory.resident_parameter_bytes = checked_codec_bytes(
+                memory.resident_parameter_bytes,
+                codec_spec_bytes(spec, DType::F32)?,
+            )?;
+        }
+    }
+    for (base, (weight_g, weight_v)) in weight_norm {
+        if normalized.contains_key(&format!("{base}.weight")) {
+            continue;
+        }
+        let (Some(_), Some(weight_v)) = (weight_g, weight_v) else {
+            return Err(Error::ModelLoadError(format!(
+                "Fish S2 codec has an incomplete weight_norm pair at {base}"
+            )));
+        };
+        let bytes = codec_spec_bytes(weight_v, DType::F32)?;
+        memory.resident_parameter_bytes =
+            checked_codec_bytes(memory.resident_parameter_bytes, bytes)?;
+        memory.fused_load_bytes = checked_codec_bytes(memory.fused_load_bytes, bytes)?;
+    }
+    Ok(memory)
+}
+
+fn codec_spec_bytes(spec: &PthTensorSpec, dtype: DType) -> Result<u64> {
+    spec.shape
+        .iter()
+        .try_fold(dtype.size_in_bytes() as u64, |bytes, dim| {
+            bytes.checked_mul(u64::try_from(*dim).ok()?)
+        })
+        .ok_or_else(|| Error::ModelLoadError("Fish S2 codec tensor byte size overflowed".into()))
+}
+
+fn checked_codec_bytes(left: u64, right: u64) -> Result<u64> {
+    left.checked_add(right)
+        .ok_or_else(|| Error::ModelLoadError("Fish S2 codec byte size overflowed".into()))
+}
+
 impl FishS2CodecArtifact {
     pub fn load(model_dir: &Path) -> Result<Self> {
         let path = model_dir.join("codec.pth");
@@ -228,6 +321,71 @@ fn validate_codec_state_dict(tensors: &HashMap<String, Tensor>) -> Result<()> {
 mod tests {
     use super::*;
     use candle_core::{Device, Tensor};
+
+    fn spec(name: &str, shape: &[usize], dtype: DType) -> PthTensorSpec {
+        PthTensorSpec {
+            name: name.to_owned(),
+            shape: shape.to_vec(),
+            dtype,
+            archive_member_path: format!("synthetic/{name}"),
+        }
+    }
+
+    #[test]
+    fn codec_memory_prices_selected_fused_weights_and_eager_raw_load() {
+        let specs = [
+            spec(
+                "generator.encoder.conv.parametrizations.weight.original0",
+                &[2, 1, 1],
+                DType::F32,
+            ),
+            spec(
+                "generator.encoder.conv.parametrizations.weight.original1",
+                &[2, 3, 1],
+                DType::F16,
+            ),
+            spec("generator.encoder.conv.bias", &[2], DType::F32),
+            spec("generator.encoder.freqs_cis", &[2, 2, 2], DType::BF16),
+            spec("discriminator.weight", &[4_096], DType::F32),
+            spec(
+                "generator.quantizer.in_proj.weight_g",
+                &[2, 1, 1],
+                DType::F32,
+            ),
+            spec(
+                "generator.quantizer.in_proj.weight_v",
+                &[2, 2, 1],
+                DType::F32,
+            ),
+        ];
+        assert_eq!(
+            fish_s2_codec_memory(&specs).unwrap(),
+            FishS2CodecMemory {
+                resident_parameter_bytes: 48,
+                raw_load_bytes: 16_480,
+                fused_load_bytes: 40,
+                largest_source_tensor_bytes: 16_384,
+                largest_target_tensor_bytes: 16_384,
+            }
+        );
+    }
+
+    #[test]
+    fn codec_memory_does_not_duplicate_existing_fused_weights() {
+        let specs = [
+            spec("encoder.conv.weight", &[2, 3, 1], DType::F32),
+            spec("encoder.conv.weight_g", &[2, 1, 1], DType::F32),
+            spec("encoder.conv.weight_v", &[2, 3, 1], DType::F32),
+        ];
+        let memory = fish_s2_codec_memory(&specs).unwrap();
+        assert_eq!(memory.resident_parameter_bytes, 24);
+        assert_eq!(memory.raw_load_bytes, 56);
+        assert_eq!(memory.fused_load_bytes, 0);
+        assert!(fish_s2_codec_memory(&[spec("encoder.conv.weight_g", &[2], DType::F32)]).is_err());
+        assert!(
+            fish_s2_codec_memory(&[spec("encoder.weight", &[usize::MAX], DType::F32)]).is_err()
+        );
+    }
 
     #[test]
     fn codec_artifact_reports_native_pth_loader() {

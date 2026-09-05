@@ -482,6 +482,24 @@ fn qwen38_resource_plan(backend: BackendKind) -> ModelResourcePlan {
     plan
 }
 
+fn fish_s2_resource_plan(
+    backend: BackendKind,
+    memory: crate::models::architectures::fish_s2::weights::FishS2ModelMemory,
+) -> ModelResourcePlan {
+    let mut plan = model_resource_plan(
+        backend,
+        ModelMemoryEstimate {
+            load_peak_bytes: memory.load_peak_bytes,
+            resident_bytes: memory.resident_bytes,
+        },
+    );
+    if backend == BackendKind::Cuda {
+        plan.load_authorization.host_bytes =
+            ResourceAmount::Known(memory.cuda_host_load_peak_bytes);
+    }
+    plan
+}
+
 #[derive(Debug, Clone)]
 struct InvocationAllocationV2 {
     adapter_instance: AdapterInstanceId,
@@ -1050,6 +1068,13 @@ impl ModelLifecycleController {
         let backend = self.backend_router.context().backend_kind;
         if variant == ModelVariant::Qwen3827BFp8 {
             return Ok(qwen38_resource_plan(backend));
+        }
+        if variant == ModelVariant::FishAudioS2Pro {
+            let memory = crate::models::architectures::fish_s2::weights::fish_s2_model_memory(
+                model_path,
+                &self.backend_router.context().device,
+            )?;
+            return Ok(fish_s2_resource_plan(backend, memory));
         }
         let estimate = if backend == BackendKind::Cuda {
             model_memory_estimate(variant)
@@ -2621,16 +2646,17 @@ impl RuntimeService {
 #[cfg(test)]
 mod tests {
     use super::{
-        automatic_state_group_budget, estimate_from_tensor_inventory, is_metal_command_buffer_oom,
-        kokoro_effective_context_tokens, loaded_asr_state_publication_route,
-        managed_chat_capacity_policy, model_memory_estimate, model_resource_plan,
-        plan_invocation_allocations, portable_context_ceiling, portable_context_reserve_bytes,
-        portable_invocation_context_intent, qwen38_representation_memory_estimate,
-        qwen38_resource_plan, residency_budget_has_capacity, select_lru_eviction_candidate,
-        validate_scratch_only_invocation_publication, LoadedAsrStatePublicationRoute,
-        ModelMemoryEstimate, PortableInvocationContextIntent, QWEN38_BF16_ELEMENTS,
-        QWEN38_CUDA_DEVICE_CONVERSION_SCRATCH_BYTES, QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES,
-        QWEN38_FP8_ELEMENTS, QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES, QWEN38_Q8_0_BLOCK_BYTES,
+        automatic_state_group_budget, estimate_from_tensor_inventory, fish_s2_resource_plan,
+        is_metal_command_buffer_oom, kokoro_effective_context_tokens,
+        loaded_asr_state_publication_route, managed_chat_capacity_policy, model_memory_estimate,
+        model_resource_plan, plan_invocation_allocations, portable_context_ceiling,
+        portable_context_reserve_bytes, portable_invocation_context_intent,
+        qwen38_representation_memory_estimate, qwen38_resource_plan, residency_budget_has_capacity,
+        select_lru_eviction_candidate, validate_scratch_only_invocation_publication,
+        LoadedAsrStatePublicationRoute, ModelMemoryEstimate, PortableInvocationContextIntent,
+        QWEN38_BF16_ELEMENTS, QWEN38_CUDA_DEVICE_CONVERSION_SCRATCH_BYTES,
+        QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES, QWEN38_FP8_ELEMENTS,
+        QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES, QWEN38_Q8_0_BLOCK_BYTES,
         QWEN38_Q8_0_BLOCK_ELEMENTS,
     };
     use crate::backends::kv::managed_kv_backend_compiled;
@@ -2654,6 +2680,7 @@ mod tests {
         CURRENT_INFERENCE_STATE_ABI,
     };
     use crate::model::ModelVariant;
+    use crate::models::architectures::fish_s2::weights::FishS2ModelMemory;
     use crate::runtime::adapters::{
         CapabilityKind, LoadedExecutionContract, RuntimeAdapterRegistry,
     };
@@ -3252,6 +3279,103 @@ mod tests {
                 device_bytes: ResourceAmount::Known(64),
                 ..ResourceVector::zero()
             }
+        );
+    }
+
+    #[test]
+    fn fish_s2_cuda_weight_lease_leaves_room_for_separately_charged_state() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        // Pinned checkpoint header arithmetic is verified in the Fish weight
+        // tests. This regression checks the resource-authority wiring, without
+        // claiming that every request or native-context cache fits this device.
+        let memory = FishS2ModelMemory {
+            resident_bytes: 10_712_372_164,
+            load_peak_bytes: 12_307_518_404,
+            cuda_host_load_peak_bytes: 9_944_351_744,
+        };
+        let plan = fish_s2_resource_plan(BackendKind::Cuda, memory);
+        assert_eq!(
+            plan.resident_authorization,
+            ResourceVector {
+                device_bytes: ResourceAmount::Known(memory.resident_bytes),
+                ..ResourceVector::zero()
+            }
+        );
+        let authority = vector_authority(ResourceVector {
+            host_bytes: ResourceAmount::Known(32 * GIB),
+            device_bytes: ResourceAmount::Known(24 * GIB),
+            ..ResourceVector::zero()
+        });
+        let state = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Cache, "fish-s2-state"),
+                ResourceVector {
+                    device_bytes: ResourceAmount::Known(4 * GIB),
+                    ..ResourceVector::zero()
+                },
+            )
+            .unwrap();
+        let weights = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Model, "fish-s2-weights"),
+                plan.load_authorization,
+            )
+            .expect("the weight peak and an independent state lease should fit");
+        drop(weights);
+        let old_catalog_plan = model_resource_plan(
+            BackendKind::Cuda,
+            ModelMemoryEstimate {
+                load_peak_bytes: 24 * GIB,
+                resident_bytes: 24 * GIB,
+            },
+        );
+        let error = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Model, "fish-s2-flat-catalog"),
+                old_catalog_plan.load_authorization,
+            )
+            .expect_err("the old flat 24 GiB lease left no room for state");
+        assert!(matches!(error, Error::Overloaded(_)));
+        drop(state);
+    }
+
+    #[test]
+    fn fish_s2_portable_weight_plan_charges_the_expanded_representation() {
+        let cpu_memory = FishS2ModelMemory {
+            resident_bytes: 19_836_076_996,
+            load_peak_bytes: 22_228_796_356,
+            cuda_host_load_peak_bytes: 9_944_351_744,
+        };
+        let cpu = fish_s2_resource_plan(BackendKind::Cpu, cpu_memory);
+        assert_eq!(
+            cpu.resident_authorization.host_bytes,
+            ResourceAmount::Known(cpu_memory.resident_bytes)
+        );
+        assert_eq!(
+            cpu.load_authorization.host_bytes,
+            ResourceAmount::Known(cpu_memory.load_peak_bytes)
+        );
+        assert_eq!(
+            cpu.load_authorization.device_bytes,
+            ResourceAmount::Known(0)
+        );
+        let half_memory = FishS2ModelMemory {
+            resident_bytes: 10_712_372_164,
+            load_peak_bytes: 12_307_518_404,
+            ..cpu_memory
+        };
+        let metal = fish_s2_resource_plan(BackendKind::Metal, half_memory);
+        assert_eq!(
+            metal.load_authorization.unified_bytes,
+            ResourceAmount::Known(half_memory.load_peak_bytes)
+        );
+        assert_eq!(
+            metal.resident_authorization.unified_bytes,
+            ResourceAmount::Known(half_memory.resident_bytes)
+        );
+        assert_eq!(
+            metal.load_authorization.host_bytes,
+            ResourceAmount::Known(0)
         );
     }
 
