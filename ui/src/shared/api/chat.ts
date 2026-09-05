@@ -22,12 +22,25 @@ export interface ChatCompletionRequest {
   max_tokens?: number;
 }
 
+export interface ChatTiming {
+  queue_wait_ms: number;
+  prefill_ms: number;
+  /** Sum of physical batch service durations; not elapsed decode wall time. */
+  decode_ms: number;
+  decode_wall_ms?: number;
+  decode_tokens?: number;
+  post_first_token_ms?: number;
+  ttft_ms?: number | null;
+  total_ms: number;
+}
+
 export interface ChatCompletionResponse {
   model_id: string;
   message: ChatMessage;
   stats: {
     tokens_generated: number;
     generation_time_ms: number;
+    timing?: ChatTiming;
   };
 }
 
@@ -41,6 +54,7 @@ export type ChatStreamEvent =
       stats: {
         tokens_generated: number;
         generation_time_ms: number;
+        timing?: ChatTiming;
       };
     }
   | { event: "error"; error: string };
@@ -50,7 +64,7 @@ export interface ChatStreamCallbacks {
   onDelta?: (delta: string) => void;
   onDone?: (
     message: string,
-    stats: { tokens_generated: number; generation_time_ms: number },
+    stats: { tokens_generated: number; generation_time_ms: number; timing?: ChatTiming },
   ) => void;
   onError?: (error: string) => void;
 }
@@ -276,6 +290,7 @@ interface OpenAiChatCompletion {
     completion_tokens?: number;
   };
   izwi_generation_time_ms?: number;
+  izwi_timing?: ChatTiming;
 }
 
 interface OpenAiChatChunk {
@@ -293,6 +308,7 @@ interface OpenAiChatChunk {
     completion_tokens?: number;
   };
   izwi_generation_time_ms?: number;
+  izwi_timing?: ChatTiming;
 }
 
 function openAiChatStreamError(payload: unknown): string | null {
@@ -629,6 +645,7 @@ export class ChatApiClient {
       stats: {
         tokens_generated: response.usage?.completion_tokens ?? 0,
         generation_time_ms: response.izwi_generation_time_ms ?? 0,
+        ...(response.izwi_timing ? { timing: response.izwi_timing } : {}),
       },
     };
   }
@@ -652,6 +669,7 @@ export class ChatApiClient {
             messages: request.messages,
             max_tokens: request.max_tokens,
             stream: true,
+            stream_options: { include_usage: true },
           }),
           signal: abortController.signal,
         });
@@ -670,6 +688,7 @@ export class ChatApiClient {
         const streamStartedAt = performance.now();
         let completionTokens: number | null = null;
         let generationTimeMs: number | null = null;
+        let timing: ChatTiming | undefined;
         let sawTerminalChunk = false;
 
         await consumeDataStream(response, (data) => {
@@ -689,6 +708,7 @@ export class ChatApiClient {
                     completionTokens ??
                     Math.max(1, Math.floor(fullText.length / 4)),
                   generation_time_ms: generationTimeMs ?? elapsedMs,
+                  ...(timing ? { timing } : {}),
                 });
               }
             }
@@ -710,6 +730,7 @@ export class ChatApiClient {
             }
 
             const chunk = payload as OpenAiChatChunk;
+            if (chunk.izwi_timing) timing = chunk.izwi_timing;
             if (typeof chunk.izwi_generation_time_ms === "number") {
               generationTimeMs = chunk.izwi_generation_time_ms;
             }

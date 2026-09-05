@@ -175,11 +175,30 @@ if ! jq -n -e --slurpfile baseline "${baseline}" --slurpfile depth_1 "${depth_1}
       ($case.end_to_end_completion_tps | complete_stats) and
       ($case.server_generation_ms | complete_stats) and
       ($case.end_to_end_ms | complete_stats) and
-      ($case.decode_samples | type == "array" and length > 0 and
+      ($case.server_request_samples | type == "array" and length > 0 and
         length == $case.end_to_end_completion_tps.count and
         all((.completion_tokens | integer_number) and
             (.generation_ms | positive_number) and
-            (.tokens_per_second | positive_number)));
+            (.tokens_per_second | positive_number) and
+            ((.tokens_per_second - .completion_tokens * 1000 / .generation_ms) | fabs < 0.000001) and
+            (.finish_reason == "stop" or .finish_reason == "length"))) and
+      ($case.decode_wall_samples | type == "array" and
+        length == ($case.server_request_samples | length) and
+        all((.committed_tokens | integer_number) and (.wall_ms | positive_number) and
+            (.tokens_per_second | positive_number) and
+            ((.tokens_per_second - .committed_tokens * 1000 / .wall_ms) | fabs < 0.000001) and
+            (.physical_service_ms | type == "number" and . >= 0))) and
+      ([$case.decode_wall_samples[] as $decode |
+        [$case.server_request_samples[] | select(.index == $decode.index)] |
+        length == 1 and .[0].completion_tokens >= $decode.committed_tokens and
+        .[0].generation_ms >= $decode.wall_ms] | all) and
+      ([$case.server_request_samples[].index] | length == (unique | length)) and
+      ([$case.decode_wall_samples[].index] | length == (unique | length)) and
+      ($case.sampling == {"temperature":0,"seed":0,"reasoning_policy":"model_default"}) and
+      ($case.prompt | type == "string" and length > 0) and
+      ($case.max_tokens | integer_number) and
+      ($case.prefix_cache == "cold" or $case.prefix_cache == "warm") and
+      (if $case.prefix_cache == "cold" then $case.prefix_hits_delta == 0 else true end);
     def runtime_cell($enabled; $depth):
       .status == "passed" and .evidence_level == "runtime_validated" and
       .promotion_eligible == false and
@@ -203,8 +222,10 @@ if ! jq -n -e --slurpfile baseline "${baseline}" --slurpfile depth_1 "${depth_1}
         ([.[].name] | length == (unique | length)) and all(complete_case));
     def mtp_case($enabled; $depth):
       if $enabled then
-        (.mtp.rounds | integer_number) and (.mtp.drafted_tokens | integer_number) and
-        (.mtp.target_verified_tokens | integer_number) and
+        (if .concurrent == 1 then
+           (.mtp.rounds | integer_number) and (.mtp.drafted_tokens | integer_number) and
+           (.mtp.target_verified_tokens | integer_number)
+         else [.mtp.rounds,.mtp.drafted_tokens,.mtp.target_verified_tokens] | all(type == "number" and . >= 0 and floor == .) end) and
         .mtp.drafted_tokens <= (.mtp.rounds * $depth)
       else
         .mtp.rounds == 0 and .mtp.drafted_tokens == 0
@@ -227,7 +248,10 @@ if ! jq -n -e --slurpfile baseline "${baseline}" --slurpfile depth_1 "${depth_1}
       [$candidate.measurements[] as $case |
        $cells[0].measurements[] |
        select(.name == $case.name) |
-       .target_prompt_words == $case.target_prompt_words and .concurrent == $case.concurrent]
+       .target_prompt_words == $case.target_prompt_words and .concurrent == $case.concurrent and
+       .prompt == $case.prompt and .system == $case.system and .max_tokens == $case.max_tokens and
+       .prefix_cache == $case.prefix_cache and .sampling == $case.sampling and
+       (.server_request_samples | length) == ($case.server_request_samples | length)]
       | all))
   ' >/dev/null; then
     write_failure incomplete_or_unpaired_runtime_evidence
@@ -240,7 +264,12 @@ if [[ "${thresholds}" != "null" ]] && ! jq -e '
     type == "object" and (.mtp | type == "object") and
     (.mtp.minimum_completion_tps_p50_speedup_ratio | type == "number" and . > 1) and
     (.mtp.maximum_ttft_p95_regression_ratio | type == "number" and . >= 1) and
-    (.mtp.maximum_peak_device_memory_ratio | type == "number" and . >= 1)
+    (.mtp.maximum_peak_device_memory_ratio | type == "number" and . >= 1) and
+    (.single_sequence.minimum_user_tps_p50 | type == "number" and . > 0) and
+    (.single_sequence.minimum_decode_tps_p50 | type == "number" and . > 0) and
+    (.single_sequence.minimum_runs | type == "number" and . >= 10 and floor == .) and
+    (.single_sequence.user_cases | type == "array" and length > 0 and all(type == "string")) and
+    (.single_sequence.sustained_cases | type == "object" and length > 0 and all(.[]; type == "number" and . > 0 and floor == .))
   ' <<<"${thresholds}" >/dev/null; then
     write_failure invalid_declared_mtp_performance_thresholds
     echo "Declared MTP thresholds are incomplete or cannot certify an improvement" >&2
@@ -251,10 +280,30 @@ jq -n --slurpfile baseline "${baseline}" --slurpfile depth_1 "${depth_1}" \
     --slurpfile depth_2 "${depth_2}" --slurpfile depth_3 "${depth_3}" \
     --arg baseline_path "${baseline}" --arg depth_1_path "${depth_1}" \
     --arg depth_2_path "${depth_2}" --arg depth_3_path "${depth_3}" '
+    def quantile($p): sort | .[(($p * (length - 1)) | floor)];
+    def single_sequence($candidate; $thresholds):
+      $thresholds.single_sequence as $gate |
+      if $gate == null then false else
+        ([$gate.user_cases[] as $name |
+          [$candidate.measurements[] | select(.name == $name)] |
+          length == 1 and (.[0] | .concurrent == 1 and .prefix_cache == "cold" and .prefix_hits_delta == 0 and
+            (.server_request_samples | length) >= $gate.minimum_runs and
+            ([.server_request_samples[].tokens_per_second] | quantile(0.5)) >= $gate.minimum_user_tps_p50)] | all) and
+        ([$gate.sustained_cases | to_entries[] as $case |
+          [$candidate.measurements[] | select(.name == $case.key)] |
+          length == 1 and (.[0] | .concurrent == 1 and .prefix_cache == "cold" and .prefix_hits_delta == 0 and
+            (.decode_wall_samples | length) >= $gate.minimum_runs and
+            ([.decode_wall_samples[].committed_tokens] | all(. >= $case.value)) and
+            ([.decode_wall_samples[].tokens_per_second] | quantile(0.5)) >= $gate.minimum_decode_tps_p50)] | all)
+      end;
     def comparison($candidate; $depth; $baseline; $thresholds):
       [$candidate.measurements[] as $case |
        ($baseline.measurements[] | select(.name == $case.name)) as $base |
        {name:$case.name,
+        user_tps_p10:([$case.server_request_samples[].tokens_per_second] | quantile(0.1)),
+        user_tps_p50:([$case.server_request_samples[].tokens_per_second] | quantile(0.5)),
+        decode_tps_p10:([$case.decode_wall_samples[].tokens_per_second] | quantile(0.1)),
+        decode_tps_p50:([$case.decode_wall_samples[].tokens_per_second] | quantile(0.5)),
         completion_tps_p50_ratio:($case.end_to_end_completion_tps.p50 / $base.end_to_end_completion_tps.p50),
         ttft_p95_ratio:($case.ttft_ms.p95 / $base.ttft_ms.p95)} |
        . + {meets_declared_thresholds:
@@ -265,9 +314,11 @@ jq -n --slurpfile baseline "${baseline}" --slurpfile depth_1 "${depth_1}" \
       ($candidate.memory.peak_device_memory_used_bytes /
        $baseline.memory.peak_device_memory_used_bytes) as $memory_ratio |
       {depth:$depth,peak_device_memory_ratio:$memory_ratio,cases:$cases,
+       meets_single_sequence_thresholds:single_sequence($candidate; $thresholds),
        mean_completion_tps_p50_ratio:([$cases[].completion_tps_p50_ratio] | add / length),
        meets_declared_thresholds:
          (if $thresholds == null then null else
+            single_sequence($candidate; $thresholds) and
             $memory_ratio <= $thresholds.mtp.maximum_peak_device_memory_ratio and
             ([$cases[].meets_declared_thresholds] | all)
           end)};

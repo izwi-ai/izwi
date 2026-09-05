@@ -144,6 +144,8 @@ struct OpenAiChatCompletionResponse {
     usage: OpenAiUsage,
     #[serde(skip_serializing_if = "Option::is_none")]
     izwi_generation_time_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    izwi_timing: Option<izwi_core::engine::LatencyBreakdown>,
 }
 
 #[derive(Debug, Serialize)]
@@ -180,6 +182,8 @@ struct OpenAiChatChunk {
     usage: Option<OpenAiUsage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     izwi_generation_time_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    izwi_timing: Option<izwi_core::engine::LatencyBreakdown>,
 }
 
 #[derive(Debug, Serialize)]
@@ -695,7 +699,7 @@ pub async fn completions(
                 content: assistant_content,
                 tool_calls: assistant_tool_calls,
             },
-            finish_reason,
+            finish_reason: measured_finish_reason(finish_reason, generation.finish_reason),
         }],
         usage: OpenAiUsage {
             prompt_tokens,
@@ -705,6 +709,10 @@ pub async fn completions(
         izwi_generation_time_ms: compat_profile
             .is_relaxed()
             .then_some(generation.generation_time_ms),
+        izwi_timing: compat_profile
+            .is_relaxed()
+            .then_some(generation.latency_breakdown)
+            .flatten(),
     };
 
     Ok(Json(response).into_response())
@@ -748,6 +756,7 @@ async fn complete_stream(
                         }],
                         usage: None,
                         izwi_generation_time_ms: None,
+                        izwi_timing: None,
                     })
                     .unwrap_or_default(),
                     false,
@@ -769,6 +778,7 @@ async fn complete_stream(
                         }],
                         usage: None,
                         izwi_generation_time_ms: None,
+                        izwi_timing: None,
                     })
                     .unwrap_or_default(),
                     false,
@@ -794,7 +804,7 @@ async fn complete_stream(
                                 finish_reason: Some(if tool_calls.is_some() {
                                     "tool_calls"
                                 } else {
-                                    finish_reason
+                                    measured_finish_reason(finish_reason, generation.finish_reason)
                                 }),
                             }],
                             usage: include_usage.then_some(OpenAiUsage {
@@ -806,6 +816,8 @@ async fn complete_stream(
                             izwi_generation_time_ms: compat_profile
                                 .is_relaxed()
                                 .then_some(generation.generation_time_ms),
+                            izwi_timing: compat_profile.is_relaxed()
+                                .then_some(generation.latency_breakdown).flatten(),
                         })
                         .unwrap_or_default(),
                         true,
@@ -1180,5 +1192,96 @@ mod tests {
             .as_ref()
             .and_then(|function| function.arguments.as_deref())
             .is_some_and(|args| args.contains("Harare")));
+    }
+}
+
+// Tool calls keep their OpenAI termination contract; ordinary output carries
+// the engine's actual budget termination rather than reporting every run as stop.
+fn measured_finish_reason(
+    parsed: &'static str,
+    reason: Option<izwi_core::engine::OutputFinishReason>,
+) -> &'static str {
+    if parsed == "tool_calls" {
+        parsed
+    } else if reason == Some(izwi_core::engine::OutputFinishReason::MaxTokens) {
+        "length"
+    } else {
+        parsed
+    }
+}
+
+#[cfg(test)]
+mod timing_contract_tests {
+    use super::*;
+
+    #[test]
+    fn budget_termination_is_length_without_overriding_tool_calls() {
+        assert_eq!(
+            measured_finish_reason(
+                "stop",
+                Some(izwi_core::engine::OutputFinishReason::MaxTokens)
+            ),
+            "length"
+        );
+        assert_eq!(
+            measured_finish_reason(
+                "stop",
+                Some(izwi_core::engine::OutputFinishReason::StopToken)
+            ),
+            "stop"
+        );
+        assert_eq!(
+            measured_finish_reason(
+                "tool_calls",
+                Some(izwi_core::engine::OutputFinishReason::MaxTokens)
+            ),
+            "tool_calls"
+        );
+    }
+
+    #[test]
+    fn json_and_sse_preserve_independent_timing_and_omit_absent_extensions() {
+        let timing: izwi_core::engine::LatencyBreakdown =
+            serde_json::from_value(serde_json::json!({
+                "queue_wait_ms": 10.0, "prefill_ms": 20.0, "decode_ms": 30.0,
+                "decode_wall_ms": 50.0, "decode_tokens": 3, "post_first_token_ms": 50.0,
+                "ttft_ms": 30.0, "total_ms": 90.0, "prefill_steps": 1, "decode_steps": 2
+            }))
+            .unwrap();
+        let json = OpenAiChatCompletionResponse {
+            id: "timing".into(),
+            object: "chat.completion",
+            created: 0,
+            model: "fixture".into(),
+            choices: vec![],
+            usage: OpenAiUsage {
+                prompt_tokens: 5,
+                completion_tokens: 4,
+                total_tokens: 9,
+            },
+            izwi_generation_time_ms: Some(90.0),
+            izwi_timing: Some(timing.clone()),
+        };
+        let mut sse = OpenAiChatChunk {
+            id: "timing".into(),
+            object: "chat.completion.chunk",
+            created: 0,
+            model: "fixture".into(),
+            choices: vec![],
+            usage: None,
+            izwi_generation_time_ms: Some(90.0),
+            izwi_timing: Some(timing),
+        };
+        let json = serde_json::to_value(json).unwrap();
+        let chunk = serde_json::to_value(&sse).unwrap();
+        assert_eq!(json["izwi_timing"], chunk["izwi_timing"]);
+        assert_eq!(json["izwi_generation_time_ms"], 90.0);
+        assert_eq!(chunk["izwi_timing"]["decode_wall_ms"], 50.0);
+        assert_eq!(chunk["izwi_timing"]["decode_tokens"], 3);
+        sse.izwi_generation_time_ms = None;
+        sse.izwi_timing = None;
+        let strict = serde_json::to_value(sse).unwrap();
+        assert!(strict.get("izwi_timing").is_none());
+        assert!(strict.get("izwi_generation_time_ms").is_none());
     }
 }

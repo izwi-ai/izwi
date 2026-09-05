@@ -94,6 +94,15 @@ if ! jq -e '
     (.acceptance.performance_thresholds.policy == "declare-before-promotion-runs") and
     ((.acceptance.performance_thresholds.values == null) or
      (.acceptance.performance_thresholds.values | type == "object")) and
+    (if .hardware_profile.id == "nvidia-l40s-48gb" then
+       .acceptance.performance_thresholds.values.single_sequence as $gate |
+       $gate.minimum_user_tps_p50 >= 40 and $gate.minimum_decode_tps_p50 >= 40 and
+       $gate.minimum_runs >= 10 and
+       ([.cases[] | select(.name == "natural-prompt-c1") |
+         .prompt == "Explain llm inference to me" and .iterations >= 10 and .concurrent == 1 and .prefix_cache == "cold"] | length == 1 and all) and
+       ([.cases[] | select(.name == "decode-short-c1" or .name == "decode-sustained-c1") |
+         .iterations >= 10 and .concurrent == 1 and .prefix_cache == "cold"] | length == 2 and all)
+     else true end) and
     (.cases | type == "array" and length > 0) and
     ([.cases[].name] | length == (unique | length)) and
     ([.cases[] |
@@ -101,7 +110,10 @@ if ! jq -e '
         (.prompt_words | type == "number" and . >= 1 and floor == .) and
         (.max_tokens | type == "number" and . >= 1 and floor == .) and
         (.iterations | type == "number" and . >= 3 and floor == .) and
-        (.concurrent | type == "number" and . >= 1 and floor == .)
+        (.concurrent | type == "number" and . >= 1 and floor == .) and
+        (.prefix_cache == "cold" or .prefix_cache == "warm") and
+        ((.prompt == null) or (.prompt | type == "string" and length > 0)) and
+        ((.system == null) or (.system | type == "string"))
     ] | all(. == true)) and
     ([.cases[].prompt_words] | contains([32, 512, 2048, 8192, 32768])) and
     ([.cases[].concurrent] | contains([1, 2, 4, 8])) and
@@ -146,12 +158,18 @@ write_certificate() {
 model=$(jq -r '.model' "${workload}")
 {
     printf '# Generated from %s\n# SHA-256: %s\n\n' "${workload}" "${workload_hash}"
-    while IFS=$'\t' read -r name prompt_words max_tokens iterations concurrent; do
-        prompt=$(awk -v count="${prompt_words}" 'BEGIN { for (i=1;i<=count;i++) printf "%s%s",(i==1?"":" "),"evidence" }')
+    while IFS= read -r row; do
+        case_json=$(printf '%s' "${row}" | base64 --decode)
+        name=$(jq -r '.name' <<<"${case_json}")
+        prompt=$(jq -r 'if .prompt then .prompt else [range(.prompt_words)|"evidence"]|join(" ") end' <<<"${case_json}")
         printf '[[benchmarks]]\nname = "%s"\ncommand = "chat"\nmodel = "%s"\n' "${name}" "${model}"
-        printf 'iterations = %s\nconcurrent = %s\nwarmup = true\nmax_tokens = %s\n' "${iterations}" "${concurrent}" "${max_tokens}"
-        printf 'prompt = "%s"\n\n' "${prompt}"
-    done < <(jq -r '.cases[] | [.name,.prompt_words,.max_tokens,.iterations,.concurrent] | @tsv' "${workload}")
+        jq -r '"iterations = \(.iterations)\nconcurrent = \(.concurrent)\nwarmup = true\nmax_tokens = \(.max_tokens)"' <<<"${case_json}"
+        printf 'prompt = %s\n' "$(jq -Rn --arg value "${prompt}" '$value')"
+        if jq -e '.system != null' <<<"${case_json}" >/dev/null; then
+            printf 'system = %s\n' "$(jq -c '.system' <<<"${case_json}")"
+        fi
+        printf '\n'
+    done < <(jq -r '.cases[] | @base64' "${workload}")
 } >"${manifest_path}"
 
 cuda_args=(--manifest "${manifest_path}" --server "${server}" --output "${cuda_output}" --izwi-bin "${izwi_bin}")
@@ -269,26 +287,50 @@ if ! jq -e --arg model "${model}" --slurpfile plan "${workload}" \
     (.reports | length) == ($plan[0].cases | length) and
     ([.reports[].name] | sort) == ([$plan[0].cases[].name] | sort) and
     ([.reports[] |
+      . as $result |
+      ($plan[0].cases[] | select(.name == $result.name)) as $case |
       runtime(.report.telemetry.before.models) as $before |
       runtime(.report.telemetry.after.models) as $after |
       (counter($after; "mtp_rounds_total") - counter($before; "mtp_rounds_total")) as $rounds |
       (counter($after; "mtp_draft_tokens_total") - counter($before; "mtp_draft_tokens_total")) as $drafts |
       (counter($after; "mtp_target_verified_tokens_total") - counter($before; "mtp_target_verified_tokens_total")) as $verified |
       .report.config.model == $model and .report.config.warmup == true and
+      .report.config.chat_sampling == {"temperature":0,"seed":0,"reasoning_policy":"model_default"} and
+      .report.config.iterations == $case.iterations and
+      .report.config.concurrent == $case.concurrent and
+      .report.config.max_tokens == $case.max_tokens and
+      (if $case.prompt then .report.config.prompt == $case.prompt else true end) and
+      .report.config.system == ($case.system // null) and
+      (if $case.prefix_cache == "cold" then
+        (.report.telemetry.before.engine.kv_cache.counters.prefix_hits | type == "number") and
+        (.report.telemetry.before.engine.kv_cache.counters.reused_tokens | type == "number") and
+        .report.telemetry.after.engine.kv_cache.counters.prefix_hits == .report.telemetry.before.engine.kv_cache.counters.prefix_hits and
+        .report.telemetry.after.engine.kv_cache.counters.reused_tokens == .report.telemetry.before.engine.kv_cache.counters.reused_tokens
+       else true end) and
       (.report.samples | length) == .report.config.iterations and
       (.report.summary.ttft_ms.count // 0) > 0 and
       (.report.summary.completion_tps.count // 0) > 0 and
       (.report.summary.server_generation_ms.count // 0) > 0 and
       ([.report.samples[] | (.prompt_tokens // 0) > 0 and (.completion_tokens // 0) > 0 and
         (.ttft_ms // 0) > 0 and (.completion_tps // 0) > 0 and
-        (.server_generation_ms // 0) > 0] | all(. == true)) and
+        (.server_generation_ms // 0) > 0 and
+        (.chat_timing.decode_wall_ms // 0) > 0 and
+        (.chat_timing.decode_wall_ms <= .server_generation_ms) and
+        (.chat_timing.decode_tokens // 0) > 0 and
+        (.chat_timing.decode_tokens <= .completion_tokens) and
+        (.chat_timing.decode_tokens | floor == .) and
+        (.chat_timing.decode_ms | type == "number" and . >= 0) and
+        (.chat_timing.prefill_ms | type == "number" and . >= 0) and
+        (.chat_timing.queue_wait_ms | type == "number" and . >= 0) and
+        (.finish_reason == "stop" or .finish_reason == "length") ] | all(. == true)) and
       ($after.family_diagnostics.checkpoint_revision == $plan[0].checkpoint.revision) and
       ($after.family_diagnostics.optimization_evidence.cuda_kv_storage.selected_provider |
        type == "string" and length > 0) and
       ($after.family_diagnostics.optimization_evidence.mtp.enabled == $mtp_enabled) and
       ($after.family_diagnostics.optimization_evidence.mtp.draft_tokens == $mtp_draft_tokens) and
       (if $mtp_enabled then
-         $rounds > 0 and $drafts > 0 and $verified > 0 and
+         (if $case.concurrent == 1 then $rounds > 0 and $drafts > 0 and $verified > 0
+          else $rounds >= 0 and $drafts >= 0 and $verified >= 0 end) and
          $drafts <= ($rounds * $mtp_draft_tokens) and
          counter($after; "mtp_enabled_loads_total") > 0
        else
@@ -358,9 +400,18 @@ jq -n --arg git_sha "${git_sha}" --arg workload "${workload}" \
          concurrent:$result.report.config.concurrent,ttft_ms:$result.report.summary.ttft_ms,
          end_to_end_completion_tps:$result.report.summary.completion_tps,
          server_generation_ms:$result.report.summary.server_generation_ms,
-         decode_samples:[$result.report.samples[] |
+         prompt:$result.report.config.prompt,system:$result.report.config.system,
+         sampling:$result.report.config.chat_sampling,
+         max_tokens:$result.report.config.max_tokens,prefix_cache:$case.prefix_cache,
+         prefix_hits_delta:($result.report.telemetry.after.engine.kv_cache.counters.prefix_hits - $result.report.telemetry.before.engine.kv_cache.counters.prefix_hits),
+         server_request_samples:[$result.report.samples[] |
            {index:.index,completion_tokens:.completion_tokens,generation_ms:.server_generation_ms,
-            tokens_per_second:(.completion_tokens * 1000 / .server_generation_ms)}],
+            tokens_per_second:(.completion_tokens * 1000 / .server_generation_ms),finish_reason:.finish_reason}],
+         decode_wall_samples:[$result.report.samples[] |
+           {index:.index,committed_tokens:.chat_timing.decode_tokens,wall_ms:.chat_timing.decode_wall_ms,
+            tokens_per_second:(.chat_timing.decode_tokens * 1000 / .chat_timing.decode_wall_ms),
+            physical_service_ms:.chat_timing.decode_ms,queue_wait_ms:.chat_timing.queue_wait_ms,
+            prefill_ms:.chat_timing.prefill_ms,post_first_token_ms:.chat_timing.post_first_token_ms}],
          mtp:{rounds:(counter($after;"mtp_rounds_total")-counter($before;"mtp_rounds_total")),
            drafted_tokens:(counter($after;"mtp_draft_tokens_total")-counter($before;"mtp_draft_tokens_total")),
            accepted_tokens:(counter($after;"mtp_accepted_draft_tokens_total")-counter($before;"mtp_accepted_draft_tokens_total")),

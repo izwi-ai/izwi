@@ -339,6 +339,8 @@ impl RuntimeService {
             .await?;
         let output = self.run_admitted_request(admitted).await?;
         Ok(ChatGeneration {
+            latency_breakdown: output.latency_breakdown,
+            finish_reason: output.finish_reason,
             text: output.text.unwrap_or_default(),
             prompt_tokens: output.token_stats.prompt_tokens,
             tokens_generated: output.num_tokens,
@@ -414,6 +416,8 @@ impl RuntimeService {
             .await?;
         let output = self.run_admitted_request(admitted).await?;
         Ok(ChatGeneration {
+            latency_breakdown: output.latency_breakdown,
+            finish_reason: output.finish_reason,
             text: output.text.unwrap_or_default(),
             prompt_tokens: output.token_stats.prompt_tokens,
             tokens_generated: output.num_tokens,
@@ -505,6 +509,8 @@ impl RuntimeService {
 
         let text = reconcile_streamed_chat_text(streamed_text, output.text)?;
         Ok(ChatGeneration {
+            latency_breakdown: output.latency_breakdown,
+            finish_reason: output.finish_reason,
             text,
             prompt_tokens: output.token_stats.prompt_tokens,
             tokens_generated: output.num_tokens,
@@ -614,6 +620,8 @@ impl RuntimeService {
 
         let text = reconcile_streamed_chat_text(streamed_text, output.text)?;
         Ok(ChatGeneration {
+            latency_breakdown: output.latency_breakdown,
+            finish_reason: output.finish_reason,
             text,
             prompt_tokens: output.token_stats.prompt_tokens,
             tokens_generated: output.num_tokens,

@@ -128,7 +128,7 @@ pub fn resolve_chat_request_config(
 pub enum ChatStreamEvent {
     Started,
     Delta(String),
-    Completed(ChatGeneration),
+    Completed(Box<ChatGeneration>),
     Failed(String),
     ShuttingDown,
 }
@@ -220,7 +220,7 @@ where
     }
 
     match result.expect("completed generation result must be present") {
-        Ok(generation) => Some(ChatStreamEvent::Completed(generation)),
+        Ok(generation) => Some(ChatStreamEvent::Completed(Box::new(generation))),
         Err(err) => Some(ChatStreamEvent::Failed(err.to_string())),
     }
 }
@@ -629,6 +629,8 @@ mod tests {
                     prompt_tokens: 12,
                     tokens_generated: 2,
                     generation_time_ms: 25.0,
+                    latency_breakdown: None,
+                    finish_reason: None,
                 })
             });
 
@@ -670,6 +672,8 @@ mod tests {
                     prompt_tokens: 1,
                     tokens_generated: 2,
                     generation_time_ms: 1.0,
+                    latency_breakdown: None,
+                    finish_reason: None,
                 })
             });
 
@@ -706,6 +710,8 @@ mod tests {
                     prompt_tokens: 1,
                     tokens_generated: 1,
                     generation_time_ms: 1.0,
+                    latency_breakdown: None,
+                    finish_reason: None,
                 })
             },
         );

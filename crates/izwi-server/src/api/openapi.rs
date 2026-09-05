@@ -59,6 +59,7 @@ use crate::api::openai::audio::align::{
         ChatCompletionMessage,
         ChatCompletionRequest,
         ChatCompletionResponse,
+        ChatTiming,
         ChatCompletionStreamOptions,
         ChatReasoningEffort,
         ChatTemplateKwargs,
@@ -2041,6 +2042,8 @@ pub struct ChatCompletionResponse {
     pub choices: Vec<ChatCompletionChoice>,
     pub usage: Usage,
     pub izwi_generation_time_ms: Option<f64>,
+    /// Engine request phases; absent under strict OpenAI compatibility.
+    pub izwi_timing: Option<ChatTiming>,
 }
 
 #[allow(dead_code)]
@@ -2789,4 +2792,26 @@ mod tests {
             );
         }
     }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ChatTiming {
+    pub queue_wait_ms: f64,
+    pub prefill_ms: f64,
+    /// Sum of physical batch service time, not wall time.
+    pub decode_ms: f64,
+    /// First entered decode dispatch registration to last durable token commit.
+    pub decode_wall_ms: Option<f64>,
+    pub decode_tokens: Option<usize>,
+    pub post_first_token_ms: Option<f64>,
+    pub ttft_ms: Option<f64>,
+    pub total_ms: f64,
+    pub prefill_steps: u32,
+    pub decode_steps: u32,
+    pub media_decode_ms: Option<f64>,
+    pub normalization_ms: Option<f64>,
+    pub sampling_ms: Option<f64>,
+    pub codec_ms: Option<f64>,
+    pub postprocess_ms: Option<f64>,
 }

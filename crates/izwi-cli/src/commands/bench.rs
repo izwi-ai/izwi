@@ -291,7 +291,24 @@ struct ChatBenchSample {
     prompt_tokens: usize,
     completion_tokens: usize,
     generation_time_ms: Option<f64>,
+    timing: Option<izwi_core::engine::LatencyBreakdown>,
+    finish_reason: Option<String>,
     saw_text_delta: bool,
+}
+
+impl ChatBenchSample {
+    fn server_request_tps(&self) -> Option<f64> {
+        let ms = self.generation_time_ms?;
+        (ms.is_finite() && ms > 0.0).then_some(self.completion_tokens as f64 * 1000.0 / ms)
+    }
+
+    fn decode_wall_tps(&self) -> Option<f64> {
+        let timing = self.timing.as_ref()?;
+        let ms = timing.decode_wall_ms?;
+        let tokens = timing.decode_tokens?;
+        (ms.is_finite() && ms > 0.0 && tokens > 0 && tokens <= self.completion_tokens)
+            .then_some(tokens as f64 * 1000.0 / ms)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -489,11 +506,13 @@ struct ChatStreamChunk {
     choices: Vec<ChatStreamChoice>,
     usage: Option<ChatStreamUsage>,
     izwi_generation_time_ms: Option<f64>,
+    izwi_timing: Option<izwi_core::engine::LatencyBreakdown>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ChatStreamChoice {
     delta: ChatStreamDelta,
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -562,6 +581,8 @@ struct BenchmarkReport {
 
 #[derive(Debug, Serialize)]
 struct BenchmarkRunConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat_sampling: Option<serde_json::Value>,
     model: Option<String>,
     iterations: Option<u32>,
     concurrent: Option<u32>,
@@ -591,6 +612,8 @@ struct BenchmarkSummary {
     inter_transcript_ms: Option<Stats>,
     end_to_end_ms: Option<Stats>,
     completion_tps: Option<Stats>,
+    server_request_tps: Option<Stats>,
+    decode_wall_tps: Option<Stats>,
     tokens_per_second: Option<Stats>,
     server_generation_ms: Option<Stats>,
     server_processing_ms: Option<Stats>,
@@ -607,6 +630,7 @@ struct BenchmarkSummary {
 
 #[derive(Debug, Serialize)]
 struct Stats {
+    p10: f64,
     count: usize,
     avg: f64,
     min: f64,
@@ -631,6 +655,10 @@ struct BenchmarkSample {
     prompt_tokens: Option<usize>,
     completion_tokens: Option<usize>,
     server_generation_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat_timing: Option<izwi_core::engine::LatencyBreakdown>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    finish_reason: Option<String>,
     server_processing_ms: Option<f64>,
     audio_duration_secs: Option<f64>,
     rtf: Option<f64>,
@@ -1897,6 +1925,30 @@ async fn bench_chat(
         println!("  Concurrent: {}", concurrent);
         println!("  Prompt tokens (avg):      {:.2}", prompt_tokens_avg);
         println!("  Completion tokens (avg):  {:.2}", completion_tokens_avg);
+        for (label, rates) in [
+            (
+                "Server request t/s",
+                samples
+                    .iter()
+                    .filter_map(ChatBenchSample::server_request_tps)
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                "Decode wall t/s",
+                samples
+                    .iter()
+                    .filter_map(ChatBenchSample::decode_wall_tps)
+                    .collect::<Vec<_>>(),
+            ),
+        ] {
+            if !rates.is_empty() {
+                println!(
+                    "  {label} (p10/p50): {:.2} / {:.2}",
+                    percentile(&rates, 0.1),
+                    percentile(&rates, 0.5)
+                );
+            }
+        }
         println!(
             "  TTFT (avg/p50/p95):       {:.2} / {:.2} / {:.2} ms",
             ttft_ms.iter().sum::<f64>() / ttft_ms.len() as f64,
@@ -1954,6 +2006,8 @@ async fn bench_chat(
             prompt_tokens: Some(sample.prompt_tokens),
             completion_tokens: Some(sample.completion_tokens),
             server_generation_ms: sample.generation_time_ms,
+            chat_timing: sample.timing.clone(),
+            finish_reason: sample.finish_reason.clone(),
             server_processing_ms: None,
             audio_duration_secs: None,
             rtf: None,
@@ -1974,11 +2028,14 @@ async fn bench_chat(
         ended_at,
         duration_ms: run_start.elapsed().as_secs_f64() * 1000.0,
         config: BenchmarkRunConfig {
+            chat_sampling: Some(
+                serde_json::json!({"temperature":0.0,"seed":0,"reasoning_policy":"model_default"}),
+            ),
             model: Some(model.to_string()),
             iterations: Some(iterations),
             concurrent: Some(concurrent),
             warmup,
-            stream: false,
+            stream: true,
             prompt: Some(prompt.to_string()),
             system: system.as_deref().map(|value| value.to_string()),
             max_tokens: Some(max_tokens),
@@ -2001,6 +2058,18 @@ async fn bench_chat(
             inter_transcript_ms: None,
             end_to_end_ms: stats(&total_ms),
             completion_tps: stats(&completion_tps),
+            server_request_tps: stats(
+                &samples
+                    .iter()
+                    .filter_map(ChatBenchSample::server_request_tps)
+                    .collect::<Vec<_>>(),
+            ),
+            decode_wall_tps: stats(
+                &samples
+                    .iter()
+                    .filter_map(ChatBenchSample::decode_wall_tps)
+                    .collect::<Vec<_>>(),
+            ),
             tokens_per_second: None,
             server_generation_ms: stats(&server_generation_ms),
             server_processing_ms: None,
@@ -2271,6 +2340,8 @@ async fn bench_tts(
             prompt_tokens: None,
             completion_tokens: None,
             server_generation_ms: sample.generation_time_ms,
+            chat_timing: None,
+            finish_reason: None,
             server_processing_ms: None,
             audio_duration_secs: sample.audio_duration_secs,
             rtf: sample.rtf,
@@ -2291,6 +2362,7 @@ async fn bench_tts(
         ended_at,
         duration_ms: run_start.elapsed().as_secs_f64() * 1000.0,
         config: BenchmarkRunConfig {
+            chat_sampling: None,
             model: Some(model.to_string()),
             iterations: Some(iterations),
             concurrent: Some(concurrent),
@@ -2318,6 +2390,8 @@ async fn bench_tts(
             inter_transcript_ms: None,
             end_to_end_ms: stats(&times),
             completion_tps: None,
+            server_request_tps: None,
+            decode_wall_tps: None,
             tokens_per_second: stats(&tokens_per_second),
             server_generation_ms: stats(&generation_ms),
             server_processing_ms: None,
@@ -2586,6 +2660,8 @@ async fn bench_asr(
             prompt_tokens: None,
             completion_tokens: None,
             server_generation_ms: None,
+            chat_timing: None,
+            finish_reason: None,
             server_processing_ms: sample.response.processing_time_ms,
             audio_duration_secs: sample.response.duration,
             rtf: sample.response.rtf,
@@ -2610,6 +2686,7 @@ async fn bench_asr(
         ended_at,
         duration_ms: run_start.elapsed().as_secs_f64() * 1000.0,
         config: BenchmarkRunConfig {
+            chat_sampling: None,
             model: Some(model.to_string()),
             iterations: Some(iterations),
             concurrent: Some(concurrent),
@@ -2637,6 +2714,8 @@ async fn bench_asr(
             inter_transcript_ms: stats(&inter_transcript_ms),
             end_to_end_ms: stats(&times),
             completion_tps: None,
+            server_request_tps: None,
+            decode_wall_tps: None,
             tokens_per_second: None,
             server_generation_ms: None,
             server_processing_ms: stats(&processing_ms),
@@ -2738,6 +2817,7 @@ async fn bench_throughput(
         ended_at,
         duration_ms: measured_elapsed.as_secs_f64() * 1000.0,
         config: BenchmarkRunConfig {
+            chat_sampling: None,
             model: None,
             iterations: None,
             concurrent: Some(concurrent),
@@ -2765,6 +2845,8 @@ async fn bench_throughput(
             inter_transcript_ms: None,
             end_to_end_ms: None,
             completion_tps: None,
+            server_request_tps: None,
+            decode_wall_tps: None,
             tokens_per_second: None,
             server_generation_ms: None,
             server_processing_ms: None,
@@ -3239,6 +3321,8 @@ async fn run_chat_request(
             "include_usage": true,
         },
         "max_completion_tokens": max_tokens,
+        "temperature": 0.0,
+        "seed": 0,
     });
 
     // Client-observed TTFT includes request transmission, server admission,
@@ -3351,6 +3435,11 @@ fn handle_chat_stream_event(
                 prompt_tokens: *prompt_tokens,
                 completion_tokens: *completion_tokens,
                 generation_time_ms: *generation_time_ms,
+                timing: chunk.izwi_timing,
+                finish_reason: chunk
+                    .choices
+                    .iter()
+                    .find_map(|choice| choice.finish_reason.clone()),
                 saw_text_delta: first_delta_at.is_some(),
             }));
         }
@@ -3380,6 +3469,7 @@ fn stats(data: &[f64]) -> Option<Stats> {
         avg: data.iter().sum::<f64>() / data.len() as f64,
         min: data.iter().copied().fold(f64::INFINITY, f64::min),
         max: data.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        p10: percentile(data, 0.1),
         p50: percentile(data, 0.5),
         p95: percentile(data, 0.95),
         p99: percentile(data, 0.99),
@@ -5594,7 +5684,7 @@ mod tests {
         let mut generation_time_ms = None;
 
         let delta = r#"data: {"choices":[{"delta":{"content":"hello"}}],"usage":null,"izwi_generation_time_ms":null}"#;
-        let terminal = r#"data: {"choices":[{"delta":{"content":null}}],"usage":{"prompt_tokens":42,"completion_tokens":7},"izwi_generation_time_ms":123.0}"#;
+        let terminal = r#"data: {"choices":[{"delta":{"content":null},"finish_reason":"length"}],"usage":{"prompt_tokens":42,"completion_tokens":7},"izwi_generation_time_ms":123.0,"izwi_timing":{"queue_wait_ms":10,"prefill_ms":20,"decode_ms":60,"decode_wall_ms":90,"decode_tokens":6,"post_first_token_ms":90,"ttft_ms":30,"total_ms":123,"prefill_steps":1,"decode_steps":3}}"#;
 
         let sample = handle_chat_stream_event(
             delta,
@@ -5621,6 +5711,10 @@ mod tests {
         assert_eq!(sample.prompt_tokens, 42);
         assert_eq!(sample.completion_tokens, 7);
         assert_eq!(sample.generation_time_ms, Some(123.0));
+        assert_eq!(sample.finish_reason.as_deref(), Some("length"));
+        assert_eq!(sample.timing.as_ref().unwrap().decode_tokens, Some(6));
+        assert_eq!(sample.server_request_tps(), Some(7000.0 / 123.0));
+        assert_eq!(sample.decode_wall_tps(), Some(6000.0 / 90.0));
         assert!(sample.ttft_ms >= 0.0);
     }
 
@@ -6046,6 +6140,8 @@ mod tests {
             prompt_tokens: None,
             completion_tokens: None,
             server_generation_ms: None,
+            chat_timing: None,
+            finish_reason: None,
             server_processing_ms: Some(120.0),
             audio_duration_secs: Some(10.0),
             rtf: Some(0.012),
