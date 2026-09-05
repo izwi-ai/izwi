@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use izwi_core::backends::BackendPreference;
+use izwi_core::performance::PerformanceConfigOverrides;
 use izwi_core::{
     BatchSizePreference, ContextLengthPreference, PhysicalExecutionMode, PhysicalInFlightLimit,
     ServeRuntimeConfig, ServeRuntimeConfigOverrides,
@@ -56,6 +57,8 @@ impl ModelsConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RuntimeConfig {
+    #[serde(default, skip_serializing_if = "PerformanceConfigOverrides::is_empty")]
+    pub performance: PerformanceConfigOverrides,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<BackendPreference>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -96,7 +99,8 @@ pub struct RuntimeConfig {
 
 impl RuntimeConfig {
     fn is_empty(&self) -> bool {
-        self.backend.is_none()
+        self.performance.is_empty()
+            && self.backend.is_none()
             && self.max_batch_size.is_none()
             && self.physical_execution_mode.is_none()
             && self.max_physical_in_flight.is_none()
@@ -185,6 +189,7 @@ impl Config {
                 dir: Some(defaults.models_dir),
             },
             runtime: RuntimeConfig {
+                performance: PerformanceConfigOverrides::from(&defaults.performance),
                 backend: Some(defaults.backend),
                 max_batch_size: Some(defaults.max_batch_size),
                 physical_execution_mode: Some(defaults.physical_execution_mode),
@@ -221,6 +226,7 @@ impl Config {
         };
 
         ServeRuntimeConfigOverrides {
+            performance: self.runtime.performance.clone(),
             host: self.server.host.clone(),
             port: self.server.port,
             models_dir: self.models.dir.clone(),
@@ -250,6 +256,13 @@ impl Config {
     }
 
     pub fn set_value(&mut self, key: &str, value: &str) -> Result<()> {
+        if let Some(key) = key.strip_prefix("runtime.performance.") {
+            return self
+                .runtime
+                .performance
+                .set_value(key, value.trim())
+                .map_err(Into::into);
+        }
         match key {
             "server.host" => self.server.host = Some(parse_string(value)?),
             "server.port" => self.server.port = Some(parse_u16(value)?),
@@ -330,6 +343,11 @@ impl Config {
     }
 
     pub fn get_value(&self, key: &str) -> Option<toml::Value> {
+        if let Some(key) = key.strip_prefix("runtime.performance.") {
+            let (group, field) = key.split_once('.')?;
+            let value = toml::Value::try_from(&self.runtime.performance).ok()?;
+            return value.get(group)?.get(field).cloned();
+        }
         match key {
             "server.host" => self.server.host.clone().map(toml::Value::String),
             "server.port" => self
@@ -442,11 +460,8 @@ impl Config {
 }
 
 fn config_path(path: Option<&PathBuf>) -> PathBuf {
-    path.cloned().unwrap_or_else(|| {
-        dirs::config_dir()
-            .map(|p| p.join("izwi").join("config.toml"))
-            .unwrap_or_else(|| PathBuf::from("config.toml"))
-    })
+    path.cloned()
+        .unwrap_or_else(izwi_core::performance::default_user_config_path)
 }
 
 fn parse_string(value: &str) -> Result<String> {
@@ -552,6 +567,7 @@ mod tests {
                 dir: Some(PathBuf::from("/tmp/models")),
             },
             runtime: RuntimeConfig {
+                performance: PerformanceConfigOverrides::default(),
                 backend: Some(BackendPreference::Cpu),
                 max_batch_size: Some(BatchSizePreference::fixed(12).unwrap()),
                 physical_execution_mode: Some(PhysicalExecutionMode::Shadow),
@@ -715,5 +731,70 @@ mod tests {
             config.runtime.max_physical_in_flight
         );
         assert_eq!(loaded.ui.enabled, config.ui.enabled);
+    }
+
+    #[test]
+    fn performance_config_set_get_and_save_preserve_partial_siblings() {
+        let mut config: Config = toml::from_str("[runtime.performance.cuda]\nmtp_draft_tokens = 3\n[ runtime.performance.loading ]\nworkers = 4").unwrap();
+        config
+            .set_value("runtime.performance.cuda.mtp_adaptive", "false")
+            .unwrap();
+        config
+            .set_value("runtime.performance.cuda.mode", "off")
+            .unwrap();
+        config
+            .set_value("runtime.performance.loading.workers", "0")
+            .unwrap();
+        config
+            .set_value(
+                "runtime.performance.loading.cache_dir",
+                "/tmp/cache directory",
+            )
+            .unwrap();
+        assert_eq!(
+            config.get_value("runtime.performance.cuda.mtp_draft_tokens"),
+            Some(toml::Value::Integer(3))
+        );
+        assert_eq!(
+            config.get_value("runtime.performance.cuda.mtp_adaptive"),
+            Some(toml::Value::Boolean(false))
+        );
+        assert!(config
+            .get_value("runtime.performance.cuda.device_sampling")
+            .is_none());
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(!serialized.contains("device_sampling"));
+        let restored: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(restored.runtime.performance, config.runtime.performance);
+        let resolved = ServeRuntimeConfig::from_sources(
+            &restored.serve_runtime_overrides(),
+            &Default::default(),
+            &Default::default(),
+        );
+        assert!(!resolved.performance.clone().normalized().cuda.mtp.enabled());
+        assert_eq!(resolved.performance.loading.workers, 0);
+    }
+
+    #[test]
+    fn performance_config_rejects_invalid_values_without_erasing_previous_value() {
+        let mut config = Config::default();
+        config
+            .set_value("runtime.performance.cuda.mtp_draft_tokens", "2")
+            .unwrap();
+        for value in ["0", "4", "-1", "abc"] {
+            assert!(config
+                .set_value("runtime.performance.cuda.mtp_draft_tokens", value)
+                .is_err());
+        }
+        assert_eq!(config.runtime.performance.cuda.mtp_draft_tokens, Some(2));
+        assert!(config
+            .set_value("runtime.performance.cuda.mode", "yes")
+            .is_err());
+        assert!(config
+            .set_value("runtime.performance.loading.max_staging_bytes", "0")
+            .is_err());
+        assert!(config
+            .set_value("runtime.performance.cuda.unknown", "auto")
+            .is_err());
     }
 }

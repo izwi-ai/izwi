@@ -95,10 +95,7 @@ pub fn maybe_start_local_server<R: tauri::Runtime>(
 
     let log_path = open_server_log(app, &mut cmd)?;
 
-    cmd.env("IZWI_HOST", bind_host)
-        .env("IZWI_PORT", port.to_string())
-        .env(DESKTOP_OWNER_PIPE_ENV, "1")
-        .stdin(Stdio::piped());
+    configure_local_server_command(&mut cmd, bind_host, port);
 
     let mut child = cmd.spawn().with_context(|| {
         format!(
@@ -140,6 +137,16 @@ pub fn maybe_start_local_server<R: tauri::Runtime>(
         port,
         log_path.display()
     )
+}
+
+fn configure_local_server_command(cmd: &mut Command, bind_host: &str, port: u16) {
+    // The standalone server reads the shared user config.toml and overlays its
+    // inherited environment once. Do not synthesize default performance env
+    // here: that would erase persisted opt-outs before the server can merge them.
+    cmd.env("IZWI_HOST", bind_host)
+        .env("IZWI_PORT", port.to_string())
+        .env(DESKTOP_OWNER_PIPE_ENV, "1")
+        .stdin(Stdio::piped());
 }
 
 fn open_server_log<R: tauri::Runtime>(
@@ -342,5 +349,24 @@ mod tests {
         assert!(error
             .to_string()
             .contains("liveness response was not valid Izwi JSON"));
+    }
+
+    #[test]
+    fn performance_startup_preserves_inherited_policy_and_leaves_file_defaults_to_server() {
+        let mut command = Command::new("unused-server");
+        command.env("IZWI_CUDA_MODE", "off");
+        command.env("IZWI_CUDA_MTP_ADAPTIVE", "false");
+        configure_local_server_command(&mut command, "127.0.0.1", 8080);
+        let environment: std::collections::BTreeMap<_, _> = command.get_envs().collect();
+        assert_eq!(
+            environment[std::ffi::OsStr::new("IZWI_CUDA_MODE")],
+            Some(std::ffi::OsStr::new("off"))
+        );
+        assert_eq!(
+            environment[std::ffi::OsStr::new("IZWI_CUDA_MTP_ADAPTIVE")],
+            Some(std::ffi::OsStr::new("false"))
+        );
+        assert!(!environment.contains_key(std::ffi::OsStr::new("IZWI_LOADING_MODE")));
+        assert!(command.get_args().next().is_none());
     }
 }

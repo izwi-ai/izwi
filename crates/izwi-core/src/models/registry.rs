@@ -124,7 +124,12 @@ use crate::runtime::{DiarizationConfig, DiarizationResult};
 
 type AsrLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<NativeAsrModel>;
 type AudioChatLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<NativeAudioChatModel>;
-type ChatLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<NativeChatModel>;
+type ChatLoaderFn = fn(
+    &Path,
+    ModelVariant,
+    DeviceProfile,
+    &crate::performance::PerformanceConfig,
+) -> Result<NativeChatModel>;
 type DiarizationLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<NativeDiarizationModel>;
 type VoxtralLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<VoxtralRealtimeModel>;
 type VoxtralTtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<VoxtralTtsModel>;
@@ -272,6 +277,7 @@ fn load_qwen_chat_model(
     model_dir: &Path,
     variant: ModelVariant,
     device: DeviceProfile,
+    _performance: &crate::performance::PerformanceConfig,
 ) -> Result<NativeChatModel> {
     Ok(NativeChatModel::Qwen3(Qwen3ChatModel::load(
         model_dir, variant, device,
@@ -282,6 +288,7 @@ fn load_gemma_chat_model(
     model_dir: &Path,
     variant: ModelVariant,
     device: DeviceProfile,
+    _performance: &crate::performance::PerformanceConfig,
 ) -> Result<NativeChatModel> {
     Ok(NativeChatModel::Gemma3(Gemma3ChatModel::load(
         model_dir, variant, device,
@@ -302,6 +309,7 @@ fn load_lfm2_chat_model(
     model_dir: &Path,
     variant: ModelVariant,
     device: DeviceProfile,
+    _performance: &crate::performance::PerformanceConfig,
 ) -> Result<NativeChatModel> {
     Ok(NativeChatModel::Lfm2(Lfm2ChatModel::load(
         model_dir, variant, device,
@@ -312,6 +320,7 @@ fn load_qwen35_chat_model(
     model_dir: &Path,
     variant: ModelVariant,
     device: DeviceProfile,
+    _performance: &crate::performance::PerformanceConfig,
 ) -> Result<NativeChatModel> {
     Ok(NativeChatModel::Qwen35(Qwen35ChatModel::load(
         model_dir, variant, device,
@@ -322,6 +331,7 @@ fn load_qwen38_chat_model(
     model_dir: &Path,
     variant: ModelVariant,
     device: DeviceProfile,
+    _performance: &crate::performance::PerformanceConfig,
 ) -> Result<NativeChatModel> {
     Ok(NativeChatModel::Qwen38(Qwen38ChatModel::load(
         model_dir, variant, device,
@@ -5238,6 +5248,7 @@ impl NativeChatModel {
 
 #[derive(Clone)]
 pub struct ModelRegistry {
+    performance: crate::performance::PerformanceConfig,
     models_dir: PathBuf,
     device: DeviceProfile,
     asr_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<NativeAsrModel>>>>>,
@@ -5445,7 +5456,18 @@ fn native_chat_model_kind(model: &NativeChatModel) -> &'static str {
 
 impl ModelRegistry {
     pub fn new(models_dir: PathBuf, device: DeviceProfile) -> Self {
+        Self::new_with_performance(models_dir, device, Default::default())
+    }
+
+    /// Capture policy once for this registry. Invalid configuration is reported
+    /// at load, preserving the infallible legacy constructor API.
+    pub fn new_with_performance(
+        models_dir: PathBuf,
+        device: DeviceProfile,
+        performance: crate::performance::PerformanceConfig,
+    ) -> Self {
         Self {
+            performance: performance.snapshot_env(),
             models_dir,
             device,
             asr_models: Arc::new(RwLock::new(HashMap::new())),
@@ -5460,6 +5482,11 @@ impl ModelRegistry {
             kokoro_models: Arc::new(RwLock::new(HashMap::new())),
             effective_contexts: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Immutable policy captured for this registry's model loads.
+    pub fn performance(&self) -> &crate::performance::PerformanceConfig {
+        &self.performance
     }
 
     pub(crate) fn publish_effective_context(
@@ -5874,6 +5901,7 @@ impl ModelRegistry {
         variant: ModelVariant,
         model_dir: &Path,
     ) -> Result<ChatModelLease> {
+        self.performance.validate()?;
         let registration = resolve_chat_loader_registration(variant).ok_or_else(|| {
             Error::InvalidInput(format!("Unsupported chat model variant: {variant}"))
         })?;
@@ -5903,9 +5931,10 @@ impl ModelRegistry {
                 let model_dir = model_dir.to_path_buf();
                 let device = self.device.clone();
                 let loader = registration.loader;
+                let performance = self.performance.clone();
                 move || async move {
                     tokio::task::spawn_blocking(move || {
-                        let model = loader(&model_dir, variant, device)?;
+                        let model = loader(&model_dir, variant, device, &performance)?;
                         Ok::<NativeChatModel, Error>(model)
                     })
                     .await
@@ -7203,5 +7232,23 @@ mod tests {
         if let Some(previous) = previous {
             std::env::set_var("IZWI_LFM25_ASR_MAX_NEW_TOKENS", previous);
         }
+    }
+
+    #[test]
+    fn registry_preserves_a_resolved_policy_without_env_reapplication() {
+        let mut cli = crate::ServeRuntimeConfigOverrides::default();
+        cli.performance.cuda.mode = Some(crate::OptimizationMode::Off);
+        cli.performance.cuda.mtp_adaptive = Some(false);
+        cli.performance.loading.workers = Some(0);
+        let config =
+            crate::ServeRuntimeConfig::from_sources(&Default::default(), &Default::default(), &cli);
+        let registry = ModelRegistry::new_with_performance(
+            PathBuf::new(),
+            DeviceProfile::cpu(),
+            config.performance.clone(),
+        );
+        assert_eq!(registry.performance, config.performance);
+        assert!(!registry.performance.cuda.enabled());
+        assert!(!registry.performance.cuda.mtp_adaptive);
     }
 }
