@@ -2341,7 +2341,8 @@ impl RuntimeService {
     }
 
     /// Create a new inference engine.
-    pub fn new(config: EngineConfig) -> Result<Self> {
+    pub fn new(mut config: EngineConfig) -> Result<Self> {
+        config.performance = config.performance.resolve_env()?;
         // Reject unsupported or unsafe cache policy before any model registry,
         // device arena, or readiness state can be created.
         let cache_policy =
@@ -2355,15 +2356,17 @@ impl RuntimeService {
         Self::ensure_requested_backend_available(&backend_context)?;
         let selected_backend_kind = backend_context.backend_kind;
 
-        let model_registry = Arc::new(ModelRegistry::new(
+        let model_registry = Arc::new(ModelRegistry::new_with_performance(
             config.models_dir.clone(),
             device.clone(),
+            config.performance.clone(),
         ));
 
         let mut core_config = EngineCoreConfig::for_qwen3_tts();
         core_config.portable_context_auto = config.max_sequence_length.explicit_tokens().is_none();
         core_config.portable_context_reserve_bytes = config.portable_context_reserve_bytes;
         core_config.models_dir = config.models_dir.clone();
+        core_config.performance = config.performance.clone();
         core_config.max_batch_size = config.max_scheduler_batch_size.max(1);
         core_config.max_tensor_batch_size = config.max_batch_size;
         core_config.physical_execution_mode = config.physical_execution_mode;

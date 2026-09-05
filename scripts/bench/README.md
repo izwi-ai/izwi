@@ -205,8 +205,8 @@ Retain CPU, Apple Silicon, and NVIDIA before/after runs with the same model
 revision, prompt matrix, sampling policy, and concurrency. Promotion requires
 no quality regression and reviewed TTFT, inter-token latency, throughput,
 memory, host-read, metadata-upload, batch-width, and padding deltas for the
-exact hardware cell. CUDA-only custom Qwen3.8 kernels remain default-off until
-their own NVIDIA profile evidence passes; source compatibility with Qwen3.5
+exact hardware cell. Qwen3.8 CUDA improvements use capability-based Auto defaults with explicit
+opt-outs; hardware validation remains profile-scoped; source compatibility with Qwen3.5
 does not qualify them for cross-family promotion.
 
 The ignored native CUDA GQA oracle fails if explicitly run without CUDA or if
@@ -251,132 +251,104 @@ cell.
 
 ## Qwen3.8 CUDA hardware-profile evidence
 
-`run-qwen38-cuda-evidence.sh` imports a versioned Qwen3.8 workload and hardware
-profile into the strict CUDA model evidence runner. The included
-`benchmarks/manifests/qwen38-l40s-evidence.json` profile covers warmed
-single-user decode, longer prompts, a
-sustained 2,048-token completion, and concurrency 1/2/4/8. `prompt_words`
-controls deterministic input construction; it is not reported as a tokenizer
-token count. The certificate retains the actual prompt-token count returned by
-the server. The complete operator protocol, candidate matrix, required
-artifacts, promotion gates, and deferred phases are in
-[`docs/dev/QWEN38_L40S_VALIDATION.md`](../../docs/dev/QWEN38_L40S_VALIDATION.md).
-
-Run the strict L40S convenience profile manually on the exact deployment and
-retain the output directory:
+The shipping policy is default-on supported CUDA paths with typed opt-outs.
+`IZWI_CUDA_MODE=off` and `IZWI_LOADING_MODE=off` select subsystem baselines;
+empty settings exercise shipping Auto policy. The L40S is a measurement profile,
+not a production device-name gate. See
+[the full protocol](../../docs/dev/QWEN38_L40S_VALIDATION.md) for exact policy,
+per-feature opt-outs, cross-SM scopes and lifecycle/quality requirements.
+Auto uses Q8 pending measured device crossover evidence. Explicit `native_fp8`
+is the software-decode W8A16 provider; true W8A8 is not implemented. The 40 t/s
+hardware gate remains unmeasured.
 
 ```bash
-scripts/bench/run-qwen38-l40s-evidence.sh \
-  --mtp-depth 1 \
-  --server http://127.0.0.1:8080 \
-  --izwi-bin target/release/izwi \
-  --output target/qwen38-l40s-evidence
+scripts/bench/run-qwen38-l40s-evidence.sh --mtp-depth 1 \
+  --server http://127.0.0.1:8080 --izwi-bin target/release/izwi \
+  --output target/qwen38-l40s-default
 ```
 
-A pass requires the exact model ID, a selected device matching the manifest's
-name, compute capability, minimum VRAM, and driver constraints, a server built
-from the checked-out Git SHA, strict quality success, and measured TTFT,
-completion throughput, and sampled device-memory use for every case. It records
-detailed `nvidia-smi`, OS, imported-manifest, standard CUDA certificate, and raw
-benchmark artifacts. The
-Qwen3.8 certificate keeps both end-to-end completion throughput and per-sample
-decode throughput calculated from the server-reported generation interval; the
-two metrics must not be conflated. The workload pins the expected Hugging Face
-checkpoint revision; provisioning that
-revision remains an operator responsibility because the runner never downloads
-or mutates models.
+Set `IZWI_ENABLE_PREFIX_CACHING=false` on the server for primary evidence. The
+runner checks no measured prefix hits/reused tokens. The versioned L40S manifest
+predeclares median >=40 t/s for the existing server/UI generation-time metric on
+`Explain llm inference to me`, and >=40 committed decode wall t/s for sustained
+single-sequence 512/2048-budget cases. Each primary case has ten measured runs;
+sustained cases require actual >=384/1536 decode tokens per sample. Natural EOS
+and budget termination are recorded separately. Temperature and seed are zero.
 
-The L40S script is a small strict wrapper around the reusable CUDA runner. For
-another NVIDIA GPU, create a separate versioned workload with a distinct
-`hardware_profile.id` and run:
+CLI `chat_timing` preserves queue, prefill, physical service, monotonic decode
+wall time and committed counts. `server_request_tps` and `decode_wall_tps`
+summaries include p10/p50; latencies retain p95. Certificates use
+`server_request_samples` for the preserved generation denominator and
+`decode_wall_samples` for actual decode timing. Old misleading `decode_samples`
+are rejected. Neither speculative drafts nor SSE chunk counts are token counts.
+Strict OpenAI mode omits these extensions; use relaxed mode for evidence.
+The UI stream now explicitly requests true usage; its displayed formula is
+unchanged. The previous direct API path could estimate tokens as text length/4
+if usage was absent. Compare actual committed counts on both baseline and
+candidate builds: correcting the estimate is not an inference speedup. The
+reported original 16–18 t/s remains unverified until its build/counts are known.
 
-```bash
-scripts/bench/run-qwen38-cuda-evidence.sh \
-  --workload benchmarks/manifests/qwen38-<profile>-evidence.json \
-  --mtp-depth 1 \
-  --output target/qwen38-<profile>-evidence
-```
+The reusable `run-qwen38-cuda-evidence.sh --workload PATH` runner accepts other
+versioned device profiles. Keep the exact-SHA CLI/server, pinned checkpoint,
+selected GPU UUID/SM/driver/memory, provider and configuration checks intact.
+Declare device-specific thresholds before running; L40S absolute targets do not
+apply universally. `--allow-unsupported` and `--dry-run` never certify CUDA.
 
-Each profile owns its performance thresholds. An L40S result is useful for the
-`nvidia-l40s-48gb` deployment profile only; it cannot promote a global CUDA
-default or set an expected throughput for another GPU. Global promotion needs
-representative retained evidence across supported CUDA compute capabilities
-and a runtime capability gate that fails closed on unvalidated devices.
-
-The runner measures an existing warmed server; it does not enable optimization
-candidates. Set candidate variables on the server process and restart between
-cells. `IZWI_QWEN38_PACKED_PROJECTIONS`, `IZWI_QWEN38_CUDA_BF16_KV`,
-`IZWI_QWEN38_CAUSAL_CONV_DECODE`, `IZWI_QWEN38_DELTANET_DECODE`, and
-`IZWI_QWEN38_DECODE_EPILOGUES` are all default-off and CUDA-unvalidated. Run a
-default-off baseline and then one candidate per retained output directory
-before testing combinations.
-
-### Qwen3.8 paired MTP evidence
-
-`--mtp-depth` is required for every Qwen3.8 evidence cell. `0` means an
-explicitly disabled baseline; `1`, `2`, and `3` mean enabled MTP with that
-draft depth. The option does not configure the server. Restart the server for
-each cell with matching explicit settings so the runner can compare the
-requested policy with loaded-model diagnostics:
-
-Depth 1 is the production default and the first latency candidate to compare.
-Deeper cells remain mandatory for a complete profile certificate, but must not
-be promoted merely because their accepted length is higher: proposal work,
-recurrent-state replay, TTFT, completion TPS, and peak memory all participate
-in certification. At concurrency greater than one, scalar fallback is expected
-and aggregate throughput—not speculative acceptance—is the deciding metric.
-
-| Cell | Server settings | Runner setting |
-|---|---|---|
-| Baseline | `IZWI_QWEN38_MTP=0` | `--mtp-depth 0` |
-| Depth 1 | `IZWI_QWEN38_MTP=1 IZWI_QWEN38_MTP_DRAFT_TOKENS=1` | `--mtp-depth 1` |
-| Depth 2 | `IZWI_QWEN38_MTP=1 IZWI_QWEN38_MTP_DRAFT_TOKENS=2` | `--mtp-depth 2` |
-| Depth 3 | `IZWI_QWEN38_MTP=1 IZWI_QWEN38_MTP_DRAFT_TOKENS=3` | `--mtp-depth 3` |
-
-Retain the four directories, then validate the exact pair:
+Collect separate MTP-disabled and depths 1/2/3 bundles with other settings fixed:
 
 ```bash
 scripts/bench/certify-qwen38-mtp-evidence.sh \
-  --baseline target/qwen38-mtp-disabled \
-  --depth-1 target/qwen38-mtp-depth-1 \
-  --depth-2 target/qwen38-mtp-depth-2 \
-  --depth-3 target/qwen38-mtp-depth-3 \
+  --baseline target/qwen38-mtp-disabled --depth-1 target/qwen38-mtp-depth-1 \
+  --depth-2 target/qwen38-mtp-depth-2 --depth-3 target/qwen38-mtp-depth-3 \
   --output target/qwen38-mtp-paired
 ```
 
-The certifier rejects a missing cell or any checkpoint revision, Git SHA,
-workload hash, hardware profile, physical device identity, CUDA/compute/KV
-provider, sampled-memory, or performance-case mismatch. Its evidence levels
-are intentionally monotonic:
-
-- `implemented_unvalidated`: manifests were validated with `--dry-run`; there
-  is no device/runtime claim and promotion remains false.
-- `runtime_validated`: all four measured cells passed the runtime and pairing
-  contract, but profile thresholds are absent or no depth met them.
-- `performance_certified`: at least one depth meets every declared per-case
-  completion-TPS and TTFT threshold plus the peak-memory threshold. Only those
-  depths appear in `certified_depths`. Eligibility remains bound to the exact
-  hardware profile/device, checkpoint, and Git SHA in the certificate; it is
-  not a global CUDA claim.
-
-To permit the last state, declare these values under
-`acceptance.performance_thresholds.values.mtp` before collecting all four
-runs: `minimum_completion_tps_p50_speedup_ratio` (strictly greater than `1`),
-`maximum_ttft_p95_regression_ratio`, and
-`maximum_peak_device_memory_ratio`. These compare candidate completion-TPS p50,
-TTFT p95, and sampled peak memory to the disabled baseline. Null thresholds,
-including the checked-in L40S manifest today, can establish runtime validation
-but cannot synthesize a performance claim.
-
-On a host without an NVIDIA device, the default is a non-zero failure. Local
-workflow validation can explicitly record unsupported without inventing data:
+`--mtp-depth` asserts the loaded model state; it does not change server config.
+The paired certifier recomputes both rates, binds matching workloads and hardware,
+and requires independent absolute single-sequence gates plus relative completion,
+TTFT and memory gates. `runtime_validated` remains distinct from
+`performance_certified`. Portable fixture tests exercise pass/fail logic only:
 
 ```bash
-scripts/bench/run-qwen38-l40s-evidence.sh --mtp-depth 1 --allow-unsupported
-scripts/bench/test-run-qwen38-cuda-evidence.sh
-scripts/bench/test-run-qwen38-l40s-evidence.sh
-scripts/bench/test-certify-qwen38-mtp-evidence.sh
+bash scripts/bench/test-run-qwen38-cuda-evidence.sh
+bash scripts/bench/test-run-qwen38-l40s-evidence.sh
+bash scripts/bench/test-certify-qwen38-mtp-evidence.sh
 ```
+
+### Timed CUDA loading
+
+```bash
+scripts/bench/run-cuda-model-load-evidence.sh \
+  --manifest benchmarks/manifests/qwen38-cuda-load.txt --iterations 3 \
+  --cache-state reload --cache-provenance /path/to/provenance.json \
+  --server-log /path/to/server.log --output target/qwen38-load-reload
+bash scripts/bench/test-run-cuda-model-load-evidence.sh
+```
+
+The family manifest now includes Qwen3.8. The timed runner checks an empty
+exact-SHA CUDA server before loading, records Ready and first real request
+completion with a monotonic clock, captures optional
+`family_diagnostics.load_timing` phases/counters, and unloads. Conversion/upload
+phase counters currently cover Q8 tiles only, not dense/raw materialization. First-request
+failure or unload failure stops the cell. A supplied `--first-request` JSON body
+supports a custom chat workload; Qwen3.8 has an actual short first-request default.
+
+Source-cold/source-warm/derived-cold/derived-warm/reload are **operator-declared**
+cache states requiring provenance JSON. `unknown` is the safe default. Observed
+conversion-cache counters are separate from OS-cache declarations. The runner
+never flushes OS caches and restarting a process does not prove a cold OS cache.
+Current cached-tile lookups rehash source on each lookup for external-source
+integrity; derived-cache hits must not be described as zero-I/O warm loading.
+Use `--prepare-run` to externally prepare/restart each fresh-process cell and
+record process identities; otherwise iterations are same-process reloads.
+Retain >=3 fresh-process runs per cache cell and separately compare reloads.
+The collector always reports `performance_certified:false`; no loading speedup
+has been measured on the development host.
+
+Server Ready logs retain lifecycle phases. Scheduler grant diagnostics can be
+collected using `RUST_LOG=info,izwi_core::engine::scheduler=debug`; aggregate
+`Decode quantum granted` events by request_id and quantum_reason to show actual
+sustained grants, soft-deadline fallbacks and fairness behavior.
 
 ### Qwen3.8 KV cache precision
 

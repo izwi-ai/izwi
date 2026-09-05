@@ -129,6 +129,26 @@ describe("ChatApiClient OpenAI streaming", () => {
     });
   });
 
+  it("preserves the user denominator while carrying committed decode timing", async () => {
+    const timing = { queue_wait_ms: 12, prefill_ms: 20, decode_ms: 30,
+      decode_wall_ms: 50, decode_tokens: 3, post_first_token_ms: 50, total_ms: 90 };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(sseResponse([
+      chatChunk("four tokens"),
+      { id: "timed", model: "Qwen3.8-27B-FP8",
+        choices: [{index: 0, delta: {}, finish_reason: "length"}],
+        usage: {completion_tokens: 4}, izwi_generation_time_ms: 90, izwi_timing: timing },
+      "[DONE]",
+    ])));
+    const client = new ChatApiClient(new ApiHttpClient("http://localhost/v1"));
+    const done = vi.fn();
+    client.chatCompletionsStream({messages: [{role: "user", content: "Explain llm inference to me"}]}, {onDone: done});
+    await vi.waitFor(() => expect(done).toHaveBeenCalledWith("four tokens", {
+      tokens_generated: 4, generation_time_ms: 90, timing,
+    }));
+    const [, init] = vi.mocked(fetch).mock.calls[0];
+    expect(JSON.parse(String(init?.body))).toMatchObject({stream_options: {include_usage: true}});
+  });
+
   it("delivers a delta while the response body remains open", async () => {
     const stream = controlledSseResponse();
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(stream.response));

@@ -1189,14 +1189,16 @@ pub(crate) mod tests {
         let (standard_cos, standard_sin) =
             build_rope_window(seq_len, start_pos, &inv_freq, &device, DType::F32).unwrap();
 
-        assert_eq!(
-            mrope_cos.to_vec2::<f32>().unwrap(),
-            standard_cos.to_vec2::<f32>().unwrap()
-        );
-        assert_eq!(
-            mrope_sin.to_vec2::<f32>().unwrap(),
-            standard_sin.to_vec2::<f32>().unwrap()
-        );
+        // Accelerate's vector trig and scalar Rust trig differ by a few F32
+        // ULPs. Require numerical parity on both caches, not bit identity.
+        for (mrope, standard) in [(mrope_cos, standard_cos), (mrope_sin, standard_sin)] {
+            let mrope = mrope.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let standard = standard.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            assert_eq!(mrope.len(), standard.len());
+            for (actual, expected) in mrope.iter().zip(standard) {
+                assert!((actual - expected).abs() <= 1e-6, "{actual} != {expected}");
+            }
+        }
     }
 
     #[test]

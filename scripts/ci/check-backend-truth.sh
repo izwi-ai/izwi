@@ -498,6 +498,13 @@ run_cargo_cuda_device_profile() {
     cargo check --locked -p izwi-cli --features "${wrapper_features}"
     cargo check --locked -p izwi-server --features "${wrapper_features}"
     run_core_scheduler_regressions "${core_features}"
+    # These are real-device checks, including new projection, sampling,
+    # graph-lifetime and tiled-loading probes. A requested CUDA device may not
+    # silently fall back to CPU and still produce a certification record.
+    for suite in kernels::cuda models::architectures::qwen38 models::shared::attention::physical; do
+        IZWI_REQUIRE_CUDA_TEST_DEVICE=1 cargo test --locked -p izwi-core \
+            --features "${core_features}" "${suite}" --lib -- --test-threads=1
+    done
     run_server_scheduler_regressions "${wrapper_features}"
     smoke_cuda_device_if_available "${wrapper_features}"
 }

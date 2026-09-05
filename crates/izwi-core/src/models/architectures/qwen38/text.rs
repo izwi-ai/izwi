@@ -1,3 +1,8 @@
+use crate::kernels::cuda::graphs::{IslandOutput, TensorIsland};
+use crate::performance::CudaPerformanceConfig;
+const GRAPH_CACHE_BYTES: usize = 8 * 1024 * 1024;
+// Keep an admitted region working set reusable across complete 64-layer passes.
+const GRAPH_LAYER_LIMIT: usize = 8;
 use candle_core::quantized::QMatMul;
 use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
 use candle_nn::{ops, rotary_emb, Embedding, Linear};
@@ -63,6 +68,117 @@ pub(super) struct Qwen38TextDecodeBatchOutput {
     pub logits: Tensor,
 }
 
+/// Bounded verification intermediates. Q/K/V and discretization rows scale
+/// with at most four positions; the initial state is an immutable handle to
+/// the transaction checkpoint, never one full recurrent matrix per position.
+struct Qwen38LinearVerification {
+    initial: Qwen38LayerRuntimeState,
+    convolution_input: Tensor,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    g: Tensor,
+    beta: Tensor,
+}
+
+impl Qwen38LinearVerification {
+    fn recover(&self, prefix: usize) -> Result<Qwen38LayerRuntimeState> {
+        let length = self.value.dim(1)?;
+        if prefix > length {
+            return Err(Error::InvalidInput(
+                "Qwen3.8 verification prefix exceeds span".into(),
+            ));
+        }
+        let mut restored = self.initial.clone();
+        if prefix == 0 {
+            return Ok(restored);
+        }
+        let Qwen38LayerRuntimeState::Linear {
+            conv_state,
+            recurrent_state,
+        } = &mut restored
+        else {
+            return Err(Error::InferenceError(
+                "verification requires linear state".into(),
+            ));
+        };
+        let mut query = self.query.narrow(1, 0, prefix)?;
+        let mut key = self.key.narrow(1, 0, prefix)?;
+        let value = self.value.narrow(1, 0, prefix)?;
+        let repeats = value.dim(2)? / query.dim(2)?;
+        if repeats > 1 {
+            query = repeat_interleave_head_states_seq(&query, repeats)?;
+            key = repeat_interleave_head_states_seq(&key, repeats)?;
+        }
+        let base = recurrent_state.as_ref().ok_or_else(|| {
+            Error::InferenceError("verification recurrent checkpoint missing".into())
+        })?;
+        let (_, next) = recurrent_gated_delta_sequence(
+            &query,
+            &key,
+            &value,
+            &self.g.narrow(1, 0, prefix)?,
+            &self.beta.narrow(1, 0, prefix)?,
+            base.clone(),
+        )?;
+        *recurrent_state = Some(deep_copy_tensor_storage(&next)?);
+        if let Some(conv) = conv_state.as_mut() {
+            for position in 0..prefix {
+                conv.push_decode(&self.convolution_input.i((0, position))?.unsqueeze(1)?)?;
+            }
+            conv.compact_owned()?;
+        }
+        Ok(restored)
+    }
+}
+
+pub(super) struct Qwen38TextVerification {
+    pub hidden_states: Tensor,
+    initial_state: Qwen38TextRuntimeState,
+    final_state: Qwen38TextRuntimeState,
+    layers: Vec<Option<Qwen38LinearVerification>>,
+    start_position: usize,
+    view_id: u64,
+    generation: u64,
+    token_count: usize,
+}
+
+impl Qwen38TextVerification {
+    /// Install only the verified prefix. Full attention keeps already-written
+    /// KV rows and their completion fences; hybrid state is reconstructed from
+    /// compact intermediates without running target weights again.
+    pub(super) fn commit_prefix(
+        self,
+        prefix: usize,
+        state: &mut Qwen38TextRuntimeState,
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<Tensor> {
+        if cache.view_id() != self.view_id
+            || cache.logical_generation() != self.generation
+            || prefix > self.token_count
+            || cache.context_len() != self.start_position + self.token_count
+        {
+            return Err(Error::InvalidInput(
+                "Qwen3.8 verification commit is stale or out of bounds".into(),
+            ));
+        }
+        if prefix != self.token_count {
+            let mut recovered = self.initial_state;
+            for (layer, retained) in recovered.layers.iter_mut().zip(self.layers.iter()) {
+                if let Some(retained) = retained {
+                    *layer = retained.recover(prefix)?;
+                }
+            }
+            cache.truncate_verified_prefix(self.start_position + prefix)?;
+            *state = recovered;
+        } else {
+            *state = self.final_state;
+        }
+        // Detach the escaping canonical hidden rows from rejected positions.
+        deep_copy_tensor_storage(&self.hidden_states.narrow(1, 0, prefix)?).map_err(Error::from)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Qwen38ProjectionRepresentation {
     ExpandedF32,
@@ -70,11 +186,15 @@ pub enum Qwen38ProjectionRepresentation {
     ExpandedBf16,
     PackedQ8WithDenseF16,
     PackedQ8WithDenseBf16,
+    NativeFp8WithQ8FallbackF16,
+    NativeFp8WithQ8FallbackBf16,
 }
 
 impl Qwen38ProjectionRepresentation {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::NativeFp8WithQ8FallbackF16 => "native_block_fp8_with_q8_fallback_dense_f16",
+            Self::NativeFp8WithQ8FallbackBf16 => "native_block_fp8_with_q8_fallback_dense_bf16",
             Self::ExpandedF32 => "expanded_f32",
             Self::ExpandedF16 => "expanded_f16",
             Self::ExpandedBf16 => "expanded_bf16",
@@ -86,8 +206,12 @@ impl Qwen38ProjectionRepresentation {
     pub const fn compute_dtype(self) -> &'static str {
         match self {
             Self::ExpandedF32 => "f32",
-            Self::ExpandedF16 | Self::PackedQ8WithDenseF16 => "f16",
-            Self::ExpandedBf16 | Self::PackedQ8WithDenseBf16 => "bf16",
+            Self::ExpandedF16 | Self::PackedQ8WithDenseF16 | Self::NativeFp8WithQ8FallbackF16 => {
+                "f16"
+            }
+            Self::ExpandedBf16
+            | Self::PackedQ8WithDenseBf16
+            | Self::NativeFp8WithQ8FallbackBf16 => "bf16",
         }
     }
 }
@@ -445,6 +569,9 @@ enum Qwen38LayerRuntimeState {
 }
 
 struct Qwen38Layer {
+    graphs: Arc<TensorIsland>,
+    graphs_enabled: bool,
+    graph_generation: u64,
     attn_norm: Qwen38RmsNorm,
     mixer: Qwen38Mixer,
     post_attention_norm: Qwen38RmsNorm,
@@ -457,11 +584,16 @@ enum Qwen38Mixer {
 }
 
 pub(super) struct Qwen38Mlp {
+    graphs: Arc<TensorIsland>,
+    graphs_enabled: bool,
+    graph_generation: u64,
+    fused_decode: bool,
     gate_up: Qwen38ProjectionGroup,
     down: Qwen38Projection,
 }
 
 pub(super) enum Qwen38Projection {
+    NativeFp8(super::native::RawBlockFp8Projection),
     Quantized(QMatMul),
     Dense(Linear),
 }
@@ -489,11 +621,15 @@ impl Module for Qwen38Projection {
     fn forward(&self, input: &Tensor) -> candle_core::Result<Tensor> {
         if input.device().is_cuda() {
             record_cuda_projection(match self {
+                Self::NativeFp8(_) => CudaProjectionPath::NativeFp8,
                 Self::Quantized(_) => CudaProjectionPath::Q8,
                 Self::Dense(_) => CudaProjectionPath::Dense,
             });
         }
         match self {
+            Self::NativeFp8(raw) => {
+                crate::kernels::cuda::fp8::block_fp8_projection(input, &raw.weights, &raw.scales)
+            }
             Self::Quantized(projection) => projection.forward(input),
             Self::Dense(projection) => projection.forward(input),
         }
@@ -544,6 +680,7 @@ pub(super) struct Qwen38MropePlan {
 }
 
 struct Qwen38LinearAttention {
+    fused_decode: bool,
     qkv_z_proj: Qwen38ProjectionGroup,
     alpha_beta_proj: Qwen38ProjectionGroup,
     dt_bias: Tensor,
@@ -563,6 +700,7 @@ struct Qwen38LinearAttention {
 }
 
 struct Qwen38GatedRmsNorm {
+    fused_decode: bool,
     weight: Tensor,
     eps: f64,
 }
@@ -574,8 +712,33 @@ impl Qwen38TextModel {
         device: &Device,
         target: ProjectionMaterialization,
     ) -> Result<Self> {
+        let performance = crate::performance::PerformanceConfig::default().resolve_env()?;
+        Self::load_native_with_performance(tensors, native, device, target, &performance.cuda)
+    }
+
+    pub fn load_native_with_performance(
+        tensors: &IndexedSafetensors,
+        native: &Qwen38NativeConfig,
+        device: &Device,
+        target: ProjectionMaterialization,
+        performance: &CudaPerformanceConfig,
+    ) -> Result<Self> {
         let cfg = &native.text;
-        let projection_representation = native_projection_representation(device, target);
+        let projection_representation = if native_fp8_selected(
+            device,
+            target,
+            [cfg.embedding_length, cfg.feed_forward_length],
+            performance,
+        ) {
+            match target {
+                ProjectionMaterialization::F16 => {
+                    Qwen38ProjectionRepresentation::NativeFp8WithQ8FallbackF16
+                }
+                _ => Qwen38ProjectionRepresentation::NativeFp8WithQ8FallbackBf16,
+            }
+        } else {
+            native_projection_representation(device, target)
+        };
         let block = native.block_fp8.block_shape;
         let embedding_weights = tensors.materialize_dense_tensor(
             "model.language_model.embed_tokens.weight",
@@ -599,8 +762,10 @@ impl Qwen38TextModel {
             block,
             target,
             device,
+            performance,
         )?;
 
+        let graphs = Arc::new(TensorIsland::default());
         let mut layers = Vec::with_capacity(cfg.block_count);
         for (layer_idx, layer_type) in native.layer_types.iter().copied().enumerate() {
             let prefix = format!("model.language_model.layers.{layer_idx}");
@@ -620,18 +785,42 @@ impl Qwen38TextModel {
                 target,
                 device,
             )?;
-            let mlp = Qwen38Mlp::load_native(tensors, device, &prefix, cfg, block, target)?;
+            let mut mlp =
+                Qwen38Mlp::load_native(tensors, device, &prefix, cfg, block, target, performance)?;
             let mixer = match layer_type {
-                Qwen38LayerType::FullAttention => Qwen38Mixer::Full(
-                    Qwen38FullAttention::load_native(tensors, device, &prefix, cfg, block, target)?,
-                ),
+                Qwen38LayerType::FullAttention => {
+                    Qwen38Mixer::Full(Qwen38FullAttention::load_native(
+                        tensors,
+                        device,
+                        &prefix,
+                        cfg,
+                        block,
+                        target,
+                        performance,
+                    )?)
+                }
                 Qwen38LayerType::LinearAttention => {
                     Qwen38Mixer::Linear(Qwen38LinearAttention::load_native(
-                        tensors, device, &prefix, cfg, block, target,
+                        tensors,
+                        device,
+                        &prefix,
+                        cfg,
+                        block,
+                        target,
+                        performance,
                     )?)
                 }
             };
+            mlp.graphs = graphs.clone();
+            mlp.graph_generation = layer_idx as u64;
+            mlp.graphs_enabled &= layer_idx < GRAPH_LAYER_LIMIT;
             layers.push(Qwen38Layer {
+                graphs: graphs.clone(),
+                graphs_enabled: layer_idx < GRAPH_LAYER_LIMIT
+                    && device.is_cuda()
+                    && performance.enabled()
+                    && performance.decode_graphs.enabled(),
+                graph_generation: layer_idx as u64,
                 attn_norm,
                 mixer,
                 post_attention_norm,
@@ -649,10 +838,20 @@ impl Qwen38TextModel {
         })
     }
 
+    pub(super) fn graph_diagnostics(&self) -> serde_json::Value {
+        self.layers
+            .first()
+            .map_or_else(|| serde_json::json!({}), |layer| layer.graphs.diagnostics())
+    }
+
     pub fn new_state(&self) -> Qwen38TextRuntimeState {
         Qwen38TextRuntimeState {
             layers: self.layers.iter().map(Qwen38Layer::new_state).collect(),
         }
+    }
+
+    pub(super) fn device(&self) -> &Device {
+        &self.device
     }
 
     pub fn hidden_size(&self) -> usize {
@@ -922,6 +1121,55 @@ impl Qwen38TextModel {
         state: &mut Qwen38TextRuntimeState,
         cache: &mut PhysicalPagedKvCache,
     ) -> Result<Tensor> {
+        self.forward_hidden_physical_recording(input, position_ids, state, cache, None)
+    }
+
+    pub(super) fn verify_token_ids_physical(
+        &self,
+        token_ids: &[u32],
+        position_ids: &[[usize; 3]],
+        state: &mut Qwen38TextRuntimeState,
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<Qwen38TextVerification> {
+        if !(2..=4).contains(&token_ids.len()) || token_ids.len() != position_ids.len() {
+            return Err(Error::InvalidInput(
+                "Qwen3.8 verification requires two through four positions".into(),
+            ));
+        }
+        // Initialize before retaining immutable checkpoint handles.
+        for (layer, state) in self.layers.iter().zip(state.layers.iter_mut()) {
+            layer.ensure_state_initialized(state, &self.device)?;
+        }
+        let initial_state = state.clone();
+        let start_position = cache.context_len();
+        let mut layers = (0..self.layers.len()).map(|_| None).collect::<Vec<_>>();
+        let hidden_states = self.forward_hidden_physical_recording(
+            &self.embed_token_ids(token_ids)?,
+            position_ids,
+            state,
+            cache,
+            Some(&mut layers),
+        )?;
+        Ok(Qwen38TextVerification {
+            hidden_states,
+            initial_state,
+            final_state: state.clone(),
+            layers,
+            start_position,
+            token_count: token_ids.len(),
+            view_id: cache.view_id(),
+            generation: cache.logical_generation(),
+        })
+    }
+
+    fn forward_hidden_physical_recording(
+        &self,
+        input: &Tensor,
+        position_ids: &[[usize; 3]],
+        state: &mut Qwen38TextRuntimeState,
+        cache: &mut PhysicalPagedKvCache,
+        mut verification: Option<&mut Vec<Option<Qwen38LinearVerification>>>,
+    ) -> Result<Tensor> {
         self.validate_runtime_state(state)?;
         let (_, sequence_len, hidden_size) = input.dims3()?;
         if sequence_len == 0
@@ -972,6 +1220,7 @@ impl Qwen38TextModel {
                 cache,
                 &mut prepared,
                 &mut physical_layer,
+                verification.as_mut().map(|layers| &mut layers[layer_index]),
             )?;
             validate_qwen38_finite_tensor(
                 &hidden,
@@ -1092,6 +1341,45 @@ impl Qwen38Layer {
         Ok(())
     }
 
+    fn residual_norm(&self, residual: &Tensor, mixed: &Tensor) -> Result<(Tensor, Tensor)> {
+        if self.graphs_enabled
+            && residual
+                .dims3()
+                .is_ok_and(|(batch, rows, _)| batch * rows <= 4)
+        {
+            // Both outputs escape: the residual is needed after the FFN. The
+            // RMS custom op has no growable external workspace; its only
+            // allocations are its output and the explicitly retained sum.
+            let bound = residual
+                .elem_count()
+                .checked_mul(residual.dtype().size_in_bytes())
+                .and_then(|bytes| bytes.checked_mul(2));
+            if let Some(bound) = bound {
+                if let Some(outputs) = self.graphs.run_multi(
+                    &[residual, mixed],
+                    std::slice::from_ref(&self.post_attention_norm.weight),
+                    self.graph_generation,
+                    "qwen38_residual_rms",
+                    GRAPH_CACHE_BYTES,
+                    bound,
+                    |inputs| {
+                        let sum = (&inputs[0] + &inputs[1])?;
+                        let normalized = self.post_attention_norm.forward(&sum)?;
+                        Ok(IslandOutput {
+                            outputs: vec![sum, normalized],
+                            intermediates: vec![],
+                        })
+                    },
+                )? {
+                    return Ok((outputs[0].clone(), outputs[1].clone()));
+                }
+            }
+        }
+        let sum = (residual + mixed)?;
+        let normalized = self.post_attention_norm.forward(&sum)?;
+        Ok((sum, normalized))
+    }
+
     fn forward_physical(
         &self,
         hidden_states: &Tensor,
@@ -1100,6 +1388,7 @@ impl Qwen38Layer {
         cache: &PhysicalPagedKvCache,
         prepared: &mut PreparedPhysicalPagedStep,
         physical_layer: &mut usize,
+        verification: Option<&mut Option<Qwen38LinearVerification>>,
     ) -> Result<Tensor> {
         let residual = hidden_states.clone();
         let normalized = self.attn_norm.forward(hidden_states)?;
@@ -1108,7 +1397,7 @@ impl Qwen38Layer {
                 if normalized.dim(1)? == 1 {
                     mixer.forward(&normalized, state)?
                 } else {
-                    mixer.forward_sequence(&normalized, state)?
+                    mixer.forward_sequence_recording(&normalized, state, verification)?
                 }
             }
             Qwen38Mixer::Full(mixer) => {
@@ -1125,9 +1414,7 @@ impl Qwen38Layer {
                 output
             }
         };
-        let hidden_states = (&residual + &mixed)?;
-        let residual = hidden_states.clone();
-        let hidden_states = self.post_attention_norm.forward(&hidden_states)?;
+        let (residual, hidden_states) = self.residual_norm(&residual, &mixed)?;
         let hidden_states = self.mlp.forward(&hidden_states)?;
         (&residual + &hidden_states).map_err(Error::from)
     }
@@ -1174,9 +1461,7 @@ impl Qwen38Layer {
                 output
             }
         };
-        let hidden_states = (&residual + &mixed)?;
-        let residual = hidden_states.clone();
-        let hidden_states = self.post_attention_norm.forward(&hidden_states)?;
+        let (residual, hidden_states) = self.residual_norm(&residual, &mixed)?;
         let hidden_states = self.mlp.forward(&hidden_states)?;
         (&residual + &hidden_states).map_err(Error::from)
     }
@@ -1190,10 +1475,19 @@ impl Qwen38Mlp {
         cfg: &Qwen38TextConfig,
         block: [usize; 2],
         target: ProjectionMaterialization,
+        performance: &CudaPerformanceConfig,
     ) -> Result<Self> {
         let gate_name = format!("{prefix}.mlp.gate_proj.weight");
         let up_name = format!("{prefix}.mlp.up_proj.weight");
         Ok(Self {
+            graphs: Arc::new(TensorIsland::default()),
+            graphs_enabled: device.is_cuda()
+                && performance.enabled()
+                && performance.decode_graphs.enabled(),
+            graph_generation: 0,
+            fused_decode: device.is_cuda()
+                && performance.enabled()
+                && performance.fused_decode.enabled(),
             gate_up: load_native_projection_group(
                 tensors,
                 &[
@@ -1203,6 +1497,7 @@ impl Qwen38Mlp {
                 block,
                 target,
                 device,
+                performance,
             )?,
             down: load_native_projection(
                 tensors,
@@ -1211,11 +1506,85 @@ impl Qwen38Mlp {
                 block,
                 target,
                 device,
+                performance,
             )?,
         })
     }
 
     pub(super) fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
+        if self.graphs_enabled
+            && hidden_states
+                .dims3()
+                .is_ok_and(|(batch, rows, _)| batch * rows <= 4)
+        {
+            if let Some(owners) = self.native_graph_owners() {
+                let rows = hidden_states.dim(0)? * hidden_states.dim(1)?;
+                let ff = owners[0].dim(0)?;
+                let bound = rows
+                    .checked_mul(ff)
+                    .and_then(|v| v.checked_mul(8))
+                    .and_then(|v| v.checked_add(hidden_states.elem_count()))
+                    .and_then(|v| v.checked_mul(hidden_states.dtype().size_in_bytes()));
+                if let Some(bound) = bound {
+                    if let Some(outputs) = self.graphs.run_multi(
+                        &[hidden_states],
+                        &owners,
+                        self.graph_generation,
+                        "qwen38_native_fp8_mlp",
+                        GRAPH_CACHE_BYTES,
+                        bound,
+                        |inputs| self.native_graph_forward(&inputs[0]),
+                    )? {
+                        return Ok(outputs[0].clone());
+                    }
+                }
+            }
+        }
+        self.forward_eager(hidden_states)
+    }
+
+    pub(super) fn graph_diagnostics(&self) -> serde_json::Value {
+        self.graphs.diagnostics()
+    }
+
+    fn native_graph_owners(&self) -> Option<Vec<Tensor>> {
+        // Never capture Candle QMatMul: its hidden device-global MMVQ scratch
+        // can be reallocated by an unrelated projection after capture.
+        let Qwen38ProjectionGroup::Separate(projections) = &self.gate_up else {
+            return None;
+        };
+        if projections.len() != 2 {
+            return None;
+        }
+        let mut owners = Vec::with_capacity(6);
+        for projection in projections.iter().chain(std::iter::once(&self.down)) {
+            let Qwen38Projection::NativeFp8(raw) = projection else {
+                return None;
+            };
+            owners.push(raw.weights.clone());
+            owners.push(raw.scales.clone());
+        }
+        Some(owners)
+    }
+
+    fn native_graph_forward(&self, input: &Tensor) -> candle_core::Result<IslandOutput> {
+        let Qwen38ProjectionGroup::Separate(projections) = &self.gate_up else {
+            candle_core::bail!("native FP8 graph requires separate projections")
+        };
+        let gate = projections[0].forward(input)?;
+        let up = projections[1].forward(input)?;
+        // Keep the explicit SiLU intermediate alive: capture owns every
+        // allocation, including when a generic epilogue has no fused route.
+        let activated = ops::silu(&gate)?;
+        let product = (&activated * &up)?;
+        let output = self.down.forward(&product)?;
+        Ok(IslandOutput {
+            outputs: vec![output],
+            intermediates: vec![gate, up, activated, product],
+        })
+    }
+
+    fn forward_eager(&self, hidden_states: &Tensor) -> Result<Tensor> {
         // Use fused SiLU-gate-up if available (reduces memory bandwidth)
         let mut gate_up = self.gate_up.forward(hidden_states)?.into_iter();
         let gate_proj_out = gate_up.next().ok_or_else(|| {
@@ -1225,11 +1594,7 @@ impl Qwen38Mlp {
             Error::InferenceError("Qwen3.8 gate/up projection omitted up output".into())
         })?;
 
-        let candidate = if qwen38_decode_epilogues_enabled(gate_proj_out.device())
-            && gate_proj_out
-                .dims3()
-                .is_ok_and(|dims| dims.0 == 1 && dims.1 == 1)
-        {
+        let candidate = if self.fused_decode {
             let result = try_qwen38_silu_mul_decode(&gate_proj_out, &up_proj_out);
             record_cuda_kernel(CudaKernelPath::SiluMul, result.is_some());
             result
@@ -1256,6 +1621,7 @@ impl Qwen38FullAttention {
         cfg: &Qwen38TextConfig,
         block: [usize; 2],
         target: ProjectionMaterialization,
+        performance: &CudaPerformanceConfig,
     ) -> Result<Self> {
         let q_width = cfg
             .attention_head_count
@@ -1280,6 +1646,7 @@ impl Qwen38FullAttention {
                 block,
                 target,
                 device,
+                performance,
             )?,
             o_proj: load_native_projection(
                 tensors,
@@ -1291,6 +1658,7 @@ impl Qwen38FullAttention {
                 block,
                 target,
                 device,
+                performance,
             )?,
             q_norm: load_native_zero_centered_norm(
                 tensors,
@@ -1635,6 +2003,7 @@ impl Qwen38LinearAttention {
         cfg: &Qwen38TextConfig,
         block: [usize; 2],
         target: ProjectionMaterialization,
+        performance: &CudaPerformanceConfig,
     ) -> Result<Self> {
         let num_k_heads = cfg.ssm_group_count;
         let num_v_heads = cfg.ssm_time_step_rank;
@@ -1669,6 +2038,9 @@ impl Qwen38LinearAttention {
         )?;
         let conv_kernel_slices = pre_slice_conv_kernel(&conv_kernel, cfg.ssm_conv_kernel)?;
         let norm = Qwen38GatedRmsNorm {
+            fused_decode: device.is_cuda()
+                && performance.enabled()
+                && performance.fused_decode.enabled(),
             weight: tensors.materialize_dense_tensor(
                 &format!("{linear}.norm.weight"),
                 &[head_v_dim],
@@ -1682,6 +2054,9 @@ impl Qwen38LinearAttention {
         let alpha_name = format!("{linear}.in_proj_a.weight");
         let beta_name = format!("{linear}.in_proj_b.weight");
         Ok(Self {
+            fused_decode: device.is_cuda()
+                && performance.enabled()
+                && performance.fused_decode.enabled(),
             qkv_z_proj: load_native_projection_group(
                 tensors,
                 &[
@@ -1691,6 +2066,7 @@ impl Qwen38LinearAttention {
                 block,
                 target,
                 device,
+                performance,
             )?,
             alpha_beta_proj: load_native_projection_group(
                 tensors,
@@ -1701,6 +2077,7 @@ impl Qwen38LinearAttention {
                 block,
                 target,
                 device,
+                performance,
             )?,
             dt_bias,
             a,
@@ -1714,6 +2091,7 @@ impl Qwen38LinearAttention {
                 block,
                 target,
                 device,
+                performance,
             )?,
             num_k_heads,
             num_v_heads,
@@ -1780,7 +2158,7 @@ impl Qwen38LinearAttention {
 
         let beta = beta.reshape((1, self.num_v_heads))?;
         let g = g.reshape((1, self.num_v_heads))?;
-        let specialized = if qwen38_deltanet_decode_enabled(mixed_qkv.device()) {
+        let specialized = if self.fused_decode {
             let result = try_qwen38_deltanet_decode(
                 &mixed_qkv,
                 &g,
@@ -1814,8 +2192,8 @@ impl Qwen38LinearAttention {
                 self.num_v_heads,
                 self.head_v_dim,
             ))?;
-            let mut query = l2norm(&query, 1e-6)?;
-            let mut key = l2norm(&key, 1e-6)?;
+            let mut query = l2norm(&query, 1e-6, self.fused_decode)?;
+            let mut key = l2norm(&key, 1e-6, self.fused_decode)?;
             if self.num_v_heads != self.num_k_heads {
                 let repeats = self.num_v_heads / self.num_k_heads;
                 if query.device().is_cuda() {
@@ -1903,7 +2281,7 @@ impl Qwen38LinearAttention {
             };
             let beta = beta.reshape((1, self.num_v_heads))?;
             let g = g.reshape((1, self.num_v_heads))?;
-            let specialized = if qwen38_deltanet_decode_enabled(mixed_qkv.device()) {
+            let specialized = if self.fused_decode {
                 let result = try_qwen38_deltanet_decode(
                     &mixed_qkv,
                     &g,
@@ -1937,8 +2315,8 @@ impl Qwen38LinearAttention {
                     self.num_v_heads,
                     self.head_v_dim,
                 ))?;
-                let mut query = l2norm(&query, 1e-6)?;
-                let mut key = l2norm(&key, 1e-6)?;
+                let mut query = l2norm(&query, 1e-6, self.fused_decode)?;
+                let mut key = l2norm(&key, 1e-6, self.fused_decode)?;
                 if self.num_v_heads != self.num_k_heads {
                     let repeats = self.num_v_heads / self.num_k_heads;
                     if query.device().is_cuda() {
@@ -1970,6 +2348,16 @@ impl Qwen38LinearAttention {
         hidden_states: &Tensor,
         state: &mut Qwen38LayerRuntimeState,
     ) -> Result<Tensor> {
+        self.forward_sequence_recording(hidden_states, state, None)
+    }
+
+    fn forward_sequence_recording(
+        &self,
+        hidden_states: &Tensor,
+        state: &mut Qwen38LayerRuntimeState,
+        verification: Option<&mut Option<Qwen38LinearVerification>>,
+    ) -> Result<Tensor> {
+        let initial = verification.as_ref().map(|_| state.clone());
         let seq_len = hidden_states.dim(1)?;
         if seq_len == 1 {
             return self.forward(hidden_states, state);
@@ -1999,6 +2387,7 @@ impl Qwen38LinearAttention {
         )?;
         let g = softplus(&alpha.broadcast_add(&self.dt_bias)?)?.broadcast_mul(&self.a)?;
 
+        let convolution_input = verification.as_ref().map(|_| mixed_qkv.clone());
         let mixed_qkv = self.depthwise_conv_sequence(&mixed_qkv, conv_state)?;
 
         let key_width = self.num_k_heads * self.head_k_dim;
@@ -2022,8 +2411,8 @@ impl Qwen38LinearAttention {
             self.head_v_dim,
         ))?;
 
-        let query = l2norm(&query, 1e-6)?;
-        let key = l2norm(&key, 1e-6)?;
+        let query = l2norm(&query, 1e-6, self.fused_decode)?;
+        let key = l2norm(&key, 1e-6, self.fused_decode)?;
         if self.num_k_heads == 0 || !self.num_v_heads.is_multiple_of(self.num_k_heads) {
             return Err(Error::InferenceError(format!(
                 "Invalid linear-attention head layout: num_v_heads={}, num_k_heads={}",
@@ -2046,6 +2435,17 @@ impl Qwen38LinearAttention {
 
         let beta = beta.reshape((1, seq_len, self.num_v_heads))?;
         let g = g.reshape((1, seq_len, self.num_v_heads))?;
+        if let Some(retained) = verification {
+            *retained = Some(Qwen38LinearVerification {
+                initial: initial.expect("recording retains initial state"),
+                convolution_input: convolution_input.expect("recording retains conv input"),
+                query: query.clone(),
+                key: key.clone(),
+                value: value.clone(),
+                g: g.clone(),
+                beta: beta.clone(),
+            });
+        }
         let tile_size =
             qwen38_tiled_recurrence_tile_size(seq_len, self.tiled_recurrence_tile_size_override);
         let fused_sequence = if self.tiled_recurrence_enabled {
@@ -2142,7 +2542,11 @@ impl Qwen38LinearAttention {
                 )));
             }
             let history = buffer.contiguous_history()?;
-            let fused = try_qwen38_causal_conv_sequence(mixed_qkv, &self.conv_kernel, &history);
+            let fused = if !mixed_qkv.device().is_cuda() || self.fused_decode {
+                try_qwen38_causal_conv_sequence(mixed_qkv, &self.conv_kernel, &history)
+            } else {
+                None
+            };
             if mixed_qkv.device().is_cuda() {
                 record_cuda_kernel(CudaKernelPath::CausalConvPrefill, fused.is_some());
             }
@@ -2172,10 +2576,7 @@ impl Qwen38LinearAttention {
         mixed_qkv: &Tensor,
         conv_state: &mut Option<ConvRingState>,
     ) -> Result<Tensor> {
-        if self.kernel_size == 4
-            && mixed_qkv.device().is_cuda()
-            && qwen38_env_bool("IZWI_QWEN38_CAUSAL_CONV_DECODE", false)
-        {
+        if self.kernel_size == 4 && mixed_qkv.device().is_cuda() && self.fused_decode {
             let buffer = conv_state.as_mut().ok_or_else(|| {
                 Error::InferenceError(
                     "conv_state not initialized but Qwen3.8 decode convolution needs history"
@@ -2252,9 +2653,9 @@ impl Qwen38LinearAttention {
 }
 
 impl Qwen38GatedRmsNorm {
-    fn forward(&self, hidden_states: &Tensor, gate: &Tensor, decode: bool) -> Result<Tensor> {
+    fn forward(&self, hidden_states: &Tensor, gate: &Tensor, _decode: bool) -> Result<Tensor> {
         if hidden_states.dtype() == DType::F32 {
-            if decode && qwen38_decode_epilogues_enabled(hidden_states.device()) {
+            if self.fused_decode {
                 let candidate =
                     try_qwen38_gated_rms_norm_decode(hidden_states, gate, &self.weight, self.eps);
                 record_cuda_kernel(CudaKernelPath::GatedRmsNorm, candidate.is_some());
@@ -2271,6 +2672,31 @@ impl Qwen38GatedRmsNorm {
         let normalized = candle_nn::ops::rms_norm(hidden_states, &self.weight, self.eps as f32)?;
         (&normalized * &ops::silu(gate)?).map_err(Error::from)
     }
+}
+
+pub(super) fn native_fp8_selected(
+    device: &Device,
+    target: ProjectionMaterialization,
+    shape: [usize; 2],
+    performance: &CudaPerformanceConfig,
+) -> bool {
+    use crate::kernels::cuda::fp8::{provider_auto_preferred, provider_supported};
+    use crate::performance::CudaProjectionBackend;
+    let dtype = match target {
+        ProjectionMaterialization::F32 => DType::F32,
+        ProjectionMaterialization::F16 => DType::F16,
+        ProjectionMaterialization::BF16 => DType::BF16,
+    };
+    performance.enabled()
+        && match performance.projection_backend {
+            CudaProjectionBackend::Q8 => false,
+            CudaProjectionBackend::Auto => {
+                provider_auto_preferred(device, dtype, shape[0], shape[1])
+            }
+            CudaProjectionBackend::NativeFp8 => {
+                provider_supported(device, dtype, shape[0], shape[1])
+            }
+        }
 }
 
 pub(super) fn native_projection_representation(
@@ -2300,8 +2726,14 @@ pub(super) fn load_native_projection(
     block: [usize; 2],
     target: ProjectionMaterialization,
     device: &Device,
+    performance: &CudaPerformanceConfig,
 ) -> Result<Qwen38Projection> {
     if device.is_cuda() && tensors.tensor_info(name)?.dtype == SafeDType::F8_E4M3 {
+        if native_fp8_selected(device, target, shape, performance) {
+            return tensors
+                .materialize_block_fp8_raw(name, shape, block, device)
+                .map(Qwen38Projection::NativeFp8);
+        }
         return tensors
             .materialize_q8_projection(name, shape, block, device)
             .map(Qwen38Projection::Quantized);
@@ -2317,18 +2749,21 @@ fn load_native_projection_group(
     block: [usize; 2],
     target: ProjectionMaterialization,
     device: &Device,
+    performance: &CudaPerformanceConfig,
 ) -> Result<Qwen38ProjectionGroup> {
     let load_separate = || {
         projections
             .iter()
             .map(|(name, shape)| {
-                load_native_projection(tensors, name, *shape, block, target, device)
+                load_native_projection(tensors, name, *shape, block, target, device, performance)
             })
             .collect::<Result<Vec<_>>>()
             .map(Qwen38ProjectionGroup::Separate)
     };
-    if !qwen38_projection_packing_enabled(device)
-        || !projection_group_geometry_compatible(projections)
+    if !(device.is_cuda()
+        && performance.enabled()
+        && performance.packed_projections.enabled()
+        && projection_group_geometry_compatible(projections))
     {
         return load_separate();
     }
@@ -2349,6 +2784,15 @@ fn load_native_projection_group(
         return load_separate();
     }
 
+    // A direct native provider owns exact source blocks; use separate
+    // projections when their row boundaries cannot safely share one scale grid.
+    if all_fp8
+        && projections
+            .iter()
+            .any(|(_, shape)| native_fp8_selected(device, target, *shape, performance))
+    {
+        return load_separate();
+    }
     let projection = if device.is_cuda() && all_fp8 {
         tensors
             .materialize_q8_projection_group(projections, block, device)
@@ -2701,9 +3145,9 @@ fn softplus(x: &Tensor) -> Result<Tensor> {
     (&positive + &correction).map_err(Error::from)
 }
 
-fn l2norm(x: &Tensor, eps: f64) -> Result<Tensor> {
+fn l2norm(x: &Tensor, eps: f64, fused_decode: bool) -> Result<Tensor> {
     if x.dtype() == DType::F32 {
-        if qwen38_decode_epilogues_enabled(x.device()) && x.dims().len() == 3 {
+        if fused_decode && x.dims().len() == 3 {
             let candidate = try_qwen38_l2_norm_decode(x, eps);
             record_cuda_kernel(CudaKernelPath::L2Norm, candidate.is_some());
             if let Some(result) = candidate {
@@ -2755,33 +3199,12 @@ fn qwen38_env_bool(name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
-fn qwen38_projection_packing_enabled(device: &Device) -> bool {
-    qwen38_projection_packing_policy(
-        device.is_cuda(),
-        qwen38_env_bool("IZWI_QWEN38_PACKED_PROJECTIONS", false),
-    )
-}
-
-fn qwen38_decode_epilogues_enabled(device: &Device) -> bool {
-    qwen38_decode_epilogues_policy(
-        device.is_cuda(),
-        qwen38_env_bool("IZWI_QWEN38_DECODE_EPILOGUES", false),
-    )
-}
-
 fn qwen38_decode_epilogues_policy(is_cuda: bool, requested: bool) -> bool {
     is_cuda && requested
 }
 
 fn qwen38_projection_packing_policy(is_cuda: bool, requested: bool) -> bool {
     is_cuda && requested
-}
-
-fn qwen38_deltanet_decode_enabled(device: &Device) -> bool {
-    qwen38_deltanet_decode_policy(
-        device.is_cuda(),
-        qwen38_env_bool("IZWI_QWEN38_DELTANET_DECODE", false),
-    )
 }
 
 fn qwen38_deltanet_decode_policy(is_cuda: bool, requested: bool) -> bool {
@@ -3066,6 +3489,7 @@ mod tests {
             ))
         };
         let mixer = Qwen38LinearAttention {
+            fused_decode: false,
             qkv_z_proj: Qwen38ProjectionGroup::Separate(vec![dense(6, 4, 0.01), dense(2, 4, 0.02)]),
             alpha_beta_proj: Qwen38ProjectionGroup::Separate(vec![
                 dense(1, 4, 0.03),
@@ -3076,6 +3500,7 @@ mod tests {
             conv_kernel: Tensor::ones((6, 1), DType::F32, device).unwrap(),
             conv_kernel_slices: Vec::new(),
             norm: Qwen38GatedRmsNorm {
+                fused_decode: false,
                 weight: Tensor::ones(2, DType::F32, device).unwrap(),
                 eps: 1e-6,
             },
@@ -3173,7 +3598,7 @@ mod tests {
     }
 
     #[test]
-    fn projection_packing_is_cuda_only_and_disabled_without_opt_in() {
+    fn projection_packing_is_cuda_only_with_explicit_opt_out() {
         assert!(!qwen38_projection_packing_policy(false, false));
         assert!(!qwen38_projection_packing_policy(false, true));
         assert!(!qwen38_projection_packing_policy(true, false));
@@ -3181,7 +3606,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_epilogues_are_cuda_only_and_disabled_without_opt_in() {
+    fn decode_epilogues_are_cuda_only_with_explicit_opt_out() {
         assert!(!qwen38_decode_epilogues_policy(false, false));
         assert!(!qwen38_decode_epilogues_policy(false, true));
         assert!(!qwen38_decode_epilogues_policy(true, false));
@@ -3189,7 +3614,7 @@ mod tests {
     }
 
     #[test]
-    fn deltanet_decode_specialization_is_cuda_only_and_disabled_without_opt_in() {
+    fn deltanet_decode_specialization_is_cuda_only_with_explicit_opt_out() {
         assert!(!qwen38_deltanet_decode_policy(false, false));
         assert!(!qwen38_deltanet_decode_policy(false, true));
         assert!(!qwen38_deltanet_decode_policy(true, false));
@@ -3660,3 +4085,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod verification_tests;

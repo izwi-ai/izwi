@@ -3,7 +3,7 @@
 //! Inspired by vLLM, SGlang, Ollama, and llama.cpp CLIs
 #![allow(dead_code)]
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use izwi_core::backends::BackendPreference;
 use std::path::PathBuf;
 
@@ -71,6 +71,118 @@ pub struct Cli {
     pub no_color: bool,
 }
 
+/// Optional CLI layer for CUDA and loading policies. Every field is optional
+/// so a flag cannot erase a sibling from TOML or the environment.
+#[derive(Args, Debug, Clone, Default)]
+pub struct PerformanceArgs {
+    /// CUDA performance master mode (auto/off); off dominates individual features
+    #[arg(
+        long = "cuda-performance",
+        alias = "cuda-mode",
+        value_name = "AUTO_OR_OFF"
+    )]
+    pub cuda_mode: Option<izwi_core::OptimizationMode>,
+    /// CUDA projection backend (auto/q8/native_fp8)
+    #[arg(long, value_name = "BACKEND")]
+    pub cuda_projection_backend: Option<izwi_core::CudaProjectionBackend>,
+    /// CUDA packed projections (auto/off)
+    #[arg(long, value_name = "AUTO_OR_OFF")]
+    pub cuda_packed_projections: Option<izwi_core::OptimizationMode>,
+    /// CUDA fused decode (auto/off)
+    #[arg(long, value_name = "AUTO_OR_OFF")]
+    pub cuda_fused_decode: Option<izwi_core::OptimizationMode>,
+    /// CUDA device sampling (auto/off)
+    #[arg(long, value_name = "AUTO_OR_OFF")]
+    pub cuda_device_sampling: Option<izwi_core::OptimizationMode>,
+    /// CUDA decode graphs (auto/off)
+    #[arg(long, value_name = "AUTO_OR_OFF")]
+    pub cuda_decode_graphs: Option<izwi_core::OptimizationMode>,
+    /// CUDA mtp (auto/off)
+    #[arg(long, value_name = "AUTO_OR_OFF")]
+    pub cuda_mtp: Option<izwi_core::OptimizationMode>,
+    /// CUDA mtp quantum (auto/off)
+    #[arg(long, value_name = "AUTO_OR_OFF")]
+    pub cuda_mtp_quantum: Option<izwi_core::OptimizationMode>,
+    /// CUDA mtp draft tokens (1..3; default 1)
+    #[arg(long, value_parser = parse_mtp_depth)]
+    pub cuda_mtp_draft_tokens: Option<usize>,
+    /// CUDA mtp adaptive (true/false; default true)
+    #[arg(long, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub cuda_mtp_adaptive: Option<bool>,
+    /// LOADING performance master mode (auto/off); off dominates individual features
+    #[arg(
+        long = "loading-performance",
+        alias = "loading-mode",
+        value_name = "AUTO_OR_OFF"
+    )]
+    pub loading_mode: Option<izwi_core::OptimizationMode>,
+    /// LOADING derived weight cache (auto/off)
+    #[arg(long, value_name = "AUTO_OR_OFF")]
+    pub loading_derived_weight_cache: Option<izwi_core::OptimizationMode>,
+    /// LOADING parallel conversion (auto/off)
+    #[arg(long, value_name = "AUTO_OR_OFF")]
+    pub loading_parallel_conversion: Option<izwi_core::OptimizationMode>,
+    /// LOADING pinned uploads (auto/off)
+    #[arg(long, value_name = "AUTO_OR_OFF")]
+    pub loading_pinned_uploads: Option<izwi_core::OptimizationMode>,
+    /// LOADING io strategy (auto/mmap/sequential)
+    #[arg(long, value_name = "STRATEGY")]
+    pub loading_io_strategy: Option<izwi_core::LoadingIoStrategy>,
+    /// LOADING workers (0 selects automatically)
+    #[arg(long)]
+    pub loading_workers: Option<usize>,
+    /// LOADING max staging bytes (positive byte limit; default 256 MiB)
+    #[arg(long, value_parser = parse_staging_bytes)]
+    pub loading_max_staging_bytes: Option<usize>,
+    /// LOADING cache max bytes
+    #[arg(long)]
+    pub loading_cache_max_bytes: Option<u64>,
+    /// LOADING cache dir
+    #[arg(long)]
+    pub loading_cache_dir: Option<PathBuf>,
+}
+
+fn parse_mtp_depth(value: &str) -> std::result::Result<usize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|value| (1..=3).contains(value))
+        .ok_or_else(|| "MTP draft tokens must be in 1..=3".to_string())
+}
+fn parse_staging_bytes(value: &str) -> std::result::Result<usize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "staging byte limit must be positive".to_string())
+}
+
+impl PerformanceArgs {
+    pub fn into_overrides(self) -> izwi_core::PerformanceConfigOverrides {
+        let mut overrides = izwi_core::PerformanceConfigOverrides::default();
+        overrides.cuda.mode = self.cuda_mode;
+        overrides.cuda.projection_backend = self.cuda_projection_backend;
+        overrides.cuda.packed_projections = self.cuda_packed_projections;
+        overrides.cuda.fused_decode = self.cuda_fused_decode;
+        overrides.cuda.device_sampling = self.cuda_device_sampling;
+        overrides.cuda.decode_graphs = self.cuda_decode_graphs;
+        overrides.cuda.mtp = self.cuda_mtp;
+        overrides.cuda.mtp_quantum = self.cuda_mtp_quantum;
+        overrides.cuda.mtp_draft_tokens = self.cuda_mtp_draft_tokens;
+        overrides.cuda.mtp_adaptive = self.cuda_mtp_adaptive;
+        overrides.loading.mode = self.loading_mode;
+        overrides.loading.derived_weight_cache = self.loading_derived_weight_cache;
+        overrides.loading.parallel_conversion = self.loading_parallel_conversion;
+        overrides.loading.pinned_uploads = self.loading_pinned_uploads;
+        overrides.loading.io_strategy = self.loading_io_strategy;
+        overrides.loading.workers = self.loading_workers;
+        overrides.loading.max_staging_bytes = self.loading_max_staging_bytes;
+        overrides.loading.cache_max_bytes = self.loading_cache_max_bytes;
+        overrides.loading.cache_dir = self.loading_cache_dir;
+        overrides
+    }
+}
+
 #[derive(Subcommand)]
 pub enum Commands {
     /// Start the inference server
@@ -79,6 +191,8 @@ pub enum Commands {
     /// Supports graceful shutdown with Ctrl+C.
     #[command(name = "serve", alias = "server")]
     Serve {
+        #[command(flatten)]
+        performance: PerformanceArgs,
         /// Startup mode
         ///
         /// - server: Start only the HTTP server
@@ -674,7 +788,7 @@ pub enum ConfigCommands {
 
     /// Set a configuration value
     Set {
-        /// Configuration key (e.g., server.host, runtime.max_batch_size, ui.enabled)
+        /// Configuration key (e.g., runtime.performance.cuda.mode, runtime.performance.loading.mode)
         key: String,
         /// Configuration value
         value: String,
@@ -837,6 +951,69 @@ mod tests {
                 assert_eq!(max_physical_in_flight.map(|limit| limit.get()), Some(3));
             }
             _ => panic!("expected serve command"),
+        }
+    }
+
+    #[test]
+    fn serve_performance_flags_are_partial_and_preserve_explicit_false() {
+        let cli = Cli::try_parse_from([
+            "izwi",
+            "serve",
+            "--cuda-performance",
+            "off",
+            "--cuda-mtp",
+            "auto",
+            "--cuda-mtp-adaptive",
+            "false",
+            "--loading-workers",
+            "0",
+            "--loading-performance",
+            "off",
+        ])
+        .unwrap();
+        let Commands::Serve { performance, .. } = cli.command else {
+            panic!("serve");
+        };
+        let overrides = performance.into_overrides();
+        assert_eq!(overrides.cuda.mode, Some(izwi_core::OptimizationMode::Off));
+        assert_eq!(overrides.cuda.mtp, Some(izwi_core::OptimizationMode::Auto));
+        assert_eq!(overrides.cuda.mtp_adaptive, Some(false));
+        assert_eq!(overrides.loading.workers, Some(0));
+        assert!(overrides.cuda.packed_projections.is_none());
+        assert!(overrides.loading.derived_weight_cache.is_none());
+    }
+
+    #[test]
+    fn performance_help_and_invalid_values_cover_operator_contract() {
+        use clap::CommandFactory;
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("serve")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        for flag in [
+            "--cuda-performance",
+            "--cuda-projection-backend",
+            "--cuda-mtp-adaptive",
+            "--loading-performance",
+            "--loading-max-staging-bytes",
+            "--loading-cache-dir",
+        ] {
+            assert!(help.contains(flag), "missing {flag}");
+        }
+        for (flag, value) in [
+            ("--cuda-mtp-draft-tokens", "0"),
+            ("--cuda-mtp-draft-tokens", "4"),
+            ("--cuda-mtp-adaptive", "maybe"),
+            ("--cuda-performance", "on"),
+            ("--loading-max-staging-bytes", "0"),
+            ("--loading-io-strategy", "random"),
+        ] {
+            assert!(
+                Cli::try_parse_from(["izwi", "serve", flag, value]).is_err(),
+                "{flag}={value}"
+            );
         }
     }
 }

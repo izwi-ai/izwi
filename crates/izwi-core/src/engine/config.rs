@@ -61,6 +61,9 @@ pub(crate) fn tts_explicit_output_limit(
 /// Configuration for the engine core.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineCoreConfig {
+    /// Performance policy, resolved once before model loading.
+    #[serde(default)]
+    pub performance: crate::performance::PerformanceConfig,
     /// Directory containing models
     #[serde(default = "default_models_dir")]
     pub models_dir: PathBuf,
@@ -364,6 +367,7 @@ fn default_max_prefix_cache_pages() -> usize {
 impl Default for EngineCoreConfig {
     fn default() -> Self {
         Self {
+            performance: Default::default(),
             models_dir: default_models_dir(),
             max_batch_size: default_max_batch_size(),
             max_tensor_batch_size: BatchSizePreference::Auto,

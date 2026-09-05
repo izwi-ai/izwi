@@ -30,15 +30,23 @@ fn get_config_path(override_path: Option<&PathBuf>) -> Result<PathBuf> {
         return Ok(path.clone());
     }
 
-    let config_dir = dirs::config_dir()
-        .ok_or_else(|| CliError::ConfigError("Could not find config directory".to_string()))?;
-    Ok(config_dir.join("izwi").join("config.toml"))
+    Ok(izwi_core::performance::default_user_config_path())
 }
 
 fn default_config_contents() -> Result<String> {
     let body = toml::to_string_pretty(&Config::default_template())
         .map_err(|e| CliError::ConfigError(e.to_string()))?;
-    Ok(format!("# Izwi Configuration\n\n{body}"))
+    Ok(format!(
+        "# Izwi Configuration\n\n\
+# CUDA/loading optimizations default to auto on supported paths.\n\
+# Opt out: izwi config set runtime.performance.cuda.mode off\n\
+# Loading opt-out: izwi config set runtime.performance.loading.mode off\n\
+# Each feature accepts auto/off. projection_backend: auto/q8/native_fp8.\n\
+# io_strategy: auto/mmap/sequential; mtp_draft_tokens: 1..3.\n\
+# workers=0 chooses automatically; staging and cache limits are bytes.\n\
+# Precedence: defaults < TOML < environment < CLI.\n\
+# Changes require model reload (restart a serving process).\n\n{body}"
+    ))
 }
 
 async fn show_config(path: &PathBuf, theme: &Theme) -> Result<()> {
@@ -70,6 +78,10 @@ async fn set_config(path: &PathBuf, key: &str, value: &str, theme: &Theme) -> Re
         .map_err(|e| CliError::ConfigError(e.to_string()))?;
 
     theme.success(&format!("Set {} = {}", key, value));
+    if key.starts_with("runtime.performance.") {
+        theme
+            .info("Performance changes require model reload; restart an existing serving process.");
+    }
     Ok(())
 }
 
@@ -78,6 +90,11 @@ async fn get_config(path: &PathBuf, key: &str, _theme: &Theme) -> Result<()> {
 
     if let Some(value) = config.get_value(key) {
         println!("{} = {}", key, value);
+        return Ok(());
+    }
+
+    if key == "runtime.performance.loading.cache_dir" {
+        println!("{} not set (automatic model cache directory)", key);
         return Ok(());
     }
 
@@ -142,4 +159,27 @@ async fn reset_config(path: &PathBuf, yes: bool, theme: &Theme) -> Result<()> {
 
     theme.success("Configuration reset to defaults");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_help_documents_default_on_and_opt_out_contract() {
+        let contents = default_config_contents().unwrap();
+        assert!(contents.contains("runtime.performance.cuda.mode off"));
+        assert!(contents.contains("runtime.performance.loading.mode off"));
+        assert!(contents.contains("defaults < TOML < environment < CLI"));
+        assert!(contents.contains("restart a serving process"));
+        let config: Config = toml::from_str(&contents).unwrap();
+        assert_eq!(
+            config.get_value("runtime.performance.cuda.mode"),
+            Some(toml::Value::String("auto".into()))
+        );
+        assert_eq!(
+            config.get_value("runtime.performance.loading.workers"),
+            Some(toml::Value::Integer(0))
+        );
+    }
 }

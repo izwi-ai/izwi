@@ -1213,6 +1213,10 @@ pub struct ExecutionProfile {
     /// transaction. The scheduler may reduce this for fairness or latency.
     #[serde(default = "default_preferred_decode_tokens")]
     pub preferred_decode_tokens: usize,
+    /// A loaded CUDA adapter may retain its isolated multi-token quantum after
+    /// a soft scheduling SLA. This never relaxes hard deadlines or peer fairness.
+    #[serde(default)]
+    pub sustained_decode_quantum: bool,
     pub resolved_from_loaded_model: bool,
     pub compute_dtype: String,
     pub kv_dtype: String,
@@ -1249,6 +1253,7 @@ impl ExecutionProfile {
             prefix_reuse_safe: false,
             max_batch_size: 1,
             preferred_decode_tokens: 1,
+            sustained_decode_quantum: false,
             resolved_from_loaded_model: false,
             compute_dtype: "unknown".to_string(),
             kv_dtype: "none".to_string(),
@@ -1288,6 +1293,14 @@ impl ExecutionProfile {
         } else {
             PhysicalLaunchPolicy::ExecutionGroupExclusive
         }
+    }
+
+    pub fn effective_sustained_decode_quantum(&self) -> bool {
+        self.resolved_from_loaded_model
+            && self.backend == BackendKind::Cuda
+            && self.incremental_decode
+            && self.preferred_decode_tokens > 1
+            && self.sustained_decode_quantum
     }
 }
 

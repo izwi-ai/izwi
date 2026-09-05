@@ -155,6 +155,8 @@ pub struct DiarizationConfig {
 
 #[derive(Debug, Clone)]
 pub struct ChatGeneration {
+    pub latency_breakdown: Option<crate::engine::LatencyBreakdown>,
+    pub finish_reason: Option<crate::engine::OutputFinishReason>,
     pub text: String,
     pub prompt_tokens: usize,
     pub tokens_generated: usize,

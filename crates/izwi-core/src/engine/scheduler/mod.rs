@@ -532,6 +532,7 @@ struct RequestCachePolicy {
     recompute_safe: bool,
     cache_release_safe: bool,
     preferred_decode_tokens: usize,
+    sustained_decode_quantum: bool,
 }
 
 impl Default for RequestCachePolicy {
@@ -545,6 +546,7 @@ impl Default for RequestCachePolicy {
             recompute_safe: false,
             cache_release_safe: false,
             preferred_decode_tokens: 1,
+            sustained_decode_quantum: false,
         }
     }
 }
@@ -869,6 +871,7 @@ impl Scheduler {
             recompute_safe: profile.recompute_safe,
             cache_release_safe: profile.cache_release_safe,
             preferred_decode_tokens: profile.preferred_decode_tokens.max(1),
+            sustained_decode_quantum: profile.effective_sustained_decode_quantum(),
         };
         true
     }
@@ -1106,6 +1109,7 @@ impl Scheduler {
                     overdue_ms,
                     metadata.cache_policy.decode_batch == NativeBatchMode::Continuous,
                     metadata.cache_policy.preferred_decode_tokens,
+                    metadata.cache_policy.sustained_decode_quantum,
                 ))
             })
             .collect();
@@ -1181,6 +1185,7 @@ impl Scheduler {
             overdue_ms,
             continuous_decode,
             preferred_decode_tokens,
+            sustained_decode_quantum,
         ) in decode_candidates
         {
             if self.config.enable_preemption
@@ -1209,10 +1214,33 @@ impl Scheduler {
                 workload_class,
                 preferred_decode_tokens,
                 continuous_decode,
+                sustained_decode_quantum,
             );
             if num_tokens == 0 {
                 continue;
             }
+
+            let quantum_reason = if num_tokens > 1 {
+                "model_preference"
+            } else if remaining_decode_budget <= 1 || remaining_decode_tokens <= 1 {
+                "token_budget"
+            } else if self.waiting_count() > 0 || self.running.len() > 1 {
+                "peer_fairness"
+            } else if overdue_ms > 0.0 && !sustained_decode_quantum {
+                "soft_deadline"
+            } else if preferred_decode_tokens <= 1 {
+                "scalar_model_policy"
+            } else {
+                "workload_policy"
+            };
+            debug!(
+                request_id = %request_id,
+                granted_tokens = num_tokens,
+                preferred_tokens = preferred_decode_tokens,
+                quantum_reason,
+                sustained_decode_quantum,
+                "Decode quantum granted"
+            );
 
             if let Some(running) = self.running.get_mut(&request_id) {
                 running.paused = false;
@@ -2577,6 +2605,7 @@ impl Scheduler {
         workload_class: WorkloadClass,
         preferred_decode_tokens: usize,
         continuous_decode: bool,
+        sustained_decode_quantum: bool,
     ) -> usize {
         let base = remaining_decode_budget.min(remaining_request_tokens).max(1);
         let preferred_decode_tokens = preferred_decode_tokens.max(1);
@@ -2589,7 +2618,7 @@ impl Scheduler {
                     .count()
                     == 1
                 && !has_waiting_work
-                && overdue_ms <= 0.0;
+                && (overdue_ms <= 0.0 || sustained_decode_quantum);
             if exact_solo && preferred_decode_tokens > 1 {
                 return preferred_decode_tokens.min(base).max(1);
             }
@@ -2602,7 +2631,7 @@ impl Scheduler {
             return 1.min(base);
         }
         let active_decode_requests = self.running.values().filter(|r| r.prefill_complete).count();
-        if has_waiting_work || overdue_ms > 0.0 {
+        if has_waiting_work || (overdue_ms > 0.0 && !sustained_decode_quantum) {
             return 1.min(base);
         }
         if active_decode_requests > 1 {
@@ -4233,6 +4262,125 @@ mod tests {
         let decode = scheduler.schedule();
         assert_eq!(decode.decode_requests.len(), 1);
         assert_eq!(decode.decode_requests[0].num_tokens, 4);
+    }
+
+    #[test]
+    fn sustained_cuda_quantum_survives_soft_sla_only_with_loaded_opt_in() {
+        for (backend, loaded, enabled, expected) in [
+            (BackendKind::Cuda, true, true, 2),
+            (BackendKind::Cuda, true, false, 1),
+            (BackendKind::Cuda, false, true, 1),
+            (BackendKind::Cpu, true, true, 1),
+            (BackendKind::Metal, true, true, 1),
+        ] {
+            let mut scheduler = Scheduler::new(SchedulerConfig {
+                max_batch_size: 2,
+                max_tokens_per_step: 8,
+                min_tokens_per_step: 1,
+                policy: SchedulingPolicy::FCFS,
+                enable_chunked_prefill: false,
+                enable_adaptive_batching: false,
+                enable_decode_quanta: false,
+                ..Default::default()
+            });
+            let id = "sustained-soft-sla".to_string();
+            let mut request = build_request(TaskType::Chat, &id, Priority::Normal);
+            request.workload_class = WorkloadClass::Streaming;
+            assert!(scheduler.add_request(&request));
+            let epoch = scheduler.get_sequence_id(&id).unwrap();
+            let mut profile = ExecutionProfile::fail_closed(backend, None, ExecutionMode::Sequence);
+            profile.prefill = PrefillMode::Full;
+            profile.incremental_decode = true;
+            profile.decode_batch = NativeBatchMode::Continuous;
+            profile.preferred_decode_tokens = 2;
+            profile.sustained_decode_quantum = enabled;
+            profile.resolved_from_loaded_model = loaded;
+            assert!(
+                scheduler.update_execution_profile(&SessionKey::new(id.clone(), epoch), &profile)
+            );
+            assert_eq!(scheduler.schedule().prefill_requests.len(), 1);
+            scheduler.update_after_step(&id, request.num_prompt_tokens(), 1, 1.0);
+            // Move the soft deadline instead of sleeping: prefill may already
+            // have consumed the entire interactive/streaming SLA in production.
+            scheduler.requests.get_mut(&id).unwrap().deadline_at =
+                Instant::now() - Duration::from_millis(750);
+            let scheduled = scheduler.schedule();
+            assert_eq!(scheduled.decode_requests.len(), 1);
+            assert_eq!(
+                scheduled.decode_requests[0].num_tokens, expected,
+                "backend={backend:?}, loaded={loaded}, enabled={enabled}"
+            );
+        }
+    }
+
+    #[test]
+    fn sustained_cuda_quantum_yields_to_peers_and_respects_output_and_hard_deadline() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 4,
+            max_tokens_per_step: 32,
+            min_tokens_per_step: 1,
+            policy: SchedulingPolicy::FCFS,
+            enable_chunked_prefill: false,
+            enable_adaptive_batching: false,
+            ..Default::default()
+        });
+        let id = "sustained-peer-fairness".to_string();
+        let mut request = build_request(TaskType::Chat, &id, Priority::Normal);
+        request.params.max_tokens = 5;
+        assert!(scheduler.add_request(&request));
+        let epoch = scheduler.get_sequence_id(&id).unwrap();
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cuda, None, ExecutionMode::Sequence);
+        profile.prefill = PrefillMode::Full;
+        profile.incremental_decode = true;
+        profile.decode_batch = NativeBatchMode::Continuous;
+        profile.preferred_decode_tokens = 4;
+        profile.sustained_decode_quantum = true;
+        profile.resolved_from_loaded_model = true;
+        assert!(scheduler.update_execution_profile(&SessionKey::new(id.clone(), epoch), &profile));
+        assert_eq!(scheduler.schedule().prefill_requests.len(), 1);
+        scheduler.update_after_step(&id, request.num_prompt_tokens(), 1, 1.0);
+        scheduler.requests.get_mut(&id).unwrap().deadline_at =
+            Instant::now() - Duration::from_secs(2);
+        assert_eq!(scheduler.schedule().decode_requests[0].num_tokens, 4);
+
+        let peer = build_request(TaskType::Chat, "sustained-peer", Priority::Normal);
+        assert!(scheduler.add_request(&peer));
+        let peer_epoch = scheduler.get_sequence_id(&peer.id).unwrap();
+        let mut peer_profile = profile.clone();
+        peer_profile.prefill = PrefillMode::Incremental;
+        assert!(scheduler.update_execution_profile(
+            &SessionKey::new(peer.id.clone(), peer_epoch),
+            &peer_profile,
+        ));
+        let scheduled = scheduler.schedule();
+        assert_eq!(
+            scheduled.prefill_requests.len(),
+            1,
+            "waiting peer must receive service"
+        );
+        assert_eq!(scheduled.decode_requests[0].num_tokens, 1);
+        scheduler.update_after_step(&peer.id, peer.num_prompt_tokens(), 1, 1.0);
+        let scheduled = scheduler.schedule();
+        assert!(
+            scheduled
+                .decode_requests
+                .iter()
+                .all(|row| row.num_tokens == 1),
+            "multiple active sequences must retain single-token fairness"
+        );
+        scheduler.finish_request(&peer.id);
+        scheduler.update_after_step(&id, 3, 3, 1.0);
+        assert_eq!(
+            scheduler.schedule().decode_requests[0].num_tokens,
+            1,
+            "the last output token caps a larger preferred quantum"
+        );
+        scheduler.requests.get_mut(&id).unwrap().hard_deadline =
+            Some(Instant::now() - Duration::from_millis(1));
+        let scheduled = scheduler.schedule();
+        assert!(scheduled.decode_requests.is_empty());
+        assert_eq!(scheduled.expired_requests.len(), 1);
     }
 
     #[test]

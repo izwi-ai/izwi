@@ -20,3 +20,5 @@ Gemma-3-1b-it
 Qwen3-ForcedAligner-0.6B
 Voxtral-Mini-4B-Realtime-2602
 Qwen3-TTS-Tokenizer-12Hz
+
+Qwen3.8-27B-FP8

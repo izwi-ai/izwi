@@ -178,8 +178,8 @@ pub use resources::{
 pub use scheduler::{ScheduleResult, Scheduler, SchedulerConfig, SchedulingPolicy};
 pub use types::FinishReason as OutputFinishReason;
 pub use types::{
-    AudioOutput, EngineMetrics, EngineOutput, GenerationParams, Priority, RequestId, SequenceId,
-    TaskType, TokenId,
+    AudioOutput, EngineMetrics, EngineOutput, GenerationParams, LatencyBreakdown, Priority,
+    RequestId, SequenceId, TaskType, TokenId,
 };
 
 use crate::error::{Error, Result};
@@ -850,7 +850,21 @@ impl Engine {
     }
 
     /// Create a new inference engine with explicit worker configuration.
-    pub fn new_with_worker(config: EngineCoreConfig, worker_config: WorkerConfig) -> Result<Self> {
+    pub fn new_with_worker(
+        mut config: EngineCoreConfig,
+        worker_config: WorkerConfig,
+    ) -> Result<Self> {
+        config.performance = config.performance.resolve_env()?;
+        if let Some(registry) = &worker_config.model_registry {
+            registry.performance().validate()?;
+            if registry.performance() != &config.performance {
+                return Err(Error::ConfigError(
+                    "worker registry performance differs from engine configuration; construct the registry with new_with_performance and the engine's resolved policy".into(),
+                ));
+            }
+        }
+        // A missing registry selects the legacy direct TTS loader. Preserve it;
+        // RuntimeService supplies its configured registry for managed chat loads.
         info!("Initializing inference engine");
 
         let model_registry = worker_config.model_registry.clone();
@@ -3622,11 +3636,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn performance_startup_rejects_a_registry_with_a_different_snapshot() {
+        let config = EngineCoreConfig {
+            performance: crate::ServeRuntimeConfig::from_sources(
+                &Default::default(),
+                &Default::default(),
+                &Default::default(),
+            )
+            .performance,
+            ..Default::default()
+        };
+        let mut registry_policy = config.performance.clone();
+        registry_policy.cuda.mode = crate::OptimizationMode::Off;
+        let mut worker = WorkerConfig::from(&config);
+        worker.model_registry = Some(Arc::new(ModelRegistry::new_with_performance(
+            config.models_dir.clone(),
+            worker.backend_context.device.clone(),
+            registry_policy,
+        )));
+        let error = Engine::new_with_worker(config, worker)
+            .err()
+            .expect("mismatched policy must fail");
+        assert!(error.to_string().contains("registry performance differs"));
+    }
+
     #[tokio::test]
     async fn test_engine_creation() {
         let config = EngineCoreConfig::default();
-        let engine = Engine::new(config);
-        assert!(engine.is_ok());
+        let engine = Engine::new(config).unwrap();
+        assert!(
+            engine.model_registry.is_none(),
+            "bare Engine must retain direct TTS loading"
+        );
     }
 
     #[tokio::test]

@@ -38,6 +38,9 @@ pub const LEGACY_ENV_TIMEOUT: &[&str] = &["REQUEST_TIMEOUT_SECS"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServeRuntimeConfig {
+    /// Performance policy, resolved once before model loading.
+    #[serde(default)]
+    pub performance: crate::performance::PerformanceConfig,
     pub host: String,
     pub port: u16,
     pub models_dir: PathBuf,
@@ -68,6 +71,7 @@ pub struct ServeRuntimeConfig {
 impl Default for ServeRuntimeConfig {
     fn default() -> Self {
         Self {
+            performance: Default::default(),
             host: default_host(),
             port: default_port(),
             models_dir: default_models_dir(),
@@ -103,13 +107,16 @@ impl ServeRuntimeConfig {
         env: &ServeRuntimeConfigOverrides,
         cli: &ServeRuntimeConfigOverrides,
     ) -> Self {
-        Self::default()
+        let mut config = Self::default()
             .apply_overrides(config_file)
             .apply_overrides(env)
-            .apply_overrides(cli)
+            .apply_overrides(cli);
+        config.performance.mark_environment_resolved();
+        config
     }
 
     pub fn apply_overrides(mut self, overrides: &ServeRuntimeConfigOverrides) -> Self {
+        self.performance.apply_overrides(&overrides.performance);
         if let Some(host) = overrides.host.as_ref() {
             self.host = host.clone();
         }
@@ -191,6 +198,7 @@ impl ServeRuntimeConfig {
 
     pub fn engine_config(&self) -> EngineConfig {
         EngineConfig {
+            performance: self.performance.clone(),
             models_dir: self.models_dir.clone(),
             max_loaded_models: Some(self.max_loaded_models.max(1)),
             max_batch_size: self.max_batch_size,
@@ -215,6 +223,11 @@ impl ServeRuntimeConfig {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServeRuntimeConfigOverrides {
+    #[serde(
+        default,
+        skip_serializing_if = "crate::performance::PerformanceConfigOverrides::is_empty"
+    )]
+    pub performance: crate::performance::PerformanceConfigOverrides,
     pub host: Option<String>,
     pub port: Option<u16>,
     pub models_dir: Option<PathBuf>,
@@ -245,6 +258,7 @@ pub struct ServeRuntimeConfigOverrides {
 impl ServeRuntimeConfigOverrides {
     pub fn from_env() -> Self {
         Self {
+            performance: crate::performance::PerformanceConfigOverrides::from_env(),
             host: read_env_string(ENV_HOST, &[]),
             port: read_env_u16(ENV_PORT, &[]),
             models_dir: read_env_path(ENV_MODELS_DIR, &[]),

@@ -15,7 +15,7 @@
 use anyhow::Context;
 use clap::{Parser, ValueEnum};
 use std::io::{Cursor, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 use tokio::signal;
@@ -73,6 +73,14 @@ use state::AppState;
     version = env!("CARGO_PKG_VERSION")
 )]
 struct ServerArgs {
+    /// Configuration file (defaults to the shared Izwi user config.toml).
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+
+    /// Override a performance setting, e.g. cuda.mode=off; repeat for siblings.
+    #[arg(long = "performance", value_name = "KEY=VALUE", value_parser = parse_performance_override)]
+    performance: Vec<izwi_core::PerformanceConfigOverrides>,
+
     /// Host to bind to
     #[arg(short = 'H', long)]
     host: Option<String>,
@@ -141,7 +149,8 @@ pub async fn run_from_cli(enterprise_hooks: EnterpriseHooks) -> anyhow::Result<(
 }
 
 async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> anyhow::Result<()> {
-    maybe_delegate_to_private_cuda_runtime(&args)?;
+    let serve_config = resolve_serve_runtime_config(&args)?;
+    maybe_delegate_to_private_cuda_runtime(&serve_config)?;
 
     logging::init_tracing(args.log_format);
 
@@ -152,7 +161,6 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
         "Starting Izwi TTS Server"
     );
 
-    let serve_config = resolve_serve_runtime_config(&args);
     let effective_runtime_config = serde_json::to_string(&serve_config)
         .context("failed to serialize effective server runtime configuration")?;
     info!(
@@ -375,12 +383,11 @@ fn duration_secs_from_env(
     (configured > 0).then(|| Duration::from_secs(configured.clamp(min_secs, max_secs)))
 }
 
-fn maybe_delegate_to_private_cuda_runtime(args: &ServerArgs) -> anyhow::Result<()> {
+fn maybe_delegate_to_private_cuda_runtime(serve_config: &ServeRuntimeConfig) -> anyhow::Result<()> {
     if cfg!(feature = "cuda") || backends::private_cuda_runtime_active() {
         return Ok(());
     }
 
-    let serve_config = resolve_serve_runtime_config(args);
     if !matches!(
         serve_config.backend,
         BackendPreference::Auto | BackendPreference::Cuda
@@ -485,7 +492,30 @@ fn format_cuda_runtime_unavailable(diagnostics: &CudaRuntimeDiagnostics) -> Stri
     )
 }
 
-fn resolve_serve_runtime_config(args: &ServerArgs) -> ServeRuntimeConfig {
+fn parse_performance_override(
+    value: &str,
+) -> izwi_core::Result<izwi_core::PerformanceConfigOverrides> {
+    let (key, value) = value
+        .split_once('=')
+        .ok_or_else(|| izwi_core::Error::ConfigError("expected performance KEY=VALUE".into()))?;
+    let mut overrides = izwi_core::PerformanceConfigOverrides::default();
+    overrides.set_value(
+        key.trim()
+            .strip_prefix("runtime.performance.")
+            .unwrap_or(key.trim()),
+        value,
+    )?;
+    Ok(overrides)
+}
+
+fn resolve_serve_runtime_config(args: &ServerArgs) -> anyhow::Result<ServeRuntimeConfig> {
+    resolve_serve_runtime_config_with_env(args, &ServeRuntimeConfigOverrides::from_env())
+}
+
+fn resolve_serve_runtime_config_with_env(
+    args: &ServerArgs,
+    env: &ServeRuntimeConfigOverrides,
+) -> anyhow::Result<ServeRuntimeConfig> {
     let cli = ServeRuntimeConfigOverrides {
         host: args.host.clone(),
         port: args.port,
@@ -495,8 +525,18 @@ fn resolve_serve_runtime_config(args: &ServerArgs) -> ServeRuntimeConfig {
         max_sequence_length: args.max_sequence_length,
         ..ServeRuntimeConfigOverrides::default()
     };
-    let env = ServeRuntimeConfigOverrides::from_env();
-    ServeRuntimeConfig::from_sources(&ServeRuntimeConfigOverrides::default(), &env, &cli)
+    let file = ServeRuntimeConfigOverrides {
+        performance: izwi_core::PerformanceConfigOverrides::from_user_config(
+            args.config.as_deref(),
+        )?,
+        ..Default::default()
+    };
+    let mut runtime = ServeRuntimeConfig::from_sources(&file, env, &cli);
+    for performance in &args.performance {
+        runtime.performance.apply_overrides(performance);
+    }
+    runtime.performance.validate()?;
+    Ok(runtime)
 }
 
 fn configured_preload_models() -> Vec<String> {
@@ -933,7 +973,14 @@ mod tests {
     }
 
     fn parse(args: &[&str]) -> ServerArgs {
-        ServerArgs::try_parse_from(args).expect("arguments should parse")
+        let mut parsed = ServerArgs::try_parse_from(args).expect("arguments should parse");
+        if parsed.config.is_none() {
+            // Existing defaults/env tests must not depend on the developer's
+            // real persisted configuration. This temporary directory is dropped
+            // before resolution, selecting the normal missing-file defaults.
+            parsed.config = Some(tempfile::tempdir().unwrap().path().join("absent.toml"));
+        }
+        parsed
     }
 
     #[test]
@@ -992,7 +1039,7 @@ mod tests {
         std::env::set_var("IZWI_BACKEND", "cpu");
 
         let args = parse(&["izwi-server", "--backend", "cuda"]);
-        let resolved = resolve_serve_runtime_config(&args);
+        let resolved = resolve_serve_runtime_config(&args).unwrap();
 
         assert_eq!(
             resolved.backend,
@@ -1024,7 +1071,7 @@ mod tests {
             "--max-physical-in-flight",
             "3",
         ]);
-        let resolved = resolve_serve_runtime_config(&args);
+        let resolved = resolve_serve_runtime_config(&args).unwrap();
 
         assert_eq!(
             resolved.physical_execution_mode,
@@ -1106,7 +1153,8 @@ mod tests {
             "127.0.0.1",
             "--port",
             "9000",
-        ]));
+        ]))
+        .unwrap();
 
         assert_eq!(resolved.host, "127.0.0.1");
         assert_eq!(resolved.port, 9000);
@@ -1120,7 +1168,7 @@ mod tests {
         std::env::set_var("IZWI_HOST", "127.0.0.1");
         std::env::set_var("IZWI_PORT", "8088");
 
-        let resolved = resolve_serve_runtime_config(&parse(&["izwi-server"]));
+        let resolved = resolve_serve_runtime_config(&parse(&["izwi-server"])).unwrap();
 
         assert_eq!(resolved.host, "127.0.0.1");
         assert_eq!(resolved.port, 8088);
@@ -1132,7 +1180,7 @@ mod tests {
         let _guard = env_lock();
         clear_bind_env();
 
-        let resolved = resolve_serve_runtime_config(&parse(&["izwi-server"]));
+        let resolved = resolve_serve_runtime_config(&parse(&["izwi-server"])).unwrap();
 
         assert_eq!(resolved.host, "0.0.0.0");
         assert_eq!(resolved.port, 8080);
@@ -1155,7 +1203,7 @@ mod tests {
         clear_bind_env();
         std::env::set_var("IZWI_PORT", "not-a-port");
 
-        let resolved = resolve_serve_runtime_config(&parse(&["izwi-server"]));
+        let resolved = resolve_serve_runtime_config(&parse(&["izwi-server"])).unwrap();
 
         assert_eq!(resolved.port, 8080);
         clear_bind_env();
@@ -1170,7 +1218,7 @@ mod tests {
         std::env::set_var("IZWI_MAX_CONCURRENT", "44");
         std::env::set_var("IZWI_TIMEOUT", "720");
 
-        let resolved = resolve_serve_runtime_config(&parse(&["izwi-server"]));
+        let resolved = resolve_serve_runtime_config(&parse(&["izwi-server"])).unwrap();
 
         assert_eq!(resolved.max_batch_size.fixed_rows(), Some(16));
         assert_eq!(resolved.num_threads, 6);
@@ -1186,7 +1234,7 @@ mod tests {
         std::env::set_var("MAX_CONCURRENT_REQUESTS", "45");
         std::env::set_var("REQUEST_TIMEOUT_SECS", "721");
 
-        let resolved = resolve_serve_runtime_config(&parse(&["izwi-server"]));
+        let resolved = resolve_serve_runtime_config(&parse(&["izwi-server"])).unwrap();
 
         assert_eq!(resolved.max_concurrent_requests, 45);
         assert_eq!(resolved.request_timeout_secs, 721);
@@ -1205,7 +1253,7 @@ mod tests {
         std::env::set_var("IZWI_NO_UI", "1");
         std::env::set_var("IZWI_UI_DIR", "/tmp/izwi-ui");
 
-        let resolved = resolve_serve_runtime_config(&parse(&["izwi-server"]));
+        let resolved = resolve_serve_runtime_config(&parse(&["izwi-server"])).unwrap();
 
         assert!(resolved.cors_enabled);
         assert_eq!(
@@ -1218,5 +1266,85 @@ mod tests {
         assert!(!resolved.ui_enabled);
         assert_eq!(resolved.ui_dir, std::path::PathBuf::from("/tmp/izwi-ui"));
         clear_bind_env();
+    }
+
+    #[test]
+    fn performance_startup_merges_file_inherited_environment_and_cli() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, "[runtime.performance.cuda]\nmode='off'\nmtp_draft_tokens=3\n[ runtime.performance.loading ]\ncache_max_bytes=1234\nworkers=2").unwrap();
+        let args = ServerArgs::try_parse_from([
+            "izwi-server",
+            "--config",
+            path.to_str().unwrap(),
+            "--performance",
+            "cuda.mode=off",
+            "--performance",
+            "cuda.mtp=auto",
+            "--performance",
+            "cuda.mtp_adaptive=false",
+            "--performance",
+            "loading.workers=0",
+        ])
+        .unwrap();
+        let inherited = ServeRuntimeConfigOverrides {
+            performance: izwi_core::PerformanceConfigOverrides::from_lookup(|key| match key {
+                "IZWI_CUDA_MODE" => Some("auto".into()),
+                "IZWI_CUDA_MTP_ADAPTIVE" => Some("true".into()),
+                "IZWI_LOADING_WORKERS" => Some("6".into()),
+                _ => None,
+            })
+            .unwrap(),
+            ..Default::default()
+        };
+        let runtime = resolve_serve_runtime_config_with_env(&args, &inherited).unwrap();
+        let config = runtime.engine_config().performance.resolve_env().unwrap();
+        assert_eq!(config.cuda.mode, izwi_core::OptimizationMode::Off);
+        assert!(!config.cuda.mtp_adaptive);
+        assert_eq!(config.cuda.mtp_draft_tokens, 3);
+        assert_eq!(config.loading.workers, 0);
+        assert_eq!(config.loading.cache_max_bytes, 1234);
+        assert!(!config.normalized().cuda.mtp.enabled());
+    }
+
+    #[test]
+    fn performance_startup_reads_persisted_opt_out_without_cli_flags() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, "[runtime.performance.cuda]\nmode='off'\nmtp_adaptive=false\n[ runtime.performance.loading ]\nmode='off'").unwrap();
+        let args = ServerArgs::try_parse_from(["izwi-server", "--config", path.to_str().unwrap()])
+            .unwrap();
+        let config = resolve_serve_runtime_config_with_env(&args, &Default::default()).unwrap();
+        assert!(!config.performance.cuda.enabled());
+        assert!(!config.performance.cuda.mtp_adaptive);
+        assert!(!config.performance.loading.enabled());
+    }
+
+    #[test]
+    fn performance_startup_rejects_malformed_config_and_cli_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, "[runtime.performance.cuda]\nmtp_draft_tokens=4").unwrap();
+        let args = ServerArgs::try_parse_from(["izwi-server", "--config", path.to_str().unwrap()])
+            .unwrap();
+        assert!(resolve_serve_runtime_config_with_env(&args, &Default::default()).is_err());
+        for value in [
+            "cuda.mode=maybe",
+            "cuda.mtp_draft_tokens=4",
+            "cuda.mtp_adaptive=maybe",
+            "loading.max_staging_bytes=0",
+            "not_an_assignment",
+        ] {
+            assert!(
+                ServerArgs::try_parse_from(["izwi-server", "--performance", value]).is_err(),
+                "{value}"
+            );
+        }
+        let missing = directory.path().join("not-created.toml");
+        assert!(
+            izwi_core::PerformanceConfigOverrides::from_user_config(Some(&missing))
+                .unwrap()
+                .is_empty()
+        );
     }
 }

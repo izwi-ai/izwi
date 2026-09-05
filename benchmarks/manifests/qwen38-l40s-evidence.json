@@ -17,23 +17,119 @@
     "performance_thresholds": {
       "scope": "nvidia-l40s-48gb",
       "policy": "declare-before-promotion-runs",
-      "values": null
+      "values": {
+        "mtp": {
+          "minimum_completion_tps_p50_speedup_ratio": 1.05,
+          "maximum_ttft_p95_regression_ratio": 1.05,
+          "maximum_peak_device_memory_ratio": 1.15
+        },
+        "single_sequence": {
+          "minimum_user_tps_p50": 40,
+          "minimum_decode_tps_p50": 40,
+          "minimum_runs": 10,
+          "user_cases": [
+            "natural-prompt-c1"
+          ],
+          "sustained_cases": {
+            "decode-short-c1": 384,
+            "decode-sustained-c1": 1536
+          }
+        }
+      }
     }
   },
   "notes": [
     "prompt_words is an input-size target, not a claimed tokenizer token count",
     "the evidence report records the prompt token count observed by the server",
-    "all performance cases use a warmed model and deterministic greedy sampling"
+    "all performance cases use a warmed model and deterministic greedy sampling",
+    "Primary acceptance uses cold prefixes: IZWI_ENABLE_PREFIX_CACHING=0; runner checks no measured prefix hits/reused tokens.",
+    "Request sampling is temperature=0, seed=0. Natural termination is recorded; max_tokens is not an asserted output length."
   ],
   "cases": [
-    { "name": "decode-short-c1", "prompt_words": 32, "max_tokens": 512, "iterations": 5, "concurrent": 1 },
-    { "name": "decode-sustained-c1", "prompt_words": 32, "max_tokens": 2048, "iterations": 3, "concurrent": 1 },
-    { "name": "context-512-c1", "prompt_words": 512, "max_tokens": 128, "iterations": 3, "concurrent": 1 },
-    { "name": "context-2048-c1", "prompt_words": 2048, "max_tokens": 128, "iterations": 3, "concurrent": 1 },
-    { "name": "context-8192-c1", "prompt_words": 8192, "max_tokens": 128, "iterations": 3, "concurrent": 1 },
-    { "name": "context-32768-c1", "prompt_words": 32768, "max_tokens": 128, "iterations": 3, "concurrent": 1 },
-    { "name": "decode-short-c2", "prompt_words": 32, "max_tokens": 256, "iterations": 3, "concurrent": 2 },
-    { "name": "decode-short-c4", "prompt_words": 32, "max_tokens": 256, "iterations": 3, "concurrent": 4 },
-    { "name": "decode-short-c8", "prompt_words": 32, "max_tokens": 256, "iterations": 3, "concurrent": 8 }
+    {
+      "name": "natural-prompt-c1",
+      "prompt_words": 6,
+      "prompt": "Explain llm inference to me",
+      "max_tokens": 512,
+      "iterations": 10,
+      "concurrent": 1,
+      "prefix_cache": "cold"
+    },
+    {
+      "name": "decode-short-c1",
+      "prompt_words": 32,
+      "max_tokens": 512,
+      "iterations": 10,
+      "concurrent": 1,
+      "prefix_cache": "cold",
+      "prompt": "Explain llm inference to me",
+      "system": "Give a detailed tutorial with many worked examples. Continue explaining every stage in depth for at least 600 words."
+    },
+    {
+      "name": "decode-sustained-c1",
+      "prompt_words": 32,
+      "max_tokens": 2048,
+      "iterations": 10,
+      "concurrent": 1,
+      "prefix_cache": "cold",
+      "prompt": "Explain llm inference to me",
+      "system": "Give a detailed tutorial with many worked examples. Continue explaining every stage in depth for at least 2500 words."
+    },
+    {
+      "name": "context-512-c1",
+      "prompt_words": 512,
+      "max_tokens": 128,
+      "iterations": 3,
+      "concurrent": 1,
+      "prefix_cache": "cold"
+    },
+    {
+      "name": "context-2048-c1",
+      "prompt_words": 2048,
+      "max_tokens": 128,
+      "iterations": 3,
+      "concurrent": 1,
+      "prefix_cache": "cold"
+    },
+    {
+      "name": "context-8192-c1",
+      "prompt_words": 8192,
+      "max_tokens": 128,
+      "iterations": 3,
+      "concurrent": 1,
+      "prefix_cache": "cold"
+    },
+    {
+      "name": "context-32768-c1",
+      "prompt_words": 32768,
+      "max_tokens": 128,
+      "iterations": 3,
+      "concurrent": 1,
+      "prefix_cache": "cold"
+    },
+    {
+      "name": "decode-short-c2",
+      "prompt_words": 32,
+      "max_tokens": 256,
+      "iterations": 3,
+      "concurrent": 2,
+      "prefix_cache": "cold"
+    },
+    {
+      "name": "decode-short-c4",
+      "prompt_words": 32,
+      "max_tokens": 256,
+      "iterations": 3,
+      "concurrent": 4,
+      "prefix_cache": "cold"
+    },
+    {
+      "name": "decode-short-c8",
+      "prompt_words": 32,
+      "max_tokens": 256,
+      "iterations": 3,
+      "concurrent": 8,
+      "prefix_cache": "cold"
+    }
   ]
 }

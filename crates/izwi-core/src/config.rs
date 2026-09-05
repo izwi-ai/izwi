@@ -585,6 +585,9 @@ pub(crate) fn resolve_kv_cache_policy(
 /// Main engine configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
+    /// Performance policy, resolved once before model loading.
+    #[serde(default)]
+    pub performance: crate::performance::PerformanceConfig,
     /// Directory to store downloaded models
     #[serde(default = "default_models_dir")]
     pub models_dir: PathBuf,
@@ -680,6 +683,7 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
+            performance: Default::default(),
             models_dir: default_models_dir(),
             max_loaded_models: None,
             max_batch_size: BatchSizePreference::Auto,

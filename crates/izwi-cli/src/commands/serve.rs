@@ -9,6 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub struct ServeArgs {
+    pub config_path: Option<PathBuf>,
     pub mode: ServeMode,
     pub runtime: ServeRuntimeConfig,
     pub log_level: String,
@@ -59,7 +60,10 @@ pub async fn execute(args: ServeArgs) -> Result<()> {
     println!("  Log level:      {}", args.log_level);
     println!("  Log format:     {}", args.log_format.as_str());
 
-    set_server_env(&args);
+    args.runtime
+        .performance
+        .validate()
+        .map_err(|error| CliError::ConfigError(error.to_string()))?;
 
     println!("\n{}", style("Starting server...").bold());
     let mut server_child = spawn_server(&args)?;
@@ -175,75 +179,124 @@ fn serve_mode_label(mode: &ServeMode) -> &'static str {
     }
 }
 
-fn set_server_env(args: &ServeArgs) {
-    std::env::set_var("RUST_LOG", &args.log_level);
-    std::env::set_var("IZWI_LOG_FORMAT", args.log_format.as_str());
-    std::env::set_var("IZWI_HOST", &args.runtime.host);
-    std::env::set_var("IZWI_PORT", args.runtime.port.to_string());
-    std::env::set_var(
+fn configure_server_command(cmd: &mut Command, args: &ServeArgs) -> Result<()> {
+    if let Some(path) = &args.config_path {
+        cmd.arg("--config").arg(path);
+    }
+    cmd.env("RUST_LOG", &args.log_level);
+    cmd.env("IZWI_LOG_FORMAT", args.log_format.as_str());
+    cmd.env("IZWI_HOST", &args.runtime.host);
+    cmd.env("IZWI_PORT", args.runtime.port.to_string());
+    cmd.env(
         "IZWI_MODELS_DIR",
         args.runtime.models_dir.to_string_lossy().to_string(),
     );
-    std::env::set_var(
+    cmd.env(
         "IZWI_MAX_BATCH_SIZE",
         args.runtime.max_batch_size.to_string(),
     );
-    std::env::set_var(
+    cmd.env(
         "IZWI_PHYSICAL_EXECUTION_MODE",
         args.runtime.physical_execution_mode.to_string(),
     );
-    std::env::set_var(
+    cmd.env(
         "IZWI_MAX_PHYSICAL_IN_FLIGHT",
         args.runtime.max_physical_in_flight.to_string(),
     );
-    std::env::set_var(
+    cmd.env(
         "IZWI_MAX_SCHEDULER_BATCH_SIZE",
         args.runtime.max_scheduler_batch_size.to_string(),
     );
-    std::env::set_var(
+    cmd.env(
         "IZWI_MAX_LOADED_MODELS",
         args.runtime.max_loaded_models.to_string(),
     );
-    std::env::set_var(
+    cmd.env(
         "IZWI_MAX_RETAINED_SEQUENCES",
         args.runtime.max_retained_sequences.to_string(),
     );
-    std::env::set_var(
+    cmd.env(
         "IZWI_MAX_STAGED_TRANSACTIONS",
         args.runtime.max_staged_transactions.to_string(),
     );
-    std::env::set_var(
+    cmd.env(
         "IZWI_MAX_QUEUED_REQUESTS",
         args.runtime.max_queued_requests.to_string(),
     );
-    std::env::set_var(
+    cmd.env(
         "IZWI_MAX_SEQUENCE_LENGTH",
         args.runtime.max_sequence_length.to_string(),
     );
-    std::env::set_var("IZWI_BACKEND", args.runtime.backend.as_str());
-    std::env::set_var("IZWI_NUM_THREADS", args.runtime.num_threads.to_string());
-    std::env::set_var(
+    cmd.env("IZWI_BACKEND", args.runtime.backend.as_str());
+    cmd.env("IZWI_NUM_THREADS", args.runtime.num_threads.to_string());
+    cmd.env(
         "IZWI_MAX_CONCURRENT",
         args.runtime.max_concurrent_requests.to_string(),
     );
-    std::env::set_var(
+    cmd.env(
         "IZWI_TIMEOUT",
         args.runtime.request_timeout_secs.to_string(),
     );
-    std::env::set_var(
+    cmd.env(
         "IZWI_CORS",
         if args.runtime.cors_enabled { "1" } else { "0" },
     );
-    std::env::set_var("IZWI_CORS_ORIGINS", args.runtime.cors_origins.join(","));
-    std::env::set_var(
+    cmd.env("IZWI_CORS_ORIGINS", args.runtime.cors_origins.join(","));
+    cmd.env(
         "IZWI_NO_UI",
         if args.runtime.ui_enabled { "0" } else { "1" },
     );
-    std::env::set_var(
+    cmd.env(
         "IZWI_UI_DIR",
         args.runtime.ui_dir.to_string_lossy().to_string(),
     );
-    std::env::set_var("IZWI_SERVE_MODE", serve_mode_label(&args.mode));
+    cmd.env("IZWI_SERVE_MODE", serve_mode_label(&args.mode));
+
+    cmd.env(
+        "IZWI_ENABLE_PREFIX_CACHING",
+        args.runtime.enable_prefix_caching.to_string(),
+    );
+    cmd.env(
+        "IZWI_ENABLE_CHUNKED_PREFILL",
+        args.runtime.enable_chunked_prefill.to_string(),
+    );
+    cmd.env(
+        "IZWI_MAX_PREFIX_CACHE_PAGES",
+        args.runtime.max_prefix_cache_pages.to_string(),
+    );
+    cmd.env(
+        "IZWI_CHUNKED_PREFILL_THRESHOLD",
+        args.runtime.chunked_prefill_threshold.to_string(),
+    );
+    if let Some(salt) = &args.runtime.managed_prefix_cache_salt {
+        cmd.env("IZWI_MANAGED_PREFIX_CACHE_SALT", salt);
+    } else {
+        cmd.env_remove("IZWI_MANAGED_PREFIX_CACHE_SALT");
+    }
+    // Serialize the complete resolved policy onto this child, so inherited
+    // legacy switches cannot override a higher-precedence CLI value. Remove
+    // aliases only in the child; the parent environment remains untouched.
+    args.runtime
+        .performance
+        .validate()
+        .map_err(|error| CliError::ConfigError(error.to_string()))?;
+    let performance = serde_json::to_value(&args.runtime.performance)
+        .map_err(|error| CliError::ConfigError(error.to_string()))?;
+    for binding in izwi_core::performance::ENVIRONMENT_BINDINGS {
+        for alias in binding.aliases {
+            cmd.env_remove(alias);
+        }
+        let (group, field) = binding.key.split_once('.').expect("static performance key");
+        let value = &performance[group][field];
+        if value.is_null() {
+            cmd.env_remove(binding.canonical);
+        } else if let Some(value) = value.as_str() {
+            cmd.env(binding.canonical, value);
+        } else {
+            cmd.env(binding.canonical, value.to_string());
+        }
+    }
+    Ok(())
 }
 
 fn spawn_server(args: &ServeArgs) -> Result<Child> {
@@ -276,13 +329,13 @@ fn spawn_server(args: &ServeArgs) -> Result<Child> {
         if !args.dev {
             c.arg("--release");
         }
+        c.arg("--");
         c
     } else {
         Command::new(server_binary)
     };
 
-    cmd.env("RUST_LOG", &args.log_level);
-    cmd.env("IZWI_LOG_FORMAT", args.log_format.as_str());
+    configure_server_command(&mut cmd, args)?;
     cmd.stdout(Stdio::inherit());
     cmd.stderr(Stdio::inherit());
 
@@ -601,35 +654,18 @@ mod tests {
     use super::*;
     use izwi_core::backends::BackendPreference;
 
-    fn clear_serve_env() {
-        std::env::remove_var("RUST_LOG");
-        std::env::remove_var("IZWI_LOG_FORMAT");
-        std::env::remove_var("IZWI_HOST");
-        std::env::remove_var("IZWI_PORT");
-        std::env::remove_var("IZWI_MAX_BATCH_SIZE");
-        std::env::remove_var("IZWI_PHYSICAL_EXECUTION_MODE");
-        std::env::remove_var("IZWI_MAX_PHYSICAL_IN_FLIGHT");
-        std::env::remove_var("IZWI_MAX_SCHEDULER_BATCH_SIZE");
-        std::env::remove_var("IZWI_MAX_RETAINED_SEQUENCES");
-        std::env::remove_var("IZWI_MAX_STAGED_TRANSACTIONS");
-        std::env::remove_var("IZWI_MAX_QUEUED_REQUESTS");
-        std::env::remove_var("IZWI_MAX_CONCURRENT");
-        std::env::remove_var("IZWI_TIMEOUT");
-        std::env::remove_var("IZWI_SERVE_MODE");
-        std::env::remove_var("IZWI_BACKEND");
-        std::env::remove_var("IZWI_NUM_THREADS");
-        std::env::remove_var("IZWI_MODELS_DIR");
-        std::env::remove_var("IZWI_MAX_LOADED_MODELS");
-        std::env::remove_var("IZWI_CORS");
-        std::env::remove_var("IZWI_CORS_ORIGINS");
-        std::env::remove_var("IZWI_NO_UI");
-        std::env::remove_var("IZWI_UI_DIR");
+    fn command_env(cmd: &Command, key: &str) -> Option<String> {
+        cmd.get_envs()
+            .find(|(name, _)| *name == key)
+            .and_then(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
     }
 
     fn sample_args() -> ServeArgs {
         ServeArgs {
+            config_path: None,
             mode: ServeMode::Web,
             runtime: ServeRuntimeConfig {
+                performance: Default::default(),
                 host: "0.0.0.0".to_string(),
                 port: 8080,
                 models_dir: PathBuf::from("/tmp/models"),
@@ -663,41 +699,43 @@ mod tests {
     }
 
     #[test]
-    fn set_server_env_sets_ui_and_cors_flags() {
-        let _guard = crate::test_support::env_lock();
-        clear_serve_env();
+    fn server_command_sets_ui_and_cors_flags() {
+        let mut cmd = Command::new("unused-server");
 
-        set_server_env(&sample_args());
+        configure_server_command(&mut cmd, &sample_args()).unwrap();
 
-        assert_eq!(std::env::var("IZWI_CORS").as_deref(), Ok("1"));
-        assert_eq!(std::env::var("IZWI_NO_UI").as_deref(), Ok("1"));
-        assert_eq!(std::env::var("IZWI_LOG_FORMAT").as_deref(), Ok("text"));
+        assert_eq!(command_env(&cmd, "IZWI_CORS").as_deref(), Some("1"));
+        assert_eq!(command_env(&cmd, "IZWI_NO_UI").as_deref(), Some("1"));
         assert_eq!(
-            std::env::var("IZWI_PHYSICAL_EXECUTION_MODE").as_deref(),
-            Ok("shadow")
+            command_env(&cmd, "IZWI_LOG_FORMAT").as_deref(),
+            Some("text")
         );
         assert_eq!(
-            std::env::var("IZWI_MAX_PHYSICAL_IN_FLIGHT").as_deref(),
-            Ok("3")
+            command_env(&cmd, "IZWI_PHYSICAL_EXECUTION_MODE").as_deref(),
+            Some("shadow")
         );
         assert_eq!(
-            std::env::var("IZWI_MODELS_DIR").as_deref(),
-            Ok("/tmp/models")
+            command_env(&cmd, "IZWI_MAX_PHYSICAL_IN_FLIGHT").as_deref(),
+            Some("3")
         );
-        clear_serve_env();
+        assert_eq!(
+            command_env(&cmd, "IZWI_MODELS_DIR").as_deref(),
+            Some("/tmp/models")
+        );
     }
 
     #[test]
-    fn set_server_env_passes_json_log_format() {
-        let _guard = crate::test_support::env_lock();
-        clear_serve_env();
+    fn server_command_passes_json_log_format() {
+        let mut cmd = Command::new("unused-server");
 
         let mut args = sample_args();
         args.log_format = LogFormat::Json;
-        set_server_env(&args);
+        configure_server_command(&mut cmd, &args).unwrap();
 
-        assert_eq!(std::env::var("IZWI_LOG_FORMAT").as_deref(), Ok("json"));
-        clear_serve_env();
+        assert_eq!(
+            command_env(&cmd, "IZWI_LOG_FORMAT").as_deref(),
+            Some("json")
+        );
     }
 
     #[test]
@@ -717,6 +755,63 @@ mod tests {
         assert_eq!(
             readiness_url("http://127.0.0.1:8080/v1"),
             "http://127.0.0.1:8080/v1/ready"
+        );
+    }
+
+    #[test]
+    fn server_child_receives_resolved_performance_without_parent_env_mutation() {
+        let _guard = crate::test_support::env_lock();
+        let mut args = sample_args();
+        args.runtime.performance.cuda.mode = izwi_core::OptimizationMode::Off;
+        args.runtime.performance.cuda.mtp_adaptive = false;
+        args.runtime.performance.loading.workers = 0;
+        args.runtime.performance.loading.cache_dir = Some(PathBuf::from("/tmp/child cache"));
+        let before: std::collections::BTreeMap<_, _> = std::env::vars_os().collect();
+        let mut cmd = Command::new("unused-server");
+        cmd.env("IZWI_QWEN38_MTP", "1");
+        cmd.env("IZWI_CUDA_MTP_ADAPTIVE", "true");
+        configure_server_command(&mut cmd, &args).unwrap();
+        let after: std::collections::BTreeMap<_, _> = std::env::vars_os().collect();
+        assert_eq!(before, after);
+        assert_eq!(command_env(&cmd, "IZWI_CUDA_MODE").as_deref(), Some("off"));
+        assert_eq!(
+            command_env(&cmd, "IZWI_CUDA_MTP_ADAPTIVE").as_deref(),
+            Some("false")
+        );
+        assert_eq!(
+            command_env(&cmd, "IZWI_LOADING_WORKERS").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            command_env(&cmd, "IZWI_LOADING_CACHE_DIR").as_deref(),
+            Some("/tmp/child cache")
+        );
+        assert!(cmd
+            .get_envs()
+            .any(|(name, value)| name == "IZWI_QWEN38_MTP" && value.is_none()));
+        let child_overrides =
+            izwi_core::PerformanceConfigOverrides::from_lookup(|key| command_env(&cmd, key))
+                .unwrap();
+        let mut child = izwi_core::PerformanceConfig::default();
+        child.apply_overrides(&child_overrides);
+        assert_eq!(child.cuda, args.runtime.performance.cuda);
+        assert_eq!(child.loading, args.runtime.performance.loading);
+        assert!(!child.normalized().cuda.mtp.enabled());
+    }
+
+    #[test]
+    fn performance_startup_passes_the_selected_config_file_to_server_child() {
+        let mut args = sample_args();
+        args.config_path = Some(PathBuf::from("/tmp/selected config.toml"));
+        let mut command = Command::new("unused-server");
+        configure_server_command(&mut command, &args).unwrap();
+        let arguments: Vec<_> = command.get_args().collect();
+        assert_eq!(
+            arguments,
+            [
+                std::ffi::OsStr::new("--config"),
+                std::ffi::OsStr::new("/tmp/selected config.toml")
+            ]
         );
     }
 }

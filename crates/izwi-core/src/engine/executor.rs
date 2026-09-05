@@ -3305,14 +3305,19 @@ impl ModelExecutor for NativeExecutor {
             profile.kv_dtype = "none".to_string();
         }
         if matches!(request.task_type, super::types::TaskType::Chat) {
-            profile.preferred_decode_tokens = request
+            let (preferred_decode_tokens, sustained_decode_quantum) = request
                 .prepared_chat_model_for_executor()
                 .ok()
                 .and_then(|model| match model.as_ref() {
-                    NativeChatModel::Qwen38(model) => Some(model.preferred_decode_tokens()),
+                    NativeChatModel::Qwen38(model) => Some((
+                        model.preferred_decode_tokens(),
+                        model.sustained_cuda_mtp_quantum(),
+                    )),
                     _ => None,
                 })
-                .unwrap_or(1);
+                .unwrap_or((1, false));
+            profile.preferred_decode_tokens = preferred_decode_tokens;
+            profile.sustained_decode_quantum = sustained_decode_quantum;
         }
         Some(profile)
     }

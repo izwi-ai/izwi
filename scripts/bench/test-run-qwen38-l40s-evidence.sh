@@ -22,8 +22,10 @@ jq -e '.schema == "izwi.qwen38-cuda-evidence.v1" and
        .promotion_eligible == false and
        .status == "unsupported" and .reason == "dry_run"' \
     "${tmp_dir}/dry/certificate.json" >/dev/null
-[[ $(grep -c '^\[\[benchmarks\]\]$' "${tmp_dir}/dry/imported-manifest.toml") -eq 9 ]]
-[[ $(grep -c '^model = "Qwen3.8-27B-FP8"$' "${tmp_dir}/dry/imported-manifest.toml") -eq 9 ]]
+[[ $(grep -c '^\[\[benchmarks\]\]$' "${tmp_dir}/dry/imported-manifest.toml") -eq 10 ]]
+[[ $(grep -c '^model = "Qwen3.8-27B-FP8"$' "${tmp_dir}/dry/imported-manifest.toml") -eq 10 ]]
+grep -q '^prompt = "Explain llm inference to me"$' "${tmp_dir}/dry/imported-manifest.toml"
+grep -q '^iterations = 10$' "${tmp_dir}/dry/imported-manifest.toml"
 grep -q '^warmup = true$' "${tmp_dir}/dry/imported-manifest.toml"
 grep -q '^max_tokens = 2048$' "${tmp_dir}/dry/imported-manifest.toml"
 
@@ -50,3 +52,12 @@ jq -e '.status == "unsupported" and .reason == "nvidia_device_not_observed" and 
     "${tmp_dir}/unsupported/certificate.json" >/dev/null
 
 echo "Qwen3.8 L40S evidence runner smoke test passed"
+
+for metric in minimum_user_tps_p50 minimum_decode_tps_p50; do
+    jq --arg metric "${metric}" '.acceptance.performance_thresholds.values.single_sequence[$metric] = 39' \
+        "${workload}" >"${tmp_dir}/lowered-gate.json"
+    if ${runner} --workload "${tmp_dir}/lowered-gate.json" --mtp-depth 1 \
+        --output "${tmp_dir}/lowered-${metric}" --dry-run >/dev/null 2>&1; then
+        echo "L40S must reject weakening either 40 t/s gate" >&2; exit 1
+    fi
+done

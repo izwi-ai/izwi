@@ -70,12 +70,49 @@ struct RequestPhaseTiming {
     normalization_ms: Option<f64>,
     prefill_ms: f64,
     decode_ms: f64,
+    decode_started_at: Option<Instant>,
+    last_decode_commit_at: Option<Instant>,
+    decode_tokens: usize,
+    first_token_commit_at: Option<Instant>,
+    last_token_commit_at: Option<Instant>,
     sampling_ms: Option<f64>,
     codec_ms: Option<f64>,
     postprocess_ms: Option<f64>,
     first_output_ms: Option<f64>,
     prefill_steps: u32,
     decode_steps: u32,
+}
+
+impl RequestPhaseTiming {
+    fn record_token_commit(&mut self, decode: bool, tokens: usize, at: Instant) {
+        if tokens == 0 {
+            return;
+        }
+        self.first_token_commit_at.get_or_insert(at);
+        self.last_token_commit_at = Some(at);
+        if decode {
+            self.decode_tokens = self.decode_tokens.saturating_add(tokens);
+            self.last_decode_commit_at = Some(at);
+        }
+    }
+
+    fn decode_wall_ms(&self) -> Option<f64> {
+        Some(
+            self.last_decode_commit_at?
+                .saturating_duration_since(self.decode_started_at?)
+                .as_secs_f64()
+                * 1000.0,
+        )
+    }
+
+    fn post_first_token_ms(&self) -> Option<f64> {
+        Some(
+            self.last_token_commit_at?
+                .saturating_duration_since(self.first_token_commit_at?)
+                .as_secs_f64()
+                * 1000.0,
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -151,6 +188,7 @@ struct ActiveStreamBatch {
 /// core lock but has not yet committed or rolled back.
 #[derive(Debug, Clone)]
 struct InFlightPhysicalDispatch {
+    registered_at: Instant,
     phase: ExecutionPhase,
     physical_batch: PhysicalBatch,
     scheduled: Vec<super::scheduler::ScheduledRequest>,
@@ -162,6 +200,7 @@ struct InFlightPhysicalDispatch {
 impl InFlightPhysicalDispatch {
     fn from_prepared(dispatch: &PreparedPhysicalDispatch) -> Self {
         Self {
+            registered_at: Instant::now(),
             phase: dispatch.phase(),
             physical_batch: dispatch.physical_batch().clone(),
             scheduled: dispatch.scheduled().to_vec(),
@@ -4139,6 +4178,11 @@ impl EngineCore {
                     {
                         match batch.phase {
                             ExecutionPhase::Decode => {
+                                // Use an explicit monotonic pre-execution boundary, not
+                                // elapsed service time subtracted from a later timestamp.
+                                timing
+                                    .decode_started_at
+                                    .get_or_insert(in_flight.registered_at);
                                 timing.decode_ms += step_time_ms;
                                 timing.decode_steps = timing.decode_steps.saturating_add(1);
                             }
@@ -4160,6 +4204,16 @@ impl EngineCore {
                                     | ExecutionDisposition::Finished(_)
                             )
                         {
+                            if let Some(timing) = self
+                                .request_phase_timings
+                                .get_mut(&committed.session.request_id)
+                            {
+                                timing.record_token_commit(
+                                    decode_transaction,
+                                    committed.output.tokens_generated,
+                                    Instant::now(),
+                                );
+                            }
                             committed_service_requests.push(committed.session.request_id.clone());
                         }
                         executor_outputs.push(committed);
@@ -4291,6 +4345,9 @@ impl EngineCore {
                     normalization_ms: phase.normalization_ms,
                     prefill_ms: phase.prefill_ms,
                     decode_ms: phase.decode_ms,
+                    decode_wall_ms: phase.decode_wall_ms(),
+                    decode_tokens: phase.last_decode_commit_at.map(|_| phase.decode_tokens),
+                    post_first_token_ms: phase.post_first_token_ms(),
                     sampling_ms: phase.sampling_ms,
                     codec_ms: phase.codec_ms,
                     postprocess_ms: phase.postprocess_ms,
@@ -9399,6 +9456,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn decode_timing_commits_once_and_ignores_duplicate_completion() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
+            Mutex::new(Vec::new()),
+        ))));
+        let config = EngineCoreConfig {
+            enable_chunked_prefill: false,
+            enable_adaptive_batching: false,
+            block_size: 1,
+            max_blocks: 8,
+            ..Default::default()
+        };
+        let mut core = EngineCore::new_with_unified_executor(config, executor).unwrap();
+        let mut request = EngineCoreRequest::tts("commit timing");
+        request.id = "commit-timing".into();
+        request.prompt_tokens = vec![1];
+        core.add_request(request).unwrap();
+        core.step().await.unwrap(); // prefill commits no output token in this fixture
+        let prepared = core.prepare_step().await.unwrap().unwrap();
+        let executed = core.execute_prepared_with_progress(prepared).await.unwrap();
+        let duplicate = executed.clone();
+        let committed = core.commit_step(executed).await.unwrap();
+        let timing = committed.outputs[0].latency_breakdown.as_ref().unwrap();
+        assert_eq!(timing.decode_tokens, Some(1));
+        assert!(timing.decode_wall_ms.unwrap() > 0.0);
+        assert!(timing.decode_wall_ms.unwrap() <= timing.total_ms);
+        assert!(core
+            .commit_step(duplicate)
+            .await
+            .unwrap()
+            .outputs
+            .is_empty());
+        assert_eq!(core.request_phase_timings["commit-timing"].decode_tokens, 1);
+    }
+
+    #[tokio::test]
     async fn test_step_preserves_optional_executor_phase_timings() {
         let executor = UnifiedExecutor::new_for_test(Box::new(PhaseTimingExecutor));
         let config = EngineCoreConfig {
@@ -9460,5 +9552,42 @@ mod tests {
         drop(request_upgrade);
         assert!(core.unload_managed_model_cache(model).unwrap());
         assert!(request_weak.upgrade().is_none());
+    }
+}
+
+#[cfg(test)]
+mod decode_timing_tests {
+    use super::RequestPhaseTiming;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn decode_wall_counts_commits_and_includes_between_quantum_waits() {
+        let start = Instant::now();
+        let mut timing = RequestPhaseTiming::default();
+        // A token sampled during prefill belongs to completion usage, not decode.
+        timing.record_token_commit(false, 1, start);
+        assert_eq!(timing.decode_wall_ms(), None);
+        timing.decode_started_at = Some(start + Duration::from_millis(10));
+        timing.record_token_commit(true, 2, start + Duration::from_millis(30));
+        // Drafts/failed quanta never call record_token_commit; an empty commit
+        // must not move the endpoint. Service time excludes a 50ms scheduler wait.
+        timing.decode_ms = 40.0;
+        timing.record_token_commit(true, 1, start + Duration::from_millis(100));
+        timing.record_token_commit(true, 0, start + Duration::from_millis(150));
+        assert_eq!(timing.decode_tokens, 3);
+        assert_eq!(timing.decode_wall_ms(), Some(90.0));
+        assert_eq!(timing.post_first_token_ms(), Some(100.0));
+        assert!(timing.decode_wall_ms().unwrap() > timing.decode_ms);
+    }
+
+    #[test]
+    fn entered_decode_without_committed_tokens_has_no_rate_denominator() {
+        let timing = RequestPhaseTiming {
+            decode_started_at: Some(Instant::now()),
+            decode_ms: 12.0,
+            ..Default::default()
+        };
+        assert_eq!(timing.decode_wall_ms(), None);
+        assert_eq!(timing.post_first_token_ms(), None);
     }
 }

@@ -66,6 +66,7 @@ make_runtime_cell() {
        --argjson verified_tokens "${verified_tokens}" \
        --argjson completion_tps "${completion_tps}" --argjson ttft_p95 "${ttft_p95}" \
        --argjson peak_memory "${peak_memory}" '
+      .acceptance.performance_thresholds.values = null |
       .status = "passed" |
       .reason = "measured_qwen38_cuda_profile_evidence_passed" |
       .evidence_level = "runtime_validated" |
@@ -81,19 +82,18 @@ make_runtime_cell() {
         minimum_device_memory_free_bytes:1000000000} |
       .measurements = [{name:"decode-short",target_prompt_words:32,
         observed_prompt_tokens_avg:40,completion_tokens_avg:128,concurrent:1,
-        ttft_ms:{count:3,avg:($ttft_p95 * 0.8),p50:($ttft_p95 * 0.75),p95:$ttft_p95},
-        end_to_end_completion_tps:{count:3,avg:$completion_tps,
+        ttft_ms:{count:10,avg:($ttft_p95 * 0.8),p50:($ttft_p95 * 0.75),p95:$ttft_p95},
+        end_to_end_completion_tps:{count:10,avg:$completion_tps,
           p50:$completion_tps,p95:($completion_tps * 1.02)},
-        server_generation_ms:{count:3,avg:1000,p50:1000,p95:1050},
-        decode_samples:[
-          {index:0,completion_tokens:128,generation_ms:1000,tokens_per_second:128},
-          {index:1,completion_tokens:128,generation_ms:1000,tokens_per_second:128},
-          {index:2,completion_tokens:128,generation_ms:1000,tokens_per_second:128}
-        ],
+        server_generation_ms:{count:10,avg:1000,p50:1000,p95:1050},
+        sampling:{temperature:0,seed:0,reasoning_policy:"model_default"},
+        prompt:"Explain llm inference to me",system:null,max_tokens:512,prefix_cache:"cold",prefix_hits_delta:0,
+        server_request_samples:[range(10) | {index:.,completion_tokens:128,generation_ms:1000,tokens_per_second:128,finish_reason:"stop"}],
+        decode_wall_samples:[range(10) | {index:.,committed_tokens:127,wall_ms:900,tokens_per_second:(127000/900),physical_service_ms:800}],
         mtp:{rounds:$rounds,drafted_tokens:$drafted_tokens,accepted_tokens:$drafted_tokens,
           rejected_rounds:0,bonus_tokens:$rounds,target_verified_tokens:$verified_tokens,
           target_replay_tokens:0},
-        end_to_end_ms:{count:3,avg:1100,p50:1100,p95:1150}}]
+        end_to_end_ms:{count:10,avg:1100,p50:1100,p95:1150}}]
     ' "${source}" >"${destination}"
 }
 
@@ -111,7 +111,7 @@ jq -e '.status == "passed" and .evidence_level == "runtime_validated" and
        (.comparisons | length) == 3' \
     "${tmp_dir}/paired-runtime/certificate.json" >/dev/null
 
-thresholds='{"mtp":{"minimum_completion_tps_p50_speedup_ratio":1.05,"maximum_ttft_p95_regression_ratio":1.05,"maximum_peak_device_memory_ratio":1.15}}'
+thresholds='{"mtp":{"minimum_completion_tps_p50_speedup_ratio":1.05,"maximum_ttft_p95_regression_ratio":1.05,"maximum_peak_device_memory_ratio":1.15},"single_sequence":{"minimum_user_tps_p50":40,"minimum_decode_tps_p50":40,"minimum_runs":10,"user_cases":["decode-short"],"sustained_cases":{"decode-short":64}}}'
 for depth in 0 1 2 3; do
     jq --argjson thresholds "${thresholds}" \
         '.acceptance.performance_thresholds.values = $thresholds' \
@@ -162,4 +162,31 @@ jq 'del(.measurements[0].ttft_ms.p95)' \
     "${tmp_dir}/runtime-2.json" >"${tmp_dir}/incomplete-case.json"
 expect_rejection performance-case "${tmp_dir}/incomplete-case.json"
 
-echo "Qwen3.8 MTP paired evidence certifier smoke test passed"
+# The two rates must be independent, derived from matching committed counts,
+# and cannot certify a short answer or a concurrent workload as sustained c1.
+jq '.measurements[0].decode_wall_samples[0].tokens_per_second = 999' \
+    "${tmp_dir}/runtime-2.json" >"${tmp_dir}/bad-rate.json"
+expect_rejection invented-rate "${tmp_dir}/bad-rate.json"
+jq 'del(.measurements[0].decode_wall_samples)' \
+    "${tmp_dir}/runtime-2.json" >"${tmp_dir}/missing-wall.json"
+expect_rejection legacy-denominator "${tmp_dir}/missing-wall.json"
+jq '.measurements[0].prefix_hits_delta = 1' \
+    "${tmp_dir}/runtime-2.json" >"${tmp_dir}/warm-prefix.json"
+expect_rejection warm-prefix "${tmp_dir}/warm-prefix.json"
+
+for failure in slow-user slow-decode short-decode; do
+    for depth in 1 2 3; do
+        case "${failure}" in
+          slow-user) filter='.measurements[].server_request_samples |= map(.generation_ms=4000 | .tokens_per_second=(.completion_tokens*1000/.generation_ms))' ;;
+          slow-decode) filter='.measurements[].server_request_samples |= map(.generation_ms=4000 | .tokens_per_second=(.completion_tokens*1000/.generation_ms)) | .measurements[].decode_wall_samples |= map(.wall_ms=3900 | .tokens_per_second=(.committed_tokens*1000/.wall_ms))' ;;
+          short-decode) filter='.measurements[].decode_wall_samples |= map(.committed_tokens=10 | .tokens_per_second=(.committed_tokens*1000/.wall_ms))' ;;
+        esac
+        jq "${filter}" "${tmp_dir}/performance-${depth}.json" >"${tmp_dir}/${failure}-${depth}.json"
+    done
+    ${certifier} --baseline "${tmp_dir}/performance-0.json" \
+        --depth-1 "${tmp_dir}/${failure}-1.json" --depth-2 "${tmp_dir}/${failure}-2.json" \
+        --depth-3 "${tmp_dir}/${failure}-3.json" --output "${tmp_dir}/${failure}" >/dev/null
+    jq -e '.evidence_level == "runtime_validated" and .promotion_eligible == false' "${tmp_dir}/${failure}/certificate.json" >/dev/null
+done
+
+echo "Qwen3.8 MTP paired evidence certifier fixture tests passed (no CUDA certification)"

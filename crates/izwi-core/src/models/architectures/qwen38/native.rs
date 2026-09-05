@@ -19,6 +19,14 @@ use safetensors::{tensor::TensorView, Dtype as SafeDType, SafeTensors};
 use serde::Deserialize;
 
 use crate::error::{Error, Result};
+use crate::performance::LoadingPerformanceConfig;
+
+mod cache;
+mod loading;
+mod q8;
+#[cfg(feature = "cuda")]
+mod upload;
+pub use loading::RawBlockFp8Projection;
 
 use super::chat::Qwen38TextConfig;
 
@@ -510,16 +518,24 @@ struct MtpTensorSpec {
 
 /// Tensor-to-shard index for an HF checkpoint.
 ///
-/// No shard mappings are retained. Each tensor operation maps only its indexed
-/// shard and releases that mapping before returning.
+/// Options and at most two shard mappings are retained for this load scope.
+/// Clones share the same bounded mapping cache; dropping the final checkpoint
+/// releases it. Compatibility mode retains the original per-call mapping path.
 #[derive(Debug, Clone)]
 pub struct IndexedSafetensors {
     model_dir: PathBuf,
     weight_map: BTreeMap<String, String>,
+    options: LoadingPerformanceConfig,
+    loading: Arc<loading::LoadState>,
 }
 
 impl IndexedSafetensors {
     pub fn open(model_dir: &Path) -> Result<Self> {
+        Self::open_with_options(model_dir, &LoadingPerformanceConfig::default())
+    }
+
+    pub fn open_with_options(model_dir: &Path, options: &LoadingPerformanceConfig) -> Result<Self> {
+        let started = std::time::Instant::now();
         let model_dir = model_dir.canonicalize().map_err(|err| {
             Error::ModelLoadError(format!(
                 "Failed to resolve native checkpoint directory {}: {err}",
@@ -564,6 +580,8 @@ impl IndexedSafetensors {
         Ok(Self {
             model_dir,
             weight_map: index.weight_map,
+            options: options.clone(),
+            loading: Arc::new(loading::LoadState::new(started.elapsed())),
         })
     }
 
@@ -610,6 +628,10 @@ impl IndexedSafetensors {
     where
         F: FnOnce(TensorView<'_>) -> Result<T>,
     {
+        self.check_loading_cancelled()?;
+        if self.options.enabled() {
+            return self.retained_tensor_view(name, expected_dtype, expected_shape, consume);
+        }
         let shard_path = self.shard_path_for_tensor(name)?;
         let file = File::open(&shard_path).map_err(|err| {
             Error::ModelLoadError(format!(
@@ -655,7 +677,9 @@ impl IndexedSafetensors {
                 )));
             }
         }
-        consume(view)
+        let result = consume(view);
+        self.check_loading_cancelled()?;
+        result
     }
 
     pub fn load_block_fp8_f32(
@@ -713,6 +737,14 @@ impl IndexedSafetensors {
                         "Native dense tensor `{weight_name}` has an unexpected scale tensor `{scale_name}`"
                     )));
                 }
+                if self.optimized_on(device) {
+                    return self.materialize_dense_tensor(
+                        weight_name,
+                        &expected_shape,
+                        target,
+                        device,
+                    );
+                }
                 self.with_tensor_view(
                     weight_name,
                     Some(info.dtype),
@@ -768,6 +800,13 @@ impl IndexedSafetensors {
         block_shape: [usize; 2],
         device: &Device,
     ) -> Result<QMatMul> {
+        if self.optimized_on(device) {
+            return self.materialize_q8_tiled(
+                &[(weight_name, expected_shape)],
+                block_shape,
+                device,
+            );
+        }
         let info = self.tensor_info(weight_name)?;
         if info.dtype != SafeDType::F8_E4M3 {
             return Err(Error::ModelLoadError(format!(
@@ -805,6 +844,9 @@ impl IndexedSafetensors {
         block_shape: [usize; 2],
         device: &Device,
     ) -> Result<QMatMul> {
+        if self.optimized_on(device) {
+            return self.materialize_q8_tiled(projections, block_shape, device);
+        }
         let (values, shape) = self.load_projection_group_f32(projections, block_shape, true)?;
         let q8_block = GgmlDType::Q8_0.block_size();
         if !shape[1].is_multiple_of(q8_block) {
@@ -910,6 +952,22 @@ impl IndexedSafetensors {
                 )));
             }
         }
+        if self.optimized_on(device) {
+            let _staging = self
+                .loading
+                .staging
+                .lock()
+                .map_err(|_| Error::ModelLoadError("Load staging lock poisoned".into()))?;
+            return self.with_tensor_view(name, Some(info.dtype), Some(expected_shape), |view| {
+                loading::materialize_dense_typed(
+                    view,
+                    name,
+                    target,
+                    device,
+                    self.options.max_staging_bytes,
+                )
+            });
+        }
         let values =
             self.with_tensor_view(name, Some(info.dtype), Some(expected_shape), |view| {
                 decode_dense_f32(view, name)
@@ -991,8 +1049,12 @@ pub struct Qwen38NativeCheckpoint {
 
 impl Qwen38NativeCheckpoint {
     pub fn open(model_dir: &Path) -> Result<Self> {
+        Self::open_with_options(model_dir, &LoadingPerformanceConfig::default())
+    }
+
+    pub fn open_with_options(model_dir: &Path, options: &LoadingPerformanceConfig) -> Result<Self> {
         let config = Qwen38NativeConfig::load(model_dir)?;
-        let tensors = IndexedSafetensors::open(model_dir)?;
+        let tensors = IndexedSafetensors::open_with_options(model_dir, options)?;
         tensors.validate_required_text_tensor_names(&config)?;
         let mtp = tensors.validate_mtp_tensor_manifest(&config)?;
         Ok(Self {
@@ -1579,10 +1641,10 @@ mod tests {
 
     use super::*;
 
-    struct TestDir(PathBuf);
+    pub(super) struct TestDir(PathBuf);
 
     impl TestDir {
-        fn new(label: &str) -> Self {
+        pub(super) fn new(label: &str) -> Self {
             let nonce = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -1595,7 +1657,7 @@ mod tests {
             Self(path)
         }
 
-        fn path(&self) -> &Path {
+        pub(super) fn path(&self) -> &Path {
             &self.0
         }
     }
@@ -1671,7 +1733,7 @@ mod tests {
         .unwrap()
     }
 
-    fn write_index(dir: &Path, map: serde_json::Value) {
+    pub(super) fn write_index(dir: &Path, map: serde_json::Value) {
         fs::write(
             dir.join(INDEX_FILE),
             serde_json::to_vec(&json!({ "weight_map": map })).unwrap(),
@@ -1679,7 +1741,7 @@ mod tests {
         .unwrap();
     }
 
-    fn write_safetensors(path: &Path, tensors: &[(&str, SafeDType, Vec<usize>, &[u8])]) {
+    pub(super) fn write_safetensors(path: &Path, tensors: &[(&str, SafeDType, Vec<usize>, &[u8])]) {
         let views = tensors
             .iter()
             .map(|(name, dtype, shape, data)| {
@@ -1692,7 +1754,7 @@ mod tests {
         safetensors::serialize_to_file(&views, &None, path).unwrap();
     }
 
-    fn bf16_bytes(values: &[f32]) -> Vec<u8> {
+    pub(super) fn bf16_bytes(values: &[f32]) -> Vec<u8> {
         values
             .iter()
             .flat_map(|value| bf16::from_f32(*value).to_bits().to_le_bytes())

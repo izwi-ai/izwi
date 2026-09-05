@@ -231,8 +231,22 @@ pub struct LatencyBreakdown {
     pub normalization_ms: Option<f64>,
     /// Total scheduler prefill phase wall-clock time attributed to this request.
     pub prefill_ms: f64,
-    /// Total scheduler decode phase wall-clock time attributed to this request.
+    /// Sum of physical decode batch service durations attributed to this request.
+    /// Shared batches are attributed in full; this is not decode wall time.
     pub decode_ms: f64,
+    /// Monotonic interval from registration of the first entered decode dispatch
+    /// through the last successful decode token commit. Includes dispatch waiting,
+    /// inter-quantum scheduling, retries and commit overhead; excludes initial
+    /// admission queue and prefill. Absent when no decode tokens were committed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_wall_ms: Option<f64>,
+    /// Tokens durably committed by decode quanta, never speculative proposals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_tokens: Option<usize>,
+    /// First committed token group through last committed token group. Groups may
+    /// contain multiple speculative tokens; this is not SSE inter-token latency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_first_token_ms: Option<f64>,
     /// Time spent sampling model outputs, when measured separately.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sampling_ms: Option<f64>,

@@ -48,6 +48,7 @@ pub mod kernels;
 pub mod kv;
 pub mod model;
 mod models;
+pub mod performance;
 pub mod residency;
 pub mod runtime;
 pub mod runtime_models;
@@ -81,6 +82,11 @@ pub use config::{
 };
 pub use error::{Error, Result};
 pub use models::shared::telemetry::KernelPathTelemetrySnapshot;
+pub use performance::{
+    CudaPerformanceConfig, CudaPerformanceConfigOverrides, CudaProjectionBackend,
+    LoadingIoStrategy, LoadingPerformanceConfig, LoadingPerformanceConfigOverrides,
+    OptimizationMode, PerformanceConfig, PerformanceConfigOverrides,
+};
 pub use runtime::{
     capability_conformance_cases, prometheus_voice_metric_name, prometheus_voice_metric_type,
     required_conformance_capabilities, voice_metric_catalog, voice_metric_prometheus_contract,

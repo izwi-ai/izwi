@@ -14,6 +14,13 @@ use std::collections::VecDeque;
 
 use crate::kernels::FusedSiluMulResult;
 
+#[cfg(feature = "cuda")]
+mod epilogues;
+pub mod fp8;
+pub mod graphs;
+pub mod sampling;
+pub mod timing;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CudaKernelStatus {
     pub compiled: bool,
@@ -81,14 +88,11 @@ pub fn try_fused_l2_norm(input: &Tensor, eps: f64) -> Option<Tensor> {
         .ok()
 }
 
-/// Qwen3.8-only single-launch SiLU-times-up candidate for F32 decode rows.
+/// Single-launch SiLU-times-up for contiguous F32/F16/BF16 decode and verification rows.
 pub fn try_qwen38_silu_mul_decode(gate: &Tensor, up: &Tensor) -> Option<Tensor> {
     if !cuda_tensor_pair_supported(gate, up)
-        || gate.dtype() != DType::F32
+        || !matches!(gate.dtype(), DType::F32 | DType::F16 | DType::BF16)
         || gate.dims() != up.dims()
-        || gate.dims().len() != 3
-        || gate.dim(0).ok()? != 1
-        || gate.dim(1).ok()? != 1
         || gate.elem_count() == 0
     {
         return None;
@@ -102,9 +106,8 @@ pub fn try_qwen38_silu_mul_decode(gate: &Tensor, up: &Tensor) -> Option<Tensor> 
 /// Qwen3.8-only single-launch last-axis L2 normalization candidate for decode.
 pub fn try_qwen38_l2_norm_decode(input: &Tensor, eps: f64) -> Option<Tensor> {
     if !cuda_tensor_supported(input)
-        || input.dtype() != DType::F32
-        || input.dims().len() != 3
-        || input.dim(0).ok()? != 1
+        || !matches!(input.dtype(), DType::F32 | DType::F16 | DType::BF16)
+        || input.rank() == 0
         || input.elem_count() == 0
         || !eps.is_finite()
         || eps < 0.0
@@ -133,7 +136,7 @@ pub fn try_qwen38_gated_rms_norm_decode(
 ) -> Option<Tensor> {
     if !cuda_tensor_pair_supported(hidden, gate)
         || !cuda_tensor_pair_supported(hidden, weight)
-        || hidden.dtype() != DType::F32
+        || !matches!(hidden.dtype(), DType::F32 | DType::F16 | DType::BF16)
         || hidden.dims() != gate.dims()
         || hidden.dims().len() != 2
         || hidden.elem_count() == 0
@@ -1709,7 +1712,9 @@ fn cuda_tensor_supported(tensor: &Tensor) -> bool {
 }
 
 fn cuda_tensor_pair_supported(lhs: &Tensor, rhs: &Tensor) -> bool {
-    cuda_tensor_supported(lhs) && rhs.device().is_cuda() && lhs.dtype() == rhs.dtype()
+    cuda_tensor_supported(lhs)
+        && lhs.device().same_device(rhs.device())
+        && lhs.dtype() == rhs.dtype()
 }
 
 fn cuda_gated_delta_sequence(
@@ -1833,53 +1838,7 @@ impl CustomOp2 for CudaQwen38SiluMulDecodeOp {
         up: &candle_core::CudaStorage,
         up_layout: &Layout,
     ) -> candle_core::Result<(candle_core::CudaStorage, Shape)> {
-        use candle_core::backend::BackendStorage;
-        use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
-        use candle_core::cuda_backend::{CudaStorageSlice, WrapErr};
-
-        let CudaStorageSlice::F32(gate_slice) = &gate.slice else {
-            candle_core::bail!("Qwen3.8 CUDA SiLU-mul gate must use F32 storage")
-        };
-        let CudaStorageSlice::F32(up_slice) = &up.slice else {
-            candle_core::bail!("Qwen3.8 CUDA SiLU-mul up must use F32 storage")
-        };
-        let Some((gate_start, gate_end)) = gate_layout.contiguous_offsets() else {
-            candle_core::bail!("Qwen3.8 CUDA SiLU-mul gate must be contiguous")
-        };
-        let Some((up_start, up_end)) = up_layout.contiguous_offsets() else {
-            candle_core::bail!("Qwen3.8 CUDA SiLU-mul up must be contiguous")
-        };
-        let elements = gate_layout.shape().elem_count();
-        if elements == 0
-            || elements != up_layout.shape().elem_count()
-            || elements > i32::MAX as usize
-        {
-            candle_core::bail!("Qwen3.8 CUDA SiLU-mul shape is unsupported")
-        }
-        let gate_view = gate_slice.slice(gate_start..gate_end);
-        let up_view = up_slice.slice(up_start..up_end);
-        let device = gate.device();
-        // SAFETY: the kernel writes every element before the storage is observed.
-        let output = unsafe { device.alloc::<f32>(elements)? };
-        let function = device.get_or_load_custom_func(
-            "qwen38_silu_mul_decode_f32",
-            "izwi_qwen38_decode_epilogues",
-            cuda_ptx::QWEN38,
-        )?;
-        let mut builder = function.builder();
-        builder.arg(&gate_view);
-        builder.arg(&up_view);
-        builder.arg(&output);
-        candle_core::builder_arg!(builder, elements as i32);
-        // SAFETY: the validated F32 views and element count match the CUDA ABI.
-        unsafe { builder.launch(LaunchConfig::for_num_elems(elements as u32)) }.w()?;
-        Ok((
-            candle_core::CudaStorage {
-                slice: CudaStorageSlice::F32(output),
-                device: device.clone(),
-            },
-            gate_layout.shape().clone(),
-        ))
+        epilogues::silu(gate, gate_layout, up, up_layout)
     }
 }
 
@@ -1902,54 +1861,7 @@ impl CustomOp1 for CudaQwen38L2NormDecodeOp {
         input: &candle_core::CudaStorage,
         input_layout: &Layout,
     ) -> candle_core::Result<(candle_core::CudaStorage, Shape)> {
-        use candle_core::backend::BackendStorage;
-        use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
-        use candle_core::cuda_backend::{CudaStorageSlice, WrapErr};
-
-        let CudaStorageSlice::F32(input_slice) = &input.slice else {
-            candle_core::bail!("Qwen3.8 CUDA L2 norm input must use F32 storage")
-        };
-        let Some((start, end)) = input_layout.contiguous_offsets() else {
-            candle_core::bail!("Qwen3.8 CUDA L2 norm input must be contiguous")
-        };
-        let elements = self.rows.checked_mul(self.hidden_dim).ok_or_else(|| {
-            candle_core::Error::Msg("Qwen3.8 CUDA L2 norm shape overflow".to_string())
-        })?;
-        if elements != input_layout.shape().elem_count()
-            || self.rows == 0
-            || self.hidden_dim == 0
-            || self.rows > u32::MAX as usize
-            || self.hidden_dim > i32::MAX as usize
-        {
-            candle_core::bail!("Qwen3.8 CUDA L2 norm shape is unsupported")
-        }
-        let input_view = input_slice.slice(start..end);
-        let device = input.device();
-        // SAFETY: each block writes its complete output row.
-        let output = unsafe { device.alloc::<f32>(elements)? };
-        let function = device.get_or_load_custom_func(
-            "qwen38_l2_norm_decode_f32",
-            "izwi_qwen38_decode_epilogues",
-            cuda_ptx::QWEN38,
-        )?;
-        let config = LaunchConfig {
-            grid_dim: (self.rows as u32, 1, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 256 * std::mem::size_of::<f32>() as u32,
-        };
-        let mut builder = function.builder();
-        builder.arg(&input_view);
-        builder.arg(&output);
-        candle_core::builder_arg!(builder, self.hidden_dim as i32, self.eps);
-        // SAFETY: one block owns each validated row and reduction scratch is sized for the block.
-        unsafe { builder.launch(config) }.w()?;
-        Ok((
-            candle_core::CudaStorage {
-                slice: CudaStorageSlice::F32(output),
-                device: device.clone(),
-            },
-            input_layout.shape().clone(),
-        ))
+        epilogues::l2(input, input_layout, self.rows, self.hidden_dim, self.eps)
     }
 }
 
@@ -1980,69 +1892,17 @@ impl CustomOp3 for CudaQwen38GatedRmsNormDecodeOp {
         weight: &candle_core::CudaStorage,
         weight_layout: &Layout,
     ) -> candle_core::Result<(candle_core::CudaStorage, Shape)> {
-        use candle_core::backend::BackendStorage;
-        use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
-        use candle_core::cuda_backend::{CudaStorageSlice, WrapErr};
-
-        fn contiguous_f32<'a>(
-            storage: &'a CudaStorageSlice,
-            layout: &Layout,
-            name: &str,
-        ) -> candle_core::Result<candle_core::cuda_backend::cudarc::driver::CudaView<'a, f32>>
-        {
-            let CudaStorageSlice::F32(slice) = storage else {
-                candle_core::bail!("{name} must use F32 storage")
-            };
-            let Some((start, end)) = layout.contiguous_offsets() else {
-                candle_core::bail!("{name} must be contiguous")
-            };
-            Ok(slice.slice(start..end))
-        }
-
-        let elements = self.rows.checked_mul(self.hidden_dim).ok_or_else(|| {
-            candle_core::Error::Msg("Qwen3.8 CUDA gated RMSNorm shape overflow".to_string())
-        })?;
-        if elements != hidden_layout.shape().elem_count()
-            || elements != gate_layout.shape().elem_count()
-            || self.hidden_dim != weight_layout.shape().elem_count()
-            || self.rows == 0
-            || self.hidden_dim == 0
-            || self.rows > u32::MAX as usize
-            || self.hidden_dim > i32::MAX as usize
-        {
-            candle_core::bail!("Qwen3.8 CUDA gated RMSNorm shape is unsupported")
-        }
-        let hidden_view = contiguous_f32(&hidden.slice, hidden_layout, "hidden")?;
-        let gate_view = contiguous_f32(&gate.slice, gate_layout, "gate")?;
-        let weight_view = contiguous_f32(&weight.slice, weight_layout, "weight")?;
-        let device = hidden.device();
-        // SAFETY: each block writes its complete output row.
-        let output = unsafe { device.alloc::<f32>(elements)? };
-        let function = device.get_or_load_custom_func(
-            "qwen38_gated_rms_norm_decode_f32",
-            "izwi_qwen38_decode_epilogues",
-            cuda_ptx::QWEN38,
-        )?;
-        let config = LaunchConfig {
-            grid_dim: (self.rows as u32, 1, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 256 * std::mem::size_of::<f32>() as u32,
-        };
-        let mut builder = function.builder();
-        builder.arg(&hidden_view);
-        builder.arg(&gate_view);
-        builder.arg(&weight_view);
-        builder.arg(&output);
-        candle_core::builder_arg!(builder, self.hidden_dim as i32, self.eps);
-        // SAFETY: one block owns each validated row and reduction scratch is sized for the block.
-        unsafe { builder.launch(config) }.w()?;
-        Ok((
-            candle_core::CudaStorage {
-                slice: CudaStorageSlice::F32(output),
-                device: device.clone(),
-            },
-            hidden_layout.shape().clone(),
-        ))
+        epilogues::rms(
+            hidden,
+            hidden_layout,
+            gate,
+            gate_layout,
+            weight,
+            weight_layout,
+            self.rows,
+            self.hidden_dim,
+            self.eps,
+        )
     }
 }
 
@@ -3544,7 +3404,7 @@ mod tests {
             .to_device(&candle_core::Device::Cpu)
             .unwrap();
         let actual = output.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let expected = vec![
+        let expected = [
             11.0 + 12.0 * 10.0 + 13.0 * 100.0,
             12.0 + 13.0 * 10.0 + 14.0 * 100.0,
             -21.0 + 22.0 * 0.5 + 23.0 * 2.0,
@@ -3555,6 +3415,89 @@ mod tests {
                 (actual - expected).abs() <= 1e-5,
                 "physical ShortConv mismatch at {index}: {actual} != {expected}"
             );
+        }
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+pub(crate) fn cuda_test_device() -> Option<candle_core::Device> {
+    let profile = crate::backends::DeviceSelector::detect_for_preference(
+        crate::backends::BackendPreference::Cuda,
+    )
+    .expect("CUDA test backend detection");
+    if std::env::var("IZWI_REQUIRE_CUDA_TEST_DEVICE").as_deref() == Ok("1") {
+        assert!(
+            profile.device.is_cuda(),
+            "hardware CI required a usable CUDA device"
+        );
+    }
+    profile.device.is_cuda().then_some(profile.device)
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod qwen38_dtype_device_tests {
+    use super::*;
+    #[test]
+    fn cuda_qwen38_f16_bf16_epilogues_execute_for_verification_rows() {
+        let Some(device) = cuda_test_device() else {
+            return;
+        };
+        for dtype in [DType::F16, DType::BF16] {
+            let gate = Tensor::from_vec(
+                (0..4 * 257)
+                    .map(|i| (i % 19) as f32 * 0.25 - 2.)
+                    .collect::<Vec<_>>(),
+                (1, 4, 257),
+                &candle_core::Device::Cpu,
+            )
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+            let up = Tensor::ones((1, 4, 257), dtype, &candle_core::Device::Cpu).unwrap();
+            let expected = candle_nn::ops::silu(&gate.to_dtype(DType::F32).unwrap()).unwrap();
+            let g = gate.to_device(&device).unwrap();
+            let u = up.to_device(&device).unwrap();
+            let actual =
+                try_qwen38_silu_mul_decode(&g, &u).expect("required CUDA epilogue unsupported");
+            assert_eq!(actual.dtype(), dtype);
+            for (a, e) in actual
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .iter()
+                .zip(expected.flatten_all().unwrap().to_vec1::<f32>().unwrap())
+            {
+                assert!((a - e).abs() < 0.02);
+            }
+            let normalized =
+                try_qwen38_l2_norm_decode(&g, 1e-6).expect("required low dtype L2 unsupported");
+            assert_eq!(normalized.dtype(), dtype);
+            let hidden = g.reshape((4, 257)).unwrap();
+            let weight = Tensor::ones(257, dtype, &device).unwrap();
+            let rms = try_qwen38_gated_rms_norm_decode(&hidden, &hidden, &weight, 1e-6)
+                .expect("required low dtype gated RMS unsupported");
+            assert_eq!(rms.dtype(), dtype);
+            assert!(normalized
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .iter()
+                .all(|v| v.is_finite()));
+            assert!(rms
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .iter()
+                .all(|v| v.is_finite()));
         }
     }
 }

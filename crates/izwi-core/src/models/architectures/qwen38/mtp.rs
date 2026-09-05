@@ -9,9 +9,9 @@ use super::native::{
     QWEN38_MTP_TENSOR_COUNT,
 };
 use super::text::{
-    load_native_projection, load_native_zero_centered_norm, native_projection_representation,
-    Qwen38FullAttention, Qwen38Mlp, Qwen38Projection, Qwen38ProjectionRepresentation,
-    Qwen38RmsNorm, Qwen38TextModel,
+    load_native_projection, load_native_zero_centered_norm, native_fp8_selected,
+    native_projection_representation, Qwen38FullAttention, Qwen38Mlp, Qwen38Projection,
+    Qwen38ProjectionRepresentation, Qwen38RmsNorm, Qwen38TextModel,
 };
 use crate::backends::kv::KvWriteCompletionCollector;
 use crate::error::{Error, Result};
@@ -46,6 +46,84 @@ impl TryFrom<usize> for Qwen38MtpDepth {
 
     fn try_from(value: usize) -> Result<Self> {
         Self::new(value)
+    }
+}
+
+/// Per-request latency controller. It compares elapsed time per committed
+/// token, including draft, verification and prefix commit. Exploration is
+/// bounded to four arms (scalar and depths 1..3), one probe every eight rounds.
+/// Scheduler-limited tails do not train the controller.
+#[derive(Clone, Debug)]
+pub(crate) struct AdaptiveMtp {
+    enabled: bool,
+    fixed_depth: usize,
+    selected: usize,
+    samples: [u32; 4],
+    cost_per_token: [f64; 4],
+    rounds: u64,
+    probe: usize,
+}
+
+impl AdaptiveMtp {
+    pub(crate) fn new(enabled: bool, starting_depth: usize) -> Self {
+        let depth = starting_depth.clamp(1, 3);
+        Self {
+            enabled,
+            fixed_depth: depth,
+            selected: depth,
+            samples: [0; 4],
+            cost_per_token: [0.0; 4],
+            rounds: 0,
+            probe: 0,
+        }
+    }
+
+    pub(crate) fn can_train(&self, budget: usize) -> bool {
+        self.enabled && budget >= 4
+    }
+
+    pub(crate) fn depth(&self, budget: usize) -> usize {
+        let ceiling = budget.saturating_sub(1).min(3);
+        if !self.enabled {
+            return self.fixed_depth.min(ceiling);
+        }
+        let arm = if self.rounds > 0 && self.rounds.is_multiple_of(8) {
+            self.probe
+        } else {
+            self.selected
+        };
+        arm.min(ceiling)
+    }
+
+    pub(crate) fn observe(
+        &mut self,
+        depth: usize,
+        committed: usize,
+        elapsed: std::time::Duration,
+        budget: usize,
+    ) {
+        if !self.enabled || depth > 3 || committed == 0 || budget < 4 || elapsed.is_zero() {
+            return;
+        }
+        let cost = elapsed.as_secs_f64() / committed as f64;
+        self.cost_per_token[depth] = if self.samples[depth] == 0 {
+            cost
+        } else {
+            self.cost_per_token[depth] * 0.75 + cost * 0.25
+        };
+        self.samples[depth] = self.samples[depth].saturating_add(1);
+        if self.rounds > 0 && self.rounds.is_multiple_of(8) {
+            self.probe = (self.probe + 1) % 4;
+        }
+        self.rounds = self.rounds.saturating_add(1);
+        // Require a 5% advantage before switching to reduce timer noise churn.
+        for candidate in 0..4 {
+            if self.samples[candidate] > 0
+                && self.cost_per_token[candidate] < self.cost_per_token[self.selected] * 0.95
+            {
+                self.selected = candidate;
+            }
+        }
     }
 }
 
@@ -201,6 +279,25 @@ impl Qwen38MtpHead {
         device: &Device,
         target: ProjectionMaterialization,
     ) -> Result<Self> {
+        let performance = crate::performance::PerformanceConfig::default().resolve_env()?;
+        Self::load_native_with_performance(
+            tensors,
+            native,
+            inventory,
+            device,
+            target,
+            &performance.cuda,
+        )
+    }
+
+    pub(crate) fn load_native_with_performance(
+        tensors: &IndexedSafetensors,
+        native: &Qwen38NativeConfig,
+        inventory: &Qwen38MtpInventory,
+        device: &Device,
+        target: ProjectionMaterialization,
+        performance: &crate::performance::CudaPerformanceConfig,
+    ) -> Result<Self> {
         if native.mtp.num_hidden_layers != 1 || native.mtp.use_dedicated_embeddings {
             return Err(Error::ModelLoadError(format!(
                 "Unsupported Qwen3.8 MTP topology: layers={}, dedicated_embeddings={}",
@@ -225,7 +322,21 @@ impl Qwen38MtpHead {
             .map_err(|_| Error::ModelLoadError("Qwen3.8 MTP layer id exceeds u32".into()))?;
         Ok(Self {
             device: device.clone(),
-            projection_representation: native_projection_representation(device, target),
+            projection_representation: if native_fp8_selected(
+                device,
+                target,
+                [hidden, cfg.feed_forward_length],
+                performance,
+            ) {
+                match target {
+                    ProjectionMaterialization::F16 => {
+                        Qwen38ProjectionRepresentation::NativeFp8WithQ8FallbackF16
+                    }
+                    _ => Qwen38ProjectionRepresentation::NativeFp8WithQ8FallbackBf16,
+                }
+            } else {
+                native_projection_representation(device, target)
+            },
             hidden_size: hidden,
             model_layer,
             pre_fc_norm_embedding: load_native_zero_centered_norm(
@@ -251,6 +362,7 @@ impl Qwen38MtpHead {
                 block,
                 target,
                 device,
+                performance,
             )?,
             input_layernorm: load_native_zero_centered_norm(
                 tensors,
@@ -261,7 +373,13 @@ impl Qwen38MtpHead {
                 device,
             )?,
             attention: Qwen38FullAttention::load_native(
-                tensors, device, prefix, cfg, block, target,
+                tensors,
+                device,
+                prefix,
+                cfg,
+                block,
+                target,
+                performance,
             )?,
             post_attention_layernorm: load_native_zero_centered_norm(
                 tensors,
@@ -271,7 +389,7 @@ impl Qwen38MtpHead {
                 target,
                 device,
             )?,
-            mlp: Qwen38Mlp::load_native(tensors, device, prefix, cfg, block, target)?,
+            mlp: Qwen38Mlp::load_native(tensors, device, prefix, cfg, block, target, performance)?,
             norm: load_native_zero_centered_norm(
                 tensors,
                 "mtp.norm.weight",
@@ -281,6 +399,10 @@ impl Qwen38MtpHead {
                 device,
             )?,
         })
+    }
+
+    pub(crate) fn graph_diagnostics(&self) -> serde_json::Value {
+        self.mlp.graph_diagnostics()
     }
 
     pub(crate) fn projection_representation(&self) -> Qwen38ProjectionRepresentation {
@@ -1024,5 +1146,62 @@ mod tests {
         assert_eq!(Qwen38MtpDepth::new(1).unwrap().get(), 1);
         assert_eq!(Qwen38MtpDepth::new(3).unwrap().get(), 3);
         assert!(Qwen38MtpDepth::new(4).is_err());
+    }
+}
+
+#[cfg(test)]
+mod adaptive_tests {
+    use super::AdaptiveMtp;
+    use std::time::Duration;
+    #[test]
+    fn starts_shallow_explores_bounded_depths_and_selects_elapsed_cost() {
+        let mut policy = AdaptiveMtp::new(true, 1);
+        assert_eq!(policy.depth(4), 1);
+        let mut seen = [false; 4];
+        for _ in 0..160 {
+            let depth = policy.depth(4);
+            seen[depth] = true;
+            let committed = depth + 1;
+            // Depth two is fastest despite depth three accepting more tokens.
+            let cost = [20, 15, 8, 12][depth];
+            policy.observe(
+                depth,
+                committed,
+                Duration::from_millis(cost * committed as u64),
+                4,
+            );
+        }
+        assert_eq!(seen, [true; 4]);
+        assert_eq!(policy.selected, 2);
+        assert_eq!(policy.depth(1), 0);
+        assert!(policy.depth(2) <= 1);
+    }
+    #[test]
+    fn poor_speculation_selects_scalar_and_opt_out_is_fixed() {
+        let mut policy = AdaptiveMtp::new(true, 1);
+        for _ in 0..80 {
+            let depth = policy.depth(4);
+            policy.observe(
+                depth,
+                1,
+                Duration::from_millis(if depth == 0 { 5 } else { 30 }),
+                4,
+            );
+        }
+        assert_eq!(policy.selected, 0);
+        let mut fixed = AdaptiveMtp::new(false, 3);
+        fixed.observe(0, 1, Duration::from_nanos(1), 4);
+        assert_eq!(fixed.depth(4), 3);
+        assert_eq!(fixed.depth(2), 1);
+    }
+    #[test]
+    fn cancellation_clone_and_scheduler_limited_tails_do_not_change_policy() {
+        let base = AdaptiveMtp::new(true, 1);
+        let mut cancelled = base.clone();
+        cancelled.observe(1, 2, Duration::from_millis(1), 4);
+        assert_eq!(base.rounds, 0);
+        let mut limited = base.clone();
+        limited.observe(0, 1, Duration::from_millis(1), 1);
+        assert_eq!(limited.rounds, 0);
     }
 }

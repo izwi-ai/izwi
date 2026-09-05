@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use futures::FutureExt;
 use tracing::info;
@@ -30,6 +30,9 @@ use crate::runtime::lifecycle::controller::{
     ModelLifecycleController, SharedLoadFailure, SharedLoadOutcome,
 };
 use crate::runtime::service::RuntimeService;
+
+#[path = "qwen38_memory.rs"]
+mod qwen38_memory;
 
 fn now_unix_millis() -> u64 {
     SystemTime::now()
@@ -202,6 +205,9 @@ struct ModelResourcePlan {
     load_authorization: ResourceVector,
     /// Long-lived memory retained after publication completes.
     resident_authorization: ResourceVector,
+    /// Resident capacity reserved for lazy model-owned allocations. It remains
+    /// a pending claim while physical state is fitted before first inference.
+    deferred_resident_authorization: ResourceVector,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -466,6 +472,7 @@ fn model_resource_plan(backend: BackendKind, estimate: ModelMemoryEstimate) -> M
     ModelResourcePlan {
         load_authorization,
         resident_authorization,
+        deferred_resident_authorization: ResourceVector::zero(),
     }
 }
 
@@ -1067,6 +1074,13 @@ impl ModelLifecycleController {
     ) -> Result<ModelResourcePlan> {
         let backend = self.backend_router.context().backend_kind;
         if variant == ModelVariant::Qwen3827BFp8 {
+            if backend == BackendKind::Cuda {
+                return qwen38_memory::resource_plan(
+                    model_path,
+                    &self.backend_router.context().device.device,
+                    &self.config.performance,
+                );
+            }
             return Ok(qwen38_resource_plan(backend));
         }
         if variant == ModelVariant::FishAudioS2Pro {
@@ -1197,8 +1211,11 @@ impl ModelLifecycleController {
         #[cfg(test)]
         self.maybe_panic_during_load();
 
+        let load_started = Instant::now();
         let resolved = self.resolve_model_load(variant).await?;
         let acquired = self.acquire_model_artifacts(resolved).await?;
+        let artifacts_ms = load_started.elapsed().as_secs_f64() * 1000.0;
+        let admission_started = Instant::now();
 
         self.ensure_model_budget_before_load(variant, max_loaded_models)
             .await?;
@@ -1232,6 +1249,7 @@ impl ModelLifecycleController {
         }
 
         let publication = async {
+            let admission_ms = admission_started.elapsed().as_secs_f64() * 1000.0;
             // Adapter factories are one-shot. Freeze their exact identities
             // and selectable stage graphs before model-derived state planning
             // or any physical state allocation can occur.
@@ -1240,7 +1258,10 @@ impl ModelLifecycleController {
             // This is the first operation allowed to allocate model tensors;
             // the peak host/device authorization and authoritative Loading slot
             // are both installed above.
+            let weights_started = Instant::now();
             let instantiated = self.instantiate_model(acquired).await?;
+            let weights_ms = weights_started.elapsed().as_secs_f64() * 1000.0;
+            let preparation_started = Instant::now();
             if variant.family() == crate::catalog::ModelFamily::Qwen3Asr {
                 let loaded = self
                     .model_registry
@@ -1340,19 +1361,23 @@ impl ModelLifecycleController {
             // Metal records many tensor uploads asynchronously. Flush them
             // before publishing the model so an allocation failure is owned by
             // this load transaction rather than a later state/request fence.
+            let fence_started = Instant::now();
             self.core_engine.synchronize_worker_device().await?;
+            let upload_fence_ms = fence_started.elapsed().as_secs_f64() * 1000.0;
             self.publish_loaded_model(instantiated).await?;
             // Model tensors are now visible in the backend provider's used
             // memory. Reconcile the lease before reserving any retained or
             // invocation state so live headroom does not charge the model once
             // through the provider and again as unmaterialized ledger work.
-            self.finalize_slot_materialization(
+            self.finalize_slot_materialization_with_pending(
                 variant,
                 resource_plan.resident_authorization,
+                resource_plan.deferred_resident_authorization,
             )?;
             let backend = self.backend_router.context().backend_kind;
             // Resolve physical state from the exact loaded chat implementation
             // without wrapping or replacing the already-selected adapter.
+            let state_started = Instant::now();
             let mut state_publications = HashMap::new();
             if let Some(loaded) = self.model_registry.get_chat(variant).await {
                 let loaded_cache = loaded.inference_state_contract()?;
@@ -2471,6 +2496,8 @@ impl ModelLifecycleController {
                 self.model_registry
                     .publish_effective_context(variant, effective_context)?;
             }
+            let state_allocation_ms = state_started.elapsed().as_secs_f64() * 1000.0;
+            let binding_started = Instant::now();
             self.bind_loaded_model_bundle_draft(
                 bundle_draft,
                 variant,
@@ -2517,6 +2544,19 @@ impl ModelLifecycleController {
                     .await?;
             }
             self.touch_model_usage(variant).await;
+            info!(
+                model = %variant,
+                generation,
+                artifacts_ms,
+                admission_ms,
+                weights_ms,
+                upload_fence_ms,
+                state_allocation_ms,
+                binding_publication_ms = binding_started.elapsed().as_secs_f64() * 1000.0,
+                preparation_ms = preparation_started.elapsed().as_secs_f64() * 1000.0,
+                ready_ms = load_started.elapsed().as_secs_f64() * 1000.0,
+                "Model load reached physical Ready"
+            );
             Ok(())
         }
         .await;
@@ -3633,6 +3673,62 @@ mod tests {
             assert_eq!(authority.snapshot().reserved, ResourceVector::zero());
         }
 
+        std::fs::remove_dir_all(models_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn deferred_model_graph_capacity_remains_pending_during_state_fitting() {
+        let models_dir =
+            std::env::temp_dir().join(format!("izwi-deferred-graphs-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let runtime = RuntimeService::new(EngineConfig {
+            models_dir: models_dir.clone(),
+            backend: BackendPreference::Cpu,
+            ..Default::default()
+        })
+        .unwrap();
+        let authority = Arc::new(ResourceAuthority::new(Arc::new(VectorCapacityProvider {
+            snapshot: PhysicalCapacitySnapshot {
+                capacity: all_memory_capacity(1024),
+                available: all_memory_capacity(100),
+                source: CapacitySource::Test,
+            },
+        })));
+        let bytes = |n| ResourceVector {
+            device_bytes: ResourceAmount::Known(n),
+            ..ResourceVector::zero()
+        };
+        let variant = ModelVariant::Qwen3827BFp8;
+        let lease = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Model, "weights-and-graphs"),
+                bytes(64),
+            )
+            .unwrap();
+        runtime
+            .model_lifecycle
+            .install_loading_slot(variant, lease)
+            .unwrap();
+        runtime
+            .model_lifecycle
+            .finalize_slot_materialization_with_pending(variant, bytes(64), bytes(16))
+            .unwrap();
+        assert!(matches!(
+            authority.reserve(
+                ReservationOwner::new(ReservationClass::Model, "oversized-state"),
+                bytes(85)
+            ),
+            Err(Error::Overloaded(_))
+        ));
+        let state = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Model, "fitted-state"),
+                bytes(84),
+            )
+            .unwrap();
+        assert!(runtime.model_lifecycle.remove_resident_slot(variant));
+        drop(state);
+        assert_eq!(authority.snapshot().reserved, ResourceVector::zero());
         std::fs::remove_dir_all(models_dir).unwrap();
     }
 

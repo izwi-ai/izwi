@@ -594,7 +594,7 @@ mod tests {
     fn global_fused_kernel_availability_tracks_known_backends() {
         assert_eq!(
             fused_kernels_available(),
-            cfg!(target_os = "macos") || cuda::fused_kernels_available()
+            crate::backends::metal_runtime_supported() || cuda::fused_kernels_available()
         );
     }
 }

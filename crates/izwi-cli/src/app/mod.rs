@@ -20,6 +20,7 @@ pub async fn run(cli: Cli, theme: Theme) -> Result<()> {
 
     match command {
         Commands::Serve {
+            performance,
             mode,
             host,
             port,
@@ -45,6 +46,7 @@ pub async fn run(cli: Cli, theme: Theme) -> Result<()> {
         } => {
             commands::serve::execute(build_serve_args(
                 config.as_ref(),
+                performance.into_overrides(),
                 mode,
                 host,
                 port,
@@ -227,6 +229,7 @@ pub async fn run(cli: Cli, theme: Theme) -> Result<()> {
 
 fn build_serve_args(
     config_path: Option<&PathBuf>,
+    performance: izwi_core::PerformanceConfigOverrides,
     mode: ServeMode,
     host: Option<String>,
     port: Option<u16>,
@@ -251,6 +254,7 @@ fn build_serve_args(
     no_ui: bool,
 ) -> Result<commands::serve::ServeArgs> {
     let cli_overrides = ServeRuntimeConfigOverrides {
+        performance,
         host,
         port,
         models_dir,
@@ -274,6 +278,7 @@ fn build_serve_args(
     let runtime = resolve_serve_runtime_config(config_path, &cli_overrides)?;
 
     Ok(commands::serve::ServeArgs {
+        config_path: config_path.cloned(),
         mode,
         runtime,
         log_level,
@@ -286,15 +291,27 @@ fn resolve_serve_runtime_config(
     config_path: Option<&PathBuf>,
     cli_overrides: &ServeRuntimeConfigOverrides,
 ) -> Result<ServeRuntimeConfig> {
+    resolve_serve_runtime_config_with_env(
+        config_path,
+        cli_overrides,
+        &ServeRuntimeConfigOverrides::from_env(),
+    )
+}
+
+fn resolve_serve_runtime_config_with_env(
+    config_path: Option<&PathBuf>,
+    cli_overrides: &ServeRuntimeConfigOverrides,
+    env_overrides: &ServeRuntimeConfigOverrides,
+) -> Result<ServeRuntimeConfig> {
     let file_config = crate::config::Config::load(config_path)?;
     let config_overrides = file_config.serve_runtime_overrides();
-    let env_overrides = ServeRuntimeConfigOverrides::from_env();
 
-    Ok(ServeRuntimeConfig::from_sources(
-        &config_overrides,
-        &env_overrides,
-        cli_overrides,
-    ))
+    let runtime = ServeRuntimeConfig::from_sources(&config_overrides, env_overrides, cli_overrides);
+    runtime
+        .performance
+        .validate()
+        .map_err(|error| crate::error::CliError::ConfigError(error.to_string()))?;
+    Ok(runtime)
 }
 
 #[cfg(test)]
@@ -365,6 +382,7 @@ mod tests {
 
         let args = build_serve_args(
             Some(&config_path),
+            Default::default(),
             ServeMode::Server,
             Some("cli-host".to_string()),
             None,
@@ -416,6 +434,7 @@ mod tests {
 
         let args = build_serve_args(
             None,
+            Default::default(),
             ServeMode::Server,
             None,
             None,
@@ -444,5 +463,48 @@ mod tests {
         assert_eq!(args.runtime.max_concurrent_requests, 45);
         assert_eq!(args.runtime.request_timeout_secs, 721);
         clear_serve_env();
+    }
+
+    #[test]
+    fn performance_cli_wins_over_environment_without_resetting_file_siblings() {
+        use clap::Parser;
+        let env = ServeRuntimeConfigOverrides {
+            performance: izwi_core::PerformanceConfigOverrides::from_lookup(|key| match key {
+                "IZWI_CUDA_MODE" => Some("auto".into()),
+                "IZWI_CUDA_MTP_ADAPTIVE" => Some("true".into()),
+                "IZWI_LOADING_WORKERS" => Some("6".into()),
+                _ => None,
+            })
+            .unwrap(),
+            ..Default::default()
+        };
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("performance.toml");
+        std::fs::write(&path, "[runtime.performance.cuda]\nmtp_draft_tokens=3\n[ runtime.performance.loading ]\ncache_max_bytes=1234").unwrap();
+        let cli = Cli::try_parse_from([
+            "izwi",
+            "serve",
+            "--cuda-performance",
+            "off",
+            "--cuda-mtp-adaptive",
+            "false",
+            "--loading-workers",
+            "0",
+        ])
+        .unwrap();
+        let Commands::Serve { performance, .. } = cli.command else {
+            panic!("serve");
+        };
+        let overrides = ServeRuntimeConfigOverrides {
+            performance: performance.into_overrides(),
+            ..Default::default()
+        };
+        let runtime = resolve_serve_runtime_config_with_env(Some(&path), &overrides, &env).unwrap();
+        let config = runtime.engine_config().performance.resolve_env().unwrap();
+        assert_eq!(config.cuda.mode, izwi_core::OptimizationMode::Off);
+        assert!(!config.cuda.mtp_adaptive);
+        assert_eq!(config.cuda.mtp_draft_tokens, 3);
+        assert_eq!(config.loading.workers, 0);
+        assert_eq!(config.loading.cache_max_bytes, 1234);
     }
 }

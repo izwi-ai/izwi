@@ -309,6 +309,13 @@ multi-row dispatch, while model call counters distinguish true model batching
 from scalar-envelope fallback. Retained exact-SHA evidence is still required
 before making backend-specific throughput claims.
 
+For loaded CUDA Qwen3.8 adapters, an isolated request retains its preferred MTP
+quantum after a soft scheduling SLA expires. Waiting or running peers still
+reduce the grant to one token, and hard deadlines and output budgets remain
+authoritative. `runtime.performance.cuda.mtp_quantum = "off"` restores the
+previous soft-SLA behavior. Scheduler debug events named `Decode quantum
+granted` include the requested/granted width and reason for scalar grants.
+
 `UnifiedExecutor` provides an async-safe wrapper around any `ModelExecutor` implementation. `NativeExecutor` is the current concrete backend and manages per-task decode state:
 
 | Decode State Struct | Task |

@@ -814,10 +814,10 @@ impl CandleAcceleratorKvArena {
                         "failed to record CUDA KV completion event: {error}"
                     ))
                 })?;
-                return Ok(Arc::new(CudaEventFence {
+                Ok(Arc::new(CudaEventFence {
                     event,
                     host_synchronizations: self.host_synchronizations.clone(),
-                }));
+                }))
             }
             #[cfg(not(feature = "cuda"))]
             Err(Error::InferenceError(
@@ -2110,7 +2110,7 @@ impl KvArena for CandleAcceleratorKvArena {
                         Error::InferenceError(format!("CUDA KV stream drain failed: {error}"))
                     })?;
                 self.host_synchronizations.fetch_add(1, Ordering::Relaxed);
-                return Ok(());
+                Ok(())
             }
             #[cfg(not(feature = "cuda"))]
             Err(Error::InferenceError(
