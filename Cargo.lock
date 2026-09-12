@@ -3855,6 +3855,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "izwi-serving-supervisor"
+version = "0.1.0-beta-18"
+dependencies = [
+ "fs2",
+ "izwi-serving-protocol",
+ "libc",
+ "serde",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "toml 0.8.2",
+]
+
+[[package]]
 name = "izwi-serving-worker"
 version = "0.1.0-beta-18"
 dependencies = [

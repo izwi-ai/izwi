@@ -1,0 +1,21 @@
+[package]
+name = "izwi-serving-supervisor"
+description = "Accelerator-free local worker assignment and supervision primitives for Izwi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fs2 = "0.4.3"
+izwi-serving-protocol = { path = "../izwi-serving-protocol" }
+serde = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3.10"
