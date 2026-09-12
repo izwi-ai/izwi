@@ -549,6 +549,9 @@ pub async fn spawn_remote_chat_stream_with_execution(
                         break ChatStreamEvent::Failed(error.message);
                     }
                     try_send_chat_delta(&event_tx, &backpressure, delta);
+                    if event_tx.is_closed() {
+                        return;
+                    }
                     if backpressure.is_tripped() {
                         break ChatStreamEvent::Failed(CHAT_STREAM_BACKPRESSURE_ERROR.into());
                     }

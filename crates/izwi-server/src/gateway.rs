@@ -17,7 +17,7 @@ use izwi_hooks::EnterpriseHooks;
 use serde::Serialize;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tower_http::classify::ServerErrorsFailureClass;
 use tower_http::trace::TraceLayer;
 use tracing::{field, info, info_span, warn, Span};
@@ -30,8 +30,8 @@ use crate::state::ServerLifecycle;
 #[derive(Clone)]
 pub struct GatewayState {
     pub remote_chat_execution: RemoteChatExecution,
-    pub enterprise_hooks: EnterpriseHooks,
-    pub lifecycle: ServerLifecycle,
+    pub(crate) enterprise_hooks: EnterpriseHooks,
+    pub(crate) lifecycle: ServerLifecycle,
     pub request_timeout_secs: u64,
     request_admission: Arc<Semaphore>,
 }
@@ -52,6 +52,15 @@ impl GatewayState {
             request_admission: Arc::new(Semaphore::new(max_in_flight)),
         }
     }
+
+    pub fn mark_ready(&self) {
+        self.lifecycle.mark_ready();
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct GatewayAdmissionGuard {
+    _permit: Arc<OwnedSemaphorePermit>,
 }
 
 #[derive(Debug, Serialize)]
@@ -138,16 +147,19 @@ async fn api_not_found() -> StatusCode {
 
 async fn bounded_gateway_admission(
     State(state): State<GatewayState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
-    let Ok(_permit) = state.request_admission.clone().try_acquire_owned() else {
+    let Ok(permit) = state.request_admission.clone().try_acquire_owned() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "Gateway request capacity is currently unavailable",
         )
             .into_response();
     };
+    request.extensions_mut().insert(GatewayAdmissionGuard {
+        _permit: Arc::new(permit),
+    });
     next.run(request).await
 }
 
@@ -251,7 +263,7 @@ mod tests {
     use axum::{body::Body, http::Request};
     use izwi_core::ModelVariant;
     use izwi_serving_client::{
-        mock::{MockWorker, MockWorkerConfig},
+        mock::{MockFault, MockWorker, MockWorkerConfig},
         WorkerClient, WorkerClientConfig,
     };
     use izwi_serving_protocol::{ModelAlias, ModelGeneration, PolicyRevision};
@@ -493,5 +505,86 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE
         );
         drop(held_permit);
+    }
+
+    #[tokio::test]
+    async fn gateway_admission_is_held_for_the_stream_body_lifetime() {
+        let model = ModelVariant::Qwen34BGguf;
+        let worker_config = MockWorkerConfig {
+            public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
+            fault: MockFault::Hang,
+            cancellation_delay: Duration::from_millis(100),
+            ..MockWorkerConfig::default()
+        };
+        let credentials = worker_config.credentials.clone();
+        let incarnation = worker_config.incarnation_id.clone();
+        let deployment = worker_config.deployment_id.clone();
+        let generation = worker_config.model_generation;
+        let worker = MockWorker::spawn(worker_config)
+            .await
+            .expect("mock worker should bind");
+        let remote = RemoteChatExecution::new(
+            WorkerClient::new(
+                &worker.endpoint(),
+                credentials,
+                WorkerClientConfig::default(),
+            )
+            .expect("worker client should initialize"),
+            crate::app::chat::RemoteChatExecutionConfig {
+                public_model_variant: model,
+                expected_worker_incarnation: incarnation,
+                deployment_id: deployment,
+                expected_model_generation: generation,
+                policy_revision: PolicyRevision::new("test-policy-v1")
+                    .expect("static policy revision"),
+                max_queue_wait: Duration::from_millis(100),
+                max_output_tokens: 32,
+                max_output_bytes: 4096,
+            },
+        )
+        .expect("remote execution should initialize");
+        let state = GatewayState::new(remote, EnterpriseHooks::noop(), 2, 1);
+        state.lifecycle.mark_ready();
+        let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+        let stream_request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": model.dir_name(),
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "stream": true,
+                        "max_tokens": 8
+                    })
+                    .to_string(),
+                ))
+                .expect("stream request should build")
+        };
+
+        let first = send(app.clone(), stream_request()).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(worker.active_invocations(), 1);
+
+        let rejected = send(app.clone(), stream_request()).await;
+        assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(rejected.into_body(), 4096)
+            .await
+            .expect("gateway rejection should be bounded");
+        assert_eq!(body, "Gateway request capacity is currently unavailable");
+
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while worker.active_invocations() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker teardown should be confirmed");
+
+        let admitted_again = send(app, stream_request()).await;
+        assert_eq!(admitted_again.status(), StatusCode::OK);
+        drop(admitted_again);
     }
 }

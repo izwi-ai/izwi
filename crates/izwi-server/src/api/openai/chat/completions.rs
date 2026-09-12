@@ -24,7 +24,7 @@ use crate::app::chat_content::{
     flatten_content_parts, validate_media_inputs_for_variant, FlattenedMultimodalContent,
 };
 use crate::error::ApiError;
-use crate::gateway::GatewayState;
+use crate::gateway::{GatewayAdmissionGuard, GatewayState};
 use crate::ids::new_uuid;
 use crate::state::AppState;
 use izwi_core::{
@@ -653,7 +653,7 @@ pub async fn completions(
         } else {
             spawn_chat_stream(state, execution_request)
         };
-        let stream_response = render_chat_stream(req, model_id, event_rx, compat_profile);
+        let stream_response = render_chat_stream(req, model_id, event_rx, compat_profile, None);
         return Ok(stream_response.into_response());
     }
 
@@ -673,6 +673,7 @@ pub async fn completions(
 pub async fn gateway_completions(
     State(state): State<GatewayState>,
     Extension(ctx): Extension<RequestContext>,
+    Extension(admission): Extension<GatewayAdmissionGuard>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
     let compat_profile = compatibility_profile();
@@ -687,7 +688,10 @@ pub async fn gateway_completions(
             execution_request,
         )
         .await?;
-        return Ok(render_chat_stream(req, model_id, event_rx, compat_profile).into_response());
+        return Ok(
+            render_chat_stream(req, model_id, event_rx, compat_profile, Some(admission))
+                .into_response(),
+        );
     }
     let generation = generate_remote_chat_with_execution(
         &state.remote_chat_execution,
@@ -696,6 +700,7 @@ pub async fn gateway_completions(
         execution_request,
     )
     .await?;
+    drop(admission);
     Ok(render_completion_response(
         variant,
         generation,
@@ -795,6 +800,7 @@ fn render_chat_stream(
     model_id: String,
     mut event_rx: tokio::sync::mpsc::Receiver<ChatStreamEvent>,
     compat_profile: OpenAiCompatibilityProfile,
+    admission: Option<GatewayAdmissionGuard>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let include_usage = req
         .stream_options
@@ -805,6 +811,7 @@ fn render_chat_stream(
     let created = now_unix_secs();
 
     let stream = async_stream::stream! {
+        let _admission = admission;
         let mut saw_terminal = false;
         while let Some(event) = event_rx.recv().await {
             let (payload, terminal) = match event {
