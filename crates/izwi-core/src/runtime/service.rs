@@ -2065,6 +2065,39 @@ impl std::fmt::Debug for RuntimeChatInvocation {
 }
 
 impl RuntimeChatInvocation {
+    fn from_failed_post_admission(
+        request_id: String,
+        cancellation: Arc<AtomicBool>,
+        mut guard: PendingRequestGuard,
+        error: Error,
+    ) -> Self {
+        cancellation.store(true, Ordering::Release);
+        let (event_sender, events) = mpsc::channel(1);
+        let _ = event_sender.try_send(Err(error));
+        drop(event_sender);
+        let (teardown_sender, teardown) = oneshot::channel();
+        let cleanup_request_id = request_id.clone();
+        tokio::spawn(async move {
+            if guard.confirm_cleanup().await.is_ok() {
+                let _ = teardown_sender.send(RuntimeChatTeardown {
+                    request_id: cleanup_request_id,
+                    disposition: RuntimeChatTeardownDisposition::Failed,
+                });
+            }
+            // A failed cleanup leaves the guard armed. Its Drop path retries
+            // exact-session cleanup while retaining admission fail closed; the
+            // closed teardown channel tells the worker it has no proof yet.
+        });
+        Self {
+            request_id,
+            cancellation,
+            cancellation_wakeup: Arc::new(Notify::new()),
+            events,
+            teardown: Some(teardown),
+            cancel_on_drop: false,
+        }
+    }
+
     pub fn request_id(&self) -> &str {
         &self.request_id
     }
@@ -4104,11 +4137,36 @@ impl RuntimeService {
             Some(residency_lease),
         );
         if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
-            let _ = guard.confirm_cleanup().await;
-            return Err(Error::Timeout(request_id));
+            let timeout = Error::Timeout(request_id.clone());
+            return match guard.confirm_cleanup().await {
+                Ok(_) => Err(timeout),
+                Err(cleanup_error) => Ok(RuntimeChatInvocation::from_failed_post_admission(
+                    request_id,
+                    cancellation,
+                    guard,
+                    Error::InferenceError(format!(
+                        "{timeout}; exact-session cleanup was not confirmed: {cleanup_error}"
+                    )),
+                )),
+            };
         }
-        self.bind_waiter(&request_id, waiter_registration_id, guard.session.epoch)
-            .await?;
+        if let Err(bind_error) = self
+            .bind_waiter(&request_id, waiter_registration_id, guard.session.epoch)
+            .await
+        {
+            waiter_guard.disarm();
+            return match guard.confirm_cleanup().await {
+                Ok(_) => Err(bind_error),
+                Err(cleanup_error) => Ok(RuntimeChatInvocation::from_failed_post_admission(
+                    request_id,
+                    cancellation,
+                    guard,
+                    Error::InferenceError(format!(
+                        "{bind_error}; exact-session cleanup was not confirmed: {cleanup_error}"
+                    )),
+                )),
+            };
+        }
         waiter_guard.disarm();
         self.telemetry.record_request_queued(&request_id).await;
 
