@@ -24,6 +24,7 @@ pub const MANAGED_WORKER_ENV: &str = "IZWI_WORKER_MANAGED";
 pub const WORKER_INCARNATION_ENV: &str = "IZWI_WORKER_INCARNATION_ID";
 pub const WORKER_OWNERSHIP_LOCK_ENV: &str = "IZWI_WORKER_OWNERSHIP_LOCK";
 pub const WORKER_GENERATION_FENCE_ENV: &str = "IZWI_WORKER_GENERATION_FENCE_LOCK";
+pub const WORKER_MODEL_LOAD_LOCK_ENV: &str = "IZWI_WORKER_MODEL_LOAD_LOCK";
 pub const MAX_INHERITED_ENV_VALUE_BYTES: usize = 64 * 1024;
 pub const MAX_INHERITED_ENV_TOTAL_BYTES: usize = 256 * 1024;
 
@@ -45,6 +46,7 @@ impl std::fmt::Debug for ResolvedWorkerSecret {
 pub struct WorkerLockPaths {
     ownership: PathBuf,
     generation_fence: PathBuf,
+    model_load: PathBuf,
 }
 
 impl WorkerLockPaths {
@@ -61,6 +63,7 @@ impl WorkerLockPaths {
         Self {
             ownership: namespace.resource_path(resource_identity.as_bytes()),
             generation_fence: namespace.generation_fence_path(),
+            model_load: namespace.model_load_path(),
         }
     }
 
@@ -70,6 +73,10 @@ impl WorkerLockPaths {
 
     pub fn generation_fence(&self) -> &std::path::Path {
         &self.generation_fence
+    }
+
+    pub fn model_load(&self) -> &std::path::Path {
+        &self.model_load
     }
 
     pub fn try_acquire(
@@ -316,6 +323,10 @@ pub fn build_child_launch_spec(
     set(
         WORKER_GENERATION_FENCE_ENV,
         locks.generation_fence().as_os_str().to_owned(),
+    );
+    set(
+        WORKER_MODEL_LOAD_LOCK_ENV,
+        locks.model_load().as_os_str().to_owned(),
     );
 
     match &worker.assignment {
@@ -599,6 +610,13 @@ mod tests {
             "10000"
         );
         assert_eq!(env_value(&spec, "IZWI_WORKER_TERMINATION_GRACE_MS"), "5000");
+        let model_load_lock = Path::new(env_value(&spec, WORKER_MODEL_LOAD_LOCK_ENV));
+        assert!(model_load_lock.is_absolute());
+        assert!(model_load_lock
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("model-load-"));
         let command = spec.command();
         assert_eq!(command.get_program(), spec.program());
         assert_eq!(command.get_current_dir(), Some(spec.working_directory()));
@@ -699,5 +717,22 @@ mod tests {
             ),
             Err(LaunchSpecError::InheritedEnvironmentValueTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn accelerator_ownership_and_model_load_paths_are_assignment_scoped() {
+        let directory = tempfile::tempdir().unwrap();
+        let namespace = crate::LockNamespace::open(directory.path().join("locks")).unwrap();
+        let assignment = DeviceAssignment::Cuda {
+            device_uuid: id("GPU-1234"),
+            process_local_device_index: 0,
+            device_memory_limit_bytes: 2048,
+            host_memory_limit_bytes: 512,
+        };
+        let first = WorkerLockPaths::for_worker(&namespace, &id("worker-a"), &assignment);
+        let second = WorkerLockPaths::for_worker(&namespace, &id("worker-b"), &assignment);
+        assert_eq!(first.ownership(), second.ownership());
+        assert_eq!(first.model_load(), second.model_load());
+        assert_eq!(first.model_load(), namespace.model_load_path().as_path());
     }
 }

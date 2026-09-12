@@ -2,8 +2,8 @@ use anyhow::{bail, Context};
 use izwi_core::{backends::RuntimeDeviceAssignment, EngineConfig, ModelVariant, RuntimeService};
 use izwi_serving_protocol::*;
 use izwi_serving_supervisor::{
-    try_acquire_worker_fences, LockNamespace, WorkerFenceLeases, WORKER_GENERATION_FENCE_ENV,
-    WORKER_OWNERSHIP_LOCK_ENV,
+    try_acquire_worker_fences, LockLease, LockNamespace, WorkerFenceLeases, WorkerLockPaths,
+    WORKER_GENERATION_FENCE_ENV, WORKER_MODEL_LOAD_LOCK_ENV, WORKER_OWNERSHIP_LOCK_ENV,
 };
 use izwi_serving_worker::{
     warm_up_chat_runtime, RuntimeChatExecutor, WorkerConfig, WorkerService,
@@ -25,13 +25,18 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let process = WorkerProcessConfig::from_env()?;
-    let _fences = acquire_managed_worker_fences(&process)?;
+    let managed_locks = managed_lock_context(&process)?;
+    let _fences = acquire_managed_worker_fences(&process, managed_locks.as_ref())?;
     if let DeviceAssignment::Cpu { affinity, .. } = &process.assignment {
         if !affinity.is_empty() {
             tracing::warn!(?affinity, "CPU affinity is advisory on this worker build");
         }
     }
     verify_artifact_manifest(&process)?;
+    // Serialize the allocation-heavy startup section across workers on this
+    // node. Static supervisor validation bounds resident budgets; the runtime's
+    // resource authority performs the exact load-peak reservation below.
+    let model_load_stage = acquire_model_load_stage(&process, managed_locks.as_ref())?;
     let engine = EngineConfig {
         models_dir: process.models_dir.clone(),
         max_loaded_models: Some(1),
@@ -59,6 +64,9 @@ async fn main() -> anyhow::Result<()> {
     )
     .await
     .context("warm selected model before binding")?;
+    // Resident model memory stays charged to this worker's runtime and resource
+    // lease. Only the transient node-wide load stage is released here.
+    drop(model_load_stage);
 
     let credentials = ServiceCredentials {
         credential_id: process.credential_id.clone(),
@@ -131,29 +139,77 @@ async fn main() -> anyhow::Result<()> {
         .context("serve private worker")
 }
 
-fn acquire_managed_worker_fences(
+struct ManagedLockContext {
+    namespace: LockNamespace,
+    paths: WorkerLockPaths,
+}
+
+fn managed_lock_context(
     process: &WorkerProcessConfig,
-) -> anyhow::Result<Option<WorkerFenceLeases>> {
-    if !managed_worker() {
+) -> anyhow::Result<Option<ManagedLockContext>> {
+    if !process.managed {
         return Ok(None);
     }
     let ownership = PathBuf::from(required_env(WORKER_OWNERSHIP_LOCK_ENV)?);
     let generation = PathBuf::from(required_env(WORKER_GENERATION_FENCE_ENV)?);
+    let model_load = PathBuf::from(required_env(WORKER_MODEL_LOAD_LOCK_ENV)?);
     let directory = ownership
         .parent()
         .context("worker ownership lock must have a parent directory")?;
-    if generation.parent() != Some(directory) {
-        bail!("worker ownership and generation locks must share one namespace");
+    if generation.parent() != Some(directory) || model_load.parent() != Some(directory) {
+        bail!("worker ownership, generation, and model-load locks must share one namespace");
     }
     let namespace = LockNamespace::open(directory).context("open worker lock namespace")?;
+    let paths = WorkerLockPaths::for_worker(&namespace, &process.worker_id, &process.assignment);
+    if ownership.as_path() != paths.ownership()
+        || generation.as_path() != paths.generation_fence()
+        || model_load.as_path() != paths.model_load()
+    {
+        bail!("managed worker lock paths do not match the assigned resource and node namespace");
+    }
+    Ok(Some(ManagedLockContext { namespace, paths }))
+}
+
+fn acquire_managed_worker_fences(
+    process: &WorkerProcessConfig,
+    locks: Option<&ManagedLockContext>,
+) -> anyhow::Result<Option<WorkerFenceLeases>> {
+    let Some(locks) = locks else {
+        return Ok(None);
+    };
     let metadata = format!(
         "worker={} incarnation={}",
         process.worker_id, process.incarnation_id
     );
-    let leases =
-        try_acquire_worker_fences(&namespace, &ownership, &generation, metadata.as_bytes())
-            .context("acquire assigned resource and generation fences")?;
+    let leases = try_acquire_worker_fences(
+        &locks.namespace,
+        locks.paths.ownership(),
+        locks.paths.generation_fence(),
+        metadata.as_bytes(),
+    )
+    .context("acquire assigned resource and generation fences")?;
     Ok(Some(leases))
+}
+
+fn acquire_model_load_stage(
+    process: &WorkerProcessConfig,
+    locks: Option<&ManagedLockContext>,
+) -> anyhow::Result<Option<LockLease>> {
+    let Some(locks) = locks else {
+        return Ok(None);
+    };
+    let metadata = format!(
+        "worker={} incarnation={} deployment={} generation={}",
+        process.worker_id,
+        process.incarnation_id,
+        process.deployment_id,
+        process.model_generation.get()
+    );
+    locks
+        .namespace
+        .lock_exclusive(locks.paths.model_load(), metadata.as_bytes())
+        .map(Some)
+        .context("wait for the node model-load stage")
 }
 
 async fn shutdown_signal<E: izwi_serving_worker::InvocationExecutor>(

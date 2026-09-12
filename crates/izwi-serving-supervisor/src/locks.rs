@@ -60,6 +60,14 @@ impl LockNamespace {
         self.path_for("generation", b"worker-generation-fence")
     }
 
+    /// Node-wide serialization point for model construction, loading, and warm-up.
+    ///
+    /// Resident workers keep their assignment-specific resource lease, but release
+    /// this lease as soon as their configured deployment has completed warm-up.
+    pub fn model_load_path(&self) -> PathBuf {
+        self.path_for("model-load", b"node-model-load-stage")
+    }
+
     pub fn resource_path(&self, resource_identity: &[u8]) -> PathBuf {
         self.path_for("resource", resource_identity)
     }
@@ -74,11 +82,20 @@ impl LockNamespace {
     }
 
     pub fn try_exclusive(&self, path: &Path, metadata: &[u8]) -> Result<LockLease, LockError> {
-        self.try_lock(path, LockMode::Exclusive, metadata)
+        self.open_and_lock(path, LockMode::Exclusive, metadata, false)
+    }
+
+    /// Waits for an exclusive lease.
+    ///
+    /// This is reserved for bounded supervisor startup stages. The supervising
+    /// process owns the child deadline and forcibly tears it down if the stage
+    /// cannot make progress before that deadline.
+    pub fn lock_exclusive(&self, path: &Path, metadata: &[u8]) -> Result<LockLease, LockError> {
+        self.open_and_lock(path, LockMode::Exclusive, metadata, true)
     }
 
     pub fn try_shared(&self, path: &Path, metadata: &[u8]) -> Result<LockLease, LockError> {
-        self.try_lock(path, LockMode::Shared, metadata)
+        self.open_and_lock(path, LockMode::Shared, metadata, false)
     }
 
     fn path_for(&self, prefix: &str, identity: &[u8]) -> PathBuf {
@@ -91,11 +108,12 @@ impl LockNamespace {
         self.directory.join(format!("{prefix}-{encoded}.lock"))
     }
 
-    fn try_lock(
+    fn open_and_lock(
         &self,
         path: &Path,
         mode: LockMode,
         metadata: &[u8],
+        wait: bool,
     ) -> Result<LockLease, LockError> {
         if metadata.len() > MAX_LOCK_METADATA_BYTES {
             return Err(LockError::MetadataTooLarge {
@@ -120,9 +138,11 @@ impl LockNamespace {
             path: path.to_path_buf(),
             source,
         })?;
-        let lock_result = match mode {
-            LockMode::Exclusive => FileExt::try_lock_exclusive(&file),
-            LockMode::Shared => FileExt::try_lock_shared(&file),
+        let lock_result = match (mode, wait) {
+            (LockMode::Exclusive, true) => FileExt::lock_exclusive(&file),
+            (LockMode::Exclusive, false) => FileExt::try_lock_exclusive(&file),
+            (LockMode::Shared, true) => FileExt::lock_shared(&file),
+            (LockMode::Shared, false) => FileExt::try_lock_shared(&file),
         };
         match lock_result {
             Ok(()) => {}
@@ -298,6 +318,22 @@ mod tests {
         ));
         drop(worker);
         namespace.try_exclusive(&path, b"new-supervisor").unwrap();
+    }
+
+    #[test]
+    fn model_load_stage_is_node_wide_and_exclusive() {
+        let directory = tempfile::tempdir().unwrap();
+        let namespace = LockNamespace::open(directory.path().join("locks")).unwrap();
+        let path = namespace.model_load_path();
+        let first = namespace.lock_exclusive(&path, b"worker-one").unwrap();
+        assert!(matches!(
+            namespace.try_exclusive(&path, b"worker-two"),
+            Err(LockError::Contended(_))
+        ));
+        drop(first);
+        namespace
+            .try_exclusive(&path, b"worker-two")
+            .expect("the next load stage starts after the prior stage releases");
     }
 
     #[test]
