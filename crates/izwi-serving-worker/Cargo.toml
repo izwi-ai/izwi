@@ -23,6 +23,7 @@ bytes = { workspace = true }
 dirs = { workspace = true }
 izwi-core = { path = "../izwi-core", default-features = false }
 izwi-serving-protocol = { path = "../izwi-serving-protocol" }
+izwi-serving-supervisor = { path = "../izwi-serving-supervisor" }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

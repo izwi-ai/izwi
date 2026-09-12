@@ -3884,6 +3884,7 @@ dependencies = [
  "izwi-server",
  "izwi-serving-client",
  "izwi-serving-protocol",
+ "izwi-serving-supervisor",
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
