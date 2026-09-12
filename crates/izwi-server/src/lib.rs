@@ -52,6 +52,7 @@ mod voice_defaults;
 mod voice_memory;
 mod voice_observation_store;
 mod voice_store;
+pub mod worker_registry;
 
 use batch_runtime::types::{
     DeviceClass, QueueClass, ResourceTarget, RuntimeBackendClass, WorkerResourceCapacity,
