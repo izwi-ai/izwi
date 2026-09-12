@@ -1213,14 +1213,14 @@ async fn execute_batch_tts_stage(
     hydrate_batch_reference_audio(state, &claimed, &mut request.request).await?;
     let variant = parse_tts_model_variant(request.model_id.as_str())
         .map_err(|err| anyhow::anyhow!("Unsupported TTS model: {err}"))?;
-    let ctx = RequestContext {
-        correlation_id: claimed
+    let ctx = RequestContext::new(
+        claimed
             .job
             .correlation_id
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-        principal: Principal::local_anonymous(),
-    };
+        Principal::local_anonymous(),
+    );
 
     if let Some(projection_attempt) = projection_attempt.as_ref() {
         state

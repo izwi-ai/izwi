@@ -16,8 +16,8 @@ use crate::api::openai::compat::{
 };
 use crate::api::request_context::RequestContext;
 use crate::app::chat::{
-    generate_chat, parse_chat_model, resolve_chat_request_config, spawn_chat_stream,
-    ChatExecutionRequest, ChatStreamEvent,
+    generate_chat, generate_remote_chat, parse_chat_model, resolve_chat_request_config,
+    spawn_chat_stream, ChatExecutionRequest, ChatStreamEvent,
 };
 use crate::app::chat_content::{
     flatten_content_parts, validate_media_inputs_for_variant, FlattenedMultimodalContent,
@@ -669,16 +669,25 @@ pub async fn completions(
         repetition_penalty: req.repetition_penalty,
         presence_penalty: req.presence_penalty,
         chat_config,
-        correlation_id: Some(ctx.correlation_id),
+        correlation_id: Some(ctx.correlation_id.clone()),
     };
 
     if req.stream.unwrap_or(false) {
+        if state.remote_chat_execution.is_some() {
+            return Err(ApiError::bad_request(
+                "Remote chat execution currently supports only non-streaming requests",
+            ));
+        }
         let stream_response =
             complete_stream(state, req, execution_request, compat_profile).await?;
         return Ok(stream_response.into_response());
     }
 
-    let generation = generate_chat(&state, execution_request).await?;
+    let generation = if state.remote_chat_execution.is_some() {
+        generate_remote_chat(&state, &ctx, execution_request).await?
+    } else {
+        generate_chat(&state, execution_request).await?
+    };
 
     let completion_id = new_uuid();
     let created = now_unix_secs();
@@ -852,7 +861,360 @@ async fn complete_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+        Router,
+    };
+    use izwi_core::{RuntimeService, ServeRuntimeConfig};
+    use izwi_serving_client::{
+        mock::{MockFault, MockWorker, MockWorkerConfig},
+        WorkerClient, WorkerClientConfig,
+    };
+    use izwi_serving_protocol::{
+        CredentialId, PolicyRevision, ServiceBearerToken, ServiceCredentials,
+    };
     use serde_json::json;
+    use std::path::PathBuf;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use tower::Service;
+
+    use crate::api::create_router;
+    use crate::app::chat::{RemoteChatExecution, RemoteChatExecutionConfig};
+    use crate::test_support::env_lock;
+
+    struct TempDirGuard(PathBuf);
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    async fn remote_chat_app(
+        name: &str,
+        worker_config: MockWorkerConfig,
+        client_credentials: ServiceCredentials,
+        client_config: WorkerClientConfig,
+        generation_override: Option<izwi_serving_protocol::ModelGeneration>,
+    ) -> (Router, MockWorker, TempDirGuard) {
+        let incarnation = worker_config.incarnation_id.clone();
+        let deployment = worker_config.deployment_id.clone();
+        let generation = generation_override.unwrap_or(worker_config.model_generation);
+        let worker = MockWorker::spawn(worker_config)
+            .await
+            .expect("mock worker should start");
+        let client = WorkerClient::new(&worker.endpoint(), client_credentials, client_config)
+            .expect("worker client should initialize");
+        let remote = RemoteChatExecution::new(
+            client,
+            RemoteChatExecutionConfig {
+                public_model_variant: ModelVariant::Qwen34BGguf,
+                expected_worker_incarnation: incarnation,
+                deployment_id: deployment,
+                expected_model_generation: generation,
+                policy_revision: PolicyRevision::new("test-policy-v1")
+                    .expect("static policy revision"),
+                max_queue_wait: Duration::ZERO,
+                max_output_tokens: 128,
+                max_output_bytes: 4096,
+            },
+        )
+        .expect("remote chat config should be valid");
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("izwi-remote-chat-{name}-{nanos}"));
+        let models_dir = temp_dir.join("models");
+        std::fs::create_dir_all(&models_dir).expect("models dir should exist");
+        let serve_config = ServeRuntimeConfig {
+            backend: izwi_core::backends::BackendPreference::Cpu,
+            models_dir,
+            ui_enabled: false,
+            request_timeout_secs: 2,
+            ..ServeRuntimeConfig::default()
+        };
+
+        let _env = env_lock();
+        std::env::set_var("IZWI_DB_PATH", temp_dir.join("izwi.sqlite3"));
+        std::env::set_var("IZWI_MEDIA_DIR", temp_dir.join("media"));
+        let runtime =
+            RuntimeService::new(serve_config.engine_config()).expect("runtime should init");
+        let state = AppState::new(runtime, &serve_config)
+            .expect("state should init")
+            .with_remote_chat_execution(remote);
+        std::env::remove_var("IZWI_DB_PATH");
+        std::env::remove_var("IZWI_MEDIA_DIR");
+
+        (
+            create_router(state, &serve_config),
+            worker,
+            TempDirGuard(temp_dir),
+        )
+    }
+
+    fn valid_client_credentials(config: &MockWorkerConfig) -> ServiceCredentials {
+        config.credentials.clone()
+    }
+
+    fn invalid_client_credentials() -> ServiceCredentials {
+        ServiceCredentials {
+            credential_id: CredentialId::new("wrong-credential").expect("static credential"),
+            bearer_token: ServiceBearerToken::new("wrong-secret").expect("static token"),
+        }
+    }
+
+    fn public_chat_request_for_model(model: ModelVariant) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": model.dir_name(),
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": false,
+                    "max_tokens": 32
+                })
+                .to_string(),
+            ))
+            .expect("request should build")
+    }
+
+    fn public_chat_request() -> Request<Body> {
+        public_chat_request_for_model(ModelVariant::Qwen34BGguf)
+    }
+
+    async fn send_public_chat(mut app: Router) -> Response {
+        app.as_service::<Body>()
+            .call(public_chat_request())
+            .await
+            .expect("router request should succeed")
+    }
+
+    async fn send_public_streaming_chat(mut app: Router) -> Response {
+        let mut request = public_chat_request();
+        *request.body_mut() = Body::from(
+            json!({
+                "model": ModelVariant::Qwen34BGguf.dir_name(),
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": true,
+                "max_tokens": 32
+            })
+            .to_string(),
+        );
+        app.as_service::<Body>()
+            .call(request)
+            .await
+            .expect("router request should succeed")
+    }
+
+    async fn response_json(response: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("response body should be bounded");
+        serde_json::from_slice(&bytes).expect("response should contain JSON")
+    }
+
+    async fn wait_for_active(worker: &MockWorker, expected: usize) {
+        for _ in 0..100 {
+            if worker.active_invocations() == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!(
+            "mock worker active count was {}, expected {expected}",
+            worker.active_invocations()
+        );
+    }
+
+    #[tokio::test]
+    async fn public_chat_routes_over_real_worker_transport() {
+        let worker_config = MockWorkerConfig {
+            output_text: "remote hello".to_string(),
+            ..MockWorkerConfig::default()
+        };
+        let credentials = valid_client_credentials(&worker_config);
+        let (app, _worker, _temp) = remote_chat_app(
+            "success",
+            worker_config,
+            credentials,
+            WorkerClientConfig::default(),
+            None,
+        )
+        .await;
+
+        let response = send_public_chat(app).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["choices"][0]["message"]["content"], "remote hello");
+        assert_eq!(body["choices"][0]["finish_reason"], "stop");
+        assert_eq!(body["usage"]["prompt_tokens"], 1);
+        assert_eq!(body["usage"]["completion_tokens"], 3);
+    }
+
+    #[tokio::test]
+    async fn remote_profile_rejects_streaming_instead_of_falling_back_locally() {
+        let worker_config = MockWorkerConfig::default();
+        let credentials = valid_client_credentials(&worker_config);
+        let (app, worker, _temp) = remote_chat_app(
+            "streaming-rejected",
+            worker_config,
+            credentials,
+            WorkerClientConfig::default(),
+            None,
+        )
+        .await;
+
+        let response = send_public_streaming_chat(app).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(worker.active_invocations(), 0);
+        let body = response_json(response).await;
+        assert_eq!(
+            body["error"]["message"],
+            "Remote chat execution currently supports only non-streaming requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_chat_rejects_incompatible_public_model_without_worker_dispatch() {
+        let worker_config = MockWorkerConfig::default();
+        let credentials = valid_client_credentials(&worker_config);
+        let (mut app, worker, _temp) = remote_chat_app(
+            "incompatible",
+            worker_config,
+            credentials,
+            WorkerClientConfig::default(),
+            None,
+        )
+        .await;
+
+        let response = app
+            .as_service::<Body>()
+            .call(public_chat_request_for_model(ModelVariant::Qwen317BGguf))
+            .await
+            .expect("router request should succeed");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(worker.active_invocations(), 0);
+        let body = response_json(response).await;
+        assert!(body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("incompatible with remote deployment")));
+    }
+
+    #[tokio::test]
+    async fn public_chat_surfaces_stale_model_generation_without_fallback() {
+        let worker_config = MockWorkerConfig::default();
+        let credentials = valid_client_credentials(&worker_config);
+        let stale_generation =
+            izwi_serving_protocol::ModelGeneration::new(2).expect("non-zero generation");
+        let (app, _worker, _temp) = remote_chat_app(
+            "generation",
+            worker_config,
+            credentials,
+            WorkerClientConfig::default(),
+            Some(stale_generation),
+        )
+        .await;
+
+        let response = send_public_chat(app).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["message"], "model generation changed");
+    }
+
+    #[tokio::test]
+    async fn public_chat_surfaces_authoritative_worker_capacity_rejection() {
+        let worker_config = MockWorkerConfig {
+            output_cadence: Duration::from_millis(150),
+            ..MockWorkerConfig::default()
+        };
+        let credentials = valid_client_credentials(&worker_config);
+        let (app, worker, _temp) = remote_chat_app(
+            "capacity",
+            worker_config,
+            credentials,
+            WorkerClientConfig::default(),
+            None,
+        )
+        .await;
+
+        let first = tokio::spawn(send_public_chat(app.clone()));
+        wait_for_active(&worker, 1).await;
+        let rejected = send_public_chat(app).await;
+        assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response_json(rejected).await;
+        assert_eq!(body["error"]["message"], "worker capacity is exhausted");
+        assert_eq!(
+            first.await.expect("first request task").status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn public_chat_timeout_requests_cancel_without_early_capacity_release() {
+        let worker_config = MockWorkerConfig {
+            output_cadence: Duration::from_millis(1),
+            cancellation_delay: Duration::from_millis(150),
+            fault: MockFault::Hang,
+            ..MockWorkerConfig::default()
+        };
+        let credentials = valid_client_credentials(&worker_config);
+        let client_config = WorkerClientConfig {
+            progress_timeout: Duration::from_millis(30),
+            ..WorkerClientConfig::default()
+        };
+        let (app, worker, _temp) =
+            remote_chat_app("timeout", worker_config, credentials, client_config, None).await;
+
+        let response = send_public_chat(app).await;
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(worker.active_invocations(), 1);
+        wait_for_active(&worker, 0).await;
+    }
+
+    #[tokio::test]
+    async fn public_chat_maps_worker_service_auth_failure_without_retry() {
+        let worker_config = MockWorkerConfig::default();
+        let (app, _worker, _temp) = remote_chat_app(
+            "auth",
+            worker_config,
+            invalid_client_credentials(),
+            WorkerClientConfig::default(),
+            None,
+        )
+        .await;
+
+        let response = send_public_chat(app).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn public_chat_reports_accepted_then_interrupted_as_unknown_failure() {
+        let worker_config = MockWorkerConfig {
+            fault: MockFault::AcceptedThenDisconnect,
+            ..MockWorkerConfig::default()
+        };
+        let credentials = valid_client_credentials(&worker_config);
+        let (app, _worker, _temp) = remote_chat_app(
+            "interrupted",
+            worker_config,
+            credentials,
+            WorkerClientConfig::default(),
+            None,
+        )
+        .await;
+
+        let response = send_public_chat(app).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = response_json(response).await;
+        assert!(body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("without a terminal event")));
+    }
 
     #[test]
     fn flattens_text_parts_content() {

@@ -3806,6 +3806,8 @@ dependencies = [
  "izwi-agent",
  "izwi-core",
  "izwi-hooks",
+ "izwi-serving-client",
+ "izwi-serving-protocol",
  "izwi-vad",
  "scalar_api_reference",
  "sea-orm",

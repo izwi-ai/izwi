@@ -53,6 +53,8 @@ async-trait = "0.1"
 izwi-hooks = { path = "../izwi-hooks" }
 izwi-agent = { path = "../izwi-agent" }
 izwi-vad = { path = "../izwi-vad" }
+izwi-serving-client = { path = "../izwi-serving-client" }
+izwi-serving-protocol = { path = "../izwi-serving-protocol" }
 
 config = { workspace = true }
 dirs = { workspace = true }
@@ -73,3 +75,4 @@ izwi-core = { path = "../izwi-core", default-features = false }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+izwi-serving-client = { path = "../izwi-serving-client", features = ["mock-worker"] }

@@ -11,6 +11,7 @@ use izwi_hooks::{
     HookError, HookMetadata, ObservabilityEvent, ObservabilityEventKind, Principal,
     RequestEnvelope, ResourceDescriptor,
 };
+use std::time::{Duration, Instant};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -23,9 +24,20 @@ pub struct RequestContext {
     pub correlation_id: String,
     #[allow(dead_code)]
     pub principal: Principal,
+    /// Receiver-local ingress time used to preserve the original end-to-end
+    /// request budget when work crosses another process boundary.
+    received_at: Instant,
 }
 
 impl RequestContext {
+    pub(crate) fn new(correlation_id: String, principal: Principal) -> Self {
+        Self {
+            correlation_id,
+            principal,
+            received_at: Instant::now(),
+        }
+    }
+
     /// Scheduling identity comes exclusively from the authenticated extension.
     /// Legacy durable jobs and the local anonymous principal share None.
     pub(crate) fn tenant_key(&self) -> Option<[u8; 32]> {
@@ -34,6 +46,10 @@ impl RequestContext {
         }
         use sha2::{Digest, Sha256};
         Some(Sha256::digest(principal_namespace(&self.principal).as_bytes()).into())
+    }
+
+    pub(crate) fn remaining_budget(&self, total: Duration) -> Option<Duration> {
+        total.checked_sub(self.received_at.elapsed())
     }
 }
 
@@ -54,10 +70,10 @@ pub async fn attach_request_context(mut req: Request, next: Next) -> Response {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-    req.extensions_mut().insert(RequestContext {
-        correlation_id: correlation_id.clone(),
-        principal: Principal::local_anonymous(),
-    });
+    req.extensions_mut().insert(RequestContext::new(
+        correlation_id.clone(),
+        Principal::local_anonymous(),
+    ));
 
     if let Ok(value) = HeaderValue::from_str(&correlation_id) {
         req.headers_mut().insert(REQUEST_ID_HEADER, value);
@@ -155,10 +171,10 @@ pub async fn attach_enterprise_request_context(
         None
     };
 
-    req.extensions_mut().insert(RequestContext {
-        correlation_id: correlation_id.clone(),
-        principal: principal.clone(),
-    });
+    req.extensions_mut().insert(RequestContext::new(
+        correlation_id.clone(),
+        principal.clone(),
+    ));
 
     if let Ok(value) = HeaderValue::from_str(&correlation_id) {
         req.headers_mut().insert(REQUEST_ID_HEADER, value);
@@ -341,10 +357,10 @@ fn header_to_string(value: &HeaderValue) -> Option<String> {
 mod tests {
     #[test]
     fn scheduling_tenant_identity_is_trusted_namespaced_and_anonymous_stable() {
-        let mut context = super::RequestContext {
-            correlation_id: "untrusted-header".into(),
-            principal: izwi_hooks::Principal::local_anonymous(),
-        };
+        let mut context = super::RequestContext::new(
+            "untrusted-header".into(),
+            izwi_hooks::Principal::local_anonymous(),
+        );
         assert_eq!(context.tenant_key(), None);
         context.principal.id = "a".into();
         let individual = context.tenant_key();
