@@ -28,7 +28,9 @@ pub const DEFAULT_MOCK_REQUEST_LIMIT: usize = 1024 * 1024;
 pub enum MockFault {
     None,
     Hang,
+    AcceptedWithoutAcknowledgement,
     AcceptedThenDisconnect,
+    PartialThenDisconnect,
     MalformedEvent,
     OversizedEvent { text_bytes: usize },
 }
@@ -488,6 +490,28 @@ async fn run_invocation(
     mut cancel: watch::Receiver<bool>,
     tx: mpsc::Sender<Bytes>,
 ) {
+    if state.config.fault == MockFault::AcceptedWithoutAcknowledgement {
+        // Admission is authoritative even when the acknowledgement never
+        // reaches the gateway. Close the HTTP body while retaining execution
+        // capacity until exact-attempt cancellation completes.
+        state.update_attempt(&request.attempt_id, AttemptState::Running, Some(0));
+        drop(tx);
+        let terminal_state = match cancel.changed().await {
+            Ok(()) if *cancel.borrow() => {
+                state.update_attempt(
+                    &request.attempt_id,
+                    AttemptState::ExecutionStopping,
+                    Some(0),
+                );
+                tokio::time::sleep(state.config.cancellation_delay).await;
+                AttemptState::Cancelled
+            }
+            _ => AttemptState::Failed,
+        };
+        state.update_attempt(&request.attempt_id, terminal_state, Some(0));
+        return;
+    }
+
     let accepted = InvocationEvent {
         schema_version: PROTOCOL_V1,
         request_id: request.request_id.clone(),
@@ -510,11 +534,30 @@ async fn run_invocation(
     let work = async move {
         tokio::time::sleep(state_for_work.config.output_cadence).await;
         match state_for_work.config.fault.clone() {
-            MockFault::Hang => std::future::pending::<AttemptState>().await,
-            MockFault::AcceptedThenDisconnect => AttemptState::Failed,
+            MockFault::Hang => std::future::pending::<(AttemptState, Option<u64>)>().await,
+            MockFault::AcceptedWithoutAcknowledgement => unreachable!("handled before response"),
+            MockFault::AcceptedThenDisconnect => (AttemptState::Failed, Some(0)),
+            MockFault::PartialThenDisconnect => {
+                let event = InvocationEvent {
+                    schema_version: PROTOCOL_V1,
+                    request_id: request_for_work.request_id.clone(),
+                    attempt_id: request_for_work.attempt_id.clone(),
+                    sequence: 1,
+                    event: InvocationEventKind::TextDelta {
+                        text: state_for_work.config.output_text.clone(),
+                    },
+                };
+                let _ = tx_for_work.send(encode_event(&event)).await;
+                state_for_work.update_attempt(
+                    &request_for_work.attempt_id,
+                    AttemptState::Running,
+                    Some(1),
+                );
+                (AttemptState::Failed, Some(1))
+            }
             MockFault::MalformedEvent => {
                 let _ = tx_for_work.send(Bytes::from_static(b"{malformed}\n")).await;
-                AttemptState::Failed
+                (AttemptState::Failed, Some(0))
             }
             MockFault::OversizedEvent { text_bytes } => {
                 let event = InvocationEvent {
@@ -527,7 +570,7 @@ async fn run_invocation(
                     },
                 };
                 let _ = tx_for_work.send(encode_event(&event)).await;
-                AttemptState::Failed
+                (AttemptState::Failed, Some(1))
             }
             MockFault::None => {
                 let delta = InvocationEvent {
@@ -560,17 +603,14 @@ async fn run_invocation(
                     },
                 };
                 let _ = tx_for_work.send(encode_event(&completed)).await;
-                AttemptState::Completed
+                (AttemptState::Completed, Some(2))
             }
         }
     };
     tokio::pin!(work);
 
     let (terminal_state, sequence) = tokio::select! {
-        terminal = &mut work => {
-            let sequence = (terminal == AttemptState::Completed).then_some(2);
-            (terminal, sequence)
-        },
+        terminal = &mut work => terminal,
         changed = cancel.changed() => {
             if changed.is_ok() && *cancel.borrow() {
                 state.update_attempt(

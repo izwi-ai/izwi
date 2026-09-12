@@ -259,6 +259,61 @@ async fn malformed_oversized_and_accepted_then_eof_are_never_success() {
     }
 }
 
+#[tokio::test]
+async fn lost_acknowledgement_is_unknown_and_never_releases_capacity_early() {
+    let config = MockWorkerConfig {
+        fault: MockFault::AcceptedWithoutAcknowledgement,
+        cancellation_delay: Duration::from_millis(150),
+        ..MockWorkerConfig::default()
+    };
+    let worker = MockWorker::spawn(config).await.unwrap();
+    let client = client(&worker);
+    let invocation = request(worker.config(), "lost-ack");
+    let identity = AttemptIdentity::from(&invocation);
+
+    assert!(matches!(
+        client.invoke(invocation).await,
+        Err(WorkerClientError::InterruptedUnknown)
+    ));
+    assert_eq!(worker.active_invocations(), 1);
+    assert!(matches!(
+        client
+            .invoke(request(worker.config(), "lost-ack-second"))
+            .await,
+        Err(WorkerClientError::Rejected { rejection })
+            if rejection.code == RejectionCode::CapacityExhausted
+    ));
+    assert!(matches!(
+        client.query_attempt(&identity).await.unwrap().state,
+        AttemptState::Running
+            | AttemptState::CancellationRequested
+            | AttemptState::ExecutionStopping
+    ));
+
+    tokio::time::sleep(Duration::from_millis(180)).await;
+    assert_eq!(worker.active_invocations(), 0);
+    assert_eq!(
+        client.query_attempt(&identity).await.unwrap().state,
+        AttemptState::Cancelled
+    );
+}
+
+#[tokio::test]
+async fn partial_output_then_disconnect_is_never_replayed_or_reported_as_success() {
+    let config = MockWorkerConfig {
+        fault: MockFault::PartialThenDisconnect,
+        ..MockWorkerConfig::default()
+    };
+    let worker = MockWorker::spawn(config).await.unwrap();
+    let client = client(&worker);
+    let error = client
+        .invoke_collect(request(worker.config(), "partial-eof"))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, WorkerClientError::InterruptedUnknown));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn progress_timeout_requests_cancel_but_capacity_waits_for_teardown() {
     let config = MockWorkerConfig {
