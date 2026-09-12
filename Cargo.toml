@@ -11,6 +11,7 @@ members = [
     "crates/izwi-desktop",
     "crates/izwi-serving-protocol",
     "crates/izwi-serving-client",
+    "crates/izwi-serving-worker",
 ]
 
 [workspace.package]

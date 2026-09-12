@@ -1,0 +1,39 @@
+[package]
+name = "izwi-serving-worker"
+description = "Private inference worker HTTP service for Izwi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+accelerate = ["izwi-core/accelerate"]
+cuda = ["izwi-core/cuda"]
+cudnn = ["cuda", "izwi-core/cudnn"]
+flash-attn = ["cuda", "izwi-core/flash-attn"]
+metal = ["izwi-core/metal"]
+
+[dependencies]
+anyhow = { workspace = true }
+async-stream = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+bytes = { workspace = true }
+dirs = { workspace = true }
+izwi-core = { path = "../izwi-core", default-features = false }
+izwi-serving-protocol = { path = "../izwi-serving-protocol" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+candle-core = { workspace = true }
+izwi-serving-client = { path = "../izwi-serving-client" }
+tempfile = "3.10"
+tokenizers = { workspace = true }
+tower = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

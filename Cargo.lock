@@ -3855,6 +3855,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "izwi-serving-worker"
+version = "0.1.0-beta-18"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "axum",
+ "bytes",
+ "candle-core",
+ "dirs 5.0.1",
+ "izwi-core",
+ "izwi-serving-client",
+ "izwi-serving-protocol",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokenizers",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "izwi-vad"
 version = "0.1.0-beta-18"
 dependencies = [
