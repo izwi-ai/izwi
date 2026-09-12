@@ -9,7 +9,7 @@ use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRequest
 use crate::runtime::request::ChatRuntimeRequest;
 use crate::runtime::service::{
     media_preparation_resources, retained_chat_preparation_input_bytes, AdmittedEngineRequest,
-    RuntimeService,
+    RuntimeChatInvocation, RuntimeChatInvocationRequest, RuntimeService,
 };
 use crate::runtime::types::{ChatGeneration, RuntimeRequestContext};
 use tracing::warn;
@@ -102,6 +102,37 @@ fn reconcile_streamed_chat_text(
 }
 
 impl RuntimeService {
+    /// Admit one chat request and return its worker-facing execution handle.
+    ///
+    /// Success is authoritative acceptance: coordinator capacity, a pinned
+    /// model generation and an exact Engine session have all been established.
+    pub async fn start_chat_invocation(
+        &self,
+        invocation: RuntimeChatInvocationRequest,
+    ) -> Result<RuntimeChatInvocation> {
+        let RuntimeChatInvocationRequest {
+            variant,
+            messages,
+            params,
+            chat_config,
+            correlation_id,
+            runtime_context,
+            streaming,
+        } = invocation;
+        let admitted = self
+            .build_chat_request_with_params_and_config(
+                variant,
+                messages,
+                params,
+                chat_config,
+                correlation_id.as_deref(),
+                runtime_context,
+                streaming,
+            )
+            .await?;
+        self.start_admitted_chat_invocation(admitted).await
+    }
+
     fn prompt_token_config(
         params: &GenerationParams,
         chat_config: &ChatRequestConfig,

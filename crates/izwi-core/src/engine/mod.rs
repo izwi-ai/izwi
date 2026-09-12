@@ -2225,7 +2225,14 @@ impl Engine {
         let mut processed = self.retain_incremental_model_identity(processed).await?;
         let request_id = processed.id.clone();
         let model_variant = processed.model_variant;
-        let cancellation = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Runtime-owned invocation handles install their cancellation signal
+        // before Engine admission so transport cancellation never needs this
+        // core write lock. Preserve that exact signal across preprocessing;
+        // direct Engine callers still receive a fresh engine-owned signal.
+        let cancellation = processed
+            .cancellation
+            .clone()
+            .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
         processed.set_cancellation_signal(cancellation.clone());
 
         // Add to engine core. The core write lock also makes binding a pending
@@ -5172,5 +5179,29 @@ mod tests {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn admission_preserves_a_preinstalled_cancellation_signal() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let engine = Engine::new(EngineCoreConfig::default()).unwrap();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let mut request = EngineCoreRequest::tts("worker-owned cancellation");
+        request.id = "worker-owned-cancellation".into();
+        request.set_cancellation_signal(cancellation.clone());
+
+        let session = engine.add_request_with_session(request).await.unwrap();
+        let installed = engine
+            .request_controls
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())[&session.request_id]
+            .cancellation
+            .clone();
+        assert!(Arc::ptr_eq(&installed, &cancellation));
+
+        cancellation.store(true, Ordering::Release);
+        assert!(installed.load(Ordering::Acquire));
+        engine.abort_request_session(&session).await.unwrap();
     }
 }

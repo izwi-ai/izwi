@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use futures::FutureExt;
-use tokio::sync::{Mutex, Notify, RwLock, broadcast, oneshot};
+use tokio::sync::{Mutex, Notify, RwLock, broadcast, mpsc, oneshot};
 use tokio::task::yield_now;
 use tracing::{debug, error, info_span, warn};
 
@@ -100,7 +100,7 @@ use crate::runtime::telemetry::{
     RuntimeTelemetrySnapshot, push_engine_labeled_metric, push_engine_labeled_metric_f64,
     push_engine_metric, push_engine_metric_f64, push_engine_physical_execution_metrics,
 };
-use crate::runtime::types::RuntimeRequestContext;
+use crate::runtime::types::{ChatGeneration, RuntimeRequestContext};
 use crate::runtime_models::{LoadedModelDiagnostics, ModelRegistry};
 use crate::tokenizer::Tokenizer;
 
@@ -1995,6 +1995,133 @@ pub(crate) struct AdmittedEngineRequest {
     residency_lease: ModelResidencyLease,
 }
 
+/// Fully owned input for one worker-facing chat invocation.
+///
+/// The runtime applies coordinator admission, model lifecycle fencing and
+/// exact Engine session admission before returning a [`RuntimeChatInvocation`].
+#[derive(Debug, Clone)]
+pub struct RuntimeChatInvocationRequest {
+    pub variant: ModelVariant,
+    pub messages: Vec<ChatMessage>,
+    pub params: GenerationParams,
+    pub chat_config: ChatRequestConfig,
+    pub correlation_id: Option<String>,
+    pub runtime_context: RuntimeRequestContext,
+    /// Require native model streaming and expose committed text deltas.
+    pub streaming: bool,
+}
+
+/// Ordered output emitted by an admitted chat invocation.
+#[derive(Debug, Clone)]
+pub enum RuntimeChatInvocationEvent {
+    TextDelta(String),
+    Completed(ChatGeneration),
+}
+
+/// Why an invocation reached confirmed teardown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeChatTeardownDisposition {
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+/// Proof that the invocation no longer owns coordinator or model residency.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeChatTeardown {
+    pub request_id: String,
+    pub disposition: RuntimeChatTeardownDisposition,
+}
+
+const RUNTIME_CHAT_INVOCATION_EVENT_CAPACITY: usize = 16;
+
+/// Opaque transport-facing handle for an authoritatively admitted chat request.
+///
+/// A successful constructor return is the acceptance boundary: the request
+/// already owns coordinator capacity, an exact model generation and an exact
+/// Engine session. The background driver, not this handle, owns those leases.
+/// Dropping the handle requests cancellation, while the driver retains all
+/// capacity until normal completion or exact-session cleanup is confirmed.
+pub struct RuntimeChatInvocation {
+    request_id: String,
+    cancellation: Arc<AtomicBool>,
+    cancellation_wakeup: Arc<Notify>,
+    events: mpsc::Receiver<Result<RuntimeChatInvocationEvent>>,
+    teardown: Option<oneshot::Receiver<RuntimeChatTeardown>>,
+    cancel_on_drop: bool,
+}
+
+impl std::fmt::Debug for RuntimeChatInvocation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RuntimeChatInvocation")
+            .field("request_id", &self.request_id)
+            .field(
+                "cancellation_requested",
+                &self.cancellation.load(Ordering::Acquire),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl RuntimeChatInvocation {
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    /// Cooperatively request cancellation without waiting for an Engine lock.
+    ///
+    /// `true` means this call installed the signal. It is not teardown proof;
+    /// callers that need that proof must await [`Self::wait_for_teardown`].
+    pub fn request_cancel(&self) -> bool {
+        let newly_requested = self
+            .cancellation
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        self.cancellation_wakeup.notify_waiters();
+        newly_requested
+    }
+
+    /// Receive the next committed text delta or terminal generation.
+    pub async fn next_event(&mut self) -> Result<Option<RuntimeChatInvocationEvent>> {
+        match self.events.recv().await {
+            Some(event) => event.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Stop consuming output and wait for confirmed physical teardown.
+    ///
+    /// Closing the event receiver is treated like a disconnected transport and
+    /// therefore requests cancellation if execution has not already finished.
+    pub async fn wait_for_teardown(mut self) -> Result<RuntimeChatTeardown> {
+        self.events.close();
+        self.request_cancel();
+        self.cancel_on_drop = false;
+        let teardown = self.teardown.take().ok_or_else(|| {
+            Error::InferenceError(format!(
+                "chat invocation {} lost its teardown waiter",
+                self.request_id
+            ))
+        })?;
+        teardown.await.map_err(|_| {
+            Error::InferenceError(format!(
+                "chat invocation {} ended without teardown confirmation",
+                self.request_id
+            ))
+        })
+    }
+}
+
+impl Drop for RuntimeChatInvocation {
+    fn drop(&mut self) {
+        if self.cancel_on_drop {
+            self.cancellation.store(true, Ordering::Release);
+            self.cancellation_wakeup.notify_waiters();
+        }
+    }
+}
+
 fn bind_request_to_residency(
     request: &mut EngineCoreRequest,
     residency_lease: Option<&ModelResidencyLease>,
@@ -2353,6 +2480,31 @@ impl PendingRequestGuard {
         self.residency_lease.take();
     }
 
+    /// Cancel and fence the exact Engine session before releasing admission.
+    ///
+    /// This future is cancellation-safe: if its owner disappears while the
+    /// Engine step lock is held, `Drop` transfers the still-owned leases into
+    /// the existing fail-closed detached cleanup path.
+    async fn confirm_cleanup(&mut self) -> Result<bool> {
+        remove_waiter_registration(
+            self.completion_waiters.as_ref(),
+            &self.session.request_id,
+            self.waiter_registration_id,
+        )
+        .await;
+        let aborted = self
+            .core_engine
+            .abort_request_session(&self.session)
+            .await?;
+        if aborted {
+            self.telemetry
+                .record_request_cancelled(&self.session.request_id)
+                .await;
+        }
+        self.disarm();
+        Ok(aborted)
+    }
+
     /// Transfer cancellation cleanup to a detached exact-session task without
     /// waiting for the engine core lock. Streaming callbacks execute outside
     /// the engine, so a failed or timed-out transport must be able to return
@@ -2391,6 +2543,221 @@ impl Drop for PendingRequestGuard {
     fn drop(&mut self) {
         self.defer_cleanup();
     }
+}
+
+struct RuntimeChatInvocationDriver {
+    request_id: String,
+    deadline: Option<Instant>,
+    cancellation: Arc<AtomicBool>,
+    cancellation_wakeup: Arc<Notify>,
+    events: mpsc::Sender<Result<RuntimeChatInvocationEvent>>,
+    teardown: Option<oneshot::Sender<RuntimeChatTeardown>>,
+    completion: oneshot::Receiver<Result<EngineOutput>>,
+    stream: Option<mpsc::Receiver<StreamingOutput>>,
+    stream_order: Option<StreamOutputOrder>,
+    streamed_text: String,
+    guard: PendingRequestGuard,
+}
+
+impl RuntimeChatInvocationDriver {
+    async fn send_event(&self, event: Result<RuntimeChatInvocationEvent>) -> bool {
+        tokio::select! {
+            sent = self.events.send(event) => sent.is_ok(),
+            _ = self.cancellation_wakeup.notified() => false,
+        }
+    }
+
+    async fn finish_with_output(&mut self, output: EngineOutput) -> RuntimeChatTeardownDisposition {
+        let generation = match invocation_chat_generation(&mut self.streamed_text, output) {
+            Ok(generation) => generation,
+            Err(error) => {
+                let _ = self.send_event(Err(error)).await;
+                self.guard.disarm();
+                return RuntimeChatTeardownDisposition::Failed;
+            }
+        };
+        self.guard.disarm();
+        if self
+            .send_event(Ok(RuntimeChatInvocationEvent::Completed(generation)))
+            .await
+        {
+            RuntimeChatTeardownDisposition::Completed
+        } else {
+            // Engine completion is already physical teardown. A disconnected
+            // output consumer cannot turn it back into a cancellation.
+            RuntimeChatTeardownDisposition::Completed
+        }
+    }
+
+    async fn cancel_and_confirm(&mut self) -> RuntimeChatTeardownDisposition {
+        self.cancellation.store(true, Ordering::Release);
+        if let Some(stream) = self.stream.as_mut() {
+            stream.close();
+        }
+        match self.guard.confirm_cleanup().await {
+            Ok(_) => RuntimeChatTeardownDisposition::Cancelled,
+            Err(error) => {
+                let _ = self.send_event(Err(error)).await;
+                RuntimeChatTeardownDisposition::Failed
+            }
+        }
+    }
+
+    async fn drive(mut self) {
+        let disposition = self.drive_until_terminal().await;
+        let _ = self.teardown.take().map(|sender| {
+            sender.send(RuntimeChatTeardown {
+                request_id: self.request_id.clone(),
+                disposition,
+            })
+        });
+    }
+
+    async fn drive_until_terminal(&mut self) -> RuntimeChatTeardownDisposition {
+        let mut completion_result = None;
+        let invocation_deadline = self.deadline;
+        let deadline_wait = async move {
+            match invocation_deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(deadline_wait);
+
+        loop {
+            if self.cancellation.load(Ordering::Acquire) || self.events.is_closed() {
+                return self.cancel_and_confirm().await;
+            }
+
+            if self.stream_order.is_none() {
+                if let Some(completion) = completion_result.take() {
+                    return match completion {
+                        Ok(output) => self.finish_with_output(output).await,
+                        Err(error) => {
+                            self.guard.disarm();
+                            let disposition = if matches!(error, Error::Cancelled(_)) {
+                                RuntimeChatTeardownDisposition::Cancelled
+                            } else {
+                                RuntimeChatTeardownDisposition::Failed
+                            };
+                            let _ = self.send_event(Err(error)).await;
+                            disposition
+                        }
+                    };
+                }
+            } else if self.stream.is_none() {
+                let Some(completion) = completion_result.take() else {
+                    tokio::task::yield_now().await;
+                    continue;
+                };
+                let Some(stream_order) = self.stream_order.as_ref() else {
+                    unreachable!("non-streaming invocation handled above");
+                };
+                if let Err(error) = stream_order.require_final(&self.request_id) {
+                    self.guard.disarm();
+                    let _ = self.send_event(Err(error)).await;
+                    return RuntimeChatTeardownDisposition::Failed;
+                }
+                return match completion {
+                    Ok(output) => self.finish_with_output(output).await,
+                    Err(error) => {
+                        self.guard.disarm();
+                        let disposition = if matches!(error, Error::Cancelled(_)) {
+                            RuntimeChatTeardownDisposition::Cancelled
+                        } else {
+                            RuntimeChatTeardownDisposition::Failed
+                        };
+                        let _ = self.send_event(Err(error)).await;
+                        disposition
+                    }
+                };
+            }
+
+            tokio::select! {
+                _ = self.cancellation_wakeup.notified() => {
+                    if self.cancellation.load(Ordering::Acquire) || self.events.is_closed() {
+                        return self.cancel_and_confirm().await;
+                    }
+                }
+                _ = &mut deadline_wait => {
+                    self.cancellation.store(true, Ordering::Release);
+                    let error = Error::Timeout(self.request_id.clone());
+                    let _ = self.send_event(Err(error)).await;
+                    return self.cancel_and_confirm().await;
+                }
+                completion = &mut self.completion, if completion_result.is_none() => {
+                    completion_result = Some(match completion {
+                        Ok(result) => result,
+                        Err(_) => Err(Error::InferenceError(format!(
+                            "Request {} completion channel closed unexpectedly",
+                            self.request_id
+                        ))),
+                    });
+                }
+                chunk = async {
+                    match self.stream.as_mut() {
+                        Some(stream) => stream.recv().await,
+                        None => std::future::pending().await,
+                    }
+                }, if self.stream.is_some() => {
+                    match chunk {
+                        Some(chunk) => {
+                            let observed = self
+                                .stream_order
+                                .as_mut()
+                                .expect("streaming invocation has output order")
+                                .observe(&self.request_id, &chunk);
+                            if let Err(error) = observed {
+                                let _ = self.send_event(Err(error)).await;
+                                return self.cancel_and_confirm().await;
+                            }
+                            if let Some(delta) = chunk.text.filter(|delta| !delta.is_empty()) {
+                                self.streamed_text.push_str(&delta);
+                                if !self
+                                    .send_event(Ok(RuntimeChatInvocationEvent::TextDelta(delta)))
+                                    .await
+                                {
+                                    return self.cancel_and_confirm().await;
+                                }
+                            }
+                        }
+                        None => {
+                            self.stream = None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn invocation_chat_generation(
+    streamed_text: &mut String,
+    output: EngineOutput,
+) -> Result<ChatGeneration> {
+    let terminal_text = output.text.clone();
+    let text = if streamed_text.is_empty() {
+        terminal_text.unwrap_or_default()
+    } else if terminal_text
+        .as_ref()
+        .is_none_or(|terminal| terminal.is_empty() || terminal == streamed_text)
+    {
+        std::mem::take(streamed_text)
+    } else {
+        return Err(Error::InferenceError(format!(
+            "Streaming chat text did not match terminal output (streamed {} bytes, terminal {} bytes)",
+            streamed_text.len(),
+            terminal_text.as_ref().map_or(0, String::len)
+        )));
+    };
+    Ok(ChatGeneration {
+        latency_breakdown: output.latency_breakdown,
+        finish_reason: output.finish_reason,
+        text,
+        prompt_tokens: output.token_stats.prompt_tokens,
+        tokens_generated: output.num_tokens,
+        generation_time_ms: output.generation_time.as_secs_f64() * 1000.0,
+    })
 }
 
 impl RuntimeService {
@@ -3583,6 +3950,135 @@ impl RuntimeService {
         self.observe_broker_request(&request)?;
         self.run_request_after_admission(request, job, Some(residency_lease))
             .await
+    }
+
+    /// Establish an exact Engine session for a prepared chat invocation.
+    ///
+    /// Returning from this method is the worker acceptance boundary. All
+    /// admission and model residency is transferred to a background driver so
+    /// dropping the returned transport handle cannot release capacity early.
+    pub(crate) async fn start_admitted_chat_invocation(
+        &self,
+        admitted: AdmittedEngineRequest,
+    ) -> Result<RuntimeChatInvocation> {
+        let AdmittedEngineRequest {
+            mut request,
+            job,
+            residency_lease,
+        } = admitted;
+        let streaming = request.streaming;
+        self.observe_broker_request(&request)?;
+        let (prepared, job) = self
+            .prepare_request_for_binding(request, job, Some(&residency_lease))
+            .await?;
+        request = prepared;
+        let loaded_bundle = self
+            .model_lifecycle
+            .try_get_ready_bundle(residency_lease.variant());
+        bind_request_to_residency(
+            &mut request,
+            Some(&residency_lease),
+            loaded_bundle.as_deref(),
+            streaming,
+        )?;
+        if job.spec.request_id != request.id || job.spec.deadline != request.deadline {
+            return Err(Error::InvalidInput(
+                "chat invocation does not match its coordinator admission".to_string(),
+            ));
+        }
+
+        self.ensure_step_driver_started().await;
+        let request_id = request.id.clone();
+        let deadline = request.deadline;
+        let stream_policy = request.stream_policy;
+        let cancellation = Arc::new(AtomicBool::new(false));
+        request.set_cancellation_signal(cancellation.clone());
+        let (waiter_registration_id, completion) = self.register_waiter(&request_id).await?;
+        let mut waiter_guard = WaiterRegistrationGuard::new(
+            request_id.clone(),
+            waiter_registration_id,
+            self.completion_waiters.clone(),
+        );
+
+        let (session, stream) = if streaming {
+            match self
+                .await_engine_admission_for_job(
+                    &job,
+                    self.core_engine.generate_streaming_with_session(request),
+                )
+                .await
+            {
+                Ok((session, stream)) => (session, Some(stream)),
+                Err(error) => {
+                    self.remove_waiter(&request_id, waiter_registration_id)
+                        .await;
+                    waiter_guard.disarm();
+                    return Err(error);
+                }
+            }
+        } else {
+            match self
+                .await_engine_admission_for_job(
+                    &job,
+                    self.core_engine.add_request_with_session(request),
+                )
+                .await
+            {
+                Ok(session) => (session, None),
+                Err(error) => {
+                    self.remove_waiter(&request_id, waiter_registration_id)
+                        .await;
+                    waiter_guard.disarm();
+                    return Err(error);
+                }
+            }
+        };
+
+        let mut guard = PendingRequestGuard::new(
+            session,
+            self.core_engine.clone(),
+            self.completion_waiters.clone(),
+            waiter_registration_id,
+            self.telemetry.clone(),
+            job,
+            Some(residency_lease),
+        );
+        if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+            let _ = guard.confirm_cleanup().await;
+            return Err(Error::Timeout(request_id));
+        }
+        self.bind_waiter(&request_id, waiter_registration_id, guard.session.epoch)
+            .await?;
+        waiter_guard.disarm();
+        self.telemetry.record_request_queued(&request_id).await;
+
+        let (event_sender, events) = mpsc::channel(RUNTIME_CHAT_INVOCATION_EVENT_CAPACITY);
+        let (teardown_sender, teardown) = oneshot::channel();
+        let cancellation_wakeup = Arc::new(Notify::new());
+        let driver = RuntimeChatInvocationDriver {
+            request_id: request_id.clone(),
+            deadline,
+            cancellation: cancellation.clone(),
+            cancellation_wakeup: cancellation_wakeup.clone(),
+            events: event_sender,
+            teardown: Some(teardown_sender),
+            completion,
+            stream,
+            stream_order: streaming.then(|| StreamOutputOrder::new(stream_policy)),
+            streamed_text: String::new(),
+            guard,
+        };
+        tokio::spawn(driver.drive());
+        self.step_driver_wakeup.notify_one();
+
+        Ok(RuntimeChatInvocation {
+            request_id,
+            cancellation,
+            cancellation_wakeup,
+            events,
+            teardown: Some(teardown),
+            cancel_on_drop: true,
+        })
     }
 
     async fn prepare_qwen3_asr_shape_for_binding(
@@ -7061,6 +7557,58 @@ mod tests {
             ),
             8
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_chat_handle_cancellation_is_idempotent_and_teardown_is_explicit() {
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let cancellation_wakeup = Arc::new(Notify::new());
+        let (_event_sender, events) = mpsc::channel(1);
+        let (teardown_sender, teardown) = oneshot::channel();
+        let handle = RuntimeChatInvocation {
+            request_id: "serving-request".into(),
+            cancellation: cancellation.clone(),
+            cancellation_wakeup,
+            events,
+            teardown: Some(teardown),
+            cancel_on_drop: true,
+        };
+
+        assert!(handle.request_cancel());
+        assert!(!handle.request_cancel());
+        teardown_sender
+            .send(RuntimeChatTeardown {
+                request_id: "serving-request".into(),
+                disposition: RuntimeChatTeardownDisposition::Cancelled,
+            })
+            .unwrap();
+
+        let confirmed = handle.wait_for_teardown().await.unwrap();
+        assert_eq!(confirmed.request_id, "serving-request");
+        assert_eq!(
+            confirmed.disposition,
+            RuntimeChatTeardownDisposition::Cancelled
+        );
+        assert!(cancellation.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn dropping_runtime_chat_handle_requests_cancellation() {
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let (_event_sender, events) = mpsc::channel(1);
+        let (_teardown_sender, teardown) = oneshot::channel();
+        let handle = RuntimeChatInvocation {
+            request_id: "disconnected-request".into(),
+            cancellation: cancellation.clone(),
+            cancellation_wakeup: Arc::new(Notify::new()),
+            events,
+            teardown: Some(teardown),
+            cancel_on_drop: true,
+        };
+
+        drop(handle);
+
+        assert!(cancellation.load(Ordering::Acquire));
     }
 
     fn terminal_output(reason: ExecutionFinishReason) -> EngineOutput {

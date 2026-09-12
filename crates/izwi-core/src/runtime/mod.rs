@@ -36,7 +36,10 @@ pub use conformance::{
 };
 pub use coordinator::{CoordinatorLane, CoordinatorSnapshot, InferenceCoordinator, JobSpec};
 pub(crate) use coordinator::{PhysicalExecutionAdmission, PhysicalExecutionLease};
-pub use service::RuntimeService;
+pub use service::{
+    RuntimeChatInvocation, RuntimeChatInvocationEvent, RuntimeChatInvocationRequest,
+    RuntimeChatTeardown, RuntimeChatTeardownDisposition, RuntimeService,
+};
 pub use telemetry::{
     runtime_trace_contracts, sanitized_replay_record, trace_contract_for_phase,
     EngineRuntimeTelemetrySnapshot, InferenceBrokerRuntimeTelemetrySnapshot,
