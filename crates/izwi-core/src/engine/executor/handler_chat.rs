@@ -565,6 +565,16 @@ impl NativeExecutor {
                         )
                     })?
                 }
+                Some(cache) if matches!(model.as_ref(), NativeChatModel::Lfm2(_)) => {
+                    Self::run_blocking(|| {
+                        model.start_lfm2_decode_state_managed(
+                            &request.prompt_tokens,
+                            max_new_tokens,
+                            &generation_config,
+                            cache,
+                        )
+                    })?
+                }
                 Some(cache) => Self::run_blocking(|| {
                     model.start_qwen3_decode_state_managed(
                         messages,

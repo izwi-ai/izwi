@@ -4757,6 +4757,40 @@ impl NativeChatModel {
         }
     }
 
+    pub(crate) fn start_lfm2_decode_state_managed(
+        &self,
+        prompt_ids: &[u32],
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<NativeChatDecodeState> {
+        match self {
+            Self::Lfm2(model) => {
+                let mut state = model.begin_resumable_prefill_state_managed(
+                    prompt_ids,
+                    max_new_tokens,
+                    config,
+                    cache,
+                )?;
+                let complete = model.continue_resumable_prefill_managed(
+                    &mut state,
+                    prompt_ids,
+                    0,
+                    prompt_ids.len(),
+                )?;
+                if !complete {
+                    return Err(Error::InferenceError(
+                        "LFM2 full managed prefill did not complete".into(),
+                    ));
+                }
+                Ok(NativeChatDecodeState::Lfm2(state))
+            }
+            _ => Err(Error::InvalidInput(
+                "managed LFM2 state was routed to another model family".into(),
+            )),
+        }
+    }
+
     pub(crate) fn start_qwen38_decode_state_managed(
         &self,
         messages: &[ChatMessage],
