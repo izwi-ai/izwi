@@ -2078,7 +2078,7 @@ impl RuntimeChatInvocation {
             .cancellation
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok();
-        self.cancellation_wakeup.notify_waiters();
+        self.cancellation_wakeup.notify_one();
         newly_requested
     }
 
@@ -2117,7 +2117,7 @@ impl Drop for RuntimeChatInvocation {
     fn drop(&mut self) {
         if self.cancel_on_drop {
             self.cancellation.store(true, Ordering::Release);
-            self.cancellation_wakeup.notify_waiters();
+            self.cancellation_wakeup.notify_one();
         }
     }
 }
@@ -2548,6 +2548,9 @@ impl Drop for PendingRequestGuard {
 struct RuntimeChatInvocationDriver {
     request_id: String,
     deadline: Option<Instant>,
+    observation_context: RuntimeObservationContext,
+    admission_ms: Option<f64>,
+    telemetry: Arc<RuntimeTelemetryCollector>,
     cancellation: Arc<AtomicBool>,
     cancellation_wakeup: Arc<Notify>,
     events: mpsc::Sender<Result<RuntimeChatInvocationEvent>>,
@@ -2559,61 +2562,126 @@ struct RuntimeChatInvocationDriver {
     guard: PendingRequestGuard,
 }
 
+enum RuntimeChatCompletion {
+    Delivered(Result<EngineOutput>),
+    ChannelClosed,
+}
+
 impl RuntimeChatInvocationDriver {
-    async fn send_event(&self, event: Result<RuntimeChatInvocationEvent>) -> bool {
-        tokio::select! {
-            sent = self.events.send(event) => sent.is_ok(),
-            _ = self.cancellation_wakeup.notified() => false,
-        }
+    fn try_send_event(&self, event: Result<RuntimeChatInvocationEvent>) -> bool {
+        self.events.try_send(event).is_ok()
     }
 
     async fn finish_with_output(&mut self, output: EngineOutput) -> RuntimeChatTeardownDisposition {
-        let generation = match invocation_chat_generation(&mut self.streamed_text, output) {
+        let generation = match invocation_chat_generation(&mut self.streamed_text, &output) {
             Ok(generation) => generation,
             Err(error) => {
-                let _ = self.send_event(Err(error)).await;
+                self.record_error(&error);
                 self.guard.disarm();
+                let _ = self.try_send_event(Err(error));
                 return RuntimeChatTeardownDisposition::Failed;
             }
         };
+        self.telemetry
+            .record_stage_observation(engine_output_observation(
+                self.observation_context.clone(),
+                self.admission_ms,
+                &output,
+            ));
         self.guard.disarm();
-        if self
-            .send_event(Ok(RuntimeChatInvocationEvent::Completed(generation)))
-            .await
-        {
-            RuntimeChatTeardownDisposition::Completed
-        } else {
-            // Engine completion is already physical teardown. A disconnected
-            // output consumer cannot turn it back into a cancellation.
-            RuntimeChatTeardownDisposition::Completed
-        }
+        let _ = self.try_send_event(Ok(RuntimeChatInvocationEvent::Completed(generation)));
+        // Engine completion is already physical teardown. A disconnected or
+        // slow output consumer cannot turn it back into cancellation.
+        RuntimeChatTeardownDisposition::Completed
     }
 
-    async fn cancel_and_confirm(&mut self) -> RuntimeChatTeardownDisposition {
+    fn finish_with_terminal_error(
+        &mut self,
+        error: Error,
+    ) -> RuntimeChatTeardownDisposition {
+        self.record_error(&error);
+        self.guard.disarm();
+        let disposition = if matches!(error, Error::Cancelled(_)) {
+            RuntimeChatTeardownDisposition::Cancelled
+        } else {
+            RuntimeChatTeardownDisposition::Failed
+        };
+        let _ = self.try_send_event(Err(error));
+        disposition
+    }
+
+    fn record_error(&self, error: &Error) {
+        self.telemetry
+            .record_stage_observation(engine_error_observation(
+                self.observation_context.clone(),
+                self.admission_ms,
+                error.to_string(),
+            ));
+    }
+
+    async fn cancel_and_confirm(&mut self) -> Option<RuntimeChatTeardownDisposition> {
         self.cancellation.store(true, Ordering::Release);
         if let Some(stream) = self.stream.as_mut() {
             stream.close();
         }
         match self.guard.confirm_cleanup().await {
-            Ok(_) => RuntimeChatTeardownDisposition::Cancelled,
+            Ok(_) => Some(RuntimeChatTeardownDisposition::Cancelled),
             Err(error) => {
-                let _ = self.send_event(Err(error)).await;
-                RuntimeChatTeardownDisposition::Failed
+                // A failed exact abort is not teardown proof. Best-effort error
+                // delivery must not block the guard's fail-closed cleanup path.
+                let _ = self.try_send_event(Err(error));
+                None
+            }
+        }
+    }
+
+    async fn fail_and_confirm(
+        &mut self,
+        error: Error,
+    ) -> Option<RuntimeChatTeardownDisposition> {
+        match self.cancel_and_confirm().await {
+            Some(_) => {
+                self.record_error(&error);
+                let _ = self.try_send_event(Err(error));
+                Some(RuntimeChatTeardownDisposition::Failed)
+            }
+            None => None,
+        }
+    }
+
+    async fn finish_completion(
+        &mut self,
+        completion: RuntimeChatCompletion,
+    ) -> Option<RuntimeChatTeardownDisposition> {
+        match completion {
+            RuntimeChatCompletion::Delivered(Ok(output)) => {
+                Some(self.finish_with_output(output).await)
+            }
+            RuntimeChatCompletion::Delivered(Err(error)) => {
+                Some(self.finish_with_terminal_error(error))
+            }
+            RuntimeChatCompletion::ChannelClosed => {
+                self.fail_and_confirm(Error::InferenceError(format!(
+                    "Request {} completion channel closed unexpectedly",
+                    self.request_id
+                )))
+                .await
             }
         }
     }
 
     async fn drive(mut self) {
-        let disposition = self.drive_until_terminal().await;
-        let _ = self.teardown.take().map(|sender| {
-            sender.send(RuntimeChatTeardown {
-                request_id: self.request_id.clone(),
-                disposition,
-            })
-        });
+        if let Some(disposition) = self.drive_until_terminal().await {
+            let _ = self.teardown.take().map(|sender| {
+                sender.send(RuntimeChatTeardown {
+                    request_id: self.request_id.clone(),
+                    disposition,
+                })
+            });
+        }
     }
 
-    async fn drive_until_terminal(&mut self) -> RuntimeChatTeardownDisposition {
+    async fn drive_until_terminal(&mut self) -> Option<RuntimeChatTeardownDisposition> {
         let mut completion_result = None;
         let invocation_deadline = self.deadline;
         let deadline_wait = async move {
@@ -2629,48 +2697,20 @@ impl RuntimeChatInvocationDriver {
                 return self.cancel_and_confirm().await;
             }
 
-            if self.stream_order.is_none() {
-                if let Some(completion) = completion_result.take() {
-                    return match completion {
-                        Ok(output) => self.finish_with_output(output).await,
-                        Err(error) => {
-                            self.guard.disarm();
-                            let disposition = if matches!(error, Error::Cancelled(_)) {
-                                RuntimeChatTeardownDisposition::Cancelled
-                            } else {
-                                RuntimeChatTeardownDisposition::Failed
-                            };
-                            let _ = self.send_event(Err(error)).await;
-                            disposition
-                        }
-                    };
-                }
+            if self.stream_order.is_none() && completion_result.is_some() {
+                return self
+                    .finish_completion(completion_result.take().expect("checked completion"))
+                    .await;
             } else if self.stream.is_none() {
-                let Some(completion) = completion_result.take() else {
-                    tokio::task::yield_now().await;
-                    continue;
-                };
-                let Some(stream_order) = self.stream_order.as_ref() else {
-                    unreachable!("non-streaming invocation handled above");
-                };
-                if let Err(error) = stream_order.require_final(&self.request_id) {
-                    self.guard.disarm();
-                    let _ = self.send_event(Err(error)).await;
-                    return RuntimeChatTeardownDisposition::Failed;
-                }
-                return match completion {
-                    Ok(output) => self.finish_with_output(output).await,
-                    Err(error) => {
-                        self.guard.disarm();
-                        let disposition = if matches!(error, Error::Cancelled(_)) {
-                            RuntimeChatTeardownDisposition::Cancelled
-                        } else {
-                            RuntimeChatTeardownDisposition::Failed
-                        };
-                        let _ = self.send_event(Err(error)).await;
-                        disposition
+                if let Some(completion) = completion_result.take() {
+                    let Some(stream_order) = self.stream_order.as_ref() else {
+                        unreachable!("non-streaming invocation handled above");
+                    };
+                    if let Err(error) = stream_order.require_final(&self.request_id) {
+                        return self.fail_and_confirm(error).await;
                     }
-                };
+                    return self.finish_completion(completion).await;
+                }
             }
 
             tokio::select! {
@@ -2682,16 +2722,16 @@ impl RuntimeChatInvocationDriver {
                 _ = &mut deadline_wait => {
                     self.cancellation.store(true, Ordering::Release);
                     let error = Error::Timeout(self.request_id.clone());
-                    let _ = self.send_event(Err(error)).await;
-                    return self.cancel_and_confirm().await;
+                    let disposition = self.cancel_and_confirm().await;
+                    if disposition.is_some() {
+                        let _ = self.try_send_event(Err(error));
+                    }
+                    return disposition;
                 }
                 completion = &mut self.completion, if completion_result.is_none() => {
                     completion_result = Some(match completion {
-                        Ok(result) => result,
-                        Err(_) => Err(Error::InferenceError(format!(
-                            "Request {} completion channel closed unexpectedly",
-                            self.request_id
-                        ))),
+                        Ok(result) => RuntimeChatCompletion::Delivered(result),
+                        Err(_) => RuntimeChatCompletion::ChannelClosed,
                     });
                 }
                 chunk = async {
@@ -2708,15 +2748,13 @@ impl RuntimeChatInvocationDriver {
                                 .expect("streaming invocation has output order")
                                 .observe(&self.request_id, &chunk);
                             if let Err(error) = observed {
-                                let _ = self.send_event(Err(error)).await;
-                                return self.cancel_and_confirm().await;
+                                return self.fail_and_confirm(error).await;
                             }
                             if let Some(delta) = chunk.text.filter(|delta| !delta.is_empty()) {
                                 self.streamed_text.push_str(&delta);
-                                if !self
-                                    .send_event(Ok(RuntimeChatInvocationEvent::TextDelta(delta)))
-                                    .await
-                                {
+                                if !self.try_send_event(Ok(
+                                    RuntimeChatInvocationEvent::TextDelta(delta),
+                                )) {
                                     return self.cancel_and_confirm().await;
                                 }
                             }
@@ -2733,7 +2771,7 @@ impl RuntimeChatInvocationDriver {
 
 fn invocation_chat_generation(
     streamed_text: &mut String,
-    output: EngineOutput,
+    output: &EngineOutput,
 ) -> Result<ChatGeneration> {
     let terminal_text = output.text.clone();
     let text = if streamed_text.is_empty() {
@@ -2751,13 +2789,68 @@ fn invocation_chat_generation(
         )));
     };
     Ok(ChatGeneration {
-        latency_breakdown: output.latency_breakdown,
+        latency_breakdown: output.latency_breakdown.clone(),
         finish_reason: output.finish_reason,
         text,
         prompt_tokens: output.token_stats.prompt_tokens,
         tokens_generated: output.num_tokens,
         generation_time_ms: output.generation_time.as_secs_f64() * 1000.0,
     })
+}
+
+fn engine_output_observation(
+    context: RuntimeObservationContext,
+    admission_ms: Option<f64>,
+    output: &EngineOutput,
+) -> RuntimeStageObservation {
+    let mut timing = RuntimeStageTiming {
+        admission_ms,
+        total_ms: Some(output.generation_time.as_secs_f64() * 1000.0),
+        ..RuntimeStageTiming::default()
+    };
+    if let Some(latency) = output.latency_breakdown.as_ref() {
+        timing.queue_wait_ms = Some(latency.queue_wait_ms);
+        timing.media_decode_ms = latency.media_decode_ms;
+        timing.normalization_ms = latency.normalization_ms;
+        timing.prefill_ms = Some(latency.prefill_ms);
+        timing.decode_ms = Some(latency.decode_ms);
+        timing.ttft_ms = latency.ttft_ms;
+        timing.sampling_ms = latency.sampling_ms;
+        timing.codec_ms = latency.codec_ms;
+        timing.postprocess_ms = latency.postprocess_ms;
+        timing.total_ms = Some(latency.total_ms);
+    }
+
+    let outcome = if output.error.is_some() {
+        RuntimeStageOutcome::Failed
+    } else {
+        RuntimeStageOutcome::Completed
+    };
+    let mut observation = RuntimeStageObservation::new(context, outcome);
+    observation.timing = timing;
+    observation.outputs = RuntimeStageOutputCounters {
+        prompt_tokens: Some(output.token_stats.prompt_tokens as u64),
+        generated_tokens: Some(output.token_stats.generated_tokens as u64),
+        audio_samples: Some(output.audio.samples.len() as u64),
+        transcript_chars: output.text.as_ref().map(|text| text.chars().count() as u64),
+        stop_reason: output.finish_reason.map(|reason| format!("{reason:?}")),
+        ..RuntimeStageOutputCounters::default()
+    };
+    if let Some(error) = output.error.as_ref() {
+        observation.error_kind = Some(error.clone());
+    }
+    observation
+}
+
+fn engine_error_observation(
+    context: RuntimeObservationContext,
+    admission_ms: Option<f64>,
+    error_kind: impl Into<String>,
+) -> RuntimeStageObservation {
+    let mut observation = RuntimeStageObservation::new(context, RuntimeStageOutcome::Failed)
+        .with_error_kind(error_kind);
+    observation.timing.admission_ms = admission_ms;
+    observation
 }
 
 impl RuntimeService {
@@ -3444,46 +3537,12 @@ impl RuntimeService {
         output: &EngineOutput,
         streaming: bool,
     ) {
-        let mut timing = RuntimeStageTiming {
-            admission_ms: request.admission_ms,
-            total_ms: Some(output.generation_time.as_secs_f64() * 1000.0),
-            ..RuntimeStageTiming::default()
-        };
-        if let Some(latency) = output.latency_breakdown.as_ref() {
-            timing.queue_wait_ms = Some(latency.queue_wait_ms);
-            timing.media_decode_ms = latency.media_decode_ms;
-            timing.normalization_ms = latency.normalization_ms;
-            timing.prefill_ms = Some(latency.prefill_ms);
-            timing.decode_ms = Some(latency.decode_ms);
-            timing.ttft_ms = latency.ttft_ms;
-            timing.sampling_ms = latency.sampling_ms;
-            timing.codec_ms = latency.codec_ms;
-            timing.postprocess_ms = latency.postprocess_ms;
-            timing.total_ms = Some(latency.total_ms);
-        }
-
-        let outcome = if output.error.is_some() {
-            RuntimeStageOutcome::Failed
-        } else {
-            RuntimeStageOutcome::Completed
-        };
-        let mut observation = RuntimeStageObservation::new(
-            self.engine_observation_context(request, streaming),
-            outcome,
-        );
-        observation.timing = timing;
-        observation.outputs = RuntimeStageOutputCounters {
-            prompt_tokens: Some(output.token_stats.prompt_tokens as u64),
-            generated_tokens: Some(output.token_stats.generated_tokens as u64),
-            audio_samples: Some(output.audio.samples.len() as u64),
-            transcript_chars: output.text.as_ref().map(|text| text.chars().count() as u64),
-            stop_reason: output.finish_reason.map(|reason| format!("{reason:?}")),
-            ..RuntimeStageOutputCounters::default()
-        };
-        if let Some(error) = output.error.as_ref() {
-            observation.error_kind = Some(error.clone());
-        }
-        self.telemetry.record_stage_observation(observation);
+        self.telemetry
+            .record_stage_observation(engine_output_observation(
+                self.engine_observation_context(request, streaming),
+                request.admission_ms,
+                output,
+            ));
     }
 
     fn record_engine_error_observation(
@@ -3492,13 +3551,12 @@ impl RuntimeService {
         streaming: bool,
         error_kind: impl Into<String>,
     ) {
-        let mut observation = RuntimeStageObservation::new(
-            self.engine_observation_context(request, streaming),
-            RuntimeStageOutcome::Failed,
-        )
-        .with_error_kind(error_kind);
-        observation.timing.admission_ms = request.admission_ms;
-        self.telemetry.record_stage_observation(observation);
+        self.telemetry
+            .record_stage_observation(engine_error_observation(
+                self.engine_observation_context(request, streaming),
+                request.admission_ms,
+                error_kind,
+            ));
     }
 
     pub(crate) fn coordinator_job_for_input(
@@ -3987,6 +4045,8 @@ impl RuntimeService {
             ));
         }
 
+        let observation_context = self.engine_observation_context(&request, streaming);
+        let admission_ms = request.admission_ms;
         self.ensure_step_driver_started().await;
         let request_id = request.id.clone();
         let deadline = request.deadline;
@@ -4058,6 +4118,9 @@ impl RuntimeService {
         let driver = RuntimeChatInvocationDriver {
             request_id: request_id.clone(),
             deadline,
+            observation_context,
+            admission_ms,
+            telemetry: self.telemetry.clone(),
             cancellation: cancellation.clone(),
             cancellation_wakeup: cancellation_wakeup.clone(),
             events: event_sender,
@@ -7563,6 +7626,7 @@ mod tests {
     async fn runtime_chat_handle_cancellation_is_idempotent_and_teardown_is_explicit() {
         let cancellation = Arc::new(AtomicBool::new(false));
         let cancellation_wakeup = Arc::new(Notify::new());
+        let wakeup_observer = cancellation_wakeup.clone();
         let (_event_sender, events) = mpsc::channel(1);
         let (teardown_sender, teardown) = oneshot::channel();
         let handle = RuntimeChatInvocation {
@@ -7576,6 +7640,9 @@ mod tests {
 
         assert!(handle.request_cancel());
         assert!(!handle.request_cancel());
+        tokio::time::timeout(Duration::from_millis(50), wakeup_observer.notified())
+            .await
+            .expect("cancellation wakeup must persist until the driver observes it");
         teardown_sender
             .send(RuntimeChatTeardown {
                 request_id: "serving-request".into(),
