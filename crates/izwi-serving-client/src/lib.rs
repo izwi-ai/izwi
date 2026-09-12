@@ -142,6 +142,26 @@ impl WorkerClient {
                 "endpoint must be an absolute hierarchical URL",
             ));
         }
+        if endpoint.scheme() != "http"
+            || !endpoint
+                .host_str()
+                .map(|host| host.trim_start_matches('[').trim_end_matches(']'))
+                .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+                .is_some_and(|host| host.is_loopback())
+        {
+            return Err(WorkerClientError::InvalidConfiguration(
+                "plaintext worker endpoints must use a numeric loopback address",
+            ));
+        }
+        if !endpoint.username().is_empty()
+            || endpoint.password().is_some()
+            || endpoint.query().is_some()
+            || endpoint.fragment().is_some()
+        {
+            return Err(WorkerClientError::InvalidConfiguration(
+                "worker endpoints must not contain user info, query parameters, or fragments",
+            ));
+        }
         if !endpoint.path().ends_with('/') {
             endpoint.set_path(&format!("{}/", endpoint.path()));
         }
@@ -743,5 +763,40 @@ fn spawn_cancel(client: WorkerClient, identity: AttemptIdentity) {
 impl Drop for InvocationStream {
     fn drop(&mut self) {
         self.schedule_cancel();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use izwi_serving_protocol::{CredentialId, ServiceBearerToken};
+
+    fn credentials() -> ServiceCredentials {
+        ServiceCredentials {
+            credential_id: CredentialId::new("worker-client-test").expect("static credential ID"),
+            bearer_token: ServiceBearerToken::new("worker-client-secret")
+                .expect("static bearer token"),
+        }
+    }
+
+    #[test]
+    fn worker_client_restricts_plaintext_to_numeric_loopback() {
+        let config = WorkerClientConfig::default();
+        assert!(WorkerClient::new("http://127.0.0.1:9470", credentials(), config.clone()).is_ok());
+        assert!(WorkerClient::new("http://[::1]:9470", credentials(), config.clone()).is_ok());
+
+        for endpoint in [
+            "http://localhost:9470",
+            "http://192.0.2.1:9470",
+            "https://127.0.0.1:9470",
+            "http://user:password@127.0.0.1:9470",
+            "http://127.0.0.1:9470?token=secret",
+            "http://127.0.0.1:9470#fragment",
+        ] {
+            assert!(matches!(
+                WorkerClient::new(endpoint, credentials(), config.clone()),
+                Err(WorkerClientError::InvalidConfiguration(_))
+            ));
+        }
     }
 }
