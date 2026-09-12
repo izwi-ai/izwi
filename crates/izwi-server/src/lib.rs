@@ -33,6 +33,7 @@ mod db;
 mod diarization_store;
 mod entity;
 mod error;
+mod gateway;
 mod ids;
 mod logging;
 pub mod media_ingest;
@@ -63,6 +64,11 @@ use izwi_core::{
     parse_model_variant, RuntimeService, ServeRuntimeConfig, ServeRuntimeConfigOverrides,
 };
 use izwi_hooks::EnterpriseHooks;
+use izwi_serving_client::{WorkerClient, WorkerClientConfig};
+use izwi_serving_protocol::{
+    CredentialId, DeploymentId, IncarnationId, ModelGeneration, PolicyRevision, ServiceBearerToken,
+    ServiceCredentials,
+};
 use logging::{LogFormat, SERVICE_NAME, SERVICE_VERSION};
 use persistence::PersistenceContext;
 use state::AppState;
@@ -77,6 +83,10 @@ struct ServerArgs {
     /// Configuration file (defaults to the shared Izwi user config.toml).
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
+
+    /// Process role: local inference server or hardware-independent gateway.
+    #[arg(long, value_enum, env = "IZWI_SERVER_ROLE", default_value = "local")]
+    role: ServerRole,
 
     /// Override a performance setting, e.g. cuda.mode=off; repeat for siblings.
     #[arg(long = "performance", value_name = "KEY=VALUE", value_parser = parse_performance_override)]
@@ -117,6 +127,60 @@ struct ServerArgs {
     /// Override Granite ASR dtype after backend selection (`f32`, `f16`, `bf16`).
     #[arg(long, value_name = "DTYPE")]
     granite_speech_dtype: Option<String>,
+
+    /// Private worker base URL required by gateway mode.
+    #[arg(long, env = "IZWI_GATEWAY_WORKER_ENDPOINT")]
+    worker_endpoint: Option<String>,
+
+    /// Rotatable private worker credential identifier required by gateway mode.
+    #[arg(long, env = "IZWI_GATEWAY_WORKER_CREDENTIAL_ID")]
+    worker_credential_id: Option<String>,
+
+    /// Private worker bearer token required by gateway mode.
+    #[arg(long, env = "IZWI_GATEWAY_WORKER_BEARER_TOKEN")]
+    worker_bearer_token: Option<String>,
+
+    /// Expected worker process incarnation required by gateway mode.
+    #[arg(long, env = "IZWI_GATEWAY_WORKER_INCARNATION")]
+    worker_incarnation: Option<String>,
+
+    /// Pinned worker deployment identifier required by gateway mode.
+    #[arg(long, env = "IZWI_GATEWAY_WORKER_DEPLOYMENT")]
+    worker_deployment: Option<String>,
+
+    /// Public model served by the pinned worker deployment.
+    #[arg(long, env = "IZWI_GATEWAY_PUBLIC_MODEL")]
+    public_model: Option<String>,
+
+    /// Expected non-zero model generation required by gateway mode.
+    #[arg(long, env = "IZWI_GATEWAY_MODEL_GENERATION")]
+    worker_model_generation: Option<u64>,
+
+    /// Policy revision attested on private worker requests.
+    #[arg(
+        long,
+        env = "IZWI_GATEWAY_POLICY_REVISION",
+        default_value = "local-policy-v1"
+    )]
+    gateway_policy_revision: String,
+
+    /// Maximum gateway requests concurrently in flight to the pinned worker.
+    #[arg(long, env = "IZWI_GATEWAY_MAX_IN_FLIGHT", default_value_t = 32)]
+    gateway_max_in_flight: usize,
+
+    /// Maximum time the selected worker may spend establishing runtime ownership.
+    #[arg(
+        long,
+        env = "IZWI_GATEWAY_WORKER_QUEUE_WAIT_MS",
+        default_value_t = 250
+    )]
+    gateway_worker_queue_wait_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ServerRole {
+    Local,
+    Gateway,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -151,6 +215,9 @@ pub async fn run_from_cli(enterprise_hooks: EnterpriseHooks) -> anyhow::Result<(
 
 async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> anyhow::Result<()> {
     let serve_config = resolve_serve_runtime_config(&args)?;
+    if args.role == ServerRole::Gateway {
+        return run_gateway(args, serve_config, enterprise_hooks).await;
+    }
     maybe_delegate_to_private_cuda_runtime(&serve_config)?;
 
     logging::init_tracing(args.log_format);
@@ -285,6 +352,126 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
     }
 
     Ok(())
+}
+
+async fn run_gateway(
+    args: ServerArgs,
+    serve_config: ServeRuntimeConfig,
+    enterprise_hooks: EnterpriseHooks,
+) -> anyhow::Result<()> {
+    logging::init_tracing(args.log_format);
+    let remote = gateway_remote_execution(&args, &serve_config)?;
+    let state = gateway::GatewayState::new(
+        remote,
+        enterprise_hooks,
+        serve_config.request_timeout_secs,
+        args.gateway_max_in_flight,
+    );
+    state.lifecycle.mark_ready();
+
+    info!(
+        service = SERVICE_NAME,
+        version = SERVICE_VERSION,
+        "Starting Izwi public API gateway"
+    );
+    let app = gateway::create_gateway_router(state.clone(), &serve_config);
+    let addr = format!("{}:{}", serve_config.host, serve_config.port);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    info!("Gateway listening on http://{}", addr);
+
+    let shutdown_state = state.clone();
+    let (shutdown_started_tx, shutdown_started_rx) = oneshot::channel();
+    let server = axum::serve(listener, app)
+        .with_graceful_shutdown(gateway_shutdown_signal(shutdown_state, shutdown_started_tx));
+    let http_shutdown_grace = http_shutdown_grace_timeout();
+    let server_result = await_http_server_shutdown(
+        async move { server.await },
+        shutdown_started_rx,
+        http_shutdown_grace,
+    )
+    .await;
+    if server_result.is_none() {
+        warn!(
+            grace_secs = http_shutdown_grace.as_secs(),
+            "Gateway HTTP graceful shutdown timed out; dropping remaining connections"
+        );
+    }
+    if let Some(server_result) = server_result {
+        server_result?;
+    }
+    Ok(())
+}
+
+fn gateway_remote_execution(
+    args: &ServerArgs,
+    serve_config: &ServeRuntimeConfig,
+) -> anyhow::Result<app::chat::RemoteChatExecution> {
+    fn required<'a>(value: &'a Option<String>, name: &str) -> anyhow::Result<&'a str> {
+        value
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("gateway mode requires {name}"))
+    }
+
+    if args.gateway_max_in_flight == 0
+        || args.gateway_max_in_flight > tokio::sync::Semaphore::MAX_PERMITS
+    {
+        anyhow::bail!(
+            "--gateway-max-in-flight must be between 1 and {}",
+            tokio::sync::Semaphore::MAX_PERMITS
+        );
+    }
+    if args.gateway_worker_queue_wait_ms == 0 {
+        anyhow::bail!("--gateway-worker-queue-wait-ms must be non-zero");
+    }
+    let model_generation = ModelGeneration::new(
+        args.worker_model_generation
+            .ok_or_else(|| anyhow::anyhow!("gateway mode requires --worker-model-generation"))?,
+    )?;
+    let model = parse_model_variant(required(&args.public_model, "--public-model")?)?;
+    let credentials = ServiceCredentials {
+        credential_id: CredentialId::new(required(
+            &args.worker_credential_id,
+            "--worker-credential-id",
+        )?)?,
+        bearer_token: ServiceBearerToken::new(required(
+            &args.worker_bearer_token,
+            "--worker-bearer-token or IZWI_GATEWAY_WORKER_BEARER_TOKEN",
+        )?)?,
+    };
+    let client = WorkerClient::new(
+        required(&args.worker_endpoint, "--worker-endpoint")?,
+        credentials,
+        WorkerClientConfig {
+            max_in_flight: args.gateway_max_in_flight,
+            request_timeout: Duration::from_secs(serve_config.request_timeout_secs.max(1)),
+            progress_timeout: Duration::from_secs(serve_config.request_timeout_secs.max(1)),
+            ..WorkerClientConfig::default()
+        },
+    )?;
+    app::chat::RemoteChatExecution::new(
+        client,
+        app::chat::RemoteChatExecutionConfig {
+            public_model_variant: model,
+            expected_worker_incarnation: IncarnationId::new(required(
+                &args.worker_incarnation,
+                "--worker-incarnation",
+            )?)?,
+            deployment_id: DeploymentId::new(required(
+                &args.worker_deployment,
+                "--worker-deployment",
+            )?)?,
+            expected_model_generation: model_generation,
+            policy_revision: PolicyRevision::new(args.gateway_policy_revision.trim())?,
+            max_queue_wait: Duration::from_millis(args.gateway_worker_queue_wait_ms),
+            max_output_tokens: 4096,
+            // Leave room for the private event envelope within the worker's
+            // default one-MiB encoded-event bound.
+            max_output_bytes: 512 * 1024,
+        },
+    )
+    .map_err(|error| anyhow::anyhow!(error.message))
 }
 
 fn start_batch_runtime_worker(state: &AppState) -> BatchWorkerSupervisor {
@@ -771,6 +958,37 @@ async fn shutdown_signal(
     drop(state);
 }
 
+async fn gateway_shutdown_signal(
+    state: gateway::GatewayState,
+    shutdown_started: oneshot::Sender<()>,
+) {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => info!("Received Ctrl+C, shutting down gateway..."),
+        _ = terminate => info!("Received SIGTERM, shutting down gateway..."),
+        _ = desktop_owner_exit_signal() => info!("Desktop owner pipe closed, shutting down gateway..."),
+    }
+
+    state.lifecycle.mark_draining();
+    let _ = shutdown_started.send(());
+}
+
 async fn desktop_owner_exit_signal() {
     if std::env::var_os(DESKTOP_OWNER_PIPE_ENV).as_deref() != Some(std::ffi::OsStr::new("1")) {
         std::future::pending::<()>().await;
@@ -863,6 +1081,7 @@ where
 mod tests {
     use super::*;
     use crate::test_support::env_lock;
+    use izwi_core::ModelVariant;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
@@ -1021,6 +1240,61 @@ mod tests {
             parsed.config = Some(tempfile::tempdir().unwrap().path().join("absent.toml"));
         }
         parsed
+    }
+
+    #[test]
+    fn local_server_role_remains_the_default() {
+        assert_eq!(parse(&["izwi-server"]).role, ServerRole::Local);
+    }
+
+    #[test]
+    fn gateway_configuration_builds_without_a_runtime_service() {
+        let args = parse(&[
+            "izwi-server",
+            "--role",
+            "gateway",
+            "--worker-endpoint",
+            "http://127.0.0.1:19091",
+            "--worker-credential-id",
+            "gateway-test-credential",
+            "--worker-bearer-token",
+            "gateway-test-secret",
+            "--worker-incarnation",
+            "worker-incarnation-1",
+            "--worker-deployment",
+            "qwen3-chat-v1",
+            "--public-model",
+            ModelVariant::Qwen34BGguf.dir_name(),
+            "--worker-model-generation",
+            "7",
+        ]);
+        let serve_config =
+            resolve_serve_runtime_config_with_env(&args, &ServeRuntimeConfigOverrides::default())
+                .expect("serve configuration should resolve");
+
+        let remote = gateway_remote_execution(&args, &serve_config)
+            .expect("gateway transport configuration should build");
+        assert_eq!(args.role, ServerRole::Gateway);
+        assert_eq!(
+            remote.config().public_model_variant,
+            ModelVariant::Qwen34BGguf
+        );
+        assert_eq!(remote.config().expected_model_generation.get(), 7);
+        assert_eq!(remote.config().max_queue_wait, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn gateway_configuration_rejects_missing_private_credentials() {
+        let args = parse(&[
+            "izwi-server",
+            "--role",
+            "gateway",
+            "--worker-endpoint",
+            "http://127.0.0.1:19091",
+        ]);
+        let error = gateway_remote_execution(&args, &ServeRuntimeConfig::default())
+            .expect_err("gateway configuration must be complete");
+        assert!(error.to_string().contains("--worker-model-generation"));
     }
 
     #[test]

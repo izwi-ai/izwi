@@ -105,6 +105,24 @@ pub async fn openapi_json() -> Json<Value> {
     Json(document())
 }
 
+pub async fn gateway_openapi_json() -> Json<Value> {
+    let mut doc = document();
+    if let Some(paths) = doc.get_mut("paths").and_then(Value::as_object_mut) {
+        paths.retain(|path, _| {
+            matches!(
+                path.as_str(),
+                "/livez"
+                    | "/readyz"
+                    | "/openapi.json"
+                    | "/docs"
+                    | "/docs/scalar.js"
+                    | "/v1/chat/completions"
+            )
+        });
+    }
+    Json(doc)
+}
+
 pub fn document() -> Value {
     let mut doc = serde_json::to_value(IzwiOpenApi::openapi())
         .expect("generated OpenAPI document should serialize");

@@ -317,7 +317,7 @@ pub struct ServerLifecycle {
 }
 
 impl ServerLifecycle {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let now = now_unix_secs();
         Self {
             inner: Arc::new(std::sync::RwLock::new(LifecycleInner {

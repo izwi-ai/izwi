@@ -118,7 +118,7 @@ pub fn create_router(state: AppState, serve_config: &ServeRuntimeConfig) -> Rout
         ))
 }
 
-fn apply_runtime_contract(mut app: Router, serve_config: &ServeRuntimeConfig) -> Router {
+pub(crate) fn apply_runtime_contract(mut app: Router, serve_config: &ServeRuntimeConfig) -> Router {
     if serve_config.ui_enabled {
         let index_path = serve_config.ui_dir.join("index.html");
         app = app.fallback_service(

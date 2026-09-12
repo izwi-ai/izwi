@@ -16,17 +16,19 @@ use crate::api::openai::compat::{
 };
 use crate::api::request_context::RequestContext;
 use crate::app::chat::{
-    generate_chat, generate_remote_chat, parse_chat_model, resolve_chat_request_config,
-    spawn_chat_stream, ChatExecutionRequest, ChatStreamEvent,
+    generate_chat, generate_remote_chat, generate_remote_chat_with_execution, parse_chat_model,
+    resolve_chat_request_config, spawn_chat_stream, ChatExecutionRequest, ChatStreamEvent,
 };
 use crate::app::chat_content::{
     flatten_content_parts, validate_media_inputs_for_variant, FlattenedMultimodalContent,
 };
 use crate::error::ApiError;
+use crate::gateway::GatewayState;
 use crate::ids::new_uuid;
 use crate::state::AppState;
 use izwi_core::{
-    ChatMediaInput, ChatMessage, ChatReasoningEffort, ChatRole, ChatTemplateKwargs, ModelVariant,
+    ChatGeneration, ChatMediaInput, ChatMessage, ChatReasoningEffort, ChatRole, ChatTemplateKwargs,
+    ModelVariant,
 };
 
 const CHAT_STREAM_INTERRUPTED_ERROR: &str = "Chat stream ended before a terminal event";
@@ -635,7 +637,63 @@ pub async fn completions(
 ) -> Result<Response, ApiError> {
     let compat_profile = compatibility_profile();
     validate_chat_request_compatibility(&req, compat_profile)?;
+    let (variant, execution_request) = prepare_execution_request(&req, &ctx)?;
 
+    if req.stream.unwrap_or(false) {
+        if state.remote_chat_execution.is_some() {
+            return Err(ApiError::bad_request(
+                "Remote chat execution currently supports only non-streaming requests",
+            ));
+        }
+        let stream_response =
+            complete_stream(state, req, execution_request, compat_profile).await?;
+        return Ok(stream_response.into_response());
+    }
+
+    let generation = if state.remote_chat_execution.is_some() {
+        generate_remote_chat(&state, &ctx, execution_request).await?
+    } else {
+        generate_chat(&state, execution_request).await?
+    };
+
+    Ok(render_completion_response(
+        variant,
+        generation,
+        compat_profile,
+    ))
+}
+
+pub async fn gateway_completions(
+    State(state): State<GatewayState>,
+    Extension(ctx): Extension<RequestContext>,
+    Json(req): Json<ChatCompletionRequest>,
+) -> Result<Response, ApiError> {
+    let compat_profile = compatibility_profile();
+    validate_chat_request_compatibility(&req, compat_profile)?;
+    if req.stream.unwrap_or(false) {
+        return Err(ApiError::bad_request(
+            "Remote chat execution currently supports only non-streaming requests",
+        ));
+    }
+    let (variant, execution_request) = prepare_execution_request(&req, &ctx)?;
+    let generation = generate_remote_chat_with_execution(
+        &state.remote_chat_execution,
+        state.request_timeout_secs,
+        &ctx,
+        execution_request,
+    )
+    .await?;
+    Ok(render_completion_response(
+        variant,
+        generation,
+        compat_profile,
+    ))
+}
+
+fn prepare_execution_request(
+    req: &ChatCompletionRequest,
+    ctx: &RequestContext,
+) -> Result<(ModelVariant, ChatExecutionRequest), ApiError> {
     let variant = parse_chat_model(&req.model)?;
     let (messages, media_inputs) = to_core_messages_with_media(
         variant,
@@ -658,37 +716,29 @@ pub async fn completions(
         req.tools.clone().unwrap_or_default(),
         media_inputs,
     )?;
-    let execution_request = ChatExecutionRequest {
+    Ok((
         variant,
-        messages,
-        max_completion_tokens: req.max_completion_tokens,
-        max_tokens: req.max_tokens,
-        temperature: req.temperature,
-        top_p: req.top_p,
-        top_k: req.top_k,
-        repetition_penalty: req.repetition_penalty,
-        presence_penalty: req.presence_penalty,
-        chat_config,
-        correlation_id: Some(ctx.correlation_id.clone()),
-    };
+        ChatExecutionRequest {
+            variant,
+            messages,
+            max_completion_tokens: req.max_completion_tokens,
+            max_tokens: req.max_tokens,
+            temperature: req.temperature,
+            top_p: req.top_p,
+            top_k: req.top_k,
+            repetition_penalty: req.repetition_penalty,
+            presence_penalty: req.presence_penalty,
+            chat_config,
+            correlation_id: Some(ctx.correlation_id.clone()),
+        },
+    ))
+}
 
-    if req.stream.unwrap_or(false) {
-        if state.remote_chat_execution.is_some() {
-            return Err(ApiError::bad_request(
-                "Remote chat execution currently supports only non-streaming requests",
-            ));
-        }
-        let stream_response =
-            complete_stream(state, req, execution_request, compat_profile).await?;
-        return Ok(stream_response.into_response());
-    }
-
-    let generation = if state.remote_chat_execution.is_some() {
-        generate_remote_chat(&state, &ctx, execution_request).await?
-    } else {
-        generate_chat(&state, execution_request).await?
-    };
-
+fn render_completion_response(
+    variant: ModelVariant,
+    generation: ChatGeneration,
+    compat_profile: OpenAiCompatibilityProfile,
+) -> Response {
     let completion_id = new_uuid();
     let created = now_unix_secs();
     let completion_tokens = generation.tokens_generated;
@@ -724,7 +774,7 @@ pub async fn completions(
             .flatten(),
     };
 
-    Ok(Json(response).into_response())
+    Json(response).into_response()
 }
 
 async fn complete_stream(

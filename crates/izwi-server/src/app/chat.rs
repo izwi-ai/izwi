@@ -10,8 +10,9 @@ use izwi_serving_protocol::{
     ChatParameters as WorkerChatParameters, ChatRole as WorkerChatRole, DeploymentId,
     FinishReason as WorkerFinishReason, GatewayAttestedCallerContext, IncarnationId,
     InvocationErrorCode, InvocationEventKind, InvocationInput, InvocationRequest, ModelGeneration,
-    OutputFormat, OutputLimits, PermittedAction, PolicyRevision, RejectionCode, RequestDigest,
-    RequestId, ServiceClass, TaskKind, TenantId, Usage, PROTOCOL_V1,
+    ModelReadiness, OutputFormat, OutputLimits, PermittedAction, PolicyRevision, RejectionCode,
+    RequestDigest, RequestId, ServiceClass, TaskKind, TenantId, Usage, WorkerProcessState,
+    PROTOCOL_V1,
 };
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::error::TrySendError;
@@ -106,7 +107,6 @@ pub struct RemoteChatExecutionConfig {
 }
 
 impl RemoteChatExecutionConfig {
-    #[allow(dead_code)] // Wired by the gateway-role configuration in the next slice.
     fn validate(&self) -> Result<(), ApiError> {
         if self.max_output_tokens == 0 || self.max_output_bytes == 0 {
             return Err(ApiError::internal(
@@ -124,10 +124,48 @@ pub struct RemoteChatExecution {
 }
 
 impl RemoteChatExecution {
-    #[allow(dead_code)] // Wired by the gateway-role configuration in the next slice.
     pub fn new(client: WorkerClient, config: RemoteChatExecutionConfig) -> Result<Self, ApiError> {
         config.validate()?;
         Ok(Self { client, config })
+    }
+
+    #[cfg(test)]
+    pub fn config(&self) -> &RemoteChatExecutionConfig {
+        &self.config
+    }
+
+    /// Verify that the pinned worker incarnation still advertises the exact
+    /// chat deployment and model generation configured by the gateway.
+    pub async fn readiness_check(&self) -> Result<(), String> {
+        let status = self
+            .client
+            .status()
+            .await
+            .map_err(|error| format!("worker status request failed: {error}"))?;
+        if status.incarnation_id != self.config.expected_worker_incarnation {
+            return Err("worker incarnation does not match the pinned gateway target".into());
+        }
+        if status.process_state != WorkerProcessState::Running {
+            return Err(format!(
+                "worker process is {:?}, expected running",
+                status.process_state
+            ));
+        }
+        let deployment = status
+            .deployments
+            .iter()
+            .find(|deployment| deployment.deployment_id == self.config.deployment_id)
+            .ok_or_else(|| "pinned chat deployment is not advertised by the worker".to_string())?;
+        if deployment.model_generation != self.config.expected_model_generation {
+            return Err("worker model generation does not match the pinned gateway target".into());
+        }
+        if deployment.public_model.as_str() != self.config.public_model_variant.dir_name() {
+            return Err("worker public model does not match the gateway route model".into());
+        }
+        if deployment.task != TaskKind::Chat || deployment.readiness != ModelReadiness::Ready {
+            return Err("pinned worker deployment is not ready for chat".into());
+        }
+        Ok(())
     }
 }
 
@@ -344,6 +382,15 @@ pub async fn generate_remote_chat(
         .remote_chat_execution
         .as_ref()
         .ok_or_else(|| ApiError::service_unavailable("Remote chat execution is not configured"))?;
+    generate_remote_chat_with_execution(remote, state.request_timeout_secs, context, request).await
+}
+
+pub async fn generate_remote_chat_with_execution(
+    remote: &RemoteChatExecution,
+    request_timeout_secs: u64,
+    context: &RequestContext,
+    request: ChatExecutionRequest,
+) -> Result<ChatGeneration, ApiError> {
     if request.variant != remote.config.public_model_variant {
         return Err(ApiError::bad_request(format!(
             "Requested model is incompatible with remote deployment {}",
@@ -353,7 +400,7 @@ pub async fn generate_remote_chat(
     validate_remote_chat_scope(&request)?;
 
     let remaining = context
-        .remaining_budget(Duration::from_secs(state.request_timeout_secs.max(1)))
+        .remaining_budget(Duration::from_secs(request_timeout_secs.max(1)))
         .filter(|budget| !budget.is_zero())
         .ok_or_else(|| request_timeout_error("Chat request deadline expired before dispatch"))?;
     let remaining_time_ms = u64::try_from(remaining.as_millis())

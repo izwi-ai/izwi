@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::gateway::GatewayState;
 use crate::state::AppState;
 
 const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -88,18 +89,36 @@ pub async fn attach_request_context(mut req: Request, next: Next) -> Response {
 
 pub async fn attach_enterprise_request_context(
     State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    attach_enterprise_request_context_with_hooks(
+        &state.enterprise_hooks,
+        Some(state.request_admission_snapshot().global.capacity),
+        req,
+        next,
+    )
+    .await
+}
+
+pub async fn attach_gateway_request_context(
+    State(state): State<GatewayState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    attach_enterprise_request_context_with_hooks(&state.enterprise_hooks, None, req, next).await
+}
+
+async fn attach_enterprise_request_context_with_hooks(
+    hooks: &izwi_hooks::EnterpriseHooks,
+    speech_capacity: Option<usize>,
     mut req: Request,
     next: Next,
 ) -> Response {
     let correlation_id = resolve_correlation_id(&mut req);
     let request_envelope = build_request_envelope(&req, &correlation_id);
 
-    let principal = match state
-        .enterprise_hooks
-        .auth
-        .authenticate(&request_envelope)
-        .await
-    {
+    let principal = match hooks.auth.authenticate(&request_envelope).await {
         Ok(principal) => principal,
         Err(err) => {
             warn!(error = %err, "Enterprise authentication hook rejected request");
@@ -108,8 +127,7 @@ pub async fn attach_enterprise_request_context(
     };
 
     let resource = ResourceDescriptor::http_route(req.uri().path());
-    let decision = match state
-        .enterprise_hooks
+    let decision = match hooks
         .policy
         .authorize(&AuthorizationRequest {
             principal: principal.clone(),
@@ -129,7 +147,7 @@ pub async fn attach_enterprise_request_context(
 
     if !decision.allowed {
         record_denied_request(
-            &state,
+            hooks,
             &principal,
             &resource,
             &correlation_id,
@@ -149,10 +167,7 @@ pub async fn attach_enterprise_request_context(
     }
 
     let speech_permit = if speech_admission::is_speech_generation(req.method(), req.uri().path()) {
-        match speech_admission::acquire(
-            &principal,
-            state.request_admission_snapshot().global.capacity,
-        ) {
+        match speech_admission::acquire(&principal, speech_capacity.unwrap_or(1)) {
             Ok(permit) => Some(permit),
             Err(status) => {
                 return response_with_request_id(
@@ -184,7 +199,7 @@ pub async fn attach_enterprise_request_context(
     let status = response.status();
 
     record_request_outcome(
-        &state,
+        hooks,
         &principal,
         &resource,
         &correlation_id,
@@ -238,7 +253,7 @@ fn build_request_envelope(req: &Request, correlation_id: &str) -> RequestEnvelop
 }
 
 async fn record_denied_request(
-    state: &AppState,
+    hooks: &izwi_hooks::EnterpriseHooks,
     principal: &Principal,
     resource: &ResourceDescriptor,
     correlation_id: &str,
@@ -257,13 +272,13 @@ async fn record_denied_request(
         metadata,
     };
 
-    if let Err(err) = state.enterprise_hooks.audit.record(event).await {
+    if let Err(err) = hooks.audit.record(event).await {
         warn!(error = %err, "Enterprise audit hook failed for denied request");
     }
 }
 
 async fn record_request_outcome(
-    state: &AppState,
+    hooks: &izwi_hooks::EnterpriseHooks,
     principal: &Principal,
     resource: &ResourceDescriptor,
     correlation_id: &str,
@@ -291,7 +306,7 @@ async fn record_request_outcome(
         metadata: metadata.clone(),
     };
 
-    if let Err(err) = state.enterprise_hooks.audit.record(audit_event).await {
+    if let Err(err) = hooks.audit.record(audit_event).await {
         warn!(error = %err, "Enterprise audit hook failed for request");
     }
 
@@ -303,12 +318,7 @@ async fn record_request_outcome(
         attributes: metadata,
     };
 
-    if let Err(err) = state
-        .enterprise_hooks
-        .observability
-        .record(observability_event)
-        .await
-    {
+    if let Err(err) = hooks.observability.record(observability_event).await {
         warn!(error = %err, "Enterprise observability hook failed for request");
     }
 }
