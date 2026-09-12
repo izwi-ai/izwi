@@ -26,5 +26,4 @@ pub(crate) mod tts_policy;
 pub mod voice;
 pub mod voice_realtime;
 
-pub(crate) use router::apply_runtime_contract;
 pub use router::create_router;

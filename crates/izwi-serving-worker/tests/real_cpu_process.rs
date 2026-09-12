@@ -9,7 +9,8 @@ use candle_core::{DType, Device, Tensor};
 use izwi_core::{artifacts::ArtifactManifest, ModelVariant};
 use izwi_hooks::EnterpriseHooks;
 use izwi_server::{
-    create_gateway_router, GatewayState, RemoteChatExecution, RemoteChatExecutionConfig,
+    create_gateway_router, GatewayPerimeterConfig, GatewayState, RemoteChatExecution,
+    RemoteChatExecutionConfig,
 };
 use izwi_serving_client::{WorkerClient, WorkerClientConfig};
 use izwi_serving_protocol::*;
@@ -278,7 +279,13 @@ async fn separate_cpu_worker_executes_tiny_lfm_over_real_http() {
         },
     )
     .unwrap();
-    let gateway = GatewayState::new(remote, EnterpriseHooks::noop(), 10, 2);
+    let gateway = GatewayState::new(
+        remote,
+        EnterpriseHooks::noop(),
+        GatewayPerimeterConfig::new_for_test("real-cpu-test-api-key", 1024 * 1024).unwrap(),
+        10,
+        2,
+    );
     gateway.mark_ready();
     let app = create_gateway_router(
         gateway,
@@ -292,6 +299,7 @@ async fn separate_cpu_worker_executes_tiny_lfm_over_real_http() {
             .method("POST")
             .uri("/v1/chat/completions")
             .header("content-type", "application/json")
+            .header("authorization", "Bearer real-cpu-test-api-key")
             .body(Body::from(
                 serde_json::json!({
                     "model": ModelVariant::Lfm2512BInstructGguf.dir_name(),

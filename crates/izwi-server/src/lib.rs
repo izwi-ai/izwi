@@ -35,6 +35,7 @@ mod diarization_store;
 mod entity;
 mod error;
 mod gateway;
+mod gateway_security;
 mod ids;
 mod logging;
 pub mod media_ingest;
@@ -78,6 +79,7 @@ use state::AppState;
 pub use app::chat::{RemoteChatExecution, RemoteChatExecutionConfig};
 pub use app::remote_chat_dispatch::{RemoteChatDispatchConfig, RemoteChatDispatcher};
 pub use gateway::{create_gateway_router, GatewayState};
+pub use gateway_security::{GatewayPerimeterConfig, GatewayPerimeterConfigError};
 
 const MAX_CONFIGURED_GATEWAY_WORKERS: usize = 256;
 const MAX_GATEWAY_STATUS_TTL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -391,7 +393,10 @@ async fn run_gateway(
     enterprise_hooks: EnterpriseHooks,
 ) -> anyhow::Result<()> {
     logging::init_tracing(args.log_format);
-    let (state, _status_poller) = gateway_state(&args, &serve_config, enterprise_hooks).await?;
+    let perimeter = GatewayPerimeterConfig::from_env()?;
+    perimeter.validate_public_ingress(&serve_config)?;
+    let (state, _status_poller) =
+        gateway_state(&args, &serve_config, enterprise_hooks, perimeter).await?;
     state.lifecycle.mark_ready();
 
     info!(
@@ -452,6 +457,7 @@ async fn gateway_state(
     args: &ServerArgs,
     serve_config: &ServeRuntimeConfig,
     enterprise_hooks: EnterpriseHooks,
+    perimeter: GatewayPerimeterConfig,
 ) -> anyhow::Result<(gateway::GatewayState, Option<GatewayWorkerStatusPoller>)> {
     if args.gateway_worker_endpoints.is_empty() {
         let remote = gateway_remote_execution(args, serve_config)?;
@@ -459,6 +465,7 @@ async fn gateway_state(
             gateway::GatewayState::new(
                 remote,
                 enterprise_hooks,
+                perimeter,
                 serve_config.request_timeout_secs,
                 args.gateway_max_in_flight,
             ),
@@ -584,6 +591,7 @@ async fn gateway_state(
         gateway::GatewayState::with_dispatcher(
             dispatcher,
             enterprise_hooks,
+            perimeter,
             serve_config.request_timeout_secs,
             args.gateway_max_in_flight,
         ),
@@ -1724,6 +1732,8 @@ mod tests {
             &args,
             &ServeRuntimeConfig::default(),
             EnterpriseHooks::noop(),
+            GatewayPerimeterConfig::new_for_test("registry-test-api-key", 1024 * 1024)
+                .expect("test perimeter should be valid"),
         )
         .await
         .expect("registry gateway configuration should build");

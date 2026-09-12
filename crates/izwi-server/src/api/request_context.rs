@@ -3,7 +3,7 @@ mod speech_admission;
 
 use axum::extract::Request;
 use axum::extract::State;
-use axum::http::{HeaderValue, StatusCode};
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use izwi_hooks::{
@@ -16,9 +16,13 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::gateway::GatewayState;
+use crate::gateway_security::MAX_GATEWAY_REQUEST_ID_BYTES;
 use crate::state::AppState;
 
 const REQUEST_ID_HEADER: &str = "x-request-id";
+const MAX_GATEWAY_HEADER_COUNT: usize = 128;
+const MAX_GATEWAY_HEADER_BYTES: usize = 32 * 1024;
+const MAX_GATEWAY_HEADER_VALUE_BYTES: usize = 8 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct RequestContext {
@@ -103,10 +107,226 @@ pub async fn attach_enterprise_request_context(
 
 pub async fn attach_gateway_request_context(
     State(state): State<GatewayState>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Response {
-    attach_enterprise_request_context_with_hooks(&state.enterprise_hooks, None, req, next).await
+    let correlation_id = match resolve_gateway_correlation_id(&mut req) {
+        Ok(correlation_id) => correlation_id,
+        Err(generated_id) => {
+            return gateway_rejection_response(
+                StatusCode::BAD_REQUEST,
+                &generated_id,
+                "Invalid x-request-id header",
+            )
+        }
+    };
+    if !gateway_headers_are_bounded(req.headers()) {
+        return gateway_rejection_response(
+            StatusCode::BAD_REQUEST,
+            &correlation_id,
+            "Gateway request headers exceed the configured limit",
+        );
+    }
+    let Some(principal) = state.perimeter.authenticate(req.headers()) else {
+        return gateway_rejection_response(
+            StatusCode::UNAUTHORIZED,
+            &correlation_id,
+            "Valid gateway API key required",
+        );
+    };
+    let request_envelope = build_gateway_request_envelope(&req, &correlation_id);
+    let resource = ResourceDescriptor::http_route(req.uri().path());
+    let decision = match state
+        .enterprise_hooks
+        .policy
+        .authorize(&AuthorizationRequest {
+            principal: principal.clone(),
+            action: EnterpriseAction::Inference,
+            resource: resource.clone(),
+            request: Some(request_envelope.clone()),
+            metadata: HookMetadata::new(),
+        })
+        .await
+    {
+        Ok(decision) => decision,
+        Err(err) => {
+            warn!(error = %err, "Enterprise gateway policy hook failed");
+            return gateway_rejection_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &correlation_id,
+                "Gateway authorization service unavailable",
+            );
+        }
+    };
+    if !decision.allowed {
+        record_denied_request(
+            &state.enterprise_hooks,
+            &principal,
+            &resource,
+            &correlation_id,
+            "gateway inference policy denied request",
+        )
+        .await;
+        return gateway_rejection_response(
+            StatusCode::FORBIDDEN,
+            &correlation_id,
+            "Gateway inference permission denied",
+        );
+    }
+
+    req.extensions_mut().insert(RequestContext::new(
+        correlation_id.clone(),
+        principal.clone(),
+    ));
+    if let Ok(value) = HeaderValue::from_str(&correlation_id) {
+        req.headers_mut().insert(REQUEST_ID_HEADER, value);
+    }
+    let mut response = next.run(req).await;
+    let status = response.status();
+    record_request_outcome(
+        &state.enterprise_hooks,
+        &principal,
+        &resource,
+        &correlation_id,
+        &request_envelope,
+        status,
+    )
+    .await;
+    if let Ok(value) = HeaderValue::from_str(&correlation_id) {
+        response.headers_mut().insert(REQUEST_ID_HEADER, value);
+    }
+    response
+}
+
+pub async fn attach_gateway_request_id(mut req: Request, next: Next) -> Response {
+    let correlation_id = match resolve_gateway_correlation_id(&mut req) {
+        Ok(correlation_id) => correlation_id,
+        Err(generated_id) => {
+            return gateway_rejection_response(
+                StatusCode::BAD_REQUEST,
+                &generated_id,
+                "Invalid x-request-id header",
+            )
+        }
+    };
+    if let Ok(value) = HeaderValue::from_str(&correlation_id) {
+        req.headers_mut().insert(REQUEST_ID_HEADER, value);
+    }
+    let mut response = next.run(req).await;
+    if let Ok(value) = HeaderValue::from_str(&correlation_id) {
+        response.headers_mut().insert(REQUEST_ID_HEADER, value);
+    }
+    response
+}
+
+fn resolve_gateway_correlation_id(req: &mut Request) -> Result<String, String> {
+    let mut request_ids = req.headers().get_all(REQUEST_ID_HEADER).iter();
+    let supplied = request_ids.next();
+    if request_ids.next().is_some() {
+        return Err(Uuid::new_v4().to_string());
+    }
+    let correlation_id = match supplied {
+        Some(value) => value
+            .to_str()
+            .ok()
+            .map(str::trim)
+            .filter(|value| valid_gateway_request_id(value))
+            .map(str::to_string)
+            .ok_or_else(|| Uuid::new_v4().to_string())?,
+        None => Uuid::new_v4().to_string(),
+    };
+    Ok(correlation_id)
+}
+
+pub(crate) fn gateway_trace_request_id(req: &Request) -> &str {
+    req.headers()
+        .get(REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| valid_gateway_request_id(value))
+        .unwrap_or("-")
+}
+
+fn valid_gateway_request_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_GATEWAY_REQUEST_ID_BYTES
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')
+        })
+}
+
+fn gateway_headers_are_bounded(headers: &axum::http::HeaderMap) -> bool {
+    if headers.len() > MAX_GATEWAY_HEADER_COUNT {
+        return false;
+    }
+    let mut total = 0usize;
+    for (name, value) in headers {
+        if value.as_bytes().len() > MAX_GATEWAY_HEADER_VALUE_BYTES {
+            return false;
+        }
+        let Some(next) = total
+            .checked_add(name.as_str().len())
+            .and_then(|total| total.checked_add(value.as_bytes().len()))
+        else {
+            return false;
+        };
+        if next > MAX_GATEWAY_HEADER_BYTES {
+            return false;
+        }
+        total = next;
+    }
+    true
+}
+
+fn build_gateway_request_envelope(req: &Request, correlation_id: &str) -> RequestEnvelope {
+    const UNTRUSTED_IDENTITY_HEADERS: &[&str] =
+        &["x-principal-id", "x-tenant-id", "x-scopes", "x-roles"];
+    RequestEnvelope {
+        correlation_id: correlation_id.to_string(),
+        method: req.method().to_string(),
+        path: req.uri().path().to_string(),
+        headers: req
+            .headers()
+            .iter()
+            .filter(|(name, _)| {
+                name.as_str() != header::AUTHORIZATION.as_str()
+                    && !UNTRUSTED_IDENTITY_HEADERS.contains(&name.as_str())
+            })
+            .map(|(name, value)| HeaderPair {
+                name: name.as_str().to_string(),
+                value: header_to_string(value).unwrap_or_default(),
+            })
+            .collect(),
+        remote_addr: None,
+    }
+}
+
+fn gateway_rejection_response(
+    status: StatusCode,
+    correlation_id: &str,
+    message: &'static str,
+) -> Response {
+    use crate::error::ApiError;
+
+    let mut response = match status {
+        StatusCode::UNAUTHORIZED => ApiError::unauthorized(message),
+        StatusCode::FORBIDDEN => ApiError::forbidden(message),
+        StatusCode::PAYLOAD_TOO_LARGE => ApiError::payload_too_large(message),
+        StatusCode::TOO_MANY_REQUESTS => ApiError::too_many_requests(message),
+        StatusCode::SERVICE_UNAVAILABLE => ApiError::service_unavailable(message),
+        _ => ApiError::bad_request(message),
+    }
+    .into_response();
+    if status == StatusCode::UNAUTHORIZED {
+        response.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            HeaderValue::from_static("Bearer realm=\"izwi-gateway\""),
+        );
+    }
+    if let Ok(value) = HeaderValue::from_str(correlation_id) {
+        response.headers_mut().insert(REQUEST_ID_HEADER, value);
+    }
+    response
 }
 
 async fn attach_enterprise_request_context_with_hooks(

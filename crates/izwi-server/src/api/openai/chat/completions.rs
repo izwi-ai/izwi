@@ -4,7 +4,7 @@ use std::convert::Infallible;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
-    extract::{Extension, State},
+    extract::{rejection::JsonRejection, Extension, State},
     response::{sse::Event, IntoResponse, Response, Sse},
     Json,
 };
@@ -674,8 +674,15 @@ pub async fn gateway_completions(
     State(state): State<GatewayState>,
     Extension(ctx): Extension<RequestContext>,
     Extension(admission): Extension<GatewayAdmissionGuard>,
-    Json(req): Json<ChatCompletionRequest>,
+    payload: Result<Json<ChatCompletionRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
+    let Json(req) = payload.map_err(|rejection| {
+        if rejection.status() == axum::http::StatusCode::PAYLOAD_TOO_LARGE {
+            ApiError::payload_too_large("Gateway chat request body exceeds the configured limit")
+        } else {
+            ApiError::bad_request("Gateway chat request body is not valid JSON")
+        }
+    })?;
     let compat_profile = compatibility_profile();
     validate_chat_request_compatibility(&req, compat_profile)?;
     let (variant, execution_request) = prepare_execution_request(&req, &ctx)?;

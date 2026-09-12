@@ -36,6 +36,27 @@ impl ApiError {
         }
     }
 
+    pub fn unauthorized(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: msg.into(),
+        }
+    }
+
+    pub fn payload_too_large(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: msg.into(),
+        }
+    }
+
+    pub fn too_many_requests(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: msg.into(),
+        }
+    }
+
     pub fn internal(msg: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -58,9 +79,11 @@ impl IntoResponse for ApiError {
                 "message": self.message,
                 "type": match self.status {
                     StatusCode::BAD_REQUEST => "invalid_request_error",
+                    StatusCode::UNAUTHORIZED => "authentication_error",
                     StatusCode::FORBIDDEN => "permission_denied_error",
                     StatusCode::NOT_FOUND => "not_found_error",
                     StatusCode::PAYLOAD_TOO_LARGE => "invalid_request_error",
+                    StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
                     StatusCode::SERVICE_UNAVAILABLE => "service_unavailable_error",
                     _ => "server_error",
                 },
@@ -145,5 +168,33 @@ mod tests {
             body["error"]["code"],
             StatusCode::PAYLOAD_TOO_LARGE.as_str()
         );
+    }
+
+    #[tokio::test]
+    async fn gateway_auth_and_rate_limit_errors_use_uniform_json_types() {
+        for (error, status, error_type) in [
+            (
+                ApiError::unauthorized("api key required"),
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+            ),
+            (
+                ApiError::forbidden("inference denied"),
+                StatusCode::FORBIDDEN,
+                "permission_denied_error",
+            ),
+            (
+                ApiError::too_many_requests("rate exceeded"),
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+            ),
+        ] {
+            let response = error.into_response();
+            assert_eq!(response.status(), status);
+            let body = to_bytes(response.into_body(), 4096).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["type"], error_type);
+            assert_eq!(body["error"]["code"], status.as_str());
+        }
     }
 }

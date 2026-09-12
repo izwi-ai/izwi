@@ -5,7 +5,7 @@
 //! bounded private worker client wrapped by `RemoteChatExecution`.
 
 use axum::{
-    extract::{Request, State},
+    extract::{DefaultBodyLimit, Request, State},
     http::StatusCode,
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -19,12 +19,15 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tower_http::classify::ServerErrorsFailureClass;
+use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{field, info, info_span, warn, Span};
 
-use crate::api::request_context::attach_gateway_request_context;
+use crate::api::request_context::{attach_gateway_request_context, attach_gateway_request_id};
 use crate::app::chat::RemoteChatExecution;
 use crate::app::remote_chat_dispatch::RemoteChatDispatcher;
+use crate::error::ApiError;
+use crate::gateway_security::GatewayPerimeterConfig;
 use crate::logging::{SERVICE_NAME, SERVICE_VERSION};
 use crate::state::ServerLifecycle;
 
@@ -33,6 +36,7 @@ pub struct GatewayState {
     pub(crate) chat_execution: GatewayChatExecution,
     pub(crate) enterprise_hooks: EnterpriseHooks,
     pub(crate) lifecycle: ServerLifecycle,
+    pub(crate) perimeter: GatewayPerimeterConfig,
     pub request_timeout_secs: u64,
     request_admission: Arc<Semaphore>,
 }
@@ -41,6 +45,7 @@ impl GatewayState {
     pub fn new(
         remote_chat_execution: RemoteChatExecution,
         enterprise_hooks: EnterpriseHooks,
+        perimeter: GatewayPerimeterConfig,
         request_timeout_secs: u64,
         max_in_flight: usize,
     ) -> Self {
@@ -49,6 +54,7 @@ impl GatewayState {
             chat_execution: GatewayChatExecution::Pinned(remote_chat_execution),
             enterprise_hooks,
             lifecycle: ServerLifecycle::new(),
+            perimeter,
             request_timeout_secs: request_timeout_secs.max(1),
             request_admission: Arc::new(Semaphore::new(max_in_flight)),
         }
@@ -57,6 +63,7 @@ impl GatewayState {
     pub fn with_dispatcher(
         dispatcher: RemoteChatDispatcher,
         enterprise_hooks: EnterpriseHooks,
+        perimeter: GatewayPerimeterConfig,
         request_timeout_secs: u64,
         max_in_flight: usize,
     ) -> Self {
@@ -65,6 +72,7 @@ impl GatewayState {
             chat_execution: GatewayChatExecution::Registry(dispatcher),
             enterprise_hooks,
             lifecycle: ServerLifecycle::new(),
+            perimeter,
             request_timeout_secs: request_timeout_secs.max(1),
             request_admission: Arc::new(Semaphore::new(max_in_flight)),
         }
@@ -186,10 +194,7 @@ async fn bounded_gateway_admission(
     next: Next,
 ) -> Response {
     let Ok(permit) = state.request_admission.clone().try_acquire_owned() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Gateway request capacity is currently unavailable",
-        )
+        return ApiError::service_unavailable("Gateway request capacity is currently unavailable")
             .into_response();
     };
     request.extensions_mut().insert(GatewayAdmissionGuard {
@@ -199,21 +204,15 @@ async fn bounded_gateway_admission(
 }
 
 pub fn create_gateway_router(state: GatewayState, serve_config: &ServeRuntimeConfig) -> Router {
-    let middleware_state = state.clone();
     let trace_layer = TraceLayer::new_for_http()
         .make_span_with(|request: &Request| {
-            let request_id = request
-                .headers()
-                .get("x-request-id")
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or("-");
+            let request_id = crate::api::request_context::gateway_trace_request_id(request);
             info_span!(
                 "http_request",
                 service = SERVICE_NAME,
                 version = SERVICE_VERSION,
                 method = %request.method(),
                 path = %request.uri().path(),
-                uri = %request.uri(),
                 correlation_id = %request_id,
                 status = field::Empty,
                 latency_ms = field::Empty,
@@ -255,11 +254,16 @@ pub fn create_gateway_router(state: GatewayState, serve_config: &ServeRuntimeCon
             "/chat/completions",
             post(crate::api::openai::chat::completions::gateway_completions),
         )
-        .route_layer(middleware::from_fn_with_state(
+        .fallback(api_not_found)
+        .layer(middleware::from_fn_with_state(
             state.clone(),
             bounded_gateway_admission,
         ))
-        .fallback(api_not_found);
+        .layer(DefaultBodyLimit::max(state.perimeter.max_chat_body_bytes()))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            attach_gateway_request_context,
+        ));
     let app = Router::new()
         .route("/livez", get(live_check))
         .route("/readyz", get(ready_check))
@@ -272,16 +276,30 @@ pub fn create_gateway_router(state: GatewayState, serve_config: &ServeRuntimeCon
         .fallback(api_not_found)
         .with_state(state);
 
-    // Gateway mode never serves the desktop SPA because its fallback would
-    // make unmigrated API paths appear successful.
-    let mut gateway_contract = serve_config.clone();
-    gateway_contract.ui_enabled = false;
-    crate::api::apply_runtime_contract(app, &gateway_contract)
+    apply_gateway_cors(app, serve_config)
         .layer(trace_layer)
-        .layer(middleware::from_fn_with_state(
-            middleware_state,
-            attach_gateway_request_context,
-        ))
+        .layer(middleware::from_fn(attach_gateway_request_id))
+}
+
+fn apply_gateway_cors(app: Router, serve_config: &ServeRuntimeConfig) -> Router {
+    if !serve_config.cors_enabled {
+        return app;
+    }
+    let layer = CorsLayer::new().allow_methods(Any).allow_headers(Any);
+    if serve_config.cors_origins.is_empty()
+        || serve_config
+            .cors_origins
+            .iter()
+            .any(|origin| origin.trim() == "*")
+    {
+        return app.layer(layer.allow_origin(Any));
+    }
+    let origins = serve_config
+        .cors_origins
+        .iter()
+        .filter_map(|origin| axum::http::HeaderValue::from_str(origin).ok())
+        .collect::<Vec<_>>();
+    app.layer(layer.allow_origin(origins))
 }
 
 fn now_saturating_sub(started_at: u64) -> u64 {
@@ -297,6 +315,9 @@ mod tests {
     use super::*;
     use axum::{body::Body, http::Request};
     use izwi_core::ModelVariant;
+    use izwi_hooks::{
+        AuthorizationDecision, AuthorizationRequest, EnterpriseAction, HookResult, PolicyEngine,
+    };
     use izwi_serving_client::{
         mock::{MockFault, MockWorker, MockWorkerConfig},
         WorkerClient, WorkerClientConfig,
@@ -304,14 +325,40 @@ mod tests {
     use izwi_serving_protocol::{ModelAlias, ModelGeneration, PolicyRevision};
     use serde_json::json;
     use std::collections::BTreeMap;
+    use std::sync::Mutex;
     use tower::Service;
 
     use crate::app::remote_chat_dispatch::RemoteChatDispatchConfig;
+    use crate::gateway_security::MAX_GATEWAY_REQUEST_ID_BYTES;
     use crate::worker_registry::{
         ApprovedDeployment, ApprovedWorker, BackendPolicy, WorkerRegistry, WorkerRegistryConfig,
     };
 
-    async fn send(mut app: Router, request: Request<Body>) -> Response {
+    const TEST_API_KEY: &str = "test-public-api-key-123456";
+
+    fn test_perimeter() -> GatewayPerimeterConfig {
+        GatewayPerimeterConfig::new_for_test(TEST_API_KEY, 1024 * 1024)
+            .expect("test perimeter should be valid")
+    }
+
+    async fn send(mut app: Router, mut request: Request<Body>) -> Response {
+        if request.uri().path().starts_with("/v1/")
+            && !request
+                .headers()
+                .contains_key(axum::http::header::AUTHORIZATION)
+        {
+            request.headers_mut().insert(
+                axum::http::header::AUTHORIZATION,
+                axum::http::HeaderValue::from_static("Bearer test-public-api-key-123456"),
+            );
+        }
+        app.as_service::<Body>()
+            .call(request)
+            .await
+            .expect("gateway router request should succeed")
+    }
+
+    async fn send_raw(mut app: Router, request: Request<Body>) -> Response {
         app.as_service::<Body>()
             .call(request)
             .await
@@ -381,7 +428,13 @@ mod tests {
             },
         )
         .expect("dispatcher should initialize");
-        let state = GatewayState::with_dispatcher(dispatcher, EnterpriseHooks::noop(), 2, 4);
+        let state = GatewayState::with_dispatcher(
+            dispatcher,
+            EnterpriseHooks::noop(),
+            test_perimeter(),
+            2,
+            4,
+        );
         state.lifecycle.mark_ready();
         (state, worker)
     }
@@ -481,7 +534,7 @@ mod tests {
             },
         )
         .expect("remote execution should initialize");
-        let state = GatewayState::new(remote, EnterpriseHooks::noop(), 2, 4);
+        let state = GatewayState::new(remote, EnterpriseHooks::noop(), test_perimeter(), 2, 4);
         state.lifecycle.mark_ready();
         let app = create_gateway_router(
             state,
@@ -603,7 +656,7 @@ mod tests {
             },
         )
         .expect("remote execution should initialize");
-        let state = GatewayState::new(remote, EnterpriseHooks::noop(), 2, 4);
+        let state = GatewayState::new(remote, EnterpriseHooks::noop(), test_perimeter(), 2, 4);
         state.lifecycle.mark_ready();
         let app = create_gateway_router(state, &ServeRuntimeConfig::default());
 
@@ -641,7 +694,7 @@ mod tests {
             },
         )
         .expect("remote execution should initialize");
-        let state = GatewayState::new(remote, EnterpriseHooks::noop(), 2, 1);
+        let state = GatewayState::new(remote, EnterpriseHooks::noop(), test_perimeter(), 2, 1);
         state.lifecycle.mark_ready();
         let held_permit = state
             .request_admission
@@ -705,7 +758,7 @@ mod tests {
             },
         )
         .expect("remote execution should initialize");
-        let state = GatewayState::new(remote, EnterpriseHooks::noop(), 2, 1);
+        let state = GatewayState::new(remote, EnterpriseHooks::noop(), test_perimeter(), 2, 1);
         state.lifecycle.mark_ready();
         let app = create_gateway_router(state, &ServeRuntimeConfig::default());
         let stream_request = || {
@@ -734,7 +787,13 @@ mod tests {
         let body = axum::body::to_bytes(rejected.into_body(), 4096)
             .await
             .expect("gateway rejection should be bounded");
-        assert_eq!(body, "Gateway request capacity is currently unavailable");
+        let body: serde_json::Value =
+            serde_json::from_slice(&body).expect("gateway rejection should be JSON");
+        assert_eq!(body["error"]["type"], "service_unavailable_error");
+        assert_eq!(
+            body["error"]["message"],
+            "Gateway request capacity is currently unavailable"
+        );
 
         drop(first);
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -748,5 +807,247 @@ mod tests {
         let admitted_again = send(app, stream_request()).await;
         assert_eq!(admitted_again.status(), StatusCode::OK);
         drop(admitted_again);
+    }
+
+    #[tokio::test]
+    async fn gateway_v1_requires_api_key_while_probes_and_docs_remain_public() {
+        let state = unreachable_gateway_state(test_perimeter());
+        let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+
+        for path in ["/livez", "/readyz", "/openapi.json", "/docs"] {
+            assert_ne!(
+                send_raw(app.clone(), get(path)).await.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} is an explicitly public operational surface"
+            );
+        }
+
+        let response = send_raw(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::WWW_AUTHENTICATE)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer realm=\"izwi-gateway\"")
+        );
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("authentication error must be bounded");
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "authentication_error");
+        assert_eq!(body["error"]["code"], "401");
+    }
+
+    #[tokio::test]
+    async fn gateway_disabled_cors_does_not_inherit_desktop_origins() {
+        let app = create_gateway_router(
+            unreachable_gateway_state(test_perimeter()),
+            &ServeRuntimeConfig {
+                cors_enabled: false,
+                ..ServeRuntimeConfig::default()
+            },
+        );
+        let response = send_raw(
+            app,
+            Request::builder()
+                .uri("/livez")
+                .header(axum::http::header::ORIGIN, "tauri://localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert!(response
+            .headers()
+            .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn gateway_chat_body_limit_rejects_before_json_decode_with_uniform_error() {
+        let perimeter = GatewayPerimeterConfig::new_for_test(TEST_API_KEY, 1024).unwrap();
+        let app = create_gateway_router(
+            unreachable_gateway_state(perimeter),
+            &ServeRuntimeConfig::default(),
+        );
+        let response = send(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(vec![b' '; 1025]))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("body-limit error must be bounded");
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["code"], "413");
+        assert_eq!(
+            body["error"]["message"],
+            "Gateway chat request body exceeds the configured limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_request_id_is_bounded_and_validated_before_tracing() {
+        let app = create_gateway_router(
+            unreachable_gateway_state(test_perimeter()),
+            &ServeRuntimeConfig::default(),
+        );
+        let response = send_raw(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", format!("Bearer {TEST_API_KEY}"))
+                .header("x-request-id", "x".repeat(MAX_GATEWAY_REQUEST_ID_BYTES + 1))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let request_id = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .expect("rejection should carry a server-authored request id");
+        assert!(request_id.len() <= MAX_GATEWAY_REQUEST_ID_BYTES);
+        uuid::Uuid::parse_str(request_id).expect("replacement should be a UUID");
+    }
+
+    #[tokio::test]
+    async fn gateway_headers_are_bounded_before_policy_evaluation() {
+        let app = create_gateway_router(
+            unreachable_gateway_state(test_perimeter()),
+            &ServeRuntimeConfig::default(),
+        );
+        let response = send_raw(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", format!("Bearer {TEST_API_KEY}"))
+                .header("x-padding", "x".repeat(8 * 1024 + 1))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("header-limit error must be bounded");
+        assert!(String::from_utf8_lossy(&body).contains("headers exceed"));
+    }
+
+    #[tokio::test]
+    async fn gateway_enterprise_policy_is_additional_to_server_authored_inference_identity() {
+        #[derive(Default)]
+        struct CapturingPolicy(Mutex<Option<AuthorizationRequest>>);
+
+        #[async_trait::async_trait]
+        impl PolicyEngine for CapturingPolicy {
+            async fn authorize(
+                &self,
+                request: &AuthorizationRequest,
+            ) -> HookResult<AuthorizationDecision> {
+                *self.0.lock().unwrap() = Some(request.clone());
+                Ok(AuthorizationDecision::deny("internal policy detail"))
+            }
+        }
+
+        let policy = Arc::new(CapturingPolicy::default());
+        let mut hooks = EnterpriseHooks::noop();
+        hooks.policy = policy.clone();
+        let app = create_gateway_router(
+            unreachable_gateway_state_with_hooks(test_perimeter(), hooks),
+            &ServeRuntimeConfig::default(),
+        );
+        let response = send_raw(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", format!("Bearer {TEST_API_KEY}"))
+                .header("x-principal-id", "forged-principal")
+                .header("x-tenant-id", "forged-tenant")
+                .header("x-scopes", "admin")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let captured = policy.0.lock().unwrap().clone().unwrap();
+        assert_eq!(captured.action, EnterpriseAction::Inference);
+        assert_eq!(captured.principal.id, "test-gateway-principal");
+        assert_eq!(captured.principal.tenant_id.as_deref(), Some("test-tenant"));
+        assert_eq!(captured.principal.roles, vec!["inference"]);
+        let forwarded_headers = captured.request.unwrap().headers;
+        assert!(!forwarded_headers.iter().any(|header| {
+            matches!(
+                header.name.as_str(),
+                "authorization" | "x-principal-id" | "x-tenant-id" | "x-scopes"
+            )
+        }));
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("policy error must be bounded");
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "permission_denied_error");
+        assert_eq!(
+            body["error"]["message"],
+            "Gateway inference permission denied"
+        );
+        assert!(!body.to_string().contains("internal policy detail"));
+    }
+
+    fn unreachable_gateway_state(perimeter: GatewayPerimeterConfig) -> GatewayState {
+        unreachable_gateway_state_with_hooks(perimeter, EnterpriseHooks::noop())
+    }
+
+    fn unreachable_gateway_state_with_hooks(
+        perimeter: GatewayPerimeterConfig,
+        hooks: EnterpriseHooks,
+    ) -> GatewayState {
+        let worker_config = MockWorkerConfig::default();
+        let client = WorkerClient::new(
+            "http://127.0.0.1:1",
+            worker_config.credentials.clone(),
+            WorkerClientConfig::default(),
+        )
+        .expect("test client should initialize");
+        let remote = RemoteChatExecution::new(
+            client,
+            crate::app::chat::RemoteChatExecutionConfig {
+                public_model_variant: ModelVariant::Qwen34BGguf,
+                expected_worker_incarnation: worker_config.incarnation_id,
+                deployment_id: worker_config.deployment_id,
+                expected_model_generation: worker_config.model_generation,
+                policy_revision: PolicyRevision::new("test-policy-v1").unwrap(),
+                max_queue_wait: Duration::ZERO,
+                max_output_tokens: 16,
+                max_output_bytes: 1024,
+            },
+        )
+        .expect("remote execution should initialize");
+        let state = GatewayState::new(remote, hooks, perimeter, 2, 1);
+        state.lifecycle.mark_ready();
+        state
     }
 }
