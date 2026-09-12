@@ -13,6 +13,7 @@ use izwi_serving_worker::{
 use std::{
     collections::BTreeSet, net::SocketAddr, path::Path, path::PathBuf, sync::Arc, time::Duration,
 };
+use tokio::io::AsyncReadExt;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -120,7 +121,12 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("bind private worker at {}", process.bind))?;
     tracing::info!(address = %process.bind, model = %process.public_model, backend = ?process.assignment.backend(), "worker ready");
     axum::serve(listener, worker.router())
-        .with_graceful_shutdown(shutdown_signal(worker))
+        .with_graceful_shutdown(shutdown_signal(
+            worker,
+            process.managed,
+            process.drain_grace,
+            process.cancellation_grace,
+        ))
         .await
         .context("serve private worker")
 }
@@ -150,13 +156,51 @@ fn acquire_managed_worker_fences(
     Ok(Some(leases))
 }
 
-async fn shutdown_signal<E: izwi_serving_worker::InvocationExecutor>(worker: WorkerService<E>) {
-    if tokio::signal::ctrl_c().await.is_ok() {
-        worker.begin_draining().await;
-        while worker.active_invocations() != 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+async fn shutdown_signal<E: izwi_serving_worker::InvocationExecutor>(
+    worker: WorkerService<E>,
+    managed: bool,
+    drain_grace: Duration,
+    cancellation_grace: Duration,
+) {
+    if managed {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = parent_control_closed() => {}
+        }
+    } else {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+
+    worker.begin_draining().await;
+    if wait_until_idle(&worker, drain_grace).await {
+        return;
+    }
+    worker.request_cancel_all();
+    let _ = wait_until_idle(&worker, cancellation_grace).await;
+}
+
+async fn parent_control_closed() {
+    let mut input = tokio::io::stdin();
+    let mut heartbeat = [0_u8; 1];
+    loop {
+        match input.read(&mut heartbeat).await {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
         }
     }
+}
+
+async fn wait_until_idle<E: izwi_serving_worker::InvocationExecutor>(
+    worker: &WorkerService<E>,
+    timeout: Duration,
+) -> bool {
+    tokio::time::timeout(timeout, async {
+        while worker.active_invocations() != 0 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .is_ok()
 }
 
 struct WorkerProcessConfig {
@@ -178,6 +222,9 @@ struct WorkerProcessConfig {
     max_retained_attempts: usize,
     attempt_retention: Duration,
     streaming: bool,
+    managed: bool,
+    drain_grace: Duration,
+    cancellation_grace: Duration,
 }
 
 impl WorkerProcessConfig {
@@ -237,6 +284,15 @@ impl WorkerProcessConfig {
                 DEFAULT_ATTEMPT_RETENTION.as_secs(),
             )?),
             streaming: parse_env("IZWI_WORKER_STREAMING", true)?,
+            managed: managed_worker(),
+            drain_grace: Duration::from_millis(parse_bounded_duration_env(
+                "IZWI_WORKER_DRAIN_GRACE_MS",
+                30_000,
+            )?),
+            cancellation_grace: Duration::from_millis(parse_bounded_duration_env(
+                "IZWI_WORKER_CANCELLATION_GRACE_MS",
+                10_000,
+            )?),
         })
     }
 
@@ -368,6 +424,14 @@ where
     let value = parse_env(name, fallback)?;
     if value == T::default() {
         bail!("{name} must be non-zero");
+    }
+    Ok(value)
+}
+
+fn parse_bounded_duration_env(name: &str, fallback_ms: u64) -> anyhow::Result<u64> {
+    let value = parse_positive_env(name, fallback_ms)?;
+    if value > 24 * 60 * 60 * 1000 {
+        bail!("{name} must not exceed one day");
     }
     Ok(value)
 }

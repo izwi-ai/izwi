@@ -290,6 +290,26 @@ pub fn build_child_launch_spec(
     );
     set("IZWI_WORKER_STREAMING", worker.streaming.to_string().into());
     set(
+        "IZWI_WORKER_DRAIN_GRACE_MS",
+        node.config().shutdown.drain_grace_ms.to_string().into(),
+    );
+    set(
+        "IZWI_WORKER_CANCELLATION_GRACE_MS",
+        node.config()
+            .shutdown
+            .cancellation_grace_ms
+            .to_string()
+            .into(),
+    );
+    set(
+        "IZWI_WORKER_TERMINATION_GRACE_MS",
+        node.config()
+            .shutdown
+            .termination_grace_ms
+            .to_string()
+            .into(),
+    );
+    set(
         WORKER_OWNERSHIP_LOCK_ENV,
         locks.ownership().as_os_str().to_owned(),
     );
@@ -573,6 +593,12 @@ mod tests {
             env_value(&spec, "IZWI_WORKER_HOST_MEMORY_LIMIT_BYTES"),
             env_value(&spec, "IZWI_CPU_MEMORY_BUDGET_BYTES")
         );
+        assert_eq!(env_value(&spec, "IZWI_WORKER_DRAIN_GRACE_MS"), "30000");
+        assert_eq!(
+            env_value(&spec, "IZWI_WORKER_CANCELLATION_GRACE_MS"),
+            "10000"
+        );
+        assert_eq!(env_value(&spec, "IZWI_WORKER_TERMINATION_GRACE_MS"), "5000");
         let command = spec.command();
         assert_eq!(command.get_program(), spec.program());
         assert_eq!(command.get_current_dir(), Some(spec.working_directory()));

@@ -479,6 +479,35 @@ impl<E: InvocationExecutor> WorkerService<E> {
         self.state.draining.store(true, Ordering::Release);
     }
 
+    /// Request cooperative cancellation for every currently admitted attempt.
+    /// Capacity remains held until each execution reports confirmed teardown.
+    pub fn request_cancel_all(&self) -> usize {
+        let cancellations = {
+            let mut table = self
+                .state
+                .attempts
+                .lock()
+                .expect("worker attempt table poisoned");
+            table
+                .records
+                .values_mut()
+                .filter_map(|record| {
+                    if record.state.is_terminal() || record.cancel_requested {
+                        return None;
+                    }
+                    record.cancel_requested = true;
+                    record.state = AttemptState::CancellationRequested;
+                    record.cancel.clone()
+                })
+                .collect::<Vec<_>>()
+        };
+        let requested = cancellations.len();
+        for cancellation in cancellations {
+            let _ = cancellation.send(true);
+        }
+        requested
+    }
+
     pub fn active_invocations(&self) -> usize {
         self.state.config.max_active_invocations - self.state.capacity.available_permits()
     }
@@ -1918,13 +1947,14 @@ mod tests {
         let entered = Arc::new(tokio::sync::Notify::new());
         let release_admission = Arc::new(tokio::sync::Notify::new());
         let finish_execution = Arc::new(tokio::sync::Notify::new());
+        let cancel_calls = Arc::new(AtomicUsize::new(0));
         let service = WorkerService::new(
             config(),
             DelayedExecutor {
                 entered: Arc::clone(&entered),
                 release_admission: Arc::clone(&release_admission),
                 finish_execution: Arc::clone(&finish_execution),
-                cancel_calls: Arc::new(AtomicUsize::new(0)),
+                cancel_calls: Arc::clone(&cancel_calls),
             },
         )
         .unwrap();
@@ -1956,6 +1986,16 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(service.request_cancel_all(), 1);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while cancel_calls.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(service.request_cancel_all(), 0);
+        assert_eq!(service.active_invocations(), 1);
 
         let mut second_request = invocation();
         second_request.request_id = id("request-2");
