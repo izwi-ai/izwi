@@ -391,6 +391,28 @@ pub async fn generate_remote_chat_with_execution(
     context: &RequestContext,
     request: ChatExecutionRequest,
 ) -> Result<ChatGeneration, ApiError> {
+    generate_remote_chat_with_execution_and_acceptance(
+        remote,
+        request_timeout_secs,
+        context,
+        request,
+        (),
+        |_| Ok(()),
+    )
+    .await
+}
+
+pub(crate) async fn generate_remote_chat_with_execution_and_acceptance<K, F>(
+    remote: &RemoteChatExecution,
+    request_timeout_secs: u64,
+    context: &RequestContext,
+    request: ChatExecutionRequest,
+    mut keepalive: K,
+    on_accepted: F,
+) -> Result<ChatGeneration, ApiError>
+where
+    F: FnOnce(&mut K) -> Result<(), ApiError>,
+{
     let invocation =
         prepare_remote_chat_invocation(remote, request_timeout_secs, context, request)?;
     let started = Instant::now();
@@ -399,6 +421,10 @@ pub async fn generate_remote_chat_with_execution(
         .invoke(invocation)
         .await
         .map_err(map_worker_client_error)?;
+    // WorkerClient::invoke returns only after validating the first accepted
+    // event. This is the earliest safe point for dynamic dispatch accounting
+    // to transition out of its pre-admission state.
+    on_accepted(&mut keepalive)?;
     let mut text = String::new();
     let mut latest_usage = None;
 
