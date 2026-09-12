@@ -1,5 +1,7 @@
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use sha2::{Digest, Sha256};
 use std::{fmt, str::FromStr};
+use subtle::ConstantTimeEq;
 
 pub const MAX_ID_BYTES: usize = 128;
 pub const MAX_SERVICE_TOKEN_BYTES: usize = 4096;
@@ -206,6 +208,14 @@ impl ServiceBearerToken {
     pub fn expose_secret(&self) -> &str {
         &self.0
     }
+
+    /// Compares presented bearer material through fixed-size digests so the
+    /// comparison does not short-circuit on a secret byte or token length.
+    pub fn matches_presented(&self, presented: &str) -> bool {
+        let expected: [u8; 32] = Sha256::digest(self.0.as_bytes()).into();
+        let actual: [u8; 32] = Sha256::digest(presented.as_bytes()).into();
+        bool::from(expected.ct_eq(&actual))
+    }
 }
 
 impl fmt::Debug for ServiceBearerToken {
@@ -268,6 +278,9 @@ mod tests {
         let token = ServiceBearerToken::new("top-secret").unwrap();
         assert_eq!(format!("{token:?}"), "ServiceBearerToken([REDACTED])");
         assert!(!format!("{token:?}").contains("top-secret"));
+        assert!(token.matches_presented("top-secret"));
+        assert!(!token.matches_presented("top-secreu"));
+        assert!(!token.matches_presented("short"));
         assert!(ServiceBearerToken::new("bad\r\ntoken").is_err());
     }
 }

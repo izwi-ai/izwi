@@ -3826,11 +3826,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "izwi-serving-client"
+version = "0.1.0-beta-18"
+dependencies = [
+ "async-stream",
+ "axum",
+ "bytes",
+ "futures",
+ "izwi-serving-protocol",
+ "reqwest 0.11.27",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "izwi-serving-protocol"
 version = "0.1.0-beta-18"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2",
+ "subtle",
  "thiserror 1.0.69",
 ]
 
