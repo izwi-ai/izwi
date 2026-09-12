@@ -356,6 +356,31 @@ mod tests {
             "deterministic mock response"
         );
 
+        let streaming_request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": model.dir_name(),
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": true,
+                    "stream_options": {"include_usage": true},
+                    "max_tokens": 32
+                })
+                .to_string(),
+            ))
+            .expect("streaming chat request should build");
+        let response = send(app.clone(), streaming_request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("SSE response should be bounded");
+        let body = String::from_utf8(body.to_vec()).expect("SSE should be UTF-8");
+        assert!(body.contains("deterministic mock response"));
+        assert!(body.contains("\"completion_tokens\":3"));
+        assert!(body.contains("data: [DONE]"));
+
         let openapi = send(app, get("/openapi.json")).await;
         let body = axum::body::to_bytes(openapi.into_body(), 1024 * 1024)
             .await

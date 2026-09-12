@@ -17,7 +17,8 @@ use crate::api::openai::compat::{
 use crate::api::request_context::RequestContext;
 use crate::app::chat::{
     generate_chat, generate_remote_chat, generate_remote_chat_with_execution, parse_chat_model,
-    resolve_chat_request_config, spawn_chat_stream, ChatExecutionRequest, ChatStreamEvent,
+    resolve_chat_request_config, spawn_chat_stream, spawn_remote_chat_stream_with_execution,
+    ChatExecutionRequest, ChatStreamEvent,
 };
 use crate::app::chat_content::{
     flatten_content_parts, validate_media_inputs_for_variant, FlattenedMultimodalContent,
@@ -640,13 +641,19 @@ pub async fn completions(
     let (variant, execution_request) = prepare_execution_request(&req, &ctx)?;
 
     if req.stream.unwrap_or(false) {
-        if state.remote_chat_execution.is_some() {
-            return Err(ApiError::bad_request(
-                "Remote chat execution currently supports only non-streaming requests",
-            ));
-        }
-        let stream_response =
-            complete_stream(state, req, execution_request, compat_profile).await?;
+        let model_id = execution_request.variant.dir_name().to_string();
+        let event_rx = if let Some(remote) = state.remote_chat_execution.as_ref() {
+            spawn_remote_chat_stream_with_execution(
+                remote,
+                state.request_timeout_secs,
+                &ctx,
+                execution_request,
+            )
+            .await?
+        } else {
+            spawn_chat_stream(state, execution_request)
+        };
+        let stream_response = render_chat_stream(req, model_id, event_rx, compat_profile);
         return Ok(stream_response.into_response());
     }
 
@@ -670,12 +677,18 @@ pub async fn gateway_completions(
 ) -> Result<Response, ApiError> {
     let compat_profile = compatibility_profile();
     validate_chat_request_compatibility(&req, compat_profile)?;
-    if req.stream.unwrap_or(false) {
-        return Err(ApiError::bad_request(
-            "Remote chat execution currently supports only non-streaming requests",
-        ));
-    }
     let (variant, execution_request) = prepare_execution_request(&req, &ctx)?;
+    if req.stream.unwrap_or(false) {
+        let model_id = execution_request.variant.dir_name().to_string();
+        let event_rx = spawn_remote_chat_stream_with_execution(
+            &state.remote_chat_execution,
+            state.request_timeout_secs,
+            &ctx,
+            execution_request,
+        )
+        .await?;
+        return Ok(render_chat_stream(req, model_id, event_rx, compat_profile).into_response());
+    }
     let generation = generate_remote_chat_with_execution(
         &state.remote_chat_execution,
         state.request_timeout_secs,
@@ -777,22 +790,19 @@ fn render_completion_response(
     Json(response).into_response()
 }
 
-async fn complete_stream(
-    state: AppState,
+fn render_chat_stream(
     req: ChatCompletionRequest,
-    execution_request: ChatExecutionRequest,
+    model_id: String,
+    mut event_rx: tokio::sync::mpsc::Receiver<ChatStreamEvent>,
     compat_profile: OpenAiCompatibilityProfile,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let include_usage = req
         .stream_options
         .as_ref()
         .and_then(|opts| opts.include_usage)
         .unwrap_or(false);
-    let model_id = execution_request.variant.dir_name().to_string();
-
     let completion_id = new_uuid();
     let created = now_unix_secs();
-    let mut event_rx = spawn_chat_stream(state, execution_request);
 
     let stream = async_stream::stream! {
         let mut saw_terminal = false;
@@ -905,7 +915,7 @@ async fn complete_stream(
         yield Ok(Event::default().data("[DONE]"));
     };
 
-    Ok(Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default()))
+    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
 }
 
 #[cfg(test)]
@@ -1107,11 +1117,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_profile_rejects_streaming_instead_of_falling_back_locally() {
-        let worker_config = MockWorkerConfig::default();
+    async fn public_streaming_chat_preserves_sse_over_worker_transport() {
+        let worker_config = MockWorkerConfig {
+            output_text: "remote streaming hello".into(),
+            ..MockWorkerConfig::default()
+        };
         let credentials = valid_client_credentials(&worker_config);
         let (app, worker, _temp) = remote_chat_app(
-            "streaming-rejected",
+            "streaming",
             worker_config,
             credentials,
             WorkerClientConfig::default(),
@@ -1120,13 +1133,52 @@ mod tests {
         .await;
 
         let response = send_public_streaming_chat(app).await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(worker.active_invocations(), 0);
-        let body = response_json(response).await;
+        assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            body["error"]["message"],
-            "Remote chat execution currently supports only non-streaming requests"
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
         );
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("stream response should remain bounded");
+        let body = String::from_utf8(body.to_vec()).expect("SSE should be UTF-8");
+        assert!(body.contains("remote streaming hello"));
+        assert!(body.contains("\"finish_reason\":\"stop\""));
+        assert!(body.contains("data: [DONE]"));
+        assert_eq!(worker.active_invocations(), 0);
+    }
+
+    #[tokio::test]
+    async fn dropping_public_remote_stream_cancels_without_early_capacity_release() {
+        let worker_config = MockWorkerConfig {
+            fault: MockFault::Hang,
+            cancellation_delay: Duration::from_millis(100),
+            ..MockWorkerConfig::default()
+        };
+        let credentials = valid_client_credentials(&worker_config);
+        let (app, worker, _temp) = remote_chat_app(
+            "stream-disconnect",
+            worker_config,
+            credentials,
+            WorkerClientConfig::default(),
+            None,
+        )
+        .await;
+
+        let response = send_public_streaming_chat(app).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(worker.active_invocations(), 1);
+        drop(response);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(
+            worker.active_invocations(),
+            1,
+            "cancellation acknowledgement is not teardown proof"
+        );
+        wait_for_active(&worker, 0).await;
     }
 
     #[tokio::test]

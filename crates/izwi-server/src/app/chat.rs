@@ -391,22 +391,8 @@ pub async fn generate_remote_chat_with_execution(
     context: &RequestContext,
     request: ChatExecutionRequest,
 ) -> Result<ChatGeneration, ApiError> {
-    if request.variant != remote.config.public_model_variant {
-        return Err(ApiError::bad_request(format!(
-            "Requested model is incompatible with remote deployment {}",
-            remote.config.deployment_id
-        )));
-    }
-    validate_remote_chat_scope(&request)?;
-
-    let remaining = context
-        .remaining_budget(Duration::from_secs(request_timeout_secs.max(1)))
-        .filter(|budget| !budget.is_zero())
-        .ok_or_else(|| request_timeout_error("Chat request deadline expired before dispatch"))?;
-    let remaining_time_ms = u64::try_from(remaining.as_millis())
-        .unwrap_or(u64::MAX)
-        .max(1);
-    let invocation = build_remote_chat_invocation(context, request, remote, remaining_time_ms)?;
+    let invocation =
+        prepare_remote_chat_invocation(remote, request_timeout_secs, context, request)?;
     let started = Instant::now();
     let mut stream = remote
         .client
@@ -420,44 +406,19 @@ pub async fn generate_remote_chat_with_execution(
         match event.event {
             InvocationEventKind::Accepted { .. } => {}
             InvocationEventKind::TextDelta { text: delta } => {
-                let next_len = text.len().checked_add(delta.len()).ok_or_else(|| {
-                    bad_gateway_error("Worker chat output exceeded the configured byte limit")
-                })?;
-                if u64::try_from(next_len).unwrap_or(u64::MAX) > remote.config.max_output_bytes {
-                    return Err(bad_gateway_error(
-                        "Worker chat output exceeded the configured byte limit",
-                    ));
-                }
-                text.push_str(&delta);
+                append_remote_text(&mut text, &delta, remote.config.max_output_bytes)?;
             }
             InvocationEventKind::Usage { usage } => latest_usage = Some(usage),
             InvocationEventKind::Completed {
                 finish_reason,
                 usage,
             } => {
-                let usage = usage.or(latest_usage).unwrap_or(Usage {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                });
-                return Ok(ChatGeneration {
-                    latency_breakdown: None,
-                    finish_reason: Some(match finish_reason {
-                        WorkerFinishReason::Stop => {
-                            izwi_core::engine::OutputFinishReason::StopToken
-                        }
-                        WorkerFinishReason::Length => {
-                            izwi_core::engine::OutputFinishReason::MaxTokens
-                        }
-                    }),
+                return worker_chat_generation(
                     text,
-                    prompt_tokens: usize::try_from(usage.input_tokens).map_err(|_| {
-                        bad_gateway_error("Worker reported an invalid input token count")
-                    })?,
-                    tokens_generated: usize::try_from(usage.output_tokens).map_err(|_| {
-                        bad_gateway_error("Worker reported an invalid output token count")
-                    })?,
-                    generation_time_ms: started.elapsed().as_secs_f64() * 1000.0,
-                });
+                    finish_reason,
+                    usage.or(latest_usage),
+                    started,
+                );
             }
             InvocationEventKind::Error { code, message } => {
                 return Err(map_worker_terminal_error(code, message));
@@ -473,6 +434,155 @@ pub async fn generate_remote_chat_with_execution(
     Err(bad_gateway_error(
         "Worker chat stream ended without a terminal event",
     ))
+}
+
+fn prepare_remote_chat_invocation(
+    remote: &RemoteChatExecution,
+    request_timeout_secs: u64,
+    context: &RequestContext,
+    request: ChatExecutionRequest,
+) -> Result<InvocationRequest, ApiError> {
+    if request.variant != remote.config.public_model_variant {
+        return Err(ApiError::bad_request(format!(
+            "Requested model is incompatible with remote deployment {}",
+            remote.config.deployment_id
+        )));
+    }
+    validate_remote_chat_scope(&request)?;
+
+    let remaining = context
+        .remaining_budget(Duration::from_secs(request_timeout_secs.max(1)))
+        .filter(|budget| !budget.is_zero())
+        .ok_or_else(|| request_timeout_error("Chat request deadline expired before dispatch"))?;
+    let remaining_time_ms = u64::try_from(remaining.as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1);
+    build_remote_chat_invocation(context, request, remote, remaining_time_ms)
+}
+
+fn append_remote_text(text: &mut String, delta: &str, max_bytes: u64) -> Result<(), ApiError> {
+    let next_len = text.len().checked_add(delta.len()).ok_or_else(|| {
+        bad_gateway_error("Worker chat output exceeded the configured byte limit")
+    })?;
+    if u64::try_from(next_len).unwrap_or(u64::MAX) > max_bytes {
+        return Err(bad_gateway_error(
+            "Worker chat output exceeded the configured byte limit",
+        ));
+    }
+    text.push_str(delta);
+    Ok(())
+}
+
+fn worker_chat_generation(
+    text: String,
+    finish_reason: WorkerFinishReason,
+    usage: Option<Usage>,
+    started: Instant,
+) -> Result<ChatGeneration, ApiError> {
+    let usage = usage.unwrap_or(Usage {
+        input_tokens: 0,
+        output_tokens: 0,
+    });
+    Ok(ChatGeneration {
+        latency_breakdown: None,
+        finish_reason: Some(match finish_reason {
+            WorkerFinishReason::Stop => izwi_core::engine::OutputFinishReason::StopToken,
+            WorkerFinishReason::Length => izwi_core::engine::OutputFinishReason::MaxTokens,
+        }),
+        text,
+        prompt_tokens: usize::try_from(usage.input_tokens)
+            .map_err(|_| bad_gateway_error("Worker reported an invalid input token count"))?,
+        tokens_generated: usize::try_from(usage.output_tokens)
+            .map_err(|_| bad_gateway_error("Worker reported an invalid output token count"))?,
+        generation_time_ms: started.elapsed().as_secs_f64() * 1000.0,
+    })
+}
+
+/// Start an accepted private worker invocation and forward its bounded events
+/// through the existing public chat stream channel. Dropping the receiver
+/// closes the channel, drops the private stream, and schedules exact-attempt
+/// cancellation; neither layer retries the invocation.
+pub async fn spawn_remote_chat_stream_with_execution(
+    remote: &RemoteChatExecution,
+    request_timeout_secs: u64,
+    context: &RequestContext,
+    request: ChatExecutionRequest,
+) -> Result<mpsc::Receiver<ChatStreamEvent>, ApiError> {
+    let invocation =
+        prepare_remote_chat_invocation(remote, request_timeout_secs, context, request)?;
+    let mut worker_stream = remote
+        .client
+        .invoke(invocation)
+        .await
+        .map_err(map_worker_client_error)?;
+    let max_output_bytes = remote.config.max_output_bytes;
+    let (event_tx, event_rx) = mpsc::channel(CHAT_STREAM_CAPACITY);
+    tokio::spawn(async move {
+        let started = Instant::now();
+        let backpressure = Arc::new(ChatStreamBackpressure::default());
+        let mut text = String::new();
+        let mut latest_usage = None;
+        let terminal = loop {
+            let event = tokio::select! {
+                event = worker_stream.next_event() => event,
+                () = event_tx.closed() => return,
+            };
+            let event = match event {
+                Ok(Some(event)) => event,
+                Ok(None) => {
+                    break ChatStreamEvent::Failed(
+                        "Worker chat stream ended without a terminal event".into(),
+                    )
+                }
+                Err(error) => {
+                    break ChatStreamEvent::Failed(map_worker_client_error(error).message)
+                }
+            };
+            match event.event {
+                InvocationEventKind::Accepted { .. } => {
+                    if event_tx.try_send(ChatStreamEvent::Started).is_err() {
+                        return;
+                    }
+                }
+                InvocationEventKind::TextDelta { text: delta } => {
+                    if let Err(error) = append_remote_text(&mut text, &delta, max_output_bytes) {
+                        break ChatStreamEvent::Failed(error.message);
+                    }
+                    try_send_chat_delta(&event_tx, &backpressure, delta);
+                    if backpressure.is_tripped() {
+                        break ChatStreamEvent::Failed(CHAT_STREAM_BACKPRESSURE_ERROR.into());
+                    }
+                }
+                InvocationEventKind::Usage { usage } => latest_usage = Some(usage),
+                InvocationEventKind::Completed {
+                    finish_reason,
+                    usage,
+                } => match worker_chat_generation(
+                    text,
+                    finish_reason,
+                    usage.or(latest_usage),
+                    started,
+                ) {
+                    Ok(generation) => break ChatStreamEvent::Completed(Box::new(generation)),
+                    Err(error) => break ChatStreamEvent::Failed(error.message),
+                },
+                InvocationEventKind::Error { code, message } => {
+                    break ChatStreamEvent::Failed(map_worker_terminal_error(code, message).message)
+                }
+                InvocationEventKind::Cancelled { reason } => {
+                    break ChatStreamEvent::Failed(
+                        reason.unwrap_or_else(|| "Worker cancelled chat invocation".into()),
+                    )
+                }
+            }
+        };
+        // Release or cancel the private stream before terminal delivery can
+        // wait on a slow public consumer. Worker capacity remains governed by
+        // confirmed teardown, not by this gateway channel.
+        drop(worker_stream);
+        send_chat_terminal(event_tx, terminal).await;
+    });
+    Ok(event_rx)
 }
 
 fn validate_remote_chat_scope(request: &ChatExecutionRequest) -> Result<(), ApiError> {
