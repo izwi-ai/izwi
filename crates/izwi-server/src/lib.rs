@@ -1353,7 +1353,7 @@ async fn gateway_shutdown_signal(
         _ = desktop_owner_exit_signal() => info!("Desktop owner pipe closed, shutting down gateway..."),
     }
 
-    state.lifecycle.mark_draining();
+    state.begin_drain();
     let _ = shutdown_started.send(());
 }
 

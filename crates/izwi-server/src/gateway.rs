@@ -81,6 +81,14 @@ impl GatewayState {
     pub fn mark_ready(&self) {
         self.lifecycle.mark_ready();
     }
+
+    pub fn begin_drain(&self) {
+        // Publishing the lifecycle transition before closing admission avoids
+        // a gap where a newly acquired permit could pass the post-acquire
+        // lifecycle check. Existing response-owned permits remain valid.
+        self.lifecycle.mark_draining();
+        self.request_admission.close();
+    }
 }
 
 /// Execution target for the migrated public chat route. `Pinned` preserves the
@@ -193,10 +201,22 @@ async fn bounded_gateway_admission(
     mut request: Request,
     next: Next,
 ) -> Response {
+    let lifecycle = state.lifecycle.snapshot();
+    if !lifecycle.ready || lifecycle.draining {
+        return ApiError::service_unavailable("Gateway is not accepting new requests")
+            .into_response();
+    }
     let Ok(permit) = state.request_admission.clone().try_acquire_owned() else {
         return ApiError::service_unavailable("Gateway request capacity is currently unavailable")
             .into_response();
     };
+    // Recheck after reserving capacity so a concurrent drain cannot leave the
+    // permit attached to a request that was still waiting to enter admission.
+    let lifecycle = state.lifecycle.snapshot();
+    if !lifecycle.ready || lifecycle.draining {
+        return ApiError::service_unavailable("Gateway is not accepting new requests")
+            .into_response();
+    }
     request.extensions_mut().insert(GatewayAdmissionGuard {
         _permit: Arc::new(permit),
     });
@@ -723,6 +743,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gateway_admission_rejects_after_lifecycle_drain() {
+        let state = unreachable_gateway_state(test_perimeter());
+        state.begin_drain();
+        let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": ModelVariant::Qwen34BGguf.dir_name(),
+                    "messages": [{"role": "user", "content": "hello"}]
+                })
+                .to_string(),
+            ))
+            .expect("request should build");
+
+        let response = send(app, request).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("drain rejection should be bounded");
+        let body: serde_json::Value =
+            serde_json::from_slice(&body).expect("drain rejection should be JSON");
+        assert_eq!(body["error"]["type"], "service_unavailable_error");
+        assert_eq!(
+            body["error"]["message"],
+            "Gateway is not accepting new requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_admission_rejects_before_lifecycle_ready() {
+        let mut state = unreachable_gateway_state(test_perimeter());
+        state.lifecycle = ServerLifecycle::new();
+        let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+        let response = send(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": ModelVariant::Qwen34BGguf.dir_name(),
+                        "messages": [{"role": "user", "content": "hello"}]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("startup rejection should be bounded");
+        let body: serde_json::Value =
+            serde_json::from_slice(&body).expect("startup rejection should be JSON");
+        assert_eq!(
+            body["error"]["message"],
+            "Gateway is not accepting new requests"
+        );
+    }
+
+    #[tokio::test]
     async fn gateway_admission_is_held_for_the_stream_body_lifetime() {
         let model = ModelVariant::Qwen34BGguf;
         let worker_config = MockWorkerConfig {
@@ -760,7 +846,7 @@ mod tests {
         .expect("remote execution should initialize");
         let state = GatewayState::new(remote, EnterpriseHooks::noop(), test_perimeter(), 2, 1);
         state.lifecycle.mark_ready();
-        let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+        let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
         let stream_request = || {
             Request::builder()
                 .method("POST")
@@ -781,6 +867,9 @@ mod tests {
         let first = send(app.clone(), stream_request()).await;
         assert_eq!(first.status(), StatusCode::OK);
         assert_eq!(worker.active_invocations(), 1);
+        assert_eq!(state.request_admission.available_permits(), 0);
+
+        state.begin_drain();
 
         let rejected = send(app.clone(), stream_request()).await;
         assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -792,8 +881,10 @@ mod tests {
         assert_eq!(body["error"]["type"], "service_unavailable_error");
         assert_eq!(
             body["error"]["message"],
-            "Gateway request capacity is currently unavailable"
+            "Gateway is not accepting new requests"
         );
+        assert_eq!(worker.active_invocations(), 1);
+        assert_eq!(state.request_admission.available_permits(), 0);
 
         drop(first);
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -803,10 +894,10 @@ mod tests {
         })
         .await
         .expect("worker teardown should be confirmed");
+        assert_eq!(state.request_admission.available_permits(), 1);
 
-        let admitted_again = send(app, stream_request()).await;
-        assert_eq!(admitted_again.status(), StatusCode::OK);
-        drop(admitted_again);
+        let still_draining = send(app, stream_request()).await;
+        assert_eq!(still_draining.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
