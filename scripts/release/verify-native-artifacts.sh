@@ -138,7 +138,9 @@ verify_tar_archive() {
     case "$(basename "${archive}")" in
         izwi-cli-*.tar.gz)
             require_pattern "${contents_file}" '^izwi$' "public CLI"
-            require_pattern "${contents_file}" '^izwi-server$' "public server"
+            require_pattern "${contents_file}" '^izwi-server$' "gateway-capable public server"
+            require_pattern "${contents_file}" '^izwi-serving-worker$' "private inference worker"
+            require_pattern "${contents_file}" '^izwi-serving-node\.example\.toml$' "bounded node configuration example"
             require_pattern "${contents_file}" '^izwi-desktop$' "desktop binary"
             ;;
     esac
@@ -162,7 +164,9 @@ verify_zip() {
     case "$(basename "${archive}")" in
         izwi-cli-*.zip)
             require_pattern "${contents_file}" '(^|/)izwi\.exe$' "public CLI"
-            require_pattern "${contents_file}" '(^|/)izwi-server\.exe$' "public server"
+            require_pattern "${contents_file}" '(^|/)izwi-server\.exe$' "gateway-capable public server"
+            require_pattern "${contents_file}" '(^|/)izwi-serving-worker\.exe$' "private inference worker"
+            require_pattern "${contents_file}" '(^|/)izwi-serving-node\.example\.toml$' "bounded node configuration example"
             require_pattern "${contents_file}" '(^|/)izwi-desktop\.exe$' "desktop binary"
             ;;
     esac

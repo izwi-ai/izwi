@@ -1,0 +1,52 @@
+# Parser-compatible single-node CPU example for the production serving boundary.
+# Replace every absolute path, resource budget, artifact revision, and secret
+# before use. The current release does not yet include a runnable supervisor CLI.
+
+schema_version = 1
+node_id = "node-a"
+working_directory = "/var/lib/izwi"
+runtime_directory = "/run/izwi"
+host_memory_budget_bytes = 4294967296
+
+[readiness]
+startup_timeout_ms = 120000
+poll_interval_ms = 200
+
+[restart]
+initial_backoff_ms = 250
+maximum_backoff_ms = 30000
+restart_window_ms = 300000
+stable_reset_ms = 600000
+max_restarts_per_window = 5
+jitter_percent = 20
+
+[shutdown]
+drain_grace_ms = 30000
+cancellation_grace_ms = 10000
+termination_grace_ms = 5000
+
+[[workers]]
+worker_id = "chat-cpu-1"
+bind = "127.0.0.1:9470"
+binary = "cpu"
+credential_id = "chat-cpu-credential-1"
+bearer_token_env = "IZWI_WORKER_CHAT_CPU_1_TOKEN"
+max_active_invocations = 1
+max_request_bytes = 1048576
+max_retained_attempts = 128
+attempt_retention_secs = 300
+streaming = true
+
+[workers.assignment]
+backend = "cpu"
+thread_budget = 2
+affinity = []
+host_memory_limit_bytes = 3221225472
+
+[workers.deployment]
+deployment_id = "lfm25-cpu-v1"
+public_model = "LFM2.5-1.2B-Instruct-GGUF"
+artifact_revision = "REPLACE_WITH_PINNED_ARTIFACT_REVISION"
+model_generation = 1
+backend = "cpu"
+models_directory = "/var/lib/izwi/models"
