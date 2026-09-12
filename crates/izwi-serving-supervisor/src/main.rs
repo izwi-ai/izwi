@@ -24,6 +24,8 @@ use tokio::{
 
 const MAX_CLI_ARGUMENTS: usize = 16;
 const MAX_CPU_IDS: usize = 1024;
+const MAX_VALIDATION_DIAGNOSTIC_BYTES: usize = 16 * 1024;
+const TRUNCATED_DIAGNOSTIC_SUFFIX: &str = "\nvalidation_output=truncated\n";
 const SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[tokio::main]
@@ -39,6 +41,7 @@ async fn main() -> Result<(), SupervisorError> {
 }
 
 async fn run(options: CliOptions) -> Result<(), SupervisorError> {
+    let validate_only = options.validate_only;
     let config_bytes = read_bounded(&options.config, MAX_NODE_CONFIG_BYTES)?;
     let config = NodeConfig::parse_bounded(&config_bytes)?;
     require_cpu_only(&config)?;
@@ -57,8 +60,13 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
         },
     )]);
     let node = config.validate(&inventory, &binaries)?;
-    let inherited_environment = inherited_environment();
     let mut slots = resolve_slots(&node)?;
+    if validate_only {
+        print!("{}", validation_diagnostic(&node));
+        return Ok(());
+    }
+
+    let inherited_environment = inherited_environment();
 
     let locks = LockNamespace::open(&node.config().runtime_directory)?;
     let lock_metadata = format!("node={} pid={}", node.config().node_id, std::process::id());
@@ -198,6 +206,69 @@ fn resolve_slots(node: &ValidatedNodeConfig) -> Result<Vec<WorkerSlot>, Supervis
             })
         })
         .collect()
+}
+
+fn validation_diagnostic(node: &ValidatedNodeConfig) -> String {
+    let mut output = BoundedDiagnostic::new();
+    output.push_line(&format!(
+        "validation=ok mode=validate-only node={} workers={} credentials=validated-redacted",
+        node.config().node_id,
+        node.config().workers.len()
+    ));
+    for worker in &node.config().workers {
+        output.push_line(&format!(
+            "worker={} backend={:?} bind={} deployment={} generation={} max_active_invocations={} secret=redacted",
+            worker.worker_id,
+            worker.assignment.backend(),
+            worker.bind,
+            worker.deployment.deployment_id,
+            worker.deployment.model_generation.get(),
+            worker.max_active_invocations,
+        ));
+    }
+    output.finish()
+}
+
+struct BoundedDiagnostic {
+    output: String,
+    truncated: bool,
+}
+
+impl BoundedDiagnostic {
+    fn new() -> Self {
+        Self {
+            output: String::with_capacity(MAX_VALIDATION_DIAGNOSTIC_BYTES),
+            truncated: false,
+        }
+    }
+
+    fn push_line(&mut self, line: &str) {
+        if self.truncated {
+            return;
+        }
+        let payload_limit = MAX_VALIDATION_DIAGNOSTIC_BYTES - TRUNCATED_DIAGNOSTIC_SUFFIX.len();
+        let required = line.len().saturating_add(1);
+        if self.output.len().saturating_add(required) <= payload_limit {
+            self.output.push_str(line);
+            self.output.push('\n');
+            return;
+        }
+
+        let mut remaining = payload_limit
+            .saturating_sub(self.output.len())
+            .min(line.len());
+        while !line.is_char_boundary(remaining) {
+            remaining -= 1;
+        }
+        self.output.push_str(&line[..remaining]);
+        self.output.push_str(TRUNCATED_DIAGNOSTIC_SUFFIX);
+        self.truncated = true;
+    }
+
+    fn finish(self) -> String {
+        debug_assert!(self.output.len() <= MAX_VALIDATION_DIAGNOSTIC_BYTES);
+        self.output
+    }
 }
 
 async fn launch_slot(
@@ -420,6 +491,7 @@ struct CliOptions {
     cpu_worker_binary: PathBuf,
     cpu_ids: Vec<u16>,
     allocatable_host_memory_bytes: u64,
+    validate_only: bool,
 }
 
 enum ParseOutcome {
@@ -442,11 +514,20 @@ impl CliOptions {
         let mut cpu_worker_binary = None;
         let mut cpu_ids = None;
         let mut allocatable_host_memory_bytes = None;
+        let mut validate_only = false;
         let mut index = 0;
         while index < arguments.len() {
             let name = arguments[index]
                 .to_str()
                 .ok_or(SupervisorError::NonUtf8OptionName)?;
+            if name == "--validate-only" {
+                if validate_only {
+                    return Err(SupervisorError::DuplicateOption(name.to_string()));
+                }
+                validate_only = true;
+                index += 1;
+                continue;
+            }
             let value = arguments
                 .get(index + 1)
                 .ok_or_else(|| SupervisorError::MissingOptionValue(name.to_string()))?;
@@ -484,6 +565,7 @@ impl CliOptions {
             allocatable_host_memory_bytes: allocatable_host_memory_bytes.ok_or(
                 SupervisorError::MissingOption("--allocatable-host-memory-bytes"),
             )?,
+            validate_only,
         }))
     }
 }
@@ -517,6 +599,9 @@ fn print_usage() {
         "Usage: izwi-serving-supervisor \\\n  --config PATH \\\n  --cpu-worker-binary PATH \\\n  --cpu-ids 0,1,... \\\n  --allocatable-host-memory-bytes BYTES\n\n\
 This executable intentionally accepts CPU workers only. CPU IDs and allocatable host memory\n\
 must come from an operator or a trusted launcher; it does not probe or initialize accelerators."
+    );
+    eprintln!(
+        "Optional: --validate-only resolves configuration and service credentials, prints bounded redacted diagnostics, and exits without acquiring locks or launching workers."
     );
 }
 
@@ -627,6 +712,7 @@ mod tests {
         let arguments = [
             "--config",
             "/config.toml",
+            "--validate-only",
             "--cpu-worker-binary",
             "/worker",
             "--cpu-ids",
@@ -640,6 +726,7 @@ mod tests {
         };
         assert_eq!(options.cpu_ids, vec![1, 3]);
         assert_eq!(options.allocatable_host_memory_bytes, 4096);
+        assert!(options.validate_only);
         assert!(matches!(
             CliOptions::parse([OsString::from("--config"), OsString::from("/x")]),
             Err(SupervisorError::MissingOption("--cpu-worker-binary"))
@@ -648,6 +735,36 @@ mod tests {
             parse_cpu_ids("1,1"),
             Err(SupervisorError::InvalidCpuIds)
         ));
+        assert!(matches!(
+            CliOptions::parse(
+                [
+                    "--validate-only",
+                    "--validate-only",
+                    "--config",
+                    "/config.toml",
+                    "--cpu-worker-binary",
+                    "/worker",
+                    "--cpu-ids",
+                    "1",
+                    "--allocatable-host-memory-bytes",
+                    "4096",
+                ]
+                .map(OsString::from)
+            ),
+            Err(SupervisorError::DuplicateOption(option)) if option == "--validate-only"
+        ));
+    }
+
+    #[test]
+    fn diagnostic_buffer_is_hard_bounded() {
+        let mut diagnostic = BoundedDiagnostic::new();
+        diagnostic.push_line(&"x".repeat(MAX_VALIDATION_DIAGNOSTIC_BYTES * 2));
+        diagnostic.push_line("must-not-appear");
+        let output = diagnostic.finish();
+
+        assert_eq!(output.len(), MAX_VALIDATION_DIAGNOSTIC_BYTES);
+        assert!(output.ends_with(TRUNCATED_DIAGNOSTIC_SUFFIX));
+        assert!(!output.contains("must-not-appear"));
     }
 
     #[test]
