@@ -537,6 +537,7 @@ pub enum AttemptState {
     Queued,
     Running,
     CancellationRequested,
+    ExecutionStopping,
     Completed,
     Failed,
     Cancelled,
@@ -555,12 +556,33 @@ impl AttemptState {
     }
 }
 
+/// Exact invocation owner used to fence attempt lookup and cancellation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttemptIdentity {
+    pub request_id: RequestId,
+    pub attempt_id: AttemptId,
+    pub incarnation_id: IncarnationId,
+    pub deployment_id: DeploymentId,
+    pub model_generation: ModelGeneration,
+}
+
+impl From<&InvocationRequest> for AttemptIdentity {
+    fn from(request: &InvocationRequest) -> Self {
+        Self {
+            request_id: request.request_id.clone(),
+            attempt_id: request.attempt_id.clone(),
+            incarnation_id: request.expected_worker_incarnation.clone(),
+            deployment_id: request.deployment_id.clone(),
+            model_generation: request.expected_model_generation,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttemptQueryResponse {
     pub schema_version: SchemaVersion,
-    pub attempt_id: AttemptId,
     pub worker_id: WorkerId,
-    pub incarnation_id: IncarnationId,
+    pub identity: AttemptIdentity,
     pub state: AttemptState,
     pub last_sequence: Option<u64>,
 }
@@ -583,11 +605,16 @@ impl CancelDisposition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CancelAttemptRequest {
+    pub schema_version: SchemaVersion,
+    pub identity: AttemptIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CancelAttemptResponse {
     pub schema_version: SchemaVersion,
-    pub attempt_id: AttemptId,
     pub worker_id: WorkerId,
-    pub incarnation_id: IncarnationId,
+    pub identity: AttemptIdentity,
     pub disposition: CancelDisposition,
 }
 
@@ -727,6 +754,7 @@ mod tests {
     fn unknown_attempt_and_cancel_do_not_confirm_teardown() {
         assert!(!AttemptState::Unknown.proves_execution_stopped());
         assert!(!AttemptState::Expired.proves_execution_stopped());
+        assert!(!AttemptState::ExecutionStopping.proves_execution_stopped());
         assert!(!CancelDisposition::Requested.confirms_execution_stopped());
         assert!(!CancelDisposition::Unknown.confirms_execution_stopped());
         assert!(CancelDisposition::Stopped.confirms_execution_stopped());

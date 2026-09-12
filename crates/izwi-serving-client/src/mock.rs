@@ -101,7 +101,7 @@ impl MockWorkerConfig {
 
 #[derive(Debug, Clone)]
 struct AttemptRecord {
-    request_id: RequestId,
+    identity: AttemptIdentity,
     digest: RequestDigest,
     state: AttemptState,
     last_sequence: Option<u64>,
@@ -413,7 +413,7 @@ async fn invoke(State(state): State<Arc<MockState>>, headers: HeaderMap, body: B
     {
         let table = state.attempts.lock().expect("mock attempt table poisoned");
         if let Some(existing) = table.records.get(&request.attempt_id) {
-            let same = existing.request_id == request.request_id
+            let same = existing.identity.request_id == request.request_id
                 && existing.digest == request.request_digest;
             return rejection(
                 &request,
@@ -445,7 +445,7 @@ async fn invoke(State(state): State<Arc<MockState>>, headers: HeaderMap, body: B
     };
     let (cancel_tx, cancel_rx) = watch::channel(false);
     let record = AttemptRecord {
-        request_id: request.request_id.clone(),
+        identity: AttemptIdentity::from(&request),
         digest: request.request_digest.clone(),
         state: AttemptState::Admitted,
         last_sequence: Some(0),
@@ -575,7 +575,7 @@ async fn run_invocation(
             if changed.is_ok() && *cancel.borrow() {
                 state.update_attempt(
                     &request.attempt_id,
-                    AttemptState::CancellationRequested,
+                    AttemptState::ExecutionStopping,
                     None,
                 );
                 tokio::time::sleep(state.config.cancellation_delay).await;
@@ -638,9 +638,8 @@ async fn query_attempt(
     };
     Json(AttemptQueryResponse {
         schema_version: PROTOCOL_V1,
-        attempt_id,
         worker_id: state.config.worker_id.clone(),
-        incarnation_id: state.config.incarnation_id.clone(),
+        identity: record.identity.clone(),
         state: record.state,
         last_sequence: record.last_sequence,
     })
@@ -651,6 +650,7 @@ async fn cancel_attempt(
     State(state): State<Arc<MockState>>,
     headers: HeaderMap,
     Path(raw_attempt_id): Path<String>,
+    Json(request): Json<CancelAttemptRequest>,
 ) -> Response {
     if !state.authenticate(&headers) {
         return StatusCode::UNAUTHORIZED.into_response();
@@ -658,12 +658,23 @@ async fn cancel_attempt(
     let Ok(attempt_id) = AttemptId::new(raw_attempt_id) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    if request.schema_version.major != PROTOCOL_V1.major
+        || request.identity.attempt_id != attempt_id
+        || request.identity.incarnation_id != state.config.incarnation_id
+    {
+        return StatusCode::CONFLICT.into_response();
+    }
     let disposition = {
         let mut table = state.attempts.lock().expect("mock attempt table poisoned");
         if let Some(record) = table.records.get_mut(&attempt_id) {
-            if record.state.is_terminal() {
+            if record.identity != request.identity {
+                return StatusCode::CONFLICT.into_response();
+            } else if record.state.is_terminal() {
                 CancelDisposition::AlreadyTerminal
-            } else if record.state == AttemptState::CancellationRequested {
+            } else if matches!(
+                record.state,
+                AttemptState::CancellationRequested | AttemptState::ExecutionStopping
+            ) {
                 CancelDisposition::AlreadyRequested
             } else if let Some(cancel) = &record.cancel {
                 let _ = cancel.send(true);
@@ -675,7 +686,7 @@ async fn cancel_attempt(
         } else {
             drop(table);
             let tombstone = AttemptRecord {
-                request_id: RequestId::new("cancel-before-invoke").expect("static identity"),
+                identity: request.identity.clone(),
                 digest: RequestDigest::new("cancel-tombstone").expect("static identity"),
                 state: AttemptState::CancellationRequested,
                 last_sequence: None,
@@ -687,9 +698,8 @@ async fn cancel_attempt(
     };
     Json(CancelAttemptResponse {
         schema_version: PROTOCOL_V1,
-        attempt_id,
         worker_id: state.config.worker_id.clone(),
-        incarnation_id: state.config.incarnation_id.clone(),
+        identity: request.identity,
         disposition,
     })
     .into_response()

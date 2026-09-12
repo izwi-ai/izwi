@@ -79,7 +79,7 @@ async fn happy_path_uses_authenticated_real_socket_and_strict_event_identity() {
     assert_eq!(status.capacity.available_admission_credits, 1);
 
     let invocation = request(worker.config(), "happy");
-    let attempt_id = invocation.attempt_id.clone();
+    let identity = AttemptIdentity::from(&invocation);
     let events = client.invoke_collect(invocation).await.unwrap();
     assert_eq!(events.len(), 3);
     assert!(matches!(
@@ -102,10 +102,10 @@ async fn happy_path_uses_authenticated_real_socket_and_strict_event_identity() {
         [0, 1, 2]
     );
 
-    let query = client.query_attempt(&attempt_id).await.unwrap();
+    let query = client.query_attempt(&identity).await.unwrap();
     assert_eq!(query.state, AttemptState::Completed);
     assert_eq!(query.last_sequence, Some(2));
-    let cancel = client.cancel_attempt(&attempt_id).await.unwrap();
+    let cancel = client.cancel_attempt(&identity).await.unwrap();
     assert_eq!(cancel.disposition, CancelDisposition::AlreadyTerminal);
 }
 
@@ -280,7 +280,7 @@ async fn progress_timeout_requests_cancel_but_capacity_waits_for_teardown() {
     .unwrap();
 
     let timed_out = request(worker.config(), "timeout");
-    let timed_out_attempt = timed_out.attempt_id.clone();
+    let timed_out_identity = AttemptIdentity::from(&timed_out);
     let error = client.invoke_collect(timed_out).await.unwrap_err();
     assert!(matches!(
         error,
@@ -297,12 +297,15 @@ async fn progress_timeout_requests_cancel_but_capacity_waits_for_teardown() {
         Err(WorkerClientError::Rejected { rejection })
             if rejection.code == RejectionCode::CapacityExhausted
     ));
-    let query = client.query_attempt(&timed_out_attempt).await.unwrap();
-    assert_eq!(query.state, AttemptState::CancellationRequested);
+    let query = client.query_attempt(&timed_out_identity).await.unwrap();
+    assert!(matches!(
+        query.state,
+        AttemptState::CancellationRequested | AttemptState::ExecutionStopping
+    ));
 
     tokio::time::sleep(Duration::from_millis(180)).await;
     assert_eq!(worker.active_invocations(), 0);
-    let query = client.query_attempt(&timed_out_attempt).await.unwrap();
+    let query = client.query_attempt(&timed_out_identity).await.unwrap();
     assert_eq!(query.state, AttemptState::Cancelled);
 }
 

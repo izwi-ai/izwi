@@ -6,12 +6,11 @@
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use izwi_serving_protocol::{
-    AttemptId, AttemptQueryResponse, CancelAttemptResponse, DeploymentId, IncarnationId,
-    InvocationEvent, InvocationEventKind, InvocationRejection, InvocationRequest, ModelGeneration,
-    NdjsonDecodeError, NdjsonDecoder, NdjsonLimits, RequestId, ServiceCredentials,
-    WorkerDescriptor, WorkerStatus, INVOCATIONS_PATH, NDJSON_MEDIA_TYPE, PROTOCOL_V1,
-    SERVICE_AUTHORIZATION_HEADER, SERVICE_AUTH_SCHEME, SERVICE_CREDENTIAL_ID_HEADER,
-    WORKER_DESCRIPTOR_PATH, WORKER_STATUS_PATH,
+    AttemptId, AttemptIdentity, AttemptQueryResponse, CancelAttemptRequest, CancelAttemptResponse,
+    InvocationEvent, InvocationEventKind, InvocationRejection, InvocationRequest,
+    NdjsonDecodeError, NdjsonDecoder, NdjsonLimits, ServiceCredentials, WorkerDescriptor,
+    WorkerStatus, INVOCATIONS_PATH, NDJSON_MEDIA_TYPE, PROTOCOL_V1, SERVICE_AUTHORIZATION_HEADER,
+    SERVICE_AUTH_SCHEME, SERVICE_CREDENTIAL_ID_HEADER, WORKER_DESCRIPTOR_PATH, WORKER_STATUS_PATH,
 };
 use reqwest::{redirect::Policy, StatusCode};
 use serde::de::DeserializeOwned;
@@ -172,34 +171,47 @@ impl WorkerClient {
 
     pub async fn query_attempt(
         &self,
-        attempt_id: &AttemptId,
+        identity: &AttemptIdentity,
     ) -> Result<AttemptQueryResponse, WorkerClientError> {
-        self.get_json(&format!("{INVOCATIONS_PATH}/{attempt_id}"))
-            .await
+        let response = self
+            .get_json(&format!("{INVOCATIONS_PATH}/{}", identity.attempt_id))
+            .await?;
+        validate_query_response(response, identity)
     }
 
     pub async fn cancel_attempt(
         &self,
-        attempt_id: &AttemptId,
+        identity: &AttemptIdentity,
     ) -> Result<CancelAttemptResponse, WorkerClientError> {
+        let encoded = serde_json::to_vec(&CancelAttemptRequest {
+            schema_version: PROTOCOL_V1,
+            identity: identity.clone(),
+        })?;
+        if encoded.len() > self.inner.config.max_request_json_bytes {
+            return Err(WorkerClientError::RequestTooLarge {
+                actual: encoded.len(),
+                limit: self.inner.config.max_request_json_bytes,
+            });
+        }
         let permit = self.acquire_permit().await?;
         let response = tokio::time::timeout(
             self.inner.config.request_timeout,
-            self.authorized(
-                self.inner
-                    .http
-                    .post(self.url(&format!("{INVOCATIONS_PATH}/{attempt_id}/cancel"))),
-            )
+            self.authorized(self.inner.http.post(self.url(&format!(
+                "{INVOCATIONS_PATH}/{}/cancel",
+                identity.attempt_id
+            ))))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(encoded)
             .send(),
         )
         .await
         .map_err(|_| WorkerClientError::Deadline(DeadlinePhase::ResponseHeaders))?
         .map_err(WorkerClientError::Transport)?;
-        let result = self
+        let result: Result<CancelAttemptResponse, _> = self
             .decode_json_response(response, self.inner.config.max_control_body_bytes)
             .await;
         drop(permit);
-        result
+        validate_cancel_response(result?, identity)
     }
 
     /// Starts exactly one invocation POST. This method never retries.
@@ -220,7 +232,7 @@ impl WorkerClient {
         // future leaves admission uncertain. A tombstoned cancel also closes the race where the
         // cancellation reaches the worker just before the invocation POST.
         let mut admission_guard =
-            PendingInvocationGuard::new(self.clone(), request.attempt_id.clone());
+            PendingInvocationGuard::new(self.clone(), AttemptIdentity::from(&request));
         let total_deadline = Instant::now() + Duration::from_millis(request.remaining_time_ms);
         let header_budget = self
             .inner
@@ -266,7 +278,7 @@ impl WorkerClient {
             body: Box::pin(response.bytes_stream()),
             decoder: NdjsonDecoder::new(self.inner.config.ndjson_limits)?,
             pending: VecDeque::new(),
-            identity: ExpectedInvocationIdentity::from_request(&request),
+            identity: AttemptIdentity::from(&request),
             last_sequence: None,
             terminal_seen: false,
             eof_seen: false,
@@ -400,15 +412,15 @@ impl WorkerClient {
 
 struct PendingInvocationGuard {
     client: WorkerClient,
-    attempt_id: AttemptId,
+    identity: AttemptIdentity,
     armed: bool,
 }
 
 impl PendingInvocationGuard {
-    fn new(client: WorkerClient, attempt_id: AttemptId) -> Self {
+    fn new(client: WorkerClient, identity: AttemptIdentity) -> Self {
         Self {
             client,
-            attempt_id,
+            identity,
             armed: true,
         }
     }
@@ -423,7 +435,7 @@ impl Drop for PendingInvocationGuard {
         if !self.armed {
             return;
         }
-        spawn_cancel(self.client.clone(), self.attempt_id.clone());
+        spawn_cancel(self.client.clone(), self.identity.clone());
     }
 }
 
@@ -481,26 +493,31 @@ fn lossy_bounded(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-#[derive(Debug, Clone)]
-struct ExpectedInvocationIdentity {
-    request_id: RequestId,
-    attempt_id: AttemptId,
-    incarnation_id: IncarnationId,
-    deployment_id: DeploymentId,
-    model_generation: ModelGeneration,
+fn validate_query_response(
+    response: AttemptQueryResponse,
+    expected: &AttemptIdentity,
+) -> Result<AttemptQueryResponse, WorkerClientError> {
+    if response.schema_version.major != PROTOCOL_V1.major || response.identity != *expected {
+        return Err(WorkerClientError::Protocol(
+            "attempt query response owner identity did not match".into(),
+        ));
+    }
+    Ok(response)
 }
 
-impl ExpectedInvocationIdentity {
-    fn from_request(request: &InvocationRequest) -> Self {
-        Self {
-            request_id: request.request_id.clone(),
-            attempt_id: request.attempt_id.clone(),
-            incarnation_id: request.expected_worker_incarnation.clone(),
-            deployment_id: request.deployment_id.clone(),
-            model_generation: request.expected_model_generation,
-        }
+fn validate_cancel_response(
+    response: CancelAttemptResponse,
+    expected: &AttemptIdentity,
+) -> Result<CancelAttemptResponse, WorkerClientError> {
+    if response.schema_version.major != PROTOCOL_V1.major || response.identity != *expected {
+        return Err(WorkerClientError::Protocol(
+            "attempt cancellation response owner identity did not match".into(),
+        ));
     }
+    Ok(response)
 }
+
+type ExpectedInvocationIdentity = AttemptIdentity;
 
 type ResponseByteStream =
     Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send + Sync + 'static>>;
@@ -561,6 +578,10 @@ impl InvocationStream {
 
     pub fn attempt_id(&self) -> &AttemptId {
         &self.identity.attempt_id
+    }
+
+    pub fn attempt_identity(&self) -> &AttemptIdentity {
+        &self.identity
     }
 
     fn validate_first_accepted(&self, event: &InvocationEvent) -> Result<(), WorkerClientError> {
@@ -690,14 +711,14 @@ impl InvocationStream {
             return;
         }
         self.permit.take();
-        spawn_cancel(self.client.clone(), self.identity.attempt_id.clone());
+        spawn_cancel(self.client.clone(), self.identity.clone());
     }
 }
 
-fn spawn_cancel(client: WorkerClient, attempt_id: AttemptId) {
+fn spawn_cancel(client: WorkerClient, identity: AttemptIdentity) {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle.spawn(async move {
-            let _ = client.cancel_attempt(&attempt_id).await;
+            let _ = client.cancel_attempt(&identity).await;
         });
     }
 }
