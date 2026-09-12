@@ -3826,6 +3826,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "izwi-serving-protocol"
+version = "0.1.0-beta-18"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "izwi-vad"
 version = "0.1.0-beta-18"
 dependencies = [

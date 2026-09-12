@@ -9,6 +9,7 @@ members = [
     "crates/izwi-server",
     "crates/izwi-cli",
     "crates/izwi-desktop",
+    "crates/izwi-serving-protocol",
 ]
 
 [workspace.package]
