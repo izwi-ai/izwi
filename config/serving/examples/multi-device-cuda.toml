@@ -1,0 +1,111 @@
+# Parser-compatible only. Replace every REPLACE_* value and each zero UUID,
+# then validate all illustrative budgets against the target NVIDIA host.
+schema_version = 1
+node_id = "example-cuda-node"
+working_directory = "/REPLACE/WITH/IZWI_WORKING_DIRECTORY"
+runtime_directory = "/REPLACE/WITH/IZWI_RUNTIME_DIRECTORY"
+host_memory_budget_bytes = 12884901888
+
+[readiness]
+startup_timeout_ms = 120000
+poll_interval_ms = 200
+
+[restart]
+initial_backoff_ms = 250
+maximum_backoff_ms = 30000
+restart_window_ms = 300000
+stable_reset_ms = 600000
+max_restarts_per_window = 5
+jitter_percent = 20
+
+[shutdown]
+drain_grace_ms = 30000
+cancellation_grace_ms = 10000
+termination_grace_ms = 5000
+
+# Replica one of the example-chat-cuda-v1 deployment.
+[[workers]]
+worker_id = "example-chat-cuda-1"
+bind = "127.0.0.1:9480"
+binary = "cuda"
+credential_id = "example-chat-cuda-credential-1"
+bearer_token_env = "REPLACE_IZWI_WORKER_CHAT_CUDA_1_TOKEN"
+max_active_invocations = 1
+max_request_bytes = 1048576
+max_retained_attempts = 128
+attempt_retention_secs = 300
+streaming = true
+
+[workers.assignment]
+backend = "cuda"
+# Zero-valued canonical shapes are placeholders, not discovered devices.
+device_uuid = "GPU-00000000-0000-0000-0000-000000000001"
+# The supervisor exposes only the assigned UUID to this process.
+process_local_device_index = 0
+device_memory_limit_bytes = 12884901888
+host_memory_limit_bytes = 3221225472
+
+[workers.deployment]
+deployment_id = "example-chat-cuda-v1"
+public_model = "LFM2.5-1.2B-Instruct-GGUF"
+artifact_revision = "REPLACE_WITH_PINNED_ARTIFACT_REVISION"
+model_generation = 1
+backend = "cuda"
+models_directory = "/REPLACE/WITH/IZWI_MODELS_DIRECTORY"
+
+# Replica two: the same deployment on a different assigned device and port.
+[[workers]]
+worker_id = "example-chat-cuda-2"
+bind = "127.0.0.1:9481"
+binary = "cuda"
+credential_id = "example-chat-cuda-credential-2"
+bearer_token_env = "REPLACE_IZWI_WORKER_CHAT_CUDA_2_TOKEN"
+max_active_invocations = 1
+max_request_bytes = 1048576
+max_retained_attempts = 128
+attempt_retention_secs = 300
+streaming = true
+
+[workers.assignment]
+backend = "cuda"
+device_uuid = "GPU-00000000-0000-0000-0000-000000000002"
+process_local_device_index = 0
+device_memory_limit_bytes = 12884901888
+host_memory_limit_bytes = 3221225472
+
+[workers.deployment]
+deployment_id = "example-chat-cuda-v1"
+public_model = "LFM2.5-1.2B-Instruct-GGUF"
+artifact_revision = "REPLACE_WITH_PINNED_ARTIFACT_REVISION"
+model_generation = 1
+backend = "cuda"
+models_directory = "/REPLACE/WITH/IZWI_MODELS_DIRECTORY"
+
+# An independent chat deployment. This does not imply another task type or a
+# multi-stage pipeline; one invocation remains inside this assigned worker.
+[[workers]]
+worker_id = "example-chat-cuda-specialized-1"
+bind = "127.0.0.1:9482"
+binary = "cuda"
+credential_id = "example-chat-cuda-specialized-credential-1"
+bearer_token_env = "REPLACE_IZWI_WORKER_CHAT_CUDA_SPECIALIZED_1_TOKEN"
+max_active_invocations = 1
+max_request_bytes = 1048576
+max_retained_attempts = 128
+attempt_retention_secs = 300
+streaming = true
+
+[workers.assignment]
+backend = "cuda"
+device_uuid = "GPU-00000000-0000-0000-0000-000000000003"
+process_local_device_index = 0
+device_memory_limit_bytes = 12884901888
+host_memory_limit_bytes = 3221225472
+
+[workers.deployment]
+deployment_id = "example-chat-cuda-specialized-v1"
+public_model = "REPLACE_WITH_SUPPORTED_CHAT_MODEL_ALIAS"
+artifact_revision = "REPLACE_WITH_PINNED_SPECIALIZED_ARTIFACT_REVISION"
+model_generation = 1
+backend = "cuda"
+models_directory = "/REPLACE/WITH/IZWI_MODELS_DIRECTORY"

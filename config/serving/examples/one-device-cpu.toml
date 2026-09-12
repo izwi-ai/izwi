@@ -1,0 +1,52 @@
+# Parser-compatible only. Replace every REPLACE_* value and validate all
+# illustrative budgets against the target host before launching.
+schema_version = 1
+node_id = "example-cpu-node"
+working_directory = "/REPLACE/WITH/IZWI_WORKING_DIRECTORY"
+runtime_directory = "/REPLACE/WITH/IZWI_RUNTIME_DIRECTORY"
+host_memory_budget_bytes = 4294967296
+
+[readiness]
+startup_timeout_ms = 120000
+poll_interval_ms = 200
+
+[restart]
+initial_backoff_ms = 250
+maximum_backoff_ms = 30000
+restart_window_ms = 300000
+stable_reset_ms = 600000
+max_restarts_per_window = 5
+jitter_percent = 20
+
+[shutdown]
+drain_grace_ms = 30000
+cancellation_grace_ms = 10000
+termination_grace_ms = 5000
+
+[[workers]]
+worker_id = "example-chat-cpu-1"
+bind = "127.0.0.1:9470"
+binary = "cpu"
+credential_id = "example-chat-cpu-credential-1"
+bearer_token_env = "REPLACE_IZWI_WORKER_CHAT_CPU_1_TOKEN"
+max_active_invocations = 1
+max_request_bytes = 1048576
+max_retained_attempts = 128
+attempt_retention_secs = 300
+streaming = true
+
+[workers.assignment]
+backend = "cpu"
+thread_budget = 2
+# Empty affinity lets the host inventory supply the effective CPU set. Replace
+# it with validated logical CPU IDs when isolation is required.
+affinity = []
+host_memory_limit_bytes = 3221225472
+
+[workers.deployment]
+deployment_id = "example-chat-cpu-v1"
+public_model = "LFM2.5-1.2B-Instruct-GGUF"
+artifact_revision = "REPLACE_WITH_PINNED_ARTIFACT_REVISION"
+model_generation = 1
+backend = "cpu"
+models_directory = "/REPLACE/WITH/IZWI_MODELS_DIRECTORY"
