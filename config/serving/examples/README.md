@@ -31,7 +31,9 @@ live process.
 Parsing proves only that an example matches the bounded schema. Successful
 validation and launch additionally require real directories, executable worker
 binaries, available CPU resources, and exact accelerator inventory matches.
-The repository currently exposes supervisor library primitives rather than a
-standalone node-supervisor command, so these files are not launch instructions.
-Nothing in these examples is hardware validation, a certified memory profile,
-or a performance claim.
+The `izwi-serving-supervisor` command can launch the CPU example only when given
+an explicit config path, CPU worker binary, trusted CPU-ID list, and allocatable
+host-memory ceiling. Its current command-line inventory rejects Metal and CUDA
+assignments without fallback; those lanes still require a future trusted device
+inventory integration. Nothing in these examples is hardware validation, a
+certified memory profile, or a performance claim.
