@@ -1,6 +1,7 @@
 use crate::catalog::{
     CudaExecutionStatus, CudaQuantizationInfo, CudaSupportInfo, InferenceBackendHint, ModelVariant,
 };
+use crate::error::Result;
 use crate::kernels::cuda;
 use crate::models::shared::attention::flash::cuda_flash_attention_capabilities;
 
@@ -10,7 +11,10 @@ use super::cuda_plan::{
     CudaRuntimeObservation,
 };
 use super::device::{DeviceProfile, DeviceSelector};
-use super::types::{BackendContext, BackendPreference, BackendSelectionSource, ExecutionBackend};
+use super::types::{
+    BackendContext, BackendPreference, BackendSelectionSource, ExecutionBackend,
+    RuntimeDeviceAssignment,
+};
 
 #[derive(Debug, Clone)]
 pub struct BackendPlan {
@@ -84,6 +88,26 @@ impl BackendRouter {
         };
 
         BackendContext::new(preference, source, capabilities, device, reason)
+    }
+
+    /// Resolve an exact supervisor-owned worker assignment without fallback.
+    pub fn resolve_assigned_context(
+        assignment: &RuntimeDeviceAssignment,
+        source: BackendSelectionSource,
+    ) -> Result<BackendContext> {
+        let capabilities = BackendCapabilities::detect();
+        let device = DeviceSelector::select_assigned(assignment)?;
+        let kind = assignment.backend_kind();
+        Ok(BackendContext::new(
+            BackendPreference::from(kind),
+            source,
+            capabilities,
+            device,
+            format!(
+                "Selected exact {} device assigned by the worker supervisor",
+                kind.as_str()
+            ),
+        ))
     }
 
     pub fn resolve_context_for_kind(
@@ -364,6 +388,19 @@ mod tests {
             BackendRouter::resolve_context(BackendPreference::Cpu, BackendSelectionSource::Config);
         assert!(context.matches_preference());
         assert_eq!(context.backend_kind, crate::backends::BackendKind::Cpu);
+    }
+
+    #[test]
+    fn assigned_cpu_context_is_exact_and_does_not_fallback() {
+        let context = BackendRouter::resolve_assigned_context(
+            &RuntimeDeviceAssignment::Cpu,
+            BackendSelectionSource::Config,
+        )
+        .expect("assigned CPU context");
+
+        assert_eq!(context.backend_kind, crate::backends::BackendKind::Cpu);
+        assert_eq!(context.preference, BackendPreference::Cpu);
+        assert!(context.reason.contains("exact cpu device"));
     }
 
     #[test]

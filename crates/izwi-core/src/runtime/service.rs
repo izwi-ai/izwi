@@ -15,6 +15,7 @@ use crate::artifacts::{DownloadProgress, ModelLifecycleSnapshot, ModelManager};
 use crate::audio::{AudioCodec, AudioEncoder, StreamingConfig};
 use crate::backends::{
     BackendKind, BackendPreference, BackendRouter, BackendSelectionSource, DeviceProfile,
+    RuntimeDeviceAssignment,
 };
 use crate::catalog::{ModelFamily, ModelInfo, ModelVariant};
 use crate::config::{EngineConfig, PrefixCachePolicy, ResolvedKvCachePolicy};
@@ -2906,6 +2907,28 @@ impl RuntimeService {
     /// Create a new inference engine.
     pub fn new(mut config: EngineConfig) -> Result<Self> {
         config.performance = config.performance.resolve_env()?;
+        let backend_context =
+            BackendRouter::resolve_context(config.backend, BackendSelectionSource::Config);
+        Self::ensure_requested_backend_available(&backend_context)?;
+        Self::new_with_backend_context(config, backend_context)
+    }
+
+    /// Create a production worker runtime on exactly the supervisor-assigned device.
+    pub fn new_assigned(
+        mut config: EngineConfig,
+        assignment: RuntimeDeviceAssignment,
+    ) -> Result<Self> {
+        config.performance = config.performance.resolve_env()?;
+        let backend_context =
+            BackendRouter::resolve_assigned_context(&assignment, BackendSelectionSource::Config)?;
+        config.backend = BackendPreference::from(assignment.backend_kind());
+        Self::new_with_backend_context(config, backend_context)
+    }
+
+    fn new_with_backend_context(
+        mut config: EngineConfig,
+        backend_context: crate::backends::BackendContext,
+    ) -> Result<Self> {
         // Reject unsupported or unsafe cache policy before any model registry,
         // device arena, or readiness state can be created.
         let cache_policy =
@@ -2913,10 +2936,7 @@ impl RuntimeService {
         configure_runtime_threading(config.num_threads.max(1));
         let model_manager = Arc::new(ModelManager::new(config.clone())?);
 
-        let backend_context =
-            BackendRouter::resolve_context(config.backend, BackendSelectionSource::Config);
         let device = backend_context.device.clone();
-        Self::ensure_requested_backend_available(&backend_context)?;
         let selected_backend_kind = backend_context.backend_kind;
         // Zero means automatic administrative capacity, not zero usable rows.
         // This is only an upper bound: each loaded model fits exact physical state.
@@ -9275,6 +9295,18 @@ mod tests {
         assert!(message.contains("CUDA backend was requested"));
         assert!(message.contains("selected backend is `cpu`"));
         assert!(message.contains("no usable CUDA device"));
+    }
+
+    #[test]
+    fn assigned_cpu_runtime_uses_exact_production_selection() {
+        let runtime =
+            RuntimeService::new_assigned(EngineConfig::default(), RuntimeDeviceAssignment::Cpu)
+                .expect("assigned CPU runtime");
+
+        let context = runtime.backend_context();
+        assert_eq!(context.backend_kind, BackendKind::Cpu);
+        assert_eq!(context.preference, BackendPreference::Cpu);
+        assert!(context.reason.contains("exact cpu device"));
     }
 
     #[tokio::test]

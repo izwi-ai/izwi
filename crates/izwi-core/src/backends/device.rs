@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tracing::{debug, info, warn};
 
-use super::types::{BackendKind, BackendPreference};
+use super::types::{BackendKind, BackendPreference, RuntimeDeviceAssignment};
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::models::shared::memory::metal::{metal_pool_for_device, MetalMemoryPool};
@@ -651,8 +651,8 @@ pub fn metal_device_if_available(ordinal: usize) -> Option<Device> {
 }
 
 impl DeviceSelector {
-    fn try_metal() -> Option<DeviceProfile> {
-        if let Some(device) = metal_device_if_available(0) {
+    fn try_metal_at(ordinal: usize) -> Option<DeviceProfile> {
+        if let Some(device) = metal_device_if_available(ordinal) {
             // Initialize memory pool for Metal
             let memory_pool = metal_pool_for_device(&device);
 
@@ -683,8 +683,11 @@ impl DeviceSelector {
         }
     }
 
-    fn try_cuda() -> Option<DeviceProfile> {
-        let ordinal = configured_cuda_ordinal();
+    fn try_metal() -> Option<DeviceProfile> {
+        Self::try_metal_at(0)
+    }
+
+    fn try_cuda_at(ordinal: usize) -> Option<DeviceProfile> {
         let device = std::panic::catch_unwind(|| Device::cuda_if_available(ordinal))
             .ok()?
             .ok()?;
@@ -721,6 +724,10 @@ impl DeviceSelector {
         } else {
             None
         }
+    }
+
+    fn try_cuda() -> Option<DeviceProfile> {
+        Self::try_cuda_at(configured_cuda_ordinal())
     }
 
     fn detect_cuda_capabilities(ordinal: usize) -> CudaProbe {
@@ -774,12 +781,103 @@ impl DeviceSelector {
         }
     }
 
+    /// Select exactly the supervisor-assigned execution device.
+    ///
+    /// This path never consults backend preference environment variables and
+    /// never falls back to another backend or accelerator ordinal.
+    pub fn select_assigned(assignment: &RuntimeDeviceAssignment) -> Result<DeviceProfile> {
+        assignment
+            .validate()
+            .map_err(|message| Error::ConfigError(message.to_string()))?;
+
+        match assignment {
+            RuntimeDeviceAssignment::Cpu => Ok(DeviceProfile::cpu()),
+            RuntimeDeviceAssignment::Metal {
+                process_local_device_index,
+                expected_device_id,
+            } => {
+                let profile = Self::try_metal_at(*process_local_device_index).ok_or_else(|| {
+                    Error::ConfigError(format!(
+                        "assigned Metal device {} is unavailable",
+                        process_local_device_index
+                    ))
+                })?;
+                let observed = metal_device_identity(&profile.device).ok_or_else(|| {
+                    Error::ConfigError(
+                        "selected Metal device did not expose a stable identity".into(),
+                    )
+                })?;
+                if observed != *expected_device_id {
+                    return Err(Error::ConfigError(format!(
+                        "assigned Metal device identity mismatch: expected {expected_device_id}, observed {observed}"
+                    )));
+                }
+                Ok(profile)
+            }
+            RuntimeDeviceAssignment::Cuda {
+                process_local_device_index,
+                expected_device_uuid,
+            } => {
+                let profile = Self::try_cuda_at(*process_local_device_index).ok_or_else(|| {
+                    Error::ConfigError(format!(
+                        "assigned CUDA device {} is unavailable",
+                        process_local_device_index
+                    ))
+                })?;
+                let observed = cuda_device_uuid(*process_local_device_index).ok_or_else(|| {
+                    Error::ConfigError("selected CUDA device did not expose a stable UUID".into())
+                })?;
+                if !observed.eq_ignore_ascii_case(expected_device_uuid) {
+                    return Err(Error::ConfigError(format!(
+                        "assigned CUDA device UUID mismatch: expected {expected_device_uuid}, observed {observed}"
+                    )));
+                }
+                Ok(profile)
+            }
+        }
+    }
+
     pub fn detect_with_preference(preference: Option<&str>) -> Result<DeviceProfile> {
         preference
             .and_then(BackendPreference::parse)
             .map(Self::detect_for_preference)
             .unwrap_or_else(Self::detect)
     }
+}
+
+#[cfg(feature = "metal")]
+fn metal_device_identity(device: &Device) -> Option<String> {
+    match device {
+        Device::Metal(device) => Some(format!("metal:{}", device.registry_id())),
+        Device::Cpu | Device::Cuda(_) => None,
+    }
+}
+
+#[cfg(not(feature = "metal"))]
+fn metal_device_identity(_device: &Device) -> Option<String> {
+    None
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_device_uuid(ordinal: usize) -> Option<String> {
+    use candle_core::cuda_backend::cudarc::driver::CudaContext;
+
+    let uuid = CudaContext::new(ordinal).ok()?.uuid().ok()?;
+    let bytes = uuid.bytes.map(|byte| byte as u8);
+    Some(format_cuda_uuid(bytes))
+}
+
+fn format_cuda_uuid(bytes: [u8; 16]) -> String {
+    format!(
+        "GPU-{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+    )
+}
+
+#[cfg(not(feature = "cuda"))]
+fn cuda_device_uuid(_ordinal: usize) -> Option<String> {
+    None
 }
 
 #[derive(Debug, Clone, Default)]
@@ -875,6 +973,51 @@ fn detect_cuda_capabilities(_ordinal: usize) -> CudaProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assigned_cpu_selects_cpu_without_accelerator_discovery() {
+        let profile =
+            DeviceSelector::select_assigned(&RuntimeDeviceAssignment::Cpu).expect("assigned CPU");
+        assert_eq!(profile.kind, DeviceKind::Cpu);
+        assert!(profile.device.is_cpu());
+    }
+
+    #[cfg(not(feature = "metal"))]
+    #[test]
+    fn assigned_metal_fails_closed_when_not_compiled() {
+        let error = DeviceSelector::select_assigned(&RuntimeDeviceAssignment::Metal {
+            process_local_device_index: 0,
+            expected_device_id: "metal:1".into(),
+        })
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("assigned Metal device 0 is unavailable"));
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn assigned_cuda_fails_closed_when_not_compiled() {
+        let error = DeviceSelector::select_assigned(&RuntimeDeviceAssignment::Cuda {
+            process_local_device_index: 0,
+            expected_device_uuid: "GPU-00000000-0000-0000-0000-000000000000".into(),
+        })
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("assigned CUDA device 0 is unavailable"));
+    }
+
+    #[test]
+    fn cuda_uuid_uses_nvidia_canonical_shape() {
+        assert_eq!(
+            format_cuda_uuid([
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff,
+            ]),
+            "GPU-00112233-4455-6677-8899-aabbccddeeff"
+        );
+    }
 
     #[test]
     fn unsupported_metal_runtime_never_invokes_candle_probe() {
