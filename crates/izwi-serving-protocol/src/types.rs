@@ -561,6 +561,8 @@ impl AttemptState {
 pub struct AttemptIdentity {
     pub request_id: RequestId,
     pub attempt_id: AttemptId,
+    pub tenant_id: TenantId,
+    pub caller_id: CallerId,
     pub incarnation_id: IncarnationId,
     pub deployment_id: DeploymentId,
     pub model_generation: ModelGeneration,
@@ -571,6 +573,8 @@ impl From<&InvocationRequest> for AttemptIdentity {
         Self {
             request_id: request.request_id.clone(),
             attempt_id: request.attempt_id.clone(),
+            tenant_id: request.caller.tenant_id.clone(),
+            caller_id: request.caller.caller_id.clone(),
             incarnation_id: request.expected_worker_incarnation.clone(),
             deployment_id: request.deployment_id.clone(),
             model_generation: request.expected_model_generation,
