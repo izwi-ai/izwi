@@ -92,6 +92,7 @@ function Verify-TerminalZip {
     Assert-NoForbiddenEntries -Entries $entries -Label $Path
     Assert-ContainsPattern -Entries $entries -Pattern '(^|/)izwi\.exe$' -Label "public CLI"
     Assert-ContainsPattern -Entries $entries -Pattern '(^|/)izwi-server\.exe$' -Label "gateway-capable public server"
+    Assert-ContainsPattern -Entries $entries -Pattern '(^|/)izwi-serving-supervisor\.exe$' -Label "node supervisor"
     Assert-ContainsPattern -Entries $entries -Pattern '(^|/)izwi-serving-worker\.exe$' -Label "private inference worker"
     Assert-ContainsPattern -Entries $entries -Pattern '(^|/)izwi-serving-node\.example\.toml$' -Label "bounded node configuration example"
     Assert-ContainsPattern -Entries $entries -Pattern '(^|/)izwi-desktop\.exe$' -Label "desktop binary"

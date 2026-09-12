@@ -1,6 +1,6 @@
 # Parser-compatible single-node CPU example for the production serving boundary.
 # Replace every absolute path, resource budget, artifact revision, and secret
-# before use. The current release does not yet include a runnable supervisor CLI.
+# before use. The packaged supervisor accepts explicit CPU assignments only.
 
 schema_version = 1
 node_id = "node-a"
