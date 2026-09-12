@@ -28,6 +28,7 @@ const DESKTOP_OWNER_PIPE_ENV: &str = "IZWI_DESKTOP_OWNER_PIPE";
 mod api;
 mod app;
 pub use app::realtime_protocol;
+pub mod artifact_store;
 pub mod batch_runtime;
 mod chat_store;
 mod db;

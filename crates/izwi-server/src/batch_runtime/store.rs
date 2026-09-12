@@ -481,6 +481,30 @@ impl BatchRuntimeStore {
         row.as_ref().map(map_media_asset).transpose()
     }
 
+    /// Logically delete an artifact-backed media row before physical object cleanup.
+    ///
+    /// The tombstone is intentionally retained so a failed provider deletion cannot
+    /// make the object visible again. Provider-specific garbage collection may retry
+    /// physical deletion without changing the public artifact identity.
+    pub async fn tombstone_media_asset(&self, id: &str) -> anyhow::Result<bool> {
+        let db = self.db.connection().await?;
+        let now = self.now_millis();
+        let result = db
+            .execute_raw(raw::statement(
+                db,
+                r#"
+                UPDATE media_assets
+                SET updated_at = ?1, deleted_at = ?1
+                WHERE id = ?2 AND deleted_at IS NULL
+                "#,
+                vec![now.into(), id.into()],
+            )?)
+            .await
+            .context("Failed to tombstone media asset")?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
     pub async fn get_media_asset_by_storage_key(
         &self,
         storage_key: &str,

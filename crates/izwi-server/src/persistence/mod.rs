@@ -357,7 +357,7 @@ impl MediaStorageProvider for LocalMediaStorageProvider {
                 filename: request.preferred_filename,
                 content_length: Some(content_length),
                 sha256: None,
-                tenant_id: None,
+                tenant_id: tenant_id_from_metadata(&request.metadata),
                 attributes: request.metadata,
             },
         })
@@ -380,7 +380,7 @@ impl MediaStorageProvider for LocalMediaStorageProvider {
                 filename: filename_from_key(&key),
                 content_length: Some(bytes.len() as u64),
                 sha256: None,
-                tenant_id: None,
+                tenant_id: tenant_id_from_metadata(&metadata),
                 attributes: metadata,
             },
             bytes,
@@ -460,7 +460,7 @@ impl MediaStorageProvider for LocalMediaStorageProvider {
                 filename: request.preferred_filename,
                 content_length: Some(content_length),
                 sha256: Some(write.1),
-                tenant_id: None,
+                tenant_id: tenant_id_from_metadata(&request.metadata),
                 attributes: request.metadata,
             },
         })
@@ -492,7 +492,7 @@ impl MediaStorageProvider for LocalMediaStorageProvider {
                 filename: filename_from_key(&key),
                 content_length: Some(content_length),
                 sha256: None,
-                tenant_id: None,
+                tenant_id: tenant_id_from_metadata(&request.metadata),
                 attributes: request.metadata,
             },
         })
@@ -502,6 +502,10 @@ impl MediaStorageProvider for LocalMediaStorageProvider {
         storage_layout::delete_media_file(&self.media_root, Some(&request.key.key))
             .map_err(|err| HookError::Failed(err.to_string()))
     }
+}
+
+fn tenant_id_from_metadata(metadata: &HookMetadata) -> Option<String> {
+    metadata.get("tenant_id").cloned()
 }
 
 fn persist_local_tempfile_noclobber(

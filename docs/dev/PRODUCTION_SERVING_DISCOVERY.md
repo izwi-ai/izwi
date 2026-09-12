@@ -73,7 +73,7 @@ data needs to be removed.
 | Realtime transcription | Preview | In-process realtime app/runtime | Process-local session, rolling audio, bounded frame/command/output queues | WebSocket; owner-bound state | Keep local-only until session affinity and private realtime protocol exist. |
 | Realtime voice | Preview | In-process workflow coordinator | ASR/chat/TTS stage state, barge-in, voice persistence, session admission | WebSocket with multi-stage cancellation | Keep local-only; later bind each stateful stage to an explicit worker owner. |
 | Jobs and speech history | Preview | In-process DB-polling batch worker plus runtime | Transactional SQLite jobs/stages/artifacts, leases, attempt tokens | Poll/SSE/cancel with durable state | Reuse stores and fencing later; do not route as synchronous HTTP work in Phase 1. |
-| Media and saved voices | Preview | Gateway/server storage providers | Local/provider objects; some reads materialize complete values | HTTP upload/download | Keep local-only until tenant scoping and bounded remote artifact access are proven. |
+| Media and saved voices | Preview | Gateway/server storage providers | Existing routes still use local/provider paths. A route-independent `ArtifactStore` foundation now maps tenant-scoped opaque IDs to durable `media_assets` rows and private provider keys. | HTTP upload/download | Keep routes local-only. The facade has bounded, integrity-checked reads and local/remote-like provider conformance tests, but no media or voice route has been migrated to it. |
 | Model administration | Preview/operator | Direct local runtime and filesystem mutation | Downloads, model files, lifecycle locks | Progress plus load/unload/delete | Never expose through the inference worker surface; require separate operator authorization and resource-safe lifecycle control. |
 
 ## Requirement map
@@ -103,3 +103,24 @@ not replay an uncertain or partially streamed invocation on another worker.
 Multimodal chat remains on the current explicit local execution path until its
 artifact transport semantics have dedicated tests. This is a migration-ledger
 restriction, not removal of the working local behavior.
+
+## Phase 6 artifact foundation
+
+The first artifact slice adds a route-independent `ArtifactStore` facade over
+the existing `MediaStorageProvider` and SQLite-compatible `media_assets` table.
+It issues opaque UUID references, keeps storage keys internal, records tenant
+ownership in versioned server-authored metadata, validates size, content type,
+SHA-256 and provider tenant metadata, and materializes reads through a fixed-size
+streaming buffer with a configured hard byte limit. The local filesystem
+provider and a deterministic remote-like provider run through the same
+conformance contract. No schema migration or external service is required.
+
+Deletion first tombstones the durable row and then removes the provider object.
+If physical deletion fails, access stays denied and the error explicitly calls
+for a later garbage-collection retry. Retention is recorded as ephemeral,
+job-owned, or durable; automatic expiry and garbage collection are not yet
+implemented. Existing media, saved-voice, speech-history, job-output, and
+multimodal routes do not use this facade yet and remain restricted exactly as
+listed above. Attempt-specific output publication, transactional winner
+selection, remote artifact-service authentication, and fleet database ownership
+remain Phase 6 work; this foundation alone does not enable a fleet route.
