@@ -24,7 +24,7 @@ use crate::app::chat_content::{
     flatten_content_parts, validate_media_inputs_for_variant, FlattenedMultimodalContent,
 };
 use crate::error::ApiError;
-use crate::gateway::{GatewayAdmissionGuard, GatewayState};
+use crate::gateway::{GatewayAdmissionGuard, GatewayChatExecution, GatewayState};
 use crate::ids::new_uuid;
 use crate::state::AppState;
 use izwi_core::{
@@ -681,25 +681,43 @@ pub async fn gateway_completions(
     let (variant, execution_request) = prepare_execution_request(&req, &ctx)?;
     if req.stream.unwrap_or(false) {
         let model_id = execution_request.variant.dir_name().to_string();
-        let event_rx = spawn_remote_chat_stream_with_execution(
-            &state.remote_chat_execution,
-            state.request_timeout_secs,
-            &ctx,
-            execution_request,
-        )
-        .await?;
+        let event_rx = match &state.chat_execution {
+            GatewayChatExecution::Pinned(remote) => {
+                spawn_remote_chat_stream_with_execution(
+                    remote,
+                    state.request_timeout_secs,
+                    &ctx,
+                    execution_request,
+                )
+                .await?
+            }
+            GatewayChatExecution::Registry(dispatcher) => {
+                dispatcher
+                    .stream(state.request_timeout_secs, &ctx, execution_request)
+                    .await?
+            }
+        };
         return Ok(
             render_chat_stream(req, model_id, event_rx, compat_profile, Some(admission))
                 .into_response(),
         );
     }
-    let generation = generate_remote_chat_with_execution(
-        &state.remote_chat_execution,
-        state.request_timeout_secs,
-        &ctx,
-        execution_request,
-    )
-    .await?;
+    let generation = match &state.chat_execution {
+        GatewayChatExecution::Pinned(remote) => {
+            generate_remote_chat_with_execution(
+                remote,
+                state.request_timeout_secs,
+                &ctx,
+                execution_request,
+            )
+            .await?
+        }
+        GatewayChatExecution::Registry(dispatcher) => {
+            dispatcher
+                .generate(state.request_timeout_secs, &ctx, execution_request)
+                .await?
+        }
+    };
     drop(admission);
     Ok(render_completion_response(
         variant,

@@ -72,6 +72,39 @@ impl RemoteChatDispatcher {
         &self.registry
     }
 
+    /// Readiness is derived from a receiver-clock-fresh registry observation,
+    /// never from registration alone. Exhausted workers remain ready because
+    /// capacity affects admission, not service health.
+    pub fn readiness_check(&self) -> Result<(), String> {
+        let public_model = ModelAlias::new(self.config.public_model_variant.dir_name())
+            .map_err(|error| format!("invalid configured public model alias: {error}"))?;
+        let compatible = [false, true].into_iter().all(|streaming| {
+            self.registry
+                .has_fresh_compatible_worker(&WorkerSelectionRequest {
+                    protocol_version: PROTOCOL_V1,
+                    deployment_id: self.config.deployment_id.clone(),
+                    public_model: public_model.clone(),
+                    task: TaskKind::Chat,
+                    input_format: InputFormat::ChatMessages,
+                    output_format: OutputFormat::Text,
+                    streaming,
+                    realtime: false,
+                    cancellation: Some(CancellationBehavior::Cooperative),
+                    backend_policy: self.config.backend_policy,
+                    input_bytes: 0,
+                    context_tokens: None,
+                    output_tokens: Some(1),
+                })
+        });
+        if !compatible {
+            return Err(format!(
+                "no fresh compatible worker is ready for deployment {}",
+                self.config.deployment_id
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn generate(
         &self,
         request_timeout_secs: u64,

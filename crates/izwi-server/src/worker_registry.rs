@@ -479,6 +479,19 @@ impl WorkerRegistry {
         snapshot
     }
 
+    /// Reports whether a receiver-clock-fresh running worker is ready for the
+    /// exact request contract. Capacity is intentionally excluded: an
+    /// otherwise healthy but currently full deployment remains service-ready.
+    pub fn has_fresh_compatible_worker(&self, request: &WorkerSelectionRequest) -> bool {
+        let now = Instant::now();
+        let inner = lock_recover(&self.inner);
+        inner.workers.values().any(|record| {
+            fresh_observation(record, now, inner.config.status_ttl)
+                .and_then(|observation| eligible_deployment(record, observation, request))
+                .is_some()
+        })
+    }
+
     pub fn select_and_reserve(
         &self,
         request: &WorkerSelectionRequest,

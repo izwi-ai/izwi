@@ -14,6 +14,7 @@
 
 use anyhow::Context;
 use clap::{Parser, ValueEnum};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -67,8 +68,8 @@ use izwi_core::{
 use izwi_hooks::EnterpriseHooks;
 use izwi_serving_client::{WorkerClient, WorkerClientConfig};
 use izwi_serving_protocol::{
-    CredentialId, DeploymentId, IncarnationId, ModelGeneration, PolicyRevision, ServiceBearerToken,
-    ServiceCredentials,
+    CredentialId, DeploymentId, IncarnationId, ModelGeneration, NodeId, PolicyRevision,
+    ServiceBearerToken, ServiceCredentials, TaskKind, WorkerDescriptor, WorkerId, WorkerStatus,
 };
 use logging::{LogFormat, SERVICE_NAME, SERVICE_VERSION};
 use persistence::PersistenceContext;
@@ -77,6 +78,9 @@ use state::AppState;
 pub use app::chat::{RemoteChatExecution, RemoteChatExecutionConfig};
 pub use app::remote_chat_dispatch::{RemoteChatDispatchConfig, RemoteChatDispatcher};
 pub use gateway::{create_gateway_router, GatewayState};
+
+const MAX_CONFIGURED_GATEWAY_WORKERS: usize = 256;
+const MAX_GATEWAY_STATUS_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -137,6 +141,16 @@ struct ServerArgs {
     #[arg(long, env = "IZWI_GATEWAY_WORKER_ENDPOINT")]
     worker_endpoint: Option<String>,
 
+    /// Approved private worker URLs for registry-backed routing. Repeat this
+    /// option (or use a comma-separated environment value) to add capacity.
+    #[arg(
+        long = "gateway-worker-endpoint",
+        env = "IZWI_GATEWAY_WORKER_ENDPOINTS",
+        value_delimiter = ',',
+        value_name = "URL"
+    )]
+    gateway_worker_endpoints: Vec<String>,
+
     /// Rotatable private worker credential identifier required by gateway mode.
     #[arg(long, env = "IZWI_GATEWAY_WORKER_CREDENTIAL_ID")]
     worker_credential_id: Option<String>,
@@ -174,12 +188,24 @@ struct ServerArgs {
     gateway_max_in_flight: usize,
 
     /// Maximum time the selected worker may spend establishing runtime ownership.
+    #[arg(long, env = "IZWI_GATEWAY_WORKER_QUEUE_WAIT_MS", default_value_t = 250)]
+    gateway_worker_queue_wait_ms: u64,
+
+    /// Receiver-clock lifetime of a worker status observation.
     #[arg(
         long,
-        env = "IZWI_GATEWAY_WORKER_QUEUE_WAIT_MS",
-        default_value_t = 250
+        env = "IZWI_GATEWAY_WORKER_STATUS_TTL_MS",
+        default_value_t = 10_000
     )]
-    gateway_worker_queue_wait_ms: u64,
+    gateway_worker_status_ttl_ms: u64,
+
+    /// Status refresh interval for each configured registry worker.
+    #[arg(
+        long,
+        env = "IZWI_GATEWAY_WORKER_STATUS_POLL_MS",
+        default_value_t = 2_000
+    )]
+    gateway_worker_status_poll_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -365,13 +391,7 @@ async fn run_gateway(
     enterprise_hooks: EnterpriseHooks,
 ) -> anyhow::Result<()> {
     logging::init_tracing(args.log_format);
-    let remote = gateway_remote_execution(&args, &serve_config)?;
-    let state = gateway::GatewayState::new(
-        remote,
-        enterprise_hooks,
-        serve_config.request_timeout_secs,
-        args.gateway_max_in_flight,
-    );
+    let (state, _status_poller) = gateway_state(&args, &serve_config, enterprise_hooks).await?;
     state.lifecycle.mark_ready();
 
     info!(
@@ -407,18 +427,335 @@ async fn run_gateway(
     Ok(())
 }
 
-fn gateway_remote_execution(
+struct GatewayWorkerStatusPoller {
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+#[derive(Clone)]
+struct GatewayWorkerExpectation {
+    client: WorkerClient,
+    worker_id: WorkerId,
+    node_id: NodeId,
+    deployment: worker_registry::ApprovedDeployment,
+    validated_capacity: u32,
+}
+
+impl Drop for GatewayWorkerStatusPoller {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+async fn gateway_state(
     args: &ServerArgs,
     serve_config: &ServeRuntimeConfig,
-) -> anyhow::Result<app::chat::RemoteChatExecution> {
-    fn required<'a>(value: &'a Option<String>, name: &str) -> anyhow::Result<&'a str> {
-        value
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("gateway mode requires {name}"))
+    enterprise_hooks: EnterpriseHooks,
+) -> anyhow::Result<(gateway::GatewayState, Option<GatewayWorkerStatusPoller>)> {
+    if args.gateway_worker_endpoints.is_empty() {
+        let remote = gateway_remote_execution(args, serve_config)?;
+        return Ok((
+            gateway::GatewayState::new(
+                remote,
+                enterprise_hooks,
+                serve_config.request_timeout_secs,
+                args.gateway_max_in_flight,
+            ),
+            None,
+        ));
     }
 
+    if args.worker_endpoint.is_some() {
+        anyhow::bail!(
+            "--worker-endpoint cannot be combined with --gateway-worker-endpoint; use the former for pinned compatibility or repeat the latter for registry routing"
+        );
+    }
+    if args.worker_incarnation.is_some() {
+        anyhow::bail!(
+            "--worker-incarnation applies only to pinned --worker-endpoint mode; registry routing validates each discovered incarnation"
+        );
+    }
+
+    validate_gateway_limits(args)?;
+    let deployment_id = DeploymentId::new(required_gateway_value(
+        &args.worker_deployment,
+        "--worker-deployment",
+    )?)?;
+    let public_model = parse_model_variant(required_gateway_value(
+        &args.public_model,
+        "--public-model",
+    )?)?;
+    let expected_generation = ModelGeneration::new(
+        args.worker_model_generation
+            .ok_or_else(|| anyhow::anyhow!("gateway mode requires --worker-model-generation"))?,
+    )?;
+    let credentials = gateway_worker_credentials(args)?;
+    let registry_config = worker_registry::WorkerRegistryConfig {
+        max_workers: args.gateway_worker_endpoints.len(),
+        max_deployments_per_worker: 32,
+        max_local_dispatches: args.gateway_max_in_flight,
+        status_ttl: Duration::from_millis(args.gateway_worker_status_ttl_ms),
+    };
+    let registry = worker_registry::WorkerRegistry::new(registry_config)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let client_config = WorkerClientConfig {
+        max_in_flight: args.gateway_max_in_flight,
+        request_timeout: Duration::from_secs(serve_config.request_timeout_secs.max(1)),
+        progress_timeout: Duration::from_secs(serve_config.request_timeout_secs.max(1)),
+        ..WorkerClientConfig::default()
+    };
+
+    let mut endpoints = BTreeSet::new();
+    let mut approved_worker_ids = BTreeSet::new();
+    let mut polling_workers = Vec::with_capacity(args.gateway_worker_endpoints.len());
+    for configured_endpoint in &args.gateway_worker_endpoints {
+        let endpoint = configured_endpoint.trim();
+        if endpoint.is_empty() {
+            anyhow::bail!("--gateway-worker-endpoint values must not be empty");
+        }
+        if !endpoints.insert(endpoint.to_string()) {
+            anyhow::bail!("duplicate --gateway-worker-endpoint: {endpoint}");
+        }
+        let client = WorkerClient::new(endpoint, credentials.clone(), client_config.clone())?;
+        let descriptor = client.descriptor().await.with_context(|| {
+            format!("failed to read approved worker descriptor from {endpoint}")
+        })?;
+        let status = client
+            .status()
+            .await
+            .with_context(|| format!("failed to read initial worker status from {endpoint}"))?;
+        if !approved_worker_ids.insert(descriptor.worker_id.clone()) {
+            anyhow::bail!(
+                "configured gateway endpoints must identify distinct logical workers; duplicate {}",
+                descriptor.worker_id
+            );
+        }
+        let expectation = initial_gateway_worker_expectation(
+            client,
+            &descriptor,
+            &status,
+            &deployment_id,
+            public_model.dir_name(),
+            expected_generation,
+        )?;
+        approve_gateway_worker(&registry, &expectation, descriptor, status)?;
+        polling_workers.push(expectation);
+    }
+
+    let dispatcher = app::remote_chat_dispatch::RemoteChatDispatcher::new(
+        registry.clone(),
+        app::remote_chat_dispatch::RemoteChatDispatchConfig {
+            public_model_variant: public_model,
+            deployment_id,
+            policy_revision: PolicyRevision::new(args.gateway_policy_revision.trim())?,
+            backend_policy: gateway_backend_policy(args.backend.as_ref()),
+            max_queue_wait: Duration::from_millis(args.gateway_worker_queue_wait_ms),
+            max_output_tokens: 4096,
+            max_output_bytes: 512 * 1024,
+        },
+    )
+    .map_err(|error| anyhow::anyhow!(error.message))?;
+    let polling_interval = Duration::from_millis(args.gateway_worker_status_poll_ms);
+    let tasks = polling_workers
+        .into_iter()
+        .map(|expected| {
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(polling_interval);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                // The initial observation was recorded synchronously above.
+                ticker.tick().await;
+                loop {
+                    ticker.tick().await;
+                    if let Err(error) = refresh_gateway_worker_status(&registry, &expected).await {
+                        warn!(
+                            worker_id = %expected.worker_id,
+                            error = %error,
+                            "Worker status refresh failed"
+                        );
+                    }
+                }
+            })
+        })
+        .collect();
+
+    Ok((
+        gateway::GatewayState::with_dispatcher(
+            dispatcher,
+            enterprise_hooks,
+            serve_config.request_timeout_secs,
+            args.gateway_max_in_flight,
+        ),
+        Some(GatewayWorkerStatusPoller { tasks }),
+    ))
+}
+
+fn initial_gateway_worker_expectation(
+    client: WorkerClient,
+    descriptor: &WorkerDescriptor,
+    status: &WorkerStatus,
+    deployment_id: &DeploymentId,
+    public_model: &str,
+    expected_generation: ModelGeneration,
+) -> anyhow::Result<GatewayWorkerExpectation> {
+    if status.worker_id != descriptor.worker_id
+        || status.node_id != descriptor.node_id
+        || status.incarnation_id != descriptor.incarnation_id
+    {
+        anyhow::bail!("initial worker descriptor and status identity do not match");
+    }
+    let selected_deployment = status
+        .deployments
+        .iter()
+        .find(|deployment| deployment.deployment_id == *deployment_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "worker {} does not advertise configured deployment {}",
+                descriptor.worker_id,
+                deployment_id
+            )
+        })?;
+    if selected_deployment.public_model.as_str() != public_model
+        || selected_deployment.model_generation != expected_generation
+        || selected_deployment.task != TaskKind::Chat
+    {
+        anyhow::bail!(
+            "worker {} deployment {} does not match configured chat model/generation",
+            descriptor.worker_id,
+            deployment_id
+        );
+    }
+    let validated_capacity = configured_worker_capacity(status)?;
+    Ok(GatewayWorkerExpectation {
+        client,
+        worker_id: descriptor.worker_id.clone(),
+        node_id: descriptor.node_id.clone(),
+        deployment: worker_registry::ApprovedDeployment::from_loaded(selected_deployment),
+        validated_capacity,
+    })
+}
+
+fn configured_worker_capacity(status: &WorkerStatus) -> anyhow::Result<u32> {
+    status
+        .capacity
+        .max_active_invocations
+        .checked_add(status.capacity.max_queued_invocations)
+        .filter(|capacity| *capacity > 0)
+        .ok_or_else(|| anyhow::anyhow!("worker has invalid configured capacity"))
+}
+
+fn validate_gateway_worker_observation(
+    expected: &GatewayWorkerExpectation,
+    descriptor: &WorkerDescriptor,
+    status: WorkerStatus,
+) -> anyhow::Result<WorkerStatus> {
+    if descriptor.worker_id != expected.worker_id || descriptor.node_id != expected.node_id {
+        anyhow::bail!("restarted worker changed its approved logical worker or node identity");
+    }
+    if status.incarnation_id != descriptor.incarnation_id {
+        anyhow::bail!("restarted worker descriptor and status identity do not match");
+    }
+    validate_gateway_worker_status(expected, status)
+}
+
+fn validate_gateway_worker_status(
+    expected: &GatewayWorkerExpectation,
+    mut status: WorkerStatus,
+) -> anyhow::Result<WorkerStatus> {
+    if status.worker_id != expected.worker_id || status.node_id != expected.node_id {
+        anyhow::bail!("worker status changed its approved logical worker or node identity");
+    }
+    if configured_worker_capacity(&status)? != expected.validated_capacity {
+        anyhow::bail!("restarted worker changed its validated capacity");
+    }
+    let deployment = status
+        .deployments
+        .iter()
+        .find(|deployment| deployment.deployment_id == expected.deployment.deployment_id)
+        .ok_or_else(|| anyhow::anyhow!("restarted worker omitted its approved deployment"))?;
+    if worker_registry::ApprovedDeployment::from_loaded(deployment) != expected.deployment {
+        anyhow::bail!("restarted worker changed its approved deployment contract");
+    }
+
+    // Retain only the configured deployment in the local routing view. Other
+    // worker-local deployments are neither approved nor selectable merely
+    // because an authenticated endpoint advertised them.
+    status
+        .deployments
+        .retain(|deployment| deployment.deployment_id == expected.deployment.deployment_id);
+    Ok(status)
+}
+
+fn approve_gateway_worker(
+    registry: &worker_registry::WorkerRegistry,
+    expected: &GatewayWorkerExpectation,
+    descriptor: WorkerDescriptor,
+    status: WorkerStatus,
+) -> anyhow::Result<()> {
+    let status = validate_gateway_worker_observation(expected, &descriptor, status)?;
+    registry
+        .approve(worker_registry::ApprovedWorker {
+            descriptor,
+            client: expected.client.clone(),
+            approved_deployments: BTreeMap::from([(
+                expected.deployment.deployment_id.clone(),
+                expected.deployment.clone(),
+            )]),
+            validated_capacity: expected.validated_capacity,
+        })
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    registry
+        .observe_status(status)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))
+}
+
+async fn refresh_gateway_worker_status(
+    registry: &worker_registry::WorkerRegistry,
+    expected: &GatewayWorkerExpectation,
+) -> anyhow::Result<()> {
+    let status = validate_gateway_worker_status(expected, expected.client.status().await?)?;
+    match registry.observe_status(status.clone()) {
+        Ok(()) => Ok(()),
+        Err(worker_registry::WorkerRegistryError::UnknownOrStaleIncarnation) => {
+            let descriptor = expected.client.descriptor().await?;
+            approve_gateway_worker(registry, expected, descriptor, status)
+        }
+        Err(error) => Err(anyhow::anyhow!(error.to_string())),
+    }
+}
+
+fn required_gateway_value<'a>(value: &'a Option<String>, name: &str) -> anyhow::Result<&'a str> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("gateway mode requires {name}"))
+}
+
+fn gateway_worker_credentials(args: &ServerArgs) -> anyhow::Result<ServiceCredentials> {
+    Ok(ServiceCredentials {
+        credential_id: CredentialId::new(required_gateway_value(
+            &args.worker_credential_id,
+            "--worker-credential-id",
+        )?)?,
+        bearer_token: ServiceBearerToken::new(required_gateway_value(
+            &args.worker_bearer_token,
+            "--worker-bearer-token or IZWI_GATEWAY_WORKER_BEARER_TOKEN",
+        )?)?,
+    })
+}
+
+fn gateway_backend_policy(backend: Option<&BackendArg>) -> worker_registry::BackendPolicy {
+    match backend {
+        Some(BackendArg::Cpu) => worker_registry::BackendPolicy::CPU_ONLY,
+        Some(BackendArg::Metal) => worker_registry::BackendPolicy::METAL_ONLY,
+        Some(BackendArg::Cuda) => worker_registry::BackendPolicy::CUDA_ONLY,
+        Some(BackendArg::Auto) | None => worker_registry::BackendPolicy::ANY,
+    }
+}
+
+fn validate_gateway_limits(args: &ServerArgs) -> anyhow::Result<()> {
     if args.gateway_max_in_flight == 0
         || args.gateway_max_in_flight > tokio::sync::Semaphore::MAX_PERMITS
     {
@@ -430,23 +767,40 @@ fn gateway_remote_execution(
     if args.gateway_worker_queue_wait_ms == 0 {
         anyhow::bail!("--gateway-worker-queue-wait-ms must be non-zero");
     }
+    if args.gateway_worker_endpoints.len() > MAX_CONFIGURED_GATEWAY_WORKERS {
+        anyhow::bail!(
+            "at most {MAX_CONFIGURED_GATEWAY_WORKERS} --gateway-worker-endpoint values are supported"
+        );
+    }
+    let ttl = Duration::from_millis(args.gateway_worker_status_ttl_ms);
+    let poll = Duration::from_millis(args.gateway_worker_status_poll_ms);
+    if ttl.is_zero() || ttl > MAX_GATEWAY_STATUS_TTL {
+        anyhow::bail!("--gateway-worker-status-ttl-ms is outside the supported range");
+    }
+    if poll.is_zero() || poll >= ttl {
+        anyhow::bail!(
+            "--gateway-worker-status-poll-ms must be non-zero and less than the status TTL"
+        );
+    }
+    Ok(())
+}
+
+fn gateway_remote_execution(
+    args: &ServerArgs,
+    serve_config: &ServeRuntimeConfig,
+) -> anyhow::Result<app::chat::RemoteChatExecution> {
+    validate_gateway_limits(args)?;
     let model_generation = ModelGeneration::new(
         args.worker_model_generation
             .ok_or_else(|| anyhow::anyhow!("gateway mode requires --worker-model-generation"))?,
     )?;
-    let model = parse_model_variant(required(&args.public_model, "--public-model")?)?;
-    let credentials = ServiceCredentials {
-        credential_id: CredentialId::new(required(
-            &args.worker_credential_id,
-            "--worker-credential-id",
-        )?)?,
-        bearer_token: ServiceBearerToken::new(required(
-            &args.worker_bearer_token,
-            "--worker-bearer-token or IZWI_GATEWAY_WORKER_BEARER_TOKEN",
-        )?)?,
-    };
+    let model = parse_model_variant(required_gateway_value(
+        &args.public_model,
+        "--public-model",
+    )?)?;
+    let credentials = gateway_worker_credentials(args)?;
     let client = WorkerClient::new(
-        required(&args.worker_endpoint, "--worker-endpoint")?,
+        required_gateway_value(&args.worker_endpoint, "--worker-endpoint")?,
         credentials,
         WorkerClientConfig {
             max_in_flight: args.gateway_max_in_flight,
@@ -459,11 +813,11 @@ fn gateway_remote_execution(
         client,
         app::chat::RemoteChatExecutionConfig {
             public_model_variant: model,
-            expected_worker_incarnation: IncarnationId::new(required(
+            expected_worker_incarnation: IncarnationId::new(required_gateway_value(
                 &args.worker_incarnation,
                 "--worker-incarnation",
             )?)?,
-            deployment_id: DeploymentId::new(required(
+            deployment_id: DeploymentId::new(required_gateway_value(
                 &args.worker_deployment,
                 "--worker-deployment",
             )?)?,
@@ -1087,6 +1441,8 @@ mod tests {
     use super::*;
     use crate::test_support::env_lock;
     use izwi_core::ModelVariant;
+    use izwi_serving_client::mock::{MockWorker, MockWorkerConfig};
+    use izwi_serving_protocol::{IncarnationId, ModelAlias, NodeId, WorkerId};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
@@ -1300,6 +1656,191 @@ mod tests {
         let error = gateway_remote_execution(&args, &ServeRuntimeConfig::default())
             .expect_err("gateway configuration must be complete");
         assert!(error.to_string().contains("--worker-model-generation"));
+    }
+
+    #[test]
+    fn registry_gateway_endpoint_list_is_bounded() {
+        let parsed = parse(&[
+            "izwi-server",
+            "--role",
+            "gateway",
+            "--gateway-worker-endpoint",
+            "http://127.0.0.1:19091",
+            "--gateway-worker-endpoint",
+            "http://127.0.0.1:19092",
+        ]);
+        assert_eq!(
+            parsed.gateway_worker_endpoints,
+            vec![
+                "http://127.0.0.1:19091".to_string(),
+                "http://127.0.0.1:19092".to_string()
+            ]
+        );
+
+        let mut args = parse(&["izwi-server", "--role", "gateway"]);
+        args.gateway_worker_endpoints = (0..=MAX_CONFIGURED_GATEWAY_WORKERS)
+            .map(|index| format!("http://127.0.0.1:{}", 20_000 + index))
+            .collect();
+
+        let error = validate_gateway_limits(&args).expect_err("worker list must be bounded");
+        assert!(error
+            .to_string()
+            .contains("--gateway-worker-endpoint values"));
+    }
+
+    #[tokio::test]
+    async fn registry_gateway_configuration_approves_worker_without_runtime() {
+        let model = ModelVariant::Qwen34BGguf;
+        let public_model = ModelAlias::new(model.dir_name()).expect("static model alias");
+        let first = MockWorker::spawn(MockWorkerConfig {
+            worker_id: WorkerId::new("gateway-worker-a").expect("static worker id"),
+            node_id: NodeId::new("gateway-node-a").expect("static node id"),
+            incarnation_id: IncarnationId::new("gateway-incarnation-a")
+                .expect("static incarnation"),
+            public_model: public_model.clone(),
+            ..MockWorkerConfig::default()
+        })
+        .await
+        .expect("mock worker should bind");
+        let credentials = first.config().credentials.clone();
+        let mut args = parse(&[
+            "izwi-server",
+            "--role",
+            "gateway",
+            "--worker-credential-id",
+            credentials.credential_id.as_str(),
+            "--worker-bearer-token",
+            credentials.bearer_token.expose_secret(),
+            "--worker-deployment",
+            first.config().deployment_id.as_str(),
+            "--public-model",
+            model.dir_name(),
+            "--worker-model-generation",
+            "1",
+        ]);
+        args.gateway_worker_endpoints = vec![first.endpoint()];
+
+        let (state, poller) = gateway_state(
+            &args,
+            &ServeRuntimeConfig::default(),
+            EnterpriseHooks::noop(),
+        )
+        .await
+        .expect("registry gateway configuration should build");
+        assert!(matches!(
+            &state.chat_execution,
+            gateway::GatewayChatExecution::Registry(_)
+        ));
+        let poller = poller.expect("registry mode should retain status pollers");
+        assert_eq!(poller.tasks.len(), 1);
+        assert!(state.chat_execution.readiness_check().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn restarted_worker_reapproval_pins_stable_identity_and_deployment() {
+        let model = ModelVariant::Qwen34BGguf;
+        let worker = MockWorker::spawn(MockWorkerConfig {
+            worker_id: WorkerId::new("restart-worker").expect("static worker id"),
+            node_id: NodeId::new("restart-node").expect("static node id"),
+            incarnation_id: IncarnationId::new("restart-incarnation-1")
+                .expect("static incarnation"),
+            public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
+            ..MockWorkerConfig::default()
+        })
+        .await
+        .expect("mock worker should bind");
+        let client = WorkerClient::new(
+            &worker.endpoint(),
+            worker.config().credentials.clone(),
+            WorkerClientConfig::default(),
+        )
+        .expect("client should initialize");
+        let descriptor = client.descriptor().await.expect("descriptor should load");
+        let status = client.status().await.expect("status should load");
+        let deployment_id = worker.config().deployment_id.clone();
+        let expected = initial_gateway_worker_expectation(
+            client,
+            &descriptor,
+            &status,
+            &deployment_id,
+            model.dir_name(),
+            worker.config().model_generation,
+        )
+        .expect("initial worker should match configuration");
+        let registry =
+            worker_registry::WorkerRegistry::new(worker_registry::WorkerRegistryConfig::default())
+                .expect("registry should initialize");
+        approve_gateway_worker(&registry, &expected, descriptor, status.clone())
+            .expect("initial worker should be approved");
+
+        let next_incarnation =
+            IncarnationId::new("restart-incarnation-2").expect("static replacement incarnation");
+        let mut descriptor = expected
+            .client
+            .descriptor()
+            .await
+            .expect("descriptor should load");
+        descriptor.incarnation_id = next_incarnation.clone();
+        let mut restarted_status = status.clone();
+        restarted_status.incarnation_id = next_incarnation;
+        restarted_status.status_sequence = 1;
+        approve_gateway_worker(
+            &registry,
+            &expected,
+            descriptor.clone(),
+            restarted_status.clone(),
+        )
+        .expect("matching replacement incarnation should be approved");
+        assert_eq!(
+            registry
+                .observe_status(status)
+                .expect_err("old incarnation must be fenced"),
+            worker_registry::WorkerRegistryError::UnknownOrStaleIncarnation
+        );
+
+        descriptor.node_id = NodeId::new("unapproved-node").expect("static node id");
+        restarted_status.node_id = descriptor.node_id.clone();
+        assert!(
+            approve_gateway_worker(&registry, &expected, descriptor, restarted_status)
+                .expect_err("replacement node identity must stay pinned")
+                .to_string()
+                .contains("logical worker or node identity")
+        );
+
+        let mut descriptor = expected
+            .client
+            .descriptor()
+            .await
+            .expect("descriptor should load");
+        descriptor.incarnation_id =
+            IncarnationId::new("restart-incarnation-3").expect("static replacement incarnation");
+        let mut changed_capacity = expected.client.status().await.expect("status should load");
+        changed_capacity.incarnation_id = descriptor.incarnation_id.clone();
+        changed_capacity.capacity.max_active_invocations += 1;
+        assert!(
+            approve_gateway_worker(&registry, &expected, descriptor, changed_capacity)
+                .expect_err("replacement capacity must stay pinned")
+                .to_string()
+                .contains("validated capacity")
+        );
+
+        let mut descriptor = expected
+            .client
+            .descriptor()
+            .await
+            .expect("descriptor should load");
+        descriptor.incarnation_id =
+            IncarnationId::new("restart-incarnation-4").expect("static replacement incarnation");
+        let mut changed_deployment = expected.client.status().await.expect("status should load");
+        changed_deployment.incarnation_id = descriptor.incarnation_id.clone();
+        changed_deployment.deployments[0].model_generation =
+            ModelGeneration::new(2).expect("non-zero changed generation");
+        assert!(
+            approve_gateway_worker(&registry, &expected, descriptor, changed_deployment)
+                .expect_err("replacement deployment must stay pinned")
+                .to_string()
+                .contains("deployment contract")
+        );
     }
 
     #[test]

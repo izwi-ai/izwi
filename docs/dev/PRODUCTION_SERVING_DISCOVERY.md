@@ -65,7 +65,7 @@ data needs to be removed.
 
 | Route family | Maturity | Current inference owner | State and artifact dependencies | Streaming/cancellation | Initial topology decision |
 |---|---|---|---|---|---|
-| `POST /v1/chat/completions` | Stable | In-process `RuntimeService` through `app/chat.rs` | Stateless for this route; model/tokenizer remain runtime-owned | JSON and SSE; bounded 64-event application channel with explicit interruption handling | Migrate text-only non-streaming first. Keep gateway-side OpenAI parsing and response mapping. Preserve local and SSE paths until separately migrated. |
+| `POST /v1/chat/completions` | Stable | Local profile: in-process `RuntimeService`; gateway profile: one selected private worker | Stateless at the gateway; model/tokenizer remain worker-owned | JSON and SSE cross the bounded worker transport; disconnect/timeout requests exact-attempt cancellation without retry | Enabled remotely for text-only chat in the single-node gateway profile. The registry supports independent replicas, but plaintext worker URLs are restricted to numeric loopback until authenticated TLS is implemented. Multimodal chat remains local-only. |
 | `POST /v1/audio/speech` | Stable | In-process `RuntimeService` | Saved voices, reference audio, codecs, long-form spool files, speech history | Binary or SSE, model-specific timeout and bounded audio/event queues | Keep local-only until worker artifact/voice resolution and binary-stream contracts are explicit. |
 | `POST /v1/audio/transcriptions` | Stable | In-process `RuntimeService` | Multipart/JSON audio, optional alignment model, timestamp/subtitle formatting | JSON or SSE with bounded terminal delivery | Keep local-only initially; migrate after bounded artifact/stream transfer is available. |
 | `GET /v1/models` | Stable | Reads live local runtime/catalog | Catalog and loaded-model state are currently coupled | Non-streaming | Preserve locally; gateway needs a catalog separate from ready deployment status before migration. |
@@ -81,7 +81,7 @@ data needs to be removed.
 | Requirement | Existing code to reuse | Initial change |
 |---|---|---|
 | Backend-neutral private contract | Serializable worker concepts in `batch_runtime/types.rs`; realtime version/sequence conventions | Add a small accelerator-free protocol crate with explicit protocol/schema versions, identities, assignment, deployment/generation, status/capacity, request/events, cancellation, and stable errors. |
-| Real HTTP separation | Axum/Tokio server stack and workspace Reqwest client | Add a real loopback TCP mock worker and a bounded client; do not treat an in-process trait call as transport evidence. |
+| Real HTTP separation | Axum/Tokio server stack and workspace Reqwest client | Implemented for chat over a bounded loopback-only private client. Remote network endpoints remain disabled until mutually authenticated TLS and operator-pinned approval land. |
 | Worker-authoritative capacity | `InferenceCoordinator` and RAII execution/resource leases | Mock uses atomic fail-fast admission; real worker later adapts `RuntimeService` rather than adding a competing scheduler. |
 | Bounded parsing and retention | Existing bounded route channels/audio parsers | Limit request bytes, NDJSON line bytes, total stream bytes, event count, client pool concurrency, and mock attempt retention. EOF without terminal is interrupted/unknown. |
 | Cancellation safety | Runtime pending guards, exact abort, terminal quarantine, detached blocking ownership | Gateway requests cancellation but never releases worker capacity. Mock must retain its permit through simulated teardown after disconnect/timeout. |
@@ -92,13 +92,14 @@ data needs to be removed.
 
 ## First vertical slice
 
-The first migrated behavior is text-only, non-streaming
-`POST /v1/chat/completions`. Public authentication, request validation,
-OpenAI-compatible schema handling, tool parsing, and response encoding stay in
-the gateway. The private request carries only normalized, typed chat input and a
-gateway-attested caller context. The worker validates its own incarnation,
-deployment generation, readiness, and capacity before acknowledging admission.
+The first migrated behavior was text-only `POST /v1/chat/completions`.
+Non-streaming JSON and SSE now retain public OpenAI parsing/encoding in the
+gateway and cross the same private worker boundary. The private request carries
+only normalized, typed chat input and a gateway-attested caller context. The
+worker validates its own incarnation, deployment generation, readiness, and
+capacity before acknowledging admission. Registry routing selects once and does
+not replay an uncertain or partially streamed invocation on another worker.
 
-Multimodal chat and SSE remain on the current explicit local execution path
-until their transport semantics have dedicated tests. This is a migration
-ledger restriction, not removal of the working local behavior.
+Multimodal chat remains on the current explicit local execution path until its
+artifact transport semantics have dedicated tests. This is a migration-ledger
+restriction, not removal of the working local behavior.
