@@ -73,6 +73,9 @@ use logging::{LogFormat, SERVICE_NAME, SERVICE_VERSION};
 use persistence::PersistenceContext;
 use state::AppState;
 
+pub use app::chat::{RemoteChatExecution, RemoteChatExecutionConfig};
+pub use gateway::{create_gateway_router, GatewayState};
+
 #[derive(Debug, Parser)]
 #[command(
     name = "izwi-server",

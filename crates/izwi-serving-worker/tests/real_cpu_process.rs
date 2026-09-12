@@ -3,9 +3,14 @@
 //! This fixture exercises the existing RuntimeService loader, scheduler,
 //! managed memory, and decode path. It never downloads the 1.2B artifact.
 
+use axum::{body::Body, http::Request};
 use candle_core::quantized::{gguf_file, GgmlDType, QTensor};
 use candle_core::{DType, Device, Tensor};
 use izwi_core::{artifacts::ArtifactManifest, ModelVariant};
+use izwi_hooks::EnterpriseHooks;
+use izwi_server::{
+    create_gateway_router, GatewayState, RemoteChatExecution, RemoteChatExecutionConfig,
+};
 use izwi_serving_client::{WorkerClient, WorkerClientConfig};
 use izwi_serving_protocol::*;
 use std::{
@@ -15,6 +20,7 @@ use std::{
     process::Stdio,
     time::Duration,
 };
+use tower::ServiceExt;
 
 fn id<T: TryFrom<&'static str>>(value: &'static str) -> T
 where
@@ -208,7 +214,7 @@ async fn separate_cpu_worker_executes_tiny_lfm_over_real_http() {
             schema_version: PROTOCOL_V1,
             request_id: id("real-request-1"),
             attempt_id: id("real-attempt-1"),
-            expected_worker_incarnation: descriptor.incarnation_id,
+            expected_worker_incarnation: descriptor.incarnation_id.clone(),
             deployment_id: id("lfm25-cpu-v1"),
             expected_model_generation: ModelGeneration::new(1).unwrap(),
             caller: GatewayAttestedCallerContext {
@@ -254,6 +260,74 @@ async fn separate_cpu_worker_executes_tiny_lfm_over_real_http() {
         events.last().map(|event| &event.event),
         Some(InvocationEventKind::Completed { .. })
     ));
+    assert!(events.iter().any(|event| {
+        matches!(&event.event, InvocationEventKind::TextDelta { text } if !text.is_empty())
+    }));
+
+    let remote = RemoteChatExecution::new(
+        client,
+        RemoteChatExecutionConfig {
+            public_model_variant: ModelVariant::Lfm2512BInstructGguf,
+            expected_worker_incarnation: descriptor.incarnation_id,
+            deployment_id: id("lfm25-cpu-v1"),
+            expected_model_generation: ModelGeneration::new(1).unwrap(),
+            policy_revision: id("real-cpu-policy-v1"),
+            max_queue_wait: Duration::from_secs(2),
+            max_output_tokens: 1,
+            max_output_bytes: 1024,
+        },
+    )
+    .unwrap();
+    let gateway = GatewayState::new(remote, EnterpriseHooks::noop(), 10, 2);
+    gateway.mark_ready();
+    let app = create_gateway_router(
+        gateway,
+        &izwi_core::ServeRuntimeConfig {
+            ui_enabled: false,
+            ..izwi_core::ServeRuntimeConfig::default()
+        },
+    );
+    let public_request = |stream: bool| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "model": ModelVariant::Lfm2512BInstructGguf.dir_name(),
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "temperature": 0.0,
+                    "top_p": 1.0,
+                    "max_tokens": 1,
+                    "stream": stream,
+                    "stream_options": {"include_usage": true}
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    };
+
+    let response = app.clone().oneshot(public_request(false)).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["object"], "chat.completion");
+    assert!(body["choices"][0]["message"]["content"]
+        .as_str()
+        .is_some_and(|text| !text.is_empty()));
+    assert_eq!(body["usage"]["completion_tokens"], 1);
+
+    let response = app.oneshot(public_request(true)).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains("chat.completion.chunk"));
+    assert!(body.contains("\"completion_tokens\":1"));
+    assert!(body.contains("data: [DONE]"));
 
     child.0.start_kill().unwrap();
     let _ = child.0.wait().await;

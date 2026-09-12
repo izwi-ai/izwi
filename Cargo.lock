@@ -3866,6 +3866,8 @@ dependencies = [
  "candle-core",
  "dirs 5.0.1",
  "izwi-core",
+ "izwi-hooks",
+ "izwi-server",
  "izwi-serving-client",
  "izwi-serving-protocol",
  "serde_json",
