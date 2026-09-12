@@ -162,11 +162,28 @@ impl WorkerClient {
     }
 
     pub async fn descriptor(&self) -> Result<WorkerDescriptor, WorkerClientError> {
-        self.get_json(WORKER_DESCRIPTOR_PATH).await
+        let descriptor: WorkerDescriptor = self.get_json(WORKER_DESCRIPTOR_PATH).await?;
+        if descriptor.schema_version.major != PROTOCOL_V1.major
+            || !descriptor
+                .supported_protocol_versions
+                .iter()
+                .any(|version| version.major == PROTOCOL_V1.major)
+        {
+            return Err(WorkerClientError::Protocol(
+                "worker does not advertise a compatible protocol major version".into(),
+            ));
+        }
+        Ok(descriptor)
     }
 
     pub async fn status(&self) -> Result<WorkerStatus, WorkerClientError> {
-        self.get_json(WORKER_STATUS_PATH).await
+        let status: WorkerStatus = self.get_json(WORKER_STATUS_PATH).await?;
+        if status.schema_version.major != PROTOCOL_V1.major {
+            return Err(WorkerClientError::Protocol(
+                "worker status uses an incompatible protocol major version".into(),
+            ));
+        }
+        Ok(status)
     }
 
     pub async fn query_attempt(
