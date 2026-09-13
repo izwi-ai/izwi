@@ -53,6 +53,14 @@ impl RequestContext {
         Some(Sha256::digest(principal_namespace(&self.principal).as_bytes()).into())
     }
 
+    /// Stable durable-store namespace derived only from authenticated identity.
+    /// Unlike `tenant_key`, the local anonymous principal remains explicitly
+    /// namespaced so its public idempotency keys cannot collide with another
+    /// principal representation.
+    pub(crate) fn tenant_scope(&self) -> String {
+        principal_namespace(&self.principal)
+    }
+
     pub(crate) fn remaining_budget(&self, total: Duration) -> Option<Duration> {
         total.checked_sub(self.received_at.elapsed())
     }
@@ -600,6 +608,7 @@ mod tests {
         context.principal.id = "another-member".into();
         context.correlation_id = "different-header".into();
         assert_eq!(context.tenant_key(), tenant);
+        assert_eq!(context.tenant_scope(), "tenant:a");
     }
 
     use super::*;

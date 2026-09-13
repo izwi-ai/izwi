@@ -348,8 +348,8 @@ pub const MAX_DURABLE_IDEMPOTENCY_CANONICAL_REQUEST_BYTES: usize = 1024 * 1024;
 pub const MAX_DURABLE_IDEMPOTENCY_RESULT_BYTES: usize = 64 * 1024;
 pub const MAX_DURABLE_IDEMPOTENCY_RESERVATION_TTL_MS: u64 = 10 * 60 * 1_000;
 pub const MAX_DURABLE_IDEMPOTENCY_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
-const MAX_DURABLE_TTS_TEXT_BYTES: usize = 1024 * 1024;
-const MAX_DURABLE_TTS_REQUEST_JSON_BYTES: usize = 1024 * 1024;
+pub const MAX_DURABLE_TTS_TEXT_BYTES: usize = 1024 * 1024;
+const MAX_DURABLE_TTS_REQUEST_JSON_BYTES: usize = 2 * 1024 * 1024;
 const MAX_DURABLE_TTS_METADATA_JSON_BYTES: usize = 64 * 1024;
 const MAX_DURABLE_TTS_OPTIONAL_FIELD_BYTES: usize = 64 * 1024;
 const MAX_DURABLE_TTS_CORRELATION_BYTES: usize = 256;
@@ -1072,8 +1072,9 @@ impl BatchRuntimeStore {
             audio_mime_type: audio_mime_type.clone(),
             audio_filename: audio_filename.clone(),
         };
-        let response_json = serde_json::to_value(&record)
-            .context("Failed to encode durable text TTS acceptance response")?;
+        // Persist only a bounded lookup key. Replays load the route projection
+        // by ID, avoiding a second copy of potentially 1 MiB input text.
+        let response_json = json!({"record_id": record_id.clone()});
         let response_json_string = input
             .reservation
             .as_ref()
@@ -6431,7 +6432,7 @@ mod tests {
         };
         assert_eq!(replay.runtime_job_id, accepted.job.id);
         assert_eq!(
-            replay.response_json["id"].as_str(),
+            replay.response_json["record_id"].as_str(),
             Some(accepted.record.id.as_str())
         );
         assert_eq!(
@@ -6488,19 +6489,25 @@ mod tests {
             outcome => panic!("unexpected reservation outcome: {outcome:?}"),
         };
         let mut acceptance = durable_text_tts_acceptance(Some(reservation));
-        acceptance.projection.input_text = "x".repeat(MAX_DURABLE_IDEMPOTENCY_RESULT_BYTES + 1);
-        assert!(
-            acceptance.clone().projection.input_text.len() > MAX_DURABLE_IDEMPOTENCY_RESULT_BYTES
-        );
-        assert!(store
+        acceptance.projection.input_text = "x".repeat(MAX_DURABLE_TTS_TEXT_BYTES);
+        let accepted = match store
             .accept_durable_text_tts(acceptance)
             .await
-            .unwrap_err()
-            .to_string()
-            .contains("result exceeds"));
+            .expect("maximum bounded input should be accepted")
+        {
+            DurableTextTtsAcceptanceOutcome::Committed(accepted) => accepted,
+            DurableTextTtsAcceptanceOutcome::ReservationLost => {
+                panic!("bounded reservation unexpectedly lost")
+            }
+        };
+        let replay_payload = json!({"record_id": accepted.record.id});
+        assert!(
+            serde_json::to_vec(&replay_payload).unwrap().len()
+                <= MAX_DURABLE_IDEMPOTENCY_RESULT_BYTES
+        );
         assert_eq!(
             durable_text_tts_row_counts(&store).await,
-            [0, 0, 0, 0, 0, 1]
+            [1, 1, 1, 1, 1, 1]
         );
 
         let mut oversized_text = durable_text_tts_acceptance(None);
@@ -6523,7 +6530,7 @@ mod tests {
             .contains("model snapshot exceeds"));
         assert_eq!(
             durable_text_tts_row_counts(&store).await,
-            [0, 0, 0, 0, 0, 1]
+            [1, 1, 1, 1, 1, 1]
         );
     }
 

@@ -26,8 +26,11 @@ use crate::api::tts_policy::qwen_tts_auto_max_frames_for_text;
 use crate::api::tts_policy::resolve_tts_output_frames;
 use crate::batch_runtime::{
     store::{
-        sha256_hex, NewIdempotencyRecord, NewJobStage, NewJobStageDispatch, NewMediaAsset,
-        NewRuntimeArtifact, NewRuntimeJob, NewStageOutputArtifact, NewTextAsset,
+        canonical_request_digest, sha256_hex, DurableIdempotencyBegin, DurableIdempotencyRequest,
+        DurableTextTtsAcceptanceOutcome, NewDurableTextTtsAcceptance, NewIdempotencyRecord,
+        NewJobStage, NewJobStageDispatch, NewMediaAsset, NewRuntimeArtifact, NewRuntimeJob,
+        NewStageOutputArtifact, NewTextAsset, DURABLE_IDEMPOTENCY_DIGEST_VERSION,
+        MAX_DURABLE_IDEMPOTENCY_KEY_BYTES, MAX_DURABLE_TTS_TEXT_BYTES,
     },
     types::{
         ClaimedStage, QueueClass, RuntimeArtifactKind, RuntimeArtifactRole, RuntimeJobKind,
@@ -63,6 +66,9 @@ const DEFAULT_STREAM_EVENT_QUEUE_CAPACITY: usize = 32;
 const STREAM_CLIENT_DISCONNECTED_MESSAGE: &str = "Streaming client disconnected before completion";
 pub(crate) const BATCH_TTS_STAGE_KIND: &str = "tts_synthesize";
 const REFERENCE_AUDIO_UPLOAD_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+const DURABLE_TTS_IDEMPOTENCY_OPERATION: &str = "speech.text_to_speech.create";
+const DURABLE_TTS_IDEMPOTENCY_RESERVATION_TTL_MS: u64 = 60 * 1_000;
+const DURABLE_TTS_IDEMPOTENCY_RETENTION_MS: u64 = 24 * 60 * 60 * 1_000;
 
 #[derive(Debug, Deserialize, Default)]
 pub(crate) struct RecordAudioQuery {
@@ -140,6 +146,11 @@ impl BatchSpeechRequest {
         input_text: String,
         mut request: CreateSpeechHistoryRecordRequest,
     ) -> Self {
+        // The durable envelope owns these canonical execution fields. Keeping
+        // copies in the public request doubles large text in storage and makes
+        // the advertised text bound untruthful.
+        request.model_id = None;
+        request.text = None;
         request.reference_audio = None;
         Self {
             tenant_key: None,
@@ -149,6 +160,12 @@ impl BatchSpeechRequest {
             request,
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct DurableTextTtsReplay {
+    #[serde(alias = "id")]
+    record_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -528,12 +545,13 @@ pub async fn create_text_to_speech_record(
     headers: HeaderMap,
     Json(req): Json<CreateSpeechHistoryRecordRequest>,
 ) -> Result<Response, ApiError> {
+    let idempotency_key = extract_idempotency_key(&headers)?;
     create_record(
         state,
         ctx,
         req,
         SpeechRouteKind::TextToSpeech,
-        extract_idempotency_key(&headers),
+        idempotency_key,
     )
     .await
 }
@@ -720,6 +738,21 @@ async fn create_record(
         )?;
     }
     validate_reference_voice_selection(&req)?;
+    if route_kind == SpeechRouteKind::TextToSpeech && idempotency_key.is_some() {
+        if req.stream.unwrap_or(false) {
+            return Err(ApiError::bad_request(
+                "Idempotency-Key is not supported for streaming text-to-speech requests",
+            ));
+        }
+        if req.reference_audio.is_some()
+            || req.reference_text.is_some()
+            || req.saved_voice_id.is_some()
+        {
+            return Err(ApiError::bad_request(
+                "Idempotency-Key currently supports only text-only text-to-speech requests",
+            ));
+        }
+    }
     req = resolve_saved_voice_selection(&state, req).await?;
     req = normalize_for_model_capabilities(route_kind, variant, req)?;
     if req.stream.unwrap_or(false) && route_kind != SpeechRouteKind::TextToSpeech {
@@ -729,6 +762,22 @@ async fn create_record(
     }
 
     if route_kind == SpeechRouteKind::TextToSpeech {
+        let is_text_only = req.reference_audio.is_none()
+            && req.reference_text.is_none()
+            && req.saved_voice_id.is_none();
+        if !req.stream.unwrap_or(false) && is_text_only {
+            return accept_durable_text_tts_record(
+                &state,
+                &ctx,
+                req,
+                route_kind,
+                model_id,
+                input_text,
+                idempotency_key,
+            )
+            .await;
+        }
+
         let placeholder = create_pending_record(
             &state,
             route_kind,
@@ -812,6 +861,232 @@ async fn create_record(
     Ok(Json(record).into_response())
 }
 
+async fn accept_durable_text_tts_record(
+    state: &AppState,
+    ctx: &RequestContext,
+    mut req: CreateSpeechHistoryRecordRequest,
+    route_kind: SpeechRouteKind,
+    model_id: String,
+    input_text: String,
+    idempotency_key: Option<String>,
+) -> Result<Response, ApiError> {
+    if input_text.len() > MAX_DURABLE_TTS_TEXT_BYTES {
+        return Err(ApiError::payload_too_large(format!(
+            "Text-to-speech input exceeds {MAX_DURABLE_TTS_TEXT_BYTES} bytes"
+        )));
+    }
+
+    // Normalize aliases/defaults that execute identically so callers do not
+    // get false idempotency conflicts for equivalent public requests.
+    normalize_durable_text_tts_request(&mut req);
+
+    let mut request_snapshot = BatchSpeechRequest::for_durable_job(
+        route_kind,
+        model_id.clone(),
+        input_text.clone(),
+        req.clone(),
+    );
+    request_snapshot.tenant_key = ctx.tenant_key();
+    let request_json = serde_json::to_value(&request_snapshot)
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+
+    let reservation = if let Some(idempotency_key) = idempotency_key {
+        let digest = durable_text_tts_request_digest(&request_snapshot)?;
+        let begin = state
+            .batch_runtime_store
+            .reserve_durable_idempotency(DurableIdempotencyRequest {
+                tenant_scope: ctx.tenant_scope(),
+                operation: DURABLE_TTS_IDEMPOTENCY_OPERATION.to_string(),
+                idempotency_key,
+                digest_version: DURABLE_IDEMPOTENCY_DIGEST_VERSION,
+                request_digest: digest,
+                reservation_ttl_ms: DURABLE_TTS_IDEMPOTENCY_RESERVATION_TTL_MS,
+            })
+            .await
+            .map_err(map_store_error)?;
+        match begin {
+            DurableIdempotencyBegin::Acquired(reservation) => Some(reservation),
+            DurableIdempotencyBegin::Replay(replay) => {
+                let replay: DurableTextTtsReplay = serde_json::from_value(replay.response_json)
+                    .map_err(|err| {
+                        ApiError::internal(format!(
+                            "Stored text-to-speech idempotency response is invalid: {err}"
+                        ))
+                    })?;
+                let record = state
+                    .speech_history_store
+                    .get_record(SpeechRouteKind::TextToSpeech, replay.record_id)
+                    .await
+                    .map_err(map_store_error)?
+                    .ok_or_else(|| {
+                        ApiError::internal(
+                            "Stored text-to-speech idempotency record no longer exists",
+                        )
+                    })?;
+                return Ok((StatusCode::ACCEPTED, Json(record)).into_response());
+            }
+            DurableIdempotencyBegin::Conflict => {
+                return Err(ApiError {
+                    status: StatusCode::CONFLICT,
+                    message:
+                        "Idempotency-Key was already used for a different text-to-speech request"
+                            .to_string(),
+                });
+            }
+            DurableIdempotencyBegin::InProgress { .. } => {
+                return Err(ApiError {
+                    status: StatusCode::CONFLICT,
+                    message: "A matching text-to-speech request is still being accepted"
+                        .to_string(),
+                });
+            }
+            DurableIdempotencyBegin::CapacityExceeded => {
+                return Err(ApiError::service_unavailable(
+                    "Durable idempotency capacity is exhausted",
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Err(err) = state
+        .batch_runtime_store
+        .preflight_speech_admission(ctx.tenant_key())
+        .await
+    {
+        if let Some(reservation) = reservation.as_ref() {
+            let _ = state
+                .batch_runtime_store
+                .release_durable_idempotency(reservation)
+                .await;
+        }
+        return Err(map_durable_tts_acceptance_error(err));
+    }
+
+    let projection = NewSpeechHistoryRecord {
+        route_kind,
+        processing_status: SpeechHistoryProcessingStatus::Pending,
+        processing_error: None,
+        model_id: Some(model_id.clone()),
+        speaker: req.speaker.clone(),
+        language: req.language.clone(),
+        saved_voice_id: None,
+        speed: req.speed.map(f64::from),
+        input_text: input_text.clone(),
+        voice_description: req.voice_description.clone(),
+        reference_text: None,
+        generation_time_ms: 0.0,
+        audio_duration_secs: None,
+        rtf: None,
+        tokens_generated: None,
+        audio_mime_type: AudioEncoder::content_type(AudioFormat::Wav).to_string(),
+        audio_filename: Some(default_audio_filename(route_kind, "wav")),
+        audio_bytes: Vec::new(),
+    };
+    let model_snapshot_json = serde_json::json!({
+        "version": 1,
+        "model_id": model_id,
+        "request_sha256": sha256_hex(request_json.to_string().as_bytes()),
+        "text_sha256": sha256_hex(input_text.as_bytes()),
+        "reference_audio_sha256": serde_json::Value::Null,
+        "reference_text_sha256": serde_json::Value::Null,
+    });
+    let acceptance = NewDurableTextTtsAcceptance {
+        projection,
+        request_json,
+        model_snapshot_json,
+        retry_policy_json: serde_json::json!({"max_attempts": 2}),
+        priority: 0,
+        max_attempts: 2,
+        correlation_id: Some(ctx.correlation_id.clone()),
+        stage_kind: BATCH_TTS_STAGE_KIND.to_string(),
+        queue_class: QueueClass::BatchTts,
+        resource_hints: StageResourceHints::default(),
+        reservation: reservation.clone(),
+        idempotency_retention_ms: DURABLE_TTS_IDEMPOTENCY_RETENTION_MS,
+    };
+
+    let outcome = match state
+        .batch_runtime_store
+        .accept_durable_text_tts(acceptance)
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            if let Some(reservation) = reservation.as_ref() {
+                let _ = state
+                    .batch_runtime_store
+                    .release_durable_idempotency(reservation)
+                    .await;
+            }
+            return Err(map_durable_tts_acceptance_error(err));
+        }
+    };
+
+    match outcome {
+        DurableTextTtsAcceptanceOutcome::Committed(accepted) => {
+            state.runtime.record_batch_tts_pipeline_job();
+            Ok((StatusCode::ACCEPTED, Json(accepted.record)).into_response())
+        }
+        DurableTextTtsAcceptanceOutcome::ReservationLost => {
+            if let Some(reservation) = reservation.as_ref() {
+                let _ = state
+                    .batch_runtime_store
+                    .release_durable_idempotency(reservation)
+                    .await;
+            }
+            Err(ApiError {
+                status: StatusCode::CONFLICT,
+                message: "Text-to-speech idempotency reservation expired before acceptance"
+                    .to_string(),
+            })
+        }
+    }
+}
+
+fn normalize_durable_text_tts_request(req: &mut CreateSpeechHistoryRecordRequest) {
+    req.stream = Some(false);
+    req.max_output_tokens = req.max_output_tokens.or(req.max_tokens);
+    req.max_tokens = None;
+}
+
+fn durable_text_tts_request_digest(request: &BatchSpeechRequest) -> Result<String, ApiError> {
+    let semantic_request = serde_json::json!({
+        "version": DURABLE_IDEMPOTENCY_DIGEST_VERSION,
+        "operation": DURABLE_TTS_IDEMPOTENCY_OPERATION,
+        "route_kind": request.route_kind,
+        "model_id": &request.model_id,
+        "input_text_sha256": sha256_hex(request.input_text.as_bytes()),
+        "input_text_bytes": request.input_text.len(),
+        "request": &request.request,
+    });
+    canonical_request_digest(&semantic_request).map_err(|err| {
+        ApiError::payload_too_large(format!(
+            "Text-to-speech idempotency request cannot be canonicalized: {err}"
+        ))
+    })
+}
+
+fn map_durable_tts_acceptance_error(err: anyhow::Error) -> ApiError {
+    let message = err.to_string();
+    if message.contains("Speech job admission capacity exhausted") {
+        return ApiError::too_many_requests(message);
+    }
+    if message.contains("Durable text TTS input") || message.contains("Durable text TTS request") {
+        return ApiError::payload_too_large(message);
+    }
+    if message.starts_with("Durable text TTS")
+        || message.contains("speaker exceeds")
+        || message.contains("language exceeds")
+        || message.contains("voice description exceeds")
+        || message.contains("correlation ID exceeds")
+    {
+        return ApiError::bad_request(message);
+    }
+    map_store_error(err)
+}
+
 async fn create_pending_record(
     state: &AppState,
     route_kind: SpeechRouteKind,
@@ -845,14 +1120,39 @@ async fn create_pending_record(
         .map_err(map_store_error)
 }
 
-fn extract_idempotency_key(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get("idempotency-key")
-        .or_else(|| headers.get("x-idempotency-key"))
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
+fn extract_idempotency_key(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+    let mut selected: Option<String> = None;
+    for name in ["idempotency-key", "x-idempotency-key"] {
+        for value in headers.get_all(name).iter() {
+            let value = value.to_str().map_err(|_| {
+                ApiError::bad_request("Idempotency-Key must contain valid visible text")
+            })?;
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(ApiError::bad_request("Idempotency-Key cannot be empty"));
+            }
+            if value.len() > MAX_DURABLE_IDEMPOTENCY_KEY_BYTES {
+                return Err(ApiError::bad_request(format!(
+                    "Idempotency-Key exceeds {MAX_DURABLE_IDEMPOTENCY_KEY_BYTES} bytes"
+                )));
+            }
+            if value.chars().any(char::is_control) {
+                return Err(ApiError::bad_request(
+                    "Idempotency-Key cannot contain control characters",
+                ));
+            }
+            match selected.as_deref() {
+                Some(existing) if existing != value => {
+                    return Err(ApiError::bad_request(
+                        "Conflicting Idempotency-Key header values",
+                    ));
+                }
+                Some(_) => {}
+                None => selected = Some(value.to_string()),
+            }
+        }
+    }
+    Ok(selected)
 }
 
 async fn ingest_batch_reference_audio(
@@ -2734,6 +3034,87 @@ mod tests {
     }
 
     #[test]
+    fn idempotency_headers_are_bounded_text_and_unambiguous() {
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", HeaderValue::from_static(" request-1 "));
+        headers.insert("x-idempotency-key", HeaderValue::from_static("request-1"));
+        assert_eq!(
+            extract_idempotency_key(&headers).unwrap().as_deref(),
+            Some("request-1")
+        );
+
+        headers.insert("x-idempotency-key", HeaderValue::from_static("request-2"));
+        assert_eq!(
+            extract_idempotency_key(&headers).unwrap_err().status,
+            StatusCode::BAD_REQUEST
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", HeaderValue::from_static(""));
+        assert_eq!(
+            extract_idempotency_key(&headers).unwrap_err().status,
+            StatusCode::BAD_REQUEST
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "idempotency-key",
+            HeaderValue::from_str(&"x".repeat(MAX_DURABLE_IDEMPOTENCY_KEY_BYTES + 1)).unwrap(),
+        );
+        assert_eq!(
+            extract_idempotency_key(&headers).unwrap_err().status,
+            StatusCode::BAD_REQUEST
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "idempotency-key",
+            HeaderValue::from_bytes(&[0x80]).expect("opaque header value"),
+        );
+        assert_eq!(
+            extract_idempotency_key(&headers).unwrap_err().status,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn durable_tts_digest_normalizes_aliases_and_excludes_tenant_scope() {
+        let mut first = base_request();
+        first.max_tokens = Some(128);
+        normalize_durable_text_tts_request(&mut first);
+        let mut first = BatchSpeechRequest::for_durable_job(
+            SpeechRouteKind::TextToSpeech,
+            "Qwen3-TTS-12Hz-1.7B-Base".into(),
+            "Hello".into(),
+            first,
+        );
+        first.tenant_key = Some([1; 32]);
+
+        let mut equivalent = base_request();
+        equivalent.stream = Some(false);
+        equivalent.max_output_tokens = Some(128);
+        normalize_durable_text_tts_request(&mut equivalent);
+        let mut equivalent = BatchSpeechRequest::for_durable_job(
+            SpeechRouteKind::TextToSpeech,
+            "Qwen3-TTS-12Hz-1.7B-Base".into(),
+            "Hello".into(),
+            equivalent,
+        );
+        equivalent.tenant_key = Some([2; 32]);
+
+        assert_eq!(
+            durable_text_tts_request_digest(&first).unwrap(),
+            durable_text_tts_request_digest(&equivalent).unwrap()
+        );
+
+        equivalent.input_text = "Different".into();
+        assert_ne!(
+            durable_text_tts_request_digest(&first).unwrap(),
+            durable_text_tts_request_digest(&equivalent).unwrap()
+        );
+    }
+
+    #[test]
     fn stream_spool_allowance_preserves_fish_full_output_and_long_form() {
         let single = stream_pcm_byte_allowance(ModelVariant::FishAudioS2Pro, 44_100, 1);
         let full_slow_pcm = ModelVariant::FISH_S2_PRO_MAX_OUTPUT_FRAMES * 2048 * 2 * 4;
@@ -2789,6 +3170,8 @@ mod tests {
         );
         let json = serde_json::to_value(snapshot).expect("serialize batch request");
 
+        assert!(json["request"]["model_id"].is_null());
+        assert!(json["request"]["text"].is_null());
         assert!(json["request"]["reference_audio"].is_null());
         assert_eq!(json["request"]["reference_text"], "Reference words");
     }

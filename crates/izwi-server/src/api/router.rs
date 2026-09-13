@@ -1402,6 +1402,211 @@ mod tests {
         drop(temp_dir);
     }
 
+    #[tokio::test]
+    async fn text_only_tts_idempotency_replays_and_conflicts_without_duplicate_work() {
+        use crate::speech_history_store::SpeechRouteKind;
+
+        let (state, _root) = test_state("text_only_tts_idempotency", false);
+        state.lifecycle.mark_ready();
+        let config = ServeRuntimeConfig {
+            backend: izwi_core::backends::BackendPreference::Cpu,
+            ui_enabled: false,
+            ..ServeRuntimeConfig::default()
+        };
+        let app = create_router(state.clone(), &config);
+        let body = serde_json::json!({
+            "model_id": "Qwen3-TTS-12Hz-1.7B-CustomVoice",
+            "text": "Atomic speech request"
+        })
+        .to_string();
+
+        let first = send_request(
+            app.clone(),
+            build_request_with_idempotency(&body, "tts-request-1"),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let first = read_json(first).await;
+        let first_id = first["id"].as_str().unwrap().to_string();
+        assert_eq!(first["processing_status"], "pending");
+
+        // Replays must bypass fresh admission: the original request itself
+        // fills this one-job capacity limit.
+        let _env = env_lock();
+        std::env::set_var("IZWI_TTS_MAX_ACTIVE_JOBS", "1");
+        let replay = send_request(
+            app.clone(),
+            build_request_with_idempotency(&body, "tts-request-1"),
+        )
+        .await;
+        std::env::remove_var("IZWI_TTS_MAX_ACTIVE_JOBS");
+        assert_eq!(replay.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            read_json(replay).await["id"].as_str(),
+            Some(first_id.as_str())
+        );
+
+        let changed = serde_json::json!({
+            "model_id": "Qwen3-TTS-12Hz-1.7B-CustomVoice",
+            "text": "Different speech request"
+        })
+        .to_string();
+        let conflict = send_request(
+            app,
+            build_request_with_idempotency(&changed, "tts-request-1"),
+        )
+        .await;
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+
+        let jobs = state
+            .batch_runtime_store
+            .list_active_jobs_by_kind(RuntimeJobKind::TtsSpeech)
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].route_record_id.as_deref(), Some(first_id.as_str()));
+        let stages = state
+            .batch_runtime_store
+            .list_stages_for_job(&jobs[0].id)
+            .await
+            .unwrap();
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].status, RuntimeStageStatus::Queued);
+        let (records, _) = state
+            .speech_history_store
+            .list_records_page(SpeechRouteKind::TextToSpeech, 10, None)
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn text_only_tts_accepts_maximum_bounded_input_with_idempotency() {
+        use crate::batch_runtime::store::MAX_DURABLE_TTS_TEXT_BYTES;
+
+        let (state, _root) = test_state("bounded_tts_idempotency", false);
+        state.lifecycle.mark_ready();
+        let config = ServeRuntimeConfig {
+            backend: izwi_core::backends::BackendPreference::Cpu,
+            ui_enabled: false,
+            ..ServeRuntimeConfig::default()
+        };
+        let app = create_router(state, &config);
+        let body = serde_json::json!({
+            "model_id": "Qwen3-TTS-12Hz-1.7B-CustomVoice",
+            "text": "x".repeat(MAX_DURABLE_TTS_TEXT_BYTES)
+        })
+        .to_string();
+
+        let first = send_request(
+            app.clone(),
+            build_request_with_idempotency(&body, "maximum-text"),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let first_id = read_json(first).await["id"].as_str().unwrap().to_string();
+
+        let replay = send_request(app, build_request_with_idempotency(&body, "maximum-text")).await;
+        assert_eq!(replay.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            read_json(replay).await["id"].as_str(),
+            Some(first_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn keyed_streaming_and_reference_tts_reject_before_creating_records() {
+        use crate::speech_history_store::SpeechRouteKind;
+
+        let (state, _root) = test_state("keyed_tts_unsupported_shapes", false);
+        state.lifecycle.mark_ready();
+        let config = ServeRuntimeConfig {
+            backend: izwi_core::backends::BackendPreference::Cpu,
+            ui_enabled: false,
+            ..ServeRuntimeConfig::default()
+        };
+        let app = create_router(state.clone(), &config);
+        for body in [
+            serde_json::json!({
+                "model_id": "Qwen3-TTS-12Hz-1.7B-CustomVoice",
+                "text": "stream me",
+                "stream": true
+            })
+            .to_string(),
+            serde_json::json!({
+                "model_id": "Qwen3-TTS-12Hz-1.7B-Base",
+                "text": "clone me",
+                "reference_audio": "not-valid-base64",
+                "reference_text": "reference words"
+            })
+            .to_string(),
+        ] {
+            let response = send_request(
+                app.clone(),
+                build_request_with_idempotency(&body, "unsupported-key"),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let (records, _) = state
+            .speech_history_store
+            .list_records_page(SpeechRouteKind::TextToSpeech, 10, None)
+            .await
+            .unwrap();
+        assert!(records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn text_only_tts_admission_rejection_leaves_no_failed_placeholder() {
+        use crate::speech_history_store::SpeechRouteKind;
+
+        let (state, _root) = test_state("atomic_tts_admission", false);
+        state.lifecycle.mark_ready();
+        let config = ServeRuntimeConfig {
+            backend: izwi_core::backends::BackendPreference::Cpu,
+            ui_enabled: false,
+            ..ServeRuntimeConfig::default()
+        };
+        let app = create_router(state.clone(), &config);
+        let body = serde_json::json!({
+            "model_id": "Qwen3-TTS-12Hz-1.7B-CustomVoice",
+            "text": "first"
+        })
+        .to_string();
+        let accepted = send_request(
+            app.clone(),
+            build_request(Method::POST, "/v1/text-to-speech", Some(&body)),
+        )
+        .await;
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+
+        let _env = env_lock();
+        std::env::set_var("IZWI_TTS_MAX_ACTIVE_JOBS", "1");
+        let rejected = send_request(
+            app,
+            build_request(
+                Method::POST,
+                "/v1/text-to-speech",
+                Some(
+                    &serde_json::json!({
+                        "model_id": "Qwen3-TTS-12Hz-1.7B-CustomVoice",
+                        "text": "second"
+                    })
+                    .to_string(),
+                ),
+            ),
+        )
+        .await;
+        std::env::remove_var("IZWI_TTS_MAX_ACTIVE_JOBS");
+        assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+        let (records, _) = state
+            .speech_history_store
+            .list_records_page(SpeechRouteKind::TextToSpeech, 10, None)
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 1);
+    }
+
     async fn speech_replay_fixture(state: &AppState, tenant: Option<[u8; 32]>) -> (String, String) {
         use crate::batch_runtime::store::{sha256_hex, NewStageOutputArtifact};
         use crate::speech_history_store::{
@@ -2392,6 +2597,16 @@ mod tests {
             } else {
                 Body::empty()
             })
+            .expect("request should build")
+    }
+
+    fn build_request_with_idempotency(body: &str, key: &str) -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/v1/text-to-speech")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("idempotency-key", key)
+            .body(Body::from(body.to_string()))
             .expect("request should build")
     }
 
