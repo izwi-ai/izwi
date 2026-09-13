@@ -157,6 +157,10 @@ impl WorkerClientTlsConfig {
     pub fn is_configured(&self) -> bool {
         !self.private_ca_roots_pem.is_empty() || self.client_identity_pem.is_some()
     }
+
+    pub fn has_client_identity(&self) -> bool {
+        self.client_identity_pem.is_some()
+    }
 }
 
 fn parse_pem_items(
@@ -381,6 +385,21 @@ impl WorkerClient {
                 config,
             }),
         })
+    }
+
+    pub fn uses_https(&self) -> bool {
+        self.inner.endpoint.scheme() == "https"
+    }
+
+    pub fn uses_numeric_loopback_http(&self) -> bool {
+        self.inner.endpoint.scheme() == "http"
+            && self
+                .inner
+                .endpoint
+                .host_str()
+                .map(|host| host.trim_start_matches('[').trim_end_matches(']'))
+                .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+                .is_some_and(|host| host.is_loopback())
     }
 
     pub async fn descriptor(&self) -> Result<WorkerDescriptor, WorkerClientError> {
@@ -1134,14 +1153,19 @@ MAECAQ==
     #[test]
     fn worker_client_allows_verified_https_and_restricts_plaintext_to_numeric_loopback() {
         let config = WorkerClientConfig::default();
-        assert!(WorkerClient::new("http://127.0.0.1:9470", credentials(), config.clone()).is_ok());
+        let loopback =
+            WorkerClient::new("http://127.0.0.1:9470", credentials(), config.clone()).unwrap();
+        assert!(loopback.uses_numeric_loopback_http());
+        assert!(!loopback.uses_https());
         assert!(WorkerClient::new("http://[::1]:9470", credentials(), config.clone()).is_ok());
-        assert!(WorkerClient::new(
+        let https = WorkerClient::new(
             "https://worker.example.test:9470/private/",
             credentials(),
-            config.clone()
+            config.clone(),
         )
-        .is_ok());
+        .unwrap();
+        assert!(https.uses_https());
+        assert!(!https.uses_numeric_loopback_http());
         assert!(WorkerClient::new("https://192.0.2.1:9470", credentials(), config.clone()).is_ok());
 
         for endpoint in [
@@ -1160,12 +1184,14 @@ MAECAQ==
 
     #[test]
     fn tls_configuration_is_bounded_and_redacted() {
+        assert!(!WorkerClientTlsConfig::default().has_client_identity());
         let tls = WorkerClientTlsConfig::from_pem(
             vec![TEST_CA_PEM.as_bytes().to_vec()],
             Some(TEST_CA_PEM.as_bytes().to_vec()),
             Some(TEST_KEY_PEM.as_bytes().to_vec()),
         )
         .expect("bounded material");
+        assert!(tls.has_client_identity());
         let debug = format!("{tls:?}");
         assert!(debug.contains("private_ca_root_count: 1"));
         assert!(debug.contains("[REDACTED]"));

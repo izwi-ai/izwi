@@ -107,6 +107,10 @@ worker links made by a gateway.
 
 ### Binds and TLS
 
+- `--gateway-topology standalone` is the default and accepts only numeric-
+  loopback HTTP worker endpoints. `--gateway-topology fleet-one-gateway`
+  requires `--role gateway`, HTTPS, a configured client certificate/private
+  key, and versioned worker approvals that pin both node and worker identity.
 - The bundled worker rejects every non-loopback bind. Plaintext worker client
   URLs must use a numeric loopback host such as `127.0.0.1` or `::1`; `localhost`
   is deliberately not accepted.
@@ -218,6 +222,7 @@ the process shape is:
 ```sh
 izwi-server \
   --role gateway \
+  --gateway-topology standalone \
   --host 127.0.0.1 \
   --port 8080 \
   --public-model LFM2.5-1.2B-Instruct-GGUF \
@@ -232,12 +237,29 @@ izwi-server \
   --gateway-worker-status-poll-ms 2000
 ```
 
-Supply the public and private credential environment described above. Approval
-syntax is exactly:
+Supply the public and private credential environment described above. The
+standalone numeric-loopback compatibility syntax is:
 
 ```text
 URL|TASK|PUBLIC_MODEL|DEPLOYMENT_ID|MODEL_GENERATION
 ```
+
+The fleet-one-gateway syntax is versioned and pins operator-approved logical
+identities rather than trusting the first descriptor returned by an endpoint:
+
+```text
+v1|HTTPS_URL|NODE_ID|WORKER_ID|TASK|PUBLIC_MODEL|DEPLOYMENT_ID|MODEL_GENERATION
+```
+
+Fleet mode rejects the pinned `--worker-endpoint` form, legacy repeated
+`--gateway-worker-endpoint` values, five-field approvals, plaintext endpoints,
+and missing client identity before descriptor/status network I/O. Bearer
+service authentication remains required in addition to mTLS. This policy does
+not make the bundled loopback-only worker a supported remote deployment: use a
+reviewed TLS/mTLS proxy and retain real separate-machine handshake evidence.
+Configurations that previously used remote HTTPS under the implicit local
+policy must migrate explicitly to `fleet-one-gateway`, v1 approvals, and client
+certificate/key references; there is no legacy remote-HTTPS compatibility mode.
 
 Repeat `--gateway-worker-approval` for replicas. A pool is keyed by task and
 public model. All replicas in a pool must agree on deployment ID, generation,
@@ -248,9 +270,9 @@ the authenticated initial status contract. The node TOML is therefore the
 operator's artifact-revision source of truth for this single-node profile.
 
 Legacy `--worker-endpoint` pins one exact incarnation and should be retained
-only for compatibility. Legacy repeated `--gateway-worker-endpoint` entries use
-one chat deployment/generation supplied separately. Do not mix legacy endpoints
-with typed approvals.
+only for standalone compatibility. Legacy repeated `--gateway-worker-endpoint`
+entries use one chat deployment/generation supplied separately. Do not mix
+legacy endpoints with typed approvals.
 
 The registry supports at most 256 configured workers; deployment tables support
 at most 64 pools and 256 replicas per pool. Poll interval must be nonzero and

@@ -8,7 +8,9 @@
 
 use std::str::FromStr;
 
-use izwi_serving_protocol::{DeploymentId, ModelAlias, ModelGeneration, TaskKind};
+use izwi_serving_protocol::{
+    DeploymentId, ModelAlias, ModelGeneration, NodeId, TaskKind, WorkerId,
+};
 
 use crate::worker_registry::ApprovedDeployment;
 
@@ -20,16 +22,39 @@ const MAX_GATEWAY_ENDPOINT_BYTES: usize = 2 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayWorkerApproval {
     pub endpoint: String,
+    pub identity: GatewayWorkerApprovalIdentity,
     pub task: TaskKind,
     pub public_model: ModelAlias,
     pub deployment_id: DeploymentId,
     pub model_generation: ModelGeneration,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GatewayWorkerApprovalIdentity {
+    /// Compatibility form used only by the standalone/single-node profile.
+    DiscoverFromAuthenticatedEndpoint,
+    /// Versioned fleet form whose logical identities are operator-approved.
+    V1 {
+        node_id: NodeId,
+        worker_id: WorkerId,
+    },
+}
+
+impl GatewayWorkerApproval {
+    pub fn pinned_identity(&self) -> Option<(&NodeId, &WorkerId)> {
+        match &self.identity {
+            GatewayWorkerApprovalIdentity::DiscoverFromAuthenticatedEndpoint => None,
+            GatewayWorkerApprovalIdentity::V1 { node_id, worker_id } => Some((node_id, worker_id)),
+        }
+    }
+}
+
 impl FromStr for GatewayWorkerApproval {
     type Err = GatewayDeploymentTableError;
 
-    /// Parses `URL|TASK|PUBLIC_MODEL|DEPLOYMENT_ID|MODEL_GENERATION`.
+    /// Parses the standalone compatibility form
+    /// `URL|TASK|PUBLIC_MODEL|DEPLOYMENT_ID|MODEL_GENERATION`, or the fleet form
+    /// `v1|URL|NODE_ID|WORKER_ID|TASK|PUBLIC_MODEL|DEPLOYMENT_ID|MODEL_GENERATION`.
     ///
     /// The endpoint is subsequently validated by `WorkerClient`; this parser
     /// only applies retention bounds and parses the statically pinned route.
@@ -38,19 +63,51 @@ impl FromStr for GatewayWorkerApproval {
             return Err(GatewayDeploymentTableError::ApprovalTooLong);
         }
         let fields = value.split('|').map(str::trim).collect::<Vec<_>>();
-        if fields.len() != 5 || fields.iter().any(|field| field.is_empty()) {
+        if fields.iter().any(|field| field.is_empty()) {
             return Err(GatewayDeploymentTableError::InvalidApprovalSyntax);
         }
-        if fields[0].len() > MAX_GATEWAY_ENDPOINT_BYTES {
+        let (endpoint, identity, task, public_model, deployment_id, generation) = match fields
+            .as_slice()
+        {
+            ["v1", endpoint, node_id, worker_id, task, public_model, deployment_id, generation] => {
+                (
+                    *endpoint,
+                    GatewayWorkerApprovalIdentity::V1 {
+                        node_id: NodeId::new(*node_id)
+                            .map_err(|_| GatewayDeploymentTableError::InvalidNodeId)?,
+                        worker_id: WorkerId::new(*worker_id)
+                            .map_err(|_| GatewayDeploymentTableError::InvalidWorkerId)?,
+                    },
+                    *task,
+                    *public_model,
+                    *deployment_id,
+                    *generation,
+                )
+            }
+            ["v1", ..] => return Err(GatewayDeploymentTableError::InvalidApprovalSyntax),
+            [version, ..] if version.starts_with('v') => {
+                return Err(GatewayDeploymentTableError::UnsupportedApprovalVersion);
+            }
+            [endpoint, task, public_model, deployment_id, generation] => (
+                *endpoint,
+                GatewayWorkerApprovalIdentity::DiscoverFromAuthenticatedEndpoint,
+                *task,
+                *public_model,
+                *deployment_id,
+                *generation,
+            ),
+            _ => return Err(GatewayDeploymentTableError::InvalidApprovalSyntax),
+        };
+        if endpoint.len() > MAX_GATEWAY_ENDPOINT_BYTES {
             return Err(GatewayDeploymentTableError::EndpointTooLong);
         }
-        let task = match fields[1] {
+        let task = match task {
             "chat" => TaskKind::Chat,
             "text_to_speech" => TaskKind::TextToSpeech,
             "speech_to_text" => TaskKind::SpeechToText,
             _ => return Err(GatewayDeploymentTableError::UnknownTask),
         };
-        let generation = fields[4]
+        let generation = generation
             .parse::<u64>()
             .map_err(|_| GatewayDeploymentTableError::InvalidGeneration)
             .and_then(|generation| {
@@ -58,11 +115,12 @@ impl FromStr for GatewayWorkerApproval {
                     .map_err(|_| GatewayDeploymentTableError::InvalidGeneration)
             })?;
         Ok(Self {
-            endpoint: fields[0].to_string(),
+            endpoint: endpoint.to_string(),
+            identity,
             task,
-            public_model: ModelAlias::new(fields[2])
+            public_model: ModelAlias::new(public_model)
                 .map_err(|_| GatewayDeploymentTableError::InvalidPublicModel)?,
-            deployment_id: DeploymentId::new(fields[3])
+            deployment_id: DeploymentId::new(deployment_id)
                 .map_err(|_| GatewayDeploymentTableError::InvalidDeploymentId)?,
             model_generation: generation,
         })
@@ -179,15 +237,21 @@ pub enum GatewayDeploymentTableError {
     #[error("gateway worker approval exceeds its encoded size limit")]
     ApprovalTooLong,
     #[error(
-        "gateway worker approval must be URL|TASK|PUBLIC_MODEL|DEPLOYMENT_ID|MODEL_GENERATION"
+        "gateway worker approval must use the standalone 5-field form or v1 8-field fleet form"
     )]
     InvalidApprovalSyntax,
+    #[error("gateway worker approval uses an unsupported version")]
+    UnsupportedApprovalVersion,
     #[error("gateway worker approval endpoint exceeds its size limit")]
     EndpointTooLong,
     #[error("gateway worker approval task must be chat, text_to_speech, or speech_to_text")]
     UnknownTask,
     #[error("gateway worker approval has an invalid public model alias")]
     InvalidPublicModel,
+    #[error("gateway worker approval has an invalid node identifier")]
+    InvalidNodeId,
+    #[error("gateway worker approval has an invalid worker identifier")]
+    InvalidWorkerId,
     #[error("gateway worker approval has an invalid deployment identifier")]
     InvalidDeploymentId,
     #[error("gateway worker approval model generation must be a non-zero integer")]
@@ -358,6 +422,10 @@ mod tests {
         let parsed: GatewayWorkerApproval = "http://127.0.0.1:19091|chat|chat-model|chat-prod|7"
             .parse()
             .unwrap();
+        assert_eq!(
+            parsed.identity,
+            GatewayWorkerApprovalIdentity::DiscoverFromAuthenticatedEndpoint
+        );
         assert_eq!(parsed.task, TaskKind::Chat);
         assert_eq!(parsed.public_model.as_str(), "chat-model");
         assert_eq!(parsed.model_generation.get(), 7);
@@ -369,6 +437,42 @@ mod tests {
             .parse::<GatewayWorkerApproval>()
             .unwrap_err(),
             GatewayDeploymentTableError::ApprovalTooLong
+        );
+
+        let fleet: GatewayWorkerApproval =
+            "v1|https://worker.example.test:9470|node-a|worker-a|chat|chat-model|chat-prod|7"
+                .parse()
+                .unwrap();
+        assert_eq!(
+            fleet.pinned_identity(),
+            Some((
+                &NodeId::new("node-a").unwrap(),
+                &WorkerId::new("worker-a").unwrap()
+            ))
+        );
+        assert_eq!(
+            "v2|https://worker.example.test:9470|node-a|worker-a|chat|chat-model|chat-prod|7"
+                .parse::<GatewayWorkerApproval>()
+                .unwrap_err(),
+            GatewayDeploymentTableError::UnsupportedApprovalVersion
+        );
+        assert_eq!(
+            "v1|https://worker.example.test:9470|node-a|worker-a|chat"
+                .parse::<GatewayWorkerApproval>()
+                .unwrap_err(),
+            GatewayDeploymentTableError::InvalidApprovalSyntax
+        );
+        assert_eq!(
+            "v1|https://worker.example.test:9470|bad node|worker-a|chat|chat-model|chat-prod|7"
+                .parse::<GatewayWorkerApproval>()
+                .unwrap_err(),
+            GatewayDeploymentTableError::InvalidNodeId
+        );
+        assert_eq!(
+            "v1|https://worker.example.test:9470|node-a|bad worker|chat|chat-model|chat-prod|7"
+                .parse::<GatewayWorkerApproval>()
+                .unwrap_err(),
+            GatewayDeploymentTableError::InvalidWorkerId
         );
     }
 }

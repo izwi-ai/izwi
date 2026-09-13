@@ -80,9 +80,10 @@ Copy this section into the release record and attach exact command output.
 - [ ] Verify public API and private worker credentials are secret references,
   absent from argv, config artifacts, diagnostics, and logs.
 - [ ] Keep worker HTTP on numeric loopback. For an approved remote profile,
+  select `fleet-one-gateway`, use only versioned node/worker-pinned approvals,
   require certificate-verified HTTPS through a trusted TLS/mTLS termination
-  layer, use only bounded absolute PEM references, and record its trust
-  configuration. Prove the handshake on the actual topology.
+  layer, use bounded absolute PEM references, and record its trust configuration.
+  Prove the handshake and client-certificate enforcement on the actual topology.
 - [ ] Terminate public TLS before any non-loopback gateway bind and explicitly
   acknowledge the trusted ingress setting.
 - [ ] Keep CORS disabled or use a reviewed explicit origin allowlist.
@@ -169,7 +170,7 @@ reviewer/date:
 
 | ID | Severity | Applies to | Current control | Release effect / exit gate |
 |---|---|---|---|---|
-| PSR-001 | High | Remote/multi-machine | Worker clients require verified HTTPS and support bounded private roots plus one shared mTLS client identity; bundled workers still bind loopback | No native remote profile until TLS/mTLS termination and a separate-machine handshake/contract test are approved |
+| PSR-001 | High | Remote/multi-machine | Explicit fleet topology rejects legacy/TOFU identities, plaintext, and missing mTLS client identity; bundled workers still bind loopback | No native remote profile until TLS/mTLS termination enforcement and a separate-machine handshake/contract test are approved |
 | PSR-002 | High | Metal/CUDA supervisor | Schema and workers carry explicit assignments; supervisor CLI rejects unsupported lanes without CPU fallback | Do not release supervisor-managed Metal/CUDA until trusted inventory/launch integration and target hardware tests pass |
 | PSR-003 | High | Multiple gateways | Registry, circuit, tenant rate limits, and accepted-work ownership are process-local | No strict fleet quota/HA claim until Phase 8 shared or conservatively partitioned authorities pass restart/partition tests |
 | PSR-004 | High | Unmigrated APIs | Gateway exposes only chat and returns 404 for representative local routes | Do not advertise models, audio, Responses, workflows, history, admin, or live-session APIs remotely before their ledger gates pass |

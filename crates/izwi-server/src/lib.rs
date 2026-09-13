@@ -161,6 +161,15 @@ struct ServerArgs {
     #[arg(long, env = "IZWI_GATEWAY_WORKER_ENDPOINT")]
     worker_endpoint: Option<String>,
 
+    /// Worker-network policy (`standalone` or `fleet-one-gateway`).
+    #[arg(
+        long,
+        value_enum,
+        env = "IZWI_GATEWAY_TOPOLOGY",
+        default_value = "standalone"
+    )]
+    gateway_topology: GatewayTopology,
+
     /// Approved private worker URLs for registry-backed routing. Repeat this
     /// option (or use a comma-separated environment value) to add capacity.
     #[arg(
@@ -172,9 +181,10 @@ struct ServerArgs {
     gateway_worker_endpoints: Vec<String>,
 
     /// Statically approved worker routing entries. Repeat this option (or use
-    /// a comma-separated environment value) with
-    /// URL|TASK|PUBLIC_MODEL|DEPLOYMENT_ID|MODEL_GENERATION. This cannot be
-    /// combined with the legacy gateway worker endpoint list.
+    /// a comma-separated environment value) with the standalone five-field
+    /// form or v1|URL|NODE_ID|WORKER_ID|TASK|PUBLIC_MODEL|DEPLOYMENT_ID|
+    /// MODEL_GENERATION for fleet mode. This cannot be combined with the
+    /// legacy gateway worker endpoint list.
     #[arg(
         long = "gateway-worker-approval",
         env = "IZWI_GATEWAY_WORKER_APPROVALS",
@@ -278,6 +288,12 @@ enum ServerRole {
     Gateway,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum GatewayTopology {
+    Standalone,
+    FleetOneGateway,
+}
+
 #[derive(Debug, Clone, ValueEnum)]
 enum BackendArg {
     Auto,
@@ -309,6 +325,7 @@ pub async fn run_from_cli(enterprise_hooks: EnterpriseHooks) -> anyhow::Result<(
 }
 
 async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> anyhow::Result<()> {
+    validate_role_topology(args.role, args.gateway_topology)?;
     let serve_config = resolve_serve_runtime_config(&args)?;
     if args.role == ServerRole::Gateway {
         return run_gateway(args, serve_config, enterprise_hooks).await;
@@ -449,6 +466,13 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
     Ok(())
 }
 
+fn validate_role_topology(role: ServerRole, topology: GatewayTopology) -> anyhow::Result<()> {
+    if role == ServerRole::Local && topology != GatewayTopology::Standalone {
+        anyhow::bail!("non-standalone gateway topology requires --role gateway");
+    }
+    Ok(())
+}
+
 async fn run_gateway(
     args: ServerArgs,
     serve_config: ServeRuntimeConfig,
@@ -526,6 +550,7 @@ async fn gateway_state(
     enterprise_hooks: EnterpriseHooks,
     perimeter: GatewayPerimeterConfig,
 ) -> anyhow::Result<(gateway::GatewayState, Option<GatewayWorkerStatusPoller>)> {
+    validate_gateway_topology_source(args)?;
     if args.gateway_worker_endpoints.is_empty() && args.gateway_worker_approvals.is_empty() {
         let remote = gateway_remote_execution(args, serve_config)?;
         return Ok((
@@ -569,12 +594,11 @@ async fn gateway_state(
     let registry = worker_registry::WorkerRegistry::new(registry_config)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let worker_tls = gateway_worker_tls::worker_client_tls_from_env()?;
+    validate_gateway_topology_policy(args.gateway_topology, &worker_approvals, &worker_tls)?;
     let client_config = gateway_worker_client_config(args, worker_tls);
 
     let mut endpoints = BTreeSet::new();
-    let mut approved_worker_ids = BTreeSet::new();
-    let mut polling_workers = Vec::with_capacity(worker_approvals.len());
-    let mut deployment_table = gateway_deployments::GatewayDeploymentTable::default();
+    let mut configured_workers = Vec::with_capacity(worker_approvals.len());
     for approval in worker_approvals {
         let endpoint = approval.endpoint.trim();
         if endpoint.is_empty() {
@@ -584,6 +608,19 @@ async fn gateway_state(
             anyhow::bail!("duplicate configured gateway worker endpoint: {endpoint}");
         }
         let client = WorkerClient::new(endpoint, credentials.clone(), client_config.clone())?;
+        validate_gateway_worker_endpoint_policy(
+            args.gateway_topology,
+            client.uses_https(),
+            client.uses_numeric_loopback_http(),
+        )?;
+        configured_workers.push((approval, client));
+    }
+
+    let mut approved_worker_ids = BTreeSet::new();
+    let mut polling_workers = Vec::with_capacity(configured_workers.len());
+    let mut deployment_table = gateway_deployments::GatewayDeploymentTable::default();
+    for (approval, client) in configured_workers {
+        let endpoint = approval.endpoint.trim();
         let descriptor = client.descriptor().await.with_context(|| {
             format!("failed to read approved worker descriptor from {endpoint}")
         })?;
@@ -671,6 +708,13 @@ fn initial_gateway_worker_expectation(
     status: &WorkerStatus,
     approval: &gateway_deployments::GatewayWorkerApproval,
 ) -> anyhow::Result<GatewayWorkerExpectation> {
+    if let Some((node_id, worker_id)) = approval.pinned_identity() {
+        if descriptor.node_id != *node_id || descriptor.worker_id != *worker_id {
+            anyhow::bail!(
+                "worker descriptor does not match its operator-approved node and worker identity"
+            );
+        }
+    }
     if status.worker_id != descriptor.worker_id
         || status.node_id != descriptor.node_id
         || status.incarnation_id != descriptor.incarnation_id
@@ -739,12 +783,76 @@ fn configured_gateway_worker_approvals(
         .iter()
         .map(|endpoint| gateway_deployments::GatewayWorkerApproval {
             endpoint: endpoint.clone(),
+            identity: gateway_deployments::GatewayWorkerApprovalIdentity::DiscoverFromAuthenticatedEndpoint,
             task: TaskKind::Chat,
             public_model: legacy_public_model.clone(),
             deployment_id: deployment_id.clone(),
             model_generation,
         })
         .collect())
+}
+
+fn validate_gateway_topology_policy(
+    topology: GatewayTopology,
+    approvals: &[gateway_deployments::GatewayWorkerApproval],
+    tls: &izwi_serving_client::WorkerClientTlsConfig,
+) -> anyhow::Result<()> {
+    let mut pinned_worker_ids = BTreeSet::new();
+    for approval in approvals {
+        if let Some((_node_id, worker_id)) = approval.pinned_identity() {
+            if !pinned_worker_ids.insert(worker_id.clone()) {
+                anyhow::bail!("duplicate operator-approved logical worker identity: {worker_id}");
+            }
+        }
+    }
+    if topology == GatewayTopology::Standalone {
+        return Ok(());
+    }
+    if approvals.is_empty() {
+        anyhow::bail!("fleet-one-gateway topology requires at least one worker approval");
+    }
+    if !tls.has_client_identity() {
+        anyhow::bail!(
+            "fleet-one-gateway topology requires a client certificate and private key for mutual TLS"
+        );
+    }
+    if approvals
+        .iter()
+        .any(|approval| approval.pinned_identity().is_none())
+    {
+        anyhow::bail!(
+            "fleet-one-gateway topology requires versioned v1 approvals with pinned node and worker identities"
+        );
+    }
+    Ok(())
+}
+
+fn validate_gateway_topology_source(args: &ServerArgs) -> anyhow::Result<()> {
+    if args.gateway_topology == GatewayTopology::FleetOneGateway
+        && args.gateway_worker_approvals.is_empty()
+    {
+        anyhow::bail!(
+            "fleet-one-gateway topology requires versioned --gateway-worker-approval entries; pinned and legacy endpoint modes are standalone-only"
+        );
+    }
+    Ok(())
+}
+
+fn validate_gateway_worker_endpoint_policy(
+    topology: GatewayTopology,
+    uses_https: bool,
+    uses_numeric_loopback_http: bool,
+) -> anyhow::Result<()> {
+    match topology {
+        GatewayTopology::Standalone if !uses_numeric_loopback_http => {
+            anyhow::bail!("standalone worker endpoints must use numeric-loopback HTTP")
+        }
+        GatewayTopology::FleetOneGateway if !uses_https => {
+            anyhow::bail!("fleet-one-gateway worker endpoints must use HTTPS")
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn configured_worker_capacity(status: &WorkerStatus) -> anyhow::Result<u32> {
@@ -978,6 +1086,11 @@ fn gateway_remote_execution(
         required_gateway_value(&args.worker_endpoint, "--worker-endpoint")?,
         credentials,
         gateway_worker_client_config(args, worker_tls),
+    )?;
+    validate_gateway_worker_endpoint_policy(
+        args.gateway_topology,
+        client.uses_https(),
+        client.uses_numeric_loopback_http(),
     )?;
     app::chat::RemoteChatExecution::new(
         client,
@@ -1797,7 +1910,126 @@ mod tests {
 
     #[test]
     fn local_server_role_remains_the_default() {
-        assert_eq!(parse(&["izwi-server"]).role, ServerRole::Local);
+        let args = parse(&["izwi-server"]);
+        assert_eq!(args.role, ServerRole::Local);
+        assert_eq!(args.gateway_topology, GatewayTopology::Standalone);
+        validate_role_topology(args.role, args.gateway_topology).expect("local standalone role");
+        assert!(
+            validate_role_topology(ServerRole::Local, GatewayTopology::FleetOneGateway)
+                .unwrap_err()
+                .to_string()
+                .contains("requires --role gateway")
+        );
+    }
+
+    #[test]
+    fn fleet_topology_requires_versioned_identity_mtls_and_https() {
+        const TEST_CERT_PEM: &[u8] =
+            b"-----BEGIN CERTIFICATE-----\nMAECAQ==\n-----END CERTIFICATE-----\n";
+        const TEST_KEY_PEM: &[u8] =
+            b"-----BEGIN PRIVATE KEY-----\nMAECAQ==\n-----END PRIVATE KEY-----\n";
+        let fleet: gateway_deployments::GatewayWorkerApproval =
+            "v1|https://worker.example.test:9470|node-a|worker-a|chat|chat-model|chat-prod|7"
+                .parse()
+                .expect("versioned fleet approval");
+        let legacy: gateway_deployments::GatewayWorkerApproval =
+            "http://127.0.0.1:9470|chat|chat-model|chat-prod|7"
+                .parse()
+                .expect("standalone compatibility approval");
+        let empty_tls = izwi_serving_client::WorkerClientTlsConfig::default();
+        assert!(validate_gateway_topology_policy(
+            GatewayTopology::FleetOneGateway,
+            std::slice::from_ref(&fleet),
+            &empty_tls,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("mutual TLS"));
+        let ca_only_tls = izwi_serving_client::WorkerClientTlsConfig::from_pem(
+            vec![TEST_CERT_PEM.to_vec()],
+            None,
+            None,
+        )
+        .expect("bounded test CA");
+        assert!(validate_gateway_topology_policy(
+            GatewayTopology::FleetOneGateway,
+            std::slice::from_ref(&fleet),
+            &ca_only_tls,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("mutual TLS"));
+
+        let identity_tls = izwi_serving_client::WorkerClientTlsConfig::from_pem(
+            Vec::new(),
+            Some(TEST_CERT_PEM.to_vec()),
+            Some(TEST_KEY_PEM.to_vec()),
+        )
+        .expect("bounded test identity");
+        validate_gateway_topology_policy(
+            GatewayTopology::FleetOneGateway,
+            std::slice::from_ref(&fleet),
+            &identity_tls,
+        )
+        .expect("versioned fleet policy");
+        let mut duplicate = fleet.clone();
+        duplicate.endpoint = "https://worker-b.example.test:9470".to_string();
+        assert!(validate_gateway_topology_policy(
+            GatewayTopology::FleetOneGateway,
+            &[fleet.clone(), duplicate],
+            &identity_tls,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("duplicate operator-approved"));
+        assert!(validate_gateway_topology_policy(
+            GatewayTopology::FleetOneGateway,
+            std::slice::from_ref(&legacy),
+            &identity_tls,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("versioned v1 approvals"));
+        validate_gateway_worker_endpoint_policy(GatewayTopology::FleetOneGateway, true, false)
+            .expect("HTTPS fleet endpoint");
+        assert!(validate_gateway_worker_endpoint_policy(
+            GatewayTopology::FleetOneGateway,
+            false,
+            true,
+        )
+        .is_err());
+        validate_gateway_worker_endpoint_policy(GatewayTopology::Standalone, false, true)
+            .expect("standalone loopback compatibility");
+        assert!(
+            validate_gateway_worker_endpoint_policy(GatewayTopology::Standalone, true, false,)
+                .is_err()
+        );
+
+        let pinned_fleet = parse(&[
+            "izwi-server",
+            "--role",
+            "gateway",
+            "--gateway-topology",
+            "fleet-one-gateway",
+            "--worker-endpoint",
+            "https://worker.example.test:9470",
+        ]);
+        assert!(validate_gateway_topology_source(&pinned_fleet)
+            .unwrap_err()
+            .to_string()
+            .contains("pinned and legacy"));
+    }
+
+    #[test]
+    fn gateway_topology_parses_from_cli_and_environment() {
+        let cli = parse(&["izwi-server", "--gateway-topology", "fleet-one-gateway"]);
+        assert_eq!(cli.gateway_topology, GatewayTopology::FleetOneGateway);
+
+        let _guard = env_lock();
+        std::env::set_var("IZWI_GATEWAY_TOPOLOGY", "fleet-one-gateway");
+        let from_env = parse(&["izwi-server"]);
+        std::env::remove_var("IZWI_GATEWAY_TOPOLOGY");
+        assert_eq!(from_env.gateway_topology, GatewayTopology::FleetOneGateway);
     }
 
     #[test]
@@ -2026,11 +2258,44 @@ mod tests {
         let deployment_id = worker.config().deployment_id.clone();
         let approval = gateway_deployments::GatewayWorkerApproval {
             endpoint: worker.endpoint(),
+            identity: gateway_deployments::GatewayWorkerApprovalIdentity::V1 {
+                node_id: worker.config().node_id.clone(),
+                worker_id: worker.config().worker_id.clone(),
+            },
             task: TaskKind::Chat,
             public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
             deployment_id,
             model_generation: worker.config().model_generation,
         };
+        let mut wrong_identity = approval.clone();
+        wrong_identity.identity = gateway_deployments::GatewayWorkerApprovalIdentity::V1 {
+            node_id: NodeId::new("unapproved-node").expect("static node id"),
+            worker_id: worker.config().worker_id.clone(),
+        };
+        assert!(initial_gateway_worker_expectation(
+            client.clone(),
+            &descriptor,
+            &status,
+            &wrong_identity,
+        )
+        .err()
+        .expect("unapproved node must fail")
+        .to_string()
+        .contains("operator-approved"));
+        wrong_identity.identity = gateway_deployments::GatewayWorkerApprovalIdentity::V1 {
+            node_id: worker.config().node_id.clone(),
+            worker_id: WorkerId::new("unapproved-worker").expect("static worker id"),
+        };
+        assert!(initial_gateway_worker_expectation(
+            client.clone(),
+            &descriptor,
+            &status,
+            &wrong_identity,
+        )
+        .err()
+        .expect("unapproved worker must fail")
+        .to_string()
+        .contains("operator-approved"));
         let expected = initial_gateway_worker_expectation(client, &descriptor, &status, &approval)
             .expect("initial worker should match configuration");
         let registry =
