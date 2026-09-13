@@ -21,9 +21,11 @@ use izwi_hooks::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 
 const ARTIFACT_METADATA_VERSION: u64 = 1;
 const MAX_TENANT_ID_BYTES: usize = 128;
@@ -228,6 +230,102 @@ pub struct ArtifactDescriptor {
 pub struct ArtifactBytes {
     pub descriptor: ArtifactDescriptor,
     pub bytes: Vec<u8>,
+}
+
+pub struct ArtifactStream {
+    pub descriptor: ArtifactDescriptor,
+    pub reader: Pin<Box<dyn AsyncRead + Send>>,
+}
+
+struct VerifiedArtifactReader {
+    inner: Pin<Box<dyn AsyncRead + Send>>,
+    expected_size: u64,
+    expected_digest: String,
+    total: u64,
+    digest: Option<Sha256>,
+    finished: bool,
+    scratch: Box<[u8; READ_CHUNK_BYTES]>,
+}
+
+impl AsyncRead for VerifiedArtifactReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.finished {
+            return Poll::Ready(Ok(()));
+        }
+        if buffer.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let remaining = this.expected_size.saturating_sub(this.total);
+        let capacity = if remaining == 0 {
+            1
+        } else {
+            usize::try_from(remaining)
+                .unwrap_or(usize::MAX)
+                .min(buffer.remaining())
+                .min(READ_CHUNK_BYTES)
+        };
+        let mut provider_buffer = ReadBuf::new(&mut this.scratch[..capacity]);
+        match this.inner.as_mut().poll_read(cx, &mut provider_buffer) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(error)) => {
+                this.finished = true;
+                Poll::Ready(Err(error))
+            }
+            Poll::Ready(Ok(())) => {
+                let read = provider_buffer.filled().len();
+                if read == 0 {
+                    this.finished = true;
+                    if this.total != this.expected_size {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "artifact stream ended before its declared size",
+                        )));
+                    }
+                    let Some(digest) = this.digest.take() else {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "artifact stream verifier lost its digest state",
+                        )));
+                    };
+                    let actual_digest = format!("{:x}", digest.finalize());
+                    if actual_digest != this.expected_digest {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "artifact stream digest did not match",
+                        )));
+                    }
+                    return Poll::Ready(Ok(()));
+                }
+                if remaining == 0 {
+                    this.finished = true;
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "artifact stream exceeded its declared size",
+                    )));
+                }
+                this.total = match this.total.checked_add(read as u64) {
+                    Some(total) if total <= this.expected_size => total,
+                    _ => {
+                        this.finished = true;
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "artifact stream exceeded its declared size",
+                        )));
+                    }
+                };
+                if let Some(digest) = this.digest.as_mut() {
+                    digest.update(provider_buffer.filled());
+                }
+                buffer.put_slice(provider_buffer.filled());
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -569,6 +667,40 @@ impl ArtifactStore {
         Ok(ArtifactBytes {
             descriptor: descriptor_from_asset(&asset)?,
             bytes,
+        })
+    }
+
+    pub async fn read_stream(
+        &self,
+        tenant: &ArtifactTenant,
+        id: &ArtifactId,
+    ) -> Result<ArtifactStream, ArtifactStoreError> {
+        let asset = self.resolve_active(tenant, id).await?;
+        if asset.size_bytes == 0 || asset.size_bytes > self.limits.max_file_object_bytes {
+            return Err(ArtifactStoreError::TooLarge);
+        }
+        let expected_digest = validate_digest(asset.sha256.as_deref())?;
+        let stream = self
+            .provider
+            .get_stream(MediaReadRequest {
+                key: MediaObjectKey::new(asset.storage_key.clone()),
+                metadata: tenant_metadata(tenant),
+            })
+            .await
+            .map_err(map_provider_read_error)?;
+        validate_stored_read_metadata(tenant, &asset, &stream.metadata, &expected_digest)?;
+        let descriptor = descriptor_from_asset(&asset)?;
+        Ok(ArtifactStream {
+            descriptor,
+            reader: Box::pin(VerifiedArtifactReader {
+                inner: stream.reader,
+                expected_size: asset.size_bytes,
+                expected_digest,
+                total: 0,
+                digest: Some(Sha256::new()),
+                finished: false,
+                scratch: Box::new([0; READ_CHUNK_BYTES]),
+            }),
         })
     }
 
@@ -1629,6 +1761,13 @@ mod tests {
             store.read(&tenant, &id).await,
             Err(ArtifactStoreError::TooLarge)
         ));
+        let mut verified = store.read_stream(&tenant, &id).await.unwrap();
+        assert_eq!(verified.descriptor.size_bytes, bytes.len() as u64);
+        let mut empty = [];
+        assert_eq!(verified.reader.read(&mut empty).await.unwrap(), 0);
+        let mut streamed = Vec::new();
+        verified.reader.read_to_end(&mut streamed).await.unwrap();
+        assert_eq!(streamed, bytes);
         let asset = metadata
             .get_media_asset(id.as_str())
             .await
@@ -1642,6 +1781,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stored.bytes, bytes);
+
+        provider.tamper_single_object(vec![0x2f; bytes.len()]);
+        let mut corrupted = store.read_stream(&tenant, &id).await.unwrap();
+        let mut discarded = Vec::new();
+        assert!(corrupted.reader.read_to_end(&mut discarded).await.is_err());
+
+        provider.tamper_single_object(vec![0x2f; bytes.len() - 1]);
+        assert!(matches!(
+            store.read_stream(&tenant, &id).await,
+            Err(ArtifactStoreError::Integrity("declared size mismatch"))
+        ));
+
+        provider.tamper_single_object(vec![0x2f; bytes.len() + 1]);
+        assert!(matches!(
+            store.read_stream(&tenant, &id).await,
+            Err(ArtifactStoreError::Integrity("declared size mismatch"))
+        ));
+    }
+
+    #[tokio::test]
+    async fn verified_stream_reader_handles_empty_reads_and_rejects_short_or_long_bodies() {
+        async fn read(bytes: &[u8], expected: &[u8]) -> std::io::Result<Vec<u8>> {
+            let mut reader = VerifiedArtifactReader {
+                inner: Box::pin(Cursor::new(bytes.to_vec())),
+                expected_size: expected.len() as u64,
+                expected_digest: sha256_hex(expected),
+                total: 0,
+                digest: Some(Sha256::new()),
+                finished: false,
+                scratch: Box::new([0; READ_CHUNK_BYTES]),
+            };
+            let mut empty = [];
+            assert_eq!(reader.read(&mut empty).await?, 0);
+            let mut output = Vec::new();
+            reader.read_to_end(&mut output).await?;
+            Ok(output)
+        }
+
+        assert_eq!(read(b"exact", b"exact").await.unwrap(), b"exact");
+        assert_eq!(
+            read(b"shor", b"short").await.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(
+            read(b"longer", b"long").await.unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
     }
 
     #[tokio::test]

@@ -2274,11 +2274,12 @@ impl BatchRuntimeStore {
                 runtime_stage_id, runtime_attempt_token, model_id, speaker,
                 language, saved_voice_id, speed, input_text, voice_description,
                 reference_text, generation_time_ms, audio_duration_secs, rtf,
-                tokens_generated, audio_mime_type, audio_filename, audio_storage_path
+                tokens_generated, audio_mime_type, audio_filename, audio_storage_path,
+                audio_media_asset_id, audio_artifact_tenant
             )
             VALUES (?1, ?2, 'text_to_speech', 'pending', NULL, NULL, NULL, ?3,
                     ?4, ?5, NULL, ?6, ?7, ?8, NULL, 0.0, NULL, NULL, NULL,
-                    ?9, ?10, '')
+                    ?9, ?10, '', NULL, NULL)
             "#,
             vec![
                 record_id.clone().into(),

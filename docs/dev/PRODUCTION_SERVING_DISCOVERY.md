@@ -153,16 +153,26 @@ Durable Fish PCM replay is the first route-state adopter: each new chunk is a
 tenant-scoped opaque object, and its publication marker, media row, exact active
 attempt reference, and reservation consumption commit together. Runtime rows do
 not expose provider keys. Existing raw-key journals remain readable and
-deletable for local upgrade compatibility. The final speech WAV, saved voices,
-history rows, references, other job outputs, Studio, media routes, and multimodal
-inputs still retain legacy provider paths. Their tenant and fleet ownership
-gates remain Phase 6 work; this partial adoption does not enable a new gateway
-route.
+deletable for local upgrade compatibility. Speech-history rows can now retain an
+exact tenant plus opaque artifact ID and stream that artifact with terminal size
+and SHA-256 verification; legacy path rows remain readable and deletable for
+local upgrade compatibility. The unique artifact-reference index prevents two
+history rows from claiming the same object. No public speech producer writes the
+opaque history form yet, and opaque completion, replacement, and deletion stay
+fail-closed until they share one transactional settlement path. The final speech
+WAV, saved voices, references, other job outputs, Studio, media routes, and
+multimodal inputs still retain legacy provider paths. Their tenant and fleet
+ownership gates remain Phase 6 work; this partial adoption does not enable a new
+gateway route.
 
 Reserved-write protocol v1 also has a separately advertised file capability.
 It streams a finalized local file through fixed-size buffers while enforcing the
 same pre-recorded write ID, length, digest, deadline, idempotency, and recovery
 fence as byte writes. Bytes-only reserved-write providers remain valid for PCM
 chunks and are not silently accepted for final files. The local provider passes
-this contract; final Fish WAV routing and a verified opaque streaming-read facade
-remain separate adoption gates, so this primitive alone exposes no new route.
+this contract. Artifact streaming reads and the read-only speech-history opaque-
+reference consumer are implemented. Opaque responses omit `Content-Length` so a
+terminal length or digest failure remains observable, although already-read
+chunks are not authenticated independently. Final Fish WAV publication and
+lifecycle settlement remain separate adoption gates, so this primitive alone
+exposes no new route.

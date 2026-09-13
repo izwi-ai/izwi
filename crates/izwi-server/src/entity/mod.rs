@@ -275,6 +275,8 @@ pub mod speech_history_records {
         pub audio_mime_type: String,
         pub audio_filename: Option<String>,
         pub audio_storage_path: String,
+        pub audio_media_asset_id: Option<String>,
+        pub audio_artifact_tenant: Option<String>,
     }
     empty_relation!();
 }

@@ -16,11 +16,18 @@ struct RequiredUniqueIndex {
     columns: &'static [&'static str],
 }
 
-const REQUIRED_UNIQUE_INDEXES: &[RequiredUniqueIndex] = &[RequiredUniqueIndex {
-    table: "runtime_artifacts",
-    name: "idx_runtime_artifacts_attempt_publication",
-    columns: &["stage_id", "producer_attempt_token", "publication_key"],
-}];
+const REQUIRED_UNIQUE_INDEXES: &[RequiredUniqueIndex] = &[
+    RequiredUniqueIndex {
+        table: "runtime_artifacts",
+        name: "idx_runtime_artifacts_attempt_publication",
+        columns: &["stage_id", "producer_attempt_token", "publication_key"],
+    },
+    RequiredUniqueIndex {
+        table: "speech_history_records",
+        name: "idx_speech_history_audio_media_asset",
+        columns: &["audio_media_asset_id"],
+    },
+];
 
 const REQUIRED_SCHEMA_TABLES: &[RequiredSchemaTable] = &[
     RequiredSchemaTable {
@@ -220,6 +227,8 @@ const REQUIRED_SCHEMA_TABLES: &[RequiredSchemaTable] = &[
             "audio_mime_type",
             "audio_filename",
             "audio_storage_path",
+            "audio_media_asset_id",
+            "audio_artifact_tenant",
         ],
     },
     RequiredSchemaTable {

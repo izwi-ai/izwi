@@ -428,8 +428,14 @@ expired write ID. The reservation ledger is capped at 65,536 and each cleanup
 scan at 64. New durable Fish PCM replay chunks use tenant-scoped opaque artifact
 IDs and an atomic attempt-publication transaction; provider keys remain private.
 Existing raw-key replay rows stay compatible. Final WAVs, saved voices, history
-audio, references, other media, and gateway audio transport retain their
-existing provider path until explicitly migrated.
+audio producers, references, other media, and gateway audio transport retain
+their existing provider path until explicitly migrated. Speech-history storage
+can consume an exact tenant-scoped opaque reference and exposes it through the
+existing bounded streaming response; it rejects incomplete, ambiguous, wrong-
+tenant, metadata-mismatched, or multiply-owned references. Opaque completion,
+replacement, and deletion deliberately fail until transactional settlement is
+enabled. This read-only consumer support does not by itself migrate a producer
+or enable a gateway audio route.
 
 Reserved-write protocol v1 exposes reserved file publication as a separate
 capability. The built-in local provider streams a finalized file with a fixed

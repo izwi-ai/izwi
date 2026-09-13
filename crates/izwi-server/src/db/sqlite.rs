@@ -206,6 +206,34 @@ mod tests {
         .expect("legacy provider write count");
         assert_eq!(legacy_provider_writes, 1);
 
+        let legacy_speech = db
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT audio_storage_path, audio_media_asset_id, audio_artifact_tenant FROM speech_history_records WHERE id = 'legacy-speech'"
+                    .to_string(),
+            ))
+            .await
+            .expect("legacy speech query")
+            .expect("legacy speech row");
+        assert_eq!(
+            legacy_speech
+                .try_get_by_index::<String>(0)
+                .expect("legacy audio path"),
+            "generated-speech/legacy.wav"
+        );
+        assert_eq!(
+            legacy_speech
+                .try_get_by_index::<Option<String>>(1)
+                .expect("opaque media id"),
+            None
+        );
+        assert_eq!(
+            legacy_speech
+                .try_get_by_index::<Option<String>>(2)
+                .expect("opaque tenant"),
+            None
+        );
+
         std::env::remove_var("IZWI_DB_PATH");
         std::env::remove_var("IZWI_MEDIA_DIR");
     }
@@ -320,6 +348,8 @@ mod tests {
         ("speech_history_records", "processing_error"),
         ("speech_history_records", "runtime_stage_id"),
         ("speech_history_records", "runtime_attempt_token"),
+        ("speech_history_records", "audio_media_asset_id"),
+        ("speech_history_records", "audio_artifact_tenant"),
         ("diarization_records", "speaker_name_overrides_json"),
         ("diarization_records", "processing_status"),
         ("diarization_records", "processing_error"),
@@ -449,6 +479,17 @@ mod tests {
             audio_mime_type TEXT NOT NULL,
             audio_filename TEXT NULL,
             audio_storage_path TEXT NOT NULL
+        );
+
+        INSERT INTO speech_history_records (
+            id, created_at, route_kind, model_id, speaker, language, input_text,
+            voice_description, reference_text, generation_time_ms,
+            audio_duration_secs, rtf, tokens_generated, audio_mime_type,
+            audio_filename, audio_storage_path
+        ) VALUES (
+            'legacy-speech', 1, 'text_to_speech', NULL, NULL, NULL, 'legacy',
+            NULL, NULL, 1.0, NULL, NULL, NULL, 'audio/wav', 'legacy.wav',
+            'generated-speech/legacy.wav'
         );
 
         CREATE TABLE diarization_records (

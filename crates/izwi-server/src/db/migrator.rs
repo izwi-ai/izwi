@@ -232,7 +232,9 @@ const BASELINE_SCHEMA: &[&str] = &[
         tokens_generated INTEGER NULL,
         audio_mime_type TEXT NOT NULL,
         audio_filename TEXT NULL,
-        audio_storage_path TEXT NOT NULL
+        audio_storage_path TEXT NOT NULL,
+        audio_media_asset_id TEXT NULL,
+        audio_artifact_tenant TEXT NULL
     );
     "#,
     "CREATE INDEX IF NOT EXISTS idx_speech_history_route_created_at ON speech_history_records(route_kind, created_at DESC);",
@@ -601,6 +603,7 @@ const POST_COMPATIBILITY_SCHEMA: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_job_stages_queue_resources ON job_stages(queue_class, resource_target, required_backend, required_device_class, min_resource_memory_bytes, resource_concurrency_weight, status);",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_artifacts_attempt_publication ON runtime_artifacts(stage_id, producer_attempt_token, publication_key);",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_media_assets_source_profile ON media_assets(source_asset_id, canonical_profile_version);",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_speech_history_audio_media_asset ON speech_history_records(audio_media_asset_id);",
 ];
 
 const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
@@ -857,6 +860,16 @@ const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
     CompatibilityColumn {
         table: "speech_history_records",
         column: "runtime_attempt_token",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "speech_history_records",
+        column: "audio_media_asset_id",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "speech_history_records",
+        column: "audio_artifact_tenant",
         definition: "TEXT NULL",
     },
     CompatibilityColumn {

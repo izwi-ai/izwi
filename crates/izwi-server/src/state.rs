@@ -465,14 +465,14 @@ impl AppState {
         let chat_store = Arc::new(ChatStore::initialize()?);
         let transcription_store = Arc::new(TranscriptionStore::initialize()?);
         let diarization_store = Arc::new(DiarizationStore::initialize()?);
-        let speech_history_store = Arc::new(SpeechHistoryStore::initialize()?);
         let saved_voice_store = Arc::new(SavedVoiceStore::initialize()?);
         let studio_store = Arc::new(StudioProjectStore::initialize()?);
         let voice_store = Arc::new(VoiceStore::initialize()?);
         let voice_observation_store = Arc::new(VoiceObservationStore::initialize()?);
         let onboarding_store = Arc::new(OnboardingStore::initialize()?);
+        let store_database = StoreDatabase::from_default_path()?;
         let batch_runtime_store = Arc::new(BatchRuntimeStore::initialize_with_database(
-            StoreDatabase::from_default_path()?,
+            store_database.clone(),
         ));
         let media_storage: Arc<dyn MediaStorageProvider> = Arc::new(
             LocalMediaStorageProvider::new(storage_layout::resolve_media_root()),
@@ -482,6 +482,11 @@ impl AppState {
             media_storage.clone(),
             ArtifactStoreLimits::default(),
         )?);
+        let speech_history_store = Arc::new(SpeechHistoryStore::initialize_with_storage(
+            store_database,
+            media_storage.clone(),
+            artifact_store.clone(),
+        ));
         let media_ingest = Arc::new(MediaIngestService::new(
             media_storage,
             batch_runtime_store.clone(),
@@ -548,10 +553,6 @@ impl AppState {
             store_database.clone(),
             media_storage.clone(),
         ));
-        let speech_history_store = Arc::new(SpeechHistoryStore::initialize_with_storage(
-            store_database.clone(),
-            media_storage.clone(),
-        ));
         let saved_voice_store = Arc::new(SavedVoiceStore::initialize_with_storage(
             store_database.clone(),
             media_storage.clone(),
@@ -574,6 +575,11 @@ impl AppState {
             media_storage.clone(),
             ArtifactStoreLimits::default(),
         )?);
+        let speech_history_store = Arc::new(SpeechHistoryStore::initialize_with_storage(
+            store_database.clone(),
+            media_storage.clone(),
+            artifact_store.clone(),
+        ));
         let media_ingest = Arc::new(MediaIngestService::new(
             media_storage,
             batch_runtime_store.clone(),
