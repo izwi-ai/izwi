@@ -1,7 +1,7 @@
 //! OpenAI-compatible chat completions endpoints.
 
 use std::convert::Infallible;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
     extract::{rejection::JsonRejection, Extension, State},
@@ -24,7 +24,9 @@ use crate::app::chat_content::{
     flatten_content_parts, validate_media_inputs_for_variant, FlattenedMultimodalContent,
 };
 use crate::error::ApiError;
-use crate::gateway::{GatewayAdmissionGuard, GatewayChatExecution, GatewayState};
+use crate::gateway::{
+    GatewayAdmissionGuard, GatewayChatExecution, GatewayState, GatewayStreamMetricsGuard,
+};
 use crate::ids::new_uuid;
 use crate::state::AppState;
 use izwi_core::{
@@ -653,7 +655,8 @@ pub async fn completions(
         } else {
             spawn_chat_stream(state, execution_request)
         };
-        let stream_response = render_chat_stream(req, model_id, event_rx, compat_profile, None);
+        let stream_response =
+            render_chat_stream(req, model_id, event_rx, compat_profile, None, None);
         return Ok(stream_response.into_response());
     }
 
@@ -691,7 +694,8 @@ pub async fn gateway_completions(
         .await?;
     if req.stream.unwrap_or(false) {
         let model_id = execution_request.variant.dir_name().to_string();
-        let event_rx = match &state.chat_execution {
+        let dispatch_started = Instant::now();
+        let event_rx = match match &state.chat_execution {
             GatewayChatExecution::Pinned(remote) => {
                 spawn_remote_chat_stream_with_execution(
                     remote,
@@ -699,20 +703,36 @@ pub async fn gateway_completions(
                     &ctx,
                     execution_request,
                 )
-                .await?
+                .await
             }
             GatewayChatExecution::Registry(dispatcher) => {
                 dispatcher
                     .stream(state.request_timeout_secs, &ctx, execution_request)
-                    .await?
+                    .await
+            }
+        } {
+            Ok(event_rx) => {
+                state.record_dispatch_success(dispatch_started.elapsed());
+                event_rx
+            }
+            Err(error) => {
+                state.record_dispatch_failure(dispatch_started.elapsed());
+                return Err(error);
             }
         };
-        return Ok(
-            render_chat_stream(req, model_id, event_rx, compat_profile, Some(admission))
-                .into_response(),
-        );
+        let stream_observation = state.begin_stream_observation();
+        return Ok(render_chat_stream(
+            req,
+            model_id,
+            event_rx,
+            compat_profile,
+            Some(admission),
+            Some(stream_observation),
+        )
+        .into_response());
     }
-    let generation = match &state.chat_execution {
+    let dispatch_started = Instant::now();
+    let generation = match match &state.chat_execution {
         GatewayChatExecution::Pinned(remote) => {
             generate_remote_chat_with_execution(
                 remote,
@@ -720,12 +740,21 @@ pub async fn gateway_completions(
                 &ctx,
                 execution_request,
             )
-            .await?
+            .await
         }
         GatewayChatExecution::Registry(dispatcher) => {
             dispatcher
                 .generate(state.request_timeout_secs, &ctx, execution_request)
-                .await?
+                .await
+        }
+    } {
+        Ok(generation) => {
+            state.record_dispatch_success(dispatch_started.elapsed());
+            generation
+        }
+        Err(error) => {
+            state.record_dispatch_failure(dispatch_started.elapsed());
+            return Err(error);
         }
     };
     drop(admission);
@@ -829,6 +858,7 @@ fn render_chat_stream(
     mut event_rx: tokio::sync::mpsc::Receiver<ChatStreamEvent>,
     compat_profile: OpenAiCompatibilityProfile,
     admission: Option<GatewayAdmissionGuard>,
+    stream_observation: Option<GatewayStreamMetricsGuard>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let include_usage = req
         .stream_options
@@ -840,6 +870,7 @@ fn render_chat_stream(
 
     let stream = async_stream::stream! {
         let _admission = admission;
+        let mut stream_observation = stream_observation;
         let mut saw_terminal = false;
         while let Some(event) = event_rx.recv().await {
             let (payload, terminal) = match event {
@@ -888,6 +919,9 @@ fn render_chat_stream(
                     false,
                 ),
                 ChatStreamEvent::Completed(generation) => {
+                    if let Some(observation) = stream_observation.as_mut() {
+                        observation.record_completion();
+                    }
                     let (_, tool_calls, finish_reason) =
                         build_assistant_response_parts(generation.text);
                     let delta_tool_calls =
@@ -927,14 +961,21 @@ fn render_chat_stream(
                         true,
                     )
                 }
-                ChatStreamEvent::Failed(error) => (
-                    openai_chat_stream_error_payload(error),
-                    true,
-                ),
-                ChatStreamEvent::ShuttingDown => (
-                    openai_chat_stream_error_payload("Server is shutting down"),
-                    true,
-                ),
+                ChatStreamEvent::Failed(error) => {
+                    if let Some(observation) = stream_observation.as_mut() {
+                        observation.record_failure();
+                    }
+                    (openai_chat_stream_error_payload(error), true)
+                }
+                ChatStreamEvent::ShuttingDown => {
+                    if let Some(observation) = stream_observation.as_mut() {
+                        observation.record_failure();
+                    }
+                    (
+                        openai_chat_stream_error_payload("Server is shutting down"),
+                        true,
+                    )
+                }
             };
             if terminal {
                 saw_terminal = true;
@@ -945,6 +986,9 @@ fn render_chat_stream(
             }
         }
         if let Some(payload) = openai_chat_stream_interruption_payload(saw_terminal) {
+            if let Some(observation) = stream_observation.as_mut() {
+                observation.record_failure();
+            }
             yield Ok(Event::default().data(payload));
         }
         yield Ok(Event::default().data("[DONE]"));

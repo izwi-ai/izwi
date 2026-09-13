@@ -6,7 +6,7 @@
 
 use axum::{
     extract::{DefaultBodyLimit, Request, State},
-    http::StatusCode,
+    http::{header, HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -17,6 +17,8 @@ use izwi_hooks::{
     EnterpriseAction, EnterpriseHooks, HookMetadata, QuotaRequest, ResourceDescriptor,
 };
 use serde::Serialize;
+use std::fmt::{self, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -47,6 +49,7 @@ pub struct GatewayState {
     request_admission: Arc<Semaphore>,
     rate_quota: GatewayRateQuota,
     max_output_tokens: u32,
+    metrics: GatewayMetrics,
 }
 
 impl GatewayState {
@@ -68,6 +71,7 @@ impl GatewayState {
             request_admission: Arc::new(Semaphore::new(max_in_flight)),
             rate_quota: GatewayRateQuota::new(GatewayRateQuotaConfig::default()),
             max_output_tokens,
+            metrics: GatewayMetrics::default(),
         }
     }
 
@@ -89,6 +93,7 @@ impl GatewayState {
             request_admission: Arc::new(Semaphore::new(max_in_flight)),
             rate_quota: GatewayRateQuota::new(GatewayRateQuotaConfig::default()),
             max_output_tokens,
+            metrics: GatewayMetrics::default(),
         }
     }
 
@@ -144,6 +149,10 @@ impl GatewayState {
                 ApiError::service_unavailable("Gateway quota service unavailable")
             })?;
         if !decision.allowed {
+            self.metrics
+                .inner
+                .quota_rejections
+                .fetch_add(1, Ordering::Relaxed);
             return Err(ApiError::too_many_requests(
                 "Gateway tenant rate limit exceeded",
             ));
@@ -154,13 +163,31 @@ impl GatewayState {
         })?;
         match self.rate_quota.check(tenant_key) {
             Ok(GatewayRateDecision::Allowed) => Ok(()),
-            Ok(GatewayRateDecision::Limited) => Err(ApiError::too_many_requests(
-                "Gateway tenant rate limit exceeded",
-            )),
+            Ok(GatewayRateDecision::Limited) => {
+                self.metrics
+                    .inner
+                    .quota_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(ApiError::too_many_requests(
+                    "Gateway tenant rate limit exceeded",
+                ))
+            }
             Err(_) => Err(ApiError::service_unavailable(
                 "Gateway tenant rate limiter unavailable",
             )),
         }
+    }
+
+    pub(crate) fn record_dispatch_success(&self, elapsed: Duration) {
+        self.metrics.record_dispatch(elapsed, false);
+    }
+
+    pub(crate) fn record_dispatch_failure(&self, elapsed: Duration) {
+        self.metrics.record_dispatch(elapsed, true);
+    }
+
+    pub(crate) fn begin_stream_observation(&self) -> GatewayStreamMetricsGuard {
+        self.metrics.begin_stream()
     }
 
     pub fn mark_ready(&self) {
@@ -197,6 +224,252 @@ impl GatewayChatExecution {
 #[derive(Clone)]
 pub(crate) struct GatewayAdmissionGuard {
     _permit: Arc<OwnedSemaphorePermit>,
+    _active_request: Arc<GatewayActiveRequestGuard>,
+}
+
+const MAX_PROMETHEUS_RESPONSE_BYTES: usize = 4096;
+
+#[derive(Clone, Default)]
+struct GatewayMetrics {
+    inner: Arc<GatewayMetricCounters>,
+}
+
+impl fmt::Debug for GatewayMetrics {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GatewayMetrics")
+            .field("cardinality", &"fixed")
+            .finish()
+    }
+}
+
+#[derive(Default)]
+struct GatewayMetricCounters {
+    active_requests: AtomicU64,
+    active_streams: AtomicU64,
+    auth_rejections: AtomicU64,
+    quota_rejections: AtomicU64,
+    body_limit_rejections: AtomicU64,
+    routing_dispatch_failures: AtomicU64,
+    dispatch_calls: AtomicU64,
+    dispatch_latency_micros: AtomicU64,
+    http_2xx: AtomicU64,
+    http_3xx: AtomicU64,
+    http_4xx: AtomicU64,
+    http_5xx: AtomicU64,
+    http_other: AtomicU64,
+}
+
+struct GatewayActiveRequestGuard {
+    metrics: GatewayMetrics,
+}
+
+impl Drop for GatewayActiveRequestGuard {
+    fn drop(&mut self) {
+        self.metrics
+            .inner
+            .active_requests
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+pub(crate) struct GatewayStreamMetricsGuard {
+    metrics: GatewayMetrics,
+    terminal_observed: bool,
+}
+
+impl GatewayStreamMetricsGuard {
+    pub(crate) fn record_completion(&mut self) {
+        self.terminal_observed = true;
+    }
+
+    pub(crate) fn record_failure(&mut self) {
+        if !self.terminal_observed {
+            self.metrics
+                .inner
+                .routing_dispatch_failures
+                .fetch_add(1, Ordering::Relaxed);
+            self.terminal_observed = true;
+        }
+    }
+}
+
+impl Drop for GatewayStreamMetricsGuard {
+    fn drop(&mut self) {
+        if !self.terminal_observed {
+            self.metrics
+                .inner
+                .routing_dispatch_failures
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        self.metrics
+            .inner
+            .active_streams
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl GatewayMetrics {
+    fn begin_request(&self) -> GatewayActiveRequestGuard {
+        self.inner.active_requests.fetch_add(1, Ordering::Relaxed);
+        GatewayActiveRequestGuard {
+            metrics: self.clone(),
+        }
+    }
+
+    fn begin_stream(&self) -> GatewayStreamMetricsGuard {
+        self.inner.active_streams.fetch_add(1, Ordering::Relaxed);
+        GatewayStreamMetricsGuard {
+            metrics: self.clone(),
+            terminal_observed: false,
+        }
+    }
+
+    fn record_dispatch(&self, elapsed: Duration, failed: bool) {
+        self.inner.dispatch_calls.fetch_add(1, Ordering::Relaxed);
+        self.inner.dispatch_latency_micros.fetch_add(
+            u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        if failed {
+            self.inner
+                .routing_dispatch_failures
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_http_outcome(&self, status: StatusCode) {
+        let counter = match status.as_u16() / 100 {
+            2 => &self.inner.http_2xx,
+            3 => &self.inner.http_3xx,
+            4 => &self.inner.http_4xx,
+            5 => &self.inner.http_5xx,
+            _ => &self.inner.http_other,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn render_prometheus(&self) -> String {
+        let snapshot = self.snapshot();
+        let mut output = String::with_capacity(MAX_PROMETHEUS_RESPONSE_BYTES);
+        macro_rules! metric {
+            ($name:literal, $kind:literal, $help:literal, $value:expr) => {{
+                let _ = writeln!(output, concat!("# HELP ", $name, " ", $help));
+                let _ = writeln!(output, concat!("# TYPE ", $name, " ", $kind));
+                let _ = writeln!(output, concat!($name, " {}"), $value);
+            }};
+        }
+        metric!(
+            "izwi_gateway_active_requests",
+            "gauge",
+            "Currently admitted public requests.",
+            snapshot.active_requests
+        );
+        metric!(
+            "izwi_gateway_active_streams",
+            "gauge",
+            "Currently open public streams.",
+            snapshot.active_streams
+        );
+        metric!(
+            "izwi_gateway_auth_rejections_total",
+            "counter",
+            "Public or metrics authentication rejections.",
+            snapshot.auth_rejections
+        );
+        metric!(
+            "izwi_gateway_quota_rejections_total",
+            "counter",
+            "Public tenant quota rejections.",
+            snapshot.quota_rejections
+        );
+        metric!(
+            "izwi_gateway_body_limit_rejections_total",
+            "counter",
+            "Public body-size rejections.",
+            snapshot.body_limit_rejections
+        );
+        metric!(
+            "izwi_gateway_routing_dispatch_failures_total",
+            "counter",
+            "Worker routing, dispatch, or accepted-stream failures.",
+            snapshot.routing_dispatch_failures
+        );
+        metric!(
+            "izwi_gateway_dispatch_calls_total",
+            "counter",
+            "Worker dispatch calls observed.",
+            snapshot.dispatch_calls
+        );
+        metric!("izwi_gateway_dispatch_latency_microseconds_total", "counter", "Accumulated worker-call latency; streams stop at acceptance and non-streaming calls at completion.", snapshot.dispatch_latency_micros);
+        metric!(
+            "izwi_gateway_http_responses_2xx_total",
+            "counter",
+            "HTTP responses in the 2xx class.",
+            snapshot.http_2xx
+        );
+        metric!(
+            "izwi_gateway_http_responses_3xx_total",
+            "counter",
+            "HTTP responses in the 3xx class.",
+            snapshot.http_3xx
+        );
+        metric!(
+            "izwi_gateway_http_responses_4xx_total",
+            "counter",
+            "HTTP responses in the 4xx class.",
+            snapshot.http_4xx
+        );
+        metric!(
+            "izwi_gateway_http_responses_5xx_total",
+            "counter",
+            "HTTP responses in the 5xx class.",
+            snapshot.http_5xx
+        );
+        metric!(
+            "izwi_gateway_http_responses_other_total",
+            "counter",
+            "HTTP responses outside standard classes.",
+            snapshot.http_other
+        );
+        debug_assert!(output.len() <= MAX_PROMETHEUS_RESPONSE_BYTES);
+        output
+    }
+
+    fn snapshot(&self) -> GatewayMetricsSnapshot {
+        GatewayMetricsSnapshot {
+            active_requests: self.inner.active_requests.load(Ordering::Relaxed),
+            active_streams: self.inner.active_streams.load(Ordering::Relaxed),
+            auth_rejections: self.inner.auth_rejections.load(Ordering::Relaxed),
+            quota_rejections: self.inner.quota_rejections.load(Ordering::Relaxed),
+            body_limit_rejections: self.inner.body_limit_rejections.load(Ordering::Relaxed),
+            routing_dispatch_failures: self.inner.routing_dispatch_failures.load(Ordering::Relaxed),
+            dispatch_calls: self.inner.dispatch_calls.load(Ordering::Relaxed),
+            dispatch_latency_micros: self.inner.dispatch_latency_micros.load(Ordering::Relaxed),
+            http_2xx: self.inner.http_2xx.load(Ordering::Relaxed),
+            http_3xx: self.inner.http_3xx.load(Ordering::Relaxed),
+            http_4xx: self.inner.http_4xx.load(Ordering::Relaxed),
+            http_5xx: self.inner.http_5xx.load(Ordering::Relaxed),
+            http_other: self.inner.http_other.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct GatewayMetricsSnapshot {
+    active_requests: u64,
+    active_streams: u64,
+    auth_rejections: u64,
+    quota_rejections: u64,
+    body_limit_rejections: u64,
+    routing_dispatch_failures: u64,
+    dispatch_calls: u64,
+    dispatch_latency_micros: u64,
+    http_2xx: u64,
+    http_3xx: u64,
+    http_4xx: u64,
+    http_5xx: u64,
+    http_other: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -281,6 +554,69 @@ async fn api_not_found() -> StatusCode {
     StatusCode::NOT_FOUND
 }
 
+async fn gateway_metrics(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
+    if !state.perimeter.metrics_enabled() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if !state.perimeter.authenticate_metrics(&headers) {
+        state
+            .metrics
+            .inner
+            .auth_rejections
+            .fetch_add(1, Ordering::Relaxed);
+        let mut response = StatusCode::UNAUTHORIZED.into_response();
+        response.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            axum::http::HeaderValue::from_static("Bearer realm=\"izwi-gateway-metrics\""),
+        );
+        return response;
+    }
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        state.metrics.render_prometheus(),
+    )
+        .into_response()
+}
+
+async fn observe_gateway_http_outcome(
+    State(state): State<GatewayState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let response = next.run(request).await;
+    state.metrics.record_http_outcome(response.status());
+    response
+}
+
+async fn observe_gateway_v1_rejections(
+    State(state): State<GatewayState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let response = next.run(request).await;
+    match response.status() {
+        StatusCode::UNAUTHORIZED => {
+            state
+                .metrics
+                .inner
+                .auth_rejections
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        StatusCode::PAYLOAD_TOO_LARGE => {
+            state
+                .metrics
+                .inner
+                .body_limit_rejections
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+    response
+}
+
 async fn bounded_gateway_admission(
     State(state): State<GatewayState>,
     mut request: Request,
@@ -304,6 +640,7 @@ async fn bounded_gateway_admission(
     }
     request.extensions_mut().insert(GatewayAdmissionGuard {
         _permit: Arc::new(permit),
+        _active_request: Arc::new(state.metrics.begin_request()),
     });
     next.run(request).await
 }
@@ -368,10 +705,16 @@ pub fn create_gateway_router(state: GatewayState, serve_config: &ServeRuntimeCon
         .layer(middleware::from_fn_with_state(
             state.clone(),
             attach_gateway_request_context,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            observe_gateway_v1_rejections,
         ));
     let app = Router::new()
         .route("/livez", get(live_check))
         .route("/readyz", get(ready_check))
+        .route("/internal/metrics", get(gateway_metrics))
+        .route("/internal/metrics/prometheus", get(gateway_metrics))
         .route(
             "/openapi.json",
             get(crate::api::openapi::gateway_openapi_json),
@@ -379,11 +722,15 @@ pub fn create_gateway_router(state: GatewayState, serve_config: &ServeRuntimeCon
         .merge(crate::api::docs::router())
         .nest("/v1", v1_routes)
         .fallback(api_not_found)
-        .with_state(state);
+        .with_state(state.clone());
 
     apply_gateway_cors(app, serve_config)
         .layer(trace_layer)
         .layer(middleware::from_fn(attach_gateway_request_id))
+        .layer(middleware::from_fn_with_state(
+            state,
+            observe_gateway_http_outcome,
+        ))
 }
 
 fn apply_gateway_cors(app: Router, serve_config: &ServeRuntimeConfig) -> Router {
@@ -443,6 +790,7 @@ mod tests {
     };
 
     const TEST_API_KEY: &str = "test-public-api-key-123456";
+    const TEST_METRICS_API_KEY: &str = "test-metrics-api-key-654321";
 
     fn test_perimeter() -> GatewayPerimeterConfig {
         GatewayPerimeterConfig::new_for_test(TEST_API_KEY, 1024 * 1024)
@@ -480,6 +828,14 @@ mod tests {
             .expect("request should build")
     }
 
+    fn get_with_bearer(path: &str, bearer: &str) -> Request<Body> {
+        Request::builder()
+            .uri(path)
+            .header("authorization", format!("Bearer {bearer}"))
+            .body(Body::empty())
+            .expect("request should build")
+    }
+
     fn valid_chat_request(max_tokens: usize) -> Request<Body> {
         Request::builder()
             .method("POST")
@@ -494,6 +850,43 @@ mod tests {
                 .to_string(),
             ))
             .expect("chat request should build")
+    }
+
+    #[test]
+    fn fixed_gateway_metrics_track_lifetimes_latency_and_status_classes() {
+        let metrics = GatewayMetrics::default();
+        let request = metrics.begin_request();
+        let mut stream = metrics.begin_stream();
+        metrics.record_dispatch(Duration::from_micros(7), true);
+        for status in [
+            StatusCode::CONTINUE,
+            StatusCode::OK,
+            StatusCode::TEMPORARY_REDIRECT,
+            StatusCode::BAD_REQUEST,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            metrics.record_http_outcome(status);
+        }
+        let active = metrics.snapshot();
+        assert_eq!(active.active_requests, 1);
+        assert_eq!(active.active_streams, 1);
+        assert_eq!(active.dispatch_calls, 1);
+        assert_eq!(active.dispatch_latency_micros, 7);
+        assert_eq!(active.routing_dispatch_failures, 1);
+        assert_eq!(active.http_2xx, 1);
+        assert_eq!(active.http_3xx, 1);
+        assert_eq!(active.http_4xx, 1);
+        assert_eq!(active.http_5xx, 1);
+        assert_eq!(active.http_other, 1);
+        stream.record_completion();
+        drop(stream);
+        drop(request);
+        assert_eq!(metrics.snapshot().active_requests, 0);
+        assert_eq!(metrics.snapshot().active_streams, 0);
+        let abandoned_stream = metrics.begin_stream();
+        drop(abandoned_stream);
+        assert_eq!(metrics.snapshot().routing_dispatch_failures, 2);
+        assert!(metrics.render_prometheus().len() <= MAX_PROMETHEUS_RESPONSE_BYTES);
     }
 
     async fn registry_gateway_state(model: ModelVariant) -> (GatewayState, MockWorker) {
@@ -567,7 +960,7 @@ mod tests {
     async fn public_chat_nonstream_and_stream_use_registry_dispatcher() {
         let model = ModelVariant::Qwen34BGguf;
         let (state, _worker) = registry_gateway_state(model).await;
-        let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+        let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
 
         assert_eq!(
             send(app.clone(), get("/readyz")).await.status(),
@@ -621,6 +1014,11 @@ mod tests {
         let body = String::from_utf8(body.to_vec()).expect("SSE should be UTF-8");
         assert!(body.contains("deterministic mock response"));
         assert!(body.contains("data: [DONE]"));
+        let metrics = state.metrics.snapshot();
+        assert_eq!(metrics.dispatch_calls, 2);
+        assert_eq!(metrics.routing_dispatch_failures, 0);
+        assert_eq!(metrics.active_requests, 0);
+        assert_eq!(metrics.active_streams, 0);
     }
 
     #[tokio::test]
@@ -1141,6 +1539,8 @@ mod tests {
         assert_eq!(first.status(), StatusCode::OK);
         assert_eq!(worker.active_invocations(), 1);
         assert_eq!(state.request_admission.available_permits(), 0);
+        assert_eq!(state.metrics.snapshot().active_requests, 1);
+        assert_eq!(state.metrics.snapshot().active_streams, 1);
 
         state.begin_drain();
 
@@ -1168,6 +1568,8 @@ mod tests {
         .await
         .expect("worker teardown should be confirmed");
         assert_eq!(state.request_admission.available_permits(), 1);
+        assert_eq!(state.metrics.snapshot().active_requests, 0);
+        assert_eq!(state.metrics.snapshot().active_streams, 0);
 
         let still_draining = send(app, stream_request()).await;
         assert_eq!(still_draining.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -1176,7 +1578,7 @@ mod tests {
     #[tokio::test]
     async fn gateway_v1_requires_api_key_while_probes_and_docs_remain_public() {
         let state = unreachable_gateway_state(test_perimeter());
-        let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+        let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
 
         for path in ["/livez", "/readyz", "/openapi.json", "/docs"] {
             assert_ne!(
@@ -1210,6 +1612,91 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"]["type"], "authentication_error");
         assert_eq!(body["error"]["code"], "401");
+        assert_eq!(state.metrics.snapshot().auth_rejections, 1);
+    }
+
+    #[tokio::test]
+    async fn gateway_metrics_are_absent_without_a_separate_credential() {
+        let app = create_gateway_router(
+            unreachable_gateway_state(test_perimeter()),
+            &ServeRuntimeConfig::default(),
+        );
+        for path in ["/internal/metrics", "/internal/metrics/prometheus"] {
+            assert_eq!(
+                send_raw(app.clone(), get(path)).await.status(),
+                StatusCode::NOT_FOUND
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn gateway_metrics_require_their_own_key_and_have_fixed_redacted_cardinality() {
+        let perimeter = test_perimeter()
+            .with_metrics_api_key_for_test(TEST_METRICS_API_KEY)
+            .unwrap();
+        let state = unreachable_gateway_state(perimeter);
+        let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
+
+        assert_eq!(
+            send_raw(app.clone(), get("/internal/metrics"))
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            send_raw(
+                app.clone(),
+                get_with_bearer("/internal/metrics", TEST_API_KEY),
+            )
+            .await
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let response = send_raw(
+            app,
+            get_with_bearer("/internal/metrics/prometheus", TEST_METRICS_API_KEY),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), MAX_PROMETHEUS_RESPONSE_BYTES)
+            .await
+            .expect("metrics response must remain bounded");
+        let body = String::from_utf8(body.to_vec()).expect("metrics must be UTF-8");
+        assert!(body.contains("izwi_gateway_active_requests 0"));
+        assert!(body.contains("izwi_gateway_auth_rejections_total 2"));
+        assert_eq!(body.matches("# TYPE ").count(), 13);
+        assert!(
+            !body.contains('{'),
+            "metrics must not contain dynamic labels"
+        );
+        for private in [
+            TEST_API_KEY,
+            TEST_METRICS_API_KEY,
+            "test-gateway-principal",
+            "test-tenant",
+            ModelVariant::Qwen34BGguf.dir_name(),
+            "quota test",
+        ] {
+            assert!(!body.contains(private));
+        }
+        let snapshot = state.metrics.snapshot();
+        assert_eq!(snapshot.auth_rejections, 2);
+        assert_eq!(snapshot.http_2xx, 1);
+        assert_eq!(snapshot.http_4xx, 2);
+    }
+
+    #[tokio::test]
+    async fn gateway_dispatch_failure_and_latency_are_counted_without_dynamic_dimensions() {
+        let state = unreachable_gateway_state(test_perimeter());
+        let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
+        let response = send(app, valid_chat_request(4)).await;
+        assert_ne!(response.status(), StatusCode::OK);
+        let snapshot = state.metrics.snapshot();
+        assert_eq!(snapshot.dispatch_calls, 1);
+        assert_eq!(snapshot.routing_dispatch_failures, 1);
+        assert_eq!(snapshot.active_requests, 0);
+        assert_eq!(snapshot.active_streams, 0);
+        assert_eq!(snapshot.http_5xx, 1);
     }
 
     #[tokio::test]
@@ -1239,10 +1726,8 @@ mod tests {
     #[tokio::test]
     async fn gateway_chat_body_limit_rejects_before_json_decode_with_uniform_error() {
         let perimeter = GatewayPerimeterConfig::new_for_test(TEST_API_KEY, 1024).unwrap();
-        let app = create_gateway_router(
-            unreachable_gateway_state(perimeter),
-            &ServeRuntimeConfig::default(),
-        );
+        let state = unreachable_gateway_state(perimeter);
+        let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
         let response = send(
             app,
             Request::builder()
@@ -1264,14 +1749,14 @@ mod tests {
             body["error"]["message"],
             "Gateway chat request body exceeds the configured limit"
         );
+        assert_eq!(state.metrics.snapshot().body_limit_rejections, 1);
+        assert_eq!(state.metrics.snapshot().http_4xx, 1);
     }
 
     #[tokio::test]
     async fn gateway_request_id_is_bounded_and_validated_before_tracing() {
-        let app = create_gateway_router(
-            unreachable_gateway_state(test_perimeter()),
-            &ServeRuntimeConfig::default(),
-        );
+        let state = unreachable_gateway_state(test_perimeter());
+        let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
         let response = send_raw(
             app,
             Request::builder()
@@ -1292,6 +1777,7 @@ mod tests {
             .expect("rejection should carry a server-authored request id");
         assert!(request_id.len() <= MAX_GATEWAY_REQUEST_ID_BYTES);
         uuid::Uuid::parse_str(request_id).expect("replacement should be a UUID");
+        assert_eq!(state.metrics.snapshot().http_4xx, 1);
     }
 
     #[tokio::test]
@@ -1402,7 +1888,7 @@ mod tests {
         hooks.quotas = quota.clone();
         let state = unreachable_gateway_state_with_hooks(test_perimeter(), hooks)
             .with_rate_quota_config(GatewayRateQuotaConfig::new(60, 4, 8).unwrap());
-        let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+        let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
         let mut request = valid_chat_request(100);
         request.headers_mut().insert(
             "x-principal-id",
@@ -1435,6 +1921,7 @@ mod tests {
             "Gateway tenant rate limit exceeded"
         );
         assert!(!body.to_string().contains("private quota detail"));
+        assert_eq!(state.metrics.snapshot().quota_rejections, 1);
     }
 
     #[tokio::test]

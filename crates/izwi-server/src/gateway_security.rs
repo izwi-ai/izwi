@@ -25,6 +25,7 @@ const DEFAULT_PRINCIPAL_ID: &str = "gateway-api-key";
 const DEFAULT_TENANT_ID: &str = "default";
 
 const API_KEY_REF_ENV: &str = "IZWI_GATEWAY_API_KEY_REF";
+const METRICS_API_KEY_REF_ENV: &str = "IZWI_GATEWAY_METRICS_API_KEY_REF";
 const PRINCIPAL_ID_ENV: &str = "IZWI_GATEWAY_API_PRINCIPAL_ID";
 const TENANT_ID_ENV: &str = "IZWI_GATEWAY_TENANT_ID";
 const MAX_CHAT_BODY_ENV: &str = "IZWI_GATEWAY_MAX_CHAT_BODY_BYTES";
@@ -34,6 +35,8 @@ const TRUSTED_INGRESS_TLS_ENV: &str = "IZWI_GATEWAY_TRUSTED_INGRESS_TLS";
 pub struct GatewayPerimeterConfig {
     api_key: Arc<[u8]>,
     api_key_ref: Arc<str>,
+    metrics_api_key: Option<Arc<[u8]>>,
+    metrics_api_key_ref: Option<Arc<str>>,
     principal: Principal,
     max_chat_body_bytes: usize,
     trusted_ingress_tls: bool,
@@ -45,7 +48,12 @@ impl fmt::Debug for GatewayPerimeterConfig {
             .debug_struct("GatewayPerimeterConfig")
             .field("api_key", &"[REDACTED]")
             .field("api_key_ref", &self.api_key_ref)
-            .field("principal", &self.principal)
+            .field(
+                "metrics_api_key",
+                &self.metrics_api_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("metrics_api_key_ref", &self.metrics_api_key_ref)
+            .field("principal", &"[REDACTED]")
             .field("max_chat_body_bytes", &self.max_chat_body_bytes)
             .field("trusted_ingress_tls", &self.trusted_ingress_tls)
             .finish()
@@ -70,6 +78,7 @@ impl GatewayPerimeterConfig {
             .ok_or(GatewayPerimeterConfigError::MissingSecret)?
             .into_string()
             .map_err(|_| GatewayPerimeterConfigError::InvalidSecret)?;
+        let metrics_credential = optional_metrics_credential_from_env()?;
         let principal_id = bounded_identity_env(PRINCIPAL_ID_ENV, DEFAULT_PRINCIPAL_ID)?;
         let tenant_id = bounded_identity_env(TENANT_ID_ENV, DEFAULT_TENANT_ID)?;
         let max_chat_body_bytes = bounded_body_limit_from_env()?;
@@ -81,6 +90,7 @@ impl GatewayPerimeterConfig {
             tenant_id,
             max_chat_body_bytes,
             trusted_ingress_tls,
+            metrics_credential,
         )
     }
 
@@ -98,7 +108,24 @@ impl GatewayPerimeterConfig {
             "test-tenant".to_string(),
             max_chat_body_bytes,
             true,
+            None,
         )
+    }
+
+    #[doc(hidden)]
+    pub fn with_metrics_api_key_for_test(
+        mut self,
+        metrics_api_key: impl Into<String>,
+    ) -> Result<Self, GatewayPerimeterConfigError> {
+        let metrics_api_key = metrics_api_key.into();
+        validate_secret(&metrics_api_key)
+            .map_err(|_| GatewayPerimeterConfigError::InvalidMetricsSecret)?;
+        if constant_time_eq(metrics_api_key.as_bytes(), self.api_key.as_ref()) {
+            return Err(GatewayPerimeterConfigError::ReusedMetricsSecret);
+        }
+        self.metrics_api_key = Some(Arc::from(metrics_api_key.into_bytes()));
+        self.metrics_api_key_ref = Some(Arc::from("test-only"));
+        Ok(self)
     }
 
     fn new(
@@ -108,14 +135,16 @@ impl GatewayPerimeterConfig {
         tenant_id: String,
         max_chat_body_bytes: usize,
         trusted_ingress_tls: bool,
+        metrics_credential: Option<(String, String)>,
     ) -> Result<Self, GatewayPerimeterConfigError> {
-        if !(MIN_API_KEY_BYTES..=MAX_API_KEY_BYTES).contains(&api_key.len())
-            || !api_key
-                .as_bytes()
-                .iter()
-                .all(|byte| byte.is_ascii_graphic())
+        validate_secret(&api_key)?;
+        if metrics_credential
+            .as_ref()
+            .is_some_and(|(metrics_api_key, _)| {
+                constant_time_eq(metrics_api_key.as_bytes(), api_key.as_bytes())
+            })
         {
-            return Err(GatewayPerimeterConfigError::InvalidSecret);
+            return Err(GatewayPerimeterConfigError::ReusedMetricsSecret);
         }
         if !(MIN_GATEWAY_CHAT_BODY_BYTES..=MAX_GATEWAY_CHAT_BODY_BYTES)
             .contains(&max_chat_body_bytes)
@@ -128,6 +157,10 @@ impl GatewayPerimeterConfig {
         Ok(Self {
             api_key: Arc::from(api_key.into_bytes()),
             api_key_ref: Arc::from(api_key_ref),
+            metrics_api_key: metrics_credential
+                .as_ref()
+                .map(|(secret, _)| Arc::from(secret.as_bytes())),
+            metrics_api_key_ref: metrics_credential.map(|(_, secret_ref)| Arc::from(secret_ref)),
             principal: Principal {
                 id: principal_id,
                 display_name: None,
@@ -141,24 +174,20 @@ impl GatewayPerimeterConfig {
     }
 
     pub(crate) fn authenticate(&self, headers: &HeaderMap) -> Option<Principal> {
-        let mut authorization_values = headers.get_all(header::AUTHORIZATION).iter();
-        let value = authorization_values.next()?.to_str().ok()?;
-        if authorization_values.next().is_some() {
-            return None;
-        }
-        if value.len() > MAX_API_KEY_BYTES.saturating_add(7) {
-            return None;
-        }
-        let (scheme, supplied) = value.split_once(' ')?;
-        if !scheme.eq_ignore_ascii_case("bearer")
-            || supplied.is_empty()
-            || supplied.len() > MAX_API_KEY_BYTES
-            || supplied.chars().any(char::is_whitespace)
-            || !constant_time_eq(supplied.as_bytes(), self.api_key.as_ref())
-        {
+        if !authenticate_bearer(headers, self.api_key.as_ref()) {
             return None;
         }
         Some(self.principal.clone())
+    }
+
+    pub(crate) fn metrics_enabled(&self) -> bool {
+        self.metrics_api_key.is_some()
+    }
+
+    pub(crate) fn authenticate_metrics(&self, headers: &HeaderMap) -> bool {
+        self.metrics_api_key
+            .as_deref()
+            .is_some_and(|expected| authenticate_bearer(headers, expected))
     }
 
     pub fn max_chat_body_bytes(&self) -> usize {
@@ -193,6 +222,34 @@ impl GatewayPerimeterConfig {
     }
 }
 
+fn authenticate_bearer(headers: &HeaderMap, expected: &[u8]) -> bool {
+    let mut authorization_values = headers.get_all(header::AUTHORIZATION).iter();
+    let Some(value) = authorization_values
+        .next()
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    if authorization_values.next().is_some() {
+        return false;
+    }
+    if value.len() > MAX_API_KEY_BYTES.saturating_add(7) {
+        return false;
+    }
+    let Some((scheme, supplied)) = value.split_once(' ') else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("bearer")
+        || supplied.is_empty()
+        || supplied.len() > MAX_API_KEY_BYTES
+        || supplied.chars().any(char::is_whitespace)
+        || !constant_time_eq(supplied.as_bytes(), expected)
+    {
+        return false;
+    }
+    true
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum GatewayPerimeterConfigError {
     #[error("gateway API key reference must be a bounded env:VARIABLE reference")]
@@ -201,6 +258,14 @@ pub enum GatewayPerimeterConfigError {
     MissingSecret,
     #[error("gateway API key does not satisfy the bounded credential policy")]
     InvalidSecret,
+    #[error("gateway metrics API key reference must be a bounded env:VARIABLE reference")]
+    InvalidMetricsSecretReference,
+    #[error("gateway metrics API key environment reference is not set")]
+    MissingMetricsSecret,
+    #[error("gateway metrics API key does not satisfy the bounded credential policy")]
+    InvalidMetricsSecret,
+    #[error("gateway metrics API key must differ from the public inference key")]
+    ReusedMetricsSecret,
     #[error("gateway principal or tenant identity is invalid")]
     InvalidIdentity,
     #[error("gateway chat body limit is outside the supported range")]
@@ -213,6 +278,38 @@ pub enum GatewayPerimeterConfigError {
     InvalidCorsOrigin,
     #[error("non-loopback plaintext gateway binding requires IZWI_GATEWAY_TRUSTED_INGRESS_TLS=1")]
     UntrustedPlaintextBind,
+}
+
+fn optional_metrics_credential_from_env(
+) -> Result<Option<(String, String)>, GatewayPerimeterConfigError> {
+    let Some(secret_ref) = std::env::var_os(METRICS_API_KEY_REF_ENV) else {
+        return Ok(None);
+    };
+    let secret_ref = secret_ref
+        .into_string()
+        .map_err(|_| GatewayPerimeterConfigError::InvalidMetricsSecretReference)?;
+    if secret_ref.is_empty() || secret_ref.len() > MAX_SECRET_REF_BYTES {
+        return Err(GatewayPerimeterConfigError::InvalidMetricsSecretReference);
+    }
+    let variable = secret_ref
+        .strip_prefix("env:")
+        .filter(|name| valid_env_name(name))
+        .ok_or(GatewayPerimeterConfigError::InvalidMetricsSecretReference)?;
+    let secret = std::env::var_os(variable)
+        .ok_or(GatewayPerimeterConfigError::MissingMetricsSecret)?
+        .into_string()
+        .map_err(|_| GatewayPerimeterConfigError::InvalidMetricsSecret)?;
+    validate_secret(&secret).map_err(|_| GatewayPerimeterConfigError::InvalidMetricsSecret)?;
+    Ok(Some((secret, secret_ref)))
+}
+
+fn validate_secret(secret: &str) -> Result<(), GatewayPerimeterConfigError> {
+    if !(MIN_API_KEY_BYTES..=MAX_API_KEY_BYTES).contains(&secret.len())
+        || !secret.as_bytes().iter().all(|byte| byte.is_ascii_graphic())
+    {
+        return Err(GatewayPerimeterConfigError::InvalidSecret);
+    }
+    Ok(())
 }
 
 fn bounded_identity_env(name: &str, default: &str) -> Result<String, GatewayPerimeterConfigError> {
@@ -284,11 +381,14 @@ mod tests {
     use axum::http::HeaderValue;
 
     const TEST_API_KEY: &str = "test-public-api-key-123456";
+    const TEST_METRICS_KEY: &str = "test-metrics-api-key-654321";
 
     fn clear_gateway_security_env() {
         for name in [
             API_KEY_REF_ENV,
+            METRICS_API_KEY_REF_ENV,
             "IZWI_TEST_GATEWAY_SECRET",
+            "IZWI_TEST_GATEWAY_METRICS_SECRET",
             PRINCIPAL_ID_ENV,
             TENANT_ID_ENV,
             MAX_CHAT_BODY_ENV,
@@ -309,7 +409,10 @@ mod tests {
         std::env::set_var(MAX_CHAT_BODY_ENV, "4096");
         let config = GatewayPerimeterConfig::from_env().unwrap();
         assert_eq!(config.max_chat_body_bytes(), 4096);
-        assert!(!format!("{config:?}").contains(TEST_API_KEY));
+        let debug = format!("{config:?}");
+        assert!(!debug.contains(TEST_API_KEY));
+        assert!(!debug.contains("service-principal"));
+        assert!(!debug.contains("tenant-a"));
 
         std::env::set_var(API_KEY_REF_ENV, TEST_API_KEY);
         assert_eq!(
@@ -327,6 +430,52 @@ mod tests {
         let debug = format!("{config:?}");
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains(TEST_API_KEY));
+    }
+
+    #[test]
+    fn gateway_metrics_key_is_optional_separate_and_redacted() {
+        let _guard = crate::test_support::env_lock();
+        clear_gateway_security_env();
+        std::env::set_var(API_KEY_REF_ENV, "env:IZWI_TEST_GATEWAY_SECRET");
+        std::env::set_var("IZWI_TEST_GATEWAY_SECRET", TEST_API_KEY);
+        std::env::set_var(
+            METRICS_API_KEY_REF_ENV,
+            "env:IZWI_TEST_GATEWAY_METRICS_SECRET",
+        );
+        std::env::set_var("IZWI_TEST_GATEWAY_METRICS_SECRET", TEST_METRICS_KEY);
+        let config = GatewayPerimeterConfig::from_env().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer test-metrics-api-key-654321"),
+        );
+        assert!(config.metrics_enabled());
+        assert!(config.authenticate_metrics(&headers));
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer test-public-api-key-123456"),
+        );
+        assert!(!config.authenticate_metrics(&headers));
+        let debug = format!("{config:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains(TEST_API_KEY));
+        assert!(!debug.contains(TEST_METRICS_KEY));
+
+        std::env::set_var("IZWI_TEST_GATEWAY_METRICS_SECRET", TEST_API_KEY);
+        assert_eq!(
+            GatewayPerimeterConfig::from_env().unwrap_err(),
+            GatewayPerimeterConfigError::ReusedMetricsSecret
+        );
+        clear_gateway_security_env();
+    }
+
+    #[test]
+    fn gateway_metrics_key_absence_keeps_internal_scrape_disabled() {
+        let config =
+            GatewayPerimeterConfig::new_for_test(TEST_API_KEY, DEFAULT_GATEWAY_MAX_CHAT_BODY_BYTES)
+                .unwrap();
+        assert!(!config.metrics_enabled());
+        assert!(!config.authenticate_metrics(&HeaderMap::new()));
     }
 
     #[test]
@@ -383,6 +532,7 @@ mod tests {
             "tenant".to_string(),
             DEFAULT_GATEWAY_MAX_CHAT_BODY_BYTES,
             false,
+            None,
         )
         .unwrap();
         let defaults = ServeRuntimeConfig::default();
@@ -413,6 +563,7 @@ mod tests {
             "tenant".to_string(),
             DEFAULT_GATEWAY_MAX_CHAT_BODY_BYTES,
             true,
+            None,
         )
         .unwrap();
         trusted_ingress
