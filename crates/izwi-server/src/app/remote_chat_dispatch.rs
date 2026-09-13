@@ -16,13 +16,14 @@ use izwi_serving_protocol::{
 use tokio::sync::mpsc;
 
 use super::chat::{
-    collect_started_remote_chat, map_worker_client_error, prepare_remote_chat_invocation,
-    retarget_remote_chat_invocation, spawn_started_remote_chat_stream_with_execution,
-    start_remote_chat_invocation, ChatExecutionRequest, ChatStreamEvent, RemoteChatExecution,
-    RemoteChatExecutionConfig,
+    collect_started_remote_chat_with_tenant, map_worker_client_error,
+    prepare_remote_chat_invocation, retarget_remote_chat_invocation,
+    spawn_started_remote_chat_stream_with_tenant, start_remote_chat_invocation_with_tenant,
+    ChatExecutionRequest, ChatStreamEvent, RemoteChatExecution, RemoteChatExecutionConfig,
 };
 use crate::api::request_context::RequestContext;
 use crate::error::ApiError;
+use crate::gateway_tenant_concurrency::{BoundTenantWorkLease, UnboundTenantWorkLease};
 use crate::worker_registry::{
     BackendPolicy, SelectedWorker, WorkerRegistry, WorkerRegistryError, WorkerSelectionRequest,
 };
@@ -115,52 +116,64 @@ impl RemoteChatDispatcher {
         Ok(())
     }
 
-    pub async fn generate(
+    pub(crate) async fn generate(
         &self,
         request_timeout_secs: u64,
         context: &RequestContext,
         request: ChatExecutionRequest,
+        tenant_work: UnboundTenantWorkLease,
     ) -> Result<ChatGeneration, ApiError> {
         let StartedDispatch {
             remote,
             mut stream,
+            tenant_work,
             selected,
             started,
         } = self
-            .start(request_timeout_secs, context, request, false)
+            .start(request_timeout_secs, context, request, false, tenant_work)
             .await?;
         let key = selected.key.clone();
         let _dispatch = selected.dispatch;
         let registry = self.registry.clone();
-        collect_started_remote_chat(&remote, &mut stream, started, move |error| {
-            report_stream_error(&registry, &key, error);
-        })
+        collect_started_remote_chat_with_tenant(
+            &remote,
+            &mut stream,
+            started,
+            move |error| {
+                report_stream_error(&registry, &key, error);
+            },
+            tenant_work,
+        )
         .await
     }
 
     /// Returns only after the selected worker has emitted a contract-valid
     /// accepted event. The forwarding task owns the local dispatch reservation
     /// through terminal delivery or public-consumer disconnect.
-    pub async fn stream(
+    pub(crate) async fn stream(
         &self,
         request_timeout_secs: u64,
         context: &RequestContext,
         request: ChatExecutionRequest,
+        tenant_work: UnboundTenantWorkLease,
     ) -> Result<mpsc::Receiver<ChatStreamEvent>, ApiError> {
         let StartedDispatch {
             remote,
             stream,
+            tenant_work,
             selected,
             ..
         } = self
-            .start(request_timeout_secs, context, request, true)
+            .start(request_timeout_secs, context, request, true, tenant_work)
             .await?;
         let registry = self.registry.clone();
         let key = selected.key.clone();
-        let mut worker_events =
-            spawn_started_remote_chat_stream_with_execution(&remote, stream, move |error| {
-                report_stream_error(&registry, &key, error)
-            });
+        let mut worker_events = spawn_started_remote_chat_stream_with_tenant(
+            &remote,
+            stream,
+            move |error| report_stream_error(&registry, &key, error),
+            tenant_work,
+        );
 
         let (public_tx, public_rx) = mpsc::channel(FORWARDED_CHAT_STREAM_CAPACITY);
         tokio::spawn(async move {
@@ -168,7 +181,14 @@ impl RemoteChatDispatcher {
             // Dropping either receiver propagates cancellation toward the
             // exact accepted attempt; there is intentionally no reselection.
             let _dispatch = selected.dispatch;
-            while let Some(event) = worker_events.recv().await {
+            loop {
+                let event = tokio::select! {
+                    event = worker_events.recv() => event,
+                    () = public_tx.closed() => break,
+                };
+                let Some(event) = event else {
+                    break;
+                };
                 let terminal = matches!(
                     event,
                     ChatStreamEvent::Completed(_)
@@ -189,6 +209,7 @@ impl RemoteChatDispatcher {
         context: &RequestContext,
         request: ChatExecutionRequest,
         streaming: bool,
+        tenant_work: UnboundTenantWorkLease,
     ) -> Result<StartedDispatch, ApiError> {
         let selection = self.selection_request(&request, streaming)?;
         let mut selected = self
@@ -200,25 +221,38 @@ impl RemoteChatDispatcher {
             prepare_remote_chat_invocation(&remote, request_timeout_secs, context, request)?;
         let started = Instant::now();
 
-        let retry_delay = match start_remote_chat_invocation(&remote, invocation.clone()).await {
-            Ok(stream) => {
+        let retry_delay = match start_remote_chat_invocation_with_tenant(
+            &remote,
+            invocation.clone(),
+            tenant_work,
+        )
+        .await
+        {
+            Ok(started_invocation) => {
                 selected
                     .dispatch
                     .mark_accepted()
                     .map_err(map_registry_error)?;
                 return Ok(StartedDispatch {
                     remote,
-                    stream,
+                    stream: started_invocation.stream,
+                    tenant_work: started_invocation.tenant_work,
                     selected,
                     started,
                 });
             }
-            Err(error) => {
-                report_start_error(&self.registry, &selected, &error);
-                if !retryable_before_acceptance(&error) {
-                    return Err(map_worker_client_error(error));
+            Err(failure) => {
+                report_start_error(&self.registry, &selected, &failure.error);
+                let Some(retry_tenant_work) = failure.retry_tenant_work else {
+                    return Err(map_worker_client_error(failure.error));
+                };
+                if !retryable_before_acceptance(&failure.error) {
+                    return Err(map_worker_client_error(failure.error));
                 }
-                retry_delay(&error, invocation.request_id.as_str())
+                (
+                    retry_delay(&failure.error, invocation.request_id.as_str()),
+                    retry_tenant_work,
+                )
             }
         };
 
@@ -228,10 +262,10 @@ impl RemoteChatDispatcher {
             .remaining_budget(Duration::from_secs(request_timeout_secs.max(1)))
             .filter(|budget| !budget.is_zero())
             .ok_or_else(alternate_deadline_error)?;
-        if retry_delay >= remaining_before_backoff {
+        if retry_delay.0 >= remaining_before_backoff {
             return Err(alternate_deadline_error());
         }
-        tokio::time::sleep(retry_delay).await;
+        tokio::time::sleep(retry_delay.0).await;
         let mut alternate = self
             .registry
             .select_and_reserve_excluding(&selection, Some(&excluded))
@@ -243,22 +277,29 @@ impl RemoteChatDispatcher {
             .ok_or_else(alternate_deadline_error)?;
         let alternate_invocation =
             retarget_remote_chat_invocation(&invocation, &alternate_remote, remaining)?;
-        match start_remote_chat_invocation(&alternate_remote, alternate_invocation).await {
-            Ok(stream) => {
+        match start_remote_chat_invocation_with_tenant(
+            &alternate_remote,
+            alternate_invocation,
+            retry_delay.1,
+        )
+        .await
+        {
+            Ok(started_invocation) => {
                 alternate
                     .dispatch
                     .mark_accepted()
                     .map_err(map_registry_error)?;
                 Ok(StartedDispatch {
                     remote: alternate_remote,
-                    stream,
+                    stream: started_invocation.stream,
+                    tenant_work: started_invocation.tenant_work,
                     selected: alternate,
                     started,
                 })
             }
-            Err(error) => {
-                report_start_error(&self.registry, &alternate, &error);
-                Err(map_worker_client_error(error))
+            Err(failure) => {
+                report_start_error(&self.registry, &alternate, &failure.error);
+                Err(map_worker_client_error(failure.error))
             }
         }
     }
@@ -358,6 +399,7 @@ fn stable_request_jitter(request_id: &str, inclusive_max_ms: u64) -> u64 {
 struct StartedDispatch {
     remote: RemoteChatExecution,
     stream: InvocationStream,
+    tenant_work: BoundTenantWorkLease,
     selected: SelectedWorker,
     started: Instant,
 }
@@ -736,6 +778,14 @@ mod tests {
         }
     }
 
+    fn tenant_work() -> UnboundTenantWorkLease {
+        crate::gateway_tenant_concurrency::GatewayTenantConcurrency::new(
+            crate::gateway_tenant_concurrency::GatewayTenantConcurrencyConfig::new(1, 1).unwrap(),
+        )
+        .try_reserve([7; 32])
+        .unwrap()
+    }
+
     #[test]
     fn local_reservation_balances_concurrent_dispatches() {
         let registry = WorkerRegistry::new(WorkerRegistryConfig::default()).unwrap();
@@ -871,7 +921,7 @@ mod tests {
         let context = RequestContext::new("test-request".into(), Principal::local_anonymous());
 
         let mut events = dispatcher(registry)
-            .stream(2, &context, request())
+            .stream(2, &context, request(), tenant_work())
             .await
             .unwrap();
         assert!(matches!(
@@ -916,7 +966,7 @@ mod tests {
         let context = RequestContext::new("test-request".into(), Principal::local_anonymous());
 
         let generation = dispatcher(registry)
-            .generate(2, &context, request())
+            .generate(2, &context, request(), tenant_work())
             .await
             .unwrap();
         assert_eq!(generation.text, "from-b");
@@ -959,7 +1009,7 @@ mod tests {
             let context = RequestContext::new("test-request".into(), Principal::local_anonymous());
 
             let error = dispatcher(registry)
-                .generate(2, &context, request())
+                .generate(2, &context, request(), tenant_work())
                 .await
                 .unwrap_err();
             assert_eq!(error.status, StatusCode::BAD_GATEWAY);
@@ -999,7 +1049,7 @@ mod tests {
         let context = RequestContext::new("test-request".into(), Principal::local_anonymous());
 
         let error = dispatcher(registry)
-            .generate(2, &context, request())
+            .generate(2, &context, request(), tenant_work())
             .await
             .unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_GATEWAY);

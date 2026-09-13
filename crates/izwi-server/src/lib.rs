@@ -39,6 +39,7 @@ mod gateway;
 mod gateway_deployments;
 mod gateway_rate_quota;
 mod gateway_security;
+mod gateway_tenant_concurrency;
 mod gateway_worker_tls;
 mod ids;
 mod logging;
@@ -86,6 +87,9 @@ pub use app::remote_chat_dispatch::{RemoteChatDispatchConfig, RemoteChatDispatch
 pub use gateway::{create_gateway_router, GatewayState};
 pub use gateway_rate_quota::{GatewayRateQuotaConfig, GatewayRateQuotaConfigError};
 pub use gateway_security::{GatewayPerimeterConfig, GatewayPerimeterConfigError};
+pub use gateway_tenant_concurrency::{
+    GatewayTenantConcurrencyConfig, GatewayTenantConcurrencyConfigError,
+};
 
 const MAX_CONFIGURED_GATEWAY_WORKERS: usize = 256;
 const MAX_GATEWAY_STATUS_TTL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -413,10 +417,13 @@ async fn run_gateway(
     logging::init_tracing(args.log_format);
     let perimeter = GatewayPerimeterConfig::from_env()?;
     let rate_quota = GatewayRateQuotaConfig::from_env()?;
+    let tenant_concurrency = GatewayTenantConcurrencyConfig::from_env(args.gateway_max_in_flight)?;
     perimeter.validate_public_ingress(&serve_config)?;
     let (state, _status_poller) =
         gateway_state(&args, &serve_config, enterprise_hooks, perimeter).await?;
-    let state = state.with_rate_quota_config(rate_quota);
+    let state = state
+        .with_rate_quota_config(rate_quota)
+        .with_tenant_concurrency_config(tenant_concurrency);
     state.lifecycle.mark_ready();
 
     info!(

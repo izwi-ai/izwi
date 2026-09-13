@@ -33,6 +33,10 @@ use crate::app::remote_chat_dispatch::RemoteChatDispatcher;
 use crate::error::ApiError;
 use crate::gateway_rate_quota::{GatewayRateDecision, GatewayRateQuota, GatewayRateQuotaConfig};
 use crate::gateway_security::GatewayPerimeterConfig;
+use crate::gateway_tenant_concurrency::{
+    GatewayTenantConcurrency, GatewayTenantConcurrencyConfig, TenantWorkAdmissionError,
+    UnboundTenantWorkLease,
+};
 use crate::logging::{SERVICE_NAME, SERVICE_VERSION};
 use crate::state::ServerLifecycle;
 
@@ -48,6 +52,7 @@ pub struct GatewayState {
     pub request_timeout_secs: u64,
     request_admission: Arc<Semaphore>,
     rate_quota: GatewayRateQuota,
+    tenant_concurrency: GatewayTenantConcurrency,
     max_output_tokens: u32,
     metrics: GatewayMetrics,
 }
@@ -62,6 +67,9 @@ impl GatewayState {
     ) -> Self {
         debug_assert!(max_in_flight > 0);
         let max_output_tokens = remote_chat_execution.max_output_tokens();
+        let tenant_concurrency_config =
+            GatewayTenantConcurrencyConfig::new(8_usize.min(max_in_flight), max_in_flight)
+                .expect("validated gateway admission limit supports tenant ownership");
         Self {
             chat_execution: GatewayChatExecution::Pinned(remote_chat_execution),
             enterprise_hooks,
@@ -70,6 +78,7 @@ impl GatewayState {
             request_timeout_secs: request_timeout_secs.max(1),
             request_admission: Arc::new(Semaphore::new(max_in_flight)),
             rate_quota: GatewayRateQuota::new(GatewayRateQuotaConfig::default()),
+            tenant_concurrency: GatewayTenantConcurrency::new(tenant_concurrency_config),
             max_output_tokens,
             metrics: GatewayMetrics::default(),
         }
@@ -84,6 +93,9 @@ impl GatewayState {
     ) -> Self {
         debug_assert!(max_in_flight > 0);
         let max_output_tokens = dispatcher.max_output_tokens();
+        let tenant_concurrency_config =
+            GatewayTenantConcurrencyConfig::new(8_usize.min(max_in_flight), max_in_flight)
+                .expect("validated gateway admission limit supports tenant ownership");
         Self {
             chat_execution: GatewayChatExecution::Registry(dispatcher),
             enterprise_hooks,
@@ -92,6 +104,7 @@ impl GatewayState {
             request_timeout_secs: request_timeout_secs.max(1),
             request_admission: Arc::new(Semaphore::new(max_in_flight)),
             rate_quota: GatewayRateQuota::new(GatewayRateQuotaConfig::default()),
+            tenant_concurrency: GatewayTenantConcurrency::new(tenant_concurrency_config),
             max_output_tokens,
             metrics: GatewayMetrics::default(),
         }
@@ -103,6 +116,14 @@ impl GatewayState {
     /// concurrent-work accounting, which must wait for confirmed teardown.
     pub fn with_rate_quota_config(mut self, config: GatewayRateQuotaConfig) -> Self {
         self.rate_quota = GatewayRateQuota::new(config);
+        self
+    }
+
+    pub(crate) fn with_tenant_concurrency_config(
+        mut self,
+        config: GatewayTenantConcurrencyConfig,
+    ) -> Self {
+        self.tenant_concurrency = GatewayTenantConcurrency::new(config);
         self
     }
 
@@ -178,6 +199,33 @@ impl GatewayState {
         }
     }
 
+    pub(crate) fn begin_tenant_work(
+        &self,
+        context: &crate::api::request_context::RequestContext,
+    ) -> Result<UnboundTenantWorkLease, ApiError> {
+        let tenant_key = context.tenant_key().ok_or_else(|| {
+            ApiError::service_unavailable("Gateway tenant identity is unavailable")
+        })?;
+        match self.tenant_concurrency.try_reserve(tenant_key) {
+            Ok(lease) => Ok(lease),
+            Err(TenantWorkAdmissionError::TenantLimit) => {
+                self.metrics
+                    .inner
+                    .tenant_concurrency_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(ApiError::too_many_requests(
+                    "Gateway tenant concurrent-work limit exceeded",
+                ))
+            }
+            Err(
+                TenantWorkAdmissionError::OwnershipCapacity
+                | TenantWorkAdmissionError::StateUnavailable,
+            ) => Err(ApiError::service_unavailable(
+                "Gateway concurrent-work ownership capacity is unavailable",
+            )),
+        }
+    }
+
     pub(crate) fn record_dispatch_success(&self, elapsed: Duration) {
         self.metrics.record_dispatch(elapsed, false);
     }
@@ -249,6 +297,7 @@ struct GatewayMetricCounters {
     active_streams: AtomicU64,
     auth_rejections: AtomicU64,
     quota_rejections: AtomicU64,
+    tenant_concurrency_rejections: AtomicU64,
     body_limit_rejections: AtomicU64,
     routing_dispatch_failures: AtomicU64,
     dispatch_calls: AtomicU64,
@@ -349,7 +398,7 @@ impl GatewayMetrics {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn render_prometheus(&self) -> String {
+    fn render_prometheus(&self, active_tenant_work: u64) -> String {
         let snapshot = self.snapshot();
         let mut output = String::with_capacity(MAX_PROMETHEUS_RESPONSE_BYTES);
         macro_rules! metric {
@@ -382,6 +431,18 @@ impl GatewayMetrics {
             "counter",
             "Public tenant quota rejections.",
             snapshot.quota_rejections
+        );
+        metric!(
+            "izwi_gateway_tenant_concurrency_rejections_total",
+            "counter",
+            "Public tenant concurrent-work admission rejections.",
+            snapshot.tenant_concurrency_rejections
+        );
+        metric!(
+            "izwi_gateway_active_tenant_work",
+            "gauge",
+            "Tenant work retained until confirmed worker teardown.",
+            active_tenant_work
         );
         metric!(
             "izwi_gateway_body_limit_rejections_total",
@@ -442,6 +503,10 @@ impl GatewayMetrics {
             active_streams: self.inner.active_streams.load(Ordering::Relaxed),
             auth_rejections: self.inner.auth_rejections.load(Ordering::Relaxed),
             quota_rejections: self.inner.quota_rejections.load(Ordering::Relaxed),
+            tenant_concurrency_rejections: self
+                .inner
+                .tenant_concurrency_rejections
+                .load(Ordering::Relaxed),
             body_limit_rejections: self.inner.body_limit_rejections.load(Ordering::Relaxed),
             routing_dispatch_failures: self.inner.routing_dispatch_failures.load(Ordering::Relaxed),
             dispatch_calls: self.inner.dispatch_calls.load(Ordering::Relaxed),
@@ -461,6 +526,7 @@ struct GatewayMetricsSnapshot {
     active_streams: u64,
     auth_rejections: u64,
     quota_rejections: u64,
+    tenant_concurrency_rejections: u64,
     body_limit_rejections: u64,
     routing_dispatch_failures: u64,
     dispatch_calls: u64,
@@ -576,7 +642,9 @@ async fn gateway_metrics(State(state): State<GatewayState>, headers: HeaderMap) 
             header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
-        state.metrics.render_prometheus(),
+        state
+            .metrics
+            .render_prometheus(state.tenant_concurrency.active_owned_work()),
     )
         .into_response()
 }
@@ -886,14 +954,24 @@ mod tests {
         let abandoned_stream = metrics.begin_stream();
         drop(abandoned_stream);
         assert_eq!(metrics.snapshot().routing_dispatch_failures, 2);
-        assert!(metrics.render_prometheus().len() <= MAX_PROMETHEUS_RESPONSE_BYTES);
+        assert!(metrics.render_prometheus(0).len() <= MAX_PROMETHEUS_RESPONSE_BYTES);
     }
 
     async fn registry_gateway_state(model: ModelVariant) -> (GatewayState, MockWorker) {
-        let worker_config = MockWorkerConfig {
-            public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
-            ..MockWorkerConfig::default()
-        };
+        registry_gateway_state_with_config(
+            model,
+            MockWorkerConfig {
+                public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
+                ..MockWorkerConfig::default()
+            },
+        )
+        .await
+    }
+
+    async fn registry_gateway_state_with_config(
+        model: ModelVariant,
+        worker_config: MockWorkerConfig,
+    ) -> (GatewayState, MockWorker) {
         let credentials = worker_config.credentials.clone();
         let worker = MockWorker::spawn(worker_config)
             .await
@@ -1019,6 +1097,170 @@ mod tests {
         assert_eq!(metrics.routing_dispatch_failures, 0);
         assert_eq!(metrics.active_requests, 0);
         assert_eq!(metrics.active_streams, 0);
+    }
+
+    #[tokio::test]
+    async fn tenant_work_survives_stream_disconnect_until_exact_worker_teardown() {
+        let model = ModelVariant::Qwen34BGguf;
+        let worker_config = MockWorkerConfig {
+            public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
+            fault: MockFault::Hang,
+            cancellation_delay: Duration::from_millis(100),
+            ..MockWorkerConfig::default()
+        };
+        let credentials = worker_config.credentials.clone();
+        let incarnation = worker_config.incarnation_id.clone();
+        let deployment = worker_config.deployment_id.clone();
+        let generation = worker_config.model_generation;
+        let worker = MockWorker::spawn(worker_config)
+            .await
+            .expect("mock worker should bind");
+        let client = WorkerClient::new(
+            &worker.endpoint(),
+            credentials,
+            WorkerClientConfig::default(),
+        )
+        .expect("worker client should initialize");
+        let remote = RemoteChatExecution::new(
+            client,
+            crate::app::chat::RemoteChatExecutionConfig {
+                public_model_variant: model,
+                expected_worker_incarnation: incarnation,
+                deployment_id: deployment,
+                expected_model_generation: generation,
+                policy_revision: PolicyRevision::new("test-policy-v1")
+                    .expect("static policy revision"),
+                max_queue_wait: Duration::ZERO,
+                max_output_tokens: 128,
+                max_output_bytes: 4096,
+            },
+        )
+        .expect("remote execution should initialize");
+        let state = GatewayState::new(remote, EnterpriseHooks::noop(), test_perimeter(), 2, 4)
+            .with_tenant_concurrency_config(
+                GatewayTenantConcurrencyConfig::new(1, 2).expect("test tenant limit"),
+            );
+        state.lifecycle.mark_ready();
+        let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
+
+        let stream_request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": model.dir_name(),
+                        "messages": [{"role": "user", "content": "tenant ownership"}],
+                        "stream": true,
+                        "max_tokens": 8
+                    })
+                    .to_string(),
+                ))
+                .expect("stream request should build")
+        };
+
+        let response = send(app.clone(), stream_request()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(worker.active_invocations(), 1);
+        assert_eq!(state.tenant_concurrency.active_owned_work(), 1);
+        drop(response);
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(worker.active_invocations(), 1);
+        assert_eq!(
+            state.tenant_concurrency.active_owned_work(),
+            1,
+            "public disconnect and cancellation acknowledgement are not teardown proof"
+        );
+        let rejected = send(app.clone(), valid_chat_request(8)).await;
+        assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        for _ in 0..100 {
+            if worker.active_invocations() == 0 && state.tenant_concurrency.active_owned_work() == 0
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(worker.active_invocations(), 0);
+        assert_eq!(state.tenant_concurrency.active_owned_work(), 0);
+
+        let admitted_again = send(app, stream_request()).await;
+        assert_eq!(admitted_again.status(), StatusCode::OK);
+        drop(admitted_again);
+        for _ in 0..100 {
+            if worker.active_invocations() == 0 && state.tenant_concurrency.active_owned_work() == 0
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(worker.active_invocations(), 0);
+        assert_eq!(state.tenant_concurrency.active_owned_work(), 0);
+    }
+
+    #[tokio::test]
+    async fn registry_stream_disconnect_releases_only_after_exact_worker_teardown() {
+        let model = ModelVariant::Qwen34BGguf;
+        let (state, worker) = registry_gateway_state_with_config(
+            model,
+            MockWorkerConfig {
+                public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
+                fault: MockFault::Hang,
+                cancellation_delay: Duration::from_millis(100),
+                ..MockWorkerConfig::default()
+            },
+        )
+        .await;
+        let state = state.with_tenant_concurrency_config(
+            GatewayTenantConcurrencyConfig::new(1, 2).expect("test tenant limit"),
+        );
+        let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": model.dir_name(),
+                        "messages": [{"role": "user", "content": "registry ownership"}],
+                        "stream": true,
+                        "max_tokens": 8
+                    })
+                    .to_string(),
+                ))
+                .expect("stream request should build")
+        };
+
+        let response = send(app.clone(), request()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(worker.active_invocations(), 1);
+        assert_eq!(state.tenant_concurrency.active_owned_work(), 1);
+        drop(response);
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(worker.active_invocations(), 1);
+        assert_eq!(state.tenant_concurrency.active_owned_work(), 1);
+        assert_eq!(
+            send(app.clone(), valid_chat_request(8)).await.status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+
+        for _ in 0..100 {
+            if worker.active_invocations() == 0 && state.tenant_concurrency.active_owned_work() == 0
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(worker.active_invocations(), 0);
+        assert_eq!(state.tenant_concurrency.active_owned_work(), 0);
+
+        let admitted_again = send(app, request()).await;
+        assert_eq!(admitted_again.status(), StatusCode::OK);
+        drop(admitted_again);
     }
 
     #[tokio::test]
@@ -1663,8 +1905,9 @@ mod tests {
             .expect("metrics response must remain bounded");
         let body = String::from_utf8(body.to_vec()).expect("metrics must be UTF-8");
         assert!(body.contains("izwi_gateway_active_requests 0"));
+        assert!(body.contains("izwi_gateway_active_tenant_work 0"));
         assert!(body.contains("izwi_gateway_auth_rejections_total 2"));
-        assert_eq!(body.matches("# TYPE ").count(), 13);
+        assert_eq!(body.matches("# TYPE ").count(), 15);
         assert!(
             !body.contains('{'),
             "metrics must not contain dynamic labels"

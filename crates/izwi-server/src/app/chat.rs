@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use axum::http::StatusCode;
 use izwi_serving_client::{InvocationStream, WorkerClient, WorkerClientError};
 use izwi_serving_protocol::{
-    AttemptId, CallerId, ChatInput, ChatMessage as WorkerChatMessage,
+    AttemptId, AttemptIdentity, CallerId, ChatInput, ChatMessage as WorkerChatMessage,
     ChatParameters as WorkerChatParameters, ChatRole as WorkerChatRole, DeploymentId,
     FinishReason as WorkerFinishReason, GatewayAttestedCallerContext, IncarnationId,
     InvocationErrorCode, InvocationEventKind, InvocationInput, InvocationRequest, ModelGeneration,
@@ -21,6 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::api::request_context::RequestContext;
 use crate::error::ApiError;
+use crate::gateway_tenant_concurrency::{BoundTenantWorkLease, UnboundTenantWorkLease};
 use crate::ids::new_uuid;
 use crate::state::AppState;
 use izwi_core::{
@@ -395,28 +396,6 @@ pub async fn generate_remote_chat_with_execution(
     context: &RequestContext,
     request: ChatExecutionRequest,
 ) -> Result<ChatGeneration, ApiError> {
-    generate_remote_chat_with_execution_and_acceptance(
-        remote,
-        request_timeout_secs,
-        context,
-        request,
-        (),
-        |_| Ok(()),
-    )
-    .await
-}
-
-pub(crate) async fn generate_remote_chat_with_execution_and_acceptance<K, F>(
-    remote: &RemoteChatExecution,
-    request_timeout_secs: u64,
-    context: &RequestContext,
-    request: ChatExecutionRequest,
-    mut keepalive: K,
-    on_accepted: F,
-) -> Result<ChatGeneration, ApiError>
-where
-    F: FnOnce(&mut K) -> Result<(), ApiError>,
-{
     let invocation =
         prepare_remote_chat_invocation(remote, request_timeout_secs, context, request)?;
     let started = Instant::now();
@@ -425,18 +404,66 @@ where
         .invoke(invocation)
         .await
         .map_err(map_worker_client_error)?;
-    // WorkerClient::invoke returns only after validating the first accepted
-    // event. This is the earliest safe point for dynamic dispatch accounting
-    // to transition out of its pre-admission state.
-    on_accepted(&mut keepalive)?;
     collect_started_remote_chat(remote, &mut stream, started, |_| {}).await
+}
+
+pub(crate) async fn generate_remote_chat_with_execution_and_tenant(
+    remote: &RemoteChatExecution,
+    request_timeout_secs: u64,
+    context: &RequestContext,
+    request: ChatExecutionRequest,
+    tenant_work: UnboundTenantWorkLease,
+) -> Result<ChatGeneration, ApiError> {
+    let invocation =
+        prepare_remote_chat_invocation(remote, request_timeout_secs, context, request)?;
+    let started = Instant::now();
+    let started_invocation =
+        start_remote_chat_invocation_with_tenant(remote, invocation, tenant_work)
+            .await
+            .map_err(|failure| map_worker_client_error(failure.error))?;
+    let mut stream = started_invocation.stream;
+    collect_started_remote_chat_with_tenant(
+        remote,
+        &mut stream,
+        started,
+        |_| {},
+        started_invocation.tenant_work,
+    )
+    .await
 }
 
 pub(crate) async fn collect_started_remote_chat<F>(
     remote: &RemoteChatExecution,
     stream: &mut InvocationStream,
     started: Instant,
+    on_worker_error: F,
+) -> Result<ChatGeneration, ApiError>
+where
+    F: FnMut(&WorkerClientError),
+{
+    collect_started_remote_chat_inner(remote, stream, started, on_worker_error, None).await
+}
+
+pub(crate) async fn collect_started_remote_chat_with_tenant<F>(
+    remote: &RemoteChatExecution,
+    stream: &mut InvocationStream,
+    started: Instant,
+    on_worker_error: F,
+    tenant_work: BoundTenantWorkLease,
+) -> Result<ChatGeneration, ApiError>
+where
+    F: FnMut(&WorkerClientError),
+{
+    collect_started_remote_chat_inner(remote, stream, started, on_worker_error, Some(tenant_work))
+        .await
+}
+
+async fn collect_started_remote_chat_inner<F>(
+    remote: &RemoteChatExecution,
+    stream: &mut InvocationStream,
+    started: Instant,
     mut on_worker_error: F,
+    mut tenant_work: Option<BoundTenantWorkLease>,
 ) -> Result<ChatGeneration, ApiError>
 where
     F: FnMut(&WorkerClientError),
@@ -463,6 +490,9 @@ where
                 finish_reason,
                 usage,
             } => {
+                if let Some(lease) = tenant_work.take() {
+                    lease.confirm_stopped();
+                }
                 return worker_chat_generation(
                     text,
                     finish_reason,
@@ -471,9 +501,15 @@ where
                 );
             }
             InvocationEventKind::Error { code, message } => {
+                if let Some(lease) = tenant_work.take() {
+                    lease.confirm_stopped();
+                }
                 return Err(map_worker_terminal_error(code, message));
             }
             InvocationEventKind::Cancelled { reason } => {
+                if let Some(lease) = tenant_work.take() {
+                    lease.confirm_stopped();
+                }
                 return Err(cancelled_error(
                     reason.unwrap_or_else(|| "Worker cancelled chat invocation".to_string()),
                 ));
@@ -484,6 +520,47 @@ where
     Err(bad_gateway_error(
         "Worker chat stream ended without a terminal event",
     ))
+}
+
+pub(crate) struct StartedTenantInvocation {
+    pub(crate) stream: InvocationStream,
+    pub(crate) tenant_work: BoundTenantWorkLease,
+}
+
+pub(crate) struct TenantInvocationStartFailure {
+    pub(crate) error: WorkerClientError,
+    /// Present only when the failure proves the exact attempt was never
+    /// admitted. The same public-request lease may then be rebound to the one
+    /// permitted alternate attempt.
+    pub(crate) retry_tenant_work: Option<UnboundTenantWorkLease>,
+}
+
+pub(crate) async fn start_remote_chat_invocation_with_tenant(
+    remote: &RemoteChatExecution,
+    invocation: InvocationRequest,
+    tenant_work: UnboundTenantWorkLease,
+) -> Result<StartedTenantInvocation, TenantInvocationStartFailure> {
+    let identity = AttemptIdentity::from(&invocation);
+    let bound = tenant_work.bind(remote.client.clone(), identity);
+    match remote.client.invoke(invocation).await {
+        Ok(stream) => Ok(StartedTenantInvocation {
+            stream,
+            tenant_work: bound,
+        }),
+        Err(error) if error.proves_attempt_unaccepted() => Err(TenantInvocationStartFailure {
+            error,
+            retry_tenant_work: Some(bound.prove_unaccepted()),
+        }),
+        Err(error) => {
+            // Dropping a bound lease retains ownership and reconciles the exact
+            // attempt; an uncertain failure is never made eligible for retry.
+            drop(bound);
+            Err(TenantInvocationStartFailure {
+                error,
+                retry_tenant_work: None,
+            })
+        }
+    }
 }
 
 pub(crate) fn prepare_remote_chat_invocation(
@@ -552,13 +629,6 @@ pub(crate) fn retarget_remote_chat_invocation(
     Ok(alternate)
 }
 
-pub(crate) async fn start_remote_chat_invocation(
-    remote: &RemoteChatExecution,
-    invocation: InvocationRequest,
-) -> Result<InvocationStream, WorkerClientError> {
-    remote.client.invoke(invocation).await
-}
-
 fn append_remote_text(text: &mut String, delta: &str, max_bytes: u64) -> Result<(), ApiError> {
     let next_len = text.len().checked_add(delta.len()).ok_or_else(|| {
         bad_gateway_error("Worker chat output exceeded the configured byte limit")
@@ -621,10 +691,59 @@ pub async fn spawn_remote_chat_stream_with_execution(
     ))
 }
 
+pub(crate) async fn spawn_remote_chat_stream_with_tenant(
+    remote: &RemoteChatExecution,
+    request_timeout_secs: u64,
+    context: &RequestContext,
+    request: ChatExecutionRequest,
+    tenant_work: UnboundTenantWorkLease,
+) -> Result<mpsc::Receiver<ChatStreamEvent>, ApiError> {
+    let invocation =
+        prepare_remote_chat_invocation(remote, request_timeout_secs, context, request)?;
+    let started = start_remote_chat_invocation_with_tenant(remote, invocation, tenant_work)
+        .await
+        .map_err(|failure| map_worker_client_error(failure.error))?;
+    Ok(spawn_started_remote_chat_stream_with_tenant(
+        remote,
+        started.stream,
+        |_| {},
+        started.tenant_work,
+    ))
+}
+
 pub(crate) fn spawn_started_remote_chat_stream_with_execution<F>(
+    remote: &RemoteChatExecution,
+    worker_stream: InvocationStream,
+    on_worker_error: F,
+) -> mpsc::Receiver<ChatStreamEvent>
+where
+    F: Fn(&WorkerClientError) + Send + Sync + 'static,
+{
+    spawn_started_remote_chat_stream_inner(remote, worker_stream, on_worker_error, None)
+}
+
+pub(crate) fn spawn_started_remote_chat_stream_with_tenant<F>(
+    remote: &RemoteChatExecution,
+    worker_stream: InvocationStream,
+    on_worker_error: F,
+    tenant_work: BoundTenantWorkLease,
+) -> mpsc::Receiver<ChatStreamEvent>
+where
+    F: Fn(&WorkerClientError) + Send + Sync + 'static,
+{
+    spawn_started_remote_chat_stream_inner(
+        remote,
+        worker_stream,
+        on_worker_error,
+        Some(tenant_work),
+    )
+}
+
+fn spawn_started_remote_chat_stream_inner<F>(
     remote: &RemoteChatExecution,
     mut worker_stream: InvocationStream,
     on_worker_error: F,
+    mut tenant_work: Option<BoundTenantWorkLease>,
 ) -> mpsc::Receiver<ChatStreamEvent>
 where
     F: Fn(&WorkerClientError) + Send + Sync + 'static,
@@ -675,22 +794,35 @@ where
                 InvocationEventKind::Completed {
                     finish_reason,
                     usage,
-                } => match worker_chat_generation(
-                    text,
-                    finish_reason,
-                    usage.or(latest_usage),
-                    started,
-                ) {
-                    Ok(generation) => break ChatStreamEvent::Completed(Box::new(generation)),
-                    Err(error) => break ChatStreamEvent::Failed(error.message),
-                },
+                } => {
+                    if let Some(lease) = tenant_work.take() {
+                        lease.confirm_stopped();
+                    }
+                    match worker_chat_generation(
+                        text,
+                        finish_reason,
+                        usage.or(latest_usage),
+                        started,
+                    ) {
+                        Ok(generation) => break ChatStreamEvent::Completed(Box::new(generation)),
+                        Err(error) => break ChatStreamEvent::Failed(error.message),
+                    }
+                }
                 InvocationEventKind::Error { code, message } => {
-                    break ChatStreamEvent::Failed(map_worker_terminal_error(code, message).message)
+                    if let Some(lease) = tenant_work.take() {
+                        lease.confirm_stopped();
+                    }
+                    break ChatStreamEvent::Failed(
+                        map_worker_terminal_error(code, message).message,
+                    );
                 }
                 InvocationEventKind::Cancelled { reason } => {
+                    if let Some(lease) = tenant_work.take() {
+                        lease.confirm_stopped();
+                    }
                     break ChatStreamEvent::Failed(
                         reason.unwrap_or_else(|| "Worker cancelled chat invocation".into()),
-                    )
+                    );
                 }
             }
         };
@@ -698,6 +830,10 @@ where
         // wait on a slow public consumer. Worker capacity remains governed by
         // confirmed teardown, not by this gateway channel.
         drop(worker_stream);
+        // On a transport/protocol interruption this starts exact-attempt
+        // reconciliation. On a validated terminal event the lease was already
+        // consumed above, so this is a no-op.
+        drop(tenant_work);
         send_chat_terminal(event_tx, terminal).await;
     });
     event_rx

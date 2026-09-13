@@ -251,6 +251,23 @@ pub enum WorkerClientError {
     InterruptedUnknown,
 }
 
+impl WorkerClientError {
+    /// True only when the invocation could not have reached authoritative
+    /// worker admission. Every other failure must be reconciled against the
+    /// exact attempt before external capacity ownership can be released.
+    pub const fn proves_attempt_unaccepted(&self) -> bool {
+        match self {
+            Self::InvalidInvocation(_)
+            | Self::Encode(_)
+            | Self::RequestTooLarge { .. }
+            | Self::Deadline(DeadlinePhase::InFlightPermit)
+            | Self::ConnectionNotEstablished(_) => true,
+            Self::Rejected { rejection } => !rejection.accepted,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct WorkerClient {
     inner: Arc<WorkerClientInner>,
@@ -951,7 +968,7 @@ impl Drop for InvocationStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use izwi_serving_protocol::{CredentialId, ServiceBearerToken};
+    use izwi_serving_protocol::{CredentialId, RejectionCode, RequestId, ServiceBearerToken};
 
     const TEST_CA_PEM: &str = r#"-----BEGIN CERTIFICATE-----
 MIIDFjCCAf6gAwIBAgITN3i31kcwBKhGVxjuERUWxATTNTANBgkqhkiG9w0BAQsF
@@ -982,6 +999,35 @@ MAECAQ==
             bearer_token: ServiceBearerToken::new("worker-client-secret")
                 .expect("static bearer token"),
         }
+    }
+
+    #[test]
+    fn only_pre_admission_failures_prove_an_attempt_was_unaccepted() {
+        let rejection = InvocationRejection::new(
+            RequestId::new("request-1").expect("static request ID"),
+            AttemptId::new("attempt-1").expect("static attempt ID"),
+            RejectionCode::CapacityExhausted,
+            "capacity exhausted",
+        );
+        assert!(WorkerClientError::Rejected { rejection }.proves_attempt_unaccepted());
+        assert!(
+            WorkerClientError::Deadline(DeadlinePhase::InFlightPermit).proves_attempt_unaccepted()
+        );
+
+        let mut accepted_rejection = InvocationRejection::new(
+            RequestId::new("request-2").expect("static request ID"),
+            AttemptId::new("attempt-2").expect("static attempt ID"),
+            RejectionCode::CapacityExhausted,
+            "invalid accepted rejection fixture",
+        );
+        accepted_rejection.accepted = true;
+        assert!(!WorkerClientError::Rejected {
+            rejection: accepted_rejection,
+        }
+        .proves_attempt_unaccepted());
+        assert!(!WorkerClientError::Deadline(DeadlinePhase::ResponseHeaders)
+            .proves_attempt_unaccepted());
+        assert!(!WorkerClientError::InterruptedUnknown.proves_attempt_unaccepted());
     }
 
     #[test]

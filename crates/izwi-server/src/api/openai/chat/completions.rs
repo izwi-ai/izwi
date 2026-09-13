@@ -16,8 +16,9 @@ use crate::api::openai::compat::{
 };
 use crate::api::request_context::RequestContext;
 use crate::app::chat::{
-    generate_chat, generate_remote_chat, generate_remote_chat_with_execution, parse_chat_model,
-    resolve_chat_request_config, spawn_chat_stream, spawn_remote_chat_stream_with_execution,
+    generate_chat, generate_remote_chat, generate_remote_chat_with_execution_and_tenant,
+    parse_chat_model, resolve_chat_request_config, spawn_chat_stream,
+    spawn_remote_chat_stream_with_execution, spawn_remote_chat_stream_with_tenant,
     ChatExecutionRequest, ChatStreamEvent,
 };
 use crate::app::chat_content::{
@@ -692,22 +693,29 @@ pub async fn gateway_completions(
     state
         .enforce_chat_rate_quota(&ctx, &execution_request)
         .await?;
+    let tenant_work = state.begin_tenant_work(&ctx)?;
     if req.stream.unwrap_or(false) {
         let model_id = execution_request.variant.dir_name().to_string();
         let dispatch_started = Instant::now();
         let event_rx = match match &state.chat_execution {
             GatewayChatExecution::Pinned(remote) => {
-                spawn_remote_chat_stream_with_execution(
+                spawn_remote_chat_stream_with_tenant(
                     remote,
                     state.request_timeout_secs,
                     &ctx,
                     execution_request,
+                    tenant_work,
                 )
                 .await
             }
             GatewayChatExecution::Registry(dispatcher) => {
                 dispatcher
-                    .stream(state.request_timeout_secs, &ctx, execution_request)
+                    .stream(
+                        state.request_timeout_secs,
+                        &ctx,
+                        execution_request,
+                        tenant_work,
+                    )
                     .await
             }
         } {
@@ -734,17 +742,23 @@ pub async fn gateway_completions(
     let dispatch_started = Instant::now();
     let generation = match match &state.chat_execution {
         GatewayChatExecution::Pinned(remote) => {
-            generate_remote_chat_with_execution(
+            generate_remote_chat_with_execution_and_tenant(
                 remote,
                 state.request_timeout_secs,
                 &ctx,
                 execution_request,
+                tenant_work,
             )
             .await
         }
         GatewayChatExecution::Registry(dispatcher) => {
             dispatcher
-                .generate(state.request_timeout_secs, &ctx, execution_request)
+                .generate(
+                    state.request_timeout_secs,
+                    &ctx,
+                    execution_request,
+                    tenant_work,
+                )
                 .await
         }
     } {
