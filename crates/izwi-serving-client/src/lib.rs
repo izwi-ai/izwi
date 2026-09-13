@@ -144,15 +144,14 @@ impl WorkerClient {
                 "endpoint must be an absolute hierarchical URL",
             ));
         }
-        if endpoint.scheme() != "http"
-            || !endpoint
-                .host_str()
-                .map(|host| host.trim_start_matches('[').trim_end_matches(']'))
-                .and_then(|host| host.parse::<std::net::IpAddr>().ok())
-                .is_some_and(|host| host.is_loopback())
-        {
+        let numeric_loopback = endpoint
+            .host_str()
+            .map(|host| host.trim_start_matches('[').trim_end_matches(']'))
+            .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+            .is_some_and(|host| host.is_loopback());
+        if endpoint.scheme() != "https" && !(endpoint.scheme() == "http" && numeric_loopback) {
             return Err(WorkerClientError::InvalidConfiguration(
-                "plaintext worker endpoints must use a numeric loopback address",
+                "worker endpoints must use certificate-verified HTTPS or numeric loopback HTTP",
             ));
         }
         if !endpoint.username().is_empty()
@@ -791,15 +790,21 @@ mod tests {
     }
 
     #[test]
-    fn worker_client_restricts_plaintext_to_numeric_loopback() {
+    fn worker_client_allows_verified_https_and_restricts_plaintext_to_numeric_loopback() {
         let config = WorkerClientConfig::default();
         assert!(WorkerClient::new("http://127.0.0.1:9470", credentials(), config.clone()).is_ok());
         assert!(WorkerClient::new("http://[::1]:9470", credentials(), config.clone()).is_ok());
+        assert!(WorkerClient::new(
+            "https://worker.example.test:9470/private/",
+            credentials(),
+            config.clone()
+        )
+        .is_ok());
+        assert!(WorkerClient::new("https://192.0.2.1:9470", credentials(), config.clone()).is_ok());
 
         for endpoint in [
             "http://localhost:9470",
             "http://192.0.2.1:9470",
-            "https://127.0.0.1:9470",
             "http://user:password@127.0.0.1:9470",
             "http://127.0.0.1:9470?token=secret",
             "http://127.0.0.1:9470#fragment",
