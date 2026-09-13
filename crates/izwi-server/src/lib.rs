@@ -511,6 +511,7 @@ async fn gateway_state(
         max_deployments_per_worker: 32,
         max_local_dispatches: args.gateway_max_in_flight,
         status_ttl: Duration::from_millis(args.gateway_worker_status_ttl_ms),
+        ..worker_registry::WorkerRegistryConfig::default()
     };
     let registry = worker_registry::WorkerRegistry::new(registry_config)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;

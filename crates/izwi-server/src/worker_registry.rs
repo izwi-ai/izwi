@@ -5,7 +5,8 @@
 //! with the descriptor, allowed deployments, and validated capacity. Worker
 //! status can update only that exact worker incarnation. The registry is an
 //! efficiency mechanism; the selected worker remains the authoritative source
-//! of admission and this module deliberately provides no invocation retry API.
+//! of admission. The registry exposes only one exact-worker exclusion for a
+//! caller-owned, provably pre-acceptance alternate attempt; it never retries.
 
 use izwi_serving_client::WorkerClient;
 use izwi_serving_protocol::{
@@ -25,6 +26,8 @@ const MAX_REGISTRY_WORKERS: usize = 4096;
 const MAX_DEPLOYMENTS_PER_WORKER: usize = 256;
 const MAX_LOCAL_DISPATCHES: usize = 65_536;
 const MAX_STATUS_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_CIRCUIT_FAILURE_THRESHOLD: u32 = 1024;
+const MAX_CIRCUIT_OPEN_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerRegistryConfig {
@@ -32,6 +35,8 @@ pub struct WorkerRegistryConfig {
     pub max_deployments_per_worker: usize,
     pub max_local_dispatches: usize,
     pub status_ttl: Duration,
+    pub circuit_failure_threshold: u32,
+    pub circuit_open_duration: Duration,
 }
 
 impl WorkerRegistryConfig {
@@ -58,6 +63,20 @@ impl WorkerRegistryConfig {
                 "status_ttl is outside the supported range",
             ));
         }
+        if self.circuit_failure_threshold == 0
+            || self.circuit_failure_threshold > MAX_CIRCUIT_FAILURE_THRESHOLD
+        {
+            return Err(WorkerRegistryError::InvalidConfig(
+                "circuit_failure_threshold is outside the supported range",
+            ));
+        }
+        if self.circuit_open_duration.is_zero()
+            || self.circuit_open_duration > MAX_CIRCUIT_OPEN_DURATION
+        {
+            return Err(WorkerRegistryError::InvalidConfig(
+                "circuit_open_duration is outside the supported range",
+            ));
+        }
         Ok(())
     }
 }
@@ -69,6 +88,8 @@ impl Default for WorkerRegistryConfig {
             max_deployments_per_worker: 32,
             max_local_dispatches: 1024,
             status_ttl: Duration::from_secs(10),
+            circuit_failure_threshold: 3,
+            circuit_open_duration: Duration::from_secs(30),
         }
     }
 }
@@ -302,11 +323,27 @@ struct RegistryInner {
 struct WorkerRecord {
     registration: ApprovedWorker,
     observation: Option<StatusObservation>,
+    circuit: WorkerCircuitState,
 }
 
 struct StatusObservation {
     status: WorkerStatus,
     received_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerCircuitState {
+    Closed { consecutive_transport_failures: u32 },
+    Open { opened_at: Instant },
+    HalfOpenProbe,
+}
+
+impl Default for WorkerCircuitState {
+    fn default() -> Self {
+        Self::Closed {
+            consecutive_transport_failures: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -370,6 +407,7 @@ impl WorkerRegistry {
             WorkerRecord {
                 registration,
                 observation: None,
+                circuit: WorkerCircuitState::default(),
             },
         );
         Ok(())
@@ -388,8 +426,9 @@ impl WorkerRegistry {
         self.observe_status_at(status, Instant::now())
     }
 
-    /// Records freshness using only a receiver-local monotonic timestamp. The
-    /// explicit timestamp is exposed for deterministic boundary tests.
+    /// Records a status already authenticated by the approved private client,
+    /// using only a receiver-local monotonic freshness timestamp. The explicit
+    /// timestamp is exposed for deterministic boundary tests.
     pub fn observe_status_at(
         &self,
         status: WorkerStatus,
@@ -487,6 +526,14 @@ impl WorkerRegistry {
         let inner = lock_recover(&self.inner);
         inner.workers.values().any(|record| {
             fresh_observation(record, now, inner.config.status_ttl)
+                .filter(|observation| {
+                    circuit_allows_selection(
+                        record,
+                        observation,
+                        now,
+                        inner.config.circuit_open_duration,
+                    )
+                })
                 .and_then(|observation| eligible_deployment(record, observation, request))
                 .is_some()
         })
@@ -496,7 +543,18 @@ impl WorkerRegistry {
         &self,
         request: &WorkerSelectionRequest,
     ) -> Result<SelectedWorker, WorkerRegistryError> {
-        self.select_and_reserve_at(request, Instant::now())
+        self.select_and_reserve_excluding(request, None)
+    }
+
+    /// Selects a worker while excluding at most one exact worker incarnation.
+    /// This supports a bounded, provably pre-acceptance alternate selection;
+    /// the registry intentionally does not retain an unbounded attempted set.
+    pub fn select_and_reserve_excluding(
+        &self,
+        request: &WorkerSelectionRequest,
+        excluded: Option<&WorkerInstanceKey>,
+    ) -> Result<SelectedWorker, WorkerRegistryError> {
+        self.select_and_reserve_excluding_at(request, excluded, Instant::now())
     }
 
     /// Selects and immediately accounts for one local dispatch while holding
@@ -506,6 +564,16 @@ impl WorkerRegistry {
         request: &WorkerSelectionRequest,
         now: Instant,
     ) -> Result<SelectedWorker, WorkerRegistryError> {
+        self.select_and_reserve_excluding_at(request, None, now)
+    }
+
+    /// Deterministic-time variant used by receiver-clock circuit tests.
+    pub fn select_and_reserve_excluding_at(
+        &self,
+        request: &WorkerSelectionRequest,
+        excluded: Option<&WorkerInstanceKey>,
+        now: Instant,
+    ) -> Result<SelectedWorker, WorkerRegistryError> {
         let mut inner = lock_recover(&self.inner);
         if inner.dispatches.len() >= inner.config.max_local_dispatches {
             return Err(WorkerRegistryError::LocalDispatchLimitReached);
@@ -513,9 +581,20 @@ impl WorkerRegistry {
 
         let mut selected: Option<(WorkerInstanceKey, LoadedDeployment, u64, u32)> = None;
         for (key, record) in &inner.workers {
+            if excluded == Some(key) {
+                continue;
+            }
             let Some(observation) = fresh_observation(record, now, inner.config.status_ttl) else {
                 continue;
             };
+            if !circuit_allows_selection(
+                record,
+                observation,
+                now,
+                inner.config.circuit_open_duration,
+            ) {
+                continue;
+            }
             let Some(deployment) = eligible_deployment(record, observation, request) else {
                 continue;
             };
@@ -542,12 +621,21 @@ impl WorkerRegistry {
         }
 
         let (key, deployment, _, _) = selected.ok_or(WorkerRegistryError::NoEligibleWorker)?;
-        let record = inner
-            .workers
-            .get(&key)
-            .expect("selected worker remains registered under the registry lock");
-        let selected_client = record.registration.client.clone();
-        let node_id = record.registration.descriptor.node_id.clone();
+        let (selected_client, node_id, circuit_probe) = {
+            let record = inner
+                .workers
+                .get_mut(&key)
+                .expect("selected worker remains registered under the registry lock");
+            let circuit_probe = matches!(record.circuit, WorkerCircuitState::Open { .. });
+            if circuit_probe {
+                record.circuit = WorkerCircuitState::HalfOpenProbe;
+            }
+            (
+                record.registration.client.clone(),
+                record.registration.descriptor.node_id.clone(),
+                circuit_probe,
+            )
+        };
         let backend = deployment.backend;
         let deployment_id = deployment.deployment_id.clone();
         let model_generation = deployment.model_generation;
@@ -571,8 +659,61 @@ impl WorkerRegistry {
                 registry: Arc::downgrade(&self.inner),
                 dispatch_id,
                 worker: key,
+                circuit_probe,
             },
         })
+    }
+
+    /// Records any authenticated response from this exact worker incarnation.
+    /// Accepted requests and deterministic rejections both prove reachability
+    /// and close the circuit.
+    pub fn report_worker_reachable(
+        &self,
+        key: &WorkerInstanceKey,
+    ) -> Result<(), WorkerRegistryError> {
+        let mut inner = lock_recover(&self.inner);
+        let record = active_worker_mut(&mut inner, key)?;
+        record.circuit = WorkerCircuitState::default();
+        Ok(())
+    }
+
+    /// Records an outcome for which the gateway cannot authenticate a worker
+    /// response. Closed circuits accumulate bounded consecutive strikes;
+    /// a failed half-open probe immediately reopens the circuit.
+    pub fn report_worker_transport_failure(
+        &self,
+        key: &WorkerInstanceKey,
+    ) -> Result<(), WorkerRegistryError> {
+        self.report_worker_transport_failure_at(key, Instant::now())
+    }
+
+    /// Deterministic-time variant used by receiver-clock circuit tests.
+    pub fn report_worker_transport_failure_at(
+        &self,
+        key: &WorkerInstanceKey,
+        now: Instant,
+    ) -> Result<(), WorkerRegistryError> {
+        let mut inner = lock_recover(&self.inner);
+        let failure_threshold = inner.config.circuit_failure_threshold;
+        let record = active_worker_mut(&mut inner, key)?;
+        record.circuit = match record.circuit {
+            WorkerCircuitState::Closed {
+                consecutive_transport_failures,
+            } => {
+                let strikes = consecutive_transport_failures.saturating_add(1);
+                if strikes >= failure_threshold {
+                    WorkerCircuitState::Open { opened_at: now }
+                } else {
+                    WorkerCircuitState::Closed {
+                        consecutive_transport_failures: strikes,
+                    }
+                }
+            }
+            WorkerCircuitState::Open { .. } | WorkerCircuitState::HalfOpenProbe => {
+                WorkerCircuitState::Open { opened_at: now }
+            }
+        };
+        Ok(())
     }
 }
 
@@ -581,6 +722,7 @@ pub struct LocalDispatchGuard {
     registry: Weak<Mutex<RegistryInner>>,
     dispatch_id: u64,
     worker: WorkerInstanceKey,
+    circuit_probe: bool,
 }
 
 impl LocalDispatchGuard {
@@ -588,24 +730,38 @@ impl LocalDispatchGuard {
         &self.worker
     }
 
-    /// Call only after the private client has returned its validated accepted
-    /// event. A subsequent status sequence can then reconcile this estimate.
+    /// Call only after the private client has returned its authenticated,
+    /// validated accepted event. Acceptance proves reachability and closes a
+    /// half-open circuit. A subsequent status sequence can then reconcile the
+    /// local capacity estimate.
     pub fn mark_accepted(&mut self) -> Result<(), WorkerRegistryError> {
         let registry = self
             .registry
             .upgrade()
             .ok_or(WorkerRegistryError::UnknownLocalDispatch)?;
         let mut inner = lock_recover(&registry);
+        if !inner.dispatches.contains_key(&self.dispatch_id) {
+            return Err(WorkerRegistryError::UnknownLocalDispatch);
+        }
         let sequence = inner
             .workers
             .get(&self.worker)
             .and_then(|worker| worker.observation.as_ref())
             .map(|observation| observation.status.status_sequence)
             .unwrap_or(0);
+        if inner.active_incarnations.get(&self.worker.worker_id)
+            == Some(&self.worker.incarnation_id)
+        {
+            inner
+                .workers
+                .get_mut(&self.worker)
+                .expect("active worker incarnation remains registered")
+                .circuit = WorkerCircuitState::default();
+        }
         let dispatch = inner
             .dispatches
             .get_mut(&self.dispatch_id)
-            .ok_or(WorkerRegistryError::UnknownLocalDispatch)?;
+            .expect("local dispatch was verified under the registry lock");
         if dispatch.state == LocalDispatchState::Dispatched {
             dispatch.state = LocalDispatchState::AcceptedAfter {
                 status_sequence: sequence,
@@ -620,7 +776,22 @@ impl Drop for LocalDispatchGuard {
         let Some(registry) = self.registry.upgrade() else {
             return;
         };
-        lock_recover(&registry).dispatches.remove(&self.dispatch_id);
+        let mut inner = lock_recover(&registry);
+        inner.dispatches.remove(&self.dispatch_id);
+        if self.circuit_probe
+            && inner.active_incarnations.get(&self.worker.worker_id)
+                == Some(&self.worker.incarnation_id)
+        {
+            let record = inner
+                .workers
+                .get_mut(&self.worker)
+                .expect("active worker incarnation remains registered");
+            if record.circuit == WorkerCircuitState::HalfOpenProbe {
+                record.circuit = WorkerCircuitState::Open {
+                    opened_at: Instant::now(),
+                };
+            }
+        }
     }
 }
 
@@ -746,6 +917,37 @@ fn validate_status(
         return Err(WorkerRegistryError::CapacityMismatch);
     }
     Ok(())
+}
+
+fn active_worker_mut<'a>(
+    inner: &'a mut RegistryInner,
+    key: &WorkerInstanceKey,
+) -> Result<&'a mut WorkerRecord, WorkerRegistryError> {
+    if inner.active_incarnations.get(&key.worker_id) != Some(&key.incarnation_id) {
+        return Err(WorkerRegistryError::UnknownOrStaleIncarnation);
+    }
+    inner
+        .workers
+        .get_mut(key)
+        .ok_or(WorkerRegistryError::UnknownOrStaleIncarnation)
+}
+
+fn circuit_allows_selection(
+    record: &WorkerRecord,
+    observation: &StatusObservation,
+    now: Instant,
+    open_duration: Duration,
+) -> bool {
+    match record.circuit {
+        WorkerCircuitState::Closed { .. } => true,
+        WorkerCircuitState::HalfOpenProbe => false,
+        WorkerCircuitState::Open { opened_at } => {
+            observation.received_at > opened_at
+                && now
+                    .checked_duration_since(opened_at)
+                    .is_some_and(|elapsed| elapsed >= open_duration)
+        }
+    }
 }
 
 fn fresh_observation<'a>(
@@ -1036,11 +1238,30 @@ mod tests {
             WorkerRegistryError::InvalidConfig("max_workers is outside the supported range")
         );
 
+        let mut config = WorkerRegistryConfig::default();
+        config.circuit_failure_threshold = 0;
+        assert_eq!(
+            WorkerRegistry::new(config).unwrap_err(),
+            WorkerRegistryError::InvalidConfig(
+                "circuit_failure_threshold is outside the supported range"
+            )
+        );
+
+        let mut config = WorkerRegistryConfig::default();
+        config.circuit_open_duration = MAX_CIRCUIT_OPEN_DURATION + Duration::from_secs(1);
+        assert_eq!(
+            WorkerRegistry::new(config).unwrap_err(),
+            WorkerRegistryError::InvalidConfig(
+                "circuit_open_duration is outside the supported range"
+            )
+        );
+
         let registry = WorkerRegistry::new(WorkerRegistryConfig {
             max_workers: 1,
             max_deployments_per_worker: 1,
             max_local_dispatches: 1,
             status_ttl: Duration::from_secs(10),
+            ..WorkerRegistryConfig::default()
         })
         .unwrap();
         registry
@@ -1427,6 +1648,237 @@ mod tests {
             .select_and_reserve_at(&selection(), now + Duration::from_millis(1))
             .unwrap();
         assert_eq!(reconciled.key.worker_id.as_str(), "worker-b");
+    }
+
+    #[test]
+    fn exact_worker_exclusion_selects_one_bounded_alternate() {
+        let registry = WorkerRegistry::new(WorkerRegistryConfig::default()).unwrap();
+        let worker_a = registration("worker-a", "inc-a", BackendKind::Cpu, 9101, 1);
+        let worker_b = registration("worker-b", "inc-b", BackendKind::Cpu, 9102, 1);
+        let descriptor_a = worker_a.descriptor.clone();
+        let descriptor_b = worker_b.descriptor.clone();
+        registry.approve(worker_a).unwrap();
+        registry.approve(worker_b).unwrap();
+        let now = Instant::now();
+        for descriptor in [&descriptor_a, &descriptor_b] {
+            registry
+                .observe_status_at(
+                    status(
+                        descriptor,
+                        1,
+                        vec![deployment("chat-prod", "lfm2", BackendKind::Cpu)],
+                        capacity(1, 0, 1),
+                    ),
+                    now,
+                )
+                .unwrap();
+        }
+
+        let first = registry.select_and_reserve_at(&selection(), now).unwrap();
+        assert_eq!(first.key.worker_id.as_str(), "worker-a");
+        let excluded = first.key.clone();
+        drop(first);
+
+        let alternate = registry
+            .select_and_reserve_excluding_at(&selection(), Some(&excluded), now)
+            .unwrap();
+        assert_eq!(alternate.key.worker_id.as_str(), "worker-b");
+    }
+
+    #[test]
+    fn circuit_requires_cooldown_and_post_open_status_then_grants_one_probe() {
+        let registry = WorkerRegistry::new(WorkerRegistryConfig {
+            status_ttl: Duration::from_secs(30),
+            circuit_failure_threshold: 2,
+            circuit_open_duration: Duration::from_secs(3),
+            ..WorkerRegistryConfig::default()
+        })
+        .unwrap();
+        let approved = registration("worker-a", "inc-a", BackendKind::Cpu, 9101, 1);
+        let descriptor = approved.descriptor.clone();
+        let key = WorkerInstanceKey::from_descriptor(&descriptor);
+        registry.approve(approved).unwrap();
+        let now = Instant::now();
+        registry
+            .observe_status_at(
+                status(
+                    &descriptor,
+                    1,
+                    vec![deployment("chat-prod", "lfm2", BackendKind::Cpu)],
+                    capacity(1, 0, 1),
+                ),
+                now,
+            )
+            .unwrap();
+
+        registry
+            .report_worker_transport_failure_at(&key, now + Duration::from_secs(1))
+            .unwrap();
+        let after_one_strike = registry
+            .select_and_reserve_at(&selection(), now + Duration::from_secs(1))
+            .unwrap();
+        drop(after_one_strike);
+        registry
+            .report_worker_transport_failure_at(&key, now + Duration::from_secs(2))
+            .unwrap();
+
+        assert_eq!(
+            registry
+                .select_and_reserve_at(&selection(), now + Duration::from_secs(5))
+                .unwrap_err(),
+            WorkerRegistryError::NoEligibleWorker
+        );
+        registry
+            .observe_status_at(
+                status(
+                    &descriptor,
+                    2,
+                    vec![deployment("chat-prod", "lfm2", BackendKind::Cpu)],
+                    capacity(1, 0, 1),
+                ),
+                now + Duration::from_secs(3),
+            )
+            .unwrap();
+        assert_eq!(
+            registry
+                .select_and_reserve_at(&selection(), now + Duration::from_secs(4))
+                .unwrap_err(),
+            WorkerRegistryError::NoEligibleWorker
+        );
+
+        let mut probe = registry
+            .select_and_reserve_at(&selection(), now + Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(
+            registry
+                .select_and_reserve_at(&selection(), now + Duration::from_secs(5))
+                .unwrap_err(),
+            WorkerRegistryError::NoEligibleWorker
+        );
+        probe.dispatch.mark_accepted().unwrap();
+        drop(probe);
+        let closed = registry
+            .select_and_reserve_at(&selection(), now + Duration::from_secs(5))
+            .unwrap();
+        drop(closed);
+    }
+
+    #[test]
+    fn stale_circuit_outcomes_cannot_affect_replacement_incarnation() {
+        let registry = WorkerRegistry::new(WorkerRegistryConfig {
+            circuit_failure_threshold: 1,
+            circuit_open_duration: Duration::from_secs(1),
+            ..WorkerRegistryConfig::default()
+        })
+        .unwrap();
+        let old = registration("worker-a", "inc-old", BackendKind::Cpu, 9101, 1);
+        let old_key = WorkerInstanceKey::from_descriptor(&old.descriptor);
+        registry.approve(old).unwrap();
+        registry.report_worker_transport_failure(&old_key).unwrap();
+
+        let replacement = registration("worker-a", "inc-new", BackendKind::Cpu, 9102, 1);
+        let replacement_descriptor = replacement.descriptor.clone();
+        registry.approve(replacement).unwrap();
+        registry
+            .observe_status(status(
+                &replacement_descriptor,
+                1,
+                vec![deployment("chat-prod", "lfm2", BackendKind::Cpu)],
+                capacity(1, 0, 1),
+            ))
+            .unwrap();
+
+        assert_eq!(
+            registry.report_worker_reachable(&old_key).unwrap_err(),
+            WorkerRegistryError::UnknownOrStaleIncarnation
+        );
+        assert_eq!(
+            registry
+                .report_worker_transport_failure(&old_key)
+                .unwrap_err(),
+            WorkerRegistryError::UnknownOrStaleIncarnation
+        );
+        let selected = registry.select_and_reserve(&selection()).unwrap();
+        assert_eq!(selected.key.incarnation_id.as_str(), "inc-new");
+    }
+
+    #[test]
+    fn authenticated_reachable_outcome_resets_consecutive_strikes() {
+        let registry = WorkerRegistry::new(WorkerRegistryConfig {
+            circuit_failure_threshold: 2,
+            ..WorkerRegistryConfig::default()
+        })
+        .unwrap();
+        let approved = registration("worker-a", "inc-a", BackendKind::Cpu, 9101, 1);
+        let descriptor = approved.descriptor.clone();
+        let key = WorkerInstanceKey::from_descriptor(&descriptor);
+        registry.approve(approved).unwrap();
+        registry
+            .observe_status(status(
+                &descriptor,
+                1,
+                vec![deployment("chat-prod", "lfm2", BackendKind::Cpu)],
+                capacity(1, 0, 1),
+            ))
+            .unwrap();
+
+        registry.report_worker_transport_failure(&key).unwrap();
+        registry.report_worker_reachable(&key).unwrap();
+        registry.report_worker_transport_failure(&key).unwrap();
+
+        let selected = registry.select_and_reserve(&selection()).unwrap();
+        assert_eq!(selected.key, key);
+    }
+
+    #[test]
+    fn abandoned_half_open_probe_reopens_the_circuit() {
+        let registry = WorkerRegistry::new(WorkerRegistryConfig {
+            circuit_failure_threshold: 1,
+            circuit_open_duration: Duration::from_secs(1),
+            ..WorkerRegistryConfig::default()
+        })
+        .unwrap();
+        let approved = registration("worker-a", "inc-a", BackendKind::Cpu, 9101, 1);
+        let descriptor = approved.descriptor.clone();
+        let key = WorkerInstanceKey::from_descriptor(&descriptor);
+        registry.approve(approved).unwrap();
+        let now = Instant::now();
+        registry
+            .observe_status_at(
+                status(
+                    &descriptor,
+                    1,
+                    vec![deployment("chat-prod", "lfm2", BackendKind::Cpu)],
+                    capacity(1, 0, 1),
+                ),
+                now,
+            )
+            .unwrap();
+        registry
+            .report_worker_transport_failure_at(&key, now + Duration::from_secs(1))
+            .unwrap();
+        registry
+            .observe_status_at(
+                status(
+                    &descriptor,
+                    2,
+                    vec![deployment("chat-prod", "lfm2", BackendKind::Cpu)],
+                    capacity(1, 0, 1),
+                ),
+                now + Duration::from_secs(2),
+            )
+            .unwrap();
+
+        let probe = registry
+            .select_and_reserve_at(&selection(), now + Duration::from_secs(3))
+            .unwrap();
+        drop(probe);
+
+        let inner = lock_recover(&registry.inner);
+        assert!(matches!(
+            inner.workers.get(&key).expect("registered worker").circuit,
+            WorkerCircuitState::Open { .. }
+        ));
     }
 
     #[test]
