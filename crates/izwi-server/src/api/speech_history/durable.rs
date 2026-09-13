@@ -1,10 +1,11 @@
 use super::*;
-use crate::api::tts_long_form::{SpeechTextPlan, generate_speech_plan_stream_with_progress};
+use crate::api::tts_long_form::{generate_speech_plan_stream_with_progress, SpeechTextPlan};
 use crate::batch_runtime::speech_progress::{SpeechCheckpoint, SpeechPcmBatch};
 
 pub(crate) struct DurableSpeechProgress {
     state: AppState,
     attempt: StageExecutionContext,
+    artifact_tenant: crate::artifact_store::ArtifactTenant,
     checkpoint: SpeechCheckpoint,
 }
 impl DurableSpeechProgress {
@@ -13,6 +14,7 @@ impl DurableSpeechProgress {
         attempt: &StageExecutionContext,
         identity: serde_json::Value,
         total: usize,
+        tenant_key: Option<[u8; 32]>,
     ) -> anyhow::Result<Self> {
         let checkpoint = match attempt.claimed().stage.progress_json.as_ref() {
             Some(progress) => SpeechCheckpoint::recover(progress, &identity)?,
@@ -30,6 +32,7 @@ impl DurableSpeechProgress {
         Ok(Self {
             state: state.clone(),
             attempt: attempt.clone(),
+            artifact_tenant: crate::artifact_store::ArtifactTenant::from_scheduling_key(tenant_key),
             checkpoint,
         })
     }
@@ -85,62 +88,17 @@ impl DurableSpeechProgress {
             bytes.len() <= 1024 * 1024,
             "Speech PCM replay batch exceeds one MiB"
         );
-        let key = self
-            .state
-            .media_ingest
-            .persist_generated_audio(
-                format!(
-                    "{}-pcm-{}",
-                    self.attempt.claimed().job.id,
-                    uuid::Uuid::new_v4()
-                ),
-                Some("chunk.pcm"),
-                "audio/pcm-f32le",
-                &bytes,
-                "speech_replay",
-            )
-            .await?;
-        let publication_sequence = self.checkpoint.next_sequence;
-        match self
-            .checkpoint
+        self.checkpoint
             .publish_pcm(
                 &self.attempt,
-                key.clone(),
-                sha256_hex(&bytes),
+                &self.state.artifact_store,
+                &self.artifact_tenant,
+                bytes,
                 chunk.samples.len() as u64,
                 rate,
             )
-            .await
-        {
-            Ok(artifact) => {
-                if artifact.storage_key.as_deref() != Some(key.as_str()) {
-                    let _ = self.state.media_ingest.delete_object(&key).await;
-                }
-                Ok(())
-            }
-            Err(error) => {
-                // An ambiguous DB result must preserve a possibly committed object.
-                // A successful journal read proving it unreferenced permits cleanup.
-                if let Ok(page) = self
-                    .state
-                    .batch_runtime_store
-                    .speech_pcm_after(
-                        &self.attempt.claimed().job.id,
-                        publication_sequence.checked_sub(1),
-                        1,
-                    )
-                    .await
-                {
-                    if !page
-                        .iter()
-                        .any(|artifact| artifact.storage_key.as_deref() == Some(key.as_str()))
-                    {
-                        let _ = self.state.media_ingest.delete_object(&key).await;
-                    }
-                }
-                Err(error)
-            }
-        }
+            .await?;
+        Ok(())
     }
     pub(crate) async fn complete_segment(
         &mut self,
@@ -209,15 +167,23 @@ pub(super) async fn synthesize_fish_record(
             .fish_s2_artifact_fingerprint()
             .await
             .context("Fish model did not publish an artifact fingerprint")?;
-        let mut progress =
-            if let Some(attempt) = attempt {
-                Some(DurableSpeechProgress::new(state, attempt, serde_json::json!({
-                "plan": plan, "model_snapshot": claimed.map(|c| &c.job.model_snapshot_json),
-                "model": model_id, "artifact_fingerprint": artifact_fingerprint,
-            }), plan.segments.len()).await?)
-            } else {
-                None
-            };
+        let mut progress = if let Some(attempt) = attempt {
+            Some(
+                DurableSpeechProgress::new(
+                    state,
+                    attempt,
+                    serde_json::json!({
+                    "plan": plan, "model_snapshot": claimed.map(|c| &c.job.model_snapshot_json),
+                    "model": model_id, "artifact_fingerprint": artifact_fingerprint,
+                    }),
+                    plan.segments.len(),
+                    tenant_key,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
         let mut spool: Option<SpeechWavSpool> = None;
         let mut stats = StreamRequestStatistics::default();
         {
@@ -285,7 +251,8 @@ pub(super) async fn synthesize_fish_record(
                     break;
                 }
                 for artifact in page {
-                    let batch: SpeechPcmBatch = serde_json::from_value(artifact.metadata_json)?;
+                    let batch: SpeechPcmBatch =
+                        serde_json::from_value(artifact.metadata_json.clone())?;
                     anyhow::ensure!(
                         batch.sequence == restored_sequence
                             && batch.sample_offset == restored_samples,
@@ -295,16 +262,9 @@ pub(super) async fn synthesize_fish_record(
                         batch.sequence < progress.checkpoint.next_sequence,
                         "Uncheckpointed speech replay publication"
                     );
-                    let pcm = read_pcm(
-                        state,
-                        artifact
-                            .storage_key
-                            .as_deref()
-                            .context("Missing PCM object")?,
-                        &batch,
-                        artifact.sha256.as_deref(),
-                    )
-                    .await?;
+                    let artifact_tenant =
+                        crate::artifact_store::ArtifactTenant::from_scheduling_key(tenant_key);
+                    let pcm = read_pcm(state, &artifact_tenant, &artifact, &batch).await?;
                     append_samples(&mut spool, &pcm, batch.sample_rate).await?;
                     restored_samples += batch.sample_count;
                     restored_sequence += 1;
@@ -471,36 +431,75 @@ async fn append_samples(
 
 async fn read_pcm(
     state: &AppState,
-    key: &str,
+    tenant: &crate::artifact_store::ArtifactTenant,
+    artifact: &crate::batch_runtime::types::RuntimeArtifact,
     batch: &SpeechPcmBatch,
-    sha: Option<&str>,
 ) -> anyhow::Result<Vec<f32>> {
     anyhow::ensure!(
         batch.version == 1 && batch.sample_count <= 262144,
         "Invalid speech replay metadata"
     );
-    use tokio::io::AsyncReadExt;
-    let expected = batch.sample_count * 4;
-    let object = state.media_ingest.read_object_stream(key).await?;
     anyhow::ensure!(
-        object
-            .metadata
-            .content_length
-            .is_none_or(|length| length == expected),
-        "Speech replay PCM size mismatch"
+        artifact.publication_key.as_deref()
+            == Some(
+                crate::batch_runtime::speech_progress::pcm_publication_key(batch.sequence).as_str()
+            ),
+        "Speech replay sequence does not match its publication key"
     );
-    let mut bytes = Vec::with_capacity(expected as usize + 1);
-    object
-        .reader
-        .take(expected + 1)
-        .read_to_end(&mut bytes)
-        .await?;
+    let expected = batch.sample_count * 4;
+    anyhow::ensure!(
+        expected <= crate::batch_runtime::speech_progress::MAX_PCM_REPLAY_BATCH_BYTES,
+        "Speech replay PCM exceeds the per-object limit"
+    );
+    anyhow::ensure!(
+        artifact.text_asset_id.is_none(),
+        "Speech replay artifact exposes an invalid text reference"
+    );
+    let bytes = match (
+        artifact.media_asset_id.as_deref(),
+        artifact.storage_key.as_deref(),
+    ) {
+        (Some(id), None) => {
+            let id = crate::artifact_store::ArtifactId::parse(id.to_string())?;
+            let descriptor = state.artifact_store.stat(tenant, &id).await?;
+            anyhow::ensure!(
+                descriptor.content_type == "audio/pcm-f32le"
+                    && descriptor.size_bytes == expected
+                    && artifact.content_type.as_deref() == Some(descriptor.content_type.as_str())
+                    && artifact.size_bytes == Some(expected)
+                    && artifact.sha256.as_deref() == Some(descriptor.sha256.as_str()),
+                "Speech replay PCM descriptor mismatch"
+            );
+            state.artifact_store.read(tenant, &id).await?.bytes
+        }
+        (None, Some(key)) => {
+            // Compatibility for journals written before opaque replay adoption.
+            use tokio::io::AsyncReadExt;
+            let object = state.media_ingest.read_object_stream(key).await?;
+            anyhow::ensure!(
+                object
+                    .metadata
+                    .content_length
+                    .is_none_or(|length| length == expected),
+                "Speech replay PCM size mismatch"
+            );
+            let mut bytes = Vec::with_capacity(expected as usize + 1);
+            object
+                .reader
+                .take(expected + 1)
+                .read_to_end(&mut bytes)
+                .await?;
+            bytes
+        }
+        _ => anyhow::bail!("Speech replay artifact has an ambiguous storage reference"),
+    };
     anyhow::ensure!(
         bytes.len() as u64 == expected,
         "Speech replay PCM size mismatch"
     );
+    let actual_sha256 = sha256_hex(&bytes);
     anyhow::ensure!(
-        sha == Some(sha256_hex(&bytes).as_str()),
+        artifact.sha256.as_deref() == Some(actual_sha256.as_str()),
         "Speech replay checksum mismatch"
     );
     Ok(bytes
@@ -545,6 +544,8 @@ pub(super) async fn replay_response(
     if request.tenant_key != tenant {
         return Err(ApiError::forbidden("Speech job belongs to another tenant"));
     }
+    let artifact_tenant =
+        crate::artifact_store::ArtifactTenant::from_scheduling_key(request.tenant_key);
     let record = state
         .speech_history_store
         .get_record(SpeechRouteKind::TextToSpeech, record_id.clone())
@@ -581,8 +582,17 @@ pub(super) async fn replay_response(
             let mut failure = None;
             for artifact in page {
                 let result: anyhow::Result<_> = async {
-                    let batch: SpeechPcmBatch = serde_json::from_value(artifact.metadata_json)?;
-                    let samples = read_pcm(&state, artifact.storage_key.as_deref().context("Missing speech PCM")?, &batch, artifact.sha256.as_deref()).await?;
+                    let batch: SpeechPcmBatch =
+                        serde_json::from_value(artifact.metadata_json.clone())?;
+                    let expected_sequence = cursor
+                        .map(|sequence| sequence.checked_add(1).context("Speech replay cursor overflow"))
+                        .transpose()?
+                        .unwrap_or(0);
+                    anyhow::ensure!(
+                        batch.sequence == expected_sequence,
+                        "Speech replay journal has a missing or reordered sequence"
+                    );
+                    let samples = read_pcm(&state, &artifact_tenant, &artifact, &batch).await?;
                     let bytes = AudioEncoder::new(batch.sample_rate, 1).encode(&samples, AudioFormat::RawI16)?;
                     Ok((batch, bytes))
                 }.await;
@@ -690,13 +700,18 @@ pub(super) async fn cleanup_expired_replay(state: &AppState) -> anyhow::Result<(
         .expired_speech_pcm(now.saturating_sub(retention.saturating_mul(1000)))
         .await?
     {
-        if let Some(key) = artifact.storage_key.as_deref() {
-            state.media_ingest.delete_object(key).await?;
-        }
-        state
+        let job = state
             .batch_runtime_store
-            .remove_speech_pcm_artifact(&artifact.id)
-            .await?;
+            .get_job(&artifact.job_id)
+            .await?
+            .context("Speech replay artifact has no parent job")?;
+        let tenant = speech_artifact_tenant(&job)?;
+        if delete_pcm_artifact(state, &tenant, &artifact).await? {
+            state
+                .batch_runtime_store
+                .remove_speech_pcm_artifact(&artifact.id)
+                .await?;
+        }
     }
     Ok(())
 }
@@ -713,6 +728,7 @@ pub(super) async fn cleanup_record_replay(
     else {
         return Ok(());
     };
+    let tenant = speech_artifact_tenant(&job)?;
     anyhow::ensure!(
         state
             .batch_runtime_store
@@ -729,13 +745,49 @@ pub(super) async fn cleanup_record_replay(
             return Ok(());
         }
         for artifact in page {
-            if let Some(key) = artifact.storage_key.as_deref() {
-                state.media_ingest.delete_object(key).await?;
-            }
+            anyhow::ensure!(
+                delete_pcm_artifact(state, &tenant, &artifact).await?,
+                "Speech replay cleanup is durably pending; retry deletion"
+            );
             state
                 .batch_runtime_store
                 .remove_speech_pcm_artifact(&artifact.id)
                 .await?;
         }
+    }
+}
+
+fn speech_artifact_tenant(
+    job: &crate::batch_runtime::types::RuntimeJob,
+) -> anyhow::Result<crate::artifact_store::ArtifactTenant> {
+    let request: BatchSpeechRequest = serde_json::from_value(job.request_json.clone())
+        .context("Invalid server-authored speech job request")?;
+    Ok(crate::artifact_store::ArtifactTenant::from_scheduling_key(
+        request.tenant_key,
+    ))
+}
+
+async fn delete_pcm_artifact(
+    state: &AppState,
+    tenant: &crate::artifact_store::ArtifactTenant,
+    artifact: &crate::batch_runtime::types::RuntimeArtifact,
+) -> anyhow::Result<bool> {
+    match (
+        artifact.media_asset_id.as_deref(),
+        artifact.storage_key.as_deref(),
+    ) {
+        (Some(id), None) => {
+            let id = crate::artifact_store::ArtifactId::parse(id.to_string())?;
+            match state.artifact_store.delete(tenant, &id).await {
+                Ok(_) => Ok(true),
+                Err(crate::artifact_store::ArtifactStoreError::DeleteIncomplete) => Ok(false),
+                Err(error) => Err(error.into()),
+            }
+        }
+        (None, Some(key)) => {
+            state.media_ingest.delete_object(key).await?;
+            Ok(true)
+        }
+        _ => anyhow::bail!("Speech replay artifact has an ambiguous storage reference"),
     }
 }

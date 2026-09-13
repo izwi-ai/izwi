@@ -1607,7 +1607,14 @@ mod tests {
         assert_eq!(records.len(), 1);
     }
 
-    async fn speech_replay_fixture(state: &AppState, tenant: Option<[u8; 32]>) -> (String, String) {
+    async fn speech_replay_fixture(
+        state: &AppState,
+        tenant: Option<[u8; 32]>,
+        opaque: bool,
+    ) -> (String, String, Option<String>) {
+        use crate::artifact_store::{
+            ArtifactRetention, ArtifactTenant, ArtifactWrite, AttemptArtifactWrite,
+        };
         use crate::batch_runtime::store::{sha256_hex, NewStageOutputArtifact};
         use crate::speech_history_store::{
             NewSpeechHistoryRecord, SpeechHistoryProcessingStatus, SpeechRouteKind,
@@ -1672,38 +1679,83 @@ mod tests {
             .iter()
             .flat_map(|sample| sample.to_le_bytes())
             .collect();
-        let key = state
-            .media_ingest
-            .persist_generated_audio(
-                "replay-test".into(),
-                Some("pcm"),
-                "audio/pcm-f32le",
-                &bytes,
-                "speech_replay",
-            )
-            .await
-            .unwrap();
-        state.batch_runtime_store.publish_stage_output_artifact(&claimed.lease().unwrap(), NewStageOutputArtifact {
-            publication_key: "speech-pcm/00000000000000000000".into(), artifact_kind: RuntimeArtifactKind::Audio,
-            artifact_role: RuntimeArtifactRole::OutputIntermediate, media_asset_id: None, text_asset_id: None,
-            storage_key: Some(key), content_type: Some("audio/pcm-f32le".into()), filename: None,
-            size_bytes: Some(bytes.len() as u64), sha256: Some(sha256_hex(&bytes)),
-            metadata_json: serde_json::json!({"version":1,"sequence":0,"segment":0,"sample_offset":0,"sample_count":3,"sample_rate":44100}), retention_policy: "test".into(),
-        }).await.unwrap().unwrap();
+        let metadata = serde_json::json!({"version":1,"sequence":0,"segment":0,"sample_offset":0,"sample_count":3,"sample_rate":44100});
+        let media_asset_id = if opaque {
+            let artifact = state
+                .artifact_store
+                .put_attempt_artifact(
+                    &ArtifactTenant::from_scheduling_key(tenant),
+                    &claimed.lease().unwrap(),
+                    AttemptArtifactWrite {
+                        publication_key: "speech-pcm/00000000000000000000".into(),
+                        artifact_kind: RuntimeArtifactKind::Audio,
+                        artifact_role: RuntimeArtifactRole::OutputIntermediate,
+                        metadata_json: metadata,
+                        runtime_retention_policy: "test".into(),
+                        object: ArtifactWrite {
+                            content_type: "audio/pcm-f32le".into(),
+                            filename: Some("chunk.f32le".into()),
+                            bytes,
+                            retention: ArtifactRetention::Job,
+                        },
+                    },
+                    serde_json::json!({"publication_started":true}),
+                )
+                .await
+                .unwrap();
+            assert!(artifact.storage_key.is_none());
+            artifact.media_asset_id
+        } else {
+            let key = state
+                .media_ingest
+                .persist_generated_audio(
+                    "legacy-replay-test".into(),
+                    Some("chunk.pcm"),
+                    "audio/pcm-f32le",
+                    &bytes,
+                    "speech_replay",
+                )
+                .await
+                .unwrap();
+            let artifact = state
+                .batch_runtime_store
+                .publish_stage_output_artifact(
+                    &claimed.lease().unwrap(),
+                    NewStageOutputArtifact {
+                        publication_key: "speech-pcm/00000000000000000000".into(),
+                        artifact_kind: RuntimeArtifactKind::Audio,
+                        artifact_role: RuntimeArtifactRole::OutputIntermediate,
+                        media_asset_id: None,
+                        text_asset_id: None,
+                        storage_key: Some(key),
+                        content_type: Some("audio/pcm-f32le".into()),
+                        filename: Some("chunk.pcm".into()),
+                        size_bytes: Some(bytes.len() as u64),
+                        sha256: Some(sha256_hex(&bytes)),
+                        metadata_json: metadata,
+                        retention_policy: "test".into(),
+                    },
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(artifact.media_asset_id.is_none());
+            None
+        };
         state
             .batch_runtime_store
             .complete_stage(&claimed.lease().unwrap(), vec![])
             .await
             .unwrap()
             .unwrap();
-        (record.id, job.id)
+        (record.id, job.id, media_asset_id)
     }
 
     #[tokio::test]
     async fn durable_speech_replay_preserves_pcm_stats_and_terminal_cancel() {
         let (state, _root) = test_state("durable_speech_replay", false);
         state.lifecycle.mark_ready();
-        let (id, job_id) = speech_replay_fixture(&state, None).await;
+        let (id, job_id, _) = speech_replay_fixture(&state, None, true).await;
         let config = ServeRuntimeConfig {
             backend: izwi_core::backends::BackendPreference::Cpu,
             ui_enabled: false,
@@ -1773,12 +1825,207 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deleting_durable_speech_removes_opaque_replay_reference() {
+        let (state, _root) = test_state("durable_speech_delete_replay", false);
+        state.lifecycle.mark_ready();
+        let (id, job_id, artifact_id) = speech_replay_fixture(&state, None, true).await;
+        let artifact_id = crate::artifact_store::ArtifactId::parse(artifact_id.unwrap()).unwrap();
+        let tenant = crate::artifact_store::ArtifactTenant::from_scheduling_key(None);
+        assert!(state
+            .artifact_store
+            .stat(&tenant, &artifact_id)
+            .await
+            .is_ok());
+        let config = ServeRuntimeConfig {
+            backend: izwi_core::backends::BackendPreference::Cpu,
+            ui_enabled: false,
+            ..ServeRuntimeConfig::default()
+        };
+
+        assert_route_status(
+            create_router(state.clone(), &config),
+            Method::DELETE,
+            &format!("/v1/text-to-speech/{id}"),
+            None,
+            StatusCode::OK,
+        )
+        .await;
+        assert!(matches!(
+            state.artifact_store.stat(&tenant, &artifact_id).await,
+            Err(crate::artifact_store::ArtifactStoreError::NotFound)
+        ));
+        assert!(state
+            .batch_runtime_store
+            .speech_pcm_after(&job_id, None, 1)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_opaque_replay_delete_retains_reference_for_retry() {
+        let (state, root) = test_state("durable_speech_delete_retry", false);
+        state.lifecycle.mark_ready();
+        let (id, job_id, artifact_id) = speech_replay_fixture(&state, None, true).await;
+        let artifact_id = crate::artifact_store::ArtifactId::parse(artifact_id.unwrap()).unwrap();
+        let tenant = crate::artifact_store::ArtifactTenant::from_scheduling_key(None);
+        let config = ServeRuntimeConfig {
+            backend: izwi_core::backends::BackendPreference::Cpu,
+            ui_enabled: false,
+            ..ServeRuntimeConfig::default()
+        };
+        let app = create_router(state.clone(), &config);
+
+        // Turn the provider root into a regular file so deletion fails with an
+        // error other than NotFound while leaving all provider bytes recoverable.
+        let media_root = root.0.join("media");
+        let media_backup = root.0.join("media-delete-retry-backup");
+        std::fs::rename(&media_root, &media_backup).unwrap();
+        std::fs::write(&media_root, b"provider unavailable").unwrap();
+        assert_route_status(
+            app.clone(),
+            Method::DELETE,
+            &format!("/v1/text-to-speech/{id}"),
+            None,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .await;
+        std::fs::remove_file(&media_root).unwrap();
+        std::fs::rename(&media_backup, &media_root).unwrap();
+
+        assert!(matches!(
+            state.artifact_store.stat(&tenant, &artifact_id).await,
+            Err(crate::artifact_store::ArtifactStoreError::NotFound)
+        ));
+        assert_eq!(
+            state
+                .batch_runtime_store
+                .speech_pcm_after(&job_id, None, 1)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        assert_route_status(
+            app,
+            Method::DELETE,
+            &format!("/v1/text-to-speech/{id}"),
+            None,
+            StatusCode::OK,
+        )
+        .await;
+        assert!(state
+            .batch_runtime_store
+            .speech_pcm_after(&job_id, None, 1)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_raw_key_speech_replay_remains_readable_and_deletable() {
+        let (state, _root) = test_state("legacy_speech_replay", false);
+        state.lifecycle.mark_ready();
+        let (id, job_id, artifact_id) = speech_replay_fixture(&state, None, false).await;
+        assert!(artifact_id.is_none());
+        let config = ServeRuntimeConfig {
+            backend: izwi_core::backends::BackendPreference::Cpu,
+            ui_enabled: false,
+            ..ServeRuntimeConfig::default()
+        };
+        let app = create_router(state.clone(), &config);
+        let response = send_request(
+            app.clone(),
+            build_request(
+                Method::GET,
+                &format!("/v1/text-to-speech/{id}/events"),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 65_536)
+            .await
+            .unwrap();
+        assert!(String::from_utf8(body.to_vec())
+            .unwrap()
+            .contains("\"event\":\"chunk\""));
+
+        assert_route_status(
+            app,
+            Method::DELETE,
+            &format!("/v1/text-to-speech/{id}"),
+            None,
+            StatusCode::OK,
+        )
+        .await;
+        assert!(state
+            .batch_runtime_store
+            .speech_pcm_after(&job_id, None, 1)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_speech_sequence_fails_closed_without_repeating_audio() {
+        use sea_orm::ConnectionTrait;
+
+        let (state, _root) = test_state("malformed_speech_sequence", false);
+        state.lifecycle.mark_ready();
+        let (id, job_id, _) = speech_replay_fixture(&state, None, false).await;
+        let artifact = state
+            .batch_runtime_store
+            .speech_pcm_after(&job_id, None, 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let db = state.batch_runtime_store.connection().await.unwrap();
+        db.execute_raw(
+            crate::db::raw::statement(
+                db,
+                "UPDATE runtime_artifacts SET metadata_json = ?1 WHERE id = ?2",
+                vec![
+                    serde_json::json!({"version":1,"sequence":9,"segment":0,"sample_offset":0,"sample_count":3,"sample_rate":44100}).to_string().into(),
+                    artifact.id.into(),
+                ],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let config = ServeRuntimeConfig {
+            backend: izwi_core::backends::BackendPreference::Cpu,
+            ui_enabled: false,
+            ..ServeRuntimeConfig::default()
+        };
+        let response = send_request(
+            create_router(state, &config),
+            build_request(
+                Method::GET,
+                &format!("/v1/text-to-speech/{id}/events"),
+                None,
+            ),
+        )
+        .await;
+        let body = axum::body::to_bytes(response.into_body(), 65_536)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("\"event\":\"error\""));
+        assert!(body.contains("missing or reordered sequence"));
+        assert!(!body.contains("\"event\":\"chunk\""));
+    }
+
+    #[tokio::test]
     async fn durable_speech_listener_disconnect_does_not_cancel_running_job() {
         use crate::speech_history_store::{SpeechHistoryProcessingStatus, SpeechRouteKind};
         use futures::StreamExt;
         let (state, _root) = test_state("durable_speech_disconnect", false);
         state.lifecycle.mark_ready();
-        let (id, job_id) = speech_replay_fixture(&state, None).await;
+        let (id, job_id, _) = speech_replay_fixture(&state, None, true).await;
         state
             .batch_runtime_store
             .transition_job_status(
@@ -1850,7 +2097,7 @@ mod tests {
     async fn durable_speech_replay_rejects_other_tenant() {
         let (state, _root) = test_state("durable_speech_other_tenant", false);
         state.lifecycle.mark_ready();
-        let (id, _) = speech_replay_fixture(&state, Some([7; 32])).await;
+        let (id, _, _) = speech_replay_fixture(&state, Some([7; 32]), true).await;
         let config = ServeRuntimeConfig {
             backend: izwi_core::backends::BackendPreference::Cpu,
             ui_enabled: false,

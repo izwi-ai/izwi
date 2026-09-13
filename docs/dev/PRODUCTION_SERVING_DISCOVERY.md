@@ -80,7 +80,7 @@ or media-provider option alone is not evidence of shared ownership correctness.
 | Realtime transcription | Preview | In-process realtime app/runtime | Process-local rolling state and bounded queues; only correlation identity survives upgrade | WebSocket; owner-bound state | Keep local-only until tenant session ownership, gateway affinity, and a private realtime protocol exist. |
 | Realtime voice | Preview | In-process workflow coordinator | ASR/chat/TTS state, barge-in, streaming input, active turn, and agent session are process-owned | WebSocket with multi-stage cancellation | Keep local-only; bind every stage to worker incarnation/deployment generation and explicitly interrupt on owner loss rather than implying migration. |
 | Voice-session records | Preview | Local voice workflow/store | Durable session/turn rows lack tenant, owner incarnation, and deployment generation; live state remains process-local | REST plus realtime owner | Preserve locally. Durable rows do not make a live session migratable or fleet-owned. |
-| Jobs and speech history | Preview | In-process DB-polling batch worker plus runtime | Jobs/stages/artifacts have transactional claims and attempt fencing. Text-only TTS has atomic acceptance and tenant-scoped idempotency, but history reads/mutations and route rows are not tenant-filtered. | Poll/SSE/cancel with durable state | Preserve locally. Admission/idempotency progress is not tenant-owned history; require tenant predicates and shared provider conformance before fleet exposure. |
+| Jobs and speech history | Preview | In-process DB-polling batch worker plus runtime | Jobs/stages/artifacts have transactional claims and attempt fencing. Text-only TTS has atomic acceptance and tenant-scoped idempotency. Durable Fish PCM replay now uses tenant-scoped opaque artifacts with atomic attempt publication, while the final WAV, history rows, references, and other speech routes retain legacy provider paths and incomplete tenant predicates. | Poll/SSE/cancel with durable state | Preserve locally. Opaque replay storage alone does not establish fleet ownership; require tenant predicates, final-artifact migration, and deployed shared-provider conformance before fleet exposure. |
 | Media uploads | Preview | Local/server media provider | Public routes address provider storage keys directly; `media_assets` metadata does not enforce tenant ownership and the route does not use `ArtifactStore` | HTTP upload/download | Keep local-only until upload/download use authorized opaque artifacts and never expose provider keys. |
 | Saved voices | Preview | Local saved-voice store and media provider | Rows contain provider paths and no tenant owner; `local_owner` describes use class, not authenticated caller ownership; blob/row publication is not transactional | HTTP CRUD plus TTS reuse | Keep local-only until tenant-filtered metadata, opaque artifacts, crash-safe publication/deletion, and worker-side authorized resolution exist. |
 | Studio projects and rendering | Preview | In-process Studio workflow and TTS runtime | Projects, segments, snapshots, and render metadata are durable but unscoped; rendering attaches speech records separately and export accumulates segment audio in memory | REST plus background render metadata | Keep local-only until tenant ownership, fenced render jobs, transactional result publication, shared voice/audio artifacts, and bounded export exist. |
@@ -149,8 +149,12 @@ unknown legacy shapes remain fenced for operator remediation. Provider
 `NotFound` completes recovery only when the object is absent and a future commit
 for the expired write ID is fenced.
 
-Existing media, saved-voice, speech-history, job-output, Studio, and multimodal
-routes do not use this facade yet. Their provider-write migration,
-attempt-specific losing-output cleanup after exact teardown, remote artifact
-authentication, and fleet database ownership remain Phase 6 work; this
-foundation alone does not enable a fleet route.
+Durable Fish PCM replay is the first route-state adopter: each new chunk is a
+tenant-scoped opaque object, and its publication marker, media row, exact active
+attempt reference, and reservation consumption commit together. Runtime rows do
+not expose provider keys. Existing raw-key journals remain readable and
+deletable for local upgrade compatibility. The final speech WAV, saved voices,
+history rows, references, other job outputs, Studio, media routes, and multimodal
+inputs still retain legacy provider paths. Their tenant and fleet ownership
+gates remain Phase 6 work; this partial adoption does not enable a new gateway
+route.

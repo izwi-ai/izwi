@@ -4,15 +4,21 @@
 //! after it succeeds. A publication intent is checkpointed first, so a crash in
 //! either half of publication can never silently regenerate an audible segment.
 use super::{
-    store::NewStageOutputArtifact,
+    store::sha256_hex,
     types::{RuntimeArtifact, RuntimeArtifactKind, RuntimeArtifactRole},
     worker::StageExecutionContext,
+};
+use crate::artifact_store::{
+    ArtifactRetention, ArtifactStore, ArtifactTenant, ArtifactWrite, AttemptArtifactWrite,
 };
 use anyhow::{bail, ensure, Context};
 use serde::{Deserialize, Serialize};
 
 pub const SPEECH_CHECKPOINT_VERSION: u32 = 1;
 pub const MAX_PCM_REPLAY_BATCH_BYTES: u64 = 1024 * 1024;
+// The default Fish 4,800-sample chunks need 66,150 entries for the documented
+// 120-minute qualification target. Keep a fixed ceiling above that target.
+pub const MAX_PCM_REPLAY_ENTRIES: u64 = 131_072;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SpeechCheckpoint {
@@ -104,6 +110,10 @@ impl SpeechCheckpoint {
             checkpoint.journal_bytes <= checkpoint.max_journal_bytes,
             "Speech replay storage quota exceeded"
         );
+        ensure!(
+            checkpoint.next_sequence <= MAX_PCM_REPLAY_ENTRIES,
+            "Speech replay entry quota exceeded"
+        );
         if checkpoint.active_segment.is_some() && checkpoint.publication_started {
             bail!(
                 "speech_partial_segment_interrupted: published audio cannot be regenerated safely"
@@ -134,12 +144,14 @@ impl SpeechCheckpoint {
     }
 
     /// The immutable object contains mono little-endian f32 PCM, never base64.
-    /// The caller cleans up the object if publication fails and the attempt owns it.
+    /// Provider reservation consumption, opaque media publication, the attempt
+    /// reference, and the publication marker commit in one metadata transaction.
     pub async fn publish_pcm(
         &mut self,
         attempt: &StageExecutionContext,
-        storage_key: String,
-        sha256: String,
+        artifact_store: &ArtifactStore,
+        tenant: &ArtifactTenant,
+        bytes: Vec<u8>,
         sample_count: u64,
         sample_rate: u32,
     ) -> anyhow::Result<RuntimeArtifact> {
@@ -161,6 +173,10 @@ impl SpeechCheckpoint {
             size_bytes <= MAX_PCM_REPLAY_BATCH_BYTES,
             "Speech PCM replay batch exceeds one MiB"
         );
+        ensure!(
+            bytes.len() as u64 == size_bytes,
+            "Speech PCM replay byte count does not match its samples"
+        );
         let total = self
             .journal_bytes
             .checked_add(size_bytes)
@@ -177,8 +193,10 @@ impl SpeechCheckpoint {
             .next_sequence
             .checked_add(1)
             .context("Speech sequence overflow")?;
-        self.publication_started = true;
-        self.save(attempt).await?;
+        ensure!(
+            next_sequence <= MAX_PCM_REPLAY_ENTRIES,
+            "speech_storage_limit: replay entry quota exceeded"
+        );
         let batch = SpeechPcmBatch {
             version: SPEECH_CHECKPOINT_VERSION,
             sequence: self.next_sequence,
@@ -188,29 +206,38 @@ impl SpeechCheckpoint {
             sample_rate,
         };
         let metadata = serde_json::to_value(batch)?;
-        let expected_sha256 = sha256.clone();
-        let artifact = attempt
-            .publish_output_artifact(NewStageOutputArtifact {
-                publication_key: pcm_publication_key(self.next_sequence),
-                artifact_kind: RuntimeArtifactKind::Audio,
-                artifact_role: RuntimeArtifactRole::OutputIntermediate,
-                media_asset_id: None,
-                text_asset_id: None,
-                storage_key: Some(storage_key),
-                content_type: Some("audio/pcm-f32le".to_string()),
-                filename: None,
-                size_bytes: Some(size_bytes),
-                sha256: Some(sha256),
-                metadata_json: metadata.clone(),
-                retention_policy: "speech_job_replay".to_string(),
-            })
+        let expected_sha256 = sha256_hex(&bytes);
+        let mut publication_checkpoint = self.clone();
+        publication_checkpoint.publication_started = true;
+        let artifact = artifact_store
+            .put_attempt_artifact(
+                tenant,
+                attempt.lease(),
+                AttemptArtifactWrite {
+                    publication_key: pcm_publication_key(self.next_sequence),
+                    artifact_kind: RuntimeArtifactKind::Audio,
+                    artifact_role: RuntimeArtifactRole::OutputIntermediate,
+                    metadata_json: metadata.clone(),
+                    runtime_retention_policy: "speech_job_replay".to_string(),
+                    object: ArtifactWrite {
+                        content_type: "audio/pcm-f32le".to_string(),
+                        filename: Some("chunk.f32le".to_string()),
+                        bytes,
+                        retention: ArtifactRetention::Job,
+                    },
+                },
+                serde_json::to_value(publication_checkpoint)?,
+            )
             .await?;
         ensure!(
             artifact.sha256.as_deref() == Some(expected_sha256.as_str())
                 && artifact.size_bytes == Some(size_bytes)
-                && artifact.metadata_json == metadata,
+                && artifact.metadata_json == metadata
+                && artifact.media_asset_id.is_some()
+                && artifact.storage_key.is_none(),
             "Speech replay publication key was reused for different PCM"
         );
+        self.publication_started = true;
         self.next_sequence = next_sequence;
         self.committed_samples = next_samples;
         self.sample_rate = Some(sample_rate);
@@ -285,6 +312,19 @@ mod tests {
             SpeechCheckpoint::recover(&serde_json::to_value(&checkpoint).unwrap(), &identity)
                 .is_err()
         );
+        checkpoint.journal_bytes = 0;
+        checkpoint.next_sequence = MAX_PCM_REPLAY_ENTRIES + 1;
+        assert!(
+            SpeechCheckpoint::recover(&serde_json::to_value(&checkpoint).unwrap(), &identity)
+                .is_err()
+        );
+    }
+    #[test]
+    fn replay_entry_ceiling_covers_two_hours_of_default_fish_chunks() {
+        let samples = 120_u64 * 60 * 44_100;
+        let entries = samples.div_ceil(4_800);
+        assert_eq!(entries, 66_150);
+        assert!(entries < MAX_PCM_REPLAY_ENTRIES);
     }
     #[test]
     fn cursor_keys_sort_numerically_including_large_sequences() {

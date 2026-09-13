@@ -9,6 +9,19 @@ struct RequiredSchemaTable {
     columns: &'static [&'static str],
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RequiredUniqueIndex {
+    table: &'static str,
+    name: &'static str,
+    columns: &'static [&'static str],
+}
+
+const REQUIRED_UNIQUE_INDEXES: &[RequiredUniqueIndex] = &[RequiredUniqueIndex {
+    table: "runtime_artifacts",
+    name: "idx_runtime_artifacts_attempt_publication",
+    columns: &["stage_id", "producer_attempt_token", "publication_key"],
+}];
+
 const REQUIRED_SCHEMA_TABLES: &[RequiredSchemaTable] = &[
     RequiredSchemaTable {
         name: "runtime_admission_locks",
@@ -536,6 +549,7 @@ const REQUIRED_SCHEMA_TABLES: &[RequiredSchemaTable] = &[
 pub async fn validate_provider_managed_schema(db: &DatabaseConnection) -> anyhow::Result<()> {
     let mut missing_tables = Vec::new();
     let mut missing_columns = Vec::new();
+    let mut missing_indexes = Vec::new();
 
     for table in REQUIRED_SCHEMA_TABLES {
         let columns = load_table_columns(db, table.name)
@@ -554,16 +568,130 @@ pub async fn validate_provider_managed_schema(db: &DatabaseConnection) -> anyhow
         }
     }
 
-    if !missing_tables.is_empty() || !missing_columns.is_empty() {
+    for index in REQUIRED_UNIQUE_INDEXES {
+        let columns = load_unique_index_columns(db, index.table, index.name)
+            .await
+            .with_context(|| format!("Failed to inspect enterprise index {}", index.name))?;
+        if columns.as_ref().is_none_or(|columns| {
+            !columns
+                .iter()
+                .map(String::as_str)
+                .eq(index.columns.iter().copied())
+        }) {
+            missing_indexes.push(index.name);
+        }
+    }
+
+    if !missing_tables.is_empty() || !missing_columns.is_empty() || !missing_indexes.is_empty() {
         bail!(
-            "Enterprise database schema is incomplete. Missing tables: [{}]. Missing columns: [{}]. Run the provider-managed schema setup before starting Izwi.",
+            "Enterprise database schema is incomplete. Missing tables: [{}]. Missing columns: [{}]. Missing or invalid unique indexes: [{}]. Run the provider-managed schema setup before starting Izwi.",
             missing_tables.join(", "),
-            missing_columns.join(", ")
+            missing_columns.join(", "),
+            missing_indexes.join(", ")
         );
     }
 
     validate_required_seed_data(db).await?;
     Ok(())
+}
+
+async fn load_unique_index_columns(
+    db: &DatabaseConnection,
+    table: &'static str,
+    index: &'static str,
+) -> anyhow::Result<Option<Vec<String>>> {
+    let backend = db.get_database_backend();
+    let rows = match backend {
+        DbBackend::Sqlite => {
+            let indexes = db
+                .query_all_raw(raw::statement_without_values(
+                    db,
+                    format!("PRAGMA index_list({table})"),
+                ))
+                .await?;
+            let unique = indexes.iter().any(|row| {
+                row.try_get_by_index::<String>(1).ok().as_deref() == Some(index)
+                    && row.try_get_by_index::<i64>(2).ok() == Some(1)
+                    && row.try_get_by_index::<i64>(4).ok() == Some(0)
+            });
+            if !unique {
+                return Ok(None);
+            }
+            db.query_all_raw(raw::statement_without_values(
+                db,
+                format!("PRAGMA index_info({index})"),
+            ))
+            .await?
+        }
+        DbBackend::Postgres => {
+            db.query_all_raw(raw::statement(
+                db,
+                r#"
+                SELECT attribute.attname
+                FROM pg_class table_class
+                JOIN pg_index index_meta ON index_meta.indrelid = table_class.oid
+                JOIN pg_class index_class ON index_class.oid = index_meta.indexrelid
+                JOIN LATERAL unnest(index_meta.indkey) WITH ORDINALITY
+                    AS index_key(attnum, ordinal) ON TRUE
+                JOIN pg_attribute attribute
+                    ON attribute.attrelid = table_class.oid
+                   AND attribute.attnum = index_key.attnum
+                WHERE table_class.oid = to_regclass(?1)
+                  AND index_class.relname = ?2
+                  AND index_meta.indisunique
+                  AND index_meta.indpred IS NULL
+                  AND index_meta.indexprs IS NULL
+                  AND index_meta.indisvalid
+                  AND index_meta.indisready
+                ORDER BY index_key.ordinal
+                "#,
+                vec![table.into(), index.into()],
+            )?)
+            .await?
+        }
+        DbBackend::MySql => {
+            db.query_all_raw(raw::statement(
+                db,
+                r#"
+                SELECT COLUMN_NAME
+                FROM information_schema.statistics
+                WHERE table_schema = DATABASE()
+                  AND table_name = ?1
+                  AND index_name = ?2
+                  AND NON_UNIQUE = 0
+                  AND SUB_PART IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM information_schema.statistics prefixed_part
+                      WHERE prefixed_part.table_schema = DATABASE()
+                        AND prefixed_part.table_name = ?1
+                        AND prefixed_part.index_name = ?2
+                        AND prefixed_part.SUB_PART IS NOT NULL
+                  )
+                ORDER BY SEQ_IN_INDEX
+                "#,
+                vec![table.into(), index.into()],
+            )?)
+            .await?
+        }
+        _ => bail!("Unsupported SeaORM database backend: {backend:?}"),
+    };
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let column_index = if matches!(backend, DbBackend::Sqlite) {
+        2
+    } else {
+        0
+    };
+    rows.into_iter()
+        .map(|row| {
+            row.try_get_by_index::<String>(column_index)
+                .map(|name| name.to_ascii_lowercase())
+                .map_err(Into::into)
+        })
+        .collect::<anyhow::Result<Vec<_>>>()
+        .map(Some)
 }
 
 async fn load_table_columns(
@@ -645,7 +773,7 @@ async fn validate_required_seed_data(db: &DatabaseConnection) -> anyhow::Result<
 
 #[cfg(test)]
 mod tests {
-    use super::validate_provider_managed_schema;
+    use super::{load_unique_index_columns, validate_provider_managed_schema};
     use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
 
     #[tokio::test]
@@ -689,6 +817,77 @@ mod tests {
                 .to_string()
                 .contains("provider_write_reservations.provider_request_json"),
             "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_contract_requires_exact_attempt_publication_unique_index() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("sqlite connection");
+        db.execute_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "CREATE TABLE runtime_artifacts (stage_id TEXT, producer_attempt_token TEXT, publication_key TEXT)",
+        ))
+        .await
+        .unwrap();
+        db.execute_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "CREATE INDEX idx_runtime_artifacts_attempt_publication ON runtime_artifacts(stage_id, producer_attempt_token, publication_key)",
+        ))
+        .await
+        .unwrap();
+        assert!(load_unique_index_columns(
+            &db,
+            "runtime_artifacts",
+            "idx_runtime_artifacts_attempt_publication"
+        )
+        .await
+        .unwrap()
+        .is_none());
+
+        db.execute_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "DROP INDEX idx_runtime_artifacts_attempt_publication",
+        ))
+        .await
+        .unwrap();
+        db.execute_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "CREATE UNIQUE INDEX idx_runtime_artifacts_attempt_publication ON runtime_artifacts(stage_id, producer_attempt_token, publication_key) WHERE publication_key IS NOT NULL",
+        ))
+        .await
+        .unwrap();
+        assert!(load_unique_index_columns(
+            &db,
+            "runtime_artifacts",
+            "idx_runtime_artifacts_attempt_publication"
+        )
+        .await
+        .unwrap()
+        .is_none());
+        db.execute_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "DROP INDEX idx_runtime_artifacts_attempt_publication",
+        ))
+        .await
+        .unwrap();
+        db.execute_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "CREATE UNIQUE INDEX idx_runtime_artifacts_attempt_publication ON runtime_artifacts(stage_id, producer_attempt_token, publication_key)",
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            load_unique_index_columns(
+                &db,
+                "runtime_artifacts",
+                "idx_runtime_artifacts_attempt_publication"
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            ["stage_id", "producer_attempt_token", "publication_key"]
         );
     }
 }

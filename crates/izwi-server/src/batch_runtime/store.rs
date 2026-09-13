@@ -46,6 +46,8 @@ pub struct BatchRuntimeStore {
     #[cfg(test)]
     test_provider_write_capacity: Option<u64>,
     #[cfg(test)]
+    test_pcm_replay_entry_limit: Option<u64>,
+    #[cfg(test)]
     test_durable_tts_acceptance_failpoint: Option<DurableTtsAcceptanceFailpoint>,
 }
 
@@ -422,6 +424,15 @@ pub struct NewStageOutputArtifact {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) enum ReservedStageArtifactPublication {
+    Published {
+        asset: Box<MediaAsset>,
+        artifact: RuntimeArtifact,
+    },
+    Existing(RuntimeArtifact),
+}
+
+#[derive(Debug, Clone)]
 pub struct NewIdempotencyRecord {
     pub operation: String,
     pub idempotency_key: String,
@@ -657,6 +668,8 @@ impl BatchRuntimeStore {
             #[cfg(test)]
             test_provider_write_capacity: None,
             #[cfg(test)]
+            test_pcm_replay_entry_limit: None,
+            #[cfg(test)]
             test_durable_tts_acceptance_failpoint: None,
         }
     }
@@ -677,6 +690,11 @@ impl BatchRuntimeStore {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_pcm_replay_entry_limit_for_test(&mut self, limit: u64) {
+        self.test_pcm_replay_entry_limit = Some(limit);
+    }
+
+    #[cfg(test)]
     fn set_durable_tts_acceptance_failpoint(
         &mut self,
         failpoint: Option<DurableTtsAcceptanceFailpoint>,
@@ -690,6 +708,14 @@ impl BatchRuntimeStore {
             return clock.load(Ordering::SeqCst);
         }
         current_timestamp_millis()
+    }
+
+    fn pcm_replay_entry_limit(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(limit) = self.test_pcm_replay_entry_limit {
+            return limit;
+        }
+        super::speech_progress::MAX_PCM_REPLAY_ENTRIES
     }
 
     fn inject_durable_tts_acceptance_failure(
@@ -1196,10 +1222,7 @@ impl BatchRuntimeStore {
             .await?;
         let now = self.now_millis();
         let row = get_provider_write_with(&tx, &reservation.write_id).await?;
-        if row.as_ref().is_none_or(|row| {
-            row.reservation_token != reservation.reservation_token
-                || row.storage_key != reservation.storage_key
-        }) {
+        if row.as_ref() != Some(reservation) {
             tx.rollback().await?;
             return Ok(None);
         }
@@ -1251,6 +1274,392 @@ impl BatchRuntimeStore {
         let asset = get_media_asset_with(&tx, &id).await?;
         tx.commit().await?;
         Ok(asset)
+    }
+
+    /// Atomically consume a stored provider reservation, create its opaque media
+    /// row, and attach that row to the exact active stage attempt.
+    ///
+    /// `Existing` means the attempt already committed the same publication key;
+    /// the duplicate reservation is atomically retained for bounded provider
+    /// recovery. `None` means the attempt fence was lost and its reservation was
+    /// likewise retained for recovery.
+    pub(crate) async fn publish_reserved_opaque_stage_artifact(
+        &self,
+        reservation: &ProviderWriteReservation,
+        lease: &StageLease,
+        media: NewMediaAsset,
+        mut artifact: NewStageOutputArtifact,
+        progress: serde_json::Value,
+    ) -> anyhow::Result<Option<ReservedStageArtifactPublication>> {
+        anyhow::ensure!(
+            media.storage_key.as_str() == reservation.storage_key.as_deref().unwrap_or_default()
+                && media.content_type == reservation.content_type
+                && media.filename == reservation.filename
+                && media.size_bytes == reservation.expected_size_bytes
+                && media.sha256.as_deref() == Some(reservation.expected_sha256.as_str()),
+            "Provider write publication did not match its reservation"
+        );
+        anyhow::ensure!(
+            artifact.media_asset_id.is_none()
+                && artifact.text_asset_id.is_none()
+                && artifact.storage_key.is_none(),
+            "Opaque stage artifact identity is assigned by the metadata transaction"
+        );
+        if !matches!(
+            artifact.artifact_role,
+            RuntimeArtifactRole::OutputPrimary
+                | RuntimeArtifactRole::OutputIntermediate
+                | RuntimeArtifactRole::Debug
+        ) {
+            bail!("Attempt-owned artifact publication requires an output or debug role");
+        }
+        let publication_key = artifact.publication_key.trim().to_string();
+        if publication_key.is_empty() {
+            bail!("Attempt-owned artifact publication requires a publication key");
+        }
+        let Some(attempt_token) = lease.attempt_token.as_deref() else {
+            return Ok(None);
+        };
+        let is_speech_pcm = publication_key.starts_with("speech-pcm/");
+        artifact.publication_key = publication_key.clone();
+        artifact.content_type = Some(media.content_type.clone());
+        artifact.filename = media.filename.clone();
+        artifact.size_bytes = Some(media.size_bytes);
+        artifact.sha256 = media.sha256.clone();
+        let expected_media = media.clone();
+        let expected_artifact = artifact.clone();
+        let pcm_replay_entry_limit = self.pcm_replay_entry_limit();
+        anyhow::ensure!(
+            pcm_replay_entry_limit > 0,
+            "Speech PCM replay entry limit must be positive"
+        );
+        let progress_json = bounded_json_string(
+            &progress,
+            MAX_DURABLE_TTS_METADATA_JSON_BYTES,
+            "Stage progress",
+        )?;
+
+        let db = self.db.connection().await?;
+        let tx = db
+            .begin_with_options(runtime_write_transaction_options())
+            .await
+            .context("Failed to start opaque stage artifact publication transaction")?;
+        let now = self.now_millis();
+        let row = get_provider_write_with(&tx, &reservation.write_id).await?;
+        if row.as_ref() != Some(reservation) {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        let lock_clause = match tx.get_database_backend() {
+            DbBackend::Sqlite => "",
+            DbBackend::Postgres => " FOR UPDATE OF s, j",
+            DbBackend::MySql => " FOR UPDATE",
+            backend => bail!("Unsupported runtime artifact database backend: {backend:?}"),
+        };
+        let ownership_sql = format!(
+            r#"
+            SELECT s.id
+            FROM job_stages s
+            JOIN runtime_jobs j ON j.id = s.job_id
+            WHERE s.id = ?1
+              AND s.status IN ('running', 'postprocessing')
+              AND s.cancellation_state IS NULL
+              AND s.worker_id = ?2
+              AND s.attempt_count = ?3
+              AND s.attempt_token = ?4
+              AND s.lease_expires_at IS NOT NULL
+              AND s.lease_expires_at > ?5
+              AND j.status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
+              AND j.cancellation_state IS NULL
+              AND COALESCE(j.admission_tenant, 'anonymous') = ?6
+            LIMIT 1{lock_clause}
+            "#
+        );
+        let owns_stage = tx
+            .query_one_raw(raw::statement(
+                &tx,
+                ownership_sql,
+                vec![
+                    lease.stage_id.clone().into(),
+                    lease.worker_id.clone().into(),
+                    u32_to_i64_value(lease.attempt_count).into(),
+                    attempt_token.into(),
+                    now.into(),
+                    reservation.tenant_scope.clone().into(),
+                ],
+            )?)
+            .await
+            .context("Failed to lock opaque artifact stage ownership")?
+            .is_some();
+        if !owns_stage {
+            if !mark_provider_write_cleanup_pending_with(
+                &tx,
+                reservation,
+                now,
+                "Stage attempt lost ownership before opaque artifact publication",
+            )
+            .await?
+            {
+                tx.rollback().await?;
+                return Ok(None);
+            }
+            tx.commit().await?;
+            return Ok(None);
+        }
+        if let Some(existing) =
+            active_stage_output_for_key_with(&tx, lease, attempt_token, &publication_key, now)
+                .await?
+        {
+            let exact = match existing.media_asset_id.as_deref() {
+                Some(id) => get_media_asset_with(&tx, id).await?.is_some_and(|asset| {
+                    reserved_stage_artifact_matches(
+                        &existing,
+                        &asset,
+                        &expected_media,
+                        &expected_artifact,
+                    )
+                }),
+                None => false,
+            };
+            if !mark_provider_write_cleanup_pending_with(
+                &tx,
+                reservation,
+                now,
+                "Attempt publication key was already committed",
+            )
+            .await?
+            {
+                tx.rollback().await?;
+                return Ok(None);
+            }
+            tx.commit().await?;
+            anyhow::ensure!(
+                exact,
+                "Attempt publication key was reused for a different opaque artifact"
+            );
+            return Ok(Some(ReservedStageArtifactPublication::Existing(existing)));
+        }
+
+        let media_id = new_uuid();
+        let media_metadata_json = json_to_db_string(&media.metadata_json, "{}")?;
+        tx.execute_raw(raw::statement(
+            &tx,
+            r#"
+            INSERT INTO media_assets (
+                id, created_at, updated_at, asset_kind, storage_namespace,
+                storage_key, content_type, filename, size_bytes, sha256,
+                duration_secs, sample_rate_hz, channel_count, peak_amplitude,
+                rms_amplitude, source_asset_id, canonical_profile_version,
+                scan_status, retention_policy, deleted_at, metadata_json
+            ) VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                      ?12, ?13, ?14, ?15, ?16, ?17, ?18, NULL, ?19)
+            "#,
+            vec![
+                media_id.clone().into(),
+                now.into(),
+                media.asset_kind.into(),
+                media.storage_namespace.into(),
+                media.storage_key.into(),
+                media.content_type.into(),
+                opt_string(media.filename),
+                u64_to_i64_value(media.size_bytes)?,
+                opt_string(media.sha256),
+                opt_f64(media.duration_secs),
+                opt_u32(media.sample_rate_hz),
+                opt_u16(media.channel_count),
+                opt_f32(media.peak_amplitude),
+                opt_f32(media.rms_amplitude),
+                opt_string(media.source_asset_id),
+                opt_string(media.canonical_profile_version),
+                media.scan_status.into(),
+                media.retention_policy.into(),
+                media_metadata_json.into(),
+            ],
+        )?)
+        .await
+        .context("Failed to create reserved opaque media asset")?;
+
+        artifact.media_asset_id = Some(media_id.clone());
+        let artifact_id = new_uuid();
+        let artifact_metadata_json = json_to_db_string(&artifact.metadata_json, "{}")?;
+        let conflict_clause = match tx.get_database_backend() {
+            DbBackend::Sqlite | DbBackend::Postgres => {
+                "ON CONFLICT(stage_id, producer_attempt_token, publication_key) DO NOTHING"
+            }
+            DbBackend::MySql => "ON DUPLICATE KEY UPDATE id = id",
+            backend => bail!("Unsupported runtime artifact database backend: {backend:?}"),
+        };
+        let insert_sql = format!(
+            r#"
+            INSERT INTO runtime_artifacts (
+                id, job_id, stage_id, producer_attempt_count,
+                producer_attempt_token, publication_key, created_at,
+                artifact_kind, artifact_role, media_asset_id, text_asset_id,
+                storage_key, content_type, filename, size_bytes, sha256,
+                metadata_json, retention_policy
+            )
+            SELECT
+                ?1, s.job_id, s.id, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                ?10, ?11, ?12, ?13, ?14, ?15, ?16
+            FROM job_stages s
+            JOIN runtime_jobs j ON j.id = s.job_id
+            WHERE s.id = ?17
+              AND s.status IN ('running', 'postprocessing')
+              AND s.cancellation_state IS NULL
+              AND s.worker_id = ?18
+              AND s.attempt_count = ?2
+              AND s.attempt_token = ?3
+              AND s.lease_expires_at IS NOT NULL
+              AND s.lease_expires_at > ?5
+              AND j.status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
+              AND j.cancellation_state IS NULL
+              AND COALESCE(j.admission_tenant, 'anonymous') = ?20
+              AND (
+                  ?4 NOT LIKE 'speech-pcm/%'
+                  OR (
+                      SELECT COUNT(*) FROM runtime_artifacts existing_pcm
+                      WHERE existing_pcm.job_id = s.job_id
+                        AND existing_pcm.publication_key >= 'speech-pcm/'
+                        AND existing_pcm.publication_key < 'speech-pcm0'
+                  ) < ?19
+              )
+            {conflict_clause}
+            "#
+        );
+        tx.execute_raw(raw::statement(
+            &tx,
+            insert_sql,
+            vec![
+                artifact_id.into(),
+                u32_to_i64_value(lease.attempt_count).into(),
+                attempt_token.into(),
+                publication_key.clone().into(),
+                now.into(),
+                artifact.artifact_kind.as_db_value().into(),
+                artifact.artifact_role.as_db_value().into(),
+                media_id.clone().into(),
+                opt_string(artifact.text_asset_id),
+                opt_string(artifact.storage_key),
+                opt_string(artifact.content_type),
+                opt_string(artifact.filename),
+                opt_u64(artifact.size_bytes),
+                opt_string(artifact.sha256),
+                artifact_metadata_json.into(),
+                artifact.retention_policy.into(),
+                lease.stage_id.clone().into(),
+                lease.worker_id.clone().into(),
+                i64::try_from(pcm_replay_entry_limit)?.into(),
+                reservation.tenant_scope.clone().into(),
+            ],
+        )?)
+        .await
+        .context("Failed to attach reserved opaque artifact to stage attempt")?;
+
+        let published =
+            stage_output_for_key_with(&tx, lease, attempt_token, &publication_key).await?;
+        let Some(published) = published else {
+            tx.execute_raw(raw::statement(
+                &tx,
+                "DELETE FROM media_assets WHERE id = ?1",
+                vec![media_id.into()],
+            )?)
+            .await?;
+            if !mark_provider_write_cleanup_pending_with(
+                &tx,
+                reservation,
+                now,
+                "Stage attempt lost ownership before opaque artifact publication",
+            )
+            .await?
+            {
+                tx.rollback().await?;
+                return Ok(None);
+            }
+            tx.commit().await?;
+            if is_speech_pcm {
+                bail!("speech_storage_limit: replay entry quota exceeded");
+            }
+            return Ok(None);
+        };
+        if published.media_asset_id.as_deref() != Some(media_id.as_str()) {
+            tx.execute_raw(raw::statement(
+                &tx,
+                "DELETE FROM media_assets WHERE id = ?1",
+                vec![media_id.into()],
+            )?)
+            .await?;
+            let still_active =
+                active_stage_output_for_key_with(&tx, lease, attempt_token, &publication_key, now)
+                    .await?
+                    .is_some_and(|artifact| artifact.id == published.id);
+            let exact = match published.media_asset_id.as_deref() {
+                Some(id) => get_media_asset_with(&tx, id).await?.is_some_and(|asset| {
+                    reserved_stage_artifact_matches(
+                        &published,
+                        &asset,
+                        &expected_media,
+                        &expected_artifact,
+                    )
+                }),
+                None => false,
+            };
+            if !mark_provider_write_cleanup_pending_with(
+                &tx,
+                reservation,
+                now,
+                "Concurrent attempt publication won the opaque artifact key",
+            )
+            .await?
+            {
+                tx.rollback().await?;
+                return Ok(None);
+            }
+            tx.commit().await?;
+            anyhow::ensure!(
+                still_active && exact,
+                "Attempt publication key was reused for a different opaque artifact"
+            );
+            return Ok(Some(ReservedStageArtifactPublication::Existing(published)));
+        }
+        tx.execute_raw(raw::statement(
+            &tx,
+            r#"
+            UPDATE job_stages
+            SET progress_json = ?1, updated_at = ?2
+            WHERE id = ?3
+              AND worker_id = ?4
+              AND attempt_count = ?5
+              AND attempt_token = ?6
+            "#,
+            vec![
+                progress_json.into(),
+                now.into(),
+                lease.stage_id.clone().into(),
+                lease.worker_id.clone().into(),
+                u32_to_i64_value(lease.attempt_count).into(),
+                attempt_token.into(),
+            ],
+        )?)
+        .await
+        .context("Failed to checkpoint opaque stage artifact publication")?;
+        let deleted = tx.execute_raw(raw::statement(&tx,
+            "DELETE FROM provider_write_reservations WHERE write_id = ?1 AND reservation_token = ?2 AND state = 'stored'",
+            vec![reservation.write_id.clone().into(), reservation.reservation_token.clone().into()],
+        )?).await?;
+        if deleted.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        let asset = get_media_asset_with(&tx, &media_id)
+            .await?
+            .context("Published opaque stage media asset was not found")?;
+        tx.commit()
+            .await
+            .context("Failed to commit opaque stage artifact publication")?;
+        Ok(Some(ReservedStageArtifactPublication::Published {
+            asset: Box::new(asset),
+            artifact: published,
+        }))
     }
 
     pub(crate) async fn claim_due_provider_write_cleanup(
@@ -5730,6 +6139,130 @@ async fn get_artifact_with<C: ConnectionTrait>(
     row.as_ref().map(map_runtime_artifact).transpose()
 }
 
+async fn stage_output_for_key_with<C: ConnectionTrait>(
+    db: &C,
+    lease: &StageLease,
+    attempt_token: &str,
+    publication_key: &str,
+) -> anyhow::Result<Option<RuntimeArtifact>> {
+    let sql = RUNTIME_ARTIFACT_COLUMNS_SQL.replace(
+        "WHERE id = ?1",
+        "WHERE stage_id = ?1 AND producer_attempt_count = ?2 AND producer_attempt_token = ?3 AND publication_key = ?4",
+    );
+    let row = db
+        .query_one_raw(raw::statement(
+            db,
+            sql,
+            vec![
+                lease.stage_id.clone().into(),
+                u32_to_i64_value(lease.attempt_count).into(),
+                attempt_token.into(),
+                publication_key.into(),
+            ],
+        )?)
+        .await
+        .context("Failed to load attempt-owned runtime artifact")?;
+    row.as_ref().map(map_runtime_artifact).transpose()
+}
+
+fn reserved_stage_artifact_matches(
+    artifact: &RuntimeArtifact,
+    media: &MediaAsset,
+    expected_media: &NewMediaAsset,
+    expected_artifact: &NewStageOutputArtifact,
+) -> bool {
+    artifact.artifact_kind == expected_artifact.artifact_kind
+        && artifact.artifact_role == expected_artifact.artifact_role
+        && artifact.media_asset_id.as_deref() == Some(media.id.as_str())
+        && artifact.text_asset_id.is_none()
+        && artifact.storage_key.is_none()
+        && artifact.content_type.as_deref() == Some(expected_media.content_type.as_str())
+        && artifact.filename == expected_media.filename
+        && artifact.size_bytes == Some(expected_media.size_bytes)
+        && artifact.sha256 == expected_media.sha256
+        && artifact.metadata_json == expected_artifact.metadata_json
+        && artifact.retention_policy == expected_artifact.retention_policy
+        && media.asset_kind == expected_media.asset_kind
+        && media.storage_namespace == expected_media.storage_namespace
+        && media.content_type == expected_media.content_type
+        && media.filename == expected_media.filename
+        && media.size_bytes == expected_media.size_bytes
+        && media.sha256 == expected_media.sha256
+        && media.duration_secs == expected_media.duration_secs
+        && media.sample_rate_hz == expected_media.sample_rate_hz
+        && media.channel_count == expected_media.channel_count
+        && media.peak_amplitude == expected_media.peak_amplitude
+        && media.rms_amplitude == expected_media.rms_amplitude
+        && media.source_asset_id == expected_media.source_asset_id
+        && media.canonical_profile_version == expected_media.canonical_profile_version
+        && media.scan_status == expected_media.scan_status
+        && media.retention_policy == expected_media.retention_policy
+        && media.deleted_at.is_none()
+        && media.metadata_json == expected_media.metadata_json
+}
+
+async fn active_stage_output_for_key_with<C: ConnectionTrait>(
+    db: &C,
+    lease: &StageLease,
+    attempt_token: &str,
+    publication_key: &str,
+    now: i64,
+) -> anyhow::Result<Option<RuntimeArtifact>> {
+    let row = db
+        .query_one_raw(raw::statement(
+            db,
+            r#"
+            SELECT
+                a.id,
+                a.job_id,
+                a.stage_id,
+                a.producer_attempt_count,
+                a.producer_attempt_token,
+                a.publication_key,
+                a.created_at,
+                a.artifact_kind,
+                a.artifact_role,
+                a.media_asset_id,
+                a.text_asset_id,
+                a.storage_key,
+                a.content_type,
+                a.filename,
+                a.size_bytes,
+                a.sha256,
+                a.metadata_json,
+                a.retention_policy
+            FROM runtime_artifacts a
+            JOIN job_stages s ON s.id = a.stage_id
+            JOIN runtime_jobs j ON j.id = s.job_id
+            WHERE a.stage_id = ?1
+              AND a.producer_attempt_count = ?2
+              AND a.producer_attempt_token = ?3
+              AND a.publication_key = ?4
+              AND s.status IN ('running', 'postprocessing')
+              AND s.cancellation_state IS NULL
+              AND s.worker_id = ?5
+              AND s.attempt_count = ?2
+              AND s.attempt_token = ?3
+              AND s.lease_expires_at IS NOT NULL
+              AND s.lease_expires_at > ?6
+              AND j.status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
+              AND j.cancellation_state IS NULL
+            LIMIT 1
+            "#,
+            vec![
+                lease.stage_id.clone().into(),
+                u32_to_i64_value(lease.attempt_count).into(),
+                attempt_token.into(),
+                publication_key.into(),
+                lease.worker_id.clone().into(),
+                now.into(),
+            ],
+        )?)
+        .await
+        .context("Failed to load attempt-owned runtime artifact")?;
+    row.as_ref().map(map_runtime_artifact).transpose()
+}
+
 async fn get_media_asset_with<C: ConnectionTrait>(
     db: &C,
     id: &str,
@@ -5763,6 +6296,36 @@ async fn get_provider_write_with<C: ConnectionTrait>(
         )?)
         .await?;
     row.as_ref().map(map_provider_write).transpose()
+}
+
+async fn mark_provider_write_cleanup_pending_with<C: ConnectionTrait>(
+    db: &C,
+    reservation: &ProviderWriteReservation,
+    now: i64,
+    error: &str,
+) -> anyhow::Result<bool> {
+    let available_at = i64::try_from(reservation.expires_at)?.max(now);
+    let result = db
+        .execute_raw(raw::statement(
+            db,
+            r#"
+            UPDATE provider_write_reservations
+            SET state = 'cleanup_pending', updated_at = ?1, available_at = ?2,
+                last_error = ?3, cleanup_claim_token = NULL,
+                cleanup_claim_expires_at = NULL
+            WHERE write_id = ?4 AND reservation_token = ?5
+              AND state IN ('reserved', 'stored')
+            "#,
+            vec![
+                now.into(),
+                available_at.into(),
+                truncate_utf8_bytes(error, MAX_ARTIFACT_CLEANUP_ERROR_BYTES).into(),
+                reservation.write_id.clone().into(),
+                reservation.reservation_token.clone().into(),
+            ],
+        )?)
+        .await?;
+    Ok(result.rows_affected() == 1)
 }
 
 async fn complete_job_if_all_stages_finished_with<C: ConnectionTrait>(

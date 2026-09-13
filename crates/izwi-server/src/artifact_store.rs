@@ -6,7 +6,11 @@
 
 use crate::batch_runtime::store::{
     validate_artifact_cleanup_storage_key, ArtifactCleanupIntent, ArtifactCleanupReason,
-    BatchRuntimeStore, NewMediaAsset, NewProviderWriteReservation, ProviderWriteReservation,
+    BatchRuntimeStore, NewMediaAsset, NewProviderWriteReservation, NewStageOutputArtifact,
+    ProviderWriteReservation, ReservedStageArtifactPublication,
+};
+use crate::batch_runtime::types::{
+    RuntimeArtifact, RuntimeArtifactKind, RuntimeArtifactRole, StageLease,
 };
 use crate::ids::new_uuid;
 use izwi_hooks::{
@@ -49,6 +53,18 @@ impl ArtifactTenant {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Stable tenant identity for server-authored durable scheduling records.
+    ///
+    /// The public route stores only the authenticated tenant digest, never a
+    /// caller-provided scope. Anonymous local requests share the explicit
+    /// standalone namespace.
+    pub(crate) fn from_scheduling_key(key: Option<[u8; 32]>) -> Self {
+        match key {
+            Some(key) => Self(key.iter().map(|byte| format!("{byte:02x}")).collect()),
+            None => Self("anonymous".to_string()),
+        }
     }
 }
 
@@ -155,6 +171,16 @@ pub struct ArtifactWrite {
     pub retention: ArtifactRetention,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct AttemptArtifactWrite {
+    pub publication_key: String,
+    pub artifact_kind: RuntimeArtifactKind,
+    pub artifact_role: RuntimeArtifactRole,
+    pub metadata_json: serde_json::Value,
+    pub runtime_retention_policy: String,
+    pub object: ArtifactWrite,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactDescriptor {
     pub id: ArtifactId,
@@ -213,6 +239,16 @@ pub struct ArtifactStore {
     reservation_lifetime: Duration,
 }
 
+struct StoredReservedArtifact {
+    reservation: ProviderWriteReservation,
+    storage_key: String,
+    content_type: String,
+    filename: Option<String>,
+    size_bytes: u64,
+    sha256: String,
+    retention: ArtifactRetention,
+}
+
 impl ArtifactStore {
     pub fn new(
         metadata: Arc<BatchRuntimeStore>,
@@ -233,141 +269,110 @@ impl ArtifactStore {
         tenant: &ArtifactTenant,
         write: ArtifactWrite,
     ) -> Result<ArtifactDescriptor, ArtifactStoreError> {
-        self.validate_write(&write)?;
-        if self.provider.reserved_write_protocol_version() != Some(MEDIA_RESERVED_WRITE_VERSION) {
-            return Err(ArtifactStoreError::ReservedWritesUnsupported);
-        }
-        let digest = sha256_hex(&write.bytes);
-        let size_bytes = write.bytes.len() as u64;
-        let write_id = new_uuid();
-        let provider_request = MediaWriteRequest {
-            namespace: MediaNamespace::Other("artifact-store".to_string()),
-            record_id: write_id.clone(),
-            preferred_filename: write.filename.clone(),
-            content_type: write.content_type.clone(),
-            metadata: tenant_metadata(tenant),
-        };
-        let reservation = self
-            .metadata
-            .reserve_provider_write(NewProviderWriteReservation {
-                write_id,
-                tenant_scope: tenant.as_str().to_string(),
-                storage_namespace: "artifact-store".to_string(),
-                content_type: write.content_type.clone(),
-                filename: write.filename.clone(),
-                expected_size_bytes: size_bytes,
-                expected_sha256: digest.clone(),
-                lifetime_ms: self.provider_write_lifetime().as_millis() as u64,
-                provider_request,
-            })
-            .await
-            .map_err(ArtifactStoreError::Metadata)?;
-        let provider_request = provider_write_request(&reservation);
-        let stored = match tokio::time::timeout(
-            PROVIDER_WRITE_TIMEOUT,
-            self.provider.put_reserved(
-                MediaReservedWriteRequest {
-                    version: MEDIA_RESERVED_WRITE_VERSION,
-                    write_id: reservation.write_id.clone(),
-                    expires_at_unix_ms: reservation.expires_at,
-                    content_length: reservation.expected_size_bytes,
-                    sha256: reservation.expected_sha256.clone(),
-                    request: provider_request.clone(),
-                },
-                write.bytes,
-            ),
-        )
-        .await
-        {
-            Ok(Ok(stored)) => stored,
-            Ok(Err(_)) | Err(_) => {
-                self.abandon_write(&reservation, "Reserved provider write failed")
-                    .await;
-                return Err(ArtifactStoreError::Provider);
-            }
-        };
-
-        if let Err(error) = validate_stored_write(
-            tenant,
-            &write.content_type,
-            digest.as_str(),
-            size_bytes,
-            stored.metadata.content_length,
-            stored.metadata.sha256.as_deref(),
-            stored.metadata.tenant_id.as_deref(),
-            stored.metadata.content_type.as_str(),
-            self.limits.max_object_bytes,
-        ) {
-            self.abandon_write(&reservation, "Provider metadata validation failed")
-                .await;
-            return Err(error);
-        }
-        if validate_artifact_cleanup_storage_key(&stored.key.key).is_err() {
-            self.abandon_write(&reservation, "Provider returned an invalid storage key")
-                .await;
-            return Err(ArtifactStoreError::InvalidMetadata(
-                "invalid provider storage key",
-            ));
-        }
-        let reservation = self
-            .metadata
-            .record_provider_write_stored(&reservation, &stored.key.key)
-            .await
-            .map_err(ArtifactStoreError::Metadata)?
-            .ok_or_else(|| {
-                ArtifactStoreError::Metadata(anyhow::anyhow!(
-                    "Provider write reservation expired before publication"
-                ))
-            })?;
-
-        let metadata_json = serde_json::json!({
-            "artifact_store": {
-                "version": ARTIFACT_METADATA_VERSION,
-                "tenant_id": tenant.as_str(),
-            }
-        });
+        let stored = self.store_reserved_write(tenant, write).await?;
         let asset = match self
             .metadata
             .publish_reserved_opaque_artifact(
-                &reservation,
-                NewMediaAsset {
-                    asset_kind: "opaque_artifact".to_string(),
-                    storage_namespace: "artifact_store_v1".to_string(),
-                    storage_key: stored.key.key.clone(),
-                    content_type: write.content_type,
-                    filename: write.filename,
-                    size_bytes,
-                    sha256: Some(digest),
-                    duration_secs: None,
-                    sample_rate_hz: None,
-                    channel_count: None,
-                    peak_amplitude: None,
-                    rms_amplitude: None,
-                    source_asset_id: None,
-                    canonical_profile_version: None,
-                    scan_status: "not_required".to_string(),
-                    retention_policy: write.retention.as_db_value().to_string(),
-                    metadata_json,
-                },
+                &stored.reservation,
+                opaque_media_asset(tenant, &stored),
             )
             .await
         {
             Ok(Some(asset)) => asset,
             Ok(None) => {
-                self.abandon_write(&reservation, "Provider write lost its publication fence")
-                    .await;
+                self.abandon_write(
+                    &stored.reservation,
+                    "Provider write lost its publication fence",
+                )
+                .await;
                 return Err(ArtifactStoreError::Metadata(anyhow::anyhow!(
                     "Provider write lost its publication fence"
                 )));
             }
             Err(error) => {
-                self.abandon_write(&reservation, "Artifact metadata publication failed")
+                self.abandon_write(&stored.reservation, "Artifact metadata publication failed")
                     .await;
                 return Err(ArtifactStoreError::Metadata(error));
             }
         };
 
         descriptor_from_asset(&asset)
+    }
+
+    pub(crate) async fn put_attempt_artifact(
+        &self,
+        tenant: &ArtifactTenant,
+        lease: &StageLease,
+        write: AttemptArtifactWrite,
+        publication_progress: serde_json::Value,
+    ) -> Result<RuntimeArtifact, ArtifactStoreError> {
+        if lease.attempt_token.is_none() {
+            return Err(ArtifactStoreError::InvalidInput(
+                "stage lease lacks an attempt token",
+            ));
+        }
+        let publication_key = write.publication_key.trim().to_string();
+        if publication_key.is_empty()
+            || publication_key.len() > 256
+            || publication_key.chars().any(char::is_control)
+        {
+            return Err(ArtifactStoreError::InvalidInput(
+                "invalid attempt publication key",
+            ));
+        }
+        if write.runtime_retention_policy.is_empty()
+            || write.runtime_retention_policy.len() > 128
+            || write.runtime_retention_policy.chars().any(char::is_control)
+        {
+            return Err(ArtifactStoreError::InvalidInput(
+                "invalid runtime retention policy",
+            ));
+        }
+        let metadata_bytes = serde_json::to_vec(&write.metadata_json)
+            .map_err(|_| ArtifactStoreError::InvalidInput("invalid artifact metadata"))?;
+        if metadata_bytes.len() > 8 * 1024 {
+            return Err(ArtifactStoreError::InvalidInput(
+                "attempt artifact metadata exceeds 8 KiB",
+            ));
+        }
+
+        let stored = self.store_reserved_write(tenant, write.object).await?;
+        let media = opaque_media_asset(tenant, &stored);
+        let artifact = NewStageOutputArtifact {
+            publication_key,
+            artifact_kind: write.artifact_kind,
+            artifact_role: write.artifact_role,
+            media_asset_id: None,
+            text_asset_id: None,
+            storage_key: None,
+            content_type: None,
+            filename: None,
+            size_bytes: None,
+            sha256: None,
+            metadata_json: write.metadata_json,
+            retention_policy: write.runtime_retention_policy,
+        };
+        match self
+            .metadata
+            .publish_reserved_opaque_stage_artifact(
+                &stored.reservation,
+                lease,
+                media,
+                artifact,
+                publication_progress,
+            )
+            .await
+        {
+            Ok(Some(ReservedStageArtifactPublication::Published { asset, artifact })) => {
+                debug_assert_eq!(artifact.media_asset_id.as_deref(), Some(asset.id.as_str()));
+                Ok(artifact)
+            }
+            Ok(Some(ReservedStageArtifactPublication::Existing(artifact))) => Ok(artifact),
+            Ok(None) => Err(ArtifactStoreError::Metadata(anyhow::anyhow!(
+                "Stage attempt lost ownership before artifact publication"
+            ))),
+            Err(error) => Err(ArtifactStoreError::Metadata(error)),
+        }
     }
 
     pub async fn stat(
@@ -530,6 +535,120 @@ impl ArtifactStore {
         Ok(report)
     }
 
+    async fn store_reserved_write(
+        &self,
+        tenant: &ArtifactTenant,
+        write: ArtifactWrite,
+    ) -> Result<StoredReservedArtifact, ArtifactStoreError> {
+        self.validate_write(&write)?;
+        if self.provider.reserved_write_protocol_version() != Some(MEDIA_RESERVED_WRITE_VERSION) {
+            return Err(ArtifactStoreError::ReservedWritesUnsupported);
+        }
+        let digest = sha256_hex(&write.bytes);
+        let size_bytes = write.bytes.len() as u64;
+        let write_id = new_uuid();
+        let provider_request = MediaWriteRequest {
+            namespace: MediaNamespace::Other("artifact-store".to_string()),
+            record_id: write_id.clone(),
+            preferred_filename: write.filename.clone(),
+            content_type: write.content_type.clone(),
+            metadata: tenant_metadata(tenant),
+        };
+        let reservation = self
+            .metadata
+            .reserve_provider_write(NewProviderWriteReservation {
+                write_id,
+                tenant_scope: tenant.as_str().to_string(),
+                storage_namespace: "artifact-store".to_string(),
+                content_type: write.content_type.clone(),
+                filename: write.filename.clone(),
+                expected_size_bytes: size_bytes,
+                expected_sha256: digest.clone(),
+                lifetime_ms: self.provider_write_lifetime().as_millis() as u64,
+                provider_request,
+            })
+            .await
+            .map_err(ArtifactStoreError::Metadata)?;
+        let provider_request = provider_write_request(&reservation);
+        let stored = match tokio::time::timeout(
+            PROVIDER_WRITE_TIMEOUT,
+            self.provider.put_reserved(
+                MediaReservedWriteRequest {
+                    version: MEDIA_RESERVED_WRITE_VERSION,
+                    write_id: reservation.write_id.clone(),
+                    expires_at_unix_ms: reservation.expires_at,
+                    content_length: reservation.expected_size_bytes,
+                    sha256: reservation.expected_sha256.clone(),
+                    request: provider_request,
+                },
+                write.bytes,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(stored)) => stored,
+            Ok(Err(_)) | Err(_) => {
+                self.abandon_write(&reservation, "Reserved provider write failed")
+                    .await;
+                return Err(ArtifactStoreError::Provider);
+            }
+        };
+
+        if let Err(error) = validate_stored_write(
+            tenant,
+            &write.content_type,
+            digest.as_str(),
+            size_bytes,
+            stored.metadata.content_length,
+            stored.metadata.sha256.as_deref(),
+            stored.metadata.tenant_id.as_deref(),
+            stored.metadata.content_type.as_str(),
+            self.limits.max_object_bytes,
+        ) {
+            self.abandon_write(&reservation, "Provider metadata validation failed")
+                .await;
+            return Err(error);
+        }
+        if validate_artifact_cleanup_storage_key(&stored.key.key).is_err() {
+            self.abandon_write(&reservation, "Provider returned an invalid storage key")
+                .await;
+            return Err(ArtifactStoreError::InvalidMetadata(
+                "invalid provider storage key",
+            ));
+        }
+        let reservation = match self
+            .metadata
+            .record_provider_write_stored(&reservation, &stored.key.key)
+            .await
+        {
+            Ok(Some(reservation)) => reservation,
+            Ok(None) => {
+                self.abandon_write(
+                    &reservation,
+                    "Provider write reservation expired before publication",
+                )
+                .await;
+                return Err(ArtifactStoreError::Metadata(anyhow::anyhow!(
+                    "Provider write reservation expired before publication"
+                )));
+            }
+            Err(error) => {
+                self.abandon_write(&reservation, "Provider storage acknowledgement failed")
+                    .await;
+                return Err(ArtifactStoreError::Metadata(error));
+            }
+        };
+        Ok(StoredReservedArtifact {
+            reservation,
+            storage_key: stored.key.key,
+            content_type: write.content_type,
+            filename: write.filename,
+            size_bytes,
+            sha256: digest,
+            retention: write.retention,
+        })
+    }
+
     fn validate_write(&self, write: &ArtifactWrite) -> Result<(), ArtifactStoreError> {
         if write.bytes.is_empty() {
             return Err(ArtifactStoreError::InvalidInput("empty artifact"));
@@ -556,11 +675,10 @@ impl ArtifactStore {
 
     fn provider_write_lifetime(&self) -> Duration {
         #[cfg(test)]
-        {
-            return self.reservation_lifetime;
-        }
+        let lifetime = self.reservation_lifetime;
         #[cfg(not(test))]
-        PROVIDER_WRITE_RESERVATION_LIFETIME
+        let lifetime = PROVIDER_WRITE_RESERVATION_LIFETIME;
+        lifetime
     }
 
     #[cfg(test)]
@@ -696,6 +814,33 @@ impl ArtifactStore {
 
 fn provider_write_request(reservation: &ProviderWriteReservation) -> MediaWriteRequest {
     reservation.provider_request.clone()
+}
+
+fn opaque_media_asset(tenant: &ArtifactTenant, stored: &StoredReservedArtifact) -> NewMediaAsset {
+    NewMediaAsset {
+        asset_kind: "opaque_artifact".to_string(),
+        storage_namespace: "artifact_store_v1".to_string(),
+        storage_key: stored.storage_key.clone(),
+        content_type: stored.content_type.clone(),
+        filename: stored.filename.clone(),
+        size_bytes: stored.size_bytes,
+        sha256: Some(stored.sha256.clone()),
+        duration_secs: None,
+        sample_rate_hz: None,
+        channel_count: None,
+        peak_amplitude: None,
+        rms_amplitude: None,
+        source_asset_id: None,
+        canonical_profile_version: None,
+        scan_status: "not_required".to_string(),
+        retention_policy: stored.retention.as_db_value().to_string(),
+        metadata_json: serde_json::json!({
+            "artifact_store": {
+                "version": ARTIFACT_METADATA_VERSION,
+                "tenant_id": tenant.as_str(),
+            }
+        }),
+    }
 }
 
 fn tenant_metadata(tenant: &ArtifactTenant) -> HookMetadata {
@@ -838,7 +983,14 @@ fn map_provider_read_error(error: HookError) -> ArtifactStoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{db::StoreDatabase, persistence::LocalMediaStorageProvider};
+    use crate::{
+        batch_runtime::{
+            store::{NewJobStage, NewRuntimeJob},
+            types::{RuntimeJobKind, RuntimeJobStatus, RuntimeStageStatus},
+        },
+        db::StoreDatabase,
+        persistence::LocalMediaStorageProvider,
+    };
     use izwi_hooks::{HookResult, MediaObjectMetadata, StoredMediaObject, StoredMediaStream};
     use std::{
         collections::{BTreeMap, BTreeSet},
@@ -865,6 +1017,75 @@ mod tests {
             },
         )
         .expect("artifact store")
+    }
+
+    async fn active_tts_lease(
+        metadata: &BatchRuntimeStore,
+        tenant_key: Option<[u8; 32]>,
+    ) -> StageLease {
+        let job = metadata
+            .create_job(NewRuntimeJob {
+                job_kind: RuntimeJobKind::TtsSpeech,
+                status: RuntimeJobStatus::Queued,
+                priority: 0,
+                model_id: Some("FishAudio-S2-Pro".into()),
+                capability: Some("tts".into()),
+                route_record_kind: None,
+                route_record_id: None,
+                input_media_asset_id: None,
+                input_text_asset_id: None,
+                request_json: serde_json::json!({"tenant_key": tenant_key}),
+                model_snapshot_json: serde_json::json!({"version": 1}),
+                retry_policy_json: serde_json::json!({}),
+                max_attempts: 1,
+                idempotency_key: None,
+                correlation_id: None,
+            })
+            .await
+            .unwrap();
+        metadata
+            .create_stage(NewJobStage {
+                job_id: job.id,
+                sequence: 0,
+                stage_kind: "tts_synthesize".into(),
+                status: RuntimeStageStatus::Queued,
+                capability: Some("tts".into()),
+                model_id: Some("FishAudio-S2-Pro".into()),
+                max_attempts: 1,
+                input_artifact_ids: vec![],
+            })
+            .await
+            .unwrap();
+        metadata
+            .claim_next_stage("artifact-worker", 60_000)
+            .await
+            .unwrap()
+            .unwrap()
+            .lease()
+            .unwrap()
+    }
+
+    fn pcm_attempt_write(bytes: Vec<u8>) -> AttemptArtifactWrite {
+        AttemptArtifactWrite {
+            publication_key: "speech-pcm/00000000000000000000".into(),
+            artifact_kind: RuntimeArtifactKind::Audio,
+            artifact_role: RuntimeArtifactRole::OutputIntermediate,
+            metadata_json: serde_json::json!({
+                "version": 1,
+                "sequence": 0,
+                "segment": 0,
+                "sample_offset": 0,
+                "sample_count": bytes.len() / 4,
+                "sample_rate": 44_100,
+            }),
+            runtime_retention_policy: "speech_job_replay".into(),
+            object: ArtifactWrite {
+                content_type: "audio/pcm-f32le".into(),
+                filename: Some("chunk.f32le".into()),
+                bytes,
+                retention: ArtifactRetention::Job,
+            },
+        }
     }
 
     fn test_provider_write_input(
@@ -950,6 +1171,7 @@ mod tests {
             ("image/png", "sample.png"),
             ("video/mp4", "sample.mp4"),
             ("audio/mpeg", "sample.mp3"),
+            ("audio/pcm-f32le", "sample.f32le"),
         ] {
             let descriptor = store
                 .put(
@@ -989,6 +1211,270 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let provider = Arc::new(MemoryMediaProvider::default());
         assert_provider_conformance(&root, provider).await;
+    }
+
+    #[test]
+    fn scheduling_tenant_mapping_is_stable_and_bounded() {
+        assert_eq!(
+            ArtifactTenant::from_scheduling_key(None).as_str(),
+            "anonymous"
+        );
+        assert_eq!(
+            ArtifactTenant::from_scheduling_key(Some([0xab; 32])).as_str(),
+            "abababababababababababababababababababababababababababababababab"
+        );
+    }
+
+    #[tokio::test]
+    async fn attempt_publication_atomically_hides_provider_keys_and_is_idempotent() {
+        let root = tempfile::tempdir().unwrap();
+        let provider = Arc::new(MemoryMediaProvider::default());
+        let metadata = Arc::new(BatchRuntimeStore::initialize_with_database(
+            StoreDatabase::new(root.path().join("attempt.sqlite3")),
+        ));
+        let mut store = ArtifactStore::new(
+            metadata.clone(),
+            provider.clone(),
+            ArtifactStoreLimits::default(),
+        )
+        .unwrap();
+        store.set_reservation_lifetime_for_test(Duration::from_millis(10));
+        let tenant_key = Some([7; 32]);
+        let tenant = ArtifactTenant::from_scheduling_key(tenant_key);
+        let lease = active_tts_lease(&metadata, tenant_key).await;
+        let bytes = [0.1_f32, -0.2, 0.3]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+
+        let first = store
+            .put_attempt_artifact(
+                &tenant,
+                &lease,
+                pcm_attempt_write(bytes.clone()),
+                serde_json::json!({"publication_started": true}),
+            )
+            .await
+            .unwrap();
+        let id = ArtifactId::parse(first.media_asset_id.clone().unwrap()).unwrap();
+        assert!(first.storage_key.is_none());
+        assert_eq!(store.read(&tenant, &id).await.unwrap().bytes, bytes);
+        assert!(matches!(
+            store
+                .read(&ArtifactTenant::parse("other").unwrap(), &id)
+                .await,
+            Err(ArtifactStoreError::NotFound)
+        ));
+        let reopened = ArtifactStore::new(
+            Arc::new(BatchRuntimeStore::initialize_with_database(
+                StoreDatabase::new(root.path().join("attempt.sqlite3")),
+            )),
+            provider.clone(),
+            ArtifactStoreLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(reopened.read(&tenant, &id).await.unwrap().bytes, bytes);
+
+        let duplicate = store
+            .put_attempt_artifact(
+                &tenant,
+                &lease,
+                pcm_attempt_write(bytes),
+                serde_json::json!({"publication_started": true}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(duplicate.id, first.id);
+        assert_eq!(provider.object_count(), 2);
+        let mut changed = pcm_attempt_write(0.9_f32.to_le_bytes().to_vec());
+        changed.metadata_json["sample_count"] = serde_json::json!(1);
+        assert!(matches!(
+            store
+                .put_attempt_artifact(
+                    &tenant,
+                    &lease,
+                    changed,
+                    serde_json::json!({"publication_started": true}),
+                )
+                .await,
+            Err(ArtifactStoreError::Metadata(_))
+        ));
+        assert_eq!(provider.object_count(), 3);
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        assert_eq!(store.cleanup_due(64).await.unwrap().completed, 2);
+        assert_eq!(provider.object_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_attempt_keeps_written_provider_object_recoverable() {
+        let root = tempfile::tempdir().unwrap();
+        let provider = Arc::new(MemoryMediaProvider::default());
+        let metadata = Arc::new(BatchRuntimeStore::initialize_with_database(
+            StoreDatabase::new(root.path().join("stale-attempt.sqlite3")),
+        ));
+        let mut store = ArtifactStore::new(
+            metadata.clone(),
+            provider.clone(),
+            ArtifactStoreLimits::default(),
+        )
+        .unwrap();
+        store.set_reservation_lifetime_for_test(Duration::from_millis(10));
+        let tenant = ArtifactTenant::from_scheduling_key(None);
+        let lease = active_tts_lease(&metadata, None).await;
+        metadata
+            .cancel_job(
+                &metadata
+                    .get_stage(&lease.stage_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .job_id,
+                Some("test cancellation".into()),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            store
+                .put_attempt_artifact(
+                    &tenant,
+                    &lease,
+                    pcm_attempt_write(0.1_f32.to_le_bytes().to_vec()),
+                    serde_json::json!({"publication_started": true}),
+                )
+                .await,
+            Err(ArtifactStoreError::Metadata(_))
+        ));
+        assert_eq!(provider.object_count(), 1);
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        assert_eq!(store.cleanup_due(64).await.unwrap().completed, 1);
+        assert_eq!(provider.object_count(), 0);
+        assert!(metadata
+            .speech_pcm_after(
+                &metadata
+                    .get_stage(&lease.stage_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .job_id,
+                None,
+                1,
+            )
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn attempt_publication_rejects_a_different_scheduling_tenant() {
+        let root = tempfile::tempdir().unwrap();
+        let provider = Arc::new(MemoryMediaProvider::default());
+        let metadata = Arc::new(BatchRuntimeStore::initialize_with_database(
+            StoreDatabase::new(root.path().join("tenant-fence.sqlite3")),
+        ));
+        let mut store = ArtifactStore::new(
+            metadata.clone(),
+            provider.clone(),
+            ArtifactStoreLimits::default(),
+        )
+        .unwrap();
+        store.set_reservation_lifetime_for_test(Duration::from_millis(10));
+        let lease = active_tts_lease(&metadata, Some([7; 32])).await;
+        let wrong_tenant = ArtifactTenant::from_scheduling_key(Some([8; 32]));
+
+        assert!(matches!(
+            store
+                .put_attempt_artifact(
+                    &wrong_tenant,
+                    &lease,
+                    pcm_attempt_write(0.1_f32.to_le_bytes().to_vec()),
+                    serde_json::json!({"publication_started": true}),
+                )
+                .await,
+            Err(ArtifactStoreError::Metadata(_))
+        ));
+        let job_id = metadata
+            .get_stage(&lease.stage_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .job_id;
+        assert!(metadata
+            .speech_pcm_after(&job_id, None, 1)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(provider.object_count(), 1);
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        assert_eq!(store.cleanup_due(64).await.unwrap().completed, 1);
+        assert_eq!(provider.object_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn pcm_entry_limit_rejects_reference_and_recovers_provider_write() {
+        let root = tempfile::tempdir().unwrap();
+        let provider = Arc::new(MemoryMediaProvider::default());
+        let mut metadata = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
+            root.path().join("pcm-limit.sqlite3"),
+        ));
+        metadata.set_pcm_replay_entry_limit_for_test(1);
+        let metadata = Arc::new(metadata);
+        let mut store = ArtifactStore::new(
+            metadata.clone(),
+            provider.clone(),
+            ArtifactStoreLimits::default(),
+        )
+        .unwrap();
+        store.set_reservation_lifetime_for_test(Duration::from_millis(10));
+        let tenant = ArtifactTenant::from_scheduling_key(None);
+        let lease = active_tts_lease(&metadata, None).await;
+        store
+            .put_attempt_artifact(
+                &tenant,
+                &lease,
+                pcm_attempt_write(0.1_f32.to_le_bytes().to_vec()),
+                serde_json::json!({"publication_started": true}),
+            )
+            .await
+            .unwrap();
+        let mut second = pcm_attempt_write(0.2_f32.to_le_bytes().to_vec());
+        second.publication_key = "speech-pcm/00000000000000000001".into();
+        second.metadata_json["sequence"] = serde_json::json!(1);
+        let error = store
+            .put_attempt_artifact(
+                &tenant,
+                &lease,
+                second,
+                serde_json::json!({"publication_started": true}),
+            )
+            .await
+            .unwrap_err();
+        let ArtifactStoreError::Metadata(error) = error else {
+            panic!("unexpected quota error: {error}");
+        };
+        let error_text = format!("{error:#}");
+        assert!(
+            error_text.contains("speech_storage_limit"),
+            "unexpected quota error: {error_text}"
+        );
+        let job_id = metadata
+            .get_stage(&lease.stage_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .job_id;
+        assert_eq!(
+            metadata
+                .speech_pcm_after(&job_id, None, 64)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(provider.object_count(), 2);
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        assert_eq!(store.cleanup_due(64).await.unwrap().completed, 1);
+        assert_eq!(provider.object_count(), 1);
     }
 
     #[tokio::test]

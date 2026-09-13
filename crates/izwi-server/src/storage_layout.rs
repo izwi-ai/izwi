@@ -187,6 +187,7 @@ pub fn content_type_from_media_path(path: &str) -> &'static str {
         Some("flac") => "audio/flac",
         Some("m4a") => "audio/mp4",
         Some("aac") => "audio/aac",
+        Some("f32le") => "audio/pcm-f32le",
         _ => "application/octet-stream",
     }
 }
@@ -262,6 +263,7 @@ pub fn media_extension_for_content_type(mime_type: &str) -> &'static str {
         "audio/webm" => "webm",
         "audio/mp4" | "audio/x-m4a" | "audio/m4a" => "m4a",
         "audio/aac" => "aac",
+        "audio/pcm-f32le" => "f32le",
         "audio/basic" => "au",
         "image/jpeg" => "jpg",
         "image/png" => "png",
@@ -310,4 +312,19 @@ pub fn resolve_media_path(media_root: &Path, relative_path: &str) -> anyhow::Res
 
 fn normalize_relative_path(path: PathBuf) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_f32_pcm_content_type_round_trips_through_local_object_keys() {
+        let extension = media_extension_for_content_type("audio/pcm-f32le");
+        assert_eq!(extension, "f32le");
+        assert_eq!(
+            content_type_from_media_path(&format!("chunk.{extension}")),
+            "audio/pcm-f32le"
+        );
+    }
 }

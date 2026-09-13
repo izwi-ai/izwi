@@ -425,13 +425,16 @@ Provider calls are bounded to thirty seconds. Maintenance uses exact cleanup
 claim tokens and recovers by write ID, including reservations with no recorded
 provider key. `NotFound` means both absent and unable to commit later for that
 expired write ID. The reservation ledger is capped at 65,536 and each cleanup
-scan at 64. Legacy media and speech routes retain their existing provider path
-until explicitly migrated.
+scan at 64. New durable Fish PCM replay chunks use tenant-scoped opaque artifact
+IDs and an atomic attempt-publication transaction; provider keys remain private.
+Existing raw-key replay rows stay compatible. Final WAVs, saved voices, history
+audio, references, other media, and gateway audio transport retain their
+existing provider path until explicitly migrated.
 
 The local reserved-write provider uses the shared image/video/audio MIME-to-file
 extension mapping because reads reconstruct MIME metadata from the object key.
-Canonical mapped types (for example `image/png`, `video/mp4`, `audio/wav`, and
-`audio/mpeg`) round-trip. Aliases such as `audio/x-wav` are rejected before
+Canonical mapped types (for example `image/png`, `video/mp4`, `audio/wav`,
+`audio/mpeg`, and `audio/pcm-f32le`) round-trip. Aliases such as `audio/x-wav` are rejected before
 publication rather than being stored under `.wav` and later misreported as
 `audio/wav`; callers should submit the canonical media type.
 
