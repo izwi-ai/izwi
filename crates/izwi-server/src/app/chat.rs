@@ -801,6 +801,7 @@ fn map_worker_client_error(error: WorkerClientError) -> ApiError {
         | WorkerClientError::Build(_)
         | WorkerClientError::Encode(_)
         | WorkerClientError::RequestTooLarge { .. }
+        | WorkerClientError::ConnectionNotEstablished(_)
         | WorkerClientError::Transport(_)
         | WorkerClientError::HttpStatus { .. }
         | WorkerClientError::ResponseTooLarge { .. }

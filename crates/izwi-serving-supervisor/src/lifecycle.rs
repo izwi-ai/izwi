@@ -488,7 +488,9 @@ pub enum LifecycleError {
 
 fn readiness_error_is_retryable(error: &WorkerClientError) -> bool {
     match error {
-        WorkerClientError::Transport(_) | WorkerClientError::Deadline(_) => true,
+        WorkerClientError::ConnectionNotEstablished(_)
+        | WorkerClientError::Transport(_)
+        | WorkerClientError::Deadline(_) => true,
         WorkerClientError::HttpStatus { status, .. } => status.is_server_error(),
         _ => false,
     }

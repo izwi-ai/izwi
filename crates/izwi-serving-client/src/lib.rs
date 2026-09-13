@@ -86,6 +86,8 @@ pub enum WorkerClientError {
     RequestTooLarge { actual: usize, limit: usize },
     #[error("worker operation exceeded its {0} deadline")]
     Deadline(DeadlinePhase),
+    #[error("worker connection was not established before the invocation could be sent: {0}")]
+    ConnectionNotEstablished(#[source] reqwest::Error),
     #[error("worker transport failed: {0}")]
     Transport(#[source] reqwest::Error),
     #[error("worker returned HTTP {status}: {body}")]
@@ -284,8 +286,17 @@ impl WorkerClient {
                 .send(),
         )
         .await
-        .map_err(|_| WorkerClientError::Deadline(DeadlinePhase::ResponseHeaders))?
-        .map_err(WorkerClientError::Transport)?;
+        .map_err(|_| WorkerClientError::Deadline(DeadlinePhase::ResponseHeaders))?;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) if error.is_connect() => {
+                // Reqwest reached no HTTP peer, so this attempt cannot have been admitted. All
+                // later failures remain acceptance-unknown and keep the cancellation guard armed.
+                admission_guard.disarm();
+                return Err(WorkerClientError::ConnectionNotEstablished(error));
+            }
+            Err(error) => return Err(WorkerClientError::Transport(error)),
+        };
 
         if !response.status().is_success() {
             let result = self.decode_invocation_rejection(response, &request).await;

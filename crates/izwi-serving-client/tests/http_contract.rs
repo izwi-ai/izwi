@@ -6,6 +6,7 @@ use izwi_serving_client::{
 };
 use izwi_serving_protocol::*;
 use std::{collections::BTreeSet, time::Duration};
+use tokio::net::TcpListener;
 
 fn id<T: TryFrom<String>>(prefix: &str, suffix: &str) -> T
 where
@@ -63,6 +64,103 @@ fn client(worker: &MockWorker) -> WorkerClient {
         WorkerClientConfig::default(),
     )
     .expect("client")
+}
+
+fn client_for_endpoint(endpoint: &str, config: WorkerClientConfig) -> WorkerClient {
+    WorkerClient::new(endpoint, MockWorkerConfig::default().credentials, config).expect("client")
+}
+
+async fn unused_loopback_endpoint() -> String {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("reserve loopback address");
+    let address = listener.local_addr().expect("loopback address");
+    drop(listener);
+    format!("http://{address}")
+}
+
+#[tokio::test]
+async fn refused_connection_is_classified_as_not_established() {
+    let endpoint = unused_loopback_endpoint().await;
+    let config = WorkerClientConfig {
+        connect_timeout: Duration::from_millis(100),
+        request_timeout: Duration::from_millis(200),
+        ..WorkerClientConfig::default()
+    };
+    let client = client_for_endpoint(&endpoint, config);
+
+    assert!(matches!(
+        client
+            .invoke(request(&MockWorkerConfig::default(), "connect-refused"))
+            .await,
+        Err(WorkerClientError::ConnectionNotEstablished(_))
+    ));
+}
+
+#[tokio::test]
+async fn response_header_timeout_remains_acceptance_unknown() {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind silent worker");
+    let endpoint = format!(
+        "http://{}",
+        listener.local_addr().expect("silent worker address")
+    );
+    let server = tokio::spawn(async move {
+        let (_connection, _) = listener.accept().await.expect("accept invocation");
+        std::future::pending::<()>().await;
+    });
+    let config = WorkerClientConfig {
+        connect_timeout: Duration::from_millis(100),
+        request_timeout: Duration::from_millis(30),
+        ..WorkerClientConfig::default()
+    };
+    let client = client_for_endpoint(&endpoint, config);
+
+    assert!(matches!(
+        client
+            .invoke(request(&MockWorkerConfig::default(), "header-timeout"))
+            .await,
+        Err(WorkerClientError::Deadline(DeadlinePhase::ResponseHeaders))
+    ));
+    server.abort();
+}
+
+#[tokio::test]
+async fn generic_http_503_is_not_a_safe_rejection() {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind status worker");
+    let endpoint = format!(
+        "http://{}",
+        listener.local_addr().expect("status worker address")
+    );
+    let app = axum::Router::new().route(
+        INVOCATIONS_PATH,
+        axum::routing::post(|| async {
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "temporarily unavailable",
+            )
+        }),
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve status worker");
+    });
+    let client = client_for_endpoint(&endpoint, WorkerClientConfig::default());
+
+    assert!(matches!(
+        client
+            .invoke(request(&MockWorkerConfig::default(), "generic-503"))
+            .await,
+        Err(WorkerClientError::HttpStatus {
+            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            ..
+        })
+    ));
+    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
