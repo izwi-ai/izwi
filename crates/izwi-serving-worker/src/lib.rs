@@ -8,8 +8,9 @@ use async_stream::stream;
 use async_trait::async_trait;
 use axum::{
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{DefaultBodyLimit, Path, Request as AxumRequest, State},
     http::{HeaderMap, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -18,6 +19,7 @@ use izwi_serving_protocol::*;
 use std::{
     collections::{HashMap, VecDeque},
     convert::Infallible,
+    fmt::Write as _,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
@@ -36,7 +38,9 @@ pub const DEFAULT_MAX_RETAINED_ATTEMPTS: usize = 1024;
 pub const DEFAULT_ATTEMPT_RETENTION: Duration = Duration::from_secs(300);
 pub const DEFAULT_EVENT_CHANNEL_CAPACITY: usize = 4;
 pub const DEFAULT_MAX_EVENT_BYTES: usize = 1024 * 1024;
+pub const WORKER_METRICS_PATH: &str = "/internal/v1/metrics/prometheus";
 const EVENT_ENVELOPE_ALLOWANCE: usize = 1024;
+const MAX_PROMETHEUS_RESPONSE_BYTES: usize = 8192;
 
 /// Immutable worker identity and bounded local resource policy.
 #[derive(Debug, Clone)]
@@ -251,6 +255,225 @@ struct WorkerState<E> {
     attempts: Mutex<AttemptTable>,
     status_sequence: AtomicU64,
     draining: AtomicBool,
+    metrics: WorkerMetrics,
+}
+
+#[derive(Clone, Default)]
+struct WorkerMetrics {
+    inner: Arc<WorkerMetricCounters>,
+}
+
+#[derive(Default)]
+struct WorkerMetricCounters {
+    admitted: AtomicU64,
+    rejected: AtomicU64,
+    auth_rejections: AtomicU64,
+    body_limit_rejections: AtomicU64,
+    admission_unknown: AtomicU64,
+    completed: AtomicU64,
+    failed: AtomicU64,
+    cancelled: AtomicU64,
+    unconfirmed_teardown: AtomicU64,
+    queue_wait_observations: AtomicU64,
+    queue_wait_micros: AtomicU64,
+    execution_observations: AtomicU64,
+    execution_micros: AtomicU64,
+    cancellation_requests: AtomicU64,
+    cancellation_to_stop_observations: AtomicU64,
+    cancellation_to_stop_micros: AtomicU64,
+    event_delivery_failures: AtomicU64,
+}
+
+impl WorkerMetrics {
+    fn add_duration(counter: &AtomicU64, duration: Duration) {
+        counter.fetch_add(
+            u64::try_from(duration.as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn record_queue_wait(&self, duration: Duration) {
+        self.inner
+            .queue_wait_observations
+            .fetch_add(1, Ordering::Relaxed);
+        Self::add_duration(&self.inner.queue_wait_micros, duration);
+    }
+
+    fn record_execution(&self, duration: Duration) {
+        self.inner
+            .execution_observations
+            .fetch_add(1, Ordering::Relaxed);
+        Self::add_duration(&self.inner.execution_micros, duration);
+    }
+
+    fn record_cancellation_started(&self) {
+        self.inner
+            .cancellation_requests
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_cancellation_stopped(&self, duration: Duration) {
+        self.inner
+            .cancellation_to_stop_observations
+            .fetch_add(1, Ordering::Relaxed);
+        Self::add_duration(&self.inner.cancellation_to_stop_micros, duration);
+    }
+
+    fn render_prometheus<E>(&self, state: &WorkerState<E>) -> String {
+        let active = state.config.max_active_invocations - state.capacity.available_permits();
+        let retained_attempts = state
+            .attempts
+            .lock()
+            .expect("worker attempt table poisoned")
+            .records
+            .len();
+        let mut output = String::with_capacity(MAX_PROMETHEUS_RESPONSE_BYTES);
+        macro_rules! metric {
+            ($name:literal, $kind:literal, $help:literal, $value:expr) => {{
+                let _ = writeln!(output, concat!("# HELP ", $name, " ", $help));
+                let _ = writeln!(output, concat!("# TYPE ", $name, " ", $kind));
+                let _ = writeln!(output, concat!($name, " {}"), $value);
+            }};
+        }
+        metric!(
+            "izwi_worker_active_invocations",
+            "gauge",
+            "Currently admitted invocations.",
+            active
+        );
+        metric!(
+            "izwi_worker_queued_invocations",
+            "gauge",
+            "Currently queued invocations.",
+            0
+        );
+        metric!(
+            "izwi_worker_retained_sessions",
+            "gauge",
+            "Currently retained stateful sessions.",
+            0
+        );
+        metric!(
+            "izwi_worker_retained_attempts",
+            "gauge",
+            "Bounded retained attempt records.",
+            retained_attempts
+        );
+        metric!(
+            "izwi_worker_draining",
+            "gauge",
+            "Whether new admission is disabled for drain.",
+            u8::from(state.draining.load(Ordering::Relaxed))
+        );
+        metric!(
+            "izwi_worker_admitted_total",
+            "counter",
+            "Runtime admissions accepted.",
+            self.inner.admitted.load(Ordering::Relaxed)
+        );
+        metric!(
+            "izwi_worker_rejected_total",
+            "counter",
+            "Requests rejected before acceptance.",
+            self.inner.rejected.load(Ordering::Relaxed)
+        );
+        metric!(
+            "izwi_worker_auth_rejections_total",
+            "counter",
+            "Private endpoint authentication rejections.",
+            self.inner.auth_rejections.load(Ordering::Relaxed)
+        );
+        metric!(
+            "izwi_worker_body_limit_rejections_total",
+            "counter",
+            "Private request body-size rejections.",
+            self.inner.body_limit_rejections.load(Ordering::Relaxed)
+        );
+        metric!(
+            "izwi_worker_admission_unknown_total",
+            "counter",
+            "Admission waits whose ownership outcome was initially unknown.",
+            self.inner.admission_unknown.load(Ordering::Relaxed)
+        );
+        metric!(
+            "izwi_worker_completed_total",
+            "counter",
+            "Invocations completed after confirmed teardown.",
+            self.inner.completed.load(Ordering::Relaxed)
+        );
+        metric!(
+            "izwi_worker_failed_total",
+            "counter",
+            "Invocations failed after confirmed teardown.",
+            self.inner.failed.load(Ordering::Relaxed)
+        );
+        metric!(
+            "izwi_worker_cancelled_total",
+            "counter",
+            "Invocations cancelled after confirmed teardown.",
+            self.inner.cancelled.load(Ordering::Relaxed)
+        );
+        metric!(
+            "izwi_worker_unconfirmed_teardown_total",
+            "counter",
+            "Invocations retaining capacity because teardown is unconfirmed.",
+            self.inner.unconfirmed_teardown.load(Ordering::Relaxed)
+        );
+        metric!(
+            "izwi_worker_queue_wait_observations_total",
+            "counter",
+            "Admission wait observations.",
+            self.inner.queue_wait_observations.load(Ordering::Relaxed)
+        );
+        metric!(
+            "izwi_worker_queue_wait_microseconds_total",
+            "counter",
+            "Accumulated runtime admission wait.",
+            self.inner.queue_wait_micros.load(Ordering::Relaxed)
+        );
+        metric!(
+            "izwi_worker_execution_observations_total",
+            "counter",
+            "Confirmed execution duration observations.",
+            self.inner.execution_observations.load(Ordering::Relaxed)
+        );
+        metric!(
+            "izwi_worker_execution_microseconds_total",
+            "counter",
+            "Accumulated admitted execution duration.",
+            self.inner.execution_micros.load(Ordering::Relaxed)
+        );
+        metric!(
+            "izwi_worker_cancellation_requests_total",
+            "counter",
+            "Executions asked to cancel.",
+            self.inner.cancellation_requests.load(Ordering::Relaxed)
+        );
+        metric!(
+            "izwi_worker_cancellation_to_stop_observations_total",
+            "counter",
+            "Confirmed cancellation-to-stop observations.",
+            self.inner
+                .cancellation_to_stop_observations
+                .load(Ordering::Relaxed)
+        );
+        metric!(
+            "izwi_worker_cancellation_to_stop_microseconds_total",
+            "counter",
+            "Accumulated cancellation-to-confirmed-stop duration.",
+            self.inner
+                .cancellation_to_stop_micros
+                .load(Ordering::Relaxed)
+        );
+        metric!(
+            "izwi_worker_event_delivery_failures_total",
+            "counter",
+            "Oversized or unavailable event deliveries.",
+            self.inner.event_delivery_failures.load(Ordering::Relaxed)
+        );
+        debug_assert!(output.len() <= MAX_PROMETHEUS_RESPONSE_BYTES);
+        output
+    }
 }
 
 impl<E> WorkerState<E> {
@@ -418,6 +641,7 @@ struct AdmissionHandoff {
     result: Result<AdmittedInvocation, AdmissionFailure>,
     permit: OwnedSemaphorePermit,
     admission_guard: OwnedRwLockReadGuard<()>,
+    execution_started_at: Instant,
 }
 
 #[derive(Default)]
@@ -452,6 +676,7 @@ impl<E: InvocationExecutor> WorkerService<E> {
                 attempts: Mutex::new(AttemptTable::default()),
                 status_sequence: AtomicU64::new(0),
                 draining: AtomicBool::new(false),
+                metrics: WorkerMetrics::default(),
             }),
         })
     }
@@ -461,6 +686,7 @@ impl<E: InvocationExecutor> WorkerService<E> {
         Router::new()
             .route(WORKER_DESCRIPTOR_PATH, get(descriptor::<E>))
             .route(WORKER_STATUS_PATH, get(status::<E>))
+            .route(WORKER_METRICS_PATH, get(metrics::<E>))
             .route(INVOCATIONS_PATH, post(invoke::<E>))
             .route(
                 &format!("{INVOCATIONS_PATH}/{{attempt_id}}"),
@@ -471,6 +697,10 @@ impl<E: InvocationExecutor> WorkerService<E> {
                 post(cancel_attempt::<E>),
             )
             .layer(DefaultBodyLimit::max(max_request_bytes))
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&self.state),
+                observe_worker_body_limit,
+            ))
             .with_state(Arc::clone(&self.state))
     }
 
@@ -513,11 +743,33 @@ impl<E: InvocationExecutor> WorkerService<E> {
     }
 }
 
+async fn observe_worker_body_limit<E: InvocationExecutor>(
+    State(state): State<Arc<WorkerState<E>>>,
+    request: AxumRequest,
+    next: Next,
+) -> Response {
+    let response = next.run(request).await;
+    if response.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        state
+            .metrics
+            .inner
+            .body_limit_rejections
+            .fetch_add(1, Ordering::Relaxed);
+        state.metrics.inner.rejected.fetch_add(1, Ordering::Relaxed);
+    }
+    response
+}
+
 async fn descriptor<E: InvocationExecutor>(
     State(state): State<Arc<WorkerState<E>>>,
     headers: HeaderMap,
 ) -> Response {
     if !state.authenticate(&headers) {
+        state
+            .metrics
+            .inner
+            .auth_rejections
+            .fetch_add(1, Ordering::Relaxed);
         return StatusCode::UNAUTHORIZED.into_response();
     }
     Json(state.config.descriptor.clone()).into_response()
@@ -528,6 +780,11 @@ async fn status<E: InvocationExecutor>(
     headers: HeaderMap,
 ) -> Response {
     if !state.authenticate(&headers) {
+        state
+            .metrics
+            .inner
+            .auth_rejections
+            .fetch_add(1, Ordering::Relaxed);
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let active = state.config.max_active_invocations - state.capacity.available_permits();
@@ -562,6 +819,28 @@ async fn status<E: InvocationExecutor>(
     .into_response()
 }
 
+async fn metrics<E: InvocationExecutor>(
+    State(state): State<Arc<WorkerState<E>>>,
+    headers: HeaderMap,
+) -> Response {
+    if !state.authenticate(&headers) {
+        state
+            .metrics
+            .inner
+            .auth_rejections
+            .fetch_add(1, Ordering::Relaxed);
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        state.metrics.render_prometheus(&state),
+    )
+        .into_response()
+}
+
 async fn invoke<E: InvocationExecutor>(
     State(state): State<Arc<WorkerState<E>>>,
     headers: HeaderMap,
@@ -569,14 +848,23 @@ async fn invoke<E: InvocationExecutor>(
 ) -> Response {
     let received_at = Instant::now();
     if !state.authenticate(&headers) {
+        state
+            .metrics
+            .inner
+            .auth_rejections
+            .fetch_add(1, Ordering::Relaxed);
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let request: InvocationRequest = match serde_json::from_slice(&body) {
         Ok(request) => request,
-        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        Err(_) => {
+            state.metrics.inner.rejected.fetch_add(1, Ordering::Relaxed);
+            return StatusCode::BAD_REQUEST.into_response();
+        }
     };
     if request.schema_version.major != PROTOCOL_V1.major {
-        return rejection(
+        return counted_rejection(
+            &state,
             &request,
             StatusCode::CONFLICT,
             RejectionCode::UnsupportedProtocolVersion,
@@ -585,7 +873,8 @@ async fn invoke<E: InvocationExecutor>(
         );
     }
     if let Err(error) = request.validate() {
-        return rejection(
+        return counted_rejection(
+            &state,
             &request,
             StatusCode::BAD_REQUEST,
             RejectionCode::InvalidRequest,
@@ -598,7 +887,8 @@ async fn invoke<E: InvocationExecutor>(
         .permitted_actions
         .contains(&PermittedAction::Invoke)
     {
-        return rejection(
+        return counted_rejection(
+            &state,
             &request,
             StatusCode::FORBIDDEN,
             RejectionCode::PolicyDenied,
@@ -607,7 +897,8 @@ async fn invoke<E: InvocationExecutor>(
         );
     }
     if state.draining.load(Ordering::Acquire) {
-        return rejection(
+        return counted_rejection(
+            &state,
             &request,
             StatusCode::SERVICE_UNAVAILABLE,
             RejectionCode::WorkerDraining,
@@ -616,7 +907,8 @@ async fn invoke<E: InvocationExecutor>(
         );
     }
     if request.expected_worker_incarnation != state.config.descriptor.incarnation_id {
-        return rejection(
+        return counted_rejection(
+            &state,
             &request,
             StatusCode::CONFLICT,
             RejectionCode::WrongWorkerIncarnation,
@@ -625,7 +917,8 @@ async fn invoke<E: InvocationExecutor>(
         );
     }
     if request.deployment_id != state.config.deployment.deployment_id {
-        return rejection(
+        return counted_rejection(
+            &state,
             &request,
             StatusCode::NOT_FOUND,
             RejectionCode::UnknownDeployment,
@@ -634,7 +927,8 @@ async fn invoke<E: InvocationExecutor>(
         );
     }
     if request.expected_model_generation != state.config.deployment.model_generation {
-        return rejection(
+        return counted_rejection(
+            &state,
             &request,
             StatusCode::CONFLICT,
             RejectionCode::WrongModelGeneration,
@@ -643,7 +937,8 @@ async fn invoke<E: InvocationExecutor>(
         );
     }
     if request.task != TaskKind::Chat || request.input.task() != TaskKind::Chat {
-        return rejection(
+        return counted_rejection(
+            &state,
             &request,
             StatusCode::UNPROCESSABLE_ENTITY,
             RejectionCode::IncompatibleTask,
@@ -654,7 +949,8 @@ async fn invoke<E: InvocationExecutor>(
     if request.service_class == ServiceClass::Realtime
         && !state.config.deployment.capability.realtime
     {
-        return rejection(
+        return counted_rejection(
+            &state,
             &request,
             StatusCode::UNPROCESSABLE_ENTITY,
             RejectionCode::IncompatibleTask,
@@ -663,7 +959,8 @@ async fn invoke<E: InvocationExecutor>(
         );
     }
     if state.config.deployment.readiness != ModelReadiness::Ready {
-        return rejection(
+        return counted_rejection(
+            &state,
             &request,
             StatusCode::SERVICE_UNAVAILABLE,
             RejectionCode::ModelNotReady,
@@ -697,7 +994,8 @@ async fn invoke<E: InvocationExecutor>(
             .output_formats
             .contains(&request.requested_output_format)
     {
-        return rejection(
+        return counted_rejection(
+            &state,
             &request,
             StatusCode::BAD_REQUEST,
             RejectionCode::InvalidRequest,
@@ -711,7 +1009,8 @@ async fn invoke<E: InvocationExecutor>(
     // ownership before `begin_draining` can return.
     let admission_guard = Arc::clone(&state.admission_gate).read_owned().await;
     if state.draining.load(Ordering::Acquire) {
-        return rejection(
+        return counted_rejection(
+            &state,
             &request,
             StatusCode::SERVICE_UNAVAILABLE,
             RejectionCode::WorkerDraining,
@@ -723,14 +1022,16 @@ async fn invoke<E: InvocationExecutor>(
     match state.reserve_attempt(&request) {
         ReserveAttempt::Reserved => {}
         ReserveAttempt::AlreadyOwned => {
+            state.metrics.inner.rejected.fetch_add(1, Ordering::Relaxed);
             return (
                 StatusCode::CONFLICT,
                 "attempt is already owned; acceptance is unknown, query or cancel it",
             )
-                .into_response()
+                .into_response();
         }
         ReserveAttempt::Conflict => {
-            return rejection(
+            return counted_rejection(
+                &state,
                 &request,
                 StatusCode::CONFLICT,
                 RejectionCode::DuplicateAttemptConflict,
@@ -739,7 +1040,8 @@ async fn invoke<E: InvocationExecutor>(
             )
         }
         ReserveAttempt::Full => {
-            return rejection(
+            return counted_rejection(
+                &state,
                 &request,
                 StatusCode::TOO_MANY_REQUESTS,
                 RejectionCode::CapacityExhausted,
@@ -753,7 +1055,8 @@ async fn invoke<E: InvocationExecutor>(
         Ok(permit) => permit,
         Err(_) => {
             state.remove_reservation(&request.attempt_id);
-            return rejection(
+            return counted_rejection(
+                &state,
                 &request,
                 StatusCode::TOO_MANY_REQUESTS,
                 RejectionCode::CapacityExhausted,
@@ -777,10 +1080,27 @@ async fn invoke<E: InvocationExecutor>(
     let ready_for_admission = Arc::clone(&admission_ready);
     tokio::spawn(async move {
         let result = admission_state.executor.admit(&admission_request).await;
+        admission_state
+            .metrics
+            .record_queue_wait(received_at.elapsed());
+        if result.is_ok() {
+            admission_state
+                .metrics
+                .inner
+                .admitted
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            admission_state
+                .metrics
+                .inner
+                .rejected
+                .fetch_add(1, Ordering::Relaxed);
+        }
         let handoff = AdmissionHandoff {
             result,
             permit,
             admission_guard,
+            execution_started_at: Instant::now(),
         };
         let abandoned_handoff = {
             let mut slot = slot_for_admission
@@ -827,6 +1147,11 @@ async fn invoke<E: InvocationExecutor>(
                 // admission under the permit; the detached path cancels and fences
                 // any later success. This is intentionally not a typed rejection.
                 state.mark_cancellation_requested(&request.attempt_id);
+                state
+                    .metrics
+                    .inner
+                    .admission_unknown
+                    .fetch_add(1, Ordering::Relaxed);
                 return (
                     StatusCode::GATEWAY_TIMEOUT,
                     "runtime admission outcome is unknown; query or cancel this attempt",
@@ -852,6 +1177,7 @@ async fn invoke<E: InvocationExecutor>(
     };
     let permit = handoff.permit;
     let admission_guard = handoff.admission_guard;
+    let execution_started_at = handoff.execution_started_at;
     let execution = admitted.into_execution();
     let (cancel_tx, cancel_rx) = watch::channel(false);
     let cancel_was_requested = state.install_admission(&request.attempt_id, cancel_tx.clone());
@@ -869,6 +1195,7 @@ async fn invoke<E: InvocationExecutor>(
         execution,
         cancel_rx,
         remaining_time,
+        execution_started_at,
         tx,
     ));
     drop(admission_guard);
@@ -891,6 +1218,7 @@ async fn run_invocation<E: InvocationExecutor>(
     mut execution: Box<dyn AdmittedExecution>,
     mut cancel: watch::Receiver<bool>,
     remaining_time: Duration,
+    execution_started_at: Instant,
     tx: mpsc::Sender<Bytes>,
 ) {
     let accepted = InvocationEvent {
@@ -907,7 +1235,7 @@ async fn run_invocation<E: InvocationExecutor>(
         },
     };
     let accepted_delivered = matches!(
-        try_send_event(&state.config, &tx, accepted),
+        try_send_event(&state.config, &state.metrics, &tx, accepted),
         EventSendResult::Sent
     );
     state.update_attempt(&request.attempt_id, AttemptState::Running, Some(0));
@@ -918,8 +1246,10 @@ async fn run_invocation<E: InvocationExecutor>(
     let mut output_bytes = 0usize;
     let mut timed_out = false;
     let mut cancellation_requested = !accepted_delivered || *cancel.borrow();
+    let mut cancellation_started_at = None;
     let mut terminal = None;
     if cancellation_requested {
+        mark_execution_cancellation(&state.metrics, &mut cancellation_started_at);
         execution.request_cancel();
         state.update_attempt(&request.attempt_id, AttemptState::ExecutionStopping, None);
     }
@@ -930,6 +1260,7 @@ async fn run_invocation<E: InvocationExecutor>(
             () = &mut deadline, if !timed_out => {
                 timed_out = true;
                 cancellation_requested = true;
+                mark_execution_cancellation(&state.metrics, &mut cancellation_started_at);
                 execution.request_cancel();
                 state.update_attempt(
                     &request.attempt_id,
@@ -939,6 +1270,7 @@ async fn run_invocation<E: InvocationExecutor>(
             }
             () = tx.closed(), if !cancellation_requested => {
                 cancellation_requested = true;
+                mark_execution_cancellation(&state.metrics, &mut cancellation_started_at);
                 execution.request_cancel();
                 state.update_attempt(
                     &request.attempt_id,
@@ -949,6 +1281,7 @@ async fn run_invocation<E: InvocationExecutor>(
             changed = cancel.changed(), if !cancellation_requested => {
                 if changed.is_ok() && *cancel.borrow() {
                     cancellation_requested = true;
+                    mark_execution_cancellation(&state.metrics, &mut cancellation_started_at);
                     execution.request_cancel();
                     state.update_attempt(
                         &request.attempt_id,
@@ -967,6 +1300,7 @@ async fn run_invocation<E: InvocationExecutor>(
                                 message: "runtime output exceeded the requested byte limit".into(),
                             }));
                             cancellation_requested = true;
+                            mark_execution_cancellation(&state.metrics, &mut cancellation_started_at);
                             execution.request_cancel();
                             state.update_attempt(
                                 &request.attempt_id,
@@ -982,7 +1316,7 @@ async fn run_invocation<E: InvocationExecutor>(
                             sequence,
                             event: InvocationEventKind::TextDelta { text },
                         };
-                        match try_send_event(&state.config, &tx, event) {
+                        match try_send_event(&state.config, &state.metrics, &tx, event) {
                             EventSendResult::Sent => {
                                 state.update_attempt(
                                     &request.attempt_id,
@@ -997,10 +1331,12 @@ async fn run_invocation<E: InvocationExecutor>(
                                     message: "encoded output event exceeded the worker limit".into(),
                                 }));
                                 cancellation_requested = true;
+                                mark_execution_cancellation(&state.metrics, &mut cancellation_started_at);
                                 execution.request_cancel();
                             }
                             EventSendResult::Unavailable => {
                                 cancellation_requested = true;
+                                mark_execution_cancellation(&state.metrics, &mut cancellation_started_at);
                                 execution.request_cancel();
                             }
                         }
@@ -1019,6 +1355,7 @@ async fn run_invocation<E: InvocationExecutor>(
                                     code: InvocationErrorCode::OutputLimitExceeded,
                                     message: "runtime output exceeded the requested byte limit".into(),
                                 }));
+                                mark_execution_cancellation(&state.metrics, &mut cancellation_started_at);
                                 execution.request_cancel();
                                 continue;
                             }
@@ -1029,7 +1366,7 @@ async fn run_invocation<E: InvocationExecutor>(
                                 sequence,
                                 event: InvocationEventKind::TextDelta { text },
                             };
-                            match try_send_event(&state.config, &tx, delta) {
+                            match try_send_event(&state.config, &state.metrics, &tx, delta) {
                                 EventSendResult::Sent => {
                                     state.update_attempt(
                                         &request.attempt_id,
@@ -1043,11 +1380,13 @@ async fn run_invocation<E: InvocationExecutor>(
                                         code: InvocationErrorCode::OutputLimitExceeded,
                                         message: "encoded output event exceeded the worker limit".into(),
                                     }));
+                                    mark_execution_cancellation(&state.metrics, &mut cancellation_started_at);
                                     execution.request_cancel();
                                     continue;
                                 }
                                 EventSendResult::Unavailable => {
                                     cancellation_requested = true;
+                                    mark_execution_cancellation(&state.metrics, &mut cancellation_started_at);
                                     execution.request_cancel();
                                 }
                             }
@@ -1073,11 +1412,24 @@ async fn run_invocation<E: InvocationExecutor>(
     // worker capacity until the admitted runtime owner confirms cleanup.
     let teardown = execution.wait_for_teardown().await;
     if teardown == ExecutionTeardown::Unconfirmed {
+        state
+            .metrics
+            .inner
+            .unconfirmed_teardown
+            .fetch_add(1, Ordering::Relaxed);
         state.update_attempt(&request.attempt_id, AttemptState::ExecutionStopping, None);
         // Fail closed: losing capacity is safer than advertising a credit
         // while native work may still exist in this incarnation.
         std::mem::forget(permit);
         return;
+    }
+    state
+        .metrics
+        .record_execution(execution_started_at.elapsed());
+    if let Some(started_at) = cancellation_started_at {
+        state
+            .metrics
+            .record_cancellation_stopped(started_at.elapsed());
     }
     let terminal = if timed_out {
         TerminalEvent::Failed(ExecutionFailure {
@@ -1114,6 +1466,7 @@ async fn settle_abandoned_admission<E: InvocationExecutor>(
         result,
         permit,
         admission_guard,
+        execution_started_at,
     } = handoff;
     let Ok(admitted) = result else {
         state.remove_reservation(&request.attempt_id);
@@ -1121,25 +1474,56 @@ async fn settle_abandoned_admission<E: InvocationExecutor>(
         return;
     };
     let execution = admitted.into_execution();
+    let cancellation_started_at = Instant::now();
+    state.metrics.record_cancellation_started();
     execution.request_cancel();
     state.update_attempt(&request.attempt_id, AttemptState::ExecutionStopping, None);
     drop(admission_guard);
     match execution.wait_for_teardown().await {
         ExecutionTeardown::Completed => {
+            state
+                .metrics
+                .inner
+                .completed
+                .fetch_add(1, Ordering::Relaxed);
             state.update_attempt(&request.attempt_id, AttemptState::Completed, None)
         }
         ExecutionTeardown::Cancelled => {
+            state
+                .metrics
+                .inner
+                .cancelled
+                .fetch_add(1, Ordering::Relaxed);
             state.update_attempt(&request.attempt_id, AttemptState::Cancelled, None)
         }
         ExecutionTeardown::Failed => {
+            state.metrics.inner.failed.fetch_add(1, Ordering::Relaxed);
             state.update_attempt(&request.attempt_id, AttemptState::Failed, None)
         }
         ExecutionTeardown::Unconfirmed => {
+            state
+                .metrics
+                .inner
+                .unconfirmed_teardown
+                .fetch_add(1, Ordering::Relaxed);
             std::mem::forget(permit);
             return;
         }
     }
+    state
+        .metrics
+        .record_execution(execution_started_at.elapsed());
+    state
+        .metrics
+        .record_cancellation_stopped(cancellation_started_at.elapsed());
     drop(permit);
+}
+
+fn mark_execution_cancellation(metrics: &WorkerMetrics, started_at: &mut Option<Instant>) {
+    if started_at.is_none() {
+        *started_at = Some(Instant::now());
+        metrics.record_cancellation_started();
+    }
 }
 
 enum TerminalEvent {
@@ -1162,26 +1546,43 @@ fn publish_terminal<E>(
         TerminalEvent::Completed {
             finish_reason,
             usage,
-        } => (
-            AttemptState::Completed,
-            InvocationEventKind::Completed {
-                finish_reason,
-                usage: Some(usage),
-            },
-        ),
-        TerminalEvent::Cancelled => (
-            AttemptState::Cancelled,
-            InvocationEventKind::Cancelled {
-                reason: Some("requested".into()),
-            },
-        ),
-        TerminalEvent::Failed(failure) => (
-            AttemptState::Failed,
-            InvocationEventKind::Error {
-                code: failure.code,
-                message: bounded_message(failure.message),
-            },
-        ),
+        } => {
+            state
+                .metrics
+                .inner
+                .completed
+                .fetch_add(1, Ordering::Relaxed);
+            (
+                AttemptState::Completed,
+                InvocationEventKind::Completed {
+                    finish_reason,
+                    usage: Some(usage),
+                },
+            )
+        }
+        TerminalEvent::Cancelled => {
+            state
+                .metrics
+                .inner
+                .cancelled
+                .fetch_add(1, Ordering::Relaxed);
+            (
+                AttemptState::Cancelled,
+                InvocationEventKind::Cancelled {
+                    reason: Some("requested".into()),
+                },
+            )
+        }
+        TerminalEvent::Failed(failure) => {
+            state.metrics.inner.failed.fetch_add(1, Ordering::Relaxed);
+            (
+                AttemptState::Failed,
+                InvocationEventKind::Error {
+                    code: failure.code,
+                    message: bounded_message(failure.message),
+                },
+            )
+        }
     };
     let event = InvocationEvent {
         schema_version: PROTOCOL_V1,
@@ -1191,7 +1592,7 @@ fn publish_terminal<E>(
         event,
     };
     let published = matches!(
-        try_send_event(&state.config, tx, event),
+        try_send_event(&state.config, &state.metrics, tx, event),
         EventSendResult::Sent
     );
     state.update_attempt(
@@ -1210,19 +1611,34 @@ enum EventSendResult {
 
 fn try_send_event(
     config: &WorkerConfig,
+    metrics: &WorkerMetrics,
     tx: &mpsc::Sender<Bytes>,
     event: InvocationEvent,
 ) -> EventSendResult {
     let Ok(mut encoded) = serde_json::to_vec(&event) else {
+        metrics
+            .inner
+            .event_delivery_failures
+            .fetch_add(1, Ordering::Relaxed);
         return EventSendResult::Oversized;
     };
     if encoded.len().saturating_add(1) > config.max_event_bytes {
+        metrics
+            .inner
+            .event_delivery_failures
+            .fetch_add(1, Ordering::Relaxed);
         return EventSendResult::Oversized;
     }
     encoded.push(b'\n');
     match tx.try_send(Bytes::from(encoded)) {
         Ok(()) => EventSendResult::Sent,
-        Err(_) => EventSendResult::Unavailable,
+        Err(_) => {
+            metrics
+                .inner
+                .event_delivery_failures
+                .fetch_add(1, Ordering::Relaxed);
+            EventSendResult::Unavailable
+        }
     }
 }
 
@@ -1232,6 +1648,11 @@ async fn query_attempt<E: InvocationExecutor>(
     headers: HeaderMap,
 ) -> Response {
     if !state.authenticate(&headers) {
+        state
+            .metrics
+            .inner
+            .auth_rejections
+            .fetch_add(1, Ordering::Relaxed);
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let Ok(attempt_id) = AttemptId::new(raw_attempt_id) else {
@@ -1276,6 +1697,11 @@ async fn cancel_attempt<E: InvocationExecutor>(
     Json(request): Json<CancelAttemptRequest>,
 ) -> Response {
     if !state.authenticate(&headers) {
+        state
+            .metrics
+            .inner
+            .auth_rejections
+            .fetch_add(1, Ordering::Relaxed);
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let Ok(path_attempt_id) = AttemptId::new(attempt_id) else {
@@ -1354,6 +1780,18 @@ async fn cancel_attempt<E: InvocationExecutor>(
         disposition,
     })
     .into_response()
+}
+
+fn counted_rejection<E>(
+    state: &WorkerState<E>,
+    request: &InvocationRequest,
+    status: StatusCode,
+    code: RejectionCode,
+    message: impl Into<String>,
+    retry_after_ms: Option<u64>,
+) -> Response {
+    state.metrics.inner.rejected.fetch_add(1, Ordering::Relaxed);
+    rejection(request, status, code, message, retry_after_ms)
 }
 
 fn rejection(
@@ -1621,6 +2059,87 @@ mod tests {
             InvocationEventKind::Completed { .. }
         ));
         assert_eq!(service.active_invocations(), 0);
+    }
+
+    #[tokio::test]
+    async fn worker_metrics_are_authenticated_bounded_and_fixed_cardinality() {
+        let executor = ScriptExecutor {
+            events: Mutex::new(Some(VecDeque::from([ExecutionEvent::Completed {
+                text: Some("tiny response".into()),
+                finish_reason: FinishReason::Stop,
+                input_tokens: 2,
+                output_tokens: 2,
+            }]))),
+            teardown: ExecutionTeardown::Completed,
+            cancel_calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let service = WorkerService::new(config(), executor).unwrap();
+
+        let denied = service
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri(WORKER_METRICS_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let response = service
+            .router()
+            .oneshot(authorized_request(
+                "POST",
+                INVOCATIONS_PATH,
+                Body::from(serde_json::to_vec(&invocation()).unwrap()),
+            ))
+            .await
+            .unwrap();
+        let _ = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+
+        let scrape = service
+            .router()
+            .oneshot(authorized_request(
+                "GET",
+                WORKER_METRICS_PATH,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(scrape.status(), StatusCode::OK);
+        assert_eq!(
+            scrape.headers()[axum::http::header::CONTENT_TYPE],
+            "text/plain; version=0.0.4; charset=utf-8"
+        );
+        let body = to_bytes(scrape.into_body(), MAX_PROMETHEUS_RESPONSE_BYTES)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(body.len() <= MAX_PROMETHEUS_RESPONSE_BYTES);
+        assert!(body.contains("izwi_worker_active_invocations 0\n"));
+        assert!(body.contains("izwi_worker_retained_attempts 1\n"));
+        assert!(body.contains("izwi_worker_admitted_total 1\n"));
+        assert!(body.contains("izwi_worker_completed_total 1\n"));
+        assert!(body.contains("izwi_worker_auth_rejections_total 1\n"));
+        assert!(body.contains("izwi_worker_queue_wait_observations_total 1\n"));
+        assert!(body.contains("izwi_worker_execution_observations_total 1\n"));
+        for private_value in [
+            "cpu-worker",
+            "local-node",
+            "incarnation-1",
+            "lfm-cpu-v1",
+            "tiny-lfm",
+            "tenant-1",
+            "caller-1",
+            "worker-secret",
+        ] {
+            assert!(!body.contains(private_value));
+        }
+        assert!(body
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .all(|line| !line.contains('{')));
     }
 
     #[tokio::test]
@@ -1892,6 +2411,23 @@ mod tests {
         })
         .await
         .unwrap();
+
+        let scrape = service
+            .router()
+            .oneshot(authorized_request(
+                "GET",
+                WORKER_METRICS_PATH,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let body = to_bytes(scrape.into_body(), MAX_PROMETHEUS_RESPONSE_BYTES)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(body.contains("izwi_worker_cancellation_requests_total 1\n"));
+        assert!(body.contains("izwi_worker_cancelled_total 1\n"));
+        assert!(body.contains("izwi_worker_cancellation_to_stop_observations_total 1\n"));
     }
 
     #[tokio::test]
@@ -1914,6 +2450,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let scrape = service
+            .router()
+            .oneshot(authorized_request(
+                "GET",
+                WORKER_METRICS_PATH,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let body = to_bytes(scrape.into_body(), MAX_PROMETHEUS_RESPONSE_BYTES)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(body.contains("izwi_worker_body_limit_rejections_total 1\n"));
+        assert!(body.contains("izwi_worker_rejected_total 1\n"));
     }
 
     #[tokio::test]

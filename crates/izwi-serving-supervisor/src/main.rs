@@ -17,15 +17,15 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::watch,
+    sync::{mpsc, watch},
     task::JoinSet,
     time::{Instant, MissedTickBehavior},
 };
 
 const MAX_CLI_ARGUMENTS: usize = 16;
 const MAX_CPU_IDS: usize = 1024;
-const MAX_VALIDATION_DIAGNOSTIC_BYTES: usize = 16 * 1024;
-const TRUNCATED_DIAGNOSTIC_SUFFIX: &str = "\nvalidation_output=truncated\n";
+const MAX_DIAGNOSTIC_RESPONSE_BYTES: usize = 16 * 1024;
+const TRUNCATED_DIAGNOSTIC_SUFFIX: &str = "\ndiagnostic_output=truncated\n";
 const SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[tokio::main]
@@ -82,8 +82,11 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
         wait_for_shutdown_request().await;
         let _ = shutdown_tx.send(true);
     });
+    let (diagnostic_tx, mut diagnostic_rx) = mpsc::channel(1);
+    spawn_diagnostic_signal_listener(diagnostic_tx);
 
     let started_at = Instant::now();
+    let mut metrics = SupervisorMetrics::default();
     for slot in &mut slots {
         if *shutdown_rx.borrow() {
             break;
@@ -95,6 +98,7 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
             slot,
             &mut shutdown_rx,
             started_at,
+            &mut metrics,
         )
         .await;
     }
@@ -108,8 +112,11 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
                     break;
                 }
             }
+            Some(()) = diagnostic_rx.recv() => {
+                eprint!("{}", runtime_diagnostic(&node, &slots, &metrics, started_at));
+            }
             _ = poll.tick() => {
-                observe_exits(&mut slots, started_at);
+                observe_exits(&mut slots, started_at, &mut metrics);
                 if let Some(slot) = next_restart_slot(&mut slots) {
                     launch_slot(
                         &node,
@@ -118,13 +125,14 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
                         slot,
                         &mut shutdown_rx,
                         started_at,
+                        &mut metrics,
                     ).await;
                 }
             }
         }
     }
 
-    drain_all(slots, node.config().shutdown.clone()).await;
+    drain_all(slots, node.config().shutdown.clone(), &mut metrics).await;
     Ok(())
 }
 
@@ -139,6 +147,18 @@ struct WorkerSlot {
     exit_observation_failed: bool,
 }
 
+#[derive(Debug, Default)]
+struct SupervisorMetrics {
+    launch_attempts: u64,
+    readiness_successes: u64,
+    readiness_failures: u64,
+    restarts_scheduled: u64,
+    quarantines: u64,
+    unexpected_exits: u64,
+    exit_observation_failures: u64,
+    stop_failures: u64,
+}
+
 impl WorkerSlot {
     fn restart_due(&self) -> bool {
         self.process.is_none()
@@ -148,7 +168,12 @@ impl WorkerSlot {
                 .is_some_and(|deadline| Instant::now() >= deadline)
     }
 
-    fn record_failure(&mut self, supervisor_started_at: Instant, uptime: Duration) {
+    fn record_failure(
+        &mut self,
+        supervisor_started_at: Instant,
+        uptime: Duration,
+        metrics: &mut SupervisorMetrics,
+    ) {
         self.process = None;
         self.process_started_at = None;
         self.exit_observation_failed = false;
@@ -157,6 +182,7 @@ impl WorkerSlot {
             .record_failure(supervisor_started_at.elapsed(), uptime)
         {
             RestartDecision::RestartAfter(delay) => {
+                metrics.restarts_scheduled = metrics.restarts_scheduled.saturating_add(1);
                 self.restart_at = Some(Instant::now() + delay);
                 eprintln!(
                     "worker {} unavailable; restart scheduled in {} ms",
@@ -165,6 +191,7 @@ impl WorkerSlot {
                 );
             }
             RestartDecision::Quarantine => {
+                metrics.quarantines = metrics.quarantines.saturating_add(1);
                 self.restart_at = None;
                 eprintln!(
                     "worker {} exceeded its bounded restart budget and is quarantined",
@@ -233,6 +260,115 @@ fn validation_diagnostic(node: &ValidatedNodeConfig) -> String {
     output.finish()
 }
 
+fn runtime_diagnostic(
+    node: &ValidatedNodeConfig,
+    slots: &[WorkerSlot],
+    metrics: &SupervisorMetrics,
+    started_at: Instant,
+) -> String {
+    let mut output = BoundedDiagnostic::new();
+    let running = slots.iter().filter(|slot| slot.process.is_some()).count();
+    let quarantined = slots
+        .iter()
+        .filter(|slot| slot.restart.is_quarantined())
+        .count();
+    let restart_pending = slots
+        .iter()
+        .filter(|slot| slot.process.is_none() && slot.restart_at.is_some())
+        .count();
+    output.push_line(&format!(
+        "supervisor_status version={} node={} uptime_ms={} workers={} running={} restart_pending={} quarantined={} launch_attempts_total={} readiness_successes_total={} readiness_failures_total={} restarts_scheduled_total={} quarantines_total={} unexpected_exits_total={} exit_observation_failures_total={} stop_failures_total={}",
+        env!("CARGO_PKG_VERSION"),
+        node.config().node_id,
+        started_at.elapsed().as_millis(),
+        slots.len(),
+        running,
+        restart_pending,
+        quarantined,
+        metrics.launch_attempts,
+        metrics.readiness_successes,
+        metrics.readiness_failures,
+        metrics.restarts_scheduled,
+        metrics.quarantines,
+        metrics.unexpected_exits,
+        metrics.exit_observation_failures,
+        metrics.stop_failures,
+    ));
+    for slot in slots {
+        let configured = node
+            .worker(&slot.worker_id)
+            .expect("worker slots are derived from validated configuration");
+        let (state, process_id, incarnation, assignment_source) =
+            if let Some(process) = &slot.process {
+                (
+                    if slot.exit_observation_failed {
+                        "observation-uncertain"
+                    } else {
+                        "ready"
+                    },
+                    process
+                        .process_id()
+                        .map_or_else(|| "unavailable".to_string(), |id| id.to_string()),
+                    process.readiness().expected().incarnation_id().to_string(),
+                    "verified",
+                )
+            } else if slot.restart.is_quarantined() {
+                (
+                    "quarantined",
+                    "none".to_string(),
+                    "none".to_string(),
+                    "configured",
+                )
+            } else if slot.restart_at.is_some() {
+                (
+                    "restart-pending",
+                    "none".to_string(),
+                    "none".to_string(),
+                    "configured",
+                )
+            } else {
+                (
+                    "unavailable",
+                    "none".to_string(),
+                    "none".to_string(),
+                    "configured",
+                )
+            };
+        output.push_line(&format!(
+            "worker={} state={} pid={} incarnation={} assignment_source={} backend={:?} assignment={:?} deployment={} generation={} secret=redacted",
+            slot.worker_id,
+            state,
+            process_id,
+            incarnation,
+            assignment_source,
+            configured.assignment.backend(),
+            configured.assignment,
+            configured.deployment.deployment_id,
+            configured.deployment.model_generation.get(),
+        ));
+    }
+    output.finish()
+}
+
+fn spawn_diagnostic_signal_listener(sender: mpsc::Sender<()>) {
+    #[cfg(unix)]
+    tokio::spawn(async move {
+        // This is a local administrative surface: Unix signal permissions gate
+        // access, and no unauthenticated network listener is introduced.
+        let Ok(mut signal) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+        else {
+            return;
+        };
+        while signal.recv().await.is_some() {
+            // Coalesce repeated operator requests instead of buffering diagnostics.
+            let _ = sender.try_send(());
+        }
+    });
+    #[cfg(not(unix))]
+    drop(sender);
+}
+
 struct BoundedDiagnostic {
     output: String,
     truncated: bool,
@@ -241,7 +377,7 @@ struct BoundedDiagnostic {
 impl BoundedDiagnostic {
     fn new() -> Self {
         Self {
-            output: String::with_capacity(MAX_VALIDATION_DIAGNOSTIC_BYTES),
+            output: String::with_capacity(MAX_DIAGNOSTIC_RESPONSE_BYTES),
             truncated: false,
         }
     }
@@ -250,7 +386,7 @@ impl BoundedDiagnostic {
         if self.truncated {
             return;
         }
-        let payload_limit = MAX_VALIDATION_DIAGNOSTIC_BYTES - TRUNCATED_DIAGNOSTIC_SUFFIX.len();
+        let payload_limit = MAX_DIAGNOSTIC_RESPONSE_BYTES - TRUNCATED_DIAGNOSTIC_SUFFIX.len();
         let required = line.len().saturating_add(1);
         if self.output.len().saturating_add(required) <= payload_limit {
             self.output.push_str(line);
@@ -270,7 +406,7 @@ impl BoundedDiagnostic {
     }
 
     fn finish(self) -> String {
-        debug_assert!(self.output.len() <= MAX_VALIDATION_DIAGNOSTIC_BYTES);
+        debug_assert!(self.output.len() <= MAX_DIAGNOSTIC_RESPONSE_BYTES);
         self.output
     }
 }
@@ -282,7 +418,9 @@ async fn launch_slot(
     slot: &mut WorkerSlot,
     shutdown: &mut watch::Receiver<bool>,
     supervisor_started_at: Instant,
+    metrics: &mut SupervisorMetrics,
 ) {
+    metrics.launch_attempts = metrics.launch_attempts.saturating_add(1);
     slot.restart_at = None;
     let incarnation = IncarnationId::new(uuid::Uuid::new_v4().simple().to_string())
         .expect("UUID incarnation is a valid bounded identity");
@@ -305,7 +443,8 @@ async fn launch_slot(
                 "worker {} launch specification failed: {error}",
                 slot.worker_id
             );
-            slot.record_failure(supervisor_started_at, Duration::ZERO);
+            metrics.readiness_failures = metrics.readiness_failures.saturating_add(1);
+            slot.record_failure(supervisor_started_at, Duration::ZERO, metrics);
             return;
         }
     };
@@ -317,7 +456,8 @@ async fn launch_slot(
         Ok(expected) => expected,
         Err(error) => {
             eprintln!("worker {} identity setup failed: {error}", slot.worker_id);
-            slot.record_failure(supervisor_started_at, Duration::ZERO);
+            metrics.readiness_failures = metrics.readiness_failures.saturating_add(1);
+            slot.record_failure(supervisor_started_at, Duration::ZERO, metrics);
             return;
         }
     };
@@ -334,7 +474,8 @@ async fn launch_slot(
         Ok(process) => process,
         Err(error) => {
             eprintln!("worker {} spawn failed: {error}", slot.worker_id);
-            slot.record_failure(supervisor_started_at, Duration::ZERO);
+            metrics.readiness_failures = metrics.readiness_failures.saturating_add(1);
+            slot.record_failure(supervisor_started_at, Duration::ZERO, metrics);
             return;
         }
     };
@@ -348,6 +489,7 @@ async fn launch_slot(
     };
     match readiness {
         Some(Ok(_)) => {
+            metrics.readiness_successes = metrics.readiness_successes.saturating_add(1);
             eprintln!(
                 "worker {} ready as incarnation {}",
                 slot.worker_id,
@@ -358,36 +500,46 @@ async fn launch_slot(
             slot.exit_observation_failed = false;
         }
         Some(Err(error)) => {
+            metrics.readiness_failures = metrics.readiness_failures.saturating_add(1);
             eprintln!("worker {} failed readiness: {error}", slot.worker_id);
             if let Err(stop_error) = process.drain_and_stop(&node.config().shutdown).await {
+                metrics.stop_failures = metrics.stop_failures.saturating_add(1);
                 eprintln!("worker {} cleanup failed: {stop_error}", slot.worker_id);
             }
-            slot.record_failure(supervisor_started_at, process_started_at.elapsed());
+            slot.record_failure(supervisor_started_at, process_started_at.elapsed(), metrics);
         }
         None => {
             if let Err(error) = process.drain_and_stop(&node.config().shutdown).await {
+                metrics.stop_failures = metrics.stop_failures.saturating_add(1);
                 eprintln!("worker {} shutdown cleanup failed: {error}", slot.worker_id);
             }
         }
     }
 }
 
-fn observe_exits(slots: &mut [WorkerSlot], supervisor_started_at: Instant) {
+fn observe_exits(
+    slots: &mut [WorkerSlot],
+    supervisor_started_at: Instant,
+    metrics: &mut SupervisorMetrics,
+) {
     for slot in slots {
         let Some(process) = slot.process.as_mut() else {
             continue;
         };
         match process.try_wait() {
             Ok(Some(status)) => {
+                metrics.unexpected_exits = metrics.unexpected_exits.saturating_add(1);
                 eprintln!("worker {} exited with {status}", slot.worker_id);
                 let uptime = slot
                     .process_started_at
                     .map_or(Duration::ZERO, |started| started.elapsed());
-                slot.record_failure(supervisor_started_at, uptime);
+                slot.record_failure(supervisor_started_at, uptime, metrics);
             }
             Ok(None) => slot.exit_observation_failed = false,
             Err(error) => {
                 if !slot.exit_observation_failed {
+                    metrics.exit_observation_failures =
+                        metrics.exit_observation_failures.saturating_add(1);
                     eprintln!("worker {} exit observation failed: {error}", slot.worker_id);
                     slot.exit_observation_failed = true;
                 }
@@ -408,7 +560,11 @@ fn next_restart_slot(slots: &mut [WorkerSlot]) -> Option<&mut WorkerSlot> {
     slots.get_mut(index)
 }
 
-async fn drain_all(slots: Vec<WorkerSlot>, policy: izwi_serving_supervisor::ShutdownPolicy) {
+async fn drain_all(
+    slots: Vec<WorkerSlot>,
+    policy: izwi_serving_supervisor::ShutdownPolicy,
+    metrics: &mut SupervisorMetrics,
+) {
     let mut drains = JoinSet::new();
     for slot in slots {
         if let Some(process) = slot.process {
@@ -424,9 +580,13 @@ async fn drain_all(slots: Vec<WorkerSlot>, policy: izwi_serving_supervisor::Shut
                 report.outcome, report.exit_status
             ),
             Ok((worker_id, Err(error))) => {
+                metrics.stop_failures = metrics.stop_failures.saturating_add(1);
                 eprintln!("worker {worker_id} shutdown failed: {error}")
             }
-            Err(error) => eprintln!("worker shutdown task failed: {error}"),
+            Err(error) => {
+                metrics.stop_failures = metrics.stop_failures.saturating_add(1);
+                eprintln!("worker shutdown task failed: {error}")
+            }
         }
     }
 }
@@ -607,6 +767,10 @@ must come from an operator or a trusted launcher; it does not probe or initializ
     eprintln!(
         "Optional: --validate-only resolves configuration and service credentials, prints bounded redacted diagnostics, and exits without acquiring locks or launching workers."
     );
+    #[cfg(unix)]
+    eprintln!(
+        "Send SIGUSR1 to a running supervisor for one bounded, redacted status snapshot on stderr."
+    );
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -778,13 +942,86 @@ mod tests {
     #[test]
     fn diagnostic_buffer_is_hard_bounded() {
         let mut diagnostic = BoundedDiagnostic::new();
-        diagnostic.push_line(&"x".repeat(MAX_VALIDATION_DIAGNOSTIC_BYTES * 2));
+        diagnostic.push_line(&"x".repeat(MAX_DIAGNOSTIC_RESPONSE_BYTES * 2));
         diagnostic.push_line("must-not-appear");
         let output = diagnostic.finish();
 
-        assert_eq!(output.len(), MAX_VALIDATION_DIAGNOSTIC_BYTES);
+        assert_eq!(output.len(), MAX_DIAGNOSTIC_RESPONSE_BYTES);
         assert!(output.ends_with(TRUNCATED_DIAGNOSTIC_SUFFIX));
         assert!(!output.contains("must-not-appear"));
+    }
+
+    #[test]
+    fn runtime_diagnostic_is_bounded_and_redacts_credentials() {
+        let root = tempfile::tempdir().unwrap();
+        let working_directory = root.path().join("work");
+        let runtime_directory = root.path().join("run");
+        let models_directory = root.path().join("models");
+        std::fs::create_dir(&working_directory).unwrap();
+        std::fs::create_dir(&runtime_directory).unwrap();
+        std::fs::create_dir(&models_directory).unwrap();
+        let worker_binary = root.path().join("worker");
+        std::fs::write(&worker_binary, b"worker").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&worker_binary, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        let assignment = DeviceAssignment::Cpu {
+            thread_budget: 1,
+            affinity: vec![1],
+            host_memory_limit_bytes: 512,
+        };
+        let mut config = config(assignment, WorkerBinaryFlavor::Cpu);
+        config.working_directory = working_directory;
+        config.runtime_directory = runtime_directory;
+        config.workers[0].deployment.models_directory = models_directory;
+        let inventory = HostInventory {
+            effective_cpu_ids: vec![1],
+            allocatable_host_memory_bytes: 4096,
+            metal_devices: Vec::new(),
+            cuda_devices: Vec::new(),
+        };
+        let binaries = BinaryCatalog::new([(
+            WorkerBinaryFlavor::Cpu,
+            BinaryRecord {
+                path: worker_binary,
+                supported_backends: vec![BackendKind::Cpu],
+            },
+        )]);
+        let node = config.validate(&inventory, &binaries).unwrap();
+        let slot = WorkerSlot {
+            worker_id: id("worker-a"),
+            secret_environment_name: "WORKER_TOKEN".into(),
+            secret: ResolvedWorkerSecret {
+                bearer_token: ServiceBearerToken::new("private-worker-secret").unwrap(),
+            },
+            restart: RestartController::for_worker(&node, &id("worker-a")).unwrap(),
+            process: None,
+            process_started_at: None,
+            restart_at: Some(Instant::now()),
+            exit_observation_failed: false,
+        };
+        let metrics = SupervisorMetrics {
+            launch_attempts: 2,
+            readiness_successes: 1,
+            readiness_failures: 1,
+            restarts_scheduled: 1,
+            ..SupervisorMetrics::default()
+        };
+
+        let diagnostic = runtime_diagnostic(&node, &[slot], &metrics, Instant::now());
+
+        assert!(diagnostic.len() <= MAX_DIAGNOSTIC_RESPONSE_BYTES);
+        assert!(diagnostic.contains("supervisor_status"));
+        assert!(diagnostic.contains("launch_attempts_total=2"));
+        assert!(diagnostic.contains("worker=worker-a state=restart-pending"));
+        assert!(diagnostic.contains("backend=Cpu"));
+        assert!(diagnostic.contains("secret=redacted"));
+        for secret in ["private-worker-secret", "WORKER_TOKEN", "credential-a"] {
+            assert!(!diagnostic.contains(secret));
+        }
     }
 
     #[test]
