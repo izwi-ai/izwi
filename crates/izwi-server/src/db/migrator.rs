@@ -378,6 +378,20 @@ const BASELINE_SCHEMA: &[&str] = &[
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_media_assets_storage_key ON media_assets(storage_key);",
     "CREATE INDEX IF NOT EXISTS idx_media_assets_created_at ON media_assets(created_at DESC, id DESC);",
     r#"
+    CREATE TABLE IF NOT EXISTS artifact_cleanup_intents (
+        id TEXT PRIMARY KEY,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        available_at INTEGER NOT NULL,
+        storage_key TEXT NOT NULL UNIQUE,
+        tenant_scope TEXT NOT NULL,
+        reason TEXT NOT NULL CHECK(reason = 'artifact_deleted'),
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT NULL
+    );
+    "#,
+    "CREATE INDEX IF NOT EXISTS idx_artifact_cleanup_due ON artifact_cleanup_intents(available_at ASC, created_at ASC, id ASC);",
+    r#"
     CREATE TABLE IF NOT EXISTS text_assets (
         id TEXT PRIMARY KEY,
         created_at INTEGER NOT NULL,

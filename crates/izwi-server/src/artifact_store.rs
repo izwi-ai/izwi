@@ -4,7 +4,10 @@
 //! [`ArtifactId`] values while provider keys remain private to this facade and
 //! the existing durable `media_assets` table.
 
-use crate::batch_runtime::store::{BatchRuntimeStore, NewMediaAsset};
+use crate::batch_runtime::store::{
+    validate_artifact_cleanup_storage_key, ArtifactCleanupIntent, ArtifactCleanupReason,
+    BatchRuntimeStore, NewMediaAsset,
+};
 use izwi_hooks::{
     HookError, HookMetadata, MediaDeleteRequest, MediaNamespace, MediaObjectKey, MediaReadRequest,
     MediaStorageProvider, MediaWriteRequest,
@@ -12,6 +15,7 @@ use izwi_hooks::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::AsyncReadExt;
 
 const ARTIFACT_METADATA_VERSION: u64 = 1;
@@ -19,6 +23,8 @@ const MAX_TENANT_ID_BYTES: usize = 128;
 const MAX_ARTIFACT_ID_BYTES: usize = 64;
 const ABSOLUTE_MAX_OBJECT_BYTES: u64 = 1024 * 1024 * 1024;
 const READ_CHUNK_BYTES: usize = 64 * 1024;
+const PROVIDER_DELETE_TIMEOUT: Duration = Duration::from_secs(5);
+const CLEANUP_BATCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ArtifactTenant(String);
@@ -163,6 +169,13 @@ pub struct ArtifactBytes {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ArtifactCleanupReport {
+    pub inspected: usize,
+    pub completed: usize,
+    pub deferred: usize,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ArtifactStoreError {
     #[error("invalid artifact request: {0}")]
@@ -243,6 +256,12 @@ impl ArtifactStore {
         ) {
             self.compensate_delete(stored.key, request_metadata).await;
             return Err(error);
+        }
+        if validate_artifact_cleanup_storage_key(&stored.key.key).is_err() {
+            self.compensate_delete(stored.key, request_metadata).await;
+            return Err(ArtifactStoreError::InvalidMetadata(
+                "invalid provider storage key",
+            ));
         }
 
         let metadata_json = serde_json::json!({
@@ -368,26 +387,59 @@ impl ArtifactStore {
             Some(asset) => asset,
             None => return Ok(false),
         };
-        let newly_deleted = if asset.deleted_at.is_none() {
-            self.metadata
-                .tombstone_media_asset(id.as_str())
-                .await
-                .map_err(ArtifactStoreError::Metadata)?
-        } else {
-            false
-        };
-
-        match self
-            .provider
-            .delete(MediaDeleteRequest {
-                key: MediaObjectKey::new(asset.storage_key),
-                metadata: tenant_metadata(tenant),
-            })
+        let newly_deleted = self
+            .metadata
+            .tombstone_media_asset_with_cleanup(
+                id.as_str(),
+                tenant.as_str(),
+                ArtifactCleanupReason::ArtifactDeleted,
+            )
             .await
-        {
-            Ok(()) | Err(HookError::NotFound(_)) => Ok(newly_deleted),
-            Err(_) => Err(ArtifactStoreError::DeleteIncomplete),
+            .map_err(ArtifactStoreError::Metadata)?;
+        let Some(intent) = self
+            .metadata
+            .artifact_cleanup_intent_for_storage_key(&asset.storage_key)
+            .await
+            .map_err(ArtifactStoreError::Metadata)?
+        else {
+            // The transaction guaranteed an intent existed. Its absence here
+            // means a concurrent cleaner already completed physical deletion.
+            return Ok(newly_deleted);
+        };
+        match self.cleanup_intent(&intent).await? {
+            true => Ok(newly_deleted),
+            false => Err(ArtifactStoreError::DeleteIncomplete),
         }
+    }
+
+    /// Process a bounded page of already-fenced provider deletions.
+    ///
+    /// Pending rows are retained with capped backoff after provider failure.
+    /// This intentionally does not infer cleanup eligibility from reachability
+    /// or attempt lease expiry.
+    pub async fn cleanup_due(
+        &self,
+        limit: usize,
+    ) -> Result<ArtifactCleanupReport, ArtifactStoreError> {
+        let intents = self
+            .metadata
+            .due_artifact_cleanup_intents(limit)
+            .await
+            .map_err(ArtifactStoreError::Metadata)?;
+        let deadline = tokio::time::Instant::now() + CLEANUP_BATCH_TIMEOUT;
+        let mut report = ArtifactCleanupReport::default();
+        for intent in intents {
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            report.inspected += 1;
+            if self.cleanup_intent(&intent).await? {
+                report.completed += 1;
+            } else {
+                report.deferred += 1;
+            }
+        }
+        Ok(report)
     }
 
     fn validate_write(&self, write: &ArtifactWrite) -> Result<(), ArtifactStoreError> {
@@ -452,6 +504,44 @@ impl ArtifactStore {
             .provider
             .delete(MediaDeleteRequest { key, metadata })
             .await;
+    }
+
+    async fn cleanup_intent(
+        &self,
+        intent: &ArtifactCleanupIntent,
+    ) -> Result<bool, ArtifactStoreError> {
+        let tenant = ArtifactTenant::parse(intent.tenant_scope.clone())?;
+        let deletion = tokio::time::timeout(
+            PROVIDER_DELETE_TIMEOUT,
+            self.provider.delete(MediaDeleteRequest {
+                key: MediaObjectKey::new(intent.storage_key.clone()),
+                metadata: tenant_metadata(&tenant),
+            }),
+        )
+        .await;
+        match deletion {
+            Ok(Ok(())) | Ok(Err(HookError::NotFound(_))) => {
+                self.metadata
+                    .complete_artifact_cleanup(&intent.id, &intent.storage_key)
+                    .await
+                    .map_err(ArtifactStoreError::Metadata)?;
+                Ok(true)
+            }
+            Ok(Err(error)) => {
+                self.metadata
+                    .defer_artifact_cleanup(intent, &error.to_string())
+                    .await
+                    .map_err(ArtifactStoreError::Metadata)?;
+                Ok(false)
+            }
+            Err(_) => {
+                self.metadata
+                    .defer_artifact_cleanup(intent, "Artifact provider deletion timed out")
+                    .await
+                    .map_err(ArtifactStoreError::Metadata)?;
+                Ok(false)
+            }
+        }
     }
 }
 
@@ -739,6 +829,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_provider_storage_keys_are_compensated_before_metadata_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let provider = Arc::new(MemoryMediaProvider::default());
+        let store = conformance_store(&root, provider.clone());
+        let tenant = ArtifactTenant::parse("tenant-a").unwrap();
+
+        for key in [
+            String::new(),
+            "bad\nkey".to_string(),
+            "x".repeat(2 * 1024 + 1),
+        ] {
+            provider.set_next_key(key);
+            assert!(matches!(
+                store
+                    .put(
+                        &tenant,
+                        ArtifactWrite {
+                            content_type: "application/octet-stream".to_string(),
+                            filename: None,
+                            bytes: b"artifact".to_vec(),
+                            retention: ArtifactRetention::Ephemeral,
+                        },
+                    )
+                    .await,
+                Err(ArtifactStoreError::InvalidMetadata(
+                    "invalid provider storage key"
+                ))
+            ));
+            assert_eq!(provider.object_count(), 0);
+        }
+    }
+
+    #[tokio::test]
     async fn filename_cannot_escape_provider_namespace() {
         let root = tempfile::tempdir().unwrap();
         let provider = Arc::new(MemoryMediaProvider::default());
@@ -800,6 +923,229 @@ mod tests {
         assert_eq!(provider.object_count(), 0);
     }
 
+    #[tokio::test]
+    async fn cleanup_intent_survives_store_reopen_and_retries_known_dead_object() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("artifacts.sqlite3");
+        let clock = Arc::new(std::sync::atomic::AtomicI64::new(1_000));
+        let mut metadata =
+            BatchRuntimeStore::initialize_with_database(StoreDatabase::new(db_path.clone()));
+        metadata.set_test_clock(clock.clone());
+        let provider = Arc::new(MemoryMediaProvider::default());
+        let store = ArtifactStore::new(
+            Arc::new(metadata),
+            provider.clone(),
+            ArtifactStoreLimits::default(),
+        )
+        .unwrap();
+        let tenant = ArtifactTenant::parse("tenant-a").unwrap();
+        let descriptor = put_test_artifact(&store, &tenant, "reopen").await;
+        provider.fail_deletes.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            store.delete(&tenant, &descriptor.id).await,
+            Err(ArtifactStoreError::DeleteIncomplete)
+        ));
+        drop(store);
+
+        clock.store(2_000, Ordering::SeqCst);
+        let mut reopened = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(db_path));
+        reopened.set_test_clock(clock);
+        provider.fail_deletes.store(false, Ordering::SeqCst);
+        let reopened = ArtifactStore::new(
+            Arc::new(reopened),
+            provider.clone(),
+            ArtifactStoreLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.cleanup_due(64).await.unwrap(),
+            ArtifactCleanupReport {
+                inspected: 1,
+                completed: 1,
+                deferred: 0,
+            }
+        );
+        assert_eq!(provider.object_count(), 0);
+        assert!(reopened
+            .metadata
+            .due_artifact_cleanup_intents(64)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn cleanup_capacity_failure_happens_before_second_tombstone() {
+        let root = tempfile::tempdir().unwrap();
+        let mut metadata = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
+            root.path().join("artifacts.sqlite3"),
+        ));
+        metadata.set_artifact_cleanup_capacity_for_test(1);
+        let provider = Arc::new(MemoryMediaProvider::default());
+        let store = ArtifactStore::new(
+            Arc::new(metadata),
+            provider.clone(),
+            ArtifactStoreLimits::default(),
+        )
+        .unwrap();
+        let tenant = ArtifactTenant::parse("tenant-a").unwrap();
+        let first = put_test_artifact(&store, &tenant, "first").await;
+        let second = put_test_artifact(&store, &tenant, "second").await;
+        provider.fail_deletes.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            store.delete(&tenant, &first.id).await,
+            Err(ArtifactStoreError::DeleteIncomplete)
+        ));
+        assert!(matches!(
+            store.delete(&tenant, &second.id).await,
+            Err(ArtifactStoreError::Metadata(_))
+        ));
+        assert_eq!(store.stat(&tenant, &second.id).await.unwrap(), second);
+    }
+
+    #[tokio::test]
+    async fn provider_not_found_completes_cleanup_idempotently() {
+        let root = tempfile::tempdir().unwrap();
+        let provider = Arc::new(MemoryMediaProvider::default());
+        let store = conformance_store(&root, provider.clone());
+        let tenant = ArtifactTenant::parse("tenant-a").unwrap();
+        let descriptor = put_test_artifact(&store, &tenant, "missing").await;
+        provider.remove_single_object();
+
+        assert!(store.delete(&tenant, &descriptor.id).await.unwrap());
+        assert!(store
+            .metadata
+            .due_artifact_cleanup_intents(64)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn due_cleanup_is_bounded_and_never_selects_active_artifacts() {
+        let root = tempfile::tempdir().unwrap();
+        let clock = Arc::new(std::sync::atomic::AtomicI64::new(1_000));
+        let mut metadata = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
+            root.path().join("artifacts.sqlite3"),
+        ));
+        metadata.set_test_clock(clock.clone());
+        let provider = Arc::new(MemoryMediaProvider::default());
+        let store = ArtifactStore::new(
+            Arc::new(metadata),
+            provider.clone(),
+            ArtifactStoreLimits::default(),
+        )
+        .unwrap();
+        let tenant = ArtifactTenant::parse("tenant-a").unwrap();
+        let active = put_test_artifact(&store, &tenant, "active").await;
+        assert_eq!(store.cleanup_due(0).await.unwrap().inspected, 0);
+        assert_eq!(store.cleanup_due(usize::MAX).await.unwrap().inspected, 0);
+        assert_eq!(store.stat(&tenant, &active.id).await.unwrap(), active);
+
+        provider.fail_deletes.store(true, Ordering::SeqCst);
+        for index in 0..65 {
+            let artifact = put_test_artifact(&store, &tenant, &format!("dead-{index}")).await;
+            assert!(matches!(
+                store.delete(&tenant, &artifact.id).await,
+                Err(ArtifactStoreError::DeleteIncomplete)
+            ));
+        }
+        clock.store(2_000, Ordering::SeqCst);
+        provider.fail_deletes.store(false, Ordering::SeqCst);
+        let first = store.cleanup_due(usize::MAX).await.unwrap();
+        assert_eq!(first.inspected, 64);
+        assert_eq!(first.completed, 64);
+        let second = store.cleanup_due(usize::MAX).await.unwrap();
+        assert_eq!(second.inspected, 1);
+        assert_eq!(second.completed, 1);
+        assert_eq!(store.stat(&tenant, &active.id).await.unwrap(), active);
+    }
+
+    #[tokio::test]
+    async fn duplicate_cleaners_and_retry_metadata_remain_safe_and_bounded() {
+        let root = tempfile::tempdir().unwrap();
+        let clock = Arc::new(std::sync::atomic::AtomicI64::new(1_000));
+        let mut metadata = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
+            root.path().join("artifacts.sqlite3"),
+        ));
+        metadata.set_test_clock(clock.clone());
+        let provider = Arc::new(MemoryMediaProvider::default());
+        let store = ArtifactStore::new(
+            Arc::new(metadata),
+            provider.clone(),
+            ArtifactStoreLimits::default(),
+        )
+        .unwrap();
+        let tenant = ArtifactTenant::parse("tenant-a").unwrap();
+        let descriptor = put_test_artifact(&store, &tenant, "duplicate").await;
+        provider.set_delete_error("é".repeat(600));
+        assert!(matches!(
+            store.delete(&tenant, &descriptor.id).await,
+            Err(ArtifactStoreError::DeleteIncomplete)
+        ));
+        let mut intent = store
+            .metadata
+            .artifact_cleanup_intent_for_storage_key(
+                &store
+                    .resolve(&tenant, &descriptor.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .storage_key,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(intent.attempt_count, 1);
+        assert!(intent.last_error.as_ref().unwrap().len() <= 512);
+        for _ in 0..14 {
+            clock.store(intent.available_at as i64, Ordering::SeqCst);
+            assert!(matches!(
+                store.delete(&tenant, &descriptor.id).await,
+                Err(ArtifactStoreError::DeleteIncomplete)
+            ));
+            let next = store
+                .metadata
+                .artifact_cleanup_intent_for_storage_key(&intent.storage_key)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(next.available_at - intent.available_at <= 60 * 60 * 1000);
+            intent = next;
+        }
+
+        provider.clear_delete_error();
+        let first_cleaner = intent.clone();
+        let second_cleaner = intent;
+        assert!(store.cleanup_intent(&first_cleaner).await.unwrap());
+        assert!(store.cleanup_intent(&second_cleaner).await.unwrap());
+        assert!(store
+            .metadata
+            .artifact_cleanup_intent_for_storage_key(&first_cleaner.storage_key)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    async fn put_test_artifact(
+        store: &ArtifactStore,
+        tenant: &ArtifactTenant,
+        label: &str,
+    ) -> ArtifactDescriptor {
+        store
+            .put(
+                tenant,
+                ArtifactWrite {
+                    content_type: "application/octet-stream".to_string(),
+                    filename: Some(format!("{label}.bin")),
+                    bytes: label.as_bytes().to_vec(),
+                    retention: ArtifactRetention::Ephemeral,
+                },
+            )
+            .await
+            .unwrap()
+    }
+
     #[derive(Clone)]
     struct MemoryObject {
         bytes: Vec<u8>,
@@ -810,6 +1156,8 @@ mod tests {
     struct MemoryMediaProvider {
         objects: Mutex<BTreeMap<String, MemoryObject>>,
         fail_deletes: AtomicBool,
+        delete_error: Mutex<Option<String>>,
+        next_key: Mutex<Option<String>>,
     }
 
     impl MemoryMediaProvider {
@@ -824,6 +1172,23 @@ mod tests {
             object.metadata.content_length = Some(object.bytes.len() as u64);
             object.metadata.sha256 = None;
         }
+
+        fn remove_single_object(&self) {
+            let key = self.objects.lock().unwrap().keys().next().cloned().unwrap();
+            self.objects.lock().unwrap().remove(&key);
+        }
+
+        fn set_delete_error(&self, error: String) {
+            *self.delete_error.lock().unwrap() = Some(error);
+        }
+
+        fn clear_delete_error(&self) {
+            *self.delete_error.lock().unwrap() = None;
+        }
+
+        fn set_next_key(&self, key: String) {
+            *self.next_key.lock().unwrap() = Some(key);
+        }
     }
 
     #[async_trait::async_trait]
@@ -833,7 +1198,12 @@ mod tests {
             request: MediaWriteRequest,
             bytes: Vec<u8>,
         ) -> HookResult<StoredMediaObject> {
-            let key = format!("private/object/{}", request.record_id);
+            let key = self
+                .next_key
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or_else(|| format!("private/object/{}", request.record_id));
             let tenant_id = request.metadata.get("tenant_id").cloned();
             let metadata = MediaObjectMetadata {
                 content_type: request.content_type,
@@ -885,6 +1255,9 @@ mod tests {
         }
 
         async fn delete(&self, request: MediaDeleteRequest) -> HookResult<()> {
+            if let Some(error) = self.delete_error.lock().unwrap().clone() {
+                return Err(HookError::Failed(error));
+            }
             if self.fail_deletes.load(Ordering::SeqCst) {
                 return Err(HookError::Failed("injected delete failure".to_string()));
             }

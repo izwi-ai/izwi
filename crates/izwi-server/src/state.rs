@@ -1,6 +1,7 @@
 //! Application state management with high-concurrency optimizations
 
 use crate::app::chat::RemoteChatExecution;
+use crate::artifact_store::{ArtifactStore, ArtifactStoreLimits};
 use crate::batch_runtime::{store::BatchRuntimeStore, worker::BatchWorkerHealth};
 use crate::chat_store::ChatStore;
 use crate::db::StoreDatabase;
@@ -431,6 +432,8 @@ pub struct AppState {
     pub voice_observation_store: Arc<VoiceObservationStore>,
     /// Durable batch runtime store for media/text assets, jobs, stages, and artifacts.
     pub batch_runtime_store: Arc<BatchRuntimeStore>,
+    /// Tenant-scoped opaque artifacts plus durable physical-deletion recovery.
+    pub artifact_store: Arc<ArtifactStore>,
     /// Shared strict media validation, canonicalization, storage, and asset registration service.
     pub media_ingest: Arc<MediaIngestService>,
     /// In-process batch worker health snapshot used by readiness and diagnostics.
@@ -474,6 +477,11 @@ impl AppState {
         let media_storage: Arc<dyn MediaStorageProvider> = Arc::new(
             LocalMediaStorageProvider::new(storage_layout::resolve_media_root()),
         );
+        let artifact_store = Arc::new(ArtifactStore::new(
+            batch_runtime_store.clone(),
+            media_storage.clone(),
+            ArtifactStoreLimits::default(),
+        )?);
         let media_ingest = Arc::new(MediaIngestService::new(
             media_storage,
             batch_runtime_store.clone(),
@@ -506,6 +514,7 @@ impl AppState {
             voice_store,
             voice_observation_store,
             batch_runtime_store,
+            artifact_store,
             media_ingest,
             batch_worker_health,
         })
@@ -560,6 +569,11 @@ impl AppState {
         let batch_runtime_store = Arc::new(BatchRuntimeStore::initialize_with_database(
             store_database.clone(),
         ));
+        let artifact_store = Arc::new(ArtifactStore::new(
+            batch_runtime_store.clone(),
+            media_storage.clone(),
+            ArtifactStoreLimits::default(),
+        )?);
         let media_ingest = Arc::new(MediaIngestService::new(
             media_storage,
             batch_runtime_store.clone(),
@@ -592,6 +606,7 @@ impl AppState {
             voice_store,
             voice_observation_store,
             batch_runtime_store,
+            artifact_store,
             media_ingest,
             batch_worker_health,
         })

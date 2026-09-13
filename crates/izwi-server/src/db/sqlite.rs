@@ -274,6 +274,7 @@ mod tests {
         "studio_project_snapshots",
         "studio_project_render_jobs",
         "media_assets",
+        "artifact_cleanup_intents",
         "durable_idempotency_keys_v2",
     ];
 

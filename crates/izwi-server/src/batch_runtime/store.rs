@@ -41,6 +41,8 @@ pub struct BatchRuntimeStore {
     #[cfg(test)]
     test_tts_admission_limits: Option<(usize, usize)>,
     #[cfg(test)]
+    test_artifact_cleanup_capacity: Option<u64>,
+    #[cfg(test)]
     test_durable_tts_acceptance_failpoint: Option<DurableTtsAcceptanceFailpoint>,
 }
 
@@ -63,6 +65,40 @@ pub struct NewMediaAsset {
     pub scan_status: String,
     pub retention_policy: String,
     pub metadata_json: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArtifactCleanupReason {
+    ArtifactDeleted,
+}
+
+impl ArtifactCleanupReason {
+    fn as_db_value(self) -> &'static str {
+        match self {
+            Self::ArtifactDeleted => "artifact_deleted",
+        }
+    }
+
+    fn from_db_value(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "artifact_deleted" => Ok(Self::ArtifactDeleted),
+            _ => bail!("Unknown artifact cleanup reason"),
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ArtifactCleanupIntent {
+    pub id: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub available_at: u64,
+    pub storage_key: String,
+    pub tenant_scope: String,
+    pub reason: ArtifactCleanupReason,
+    pub attempt_count: u32,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -168,6 +204,12 @@ const DEFAULT_STAGE_CLAIM_CANDIDATE_LIMIT: usize = 64;
 const MAX_STAGE_CLAIM_CANDIDATE_LIMIT: usize = 512;
 pub(crate) const DEFAULT_RUNTIME_MAINTENANCE_BATCH_LIMIT: usize = 64;
 const MAX_RUNTIME_MAINTENANCE_BATCH_LIMIT: usize = 512;
+const MAX_ARTIFACT_CLEANUP_INTENTS: u64 = 65_536;
+const MAX_ARTIFACT_CLEANUP_BATCH: usize = 64;
+const MAX_ARTIFACT_CLEANUP_STORAGE_KEY_BYTES: usize = 2 * 1024;
+const MAX_ARTIFACT_CLEANUP_TENANT_BYTES: usize = 128;
+const MAX_ARTIFACT_CLEANUP_ERROR_BYTES: usize = 512;
+const MAX_ARTIFACT_CLEANUP_BACKOFF_MS: u64 = 60 * 60 * 1000;
 
 fn bounded_maintenance_batch_limit(limit: usize) -> usize {
     limit.clamp(1, MAX_RUNTIME_MAINTENANCE_BATCH_LIMIT)
@@ -519,13 +561,20 @@ impl BatchRuntimeStore {
             #[cfg(test)]
             test_tts_admission_limits: None,
             #[cfg(test)]
+            test_artifact_cleanup_capacity: None,
+            #[cfg(test)]
             test_durable_tts_acceptance_failpoint: None,
         }
     }
 
     #[cfg(test)]
-    pub(super) fn set_test_clock(&mut self, clock: Arc<AtomicI64>) {
+    pub(crate) fn set_test_clock(&mut self, clock: Arc<AtomicI64>) {
         self.test_clock = Some(clock);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_artifact_cleanup_capacity_for_test(&mut self, capacity: u64) {
+        self.test_artifact_cleanup_capacity = Some(capacity);
     }
 
     #[cfg(test)]
@@ -661,6 +710,244 @@ impl BatchRuntimeStore {
             .context("Failed to tombstone media asset")?;
 
         Ok(result.rows_affected() == 1)
+    }
+
+    /// Atomically hide one opaque artifact and retain its provider key for
+    /// idempotent physical deletion. Capacity is checked under a durable lock
+    /// before the tombstone changes visibility.
+    pub(crate) async fn tombstone_media_asset_with_cleanup(
+        &self,
+        id: &str,
+        tenant_scope: &str,
+        reason: ArtifactCleanupReason,
+    ) -> anyhow::Result<bool> {
+        validate_artifact_cleanup_tenant(tenant_scope)?;
+        let db = self.db.connection().await?;
+        let tx = db
+            .begin_with_options(runtime_write_transaction_options())
+            .await
+            .context("Failed to start artifact cleanup transaction")?;
+        lock_artifact_cleanup_capacity(&tx).await?;
+
+        let Some(asset) = tx
+            .query_one_raw(raw::statement(
+                &tx,
+                r#"
+                SELECT storage_key, deleted_at
+                FROM media_assets
+                WHERE id = ?1
+                  AND asset_kind = 'opaque_artifact'
+                  AND storage_namespace = 'artifact_store_v1'
+                "#,
+                vec![id.into()],
+            )?)
+            .await
+            .context("Failed to load opaque artifact for deletion")?
+        else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        let storage_key: String = asset.try_get_by_index(0)?;
+        validate_artifact_cleanup_storage_key(&storage_key)?;
+        let already_deleted = asset.try_get_by_index::<Option<i64>>(1)?.is_some();
+
+        let existing_tenant = tx
+            .query_one_raw(raw::statement(
+                &tx,
+                "SELECT tenant_scope FROM artifact_cleanup_intents WHERE storage_key = ?1",
+                vec![storage_key.clone().into()],
+            )?)
+            .await
+            .context("Failed to inspect existing artifact cleanup intent")?
+            .map(|row| row.try_get_by_index::<String>(0))
+            .transpose()?;
+        if let Some(existing_tenant) = existing_tenant {
+            anyhow::ensure!(
+                existing_tenant == tenant_scope,
+                "Artifact cleanup key is already owned by another tenant"
+            );
+        } else {
+            let count = tx
+                .query_one_raw(raw::statement(
+                    &tx,
+                    "SELECT COUNT(*) FROM artifact_cleanup_intents",
+                    vec![],
+                )?)
+                .await
+                .context("Failed to count artifact cleanup intents")?
+                .ok_or_else(|| anyhow!("Artifact cleanup count returned no row"))?
+                .try_get_by_index::<i64>(0)?;
+            let capacity = self.artifact_cleanup_capacity();
+            anyhow::ensure!(
+                u64::try_from(count)? < capacity,
+                "Artifact cleanup capacity exhausted ({capacity} pending intents)"
+            );
+            let now = self.now_millis();
+            tx.execute_raw(raw::statement(
+                &tx,
+                r#"
+                INSERT INTO artifact_cleanup_intents (
+                    id, created_at, updated_at, available_at, storage_key,
+                    tenant_scope, reason, attempt_count, last_error
+                )
+                VALUES (?1, ?2, ?2, ?2, ?3, ?4, ?5, 0, NULL)
+                "#,
+                vec![
+                    new_uuid().into(),
+                    now.into(),
+                    storage_key.into(),
+                    tenant_scope.into(),
+                    reason.as_db_value().into(),
+                ],
+            )?)
+            .await
+            .context("Failed to persist artifact cleanup intent")?;
+        }
+
+        let newly_deleted = if already_deleted {
+            false
+        } else {
+            let now = self.now_millis();
+            tx.execute_raw(raw::statement(
+                &tx,
+                r#"
+                UPDATE media_assets
+                SET updated_at = ?1, deleted_at = ?1
+                WHERE id = ?2 AND deleted_at IS NULL
+                "#,
+                vec![now.into(), id.into()],
+            )?)
+            .await
+            .context("Failed to tombstone media asset")?
+            .rows_affected()
+                == 1
+        };
+        tx.commit()
+            .await
+            .context("Failed to commit artifact cleanup intent")?;
+        Ok(newly_deleted)
+    }
+
+    pub(crate) async fn due_artifact_cleanup_intents(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ArtifactCleanupIntent>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let db = self.db.connection().await?;
+        let rows = db
+            .query_all_raw(raw::statement(
+                db,
+                r#"
+                SELECT c.id, c.created_at, c.updated_at, c.available_at,
+                       c.storage_key, c.tenant_scope, c.reason,
+                       c.attempt_count, c.last_error
+                FROM artifact_cleanup_intents c
+                JOIN media_assets m ON m.storage_key = c.storage_key
+                WHERE c.available_at <= ?1
+                  AND c.reason = 'artifact_deleted'
+                  AND m.asset_kind = 'opaque_artifact'
+                  AND m.storage_namespace = 'artifact_store_v1'
+                  AND m.deleted_at IS NOT NULL
+                ORDER BY c.available_at ASC, c.created_at ASC, c.id ASC
+                LIMIT ?2
+                "#,
+                vec![
+                    self.now_millis().into(),
+                    i64::try_from(limit.min(MAX_ARTIFACT_CLEANUP_BATCH))?.into(),
+                ],
+            )?)
+            .await
+            .context("Failed to list due artifact cleanup intents")?;
+        rows.iter().map(map_artifact_cleanup_intent).collect()
+    }
+
+    pub(crate) async fn artifact_cleanup_intent_for_storage_key(
+        &self,
+        storage_key: &str,
+    ) -> anyhow::Result<Option<ArtifactCleanupIntent>> {
+        validate_artifact_cleanup_storage_key(storage_key)?;
+        let db = self.db.connection().await?;
+        let row = db
+            .query_one_raw(raw::statement(
+                db,
+                r#"
+                SELECT id, created_at, updated_at, available_at, storage_key,
+                       tenant_scope, reason, attempt_count, last_error
+                FROM artifact_cleanup_intents
+                WHERE storage_key = ?1
+                "#,
+                vec![storage_key.into()],
+            )?)
+            .await
+            .context("Failed to load artifact cleanup intent")?;
+        row.as_ref().map(map_artifact_cleanup_intent).transpose()
+    }
+
+    pub(crate) async fn complete_artifact_cleanup(
+        &self,
+        id: &str,
+        storage_key: &str,
+    ) -> anyhow::Result<bool> {
+        validate_artifact_cleanup_storage_key(storage_key)?;
+        let db = self.db.connection().await?;
+        let result = db
+            .execute_raw(raw::statement(
+                db,
+                "DELETE FROM artifact_cleanup_intents WHERE id = ?1 AND storage_key = ?2",
+                vec![id.into(), storage_key.into()],
+            )?)
+            .await
+            .context("Failed to complete artifact cleanup intent")?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn defer_artifact_cleanup(
+        &self,
+        intent: &ArtifactCleanupIntent,
+        error: &str,
+    ) -> anyhow::Result<bool> {
+        validate_artifact_cleanup_storage_key(&intent.storage_key)?;
+        let attempt_count = intent.attempt_count.saturating_add(1);
+        let shift = intent.attempt_count.min(12);
+        let backoff_ms = 1_000_u64
+            .checked_shl(shift)
+            .unwrap_or(MAX_ARTIFACT_CLEANUP_BACKOFF_MS)
+            .min(MAX_ARTIFACT_CLEANUP_BACKOFF_MS);
+        let now = self.now_millis();
+        let available_at = now.saturating_add(i64::try_from(backoff_ms)?);
+        let last_error = truncate_utf8_bytes(error, MAX_ARTIFACT_CLEANUP_ERROR_BYTES);
+        let db = self.db.connection().await?;
+        let result = db
+            .execute_raw(raw::statement(
+                db,
+                r#"
+                UPDATE artifact_cleanup_intents
+                SET updated_at = ?1, available_at = ?2, attempt_count = ?3,
+                    last_error = ?4
+                WHERE id = ?5 AND storage_key = ?6
+                "#,
+                vec![
+                    now.into(),
+                    available_at.into(),
+                    i64::from(attempt_count).into(),
+                    last_error.into(),
+                    intent.id.clone().into(),
+                    intent.storage_key.clone().into(),
+                ],
+            )?)
+            .await
+            .context("Failed to defer artifact cleanup intent")?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    fn artifact_cleanup_capacity(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(capacity) = self.test_artifact_cleanup_capacity {
+            return capacity;
+        }
+        MAX_ARTIFACT_CLEANUP_INTENTS
     }
 
     pub async fn get_media_asset_by_storage_key(
@@ -4442,6 +4729,62 @@ async fn lock_durable_idempotency<C: ConnectionTrait>(db: &C) -> anyhow::Result<
     Ok(())
 }
 
+async fn lock_artifact_cleanup_capacity<C: ConnectionTrait>(db: &C) -> anyhow::Result<()> {
+    let insert_sql = match db.get_database_backend() {
+        DbBackend::Sqlite | DbBackend::Postgres => {
+            "INSERT INTO runtime_admission_locks (id, lock_value) VALUES ('artifact_cleanup', 1) ON CONFLICT (id) DO NOTHING"
+        }
+        DbBackend::MySql => {
+            "INSERT IGNORE INTO runtime_admission_locks (id, lock_value) VALUES ('artifact_cleanup', 1)"
+        }
+        backend => bail!("Unsupported artifact cleanup database backend: {backend:?}"),
+    };
+    db.execute_raw(raw::statement(db, insert_sql, vec![])?)
+        .await
+        .context("Failed to initialize artifact cleanup lock")?;
+    db.execute_raw(raw::statement(
+        db,
+        "UPDATE runtime_admission_locks SET lock_value = lock_value WHERE id = 'artifact_cleanup'",
+        vec![],
+    )?)
+    .await
+    .context("Failed to lock artifact cleanup capacity")?;
+    Ok(())
+}
+
+pub(crate) fn validate_artifact_cleanup_storage_key(storage_key: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !storage_key.is_empty()
+            && storage_key.len() <= MAX_ARTIFACT_CLEANUP_STORAGE_KEY_BYTES
+            && !storage_key.chars().any(char::is_control),
+        "Invalid artifact cleanup storage key"
+    );
+    Ok(())
+}
+
+fn validate_artifact_cleanup_tenant(tenant_scope: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !tenant_scope.is_empty()
+            && tenant_scope.len() <= MAX_ARTIFACT_CLEANUP_TENANT_BYTES
+            && tenant_scope
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_-.:@".contains(&byte)),
+        "Invalid artifact cleanup tenant scope"
+    );
+    Ok(())
+}
+
+fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut boundary = max_bytes;
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value[..boundary].to_string()
+}
+
 async fn load_durable_idempotency_with<C: ConnectionTrait>(
     db: &C,
     tenant_scope: &str,
@@ -4806,6 +5149,31 @@ fn map_media_asset(row: &QueryResult) -> anyhow::Result<MediaAsset> {
         retention_policy: row.try_get_by_index(18)?,
         deleted_at: opt_i64_to_u64(row.try_get_by_index(19)?)?,
         metadata_json: parse_json_value(row.try_get_by_index::<String>(20)?, json!({})),
+    })
+}
+
+fn map_artifact_cleanup_intent(row: &QueryResult) -> anyhow::Result<ArtifactCleanupIntent> {
+    let storage_key: String = row.try_get_by_index(4)?;
+    let tenant_scope: String = row.try_get_by_index(5)?;
+    validate_artifact_cleanup_storage_key(&storage_key)?;
+    validate_artifact_cleanup_tenant(&tenant_scope)?;
+    let last_error: Option<String> = row.try_get_by_index(8)?;
+    anyhow::ensure!(
+        last_error
+            .as_ref()
+            .is_none_or(|error| error.len() <= MAX_ARTIFACT_CLEANUP_ERROR_BYTES),
+        "Stored artifact cleanup error exceeds its bound"
+    );
+    Ok(ArtifactCleanupIntent {
+        id: row.try_get_by_index(0)?,
+        created_at: i64_to_u64(row.try_get_by_index(1)?)?,
+        updated_at: i64_to_u64(row.try_get_by_index(2)?)?,
+        available_at: i64_to_u64(row.try_get_by_index(3)?)?,
+        storage_key,
+        tenant_scope,
+        reason: ArtifactCleanupReason::from_db_value(&row.try_get_by_index::<String>(6)?)?,
+        attempt_count: i64_to_u32(row.try_get_by_index(7)?)?,
+        last_error,
     })
 }
 

@@ -337,6 +337,20 @@ const REQUIRED_SCHEMA_TABLES: &[RequiredSchemaTable] = &[
         ],
     },
     RequiredSchemaTable {
+        name: "artifact_cleanup_intents",
+        columns: &[
+            "id",
+            "created_at",
+            "updated_at",
+            "available_at",
+            "storage_key",
+            "tenant_scope",
+            "reason",
+            "attempt_count",
+            "last_error",
+        ],
+    },
+    RequiredSchemaTable {
         name: "text_assets",
         columns: &[
             "id",

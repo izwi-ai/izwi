@@ -9,6 +9,7 @@ use super::{
         WORKER_REGISTRATION_VERSION,
     },
 };
+use crate::artifact_store::ArtifactStore;
 use crate::ids::new_uuid;
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
@@ -492,6 +493,7 @@ pub struct BatchWorkerRunner {
     active_executions: Arc<RwLock<HashMap<String, ActiveExecution>>>,
     claim_lock: Arc<tokio::sync::Mutex<()>>,
     heartbeat_lock: Arc<tokio::sync::Mutex<()>>,
+    artifact_store: Option<Arc<ArtifactStore>>,
 }
 
 impl BatchWorkerRunner {
@@ -532,6 +534,7 @@ impl BatchWorkerRunner {
             health,
             drain,
             runtime_observer: None,
+            artifact_store: None,
             last_maintenance_at: Arc::new(RwLock::new(None)),
             active_executions: Arc::new(RwLock::new(HashMap::new())),
             claim_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -541,6 +544,11 @@ impl BatchWorkerRunner {
 
     pub fn with_runtime_observer(mut self, runtime: Arc<RuntimeService>) -> Self {
         self.runtime_observer = Some(runtime);
+        self
+    }
+
+    pub fn with_artifact_store(mut self, artifact_store: Arc<ArtifactStore>) -> Self {
+        self.artifact_store = Some(artifact_store);
         self
     }
 
@@ -967,6 +975,12 @@ impl BatchWorkerRunner {
             .recover_expired_stage_leases(self.config.maintenance_batch_limit)
             .await
             .context("Failed to recover expired runtime stage leases")?;
+        if let Some(artifact_store) = self.artifact_store.as_ref() {
+            artifact_store
+                .cleanup_due(self.config.maintenance_batch_limit)
+                .await
+                .context("Failed to clean tombstoned artifact objects")?;
+        }
         for executor in self.executors.values() {
             executor.maintenance().await?;
         }

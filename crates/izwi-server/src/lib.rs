@@ -954,6 +954,7 @@ fn start_batch_runtime_worker(state: &AppState) -> BatchWorkerSupervisor {
         state.batch_worker_health.clone(),
     )
     .with_runtime_observer(state.runtime.clone())
+    .with_artifact_store(state.artifact_store.clone())
     .spawn()
 }
 
