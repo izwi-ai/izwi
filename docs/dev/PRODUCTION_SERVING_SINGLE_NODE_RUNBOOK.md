@@ -16,6 +16,7 @@ The architecture and route decisions are recorded in
 [route migration ledger](PRODUCTION_SERVING_DISCOVERY.md), and the
 [packaging evidence](PRODUCTION_SERVING_PACKAGING.md). Use the
 [release checklist and risk register](PRODUCTION_SERVING_RELEASE_CHECKLIST.md)
+and the [exact-profile support matrix](PRODUCTION_SERVING_SUPPORT_MATRIX.md)
 for profile approval. Node configuration
 examples live in [`config/serving/examples`](../../config/serving/examples/README.md).
 

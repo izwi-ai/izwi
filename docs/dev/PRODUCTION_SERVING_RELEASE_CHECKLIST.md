@@ -6,6 +6,7 @@ Use this document with the
 [single-node operations runbook](PRODUCTION_SERVING_SINGLE_NODE_RUNBOOK.md),
 [route migration ledger](PRODUCTION_SERVING_DISCOVERY.md),
 [packaging evidence](PRODUCTION_SERVING_PACKAGING.md), and
+[support matrix](PRODUCTION_SERVING_SUPPORT_MATRIX.md), and
 [architecture decision](adr/0002-production-worker-boundary.md). A release is
 approved by an operator for one exact profile, backend, model, artifact revision,
 and hardware class. Evidence from another cell does not carry over.
