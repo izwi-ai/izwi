@@ -1389,6 +1389,64 @@ mod tests {
     }
 
     #[test]
+    fn partition_expiry_blocks_new_work_until_a_newer_authenticated_status() {
+        let registry = WorkerRegistry::new(WorkerRegistryConfig {
+            status_ttl: Duration::from_secs(10),
+            ..WorkerRegistryConfig::default()
+        })
+        .unwrap();
+        let approved = registration("worker-a", "inc-a", BackendKind::Cpu, 9101, 2);
+        let descriptor = approved.descriptor.clone();
+        registry.approve(approved).unwrap();
+        let observed = Instant::now();
+        registry
+            .observe_status_at(
+                status(
+                    &descriptor,
+                    1,
+                    vec![deployment("chat-prod", "lfm2", BackendKind::Cpu)],
+                    capacity(2, 0, 2),
+                ),
+                observed,
+            )
+            .unwrap();
+
+        let mut active = registry
+            .select_and_reserve_at(&selection(), observed + Duration::from_secs(1))
+            .unwrap();
+        active.dispatch.mark_accepted().unwrap();
+        assert_eq!(
+            registry
+                .select_and_reserve_at(&selection(), observed + Duration::from_secs(10))
+                .unwrap_err(),
+            WorkerRegistryError::NoEligibleWorker,
+            "status expiry must stop only new selection"
+        );
+        {
+            let inner = lock_recover(&registry.inner);
+            assert_eq!(inner.dispatches.len(), 1, "active ownership is retained");
+        }
+
+        registry
+            .observe_status_at(
+                status(
+                    &descriptor,
+                    2,
+                    vec![deployment("chat-prod", "lfm2", BackendKind::Cpu)],
+                    capacity(2, 1, 1),
+                ),
+                observed + Duration::from_secs(11),
+            )
+            .unwrap();
+        let after_reconnect = registry
+            .select_and_reserve_at(&selection(), observed + Duration::from_secs(11))
+            .unwrap();
+        assert_eq!(after_reconnect.key.incarnation_id.as_str(), "inc-a");
+        drop(after_reconnect);
+        drop(active);
+    }
+
+    #[test]
     fn readiness_is_per_deployment_and_separate_from_saturation() {
         let registry = WorkerRegistry::new(WorkerRegistryConfig::default()).unwrap();
         let approved = registration("worker-a", "inc-a", BackendKind::Cpu, 9101, 1);
