@@ -28,6 +28,9 @@ use crate::worker_registry::{
 };
 
 const FORWARDED_CHAT_STREAM_CAPACITY: usize = 64;
+const RETRY_BACKOFF_BASE_MS: u64 = 10;
+const RETRY_BACKOFF_JITTER_MS: u64 = 10;
+const RETRY_BACKOFF_MAX_MS: u64 = 100;
 
 #[derive(Debug, Clone)]
 pub struct RemoteChatDispatchConfig {
@@ -197,7 +200,7 @@ impl RemoteChatDispatcher {
             prepare_remote_chat_invocation(&remote, request_timeout_secs, context, request)?;
         let started = Instant::now();
 
-        match start_remote_chat_invocation(&remote, invocation.clone()).await {
+        let retry_delay = match start_remote_chat_invocation(&remote, invocation.clone()).await {
             Ok(stream) => {
                 selected
                     .dispatch
@@ -215,11 +218,20 @@ impl RemoteChatDispatcher {
                 if !retryable_before_acceptance(&error) {
                     return Err(map_worker_client_error(error));
                 }
+                retry_delay(&error, invocation.request_id.as_str())
             }
-        }
+        };
 
         let excluded = selected.key.clone();
         drop(selected);
+        let remaining_before_backoff = context
+            .remaining_budget(Duration::from_secs(request_timeout_secs.max(1)))
+            .filter(|budget| !budget.is_zero())
+            .ok_or_else(alternate_deadline_error)?;
+        if retry_delay >= remaining_before_backoff {
+            return Err(alternate_deadline_error());
+        }
+        tokio::time::sleep(retry_delay).await;
         let mut alternate = self
             .registry
             .select_and_reserve_excluding(&selection, Some(&excluded))
@@ -228,10 +240,7 @@ impl RemoteChatDispatcher {
         let remaining = context
             .remaining_budget(Duration::from_secs(request_timeout_secs.max(1)))
             .filter(|budget| !budget.is_zero())
-            .ok_or_else(|| ApiError {
-                status: axum::http::StatusCode::REQUEST_TIMEOUT,
-                message: "Chat request deadline expired before alternate dispatch".into(),
-            })?;
+            .ok_or_else(alternate_deadline_error)?;
         let alternate_invocation =
             retarget_remote_chat_invocation(&invocation, &alternate_remote, remaining)?;
         match start_remote_chat_invocation(&alternate_remote, alternate_invocation).await {
@@ -314,6 +323,36 @@ impl RemoteChatDispatcher {
             },
         )
     }
+}
+
+fn alternate_deadline_error() -> ApiError {
+    ApiError {
+        status: axum::http::StatusCode::REQUEST_TIMEOUT,
+        message: "Chat request deadline expired before alternate dispatch".into(),
+    }
+}
+
+fn retry_delay(error: &WorkerClientError, request_id: &str) -> Duration {
+    let advised_ms = match error {
+        WorkerClientError::Rejected { rejection } => rejection.retry_after_ms,
+        _ => None,
+    }
+    .unwrap_or(RETRY_BACKOFF_BASE_MS)
+    .clamp(RETRY_BACKOFF_BASE_MS, RETRY_BACKOFF_MAX_MS);
+    let jitter_ceiling = RETRY_BACKOFF_MAX_MS.saturating_sub(advised_ms);
+    let jitter_window = RETRY_BACKOFF_JITTER_MS.min(jitter_ceiling);
+    let jitter_ms = stable_request_jitter(request_id, jitter_window);
+    Duration::from_millis(advised_ms.saturating_add(jitter_ms))
+}
+
+fn stable_request_jitter(request_id: &str, inclusive_max_ms: u64) -> u64 {
+    if inclusive_max_ms == 0 {
+        return 0;
+    }
+    let hash = request_id.bytes().fold(2_166_136_261u64, |state, byte| {
+        state.wrapping_mul(16_777_619) ^ u64::from(byte)
+    });
+    hash % inclusive_max_ms.saturating_add(1)
 }
 
 struct StartedDispatch {
@@ -774,6 +813,40 @@ mod tests {
         assert!(!retryable_before_acceptance(&WorkerClientError::Rejected {
             rejection: invalid_accepted,
         },));
+    }
+
+    #[test]
+    fn retry_backoff_honors_advice_with_bounded_stable_jitter() {
+        let rejection = |retry_after_ms| {
+            let mut rejection = InvocationRejection::new(
+                id("request-1"),
+                id("attempt-1"),
+                RejectionCode::CapacityExhausted,
+                "test",
+            );
+            rejection.retry_after_ms = retry_after_ms;
+            WorkerClientError::Rejected { rejection }
+        };
+
+        let default_delay = retry_delay(&rejection(None), "request-1");
+        assert!(default_delay >= Duration::from_millis(RETRY_BACKOFF_BASE_MS));
+        assert!(
+            default_delay <= Duration::from_millis(RETRY_BACKOFF_BASE_MS + RETRY_BACKOFF_JITTER_MS)
+        );
+        assert_eq!(
+            default_delay,
+            retry_delay(&rejection(None), "request-1"),
+            "one request must use a stable retry delay"
+        );
+
+        let advised = retry_delay(&rejection(Some(95)), "request-1");
+        assert!(advised >= Duration::from_millis(95));
+        assert!(advised <= Duration::from_millis(RETRY_BACKOFF_MAX_MS));
+        assert_eq!(
+            retry_delay(&rejection(Some(u64::MAX)), "request-1"),
+            Duration::from_millis(RETRY_BACKOFF_MAX_MS),
+            "untrusted worker advice must be clamped"
+        );
     }
 
     #[tokio::test]
