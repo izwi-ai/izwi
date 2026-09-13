@@ -28,6 +28,8 @@ pub const DEFAULT_MOCK_REQUEST_LIMIT: usize = 1024 * 1024;
 pub enum MockFault {
     None,
     Hang,
+    UsageTrickleWithoutOutput,
+    ByteTrickleWithoutEvent,
     AcceptedWithoutAcknowledgement,
     AcceptedThenDisconnect,
     PartialThenDisconnect,
@@ -535,6 +537,37 @@ async fn run_invocation(
         tokio::time::sleep(state_for_work.config.output_cadence).await;
         match state_for_work.config.fault.clone() {
             MockFault::Hang => std::future::pending::<(AttemptState, Option<u64>)>().await,
+            MockFault::UsageTrickleWithoutOutput => {
+                let mut sequence = 1_u64;
+                loop {
+                    tokio::time::sleep(state_for_work.config.output_cadence).await;
+                    let event = InvocationEvent {
+                        schema_version: PROTOCOL_V1,
+                        request_id: request_for_work.request_id.clone(),
+                        attempt_id: request_for_work.attempt_id.clone(),
+                        sequence,
+                        event: InvocationEventKind::Usage {
+                            usage: Usage {
+                                input_tokens: 1,
+                                output_tokens: 0,
+                            },
+                        },
+                    };
+                    let _ = tx_for_work.send(encode_event(&event)).await;
+                    state_for_work.update_attempt(
+                        &request_for_work.attempt_id,
+                        AttemptState::Running,
+                        Some(sequence),
+                    );
+                    sequence = sequence.saturating_add(1);
+                }
+            }
+            MockFault::ByteTrickleWithoutEvent => loop {
+                tokio::time::sleep(state_for_work.config.output_cadence).await;
+                // This is an incomplete NDJSON record by design. Transport
+                // activity must not count as useful invocation progress.
+                let _ = tx_for_work.send(Bytes::from_static(b"{")).await;
+            },
             MockFault::AcceptedWithoutAcknowledgement => unreachable!("handled before response"),
             MockFault::AcceptedThenDisconnect => (AttemptState::Failed, Some(0)),
             MockFault::PartialThenDisconnect => {

@@ -462,6 +462,100 @@ async fn progress_timeout_requests_cancel_but_capacity_waits_for_teardown() {
     assert_eq!(query.state, AttemptState::Cancelled);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn usage_trickle_does_not_reset_first_useful_output_deadline() {
+    assert_non_output_trickle_times_out(MockFault::UsageTrickleWithoutOutput, "usage-trickle")
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raw_byte_trickle_does_not_reset_first_useful_output_deadline() {
+    assert_non_output_trickle_times_out(MockFault::ByteTrickleWithoutEvent, "byte-trickle").await;
+}
+
+async fn assert_non_output_trickle_times_out(fault: MockFault, suffix: &str) {
+    let config = MockWorkerConfig {
+        fault,
+        output_cadence: Duration::from_millis(10),
+        cancellation_delay: Duration::from_millis(80),
+        ..MockWorkerConfig::default()
+    };
+    let worker = MockWorker::spawn(config).await.unwrap();
+    let client = WorkerClient::new(
+        &worker.endpoint(),
+        worker.config().credentials.clone(),
+        WorkerClientConfig {
+            progress_timeout: Duration::from_millis(35),
+            request_timeout: Duration::from_millis(200),
+            ..WorkerClientConfig::default()
+        },
+    )
+    .unwrap();
+    let invocation = request(worker.config(), suffix);
+    let identity = AttemptIdentity::from(&invocation);
+
+    let error = client.invoke_collect(invocation).await.unwrap_err();
+    assert!(matches!(
+        error,
+        WorkerClientError::Deadline(DeadlinePhase::StreamProgress)
+    ));
+    assert_eq!(worker.active_invocations(), 1);
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(matches!(
+        client.query_attempt(&identity).await.unwrap().state,
+        AttemptState::CancellationRequested | AttemptState::ExecutionStopping
+    ));
+    assert_eq!(worker.active_invocations(), 1);
+
+    tokio::time::sleep(Duration::from_millis(90)).await;
+    assert_eq!(worker.active_invocations(), 0);
+    assert_eq!(
+        client.query_attempt(&identity).await.unwrap().state,
+        AttemptState::Cancelled
+    );
+}
+
+#[tokio::test]
+async fn text_delta_resets_progress_deadline_until_completion() {
+    let config = MockWorkerConfig {
+        output_cadence: Duration::from_millis(25),
+        ..MockWorkerConfig::default()
+    };
+    let worker = MockWorker::spawn(config).await.unwrap();
+    let client = WorkerClient::new(
+        &worker.endpoint(),
+        worker.config().credentials.clone(),
+        WorkerClientConfig {
+            progress_timeout: Duration::from_millis(40),
+            request_timeout: Duration::from_millis(200),
+            ..WorkerClientConfig::default()
+        },
+    )
+    .unwrap();
+
+    let events = client
+        .invoke_collect(request(worker.config(), "progressing-output"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        events.as_slice(),
+        [
+            InvocationEvent {
+                event: InvocationEventKind::Accepted { .. },
+                ..
+            },
+            InvocationEvent {
+                event: InvocationEventKind::TextDelta { .. },
+                ..
+            },
+            InvocationEvent {
+                event: InvocationEventKind::Completed { .. },
+                ..
+            }
+        ]
+    ));
+}
+
 #[tokio::test]
 async fn request_body_is_bounded_before_any_post() {
     let worker = MockWorker::spawn(MockWorkerConfig::default())

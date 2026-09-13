@@ -172,6 +172,9 @@ pub struct WorkerClientConfig {
     pub max_in_flight: usize,
     pub connect_timeout: Duration,
     pub request_timeout: Duration,
+    /// Maximum wait for a complete meaningful invocation event. After worker
+    /// acceptance this is both the first-useful-output and output-progress
+    /// idle budget. Raw HTTP chunks and usage-only events do not reset it.
     pub progress_timeout: Duration,
     pub max_request_json_bytes: usize,
     pub max_control_body_bytes: usize,
@@ -509,6 +512,11 @@ impl WorkerClient {
             )));
         }
 
+        let now = Instant::now();
+        let progress_deadline = now
+            .checked_add(self.inner.config.progress_timeout)
+            .unwrap_or(total_deadline)
+            .min(total_deadline);
         let mut stream = InvocationStream {
             client: self.clone(),
             body: Box::pin(response.bytes_stream()),
@@ -520,6 +528,7 @@ impl WorkerClient {
             eof_seen: false,
             permit: Some(permit),
             total_deadline,
+            progress_deadline,
         };
         // The live stream now owns best-effort cancellation for every exit path.
         admission_guard.disarm();
@@ -769,6 +778,7 @@ pub struct InvocationStream {
     eof_seen: bool,
     permit: Option<OwnedSemaphorePermit>,
     total_deadline: Instant,
+    progress_deadline: Instant,
 }
 
 impl std::fmt::Debug for InvocationStream {
@@ -844,13 +854,19 @@ impl InvocationStream {
 
     async fn fill_pending(&mut self) -> Result<(), WorkerClientError> {
         while self.pending.is_empty() && !self.eof_seen {
-            let remaining = self
-                .total_deadline
-                .saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
+            let now = Instant::now();
+            let total_remaining = self.total_deadline.saturating_duration_since(now);
+            if total_remaining.is_zero() {
                 return Err(WorkerClientError::Deadline(DeadlinePhase::TotalInvocation));
             }
-            let budget = remaining.min(self.client.inner.config.progress_timeout);
+            let progress_remaining = self.progress_deadline.saturating_duration_since(now);
+            if progress_remaining.is_zero() {
+                return Err(WorkerClientError::Deadline(DeadlinePhase::StreamProgress));
+            }
+            // This deadline is deliberately fixed between complete useful
+            // events. Repeated body fragments cannot keep an invocation alive
+            // without accepted model output.
+            let budget = total_remaining.min(progress_remaining);
             let next = tokio::time::timeout(budget, self.body.next())
                 .await
                 .map_err(|_| {
@@ -936,6 +952,24 @@ impl InvocationStream {
             ));
         }
         self.last_sequence = Some(event.sequence);
+        if matches!(
+            &event.event,
+            InvocationEventKind::Accepted { .. }
+                | InvocationEventKind::TextDelta { .. }
+                | InvocationEventKind::Completed { .. }
+                | InvocationEventKind::Error { .. }
+                | InvocationEventKind::Cancelled { .. }
+        ) {
+            // Acceptance starts the first-useful-output clock. Each text delta
+            // advances the progress clock, and a legitimate terminal event
+            // gives protocol EOF its own bounded drain window. Usage is
+            // metadata, not proof that model output is progressing.
+            let now = Instant::now();
+            self.progress_deadline = now
+                .checked_add(self.client.inner.config.progress_timeout)
+                .unwrap_or(self.total_deadline)
+                .min(self.total_deadline);
+        }
         if event.is_terminal() {
             self.terminal_seen = true;
         }

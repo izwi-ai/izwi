@@ -29,6 +29,12 @@ use crate::worker_registry::{
 };
 
 const FORWARDED_CHAT_STREAM_CAPACITY: usize = 64;
+#[cfg(not(test))]
+const FORWARDED_CHAT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const FORWARDED_CHAT_SEND_TIMEOUT: Duration = Duration::from_millis(100);
+const FORWARDED_CHAT_SLOW_CONSUMER_ERROR: &str =
+    "Chat stream consumer is too slow; worker relay was cancelled";
 const RETRY_BACKOFF_BASE_MS: u64 = 10;
 const RETRY_BACKOFF_JITTER_MS: u64 = 10;
 const RETRY_BACKOFF_MAX_MS: u64 = 100;
@@ -195,7 +201,19 @@ impl RemoteChatDispatcher {
                         | ChatStreamEvent::Failed(_)
                         | ChatStreamEvent::ShuttingDown
                 );
-                if public_tx.send(event).await.is_err() || terminal {
+                let sent =
+                    tokio::time::timeout(FORWARDED_CHAT_SEND_TIMEOUT, public_tx.send(event)).await;
+                if !matches!(sent, Ok(Ok(()))) {
+                    // If a slot opened at the timeout boundary, preserve a
+                    // specific terminal reason. Otherwise closing the channel
+                    // makes the public SSE encoder emit its generic explicit
+                    // interruption rather than fabricated success.
+                    let _ = public_tx.try_send(ChatStreamEvent::Failed(
+                        FORWARDED_CHAT_SLOW_CONSUMER_ERROR.into(),
+                    ));
+                    break;
+                }
+                if terminal {
                     break;
                 }
             }
@@ -520,6 +538,7 @@ mod tests {
         Reject(RejectionCode),
         AcceptedWithoutAcknowledgement,
         PartialThenDisconnect,
+        ManyDeltas(usize),
         Success(String),
     }
 
@@ -605,6 +624,20 @@ mod tests {
                     text: "partial".into(),
                 }],
             ),
+            ScriptedResponse::ManyDeltas(count) => {
+                let mut following = Vec::with_capacity(count.saturating_add(1));
+                following.extend(
+                    (0..count).map(|_| InvocationEventKind::TextDelta { text: "x".into() }),
+                );
+                following.push(InvocationEventKind::Completed {
+                    finish_reason: FinishReason::Stop,
+                    usage: Some(Usage {
+                        input_tokens: 1,
+                        output_tokens: u64::try_from(count).unwrap_or(u64::MAX),
+                    }),
+                });
+                accepted_response(&request, following)
+            }
             ScriptedResponse::Success(text) => accepted_response(
                 &request,
                 vec![
@@ -937,6 +970,69 @@ mod tests {
             Some(ChatStreamEvent::Completed(_))
         ));
         assert_eq!(worker_b.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn non_draining_public_stream_cannot_retain_registry_dispatch() {
+        let worker = ScriptedWorker::spawn(
+            ScriptedResponse::ManyDeltas(FORWARDED_CHAT_STREAM_CAPACITY * 3),
+            Duration::ZERO,
+        )
+        .await;
+        let registry = WorkerRegistry::new(WorkerRegistryConfig {
+            max_local_dispatches: 1,
+            ..WorkerRegistryConfig::default()
+        })
+        .unwrap();
+        register(
+            &registry,
+            "worker-a",
+            "inc-a",
+            client(&worker.endpoint()),
+            1,
+        );
+        let dispatcher = dispatcher(registry.clone());
+        let selection = dispatcher.selection_request(&request(), true).unwrap();
+
+        let mut public_events = dispatcher
+            .stream(
+                2,
+                &RequestContext::new("test-request".into(), Principal::local_anonymous()),
+                request(),
+                tenant_work(),
+            )
+            .await
+            .unwrap();
+        let replacement = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match registry.select_and_reserve(&selection) {
+                    Ok(selected) => break selected,
+                    Err(WorkerRegistryError::LocalDispatchLimitReached) => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => panic!("unexpected replacement selection failure: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("slow-consumer forwarding timeout must release dispatch ownership");
+        drop(replacement);
+
+        let mut saw_completion = false;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while let Some(event) = public_events.recv().await {
+                saw_completion |= matches!(event, ChatStreamEvent::Completed(_));
+            }
+        })
+        .await
+        .expect("timed-out bridge must close its public event channel");
+        assert!(
+            !saw_completion,
+            "a truncated slow-consumer stream must never fabricate completion"
+        );
+        // `render_chat_stream` maps this non-terminal channel closure to an
+        // explicit SSE error before [DONE]; its dedicated route-level test
+        // covers that public encoding contract.
     }
 
     #[tokio::test]
