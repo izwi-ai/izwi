@@ -14,7 +14,9 @@ profile.
 The architecture and route decisions are recorded in
 [ADR 0002](adr/0002-production-worker-boundary.md), the
 [route migration ledger](PRODUCTION_SERVING_DISCOVERY.md), and the
-[packaging evidence](PRODUCTION_SERVING_PACKAGING.md). Node configuration
+[packaging evidence](PRODUCTION_SERVING_PACKAGING.md). Use the
+[release checklist and risk register](PRODUCTION_SERVING_RELEASE_CHECKLIST.md)
+for profile approval. Node configuration
 examples live in [`config/serving/examples`](../../config/serving/examples/README.md).
 
 ## Supported topology
@@ -431,7 +433,7 @@ to unrelated local-engine tests elsewhere in the repository.
 
 | Lane | Current evidence | Operational status |
 |---|---|---|
-| Deterministic mock worker | Real-loopback HTTP contract and public gateway tests cover auth/version/bounds, success, incompatible model/deployment, authoritative capacity rejection, timeout, lost acknowledgement, partial stream, cancellation, two replicas, circuit fencing, and the bounded one-alternate policy. The focused alternate-dispatch suite passed 6/6 in this work session. | Implementation/test evidence only; not production readiness |
+| Deterministic mock worker | Real-loopback HTTP contract and public gateway tests cover auth/version/bounds, success, incompatible model/deployment, authoritative capacity rejection, timeout, lost acknowledgement, partial stream, cancellation, two replicas, circuit fencing, and the bounded one-alternate policy. The focused alternate-dispatch suite passed 7/7 in this work session, including bounded backoff/jitter. | Implementation/test evidence only; not production readiness |
 | Real CPU execution | A subprocess worker loaded/warmed a generated tiny supported LFM2 GGUF and completed public JSON and SSE chat through the gateway | Proven development-path process separation; not a production model/resource/performance certificate |
 | Metal compilation | No serving-specific Metal build was run in this work session | Not established |
 | Real Metal execution | No separated gateway/supervisor/worker inference was run on Metal | Not established; supervisor executable rejects Metal configs |
