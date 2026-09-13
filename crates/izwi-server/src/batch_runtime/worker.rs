@@ -248,6 +248,7 @@ impl StageExecutionOutcome {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum StageCancellationReason {
+    UserRequested,
     ExecutionDeadline,
     DrainDeadline,
     LeaseLost,
@@ -257,6 +258,7 @@ pub enum StageCancellationReason {
 impl StageCancellationReason {
     fn as_error_code(self) -> &'static str {
         match self {
+            Self::UserRequested => "user_requested",
             Self::ExecutionDeadline => "execution_deadline",
             Self::DrainDeadline => "drain_deadline",
             Self::LeaseLost => "lease_lost",
@@ -732,18 +734,32 @@ impl BatchWorkerRunner {
         let mut cancellation_tick = tokio::time::interval(cancellation_poll_interval);
         cancellation_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         cancellation_tick.tick().await;
+        let mut awaiting_requested_teardown = false;
         let execution_result = loop {
             tokio::select! {
                 result = &mut execution => {
+                    let persisted_state = self.store.stage_lease_state(&lease).await?;
+                    if matches!(
+                        persisted_state,
+                        Some(super::store::StageLeaseState::CancellationRequested)
+                    ) {
+                        self.store.mark_stage_execution_stopping(&lease).await?;
+                        cancellation.cancel(StageCancellationReason::UserRequested);
+                    } else if matches!(
+                        persisted_state,
+                        Some(super::store::StageLeaseState::ExecutionStopping)
+                    ) {
+                        cancellation.cancel(StageCancellationReason::UserRequested);
+                    }
                     break match cancellation.reason() {
                         Some(reason) => StageExecutionResolution::Cancelled(reason),
                         None => StageExecutionResolution::Finished(result),
                     };
                 },
-                reason = cancellation.cancelled() => {
+                reason = cancellation.cancelled(), if !awaiting_requested_teardown => {
                     break StageExecutionResolution::Cancelled(reason);
                 },
-                _ = &mut deadline_wait => {
+                _ = &mut deadline_wait, if !awaiting_requested_teardown => {
                     cancellation.cancel(StageCancellationReason::ExecutionDeadline);
                     break StageExecutionResolution::Cancelled(
                         StageCancellationReason::ExecutionDeadline,
@@ -766,11 +782,24 @@ impl BatchWorkerRunner {
                     ).await?;
                 },
                 _ = cancellation_tick.tick() => {
-                    if !self.store.stage_lease_is_active(&lease).await? {
-                        cancellation.cancel(StageCancellationReason::LeaseLost);
-                        break StageExecutionResolution::Cancelled(
-                            StageCancellationReason::LeaseLost,
-                        );
+                    match self.store.stage_lease_state(&lease).await? {
+                        Some(super::store::StageLeaseState::Active) => {}
+                        Some(super::store::StageLeaseState::CancellationRequested) => {
+                            if self.store.mark_stage_execution_stopping(&lease).await? {
+                                awaiting_requested_teardown = true;
+                                cancellation.cancel(StageCancellationReason::UserRequested);
+                            }
+                        }
+                        Some(super::store::StageLeaseState::ExecutionStopping) => {
+                            awaiting_requested_teardown = true;
+                            cancellation.cancel(StageCancellationReason::UserRequested);
+                        }
+                        None => {
+                            cancellation.cancel(StageCancellationReason::LeaseLost);
+                            break StageExecutionResolution::Cancelled(
+                                StageCancellationReason::LeaseLost,
+                            );
+                        }
                     }
                 }
             }
@@ -834,6 +863,32 @@ impl BatchWorkerRunner {
                 self.record_heartbeat("idle", None).await?;
             }
             StageExecutionResolution::Cancelled(reason) => {
+                if reason == StageCancellationReason::UserRequested {
+                    let finalized = self.store.finalize_stage_cancellation(&lease).await?;
+                    self.record_stage_observation(
+                        &claimed,
+                        RuntimeStageOutcome::Cancelled,
+                        Some(stage_started.elapsed().as_secs_f64() * 1000.0),
+                        None,
+                        Some(reason.as_error_code().to_string()),
+                    );
+                    self.record_heartbeat(
+                        if self.drain.is_draining() {
+                            "draining"
+                        } else {
+                            "idle"
+                        },
+                        None,
+                    )
+                    .await?;
+                    if finalized.is_none() {
+                        self.health.record_error(
+                            "User-cancelled stage lost ownership before finalization".to_string(),
+                        );
+                    }
+                    drop(_active_execution);
+                    return Ok(true);
+                }
                 // Always attempt an owner-fenced relinquish, even after an
                 // observed lease loss: an expired-but-unreclaimed attempt is
                 // still ours to retry, while a reclaimed attempt safely no-ops
@@ -1258,7 +1313,9 @@ mod tests {
     use crate::{
         batch_runtime::{
             store::{NewJobStage, NewRuntimeJob},
-            types::{RuntimeJobKind, RuntimeJobStatus, RuntimeStageStatus},
+            types::{
+                RuntimeCancellationState, RuntimeJobKind, RuntimeJobStatus, RuntimeStageStatus,
+            },
         },
         db::StoreDatabase,
     };
@@ -1280,6 +1337,12 @@ mod tests {
 
     struct ContextBlockingExecutor {
         started: Arc<Notify>,
+        cancellation: Arc<RwLock<Option<StageCancellationSignal>>>,
+    }
+
+    struct CancellationAwareBlockingExecutor {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
         cancellation: Arc<RwLock<Option<StageCancellationSignal>>>,
     }
 
@@ -1360,6 +1423,32 @@ mod tests {
                 .unwrap_or_else(|poison| poison.into_inner()) = Some(context.cancellation());
             self.started.notify_one();
             std::future::pending::<anyhow::Result<StageExecutionOutcome>>().await
+        }
+    }
+
+    #[async_trait]
+    impl StageExecutor for CancellationAwareBlockingExecutor {
+        fn stage_kind(&self) -> &'static str {
+            "fake_stage"
+        }
+
+        async fn execute(&self, _claimed: ClaimedStage) -> anyhow::Result<StageExecutionOutcome> {
+            anyhow::bail!("runner did not invoke context-aware stage execution")
+        }
+
+        async fn execute_with_context(
+            &self,
+            context: StageExecutionContext,
+        ) -> anyhow::Result<StageExecutionOutcome> {
+            *self
+                .cancellation
+                .write()
+                .unwrap_or_else(|poison| poison.into_inner()) = Some(context.cancellation());
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(StageExecutionOutcome {
+                output_artifact_ids: vec!["must-not-publish".to_string()],
+            })
         }
     }
 
@@ -1786,33 +1875,113 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_during_execution_cannot_be_overwritten() {
-        let store = build_store();
+    async fn cancellation_retains_capacity_until_non_cooperative_executor_teardown() {
+        let clock = Arc::new(AtomicI64::new(
+            super::super::store::current_timestamp_millis(),
+        ));
+        let root = tempfile::tempdir().expect("temp dir");
+        let mut store = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
+            root.path().join("runtime.sqlite"),
+        ));
+        store.set_test_clock(clock.clone());
+        let store = Arc::new(store);
         let (job_id, stage_id) = create_queued_fake_stage(&store, 1).await.expect("stage");
         let started = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
+        let observed_cancellation = Arc::new(RwLock::new(None));
+        let mut config = BatchWorkerConfig::local("worker-test");
+        config.lease_duration = Duration::from_millis(40);
+        config.poll_interval = Duration::from_millis(10);
         let runner = BatchWorkerRunner::new(
             store.clone(),
-            vec![Arc::new(BlockingExecutor {
+            vec![Arc::new(CancellationAwareBlockingExecutor {
                 started: started.clone(),
                 release: release.clone(),
+                cancellation: observed_cancellation.clone(),
             })],
-            BatchWorkerConfig::local("worker-test"),
+            config,
             BatchWorkerHealth::new("worker-test"),
         );
-        let run = tokio::spawn(async move { runner.run_once().await });
+        let mut run = tokio::spawn(async move { runner.run_once().await });
         tokio::time::timeout(Duration::from_secs(2), started.notified())
             .await
             .expect("executor should start");
 
-        store
+        let cancellation = store
             .cancel_job(&job_id, Some("cancel while executing".to_string()))
             .await
             .expect("cancel")
             .expect("cancelled job");
+        assert_eq!(cancellation.status, RuntimeJobStatus::Running);
+        assert_eq!(
+            cancellation.cancellation_state,
+            Some(RuntimeCancellationState::Requested)
+        );
+
+        let requested = store
+            .get_stage(&stage_id)
+            .await
+            .expect("stage")
+            .expect("stage exists");
+        let owner = requested.worker_id.clone();
+        let lease_expiry = requested.lease_expires_at;
+        let attempt_token = requested.attempt_token.clone();
+        assert_eq!(requested.status, RuntimeStageStatus::Running);
+        assert_eq!(
+            requested.cancellation_state,
+            Some(RuntimeCancellationState::Requested)
+        );
+        assert!(owner.is_some());
+        assert!(lease_expiry.is_some());
+        assert!(attempt_token.is_some());
+
+        clock.fetch_add(100, Ordering::SeqCst);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let stage = store
+                    .get_stage(&stage_id)
+                    .await
+                    .expect("stage")
+                    .expect("stage exists");
+                if stage.cancellation_state == Some(RuntimeCancellationState::ExecutionStopping) {
+                    assert_eq!(stage.worker_id, owner);
+                    assert_eq!(stage.attempt_token, attempt_token);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker should observe cancellation request");
+        let signal = observed_cancellation
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+            .expect("executor cancellation signal");
+        assert_eq!(
+            signal.reason(),
+            Some(StageCancellationReason::UserRequested)
+        );
+
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut run)
+            .await
+            .is_err());
+        let still_stopping = store
+            .get_stage(&stage_id)
+            .await
+            .expect("stage")
+            .expect("stage exists");
+        assert_eq!(still_stopping.status, RuntimeStageStatus::Running);
+        assert_eq!(still_stopping.worker_id, owner);
+        assert!(still_stopping.lease_expires_at.is_some_and(
+            |expires_at| expires_at > u64::try_from(clock.load(Ordering::SeqCst)).unwrap()
+        ));
+
+        release.notify_one();
         assert!(tokio::time::timeout(Duration::from_secs(2), run)
             .await
-            .expect("cancelled execution should stop without executor cooperation")
+            .expect("cancelled execution should finish after executor teardown")
             .expect("runner join")
             .expect("run once"));
 
@@ -1822,8 +1991,17 @@ mod tests {
             .expect("stage")
             .expect("stage exists");
         assert_eq!(stage.status, RuntimeStageStatus::Cancelled);
+        assert_eq!(stage.cancellation_state, None);
         assert!(stage.output_artifact_ids.is_empty());
         assert_eq!(stage.lease_expires_at, None);
+        assert_eq!(stage.worker_id, None);
+        let job = store
+            .get_job(&job_id)
+            .await
+            .expect("job")
+            .expect("job exists");
+        assert_eq!(job.status, RuntimeJobStatus::Cancelled);
+        assert_eq!(job.cancellation_state, None);
     }
 
     #[tokio::test]

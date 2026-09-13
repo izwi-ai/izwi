@@ -1,7 +1,7 @@
 use super::types::{
     ClaimedStage, IdempotencyRecord, JobStage, MediaAsset, QueueClass, RuntimeArtifact,
-    RuntimeArtifactKind, RuntimeArtifactRole, RuntimeJob, RuntimeJobKind, RuntimeJobStatus,
-    RuntimeStageStatus, RuntimeWorkerHeartbeat, RuntimeWorkerHeartbeatDetails,
+    RuntimeArtifactKind, RuntimeArtifactRole, RuntimeCancellationState, RuntimeJob, RuntimeJobKind,
+    RuntimeJobStatus, RuntimeStageStatus, RuntimeWorkerHeartbeat, RuntimeWorkerHeartbeatDetails,
     RuntimeWorkerRegistration, StageLease, StageResourceHints, TextAsset, WorkerResourceCapacity,
     WORKER_HEARTBEAT_DETAILS_VERSION, WORKER_REGISTRATION_VERSION,
 };
@@ -105,6 +105,13 @@ pub struct NewJobStageDispatch {
     pub stage: NewJobStage,
     pub queue_class: QueueClass,
     pub resource_hints: StageResourceHints,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageLeaseState {
+    Active,
+    CancellationRequested,
+    ExecutionStopping,
 }
 
 const DEFAULT_STAGE_CLAIM_CANDIDATE_LIMIT: usize = 64;
@@ -797,7 +804,7 @@ impl BatchRuntimeStore {
                        input_text_asset_id, request_json, model_snapshot_json,
                        progress_json, error_code, error_message, attempt_count,
                        max_attempts, retry_policy_json, idempotency_key,
-                       correlation_id, cancellation_reason
+                       correlation_id, cancellation_reason, cancellation_state
                 FROM runtime_jobs
                 WHERE job_kind = ?1
                   AND status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing')
@@ -828,7 +835,7 @@ impl BatchRuntimeStore {
                        input_text_asset_id, request_json, model_snapshot_json,
                        progress_json, error_code, error_message, attempt_count,
                        max_attempts, retry_policy_json, idempotency_key,
-                       correlation_id, cancellation_reason
+                       correlation_id, cancellation_reason, cancellation_state
                 FROM runtime_jobs
                 WHERE job_kind = ?1
                   AND route_record_kind = ?2
@@ -866,7 +873,7 @@ impl BatchRuntimeStore {
                        input_text_asset_id, request_json, model_snapshot_json,
                        progress_json, error_code, error_message, attempt_count,
                        max_attempts, retry_policy_json, idempotency_key,
-                       correlation_id, cancellation_reason
+                       correlation_id, cancellation_reason, cancellation_state
                 FROM runtime_jobs
                 WHERE job_kind = ?1
                   AND route_record_kind = ?2
@@ -939,9 +946,14 @@ impl BatchRuntimeStore {
                 finished_at = CASE WHEN ?1 IN ('completed', 'failed', 'cancelled', 'expired') THEN COALESCE(finished_at, ?2) ELSE finished_at END,
                 error_code = ?3,
                 error_message = ?4,
-                cancellation_reason = CASE WHEN ?1 = 'cancelled' THEN ?5 ELSE cancellation_reason END
+                cancellation_reason = CASE WHEN ?1 = 'cancelled' THEN ?5 ELSE cancellation_reason END,
+                cancellation_state = CASE
+                    WHEN ?1 IN ('completed', 'failed', 'cancelled', 'expired') THEN NULL
+                    ELSE cancellation_state
+                END
             WHERE id = ?6
               AND status IN ({expected_placeholders})
+              AND cancellation_state IS NULL
             "#
         );
         let mut values = vec![
@@ -1041,6 +1053,7 @@ impl BatchRuntimeStore {
                     error_message = NULL,
                     attempt_count = attempt_count + 1,
                     cancellation_reason = NULL,
+                    cancellation_state = NULL,
                     admission_tenant = ?3
                 WHERE id = ?2
                   AND status IN ('failed', 'cancelled', 'expired')
@@ -1069,6 +1082,7 @@ impl BatchRuntimeStore {
                 worker_id = NULL,
                 available_at = ?1,
                 attempt_token = NULL,
+                cancellation_state = NULL,
                 output_artifact_ids_json = '[]',
                 error_code = NULL,
                 error_message = NULL
@@ -1324,6 +1338,7 @@ impl BatchRuntimeStore {
                 UPDATE job_stages
                 SET
                     status = 'completed',
+                    cancellation_state = NULL,
                     updated_at = ?1,
                     finished_at = COALESCE(finished_at, ?1),
                     lease_expires_at = NULL,
@@ -1333,6 +1348,7 @@ impl BatchRuntimeStore {
                     error_message = NULL
                 WHERE id = ?3
                   AND status IN ('running', 'postprocessing')
+                  AND cancellation_state IS NULL
                   AND worker_id = ?4
                   AND attempt_count = ?5
                   AND (attempt_token = ?6 OR (attempt_token IS NULL AND ?6 IS NULL))
@@ -1343,6 +1359,7 @@ impl BatchRuntimeStore {
                       FROM runtime_jobs
                       WHERE runtime_jobs.id = job_stages.job_id
                         AND runtime_jobs.status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
+                        AND runtime_jobs.cancellation_state IS NULL
                   )
                 "#,
                 vec![
@@ -1391,7 +1408,10 @@ impl BatchRuntimeStore {
                   AND attempt_count = ?5
                   AND (attempt_token = ?6 OR (attempt_token IS NULL AND ?6 IS NULL))
                   AND lease_expires_at IS NOT NULL
-                  AND lease_expires_at > ?2
+                  AND (
+                      lease_expires_at > ?2
+                      OR cancellation_state IN ('requested', 'execution_stopping')
+                  )
                 "#,
                 vec![
                     lease_expires_at.into(),
@@ -1407,14 +1427,17 @@ impl BatchRuntimeStore {
         Ok(result.rows_affected() == 1)
     }
 
-    pub async fn stage_lease_is_active(&self, lease: &StageLease) -> anyhow::Result<bool> {
+    pub async fn stage_lease_state(
+        &self,
+        lease: &StageLease,
+    ) -> anyhow::Result<Option<StageLeaseState>> {
         let db = self.db.connection().await?;
         let now = self.now_millis();
         let row = db
             .query_one_raw(raw::statement(
                 db,
                 r#"
-                SELECT 1
+                SELECT s.cancellation_state
                 FROM job_stages s
                 JOIN runtime_jobs j ON j.id = s.job_id
                 WHERE s.id = ?1
@@ -1423,7 +1446,10 @@ impl BatchRuntimeStore {
                   AND s.attempt_count = ?3
                   AND (s.attempt_token = ?4 OR (s.attempt_token IS NULL AND ?4 IS NULL))
                   AND s.lease_expires_at IS NOT NULL
-                  AND s.lease_expires_at > ?5
+                  AND (
+                      s.lease_expires_at > ?5
+                      OR s.cancellation_state IN ('requested', 'execution_stopping')
+                  )
                   AND j.status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
                 LIMIT 1
                 "#,
@@ -1437,7 +1463,23 @@ impl BatchRuntimeStore {
             )?)
             .await
             .context("Failed to verify runtime stage lease ownership")?;
-        Ok(row.is_some())
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let state: Option<String> = row.try_get_by_index(0)?;
+        match parse_cancellation_state(state)? {
+            None => Ok(Some(StageLeaseState::Active)),
+            Some(RuntimeCancellationState::Requested) => {
+                Ok(Some(StageLeaseState::CancellationRequested))
+            }
+            Some(RuntimeCancellationState::ExecutionStopping) => {
+                Ok(Some(StageLeaseState::ExecutionStopping))
+            }
+        }
+    }
+
+    pub async fn stage_lease_is_active(&self, lease: &StageLease) -> anyhow::Result<bool> {
+        Ok(self.stage_lease_state(lease).await?.is_some())
     }
 
     pub async fn update_stage_progress(
@@ -1456,6 +1498,7 @@ impl BatchRuntimeStore {
                 SET progress_json = ?1, updated_at = ?2
                 WHERE id = ?3
                   AND status IN ('running', 'postprocessing')
+                  AND cancellation_state IS NULL
                   AND worker_id = ?4
                   AND attempt_count = ?5
                   AND (attempt_token = ?6 OR (attempt_token IS NULL AND ?6 IS NULL))
@@ -1465,6 +1508,7 @@ impl BatchRuntimeStore {
                       SELECT 1 FROM runtime_jobs
                       WHERE runtime_jobs.id = job_stages.job_id
                         AND runtime_jobs.status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
+                        AND runtime_jobs.cancellation_state IS NULL
                   )
                 "#,
                 vec![
@@ -1487,14 +1531,31 @@ impl BatchRuntimeStore {
     pub async fn yield_stage(&self, lease: &StageLease) -> anyhow::Result<bool> {
         let db = self.db.connection().await?;
         let now = self.now_millis();
-        let result = db.execute_raw(raw::statement(db, r#"
+        let result = db
+            .execute_raw(raw::statement(
+                db,
+                r#"
             UPDATE job_stages SET status = 'queued', worker_id = NULL,
                 lease_expires_at = NULL, attempt_token = NULL,
                 attempt_count = attempt_count - 1, available_at = ?1, updated_at = ?1
             WHERE id = ?2 AND worker_id = ?3 AND attempt_count = ?4 AND attempt_token = ?5
-                AND attempt_count > 0 AND status IN ('running','postprocessing') AND lease_expires_at > ?1
-                AND job_id IN (SELECT id FROM runtime_jobs WHERE status IN ('running','queued','retrying','postprocessing'))
-        "#, vec![now.into(), lease.stage_id.clone().into(), lease.worker_id.clone().into(), i64::from(lease.attempt_count).into(), opt_string(lease.attempt_token.clone())])?).await?;
+                AND attempt_count > 0 AND status IN ('running','postprocessing')
+                AND cancellation_state IS NULL AND lease_expires_at > ?1
+                AND job_id IN (
+                    SELECT id FROM runtime_jobs
+                    WHERE status IN ('running','queued','retrying','postprocessing')
+                      AND cancellation_state IS NULL
+                )
+        "#,
+                vec![
+                    now.into(),
+                    lease.stage_id.clone().into(),
+                    lease.worker_id.clone().into(),
+                    i64::from(lease.attempt_count).into(),
+                    opt_string(lease.attempt_token.clone()),
+                ],
+            )?)
+            .await?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -1527,14 +1588,15 @@ impl BatchRuntimeStore {
         if !matches!(
             stage.status,
             RuntimeStageStatus::Running | RuntimeStageStatus::Postprocessing
-        ) {
+        ) || stage.cancellation_state.is_some()
+        {
             tx.rollback().await?;
             return Ok(None);
         }
         let job = get_job_with(&tx, &stage.job_id)
             .await?
             .ok_or_else(|| anyhow!("Runtime stage parent job was not found"))?;
-        if !is_claimable_job_status(job.status) {
+        if !is_claimable_job_status(job.status) || job.cancellation_state.is_some() {
             tx.rollback().await?;
             return Ok(None);
         }
@@ -1597,10 +1659,38 @@ impl BatchRuntimeStore {
                 r#"
                 UPDATE runtime_jobs
                 SET
-                    status = 'cancelled',
+                    status = CASE
+                        WHEN EXISTS (
+                            SELECT 1 FROM job_stages
+                            WHERE job_stages.job_id = runtime_jobs.id
+                              AND job_stages.status IN ('running', 'postprocessing')
+                              AND job_stages.worker_id IS NOT NULL
+                              AND job_stages.lease_expires_at IS NOT NULL
+                        ) THEN status
+                        ELSE 'cancelled'
+                    END,
                     updated_at = ?1,
-                    finished_at = COALESCE(finished_at, ?1),
-                    cancellation_reason = ?2
+                    finished_at = CASE
+                        WHEN EXISTS (
+                            SELECT 1 FROM job_stages
+                            WHERE job_stages.job_id = runtime_jobs.id
+                              AND job_stages.status IN ('running', 'postprocessing')
+                              AND job_stages.worker_id IS NOT NULL
+                              AND job_stages.lease_expires_at IS NOT NULL
+                        ) THEN NULL
+                        ELSE COALESCE(finished_at, ?1)
+                    END,
+                    cancellation_reason = ?2,
+                    cancellation_state = CASE
+                        WHEN EXISTS (
+                            SELECT 1 FROM job_stages
+                            WHERE job_stages.job_id = runtime_jobs.id
+                              AND job_stages.status IN ('running', 'postprocessing')
+                              AND job_stages.worker_id IS NOT NULL
+                              AND job_stages.lease_expires_at IS NOT NULL
+                        ) THEN COALESCE(cancellation_state, 'requested')
+                        ELSE NULL
+                    END
                 WHERE id = ?3
                   AND status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing')
                 "#,
@@ -1619,6 +1709,7 @@ impl BatchRuntimeStore {
             UPDATE job_stages
             SET
                 status = 'cancelled',
+                cancellation_state = NULL,
                 updated_at = ?1,
                 finished_at = COALESCE(finished_at, ?1),
                 lease_expires_at = NULL,
@@ -1626,11 +1717,38 @@ impl BatchRuntimeStore {
                 available_at = NULL
             WHERE job_id = ?2
               AND status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing')
+              AND (
+                  status NOT IN ('running', 'postprocessing')
+                  OR worker_id IS NULL
+                  OR lease_expires_at IS NULL
+              )
             "#,
             vec![now.into(), job_id.into()],
         )?)
         .await
-        .context("Failed to cancel runtime job stages")?;
+        .context("Failed to cancel non-running runtime job stages")?;
+
+        tx.execute_raw(raw::statement(
+            &tx,
+            r#"
+            UPDATE job_stages
+            SET
+                cancellation_state = CASE
+                    WHEN cancellation_state = 'execution_stopping'
+                        THEN cancellation_state
+                    ELSE 'requested'
+                END,
+                updated_at = ?1,
+                available_at = NULL
+            WHERE job_id = ?2
+              AND status IN ('running', 'postprocessing')
+              AND worker_id IS NOT NULL
+              AND lease_expires_at IS NOT NULL
+            "#,
+            vec![now.into(), job_id.into()],
+        )?)
+        .await
+        .context("Failed to request cancellation of running runtime job stages")?;
 
         tx.commit()
             .await
@@ -1638,10 +1756,94 @@ impl BatchRuntimeStore {
         self.get_job(job_id).await
     }
 
+    pub async fn mark_stage_execution_stopping(&self, lease: &StageLease) -> anyhow::Result<bool> {
+        let db = self.db.connection().await?;
+        let tx = db
+            .begin_with_options(runtime_write_transaction_options())
+            .await
+            .context("Failed to start execution-stopping transaction")?;
+        let now = self.now_millis();
+        let result = tx
+            .execute_raw(raw::statement(
+                &tx,
+                r#"
+                UPDATE job_stages
+                SET cancellation_state = 'execution_stopping', updated_at = ?1
+                WHERE id = ?2
+                  AND status IN ('running', 'postprocessing')
+                  AND cancellation_state = 'requested'
+                  AND worker_id = ?3
+                  AND attempt_count = ?4
+                  AND (attempt_token = ?5 OR (attempt_token IS NULL AND ?5 IS NULL))
+                  AND lease_expires_at IS NOT NULL
+                "#,
+                vec![
+                    now.into(),
+                    lease.stage_id.clone().into(),
+                    lease.worker_id.clone().into(),
+                    u32_to_i64_value(lease.attempt_count).into(),
+                    opt_string(lease.attempt_token.clone()),
+                ],
+            )?)
+            .await
+            .context("Failed to mark runtime stage execution stopping")?;
+        if result.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        tx.execute_raw(raw::statement(
+            &tx,
+            r#"
+            UPDATE runtime_jobs
+            SET cancellation_state = 'execution_stopping', updated_at = ?1
+            WHERE id = (SELECT job_id FROM job_stages WHERE id = ?2)
+              AND cancellation_state IS NOT NULL
+              AND status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
+            "#,
+            vec![now.into(), lease.stage_id.clone().into()],
+        )?)
+        .await
+        .context("Failed to mark runtime job execution stopping")?;
+        tx.commit()
+            .await
+            .context("Failed to commit execution-stopping transaction")?;
+        Ok(true)
+    }
+
+    /// Finalize only after the caller knows this exact attempt's executor has
+    /// resolved. Attempt identity, rather than wall-clock lease freshness,
+    /// fences late settlement from stale workers.
+    pub async fn finalize_stage_cancellation(
+        &self,
+        lease: &StageLease,
+    ) -> anyhow::Result<Option<JobStage>> {
+        let db = self.db.connection().await?;
+        let tx = db
+            .begin_with_options(runtime_write_transaction_options())
+            .await
+            .context("Failed to start stage cancellation finalization transaction")?;
+        let now = self.now_millis();
+        let finalized = self
+            .finalize_stage_cancellation_with(&tx, lease, now)
+            .await?;
+        if finalized.is_none() {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        tx.commit()
+            .await
+            .context("Failed to commit stage cancellation finalization transaction")?;
+        Ok(finalized)
+    }
+
     pub async fn recover_expired_stage_leases(&self, limit: usize) -> anyhow::Result<u64> {
         let db = self.db.connection().await?;
         let now = self.now_millis();
         let limit = bounded_maintenance_batch_limit(limit);
+        // A wall-clock expiry does not prove that requested cancellation tore
+        // down execution. Only ordinary leases are eligible for retry here;
+        // cancelling attempts stay owner-fenced until exact-attempt settlement
+        // or a future supervisor-confirmed process teardown transition.
         let rows = db
             .query_all_raw(raw::statement(
                 db,
@@ -1649,6 +1851,7 @@ impl BatchRuntimeStore {
                 SELECT id, worker_id, attempt_count, attempt_token
                 FROM job_stages
                 WHERE status IN ('running', 'postprocessing')
+                  AND cancellation_state IS NULL
                   AND lease_expires_at IS NOT NULL
                   AND lease_expires_at <= ?1
                 ORDER BY lease_expires_at ASC, id ASC
@@ -2094,12 +2297,14 @@ impl BatchRuntimeStore {
             JOIN runtime_jobs j ON j.id = s.job_id
             WHERE s.id = ?17
               AND s.status IN ('running', 'postprocessing')
+              AND s.cancellation_state IS NULL
               AND s.worker_id = ?18
               AND s.attempt_count = ?2
               AND s.attempt_token = ?3
               AND s.lease_expires_at IS NOT NULL
               AND s.lease_expires_at > ?5
               AND j.status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
+              AND j.cancellation_state IS NULL
             {conflict_clause}
             "#
         );
@@ -2161,12 +2366,14 @@ impl BatchRuntimeStore {
                   AND a.producer_attempt_token = ?3
                   AND a.publication_key = ?4
                   AND s.status IN ('running', 'postprocessing')
+                  AND s.cancellation_state IS NULL
                   AND s.worker_id = ?5
                   AND s.attempt_count = ?2
                   AND s.attempt_token = ?3
                   AND s.lease_expires_at IS NOT NULL
                   AND s.lease_expires_at > ?6
                   AND j.status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
+                  AND j.cancellation_state IS NULL
                 LIMIT 1
                 "#,
                 vec![
@@ -2583,6 +2790,76 @@ impl BatchRuntimeStore {
         get_stage_with(db, stage.id.as_str()).await
     }
 
+    async fn finalize_stage_cancellation_with<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        lease: &StageLease,
+        now: i64,
+    ) -> anyhow::Result<Option<JobStage>> {
+        let result = db
+            .execute_raw(raw::statement(
+                db,
+                r#"
+                    UPDATE job_stages
+                    SET
+                        status = 'cancelled',
+                        cancellation_state = NULL,
+                        updated_at = ?1,
+                        finished_at = COALESCE(finished_at, ?1),
+                        lease_expires_at = NULL,
+                        worker_id = NULL,
+                        available_at = NULL,
+                        error_code = NULL,
+                        error_message = NULL
+                    WHERE id = ?2
+                      AND status IN ('running', 'postprocessing')
+                      AND cancellation_state IN ('requested', 'execution_stopping')
+                      AND worker_id = ?3
+                      AND attempt_count = ?4
+                      AND (attempt_token = ?5 OR (attempt_token IS NULL AND ?5 IS NULL))
+                      AND lease_expires_at IS NOT NULL
+                    "#,
+                vec![
+                    now.into(),
+                    lease.stage_id.clone().into(),
+                    lease.worker_id.clone().into(),
+                    u32_to_i64_value(lease.attempt_count).into(),
+                    opt_string(lease.attempt_token.clone()),
+                ],
+            )?)
+            .await
+            .context("Failed to finalize runtime stage cancellation")?;
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
+
+        db.execute_raw(raw::statement(
+            db,
+            r#"
+            UPDATE runtime_jobs
+            SET
+                status = 'cancelled',
+                cancellation_state = NULL,
+                updated_at = ?1,
+                finished_at = COALESCE(finished_at, ?1)
+            WHERE id = (SELECT job_id FROM job_stages WHERE id = ?2)
+              AND cancellation_state IS NOT NULL
+              AND status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
+              AND NOT EXISTS (
+                  SELECT 1 FROM job_stages
+                  WHERE job_stages.job_id = runtime_jobs.id
+                    AND job_stages.status IN ('running', 'postprocessing')
+                    AND job_stages.cancellation_state IS NOT NULL
+              )
+            "#,
+            vec![now.into(), lease.stage_id.clone().into()],
+        )?)
+        .await
+        .context("Failed to finalize runtime job cancellation")?;
+
+        get_stage_with(db, &lease.stage_id).await
+    }
+
     async fn mark_stage_failed<C: ConnectionTrait>(
         &self,
         db: &C,
@@ -2696,6 +2973,7 @@ impl BatchRuntimeStore {
                             SELECT candidate.id
                             FROM runtime_jobs AS candidate
                             WHERE candidate.status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing')
+                              AND candidate.cancellation_state IS NULL
                               AND EXISTS (
                                   SELECT 1 FROM job_stages
                                   WHERE job_stages.job_id = candidate.id
@@ -2729,6 +3007,7 @@ impl BatchRuntimeStore {
                 UPDATE runtime_jobs
                 SET
                     status = 'cancelled',
+                    cancellation_state = NULL,
                     updated_at = ?1,
                     finished_at = COALESCE(finished_at, ?1),
                     cancellation_reason = COALESCE(cancellation_reason, 'All remaining stages were cancelled')
@@ -2775,6 +3054,7 @@ impl BatchRuntimeStore {
                     SELECT candidate.id
                     FROM runtime_jobs AS candidate
                     WHERE candidate.status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
+                      AND candidate.cancellation_state IS NULL
                       AND EXISTS (SELECT 1 FROM job_stages WHERE job_stages.job_id = candidate.id)
                       AND NOT EXISTS (
                           SELECT 1 FROM job_stages
@@ -2806,6 +3086,7 @@ impl BatchRuntimeStore {
                     SELECT candidate.id
                     FROM runtime_jobs AS candidate
                     WHERE candidate.status IN ('created', 'queued', 'running', 'postprocessing')
+                      AND candidate.cancellation_state IS NULL
                       AND EXISTS (
                           SELECT 1 FROM job_stages
                           WHERE job_stages.job_id = candidate.id AND status = 'retrying'
@@ -2908,6 +3189,7 @@ async fn complete_job_if_all_stages_finished_with<C: ConnectionTrait>(
             error_message = NULL
         WHERE id = ?2
           AND status IN ('running', 'retrying', 'postprocessing', 'queued')
+          AND cancellation_state IS NULL
           AND EXISTS (SELECT 1 FROM job_stages WHERE job_id = ?2)
           AND NOT EXISTS (
               SELECT 1 FROM job_stages
@@ -2944,11 +3226,11 @@ const MEDIA_ASSET_BY_SOURCE_PROFILE_SQL: &str =
 const TEXT_ASSET_COLUMNS_SQL: &str =
     "SELECT id, created_at, updated_at, raw_text, normalized_text, language_hint, character_count, sha256, safety_status, retention_policy, structure_json FROM text_assets WHERE id = ?1";
 const RUNTIME_JOB_COLUMNS_SQL: &str =
-    "SELECT id, created_at, updated_at, queued_at, started_at, finished_at, job_kind, status, priority, model_id, capability, route_record_kind, route_record_id, input_media_asset_id, input_text_asset_id, request_json, model_snapshot_json, progress_json, error_code, error_message, attempt_count, max_attempts, retry_policy_json, idempotency_key, correlation_id, cancellation_reason FROM runtime_jobs WHERE id = ?1";
+    "SELECT id, created_at, updated_at, queued_at, started_at, finished_at, job_kind, status, priority, model_id, capability, route_record_kind, route_record_id, input_media_asset_id, input_text_asset_id, request_json, model_snapshot_json, progress_json, error_code, error_message, attempt_count, max_attempts, retry_policy_json, idempotency_key, correlation_id, cancellation_reason, cancellation_state FROM runtime_jobs WHERE id = ?1";
 const JOB_STAGE_COLUMNS_SQL: &str =
-    "SELECT id, job_id, created_at, updated_at, sequence, stage_kind, queue_class, resource_hints_json, status, capability, model_id, worker_id, lease_expires_at, available_at, attempt_token, attempt_count, max_attempts, input_artifact_ids_json, output_artifact_ids_json, progress_json, started_at, finished_at, error_code, error_message FROM job_stages WHERE id = ?1";
+    "SELECT id, job_id, created_at, updated_at, sequence, stage_kind, queue_class, resource_hints_json, status, capability, model_id, worker_id, lease_expires_at, available_at, attempt_token, attempt_count, max_attempts, input_artifact_ids_json, output_artifact_ids_json, progress_json, started_at, finished_at, error_code, error_message, cancellation_state FROM job_stages WHERE id = ?1";
 const JOB_STAGE_LIST_FOR_JOB_SQL: &str =
-    "SELECT id, job_id, created_at, updated_at, sequence, stage_kind, queue_class, resource_hints_json, status, capability, model_id, worker_id, lease_expires_at, available_at, attempt_token, attempt_count, max_attempts, input_artifact_ids_json, output_artifact_ids_json, progress_json, started_at, finished_at, error_code, error_message FROM job_stages WHERE job_id = ?1 ORDER BY sequence ASC, created_at ASC, id ASC";
+    "SELECT id, job_id, created_at, updated_at, sequence, stage_kind, queue_class, resource_hints_json, status, capability, model_id, worker_id, lease_expires_at, available_at, attempt_token, attempt_count, max_attempts, input_artifact_ids_json, output_artifact_ids_json, progress_json, started_at, finished_at, error_code, error_message, cancellation_state FROM job_stages WHERE job_id = ?1 ORDER BY sequence ASC, created_at ASC, id ASC";
 const RUNTIME_ARTIFACT_COLUMNS_SQL: &str =
     "SELECT id, job_id, stage_id, producer_attempt_count, producer_attempt_token, publication_key, created_at, artifact_kind, artifact_role, media_asset_id, text_asset_id, storage_key, content_type, filename, size_bytes, sha256, metadata_json, retention_policy FROM runtime_artifacts WHERE id = ?1";
 const RUNTIME_ARTIFACT_LIST_FOR_JOB_SQL: &str =
@@ -3148,6 +3430,7 @@ fn map_runtime_job(row: &QueryResult) -> anyhow::Result<RuntimeJob> {
         idempotency_key: row.try_get_by_index(23)?,
         correlation_id: row.try_get_by_index(24)?,
         cancellation_reason: row.try_get_by_index(25)?,
+        cancellation_state: parse_cancellation_state(row.try_get_by_index(26)?)?,
     })
 }
 
@@ -3184,7 +3467,19 @@ fn map_job_stage(row: &QueryResult) -> anyhow::Result<JobStage> {
         finished_at: opt_i64_to_u64(row.try_get_by_index(21)?)?,
         error_code: row.try_get_by_index(22)?,
         error_message: row.try_get_by_index(23)?,
+        cancellation_state: parse_cancellation_state(row.try_get_by_index(24)?)?,
     })
+}
+
+fn parse_cancellation_state(
+    value: Option<String>,
+) -> anyhow::Result<Option<RuntimeCancellationState>> {
+    value
+        .map(|value| {
+            RuntimeCancellationState::from_db_value(&value)
+                .ok_or_else(|| anyhow!("Unknown runtime cancellation state: {value}"))
+        })
+        .transpose()
 }
 
 fn map_stage_claim_candidate(row: &QueryResult) -> anyhow::Result<StageClaimCandidate> {
@@ -3802,8 +4097,14 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
+            let lease = claim.lease().unwrap();
             store
                 .cancel_job(&job.id, Some("delete recording".into()))
+                .await
+                .unwrap()
+                .unwrap();
+            store
+                .finalize_stage_cancellation(&lease)
                 .await
                 .unwrap()
                 .unwrap();
@@ -4138,6 +4439,19 @@ mod tests {
             })
             .await
             .expect("active job");
+        let stage = store
+            .create_stage(NewJobStage {
+                job_id: job.id.clone(),
+                sequence: 0,
+                stage_kind: "speech".to_string(),
+                status: RuntimeStageStatus::Queued,
+                capability: Some("tts".to_string()),
+                model_id: job.model_id.clone(),
+                max_attempts: 1,
+                input_artifact_ids: Vec::new(),
+            })
+            .await
+            .expect("queued stage");
 
         assert_eq!(
             store
@@ -4161,11 +4475,22 @@ mod tests {
             1
         );
 
-        store
+        let cancelled = store
             .cancel_job(&job.id, Some("test cancellation".to_string()))
             .await
             .expect("cancel")
             .expect("cancelled job");
+        assert_eq!(cancelled.status, RuntimeJobStatus::Cancelled);
+        assert_eq!(cancelled.cancellation_state, None);
+        assert!(cancelled.finished_at.is_some());
+        let cancelled_stage = store
+            .get_stage(&stage.id)
+            .await
+            .expect("stage")
+            .expect("stage exists");
+        assert_eq!(cancelled_stage.status, RuntimeStageStatus::Cancelled);
+        assert_eq!(cancelled_stage.cancellation_state, None);
+        assert_eq!(cancelled_stage.worker_id, None);
         assert!(store
             .get_active_job_for_route_record(
                 RuntimeJobKind::TtsSpeech,
@@ -5059,7 +5384,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_invalidates_active_stage_lease() {
+    async fn cancellation_fences_results_until_active_stage_teardown() {
         let (store, _root) = build_store();
         let (job, stage) = create_test_job_and_stage(&store, 0, "fake_stage", 1).await;
         let claimed = store
@@ -5090,14 +5415,183 @@ mod tests {
             .await
             .expect("late failure")
             .is_none());
+        let requested = store
+            .get_stage(&stage.id)
+            .await
+            .expect("stage")
+            .expect("stage exists");
+        assert_eq!(requested.status, RuntimeStageStatus::Running);
+        assert_eq!(
+            requested.cancellation_state,
+            Some(RuntimeCancellationState::Requested)
+        );
+        assert_eq!(requested.worker_id.as_deref(), Some("worker-1"));
+        assert!(requested.lease_expires_at.is_some());
+        assert!(store
+            .stage_lease_is_active(&lease)
+            .await
+            .expect("cancelling lease remains owned"));
+        let stale = StageLease {
+            attempt_token: Some("stale-attempt".to_string()),
+            ..lease.clone()
+        };
+        assert!(!store
+            .mark_stage_execution_stopping(&stale)
+            .await
+            .expect("stale stopping fence"));
+        assert!(store
+            .finalize_stage_cancellation(&stale)
+            .await
+            .expect("stale finalization fence")
+            .is_none());
+
+        assert!(store
+            .mark_stage_execution_stopping(&lease)
+            .await
+            .expect("mark execution stopping"));
+        assert!(store
+            .finalize_stage_cancellation(&lease)
+            .await
+            .expect("finalize cancellation")
+            .is_some());
+        assert!(store
+            .finalize_stage_cancellation(&lease)
+            .await
+            .expect("duplicate finalization")
+            .is_none());
+
         let cancelled = store
             .get_stage(&stage.id)
             .await
             .expect("stage")
             .expect("stage exists");
         assert_eq!(cancelled.status, RuntimeStageStatus::Cancelled);
+        assert_eq!(cancelled.cancellation_state, None);
         assert_eq!(cancelled.worker_id, None);
         assert_eq!(cancelled.lease_expires_at, None);
+    }
+
+    #[tokio::test]
+    async fn requested_cancellation_survives_lease_expiry_until_exact_owner_teardown() {
+        let (mut store, _root) = build_store();
+        let clock = Arc::new(AtomicI64::new(1_000));
+        store.set_test_clock(clock.clone());
+        let (job, stage) = create_test_job_and_stage(&store, 0, "fake_stage", 1).await;
+        let claimed = store
+            .claim_next_stage("worker-1", 10)
+            .await
+            .expect("claim")
+            .expect("active attempt");
+        let lease = claimed.lease().expect("lease");
+        store
+            .cancel_job(&job.id, Some("cancel".to_string()))
+            .await
+            .expect("cancel")
+            .expect("cancellation requested");
+
+        clock.store(2_000, Ordering::SeqCst);
+        assert_eq!(
+            store
+                .recover_expired_stage_leases(DEFAULT_RUNTIME_MAINTENANCE_BATCH_LIMIT)
+                .await
+                .expect("recovery must skip uncertain execution"),
+            0
+        );
+        assert_eq!(
+            store.stage_lease_state(&lease).await.expect("lease state"),
+            Some(StageLeaseState::CancellationRequested)
+        );
+        assert!(store
+            .mark_stage_execution_stopping(&lease)
+            .await
+            .expect("exact owner marks stopping after expiry"));
+        assert!(store
+            .renew_stage_lease(&lease, 100)
+            .await
+            .expect("exact owner renews cancellation lease"));
+        let stopping = store
+            .get_stage(&stage.id)
+            .await
+            .expect("stage")
+            .expect("stage exists");
+        assert_eq!(
+            stopping.cancellation_state,
+            Some(RuntimeCancellationState::ExecutionStopping)
+        );
+        assert_eq!(stopping.lease_expires_at, Some(2_100));
+        assert_eq!(stopping.worker_id.as_deref(), Some("worker-1"));
+    }
+
+    #[tokio::test]
+    async fn completion_and_cancellation_race_has_one_authoritative_winner() {
+        let (store, _root) = build_store();
+        let (job, stage) = create_test_job_and_stage(&store, 0, "fake_stage", 1).await;
+        let claimed = store
+            .claim_next_stage("worker-1", 60_000)
+            .await
+            .expect("claim")
+            .expect("active attempt");
+        let lease = claimed.lease().expect("lease");
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+
+        let completion_store = store.clone();
+        let completion_lease = lease.clone();
+        let completion_barrier = barrier.clone();
+        let completion = tokio::spawn(async move {
+            completion_barrier.wait().await;
+            completion_store
+                .complete_stage(&completion_lease, vec!["result".to_string()])
+                .await
+        });
+        let cancellation_store = store.clone();
+        let cancellation_job_id = job.id.clone();
+        let cancellation_barrier = barrier.clone();
+        let cancellation = tokio::spawn(async move {
+            cancellation_barrier.wait().await;
+            cancellation_store
+                .cancel_job(&cancellation_job_id, Some("race".to_string()))
+                .await
+        });
+        barrier.wait().await;
+
+        let completed = completion
+            .await
+            .expect("completion join")
+            .expect("completion");
+        let cancelled = cancellation
+            .await
+            .expect("cancellation join")
+            .expect("cancellation");
+        assert_ne!(completed.is_some(), cancelled.is_some());
+
+        if cancelled.is_some() {
+            assert!(store
+                .finalize_stage_cancellation(&lease)
+                .await
+                .expect("finalize cancellation")
+                .is_some());
+        }
+        let terminal_job = store
+            .get_job(&job.id)
+            .await
+            .expect("job")
+            .expect("job exists");
+        assert!(matches!(
+            terminal_job.status,
+            RuntimeJobStatus::Completed | RuntimeJobStatus::Cancelled
+        ));
+        assert_eq!(terminal_job.cancellation_state, None);
+        let terminal_stage = store
+            .get_stage(&stage.id)
+            .await
+            .expect("stage")
+            .expect("stage exists");
+        assert!(matches!(
+            terminal_stage.status,
+            RuntimeStageStatus::Completed | RuntimeStageStatus::Cancelled
+        ));
+        assert_eq!(terminal_stage.worker_id, None);
+        assert_eq!(terminal_stage.lease_expires_at, None);
     }
 
     #[tokio::test]
@@ -5531,15 +6025,28 @@ mod tests {
             .await
             .expect("cancel job")
             .expect("cancelled job");
-        assert!(!store
+        assert!(store
             .stage_lease_is_active(&second_lease)
             .await
-            .expect("cancelled lease check"));
+            .expect("cancelling lease check"));
         assert!(store
             .publish_stage_output_artifact(&second_lease, test_stage_output("cancelled-result"))
             .await
             .expect("cancelled publication")
             .is_none());
+        assert!(store
+            .mark_stage_execution_stopping(&second_lease)
+            .await
+            .expect("mark execution stopping"));
+        assert!(store
+            .finalize_stage_cancellation(&second_lease)
+            .await
+            .expect("finalize cancellation")
+            .is_some());
+        assert!(!store
+            .stage_lease_is_active(&second_lease)
+            .await
+            .expect("terminal lease check"));
         assert!(store
             .list_artifacts_for_job(&job.id)
             .await

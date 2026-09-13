@@ -84,7 +84,12 @@ pub async fn cancel_job(
         .await
         .map_err(map_store_error)?
         .ok_or_else(|| ApiError::bad_request("Runtime job is not cancellable"))?;
-    update_route_projection_for_cancel(&state, &cancelled).await?;
+    // A running executor remains authoritative until it confirms teardown.
+    // Keep its route projection non-terminal while the durable job reports
+    // requested/execution_stopping rather than fabricating completed cancellation.
+    if cancelled.status == RuntimeJobStatus::Cancelled {
+        update_route_projection_for_cancel(&state, &cancelled).await?;
+    }
     record_job_audit(
         &state,
         context.as_ref().map(|Extension(ctx)| ctx),
@@ -166,7 +171,9 @@ pub(crate) async fn cancel_active_audio_jobs_for_model(
             else {
                 continue;
             };
-            update_route_projection_for_cancel(state, &cancelled_job).await?;
+            if cancelled_job.status == RuntimeJobStatus::Cancelled {
+                update_route_projection_for_cancel(state, &cancelled_job).await?;
+            }
             cancelled = cancelled.saturating_add(1);
         }
     }

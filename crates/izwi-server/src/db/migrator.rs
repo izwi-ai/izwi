@@ -421,6 +421,7 @@ const BASELINE_SCHEMA: &[&str] = &[
         idempotency_key TEXT NULL,
         correlation_id TEXT NULL,
         cancellation_reason TEXT NULL,
+        cancellation_state TEXT NULL,
         FOREIGN KEY(input_media_asset_id) REFERENCES media_assets(id) ON DELETE SET NULL,
         FOREIGN KEY(input_text_asset_id) REFERENCES text_assets(id) ON DELETE SET NULL
     );
@@ -459,6 +460,7 @@ const BASELINE_SCHEMA: &[&str] = &[
         finished_at INTEGER NULL,
         error_code TEXT NULL,
         error_message TEXT NULL,
+        cancellation_state TEXT NULL,
         FOREIGN KEY(job_id) REFERENCES runtime_jobs(id) ON DELETE CASCADE
     );
     "#,
@@ -541,6 +543,16 @@ const POST_COMPATIBILITY_SCHEMA: &[&str] = &[
 ];
 
 const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
+    CompatibilityColumn {
+        table: "runtime_jobs",
+        column: "cancellation_state",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "job_stages",
+        column: "cancellation_state",
+        definition: "TEXT NULL",
+    },
     CompatibilityColumn {
         table: "runtime_jobs",
         column: "admission_tenant",

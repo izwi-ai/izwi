@@ -382,6 +382,7 @@ const REQUIRED_SCHEMA_TABLES: &[RequiredSchemaTable] = &[
             "idempotency_key",
             "correlation_id",
             "cancellation_reason",
+            "cancellation_state",
         ],
     },
     RequiredSchemaTable {
@@ -416,6 +417,7 @@ const REQUIRED_SCHEMA_TABLES: &[RequiredSchemaTable] = &[
             "finished_at",
             "error_code",
             "error_message",
+            "cancellation_state",
         ],
     },
     RequiredSchemaTable {

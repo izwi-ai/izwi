@@ -277,6 +277,8 @@ mod tests {
     ];
 
     const EXPECTED_COMPAT_COLUMNS: &[(&str, &str)] = &[
+        ("runtime_jobs", "cancellation_state"),
+        ("job_stages", "cancellation_state"),
         ("chat_threads", "system_prompt"),
         ("chat_messages", "content_parts"),
         ("media_assets", "source_asset_id"),

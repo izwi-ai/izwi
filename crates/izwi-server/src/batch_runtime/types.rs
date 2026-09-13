@@ -327,6 +327,32 @@ impl RuntimeStageStatus {
     }
 }
 
+/// Durable, non-terminal cancellation progress for work whose executor may
+/// still be using its assigned resources.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeCancellationState {
+    Requested,
+    ExecutionStopping,
+}
+
+impl RuntimeCancellationState {
+    pub const fn as_db_value(self) -> &'static str {
+        match self {
+            Self::Requested => "requested",
+            Self::ExecutionStopping => "execution_stopping",
+        }
+    }
+
+    pub fn from_db_value(value: &str) -> Option<Self> {
+        match value {
+            "requested" => Some(Self::Requested),
+            "execution_stopping" => Some(Self::ExecutionStopping),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeJobKind {
@@ -485,6 +511,9 @@ pub struct RuntimeJob {
     pub idempotency_key: Option<String>,
     pub correlation_id: Option<String>,
     pub cancellation_reason: Option<String>,
+    /// Present while cancellation has been requested but leased execution has
+    /// not yet confirmed teardown.
+    pub cancellation_state: Option<RuntimeCancellationState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -515,6 +544,9 @@ pub struct JobStage {
     pub finished_at: Option<u64>,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
+    /// Present while the exact leased attempt still owns execution resources
+    /// during cooperative cancellation.
+    pub cancellation_state: Option<RuntimeCancellationState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
