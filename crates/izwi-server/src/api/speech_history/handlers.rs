@@ -1597,9 +1597,7 @@ async fn execute_batch_tts_stage(
     let output_artifact = output_artifact
         .ok_or_else(|| anyhow::anyhow!("TTS stage did not publish its primary audio"))?;
 
-    Ok(StageExecutionOutcome {
-        output_artifact_ids: vec![output_artifact.id],
-    })
+    StageExecutionOutcome::try_new(vec![output_artifact.id])
 }
 
 fn runtime_projection_attempt(

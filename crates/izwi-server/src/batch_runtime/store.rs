@@ -234,6 +234,8 @@ const DEFAULT_STAGE_CLAIM_CANDIDATE_LIMIT: usize = 64;
 const MAX_STAGE_CLAIM_CANDIDATE_LIMIT: usize = 512;
 pub(crate) const DEFAULT_RUNTIME_MAINTENANCE_BATCH_LIMIT: usize = 64;
 const MAX_RUNTIME_MAINTENANCE_BATCH_LIMIT: usize = 512;
+pub(crate) const MAX_STAGE_OUTPUT_ARTIFACTS: usize = 64;
+pub(crate) const MAX_STAGE_OUTPUT_ARTIFACT_ID_BYTES: usize = 64;
 const MAX_ARTIFACT_CLEANUP_INTENTS: u64 = 65_536;
 const MAX_ARTIFACT_CLEANUP_BATCH: usize = 64;
 const MAX_ARTIFACT_CLEANUP_STORAGE_KEY_BYTES: usize = 2 * 1024;
@@ -2561,6 +2563,7 @@ impl BatchRuntimeStore {
         lease: &StageLease,
         output_artifact_ids: Vec<String>,
     ) -> anyhow::Result<Option<JobStage>> {
+        validate_stage_output_artifact_retention_bounds(&output_artifact_ids)?;
         let db = self.db.connection().await?;
         let tx = db
             .begin_with_options(runtime_write_transaction_options())
@@ -2618,6 +2621,56 @@ impl BatchRuntimeStore {
         let stage = get_stage_with(&tx, &lease.stage_id)
             .await?
             .ok_or_else(|| anyhow!("Completed runtime job stage was not found"))?;
+        if let Err(error) = validate_stage_output_artifact_ids(&output_artifact_ids) {
+            tx.rollback().await?;
+            return Err(error);
+        }
+        if !output_artifact_ids.is_empty() {
+            let Some(attempt_token) = lease.attempt_token.as_ref() else {
+                tx.rollback().await?;
+                bail!("Stage output artifacts require an exact attempt token");
+            };
+            let row_lock = match tx.get_database_backend() {
+                DbBackend::Sqlite => "",
+                DbBackend::Postgres | DbBackend::MySql => " FOR UPDATE",
+                backend => bail!("Unsupported runtime artifact database backend: {backend:?}"),
+            };
+            for artifact_id in &output_artifact_ids {
+                let ownership_sql = format!(
+                    r#"
+                    SELECT 1
+                    FROM runtime_artifacts
+                    WHERE id = ?1
+                      AND job_id = ?2
+                      AND stage_id = ?3
+                      AND producer_attempt_count = ?4
+                      AND producer_attempt_token = ?5
+                      AND artifact_role IN ('output_primary', 'output_intermediate', 'debug')
+                    LIMIT 1{row_lock}
+                    "#
+                );
+                let owned = tx
+                    .query_one_raw(raw::statement(
+                        &tx,
+                        ownership_sql,
+                        vec![
+                            artifact_id.clone().into(),
+                            stage.job_id.clone().into(),
+                            lease.stage_id.clone().into(),
+                            u32_to_i64_value(lease.attempt_count).into(),
+                            attempt_token.clone().into(),
+                        ],
+                    )?)
+                    .await
+                    .context("Failed to validate runtime stage output ownership")?;
+                if owned.is_none() {
+                    tx.rollback().await?;
+                    bail!(
+                        "Stage output artifact is not owned by the exact active job, stage, and attempt"
+                    );
+                }
+            }
+        }
         complete_job_if_all_stages_finished_with(&tx, stage.job_id.as_str(), now).await?;
         tx.commit()
             .await
@@ -5901,6 +5954,41 @@ fn json_to_db_string(value: &serde_json::Value, fallback: &str) -> anyhow::Resul
         .context("Failed to serialize runtime JSON payload")
 }
 
+pub(crate) fn validate_stage_output_artifact_retention_bounds(
+    output_artifact_ids: &[String],
+) -> anyhow::Result<()> {
+    if output_artifact_ids.len() > MAX_STAGE_OUTPUT_ARTIFACTS {
+        bail!("Stage output artifact count exceeds the limit of {MAX_STAGE_OUTPUT_ARTIFACTS}");
+    }
+    if output_artifact_ids
+        .iter()
+        .any(|artifact_id| artifact_id.len() > MAX_STAGE_OUTPUT_ARTIFACT_ID_BYTES)
+    {
+        bail!(
+            "Stage output artifact identifier exceeds the {MAX_STAGE_OUTPUT_ARTIFACT_ID_BYTES}-byte limit"
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_stage_output_artifact_ids(
+    output_artifact_ids: &[String],
+) -> anyhow::Result<()> {
+    validate_stage_output_artifact_retention_bounds(output_artifact_ids)?;
+    let mut unique = std::collections::HashSet::with_capacity(output_artifact_ids.len());
+    for artifact_id in output_artifact_ids {
+        let parsed = uuid::Uuid::parse_str(artifact_id)
+            .map_err(|_| anyhow!("Stage output artifact identifiers must be canonical UUIDs"))?;
+        if parsed.hyphenated().to_string() != *artifact_id {
+            bail!("Stage output artifact identifiers must be canonical UUIDs");
+        }
+        if !unique.insert(parsed) {
+            bail!("Stage output artifact identifiers must be unique");
+        }
+    }
+    Ok(())
+}
+
 fn parse_json_value(raw: String, fallback: serde_json::Value) -> serde_json::Value {
     serde_json::from_str(raw.as_str()).unwrap_or(fallback)
 }
@@ -8340,10 +8428,7 @@ mod tests {
             .expect("parent transition");
 
         assert!(store
-            .complete_stage(
-                &claimed.lease().expect("lease"),
-                vec!["late-output".to_string()],
-            )
+            .complete_stage(&claimed.lease().expect("lease"), vec![])
             .await
             .expect("late completion")
             .is_none());
@@ -8383,7 +8468,7 @@ mod tests {
         assert_eq!(second_lease.attempt_count, first_lease.attempt_count + 1);
 
         assert!(store
-            .complete_stage(&first_lease, vec!["stale-output".to_string()])
+            .complete_stage(&first_lease, vec![])
             .await
             .expect("stale completion")
             .is_none());
@@ -8407,12 +8492,17 @@ mod tests {
         assert_eq!(running.worker_id.as_deref(), Some("worker-2"));
         assert_eq!(running.attempt_count, second_lease.attempt_count);
 
+        let artifact = store
+            .publish_stage_output_artifact(&second_lease, test_stage_output("current-output"))
+            .await
+            .expect("publish current output")
+            .expect("current attempt owns output");
         let completed = store
-            .complete_stage(&second_lease, vec!["current-output".to_string()])
+            .complete_stage(&second_lease, vec![artifact.id.clone()])
             .await
             .expect("current completion")
             .expect("current owner completes");
-        assert_eq!(completed.output_artifact_ids, vec!["current-output"]);
+        assert_eq!(completed.output_artifact_ids, vec![artifact.id]);
     }
 
     #[tokio::test]
@@ -8433,7 +8523,7 @@ mod tests {
             .expect("cancelled job");
 
         assert!(store
-            .complete_stage(&lease, vec!["late-output".to_string()])
+            .complete_stage(&lease, vec![])
             .await
             .expect("late completion")
             .is_none());
@@ -8900,7 +8990,7 @@ mod tests {
         let completion = tokio::spawn(async move {
             completion_barrier.wait().await;
             completion_store
-                .complete_stage(&completion_lease, vec!["result".to_string()])
+                .complete_stage(&completion_lease, vec![])
                 .await
         });
         let cancellation_store = store.clone();
@@ -9183,7 +9273,7 @@ mod tests {
             ..lease.clone()
         };
         assert!(store
-            .complete_stage(&forged, vec!["stale-output".to_string()])
+            .complete_stage(&forged, vec![])
             .await
             .expect("forged completion")
             .is_none());
@@ -9195,8 +9285,13 @@ mod tests {
         assert_eq!(running.status, RuntimeStageStatus::Running);
         assert!(running.output_artifact_ids.is_empty());
 
+        let artifact = store
+            .publish_stage_output_artifact(&lease, test_stage_output("current-output"))
+            .await
+            .expect("publish current output")
+            .expect("current attempt owns output");
         assert!(store
-            .complete_stage(&lease, vec!["current-output".to_string()])
+            .complete_stage(&lease, vec![artifact.id])
             .await
             .expect("owned completion")
             .is_some());
@@ -9243,6 +9338,183 @@ mod tests {
             .expect("artifacts");
         assert_eq!(artifacts.len(), 1);
         assert_eq!(artifacts[0].id, first.id);
+    }
+
+    #[tokio::test]
+    async fn stage_completion_rejects_unbounded_or_unowned_output_references_atomically() {
+        let (store, _root) = build_store();
+        let (job, stage) = create_test_job_and_stage(&store, 0, "fake_stage", 1).await;
+        let claimed = store
+            .claim_next_stage("worker-a", 60_000)
+            .await
+            .expect("claim")
+            .expect("attempt");
+        let lease = claimed.lease().expect("lease");
+        let owned = store
+            .publish_stage_output_artifact(&lease, test_stage_output("owned-output"))
+            .await
+            .expect("publish owned output")
+            .expect("attempt owns output");
+
+        let too_many = (0..=MAX_STAGE_OUTPUT_ARTIFACTS)
+            .map(|_| new_uuid())
+            .collect::<Vec<_>>();
+        assert!(store
+            .complete_stage(&lease, too_many)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("count exceeds"));
+        assert!(store
+            .complete_stage(
+                &lease,
+                vec!["x".repeat(MAX_STAGE_OUTPUT_ARTIFACT_ID_BYTES + 1)],
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("byte limit"));
+        assert!(store
+            .complete_stage(&lease, vec!["not-a-uuid".to_string()])
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("canonical UUIDs"));
+        assert!(store
+            .complete_stage(&lease, vec![owned.id.clone(), owned.id.clone()])
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("must be unique"));
+        assert!(store
+            .complete_stage(&lease, vec![new_uuid()])
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("not owned"));
+
+        let (foreign_job, foreign_stage) =
+            create_test_job_and_stage(&store, 0, "fake_stage", 1).await;
+        let foreign_claim = store
+            .claim_next_stage("worker-b", 60_000)
+            .await
+            .expect("foreign claim")
+            .expect("foreign attempt");
+        assert_eq!(foreign_claim.job.id, foreign_job.id);
+        let foreign_lease = foreign_claim.lease().expect("foreign lease");
+        let foreign = store
+            .publish_stage_output_artifact(&foreign_lease, test_stage_output("foreign-output"))
+            .await
+            .expect("publish foreign output")
+            .expect("foreign attempt owns output");
+        assert!(store
+            .complete_stage(&lease, vec![foreign.id.clone()])
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("not owned"));
+
+        let db = store.db.connection().await.expect("database");
+        db.execute_raw(
+            raw::statement(
+                db,
+                r#"
+                UPDATE runtime_artifacts
+                SET job_id = ?1,
+                    producer_attempt_count = ?2,
+                    producer_attempt_token = ?3
+                WHERE id = ?4
+                "#,
+                vec![
+                    job.id.clone().into(),
+                    u32_to_i64_value(lease.attempt_count).into(),
+                    lease.attempt_token.clone().unwrap().into(),
+                    foreign.id.clone().into(),
+                ],
+            )
+            .expect("cross-stage corruption statement"),
+        )
+        .await
+        .expect("inject cross-stage artifact row");
+        assert_ne!(foreign_stage.id, stage.id);
+        assert!(store
+            .complete_stage(&lease, vec![foreign.id])
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("not owned"));
+
+        let still_running = store
+            .get_stage(&stage.id)
+            .await
+            .expect("stage")
+            .expect("stage exists");
+        assert_eq!(still_running.status, RuntimeStageStatus::Running);
+        assert!(still_running.output_artifact_ids.is_empty());
+        let completed = store
+            .complete_stage(&lease, vec![owned.id.clone()])
+            .await
+            .expect("valid completion")
+            .expect("exact attempt completes");
+        assert_eq!(completed.output_artifact_ids, vec![owned.id]);
+    }
+
+    #[tokio::test]
+    async fn reclaimed_attempt_cannot_adopt_a_previous_attempts_output() {
+        let clock = Arc::new(AtomicI64::new(current_timestamp_millis()));
+        let (mut store, _root) = build_store();
+        store.set_test_clock(clock.clone());
+        let (_job, stage) = create_test_job_and_stage(&store, 0, "fake_stage", 2).await;
+        let first = store
+            .claim_next_stage("worker-a", 100)
+            .await
+            .expect("first claim")
+            .expect("first attempt");
+        let first_lease = first.lease().expect("first lease");
+        let old_output = store
+            .publish_stage_output_artifact(&first_lease, test_stage_output("old-output"))
+            .await
+            .expect("publish old output")
+            .expect("first attempt owns output");
+
+        clock.fetch_add(101, Ordering::SeqCst);
+        assert_eq!(
+            store
+                .recover_expired_stage_leases(DEFAULT_RUNTIME_MAINTENANCE_BATCH_LIMIT)
+                .await
+                .expect("recover first attempt"),
+            1
+        );
+        let second = store
+            .claim_next_stage("worker-b", 60_000)
+            .await
+            .expect("second claim")
+            .expect("second attempt");
+        let second_lease = second.lease().expect("second lease");
+        assert!(store
+            .complete_stage(&second_lease, vec![old_output.id])
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("not owned"));
+        let running = store
+            .get_stage(&stage.id)
+            .await
+            .expect("stage")
+            .expect("stage exists");
+        assert_eq!(running.status, RuntimeStageStatus::Running);
+        assert!(running.output_artifact_ids.is_empty());
+
+        let current_output = store
+            .publish_stage_output_artifact(&second_lease, test_stage_output("current-output"))
+            .await
+            .expect("publish current output")
+            .expect("second attempt owns output");
+        store
+            .complete_stage(&second_lease, vec![current_output.id])
+            .await
+            .expect("complete current attempt")
+            .expect("current attempt completes");
     }
 
     #[tokio::test]

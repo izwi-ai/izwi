@@ -1,7 +1,7 @@
 use super::{
     store::{
-        BatchRuntimeStore, NewStageOutputArtifact, RegisteredWorkerHeartbeatUpdate,
-        StageClaimFilter, DEFAULT_RUNTIME_MAINTENANCE_BATCH_LIMIT,
+        validate_stage_output_artifact_ids, BatchRuntimeStore, NewStageOutputArtifact,
+        RegisteredWorkerHeartbeatUpdate, StageClaimFilter, DEFAULT_RUNTIME_MAINTENANCE_BATCH_LIMIT,
     },
     types::{
         ClaimedStage, QueueClass, RuntimeArtifact, RuntimeJobKind, RuntimeWorkerHeartbeatDetails,
@@ -233,9 +233,9 @@ impl BatchWorkerHealth {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct StageExecutionOutcome {
-    pub output_artifact_ids: Vec<String>,
+    output_artifact_ids: Vec<String>,
 }
 
 impl StageExecutionOutcome {
@@ -243,6 +243,21 @@ impl StageExecutionOutcome {
         Self {
             output_artifact_ids: Vec::new(),
         }
+    }
+
+    pub fn try_new(output_artifact_ids: Vec<String>) -> anyhow::Result<Self> {
+        validate_stage_output_artifact_ids(&output_artifact_ids)?;
+        Ok(Self {
+            output_artifact_ids,
+        })
+    }
+
+    pub fn output_artifact_count(&self) -> usize {
+        self.output_artifact_ids.len()
+    }
+
+    fn into_output_artifact_ids(self) -> Vec<String> {
+        self.output_artifact_ids
     }
 }
 
@@ -853,10 +868,10 @@ impl BatchWorkerRunner {
         };
         match execution_result {
             StageExecutionResolution::Finished(Ok(outcome)) => {
-                let output_artifact_count = outcome.output_artifact_ids.len();
+                let output_artifact_count = outcome.output_artifact_count();
                 let completed = self
                     .store
-                    .complete_stage(&lease, outcome.output_artifact_ids)
+                    .complete_stage(&lease, outcome.into_output_artifact_ids())
                     .await?;
                 self.record_stage_observation(
                     &claimed,
@@ -1390,7 +1405,8 @@ mod tests {
         batch_runtime::{
             store::{NewJobStage, NewRuntimeJob},
             types::{
-                RuntimeCancellationState, RuntimeJobKind, RuntimeJobStatus, RuntimeStageStatus,
+                RuntimeArtifactKind, RuntimeArtifactRole, RuntimeCancellationState, RuntimeJobKind,
+                RuntimeJobStatus, RuntimeStageStatus,
             },
         },
         db::StoreDatabase,
@@ -1430,13 +1446,34 @@ mod tests {
         }
 
         async fn execute(&self, _claimed: ClaimedStage) -> anyhow::Result<StageExecutionOutcome> {
+            anyhow::bail!("runner did not invoke context-aware fake stage execution")
+        }
+
+        async fn execute_with_context(
+            &self,
+            context: StageExecutionContext,
+        ) -> anyhow::Result<StageExecutionOutcome> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             if self.fail_first && call == 0 {
                 anyhow::bail!("planned fake failure");
             }
-            Ok(StageExecutionOutcome {
-                output_artifact_ids: vec!["artifact-1".to_string()],
-            })
+            let artifact = context
+                .publish_output_artifact(NewStageOutputArtifact {
+                    publication_key: "fake-result".to_string(),
+                    artifact_kind: RuntimeArtifactKind::Text,
+                    artifact_role: RuntimeArtifactRole::OutputPrimary,
+                    media_asset_id: None,
+                    text_asset_id: None,
+                    storage_key: None,
+                    content_type: Some("text/plain".to_string()),
+                    filename: None,
+                    size_bytes: Some(0),
+                    sha256: None,
+                    metadata_json: json!({"fixture": true}),
+                    retention_policy: "test".to_string(),
+                })
+                .await?;
+            StageExecutionOutcome::try_new(vec![artifact.id])
         }
     }
 
@@ -1449,9 +1486,7 @@ mod tests {
         async fn execute(&self, _claimed: ClaimedStage) -> anyhow::Result<StageExecutionOutcome> {
             self.started.notify_one();
             self.release.notified().await;
-            Ok(StageExecutionOutcome {
-                output_artifact_ids: vec!["blocking-artifact".to_string()],
-            })
+            Ok(StageExecutionOutcome::empty())
         }
     }
 
@@ -1500,9 +1535,7 @@ mod tests {
                 .unwrap_or_else(|poison| poison.into_inner()) = Some(context.cancellation());
             self.started.notify_one();
             self.release.notified().await;
-            Ok(StageExecutionOutcome {
-                output_artifact_ids: vec!["must-not-publish".to_string()],
-            })
+            Ok(StageExecutionOutcome::empty())
         }
     }
 
@@ -1537,9 +1570,7 @@ mod tests {
             })
             .await
             .context("synchronous test executor join")?;
-            Ok(StageExecutionOutcome {
-                output_artifact_ids: vec!["synchronous-artifact".to_string()],
-            })
+            Ok(StageExecutionOutcome::empty())
         }
     }
 
@@ -1745,10 +1776,26 @@ mod tests {
             if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
                 return Err(SpeechStageYield.into());
             }
-            Ok(StageExecutionOutcome {
-                output_artifact_ids: vec![],
-            })
+            Ok(StageExecutionOutcome::empty())
         }
+    }
+
+    #[test]
+    fn stage_execution_outcome_is_bounded_and_uuid_typed() {
+        let id = new_uuid();
+        assert_eq!(
+            StageExecutionOutcome::try_new(vec![id])
+                .expect("canonical output")
+                .output_artifact_count(),
+            1
+        );
+        assert!(StageExecutionOutcome::try_new(vec!["not-a-uuid".to_string()]).is_err());
+        assert!(StageExecutionOutcome::try_new(
+            (0..=super::super::store::MAX_STAGE_OUTPUT_ARTIFACTS)
+                .map(|_| new_uuid())
+                .collect(),
+        )
+        .is_err());
     }
 
     #[tokio::test]
@@ -1806,7 +1853,12 @@ mod tests {
             .expect("stage")
             .expect("stage exists");
         assert_eq!(stage.status, RuntimeStageStatus::Completed);
-        assert_eq!(stage.output_artifact_ids, vec!["artifact-1"]);
+        assert_eq!(stage.output_artifact_ids.len(), 1);
+        assert!(store
+            .get_artifact(&stage.output_artifact_ids[0])
+            .await
+            .expect("artifact lookup")
+            .is_some());
         let job = store
             .get_job(&job_id)
             .await
@@ -2386,7 +2438,7 @@ mod tests {
         assert_eq!(completed.status, RuntimeStageStatus::Completed);
         assert_eq!(completed.worker_id, None);
         assert_eq!(completed.lease_expires_at, None);
-        assert_eq!(completed.output_artifact_ids, vec!["blocking-artifact"]);
+        assert!(completed.output_artifact_ids.is_empty());
         let heartbeat = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let heartbeat = store
