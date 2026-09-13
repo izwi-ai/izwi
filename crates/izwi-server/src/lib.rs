@@ -39,6 +39,7 @@ mod gateway;
 mod gateway_deployments;
 mod gateway_rate_quota;
 mod gateway_security;
+mod gateway_worker_tls;
 mod ids;
 mod logging;
 pub mod media_ingest;
@@ -520,10 +521,12 @@ async fn gateway_state(
     };
     let registry = worker_registry::WorkerRegistry::new(registry_config)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let worker_tls = gateway_worker_tls::worker_client_tls_from_env()?;
     let client_config = WorkerClientConfig {
         max_in_flight: args.gateway_max_in_flight,
         request_timeout: Duration::from_secs(serve_config.request_timeout_secs.max(1)),
         progress_timeout: Duration::from_secs(serve_config.request_timeout_secs.max(1)),
+        tls: worker_tls,
         ..WorkerClientConfig::default()
     };
 
@@ -870,6 +873,7 @@ fn gateway_remote_execution(
         "--public-model",
     )?)?;
     let credentials = gateway_worker_credentials(args)?;
+    let worker_tls = gateway_worker_tls::worker_client_tls_from_env()?;
     let client = WorkerClient::new(
         required_gateway_value(&args.worker_endpoint, "--worker-endpoint")?,
         credentials,
@@ -877,6 +881,7 @@ fn gateway_remote_execution(
             max_in_flight: args.gateway_max_in_flight,
             request_timeout: Duration::from_secs(serve_config.request_timeout_secs.max(1)),
             progress_timeout: Duration::from_secs(serve_config.request_timeout_secs.max(1)),
+            tls: worker_tls,
             ..WorkerClientConfig::default()
         },
     )?;
@@ -1585,6 +1590,9 @@ mod tests {
         std::env::remove_var("IZWI_BATCH_STAGE_TIMEOUT_SECS");
         std::env::remove_var("IZWI_BATCH_WORKER_DRAIN_TIMEOUT_SECS");
         std::env::remove_var("IZWI_HTTP_SHUTDOWN_GRACE_SECS");
+        std::env::remove_var("IZWI_GATEWAY_WORKER_TLS_CA_REFS");
+        std::env::remove_var("IZWI_GATEWAY_WORKER_TLS_CLIENT_CERT_REF");
+        std::env::remove_var("IZWI_GATEWAY_WORKER_TLS_CLIENT_KEY_REF");
         assert_eq!(batch_stage_execution_timeout(), None);
         assert_eq!(batch_worker_drain_timeout(), Duration::from_secs(20));
         assert_eq!(http_shutdown_grace_timeout(), Duration::from_secs(20));

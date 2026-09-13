@@ -14,7 +14,7 @@ use izwi_serving_protocol::{
 };
 use reqwest::{redirect::Policy, StatusCode};
 use serde::de::DeserializeOwned;
-use std::{collections::VecDeque, pin::Pin, sync::Arc, time::Duration};
+use std::{collections::VecDeque, fmt, io::Cursor, pin::Pin, sync::Arc, time::Duration};
 use tokio::{sync::OwnedSemaphorePermit, time::Instant};
 
 #[cfg(any(test, feature = "mock-worker"))]
@@ -23,6 +23,149 @@ pub mod mock;
 pub const DEFAULT_MAX_REQUEST_JSON_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MAX_CONTROL_BODY_BYTES: usize = 512 * 1024;
 pub const DEFAULT_MAX_ERROR_BODY_BYTES: usize = 16 * 1024;
+pub const MAX_PRIVATE_CA_ROOTS: usize = 16;
+pub const MAX_TLS_PEM_BYTES: usize = 256 * 1024;
+pub const MAX_TOTAL_PRIVATE_CA_BYTES: usize = 1024 * 1024;
+
+/// Optional private trust roots and client identity for HTTPS worker links.
+/// PEM bytes are deliberately omitted from `Debug` output.
+#[derive(Clone, Default)]
+pub struct WorkerClientTlsConfig {
+    private_ca_roots_pem: Vec<Arc<[u8]>>,
+    client_identity_pem: Option<Arc<[u8]>>,
+}
+
+impl fmt::Debug for WorkerClientTlsConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkerClientTlsConfig")
+            .field("private_ca_root_count", &self.private_ca_roots_pem.len())
+            .field(
+                "client_identity",
+                &self.client_identity_pem.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
+impl WorkerClientTlsConfig {
+    /// Build bounded TLS material. A client certificate and private key must
+    /// always be provided together.
+    pub fn from_pem(
+        private_ca_roots_pem: Vec<Vec<u8>>,
+        client_certificate_pem: Option<Vec<u8>>,
+        client_private_key_pem: Option<Vec<u8>>,
+    ) -> Result<Self, WorkerClientError> {
+        if private_ca_roots_pem.len() > MAX_PRIVATE_CA_ROOTS {
+            return Err(WorkerClientError::InvalidConfiguration(
+                "too many private CA roots",
+            ));
+        }
+        let total_ca_bytes = private_ca_roots_pem
+            .iter()
+            .try_fold(0_usize, |total, pem| total.checked_add(pem.len()))
+            .ok_or(WorkerClientError::InvalidConfiguration(
+                "private CA roots exceed the total size limit",
+            ))?;
+        if total_ca_bytes > MAX_TOTAL_PRIVATE_CA_BYTES
+            || private_ca_roots_pem
+                .iter()
+                .any(|pem| pem.is_empty() || pem.len() > MAX_TLS_PEM_BYTES)
+        {
+            return Err(WorkerClientError::InvalidConfiguration(
+                "private CA roots exceed the bounded PEM policy",
+            ));
+        }
+        for pem in &private_ca_roots_pem {
+            let items = parse_pem_items(pem, "private CA root is not valid PEM")?;
+            if items.is_empty()
+                || items
+                    .iter()
+                    .any(|item| !matches!(item, rustls_pemfile::Item::X509Certificate(_)))
+            {
+                return Err(WorkerClientError::InvalidConfiguration(
+                    "private CA root must contain only certificate PEM blocks",
+                ));
+            }
+        }
+        let client_identity_pem = match (client_certificate_pem, client_private_key_pem) {
+            (None, None) => None,
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(WorkerClientError::InvalidConfiguration(
+                    "mTLS requires both a client certificate and private key",
+                ));
+            }
+            (Some(certificate), Some(private_key)) => {
+                if certificate.is_empty()
+                    || private_key.is_empty()
+                    || certificate.len() > MAX_TLS_PEM_BYTES
+                    || private_key.len() > MAX_TLS_PEM_BYTES
+                {
+                    return Err(WorkerClientError::InvalidConfiguration(
+                        "mTLS identity exceeds the bounded PEM policy",
+                    ));
+                }
+                let certificate_items =
+                    parse_pem_items(&certificate, "mTLS client certificate is not valid PEM")?;
+                if certificate_items.is_empty()
+                    || certificate_items
+                        .iter()
+                        .any(|item| !matches!(item, rustls_pemfile::Item::X509Certificate(_)))
+                {
+                    return Err(WorkerClientError::InvalidConfiguration(
+                        "mTLS client certificate must contain only certificate PEM blocks",
+                    ));
+                }
+                let private_key_items =
+                    parse_pem_items(&private_key, "mTLS client private key is not valid PEM")?;
+                if private_key_items.len() != 1
+                    || !private_key_items.iter().all(|item| {
+                        matches!(
+                            item,
+                            rustls_pemfile::Item::RSAKey(_)
+                                | rustls_pemfile::Item::PKCS8Key(_)
+                                | rustls_pemfile::Item::ECKey(_)
+                        )
+                    })
+                {
+                    return Err(WorkerClientError::InvalidConfiguration(
+                        "mTLS client private key must contain exactly one supported key PEM block",
+                    ));
+                }
+                let capacity = certificate
+                    .len()
+                    .checked_add(private_key.len())
+                    .and_then(|size| size.checked_add(1))
+                    .ok_or(WorkerClientError::InvalidConfiguration(
+                        "mTLS identity exceeds the bounded PEM policy",
+                    ))?;
+                let mut identity = Vec::with_capacity(capacity);
+                identity.extend_from_slice(&certificate);
+                if !certificate.ends_with(b"\n") {
+                    identity.push(b'\n');
+                }
+                identity.extend_from_slice(&private_key);
+                Some(Arc::from(identity))
+            }
+        };
+        Ok(Self {
+            private_ca_roots_pem: private_ca_roots_pem.into_iter().map(Arc::from).collect(),
+            client_identity_pem,
+        })
+    }
+
+    pub fn is_configured(&self) -> bool {
+        !self.private_ca_roots_pem.is_empty() || self.client_identity_pem.is_some()
+    }
+}
+
+fn parse_pem_items(
+    pem: &[u8],
+    error: &'static str,
+) -> Result<Vec<rustls_pemfile::Item>, WorkerClientError> {
+    rustls_pemfile::read_all(&mut Cursor::new(pem))
+        .map_err(|_| WorkerClientError::InvalidConfiguration(error))
+}
 
 #[derive(Debug, Clone)]
 pub struct WorkerClientConfig {
@@ -34,6 +177,7 @@ pub struct WorkerClientConfig {
     pub max_control_body_bytes: usize,
     pub max_error_body_bytes: usize,
     pub ndjson_limits: NdjsonLimits,
+    pub tls: WorkerClientTlsConfig,
 }
 
 impl Default for WorkerClientConfig {
@@ -47,6 +191,7 @@ impl Default for WorkerClientConfig {
             max_control_body_bytes: DEFAULT_MAX_CONTROL_BODY_BYTES,
             max_error_body_bytes: DEFAULT_MAX_ERROR_BODY_BYTES,
             ndjson_limits: NdjsonLimits::default(),
+            tls: WorkerClientTlsConfig::default(),
         }
     }
 }
@@ -166,11 +311,38 @@ impl WorkerClient {
         if !endpoint.path().ends_with('/') {
             endpoint.set_path(&format!("{}/", endpoint.path()));
         }
-        let http = reqwest::Client::builder()
+        if endpoint.scheme() != "https" && config.tls.is_configured() {
+            return Err(WorkerClientError::InvalidConfiguration(
+                "custom TLS trust or mTLS identity requires an HTTPS worker endpoint",
+            ));
+        }
+        // Additional roots augment reqwest/rustls defaults. Certificate and
+        // hostname verification remain enabled; redirects remain forbidden.
+        let mut http_builder = reqwest::Client::builder()
             .redirect(Policy::none())
-            .connect_timeout(config.connect_timeout)
-            .build()
-            .map_err(WorkerClientError::Build)?;
+            .connect_timeout(config.connect_timeout);
+        for pem in &config.tls.private_ca_roots_pem {
+            let certificate = reqwest::Certificate::from_pem(pem).map_err(|_| {
+                WorkerClientError::InvalidConfiguration("private CA root is not valid PEM")
+            })?;
+            http_builder = http_builder.add_root_certificate(certificate);
+        }
+        if let Some(pem) = &config.tls.client_identity_pem {
+            let identity = reqwest::Identity::from_pem(pem).map_err(|_| {
+                WorkerClientError::InvalidConfiguration("mTLS identity is not valid PEM")
+            })?;
+            http_builder = http_builder.identity(identity);
+        }
+        let tls_configured = config.tls.is_configured();
+        let http = http_builder.build().map_err(|error| {
+            if tls_configured {
+                WorkerClientError::InvalidConfiguration(
+                    "TLS client configuration could not be constructed",
+                )
+            } else {
+                WorkerClientError::Build(error)
+            }
+        })?;
         Ok(Self {
             inner: Arc::new(WorkerClientInner {
                 http,
@@ -781,6 +953,29 @@ mod tests {
     use super::*;
     use izwi_serving_protocol::{CredentialId, ServiceBearerToken};
 
+    const TEST_CA_PEM: &str = r#"-----BEGIN CERTIFICATE-----
+MIIDFjCCAf6gAwIBAgITN3i31kcwBKhGVxjuERUWxATTNTANBgkqhkiG9w0BAQsF
+ADAbMRkwFwYDVQQDDBBpendpLXdvcmtlci10ZXN0MB4XDTI2MDkxMzAxMjQzNVoX
+DTI2MDkxNDAxMjQzNVowGzEZMBcGA1UEAwwQaXp3aS13b3JrZXItdGVzdDCCASIw
+DQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAK7WXUQXz+AiQlFw/O317NnGjz2O
+pe0PehytgYUBrejeOg1R9uAHFGhPITKrTufgzQPCCnTAm2i3081sXGUY4AHfs2EU
+8SxW/NVdVpTvCUA+ZM1fiyqx8YLskRxA+OWp5GcLvUfPnYadv0wSpziQ7FGYmZT9
+l4al3NTKH/80ArPioAHkzh8nUVcaz4YjV9TJF076PZTBeTrlaTD2DMwSVKX2+wJf
+qsiUKI/02FsSDvZnhf7pJsrTYP/kjehjBA2WGKGVGRzMeamyc3mdZqj0YDLKrnaN
+v3nOMHM1NsQUCOzS1gn+GmRsGg9arOcSIf/N+RqEUPVMFEOITwAqCbSwuOMCAwEA
+AaNTMFEwHQYDVR0OBBYEFEJCsPVccB709Z9mqgcNZyr8n1L3MB8GA1UdIwQYMBaA
+FEJCsPVccB709Z9mqgcNZyr8n1L3MA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcN
+AQELBQADggEBAFsnPLVGo06kqcvVjfcv/7QbxdjtDVJ8hrffhpebUXJbXu/3i+Of
+eKsjYANUc6Tqwff5N1dN6DwYpEf2ICuXyj9Mm10HqUefUyfeotPdUG2xJbKoyT3+
+1blm4veHhd61dgQ3TsCSmxv1rYA8HFEhZfxqV9Mkma4Tf2B6OKnyS1KMmBpwvzre
+IiAYl1UuUQ4fSp7V8uSs7/8RdLTgOHcQ+Zmcs9sYkkhNHRWN9Ib0hMEOV7xhgAD1
+hVWwzOxiHGfjKpGYB7L1cCo1NhVeAsmVbb5SX9IOxDWgvPhvlvzKHRpyRBWeB9rF
+V90f5fOFccvW2990PS3ow99ME6x1AUPnVeo=
+-----END CERTIFICATE-----"#;
+    const TEST_KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
+MAECAQ==
+-----END PRIVATE KEY-----"#;
+
     fn credentials() -> ServiceCredentials {
         ServiceCredentials {
             credential_id: CredentialId::new("worker-client-test").expect("static credential ID"),
@@ -814,5 +1009,98 @@ mod tests {
                 Err(WorkerClientError::InvalidConfiguration(_))
             ));
         }
+    }
+
+    #[test]
+    fn tls_configuration_is_bounded_and_redacted() {
+        let tls = WorkerClientTlsConfig::from_pem(
+            vec![TEST_CA_PEM.as_bytes().to_vec()],
+            Some(TEST_CA_PEM.as_bytes().to_vec()),
+            Some(TEST_KEY_PEM.as_bytes().to_vec()),
+        )
+        .expect("bounded material");
+        let debug = format!("{tls:?}");
+        assert!(debug.contains("private_ca_root_count: 1"));
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("BEGIN CERTIFICATE"));
+        assert!(!debug.contains("BEGIN PRIVATE KEY"));
+
+        assert!(matches!(
+            WorkerClientTlsConfig::from_pem(
+                Vec::new(),
+                Some(TEST_CA_PEM.as_bytes().to_vec()),
+                None,
+            ),
+            Err(WorkerClientError::InvalidConfiguration(_))
+        ));
+        assert!(matches!(
+            WorkerClientTlsConfig::from_pem(vec![vec![b'x'; MAX_TLS_PEM_BYTES + 1]], None, None,),
+            Err(WorkerClientError::InvalidConfiguration(_))
+        ));
+        assert!(matches!(
+            WorkerClientTlsConfig::from_pem(
+                vec![b"x".to_vec(); MAX_PRIVATE_CA_ROOTS + 1],
+                None,
+                None,
+            ),
+            Err(WorkerClientError::InvalidConfiguration(_))
+        ));
+    }
+
+    #[test]
+    fn worker_client_rejects_malformed_tls_material_without_exposing_it() {
+        const SECRET_MARKER: &str = "malformed-private-ca-secret-marker";
+        let error =
+            WorkerClientTlsConfig::from_pem(vec![SECRET_MARKER.as_bytes().to_vec()], None, None)
+                .expect_err("malformed CA root must fail TLS configuration");
+        assert!(matches!(&error, WorkerClientError::InvalidConfiguration(_)));
+        assert!(!error.to_string().contains(SECRET_MARKER));
+
+        let tls =
+            WorkerClientTlsConfig::from_pem(vec![TEST_CA_PEM.as_bytes().to_vec()], None, None)
+                .expect("valid test CA");
+        let error = WorkerClient::new(
+            "http://127.0.0.1:9470",
+            credentials(),
+            WorkerClientConfig {
+                tls,
+                ..WorkerClientConfig::default()
+            },
+        )
+        .expect_err("TLS material must not be silently ignored for plaintext development");
+        assert!(matches!(&error, WorkerClientError::InvalidConfiguration(_)));
+
+        let tls = WorkerClientTlsConfig::from_pem(
+            Vec::new(),
+            Some(TEST_CA_PEM.as_bytes().to_vec()),
+            Some(TEST_KEY_PEM.as_bytes().to_vec()),
+        )
+        .expect("bounded identity material");
+        let error = WorkerClient::new(
+            "https://worker.example.test:9470",
+            credentials(),
+            WorkerClientConfig {
+                tls,
+                ..WorkerClientConfig::default()
+            },
+        )
+        .expect_err("malformed client identity must fail construction");
+        assert!(matches!(&error, WorkerClientError::InvalidConfiguration(_)));
+        assert!(!error.to_string().contains("BEGIN CERTIFICATE"));
+        assert!(!error.to_string().contains("BEGIN PRIVATE KEY"));
+    }
+
+    #[test]
+    fn worker_client_constructs_with_an_additional_private_ca_root() {
+        let tls =
+            WorkerClientTlsConfig::from_pem(vec![TEST_CA_PEM.as_bytes().to_vec()], None, None)
+                .expect("bounded CA root");
+        let config = WorkerClientConfig {
+            tls,
+            ..WorkerClientConfig::default()
+        };
+        assert!(
+            WorkerClient::new("https://worker.example.test:9470", credentials(), config,).is_ok()
+        );
     }
 }
