@@ -733,11 +733,20 @@ mod tests {
             send(app.clone(), get("/readyz")).await.status(),
             StatusCode::OK
         );
-        assert_eq!(
-            send(app.clone(), get("/v1/models")).await.status(),
-            StatusCode::NOT_FOUND,
-            "gateway mode must not expose an unmigrated local route or UI fallback"
-        );
+        for path in [
+            "/v1/models",
+            "/v1/audio/speech",
+            "/v1/audio/transcriptions",
+            "/v1/responses",
+            "/v1/admin/models",
+            "/v1/voice/sessions",
+        ] {
+            assert_eq!(
+                send(app.clone(), get(path)).await.status(),
+                StatusCode::NOT_FOUND,
+                "gateway mode must not expose unmigrated route {path} or a UI fallback"
+            );
+        }
 
         let chat_request = Request::builder()
             .method("POST")
