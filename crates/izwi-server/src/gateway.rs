@@ -334,6 +334,7 @@ fn now_saturating_sub(started_at: u64) -> u64 {
 mod tests {
     use super::*;
     use axum::{body::Body, http::Request};
+    use futures::StreamExt;
     use izwi_core::ModelVariant;
     use izwi_hooks::{
         AuthorizationDecision, AuthorizationRequest, EnterpriseAction, HookResult, PolicyEngine,
@@ -517,6 +518,166 @@ mod tests {
         let body = String::from_utf8(body.to_vec()).expect("SSE should be UTF-8");
         assert!(body.contains("deterministic mock response"));
         assert!(body.contains("data: [DONE]"));
+    }
+
+    #[tokio::test]
+    async fn public_chat_routes_concurrent_requests_to_distinct_http_replicas_without_retry() {
+        let model = ModelVariant::Qwen34BGguf;
+        let deployment_id = MockWorkerConfig::default().deployment_id;
+        let replica = |suffix: &str, output_text: &str| MockWorkerConfig {
+            worker_id: format!("mock-replica-{suffix}")
+                .try_into()
+                .expect("test worker id should be valid"),
+            node_id: format!("mock-node-{suffix}")
+                .try_into()
+                .expect("test node id should be valid"),
+            incarnation_id: format!("mock-incarnation-{suffix}")
+                .try_into()
+                .expect("test incarnation should be valid"),
+            public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
+            output_text: output_text.to_string(),
+            // Once the first delta is observed, this leaves a deterministic
+            // window in which the first worker still owns its sole permit.
+            output_cadence: Duration::from_secs(1),
+            ..MockWorkerConfig::default()
+        };
+        let worker_a = MockWorker::spawn(replica("a", "replica-a-only"))
+            .await
+            .expect("first mock replica should bind");
+        let worker_b = MockWorker::spawn(replica("b", "replica-b-only"))
+            .await
+            .expect("second mock replica should bind");
+        let registry = WorkerRegistry::new(WorkerRegistryConfig::default())
+            .expect("registry should initialize");
+
+        for worker in [&worker_a, &worker_b] {
+            let client = WorkerClient::new(
+                &worker.endpoint(),
+                worker.config().credentials.clone(),
+                WorkerClientConfig::default(),
+            )
+            .expect("worker client should initialize");
+            let descriptor = client
+                .descriptor()
+                .await
+                .expect("descriptor should be available");
+            let status = client.status().await.expect("status should be available");
+            let deployment = status
+                .deployments
+                .first()
+                .expect("mock deployment should exist")
+                .clone();
+            registry
+                .approve(ApprovedWorker {
+                    descriptor,
+                    client,
+                    approved_deployments: BTreeMap::from([(
+                        deployment.deployment_id.clone(),
+                        ApprovedDeployment::from_loaded(&deployment),
+                    )]),
+                    validated_capacity: status.capacity.max_active_invocations
+                        + status.capacity.max_queued_invocations,
+                })
+                .expect("worker should be approved");
+            registry
+                .observe_status(status)
+                .expect("initial status should be valid");
+        }
+
+        let dispatcher = RemoteChatDispatcher::new(
+            registry,
+            RemoteChatDispatchConfig {
+                public_model_variant: model,
+                deployment_id,
+                policy_revision: PolicyRevision::new("test-policy-v1")
+                    .expect("static policy revision"),
+                backend_policy: BackendPolicy::ANY,
+                max_queue_wait: Duration::ZERO,
+                max_output_tokens: 128,
+                max_output_bytes: 4096,
+            },
+        )
+        .expect("dispatcher should initialize");
+        let state = GatewayState::with_dispatcher(
+            dispatcher,
+            EnterpriseHooks::noop(),
+            test_perimeter(),
+            5,
+            2,
+        );
+        state.lifecycle.mark_ready();
+        let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+        let stream_request = |prompt: &str| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": model.dir_name(),
+                        "messages": [{"role": "user", "content": prompt}],
+                        "stream": true,
+                        "max_tokens": 8
+                    })
+                    .to_string(),
+                ))
+                .expect("stream request should build")
+        };
+
+        let first = send(app.clone(), stream_request("first replica request")).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(worker_a.active_invocations(), 1);
+        assert_eq!(worker_b.active_invocations(), 0);
+
+        let mut first_body = first.into_body().into_data_stream();
+        let mut first_bytes = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !String::from_utf8_lossy(&first_bytes).contains("replica-a-only") {
+                let chunk = first_body
+                    .next()
+                    .await
+                    .expect("first replica stream should remain open")
+                    .expect("first replica stream chunk should be readable");
+                assert!(first_bytes.len() + chunk.len() <= 64 * 1024);
+                first_bytes.extend_from_slice(&chunk);
+            }
+        })
+        .await
+        .expect("first replica should emit its distinctive delta");
+
+        let second = send(app, stream_request("second replica request")).await;
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(
+            worker_a.active_invocations(),
+            1,
+            "the first replica must retain its sole authoritative admission"
+        );
+        assert_eq!(
+            worker_b.active_invocations(),
+            1,
+            "the second request must execute exactly once on the other replica"
+        );
+
+        let second_bytes = axum::body::to_bytes(second.into_body(), 64 * 1024)
+            .await
+            .expect("second SSE response should be bounded");
+        while let Some(chunk) = first_body.next().await {
+            let chunk = chunk.expect("first replica stream chunk should be readable");
+            assert!(first_bytes.len() + chunk.len() <= 64 * 1024);
+            first_bytes.extend_from_slice(&chunk);
+        }
+        let first_text = String::from_utf8(first_bytes).expect("first SSE should be UTF-8");
+        let second_text =
+            String::from_utf8(second_bytes.to_vec()).expect("second SSE should be UTF-8");
+
+        assert_eq!(first_text.matches("replica-a-only").count(), 1);
+        assert!(!first_text.contains("replica-b-only"));
+        assert!(first_text.contains("data: [DONE]"));
+        assert_eq!(second_text.matches("replica-b-only").count(), 1);
+        assert!(!second_text.contains("replica-a-only"));
+        assert!(second_text.contains("data: [DONE]"));
+        assert_eq!(worker_a.active_invocations(), 0);
+        assert_eq!(worker_b.active_invocations(), 0);
     }
 
     #[tokio::test]
