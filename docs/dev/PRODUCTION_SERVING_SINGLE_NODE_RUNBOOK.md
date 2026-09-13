@@ -78,6 +78,7 @@ key through an environment reference:
 | referenced variable | 16-4096 byte printable bearer key | required |
 | `IZWI_GATEWAY_API_PRINCIPAL_ID` | Server-authored principal | `gateway-api-key` |
 | `IZWI_GATEWAY_TENANT_ID` | Server-authored tenant | `default` |
+| `IZWI_GATEWAY_TENANT_MAX_CONCURRENT` | Accepted or acceptance-uncertain work owned per server-authored tenant | min(8, `--gateway-max-in-flight`) |
 
 The server assigns the `inference` role/scope. Public `x-principal-id`,
 `x-tenant-id`, `x-scopes`, and `x-roles` headers are not authority. The
@@ -284,11 +285,38 @@ latency, and HTTP status classes. It intentionally contains no request IDs,
 tenant IDs, model names, prompts, or worker-controlled labels. A dropped SSE
 body counts as a stream failure unless a terminal completion was observed.
 
+The same private service credential used for descriptor, status, invocation,
+query, and cancellation authorizes a worker scrape at
+`GET /internal/v1/metrics/prometheus`. Its response is capped at 8 KiB and uses
+only fixed unlabeled process counters/gauges, including active and retained
+attempts, admissions/rejections, terminal outcomes, cancellations, and their
+accumulated timings. Keep this endpoint on the same trusted private boundary;
+it is not a public monitoring API.
+
+On Unix, send `SIGUSR1` to the supervisor process to print one redacted status
+snapshot to stderr. The snapshot is capped at 16 KiB and includes bounded
+supervisor lifecycle totals plus configured worker identity, state, process,
+incarnation, assignment, deployment, and generation. Repeated signals are
+coalesced through a one-entry channel. This local signal surface is for service
+manager diagnostics; it does not create an unauthenticated network listener.
+
 ## Admission, retry, timeout, and cancellation semantics
 
 - Gateway admission is fail-fast and bounded by `--gateway-max-in-flight`; it
   does not create an unbounded waiting queue. The lifecycle is checked both
   before and after taking a permit so drain cannot admit a racing request.
+- Tenant concurrent-work admission is separately fail-fast and defaults to
+  `min(8, --gateway-max-in-flight)`, configurable with
+  `IZWI_GATEWAY_TENANT_MAX_CONCURRENT` but never above global ownership. The
+  tenant is derived from authenticated server state, not caller identity
+  headers. A tenant-limit rejection is 429; exhausted or unavailable global
+  ownership state is 503.
+- Once an exact worker attempt is bound, tenant ownership survives a response
+  timeout, dropped JSON response, or SSE disconnect. It is released only by an
+  authenticated terminal worker event, a cancellation disposition that proves
+  teardown, or an exact-attempt query that proves execution stopped. The
+  reconciler retries idempotent exact cancellation with bounded backoff; stale
+  status and an expired public deadline are not teardown proof.
 - Registry capacity is advisory. Selection uses only an approved, fresh,
   running, capability-compatible worker and subtracts bounded local dispatch
   reservations, but the selected worker atomically accepts or rejects the exact
@@ -334,6 +362,7 @@ The important current bounds are:
 | Gateway headers | 128 fields, 32 KiB total, 8 KiB per value |
 | Gateway request ID | one safe-ASCII value, at most 128 bytes |
 | Gateway admissions | configured semaphore, fail-fast |
+| Gateway tenant work | process-local per-tenant and total ownership, fail-fast; hard cap 100,000 and configured total no greater than `--gateway-max-in-flight` |
 | Configured registry | 256 workers; bounded deployment/local-dispatch tables |
 | Worker request body | node `max_request_bytes`, at most 64 MiB by schema |
 | Worker execution | `max_active_invocations`, atomic and fail-fast; no transport queue |
@@ -441,14 +470,16 @@ configuration with another fresh generation, and repeat the same sequence.
 | Public route returns 403 or 503 from policy | Enterprise inference policy result or hook health | Repair policy service/rules; do not bypass the hook |
 | Request returns 400/413 | Request ID/header/body/model/multimodal bounds | Fix the request or explicitly configured bounded limit |
 | Request returns overload/unavailable | Gateway semaphore, fresh eligible workers, worker authoritative capacity, drain state, circuit logs | Shed load or add an independently budgeted worker; do not create an unbounded proxy queue |
+| Same tenant receives 429 | `IZWI_GATEWAY_TENANT_MAX_CONCURRENT` and exact attempts still awaiting terminal teardown | Wait for confirmed completion/teardown or raise the limit only with measured capacity; do not release on client disconnect |
 | Stream stops without terminal output | Timeout, proxy disconnect, slow consumer, worker/protocol error | Treat result as unknown; inspect the exact attempt and never replay automatically |
 | Worker repeatedly restarts or is quarantined | First failure, resource limits, manifest/model load, lock ownership, stable-uptime threshold | Drain the gateway, fix root cause, validate, then restart supervisor |
 | New worker incarnation is ignored | Logical worker/node, capacity, artifact/generation/profile/capability drift | Make node config and gateway approval agree; do not accept status-advertised drift |
 
 Use structured service logs and request IDs, but do not log authorization
-headers, bearer values, raw private error bodies, or tenant payloads. The
-current diagnostics and metrics surface is incomplete; absence of a log or
-metric is not proof of teardown.
+headers, bearer values, raw private error bodies, or tenant payloads. Gateway
+and worker metrics plus supervisor diagnostics remain operational evidence, not
+teardown proof; only the exact-attempt terminal paths described above release
+accepted-work ownership.
 
 ## Evidence and support matrix
 

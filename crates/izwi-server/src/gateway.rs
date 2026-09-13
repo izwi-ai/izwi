@@ -111,9 +111,8 @@ impl GatewayState {
     }
 
     /// Override process-local request-rate policy and the exact private worker
-    /// output ceiling. This remains rate-only: the response-owned global
-    /// admission guard is intentionally separate from future tenant
-    /// concurrent-work accounting, which must wait for confirmed teardown.
+    /// output ceiling. This remains rate-only: response-owned global admission
+    /// and teardown-aware tenant concurrent-work ownership are separate gates.
     pub fn with_rate_quota_config(mut self, config: GatewayRateQuotaConfig) -> Self {
         self.rate_quota = GatewayRateQuota::new(config);
         self

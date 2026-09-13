@@ -37,9 +37,11 @@ gateway loss.
   must not blindly retry it on another worker.
 - Partially emitted SSE output is terminally interrupted, never reconstructed or
   transparently replayed. A replacement gateway cannot resume that stream.
-- Gateway-local admission, circuit, metrics, and tenant rate state reset with the
-  process. This is one reason the multiple-gateway and strict fleet-quota profiles
-  remain unsupported.
+- Gateway-local admission, circuit, metrics, tenant rate state, and accepted-work
+  ownership reset with the process. Within one live gateway, accepted-work
+  ownership survives public timeout/disconnect until exact worker teardown is
+  proven; it is not a crash-persistent or shared fleet authority. This is one
+  reason the multiple-gateway and strict fleet-quota profiles remain unsupported.
 - Gateway mode intentionally owns no SQLite database, model runtime, accelerator,
   process-local session, or durable artifact provider. Durable/local workflows do
   not fail over through a replacement gateway because they are not advertised by
