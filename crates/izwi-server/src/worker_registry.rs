@@ -1574,6 +1574,47 @@ mod tests {
     }
 
     #[test]
+    fn mixed_backends_route_by_declared_policy_without_a_fixed_preference() {
+        let registry = WorkerRegistry::new(WorkerRegistryConfig::default()).unwrap();
+        let workers = [
+            ("worker-a-metal", "inc-metal", BackendKind::Metal, 9101),
+            ("worker-b-cuda", "inc-cuda", BackendKind::Cuda, 9102),
+            ("worker-c-cpu", "inc-cpu", BackendKind::Cpu, 9103),
+        ];
+        for (worker, incarnation, backend, port) in workers {
+            let approved = registration(worker, incarnation, backend, port, 1);
+            let descriptor = approved.descriptor.clone();
+            registry.approve(approved).unwrap();
+            registry
+                .observe_status(status(
+                    &descriptor,
+                    1,
+                    vec![deployment("chat-prod", "lfm2", backend)],
+                    capacity(1, 0, 1),
+                ))
+                .unwrap();
+        }
+
+        // ANY uses the normal load/stable-identity ordering. It does not
+        // silently prefer CUDA, Metal, or CPU.
+        let selected = registry.select_and_reserve(&selection()).unwrap();
+        assert_eq!(selected.backend, BackendKind::Metal);
+        drop(selected);
+
+        for (policy, expected) in [
+            (BackendPolicy::CPU_ONLY, BackendKind::Cpu),
+            (BackendPolicy::METAL_ONLY, BackendKind::Metal),
+            (BackendPolicy::CUDA_ONLY, BackendKind::Cuda),
+        ] {
+            let mut request = selection();
+            request.backend_policy = policy;
+            let selected = registry.select_and_reserve(&request).unwrap();
+            assert_eq!(selected.backend, expected);
+            drop(selected);
+        }
+    }
+
+    #[test]
     fn selection_uses_capacity_weighted_score_then_stable_identity() {
         let registry = WorkerRegistry::new(WorkerRegistryConfig::default()).unwrap();
         let worker_a = registration("worker-a", "inc-a", BackendKind::Cpu, 9101, 4);
