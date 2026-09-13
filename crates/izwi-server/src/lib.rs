@@ -58,6 +58,7 @@ mod voice_observation_store;
 mod voice_store;
 pub mod worker_registry;
 
+use batch_runtime::store::DEFAULT_RUNTIME_MAINTENANCE_BATCH_LIMIT;
 use batch_runtime::types::{
     DeviceClass, QueueClass, ResourceTarget, RuntimeBackendClass, WorkerResourceCapacity,
 };
@@ -316,7 +317,7 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
     let mut startup_warnings = Vec::new();
     if let Err(err) = state
         .batch_runtime_store
-        .reconcile_inconsistent_states()
+        .reconcile_inconsistent_states(DEFAULT_RUNTIME_MAINTENANCE_BATCH_LIMIT)
         .await
     {
         startup_warnings.push(format!(

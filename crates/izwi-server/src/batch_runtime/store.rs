@@ -109,6 +109,12 @@ pub struct NewJobStageDispatch {
 
 const DEFAULT_STAGE_CLAIM_CANDIDATE_LIMIT: usize = 64;
 const MAX_STAGE_CLAIM_CANDIDATE_LIMIT: usize = 512;
+pub(crate) const DEFAULT_RUNTIME_MAINTENANCE_BATCH_LIMIT: usize = 64;
+const MAX_RUNTIME_MAINTENANCE_BATCH_LIMIT: usize = 512;
+
+fn bounded_maintenance_batch_limit(limit: usize) -> usize {
+    limit.clamp(1, MAX_RUNTIME_MAINTENANCE_BATCH_LIMIT)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StageClaimFilter {
@@ -1632,9 +1638,10 @@ impl BatchRuntimeStore {
         self.get_job(job_id).await
     }
 
-    pub async fn recover_expired_stage_leases(&self) -> anyhow::Result<u64> {
+    pub async fn recover_expired_stage_leases(&self, limit: usize) -> anyhow::Result<u64> {
         let db = self.db.connection().await?;
         let now = self.now_millis();
+        let limit = bounded_maintenance_batch_limit(limit);
         let rows = db
             .query_all_raw(raw::statement(
                 db,
@@ -1644,8 +1651,10 @@ impl BatchRuntimeStore {
                 WHERE status IN ('running', 'postprocessing')
                   AND lease_expires_at IS NOT NULL
                   AND lease_expires_at <= ?1
+                ORDER BY lease_expires_at ASC, id ASC
+                LIMIT ?2
                 "#,
-                vec![now.into()],
+                vec![now.into(), i64::try_from(limit)?.into()],
             )?)
             .await
             .context("Failed to list expired runtime stage leases")?;
@@ -2653,6 +2662,7 @@ impl BatchRuntimeStore {
 
     pub async fn reconcile_inconsistent_states(
         &self,
+        limit: usize,
     ) -> anyhow::Result<RuntimeReconciliationReport> {
         let db = self.db.connection().await?;
         let tx = db
@@ -2661,11 +2671,15 @@ impl BatchRuntimeStore {
             .context("Failed to start runtime reconciliation transaction")?;
         let now = self.now_millis();
         let mut report = RuntimeReconciliationReport::default();
+        let mut remaining = bounded_maintenance_batch_limit(limit);
 
         for (status, stage_status, excluded_statuses) in [
             ("failed", "failed", "'failed'"),
             ("expired", "expired", "'failed', 'expired'"),
         ] {
+            if remaining == 0 {
+                break;
+            }
             let result = tx
                 .execute_raw(raw::statement(
                     &tx,
@@ -2678,29 +2692,38 @@ impl BatchRuntimeStore {
                             finished_at = COALESCE(finished_at, ?1),
                             error_code = COALESCE(error_code, 'stage_{status}'),
                             error_message = COALESCE(error_message, 'Runtime stage became {status}')
-                        WHERE status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing')
-                          AND EXISTS (
-                              SELECT 1 FROM job_stages
-                              WHERE job_stages.job_id = runtime_jobs.id
-                                AND job_stages.status = '{stage_status}'
-                          )
-                          AND NOT EXISTS (
-                              SELECT 1 FROM job_stages
-                              WHERE job_stages.job_id = runtime_jobs.id
-                                AND job_stages.status IN ({excluded_statuses})
-                                AND job_stages.status <> '{stage_status}'
+                        WHERE id IN (
+                            SELECT candidate.id
+                            FROM runtime_jobs AS candidate
+                            WHERE candidate.status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing')
+                              AND EXISTS (
+                                  SELECT 1 FROM job_stages
+                                  WHERE job_stages.job_id = candidate.id
+                                    AND job_stages.status = '{stage_status}'
+                              )
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM job_stages
+                                  WHERE job_stages.job_id = candidate.id
+                                    AND job_stages.status IN ({excluded_statuses})
+                                    AND job_stages.status <> '{stage_status}'
+                              )
+                            ORDER BY candidate.updated_at ASC, candidate.id ASC
+                            LIMIT ?2
                           )
                         "#
                     ),
-                    vec![now.into()],
+                    vec![now.into(), i64::try_from(remaining)?.into()],
                 )?)
                 .await
                 .with_context(|| format!("Failed to reconcile {status} runtime jobs"))?;
             report.jobs_repaired = report.jobs_repaired.saturating_add(result.rows_affected());
+            remaining = remaining.saturating_sub(result.rows_affected() as usize);
         }
 
-        let cancelled = tx
-            .execute_raw(raw::statement(
+        let cancelled = if remaining == 0 {
+            0
+        } else {
+            tx.execute_raw(raw::statement(
                 &tx,
                 r#"
                 UPDATE runtime_jobs
@@ -2709,27 +2732,36 @@ impl BatchRuntimeStore {
                     updated_at = ?1,
                     finished_at = COALESCE(finished_at, ?1),
                     cancellation_reason = COALESCE(cancellation_reason, 'All remaining stages were cancelled')
-                WHERE status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing')
-                  AND EXISTS (
-                      SELECT 1 FROM job_stages
-                      WHERE job_stages.job_id = runtime_jobs.id AND status = 'cancelled'
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM job_stages
-                      WHERE job_stages.job_id = runtime_jobs.id
-                        AND status NOT IN ('completed', 'skipped', 'cancelled')
+                WHERE id IN (
+                    SELECT candidate.id
+                    FROM runtime_jobs AS candidate
+                    WHERE candidate.status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing')
+                      AND EXISTS (
+                          SELECT 1 FROM job_stages
+                          WHERE job_stages.job_id = candidate.id AND status = 'cancelled'
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM job_stages
+                          WHERE job_stages.job_id = candidate.id
+                            AND status NOT IN ('completed', 'skipped', 'cancelled')
+                      )
+                    ORDER BY candidate.updated_at ASC, candidate.id ASC
+                    LIMIT ?2
                   )
                 "#,
-                vec![now.into()],
+                vec![now.into(), i64::try_from(remaining)?.into()],
             )?)
             .await
-            .context("Failed to reconcile cancelled runtime jobs")?;
-        report.jobs_repaired = report
-            .jobs_repaired
-            .saturating_add(cancelled.rows_affected());
+            .context("Failed to reconcile cancelled runtime jobs")?
+            .rows_affected()
+        };
+        report.jobs_repaired = report.jobs_repaired.saturating_add(cancelled);
+        remaining = remaining.saturating_sub(cancelled as usize);
 
-        let completed = tx
-            .execute_raw(raw::statement(
+        let completed = if remaining == 0 {
+            0
+        } else {
+            tx.execute_raw(raw::statement(
                 &tx,
                 r#"
                 UPDATE runtime_jobs
@@ -2739,44 +2771,62 @@ impl BatchRuntimeStore {
                     finished_at = COALESCE(finished_at, ?1),
                     error_code = NULL,
                     error_message = NULL
-                WHERE status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
-                  AND EXISTS (SELECT 1 FROM job_stages WHERE job_stages.job_id = runtime_jobs.id)
-                  AND NOT EXISTS (
-                      SELECT 1 FROM job_stages
-                      WHERE job_stages.job_id = runtime_jobs.id
-                        AND status NOT IN ('completed', 'skipped')
+                WHERE id IN (
+                    SELECT candidate.id
+                    FROM runtime_jobs AS candidate
+                    WHERE candidate.status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
+                      AND EXISTS (SELECT 1 FROM job_stages WHERE job_stages.job_id = candidate.id)
+                      AND NOT EXISTS (
+                          SELECT 1 FROM job_stages
+                          WHERE job_stages.job_id = candidate.id
+                            AND status NOT IN ('completed', 'skipped')
+                      )
+                    ORDER BY candidate.updated_at ASC, candidate.id ASC
+                    LIMIT ?2
                   )
                 "#,
-                vec![now.into()],
+                vec![now.into(), i64::try_from(remaining)?.into()],
             )?)
             .await
-            .context("Failed to reconcile completed runtime jobs")?;
-        report.jobs_repaired = report
-            .jobs_repaired
-            .saturating_add(completed.rows_affected());
+            .context("Failed to reconcile completed runtime jobs")?
+            .rows_affected()
+        };
+        report.jobs_repaired = report.jobs_repaired.saturating_add(completed);
+        remaining = remaining.saturating_sub(completed as usize);
 
-        let retrying = tx
-            .execute_raw(raw::statement(
+        let retrying = if remaining == 0 {
+            0
+        } else {
+            tx.execute_raw(raw::statement(
                 &tx,
                 r#"
                 UPDATE runtime_jobs
                 SET status = 'retrying', updated_at = ?1
-                WHERE status IN ('created', 'queued', 'running', 'postprocessing')
-                  AND EXISTS (
-                      SELECT 1 FROM job_stages
-                      WHERE job_stages.job_id = runtime_jobs.id AND status = 'retrying'
+                WHERE id IN (
+                    SELECT candidate.id
+                    FROM runtime_jobs AS candidate
+                    WHERE candidate.status IN ('created', 'queued', 'running', 'postprocessing')
+                      AND EXISTS (
+                          SELECT 1 FROM job_stages
+                          WHERE job_stages.job_id = candidate.id AND status = 'retrying'
+                      )
+                    ORDER BY candidate.updated_at ASC, candidate.id ASC
+                    LIMIT ?2
                   )
                 "#,
-                vec![now.into()],
+                vec![now.into(), i64::try_from(remaining)?.into()],
             )?)
             .await
-            .context("Failed to reconcile retrying runtime jobs")?;
-        report.jobs_repaired = report
-            .jobs_repaired
-            .saturating_add(retrying.rows_affected());
+            .context("Failed to reconcile retrying runtime jobs")?
+            .rows_affected()
+        };
+        report.jobs_repaired = report.jobs_repaired.saturating_add(retrying);
+        remaining = remaining.saturating_sub(retrying as usize);
 
-        let stages = tx
-            .execute_raw(raw::statement(
+        let stages = if remaining == 0 {
+            0
+        } else {
+            tx.execute_raw(raw::statement(
                 &tx,
                 r#"
                 UPDATE job_stages
@@ -2792,18 +2842,26 @@ impl BatchRuntimeStore {
                     available_at = NULL,
                     error_code = COALESCE(error_code, 'parent_terminal'),
                     error_message = COALESCE(error_message, 'Parent runtime job is terminal')
-                WHERE status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing')
-                  AND EXISTS (
-                      SELECT 1 FROM runtime_jobs
-                      WHERE runtime_jobs.id = job_stages.job_id
-                        AND runtime_jobs.status IN ('failed', 'cancelled', 'expired')
+                WHERE id IN (
+                    SELECT candidate.id
+                    FROM job_stages AS candidate
+                    WHERE candidate.status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing')
+                      AND EXISTS (
+                          SELECT 1 FROM runtime_jobs
+                          WHERE runtime_jobs.id = candidate.job_id
+                            AND runtime_jobs.status IN ('failed', 'cancelled', 'expired')
+                      )
+                    ORDER BY candidate.updated_at ASC, candidate.id ASC
+                    LIMIT ?2
                   )
                 "#,
-                vec![now.into()],
+                vec![now.into(), i64::try_from(remaining)?.into()],
             )?)
             .await
-            .context("Failed to reconcile stages owned by terminal runtime jobs")?;
-        report.stages_repaired = stages.rows_affected();
+            .context("Failed to reconcile stages owned by terminal runtime jobs")?
+            .rows_affected()
+        };
+        report.stages_repaired = stages;
 
         tx.commit()
             .await
@@ -4369,7 +4427,10 @@ mod tests {
         assert_eq!(claimed.stage.status, RuntimeStageStatus::Running);
         assert_eq!(claimed.stage.attempt_count, 1);
 
-        let recovered = store.recover_expired_stage_leases().await.expect("recover");
+        let recovered = store
+            .recover_expired_stage_leases(DEFAULT_RUNTIME_MAINTENANCE_BATCH_LIMIT)
+            .await
+            .expect("recover");
         assert_eq!(recovered, 1);
 
         let retried = store
@@ -4393,6 +4454,212 @@ mod tests {
             .expect("stage")
             .expect("stage exists");
         assert_eq!(cancelled_stage.status, RuntimeStageStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn expired_lease_recovery_runs_in_stable_bounded_batches() {
+        let (mut store, _root) = build_store();
+        let clock = Arc::new(AtomicI64::new(1_000));
+        store.set_test_clock(clock.clone());
+        let mut stage_ids = Vec::new();
+
+        for index in 0..3 {
+            clock.store(1_000 + index * 100, Ordering::SeqCst);
+            let (_job, stage) = create_test_job_and_stage(&store, 0, "fake_stage", 3).await;
+            let worker_id = format!("worker-{index}");
+            let claimed = store
+                .claim_next_stage(&worker_id, 10)
+                .await
+                .expect("claim")
+                .expect("stage should be claimed");
+            assert_eq!(claimed.stage.id, stage.id);
+            stage_ids.push(stage.id);
+        }
+
+        clock.store(10_000, Ordering::SeqCst);
+        assert_eq!(
+            store
+                .recover_expired_stage_leases(2)
+                .await
+                .expect("first recovery batch"),
+            2
+        );
+        for stage_id in &stage_ids[..2] {
+            assert_eq!(
+                store
+                    .get_stage(stage_id)
+                    .await
+                    .expect("stage")
+                    .expect("stage exists")
+                    .status,
+                RuntimeStageStatus::Retrying
+            );
+        }
+        assert_eq!(
+            store
+                .get_stage(&stage_ids[2])
+                .await
+                .expect("stage")
+                .expect("stage exists")
+                .status,
+            RuntimeStageStatus::Running
+        );
+
+        assert_eq!(
+            store
+                .recover_expired_stage_leases(2)
+                .await
+                .expect("second recovery batch"),
+            1
+        );
+        assert_eq!(
+            store
+                .get_stage(&stage_ids[2])
+                .await
+                .expect("stage")
+                .expect("stage exists")
+                .status,
+            RuntimeStageStatus::Retrying
+        );
+        assert_eq!(
+            store
+                .recover_expired_stage_leases(2)
+                .await
+                .expect("empty recovery batch"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn acknowledged_job_survives_store_reconstruction_and_completes() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let db_path = root.path().join("runtime.sqlite");
+        let first_store =
+            BatchRuntimeStore::initialize_with_database(StoreDatabase::new(db_path.clone()));
+        let input = first_store
+            .create_text_asset(NewTextAsset {
+                raw_text: "durable input".to_string(),
+                normalized_text: None,
+                language_hint: Some("en".to_string()),
+                sha256: Some(sha256_hex(b"durable input")),
+                safety_status: "accepted".to_string(),
+                retention_policy: "default".to_string(),
+                structure_json: json!({}),
+            })
+            .await
+            .expect("durable input");
+        let job = first_store
+            .create_job(NewRuntimeJob {
+                job_kind: RuntimeJobKind::TtsSpeech,
+                status: RuntimeJobStatus::Queued,
+                priority: 0,
+                model_id: Some("test-model".to_string()),
+                capability: Some("tts".to_string()),
+                route_record_kind: Some("durability_test".to_string()),
+                route_record_id: Some("acknowledged-job".to_string()),
+                input_media_asset_id: None,
+                input_text_asset_id: Some(input.id.clone()),
+                request_json: json!({"text": "durable input"}),
+                model_snapshot_json: json!({"model_id": "test-model"}),
+                retry_policy_json: json!({"max_attempts": 1}),
+                max_attempts: 1,
+                idempotency_key: Some("durability-test".to_string()),
+                correlation_id: Some("durability-test".to_string()),
+            })
+            .await
+            .expect("acknowledged job");
+        let stage = first_store
+            .create_stage(NewJobStage {
+                job_id: job.id.clone(),
+                sequence: 0,
+                stage_kind: "tts_generate".to_string(),
+                status: RuntimeStageStatus::Queued,
+                capability: Some("tts".to_string()),
+                model_id: job.model_id.clone(),
+                max_attempts: 1,
+                input_artifact_ids: vec![],
+            })
+            .await
+            .expect("acknowledged stage");
+
+        drop(first_store);
+
+        let restarted_store =
+            BatchRuntimeStore::initialize_with_database(StoreDatabase::new(db_path.clone()));
+        let rediscovered_input = restarted_store
+            .get_text_asset(&input.id)
+            .await
+            .expect("rediscover input")
+            .expect("durable input exists");
+        let rediscovered_job = restarted_store
+            .get_job(&job.id)
+            .await
+            .expect("rediscover job")
+            .expect("acknowledged job exists");
+        let rediscovered_stage = restarted_store
+            .get_stage(&stage.id)
+            .await
+            .expect("rediscover stage")
+            .expect("acknowledged stage exists");
+        assert_eq!(rediscovered_input.raw_text, "durable input");
+        assert_eq!(
+            rediscovered_job.input_text_asset_id.as_deref(),
+            Some(input.id.as_str())
+        );
+        assert_eq!(rediscovered_job.status, RuntimeJobStatus::Queued);
+        assert_eq!(rediscovered_stage.status, RuntimeStageStatus::Queued);
+
+        let claimed = restarted_store
+            .claim_next_stage("worker-after-restart", 60_000)
+            .await
+            .expect("claim after restart")
+            .expect("rediscovered stage is claimable");
+        assert_eq!(claimed.stage.id, stage.id);
+        assert_eq!(
+            claimed.stage.worker_id.as_deref(),
+            Some("worker-after-restart")
+        );
+        let lease = claimed.lease().expect("restart worker lease");
+        let artifact = restarted_store
+            .publish_stage_output_artifact(&lease, test_stage_output("restart-result"))
+            .await
+            .expect("publish after restart")
+            .expect("active attempt owns publication");
+        restarted_store
+            .complete_stage(&lease, vec![artifact.id.clone()])
+            .await
+            .expect("complete after restart")
+            .expect("active attempt completes stage");
+
+        drop(restarted_store);
+
+        let final_store = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(db_path));
+        let final_job = final_store
+            .get_job(&job.id)
+            .await
+            .expect("load final job")
+            .expect("final job exists");
+        let final_stage = final_store
+            .get_stage(&stage.id)
+            .await
+            .expect("load final stage")
+            .expect("final stage exists");
+        let final_artifact = final_store
+            .get_artifact(&artifact.id)
+            .await
+            .expect("load final artifact")
+            .expect("final artifact exists");
+        assert_eq!(final_job.status, RuntimeJobStatus::Completed);
+        assert_eq!(final_stage.status, RuntimeStageStatus::Completed);
+        assert_eq!(final_stage.output_artifact_ids, vec![artifact.id.clone()]);
+        assert_eq!(
+            final_artifact.producer_attempt_token,
+            artifact.producer_attempt_token
+        );
+        assert_eq!(
+            final_artifact.publication_key.as_deref(),
+            Some("restart-result")
+        );
     }
 
     #[tokio::test]
@@ -4743,7 +5010,10 @@ mod tests {
             .expect("first attempt");
         let first_lease = first.lease().expect("first lease");
         assert_eq!(
-            store.recover_expired_stage_leases().await.expect("recover"),
+            store
+                .recover_expired_stage_leases(DEFAULT_RUNTIME_MAINTENANCE_BATCH_LIMIT)
+                .await
+                .expect("recover"),
             1
         );
 
@@ -5316,7 +5586,7 @@ mod tests {
         .expect("crash cancellation");
 
         let report = store
-            .reconcile_inconsistent_states()
+            .reconcile_inconsistent_states(DEFAULT_RUNTIME_MAINTENANCE_BATCH_LIMIT)
             .await
             .expect("reconciliation");
         assert!(report.jobs_repaired >= 1);
@@ -5347,5 +5617,55 @@ mod tests {
         assert_eq!(cancelled.status, RuntimeStageStatus::Cancelled);
         assert!(cancelled.worker_id.is_none());
         assert!(cancelled.lease_expires_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn reconciliation_consumes_one_shared_bounded_budget() {
+        let (store, _root) = build_store();
+        let mut job_ids = Vec::new();
+        let db = store.connection().await.expect("database");
+
+        for _ in 0..3 {
+            let (job, stage) = create_test_job_and_stage(&store, 0, "fake_stage", 1).await;
+            db.execute_raw(
+                raw::statement(
+                    db,
+                    "UPDATE job_stages SET status = 'completed', worker_id = NULL, lease_expires_at = NULL, finished_at = ?1 WHERE id = ?2",
+                    vec![current_timestamp_millis().into(), stage.id.into()],
+                )
+                .expect("crash completion statement"),
+            )
+            .await
+            .expect("crash completion");
+            job_ids.push(job.id);
+        }
+
+        let first = store
+            .reconcile_inconsistent_states(2)
+            .await
+            .expect("first reconciliation batch");
+        assert_eq!(first.jobs_repaired, 2);
+        assert_eq!(first.stages_repaired, 0);
+        let mut completed = 0;
+        for job_id in &job_ids {
+            if store
+                .get_job(job_id)
+                .await
+                .expect("job")
+                .expect("job exists")
+                .status
+                == RuntimeJobStatus::Completed
+            {
+                completed += 1;
+            }
+        }
+        assert_eq!(completed, 2);
+
+        let second = store
+            .reconcile_inconsistent_states(2)
+            .await
+            .expect("second reconciliation batch");
+        assert_eq!(second.jobs_repaired, 1);
+        assert_eq!(second.stages_repaired, 0);
     }
 }

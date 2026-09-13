@@ -1,7 +1,7 @@
 use super::{
     store::{
         BatchRuntimeStore, NewStageOutputArtifact, RegisteredWorkerHeartbeatUpdate,
-        StageClaimFilter,
+        StageClaimFilter, DEFAULT_RUNTIME_MAINTENANCE_BATCH_LIMIT,
     },
     types::{
         ClaimedStage, QueueClass, RuntimeArtifact, RuntimeJobKind, RuntimeWorkerHeartbeatDetails,
@@ -41,6 +41,7 @@ pub struct BatchWorkerConfig {
     pub poll_interval: Duration,
     pub lease_duration: Duration,
     pub maintenance_interval: Duration,
+    pub maintenance_batch_limit: usize,
     pub execution_timeout: Option<Duration>,
     pub drain_timeout: Duration,
 }
@@ -60,6 +61,7 @@ impl BatchWorkerConfig {
             poll_interval: Duration::from_millis(250),
             lease_duration: Duration::from_secs(60),
             maintenance_interval: Duration::from_secs(30),
+            maintenance_batch_limit: DEFAULT_RUNTIME_MAINTENANCE_BATCH_LIMIT,
             execution_timeout: None,
             drain_timeout: Duration::from_secs(20),
         }
@@ -903,11 +905,11 @@ impl BatchWorkerRunner {
         }
 
         self.store
-            .reconcile_inconsistent_states()
+            .reconcile_inconsistent_states(self.config.maintenance_batch_limit)
             .await
             .context("Failed to reconcile durable runtime state")?;
         self.store
-            .recover_expired_stage_leases()
+            .recover_expired_stage_leases(self.config.maintenance_batch_limit)
             .await
             .context("Failed to recover expired runtime stage leases")?;
         for executor in self.executors.values() {
