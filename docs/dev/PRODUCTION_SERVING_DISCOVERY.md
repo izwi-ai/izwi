@@ -63,20 +63,27 @@ data needs to be removed.
 
 ## Route migration ledger
 
+Gateway mode mounts only text-only `POST /v1/chat/completions`. Every other
+family in this ledger is absent (404) in gateway mode and remains available only
+through the existing local/desktop profile where documented; a shared database
+or media-provider option alone is not evidence of shared ownership correctness.
+
 | Route family | Maturity | Current inference owner | State and artifact dependencies | Streaming/cancellation | Initial topology decision |
 |---|---|---|---|---|---|
 | `POST /v1/chat/completions` | Stable | Local profile: in-process `RuntimeService`; gateway profile: one selected private worker | Stateless at the gateway; model/tokenizer remain worker-owned | JSON and SSE cross the bounded worker transport; disconnect/timeout requests exact-attempt cancellation without retry | Enabled remotely for text-only chat in the single-node gateway profile. The registry supports independent replicas, but plaintext worker URLs are restricted to numeric loopback until authenticated TLS is implemented. Multimodal chat remains local-only. |
 | `POST /v1/audio/speech` | Stable | In-process `RuntimeService` | Saved voices, reference audio, codecs, long-form spool files, speech history | Binary or SSE, model-specific timeout and bounded audio/event queues | Keep local-only until worker artifact/voice resolution and binary-stream contracts are explicit. |
 | `POST /v1/audio/transcriptions` | Stable | In-process `RuntimeService` | Multipart/JSON audio, optional alignment model, timestamp/subtitle formatting | JSON or SSE with bounded terminal delivery | Keep local-only initially; migrate after bounded artifact/stream transfer is available. |
 | `GET /v1/models` | Stable | Reads live local runtime/catalog | Catalog and loaded-model state are currently coupled | Non-streaming | Preserve locally; gateway needs a catalog separate from ready deployment status before migration. |
-| Chat threads | Preview | In-process chat runtime | SQLite history and per-thread process locks | JSON/SSE | Keep local-only until durable ownership and remote execution are separated. |
-| OpenAI Responses | Preview | In-process runtime | Bounded process-local response map; `store: false` bypasses retention | JSON/SSE | Keep local-only. A gateway restart loses stored response records, so the route is not fleet-durable. |
-| Agent sessions and chat workflows | Preview | In-process agent/chat coordinators | Bounded process-local agent-session map plus local chat/history stores | JSON/SSE | Keep local-only until session ownership and tenant-scoped durable mutation fencing exist. |
-| Realtime transcription | Preview | In-process realtime app/runtime | Process-local session, rolling audio, bounded frame/command/output queues | WebSocket; owner-bound state | Keep local-only until session affinity and private realtime protocol exist. |
-| Realtime voice | Preview | In-process workflow coordinator | ASR/chat/TTS stage state, barge-in, voice persistence, session admission | WebSocket with multi-stage cancellation | Keep local-only; later bind each stateful stage to an explicit worker owner. |
-| Voice-session records | Preview | Local voice workflow/store | Durable SQLite session/turn metadata; live inference ownership and agent state remain process-local | REST plus realtime owner | Preserve locally. Durable rows do not imply a live session can migrate between gateways. |
-| Jobs and speech history | Preview | In-process DB-polling batch worker plus runtime | Transactional SQLite jobs/stages/artifacts, leases, attempt tokens | Poll/SSE/cancel with durable state | Reuse stores and fencing later; do not route as synchronous HTTP work in Phase 1. |
-| Media and saved voices | Preview | Gateway/server storage providers | Existing routes still use local/provider paths. A route-independent `ArtifactStore` foundation now maps tenant-scoped opaque IDs to durable `media_assets` rows and private provider keys. | HTTP upload/download | Keep routes local-only. The facade has bounded, integrity-checked reads and local/remote-like provider conformance tests, but no media or voice route has been migrated to it. |
+| Chat threads and multimodal history | Preview | In-process chat runtime | Durable rows have no tenant column; reads are unpaged; per-thread read/generate/persist locks are process-local. Media content parts retain URL/path/data-like sources rather than tenant artifacts. | JSON/SSE | Keep local-only until tenant-filtered bounded history, shared fenced turn ownership, and opaque worker-readable media artifacts exist. |
+| OpenAI Responses | Preview | In-process runtime | Bounded process-local response map with no tenant owner; terminal records appear only after execution; `store: false` is intentionally ephemeral | JSON/SSE | Keep local-only. Restart/eviction loses records and `/cancel` does not own or fence a discoverable in-flight attempt. |
+| Agent sessions and chat workflows | Preview | In-process agent/chat coordinators | Bounded process-local session metadata plus a separate durable chat thread; neither has shared owner/turn fencing or tenant-scoped workflow mutation | JSON/SSE | Keep local-only. Restart can leave an orphan durable thread; tool side effects have no fleet idempotency contract. |
+| Realtime transcription | Preview | In-process realtime app/runtime | Process-local rolling state and bounded queues; only correlation identity survives upgrade | WebSocket; owner-bound state | Keep local-only until tenant session ownership, gateway affinity, and a private realtime protocol exist. |
+| Realtime voice | Preview | In-process workflow coordinator | ASR/chat/TTS state, barge-in, streaming input, active turn, and agent session are process-owned | WebSocket with multi-stage cancellation | Keep local-only; bind every stage to worker incarnation/deployment generation and explicitly interrupt on owner loss rather than implying migration. |
+| Voice-session records | Preview | Local voice workflow/store | Durable session/turn rows lack tenant, owner incarnation, and deployment generation; live state remains process-local | REST plus realtime owner | Preserve locally. Durable rows do not make a live session migratable or fleet-owned. |
+| Jobs and speech history | Preview | In-process DB-polling batch worker plus runtime | Jobs/stages/artifacts have transactional claims and attempt fencing. Text-only TTS has atomic acceptance and tenant-scoped idempotency, but history reads/mutations and route rows are not tenant-filtered. | Poll/SSE/cancel with durable state | Preserve locally. Admission/idempotency progress is not tenant-owned history; require tenant predicates and shared provider conformance before fleet exposure. |
+| Media uploads | Preview | Local/server media provider | Public routes address provider storage keys directly; `media_assets` metadata does not enforce tenant ownership and the route does not use `ArtifactStore` | HTTP upload/download | Keep local-only until upload/download use authorized opaque artifacts and never expose provider keys. |
+| Saved voices | Preview | Local saved-voice store and media provider | Rows contain provider paths and no tenant owner; `local_owner` describes use class, not authenticated caller ownership; blob/row publication is not transactional | HTTP CRUD plus TTS reuse | Keep local-only until tenant-filtered metadata, opaque artifacts, crash-safe publication/deletion, and worker-side authorized resolution exist. |
+| Studio projects and rendering | Preview | In-process Studio workflow and TTS runtime | Projects, segments, snapshots, and render metadata are durable but unscoped; rendering attaches speech records separately and export accumulates segment audio in memory | REST plus background render metadata | Keep local-only until tenant ownership, fenced render jobs, transactional result publication, shared voice/audio artifacts, and bounded export exist. |
 | Model administration | Preview/operator | Direct local runtime and filesystem mutation | Downloads, model files, lifecycle locks | Progress plus load/unload/delete | Never expose through the inference worker surface; require separate operator authorization and resource-safe lifecycle control. |
 
 ## Requirement map
@@ -109,21 +116,24 @@ restriction, not removal of the working local behavior.
 
 ## Phase 6 artifact foundation
 
-The first artifact slice adds a route-independent `ArtifactStore` facade over
+The artifact foundation adds a route-independent `ArtifactStore` facade over
 the existing `MediaStorageProvider` and SQLite-compatible `media_assets` table.
 It issues opaque UUID references, keeps storage keys internal, records tenant
 ownership in versioned server-authored metadata, validates size, content type,
 SHA-256 and provider tenant metadata, and materializes reads through a fixed-size
 streaming buffer with a configured hard byte limit. The local filesystem
 provider and a deterministic remote-like provider run through the same
-conformance contract. No schema migration or external service is required.
+conformance contract. Standalone mode requires no external service.
 
-Deletion first tombstones the durable row and then removes the provider object.
-If physical deletion fails, access stays denied and the error explicitly calls
-for a later garbage-collection retry. Retention is recorded as ephemeral,
-job-owned, or durable; automatic expiry and garbage collection are not yet
-implemented. Existing media, saved-voice, speech-history, job-output, and
-multimodal routes do not use this facade yet and remain restricted exactly as
-listed above. Attempt-specific output publication, transactional winner
-selection, remote artifact-service authentication, and fleet database ownership
-remain Phase 6 work; this foundation alone does not enable a fleet route.
+Deletion atomically tombstones the durable row and inserts a bounded deletion
+intent before attempting the provider. Success and provider `NotFound` complete
+the intent; failures survive restart with bounded errors, exponential backoff,
+per-call deadlines, and fixed-size maintenance batches. Local batch-worker
+maintenance processes only explicitly tombstoned facade objects, never a global
+"unreferenced" sweep or a lease-expiry guess. Retention class is recorded, but
+automatic expiry is not implemented. Existing media, saved-voice,
+speech-history, job-output, Studio, and multimodal routes do not use this facade
+yet. Provider-write reservations, blob-before-row crash recovery,
+attempt-specific losing-output cleanup after exact teardown, remote artifact
+authentication, and fleet database ownership remain Phase 6 work; this
+foundation alone does not enable a fleet route.

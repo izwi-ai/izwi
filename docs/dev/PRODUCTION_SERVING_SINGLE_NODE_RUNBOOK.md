@@ -396,11 +396,15 @@ profile where applicable:
 - `/v1/audio/speech`
 - `/v1/audio/transcriptions`
 - `/v1/responses`
+- `/v1/media`
+- `/v1/voices`
+- `/v1/studio/projects`
+- `/v1/jobs`
 - `/v1/admin/models`
 - `/v1/voice/sessions`
 
 Multimodal chat is also local-only. Realtime transcription/voice, agent and chat
-workflows, durable jobs/history, media/saved voices, and model administration
+workflows, durable jobs/history, media, saved voices, Studio, and model administration
 must not be published through the gateway until their state, artifact,
 streaming, ownership, and cancellation contracts are migrated. The complete
 ownership decision is in the
