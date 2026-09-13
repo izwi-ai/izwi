@@ -158,3 +158,11 @@ history rows, references, other job outputs, Studio, media routes, and multimoda
 inputs still retain legacy provider paths. Their tenant and fleet ownership
 gates remain Phase 6 work; this partial adoption does not enable a new gateway
 route.
+
+Reserved-write protocol v1 also has a separately advertised file capability.
+It streams a finalized local file through fixed-size buffers while enforcing the
+same pre-recorded write ID, length, digest, deadline, idempotency, and recovery
+fence as byte writes. Bytes-only reserved-write providers remain valid for PCM
+chunks and are not silently accepted for final files. The local provider passes
+this contract; final Fish WAV routing and a verified opaque streaming-read facade
+remain separate adoption gates, so this primitive alone exposes no new route.

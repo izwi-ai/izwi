@@ -83,6 +83,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Threading",
 ] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 izwi-serving-client = { path = "../izwi-serving-client", features = ["mock-worker"] }

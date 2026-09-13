@@ -3810,6 +3810,7 @@ dependencies = [
  "izwi-serving-client",
  "izwi-serving-protocol",
  "izwi-vad",
+ "libc",
  "scalar_api_reference",
  "sea-orm",
  "serde",

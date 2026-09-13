@@ -60,6 +60,12 @@ deletion retains a durable cleanup intent across provider failure. Existing
 raw-key replay rows remain supported for local upgrade compatibility, while the
 final WAV and speech-history audio path are not migrated yet.
 
+The provider contract includes an explicit reserved-file capability for that
+future final-WAV migration. It copies and hashes finalized spools with fixed
+64 KiB buffers and retains the same write-ID expiry/recovery fence. A provider
+that supports reserved byte writes but not reserved files must keep final-WAV
+fleet readiness disabled; there is no fallback to an unreserved file upload.
+
 Media providers must implement reserved writes plus the bounded file publication
 and streaming read interfaces used by long speech. A legacy whole-byte
 upload/download adapter is not sufficient for new replay entries. Test provider

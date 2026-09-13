@@ -431,6 +431,13 @@ Existing raw-key replay rows stay compatible. Final WAVs, saved voices, history
 audio, references, other media, and gateway audio transport retain their
 existing provider path until explicitly migrated.
 
+Reserved-write protocol v1 exposes reserved file publication as a separate
+capability. The built-in local provider streams a finalized file with a fixed
+64 KiB buffer, validates its declared length and SHA-256, and publishes under
+the existing per-write lock and expiry fence. Do not advertise final speech
+artifacts through a bytes-only provider; Izwi does not fall back to legacy
+`put_file` for an opaque reserved-file request.
+
 The local reserved-write provider uses the shared image/video/audio MIME-to-file
 extension mapping because reads reconstruct MIME metadata from the object key.
 Canonical mapped types (for example `image/png`, `video/mp4`, `audio/wav`,

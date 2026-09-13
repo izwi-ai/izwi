@@ -637,6 +637,14 @@ pub trait MediaStorageProvider: Send + Sync {
         None
     }
 
+    /// Whether protocol v1 reserved writes can stream from a finalized file.
+    ///
+    /// This is separate from `reserved_write_protocol_version` so an existing
+    /// bytes-only provider is never silently treated as safe for large files.
+    fn supports_reserved_file_writes(&self) -> bool {
+        false
+    }
+
     async fn put(
         &self,
         request: MediaWriteRequest,
@@ -656,6 +664,22 @@ pub trait MediaStorageProvider: Send + Sync {
     ) -> HookResult<StoredMediaObject> {
         Err(HookError::Failed(
             "Media provider does not support reserved writes".into(),
+        ))
+    }
+
+    /// Atomically publish a finalized file for a pre-recorded write ID.
+    ///
+    /// Implementations must read with bounded buffers, validate the declared
+    /// length and digest while reading, reject publication at or after the
+    /// deadline, and provide the same idempotency/recovery fence as
+    /// [`Self::put_reserved`].
+    async fn put_reserved_file(
+        &self,
+        _request: MediaReservedWriteRequest,
+        _path: std::path::PathBuf,
+    ) -> HookResult<StoredMediaObject> {
+        Err(HookError::Failed(
+            "Media provider does not support reserved file writes".into(),
         ))
     }
 

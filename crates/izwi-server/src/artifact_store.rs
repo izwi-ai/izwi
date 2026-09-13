@@ -16,10 +16,11 @@ use crate::ids::new_uuid;
 use izwi_hooks::{
     HookError, HookMetadata, MediaDeleteRequest, MediaNamespace, MediaObjectKey, MediaReadRequest,
     MediaReservedWriteRecoveryRequest, MediaReservedWriteRequest, MediaStorageProvider,
-    MediaWriteRequest, MEDIA_RESERVED_WRITE_VERSION,
+    MediaWriteRequest, StoredMediaObject, MEDIA_RESERVED_WRITE_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
@@ -128,6 +129,7 @@ impl ArtifactRetention {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArtifactStoreLimits {
     pub max_object_bytes: u64,
+    pub max_file_object_bytes: u64,
     pub max_content_type_bytes: usize,
     pub max_filename_bytes: usize,
 }
@@ -137,6 +139,12 @@ impl ArtifactStoreLimits {
         if self.max_object_bytes == 0 || self.max_object_bytes > ABSOLUTE_MAX_OBJECT_BYTES {
             return Err(ArtifactStoreError::InvalidInput(
                 "invalid artifact object-size limit",
+            ));
+        }
+        if self.max_file_object_bytes == 0 || self.max_file_object_bytes > ABSOLUTE_MAX_OBJECT_BYTES
+        {
+            return Err(ArtifactStoreError::InvalidInput(
+                "invalid artifact file-size limit",
             ));
         }
         if self.max_content_type_bytes == 0 || self.max_content_type_bytes > 256 {
@@ -157,6 +165,7 @@ impl Default for ArtifactStoreLimits {
     fn default() -> Self {
         Self {
             max_object_bytes: 64 * 1024 * 1024,
+            max_file_object_bytes: ABSOLUTE_MAX_OBJECT_BYTES,
             max_content_type_bytes: 128,
             max_filename_bytes: 255,
         }
@@ -179,6 +188,28 @@ pub(crate) struct AttemptArtifactWrite {
     pub metadata_json: serde_json::Value,
     pub runtime_retention_policy: String,
     pub object: ArtifactWrite,
+}
+
+#[allow(dead_code)] // The final-WAV adopter follows the provider primitive.
+#[derive(Debug, Clone)]
+pub(crate) struct ArtifactFileWrite {
+    pub content_type: String,
+    pub filename: Option<String>,
+    pub path: PathBuf,
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub retention: ArtifactRetention,
+}
+
+#[allow(dead_code)] // The final-WAV adopter follows the provider primitive.
+#[derive(Debug, Clone)]
+pub(crate) struct AttemptArtifactFileWrite {
+    pub publication_key: String,
+    pub artifact_kind: RuntimeArtifactKind,
+    pub artifact_role: RuntimeArtifactRole,
+    pub metadata_json: serde_json::Value,
+    pub runtime_retention_policy: String,
+    pub object: ArtifactFileWrite,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,6 +255,8 @@ pub enum ArtifactStoreError {
     Provider,
     #[error("artifact storage provider lacks reserved-write protocol v1")]
     ReservedWritesUnsupported,
+    #[error("artifact storage provider lacks reserved-file writes")]
+    ReservedFileWritesUnsupported,
     #[error("artifact read failed")]
     Read,
     #[error("artifact was hidden, but physical deletion must be retried")]
@@ -306,12 +339,91 @@ impl ArtifactStore {
         write: AttemptArtifactWrite,
         publication_progress: serde_json::Value,
     ) -> Result<RuntimeArtifact, ArtifactStoreError> {
+        let AttemptArtifactWrite {
+            publication_key,
+            artifact_kind,
+            artifact_role,
+            metadata_json,
+            runtime_retention_policy,
+            object,
+        } = write;
+        self.validate_attempt_artifact(
+            lease,
+            &publication_key,
+            &runtime_retention_policy,
+            &metadata_json,
+        )?;
+        let stored = self.store_reserved_write(tenant, object).await?;
+        self.publish_stored_attempt_artifact(
+            tenant,
+            lease,
+            publication_key,
+            artifact_kind,
+            artifact_role,
+            metadata_json,
+            runtime_retention_policy,
+            stored,
+            publication_progress,
+        )
+        .await
+    }
+
+    #[allow(dead_code)] // Exercised by conformance tests before route adoption.
+    pub(crate) async fn put_attempt_file_artifact(
+        &self,
+        tenant: &ArtifactTenant,
+        lease: &StageLease,
+        write: AttemptArtifactFileWrite,
+        publication_progress: serde_json::Value,
+    ) -> Result<RuntimeArtifact, ArtifactStoreError> {
+        if !self.provider.supports_reserved_file_writes() {
+            return Err(ArtifactStoreError::ReservedFileWritesUnsupported);
+        }
+        if self.provider.reserved_write_protocol_version() != Some(MEDIA_RESERVED_WRITE_VERSION) {
+            return Err(ArtifactStoreError::ReservedWritesUnsupported);
+        }
+        let AttemptArtifactFileWrite {
+            publication_key,
+            artifact_kind,
+            artifact_role,
+            metadata_json,
+            runtime_retention_policy,
+            object,
+        } = write;
+        self.validate_attempt_artifact(
+            lease,
+            &publication_key,
+            &runtime_retention_policy,
+            &metadata_json,
+        )?;
+        let stored = self.store_reserved_file(tenant, object).await?;
+        self.publish_stored_attempt_artifact(
+            tenant,
+            lease,
+            publication_key,
+            artifact_kind,
+            artifact_role,
+            metadata_json,
+            runtime_retention_policy,
+            stored,
+            publication_progress,
+        )
+        .await
+    }
+
+    fn validate_attempt_artifact(
+        &self,
+        lease: &StageLease,
+        publication_key: &str,
+        runtime_retention_policy: &str,
+        metadata_json: &serde_json::Value,
+    ) -> Result<(), ArtifactStoreError> {
         if lease.attempt_token.is_none() {
             return Err(ArtifactStoreError::InvalidInput(
                 "stage lease lacks an attempt token",
             ));
         }
-        let publication_key = write.publication_key.trim().to_string();
+        let publication_key = publication_key.trim();
         if publication_key.is_empty()
             || publication_key.len() > 256
             || publication_key.chars().any(char::is_control)
@@ -320,15 +432,15 @@ impl ArtifactStore {
                 "invalid attempt publication key",
             ));
         }
-        if write.runtime_retention_policy.is_empty()
-            || write.runtime_retention_policy.len() > 128
-            || write.runtime_retention_policy.chars().any(char::is_control)
+        if runtime_retention_policy.is_empty()
+            || runtime_retention_policy.len() > 128
+            || runtime_retention_policy.chars().any(char::is_control)
         {
             return Err(ArtifactStoreError::InvalidInput(
                 "invalid runtime retention policy",
             ));
         }
-        let metadata_bytes = serde_json::to_vec(&write.metadata_json)
+        let metadata_bytes = serde_json::to_vec(metadata_json)
             .map_err(|_| ArtifactStoreError::InvalidInput("invalid artifact metadata"))?;
         if metadata_bytes.len() > 8 * 1024 {
             return Err(ArtifactStoreError::InvalidInput(
@@ -336,12 +448,27 @@ impl ArtifactStore {
             ));
         }
 
-        let stored = self.store_reserved_write(tenant, write.object).await?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_stored_attempt_artifact(
+        &self,
+        tenant: &ArtifactTenant,
+        lease: &StageLease,
+        publication_key: String,
+        artifact_kind: RuntimeArtifactKind,
+        artifact_role: RuntimeArtifactRole,
+        metadata_json: serde_json::Value,
+        runtime_retention_policy: String,
+        stored: StoredReservedArtifact,
+        publication_progress: serde_json::Value,
+    ) -> Result<RuntimeArtifact, ArtifactStoreError> {
         let media = opaque_media_asset(tenant, &stored);
         let artifact = NewStageOutputArtifact {
-            publication_key,
-            artifact_kind: write.artifact_kind,
-            artifact_role: write.artifact_role,
+            publication_key: publication_key.trim().to_string(),
+            artifact_kind,
+            artifact_role,
             media_asset_id: None,
             text_asset_id: None,
             storage_key: None,
@@ -349,8 +476,8 @@ impl ArtifactStore {
             filename: None,
             size_bytes: None,
             sha256: None,
-            metadata_json: write.metadata_json,
-            retention_policy: write.runtime_retention_policy,
+            metadata_json,
+            retention_policy: runtime_retention_policy,
         };
         match self
             .metadata
@@ -546,29 +673,15 @@ impl ArtifactStore {
         }
         let digest = sha256_hex(&write.bytes);
         let size_bytes = write.bytes.len() as u64;
-        let write_id = new_uuid();
-        let provider_request = MediaWriteRequest {
-            namespace: MediaNamespace::Other("artifact-store".to_string()),
-            record_id: write_id.clone(),
-            preferred_filename: write.filename.clone(),
-            content_type: write.content_type.clone(),
-            metadata: tenant_metadata(tenant),
-        };
         let reservation = self
-            .metadata
-            .reserve_provider_write(NewProviderWriteReservation {
-                write_id,
-                tenant_scope: tenant.as_str().to_string(),
-                storage_namespace: "artifact-store".to_string(),
-                content_type: write.content_type.clone(),
-                filename: write.filename.clone(),
-                expected_size_bytes: size_bytes,
-                expected_sha256: digest.clone(),
-                lifetime_ms: self.provider_write_lifetime().as_millis() as u64,
-                provider_request,
-            })
-            .await
-            .map_err(ArtifactStoreError::Metadata)?;
+            .reserve_write(
+                tenant,
+                &write.content_type,
+                write.filename.as_deref(),
+                size_bytes,
+                &digest,
+            )
+            .await?;
         let provider_request = provider_write_request(&reservation);
         let stored = match tokio::time::timeout(
             PROVIDER_WRITE_TIMEOUT,
@@ -594,16 +707,136 @@ impl ArtifactStore {
             }
         };
 
+        self.finish_reserved_write(
+            tenant,
+            write.content_type,
+            write.filename,
+            size_bytes,
+            digest,
+            write.retention,
+            self.limits.max_object_bytes,
+            reservation,
+            stored,
+        )
+        .await
+    }
+
+    #[allow(dead_code)]
+    async fn store_reserved_file(
+        &self,
+        tenant: &ArtifactTenant,
+        write: ArtifactFileWrite,
+    ) -> Result<StoredReservedArtifact, ArtifactStoreError> {
+        if !self.provider.supports_reserved_file_writes() {
+            return Err(ArtifactStoreError::ReservedFileWritesUnsupported);
+        }
+        if self.provider.reserved_write_protocol_version() != Some(MEDIA_RESERVED_WRITE_VERSION) {
+            return Err(ArtifactStoreError::ReservedWritesUnsupported);
+        }
+        self.validate_file_write(&write)?;
+        let reservation = self
+            .reserve_write(
+                tenant,
+                &write.content_type,
+                write.filename.as_deref(),
+                write.size_bytes,
+                &write.sha256,
+            )
+            .await?;
+        let provider_request = provider_write_request(&reservation);
+        let stored = match tokio::time::timeout(
+            PROVIDER_WRITE_TIMEOUT,
+            self.provider.put_reserved_file(
+                MediaReservedWriteRequest {
+                    version: MEDIA_RESERVED_WRITE_VERSION,
+                    write_id: reservation.write_id.clone(),
+                    expires_at_unix_ms: reservation.expires_at,
+                    content_length: reservation.expected_size_bytes,
+                    sha256: reservation.expected_sha256.clone(),
+                    request: provider_request,
+                },
+                write.path,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(stored)) => stored,
+            Ok(Err(_)) | Err(_) => {
+                self.abandon_write(&reservation, "Reserved provider file write failed")
+                    .await;
+                return Err(ArtifactStoreError::Provider);
+            }
+        };
+
+        self.finish_reserved_write(
+            tenant,
+            write.content_type,
+            write.filename,
+            write.size_bytes,
+            write.sha256,
+            write.retention,
+            self.limits.max_file_object_bytes,
+            reservation,
+            stored,
+        )
+        .await
+    }
+
+    async fn reserve_write(
+        &self,
+        tenant: &ArtifactTenant,
+        content_type: &str,
+        filename: Option<&str>,
+        size_bytes: u64,
+        digest: &str,
+    ) -> Result<ProviderWriteReservation, ArtifactStoreError> {
+        let write_id = new_uuid();
+        let provider_request = MediaWriteRequest {
+            namespace: MediaNamespace::Other("artifact-store".to_string()),
+            record_id: write_id.clone(),
+            preferred_filename: filename.map(str::to_string),
+            content_type: content_type.to_string(),
+            metadata: tenant_metadata(tenant),
+        };
+        self.metadata
+            .reserve_provider_write(NewProviderWriteReservation {
+                write_id,
+                tenant_scope: tenant.as_str().to_string(),
+                storage_namespace: "artifact-store".to_string(),
+                content_type: content_type.to_string(),
+                filename: filename.map(str::to_string),
+                expected_size_bytes: size_bytes,
+                expected_sha256: digest.to_string(),
+                lifetime_ms: self.provider_write_lifetime().as_millis() as u64,
+                provider_request,
+            })
+            .await
+            .map_err(ArtifactStoreError::Metadata)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_reserved_write(
+        &self,
+        tenant: &ArtifactTenant,
+        content_type: String,
+        filename: Option<String>,
+        size_bytes: u64,
+        digest: String,
+        retention: ArtifactRetention,
+        max_object_bytes: u64,
+        reservation: ProviderWriteReservation,
+        stored: StoredMediaObject,
+    ) -> Result<StoredReservedArtifact, ArtifactStoreError> {
         if let Err(error) = validate_stored_write(
             tenant,
-            &write.content_type,
+            &content_type,
             digest.as_str(),
             size_bytes,
             stored.metadata.content_length,
             stored.metadata.sha256.as_deref(),
             stored.metadata.tenant_id.as_deref(),
             stored.metadata.content_type.as_str(),
-            self.limits.max_object_bytes,
+            max_object_bytes,
         ) {
             self.abandon_write(&reservation, "Provider metadata validation failed")
                 .await;
@@ -641,11 +874,11 @@ impl ArtifactStore {
         Ok(StoredReservedArtifact {
             reservation,
             storage_key: stored.key.key,
-            content_type: write.content_type,
-            filename: write.filename,
+            content_type,
+            filename,
             size_bytes,
             sha256: digest,
-            retention: write.retention,
+            retention,
         })
     }
 
@@ -656,14 +889,42 @@ impl ArtifactStore {
         if write.bytes.len() as u64 > self.limits.max_object_bytes {
             return Err(ArtifactStoreError::TooLarge);
         }
-        validate_content_type(&write.content_type, self.limits.max_content_type_bytes)?;
-        if let Some(filename) = &write.filename {
+        self.validate_object_identity(&write.content_type, write.filename.as_deref())
+    }
+
+    #[allow(dead_code)]
+    fn validate_file_write(&self, write: &ArtifactFileWrite) -> Result<(), ArtifactStoreError> {
+        if write.size_bytes == 0 {
+            return Err(ArtifactStoreError::InvalidInput("empty artifact"));
+        }
+        if write.size_bytes > self.limits.max_file_object_bytes {
+            return Err(ArtifactStoreError::TooLarge);
+        }
+        validate_digest(Some(&write.sha256))?;
+        self.validate_object_identity(&write.content_type, write.filename.as_deref())?;
+        let metadata = std::fs::symlink_metadata(&write.path)
+            .map_err(|_| ArtifactStoreError::InvalidInput("artifact file is unavailable"))?;
+        if !metadata.file_type().is_file() {
+            return Err(ArtifactStoreError::InvalidInput(
+                "artifact file must be a regular file",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_object_identity(
+        &self,
+        content_type: &str,
+        filename: Option<&str>,
+    ) -> Result<(), ArtifactStoreError> {
+        validate_content_type(content_type, self.limits.max_content_type_bytes)?;
+        if let Some(filename) = filename {
             if filename.is_empty()
                 || filename.len() > self.limits.max_filename_bytes
                 || filename.chars().any(char::is_control)
                 || filename.contains('/')
                 || filename.contains('\\')
-                || matches!(filename.as_str(), "." | "..")
+                || matches!(filename, "." | "..")
             {
                 return Err(ArtifactStoreError::InvalidInput(
                     "invalid artifact filename",
@@ -904,10 +1165,11 @@ fn validate_stored_write(
             "provider content-type mismatch",
         ));
     }
-    if let Some(digest) = digest {
-        if validate_digest(Some(digest))? != expected_digest {
-            return Err(ArtifactStoreError::Integrity("provider digest mismatch"));
-        }
+    let digest = digest.ok_or(ArtifactStoreError::Integrity(
+        "provider omitted reserved-write digest",
+    ))?;
+    if validate_digest(Some(digest))? != expected_digest {
+        return Err(ArtifactStoreError::Integrity("provider digest mismatch"));
     }
     Ok(())
 }
@@ -990,6 +1252,7 @@ mod tests {
         },
         db::StoreDatabase,
         persistence::LocalMediaStorageProvider,
+        storage_layout,
     };
     use izwi_hooks::{HookResult, MediaObjectMetadata, StoredMediaObject, StoredMediaStream};
     use std::{
@@ -1084,6 +1347,27 @@ mod tests {
                 filename: Some("chunk.f32le".into()),
                 bytes,
                 retention: ArtifactRetention::Job,
+            },
+        }
+    }
+
+    fn file_attempt_write(path: PathBuf, bytes: &[u8]) -> AttemptArtifactFileWrite {
+        AttemptArtifactFileWrite {
+            publication_key: "primary-audio".into(),
+            artifact_kind: RuntimeArtifactKind::Audio,
+            artifact_role: RuntimeArtifactRole::OutputPrimary,
+            metadata_json: serde_json::json!({
+                "sample_rate": 44_100,
+                "sample_count": bytes.len() / 2,
+            }),
+            runtime_retention_policy: "speech_history".into(),
+            object: ArtifactFileWrite {
+                content_type: "audio/wav".into(),
+                filename: Some("speech.wav".into()),
+                path,
+                size_bytes: bytes.len() as u64,
+                sha256: sha256_hex(bytes),
+                retention: ArtifactRetention::Durable,
             },
         }
     }
@@ -1303,6 +1587,219 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(15)).await;
         assert_eq!(store.cleanup_due(64).await.unwrap().completed, 2);
         assert_eq!(provider.object_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn reserved_file_attempt_publication_is_opaque_and_provider_readable() {
+        let root = tempfile::tempdir().unwrap();
+        let provider = Arc::new(MemoryMediaProvider::default());
+        let metadata = Arc::new(BatchRuntimeStore::initialize_with_database(
+            StoreDatabase::new(root.path().join("attempt-file.sqlite3")),
+        ));
+        let store = ArtifactStore::new(
+            metadata.clone(),
+            provider.clone(),
+            ArtifactStoreLimits {
+                max_object_bytes: 1024,
+                max_file_object_bytes: 256 * 1024,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let tenant_key = Some([7; 32]);
+        let tenant = ArtifactTenant::from_scheduling_key(tenant_key);
+        let lease = active_tts_lease(&metadata, tenant_key).await;
+        let bytes = vec![0x5a; 128 * 1024 + 3];
+        let path = root.path().join("speech.wav");
+        tokio::fs::write(&path, &bytes).await.unwrap();
+
+        let artifact = store
+            .put_attempt_file_artifact(
+                &tenant,
+                &lease,
+                file_attempt_write(path, &bytes),
+                serde_json::json!({"final_audio_published": true}),
+            )
+            .await
+            .unwrap();
+        let id = ArtifactId::parse(artifact.media_asset_id.clone().unwrap()).unwrap();
+        assert!(artifact.storage_key.is_none());
+        assert_eq!(artifact.size_bytes, Some(bytes.len() as u64));
+        assert!(matches!(
+            store.read(&tenant, &id).await,
+            Err(ArtifactStoreError::TooLarge)
+        ));
+        let asset = metadata
+            .get_media_asset(id.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+        let stored = provider
+            .get(MediaReadRequest {
+                key: MediaObjectKey::new(asset.storage_key),
+                metadata: tenant_metadata(&tenant),
+            })
+            .await
+            .unwrap();
+        assert_eq!(stored.bytes, bytes);
+    }
+
+    #[tokio::test]
+    async fn reserved_file_capability_and_source_identity_fail_before_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let provider = Arc::new(MemoryMediaProvider::default());
+        let metadata = Arc::new(BatchRuntimeStore::initialize_with_database(
+            StoreDatabase::new(root.path().join("attempt-file-errors.sqlite3")),
+        ));
+        let mut store = ArtifactStore::new(
+            metadata.clone(),
+            provider.clone(),
+            ArtifactStoreLimits::default(),
+        )
+        .unwrap();
+        store.set_reservation_lifetime_for_test(Duration::from_millis(10));
+        let tenant = ArtifactTenant::from_scheduling_key(None);
+        let lease = active_tts_lease(&metadata, None).await;
+        let bytes = b"bounded file".to_vec();
+        let path = root.path().join("source.wav");
+        tokio::fs::write(&path, &bytes).await.unwrap();
+
+        provider
+            .supports_reserved_files
+            .store(false, Ordering::SeqCst);
+        let mut unavailable = file_attempt_write(root.path().join("missing.wav"), &bytes);
+        unavailable.object.size_bytes = bytes.len() as u64;
+        assert!(matches!(
+            store
+                .put_attempt_file_artifact(&tenant, &lease, unavailable, serde_json::json!({}),)
+                .await,
+            Err(ArtifactStoreError::ReservedFileWritesUnsupported)
+        ));
+        assert_eq!(provider.object_count(), 0);
+
+        provider
+            .supports_reserved_files
+            .store(true, Ordering::SeqCst);
+        provider.supports_reserved.store(false, Ordering::SeqCst);
+        let unavailable = file_attempt_write(root.path().join("still-missing.wav"), &bytes);
+        assert!(matches!(
+            store
+                .put_attempt_file_artifact(&tenant, &lease, unavailable, serde_json::json!({}),)
+                .await,
+            Err(ArtifactStoreError::ReservedWritesUnsupported)
+        ));
+        assert_eq!(provider.object_count(), 0);
+
+        provider.supports_reserved.store(true, Ordering::SeqCst);
+        let mut wrong_digest = file_attempt_write(path, &bytes);
+        wrong_digest.object.sha256 = "0".repeat(64);
+        assert!(matches!(
+            store
+                .put_attempt_file_artifact(&tenant, &lease, wrong_digest, serde_json::json!({}),)
+                .await,
+            Err(ArtifactStoreError::Provider)
+        ));
+        assert_eq!(provider.object_count(), 0);
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        assert_eq!(store.cleanup_due(64).await.unwrap().completed, 1);
+    }
+
+    #[tokio::test]
+    async fn local_reserved_file_restart_cleanup_removes_partial_and_unacknowledged_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("reserved-file-recovery.sqlite3");
+        let media_root = root.path().join("media");
+        let provider = Arc::new(LocalMediaStorageProvider::new(media_root.clone()));
+        let metadata = Arc::new(BatchRuntimeStore::initialize_with_database(
+            StoreDatabase::new(db_path.clone()),
+        ));
+        let mut store = ArtifactStore::new(
+            metadata.clone(),
+            provider.clone(),
+            ArtifactStoreLimits::default(),
+        )
+        .unwrap();
+        store.set_reservation_lifetime_for_test(Duration::from_millis(100));
+        let tenant = ArtifactTenant::from_scheduling_key(None);
+        let lease = active_tts_lease(&metadata, None).await;
+        let bytes = vec![0x35; 128 * 1024 + 3];
+        let path = root.path().join("speech.wav");
+        tokio::fs::write(&path, &bytes).await.unwrap();
+
+        let mut mismatched = file_attempt_write(path.clone(), &bytes);
+        mismatched.object.sha256 = "0".repeat(64);
+        assert!(matches!(
+            store
+                .put_attempt_file_artifact(&tenant, &lease, mismatched, serde_json::json!({}),)
+                .await,
+            Err(ArtifactStoreError::Provider)
+        ));
+
+        let reservation = metadata
+            .reserve_provider_write(test_provider_write_input(
+                tenant.as_str(),
+                "artifact-store",
+                "audio/wav",
+                Some("speech.wav"),
+                &bytes,
+                100,
+            ))
+            .await
+            .unwrap();
+        let stored = provider
+            .put_reserved_file(
+                MediaReservedWriteRequest {
+                    version: MEDIA_RESERVED_WRITE_VERSION,
+                    write_id: reservation.write_id.clone(),
+                    expires_at_unix_ms: reservation.expires_at,
+                    content_length: reservation.expected_size_bytes,
+                    sha256: reservation.expected_sha256.clone(),
+                    request: provider_write_request(&reservation),
+                },
+                path,
+            )
+            .await
+            .unwrap();
+        let stored_path = storage_layout::resolve_media_path(&media_root, &stored.key.key).unwrap();
+        assert!(stored_path.exists());
+        let reserved_root = media_root.join("generated/reserved-writes");
+        assert_eq!(std::fs::read_dir(&reserved_root).unwrap().count(), 2);
+
+        drop(store);
+        drop(metadata);
+        tokio::time::sleep(Duration::from_millis(110)).await;
+        let reopened = ArtifactStore::new(
+            Arc::new(BatchRuntimeStore::initialize_with_database(
+                StoreDatabase::new(db_path),
+            )),
+            provider,
+            ArtifactStoreLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(reopened.cleanup_due(64).await.unwrap().completed, 2);
+        assert!(!stored_path.exists());
+        assert_eq!(std::fs::read_dir(reserved_root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn reserved_publication_requires_an_exact_provider_digest() {
+        let tenant = ArtifactTenant::parse("tenant-a").unwrap();
+        assert!(matches!(
+            validate_stored_write(
+                &tenant,
+                "audio/wav",
+                &sha256_hex(b"audio"),
+                5,
+                Some(5),
+                None,
+                Some("tenant-a"),
+                "audio/wav",
+                1024,
+            ),
+            Err(ArtifactStoreError::Integrity(
+                "provider omitted reserved-write digest"
+            ))
+        ));
     }
 
     #[tokio::test]
@@ -2140,6 +2637,7 @@ mod tests {
     struct MemoryMediaProvider {
         state: Mutex<MemoryProviderState>,
         supports_reserved: AtomicBool,
+        supports_reserved_files: AtomicBool,
         now_unix_ms: AtomicU64,
         reserved_put_gate: Mutex<Option<(StdArc<Notify>, StdArc<Notify>)>>,
         fail_deletes: AtomicBool,
@@ -2152,6 +2650,7 @@ mod tests {
             Self {
                 state: Mutex::default(),
                 supports_reserved: AtomicBool::new(true),
+                supports_reserved_files: AtomicBool::new(true),
                 now_unix_ms: AtomicU64::new(0),
                 reserved_put_gate: Mutex::default(),
                 fail_deletes: AtomicBool::default(),
@@ -2218,6 +2717,10 @@ mod tests {
             self.supports_reserved
                 .load(Ordering::SeqCst)
                 .then_some(MEDIA_RESERVED_WRITE_VERSION)
+        }
+
+        fn supports_reserved_file_writes(&self) -> bool {
+            self.supports_reserved_files.load(Ordering::SeqCst)
         }
 
         async fn put(
@@ -2334,6 +2837,37 @@ mod tests {
                 key: MediaObjectKey::new(key),
                 metadata,
             })
+        }
+
+        async fn put_reserved_file(
+            &self,
+            request: MediaReservedWriteRequest,
+            path: PathBuf,
+        ) -> HookResult<StoredMediaObject> {
+            let mut source = tokio::fs::File::open(path)
+                .await
+                .map_err(|error| HookError::Failed(error.to_string()))?;
+            let capacity = usize::try_from(request.content_length)
+                .unwrap_or(0)
+                .min(64 * 1024);
+            let mut bytes = Vec::with_capacity(capacity);
+            let mut buffer = [0u8; 64 * 1024];
+            loop {
+                let count = source
+                    .read(&mut buffer)
+                    .await
+                    .map_err(|error| HookError::Failed(error.to_string()))?;
+                if count == 0 {
+                    break;
+                }
+                if bytes.len().saturating_add(count) as u64 > request.content_length {
+                    return Err(HookError::Failed(
+                        "reserved file exceeds declared length".into(),
+                    ));
+                }
+                bytes.extend_from_slice(&buffer[..count]);
+            }
+            self.put_reserved(request, bytes).await
         }
 
         async fn recover_reserved_write(

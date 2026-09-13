@@ -16,6 +16,8 @@ use sea_orm::{DatabaseConnection, DatabaseConnectionType, DbBackend};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+const RESERVED_FILE_COPY_BUFFER_BYTES: usize = 64 * 1024;
+
 #[derive(Clone)]
 pub struct PersistenceContext {
     pub database: DatabaseContext,
@@ -337,6 +339,10 @@ impl MediaStorageProvider for LocalMediaStorageProvider {
         Some(MEDIA_RESERVED_WRITE_VERSION)
     }
 
+    fn supports_reserved_file_writes(&self) -> bool {
+        true
+    }
+
     async fn put(
         &self,
         request: MediaWriteRequest,
@@ -401,11 +407,12 @@ impl MediaStorageProvider for LocalMediaStorageProvider {
                 validate_reserved_write_directory(parent, &final_name, &temporary_name)?;
                 if target.exists() {
                     anyhow::ensure!(
-                        file_matches_bytes(&target, &bytes)?,
+                        file_matches_bytes(&target, &bytes, deadline)?,
                         "Reserved media write ID was reused for different bytes"
                     );
                     remove_if_present(&parent.join(&temporary_name))?;
                     sync_directory(parent)?;
+                    ensure_reserved_write_live(deadline)?;
                     return Ok(());
                 }
                 let temporary_path = parent.join(&temporary_name);
@@ -423,13 +430,117 @@ impl MediaStorageProvider for LocalMediaStorageProvider {
                     Ok(()) => {
                         std::fs::remove_file(&temporary_path)?;
                         sync_directory(parent)?;
+                        if let Err(error) = ensure_reserved_write_live(deadline) {
+                            remove_if_present(&target)?;
+                            sync_directory(parent)?;
+                            return Err(error);
+                        }
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                         anyhow::ensure!(
-                            file_matches_bytes(&target, &bytes)?,
+                            file_matches_bytes(&target, &bytes, deadline)?,
                             "Reserved media write ID was reused for different bytes"
                         );
                         std::fs::remove_file(&temporary_path)?;
+                        sync_directory(parent)?;
+                        ensure_reserved_write_live(deadline)?;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|error| HookError::Failed(error.to_string()))?
+        .map_err(|error| HookError::Failed(error.to_string()))?;
+
+        Ok(StoredMediaObject {
+            key: MediaObjectKey::new(key),
+            metadata: MediaObjectMetadata {
+                content_type,
+                filename,
+                content_length: Some(content_length),
+                sha256: Some(digest),
+                tenant_id: tenant_id_from_metadata(&metadata),
+                attributes: metadata,
+            },
+        })
+    }
+
+    async fn put_reserved_file(
+        &self,
+        request: MediaReservedWriteRequest,
+        path: PathBuf,
+    ) -> HookResult<StoredMediaObject> {
+        validate_reserved_write_request(&request)?;
+        let fingerprint =
+            reserved_write_fingerprint(&request.request, request.content_length, &request.sha256);
+        let key = reserved_local_key(&request.request, &request.write_id, &fingerprint);
+        let media_root = self.media_root.clone();
+        let key_for_write = key.clone();
+        let deadline = request.expires_at_unix_ms;
+        let write_id = request.write_id.clone();
+        let content_type = request.request.content_type.clone();
+        let filename = request.request.preferred_filename.clone();
+        let metadata = request.request.metadata.clone();
+        let content_length = request.content_length;
+        let digest = request.sha256.clone();
+        let expected_digest = digest.clone();
+        tokio::task::spawn_blocking(move || {
+            with_reserved_write_lock(&media_root, &write_id, || {
+                ensure_reserved_write_live(deadline)?;
+                let target = storage_layout::resolve_media_path(&media_root, &key_for_write)?;
+                let parent = target.parent().context("Reserved media parent directory")?;
+                std::fs::create_dir_all(parent)?;
+                let final_name = target
+                    .file_name()
+                    .context("Reserved media filename")?
+                    .to_string_lossy()
+                    .into_owned();
+                let temporary_name = format!(".{fingerprint}.tmp");
+                validate_reserved_write_directory(parent, &final_name, &temporary_name)?;
+                let temporary_path = parent.join(&temporary_name);
+                copy_file_with_digest(
+                    &path,
+                    &temporary_path,
+                    content_length,
+                    &expected_digest,
+                    deadline,
+                )?;
+                ensure_reserved_write_live(deadline)?;
+                if target.exists() {
+                    anyhow::ensure!(
+                        file_matches_digest(&target, content_length, &expected_digest, deadline,)?,
+                        "Reserved media write ID was reused for different bytes"
+                    );
+                    remove_if_present(&temporary_path)?;
+                    sync_directory(parent)?;
+                    ensure_reserved_write_live(deadline)?;
+                    return Ok(());
+                }
+                match std::fs::hard_link(&temporary_path, &target) {
+                    Ok(()) => {
+                        std::fs::remove_file(&temporary_path)?;
+                        sync_directory(parent)?;
+                        if let Err(error) = ensure_reserved_write_live(deadline) {
+                            remove_if_present(&target)?;
+                            sync_directory(parent)?;
+                            return Err(error);
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        anyhow::ensure!(
+                            file_matches_digest(
+                                &target,
+                                content_length,
+                                &expected_digest,
+                                deadline,
+                            )?,
+                            "Reserved media write ID was reused for different bytes"
+                        );
+                        std::fs::remove_file(&temporary_path)?;
+                        sync_directory(parent)?;
+                        ensure_reserved_write_live(deadline)?;
                     }
                     Err(error) => return Err(error.into()),
                 }
@@ -652,12 +763,21 @@ impl MediaStorageProvider for LocalMediaStorageProvider {
 }
 
 fn validate_reserved_write(request: &MediaReservedWriteRequest, bytes: &[u8]) -> HookResult<()> {
+    validate_reserved_write_request(request)?;
+    if request.content_length != bytes.len() as u64 || sha256_hex_bytes(bytes) != request.sha256 {
+        return Err(HookError::Failed(
+            "Invalid reserved media write identity".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_reserved_write_request(request: &MediaReservedWriteRequest) -> HookResult<()> {
     if request.version != MEDIA_RESERVED_WRITE_VERSION
         || uuid::Uuid::parse_str(&request.write_id).is_err()
         || request.request.record_id != request.write_id
-        || request.content_length != bytes.len() as u64
+        || request.content_length == 0
         || !valid_sha256(&request.sha256)
-        || sha256_hex_bytes(bytes) != request.sha256
         || !reserved_content_type_round_trips(&request.request.content_type)
     {
         return Err(HookError::Failed(
@@ -846,16 +966,19 @@ fn reserved_write_parent_for_key(media_root: &Path, key: &str) -> Option<PathBuf
         .map(Path::to_path_buf)
 }
 
-fn file_matches_bytes(path: &Path, expected: &[u8]) -> anyhow::Result<bool> {
+fn file_matches_bytes(path: &Path, expected: &[u8], deadline: u64) -> anyhow::Result<bool> {
     use std::io::Read as _;
-    let mut file = std::fs::File::open(path)?;
-    if file.metadata()?.len() != expected.len() as u64 {
+    let mut file = open_reserved_source(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() || metadata.len() != expected.len() as u64 {
         return Ok(false);
     }
     let mut offset = 0usize;
     let mut buffer = [0u8; 64 * 1024];
     loop {
+        ensure_reserved_write_live(deadline)?;
         let count = file.read(&mut buffer)?;
+        ensure_reserved_write_live(deadline)?;
         if count == 0 {
             return Ok(offset == expected.len());
         }
@@ -864,6 +987,122 @@ fn file_matches_bytes(path: &Path, expected: &[u8]) -> anyhow::Result<bool> {
         }
         offset += count;
     }
+}
+
+fn copy_file_with_digest(
+    source_path: &Path,
+    temporary_path: &Path,
+    expected_length: u64,
+    expected_digest: &str,
+    deadline: u64,
+) -> anyhow::Result<()> {
+    let mut source = open_reserved_source(source_path)?;
+    let source_metadata = source.metadata()?;
+    anyhow::ensure!(
+        source_metadata.file_type().is_file(),
+        "Reserved media source must be a regular file"
+    );
+    anyhow::ensure!(
+        source_metadata.len() == expected_length,
+        "Reserved media source length does not match its declaration"
+    );
+    let mut temporary = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(temporary_path)?;
+    copy_reader_with_digest(
+        &mut source,
+        &mut temporary,
+        expected_length,
+        expected_digest,
+        deadline,
+    )?;
+    temporary.sync_all()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_reserved_source(path: &Path) -> anyhow::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    Ok(std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?)
+}
+
+#[cfg(not(unix))]
+fn open_reserved_source(path: &Path) -> anyhow::Result<std::fs::File> {
+    Ok(std::fs::OpenOptions::new().read(true).open(path)?)
+}
+
+fn copy_reader_with_digest<R: std::io::Read, W: std::io::Write>(
+    source: &mut R,
+    temporary: &mut W,
+    expected_length: u64,
+    expected_digest: &str,
+    deadline: u64,
+) -> anyhow::Result<()> {
+    use sha2::{Digest as _, Sha256};
+
+    let mut buffer = [0u8; RESERVED_FILE_COPY_BUFFER_BYTES];
+    let mut total = 0u64;
+    let mut digest = Sha256::new();
+    loop {
+        ensure_reserved_write_live(deadline)?;
+        let count = std::io::Read::read(source, &mut buffer)?;
+        ensure_reserved_write_live(deadline)?;
+        if count == 0 {
+            break;
+        }
+        total = total
+            .checked_add(count as u64)
+            .context("Reserved media source length overflow")?;
+        anyhow::ensure!(
+            total <= expected_length,
+            "Reserved media source exceeds its declared length"
+        );
+        std::io::Write::write_all(temporary, &buffer[..count])?;
+        digest.update(&buffer[..count]);
+    }
+    anyhow::ensure!(
+        total == expected_length,
+        "Reserved media source length does not match its declaration"
+    );
+    anyhow::ensure!(
+        format!("{:x}", digest.finalize()) == expected_digest,
+        "Reserved media source digest does not match its declaration"
+    );
+    Ok(())
+}
+
+fn file_matches_digest(
+    path: &Path,
+    expected_length: u64,
+    expected_digest: &str,
+    deadline: u64,
+) -> anyhow::Result<bool> {
+    use sha2::{Digest as _, Sha256};
+    use std::io::Read as _;
+
+    let mut file = open_reserved_source(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() || metadata.len() != expected_length {
+        return Ok(false);
+    }
+    let mut buffer = [0u8; 64 * 1024];
+    let mut digest = Sha256::new();
+    loop {
+        ensure_reserved_write_live(deadline)?;
+        let count = file.read(&mut buffer)?;
+        ensure_reserved_write_live(deadline)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", digest.finalize()) == expected_digest)
 }
 
 fn tenant_id_from_metadata(metadata: &HookMetadata) -> Option<String> {
@@ -975,8 +1214,62 @@ mod tests {
     use crate::test_support::env_lock;
     use izwi_hooks::{DatabaseProvider, DatabaseProviderDecision, MediaStorageResolver};
     use sea_orm::DbBackend;
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::time::Duration;
+
+    #[test]
+    fn reserved_file_copy_uses_a_fixed_buffer_and_checks_in_flight_expiry() {
+        struct RecordingReader {
+            inner: std::io::Cursor<Vec<u8>>,
+            max_requested: usize,
+            delay_first_read: bool,
+        }
+
+        impl Read for RecordingReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.max_requested = self.max_requested.max(buffer.len());
+                if self.delay_first_read {
+                    self.delay_first_read = false;
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                self.inner.read(buffer)
+            }
+        }
+
+        let bytes = vec![0x2a; RESERVED_FILE_COPY_BUFFER_BYTES * 2 + 3];
+        let mut source = RecordingReader {
+            inner: std::io::Cursor::new(bytes.clone()),
+            max_requested: 0,
+            delay_first_read: false,
+        };
+        let mut destination = Vec::new();
+        copy_reader_with_digest(
+            &mut source,
+            &mut destination,
+            bytes.len() as u64,
+            &sha256_hex_bytes(&bytes),
+            current_unix_millis() + 5_000,
+        )
+        .unwrap();
+        assert_eq!(destination, bytes);
+        assert_eq!(source.max_requested, RESERVED_FILE_COPY_BUFFER_BYTES);
+
+        let mut expiring_source = RecordingReader {
+            inner: std::io::Cursor::new(b"deadline".to_vec()),
+            max_requested: 0,
+            delay_first_read: true,
+        };
+        let mut incomplete = Vec::new();
+        assert!(copy_reader_with_digest(
+            &mut expiring_source,
+            &mut incomplete,
+            8,
+            &sha256_hex_bytes(b"deadline"),
+            current_unix_millis() + 1,
+        )
+        .is_err());
+        assert!(incomplete.is_empty());
+    }
 
     #[test]
     fn local_media_publish_falls_back_when_atomic_rename_is_denied() {
@@ -1105,6 +1398,131 @@ mod tests {
             )
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn local_reserved_file_write_streams_and_enforces_exact_identity() {
+        use tokio::io::AsyncReadExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let media_root = directory.path().join("media");
+        let provider = LocalMediaStorageProvider::new(media_root.clone());
+        assert!(provider.supports_reserved_file_writes());
+        let bytes = vec![0x6d; 128 * 1024 + 3];
+        let source = directory.path().join("source.bin");
+        tokio::fs::write(&source, &bytes).await.unwrap();
+        let write_id = uuid::Uuid::new_v4().to_string();
+        let request = MediaWriteRequest {
+            namespace: MediaNamespace::Other("artifact-store".into()),
+            record_id: write_id.clone(),
+            preferred_filename: Some("artifact.bin".into()),
+            content_type: "application/octet-stream".into(),
+            metadata: HookMetadata::new(),
+        };
+        let envelope = MediaReservedWriteRequest {
+            version: MEDIA_RESERVED_WRITE_VERSION,
+            write_id,
+            expires_at_unix_ms: current_unix_millis() + 500,
+            content_length: bytes.len() as u64,
+            sha256: sha256_hex_bytes(&bytes),
+            request,
+        };
+        let stored = provider
+            .put_reserved_file(envelope.clone(), source.clone())
+            .await
+            .unwrap();
+        let repeated = provider
+            .put_reserved_file(envelope.clone(), source.clone())
+            .await
+            .unwrap();
+        assert_eq!(repeated.key, stored.key);
+        let mut stream = provider
+            .get_stream(MediaReadRequest {
+                key: stored.key.clone(),
+                metadata: HookMetadata::new(),
+            })
+            .await
+            .unwrap();
+        let mut round_trip = Vec::new();
+        stream.reader.read_to_end(&mut round_trip).await.unwrap();
+        assert_eq!(round_trip, bytes);
+
+        let changed = vec![0x4b; bytes.len()];
+        tokio::fs::write(&source, &changed).await.unwrap();
+        assert!(provider
+            .put_reserved_file(envelope.clone(), source.clone())
+            .await
+            .is_err());
+        let mut preserved = provider
+            .get_stream(MediaReadRequest {
+                key: stored.key.clone(),
+                metadata: HookMetadata::new(),
+            })
+            .await
+            .unwrap();
+        let mut preserved_bytes = Vec::new();
+        preserved
+            .reader
+            .read_to_end(&mut preserved_bytes)
+            .await
+            .unwrap();
+        assert_eq!(preserved_bytes, bytes);
+
+        let mut wrong_length = envelope.clone();
+        wrong_length.write_id = uuid::Uuid::new_v4().to_string();
+        wrong_length.request.record_id = wrong_length.write_id.clone();
+        wrong_length.content_length = changed.len() as u64 + 1;
+        wrong_length.sha256 = sha256_hex_bytes(&changed);
+        assert!(provider
+            .put_reserved_file(wrong_length.clone(), source)
+            .await
+            .is_err());
+
+        let reserved_root = media_root.join("generated/reserved-writes");
+        let first_parent = storage_layout::resolve_media_path(&media_root, &stored.key.key)
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        assert!(std::fs::read_dir(&first_parent).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
+
+        let delay_ms = envelope
+            .expires_at_unix_ms
+            .saturating_sub(current_unix_millis())
+            + 10;
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        provider
+            .recover_reserved_write(MediaReservedWriteRecoveryRequest {
+                version: MEDIA_RESERVED_WRITE_VERSION,
+                write_id: envelope.write_id.clone(),
+                expires_at_unix_ms: envelope.expires_at_unix_ms,
+                content_length: envelope.content_length,
+                sha256: envelope.sha256.clone(),
+                request: envelope.request.clone(),
+                storage_key: Some(stored.key),
+            })
+            .await
+            .unwrap();
+        provider
+            .recover_reserved_write(MediaReservedWriteRecoveryRequest {
+                version: MEDIA_RESERVED_WRITE_VERSION,
+                write_id: wrong_length.write_id,
+                expires_at_unix_ms: wrong_length.expires_at_unix_ms,
+                content_length: wrong_length.content_length,
+                sha256: wrong_length.sha256,
+                request: wrong_length.request,
+                storage_key: None,
+            })
+            .await
+            .unwrap();
+        assert!(!first_parent.exists());
+        assert_eq!(std::fs::read_dir(reserved_root).unwrap().count(), 0);
     }
 
     #[tokio::test]
