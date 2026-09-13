@@ -23,6 +23,7 @@ db-postgres = ["sea-orm/sqlx-postgres"]
 
 [dependencies]
 tempfile = "3.10"
+fs2 = "0.4.3"
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 futures = { workspace = true }
@@ -72,6 +73,15 @@ izwi-core = { path = "../izwi-core", default-features = false, features = ["acce
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 izwi-core = { path = "../izwi-core", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

@@ -205,6 +205,7 @@ Persistence and delivery controls are process-wide unless noted:
 | Control | Default | Purpose |
 | --- | --- | --- |
 | `IZWI_TTS_TOTAL_SPOOL_BYTES` | 1 GiB | Aggregate temporary speech WAV allocation |
+| `IZWI_SPEECH_SPOOL_DIR` | System temporary directory `izwi/speech-spool` child | Owner-only local scratch root for process-locked speech temporary files |
 | `IZWI_TTS_TOTAL_UPLOAD_BYTES` | 256 MiB | Aggregate in-progress upload buffers |
 | `IZWI_AUDIO_STREAM_TOTAL_EVENT_BYTES` | 64 MiB | Aggregate queued SSE event bytes |
 | `IZWI_AUDIO_STREAM_MAX_EVENT_BYTES` | 4 MiB | Per-stream queued SSE event bytes |

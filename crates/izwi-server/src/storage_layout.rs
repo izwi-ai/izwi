@@ -7,6 +7,7 @@ const APP_NAME_DIR: &str = "izwi";
 const DEFAULT_DB_FILENAME: &str = "izwi.sqlite3";
 const DB_ENV_PRIMARY: &str = "IZWI_DB_PATH";
 const MEDIA_ENV_PRIMARY: &str = "IZWI_MEDIA_DIR";
+const SPEECH_SPOOL_ENV_PRIMARY: &str = "IZWI_SPEECH_SPOOL_DIR";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaGroup {
@@ -37,6 +38,19 @@ pub fn resolve_media_root() -> PathBuf {
     }
 
     resolve_data_root().join("media")
+}
+
+/// Resolve the process-owned scratch root used by local speech requests.
+///
+/// This is intentionally separate from durable media: files below this root
+/// are temporary and can be reclaimed only through the ownership protocol in
+/// `speech_spool`.
+pub fn resolve_speech_spool_root() -> PathBuf {
+    if let Some(path) = env_path(SPEECH_SPOOL_ENV_PRIMARY) {
+        return path;
+    }
+
+    std::env::temp_dir().join(APP_NAME_DIR).join("speech-spool")
 }
 
 pub fn ensure_storage_dirs(db_path: &Path, media_root: &Path) -> anyhow::Result<()> {

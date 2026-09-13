@@ -49,6 +49,7 @@ mod persistence;
 mod saved_voice_store;
 mod speech_history_store;
 mod speech_resource_budget;
+mod speech_spool;
 mod state;
 mod storage_layout;
 mod studio_project_store;

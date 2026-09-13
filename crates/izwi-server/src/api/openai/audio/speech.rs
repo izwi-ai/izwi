@@ -257,8 +257,8 @@ async fn fish_file_speech(
     let (sender, mut receiver) = mpsc::channel::<AudioChunk>(2);
     let format = resolved_format.format;
     let collect = async {
-        let raw_owner =
-            tempfile::NamedTempFile::new().map_err(|e| ApiError::internal(e.to_string()))?;
+        let raw_owner = crate::speech_spool::new_speech_tempfile()
+            .map_err(|e| ApiError::internal(e.to_string()))?;
         let mut raw = tokio::fs::File::from_std(
             raw_owner
                 .reopen()

@@ -3801,6 +3801,7 @@ dependencies = [
  "clap",
  "config",
  "dirs 5.0.1",
+ "fs2",
  "futures",
  "hound",
  "izwi-agent",
@@ -3825,6 +3826,7 @@ dependencies = [
  "tracing-subscriber",
  "utoipa",
  "uuid",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

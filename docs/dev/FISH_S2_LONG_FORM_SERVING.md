@@ -52,6 +52,20 @@ not sufficient. Test provider failures, quota exhaustion, partial files, cleanup
 and restart recovery using the deployed adapter. Plan storage retention and
 cleanup for replay artifacts and failed jobs as well as successful recordings.
 
+Local speech scratch files live below a lazily created, process-owned directory
+under `IZWI_SPEECH_SPOOL_DIR` (by default the system temporary directory's
+`izwi/speech-spool` child). The root must be a non-symlink directory accessible
+only to its owner. Each process holds an exclusive lock for its UUID-named child;
+first-use cleanup removes a recognized sibling only after acquiring that exact
+lock. It never infers death from a PID, age, or expired lease. Live, malformed,
+symlinked, or scan-limit-exceeding entries are left untouched. Temporary files
+are also atomically capped at 255 per process so every normally produced owner
+directory remains within the recovery scan limit. They remain RAII-owned, so
+success, rejection, cancellation, timeout, and response drop release their
+individual files while the existing aggregate spool-byte budget remains
+authoritative. Unix mode bits and Windows protected DACLs restrict both the
+root and process directory to the current owner.
+
 ## Database migration and model identity
 
 Local SQLite applies the compatibility migration automatically. Provider-managed

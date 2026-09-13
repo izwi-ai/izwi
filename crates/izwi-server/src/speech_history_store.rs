@@ -24,7 +24,7 @@ use crate::{
 /// cancellation or disconnect. `finish_file` retains the file without an upload buffer.
 pub(crate) struct SpeechWavSpool {
     file: tokio::fs::File,
-    temporary: tempfile::NamedTempFile,
+    temporary: crate::speech_spool::SpeechTempFile,
     sample_rate: u32,
     pcm_bytes: usize,
     max_pcm_bytes: usize,
@@ -81,7 +81,8 @@ impl SpeechWavSpool {
             sample_rate > 0 && sample_rate <= u32::MAX / 2,
             "Invalid WAV sample rate"
         );
-        let temporary = tempfile::NamedTempFile::new().context("Create speech WAV spool")?;
+        let temporary =
+            crate::speech_spool::new_speech_tempfile().context("Create speech WAV spool")?;
         let mut file = temporary.reopen()?;
         std::io::Write::write_all(&mut file, &[0; 44])?;
         Ok(Self {
@@ -191,7 +192,7 @@ impl SpeechWavSpool {
 
 /// Owns both the finalized file and its disk reservation through upload/response.
 pub(crate) struct SpeechWavArtifact {
-    temporary: tempfile::NamedTempFile,
+    temporary: crate::speech_spool::SpeechTempFile,
     sample_rate: u32,
     pcm_bytes: usize,
     _disk_reservation: crate::speech_resource_budget::ByteReservation,
@@ -2029,26 +2030,40 @@ mod tests {
             .await
             .expect("active job lookup")
             .expect("active job");
-        runtime
+        let cancelled = runtime
             .cancel_job(&active_job.id, Some("test cancellation".to_string()))
             .await
             .expect("cancel runtime job")
             .expect("cancelled runtime job");
+        assert_eq!(cancelled.status, RuntimeJobStatus::Running);
+        assert_eq!(
+            cancelled.cancellation_state,
+            Some(crate::batch_runtime::types::RuntimeCancellationState::Requested)
+        );
+        let cancelling = store
+            .get_record(SpeechRouteKind::TextToSpeech, resumable.id.clone())
+            .await
+            .expect("cancelling projection lookup")
+            .expect("cancelling projection");
+        assert_eq!(
+            cancelling.processing_status,
+            SpeechHistoryProcessingStatus::Pending
+        );
         assert_eq!(
             store
                 .reconcile_stale_processing_records()
                 .await
-                .expect("terminal reconciliation"),
-            1
+                .expect("cancelling reconciliation"),
+            0
         );
-        let terminal = store
+        let still_cancelling = store
             .get_record(SpeechRouteKind::TextToSpeech, resumable.id)
             .await
-            .expect("terminal lookup")
-            .expect("terminal record");
+            .expect("post-reconciliation lookup")
+            .expect("post-reconciliation record");
         assert_eq!(
-            terminal.processing_status,
-            SpeechHistoryProcessingStatus::Failed
+            still_cancelling.processing_status,
+            SpeechHistoryProcessingStatus::Pending
         );
 
         clear_env();
