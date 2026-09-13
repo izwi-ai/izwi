@@ -99,18 +99,27 @@ currently has one private credential pair for all configured workers:
 
 Consequently, every worker selected by one gateway must currently accept that
 same pair. Configure the same credential ID and secret value across replica
-entries, or use separate gateways. Per-worker gateway credentials and mTLS
-identity are not implemented.
+entries, or use separate gateways. Per-worker gateway credentials are not
+implemented. One optional client identity can be configured for all HTTPS
+worker links made by a gateway.
 
 ### Binds and TLS
 
 - The bundled worker rejects every non-loopback bind. Plaintext worker client
   URLs must use a numeric loopback host such as `127.0.0.1` or `::1`; `localhost`
   is deliberately not accepted.
-- The worker client accepts certificate-verified HTTPS endpoints, but the
-  bundled worker does not terminate TLS. A remote HTTPS topology therefore
-  needs a separately managed trusted TLS/mTLS ingress or sidecar proxying to the
-  worker's loopback listener. This is not a native multi-machine profile.
+- The worker client accepts certificate-verified HTTPS endpoints, augments the
+  platform trust store with up to 16 private CA PEM files, and can present one
+  client certificate/key identity. Configure bounded absolute `file:`
+  references with `IZWI_GATEWAY_WORKER_TLS_CA_REFS` (comma-separated),
+  `IZWI_GATEWAY_WORKER_TLS_CLIENT_CERT_REF`, and
+  `IZWI_GATEWAY_WORKER_TLS_CLIENT_KEY_REF`. Certificate and key references must
+  be supplied together. Each PEM file is limited to 256 KiB and all private CA
+  files together to 1 MiB. TLS material on a plaintext endpoint is rejected.
+- The bundled worker does not terminate TLS. A remote HTTPS topology therefore
+  still needs a separately managed trusted TLS/mTLS ingress or sidecar proxying
+  to the worker's loopback listener. This is not a native multi-machine profile
+  until that deployment has separate-machine transport evidence.
 - The gateway itself does not terminate TLS. Bind it to loopback behind a TLS
   ingress. A non-loopback gateway bind is rejected unless
   `IZWI_GATEWAY_TRUSTED_INGRESS_TLS=1` explicitly acknowledges that trusted
@@ -259,6 +268,20 @@ Authorization: Bearer <public gateway API key>
 Send a bounded text-only `POST /v1/chat/completions` first without streaming,
 then with the existing OpenAI-compatible SSE form. Preserve and inspect the
 returned `x-request-id`. Do not use an inference request as a liveness probe.
+
+### 4. Scrape bounded gateway metrics
+
+Metrics are absent (404) unless `IZWI_GATEWAY_METRICS_API_KEY_REF` names a
+bounded `env:VARIABLE` secret. That secret must differ from the public inference
+key. With it configured, authenticate separately and scrape either
+`GET /internal/metrics` or `GET /internal/metrics/prometheus`.
+
+The response is capped at 4 KiB and contains only a fixed set of unlabeled
+counters/gauges for active admitted requests and streams, auth/quota/body
+rejections, routing or dispatch failures, dispatch calls and accumulated
+latency, and HTTP status classes. It intentionally contains no request IDs,
+tenant IDs, model names, prompts, or worker-controlled labels. A dropped SSE
+body counts as a stream failure unless a terminal completion was observed.
 
 ## Admission, retry, timeout, and cancellation semantics
 

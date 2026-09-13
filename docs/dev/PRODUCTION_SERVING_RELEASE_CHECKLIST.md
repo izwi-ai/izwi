@@ -80,7 +80,8 @@ Copy this section into the release record and attach exact command output.
   absent from argv, config artifacts, diagnostics, and logs.
 - [ ] Keep worker HTTP on numeric loopback. For an approved remote profile,
   require certificate-verified HTTPS through a trusted TLS/mTLS termination
-  layer and record its trust configuration.
+  layer, use only bounded absolute PEM references, and record its trust
+  configuration. Prove the handshake on the actual topology.
 - [ ] Terminate public TLS before any non-loopback gateway bind and explicitly
   acknowledge the trusted ingress setting.
 - [ ] Keep CORS disabled or use a reviewed explicit origin allowlist.
@@ -167,14 +168,14 @@ reviewer/date:
 
 | ID | Severity | Applies to | Current control | Release effect / exit gate |
 |---|---|---|---|---|
-| PSR-001 | High | Remote/multi-machine | Worker clients require verified HTTPS; bundled workers bind loopback | No native remote profile until TLS/mTLS termination and a separate-machine contract test are approved |
+| PSR-001 | High | Remote/multi-machine | Worker clients require verified HTTPS and support bounded private roots plus one shared mTLS client identity; bundled workers still bind loopback | No native remote profile until TLS/mTLS termination and a separate-machine handshake/contract test are approved |
 | PSR-002 | High | Metal/CUDA supervisor | Schema and workers carry explicit assignments; supervisor CLI rejects unsupported lanes without CPU fallback | Do not release supervisor-managed Metal/CUDA until trusted inventory/launch integration and target hardware tests pass |
 | PSR-003 | High | Multiple gateways | Registry, circuit state, and tenant rate limits are process-local | No strict fleet quota/HA claim until Phase 8 shared or conservatively partitioned authorities pass restart/partition tests |
 | PSR-004 | High | Unmigrated APIs | Gateway exposes only chat and returns 404 for representative local routes | Do not advertise models, audio, Responses, workflows, history, admin, or live-session APIs remotely before their ledger gates pass |
-| PSR-005 | High | Durable idempotency | Worker attempt IDs suppress bounded local duplicates; job attempt tokens fence writers | Do not promise public durable replay until tenant-scoped reservation/commit/replay, digest conflicts, expiry, and route integration pass |
+| PSR-005 | High | Durable idempotency | The store has bounded tenant-scoped reservation/commit/replay primitives; worker attempt IDs and job attempt tokens fence execution writers | Do not promise public durable replay until job creation and idempotency commit are atomic or recoverable together and route integration passes |
 | PSR-006 | Medium | Durable cancellation UI/projections | Store retains requested/stopping ownership and fences results until executor teardown | Reconcile route projections after asynchronous terminal cancellation before claiming complete cross-route cancellation state |
 | PSR-007 | Medium | Tenant concurrency | Gateway has bounded global admission and process-local request rates; worker admission is authoritative | Do not claim per-tenant active-work limits until permits reconcile against terminal worker state or confirmed teardown |
-| PSR-008 | Medium | Observability | Structured request logs and existing local runtime metrics exist; runbook describes checks | Complete bounded gateway/router/worker metrics and private export before unattended production operation |
+| PSR-008 | Medium | Observability | The gateway exposes separately authenticated, fixed-cardinality bounded metrics; structured request logs and local runtime metrics remain available | Add equivalent bounded worker/supervisor metrics and validate alerts before unattended production operation |
 | PSR-009 | Medium | Artifact lifecycle | Opaque tenant-scoped store validates size/type/digest and tombstones deletion | Add retention/orphan/losing-attempt cleanup and remote artifact transport before advertising artifact-dependent remote routes |
 | PSR-010 | Medium | Credential rotation | Public gateway has one API key/tenant and gateways use one private worker credential pair | Document coordinated rotation; add multi-key/per-worker identity where the deployment requires independent revocation |
 | PSR-011 | High | Hardware/performance claims | Source, parser, mock, and tiny CPU evidence are separated | No Metal, CUDA, multi-GPU, soak, capacity, latency, or user-count claim without exact retained target evidence |
