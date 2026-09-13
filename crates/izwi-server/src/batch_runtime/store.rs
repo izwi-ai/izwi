@@ -16,11 +16,12 @@ use crate::{
     },
 };
 use anyhow::{anyhow, bail, Context};
+use izwi_hooks::{HookMetadata, MediaNamespace, MediaWriteRequest};
 use sea_orm::{
     ConnectionTrait, DatabaseConnection, DbBackend, QueryResult, SqliteTransactionMode,
     TransactionOptions, TransactionTrait, Value,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
@@ -105,6 +106,7 @@ pub(crate) struct ArtifactCleanupIntent {
 
 #[derive(Debug, Clone)]
 pub(crate) struct NewProviderWriteReservation {
+    pub write_id: String,
     pub tenant_scope: String,
     pub storage_namespace: String,
     pub content_type: String,
@@ -112,6 +114,7 @@ pub(crate) struct NewProviderWriteReservation {
     pub expected_size_bytes: u64,
     pub expected_sha256: String,
     pub lifetime_ms: u64,
+    pub provider_request: MediaWriteRequest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,9 +129,51 @@ pub(crate) struct ProviderWriteReservation {
     pub filename: Option<String>,
     pub expected_size_bytes: u64,
     pub expected_sha256: String,
+    pub provider_request: MediaWriteRequest,
     pub storage_key: Option<String>,
     pub cleanup_claim_token: Option<String>,
     pub cleanup_attempt_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderWriteRequestEnvelope {
+    version: u16,
+    request: ProviderWriteRequestV1,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderWriteRequestV1 {
+    namespace: MediaNamespace,
+    record_id: String,
+    preferred_filename: Option<String>,
+    content_type: String,
+    metadata: HookMetadata,
+}
+
+impl From<&MediaWriteRequest> for ProviderWriteRequestV1 {
+    fn from(request: &MediaWriteRequest) -> Self {
+        Self {
+            namespace: request.namespace.clone(),
+            record_id: request.record_id.clone(),
+            preferred_filename: request.preferred_filename.clone(),
+            content_type: request.content_type.clone(),
+            metadata: request.metadata.clone(),
+        }
+    }
+}
+
+impl From<ProviderWriteRequestV1> for MediaWriteRequest {
+    fn from(request: ProviderWriteRequestV1) -> Self {
+        Self {
+            namespace: request.namespace,
+            record_id: request.record_id,
+            preferred_filename: request.preferred_filename,
+            content_type: request.content_type,
+            metadata: request.metadata,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -247,9 +292,16 @@ const MAX_PROVIDER_WRITE_CLEANUP_BATCH: usize = 64;
 const MAX_PROVIDER_WRITE_NAMESPACE_BYTES: usize = 128;
 const MAX_PROVIDER_WRITE_CONTENT_TYPE_BYTES: usize = 256;
 const MAX_PROVIDER_WRITE_FILENAME_BYTES: usize = 1024;
+const MAX_PROVIDER_WRITE_REQUEST_ENVELOPE_BYTES: usize = 8 * 1024;
+const MAX_PROVIDER_WRITE_RECORD_ID_BYTES: usize = 64;
+const MAX_PROVIDER_WRITE_METADATA_ENTRIES: usize = 16;
+const MAX_PROVIDER_WRITE_METADATA_KEY_BYTES: usize = 128;
+const MAX_PROVIDER_WRITE_METADATA_VALUE_BYTES: usize = 1024;
+const MAX_PROVIDER_WRITE_METADATA_BYTES: usize = 4 * 1024;
 const MAX_PROVIDER_WRITE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_PROVIDER_WRITE_LIFETIME_MS: u64 = 10 * 60 * 1000;
 const PROVIDER_WRITE_CLEANUP_CLAIM_MS: u64 = 30 * 1000;
+const PROVIDER_WRITE_REQUEST_ENVELOPE_VERSION: u16 = 1;
 
 fn bounded_maintenance_batch_limit(limit: usize) -> usize {
     limit.clamp(1, MAX_RUNTIME_MAINTENANCE_BATCH_LIMIT)
@@ -1002,6 +1054,7 @@ impl BatchRuntimeStore {
         input: NewProviderWriteReservation,
     ) -> anyhow::Result<ProviderWriteReservation> {
         validate_provider_write_input(&input)?;
+        let request_envelope_json = serialize_provider_write_request(&input.provider_request)?;
         let db = self.db.connection().await?;
         let tx = db
             .begin_with_options(runtime_write_transaction_options())
@@ -1024,7 +1077,7 @@ impl BatchRuntimeStore {
         );
         let now = self.now_millis();
         let expires_at = now.saturating_add(i64::try_from(input.lifetime_ms)?);
-        let write_id = new_uuid();
+        let write_id = input.write_id.clone();
         let reservation_token = new_uuid();
         tx.execute_raw(raw::statement(
             &tx,
@@ -1033,10 +1086,11 @@ impl BatchRuntimeStore {
                 write_id, reservation_token, created_at, updated_at, expires_at,
                 available_at, state, tenant_scope, storage_namespace,
                 content_type, filename, expected_size_bytes, expected_sha256,
+                provider_request_json,
                 storage_key, cleanup_claim_token, cleanup_claim_expires_at,
                 cleanup_attempt_count, last_error
             ) VALUES (?1, ?2, ?3, ?3, ?4, ?4, 'reserved', ?5, ?6, ?7, ?8,
-                      ?9, ?10, NULL, NULL, NULL, 0, NULL)
+                      ?9, ?10, ?11, NULL, NULL, NULL, 0, NULL)
             "#,
             vec![
                 write_id.clone().into(),
@@ -1049,6 +1103,7 @@ impl BatchRuntimeStore {
                 opt_string(input.filename),
                 u64_to_i64_value(input.expected_size_bytes)?,
                 input.expected_sha256.into(),
+                request_envelope_json.into(),
             ],
         )?)
         .await
@@ -1210,17 +1265,26 @@ impl BatchRuntimeStore {
             .begin_with_options(runtime_write_transaction_options())
             .await?;
         let now = self.now_millis();
+        let request_length = provider_write_request_length_sql(tx.get_database_backend())?;
+        let selection_sql = format!(
+            r#"
+            SELECT write_id FROM provider_write_reservations
+            WHERE (
+                (state IN ('reserved', 'stored', 'cleanup_pending') AND available_at <= ?1)
+                OR (state = 'cleanup_claimed' AND cleanup_claim_expires_at <= ?1)
+            )
+              AND (provider_request_json IS NOT NULL OR storage_namespace = 'artifact-store')
+              AND (provider_request_json IS NULL OR {request_length} <= ?2)
+            ORDER BY available_at ASC, created_at ASC, write_id ASC LIMIT ?3
+            "#
+        );
         let rows = tx
             .query_all_raw(raw::statement(
                 &tx,
-                r#"
-            SELECT write_id FROM provider_write_reservations
-            WHERE (state IN ('reserved', 'stored', 'cleanup_pending') AND available_at <= ?1)
-               OR (state = 'cleanup_claimed' AND cleanup_claim_expires_at <= ?1)
-            ORDER BY available_at ASC, created_at ASC, write_id ASC LIMIT ?2
-        "#,
+                selection_sql,
                 vec![
                     now.into(),
+                    i64::try_from(MAX_PROVIDER_WRITE_REQUEST_ENVELOPE_BYTES)?.into(),
                     i64::try_from(limit.min(MAX_PROVIDER_WRITE_CLEANUP_BATCH))?.into(),
                 ],
             )?)
@@ -1252,8 +1316,21 @@ impl BatchRuntimeStore {
                 )?)
                 .await?;
             if result.rows_affected() == 1 {
-                if let Some(reservation) = get_provider_write_with(&tx, &write_id).await? {
-                    claimed.push(reservation);
+                match get_provider_write_with(&tx, &write_id).await {
+                    Ok(Some(reservation)) => claimed.push(reservation),
+                    Ok(None) => {
+                        quarantine_invalid_provider_write(
+                            &tx,
+                            &write_id,
+                            now,
+                            "Provider write request envelope could not be loaded safely",
+                        )
+                        .await?;
+                    }
+                    Err(error) => {
+                        quarantine_invalid_provider_write(&tx, &write_id, now, &error.to_string())
+                            .await?;
+                    }
                 }
             }
         }
@@ -5190,7 +5267,51 @@ async fn lock_provider_write_capacity<C: ConnectionTrait>(db: &C) -> anyhow::Res
     Ok(())
 }
 
+async fn quarantine_invalid_provider_write<C: ConnectionTrait>(
+    db: &C,
+    write_id: &str,
+    now: i64,
+    error: &str,
+) -> anyhow::Result<()> {
+    let available_at = now.saturating_add(i64::try_from(MAX_ARTIFACT_CLEANUP_BACKOFF_MS)?);
+    let result = db
+        .execute_raw(raw::statement(
+            db,
+            r#"
+            UPDATE provider_write_reservations
+            SET state = 'cleanup_pending', updated_at = ?1, available_at = ?2,
+                cleanup_attempt_count = CASE
+                    WHEN cleanup_attempt_count < 4294967295
+                    THEN cleanup_attempt_count + 1
+                    ELSE cleanup_attempt_count
+                END,
+                last_error = ?3, cleanup_claim_token = NULL,
+                cleanup_claim_expires_at = NULL
+            WHERE write_id = ?4 AND state = 'cleanup_claimed'
+            "#,
+            vec![
+                now.into(),
+                available_at.into(),
+                truncate_utf8_bytes(error, MAX_ARTIFACT_CLEANUP_ERROR_BYTES).into(),
+                write_id.into(),
+            ],
+        )?)
+        .await
+        .context("Failed to quarantine invalid provider write request")?;
+    anyhow::ensure!(
+        result.rows_affected() == 1,
+        "Invalid provider write request lost its cleanup claim"
+    );
+    Ok(())
+}
+
 fn validate_provider_write_input(input: &NewProviderWriteReservation) -> anyhow::Result<()> {
+    let write_id = uuid::Uuid::parse_str(&input.write_id)
+        .map_err(|_| anyhow!("Invalid provider write identity"))?;
+    anyhow::ensure!(
+        write_id.hyphenated().to_string() == input.write_id,
+        "Invalid provider write identity"
+    );
     validate_artifact_cleanup_tenant(&input.tenant_scope)?;
     anyhow::ensure!(
         !input.storage_namespace.is_empty()
@@ -5228,7 +5349,192 @@ fn validate_provider_write_input(input: &NewProviderWriteReservation) -> anyhow:
         input.lifetime_ms > 0 && input.lifetime_ms <= MAX_PROVIDER_WRITE_LIFETIME_MS,
         "Invalid provider write lifetime"
     );
+    validate_provider_write_request(
+        &input.provider_request,
+        &input.write_id,
+        &input.tenant_scope,
+        &input.storage_namespace,
+        &input.content_type,
+        input.filename.as_deref(),
+    )?;
     Ok(())
+}
+
+fn validate_provider_write_request(
+    request: &MediaWriteRequest,
+    write_id: &str,
+    tenant_scope: &str,
+    storage_namespace: &str,
+    content_type: &str,
+    filename: Option<&str>,
+) -> anyhow::Result<()> {
+    match &request.namespace {
+        MediaNamespace::Other(namespace) => anyhow::ensure!(
+            !namespace.is_empty()
+                && namespace.len() <= MAX_PROVIDER_WRITE_NAMESPACE_BYTES
+                && !namespace.chars().any(char::is_control),
+            "Invalid provider request namespace"
+        ),
+        MediaNamespace::TranscriptionUpload
+        | MediaNamespace::DiarizationUpload
+        | MediaNamespace::GeneratedSpeech
+        | MediaNamespace::SavedVoice
+        | MediaNamespace::ChatMedia
+        | MediaNamespace::Export => {}
+    }
+    anyhow::ensure!(
+        provider_namespace_storage_value(&request.namespace) == storage_namespace,
+        "Provider request namespace does not match its reservation"
+    );
+    anyhow::ensure!(
+        request.record_id == write_id
+            && !request.record_id.is_empty()
+            && request.record_id.len() <= MAX_PROVIDER_WRITE_RECORD_ID_BYTES
+            && !request.record_id.chars().any(char::is_control),
+        "Invalid provider request record identity"
+    );
+    anyhow::ensure!(
+        request.content_type == content_type && request.preferred_filename.as_deref() == filename,
+        "Provider request does not match its reservation"
+    );
+    anyhow::ensure!(
+        request.metadata.get("tenant_id").map(String::as_str) == Some(tenant_scope),
+        "Provider request tenant does not match its reservation"
+    );
+    anyhow::ensure!(
+        request.metadata.len() <= MAX_PROVIDER_WRITE_METADATA_ENTRIES,
+        "Provider request metadata entry count exceeds the limit"
+    );
+    let mut metadata_bytes = 0usize;
+    for (key, value) in &request.metadata {
+        anyhow::ensure!(
+            !key.is_empty()
+                && key.len() <= MAX_PROVIDER_WRITE_METADATA_KEY_BYTES
+                && !key.chars().any(char::is_control),
+            "Invalid provider request metadata key"
+        );
+        anyhow::ensure!(
+            value.len() <= MAX_PROVIDER_WRITE_METADATA_VALUE_BYTES
+                && !value.chars().any(char::is_control),
+            "Invalid provider request metadata value"
+        );
+        metadata_bytes = metadata_bytes
+            .checked_add(key.len())
+            .and_then(|bytes| bytes.checked_add(value.len()))
+            .context("Provider request metadata size overflowed")?;
+    }
+    anyhow::ensure!(
+        metadata_bytes <= MAX_PROVIDER_WRITE_METADATA_BYTES,
+        "Provider request metadata exceeds the aggregate byte limit"
+    );
+    Ok(())
+}
+
+fn serialize_provider_write_request(request: &MediaWriteRequest) -> anyhow::Result<String> {
+    let mut output = BoundedJsonBuffer::new(MAX_PROVIDER_WRITE_REQUEST_ENVELOPE_BYTES);
+    let result = serde_json::to_writer(
+        &mut output,
+        &ProviderWriteRequestEnvelope {
+            version: PROVIDER_WRITE_REQUEST_ENVELOPE_VERSION,
+            request: request.into(),
+        },
+    );
+    if output.overflowed {
+        bail!("Provider write request envelope exceeds the byte limit");
+    }
+    result.context("Failed to serialize provider write request envelope")?;
+    String::from_utf8(output.bytes).context("Provider write request envelope was not UTF-8")
+}
+
+fn deserialize_provider_write_request(raw: &str) -> anyhow::Result<MediaWriteRequest> {
+    anyhow::ensure!(
+        raw.len() <= MAX_PROVIDER_WRITE_REQUEST_ENVELOPE_BYTES,
+        "Stored provider write request envelope exceeds the byte limit"
+    );
+    let envelope: ProviderWriteRequestEnvelope =
+        serde_json::from_str(raw).context("Stored provider write request envelope is invalid")?;
+    anyhow::ensure!(
+        envelope.version == PROVIDER_WRITE_REQUEST_ENVELOPE_VERSION,
+        "Stored provider write request envelope version is unsupported"
+    );
+    Ok(envelope.request.into())
+}
+
+fn legacy_provider_write_request(
+    write_id: &str,
+    tenant_scope: &str,
+    storage_namespace: &str,
+    content_type: &str,
+    filename: Option<&str>,
+) -> anyhow::Result<MediaWriteRequest> {
+    anyhow::ensure!(
+        storage_namespace == "artifact-store",
+        "Legacy provider write request cannot be reconstructed safely"
+    );
+    let mut metadata = HookMetadata::new();
+    metadata.insert("tenant_id".to_string(), tenant_scope.to_string());
+    Ok(MediaWriteRequest {
+        namespace: MediaNamespace::Other(storage_namespace.to_string()),
+        record_id: write_id.to_string(),
+        preferred_filename: filename.map(str::to_string),
+        content_type: content_type.to_string(),
+        metadata,
+    })
+}
+
+fn provider_namespace_storage_value(namespace: &MediaNamespace) -> &str {
+    match namespace {
+        MediaNamespace::TranscriptionUpload => "transcription_upload",
+        MediaNamespace::DiarizationUpload => "diarization_upload",
+        MediaNamespace::GeneratedSpeech => "generated_speech",
+        MediaNamespace::SavedVoice => "saved_voice",
+        MediaNamespace::ChatMedia => "chat_media",
+        MediaNamespace::Export => "export",
+        MediaNamespace::Other(namespace) => namespace,
+    }
+}
+
+fn provider_write_request_length_sql(backend: DbBackend) -> anyhow::Result<&'static str> {
+    match backend {
+        DbBackend::Sqlite => Ok("LENGTH(CAST(provider_request_json AS BLOB))"),
+        DbBackend::Postgres | DbBackend::MySql => Ok("OCTET_LENGTH(provider_request_json)"),
+        backend => bail!("Unsupported provider write database backend: {backend:?}"),
+    }
+}
+
+struct BoundedJsonBuffer {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+    overflowed: bool,
+}
+
+impl BoundedJsonBuffer {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(max_bytes.min(1024)),
+            max_bytes,
+            overflowed: false,
+        }
+    }
+}
+
+impl Write for BoundedJsonBuffer {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let Some(new_len) = self.bytes.len().checked_add(bytes.len()) else {
+            self.overflowed = true;
+            return Err(io::Error::other("bounded JSON buffer overflow"));
+        };
+        if new_len > self.max_bytes {
+            self.overflowed = true;
+            return Err(io::Error::other("bounded JSON buffer limit exceeded"));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 pub(crate) fn validate_artifact_cleanup_storage_key(storage_key: &str) -> anyhow::Result<()> {
@@ -5442,11 +5748,18 @@ async fn get_provider_write_with<C: ConnectionTrait>(
     db: &C,
     write_id: &str,
 ) -> anyhow::Result<Option<ProviderWriteReservation>> {
+    let request_length = provider_write_request_length_sql(db.get_database_backend())?;
+    let sql = format!(
+        "{PROVIDER_WRITE_COLUMNS_SQL} AND (provider_request_json IS NULL OR {request_length} <= ?2)"
+    );
     let row = db
         .query_one_raw(raw::statement(
             db,
-            PROVIDER_WRITE_COLUMNS_SQL,
-            vec![write_id.into()],
+            sql,
+            vec![
+                write_id.into(),
+                i64::try_from(MAX_PROVIDER_WRITE_REQUEST_ENVELOPE_BYTES)?.into(),
+            ],
         )?)
         .await?;
     row.as_ref().map(map_provider_write).transpose()
@@ -5499,7 +5812,7 @@ pub fn current_timestamp_millis() -> i64 {
 
 const MEDIA_ASSET_COLUMNS_SQL: &str =
     "SELECT id, created_at, updated_at, asset_kind, storage_namespace, storage_key, content_type, filename, size_bytes, sha256, duration_secs, sample_rate_hz, channel_count, peak_amplitude, rms_amplitude, source_asset_id, canonical_profile_version, scan_status, retention_policy, deleted_at, metadata_json FROM media_assets WHERE id = ?1";
-const PROVIDER_WRITE_COLUMNS_SQL: &str = "SELECT write_id, reservation_token, created_at, expires_at, tenant_scope, storage_namespace, content_type, filename, expected_size_bytes, expected_sha256, storage_key, cleanup_claim_token, cleanup_attempt_count FROM provider_write_reservations WHERE write_id = ?1";
+const PROVIDER_WRITE_COLUMNS_SQL: &str = "SELECT write_id, reservation_token, created_at, expires_at, tenant_scope, storage_namespace, content_type, filename, expected_size_bytes, expected_sha256, provider_request_json, storage_key, cleanup_claim_token, cleanup_attempt_count FROM provider_write_reservations WHERE write_id = ?1";
 const MEDIA_ASSET_BY_STORAGE_KEY_SQL: &str =
     "SELECT id, created_at, updated_at, asset_kind, storage_namespace, storage_key, content_type, filename, size_bytes, sha256, duration_secs, sample_rate_hz, channel_count, peak_amplitude, rms_amplitude, source_asset_id, canonical_profile_version, scan_status, retention_policy, deleted_at, metadata_json FROM media_assets WHERE storage_key = ?1 AND deleted_at IS NULL";
 const MEDIA_ASSET_BY_SOURCE_PROFILE_SQL: &str =
@@ -5686,20 +5999,36 @@ fn map_artifact_cleanup_intent(row: &QueryResult) -> anyhow::Result<ArtifactClea
 }
 
 fn map_provider_write(row: &QueryResult) -> anyhow::Result<ProviderWriteReservation> {
+    let write_id: String = row.try_get_by_index(0)?;
+    let tenant_scope: String = row.try_get_by_index(4)?;
+    let storage_namespace: String = row.try_get_by_index(5)?;
+    let content_type: String = row.try_get_by_index(6)?;
+    let filename: Option<String> = row.try_get_by_index(7)?;
+    let provider_request = match row.try_get_by_index::<Option<String>>(10)? {
+        Some(raw) => deserialize_provider_write_request(&raw)?,
+        None => legacy_provider_write_request(
+            &write_id,
+            &tenant_scope,
+            &storage_namespace,
+            &content_type,
+            filename.as_deref(),
+        )?,
+    };
     let reservation = ProviderWriteReservation {
-        write_id: row.try_get_by_index(0)?,
+        write_id,
         reservation_token: row.try_get_by_index(1)?,
         created_at: i64_to_u64(row.try_get_by_index(2)?)?,
         expires_at: i64_to_u64(row.try_get_by_index(3)?)?,
-        tenant_scope: row.try_get_by_index(4)?,
-        storage_namespace: row.try_get_by_index(5)?,
-        content_type: row.try_get_by_index(6)?,
-        filename: row.try_get_by_index(7)?,
+        tenant_scope,
+        storage_namespace,
+        content_type,
+        filename,
         expected_size_bytes: i64_to_u64(row.try_get_by_index(8)?)?,
         expected_sha256: row.try_get_by_index(9)?,
-        storage_key: row.try_get_by_index(10)?,
-        cleanup_claim_token: row.try_get_by_index(11)?,
-        cleanup_attempt_count: i64_to_u32(row.try_get_by_index(12)?)?,
+        provider_request,
+        storage_key: row.try_get_by_index(11)?,
+        cleanup_claim_token: row.try_get_by_index(12)?,
+        cleanup_attempt_count: i64_to_u32(row.try_get_by_index(13)?)?,
     };
     anyhow::ensure!(
         uuid::Uuid::parse_str(&reservation.write_id).is_ok()
@@ -5711,6 +6040,7 @@ fn map_provider_write(row: &QueryResult) -> anyhow::Result<ProviderWriteReservat
         "Stored provider write identity is invalid"
     );
     validate_provider_write_input(&NewProviderWriteReservation {
+        write_id: reservation.write_id.clone(),
         tenant_scope: reservation.tenant_scope.clone(),
         storage_namespace: reservation.storage_namespace.clone(),
         content_type: reservation.content_type.clone(),
@@ -5720,6 +6050,7 @@ fn map_provider_write(row: &QueryResult) -> anyhow::Result<ProviderWriteReservat
         lifetime_ms: reservation
             .expires_at
             .saturating_sub(reservation.created_at),
+        provider_request: reservation.provider_request.clone(),
     })?;
     if let Some(key) = reservation.storage_key.as_deref() {
         validate_artifact_cleanup_storage_key(key)?;
@@ -6256,6 +6587,365 @@ mod tests {
             BatchRuntimeStore::initialize_with_database(StoreDatabase::new(db_path)),
             root,
         )
+    }
+
+    fn test_provider_write_input(
+        namespace: MediaNamespace,
+        storage_namespace: &str,
+        lifetime_ms: u64,
+    ) -> NewProviderWriteReservation {
+        let write_id = new_uuid();
+        let mut metadata = HookMetadata::new();
+        metadata.insert("tenant_id".to_string(), "tenant-a".to_string());
+        NewProviderWriteReservation {
+            write_id: write_id.clone(),
+            tenant_scope: "tenant-a".to_string(),
+            storage_namespace: storage_namespace.to_string(),
+            content_type: "application/octet-stream".to_string(),
+            filename: Some("artifact.bin".to_string()),
+            expected_size_bytes: 4,
+            expected_sha256: sha256_hex(b"data"),
+            lifetime_ms,
+            provider_request: MediaWriteRequest {
+                namespace,
+                record_id: write_id,
+                preferred_filename: Some("artifact.bin".to_string()),
+                content_type: "application/octet-stream".to_string(),
+                metadata,
+            },
+        }
+    }
+
+    #[test]
+    fn provider_write_request_envelope_is_typed_and_bounded() {
+        let mut input = test_provider_write_input(
+            MediaNamespace::Other("artifact-store".to_string()),
+            "artifact-store",
+            1_000,
+        );
+        input
+            .provider_request
+            .metadata
+            .insert("workflow_stage".to_string(), "finalize".to_string());
+        validate_provider_write_input(&input).expect("valid exact provider request");
+        let serialized = serialize_provider_write_request(&input.provider_request).unwrap();
+        assert_eq!(
+            deserialize_provider_write_request(&serialized).unwrap(),
+            input.provider_request
+        );
+        assert!(deserialize_provider_write_request("{}").is_err());
+        assert!(deserialize_provider_write_request(
+            &"x".repeat(MAX_PROVIDER_WRITE_REQUEST_ENVELOPE_BYTES + 1)
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("exceeds"));
+        let unsupported = serialized.replacen("\"version\":1", "\"version\":2", 1);
+        assert!(deserialize_provider_write_request(&unsupported)
+            .unwrap_err()
+            .to_string()
+            .contains("version is unsupported"));
+        let mut nested_unknown: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        nested_unknown["request"]["future_field"] = json!("must-not-be-dropped");
+        assert!(
+            deserialize_provider_write_request(&nested_unknown.to_string())
+                .unwrap_err()
+                .to_string()
+                .contains("invalid")
+        );
+
+        let mut invalid = input.clone();
+        invalid.write_id = invalid.write_id.to_ascii_uppercase();
+        invalid.provider_request.record_id = invalid.write_id.clone();
+        assert!(validate_provider_write_input(&invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("identity"));
+
+        let mut invalid = input.clone();
+        invalid.provider_request.record_id = new_uuid();
+        assert!(validate_provider_write_input(&invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("record identity"));
+
+        let mut invalid = input.clone();
+        invalid.provider_request.namespace = MediaNamespace::Other("other".to_string());
+        assert!(validate_provider_write_input(&invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("namespace does not match"));
+
+        let mut invalid = input.clone();
+        invalid.provider_request.namespace = MediaNamespace::Other(String::new());
+        assert!(validate_provider_write_input(&invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("request namespace"));
+
+        let mut invalid = input.clone();
+        invalid.provider_request.content_type = "text/plain".to_string();
+        assert!(validate_provider_write_input(&invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("does not match"));
+
+        let mut invalid = input.clone();
+        invalid.provider_request.metadata = (0..=MAX_PROVIDER_WRITE_METADATA_ENTRIES)
+            .map(|index| (format!("key-{index}"), "value".to_string()))
+            .collect();
+        invalid
+            .provider_request
+            .metadata
+            .insert("tenant_id".to_string(), "tenant-a".to_string());
+        assert!(validate_provider_write_input(&invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("entry count"));
+
+        let mut invalid = input.clone();
+        invalid.provider_request.metadata.insert(
+            "k".repeat(MAX_PROVIDER_WRITE_METADATA_KEY_BYTES + 1),
+            "value".to_string(),
+        );
+        assert!(validate_provider_write_input(&invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("metadata key"));
+
+        let mut invalid = input.clone();
+        invalid.provider_request.metadata.insert(
+            "large".to_string(),
+            "v".repeat(MAX_PROVIDER_WRITE_METADATA_VALUE_BYTES + 1),
+        );
+        assert!(validate_provider_write_input(&invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("metadata value"));
+
+        let mut invalid = input.clone();
+        for index in 0..5 {
+            invalid
+                .provider_request
+                .metadata
+                .insert(format!("aggregate-{index}"), "v".repeat(900));
+        }
+        assert!(validate_provider_write_input(&invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("aggregate byte limit"));
+
+        let mut invalid = input.clone();
+        invalid.provider_request.namespace =
+            MediaNamespace::Other("n".repeat(MAX_PROVIDER_WRITE_NAMESPACE_BYTES + 1));
+        assert!(validate_provider_write_input(&invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("request namespace"));
+
+        let mut invalid = input;
+        invalid.provider_request.metadata.clear();
+        invalid
+            .provider_request
+            .metadata
+            .insert("tenant_id".to_string(), "tenant-a".to_string());
+        for index in 0..4 {
+            invalid
+                .provider_request
+                .metadata
+                .insert(format!("escaped-{index}"), "\\\"".repeat(500));
+        }
+        assert!(serialize_provider_write_request(&invalid.provider_request)
+            .unwrap_err()
+            .to_string()
+            .contains("envelope exceeds"));
+    }
+
+    #[tokio::test]
+    async fn provider_write_request_roundtrips_and_legacy_recovery_fails_closed() {
+        let (mut store, _root) = build_store();
+        let clock = Arc::new(AtomicI64::new(1_000));
+        store.set_test_clock(clock.clone());
+
+        let mut exact =
+            test_provider_write_input(MediaNamespace::GeneratedSpeech, "generated_speech", 10);
+        exact
+            .provider_request
+            .metadata
+            .insert("workflow_stage".to_string(), "finalize".to_string());
+        let exact = store.reserve_provider_write(exact).await.unwrap();
+        assert_eq!(
+            exact.provider_request.namespace,
+            MediaNamespace::GeneratedSpeech
+        );
+        assert_eq!(
+            exact
+                .provider_request
+                .metadata
+                .get("workflow_stage")
+                .map(String::as_str),
+            Some("finalize")
+        );
+
+        let legacy = store
+            .reserve_provider_write(test_provider_write_input(
+                MediaNamespace::Other("artifact-store".to_string()),
+                "artifact-store",
+                10,
+            ))
+            .await
+            .unwrap();
+        let db = store.connection().await.unwrap();
+        db.execute_raw(
+            raw::statement(
+                db,
+                "UPDATE provider_write_reservations SET provider_request_json = NULL WHERE write_id IN (?1, ?2)",
+                vec![exact.write_id.clone().into(), legacy.write_id.clone().into()],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        clock.store(1_010, Ordering::SeqCst);
+        let claimed = store.claim_due_provider_write_cleanup(64).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].write_id, legacy.write_id);
+        assert_eq!(
+            claimed[0].provider_request,
+            legacy_provider_write_request(
+                &legacy.write_id,
+                &legacy.tenant_scope,
+                &legacy.storage_namespace,
+                &legacy.content_type,
+                legacy.filename.as_deref(),
+            )
+            .unwrap()
+        );
+        let retained = db
+            .query_one_raw(
+                raw::statement(
+                    db,
+                    "SELECT COUNT(*) FROM provider_write_reservations WHERE write_id = ?1 AND provider_request_json IS NULL",
+                    vec![exact.write_id.into()],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get_by_index::<i64>(0)
+            .unwrap();
+        assert_eq!(retained, 1);
+    }
+
+    #[tokio::test]
+    async fn invalid_provider_write_rows_remain_fenced_without_starving_cleanup() {
+        let (mut store, _root) = build_store();
+        let clock = Arc::new(AtomicI64::new(1_000));
+        store.set_test_clock(clock.clone());
+        let poison = store
+            .reserve_provider_write(test_provider_write_input(
+                MediaNamespace::Other("artifact-store".to_string()),
+                "artifact-store",
+                10,
+            ))
+            .await
+            .unwrap();
+        let oversized = store
+            .reserve_provider_write(test_provider_write_input(
+                MediaNamespace::GeneratedSpeech,
+                "generated_speech",
+                10,
+            ))
+            .await
+            .unwrap();
+        let valid = store
+            .reserve_provider_write(test_provider_write_input(
+                MediaNamespace::Other("artifact-store".to_string()),
+                "artifact-store",
+                10,
+            ))
+            .await
+            .unwrap();
+        let db = store.connection().await.unwrap();
+        db.execute_raw(
+            raw::statement(
+                db,
+                "UPDATE provider_write_reservations SET provider_request_json = ?1, created_at = 0 WHERE write_id = ?2",
+                vec![
+                    "{\"version\":1,\"request\":{\"future_field\":true}}"
+                        .into(),
+                    poison.write_id.clone().into(),
+                ],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        db.execute_raw(
+            raw::statement(
+                db,
+                "UPDATE provider_write_reservations SET provider_request_json = ?1, created_at = -1 WHERE write_id = ?2",
+                vec![
+                    "x"
+                        .repeat(MAX_PROVIDER_WRITE_REQUEST_ENVELOPE_BYTES + 1)
+                        .into(),
+                    oversized.write_id.clone().into(),
+                ],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        clock.store(1_010, Ordering::SeqCst);
+        let claimed = store.claim_due_provider_write_cleanup(64).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].write_id, valid.write_id);
+        assert!(get_provider_write_with(db, &oversized.write_id)
+            .await
+            .unwrap()
+            .is_none());
+
+        let quarantined = db
+            .query_one_raw(
+                raw::statement(
+                    db,
+                    "SELECT state, available_at, cleanup_attempt_count, last_error FROM provider_write_reservations WHERE write_id = ?1",
+                    vec![poison.write_id.into()],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            quarantined.try_get_by_index::<String>(0).unwrap(),
+            "cleanup_pending"
+        );
+        assert!(quarantined.try_get_by_index::<i64>(1).unwrap() > 1_010);
+        assert_eq!(quarantined.try_get_by_index::<i64>(2).unwrap(), 1);
+        assert!(quarantined
+            .try_get_by_index::<Option<String>>(3)
+            .unwrap()
+            .is_some());
+
+        let oversized_retained = db
+            .query_one_raw(
+                raw::statement(
+                    db,
+                    "SELECT COUNT(*) FROM provider_write_reservations WHERE write_id = ?1 AND state = 'reserved'",
+                    vec![oversized.write_id.into()],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get_by_index::<i64>(0)
+            .unwrap();
+        assert_eq!(oversized_retained, 1);
     }
 
     fn durable_idempotency_request(

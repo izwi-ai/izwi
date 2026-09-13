@@ -8,6 +8,7 @@ use crate::batch_runtime::store::{
     validate_artifact_cleanup_storage_key, ArtifactCleanupIntent, ArtifactCleanupReason,
     BatchRuntimeStore, NewMediaAsset, NewProviderWriteReservation, ProviderWriteReservation,
 };
+use crate::ids::new_uuid;
 use izwi_hooks::{
     HookError, HookMetadata, MediaDeleteRequest, MediaNamespace, MediaObjectKey, MediaReadRequest,
     MediaReservedWriteRecoveryRequest, MediaReservedWriteRequest, MediaStorageProvider,
@@ -238,9 +239,18 @@ impl ArtifactStore {
         }
         let digest = sha256_hex(&write.bytes);
         let size_bytes = write.bytes.len() as u64;
+        let write_id = new_uuid();
+        let provider_request = MediaWriteRequest {
+            namespace: MediaNamespace::Other("artifact-store".to_string()),
+            record_id: write_id.clone(),
+            preferred_filename: write.filename.clone(),
+            content_type: write.content_type.clone(),
+            metadata: tenant_metadata(tenant),
+        };
         let reservation = self
             .metadata
             .reserve_provider_write(NewProviderWriteReservation {
+                write_id,
                 tenant_scope: tenant.as_str().to_string(),
                 storage_namespace: "artifact-store".to_string(),
                 content_type: write.content_type.clone(),
@@ -248,6 +258,7 @@ impl ArtifactStore {
                 expected_size_bytes: size_bytes,
                 expected_sha256: digest.clone(),
                 lifetime_ms: self.provider_write_lifetime().as_millis() as u64,
+                provider_request,
             })
             .await
             .map_err(ArtifactStoreError::Metadata)?;
@@ -684,16 +695,7 @@ impl ArtifactStore {
 }
 
 fn provider_write_request(reservation: &ProviderWriteReservation) -> MediaWriteRequest {
-    MediaWriteRequest {
-        namespace: MediaNamespace::Other(reservation.storage_namespace.clone()),
-        record_id: reservation.write_id.clone(),
-        preferred_filename: reservation.filename.clone(),
-        content_type: reservation.content_type.clone(),
-        metadata: tenant_metadata(
-            &ArtifactTenant::parse(reservation.tenant_scope.clone())
-                .expect("stored provider reservation has a validated tenant"),
-        ),
-    }
+    reservation.provider_request.clone()
 }
 
 fn tenant_metadata(tenant: &ArtifactTenant) -> HookMetadata {
@@ -863,6 +865,35 @@ mod tests {
             },
         )
         .expect("artifact store")
+    }
+
+    fn test_provider_write_input(
+        tenant_scope: &str,
+        storage_namespace: &str,
+        content_type: &str,
+        filename: Option<&str>,
+        bytes: &[u8],
+        lifetime_ms: u64,
+    ) -> NewProviderWriteReservation {
+        let write_id = new_uuid();
+        let tenant = ArtifactTenant::parse(tenant_scope).unwrap();
+        NewProviderWriteReservation {
+            write_id: write_id.clone(),
+            tenant_scope: tenant_scope.to_string(),
+            storage_namespace: storage_namespace.to_string(),
+            content_type: content_type.to_string(),
+            filename: filename.map(str::to_string),
+            expected_size_bytes: bytes.len() as u64,
+            expected_sha256: sha256_hex(bytes),
+            lifetime_ms,
+            provider_request: MediaWriteRequest {
+                namespace: MediaNamespace::Other(storage_namespace.to_string()),
+                record_id: write_id,
+                preferred_filename: filename.map(str::to_string),
+                content_type: content_type.to_string(),
+                metadata: tenant_metadata(&tenant),
+            },
+        }
     }
 
     async fn assert_provider_conformance(root: &TempDir, provider: Arc<dyn MediaStorageProvider>) {
@@ -1082,22 +1113,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_blob_without_returned_key_is_recovered_after_reopen() {
+    async fn exact_provider_request_without_returned_key_is_recovered_after_reopen() {
         let root = tempfile::tempdir().unwrap();
         let db_path = root.path().join("artifacts.sqlite3");
         let provider = Arc::new(MemoryMediaProvider::default());
         let metadata = Arc::new(BatchRuntimeStore::initialize_with_database(
             StoreDatabase::new(db_path.clone()),
         ));
+        let write_id = new_uuid();
+        let mut request_metadata = HookMetadata::new();
+        request_metadata.insert("tenant_id".into(), "tenant-a".into());
+        request_metadata.insert("workflow_stage".into(), "speech-finalize".into());
         let reservation = metadata
             .reserve_provider_write(NewProviderWriteReservation {
+                write_id: write_id.clone(),
                 tenant_scope: "tenant-a".into(),
-                storage_namespace: "artifact-store".into(),
+                storage_namespace: "generated_speech".into(),
                 content_type: "application/octet-stream".into(),
                 filename: Some("crash.bin".into()),
                 expected_size_bytes: 5,
                 expected_sha256: sha256_hex(b"crash"),
                 lifetime_ms: 100,
+                provider_request: MediaWriteRequest {
+                    namespace: MediaNamespace::GeneratedSpeech,
+                    record_id: write_id,
+                    preferred_filename: Some("crash.bin".into()),
+                    content_type: "application/octet-stream".into(),
+                    metadata: request_metadata,
+                },
             })
             .await
             .unwrap();
@@ -1195,15 +1238,14 @@ mod tests {
         ));
         metadata.set_provider_write_capacity_for_test(1);
         let metadata = Arc::new(metadata);
-        let input = NewProviderWriteReservation {
-            tenant_scope: "tenant-a".into(),
-            storage_namespace: "artifact-store".into(),
-            content_type: "application/octet-stream".into(),
-            filename: None,
-            expected_size_bytes: 1,
-            expected_sha256: sha256_hex(b"x"),
-            lifetime_ms: 60_000,
-        };
+        let input = test_provider_write_input(
+            "tenant-a",
+            "artifact-store",
+            "application/octet-stream",
+            None,
+            b"x",
+            60_000,
+        );
         metadata
             .reserve_provider_write(input.clone())
             .await
@@ -1237,15 +1279,14 @@ mod tests {
         ));
         metadata.set_test_clock(clock.clone());
         let reservation = metadata
-            .reserve_provider_write(NewProviderWriteReservation {
-                tenant_scope: "tenant-a".into(),
-                storage_namespace: "artifact-store".into(),
-                content_type: "application/octet-stream".into(),
-                filename: None,
-                expected_size_bytes: 1,
-                expected_sha256: sha256_hex(b"x"),
-                lifetime_ms: 10,
-            })
+            .reserve_provider_write(test_provider_write_input(
+                "tenant-a",
+                "artifact-store",
+                "application/octet-stream",
+                None,
+                b"x",
+                10,
+            ))
             .await
             .unwrap();
         metadata

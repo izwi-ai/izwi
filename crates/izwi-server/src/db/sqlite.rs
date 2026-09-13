@@ -198,6 +198,14 @@ mod tests {
         .expect("default profile count");
         assert_eq!(default_profiles, 1);
 
+        let legacy_provider_writes = query_i64_scalar(
+            &db,
+            "SELECT COUNT(*) FROM provider_write_reservations WHERE write_id = '00000000-0000-4000-8000-000000000001' AND provider_request_json IS NULL",
+        )
+        .await
+        .expect("legacy provider write count");
+        assert_eq!(legacy_provider_writes, 1);
+
         std::env::remove_var("IZWI_DB_PATH");
         std::env::remove_var("IZWI_MEDIA_DIR");
     }
@@ -286,6 +294,7 @@ mod tests {
         ("chat_messages", "content_parts"),
         ("media_assets", "source_asset_id"),
         ("media_assets", "canonical_profile_version"),
+        ("provider_write_reservations", "provider_request_json"),
         ("onboarding_state", "analytics_opt_in"),
         ("transcription_records", "transcription_mode"),
         ("transcription_records", "aligner_model_id"),
@@ -370,6 +379,42 @@ mod tests {
             retention_policy TEXT NOT NULL DEFAULT 'default',
             deleted_at INTEGER NULL,
             metadata_json TEXT NOT NULL DEFAULT '{}'
+        );
+
+        CREATE TABLE provider_write_reservations (
+            write_id TEXT PRIMARY KEY,
+            reservation_token TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            available_at INTEGER NOT NULL,
+            state TEXT NOT NULL,
+            tenant_scope TEXT NOT NULL,
+            storage_namespace TEXT NOT NULL,
+            content_type TEXT NOT NULL,
+            filename TEXT NULL,
+            expected_size_bytes INTEGER NOT NULL,
+            expected_sha256 TEXT NOT NULL,
+            storage_key TEXT NULL,
+            cleanup_claim_token TEXT NULL,
+            cleanup_claim_expires_at INTEGER NULL,
+            cleanup_attempt_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT NULL
+        );
+
+        INSERT INTO provider_write_reservations (
+            write_id, reservation_token, created_at, updated_at, expires_at,
+            available_at, state, tenant_scope, storage_namespace, content_type,
+            filename, expected_size_bytes, expected_sha256, storage_key,
+            cleanup_claim_token, cleanup_claim_expires_at,
+            cleanup_attempt_count, last_error
+        ) VALUES (
+            '00000000-0000-4000-8000-000000000001',
+            '00000000-0000-4000-8000-000000000002',
+            1, 1, 2, 2, 'reserved', 'tenant-a', 'artifact-store',
+            'application/octet-stream', NULL, 1,
+            '0000000000000000000000000000000000000000000000000000000000000000',
+            NULL, NULL, NULL, 0, NULL
         );
 
         CREATE TABLE transcription_records (

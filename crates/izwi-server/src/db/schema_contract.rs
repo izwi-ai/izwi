@@ -366,6 +366,7 @@ const REQUIRED_SCHEMA_TABLES: &[RequiredSchemaTable] = &[
             "filename",
             "expected_size_bytes",
             "expected_sha256",
+            "provider_request_json",
             "storage_key",
             "cleanup_claim_token",
             "cleanup_claim_expires_at",
@@ -664,6 +665,29 @@ mod tests {
             .expect_err("legacy provider schema should fail");
         assert!(
             error.to_string().contains("chat_threads.system_prompt"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_contract_requires_exact_provider_write_request_envelopes() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("sqlite connection");
+        db.execute_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "CREATE TABLE provider_write_reservations (write_id TEXT PRIMARY KEY)",
+        ))
+        .await
+        .expect("partial provider-write table");
+
+        let error = validate_provider_managed_schema(&db)
+            .await
+            .expect_err("provider schema without request envelope should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("provider_write_reservations.provider_request_json"),
             "{error}"
         );
     }

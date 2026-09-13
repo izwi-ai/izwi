@@ -406,6 +406,7 @@ const BASELINE_SCHEMA: &[&str] = &[
         filename TEXT NULL,
         expected_size_bytes INTEGER NOT NULL,
         expected_sha256 TEXT NOT NULL,
+        provider_request_json TEXT NULL,
         storage_key TEXT NULL,
         cleanup_claim_token TEXT NULL,
         cleanup_claim_expires_at INTEGER NULL,
@@ -603,6 +604,11 @@ const POST_COMPATIBILITY_SCHEMA: &[&str] = &[
 ];
 
 const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
+    CompatibilityColumn {
+        table: "provider_write_reservations",
+        column: "provider_request_json",
+        definition: "TEXT NULL",
+    },
     CompatibilityColumn {
         table: "runtime_jobs",
         column: "cancellation_state",

@@ -138,11 +138,16 @@ per-call deadlines, and fixed-size maintenance batches. Local batch-worker
 maintenance processes only explicitly tombstoned facade objects, never a global
 "unreferenced" sweep or a lease-expiry guess. Retention class is recorded, but
 automatic expiry is not implemented. Opaque `ArtifactStore` creation now commits
-a bounded provider-write reservation before sending bytes. The opt-in versioned
-provider operation is recoverable by write ID even when a crash prevents its
-returned key reaching the database; metadata publication atomically consumes
-the reservation. Provider `NotFound` completes recovery only when the object is
-absent and a future commit for the expired write ID is fenced.
+a bounded provider-write reservation before sending bytes. That reservation
+retains an independently versioned, bounded copy of the exact typed namespace,
+record identity, filename, content type, and provider metadata. The opt-in
+versioned provider operation is therefore recoverable by its original request
+even when a crash prevents its returned key reaching the database; metadata
+publication atomically consumes the reservation. Historical rows without an
+envelope are recoverable only for the provable `artifact-store` request shape;
+unknown legacy shapes remain fenced for operator remediation. Provider
+`NotFound` completes recovery only when the object is absent and a future commit
+for the expired write ID is fenced.
 
 Existing media, saved-voice, speech-history, job-output, Studio, and multimodal
 routes do not use this facade yet. Their provider-write migration,
