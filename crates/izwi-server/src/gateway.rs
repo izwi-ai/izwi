@@ -13,7 +13,9 @@ use axum::{
     Json, Router,
 };
 use izwi_core::ServeRuntimeConfig;
-use izwi_hooks::EnterpriseHooks;
+use izwi_hooks::{
+    EnterpriseAction, EnterpriseHooks, HookMetadata, QuotaRequest, ResourceDescriptor,
+};
 use serde::Serialize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,12 +26,16 @@ use tower_http::trace::TraceLayer;
 use tracing::{field, info, info_span, warn, Span};
 
 use crate::api::request_context::{attach_gateway_request_context, attach_gateway_request_id};
-use crate::app::chat::RemoteChatExecution;
+use crate::app::chat::{ChatExecutionRequest, RemoteChatExecution};
 use crate::app::remote_chat_dispatch::RemoteChatDispatcher;
 use crate::error::ApiError;
+use crate::gateway_rate_quota::{GatewayRateDecision, GatewayRateQuota, GatewayRateQuotaConfig};
 use crate::gateway_security::GatewayPerimeterConfig;
 use crate::logging::{SERVICE_NAME, SERVICE_VERSION};
 use crate::state::ServerLifecycle;
+
+const CHAT_COMPLETIONS_RESOURCE: &str = "/v1/chat/completions";
+const MAX_GATEWAY_QUOTA_HOOK_TIME: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 pub struct GatewayState {
@@ -39,6 +45,8 @@ pub struct GatewayState {
     pub(crate) perimeter: GatewayPerimeterConfig,
     pub request_timeout_secs: u64,
     request_admission: Arc<Semaphore>,
+    rate_quota: GatewayRateQuota,
+    max_output_tokens: u32,
 }
 
 impl GatewayState {
@@ -50,6 +58,7 @@ impl GatewayState {
         max_in_flight: usize,
     ) -> Self {
         debug_assert!(max_in_flight > 0);
+        let max_output_tokens = remote_chat_execution.max_output_tokens();
         Self {
             chat_execution: GatewayChatExecution::Pinned(remote_chat_execution),
             enterprise_hooks,
@@ -57,6 +66,8 @@ impl GatewayState {
             perimeter,
             request_timeout_secs: request_timeout_secs.max(1),
             request_admission: Arc::new(Semaphore::new(max_in_flight)),
+            rate_quota: GatewayRateQuota::new(GatewayRateQuotaConfig::default()),
+            max_output_tokens,
         }
     }
 
@@ -68,6 +79,7 @@ impl GatewayState {
         max_in_flight: usize,
     ) -> Self {
         debug_assert!(max_in_flight > 0);
+        let max_output_tokens = dispatcher.max_output_tokens();
         Self {
             chat_execution: GatewayChatExecution::Registry(dispatcher),
             enterprise_hooks,
@@ -75,6 +87,79 @@ impl GatewayState {
             perimeter,
             request_timeout_secs: request_timeout_secs.max(1),
             request_admission: Arc::new(Semaphore::new(max_in_flight)),
+            rate_quota: GatewayRateQuota::new(GatewayRateQuotaConfig::default()),
+            max_output_tokens,
+        }
+    }
+
+    /// Override process-local request-rate policy and the exact private worker
+    /// output ceiling. This remains rate-only: the response-owned global
+    /// admission guard is intentionally separate from future tenant
+    /// concurrent-work accounting, which must wait for confirmed teardown.
+    pub fn with_rate_quota_config(mut self, config: GatewayRateQuotaConfig) -> Self {
+        self.rate_quota = GatewayRateQuota::new(config);
+        self
+    }
+
+    pub(crate) async fn enforce_chat_rate_quota(
+        &self,
+        context: &crate::api::request_context::RequestContext,
+        request: &ChatExecutionRequest,
+    ) -> Result<(), ApiError> {
+        let requested_tokens = request
+            .max_completion_tokens
+            .or(request.max_tokens)
+            .unwrap_or(usize::MAX)
+            .max(1);
+        let estimated_units = u32::try_from(requested_tokens)
+            .unwrap_or(u32::MAX)
+            .min(self.max_output_tokens)
+            .max(1);
+        let resource = ResourceDescriptor::http_route(CHAT_COMPLETIONS_RESOURCE);
+        let hook_budget = context
+            .remaining_budget(Duration::from_secs(self.request_timeout_secs))
+            .unwrap_or(Duration::ZERO)
+            .min(MAX_GATEWAY_QUOTA_HOOK_TIME);
+        if hook_budget.is_zero() {
+            return Err(ApiError::service_unavailable(
+                "Gateway quota service unavailable",
+            ));
+        }
+        let quota_request = QuotaRequest {
+            principal: Some(context.principal.clone()),
+            action: EnterpriseAction::Inference,
+            resource,
+            estimated_units: Some(u64::from(estimated_units)),
+            metadata: HookMetadata::new(),
+        };
+        let evaluation = self.enterprise_hooks.quotas.evaluate(&quota_request);
+        let decision = tokio::time::timeout(hook_budget, evaluation)
+            .await
+            .map_err(|_| {
+                warn!("Enterprise gateway quota hook timed out");
+                ApiError::service_unavailable("Gateway quota service unavailable")
+            })?
+            .map_err(|_| {
+                warn!("Enterprise gateway quota hook failed");
+                ApiError::service_unavailable("Gateway quota service unavailable")
+            })?;
+        if !decision.allowed {
+            return Err(ApiError::too_many_requests(
+                "Gateway tenant rate limit exceeded",
+            ));
+        }
+
+        let tenant_key = context.tenant_key().ok_or_else(|| {
+            ApiError::service_unavailable("Gateway tenant identity is unavailable")
+        })?;
+        match self.rate_quota.check(tenant_key) {
+            Ok(GatewayRateDecision::Allowed) => Ok(()),
+            Ok(GatewayRateDecision::Limited) => Err(ApiError::too_many_requests(
+                "Gateway tenant rate limit exceeded",
+            )),
+            Err(_) => Err(ApiError::service_unavailable(
+                "Gateway tenant rate limiter unavailable",
+            )),
         }
     }
 
@@ -337,7 +422,8 @@ mod tests {
     use futures::StreamExt;
     use izwi_core::ModelVariant;
     use izwi_hooks::{
-        AuthorizationDecision, AuthorizationRequest, EnterpriseAction, HookResult, PolicyEngine,
+        AuthorizationDecision, AuthorizationRequest, EnterpriseAction, HookError, HookResult,
+        PolicyEngine, QuotaDecision, QuotaLimiter, QuotaRequest,
     };
     use izwi_serving_client::{
         mock::{MockFault, MockWorker, MockWorkerConfig},
@@ -349,6 +435,7 @@ mod tests {
     use std::sync::Mutex;
     use tower::Service;
 
+    use crate::api::request_context::RequestContext;
     use crate::app::remote_chat_dispatch::RemoteChatDispatchConfig;
     use crate::gateway_security::MAX_GATEWAY_REQUEST_ID_BYTES;
     use crate::worker_registry::{
@@ -391,6 +478,22 @@ mod tests {
             .uri(path)
             .body(Body::empty())
             .expect("request should build")
+    }
+
+    fn valid_chat_request(max_tokens: usize) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": ModelVariant::Qwen34BGguf.dir_name(),
+                    "messages": [{"role": "user", "content": "quota test"}],
+                    "max_tokens": max_tokens
+                })
+                .to_string(),
+            ))
+            .expect("chat request should build")
     }
 
     async fn registry_gateway_state(model: ModelVariant) -> (GatewayState, MockWorker) {
@@ -1276,6 +1379,129 @@ mod tests {
             "Gateway inference permission denied"
         );
         assert!(!body.to_string().contains("internal policy detail"));
+    }
+
+    #[tokio::test]
+    async fn gateway_quota_hook_receives_server_identity_and_effective_output_units() {
+        #[derive(Default)]
+        struct CapturingQuota(Mutex<Option<QuotaRequest>>);
+
+        #[async_trait::async_trait]
+        impl QuotaLimiter for CapturingQuota {
+            async fn evaluate(&self, request: &QuotaRequest) -> HookResult<QuotaDecision> {
+                *self.0.lock().unwrap() = Some(request.clone());
+                Ok(QuotaDecision {
+                    allowed: false,
+                    reason: Some("private quota detail".into()),
+                })
+            }
+        }
+
+        let quota = Arc::new(CapturingQuota::default());
+        let mut hooks = EnterpriseHooks::noop();
+        hooks.quotas = quota.clone();
+        let state = unreachable_gateway_state_with_hooks(test_perimeter(), hooks)
+            .with_rate_quota_config(GatewayRateQuotaConfig::new(60, 4, 8).unwrap());
+        let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+        let mut request = valid_chat_request(100);
+        request.headers_mut().insert(
+            "x-principal-id",
+            axum::http::HeaderValue::from_static("forged-principal"),
+        );
+        request.headers_mut().insert(
+            "x-tenant-id",
+            axum::http::HeaderValue::from_static("forged-tenant"),
+        );
+        let response = send(app, request).await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let captured = quota.0.lock().unwrap().clone().unwrap();
+        assert_eq!(captured.action, EnterpriseAction::Inference);
+        let principal = captured.principal.unwrap();
+        assert_eq!(principal.id, "test-gateway-principal");
+        assert_eq!(principal.tenant_id.as_deref(), Some("test-tenant"));
+        assert_eq!(
+            captured.resource,
+            ResourceDescriptor::http_route(CHAT_COMPLETIONS_RESOURCE)
+        );
+        assert_eq!(captured.estimated_units, Some(16));
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("quota denial must be bounded");
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "rate_limit_error");
+        assert_eq!(
+            body["error"]["message"],
+            "Gateway tenant rate limit exceeded"
+        );
+        assert!(!body.to_string().contains("private quota detail"));
+    }
+
+    #[tokio::test]
+    async fn gateway_quota_hook_failure_fails_closed_with_stable_error() {
+        struct FailingQuota;
+
+        #[async_trait::async_trait]
+        impl QuotaLimiter for FailingQuota {
+            async fn evaluate(&self, _request: &QuotaRequest) -> HookResult<QuotaDecision> {
+                Err(HookError::Failed("private dependency detail".into()))
+            }
+        }
+
+        let mut hooks = EnterpriseHooks::noop();
+        hooks.quotas = Arc::new(FailingQuota);
+        let app = create_gateway_router(
+            unreachable_gateway_state_with_hooks(test_perimeter(), hooks),
+            &ServeRuntimeConfig::default(),
+        );
+        let response = send(app, valid_chat_request(4)).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("quota failure must be bounded");
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body["error"]["message"],
+            "Gateway quota service unavailable"
+        );
+        assert!(!body.to_string().contains("private dependency detail"));
+    }
+
+    #[tokio::test]
+    async fn local_tenant_rate_limit_runs_only_after_validated_chat_input() {
+        let state = unreachable_gateway_state(test_perimeter())
+            .with_rate_quota_config(GatewayRateQuotaConfig::new(1, 1, 1).unwrap());
+        let principal = state
+            .perimeter
+            .authenticate(&axum::http::HeaderMap::from_iter([(
+                axum::http::header::AUTHORIZATION,
+                axum::http::HeaderValue::from_static("Bearer test-public-api-key-123456"),
+            )]))
+            .expect("test API key should authenticate");
+        let tenant_key = RequestContext::new("quota-test".into(), principal)
+            .tenant_key()
+            .expect("gateway principal has a tenant key");
+        let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
+
+        let invalid = send(
+            app.clone(),
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            state.rate_quota.check(tenant_key).unwrap(),
+            GatewayRateDecision::Allowed,
+            "invalid input must not spend a rate token"
+        );
+
+        let limited = send(app, valid_chat_request(4)).await;
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     fn unreachable_gateway_state(perimeter: GatewayPerimeterConfig) -> GatewayState {

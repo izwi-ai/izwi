@@ -686,6 +686,9 @@ pub async fn gateway_completions(
     let compat_profile = compatibility_profile();
     validate_chat_request_compatibility(&req, compat_profile)?;
     let (variant, execution_request) = prepare_execution_request(&req, &ctx)?;
+    state
+        .enforce_chat_rate_quota(&ctx, &execution_request)
+        .await?;
     if req.stream.unwrap_or(false) {
         let model_id = execution_request.variant.dir_name().to_string();
         let event_rx = match &state.chat_execution {

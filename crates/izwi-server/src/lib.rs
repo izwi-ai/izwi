@@ -37,6 +37,7 @@ mod entity;
 mod error;
 mod gateway;
 mod gateway_deployments;
+mod gateway_rate_quota;
 mod gateway_security;
 mod ids;
 mod logging;
@@ -82,6 +83,7 @@ use state::AppState;
 pub use app::chat::{RemoteChatExecution, RemoteChatExecutionConfig};
 pub use app::remote_chat_dispatch::{RemoteChatDispatchConfig, RemoteChatDispatcher};
 pub use gateway::{create_gateway_router, GatewayState};
+pub use gateway_rate_quota::{GatewayRateQuotaConfig, GatewayRateQuotaConfigError};
 pub use gateway_security::{GatewayPerimeterConfig, GatewayPerimeterConfigError};
 
 const MAX_CONFIGURED_GATEWAY_WORKERS: usize = 256;
@@ -409,9 +411,11 @@ async fn run_gateway(
 ) -> anyhow::Result<()> {
     logging::init_tracing(args.log_format);
     let perimeter = GatewayPerimeterConfig::from_env()?;
+    let rate_quota = GatewayRateQuotaConfig::from_env()?;
     perimeter.validate_public_ingress(&serve_config)?;
     let (state, _status_poller) =
         gateway_state(&args, &serve_config, enterprise_hooks, perimeter).await?;
+    let state = state.with_rate_quota_config(rate_quota);
     state.lifecycle.mark_ready();
 
     info!(
