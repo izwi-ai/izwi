@@ -1,9 +1,9 @@
 use crate::{ChildLaunchSpec, ReadinessPolicy, RestartPolicy, ShutdownPolicy, ValidatedNodeConfig};
 use izwi_serving_client::{WorkerClient, WorkerClientConfig, WorkerClientError};
 use izwi_serving_protocol::{
-    ArtifactRevision, BackendKind, DeploymentId, DeviceAssignment, IncarnationId, ModelAlias,
-    ModelGeneration, ModelReadiness, NodeId, ServiceCredentials, WorkerDescriptor, WorkerId,
-    WorkerProcessState, WorkerStatus,
+    ArtifactRevision, BackendKind, Capability, DeploymentId, DeviceAssignment, IncarnationId,
+    ModelAlias, ModelGeneration, ModelReadiness, NodeId, ServiceCredentials, TaskKind,
+    WorkerDescriptor, WorkerId, WorkerProcessState, WorkerStatus,
 };
 use sha2::{Digest, Sha256};
 use std::{collections::VecDeque, io, process::ExitStatus, time::Duration};
@@ -27,7 +27,12 @@ pub struct ExpectedWorkerIdentity {
     public_model: ModelAlias,
     artifact_revision: ArtifactRevision,
     model_generation: ModelGeneration,
+    task: TaskKind,
     backend: BackendKind,
+    precision: String,
+    execution_representation: String,
+    tokenizer_revision: Option<ArtifactRevision>,
+    capability: Capability,
     max_active_invocations: u32,
     endpoint: String,
 }
@@ -50,7 +55,12 @@ impl ExpectedWorkerIdentity {
             public_model: worker.deployment.public_model.clone(),
             artifact_revision: worker.deployment.artifact_revision.clone(),
             model_generation: worker.deployment.model_generation,
+            task: worker.deployment.task,
             backend: worker.deployment.backend,
+            precision: worker.deployment.precision.clone(),
+            execution_representation: worker.deployment.execution_representation.clone(),
+            tokenizer_revision: worker.deployment.tokenizer_revision.clone(),
+            capability: worker.deployment.expected_capability(),
             max_active_invocations: worker.max_active_invocations,
             endpoint: format!("http://{}", worker.bind),
         })
@@ -167,6 +177,18 @@ impl ReadinessTracker {
         if matching.next().is_some() {
             return Err(IdentityMismatch::DuplicateDeployment);
         }
+        if deployment.task != self.expected.task {
+            return Err(IdentityMismatch::DeploymentTask);
+        }
+        if deployment.precision != self.expected.precision
+            || deployment.execution_representation != self.expected.execution_representation
+            || deployment.tokenizer_revision != self.expected.tokenizer_revision
+        {
+            return Err(IdentityMismatch::ExecutionProfile);
+        }
+        if deployment.capability != self.expected.capability {
+            return Err(IdentityMismatch::CapabilityProfile);
+        }
         if deployment.readiness == ModelReadiness::Failed {
             return Err(IdentityMismatch::DeploymentFailed);
         }
@@ -208,6 +230,12 @@ pub enum IdentityMismatch {
     Deployment,
     #[error("worker reported the assigned deployment more than once")]
     DuplicateDeployment,
+    #[error("the assigned deployment task differs from the configured task")]
+    DeploymentTask,
+    #[error("the assigned deployment execution profile differs from its configured profile")]
+    ExecutionProfile,
+    #[error("the assigned deployment capability differs from its configured capability profile")]
+    CapabilityProfile,
     #[error("the assigned deployment reported a failed readiness state")]
     DeploymentFailed,
 }
@@ -662,7 +690,22 @@ mod tests {
             public_model: id("model-a"),
             artifact_revision: id("revision-a"),
             model_generation: ModelGeneration::new(7).unwrap(),
+            task: TaskKind::Chat,
             backend: BackendKind::Cpu,
+            precision: "f32".into(),
+            execution_representation: "dense".into(),
+            tokenizer_revision: None,
+            capability: Capability {
+                task: TaskKind::Chat,
+                streaming: true,
+                realtime: false,
+                cancellation: CancellationBehavior::Cooperative,
+                accepted_input_formats: BTreeSet::from([InputFormat::ChatMessages]),
+                output_formats: BTreeSet::from([OutputFormat::Text]),
+                max_input_bytes: 4096,
+                max_context_tokens: Some(512),
+                max_output_tokens: Some(128),
+            },
             max_active_invocations: 2,
             endpoint: "http://127.0.0.1:9470".into(),
         }
@@ -694,23 +737,13 @@ mod tests {
                 public_model: expected.public_model.clone(),
                 artifact_revision: expected.artifact_revision.clone(),
                 model_generation: expected.model_generation,
-                task: TaskKind::Chat,
+                task: expected.task,
                 backend: expected.backend,
-                precision: "f32".into(),
-                execution_representation: "dense".into(),
-                tokenizer_revision: None,
+                precision: expected.precision.clone(),
+                execution_representation: expected.execution_representation.clone(),
+                tokenizer_revision: expected.tokenizer_revision.clone(),
                 readiness: ModelReadiness::Ready,
-                capability: Capability {
-                    task: TaskKind::Chat,
-                    streaming: true,
-                    realtime: false,
-                    cancellation: CancellationBehavior::Cooperative,
-                    accepted_input_formats: BTreeSet::from([InputFormat::ChatMessages]),
-                    output_formats: BTreeSet::from([OutputFormat::Text]),
-                    max_input_bytes: 4096,
-                    max_context_tokens: Some(512),
-                    max_output_tokens: Some(128),
-                },
+                capability: expected.capability.clone(),
             }],
             capacity: CapacitySnapshot {
                 max_active_invocations: expected.max_active_invocations,
@@ -782,6 +815,51 @@ mod tests {
         assert_eq!(
             tracker.observe_status(&status(&expected, 5)).unwrap_err(),
             IdentityMismatch::NonIncreasingStatusSequence
+        );
+    }
+
+    #[test]
+    fn readiness_rejects_task_and_execution_profile_mismatches() {
+        let expected = expected();
+        let mut tracker = ReadinessTracker::new(expected.clone());
+        tracker.verify_descriptor(&descriptor(&expected)).unwrap();
+
+        let mut wrong_task = status(&expected, 1);
+        wrong_task.deployments[0].task = TaskKind::SpeechToText;
+        assert_eq!(
+            tracker.observe_status(&wrong_task).unwrap_err(),
+            IdentityMismatch::DeploymentTask
+        );
+
+        let mut wrong_precision = status(&expected, 2);
+        wrong_precision.deployments[0].precision = "f16".into();
+        assert_eq!(
+            tracker.observe_status(&wrong_precision).unwrap_err(),
+            IdentityMismatch::ExecutionProfile
+        );
+    }
+
+    #[test]
+    fn readiness_rejects_exact_capability_profile_mismatches() {
+        let expected = expected();
+        let mut tracker = ReadinessTracker::new(expected.clone());
+        tracker.verify_descriptor(&descriptor(&expected)).unwrap();
+
+        let mut wrong_capability_task = status(&expected, 1);
+        wrong_capability_task.deployments[0].capability.task = TaskKind::TextToSpeech;
+        assert_eq!(
+            tracker.observe_status(&wrong_capability_task).unwrap_err(),
+            IdentityMismatch::CapabilityProfile
+        );
+
+        let mut wrong_formats = status(&expected, 2);
+        wrong_formats.deployments[0]
+            .capability
+            .output_formats
+            .insert(OutputFormat::Json);
+        assert_eq!(
+            tracker.observe_status(&wrong_formats).unwrap_err(),
+            IdentityMismatch::CapabilityProfile
         );
     }
 

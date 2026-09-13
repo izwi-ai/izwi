@@ -1,4 +1,6 @@
-use izwi_serving_protocol::{BackendKind, DeviceAssignment};
+use izwi_serving_protocol::{
+    BackendKind, CancellationBehavior, DeviceAssignment, InputFormat, OutputFormat, TaskKind,
+};
 use izwi_serving_supervisor::{NodeConfig, WorkerBinaryFlavor, NODE_CONFIG_SCHEMA_VERSION};
 use std::collections::BTreeSet;
 
@@ -19,6 +21,34 @@ fn parse(bytes: &[u8]) -> NodeConfig {
     NodeConfig::parse_bounded(bytes).expect("example must match the bounded node schema")
 }
 
+fn assert_explicit_chat_profile(worker: &izwi_serving_supervisor::WorkerConfig) {
+    let deployment = &worker.deployment;
+    assert_eq!(deployment.task, TaskKind::Chat);
+    assert_eq!(deployment.precision, "gguf-q4_k_m");
+    assert_eq!(deployment.execution_representation, "native-lfm2");
+    assert_eq!(deployment.tokenizer_revision, None);
+    assert_eq!(deployment.capability.streaming, worker.streaming);
+    assert!(!deployment.capability.realtime);
+    assert_eq!(
+        deployment.capability.cancellation,
+        CancellationBehavior::Cooperative
+    );
+    assert_eq!(
+        deployment.capability.accepted_input_formats,
+        BTreeSet::from([InputFormat::ChatMessages])
+    );
+    assert_eq!(
+        deployment.capability.output_formats,
+        BTreeSet::from([OutputFormat::Text])
+    );
+    assert_eq!(
+        deployment.capability.max_input_bytes,
+        worker.max_request_bytes as u64
+    );
+    assert_eq!(deployment.capability.max_context_tokens, Some(32));
+    assert_eq!(deployment.capability.max_output_tokens, Some(32));
+}
+
 #[test]
 fn one_device_examples_match_their_exact_backend_assignments() {
     let cpu = parse(CPU_EXAMPLE);
@@ -30,6 +60,7 @@ fn one_device_examples_match_their_exact_backend_assignments() {
         DeviceAssignment::Cpu { .. }
     ));
     assert_eq!(cpu.workers[0].deployment.backend, BackendKind::Cpu);
+    assert_explicit_chat_profile(&cpu.workers[0]);
 
     let metal = parse(METAL_EXAMPLE);
     assert_eq!(metal.schema_version, NODE_CONFIG_SCHEMA_VERSION);
@@ -46,6 +77,7 @@ fn one_device_examples_match_their_exact_backend_assignments() {
     assert!(device_id.as_str().starts_with("metal:REPLACE_"));
     assert_eq!(*process_local_device_index, 0);
     assert_eq!(metal.workers[0].deployment.backend, BackendKind::Metal);
+    assert_explicit_chat_profile(&metal.workers[0]);
 }
 
 #[test]
@@ -59,6 +91,7 @@ fn cuda_example_assigns_one_unique_uuid_per_process() {
     for worker in &config.workers {
         assert_eq!(worker.binary, WorkerBinaryFlavor::Cuda);
         assert_eq!(worker.deployment.backend, BackendKind::Cuda);
+        assert_explicit_chat_profile(worker);
         assert!(binds.insert(worker.bind));
         let DeviceAssignment::Cuda {
             device_uuid,
@@ -99,7 +132,7 @@ fn cuda_example_distinguishes_replicas_from_an_independent_deployment() {
 }
 
 #[test]
-fn examples_keep_secrets_external_and_do_not_invent_task_keys() {
+fn examples_keep_secrets_external_and_pin_existing_chat_capabilities() {
     for bytes in [CPU_EXAMPLE, METAL_EXAMPLE, CUDA_EXAMPLE] {
         let config = parse(bytes);
         assert!(config
@@ -109,9 +142,9 @@ fn examples_keep_secrets_external_and_do_not_invent_task_keys() {
 
         let text = std::str::from_utf8(bytes).expect("examples are UTF-8 TOML");
         assert!(text.contains("bearer_token_env = \"REPLACE_"));
-        assert!(!text.lines().any(|line| {
-            let key = line.trim_start();
-            key.starts_with("bearer_token =") || key.starts_with("task =")
-        }));
+        assert!(text.lines().any(|line| line.trim() == "task = \"chat\""));
+        assert!(!text
+            .lines()
+            .any(|line| line.trim_start().starts_with("bearer_token =")));
     }
 }

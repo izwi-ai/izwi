@@ -1,6 +1,6 @@
 # Parser-compatible only. Replace every REPLACE_* value and validate all
 # illustrative budgets against the target host before launching.
-schema_version = 1
+schema_version = 2
 node_id = "example-cpu-node"
 working_directory = "/REPLACE/WITH/IZWI_WORKING_DIRECTORY"
 runtime_directory = "/REPLACE/WITH/IZWI_RUNTIME_DIRECTORY"
@@ -48,5 +48,18 @@ deployment_id = "example-chat-cpu-v1"
 public_model = "LFM2.5-1.2B-Instruct-GGUF"
 artifact_revision = "REPLACE_WITH_PINNED_ARTIFACT_REVISION"
 model_generation = 1
+task = "chat"
 backend = "cpu"
+precision = "gguf-q4_k_m"
+execution_representation = "native-lfm2"
 models_directory = "/REPLACE/WITH/IZWI_MODELS_DIRECTORY"
+
+[workers.deployment.capability]
+streaming = true
+realtime = false
+cancellation = "cooperative"
+accepted_input_formats = ["chat_messages"]
+output_formats = ["text"]
+max_input_bytes = 1048576
+max_context_tokens = 32
+max_output_tokens = 32

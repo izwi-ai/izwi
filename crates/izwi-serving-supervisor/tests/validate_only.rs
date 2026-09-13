@@ -32,7 +32,7 @@ fn validate_only_redacts_credentials_and_never_launches_or_locks() {
     fs::write(
         &config_path,
         format!(
-            r#"schema_version = 1
+            r#"schema_version = 2
 node_id = "node-validate"
 working_directory = "{}"
 runtime_directory = "{}"
@@ -61,8 +61,21 @@ deployment_id = "deployment-validate"
 public_model = "model-validate"
 artifact_revision = "revision-validate"
 model_generation = 7
+task = "chat"
 backend = "cpu"
+precision = "gguf-q4_k_m"
+execution_representation = "native-lfm2"
 models_directory = "{}"
+
+[workers.deployment.capability]
+streaming = true
+realtime = false
+cancellation = "cooperative"
+accepted_input_formats = ["chat_messages"]
+output_formats = ["text"]
+max_input_bytes = 1024
+max_context_tokens = 32
+max_output_tokens = 32
 "#,
             working_directory.display(),
             runtime_directory.display(),

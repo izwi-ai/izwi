@@ -1,6 +1,6 @@
 # Parser-compatible only. Replace every REPLACE_* value and each zero UUID,
 # then validate all illustrative budgets against the target NVIDIA host.
-schema_version = 1
+schema_version = 2
 node_id = "example-cuda-node"
 working_directory = "/REPLACE/WITH/IZWI_WORKING_DIRECTORY"
 runtime_directory = "/REPLACE/WITH/IZWI_RUNTIME_DIRECTORY"
@@ -50,8 +50,21 @@ deployment_id = "example-chat-cuda-v1"
 public_model = "LFM2.5-1.2B-Instruct-GGUF"
 artifact_revision = "REPLACE_WITH_PINNED_ARTIFACT_REVISION"
 model_generation = 1
+task = "chat"
 backend = "cuda"
+precision = "gguf-q4_k_m"
+execution_representation = "native-lfm2"
 models_directory = "/REPLACE/WITH/IZWI_MODELS_DIRECTORY"
+
+[workers.deployment.capability]
+streaming = true
+realtime = false
+cancellation = "cooperative"
+accepted_input_formats = ["chat_messages"]
+output_formats = ["text"]
+max_input_bytes = 1048576
+max_context_tokens = 32
+max_output_tokens = 32
 
 # Replica two: the same deployment on a different assigned device and port.
 [[workers]]
@@ -78,8 +91,21 @@ deployment_id = "example-chat-cuda-v1"
 public_model = "LFM2.5-1.2B-Instruct-GGUF"
 artifact_revision = "REPLACE_WITH_PINNED_ARTIFACT_REVISION"
 model_generation = 1
+task = "chat"
 backend = "cuda"
+precision = "gguf-q4_k_m"
+execution_representation = "native-lfm2"
 models_directory = "/REPLACE/WITH/IZWI_MODELS_DIRECTORY"
+
+[workers.deployment.capability]
+streaming = true
+realtime = false
+cancellation = "cooperative"
+accepted_input_formats = ["chat_messages"]
+output_formats = ["text"]
+max_input_bytes = 1048576
+max_context_tokens = 32
+max_output_tokens = 32
 
 # An independent chat deployment. This does not imply another task type or a
 # multi-stage pipeline; one invocation remains inside this assigned worker.
@@ -107,5 +133,18 @@ deployment_id = "example-chat-cuda-specialized-v1"
 public_model = "REPLACE_WITH_SUPPORTED_CHAT_MODEL_ALIAS"
 artifact_revision = "REPLACE_WITH_PINNED_SPECIALIZED_ARTIFACT_REVISION"
 model_generation = 1
+task = "chat"
 backend = "cuda"
+precision = "gguf-q4_k_m"
+execution_representation = "native-lfm2"
 models_directory = "/REPLACE/WITH/IZWI_MODELS_DIRECTORY"
+
+[workers.deployment.capability]
+streaming = true
+realtime = false
+cancellation = "cooperative"
+accepted_input_formats = ["chat_messages"]
+output_formats = ["text"]
+max_input_bytes = 1048576
+max_context_tokens = 32
+max_output_tokens = 32

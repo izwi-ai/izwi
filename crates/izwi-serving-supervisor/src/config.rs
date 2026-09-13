@@ -1,6 +1,7 @@
 use izwi_serving_protocol::{
-    ArtifactRevision, BackendKind, CredentialId, DeploymentId, DeviceAssignment, DeviceId,
-    ModelAlias, ModelGeneration, NodeId, WorkerId,
+    ArtifactRevision, BackendKind, CancellationBehavior, Capability, CredentialId, DeploymentId,
+    DeviceAssignment, DeviceId, InputFormat, ModelAlias, ModelGeneration, NodeId, OutputFormat,
+    TaskKind, WorkerId,
 };
 use serde::{Deserialize, Deserializer};
 use std::{
@@ -10,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const NODE_CONFIG_SCHEMA_VERSION: u16 = 1;
+pub const NODE_CONFIG_SCHEMA_VERSION: u16 = 2;
 pub const MAX_NODE_CONFIG_BYTES: usize = 1024 * 1024;
 pub const MAX_WORKERS_PER_NODE: usize = 64;
 pub const MAX_ENV_NAME_BYTES: usize = 128;
@@ -20,6 +21,7 @@ pub const MAX_POLICY_DURATION_MS: u64 = 24 * 60 * 60 * 1000;
 pub const MAX_ACTIVE_INVOCATIONS_PER_WORKER: u32 = 1024;
 pub const MAX_REQUEST_BYTES_PER_WORKER: usize = 64 * 1024 * 1024;
 pub const MAX_RETAINED_ATTEMPTS_PER_WORKER: usize = 65_536;
+pub const MAX_EXECUTION_PROFILE_LABEL_BYTES: usize = 128;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -353,6 +355,7 @@ impl WorkerConfig {
                 deployment: self.deployment.backend,
             });
         }
+        self.deployment.validate_capability(self)?;
         if !self.deployment.models_directory.is_dir() {
             return Err(ConfigError::InvalidDirectory {
                 field: "models_directory",
@@ -370,8 +373,82 @@ pub struct DeploymentConfig {
     pub public_model: ModelAlias,
     pub artifact_revision: ArtifactRevision,
     pub model_generation: ModelGeneration,
+    pub task: TaskKind,
     pub backend: BackendKind,
+    pub precision: String,
+    pub execution_representation: String,
+    pub tokenizer_revision: Option<ArtifactRevision>,
+    pub capability: CapabilityProfileConfig,
     pub models_directory: PathBuf,
+}
+
+impl DeploymentConfig {
+    fn validate_capability(&self, worker: &WorkerConfig) -> Result<(), ConfigError> {
+        validate_execution_label("precision", &self.precision)?;
+        validate_execution_label("execution_representation", &self.execution_representation)?;
+        if self.capability.accepted_input_formats.is_empty() {
+            return Err(ConfigError::EmptyCapabilityFormats {
+                worker: worker.worker_id.clone(),
+                field: "accepted_input_formats",
+            });
+        }
+        if self.capability.output_formats.is_empty() {
+            return Err(ConfigError::EmptyCapabilityFormats {
+                worker: worker.worker_id.clone(),
+                field: "output_formats",
+            });
+        }
+        let request_bytes = u64::try_from(worker.max_request_bytes)
+            .map_err(|_| ConfigError::BudgetOverflow("worker request byte budget"))?;
+        if self.capability.max_input_bytes != request_bytes {
+            return Err(ConfigError::CapabilityInputLimitMismatch {
+                worker: worker.worker_id.clone(),
+                configured: self.capability.max_input_bytes,
+                worker_limit: request_bytes,
+            });
+        }
+        if self.capability.streaming != worker.streaming {
+            return Err(ConfigError::CapabilityStreamingMismatch {
+                worker: worker.worker_id.clone(),
+            });
+        }
+        if self.capability.max_context_tokens == Some(0)
+            || self.capability.max_output_tokens == Some(0)
+        {
+            return Err(ConfigError::ZeroCapabilityTokenLimit {
+                worker: worker.worker_id.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn expected_capability(&self) -> Capability {
+        Capability {
+            task: self.task,
+            streaming: self.capability.streaming,
+            realtime: self.capability.realtime,
+            cancellation: self.capability.cancellation,
+            accepted_input_formats: self.capability.accepted_input_formats.clone(),
+            output_formats: self.capability.output_formats.clone(),
+            max_input_bytes: self.capability.max_input_bytes,
+            max_context_tokens: self.capability.max_context_tokens,
+            max_output_tokens: self.capability.max_output_tokens,
+        }
+    }
+}
+
+/// Exact invocation-shape contract that a deployment must advertise before it is ready.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityProfileConfig {
+    pub streaming: bool,
+    pub realtime: bool,
+    pub cancellation: CancellationBehavior,
+    pub accepted_input_formats: BTreeSet<InputFormat>,
+    pub output_formats: BTreeSet<OutputFormat>,
+    pub max_input_bytes: u64,
+    pub max_context_tokens: Option<u32>,
+    pub max_output_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
@@ -669,6 +746,27 @@ pub enum ConfigError {
         assignment: BackendKind,
         deployment: BackendKind,
     },
+    #[error(
+        "{field} must be a non-empty label of at most {MAX_EXECUTION_PROFILE_LABEL_BYTES} bytes"
+    )]
+    InvalidExecutionProfileLabel { field: &'static str },
+    #[error("worker {worker} capability {field} must not be empty")]
+    EmptyCapabilityFormats {
+        worker: WorkerId,
+        field: &'static str,
+    },
+    #[error(
+        "worker {worker} capability max_input_bytes {configured} differs from request limit {worker_limit}"
+    )]
+    CapabilityInputLimitMismatch {
+        worker: WorkerId,
+        configured: u64,
+        worker_limit: u64,
+    },
+    #[error("worker {worker} capability streaming differs from the worker streaming setting")]
+    CapabilityStreamingMismatch { worker: WorkerId },
+    #[error("worker {worker} capability token limits must be non-zero when specified")]
+    ZeroCapabilityTokenLimit { worker: WorkerId },
     #[error("worker {worker} retained attempt capacity is below active invocation capacity")]
     AttemptRetentionBelowCapacity { worker: WorkerId },
     #[error("worker {worker} attempt retention must be between one second and one day")]
@@ -699,6 +797,16 @@ fn default_attempt_retention_secs() -> u64 {
 
 fn default_streaming() -> bool {
     true
+}
+
+fn validate_execution_label(field: &'static str, value: &str) -> Result<(), ConfigError> {
+    if value.is_empty()
+        || value.len() > MAX_EXECUTION_PROFILE_LABEL_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(ConfigError::InvalidExecutionProfileLabel { field });
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -943,7 +1051,21 @@ mod tests {
                     public_model: id("model-1"),
                     artifact_revision: id("revision-1"),
                     model_generation: ModelGeneration::new(1).unwrap(),
+                    task: TaskKind::Chat,
                     backend: BackendKind::Cpu,
+                    precision: "gguf-q4_k_m".into(),
+                    execution_representation: "native-lfm2".into(),
+                    tokenizer_revision: None,
+                    capability: CapabilityProfileConfig {
+                        streaming: true,
+                        realtime: false,
+                        cancellation: CancellationBehavior::Cooperative,
+                        accepted_input_formats: BTreeSet::from([InputFormat::ChatMessages]),
+                        output_formats: BTreeSet::from([OutputFormat::Text]),
+                        max_input_bytes: 4096,
+                        max_context_tokens: Some(32),
+                        max_output_tokens: Some(32),
+                    },
                     models_directory: directory.to_path_buf(),
                 },
                 max_active_invocations: 1,
@@ -988,7 +1110,7 @@ mod tests {
         assert!(matches!(error, ConfigError::Toml(_)));
 
         let nested = br#"
-schema_version = 1
+schema_version = 2
 node_id = "node-a"
 working_directory = "/tmp"
 runtime_directory = "/tmp/izwi-run"
@@ -1012,8 +1134,21 @@ deployment_id = "deployment-1"
 public_model = "model-1"
 artifact_revision = "revision-1"
 model_generation = 1
+task = "chat"
 backend = "cpu"
+precision = "gguf-q4_k_m"
+execution_representation = "native-lfm2"
 models_directory = "/tmp"
+
+[workers.deployment.capability]
+streaming = true
+realtime = false
+cancellation = "cooperative"
+accepted_input_formats = ["chat_messages"]
+output_formats = ["text"]
+max_input_bytes = 512
+max_context_tokens = 32
+max_output_tokens = 32
 "#;
         assert!(matches!(
             NodeConfig::parse_bounded(nested),
@@ -1039,7 +1174,7 @@ models_directory = "/tmp"
         let path = format!("{:?}", directory.path().to_string_lossy());
         let toml = format!(
             r#"
-schema_version = 1
+schema_version = 2
 node_id = "node-a"
 working_directory = {path}
 runtime_directory = {path}
@@ -1063,12 +1198,30 @@ deployment_id = "deployment-1"
 public_model = "model-1"
 artifact_revision = "revision-1"
 model_generation = 1
+task = "chat"
 backend = "cpu"
+precision = "gguf-q4_k_m"
+execution_representation = "native-lfm2"
 models_directory = {path}
+
+[workers.deployment.capability]
+streaming = true
+realtime = false
+cancellation = "cooperative"
+accepted_input_formats = ["chat_messages"]
+output_formats = ["text"]
+max_input_bytes = 1048576
+max_context_tokens = 32
+max_output_tokens = 32
 "#
         );
         let parsed = NodeConfig::parse_bounded(toml.as_bytes()).unwrap();
         assert_eq!(parsed.workers.len(), 1);
+        assert_eq!(parsed.workers[0].deployment.task, TaskKind::Chat);
+        assert_eq!(
+            parsed.workers[0].deployment.capability.output_formats,
+            BTreeSet::from([OutputFormat::Text])
+        );
         assert!(matches!(
             parsed.workers[0].assignment,
             DeviceAssignment::Cpu {
@@ -1076,6 +1229,35 @@ models_directory = {path}
                 host_memory_limit_bytes: 512,
                 ..
             }
+        ));
+
+        let unknown_capability_field = toml.replace(
+            "max_output_tokens = 32",
+            "max_output_tokens = 32\nunknown_capability_field = true",
+        );
+        assert!(matches!(
+            NodeConfig::parse_bounded(unknown_capability_field.as_bytes()),
+            Err(ConfigError::Toml(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_capability_profiles_that_disagree_with_worker_limits() {
+        let directory = tempfile::tempdir().unwrap();
+        let binaries = catalog(executable(directory.path()));
+
+        let mut input_limit = cpu_config(directory.path());
+        input_limit.workers[0].deployment.capability.max_input_bytes = 4095;
+        assert!(matches!(
+            input_limit.validate(&inventory(), &binaries),
+            Err(ConfigError::CapabilityInputLimitMismatch { .. })
+        ));
+
+        let mut streaming = cpu_config(directory.path());
+        streaming.workers[0].deployment.capability.streaming = false;
+        assert!(matches!(
+            streaming.validate(&inventory(), &binaries),
+            Err(ConfigError::CapabilityStreamingMismatch { .. })
         ));
     }
 

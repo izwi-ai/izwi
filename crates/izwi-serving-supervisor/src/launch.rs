@@ -438,15 +438,15 @@ fn os_string_bytes(value: &OsStr) -> usize {
 mod tests {
     use super::*;
     use crate::{
-        BinaryCatalog, BinaryRecord, DeploymentConfig, HostInventory, NodeConfig, ReadinessPolicy,
-        RestartPolicy, ShutdownPolicy, WorkerBinaryFlavor, WorkerConfig,
-        NODE_CONFIG_SCHEMA_VERSION,
+        BinaryCatalog, BinaryRecord, CapabilityProfileConfig, DeploymentConfig, HostInventory,
+        NodeConfig, ReadinessPolicy, RestartPolicy, ShutdownPolicy, WorkerBinaryFlavor,
+        WorkerConfig, NODE_CONFIG_SCHEMA_VERSION,
     };
     use izwi_serving_protocol::{
-        ArtifactRevision, BackendKind, CredentialId, DeploymentId, ModelAlias, ModelGeneration,
-        NodeId,
+        ArtifactRevision, BackendKind, CancellationBehavior, CredentialId, DeploymentId,
+        InputFormat, ModelAlias, ModelGeneration, NodeId, OutputFormat, TaskKind,
     };
-    use std::{fs, io::Write, path::Path};
+    use std::{collections::BTreeSet, fs, io::Write, path::Path};
 
     fn id<T: TryFrom<&'static str>>(value: &'static str) -> T
     where
@@ -494,7 +494,21 @@ mod tests {
                     public_model: id::<ModelAlias>("model-a"),
                     artifact_revision: id::<ArtifactRevision>("revision-a"),
                     model_generation: ModelGeneration::new(7).unwrap(),
+                    task: TaskKind::Chat,
                     backend,
+                    precision: "gguf-q4_k_m".into(),
+                    execution_representation: "native-lfm2".into(),
+                    tokenizer_revision: None,
+                    capability: CapabilityProfileConfig {
+                        streaming: true,
+                        realtime: false,
+                        cancellation: CancellationBehavior::Cooperative,
+                        accepted_input_formats: BTreeSet::from([InputFormat::ChatMessages]),
+                        output_formats: BTreeSet::from([OutputFormat::Text]),
+                        max_input_bytes: 4096,
+                        max_context_tokens: Some(32),
+                        max_output_tokens: Some(32),
+                    },
                     models_directory: directory.into(),
                 },
                 max_active_invocations: 1,

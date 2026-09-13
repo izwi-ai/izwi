@@ -217,12 +217,16 @@ fn validation_diagnostic(node: &ValidatedNodeConfig) -> String {
     ));
     for worker in &node.config().workers {
         output.push_line(&format!(
-            "worker={} backend={:?} bind={} deployment={} generation={} max_active_invocations={} secret=redacted",
+            "worker={} backend={:?} bind={} deployment={} generation={} task={:?} precision={} execution={} streaming={} max_active_invocations={} secret=redacted",
             worker.worker_id,
             worker.assignment.backend(),
             worker.bind,
             worker.deployment.deployment_id,
             worker.deployment.model_generation.get(),
+            worker.deployment.task,
+            worker.deployment.precision,
+            worker.deployment.execution_representation,
+            worker.deployment.capability.streaming,
             worker.max_active_invocations,
         ));
     }
@@ -659,12 +663,14 @@ enum SupervisorError {
 mod tests {
     use super::*;
     use izwi_serving_protocol::{
-        ArtifactRevision, CredentialId, DeploymentId, DeviceId, ModelAlias, ModelGeneration, NodeId,
+        ArtifactRevision, CancellationBehavior, CredentialId, DeploymentId, DeviceId, InputFormat,
+        ModelAlias, ModelGeneration, NodeId, OutputFormat, TaskKind,
     };
     use izwi_serving_supervisor::{
-        DeploymentConfig, ReadinessPolicy, RestartPolicy, ShutdownPolicy, WorkerConfig,
-        NODE_CONFIG_SCHEMA_VERSION,
+        CapabilityProfileConfig, DeploymentConfig, ReadinessPolicy, RestartPolicy, ShutdownPolicy,
+        WorkerConfig, NODE_CONFIG_SCHEMA_VERSION,
     };
+    use std::collections::BTreeSet;
 
     fn id<T: TryFrom<&'static str>>(value: &'static str) -> T
     where
@@ -692,7 +698,21 @@ mod tests {
                     public_model: id::<ModelAlias>("model-a"),
                     artifact_revision: id::<ArtifactRevision>("revision-a"),
                     model_generation: ModelGeneration::new(1).unwrap(),
+                    task: TaskKind::Chat,
                     backend: BackendKind::Cpu,
+                    precision: "gguf-q4_k_m".into(),
+                    execution_representation: "native-lfm2".into(),
+                    tokenizer_revision: None,
+                    capability: CapabilityProfileConfig {
+                        streaming: true,
+                        realtime: false,
+                        cancellation: CancellationBehavior::Cooperative,
+                        accepted_input_formats: BTreeSet::from([InputFormat::ChatMessages]),
+                        output_formats: BTreeSet::from([OutputFormat::Text]),
+                        max_input_bytes: 1024,
+                        max_context_tokens: Some(32),
+                        max_output_tokens: Some(32),
+                    },
                     models_directory: PathBuf::from("/models"),
                 },
                 max_active_invocations: 1,

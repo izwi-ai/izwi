@@ -1,4 +1,4 @@
-use izwi_serving_protocol::BackendKind;
+use izwi_serving_protocol::{BackendKind, TaskKind};
 use izwi_serving_supervisor::{NodeConfig, WorkerBinaryFlavor, NODE_CONFIG_SCHEMA_VERSION};
 
 const EXAMPLE: &[u8] = include_bytes!(concat!(
@@ -14,4 +14,9 @@ fn packaged_node_example_matches_the_bounded_schema() {
     assert_eq!(config.workers.len(), 1);
     assert_eq!(config.workers[0].binary, WorkerBinaryFlavor::Cpu);
     assert_eq!(config.workers[0].assignment.backend(), BackendKind::Cpu);
+    assert_eq!(config.workers[0].deployment.task, TaskKind::Chat);
+    assert_eq!(
+        config.workers[0].deployment.capability.streaming,
+        config.workers[0].streaming
+    );
 }
