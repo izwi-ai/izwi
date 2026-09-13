@@ -518,6 +518,32 @@ pub struct MediaDeleteRequest {
     pub metadata: HookMetadata,
 }
 
+/// Version one of the opt-in crash-recoverable media write protocol.
+pub const MEDIA_RESERVED_WRITE_VERSION: u16 = 1;
+
+/// A provider-visible write identity recorded durably before bytes are sent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaReservedWriteRequest {
+    pub version: u16,
+    pub write_id: String,
+    pub expires_at_unix_ms: u64,
+    pub content_length: u64,
+    pub sha256: String,
+    pub request: MediaWriteRequest,
+}
+
+/// Recover an expired or explicitly abandoned reserved write.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaReservedWriteRecoveryRequest {
+    pub version: u16,
+    pub write_id: String,
+    pub expires_at_unix_ms: u64,
+    pub content_length: u64,
+    pub sha256: String,
+    pub request: MediaWriteRequest,
+    pub storage_key: Option<MediaObjectKey>,
+}
+
 #[derive(Clone)]
 pub enum MediaStorageProviderDecision {
     UseDefault,
@@ -606,11 +632,46 @@ pub trait MediaStorageResolver: Send + Sync {
 
 #[async_trait]
 pub trait MediaStorageProvider: Send + Sync {
+    /// Reserved-write protocol implemented by these methods, if any.
+    fn reserved_write_protocol_version(&self) -> Option<u16> {
+        None
+    }
+
     async fn put(
         &self,
         request: MediaWriteRequest,
         bytes: Vec<u8>,
     ) -> HookResult<StoredMediaObject>;
+
+    /// Atomically publish one idempotent object for a pre-recorded write ID.
+    ///
+    /// Implementations must reject publication at or after `expires_at_unix_ms`.
+    /// Repeating an ID may return the original object only when its bytes and
+    /// metadata match. This is opt-in so legacy providers keep their existing
+    /// behavior without being treated as crash-recoverable.
+    async fn put_reserved(
+        &self,
+        _request: MediaReservedWriteRequest,
+        _bytes: Vec<u8>,
+    ) -> HookResult<StoredMediaObject> {
+        Err(HookError::Failed(
+            "Media provider does not support reserved writes".into(),
+        ))
+    }
+
+    /// Remove every object associated with a reserved write after its deadline.
+    ///
+    /// The call must serialize with publication for the same write ID. A
+    /// `NotFound` result means both that no object exists and that no future
+    /// commit for this expired write ID can become visible.
+    async fn recover_reserved_write(
+        &self,
+        _request: MediaReservedWriteRecoveryRequest,
+    ) -> HookResult<()> {
+        Err(HookError::Failed(
+            "Media provider does not support reserved-write recovery".into(),
+        ))
+    }
 
     async fn get(&self, request: MediaReadRequest) -> HookResult<StoredMediaBytes>;
 

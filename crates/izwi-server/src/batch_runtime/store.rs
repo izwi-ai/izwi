@@ -43,6 +43,8 @@ pub struct BatchRuntimeStore {
     #[cfg(test)]
     test_artifact_cleanup_capacity: Option<u64>,
     #[cfg(test)]
+    test_provider_write_capacity: Option<u64>,
+    #[cfg(test)]
     test_durable_tts_acceptance_failpoint: Option<DurableTtsAcceptanceFailpoint>,
 }
 
@@ -99,6 +101,34 @@ pub(crate) struct ArtifactCleanupIntent {
     pub reason: ArtifactCleanupReason,
     pub attempt_count: u32,
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct NewProviderWriteReservation {
+    pub tenant_scope: String,
+    pub storage_namespace: String,
+    pub content_type: String,
+    pub filename: Option<String>,
+    pub expected_size_bytes: u64,
+    pub expected_sha256: String,
+    pub lifetime_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderWriteReservation {
+    pub write_id: String,
+    pub reservation_token: String,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub tenant_scope: String,
+    pub storage_namespace: String,
+    pub content_type: String,
+    pub filename: Option<String>,
+    pub expected_size_bytes: u64,
+    pub expected_sha256: String,
+    pub storage_key: Option<String>,
+    pub cleanup_claim_token: Option<String>,
+    pub cleanup_attempt_count: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -210,6 +240,14 @@ const MAX_ARTIFACT_CLEANUP_STORAGE_KEY_BYTES: usize = 2 * 1024;
 const MAX_ARTIFACT_CLEANUP_TENANT_BYTES: usize = 128;
 const MAX_ARTIFACT_CLEANUP_ERROR_BYTES: usize = 512;
 const MAX_ARTIFACT_CLEANUP_BACKOFF_MS: u64 = 60 * 60 * 1000;
+const MAX_PROVIDER_WRITE_RESERVATIONS: u64 = 65_536;
+const MAX_PROVIDER_WRITE_CLEANUP_BATCH: usize = 64;
+const MAX_PROVIDER_WRITE_NAMESPACE_BYTES: usize = 128;
+const MAX_PROVIDER_WRITE_CONTENT_TYPE_BYTES: usize = 256;
+const MAX_PROVIDER_WRITE_FILENAME_BYTES: usize = 1024;
+const MAX_PROVIDER_WRITE_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_PROVIDER_WRITE_LIFETIME_MS: u64 = 10 * 60 * 1000;
+const PROVIDER_WRITE_CLEANUP_CLAIM_MS: u64 = 30 * 1000;
 
 fn bounded_maintenance_batch_limit(limit: usize) -> usize {
     limit.clamp(1, MAX_RUNTIME_MAINTENANCE_BATCH_LIMIT)
@@ -563,6 +601,8 @@ impl BatchRuntimeStore {
             #[cfg(test)]
             test_artifact_cleanup_capacity: None,
             #[cfg(test)]
+            test_provider_write_capacity: None,
+            #[cfg(test)]
             test_durable_tts_acceptance_failpoint: None,
         }
     }
@@ -575,6 +615,11 @@ impl BatchRuntimeStore {
     #[cfg(test)]
     pub(crate) fn set_artifact_cleanup_capacity_for_test(&mut self, capacity: u64) {
         self.test_artifact_cleanup_capacity = Some(capacity);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_provider_write_capacity_for_test(&mut self, capacity: u64) {
+        self.test_provider_write_capacity = Some(capacity);
     }
 
     #[cfg(test)]
@@ -948,6 +993,325 @@ impl BatchRuntimeStore {
             return capacity;
         }
         MAX_ARTIFACT_CLEANUP_INTENTS
+    }
+
+    pub(crate) async fn reserve_provider_write(
+        &self,
+        input: NewProviderWriteReservation,
+    ) -> anyhow::Result<ProviderWriteReservation> {
+        validate_provider_write_input(&input)?;
+        let db = self.db.connection().await?;
+        let tx = db
+            .begin_with_options(runtime_write_transaction_options())
+            .await
+            .context("Failed to start provider write reservation transaction")?;
+        lock_provider_write_capacity(&tx).await?;
+        let count = tx
+            .query_one_raw(raw::statement(
+                &tx,
+                "SELECT COUNT(*) FROM provider_write_reservations",
+                vec![],
+            )?)
+            .await?
+            .context("Provider write reservation count returned no row")?
+            .try_get_by_index::<i64>(0)?;
+        let capacity = self.provider_write_capacity();
+        anyhow::ensure!(
+            u64::try_from(count)? < capacity,
+            "Provider write reservation capacity exhausted ({capacity} active reservations)"
+        );
+        let now = self.now_millis();
+        let expires_at = now.saturating_add(i64::try_from(input.lifetime_ms)?);
+        let write_id = new_uuid();
+        let reservation_token = new_uuid();
+        tx.execute_raw(raw::statement(
+            &tx,
+            r#"
+            INSERT INTO provider_write_reservations (
+                write_id, reservation_token, created_at, updated_at, expires_at,
+                available_at, state, tenant_scope, storage_namespace,
+                content_type, filename, expected_size_bytes, expected_sha256,
+                storage_key, cleanup_claim_token, cleanup_claim_expires_at,
+                cleanup_attempt_count, last_error
+            ) VALUES (?1, ?2, ?3, ?3, ?4, ?4, 'reserved', ?5, ?6, ?7, ?8,
+                      ?9, ?10, NULL, NULL, NULL, 0, NULL)
+            "#,
+            vec![
+                write_id.clone().into(),
+                reservation_token.clone().into(),
+                now.into(),
+                expires_at.into(),
+                input.tenant_scope.into(),
+                input.storage_namespace.into(),
+                input.content_type.into(),
+                opt_string(input.filename),
+                u64_to_i64_value(input.expected_size_bytes)?,
+                input.expected_sha256.into(),
+            ],
+        )?)
+        .await
+        .context("Failed to reserve provider write")?;
+        let reservation = get_provider_write_with(&tx, &write_id)
+            .await?
+            .context("Reserved provider write was not found")?;
+        tx.commit().await?;
+        Ok(reservation)
+    }
+
+    pub(crate) async fn record_provider_write_stored(
+        &self,
+        reservation: &ProviderWriteReservation,
+        storage_key: &str,
+    ) -> anyhow::Result<Option<ProviderWriteReservation>> {
+        validate_artifact_cleanup_storage_key(storage_key)?;
+        let db = self.db.connection().await?;
+        let now = self.now_millis();
+        let result = db
+            .execute_raw(raw::statement(
+                db,
+                r#"
+                UPDATE provider_write_reservations
+                SET state = 'stored', storage_key = ?1, updated_at = ?2
+                WHERE write_id = ?3 AND reservation_token = ?4
+                  AND state = 'reserved' AND expires_at > ?2
+                "#,
+                vec![
+                    storage_key.into(),
+                    now.into(),
+                    reservation.write_id.clone().into(),
+                    reservation.reservation_token.clone().into(),
+                ],
+            )?)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
+        get_provider_write_with(db, &reservation.write_id).await
+    }
+
+    pub(crate) async fn abandon_provider_write(
+        &self,
+        reservation: &ProviderWriteReservation,
+        error: &str,
+    ) -> anyhow::Result<bool> {
+        let now = self.now_millis();
+        let available_at = i64::try_from(reservation.expires_at)?.max(now);
+        let db = self.db.connection().await?;
+        let result = db
+            .execute_raw(raw::statement(
+                db,
+                r#"
+                UPDATE provider_write_reservations
+                SET state = 'cleanup_pending', updated_at = ?1, available_at = ?2,
+                    last_error = ?3, cleanup_claim_token = NULL,
+                    cleanup_claim_expires_at = NULL
+                WHERE write_id = ?4 AND reservation_token = ?5
+                  AND state IN ('reserved', 'stored')
+                "#,
+                vec![
+                    now.into(),
+                    available_at.into(),
+                    truncate_utf8_bytes(error, MAX_ARTIFACT_CLEANUP_ERROR_BYTES).into(),
+                    reservation.write_id.clone().into(),
+                    reservation.reservation_token.clone().into(),
+                ],
+            )?)
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn publish_reserved_opaque_artifact(
+        &self,
+        reservation: &ProviderWriteReservation,
+        input: NewMediaAsset,
+    ) -> anyhow::Result<Option<MediaAsset>> {
+        anyhow::ensure!(
+            input.storage_key.as_str() == reservation.storage_key.as_deref().unwrap_or_default()
+                && input.content_type == reservation.content_type
+                && input.filename == reservation.filename
+                && input.size_bytes == reservation.expected_size_bytes
+                && input.sha256.as_deref() == Some(reservation.expected_sha256.as_str()),
+            "Provider write publication did not match its reservation"
+        );
+        let db = self.db.connection().await?;
+        let tx = db
+            .begin_with_options(runtime_write_transaction_options())
+            .await?;
+        let now = self.now_millis();
+        let row = get_provider_write_with(&tx, &reservation.write_id).await?;
+        if row.as_ref().is_none_or(|row| {
+            row.reservation_token != reservation.reservation_token
+                || row.storage_key != reservation.storage_key
+        }) {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        let id = new_uuid();
+        let metadata_json = json_to_db_string(&input.metadata_json, "{}")?;
+        tx.execute_raw(raw::statement(
+            &tx,
+            r#"
+            INSERT INTO media_assets (
+                id, created_at, updated_at, asset_kind, storage_namespace,
+                storage_key, content_type, filename, size_bytes, sha256,
+                duration_secs, sample_rate_hz, channel_count, peak_amplitude,
+                rms_amplitude, source_asset_id, canonical_profile_version,
+                scan_status, retention_policy, deleted_at, metadata_json
+            ) VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                      ?12, ?13, ?14, ?15, ?16, ?17, ?18, NULL, ?19)
+        "#,
+            vec![
+                id.clone().into(),
+                now.into(),
+                input.asset_kind.into(),
+                input.storage_namespace.into(),
+                input.storage_key.into(),
+                input.content_type.into(),
+                opt_string(input.filename),
+                u64_to_i64_value(input.size_bytes)?,
+                opt_string(input.sha256),
+                opt_f64(input.duration_secs),
+                opt_u32(input.sample_rate_hz),
+                opt_u16(input.channel_count),
+                opt_f32(input.peak_amplitude),
+                opt_f32(input.rms_amplitude),
+                opt_string(input.source_asset_id),
+                opt_string(input.canonical_profile_version),
+                input.scan_status.into(),
+                input.retention_policy.into(),
+                metadata_json.into(),
+            ],
+        )?)
+        .await?;
+        let deleted = tx.execute_raw(raw::statement(&tx,
+            "DELETE FROM provider_write_reservations WHERE write_id = ?1 AND reservation_token = ?2 AND state = 'stored'",
+            vec![reservation.write_id.clone().into(), reservation.reservation_token.clone().into()],
+        )?).await?;
+        if deleted.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        let asset = get_media_asset_with(&tx, &id).await?;
+        tx.commit().await?;
+        Ok(asset)
+    }
+
+    pub(crate) async fn claim_due_provider_write_cleanup(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ProviderWriteReservation>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let db = self.db.connection().await?;
+        let tx = db
+            .begin_with_options(runtime_write_transaction_options())
+            .await?;
+        let now = self.now_millis();
+        let rows = tx
+            .query_all_raw(raw::statement(
+                &tx,
+                r#"
+            SELECT write_id FROM provider_write_reservations
+            WHERE (state IN ('reserved', 'stored', 'cleanup_pending') AND available_at <= ?1)
+               OR (state = 'cleanup_claimed' AND cleanup_claim_expires_at <= ?1)
+            ORDER BY available_at ASC, created_at ASC, write_id ASC LIMIT ?2
+        "#,
+                vec![
+                    now.into(),
+                    i64::try_from(limit.min(MAX_PROVIDER_WRITE_CLEANUP_BATCH))?.into(),
+                ],
+            )?)
+            .await?;
+        let mut claimed = Vec::with_capacity(rows.len());
+        for row in rows {
+            let write_id: String = row.try_get_by_index(0)?;
+            let claim_token = new_uuid();
+            let claim_expires_at =
+                now.saturating_add(i64::try_from(PROVIDER_WRITE_CLEANUP_CLAIM_MS)?);
+            let result = tx
+                .execute_raw(raw::statement(
+                    &tx,
+                    r#"
+                UPDATE provider_write_reservations
+                SET state = 'cleanup_claimed', updated_at = ?1,
+                    cleanup_claim_token = ?2, cleanup_claim_expires_at = ?3
+                WHERE write_id = ?4 AND (
+                    (state IN ('reserved', 'stored', 'cleanup_pending') AND available_at <= ?1)
+                    OR (state = 'cleanup_claimed' AND cleanup_claim_expires_at <= ?1)
+                )
+            "#,
+                    vec![
+                        now.into(),
+                        claim_token.into(),
+                        claim_expires_at.into(),
+                        write_id.clone().into(),
+                    ],
+                )?)
+                .await?;
+            if result.rows_affected() == 1 {
+                if let Some(reservation) = get_provider_write_with(&tx, &write_id).await? {
+                    claimed.push(reservation);
+                }
+            }
+        }
+        tx.commit().await?;
+        Ok(claimed)
+    }
+
+    pub(crate) async fn complete_provider_write_cleanup(
+        &self,
+        reservation: &ProviderWriteReservation,
+    ) -> anyhow::Result<bool> {
+        let db = self.db.connection().await?;
+        let result = db.execute_raw(raw::statement(db,
+            "DELETE FROM provider_write_reservations WHERE write_id = ?1 AND state = 'cleanup_claimed' AND cleanup_claim_token = ?2",
+            vec![reservation.write_id.clone().into(), opt_string(reservation.cleanup_claim_token.clone())],
+        )?).await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn defer_provider_write_cleanup(
+        &self,
+        reservation: &ProviderWriteReservation,
+        error: &str,
+    ) -> anyhow::Result<bool> {
+        let attempt = reservation.cleanup_attempt_count.saturating_add(1);
+        let backoff = 1_000_u64
+            .checked_shl(reservation.cleanup_attempt_count.min(12))
+            .unwrap_or(MAX_ARTIFACT_CLEANUP_BACKOFF_MS)
+            .min(MAX_ARTIFACT_CLEANUP_BACKOFF_MS);
+        let now = self.now_millis();
+        let db = self.db.connection().await?;
+        let result = db
+            .execute_raw(raw::statement(
+                db,
+                r#"
+            UPDATE provider_write_reservations
+            SET state = 'cleanup_pending', updated_at = ?1, available_at = ?2,
+                cleanup_attempt_count = ?3, last_error = ?4,
+                cleanup_claim_token = NULL, cleanup_claim_expires_at = NULL
+            WHERE write_id = ?5 AND state = 'cleanup_claimed' AND cleanup_claim_token = ?6
+        "#,
+                vec![
+                    now.into(),
+                    now.saturating_add(i64::try_from(backoff)?).into(),
+                    i64::from(attempt).into(),
+                    truncate_utf8_bytes(error, MAX_ARTIFACT_CLEANUP_ERROR_BYTES).into(),
+                    reservation.write_id.clone().into(),
+                    opt_string(reservation.cleanup_claim_token.clone()),
+                ],
+            )?)
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    fn provider_write_capacity(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(capacity) = self.test_provider_write_capacity {
+            return capacity;
+        }
+        MAX_PROVIDER_WRITE_RESERVATIONS
     }
 
     pub async fn get_media_asset_by_storage_key(
@@ -4752,6 +5116,68 @@ async fn lock_artifact_cleanup_capacity<C: ConnectionTrait>(db: &C) -> anyhow::R
     Ok(())
 }
 
+async fn lock_provider_write_capacity<C: ConnectionTrait>(db: &C) -> anyhow::Result<()> {
+    let insert_sql = match db.get_database_backend() {
+        DbBackend::Sqlite | DbBackend::Postgres => {
+            "INSERT INTO runtime_admission_locks (id, lock_value) VALUES ('provider_writes', 1) ON CONFLICT (id) DO NOTHING"
+        }
+        DbBackend::MySql => {
+            "INSERT IGNORE INTO runtime_admission_locks (id, lock_value) VALUES ('provider_writes', 1)"
+        }
+        backend => bail!("Unsupported provider write database backend: {backend:?}"),
+    };
+    db.execute_raw(raw::statement(db, insert_sql, vec![])?)
+        .await?;
+    db.execute_raw(raw::statement(
+        db,
+        "UPDATE runtime_admission_locks SET lock_value = lock_value WHERE id = 'provider_writes'",
+        vec![],
+    )?)
+    .await?;
+    Ok(())
+}
+
+fn validate_provider_write_input(input: &NewProviderWriteReservation) -> anyhow::Result<()> {
+    validate_artifact_cleanup_tenant(&input.tenant_scope)?;
+    anyhow::ensure!(
+        !input.storage_namespace.is_empty()
+            && input.storage_namespace.len() <= MAX_PROVIDER_WRITE_NAMESPACE_BYTES
+            && !input.storage_namespace.chars().any(char::is_control),
+        "Invalid provider write namespace"
+    );
+    anyhow::ensure!(
+        !input.content_type.is_empty()
+            && input.content_type.len() <= MAX_PROVIDER_WRITE_CONTENT_TYPE_BYTES
+            && !input.content_type.chars().any(char::is_control),
+        "Invalid provider write content type"
+    );
+    anyhow::ensure!(
+        input.filename.as_ref().is_none_or(|filename| {
+            !filename.is_empty()
+                && filename.len() <= MAX_PROVIDER_WRITE_FILENAME_BYTES
+                && !filename.chars().any(char::is_control)
+        }),
+        "Invalid provider write filename"
+    );
+    anyhow::ensure!(
+        input.expected_size_bytes > 0 && input.expected_size_bytes <= MAX_PROVIDER_WRITE_BYTES,
+        "Invalid provider write size"
+    );
+    anyhow::ensure!(
+        input.expected_sha256.len() == 64
+            && input
+                .expected_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit()),
+        "Invalid provider write digest"
+    );
+    anyhow::ensure!(
+        input.lifetime_ms > 0 && input.lifetime_ms <= MAX_PROVIDER_WRITE_LIFETIME_MS,
+        "Invalid provider write lifetime"
+    );
+    Ok(())
+}
+
 pub(crate) fn validate_artifact_cleanup_storage_key(storage_key: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         !storage_key.is_empty()
@@ -4945,6 +5371,34 @@ async fn get_artifact_with<C: ConnectionTrait>(
     row.as_ref().map(map_runtime_artifact).transpose()
 }
 
+async fn get_media_asset_with<C: ConnectionTrait>(
+    db: &C,
+    id: &str,
+) -> anyhow::Result<Option<MediaAsset>> {
+    let row = db
+        .query_one_raw(raw::statement(
+            db,
+            MEDIA_ASSET_COLUMNS_SQL,
+            vec![id.into()],
+        )?)
+        .await?;
+    row.as_ref().map(map_media_asset).transpose()
+}
+
+async fn get_provider_write_with<C: ConnectionTrait>(
+    db: &C,
+    write_id: &str,
+) -> anyhow::Result<Option<ProviderWriteReservation>> {
+    let row = db
+        .query_one_raw(raw::statement(
+            db,
+            PROVIDER_WRITE_COLUMNS_SQL,
+            vec![write_id.into()],
+        )?)
+        .await?;
+    row.as_ref().map(map_provider_write).transpose()
+}
+
 async fn complete_job_if_all_stages_finished_with<C: ConnectionTrait>(
     db: &C,
     job_id: &str,
@@ -4992,6 +5446,7 @@ pub fn current_timestamp_millis() -> i64 {
 
 const MEDIA_ASSET_COLUMNS_SQL: &str =
     "SELECT id, created_at, updated_at, asset_kind, storage_namespace, storage_key, content_type, filename, size_bytes, sha256, duration_secs, sample_rate_hz, channel_count, peak_amplitude, rms_amplitude, source_asset_id, canonical_profile_version, scan_status, retention_policy, deleted_at, metadata_json FROM media_assets WHERE id = ?1";
+const PROVIDER_WRITE_COLUMNS_SQL: &str = "SELECT write_id, reservation_token, created_at, expires_at, tenant_scope, storage_namespace, content_type, filename, expected_size_bytes, expected_sha256, storage_key, cleanup_claim_token, cleanup_attempt_count FROM provider_write_reservations WHERE write_id = ?1";
 const MEDIA_ASSET_BY_STORAGE_KEY_SQL: &str =
     "SELECT id, created_at, updated_at, asset_kind, storage_namespace, storage_key, content_type, filename, size_bytes, sha256, duration_secs, sample_rate_hz, channel_count, peak_amplitude, rms_amplitude, source_asset_id, canonical_profile_version, scan_status, retention_policy, deleted_at, metadata_json FROM media_assets WHERE storage_key = ?1 AND deleted_at IS NULL";
 const MEDIA_ASSET_BY_SOURCE_PROFILE_SQL: &str =
@@ -5175,6 +5630,48 @@ fn map_artifact_cleanup_intent(row: &QueryResult) -> anyhow::Result<ArtifactClea
         attempt_count: i64_to_u32(row.try_get_by_index(7)?)?,
         last_error,
     })
+}
+
+fn map_provider_write(row: &QueryResult) -> anyhow::Result<ProviderWriteReservation> {
+    let reservation = ProviderWriteReservation {
+        write_id: row.try_get_by_index(0)?,
+        reservation_token: row.try_get_by_index(1)?,
+        created_at: i64_to_u64(row.try_get_by_index(2)?)?,
+        expires_at: i64_to_u64(row.try_get_by_index(3)?)?,
+        tenant_scope: row.try_get_by_index(4)?,
+        storage_namespace: row.try_get_by_index(5)?,
+        content_type: row.try_get_by_index(6)?,
+        filename: row.try_get_by_index(7)?,
+        expected_size_bytes: i64_to_u64(row.try_get_by_index(8)?)?,
+        expected_sha256: row.try_get_by_index(9)?,
+        storage_key: row.try_get_by_index(10)?,
+        cleanup_claim_token: row.try_get_by_index(11)?,
+        cleanup_attempt_count: i64_to_u32(row.try_get_by_index(12)?)?,
+    };
+    anyhow::ensure!(
+        uuid::Uuid::parse_str(&reservation.write_id).is_ok()
+            && uuid::Uuid::parse_str(&reservation.reservation_token).is_ok()
+            && reservation
+                .cleanup_claim_token
+                .as_deref()
+                .is_none_or(|token| { uuid::Uuid::parse_str(token).is_ok() }),
+        "Stored provider write identity is invalid"
+    );
+    validate_provider_write_input(&NewProviderWriteReservation {
+        tenant_scope: reservation.tenant_scope.clone(),
+        storage_namespace: reservation.storage_namespace.clone(),
+        content_type: reservation.content_type.clone(),
+        filename: reservation.filename.clone(),
+        expected_size_bytes: reservation.expected_size_bytes,
+        expected_sha256: reservation.expected_sha256.clone(),
+        lifetime_ms: reservation
+            .expires_at
+            .saturating_sub(reservation.created_at),
+    })?;
+    if let Some(key) = reservation.storage_key.as_deref() {
+        validate_artifact_cleanup_storage_key(key)?;
+    }
+    Ok(reservation)
 }
 
 fn map_text_asset(row: &QueryResult) -> anyhow::Result<TextAsset> {

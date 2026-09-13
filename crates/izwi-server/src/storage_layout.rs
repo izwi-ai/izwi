@@ -242,7 +242,19 @@ fn resolve_audio_extension(preferred_filename: Option<&str>, mime_type: &str) ->
         .trim()
         .to_ascii_lowercase();
 
-    let mapped = match mime.as_str() {
+    media_extension_for_content_type(&mime).to_string()
+}
+
+/// Stable extension mapping used by local providers that reconstruct MIME
+/// metadata from object keys on read.
+pub fn media_extension_for_content_type(mime_type: &str) -> &'static str {
+    let mime = mime_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    match mime.as_str() {
         "audio/wav" | "audio/x-wav" | "audio/wave" => "wav",
         "audio/mpeg" | "audio/mp3" => "mp3",
         "audio/ogg" | "audio/vorbis" => "ogg",
@@ -268,9 +280,7 @@ fn resolve_audio_extension(preferred_filename: Option<&str>, mime_type: &str) ->
         "video/mpeg" => "mpeg",
         "video/3gpp" => "3gp",
         _ => "bin",
-    };
-
-    mapped.to_string()
+    }
 }
 
 fn is_safe_extension(ext: &str) -> bool {

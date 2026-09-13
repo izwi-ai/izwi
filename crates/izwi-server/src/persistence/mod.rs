@@ -8,8 +8,9 @@ use izwi_hooks::{
     DatabaseBackend, DatabaseConnectionDecision, DatabaseMigrationMode, DatabaseProviderDecision,
     DatabaseProviderRequest, EnterpriseHooks, HookError, HookMetadata, HookResult,
     MediaDeleteRequest, MediaNamespace, MediaObjectKey, MediaObjectMetadata, MediaReadRequest,
-    MediaStorageProvider, MediaStorageProviderDecision, MediaStorageProviderRequest,
-    MediaWriteRequest, StoredMediaBytes, StoredMediaObject,
+    MediaReservedWriteRecoveryRequest, MediaReservedWriteRequest, MediaStorageProvider,
+    MediaStorageProviderDecision, MediaStorageProviderRequest, MediaWriteRequest, StoredMediaBytes,
+    StoredMediaObject, MEDIA_RESERVED_WRITE_VERSION,
 };
 use sea_orm::{DatabaseConnection, DatabaseConnectionType, DbBackend};
 use std::path::{Path, PathBuf};
@@ -332,6 +333,10 @@ impl LocalMediaStorageProvider {
 
 #[async_trait::async_trait]
 impl MediaStorageProvider for LocalMediaStorageProvider {
+    fn reserved_write_protocol_version(&self) -> Option<u16> {
+        Some(MEDIA_RESERVED_WRITE_VERSION)
+    }
+
     async fn put(
         &self,
         request: MediaWriteRequest,
@@ -361,6 +366,136 @@ impl MediaStorageProvider for LocalMediaStorageProvider {
                 attributes: request.metadata,
             },
         })
+    }
+
+    async fn put_reserved(
+        &self,
+        request: MediaReservedWriteRequest,
+        bytes: Vec<u8>,
+    ) -> HookResult<StoredMediaObject> {
+        validate_reserved_write(&request, &bytes)?;
+        let fingerprint =
+            reserved_write_fingerprint(&request.request, request.content_length, &request.sha256);
+        let key = reserved_local_key(&request.request, &request.write_id, &fingerprint);
+        let media_root = self.media_root.clone();
+        let key_for_write = key.clone();
+        let deadline = request.expires_at_unix_ms;
+        let write_id = request.write_id.clone();
+        let content_type = request.request.content_type.clone();
+        let filename = request.request.preferred_filename.clone();
+        let metadata = request.request.metadata.clone();
+        let content_length = request.content_length;
+        let digest = request.sha256.clone();
+        tokio::task::spawn_blocking(move || {
+            with_reserved_write_lock(&media_root, &write_id, || {
+                ensure_reserved_write_live(deadline)?;
+                let target = storage_layout::resolve_media_path(&media_root, &key_for_write)?;
+                let parent = target.parent().context("Reserved media parent directory")?;
+                std::fs::create_dir_all(parent)?;
+                let final_name = target
+                    .file_name()
+                    .context("Reserved media filename")?
+                    .to_string_lossy()
+                    .into_owned();
+                let temporary_name = format!(".{fingerprint}.tmp");
+                validate_reserved_write_directory(parent, &final_name, &temporary_name)?;
+                if target.exists() {
+                    anyhow::ensure!(
+                        file_matches_bytes(&target, &bytes)?,
+                        "Reserved media write ID was reused for different bytes"
+                    );
+                    remove_if_present(&parent.join(&temporary_name))?;
+                    sync_directory(parent)?;
+                    return Ok(());
+                }
+                let temporary_path = parent.join(&temporary_name);
+                let mut temporary = std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .write(true)
+                    .open(&temporary_path)?;
+                use std::io::Write as _;
+                temporary.write_all(&bytes)?;
+                temporary.sync_all()?;
+                drop(temporary);
+                ensure_reserved_write_live(deadline)?;
+                match std::fs::hard_link(&temporary_path, &target) {
+                    Ok(()) => {
+                        std::fs::remove_file(&temporary_path)?;
+                        sync_directory(parent)?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        anyhow::ensure!(
+                            file_matches_bytes(&target, &bytes)?,
+                            "Reserved media write ID was reused for different bytes"
+                        );
+                        std::fs::remove_file(&temporary_path)?;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|error| HookError::Failed(error.to_string()))?
+        .map_err(|error| HookError::Failed(error.to_string()))?;
+
+        Ok(StoredMediaObject {
+            key: MediaObjectKey::new(key),
+            metadata: MediaObjectMetadata {
+                content_type,
+                filename,
+                content_length: Some(content_length),
+                sha256: Some(digest),
+                tenant_id: tenant_id_from_metadata(&metadata),
+                attributes: metadata,
+            },
+        })
+    }
+
+    async fn recover_reserved_write(
+        &self,
+        request: MediaReservedWriteRecoveryRequest,
+    ) -> HookResult<()> {
+        validate_reserved_recovery(&request)?;
+        let fingerprint =
+            reserved_write_fingerprint(&request.request, request.content_length, &request.sha256);
+        let expected_key = reserved_local_key(&request.request, &request.write_id, &fingerprint);
+        if let Some(key) = request.storage_key.as_ref() {
+            if key.key != expected_key {
+                return Err(HookError::Failed(
+                    "Reserved media recovery key did not match its write ID".into(),
+                ));
+            }
+        }
+        let media_root = self.media_root.clone();
+        tokio::task::spawn_blocking(move || {
+            with_reserved_write_lock(&media_root, &request.write_id, || {
+                anyhow::ensure!(
+                    current_unix_millis() >= request.expires_at_unix_ms,
+                    "Reserved media write is not yet recoverable"
+                );
+                let target = storage_layout::resolve_media_path(&media_root, &expected_key)?;
+                let parent = target.parent().context("Reserved media parent directory")?;
+                let final_name = target
+                    .file_name()
+                    .context("Reserved media filename")?
+                    .to_string_lossy()
+                    .into_owned();
+                let temporary_name = format!(".{fingerprint}.tmp");
+                validate_reserved_write_directory(parent, &final_name, &temporary_name)?;
+                remove_if_present(&target)?;
+                remove_if_present(&parent.join(temporary_name))?;
+                match std::fs::remove_dir(parent) {
+                    Ok(()) => Ok(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err(error.into()),
+                }
+            })
+        })
+        .await
+        .map_err(|error| HookError::Failed(error.to_string()))?
+        .map_err(|error| HookError::Failed(error.to_string()))
     }
 
     async fn get(&self, request: MediaReadRequest) -> HookResult<StoredMediaBytes> {
@@ -500,7 +635,234 @@ impl MediaStorageProvider for LocalMediaStorageProvider {
 
     async fn delete(&self, request: MediaDeleteRequest) -> HookResult<()> {
         storage_layout::delete_media_file(&self.media_root, Some(&request.key.key))
-            .map_err(|err| HookError::Failed(err.to_string()))
+            .map_err(|err| HookError::Failed(err.to_string()))?;
+        if let Some(parent) = reserved_write_parent_for_key(&self.media_root, &request.key.key) {
+            match std::fs::remove_dir(parent) {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                    ) => {}
+                Err(error) => return Err(HookError::Failed(error.to_string())),
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_reserved_write(request: &MediaReservedWriteRequest, bytes: &[u8]) -> HookResult<()> {
+    if request.version != MEDIA_RESERVED_WRITE_VERSION
+        || uuid::Uuid::parse_str(&request.write_id).is_err()
+        || request.request.record_id != request.write_id
+        || request.content_length != bytes.len() as u64
+        || !valid_sha256(&request.sha256)
+        || sha256_hex_bytes(bytes) != request.sha256
+        || !reserved_content_type_round_trips(&request.request.content_type)
+    {
+        return Err(HookError::Failed(
+            "Invalid reserved media write identity".into(),
+        ));
+    }
+    ensure_reserved_write_live(request.expires_at_unix_ms)
+        .map_err(|error| HookError::Failed(error.to_string()))
+}
+
+fn validate_reserved_recovery(request: &MediaReservedWriteRecoveryRequest) -> HookResult<()> {
+    if request.version != MEDIA_RESERVED_WRITE_VERSION
+        || uuid::Uuid::parse_str(&request.write_id).is_err()
+        || request.request.record_id != request.write_id
+        || request.content_length == 0
+        || !valid_sha256(&request.sha256)
+    {
+        return Err(HookError::Failed(
+            "Invalid reserved media recovery identity".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_reserved_write_live(expires_at_unix_ms: u64) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        current_unix_millis() < expires_at_unix_ms,
+        "Reserved media write expired before publication"
+    );
+    Ok(())
+}
+
+fn current_unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn reserved_local_key(request: &MediaWriteRequest, write_id: &str, fingerprint: &str) -> String {
+    let extension = storage_layout::media_extension_for_content_type(&request.content_type);
+    format!("generated/reserved-writes/{write_id}/{fingerprint}.{extension}")
+}
+
+fn reserved_content_type_round_trips(content_type: &str) -> bool {
+    let extension = storage_layout::media_extension_for_content_type(content_type);
+    storage_layout::content_type_from_media_path(&format!("reserved.{extension}")) == content_type
+}
+
+fn with_reserved_write_lock<T>(
+    media_root: &Path,
+    write_id: &str,
+    operation: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    use fs2::FileExt as _;
+    let write_uuid = uuid::Uuid::parse_str(write_id)?;
+    let lock_root = media_root.join(".reserved-write-locks");
+    std::fs::create_dir_all(&lock_root)?;
+    // A fixed shard set stays bounded and avoids the inode race caused by
+    // unlinking a per-write lock file while another process is waiting on it.
+    let lock_path = lock_root.join(format!("{:02x}.lock", write_uuid.as_bytes()[0]));
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)?;
+    lock.lock_exclusive()?;
+    let result = operation();
+    let unlock = lock.unlock();
+    drop(lock);
+    result.and_then(|value| unlock.map(|_| value).map_err(Into::into))
+}
+
+fn sha256_hex_bytes(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn reserved_write_fingerprint(
+    request: &MediaWriteRequest,
+    content_length: u64,
+    content_sha256: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(b"izwi-media-reserved-write-v1\0");
+    match &request.namespace {
+        MediaNamespace::TranscriptionUpload => digest.update(b"transcription-upload"),
+        MediaNamespace::DiarizationUpload => digest.update(b"diarization-upload"),
+        MediaNamespace::GeneratedSpeech => digest.update(b"generated-speech"),
+        MediaNamespace::SavedVoice => digest.update(b"saved-voice"),
+        MediaNamespace::ChatMedia => digest.update(b"chat-media"),
+        MediaNamespace::Export => digest.update(b"export"),
+        MediaNamespace::Other(value) => {
+            digest.update(b"other");
+            update_fingerprint_field(&mut digest, value.as_bytes());
+        }
+    }
+    update_fingerprint_field(&mut digest, request.record_id.as_bytes());
+    match request.preferred_filename.as_deref() {
+        Some(filename) => {
+            digest.update([1]);
+            update_fingerprint_field(&mut digest, filename.as_bytes());
+        }
+        None => digest.update([0]),
+    }
+    update_fingerprint_field(&mut digest, request.content_type.as_bytes());
+    for (key, value) in &request.metadata {
+        update_fingerprint_field(&mut digest, key.as_bytes());
+        update_fingerprint_field(&mut digest, value.as_bytes());
+    }
+    digest.update(content_length.to_be_bytes());
+    update_fingerprint_field(&mut digest, content_sha256.as_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+fn update_fingerprint_field(digest: &mut sha2::Sha256, value: &[u8]) {
+    use sha2::Digest as _;
+    digest.update((value.len() as u64).to_be_bytes());
+    digest.update(value);
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_reserved_write_directory(
+    directory: &Path,
+    final_name: &str,
+    temporary_name: &str,
+) -> anyhow::Result<()> {
+    match std::fs::read_dir(directory) {
+        Ok(entries) => {
+            let mut count = 0usize;
+            for entry in entries {
+                count += 1;
+                anyhow::ensure!(count <= 2, "Reserved media write directory is not bounded");
+                let name = entry?.file_name();
+                anyhow::ensure!(
+                    name == std::ffi::OsStr::new(final_name)
+                        || name == std::ffi::OsStr::new(temporary_name),
+                    "Reserved media write ID was reused for different bytes or metadata"
+                );
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn remove_if_present(path: &Path) -> anyhow::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> anyhow::Result<()> {
+    std::fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+fn reserved_write_parent_for_key(media_root: &Path, key: &str) -> Option<PathBuf> {
+    let suffix = key.strip_prefix("generated/reserved-writes/")?;
+    let mut segments = suffix.split('/');
+    let write_id = segments.next()?;
+    let filename = segments.next()?;
+    if segments.next().is_some() || filename.is_empty() || uuid::Uuid::parse_str(write_id).is_err()
+    {
+        return None;
+    }
+    storage_layout::resolve_media_path(media_root, key)
+        .ok()?
+        .parent()
+        .map(Path::to_path_buf)
+}
+
+fn file_matches_bytes(path: &Path, expected: &[u8]) -> anyhow::Result<bool> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path)?;
+    if file.metadata()?.len() != expected.len() as u64 {
+        return Ok(false);
+    }
+    let mut offset = 0usize;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(offset == expected.len());
+        }
+        if expected.get(offset..offset + count) != Some(&buffer[..count]) {
+            return Ok(false);
+        }
+        offset += count;
     }
 }
 
@@ -614,6 +976,7 @@ mod tests {
     use izwi_hooks::{DatabaseProvider, DatabaseProviderDecision, MediaStorageResolver};
     use sea_orm::DbBackend;
     use std::io::Write;
+    use std::time::Duration;
 
     #[test]
     fn local_media_publish_falls_back_when_atomic_rename_is_denied() {
@@ -668,6 +1031,80 @@ mod tests {
             b"existing audio"
         );
         assert!(error.to_string().contains("hard link"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn local_reserved_write_recovery_fences_late_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = LocalMediaStorageProvider::new(directory.path().join("media"));
+        let write_id = uuid::Uuid::new_v4().to_string();
+        let expires_at_unix_ms = current_unix_millis() + 500;
+        let request = MediaWriteRequest {
+            namespace: MediaNamespace::Other("artifact-store".into()),
+            record_id: write_id.clone(),
+            preferred_filename: Some("artifact.bin".into()),
+            content_type: "application/octet-stream".into(),
+            metadata: HookMetadata::new(),
+        };
+        let stored = provider
+            .put_reserved(
+                MediaReservedWriteRequest {
+                    version: MEDIA_RESERVED_WRITE_VERSION,
+                    write_id: write_id.clone(),
+                    expires_at_unix_ms,
+                    content_length: 8,
+                    sha256: sha256_hex_bytes(b"reserved"),
+                    request: request.clone(),
+                },
+                b"reserved".to_vec(),
+            )
+            .await
+            .unwrap();
+        let mut mismatched_request = request.clone();
+        mismatched_request
+            .metadata
+            .insert("tenant_id".into(), "different-tenant".into());
+        assert!(provider
+            .put_reserved(
+                MediaReservedWriteRequest {
+                    version: MEDIA_RESERVED_WRITE_VERSION,
+                    write_id: write_id.clone(),
+                    expires_at_unix_ms,
+                    content_length: 8,
+                    sha256: sha256_hex_bytes(b"reserved"),
+                    request: mismatched_request,
+                },
+                b"reserved".to_vec(),
+            )
+            .await
+            .is_err());
+        tokio::time::sleep(Duration::from_millis(510)).await;
+        provider
+            .recover_reserved_write(MediaReservedWriteRecoveryRequest {
+                version: MEDIA_RESERVED_WRITE_VERSION,
+                write_id: write_id.clone(),
+                expires_at_unix_ms,
+                content_length: 8,
+                sha256: sha256_hex_bytes(b"reserved"),
+                request: request.clone(),
+                storage_key: Some(stored.key),
+            })
+            .await
+            .unwrap();
+        assert!(provider
+            .put_reserved(
+                MediaReservedWriteRequest {
+                    version: MEDIA_RESERVED_WRITE_VERSION,
+                    write_id,
+                    expires_at_unix_ms,
+                    content_length: 8,
+                    sha256: sha256_hex_bytes(b"reserved"),
+                    request,
+                },
+                b"reserved".to_vec(),
+            )
+            .await
+            .is_err());
     }
 
     #[tokio::test]

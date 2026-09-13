@@ -392,6 +392,29 @@ const BASELINE_SCHEMA: &[&str] = &[
     "#,
     "CREATE INDEX IF NOT EXISTS idx_artifact_cleanup_due ON artifact_cleanup_intents(available_at ASC, created_at ASC, id ASC);",
     r#"
+    CREATE TABLE IF NOT EXISTS provider_write_reservations (
+        write_id TEXT PRIMARY KEY,
+        reservation_token TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        available_at INTEGER NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('reserved', 'stored', 'cleanup_pending', 'cleanup_claimed')),
+        tenant_scope TEXT NOT NULL,
+        storage_namespace TEXT NOT NULL,
+        content_type TEXT NOT NULL,
+        filename TEXT NULL,
+        expected_size_bytes INTEGER NOT NULL,
+        expected_sha256 TEXT NOT NULL,
+        storage_key TEXT NULL,
+        cleanup_claim_token TEXT NULL,
+        cleanup_claim_expires_at INTEGER NULL,
+        cleanup_attempt_count INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT NULL
+    );
+    "#,
+    "CREATE INDEX IF NOT EXISTS idx_provider_write_cleanup_due ON provider_write_reservations(state, available_at ASC, expires_at ASC, created_at ASC, write_id ASC);",
+    r#"
     CREATE TABLE IF NOT EXISTS text_assets (
         id TEXT PRIMARY KEY,
         created_at INTEGER NOT NULL,

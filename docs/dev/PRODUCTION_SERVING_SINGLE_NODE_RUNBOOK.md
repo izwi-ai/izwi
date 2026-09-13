@@ -385,6 +385,23 @@ facade similarly has bounded, integrity-checked reads and tombstone-first
 deletion, but no gateway artifact route, automatic expiry/GC, or fleet adapter
 is enabled.
 
+Opaque artifact creation requires reserved-write protocol v1 from the selected
+media provider. Its database reservation exists before bytes leave the process,
+expires after one minute, and is atomically consumed by metadata publication.
+Provider calls are bounded to thirty seconds. Maintenance uses exact cleanup
+claim tokens and recovers by write ID, including reservations with no recorded
+provider key. `NotFound` means both absent and unable to commit later for that
+expired write ID. The reservation ledger is capped at 65,536 and each cleanup
+scan at 64. Legacy media and speech routes retain their existing provider path
+until explicitly migrated.
+
+The local reserved-write provider uses the shared image/video/audio MIME-to-file
+extension mapping because reads reconstruct MIME metadata from the object key.
+Canonical mapped types (for example `image/png`, `video/mp4`, `audio/wav`, and
+`audio/mpeg`) round-trip. Aliases such as `audio/x-wav` are rejected before
+publication rather than being stored under `.wav` and later misreported as
+`audio/wav`; callers should submit the canonical media type.
+
 ## Route migration gates
 
 Gateway mode currently exposes only text-only
