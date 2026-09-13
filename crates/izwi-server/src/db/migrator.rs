@@ -510,6 +510,29 @@ const BASELINE_SCHEMA: &[&str] = &[
     );
     "#,
     "CREATE INDEX IF NOT EXISTS idx_idempotency_keys_runtime_job ON idempotency_keys(runtime_job_id);",
+    // Version two deliberately uses a new table instead of rewriting the legacy
+    // primary key in place. Existing installations retain their local-only
+    // records while new callers get tenant-scoped reservation semantics.
+    r#"
+    CREATE TABLE IF NOT EXISTS durable_idempotency_keys_v2 (
+        tenant_scope TEXT NOT NULL,
+        operation TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        digest_version INTEGER NOT NULL,
+        request_digest TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('reserved', 'committed')),
+        reservation_token TEXT NOT NULL,
+        runtime_job_id TEXT NULL,
+        response_json TEXT NULL,
+        PRIMARY KEY(tenant_scope, operation, idempotency_key),
+        FOREIGN KEY(runtime_job_id) REFERENCES runtime_jobs(id) ON DELETE SET NULL
+    );
+    "#,
+    "CREATE INDEX IF NOT EXISTS idx_durable_idempotency_v2_expiry ON durable_idempotency_keys_v2(expires_at ASC, created_at ASC, tenant_scope ASC, operation ASC, idempotency_key ASC);",
+    "CREATE INDEX IF NOT EXISTS idx_durable_idempotency_v2_runtime_job ON durable_idempotency_keys_v2(runtime_job_id);",
     r#"
     CREATE TABLE IF NOT EXISTS runtime_worker_heartbeats (
         worker_id TEXT PRIMARY KEY,

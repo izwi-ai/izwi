@@ -22,6 +22,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
+    io::{self, Write},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -247,6 +248,72 @@ pub struct NewIdempotencyRecord {
     pub runtime_job_id: Option<String>,
     pub conflict_message: Option<String>,
     pub metadata_json: serde_json::Value,
+}
+
+/// Versioned, bounded identity for one durable create-operation request.
+///
+/// This contract is intentionally separate from worker-attempt duplicate
+/// suppression and does not imply replay for synchronous streaming requests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableIdempotencyRequest {
+    pub tenant_scope: String,
+    pub operation: String,
+    pub idempotency_key: String,
+    pub digest_version: u16,
+    pub request_digest: String,
+    pub reservation_ttl_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableIdempotencyReservation {
+    pub tenant_scope: String,
+    pub operation: String,
+    pub idempotency_key: String,
+    pub digest_version: u16,
+    pub request_digest: String,
+    pub reservation_token: String,
+    pub expires_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DurableIdempotencyReplay {
+    pub runtime_job_id: String,
+    pub response_json: serde_json::Value,
+    pub expires_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DurableIdempotencyBegin {
+    Acquired(DurableIdempotencyReservation),
+    Replay(DurableIdempotencyReplay),
+    Conflict,
+    InProgress { expires_at: u64 },
+    CapacityExceeded,
+}
+
+pub const DURABLE_IDEMPOTENCY_DIGEST_VERSION: u16 = 1;
+pub const MAX_DURABLE_IDEMPOTENCY_TENANT_BYTES: usize = 256;
+pub const MAX_DURABLE_IDEMPOTENCY_OPERATION_BYTES: usize = 128;
+pub const MAX_DURABLE_IDEMPOTENCY_KEY_BYTES: usize = 256;
+pub const MAX_DURABLE_IDEMPOTENCY_CANONICAL_REQUEST_BYTES: usize = 1024 * 1024;
+pub const MAX_DURABLE_IDEMPOTENCY_RESULT_BYTES: usize = 64 * 1024;
+pub const MAX_DURABLE_IDEMPOTENCY_RESERVATION_TTL_MS: u64 = 10 * 60 * 1_000;
+pub const MAX_DURABLE_IDEMPOTENCY_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+const MAX_DURABLE_IDEMPOTENCY_RECORDS: u64 = 65_536;
+const DEFAULT_DURABLE_IDEMPOTENCY_PRUNE_LIMIT: usize = 64;
+const MAX_DURABLE_IDEMPOTENCY_PRUNE_LIMIT: usize = 512;
+const MAX_DURABLE_IDEMPOTENCY_JSON_DEPTH: usize = 128;
+const MAX_DURABLE_IDEMPOTENCY_JSON_OBJECT_KEYS: usize = 16_384;
+
+/// Hash a semantically complete request envelope using the version-one
+/// canonical JSON encoding. Object keys are sorted recursively by Rust string
+/// order (Unicode scalar value order); array order, scalar types, and values
+/// remain significant. Uploads must be represented in the envelope by their
+/// verified content digest rather than a temporary path.
+pub fn canonical_request_digest(request: &serde_json::Value) -> anyhow::Result<String> {
+    let mut canonical = BoundedJsonBytes::new(MAX_DURABLE_IDEMPOTENCY_CANONICAL_REQUEST_BYTES);
+    write_canonical_json(request, &mut canonical, 0)?;
+    Ok(sha256_hex(&canonical.bytes))
 }
 
 #[derive(Debug, Clone)]
@@ -2542,6 +2609,321 @@ impl BatchRuntimeStore {
         rows.iter().map(map_runtime_artifact).collect()
     }
 
+    /// Reserve one tenant-scoped durable create operation.
+    ///
+    /// Callers must not acknowledge work until `commit_durable_idempotency`
+    /// succeeds. An expired reservation is eligible for a new owner; an active
+    /// reservation never permits a second caller to create work concurrently.
+    pub async fn reserve_durable_idempotency(
+        &self,
+        request: DurableIdempotencyRequest,
+    ) -> anyhow::Result<DurableIdempotencyBegin> {
+        self.reserve_durable_idempotency_with_capacity(request, MAX_DURABLE_IDEMPOTENCY_RECORDS)
+            .await
+    }
+
+    async fn reserve_durable_idempotency_with_capacity(
+        &self,
+        request: DurableIdempotencyRequest,
+        max_records: u64,
+    ) -> anyhow::Result<DurableIdempotencyBegin> {
+        validate_durable_idempotency_request(&request)?;
+        anyhow::ensure!(
+            max_records > 0,
+            "Durable idempotency capacity must be positive"
+        );
+        let db = self.db.connection().await?;
+        let tx = db
+            .begin_with_options(runtime_write_transaction_options())
+            .await
+            .context("Failed to start durable idempotency reservation transaction")?;
+        lock_durable_idempotency(&tx).await?;
+        let now = nonnegative_timestamp(self.now_millis())?;
+        prune_expired_durable_idempotency_with(&tx, now, DEFAULT_DURABLE_IDEMPOTENCY_PRUNE_LIMIT)
+            .await?;
+
+        if let Some(existing) = load_durable_idempotency_with(
+            &tx,
+            &request.tenant_scope,
+            &request.operation,
+            &request.idempotency_key,
+        )
+        .await?
+        {
+            if existing.expires_at <= now {
+                delete_durable_idempotency_with(
+                    &tx,
+                    &request.tenant_scope,
+                    &request.operation,
+                    &request.idempotency_key,
+                    now,
+                )
+                .await?;
+            } else {
+                let outcome = existing.begin_outcome(&request)?;
+                tx.commit().await?;
+                return Ok(outcome);
+            }
+        }
+
+        let count = tx
+            .query_one_raw(raw::statement(
+                &tx,
+                "SELECT COUNT(*) FROM durable_idempotency_keys_v2",
+                vec![],
+            )?)
+            .await?
+            .ok_or_else(|| anyhow!("Durable idempotency count returned no row"))?
+            .try_get_by_index::<i64>(0)?;
+        if u64::try_from(count)? >= max_records {
+            tx.commit().await?;
+            return Ok(DurableIdempotencyBegin::CapacityExceeded);
+        }
+
+        let reservation_token = new_uuid();
+        let expires_at = now
+            .checked_add(request.reservation_ttl_ms)
+            .context("Durable idempotency reservation expiry overflow")?;
+        let insert_sql = match tx.get_database_backend() {
+            DbBackend::Sqlite | DbBackend::Postgres => {
+                r#"
+                INSERT INTO durable_idempotency_keys_v2 (
+                    tenant_scope, operation, idempotency_key, created_at,
+                    updated_at, expires_at, digest_version, request_digest,
+                    state, reservation_token, runtime_job_id, response_json
+                )
+                VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7, 'reserved', ?8, NULL, NULL)
+                ON CONFLICT(tenant_scope, operation, idempotency_key) DO NOTHING
+            "#
+            }
+            DbBackend::MySql => {
+                r#"
+                INSERT IGNORE INTO durable_idempotency_keys_v2 (
+                    tenant_scope, operation, idempotency_key, created_at,
+                    updated_at, expires_at, digest_version, request_digest,
+                    state, reservation_token, runtime_job_id, response_json
+                )
+                VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7, 'reserved', ?8, NULL, NULL)
+            "#
+            }
+            backend => bail!("Unsupported durable idempotency database backend: {backend:?}"),
+        };
+        let inserted = tx
+            .execute_raw(raw::statement(
+                &tx,
+                insert_sql,
+                vec![
+                    request.tenant_scope.clone().into(),
+                    request.operation.clone().into(),
+                    request.idempotency_key.clone().into(),
+                    i64::try_from(now)?.into(),
+                    i64::try_from(expires_at)?.into(),
+                    i64::from(request.digest_version).into(),
+                    request.request_digest.clone().into(),
+                    reservation_token.clone().into(),
+                ],
+            )?)
+            .await
+            .context("Failed to reserve durable idempotency key")?;
+
+        if inserted.rows_affected() == 0 {
+            let existing = load_durable_idempotency_with(
+                &tx,
+                &request.tenant_scope,
+                &request.operation,
+                &request.idempotency_key,
+            )
+            .await?
+            .ok_or_else(|| anyhow!("Conflicting durable idempotency key disappeared"))?;
+            let outcome = existing.begin_outcome(&request)?;
+            tx.commit().await?;
+            return Ok(outcome);
+        }
+
+        tx.commit()
+            .await
+            .context("Failed to commit durable idempotency reservation")?;
+        Ok(DurableIdempotencyBegin::Acquired(
+            DurableIdempotencyReservation {
+                tenant_scope: request.tenant_scope,
+                operation: request.operation,
+                idempotency_key: request.idempotency_key,
+                digest_version: request.digest_version,
+                request_digest: request.request_digest,
+                reservation_token,
+                expires_at,
+            },
+        ))
+    }
+
+    /// Commit the replayable response for an acknowledged durable job.
+    ///
+    /// The conditional update verifies reservation ownership, request digest,
+    /// unexpired state, and existence of the referenced job in one transaction.
+    pub async fn commit_durable_idempotency(
+        &self,
+        reservation: &DurableIdempotencyReservation,
+        runtime_job_id: &str,
+        response_json: serde_json::Value,
+        retention_ms: u64,
+    ) -> anyhow::Result<Option<DurableIdempotencyReplay>> {
+        validate_durable_idempotency_identity(
+            &reservation.tenant_scope,
+            &reservation.operation,
+            &reservation.idempotency_key,
+            reservation.digest_version,
+            &reservation.request_digest,
+        )?;
+        validate_bounded_field("reservation token", &reservation.reservation_token, 64)?;
+        validate_bounded_field("runtime job ID", runtime_job_id, 128)?;
+        anyhow::ensure!(
+            (1..=MAX_DURABLE_IDEMPOTENCY_RETENTION_MS).contains(&retention_ms),
+            "Durable idempotency retention must be between 1 and {MAX_DURABLE_IDEMPOTENCY_RETENTION_MS} milliseconds"
+        );
+        let response_json_string = bounded_json_string(
+            &response_json,
+            MAX_DURABLE_IDEMPOTENCY_RESULT_BYTES,
+            "Durable idempotency result",
+        )?;
+
+        let db = self.db.connection().await?;
+        let tx = db
+            .begin_with_options(runtime_write_transaction_options())
+            .await
+            .context("Failed to start durable idempotency commit transaction")?;
+        let now = nonnegative_timestamp(self.now_millis())?;
+        let expires_at = now
+            .checked_add(retention_ms)
+            .context("Durable idempotency retention expiry overflow")?;
+        let result = tx
+            .execute_raw(raw::statement(
+                &tx,
+                r#"
+                UPDATE durable_idempotency_keys_v2
+                SET state = 'committed', updated_at = ?1, expires_at = ?2,
+                    runtime_job_id = ?3, response_json = ?4
+                WHERE tenant_scope = ?5
+                  AND operation = ?6
+                  AND idempotency_key = ?7
+                  AND state = 'reserved'
+                  AND reservation_token = ?8
+                  AND digest_version = ?9
+                  AND request_digest = ?10
+                  AND expires_at > ?1
+                  AND EXISTS (SELECT 1 FROM runtime_jobs WHERE id = ?3)
+                "#,
+                vec![
+                    i64::try_from(now)?.into(),
+                    i64::try_from(expires_at)?.into(),
+                    runtime_job_id.into(),
+                    response_json_string.into(),
+                    reservation.tenant_scope.clone().into(),
+                    reservation.operation.clone().into(),
+                    reservation.idempotency_key.clone().into(),
+                    reservation.reservation_token.clone().into(),
+                    i64::from(reservation.digest_version).into(),
+                    reservation.request_digest.clone().into(),
+                ],
+            )?)
+            .await
+            .context("Failed to commit durable idempotency result")?;
+        if result.rows_affected() == 0 {
+            let existing = load_durable_idempotency_with(
+                &tx,
+                &reservation.tenant_scope,
+                &reservation.operation,
+                &reservation.idempotency_key,
+            )
+            .await?;
+            let replay = existing.and_then(|existing| {
+                (existing.state == "committed"
+                    && existing.expires_at > now
+                    && existing.digest_version == reservation.digest_version
+                    && existing.request_digest == reservation.request_digest
+                    && existing.reservation_token == reservation.reservation_token
+                    && existing.runtime_job_id.as_deref() == Some(runtime_job_id)
+                    && existing.response_json.as_ref() == Some(&response_json))
+                .then(|| DurableIdempotencyReplay {
+                    runtime_job_id: runtime_job_id.to_string(),
+                    response_json: response_json.clone(),
+                    expires_at: existing.expires_at,
+                })
+            });
+            if replay.is_some() {
+                tx.commit().await?;
+            } else {
+                tx.rollback().await?;
+            }
+            return Ok(replay);
+        }
+        tx.commit()
+            .await
+            .context("Failed to commit durable idempotency result transaction")?;
+        Ok(Some(DurableIdempotencyReplay {
+            runtime_job_id: runtime_job_id.to_string(),
+            response_json,
+            expires_at,
+        }))
+    }
+
+    /// Release an uncommitted reservation after a request is rejected locally.
+    /// The opaque token prevents an old owner from deleting a replacement.
+    pub async fn release_durable_idempotency(
+        &self,
+        reservation: &DurableIdempotencyReservation,
+    ) -> anyhow::Result<bool> {
+        validate_durable_idempotency_identity(
+            &reservation.tenant_scope,
+            &reservation.operation,
+            &reservation.idempotency_key,
+            reservation.digest_version,
+            &reservation.request_digest,
+        )?;
+        validate_bounded_field("reservation token", &reservation.reservation_token, 64)?;
+        let db = self.db.connection().await?;
+        let result = db
+            .execute_raw(raw::statement(
+                db,
+                r#"
+                DELETE FROM durable_idempotency_keys_v2
+                WHERE tenant_scope = ?1 AND operation = ?2 AND idempotency_key = ?3
+                  AND state = 'reserved' AND reservation_token = ?4
+                  AND digest_version = ?5 AND request_digest = ?6
+                "#,
+                vec![
+                    reservation.tenant_scope.clone().into(),
+                    reservation.operation.clone().into(),
+                    reservation.idempotency_key.clone().into(),
+                    reservation.reservation_token.clone().into(),
+                    i64::from(reservation.digest_version).into(),
+                    reservation.request_digest.clone().into(),
+                ],
+            )?)
+            .await
+            .context("Failed to release durable idempotency reservation")?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Delete a deterministic bounded page of expired reservations/results.
+    pub async fn prune_expired_durable_idempotency(&self, limit: usize) -> anyhow::Result<u64> {
+        let db = self.db.connection().await?;
+        let tx = db
+            .begin_with_options(runtime_write_transaction_options())
+            .await
+            .context("Failed to start durable idempotency prune transaction")?;
+        lock_durable_idempotency(&tx).await?;
+        let removed = prune_expired_durable_idempotency_with(
+            &tx,
+            nonnegative_timestamp(self.now_millis())?,
+            limit.clamp(1, MAX_DURABLE_IDEMPOTENCY_PRUNE_LIMIT),
+        )
+        .await?;
+        tx.commit()
+            .await
+            .context("Failed to commit durable idempotency pruning")?;
+        Ok(removed)
+    }
+
     pub async fn record_idempotency(
         &self,
         input: NewIdempotencyRecord,
@@ -3150,6 +3532,358 @@ impl BatchRuntimeStore {
 
         Ok(report)
     }
+}
+
+#[derive(Debug)]
+struct StoredDurableIdempotency {
+    expires_at: u64,
+    digest_version: u16,
+    request_digest: String,
+    state: String,
+    reservation_token: String,
+    runtime_job_id: Option<String>,
+    response_json: Option<serde_json::Value>,
+}
+
+impl StoredDurableIdempotency {
+    fn begin_outcome(
+        self,
+        request: &DurableIdempotencyRequest,
+    ) -> anyhow::Result<DurableIdempotencyBegin> {
+        if self.digest_version != request.digest_version
+            || self.request_digest != request.request_digest
+        {
+            return Ok(DurableIdempotencyBegin::Conflict);
+        }
+        match self.state.as_str() {
+            "reserved" => Ok(DurableIdempotencyBegin::InProgress {
+                expires_at: self.expires_at,
+            }),
+            "committed" => Ok(DurableIdempotencyBegin::Replay(DurableIdempotencyReplay {
+                runtime_job_id: self.runtime_job_id.ok_or_else(|| {
+                    anyhow!("Committed durable idempotency record is missing its runtime job")
+                })?,
+                response_json: self.response_json.ok_or_else(|| {
+                    anyhow!("Committed durable idempotency record is missing its response")
+                })?,
+                expires_at: self.expires_at,
+            })),
+            state => bail!("Unknown durable idempotency state: {state}"),
+        }
+    }
+}
+
+fn validate_durable_idempotency_request(request: &DurableIdempotencyRequest) -> anyhow::Result<()> {
+    validate_durable_idempotency_identity(
+        &request.tenant_scope,
+        &request.operation,
+        &request.idempotency_key,
+        request.digest_version,
+        &request.request_digest,
+    )?;
+    anyhow::ensure!(
+        (1..=MAX_DURABLE_IDEMPOTENCY_RESERVATION_TTL_MS)
+            .contains(&request.reservation_ttl_ms),
+        "Durable idempotency reservation TTL must be between 1 and {MAX_DURABLE_IDEMPOTENCY_RESERVATION_TTL_MS} milliseconds"
+    );
+    Ok(())
+}
+
+fn validate_durable_idempotency_identity(
+    tenant_scope: &str,
+    operation: &str,
+    idempotency_key: &str,
+    digest_version: u16,
+    request_digest: &str,
+) -> anyhow::Result<()> {
+    validate_bounded_field(
+        "tenant scope",
+        tenant_scope,
+        MAX_DURABLE_IDEMPOTENCY_TENANT_BYTES,
+    )?;
+    validate_bounded_field(
+        "operation",
+        operation,
+        MAX_DURABLE_IDEMPOTENCY_OPERATION_BYTES,
+    )?;
+    validate_bounded_field(
+        "idempotency key",
+        idempotency_key,
+        MAX_DURABLE_IDEMPOTENCY_KEY_BYTES,
+    )?;
+    validate_request_digest(digest_version, request_digest)
+}
+
+fn validate_request_digest(digest_version: u16, request_digest: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        digest_version == DURABLE_IDEMPOTENCY_DIGEST_VERSION,
+        "Unsupported durable idempotency digest version: {digest_version}"
+    );
+    anyhow::ensure!(
+        request_digest.len() == 64
+            && request_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "Durable idempotency request digest must be lowercase SHA-256 hex"
+    );
+    Ok(())
+}
+
+fn validate_bounded_field(name: &str, value: &str, max_bytes: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !value.is_empty(),
+        "Durable idempotency {name} cannot be empty"
+    );
+    anyhow::ensure!(
+        value.len() <= max_bytes,
+        "Durable idempotency {name} exceeds {max_bytes} bytes"
+    );
+    anyhow::ensure!(
+        !value.chars().any(char::is_control),
+        "Durable idempotency {name} contains control characters"
+    );
+    Ok(())
+}
+
+fn nonnegative_timestamp(now: i64) -> anyhow::Result<u64> {
+    u64::try_from(now).context("Durable idempotency clock preceded the Unix epoch")
+}
+
+struct BoundedJsonBytes {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl BoundedJsonBytes {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(limit.min(8192)),
+            limit,
+        }
+    }
+}
+
+impl Write for BoundedJsonBytes {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if self.bytes.len().saturating_add(buffer.len()) > self.limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bounded JSON encoding exceeded its byte limit",
+            ));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn bounded_json_string(
+    value: &serde_json::Value,
+    limit: usize,
+    label: &str,
+) -> anyhow::Result<String> {
+    let mut encoded = BoundedJsonBytes::new(limit);
+    write_canonical_json(value, &mut encoded, 0)
+        .with_context(|| format!("{label} exceeds {limit} bytes or could not be encoded"))?;
+    String::from_utf8(encoded.bytes).context("JSON serialization produced invalid UTF-8")
+}
+
+fn write_canonical_json<W: Write>(
+    value: &serde_json::Value,
+    output: &mut W,
+    depth: usize,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        depth <= MAX_DURABLE_IDEMPOTENCY_JSON_DEPTH,
+        "Durable idempotency JSON exceeds maximum nesting depth of {MAX_DURABLE_IDEMPOTENCY_JSON_DEPTH}"
+    );
+    match value {
+        serde_json::Value::Null => output.write_all(b"null")?,
+        serde_json::Value::Bool(true) => output.write_all(b"true")?,
+        serde_json::Value::Bool(false) => output.write_all(b"false")?,
+        serde_json::Value::Number(value) => serde_json::to_writer(&mut *output, value)?,
+        serde_json::Value::String(value) => serde_json::to_writer(&mut *output, value)?,
+        serde_json::Value::Array(values) => {
+            output.write_all(b"[")?;
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    output.write_all(b",")?;
+                }
+                write_canonical_json(value, output, depth + 1)?;
+            }
+            output.write_all(b"]")?;
+        }
+        serde_json::Value::Object(values) => {
+            anyhow::ensure!(
+                values.len() <= MAX_DURABLE_IDEMPOTENCY_JSON_OBJECT_KEYS,
+                "Durable idempotency JSON object exceeds {MAX_DURABLE_IDEMPOTENCY_JSON_OBJECT_KEYS} keys"
+            );
+            output.write_all(b"{")?;
+            let mut keys = values.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            for (index, key) in keys.into_iter().enumerate() {
+                if index != 0 {
+                    output.write_all(b",")?;
+                }
+                serde_json::to_writer(&mut *output, key)?;
+                output.write_all(b":")?;
+                write_canonical_json(&values[key], output, depth + 1)?;
+            }
+            output.write_all(b"}")?;
+        }
+    }
+    Ok(())
+}
+
+async fn lock_durable_idempotency<C: ConnectionTrait>(db: &C) -> anyhow::Result<()> {
+    let insert_sql = match db.get_database_backend() {
+        DbBackend::Sqlite | DbBackend::Postgres => {
+            "INSERT INTO runtime_admission_locks (id, lock_value) VALUES ('durable_idempotency_v2', 1) ON CONFLICT (id) DO NOTHING"
+        }
+        DbBackend::MySql => {
+            "INSERT IGNORE INTO runtime_admission_locks (id, lock_value) VALUES ('durable_idempotency_v2', 1)"
+        }
+        backend => bail!("Unsupported durable idempotency database backend: {backend:?}"),
+    };
+    db.execute_raw(raw::statement(db, insert_sql, vec![])?)
+        .await
+        .context("Failed to initialize durable idempotency lock")?;
+    db.execute_raw(raw::statement(
+        db,
+        "UPDATE runtime_admission_locks SET lock_value = lock_value WHERE id = 'durable_idempotency_v2'",
+        vec![],
+    )?)
+    .await
+    .context("Failed to lock durable idempotency capacity")?;
+    Ok(())
+}
+
+async fn load_durable_idempotency_with<C: ConnectionTrait>(
+    db: &C,
+    tenant_scope: &str,
+    operation: &str,
+    idempotency_key: &str,
+) -> anyhow::Result<Option<StoredDurableIdempotency>> {
+    let row = db
+        .query_one_raw(raw::statement(
+            db,
+            r#"
+            SELECT expires_at, digest_version, request_digest, state,
+                   reservation_token, runtime_job_id, response_json
+            FROM durable_idempotency_keys_v2
+            WHERE tenant_scope = ?1 AND operation = ?2 AND idempotency_key = ?3
+            "#,
+            vec![
+                tenant_scope.into(),
+                operation.into(),
+                idempotency_key.into(),
+            ],
+        )?)
+        .await
+        .context("Failed to load durable idempotency key")?;
+    row.map(|row| -> anyhow::Result<StoredDurableIdempotency> {
+        let digest_version = u16::try_from(row.try_get_by_index::<i64>(1)?)?;
+        let request_digest: String = row.try_get_by_index(2)?;
+        validate_request_digest(digest_version, &request_digest)?;
+        let state: String = row.try_get_by_index(3)?;
+        anyhow::ensure!(
+            matches!(state.as_str(), "reserved" | "committed"),
+            "Unknown durable idempotency state: {state}"
+        );
+        let reservation_token: String = row.try_get_by_index(4)?;
+        validate_bounded_field("reservation token", &reservation_token, 64)?;
+        let runtime_job_id: Option<String> = row.try_get_by_index(5)?;
+        if let Some(runtime_job_id) = runtime_job_id.as_deref() {
+            validate_bounded_field("runtime job ID", runtime_job_id, 128)?;
+        }
+        let response_json = match row.try_get_by_index::<Option<String>>(6)? {
+            Some(raw) => {
+                anyhow::ensure!(
+                    raw.len() <= MAX_DURABLE_IDEMPOTENCY_RESULT_BYTES,
+                    "Stored durable idempotency result exceeds {MAX_DURABLE_IDEMPOTENCY_RESULT_BYTES} bytes"
+                );
+                Some(
+                    serde_json::from_str(&raw)
+                        .context("Failed to parse durable idempotency response")?,
+                )
+            }
+            None => None,
+        };
+        Ok(StoredDurableIdempotency {
+            expires_at: u64::try_from(row.try_get_by_index::<i64>(0)?)?,
+            digest_version,
+            request_digest,
+            state,
+            reservation_token,
+            runtime_job_id,
+            response_json,
+        })
+    })
+    .transpose()
+}
+
+async fn delete_durable_idempotency_with<C: ConnectionTrait>(
+    db: &C,
+    tenant_scope: &str,
+    operation: &str,
+    idempotency_key: &str,
+    now: u64,
+) -> anyhow::Result<bool> {
+    let result = db
+        .execute_raw(raw::statement(
+            db,
+            r#"
+            DELETE FROM durable_idempotency_keys_v2
+            WHERE tenant_scope = ?1 AND operation = ?2 AND idempotency_key = ?3
+              AND expires_at <= ?4
+            "#,
+            vec![
+                tenant_scope.into(),
+                operation.into(),
+                idempotency_key.into(),
+                i64::try_from(now)?.into(),
+            ],
+        )?)
+        .await
+        .context("Failed to delete expired durable idempotency key")?;
+    Ok(result.rows_affected() == 1)
+}
+
+async fn prune_expired_durable_idempotency_with<C: ConnectionTrait>(
+    db: &C,
+    now: u64,
+    limit: usize,
+) -> anyhow::Result<u64> {
+    let rows = db
+        .query_all_raw(raw::statement(
+            db,
+            r#"
+            SELECT tenant_scope, operation, idempotency_key
+            FROM durable_idempotency_keys_v2
+            WHERE expires_at <= ?1
+            ORDER BY expires_at ASC, created_at ASC, tenant_scope ASC,
+                     operation ASC, idempotency_key ASC
+            LIMIT ?2
+            "#,
+            vec![i64::try_from(now)?.into(), i64::try_from(limit)?.into()],
+        )?)
+        .await
+        .context("Failed to select expired durable idempotency keys")?;
+    let mut removed = 0_u64;
+    for row in rows {
+        let tenant_scope: String = row.try_get_by_index(0)?;
+        let operation: String = row.try_get_by_index(1)?;
+        let idempotency_key: String = row.try_get_by_index(2)?;
+        if delete_durable_idempotency_with(db, &tenant_scope, &operation, &idempotency_key, now)
+            .await?
+        {
+            removed = removed.saturating_add(1);
+        }
+    }
+    Ok(removed)
 }
 
 async fn get_job_with<C: ConnectionTrait>(db: &C, id: &str) -> anyhow::Result<Option<RuntimeJob>> {
@@ -3875,6 +4609,61 @@ mod tests {
         )
     }
 
+    fn durable_idempotency_request(
+        tenant_scope: &str,
+        operation: &str,
+        idempotency_key: &str,
+        payload: &[u8],
+        reservation_ttl_ms: u64,
+    ) -> DurableIdempotencyRequest {
+        DurableIdempotencyRequest {
+            tenant_scope: tenant_scope.to_string(),
+            operation: operation.to_string(),
+            idempotency_key: idempotency_key.to_string(),
+            digest_version: DURABLE_IDEMPOTENCY_DIGEST_VERSION,
+            request_digest: sha256_hex(payload),
+            reservation_ttl_ms,
+        }
+    }
+
+    #[test]
+    fn durable_idempotency_digest_uses_canonical_json_object_order() {
+        let first: serde_json::Value = serde_json::from_str(
+            r#"{"text":"hello","options":{"voice":"a","speed":1},"parts":[1,2]}"#,
+        )
+        .expect("first request");
+        let reordered: serde_json::Value = serde_json::from_str(
+            r#"{"parts":[1,2],"options":{"speed":1,"voice":"a"},"text":"hello"}"#,
+        )
+        .expect("reordered request");
+        let changed: serde_json::Value = serde_json::from_str(
+            r#"{"parts":[2,1],"options":{"speed":1,"voice":"a"},"text":"hello"}"#,
+        )
+        .expect("changed request");
+
+        assert_eq!(
+            canonical_request_digest(&first).expect("first digest"),
+            canonical_request_digest(&reordered).expect("reordered digest")
+        );
+        assert_ne!(
+            canonical_request_digest(&first).expect("first digest"),
+            canonical_request_digest(&changed).expect("changed digest")
+        );
+        assert!(canonical_request_digest(&json!(
+            "x".repeat(MAX_DURABLE_IDEMPOTENCY_CANONICAL_REQUEST_BYTES + 1)
+        ))
+        .is_err());
+
+        let mut too_deep = serde_json::Value::Null;
+        for _ in 0..=MAX_DURABLE_IDEMPOTENCY_JSON_DEPTH {
+            too_deep = serde_json::Value::Array(vec![too_deep]);
+        }
+        assert!(canonical_request_digest(&too_deep)
+            .unwrap_err()
+            .to_string()
+            .contains("maximum nesting depth"));
+    }
+
     async fn create_test_job_and_stage(
         store: &BatchRuntimeStore,
         priority: i32,
@@ -4414,6 +5203,334 @@ mod tests {
             heartbeat.registration.queue_classes,
             vec![QueueClass::Batch]
         );
+    }
+
+    #[tokio::test]
+    async fn durable_idempotency_is_tenant_and_operation_scoped_with_replay() {
+        let (mut store, _root) = build_store();
+        let clock = Arc::new(AtomicI64::new(1_000));
+        store.set_test_clock(clock);
+        let job = create_test_job(&store, 0, 1).await;
+        let request = durable_idempotency_request("tenant-a", "job.create", "key-1", b"one", 500);
+        let reservation = match store
+            .reserve_durable_idempotency(request.clone())
+            .await
+            .expect("reserve")
+        {
+            DurableIdempotencyBegin::Acquired(reservation) => reservation,
+            outcome => panic!("unexpected reservation outcome: {outcome:?}"),
+        };
+        let committed = store
+            .commit_durable_idempotency(&reservation, &job.id, json!({"job_id": job.id}), 2_000)
+            .await
+            .expect("commit")
+            .expect("owned reservation");
+        assert_eq!(committed.runtime_job_id, job.id);
+        assert_eq!(
+            store
+                .commit_durable_idempotency(
+                    &reservation,
+                    &job.id,
+                    json!({"job_id": job.id}),
+                    2_000,
+                )
+                .await
+                .expect("idempotent commit"),
+            Some(committed)
+        );
+
+        assert!(matches!(
+            store
+                .reserve_durable_idempotency(request.clone())
+                .await
+                .expect("replay"),
+            DurableIdempotencyBegin::Replay(replay)
+                if replay.runtime_job_id == job.id
+                    && replay.response_json == json!({"job_id": job.id})
+        ));
+        assert!(matches!(
+            store
+                .reserve_durable_idempotency(DurableIdempotencyRequest {
+                    request_digest: sha256_hex(b"different"),
+                    ..request.clone()
+                })
+                .await
+                .expect("conflict"),
+            DurableIdempotencyBegin::Conflict
+        ));
+        assert!(matches!(
+            store
+                .reserve_durable_idempotency(DurableIdempotencyRequest {
+                    tenant_scope: "tenant-b".to_string(),
+                    ..request.clone()
+                })
+                .await
+                .expect("other tenant"),
+            DurableIdempotencyBegin::Acquired(_)
+        ));
+        assert!(matches!(
+            store
+                .reserve_durable_idempotency(DurableIdempotencyRequest {
+                    operation: "job.export".to_string(),
+                    ..request
+                })
+                .await
+                .expect("other operation"),
+            DurableIdempotencyBegin::Acquired(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn durable_idempotency_reservations_expire_and_fence_stale_commits() {
+        let (mut store, _root) = build_store();
+        let clock = Arc::new(AtomicI64::new(1_000));
+        store.set_test_clock(clock.clone());
+        let job = create_test_job(&store, 0, 1).await;
+        let request = durable_idempotency_request("tenant-a", "job.create", "key-1", b"one", 100);
+        let first = match store
+            .reserve_durable_idempotency(request.clone())
+            .await
+            .expect("first reserve")
+        {
+            DurableIdempotencyBegin::Acquired(reservation) => reservation,
+            outcome => panic!("unexpected reservation outcome: {outcome:?}"),
+        };
+        assert!(matches!(
+            store
+                .reserve_durable_idempotency(request.clone())
+                .await
+                .expect("in progress"),
+            DurableIdempotencyBegin::InProgress { expires_at: 1_100 }
+        ));
+
+        clock.store(1_100, Ordering::SeqCst);
+        let second = match store
+            .reserve_durable_idempotency(request.clone())
+            .await
+            .expect("reserve after expiry")
+        {
+            DurableIdempotencyBegin::Acquired(reservation) => reservation,
+            outcome => panic!("unexpected reservation outcome: {outcome:?}"),
+        };
+        assert_ne!(second.reservation_token, first.reservation_token);
+        assert!(store
+            .commit_durable_idempotency(&first, &job.id, json!({"job_id": job.id}), 100)
+            .await
+            .expect("stale commit")
+            .is_none());
+        store
+            .commit_durable_idempotency(&second, &job.id, json!({"job_id": job.id}), 100)
+            .await
+            .expect("current commit")
+            .expect("current owner");
+
+        clock.store(1_200, Ordering::SeqCst);
+        assert!(matches!(
+            store
+                .reserve_durable_idempotency(request)
+                .await
+                .expect("reserve after result expiry"),
+            DurableIdempotencyBegin::Acquired(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn durable_idempotency_concurrent_reservation_has_one_owner_and_fenced_release() {
+        let (mut store, _root) = build_store();
+        store.set_test_clock(Arc::new(AtomicI64::new(1_000)));
+        let request =
+            durable_idempotency_request("tenant-a", "job.create", "concurrent-key", b"one", 500);
+        let (first, second) = tokio::join!(
+            store.reserve_durable_idempotency(request.clone()),
+            store.reserve_durable_idempotency(request.clone()),
+        );
+        let outcomes = [
+            first.expect("first reserve"),
+            second.expect("second reserve"),
+        ];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, DurableIdempotencyBegin::Acquired(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, DurableIdempotencyBegin::InProgress { .. }))
+                .count(),
+            1
+        );
+        let reservation = outcomes
+            .into_iter()
+            .find_map(|outcome| match outcome {
+                DurableIdempotencyBegin::Acquired(reservation) => Some(reservation),
+                _ => None,
+            })
+            .expect("reservation owner");
+        let mut forged = reservation.clone();
+        forged.reservation_token = new_uuid();
+        assert!(!store
+            .release_durable_idempotency(&forged)
+            .await
+            .expect("forged release"));
+        assert!(store
+            .release_durable_idempotency(&reservation)
+            .await
+            .expect("owner release"));
+        assert!(matches!(
+            store
+                .reserve_durable_idempotency(request)
+                .await
+                .expect("reserve after release"),
+            DurableIdempotencyBegin::Acquired(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn durable_idempotency_pruning_and_capacity_are_bounded_and_deterministic() {
+        let (mut store, _root) = build_store();
+        let clock = Arc::new(AtomicI64::new(1_000));
+        store.set_test_clock(clock.clone());
+        for (offset, key) in [(0, "a"), (1, "b"), (2, "c")] {
+            clock.store(1_000 + offset, Ordering::SeqCst);
+            assert!(matches!(
+                store
+                    .reserve_durable_idempotency(durable_idempotency_request(
+                        "tenant-a",
+                        "job.create",
+                        key,
+                        key.as_bytes(),
+                        100,
+                    ))
+                    .await
+                    .expect("reserve expiring key"),
+                DurableIdempotencyBegin::Acquired(_)
+            ));
+        }
+        clock.store(1_200, Ordering::SeqCst);
+        assert_eq!(
+            store
+                .prune_expired_durable_idempotency(2)
+                .await
+                .expect("bounded prune"),
+            2
+        );
+        let db = store.connection().await.expect("database");
+        let rows = db
+            .query_all_raw(
+                raw::statement(
+                    db,
+                    "SELECT idempotency_key FROM durable_idempotency_keys_v2 ORDER BY idempotency_key",
+                    vec![],
+                )
+                .expect("remaining-key query"),
+            )
+            .await
+            .expect("remaining keys");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].try_get_by_index::<String>(0).unwrap(), "c");
+
+        store
+            .prune_expired_durable_idempotency(1)
+            .await
+            .expect("remove final expired key");
+        clock.store(2_000, Ordering::SeqCst);
+        for key in ["one", "two"] {
+            assert!(matches!(
+                store
+                    .reserve_durable_idempotency_with_capacity(
+                        durable_idempotency_request(
+                            "tenant-a",
+                            "job.create",
+                            key,
+                            key.as_bytes(),
+                            100,
+                        ),
+                        2,
+                    )
+                    .await
+                    .expect("within capacity"),
+                DurableIdempotencyBegin::Acquired(_)
+            ));
+        }
+        assert!(matches!(
+            store
+                .reserve_durable_idempotency_with_capacity(
+                    durable_idempotency_request("tenant-a", "job.create", "three", b"three", 100,),
+                    2,
+                )
+                .await
+                .expect("capacity outcome"),
+            DurableIdempotencyBegin::CapacityExceeded
+        ));
+    }
+
+    #[tokio::test]
+    async fn durable_idempotency_rejects_unbounded_or_unattached_records() {
+        let (mut store, _root) = build_store();
+        let clock = Arc::new(AtomicI64::new(1_000));
+        store.set_test_clock(clock);
+        let oversized_key = "x".repeat(MAX_DURABLE_IDEMPOTENCY_KEY_BYTES + 1);
+        assert!(store
+            .reserve_durable_idempotency(durable_idempotency_request(
+                "tenant-a",
+                "job.create",
+                &oversized_key,
+                b"one",
+                100,
+            ))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("idempotency key exceeds"));
+        assert!(store
+            .reserve_durable_idempotency(DurableIdempotencyRequest {
+                request_digest: "A".repeat(64),
+                ..durable_idempotency_request("tenant-a", "job.create", "key-1", b"one", 100,)
+            })
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("lowercase SHA-256"));
+
+        let reservation = match store
+            .reserve_durable_idempotency(durable_idempotency_request(
+                "tenant-a",
+                "job.create",
+                "key-2",
+                b"two",
+                100,
+            ))
+            .await
+            .expect("reserve")
+        {
+            DurableIdempotencyBegin::Acquired(reservation) => reservation,
+            outcome => panic!("unexpected reservation outcome: {outcome:?}"),
+        };
+        assert!(store
+            .commit_durable_idempotency(
+                &reservation,
+                "missing-job",
+                json!({"job_id": "missing-job"}),
+                100,
+            )
+            .await
+            .expect("unattached commit")
+            .is_none());
+        let job = create_test_job(&store, 0, 1).await;
+        assert!(store
+            .commit_durable_idempotency(
+                &reservation,
+                &job.id,
+                json!({"result": "x".repeat(MAX_DURABLE_IDEMPOTENCY_RESULT_BYTES)}),
+                100,
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("result exceeds"));
     }
 
     #[tokio::test]

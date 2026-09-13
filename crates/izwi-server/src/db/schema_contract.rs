@@ -458,6 +458,23 @@ const REQUIRED_SCHEMA_TABLES: &[RequiredSchemaTable] = &[
         ],
     },
     RequiredSchemaTable {
+        name: "durable_idempotency_keys_v2",
+        columns: &[
+            "tenant_scope",
+            "operation",
+            "idempotency_key",
+            "created_at",
+            "updated_at",
+            "expires_at",
+            "digest_version",
+            "request_digest",
+            "state",
+            "reservation_token",
+            "runtime_job_id",
+            "response_json",
+        ],
+    },
+    RequiredSchemaTable {
         name: "runtime_worker_heartbeats",
         columns: &[
             "worker_id",
