@@ -84,12 +84,6 @@ pub async fn cancel_job(
         .await
         .map_err(map_store_error)?
         .ok_or_else(|| ApiError::bad_request("Runtime job is not cancellable"))?;
-    // A running executor remains authoritative until it confirms teardown.
-    // Keep its route projection non-terminal while the durable job reports
-    // requested/execution_stopping rather than fabricating completed cancellation.
-    if cancelled.status == RuntimeJobStatus::Cancelled {
-        update_route_projection_for_cancel(&state, &cancelled).await?;
-    }
     record_job_audit(
         &state,
         context.as_ref().map(|Extension(ctx)| ctx),
@@ -160,7 +154,7 @@ pub(crate) async fn cancel_active_audio_jobs_for_model(
             .into_iter()
             .filter(|job| runtime_job_targets_variant(job, variant))
         {
-            let Some(cancelled_job) = state
+            let Some(_) = state
                 .batch_runtime_store
                 .cancel_job(
                     &job.id,
@@ -171,9 +165,6 @@ pub(crate) async fn cancel_active_audio_jobs_for_model(
             else {
                 continue;
             };
-            if cancelled_job.status == RuntimeJobStatus::Cancelled {
-                update_route_projection_for_cancel(state, &cancelled_job).await?;
-            }
             cancelled = cancelled.saturating_add(1);
         }
     }
@@ -215,56 +206,6 @@ async fn load_job_trace(
         stages,
         artifacts,
     })
-}
-
-async fn update_route_projection_for_cancel(
-    state: &AppState,
-    job: &RuntimeJob,
-) -> Result<(), ApiError> {
-    let message = job
-        .cancellation_reason
-        .clone()
-        .unwrap_or_else(|| "Runtime job cancelled".to_string());
-    match (
-        job.job_kind,
-        job.route_record_kind.as_deref(),
-        job.route_record_id.as_deref(),
-    ) {
-        (
-            RuntimeJobKind::AsrTranscription,
-            Some("transcription" | "speaker_attributed_asr"),
-            Some(record_id),
-        ) => {
-            let updated = state
-                .transcription_store
-                .update_processing_status(
-                    record_id.to_string(),
-                    TranscriptionProcessingStatus::Failed,
-                    Some(message),
-                )
-                .await
-                .map_err(map_store_error)?;
-            warn_if_projection_missing(updated.is_some(), job);
-        }
-        (RuntimeJobKind::TtsSpeech, Some(route_kind), Some(record_id)) => {
-            let Some(route_kind) = parse_speech_route_kind(route_kind) else {
-                return Ok(());
-            };
-            let updated = state
-                .speech_history_store
-                .update_processing_status(
-                    route_kind,
-                    record_id.to_string(),
-                    SpeechHistoryProcessingStatus::Failed,
-                    Some(message),
-                )
-                .await
-                .map_err(map_store_error)?;
-            warn_if_projection_missing(updated.is_some(), job);
-        }
-        _ => {}
-    }
-    Ok(())
 }
 
 async fn update_route_projection_for_retry(

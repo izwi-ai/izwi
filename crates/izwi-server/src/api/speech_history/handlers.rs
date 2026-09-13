@@ -684,28 +684,18 @@ async fn cancel_speech_history_job(
         return Ok(None);
     };
 
-    if state
+    let _ = state
         .batch_runtime_store
         .cancel_job(&job.id, Some(reason.to_string()))
         .await
-        .map_err(map_store_error)?
-        .is_none()
-    {
-        return state
-            .speech_history_store
-            .get_record(route_kind, record_id.to_string())
-            .await
-            .map_err(map_store_error);
-    }
+        .map_err(map_store_error)?;
 
+    // A running executor remains authoritative until exact-attempt teardown.
+    // The store returns the current projection and updates it transactionally
+    // only if the durable job really became terminal.
     state
         .speech_history_store
-        .update_processing_status(
-            route_kind,
-            record_id.to_string(),
-            SpeechHistoryProcessingStatus::Failed,
-            Some(reason.to_string()),
-        )
+        .get_record(route_kind, record_id.to_string())
         .await
         .map_err(map_store_error)
 }

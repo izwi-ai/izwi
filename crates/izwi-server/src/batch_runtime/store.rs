@@ -423,6 +423,7 @@ pub struct RuntimeQueueHealthSnapshot {
 pub struct RuntimeReconciliationReport {
     pub jobs_repaired: u64,
     pub stages_repaired: u64,
+    pub route_projections_repaired: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2334,6 +2335,9 @@ impl BatchRuntimeStore {
         .await
         .context("Failed to request cancellation of running runtime job stages")?;
 
+        self.finalize_cancelled_route_projection_with(&tx, job_id)
+            .await?;
+
         tx.commit()
             .await
             .context("Failed to commit runtime job cancellation transaction")?;
@@ -3756,7 +3760,99 @@ impl BatchRuntimeStore {
         .await
         .context("Failed to finalize runtime job cancellation")?;
 
-        get_stage_with(db, &lease.stage_id).await
+        let finalized = get_stage_with(db, &lease.stage_id).await?;
+        if let Some(stage) = &finalized {
+            self.finalize_cancelled_route_projection_with(db, &stage.job_id)
+                .await?;
+        }
+        Ok(finalized)
+    }
+
+    async fn finalize_cancelled_route_projection_with<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        job_id: &str,
+    ) -> anyhow::Result<u64> {
+        let transcription = db
+            .execute_raw(raw::statement(
+                db,
+                r#"
+                UPDATE transcription_records
+                SET
+                    processing_status = 'failed',
+                    processing_error = COALESCE(
+                        NULLIF((SELECT cancellation_reason FROM runtime_jobs WHERE id = ?1), ''),
+                        'Runtime job cancelled'
+                    ),
+                    processing_progress_json = NULL,
+                    runtime_stage_id = NULL,
+                    runtime_attempt_token = NULL
+                WHERE id = (SELECT route_record_id FROM runtime_jobs WHERE id = ?1)
+                  AND processing_status IN ('pending', 'processing')
+                  AND EXISTS (
+                      SELECT 1 FROM runtime_jobs
+                      WHERE id = ?1
+                        AND job_kind = 'asr_transcription'
+                        AND status = 'cancelled'
+                        AND route_record_kind IN ('transcription', 'speaker_attributed_asr')
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM runtime_jobs AS active
+                      JOIN runtime_jobs AS cancelled ON cancelled.id = ?1
+                      WHERE active.id <> cancelled.id
+                        AND active.job_kind = cancelled.job_kind
+                        AND active.route_record_kind = cancelled.route_record_kind
+                        AND active.route_record_id = cancelled.route_record_id
+                        AND active.status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing')
+                  )
+                "#,
+                vec![job_id.into()],
+            )?)
+            .await
+            .context("Failed to finalize cancelled transcription projection")?
+            .rows_affected();
+        let speech = db
+            .execute_raw(raw::statement(
+                db,
+                r#"
+                UPDATE speech_history_records
+                SET
+                    processing_status = 'failed',
+                    processing_error = COALESCE(
+                        NULLIF((SELECT cancellation_reason FROM runtime_jobs WHERE id = ?1), ''),
+                        'Runtime job cancelled'
+                    ),
+                    runtime_stage_id = NULL,
+                    runtime_attempt_token = NULL
+                WHERE id = (SELECT route_record_id FROM runtime_jobs WHERE id = ?1)
+                  AND route_kind = (SELECT route_record_kind FROM runtime_jobs WHERE id = ?1)
+                  AND processing_status IN ('pending', 'processing')
+                  AND EXISTS (
+                      SELECT 1 FROM runtime_jobs
+                      WHERE id = ?1
+                        AND job_kind = 'tts_speech'
+                        AND status = 'cancelled'
+                        AND route_record_kind IN ('text_to_speech', 'voice_design', 'voice_cloning')
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM runtime_jobs AS active
+                      JOIN runtime_jobs AS cancelled ON cancelled.id = ?1
+                      WHERE active.id <> cancelled.id
+                        AND active.job_kind = cancelled.job_kind
+                        AND active.route_record_kind = cancelled.route_record_kind
+                        AND active.route_record_id = cancelled.route_record_id
+                        AND active.status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing')
+                  )
+                "#,
+                vec![job_id.into()],
+            )?)
+            .await
+            .context("Failed to finalize cancelled speech projection")?
+            .rows_affected();
+
+        Ok(transcription.saturating_add(speech))
     }
 
     async fn mark_stage_failed<C: ConnectionTrait>(
@@ -4042,6 +4138,61 @@ impl BatchRuntimeStore {
             .rows_affected()
         };
         report.stages_repaired = stages;
+        remaining = remaining.saturating_sub(stages as usize);
+
+        if remaining > 0 {
+            let cancelled_route_jobs = tx
+                .query_all_raw(raw::statement(
+                    &tx,
+                    r#"
+                    SELECT candidate.id
+                    FROM runtime_jobs AS candidate
+                    WHERE candidate.status = 'cancelled'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM runtime_jobs AS active
+                          WHERE active.id <> candidate.id
+                            AND active.job_kind = candidate.job_kind
+                            AND active.route_record_kind = candidate.route_record_kind
+                            AND active.route_record_id = candidate.route_record_id
+                            AND active.status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing')
+                      )
+                      AND (
+                          (
+                              candidate.job_kind = 'asr_transcription'
+                              AND candidate.route_record_kind IN ('transcription', 'speaker_attributed_asr')
+                              AND EXISTS (
+                                  SELECT 1 FROM transcription_records
+                                  WHERE transcription_records.id = candidate.route_record_id
+                                    AND processing_status IN ('pending', 'processing')
+                              )
+                          )
+                          OR (
+                              candidate.job_kind = 'tts_speech'
+                              AND candidate.route_record_kind IN ('text_to_speech', 'voice_design', 'voice_cloning')
+                              AND EXISTS (
+                                  SELECT 1 FROM speech_history_records
+                                  WHERE speech_history_records.id = candidate.route_record_id
+                                    AND speech_history_records.route_kind = candidate.route_record_kind
+                                    AND processing_status IN ('pending', 'processing')
+                              )
+                          )
+                      )
+                    ORDER BY candidate.updated_at ASC, candidate.id ASC
+                    LIMIT ?1
+                    "#,
+                    vec![i64::try_from(remaining)?.into()],
+                )?)
+                .await
+                .context("Failed to select cancelled route projections for reconciliation")?;
+            for row in cancelled_route_jobs {
+                let job_id: String = row.try_get_by_index(0)?;
+                report.route_projections_repaired =
+                    report.route_projections_repaired.saturating_add(
+                        self.finalize_cancelled_route_projection_with(&tx, &job_id)
+                            .await?,
+                    );
+            }
+        }
 
         tx.commit()
             .await
@@ -7478,6 +7629,334 @@ mod tests {
         assert_eq!(cancelled.cancellation_state, None);
         assert_eq!(cancelled.worker_id, None);
         assert_eq!(cancelled.lease_expires_at, None);
+    }
+
+    #[tokio::test]
+    async fn active_tts_cancellation_updates_projection_only_after_teardown() {
+        let (store, _root) = build_store();
+        let accepted = match store
+            .accept_durable_text_tts(durable_text_tts_acceptance(None))
+            .await
+            .expect("durable TTS acceptance")
+        {
+            DurableTextTtsAcceptanceOutcome::Committed(accepted) => accepted,
+            DurableTextTtsAcceptanceOutcome::ReservationLost => {
+                panic!("unkeyed acceptance cannot lose a reservation")
+            }
+        };
+        let claimed = store
+            .claim_next_stage("tts-worker", 60_000)
+            .await
+            .expect("claim")
+            .expect("active TTS attempt");
+        let lease = claimed.lease().expect("lease");
+        let attempt_token = lease
+            .attempt_token
+            .clone()
+            .expect("claimed stage attempt token");
+        let db = store.connection().await.expect("database");
+        db.execute_raw(
+            raw::statement(
+                db,
+                r#"
+                UPDATE speech_history_records
+                SET processing_status = 'processing', runtime_stage_id = ?1, runtime_attempt_token = ?2
+                WHERE id = ?3
+                "#,
+                vec![
+                    lease.stage_id.clone().into(),
+                    attempt_token.into(),
+                    accepted.record.id.clone().into(),
+                ],
+            )
+            .expect("projection update statement"),
+        )
+        .await
+        .expect("mark projection processing");
+
+        let requested = store
+            .cancel_job(&accepted.job.id, Some("user cancelled speech".to_string()))
+            .await
+            .expect("request cancellation")
+            .expect("active job");
+        assert_eq!(requested.status, RuntimeJobStatus::Running);
+        let processing = db
+            .query_one_raw(
+                raw::statement(
+                    db,
+                    "SELECT processing_status, processing_error FROM speech_history_records WHERE id = ?1",
+                    vec![accepted.record.id.clone().into()],
+                )
+                .expect("processing projection statement"),
+            )
+            .await
+            .expect("processing projection query")
+            .expect("processing projection");
+        assert_eq!(
+            processing
+                .try_get_by_index::<String>(0)
+                .expect("processing status"),
+            "processing"
+        );
+        assert_eq!(
+            processing
+                .try_get_by_index::<Option<String>>(1)
+                .expect("processing error"),
+            None
+        );
+
+        assert!(store
+            .mark_stage_execution_stopping(&lease)
+            .await
+            .expect("mark stopping"));
+        store
+            .finalize_stage_cancellation(&lease)
+            .await
+            .expect("finalize cancellation")
+            .expect("exact attempt finalizes");
+        let terminal = db
+            .query_one_raw(
+                raw::statement(
+                    db,
+                    "SELECT processing_status, processing_error, runtime_stage_id, runtime_attempt_token FROM speech_history_records WHERE id = ?1",
+                    vec![accepted.record.id.into()],
+                )
+                .expect("terminal projection statement"),
+            )
+            .await
+            .expect("terminal projection query")
+            .expect("terminal projection");
+        assert_eq!(
+            terminal.try_get_by_index::<String>(0).expect("status"),
+            "failed"
+        );
+        assert_eq!(
+            terminal
+                .try_get_by_index::<Option<String>>(1)
+                .expect("error")
+                .as_deref(),
+            Some("user cancelled speech")
+        );
+        assert_eq!(
+            terminal
+                .try_get_by_index::<Option<String>>(2)
+                .expect("stage binding"),
+            None
+        );
+        assert_eq!(
+            terminal
+                .try_get_by_index::<Option<String>>(3)
+                .expect("attempt binding"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_reconciliation_repairs_cancelled_transcription_projection() {
+        let (store, _root) = build_store();
+        let record_id = "cancelled-transcription";
+        let db = store.connection().await.expect("database");
+        db.execute_raw(
+            raw::statement(
+                db,
+                r#"
+                INSERT INTO transcription_records (
+                    id, created_at, processing_status, processing_error,
+                    processing_progress_json, runtime_stage_id, runtime_attempt_token,
+                    processing_time_ms, audio_mime_type, audio_storage_path, transcription
+                ) VALUES (?1, ?2, 'processing', NULL, '{}', 'old-stage', 'old-attempt', 0, 'audio/wav', '', '')
+                "#,
+                vec![record_id.into(), current_timestamp_millis().into()],
+            )
+            .expect("transcription projection statement"),
+        )
+        .await
+        .expect("transcription projection");
+        let job = store
+            .create_job(NewRuntimeJob {
+                job_kind: RuntimeJobKind::AsrTranscription,
+                status: RuntimeJobStatus::Queued,
+                priority: 0,
+                model_id: None,
+                capability: Some("asr".to_string()),
+                route_record_kind: Some("transcription".to_string()),
+                route_record_id: Some(record_id.to_string()),
+                input_media_asset_id: None,
+                input_text_asset_id: None,
+                request_json: json!({}),
+                model_snapshot_json: json!({}),
+                retry_policy_json: json!({}),
+                max_attempts: 1,
+                idempotency_key: None,
+                correlation_id: None,
+            })
+            .await
+            .expect("runtime job");
+        db.execute_raw(
+            raw::statement(
+                db,
+                r#"
+                UPDATE runtime_jobs
+                SET status = 'cancelled', cancellation_reason = 'cancelled while offline',
+                    finished_at = ?1, updated_at = ?1
+                WHERE id = ?2
+                "#,
+                vec![current_timestamp_millis().into(), job.id.into()],
+            )
+            .expect("simulate terminal job statement"),
+        )
+        .await
+        .expect("simulate terminal job");
+
+        let report = store
+            .reconcile_inconsistent_states(1)
+            .await
+            .expect("bounded reconciliation");
+        assert_eq!(report.jobs_repaired, 0);
+        assert_eq!(report.stages_repaired, 0);
+        assert_eq!(report.route_projections_repaired, 1);
+        let projection = db
+            .query_one_raw(
+                raw::statement(
+                    db,
+                    "SELECT processing_status, processing_error, processing_progress_json, runtime_stage_id, runtime_attempt_token FROM transcription_records WHERE id = ?1",
+                    vec![record_id.into()],
+                )
+                .expect("reconciled projection statement"),
+            )
+            .await
+            .expect("reconciled projection query")
+            .expect("reconciled projection");
+        assert_eq!(
+            projection.try_get_by_index::<String>(0).expect("status"),
+            "failed"
+        );
+        assert_eq!(
+            projection
+                .try_get_by_index::<Option<String>>(1)
+                .expect("error")
+                .as_deref(),
+            Some("cancelled while offline")
+        );
+        for index in 2..=4 {
+            assert_eq!(
+                projection
+                    .try_get_by_index::<Option<String>>(index)
+                    .expect("cleared runtime projection field"),
+                None
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_job_cannot_overwrite_an_active_replacement_projection() {
+        let (store, _root) = build_store();
+        let record_id = "replacement-owned-transcription";
+        let db = store.connection().await.expect("database");
+        db.execute_raw(
+            raw::statement(
+                db,
+                r#"
+                INSERT INTO transcription_records (
+                    id, created_at, processing_status, processing_error,
+                    processing_progress_json, runtime_stage_id, runtime_attempt_token,
+                    processing_time_ms, audio_mime_type, audio_storage_path, transcription
+                ) VALUES (?1, ?2, 'processing', NULL, '{}', 'replacement-stage',
+                    'replacement-attempt', 0, 'audio/wav', '', '')
+                "#,
+                vec![record_id.into(), current_timestamp_millis().into()],
+            )
+            .expect("transcription projection statement"),
+        )
+        .await
+        .expect("transcription projection");
+        let job = |correlation_id: &str| NewRuntimeJob {
+            job_kind: RuntimeJobKind::AsrTranscription,
+            status: RuntimeJobStatus::Queued,
+            priority: 0,
+            model_id: None,
+            capability: Some("asr".to_string()),
+            route_record_kind: Some("transcription".to_string()),
+            route_record_id: Some(record_id.to_string()),
+            input_media_asset_id: None,
+            input_text_asset_id: None,
+            request_json: json!({}),
+            model_snapshot_json: json!({}),
+            retry_policy_json: json!({}),
+            max_attempts: 1,
+            idempotency_key: None,
+            correlation_id: Some(correlation_id.to_string()),
+        };
+        let cancelled = store.create_job(job("old")).await.expect("old job");
+        let replacement = store
+            .create_job(job("replacement"))
+            .await
+            .expect("replacement job");
+
+        let cancelled = store
+            .cancel_job(&cancelled.id, Some("old job cancelled".to_string()))
+            .await
+            .expect("cancel old job")
+            .expect("old job is cancellable");
+        assert_eq!(cancelled.status, RuntimeJobStatus::Cancelled);
+        assert_eq!(
+            store
+                .get_job(&replacement.id)
+                .await
+                .expect("replacement lookup")
+                .expect("replacement job")
+                .status,
+            RuntimeJobStatus::Queued
+        );
+
+        let report = store
+            .reconcile_inconsistent_states(10)
+            .await
+            .expect("bounded reconciliation");
+        assert_eq!(report.route_projections_repaired, 0);
+        let projection = db
+            .query_one_raw(
+                raw::statement(
+                    db,
+                    "SELECT processing_status, processing_error, processing_progress_json, runtime_stage_id, runtime_attempt_token FROM transcription_records WHERE id = ?1",
+                    vec![record_id.into()],
+                )
+                .expect("replacement projection statement"),
+            )
+            .await
+            .expect("replacement projection query")
+            .expect("replacement projection");
+        assert_eq!(
+            projection.try_get_by_index::<String>(0).expect("status"),
+            "processing"
+        );
+        assert_eq!(
+            projection
+                .try_get_by_index::<Option<String>>(1)
+                .expect("error"),
+            None
+        );
+        assert_eq!(
+            projection
+                .try_get_by_index::<Option<String>>(2)
+                .expect("progress")
+                .as_deref(),
+            Some("{}")
+        );
+        assert_eq!(
+            projection
+                .try_get_by_index::<Option<String>>(3)
+                .expect("stage binding")
+                .as_deref(),
+            Some("replacement-stage")
+        );
+        assert_eq!(
+            projection
+                .try_get_by_index::<Option<String>>(4)
+                .expect("attempt binding")
+                .as_deref(),
+            Some("replacement-attempt")
+        );
     }
 
     #[tokio::test]
