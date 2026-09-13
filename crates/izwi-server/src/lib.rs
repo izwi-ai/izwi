@@ -438,7 +438,7 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
         );
     }
     shutdown_worker_then_cleanup(
-        batch_worker_supervisor.shutdown(),
+        batch_worker_supervisor.shutdown_for_process(),
         cleanup_runtime_for_shutdown(&state),
     )
     .await?;
@@ -1603,9 +1603,9 @@ where
     W: std::future::Future<Output = anyhow::Result<()>>,
     C: std::future::Future<Output = ()>,
 {
-    let worker_result = worker_shutdown.await;
+    worker_shutdown.await?;
     cleanup.await;
-    worker_result
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1633,7 +1633,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_shutdown_failure_still_runs_runtime_cleanup() {
+    async fn unconfirmed_worker_shutdown_skips_runtime_cleanup() {
         let cleaned = Arc::new(AtomicBool::new(false));
         let cleanup_flag = cleaned.clone();
         let result = shutdown_worker_then_cleanup(
@@ -1649,6 +1649,19 @@ mod tests {
         .await;
 
         assert!(result.is_err());
+        assert!(!cleaned.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn confirmed_worker_shutdown_runs_runtime_cleanup() {
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let cleanup_flag = cleaned.clone();
+        shutdown_worker_then_cleanup(async { Ok(()) }, async move {
+            cleanup_flag.store(true, Ordering::Release);
+        })
+        .await
+        .expect("confirmed worker shutdown");
+
         assert!(cleaned.load(Ordering::Acquire));
     }
 

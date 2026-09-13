@@ -1350,9 +1350,11 @@ fn active_speech_attempt_condition(
             WHERE s.id = {stage_placeholder}
               AND s.attempt_token = {token_placeholder}
               AND s.status IN ('running', 'postprocessing')
+              AND s.cancellation_state IS NULL
               AND s.lease_expires_at IS NOT NULL
               AND s.lease_expires_at > {now_placeholder}
               AND j.status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
+              AND j.cancellation_state IS NULL
               AND j.route_record_id = speech_history_records.id
               AND j.route_record_kind = {route_placeholder}
         )
@@ -1958,6 +1960,63 @@ mod tests {
             .expect("record lookup")
             .expect("record");
         assert_eq!(
+            unchanged.processing_status,
+            SpeechHistoryProcessingStatus::Ready
+        );
+
+        clear_env();
+    }
+
+    #[tokio::test]
+    async fn cancellation_request_fences_attempt_audio_completion() {
+        let _guard = env_lock();
+        let (temp, store) = setup_store();
+        let media_dir = temp.path().join("media");
+        let pending = store
+            .create_record(NewSpeechHistoryRecord {
+                processing_status: SpeechHistoryProcessingStatus::Pending,
+                audio_bytes: Vec::new(),
+                audio_filename: None,
+                ..ready_record()
+            })
+            .await
+            .expect("pending record");
+        let (runtime, attempt) =
+            claim_projection_attempt(&store, SpeechRouteKind::TextToSpeech, pending.id.as_str())
+                .await;
+        store
+            .bind_runtime_attempt(SpeechRouteKind::TextToSpeech, pending.id.clone(), &attempt)
+            .await
+            .expect("attempt binding")
+            .expect("active attempt should bind");
+        let stage = runtime
+            .get_stage(&attempt.stage_id)
+            .await
+            .expect("stage")
+            .expect("stage exists");
+        runtime
+            .cancel_job(&stage.job_id, Some("cancel before publication".to_string()))
+            .await
+            .expect("cancellation request")
+            .expect("job should accept cancellation");
+
+        assert!(store
+            .complete_record_for_attempt(
+                SpeechRouteKind::TextToSpeech,
+                pending.id.clone(),
+                &attempt,
+                completed_record(vec![4, 5, 6]),
+            )
+            .await
+            .expect("cancelled completion should be ignored")
+            .is_none());
+        assert_eq!(regular_file_count(&media_dir), 0);
+        let unchanged = store
+            .get_record(SpeechRouteKind::TextToSpeech, pending.id)
+            .await
+            .expect("record lookup")
+            .expect("record");
+        assert_ne!(
             unchanged.processing_status,
             SpeechHistoryProcessingStatus::Ready
         );
