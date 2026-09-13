@@ -109,6 +109,12 @@ only normalized, typed chat input and a gateway-attested caller context. The
 worker validates its own incarnation, deployment generation, readiness, and
 capacity before acknowledging admission. Registry routing selects once and does
 not replay an uncertain or partially streamed invocation on another worker.
+Gateway chat applies separate bounded admission/header, first-output,
+inter-output idle, and total invocation deadlines. Only non-empty text output
+advances the semantic progress clock; raw fragments, usage metadata, and empty
+deltas cannot keep an invocation alive. Its private parser accepts at most a
+1 MiB line, 16 MiB total, and 8,192 events, coherently covering the advertised
+4,096-token/512 KiB route ceiling while remaining bounded.
 
 Multimodal chat remains on the current explicit local execution path until its
 artifact transport semantics have dedicated tests. This is a migration-ledger

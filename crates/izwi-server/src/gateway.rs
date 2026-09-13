@@ -1019,6 +1019,7 @@ mod tests {
                 max_queue_wait: Duration::ZERO,
                 max_output_tokens: 128,
                 max_output_bytes: 4096,
+                slow_consumer_timeout: Duration::from_millis(100),
             },
         )
         .expect("dispatcher should initialize");
@@ -1132,6 +1133,7 @@ mod tests {
                 max_queue_wait: Duration::ZERO,
                 max_output_tokens: 128,
                 max_output_bytes: 4096,
+                slow_consumer_timeout: Duration::from_millis(100),
             },
         )
         .expect("remote execution should initialize");
@@ -1337,6 +1339,7 @@ mod tests {
                 max_queue_wait: Duration::ZERO,
                 max_output_tokens: 128,
                 max_output_bytes: 4096,
+                slow_consumer_timeout: Duration::from_millis(100),
             },
         )
         .expect("dispatcher should initialize");
@@ -1454,6 +1457,7 @@ mod tests {
                 max_queue_wait: Duration::ZERO,
                 max_output_tokens: 128,
                 max_output_bytes: 4096,
+                slow_consumer_timeout: Duration::from_millis(100),
             },
         )
         .expect("remote execution should initialize");
@@ -1585,6 +1589,7 @@ mod tests {
                 max_queue_wait: Duration::ZERO,
                 max_output_tokens: 128,
                 max_output_bytes: 4096,
+                slow_consumer_timeout: Duration::from_millis(100),
             },
         )
         .expect("remote execution should initialize");
@@ -1623,6 +1628,7 @@ mod tests {
                 max_queue_wait: Duration::ZERO,
                 max_output_tokens: 128,
                 max_output_bytes: 4096,
+                slow_consumer_timeout: Duration::from_millis(100),
             },
         )
         .expect("remote execution should initialize");
@@ -1753,6 +1759,7 @@ mod tests {
                 max_queue_wait: Duration::from_millis(100),
                 max_output_tokens: 32,
                 max_output_bytes: 4096,
+                slow_consumer_timeout: Duration::from_millis(100),
             },
         )
         .expect("remote execution should initialize");
@@ -2259,6 +2266,7 @@ mod tests {
                 max_queue_wait: Duration::ZERO,
                 max_output_tokens: 16,
                 max_output_bytes: 1024,
+                slow_consumer_timeout: Duration::from_millis(100),
             },
         )
         .expect("remote execution should initialize");

@@ -30,6 +30,10 @@ pub enum MockFault {
     Hang,
     UsageTrickleWithoutOutput,
     ByteTrickleWithoutEvent,
+    EmptyDeltaTrickleWithoutOutput,
+    TextDeltaThenHang,
+    ManyTextDeltas { count: usize, text_bytes: usize },
+    OpenBodyWithoutAcknowledgement,
     AcceptedWithoutAcknowledgement,
     AcceptedThenDisconnect,
     PartialThenDisconnect,
@@ -109,6 +113,7 @@ struct AttemptRecord {
     digest: RequestDigest,
     state: AttemptState,
     last_sequence: Option<u64>,
+    remaining_time_ms: u64,
     cancel: Option<watch::Sender<bool>>,
 }
 
@@ -258,6 +263,16 @@ impl MockWorker {
 
     pub fn active_invocations(&self) -> usize {
         self.state.config.max_active_invocations - self.state.capacity.available_permits()
+    }
+
+    pub fn attempt_remaining_time_ms(&self, attempt_id: &AttemptId) -> Option<u64> {
+        self.state
+            .attempts
+            .lock()
+            .expect("mock attempt table poisoned")
+            .records
+            .get(attempt_id)
+            .map(|record| record.remaining_time_ms)
     }
 }
 
@@ -453,6 +468,7 @@ async fn invoke(State(state): State<Arc<MockState>>, headers: HeaderMap, body: B
         digest: request.request_digest.clone(),
         state: AttemptState::Admitted,
         last_sequence: Some(0),
+        remaining_time_ms: request.remaining_time_ms,
         cancel: Some(cancel_tx),
     };
     if !state.insert_bounded(request.attempt_id.clone(), record) {
@@ -492,12 +508,16 @@ async fn run_invocation(
     mut cancel: watch::Receiver<bool>,
     tx: mpsc::Sender<Bytes>,
 ) {
-    if state.config.fault == MockFault::AcceptedWithoutAcknowledgement {
-        // Admission is authoritative even when the acknowledgement never
-        // reaches the gateway. Close the HTTP body while retaining execution
+    if matches!(
+        &state.config.fault,
+        MockFault::AcceptedWithoutAcknowledgement | MockFault::OpenBodyWithoutAcknowledgement
+    ) {
+        // Admission is authoritative even when the acknowledgement never reaches the gateway.
+        // Keep or close the body according to the selected fault while retaining execution
         // capacity until exact-attempt cancellation completes.
         state.update_attempt(&request.attempt_id, AttemptState::Running, Some(0));
-        drop(tx);
+        let _open_response_body =
+            (state.config.fault == MockFault::OpenBodyWithoutAcknowledgement).then_some(tx);
         let terminal_state = match cancel.changed().await {
             Ok(()) if *cancel.borrow() => {
                 state.update_attempt(
@@ -511,6 +531,7 @@ async fn run_invocation(
             _ => AttemptState::Failed,
         };
         state.update_attempt(&request.attempt_id, terminal_state, Some(0));
+        drop(_open_response_body);
         return;
     }
 
@@ -568,6 +589,86 @@ async fn run_invocation(
                 // activity must not count as useful invocation progress.
                 let _ = tx_for_work.send(Bytes::from_static(b"{")).await;
             },
+            MockFault::EmptyDeltaTrickleWithoutOutput => {
+                let mut sequence = 1_u64;
+                loop {
+                    tokio::time::sleep(state_for_work.config.output_cadence).await;
+                    let event = InvocationEvent {
+                        schema_version: PROTOCOL_V1,
+                        request_id: request_for_work.request_id.clone(),
+                        attempt_id: request_for_work.attempt_id.clone(),
+                        sequence,
+                        event: InvocationEventKind::TextDelta {
+                            text: String::new(),
+                        },
+                    };
+                    let _ = tx_for_work.send(encode_event(&event)).await;
+                    state_for_work.update_attempt(
+                        &request_for_work.attempt_id,
+                        AttemptState::Running,
+                        Some(sequence),
+                    );
+                    sequence = sequence.saturating_add(1);
+                }
+            }
+            MockFault::TextDeltaThenHang => {
+                let event = InvocationEvent {
+                    schema_version: PROTOCOL_V1,
+                    request_id: request_for_work.request_id.clone(),
+                    attempt_id: request_for_work.attempt_id.clone(),
+                    sequence: 1,
+                    event: InvocationEventKind::TextDelta {
+                        text: state_for_work.config.output_text.clone(),
+                    },
+                };
+                let _ = tx_for_work.send(encode_event(&event)).await;
+                state_for_work.update_attempt(
+                    &request_for_work.attempt_id,
+                    AttemptState::Running,
+                    Some(1),
+                );
+                std::future::pending::<(AttemptState, Option<u64>)>().await
+            }
+            MockFault::ManyTextDeltas { count, text_bytes } => {
+                let text = "x".repeat(text_bytes);
+                for index in 0..count {
+                    let sequence = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
+                    let event = InvocationEvent {
+                        schema_version: PROTOCOL_V1,
+                        request_id: request_for_work.request_id.clone(),
+                        attempt_id: request_for_work.attempt_id.clone(),
+                        sequence,
+                        event: InvocationEventKind::TextDelta { text: text.clone() },
+                    };
+                    if tx_for_work.send(encode_event(&event)).await.is_err() {
+                        return (AttemptState::Failed, Some(sequence.saturating_sub(1)));
+                    }
+                    state_for_work.update_attempt(
+                        &request_for_work.attempt_id,
+                        AttemptState::Running,
+                        Some(sequence),
+                    );
+                }
+                let sequence = u64::try_from(count).unwrap_or(u64::MAX).saturating_add(1);
+                let completed = InvocationEvent {
+                    schema_version: PROTOCOL_V1,
+                    request_id: request_for_work.request_id.clone(),
+                    attempt_id: request_for_work.attempt_id.clone(),
+                    sequence,
+                    event: InvocationEventKind::Completed {
+                        finish_reason: FinishReason::Stop,
+                        usage: Some(Usage {
+                            input_tokens: 1,
+                            output_tokens: u64::try_from(count).unwrap_or(u64::MAX),
+                        }),
+                    },
+                };
+                let _ = tx_for_work.send(encode_event(&completed)).await;
+                (AttemptState::Completed, Some(sequence))
+            }
+            MockFault::OpenBodyWithoutAcknowledgement => {
+                unreachable!("handled before response")
+            }
             MockFault::AcceptedWithoutAcknowledgement => unreachable!("handled before response"),
             MockFault::AcceptedThenDisconnect => (AttemptState::Failed, Some(0)),
             MockFault::PartialThenDisconnect => {
@@ -763,6 +864,7 @@ async fn cancel_attempt(
                 digest: RequestDigest::new("cancel-tombstone").expect("static identity"),
                 state: AttemptState::CancellationRequested,
                 last_sequence: None,
+                remaining_time_ms: 0,
                 cancel: None,
             };
             let _ = state.insert_bounded(attempt_id.clone(), tombstone);

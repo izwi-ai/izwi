@@ -29,10 +29,6 @@ use crate::worker_registry::{
 };
 
 const FORWARDED_CHAT_STREAM_CAPACITY: usize = 64;
-#[cfg(not(test))]
-const FORWARDED_CHAT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(test)]
-const FORWARDED_CHAT_SEND_TIMEOUT: Duration = Duration::from_millis(100);
 const FORWARDED_CHAT_SLOW_CONSUMER_ERROR: &str =
     "Chat stream consumer is too slow; worker relay was cancelled";
 const RETRY_BACKOFF_BASE_MS: u64 = 10;
@@ -48,13 +44,17 @@ pub struct RemoteChatDispatchConfig {
     pub max_queue_wait: Duration,
     pub max_output_tokens: u32,
     pub max_output_bytes: u64,
+    pub slow_consumer_timeout: Duration,
 }
 
 impl RemoteChatDispatchConfig {
     fn validate(&self) -> Result<(), ApiError> {
-        if self.max_output_tokens == 0 || self.max_output_bytes == 0 {
+        if self.max_output_tokens == 0
+            || self.max_output_bytes == 0
+            || self.slow_consumer_timeout.is_zero()
+        {
             return Err(ApiError::internal(
-                "Remote chat dispatch output limits must be non-zero",
+                "Remote chat dispatch output limits and slow-consumer timeout must be non-zero",
             ));
         }
         ModelAlias::new(self.public_model_variant.dir_name()).map_err(|error| {
@@ -174,6 +174,7 @@ impl RemoteChatDispatcher {
             .await?;
         let registry = self.registry.clone();
         let key = selected.key.clone();
+        let slow_consumer_timeout = self.config.slow_consumer_timeout;
         let mut worker_events = spawn_started_remote_chat_stream_with_tenant(
             &remote,
             stream,
@@ -201,8 +202,7 @@ impl RemoteChatDispatcher {
                         | ChatStreamEvent::Failed(_)
                         | ChatStreamEvent::ShuttingDown
                 );
-                let sent =
-                    tokio::time::timeout(FORWARDED_CHAT_SEND_TIMEOUT, public_tx.send(event)).await;
+                let sent = tokio::time::timeout(slow_consumer_timeout, public_tx.send(event)).await;
                 if !matches!(sent, Ok(Ok(()))) {
                     // If a slot opened at the timeout boundary, preserve a
                     // specific terminal reason. Otherwise closing the channel
@@ -379,6 +379,7 @@ impl RemoteChatDispatcher {
                 max_queue_wait: self.config.max_queue_wait,
                 max_output_tokens: self.config.max_output_tokens,
                 max_output_bytes: self.config.max_output_bytes,
+                slow_consumer_timeout: self.config.slow_consumer_timeout,
             },
         )
     }
@@ -469,6 +470,8 @@ fn counts_as_transport_failure(error: &WorkerClientError) -> bool {
             | WorkerClientError::Transport(_)
             | WorkerClientError::HttpStatus { .. }
             | WorkerClientError::Deadline(DeadlinePhase::ResponseHeaders)
+            | WorkerClientError::Deadline(DeadlinePhase::InvocationAdmission)
+            | WorkerClientError::Deadline(DeadlinePhase::FirstOutput)
             | WorkerClientError::Deadline(DeadlinePhase::StreamProgress)
             | WorkerClientError::Deadline(DeadlinePhase::TotalInvocation)
             | WorkerClientError::ResponseTooLarge { .. }
@@ -787,6 +790,7 @@ mod tests {
                 max_queue_wait: Duration::ZERO,
                 max_output_tokens: 128,
                 max_output_bytes: 4096,
+                slow_consumer_timeout: Duration::from_millis(100),
             },
         )
         .unwrap()

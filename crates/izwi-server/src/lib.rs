@@ -76,8 +76,9 @@ use izwi_core::{
 use izwi_hooks::EnterpriseHooks;
 use izwi_serving_client::{WorkerClient, WorkerClientConfig};
 use izwi_serving_protocol::{
-    CredentialId, DeploymentId, IncarnationId, ModelAlias, ModelGeneration, NodeId, PolicyRevision,
-    ServiceBearerToken, ServiceCredentials, TaskKind, WorkerDescriptor, WorkerId, WorkerStatus,
+    CredentialId, DeploymentId, IncarnationId, ModelAlias, ModelGeneration, NdjsonLimits, NodeId,
+    PolicyRevision, ServiceBearerToken, ServiceCredentials, TaskKind, WorkerDescriptor, WorkerId,
+    WorkerStatus,
 };
 use logging::{LogFormat, SERVICE_NAME, SERVICE_VERSION};
 use persistence::PersistenceContext;
@@ -94,6 +95,12 @@ pub use gateway_tenant_concurrency::{
 
 const MAX_CONFIGURED_GATEWAY_WORKERS: usize = 256;
 const MAX_GATEWAY_STATUS_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_GATEWAY_ADMISSION_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_GATEWAY_STREAM_PHASE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const MAX_GATEWAY_SLOW_CONSUMER_TIMEOUT: Duration = Duration::from_secs(60);
+const GATEWAY_NDJSON_MAX_LINE_BYTES: usize = 1024 * 1024;
+const GATEWAY_NDJSON_MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
+const GATEWAY_NDJSON_MAX_EVENTS: usize = 8192;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -215,6 +222,38 @@ struct ServerArgs {
     /// Maximum time the selected worker may spend establishing runtime ownership.
     #[arg(long, env = "IZWI_GATEWAY_WORKER_QUEUE_WAIT_MS", default_value_t = 250)]
     gateway_worker_queue_wait_ms: u64,
+
+    /// Maximum wait for private invocation response headers and admission.
+    #[arg(
+        long,
+        env = "IZWI_GATEWAY_WORKER_ADMISSION_TIMEOUT_MS",
+        default_value_t = 10_000
+    )]
+    gateway_worker_admission_timeout_ms: u64,
+
+    /// Maximum wait after admission for the first useful worker output.
+    #[arg(
+        long,
+        env = "IZWI_GATEWAY_WORKER_FIRST_OUTPUT_TIMEOUT_MS",
+        default_value_t = 60_000
+    )]
+    gateway_worker_first_output_timeout_ms: u64,
+
+    /// Maximum idle time between useful worker output events.
+    #[arg(
+        long,
+        env = "IZWI_GATEWAY_WORKER_PROGRESS_IDLE_TIMEOUT_MS",
+        default_value_t = 30_000
+    )]
+    gateway_worker_progress_idle_timeout_ms: u64,
+
+    /// Maximum wait while relaying an event to a connected slow consumer.
+    #[arg(
+        long,
+        env = "IZWI_GATEWAY_SLOW_CONSUMER_TIMEOUT_MS",
+        default_value_t = 5_000
+    )]
+    gateway_slow_consumer_timeout_ms: u64,
 
     /// Receiver-clock lifetime of a worker status observation.
     #[arg(
@@ -530,13 +569,7 @@ async fn gateway_state(
     let registry = worker_registry::WorkerRegistry::new(registry_config)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let worker_tls = gateway_worker_tls::worker_client_tls_from_env()?;
-    let client_config = WorkerClientConfig {
-        max_in_flight: args.gateway_max_in_flight,
-        request_timeout: Duration::from_secs(serve_config.request_timeout_secs.max(1)),
-        progress_timeout: Duration::from_secs(serve_config.request_timeout_secs.max(1)),
-        tls: worker_tls,
-        ..WorkerClientConfig::default()
-    };
+    let client_config = gateway_worker_client_config(args, worker_tls);
 
     let mut endpoints = BTreeSet::new();
     let mut approved_worker_ids = BTreeSet::new();
@@ -592,6 +625,7 @@ async fn gateway_state(
             max_queue_wait: Duration::from_millis(args.gateway_worker_queue_wait_ms),
             max_output_tokens: 4096,
             max_output_bytes: 512 * 1024,
+            slow_consumer_timeout: Duration::from_millis(args.gateway_slow_consumer_timeout_ms),
         },
     )
     .map_err(|error| anyhow::anyhow!(error.message))?;
@@ -844,6 +878,44 @@ fn validate_gateway_limits(args: &ServerArgs) -> anyhow::Result<()> {
     if args.gateway_worker_queue_wait_ms == 0 {
         anyhow::bail!("--gateway-worker-queue-wait-ms must be non-zero");
     }
+    let admission_timeout = Duration::from_millis(args.gateway_worker_admission_timeout_ms);
+    if admission_timeout.is_zero() || admission_timeout > MAX_GATEWAY_ADMISSION_TIMEOUT {
+        anyhow::bail!(
+            "--gateway-worker-admission-timeout-ms must be between 1 and {}",
+            MAX_GATEWAY_ADMISSION_TIMEOUT.as_millis()
+        );
+    }
+    if Duration::from_millis(args.gateway_worker_queue_wait_ms) > admission_timeout {
+        anyhow::bail!(
+            "--gateway-worker-queue-wait-ms must not exceed the worker admission timeout"
+        );
+    }
+    for (name, value) in [
+        (
+            "--gateway-worker-first-output-timeout-ms",
+            args.gateway_worker_first_output_timeout_ms,
+        ),
+        (
+            "--gateway-worker-progress-idle-timeout-ms",
+            args.gateway_worker_progress_idle_timeout_ms,
+        ),
+    ] {
+        let timeout = Duration::from_millis(value);
+        if timeout.is_zero() || timeout > MAX_GATEWAY_STREAM_PHASE_TIMEOUT {
+            anyhow::bail!(
+                "{name} must be between 1 and {}",
+                MAX_GATEWAY_STREAM_PHASE_TIMEOUT.as_millis()
+            );
+        }
+    }
+    let slow_consumer_timeout = Duration::from_millis(args.gateway_slow_consumer_timeout_ms);
+    if slow_consumer_timeout.is_zero() || slow_consumer_timeout > MAX_GATEWAY_SLOW_CONSUMER_TIMEOUT
+    {
+        anyhow::bail!(
+            "--gateway-slow-consumer-timeout-ms must be between 1 and {}",
+            MAX_GATEWAY_SLOW_CONSUMER_TIMEOUT.as_millis()
+        );
+    }
     let configured_workers = args
         .gateway_worker_endpoints
         .len()
@@ -867,9 +939,29 @@ fn validate_gateway_limits(args: &ServerArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn gateway_worker_client_config(
+    args: &ServerArgs,
+    tls: izwi_serving_client::WorkerClientTlsConfig,
+) -> WorkerClientConfig {
+    WorkerClientConfig {
+        max_in_flight: args.gateway_max_in_flight,
+        request_timeout: Duration::from_millis(args.gateway_worker_admission_timeout_ms),
+        first_output_timeout: Duration::from_millis(args.gateway_worker_first_output_timeout_ms),
+        progress_timeout: Duration::from_millis(args.gateway_worker_progress_idle_timeout_ms),
+        ndjson_limits: NdjsonLimits {
+            max_line_bytes: GATEWAY_NDJSON_MAX_LINE_BYTES,
+            max_total_bytes: GATEWAY_NDJSON_MAX_TOTAL_BYTES,
+            max_events: GATEWAY_NDJSON_MAX_EVENTS,
+            ..NdjsonLimits::default()
+        },
+        tls,
+        ..WorkerClientConfig::default()
+    }
+}
+
 fn gateway_remote_execution(
     args: &ServerArgs,
-    serve_config: &ServeRuntimeConfig,
+    _serve_config: &ServeRuntimeConfig,
 ) -> anyhow::Result<app::chat::RemoteChatExecution> {
     validate_gateway_limits(args)?;
     let model_generation = ModelGeneration::new(
@@ -885,13 +977,7 @@ fn gateway_remote_execution(
     let client = WorkerClient::new(
         required_gateway_value(&args.worker_endpoint, "--worker-endpoint")?,
         credentials,
-        WorkerClientConfig {
-            max_in_flight: args.gateway_max_in_flight,
-            request_timeout: Duration::from_secs(serve_config.request_timeout_secs.max(1)),
-            progress_timeout: Duration::from_secs(serve_config.request_timeout_secs.max(1)),
-            tls: worker_tls,
-            ..WorkerClientConfig::default()
-        },
+        gateway_worker_client_config(args, worker_tls),
     )?;
     app::chat::RemoteChatExecution::new(
         client,
@@ -912,6 +998,7 @@ fn gateway_remote_execution(
             // Leave room for the private event envelope within the worker's
             // default one-MiB encoded-event bound.
             max_output_bytes: 512 * 1024,
+            slow_consumer_timeout: Duration::from_millis(args.gateway_slow_consumer_timeout_ms),
         },
     )
     .map_err(|error| anyhow::anyhow!(error.message))
@@ -1678,6 +1765,10 @@ mod tests {
         std::env::remove_var("IZWI_BATCH_STAGE_TIMEOUT_SECS");
         std::env::remove_var("IZWI_BATCH_WORKER_DRAIN_TIMEOUT_SECS");
         std::env::remove_var("IZWI_HTTP_SHUTDOWN_GRACE_SECS");
+        std::env::remove_var("IZWI_GATEWAY_WORKER_ADMISSION_TIMEOUT_MS");
+        std::env::remove_var("IZWI_GATEWAY_WORKER_FIRST_OUTPUT_TIMEOUT_MS");
+        std::env::remove_var("IZWI_GATEWAY_WORKER_PROGRESS_IDLE_TIMEOUT_MS");
+        std::env::remove_var("IZWI_GATEWAY_SLOW_CONSUMER_TIMEOUT_MS");
     }
 
     fn parse(args: &[&str]) -> ServerArgs {
@@ -1730,6 +1821,78 @@ mod tests {
         );
         assert_eq!(remote.config().expected_model_generation.get(), 7);
         assert_eq!(remote.config().max_queue_wait, Duration::from_millis(250));
+        assert_eq!(
+            remote.config().slow_consumer_timeout,
+            Duration::from_secs(5)
+        );
+
+        let client_config = gateway_worker_client_config(
+            &args,
+            izwi_serving_client::WorkerClientTlsConfig::default(),
+        );
+        assert_eq!(client_config.request_timeout, Duration::from_secs(10));
+        assert_eq!(client_config.first_output_timeout, Duration::from_secs(60));
+        assert_eq!(client_config.progress_timeout, Duration::from_secs(30));
+        assert_eq!(
+            client_config.ndjson_limits,
+            NdjsonLimits {
+                max_line_bytes: 1024 * 1024,
+                max_total_bytes: 16 * 1024 * 1024,
+                max_events: 8192,
+                ..NdjsonLimits::default()
+            }
+        );
+    }
+
+    #[test]
+    fn gateway_stream_deadlines_are_configurable_and_bounded() {
+        let args = parse(&[
+            "izwi-server",
+            "--role",
+            "gateway",
+            "--gateway-worker-queue-wait-ms",
+            "500",
+            "--gateway-worker-admission-timeout-ms",
+            "1500",
+            "--gateway-worker-first-output-timeout-ms",
+            "2500",
+            "--gateway-worker-progress-idle-timeout-ms",
+            "1200",
+            "--gateway-slow-consumer-timeout-ms",
+            "750",
+        ]);
+        validate_gateway_limits(&args).expect("bounded stream deadlines should validate");
+        let config = gateway_worker_client_config(
+            &args,
+            izwi_serving_client::WorkerClientTlsConfig::default(),
+        );
+        assert_eq!(config.request_timeout, Duration::from_millis(1500));
+        assert_eq!(config.first_output_timeout, Duration::from_millis(2500));
+        assert_eq!(config.progress_timeout, Duration::from_millis(1200));
+
+        for (flag, value) in [
+            ("--gateway-worker-admission-timeout-ms", "60001"),
+            ("--gateway-worker-first-output-timeout-ms", "3600001"),
+            ("--gateway-worker-progress-idle-timeout-ms", "3600001"),
+            ("--gateway-slow-consumer-timeout-ms", "60001"),
+        ] {
+            let invalid = parse(&["izwi-server", "--role", "gateway", flag, value]);
+            assert!(
+                validate_gateway_limits(&invalid).is_err(),
+                "{flag} must be bounded"
+            );
+        }
+
+        let invalid_queue = parse(&[
+            "izwi-server",
+            "--role",
+            "gateway",
+            "--gateway-worker-queue-wait-ms",
+            "10001",
+            "--gateway-worker-admission-timeout-ms",
+            "10000",
+        ]);
+        assert!(validate_gateway_limits(&invalid_queue).is_err());
     }
 
     #[test]

@@ -1071,6 +1071,7 @@ mod tests {
                 max_queue_wait: Duration::ZERO,
                 max_output_tokens: 128,
                 max_output_bytes: 4096,
+                slow_consumer_timeout: Duration::from_millis(100),
             },
         )
         .expect("remote chat config should be valid");
@@ -1359,6 +1360,7 @@ mod tests {
         };
         let credentials = valid_client_credentials(&worker_config);
         let client_config = WorkerClientConfig {
+            first_output_timeout: Duration::from_millis(30),
             progress_timeout: Duration::from_millis(30),
             ..WorkerClientConfig::default()
         };

@@ -105,13 +105,17 @@ pub struct RemoteChatExecutionConfig {
     pub max_queue_wait: Duration,
     pub max_output_tokens: u32,
     pub max_output_bytes: u64,
+    pub slow_consumer_timeout: Duration,
 }
 
 impl RemoteChatExecutionConfig {
     fn validate(&self) -> Result<(), ApiError> {
-        if self.max_output_tokens == 0 || self.max_output_bytes == 0 {
+        if self.max_output_tokens == 0
+            || self.max_output_bytes == 0
+            || self.slow_consumer_timeout.is_zero()
+        {
             return Err(ApiError::internal(
-                "Remote chat output limits must be non-zero",
+                "Remote chat output limits and slow-consumer timeout must be non-zero",
             ));
         }
         Ok(())
@@ -323,10 +327,18 @@ where
 }
 
 async fn send_chat_terminal(event_tx: mpsc::Sender<ChatStreamEvent>, event: ChatStreamEvent) {
+    send_chat_terminal_with_timeout(event_tx, event, CHAT_TERMINAL_SEND_TIMEOUT).await;
+}
+
+async fn send_chat_terminal_with_timeout(
+    event_tx: mpsc::Sender<ChatStreamEvent>,
+    event: ChatStreamEvent,
+    timeout: Duration,
+) {
     // A connected receiver may stop polling forever. Terminal delivery remains
     // best-effort for that transport, but it must never retain inference or
     // workload capacity indefinitely.
-    let _ = tokio::time::timeout(CHAT_TERMINAL_SEND_TIMEOUT, event_tx.send(event)).await;
+    let _ = tokio::time::timeout(timeout, event_tx.send(event)).await;
 }
 
 pub fn max_new_tokens(
@@ -749,6 +761,7 @@ where
     F: Fn(&WorkerClientError) + Send + Sync + 'static,
 {
     let max_output_bytes = remote.config.max_output_bytes;
+    let slow_consumer_timeout = remote.config.slow_consumer_timeout;
     let (event_tx, event_rx) = mpsc::channel(CHAT_STREAM_CAPACITY);
     tokio::spawn(async move {
         let started = Instant::now();
@@ -834,7 +847,7 @@ where
         // reconciliation. On a validated terminal event the lease was already
         // consumed above, so this is a no-op.
         drop(tenant_work);
-        send_chat_terminal(event_tx, terminal).await;
+        send_chat_terminal_with_timeout(event_tx, terminal, slow_consumer_timeout).await;
     });
     event_rx
 }

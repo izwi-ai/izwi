@@ -171,10 +171,14 @@ fn parse_pem_items(
 pub struct WorkerClientConfig {
     pub max_in_flight: usize,
     pub connect_timeout: Duration,
+    /// Maximum wait for response headers and, separately once they arrive, the
+    /// first contract-valid admission event.
     pub request_timeout: Duration,
-    /// Maximum wait for a complete meaningful invocation event. After worker
-    /// acceptance this is both the first-useful-output and output-progress
-    /// idle budget. Raw HTTP chunks and usage-only events do not reset it.
+    /// Maximum wait from worker acceptance to the first non-empty model output
+    /// or a legitimate terminal event.
+    pub first_output_timeout: Duration,
+    /// Maximum idle time between non-empty model output events. Raw HTTP
+    /// chunks, empty deltas, and usage-only events do not reset it.
     pub progress_timeout: Duration,
     pub max_request_json_bytes: usize,
     pub max_control_body_bytes: usize,
@@ -189,6 +193,7 @@ impl Default for WorkerClientConfig {
             max_in_flight: 32,
             connect_timeout: Duration::from_secs(2),
             request_timeout: Duration::from_secs(10),
+            first_output_timeout: Duration::from_secs(60),
             progress_timeout: Duration::from_secs(30),
             max_request_json_bytes: DEFAULT_MAX_REQUEST_JSON_BYTES,
             max_control_body_bytes: DEFAULT_MAX_CONTROL_BODY_BYTES,
@@ -203,6 +208,8 @@ impl Default for WorkerClientConfig {
 pub enum DeadlinePhase {
     InFlightPermit,
     ResponseHeaders,
+    InvocationAdmission,
+    FirstOutput,
     StreamProgress,
     TotalInvocation,
 }
@@ -212,6 +219,8 @@ impl std::fmt::Display for DeadlinePhase {
         formatter.write_str(match self {
             Self::InFlightPermit => "in-flight permit",
             Self::ResponseHeaders => "response headers",
+            Self::InvocationAdmission => "invocation admission",
+            Self::FirstOutput => "first output",
             Self::StreamProgress => "stream progress",
             Self::TotalInvocation => "total invocation",
         })
@@ -447,8 +456,32 @@ impl WorkerClient {
     /// Starts exactly one invocation POST. This method never retries.
     pub async fn invoke(
         &self,
-        request: InvocationRequest,
+        mut request: InvocationRequest,
     ) -> Result<InvocationStream, WorkerClientError> {
+        request.validate()?;
+        let total_deadline = Instant::now() + Duration::from_millis(request.remaining_time_ms);
+        let encoded = serde_json::to_vec(&request)?;
+        if encoded.len() > self.inner.config.max_request_json_bytes {
+            return Err(WorkerClientError::RequestTooLarge {
+                actual: encoded.len(),
+                limit: self.inner.config.max_request_json_bytes,
+            });
+        }
+        let permit = self.acquire_invocation_permit(total_deadline).await?;
+        let remaining_time_ms = u64::try_from(
+            total_deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        if remaining_time_ms == 0 {
+            return Err(WorkerClientError::Deadline(DeadlinePhase::InFlightPermit));
+        }
+        // Queue and total budgets are transport metadata, not logical request content, and are
+        // deliberately excluded from the caller-supplied request digest. Preserve that digest
+        // while forwarding only the budget that remains after local client admission.
+        request.remaining_time_ms = remaining_time_ms;
+        request.max_queue_wait_ms = request.max_queue_wait_ms.min(remaining_time_ms);
         request.validate()?;
         let encoded = serde_json::to_vec(&request)?;
         if encoded.len() > self.inner.config.max_request_json_bytes {
@@ -457,13 +490,11 @@ impl WorkerClient {
                 limit: self.inner.config.max_request_json_bytes,
             });
         }
-        let permit = self.acquire_permit().await?;
         // From this point until an explicit rejection or a live response stream, dropping this
         // future leaves admission uncertain. A tombstoned cancel also closes the race where the
         // cancellation reaches the worker just before the invocation POST.
         let mut admission_guard =
             PendingInvocationGuard::new(self.clone(), AttemptIdentity::from(&request));
-        let total_deadline = Instant::now() + Duration::from_millis(request.remaining_time_ms);
         let header_budget = self
             .inner
             .config
@@ -513,8 +544,8 @@ impl WorkerClient {
         }
 
         let now = Instant::now();
-        let progress_deadline = now
-            .checked_add(self.inner.config.progress_timeout)
+        let phase_deadline = now
+            .checked_add(self.inner.config.request_timeout)
             .unwrap_or(total_deadline)
             .min(total_deadline);
         let mut stream = InvocationStream {
@@ -528,7 +559,8 @@ impl WorkerClient {
             eof_seen: false,
             permit: Some(permit),
             total_deadline,
-            progress_deadline,
+            phase_deadline,
+            deadline_phase: DeadlinePhase::InvocationAdmission,
         };
         // The live stream now owns best-effort cancellation for every exit path.
         admission_guard.disarm();
@@ -572,6 +604,23 @@ impl WorkerClient {
     async fn acquire_permit(&self) -> Result<OwnedSemaphorePermit, WorkerClientError> {
         tokio::time::timeout(
             self.inner.config.request_timeout,
+            Arc::clone(&self.inner.permits).acquire_owned(),
+        )
+        .await
+        .map_err(|_| WorkerClientError::Deadline(DeadlinePhase::InFlightPermit))?
+        .map_err(|_| WorkerClientError::InvalidConfiguration("client semaphore is closed"))
+    }
+
+    async fn acquire_invocation_permit(
+        &self,
+        total_deadline: Instant,
+    ) -> Result<OwnedSemaphorePermit, WorkerClientError> {
+        let remaining = total_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(WorkerClientError::Deadline(DeadlinePhase::InFlightPermit));
+        }
+        tokio::time::timeout(
+            self.inner.config.request_timeout.min(remaining),
             Arc::clone(&self.inner.permits).acquire_owned(),
         )
         .await
@@ -692,6 +741,7 @@ fn validate_config(config: &WorkerClientConfig) -> Result<(), WorkerClientError>
     }
     if config.connect_timeout.is_zero()
         || config.request_timeout.is_zero()
+        || config.first_output_timeout.is_zero()
         || config.progress_timeout.is_zero()
     {
         return Err(WorkerClientError::InvalidConfiguration(
@@ -778,7 +828,8 @@ pub struct InvocationStream {
     eof_seen: bool,
     permit: Option<OwnedSemaphorePermit>,
     total_deadline: Instant,
-    progress_deadline: Instant,
+    phase_deadline: Instant,
+    deadline_phase: DeadlinePhase,
 }
 
 impl std::fmt::Debug for InvocationStream {
@@ -859,21 +910,21 @@ impl InvocationStream {
             if total_remaining.is_zero() {
                 return Err(WorkerClientError::Deadline(DeadlinePhase::TotalInvocation));
             }
-            let progress_remaining = self.progress_deadline.saturating_duration_since(now);
-            if progress_remaining.is_zero() {
-                return Err(WorkerClientError::Deadline(DeadlinePhase::StreamProgress));
+            let phase_remaining = self.phase_deadline.saturating_duration_since(now);
+            if phase_remaining.is_zero() {
+                return Err(WorkerClientError::Deadline(self.deadline_phase));
             }
             // This deadline is deliberately fixed between complete useful
             // events. Repeated body fragments cannot keep an invocation alive
             // without accepted model output.
-            let budget = total_remaining.min(progress_remaining);
+            let budget = total_remaining.min(phase_remaining);
             let next = tokio::time::timeout(budget, self.body.next())
                 .await
                 .map_err(|_| {
                     if Instant::now() >= self.total_deadline {
                         WorkerClientError::Deadline(DeadlinePhase::TotalInvocation)
                     } else {
-                        WorkerClientError::Deadline(DeadlinePhase::StreamProgress)
+                        WorkerClientError::Deadline(self.deadline_phase)
                     }
                 })?;
             match next {
@@ -952,28 +1003,44 @@ impl InvocationStream {
             ));
         }
         self.last_sequence = Some(event.sequence);
-        if matches!(
-            &event.event,
-            InvocationEventKind::Accepted { .. }
-                | InvocationEventKind::TextDelta { .. }
-                | InvocationEventKind::Completed { .. }
-                | InvocationEventKind::Error { .. }
-                | InvocationEventKind::Cancelled { .. }
-        ) {
-            // Acceptance starts the first-useful-output clock. Each text delta
-            // advances the progress clock, and a legitimate terminal event
-            // gives protocol EOF its own bounded drain window. Usage is
-            // metadata, not proof that model output is progressing.
-            let now = Instant::now();
-            self.progress_deadline = now
-                .checked_add(self.client.inner.config.progress_timeout)
-                .unwrap_or(self.total_deadline)
-                .min(self.total_deadline);
+        match &event.event {
+            InvocationEventKind::Accepted { .. } => {
+                self.reset_phase_deadline(
+                    DeadlinePhase::FirstOutput,
+                    self.client.inner.config.first_output_timeout,
+                );
+            }
+            InvocationEventKind::TextDelta { text } if !text.is_empty() => {
+                self.reset_phase_deadline(
+                    DeadlinePhase::StreamProgress,
+                    self.client.inner.config.progress_timeout,
+                );
+            }
+            InvocationEventKind::Completed { .. }
+            | InvocationEventKind::Error { .. }
+            | InvocationEventKind::Cancelled { .. } => {
+                // Give protocol EOF a bounded drain window after a legitimate
+                // terminal event. This does not change the total deadline.
+                self.reset_phase_deadline(
+                    DeadlinePhase::StreamProgress,
+                    self.client.inner.config.progress_timeout,
+                );
+            }
+            InvocationEventKind::TextDelta { .. } | InvocationEventKind::Usage { .. } => {}
         }
         if event.is_terminal() {
             self.terminal_seen = true;
         }
         Ok(())
+    }
+
+    fn reset_phase_deadline(&mut self, phase: DeadlinePhase, timeout: Duration) {
+        let now = Instant::now();
+        self.deadline_phase = phase;
+        self.phase_deadline = now
+            .checked_add(timeout)
+            .unwrap_or(self.total_deadline)
+            .min(self.total_deadline);
     }
 
     fn schedule_cancel(&mut self) {

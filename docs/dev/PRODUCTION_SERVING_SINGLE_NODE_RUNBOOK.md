@@ -224,6 +224,10 @@ izwi-server \
   --gateway-worker-approval 'http://127.0.0.1:9470|chat|LFM2.5-1.2B-Instruct-GGUF|lfm25-cpu-v1|1' \
   --gateway-max-in-flight 32 \
   --gateway-worker-queue-wait-ms 250 \
+  --gateway-worker-admission-timeout-ms 10000 \
+  --gateway-worker-first-output-timeout-ms 60000 \
+  --gateway-worker-progress-idle-timeout-ms 30000 \
+  --gateway-slow-consumer-timeout-ms 5000 \
   --gateway-worker-status-ttl-ms 10000 \
   --gateway-worker-status-poll-ms 2000
 ```
@@ -252,6 +256,11 @@ The registry supports at most 256 configured workers; deployment tables support
 at most 64 pools and 256 replicas per pool. Poll interval must be nonzero and
 less than status TTL. The gateway uses receiver-monotonic observation time and
 strictly increasing status sequence numbers rather than trusting remote clocks.
+Admission/header timeout is configurable from 1 ms to 60 seconds, first-output
+and inter-output idle timeouts from 1 ms to one hour, and slow-consumer relay
+timeout from 1 ms to 60 seconds. Queue wait cannot exceed admission timeout.
+Every phase remains capped by the original request's total remaining deadline;
+transport or metadata trickles do not extend it.
 
 ### 3. Check probes and one public request
 
@@ -369,7 +378,9 @@ The important current bounds are:
 | Worker event channel | 4 events; 1 MiB encoded event limit in the real worker |
 | Worker attempt records | configured `max_retained_attempts`, at least active capacity, max 65,536; time-bounded by `attempt_retention_secs` (1-86,400) |
 | Private client JSON | 1 MiB request, 512 KiB control body, 16 KiB error body defaults |
-| Private NDJSON | 256 KiB line, 16 MiB total, 4,096 events by default |
+| Gateway private deadlines | 10 s admission/header, 60 s first output, 30 s inter-output idle; each is capped by the original 300 s default total invocation deadline |
+| Gateway slow consumer | 5 s relay wait before exact-attempt cancellation; configurable from 1 ms to 60 s |
+| Private NDJSON | Gateway chat: 1 MiB line, 16 MiB total, 8,192 events; generic client defaults remain independently bounded |
 | Remote chat output | gateway ceiling 4,096 tokens/512 KiB, further restricted by the worker capability |
 
 Backpressure is cancellation-safe: bounded channel saturation or a slow/dropped

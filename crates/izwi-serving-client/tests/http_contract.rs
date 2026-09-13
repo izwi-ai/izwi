@@ -126,6 +126,38 @@ async fn response_header_timeout_remains_acceptance_unknown() {
     server.abort();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn open_response_body_without_accepted_times_out_in_invocation_admission() {
+    let config = MockWorkerConfig {
+        fault: MockFault::OpenBodyWithoutAcknowledgement,
+        cancellation_delay: Duration::from_millis(40),
+        ..MockWorkerConfig::default()
+    };
+    let worker = MockWorker::spawn(config).await.unwrap();
+    let client = WorkerClient::new(
+        &worker.endpoint(),
+        worker.config().credentials.clone(),
+        WorkerClientConfig {
+            request_timeout: Duration::from_millis(30),
+            first_output_timeout: Duration::from_millis(200),
+            ..WorkerClientConfig::default()
+        },
+    )
+    .unwrap();
+
+    let error = client
+        .invoke(request(worker.config(), "open-body-no-accepted"))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        WorkerClientError::Deadline(DeadlinePhase::InvocationAdmission)
+    ));
+    assert_eq!(worker.active_invocations(), 1);
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert_eq!(worker.active_invocations(), 0);
+}
+
 #[tokio::test]
 async fn generic_http_503_is_not_a_safe_rejection() {
     let listener = TcpListener::bind(("127.0.0.1", 0))
@@ -320,6 +352,84 @@ async fn atomic_worker_capacity_rejects_a_second_gateway_view() {
     drop(first);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invocation_budget_includes_time_waiting_for_a_client_permit() {
+    let config = MockWorkerConfig {
+        fault: MockFault::Hang,
+        max_active_invocations: 2,
+        ..MockWorkerConfig::default()
+    };
+    let worker = MockWorker::spawn(config).await.unwrap();
+    let client = WorkerClient::new(
+        &worker.endpoint(),
+        worker.config().credentials.clone(),
+        WorkerClientConfig {
+            max_in_flight: 1,
+            request_timeout: Duration::from_millis(500),
+            first_output_timeout: Duration::from_millis(500),
+            ..WorkerClientConfig::default()
+        },
+    )
+    .unwrap();
+    let first = client
+        .invoke(request(worker.config(), "permit-budget-holder"))
+        .await
+        .unwrap();
+
+    let mut waiting_request = request(worker.config(), "permit-budget-forwarded");
+    waiting_request.remaining_time_ms = 250;
+    let waiting_identity = AttemptIdentity::from(&waiting_request);
+    let waiting_client = client.clone();
+    let waiting = tokio::spawn(async move { waiting_client.invoke(waiting_request).await });
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    drop(first);
+
+    let second = waiting.await.unwrap().unwrap();
+    let forwarded_budget = worker
+        .attempt_remaining_time_ms(&waiting_identity.attempt_id)
+        .expect("second invocation reached worker");
+    assert!(
+        forwarded_budget < 250,
+        "permit wait must be deducted from the forwarded budget: {forwarded_budget}"
+    );
+    drop(second);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invocation_total_budget_caps_wait_for_a_client_permit() {
+    let config = MockWorkerConfig {
+        fault: MockFault::Hang,
+        max_active_invocations: 2,
+        ..MockWorkerConfig::default()
+    };
+    let worker = MockWorker::spawn(config).await.unwrap();
+    let client = WorkerClient::new(
+        &worker.endpoint(),
+        worker.config().credentials.clone(),
+        WorkerClientConfig {
+            max_in_flight: 1,
+            request_timeout: Duration::from_millis(500),
+            ..WorkerClientConfig::default()
+        },
+    )
+    .unwrap();
+    let first = client
+        .invoke(request(worker.config(), "permit-deadline-holder"))
+        .await
+        .unwrap();
+    let mut waiting_request = request(worker.config(), "permit-deadline-expired");
+    waiting_request.remaining_time_ms = 30;
+
+    let started = std::time::Instant::now();
+    let error = client.invoke(waiting_request).await.unwrap_err();
+    assert!(matches!(
+        error,
+        WorkerClientError::Deadline(DeadlinePhase::InFlightPermit)
+    ));
+    assert!(started.elapsed() < Duration::from_millis(200));
+    drop(first);
+}
+
 #[tokio::test]
 async fn malformed_oversized_and_accepted_then_eof_are_never_success() {
     for (suffix, fault, expected) in [
@@ -413,7 +523,7 @@ async fn partial_output_then_disconnect_is_never_replayed_or_reported_as_success
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn progress_timeout_requests_cancel_but_capacity_waits_for_teardown() {
+async fn first_output_timeout_requests_cancel_but_capacity_waits_for_teardown() {
     let config = MockWorkerConfig {
         fault: MockFault::Hang,
         cancellation_delay: Duration::from_millis(180),
@@ -421,6 +531,7 @@ async fn progress_timeout_requests_cancel_but_capacity_waits_for_teardown() {
     };
     let worker = MockWorker::spawn(config).await.unwrap();
     let client_config = WorkerClientConfig {
+        first_output_timeout: Duration::from_millis(30),
         progress_timeout: Duration::from_millis(30),
         request_timeout: Duration::from_millis(200),
         ..WorkerClientConfig::default()
@@ -437,7 +548,7 @@ async fn progress_timeout_requests_cancel_but_capacity_waits_for_teardown() {
     let error = client.invoke_collect(timed_out).await.unwrap_err();
     assert!(matches!(
         error,
-        WorkerClientError::Deadline(DeadlinePhase::StreamProgress)
+        WorkerClientError::Deadline(DeadlinePhase::FirstOutput)
     ));
 
     // Cancellation is asynchronous and, even after it is observed, teardown is deliberately slow.
@@ -473,6 +584,15 @@ async fn raw_byte_trickle_does_not_reset_first_useful_output_deadline() {
     assert_non_output_trickle_times_out(MockFault::ByteTrickleWithoutEvent, "byte-trickle").await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_delta_trickle_does_not_reset_first_useful_output_deadline() {
+    assert_non_output_trickle_times_out(
+        MockFault::EmptyDeltaTrickleWithoutOutput,
+        "empty-delta-trickle",
+    )
+    .await;
+}
+
 async fn assert_non_output_trickle_times_out(fault: MockFault, suffix: &str) {
     let config = MockWorkerConfig {
         fault,
@@ -485,7 +605,8 @@ async fn assert_non_output_trickle_times_out(fault: MockFault, suffix: &str) {
         &worker.endpoint(),
         worker.config().credentials.clone(),
         WorkerClientConfig {
-            progress_timeout: Duration::from_millis(35),
+            first_output_timeout: Duration::from_millis(35),
+            progress_timeout: Duration::from_millis(20),
             request_timeout: Duration::from_millis(200),
             ..WorkerClientConfig::default()
         },
@@ -497,7 +618,7 @@ async fn assert_non_output_trickle_times_out(fault: MockFault, suffix: &str) {
     let error = client.invoke_collect(invocation).await.unwrap_err();
     assert!(matches!(
         error,
-        WorkerClientError::Deadline(DeadlinePhase::StreamProgress)
+        WorkerClientError::Deadline(DeadlinePhase::FirstOutput)
     ));
     assert_eq!(worker.active_invocations(), 1);
     tokio::time::sleep(Duration::from_millis(25)).await;
@@ -513,6 +634,37 @@ async fn assert_non_output_trickle_times_out(fault: MockFault, suffix: &str) {
         client.query_attempt(&identity).await.unwrap().state,
         AttemptState::Cancelled
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_empty_output_switches_to_the_progress_idle_deadline() {
+    let config = MockWorkerConfig {
+        fault: MockFault::TextDeltaThenHang,
+        output_cadence: Duration::from_millis(25),
+        cancellation_delay: Duration::from_millis(40),
+        ..MockWorkerConfig::default()
+    };
+    let worker = MockWorker::spawn(config).await.unwrap();
+    let client = WorkerClient::new(
+        &worker.endpoint(),
+        worker.config().credentials.clone(),
+        WorkerClientConfig {
+            first_output_timeout: Duration::from_millis(80),
+            progress_timeout: Duration::from_millis(20),
+            request_timeout: Duration::from_millis(200),
+            ..WorkerClientConfig::default()
+        },
+    )
+    .unwrap();
+
+    let error = client
+        .invoke_collect(request(worker.config(), "post-output-stall"))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        WorkerClientError::Deadline(DeadlinePhase::StreamProgress)
+    ));
 }
 
 #[tokio::test]
@@ -553,6 +705,69 @@ async fn text_delta_resets_progress_deadline_until_completion() {
                 ..
             }
         ]
+    ));
+}
+
+fn wide_chat_transport_config() -> WorkerClientConfig {
+    let mut config = WorkerClientConfig::default();
+    config.ndjson_limits.max_line_bytes = 1024 * 1024;
+    config.ndjson_limits.max_total_bytes = 16 * 1024 * 1024;
+    config.ndjson_limits.max_events = 8192;
+    config
+}
+
+#[tokio::test]
+async fn gateway_sized_event_budget_allows_4096_deltas_and_terminal_control_events() {
+    let config = MockWorkerConfig {
+        fault: MockFault::ManyTextDeltas {
+            count: 4096,
+            text_bytes: 1,
+        },
+        output_cadence: Duration::ZERO,
+        ..MockWorkerConfig::default()
+    };
+    let worker = MockWorker::spawn(config).await.unwrap();
+    let client = WorkerClient::new(
+        &worker.endpoint(),
+        worker.config().credentials.clone(),
+        wide_chat_transport_config(),
+    )
+    .unwrap();
+    let mut invocation = request(worker.config(), "maximum-delta-count");
+    invocation.remaining_time_ms = 20_000;
+    invocation.output_limits.max_tokens = 4096;
+    invocation.output_limits.max_bytes = 512 * 1024;
+
+    let events = client.invoke_collect(invocation).await.unwrap();
+    assert_eq!(events.len(), 4098);
+    assert!(matches!(
+        events.last().map(|event| &event.event),
+        Some(InvocationEventKind::Completed { .. })
+    ));
+}
+
+#[tokio::test]
+async fn gateway_sized_line_budget_allows_a_near_512_kib_text_delta() {
+    let output_bytes = 512 * 1024 - 1024;
+    let config = MockWorkerConfig {
+        output_text: "x".repeat(output_bytes),
+        output_cadence: Duration::ZERO,
+        ..MockWorkerConfig::default()
+    };
+    let worker = MockWorker::spawn(config).await.unwrap();
+    let client = WorkerClient::new(
+        &worker.endpoint(),
+        worker.config().credentials.clone(),
+        wide_chat_transport_config(),
+    )
+    .unwrap();
+    let mut invocation = request(worker.config(), "near-maximum-line");
+    invocation.output_limits.max_bytes = 512 * 1024;
+
+    let events = client.invoke_collect(invocation).await.unwrap();
+    assert!(matches!(
+        events.get(1).map(|event| &event.event),
+        Some(InvocationEventKind::TextDelta { text }) if text.len() == output_bytes
     ));
 }
 
