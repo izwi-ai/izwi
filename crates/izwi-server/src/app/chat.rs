@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::http::StatusCode;
-use izwi_serving_client::{WorkerClient, WorkerClientError};
+use izwi_serving_client::{InvocationStream, WorkerClient, WorkerClientError};
 use izwi_serving_protocol::{
     AttemptId, CallerId, ChatInput, ChatMessage as WorkerChatMessage,
     ChatParameters as WorkerChatParameters, ChatRole as WorkerChatRole, DeploymentId,
@@ -132,6 +132,10 @@ impl RemoteChatExecution {
     #[cfg(test)]
     pub fn config(&self) -> &RemoteChatExecutionConfig {
         &self.config
+    }
+
+    pub(crate) const fn max_output_tokens(&self) -> u32 {
+        self.config.max_output_tokens
     }
 
     /// Verify that the pinned worker incarnation still advertises the exact
@@ -425,10 +429,30 @@ where
     // event. This is the earliest safe point for dynamic dispatch accounting
     // to transition out of its pre-admission state.
     on_accepted(&mut keepalive)?;
+    collect_started_remote_chat(remote, &mut stream, started, |_| {}).await
+}
+
+pub(crate) async fn collect_started_remote_chat<F>(
+    remote: &RemoteChatExecution,
+    stream: &mut InvocationStream,
+    started: Instant,
+    mut on_worker_error: F,
+) -> Result<ChatGeneration, ApiError>
+where
+    F: FnMut(&WorkerClientError),
+{
     let mut text = String::new();
     let mut latest_usage = None;
 
-    while let Some(event) = stream.next_event().await.map_err(map_worker_client_error)? {
+    loop {
+        let event = match stream.next_event().await {
+            Ok(Some(event)) => event,
+            Ok(None) => break,
+            Err(error) => {
+                on_worker_error(&error);
+                return Err(map_worker_client_error(error));
+            }
+        };
         match event.event {
             InvocationEventKind::Accepted { .. } => {}
             InvocationEventKind::TextDelta { text: delta } => {
@@ -462,7 +486,7 @@ where
     ))
 }
 
-fn prepare_remote_chat_invocation(
+pub(crate) fn prepare_remote_chat_invocation(
     remote: &RemoteChatExecution,
     request_timeout_secs: u64,
     context: &RequestContext,
@@ -484,6 +508,55 @@ fn prepare_remote_chat_invocation(
         .unwrap_or(u64::MAX)
         .max(1);
     build_remote_chat_invocation(context, request, remote, remaining_time_ms)
+}
+
+pub(crate) fn retarget_remote_chat_invocation(
+    invocation: &InvocationRequest,
+    remote: &RemoteChatExecution,
+    remaining: Duration,
+) -> Result<InvocationRequest, ApiError> {
+    if remaining.is_zero() {
+        return Err(request_timeout_error(
+            "Chat request deadline expired before alternate dispatch",
+        ));
+    }
+    let remaining_time_ms = u64::try_from(remaining.as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1);
+    let mut alternate = invocation.clone();
+    alternate.attempt_id = AttemptId::new(new_uuid()).map_err(identifier_error)?;
+    alternate.expected_worker_incarnation = remote.config.expected_worker_incarnation.clone();
+    alternate.deployment_id = remote.config.deployment_id.clone();
+    alternate.expected_model_generation = remote.config.expected_model_generation;
+    alternate.remaining_time_ms = remaining_time_ms;
+    alternate.max_queue_wait_ms = u64::try_from(remote.config.max_queue_wait.as_millis())
+        .unwrap_or(u64::MAX)
+        .min(remaining_time_ms);
+    alternate.output_limits.max_tokens = alternate
+        .output_limits
+        .max_tokens
+        .min(remote.config.max_output_tokens)
+        .max(1);
+    alternate.output_limits.max_bytes = remote.config.max_output_bytes;
+    alternate.request_digest = request_digest(
+        &alternate.caller.tenant_id,
+        &alternate.deployment_id,
+        alternate.expected_model_generation,
+        &alternate.input,
+        alternate.output_limits.max_tokens,
+        alternate.output_limits.max_bytes,
+    )?;
+    alternate
+        .validate()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    Ok(alternate)
+}
+
+pub(crate) async fn start_remote_chat_invocation(
+    remote: &RemoteChatExecution,
+    invocation: InvocationRequest,
+) -> Result<InvocationStream, WorkerClientError> {
+    remote.client.invoke(invocation).await
 }
 
 fn append_remote_text(text: &mut String, delta: &str, max_bytes: u64) -> Result<(), ApiError> {
@@ -536,11 +609,26 @@ pub async fn spawn_remote_chat_stream_with_execution(
 ) -> Result<mpsc::Receiver<ChatStreamEvent>, ApiError> {
     let invocation =
         prepare_remote_chat_invocation(remote, request_timeout_secs, context, request)?;
-    let mut worker_stream = remote
+    let worker_stream = remote
         .client
         .invoke(invocation)
         .await
         .map_err(map_worker_client_error)?;
+    Ok(spawn_started_remote_chat_stream_with_execution(
+        remote,
+        worker_stream,
+        |_| {},
+    ))
+}
+
+pub(crate) fn spawn_started_remote_chat_stream_with_execution<F>(
+    remote: &RemoteChatExecution,
+    mut worker_stream: InvocationStream,
+    on_worker_error: F,
+) -> mpsc::Receiver<ChatStreamEvent>
+where
+    F: Fn(&WorkerClientError) + Send + Sync + 'static,
+{
     let max_output_bytes = remote.config.max_output_bytes;
     let (event_tx, event_rx) = mpsc::channel(CHAT_STREAM_CAPACITY);
     tokio::spawn(async move {
@@ -561,7 +649,8 @@ pub async fn spawn_remote_chat_stream_with_execution(
                     )
                 }
                 Err(error) => {
-                    break ChatStreamEvent::Failed(map_worker_client_error(error).message)
+                    on_worker_error(&error);
+                    break ChatStreamEvent::Failed(map_worker_client_error(error).message);
                 }
             };
             match event.event {
@@ -611,7 +700,7 @@ pub async fn spawn_remote_chat_stream_with_execution(
         drop(worker_stream);
         send_chat_terminal(event_tx, terminal).await;
     });
-    Ok(event_rx)
+    event_rx
 }
 
 fn validate_remote_chat_scope(request: &ChatExecutionRequest) -> Result<(), ApiError> {
@@ -765,7 +854,7 @@ fn identifier_error(error: izwi_serving_protocol::IdentifierError) -> ApiError {
     ))
 }
 
-fn map_worker_client_error(error: WorkerClientError) -> ApiError {
+pub(crate) fn map_worker_client_error(error: WorkerClientError) -> ApiError {
     match error {
         WorkerClientError::Rejected { rejection } => {
             let message = rejection.message;

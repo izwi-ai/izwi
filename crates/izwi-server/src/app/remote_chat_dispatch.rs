@@ -1,22 +1,25 @@
 //! Multi-worker routing for the migrated public chat slice.
 //!
 //! The registry narrows candidates using fresh, receiver-clock status, but the
-//! chosen worker remains authoritative for admission. Each dispatch performs
-//! exactly one invocation POST. Explicit rejection, uncertain acceptance, and
-//! accepted execution are all returned from that worker without failover.
+//! chosen worker remains authoritative for admission. A dispatcher may make
+//! one alternate attempt only when the first attempt is provably unaccepted;
+//! uncertain acceptance and accepted execution never fail over.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use izwi_core::{ChatGeneration, ModelVariant};
+use izwi_serving_client::{DeadlinePhase, InvocationStream, WorkerClientError};
 use izwi_serving_protocol::{
     CancellationBehavior, DeploymentId, InputFormat, ModelAlias, OutputFormat, PolicyRevision,
-    TaskKind, PROTOCOL_V1,
+    RejectionCode, TaskKind, PROTOCOL_V1,
 };
 use tokio::sync::mpsc;
 
 use super::chat::{
-    generate_remote_chat_with_execution_and_acceptance, spawn_remote_chat_stream_with_execution,
-    ChatExecutionRequest, ChatStreamEvent, RemoteChatExecution, RemoteChatExecutionConfig,
+    collect_started_remote_chat, map_worker_client_error, prepare_remote_chat_invocation,
+    retarget_remote_chat_invocation, spawn_started_remote_chat_stream_with_execution,
+    start_remote_chat_invocation, ChatExecutionRequest, ChatStreamEvent, RemoteChatExecution,
+    RemoteChatExecutionConfig,
 };
 use crate::api::request_context::RequestContext;
 use crate::error::ApiError;
@@ -72,6 +75,10 @@ impl RemoteChatDispatcher {
         &self.registry
     }
 
+    pub(crate) const fn max_output_tokens(&self) -> u32 {
+        self.config.max_output_tokens
+    }
+
     /// Readiness is derived from a receiver-clock-fresh registry observation,
     /// never from registration alone. Exhausted workers remain ready because
     /// capacity affects admission, not service health.
@@ -111,16 +118,20 @@ impl RemoteChatDispatcher {
         context: &RequestContext,
         request: ChatExecutionRequest,
     ) -> Result<ChatGeneration, ApiError> {
-        let selected = self.select(&request, false)?;
-        let remote = self.execution_for(&selected)?;
-        generate_remote_chat_with_execution_and_acceptance(
-            &remote,
-            request_timeout_secs,
-            context,
-            request,
-            selected.dispatch,
-            |dispatch| dispatch.mark_accepted().map_err(map_registry_error),
-        )
+        let StartedDispatch {
+            remote,
+            mut stream,
+            selected,
+            started,
+        } = self
+            .start(request_timeout_secs, context, request, false)
+            .await?;
+        let key = selected.key.clone();
+        let _dispatch = selected.dispatch;
+        let registry = self.registry.clone();
+        collect_started_remote_chat(&remote, &mut stream, started, move |error| {
+            report_stream_error(&registry, &key, error);
+        })
         .await
     }
 
@@ -133,19 +144,20 @@ impl RemoteChatDispatcher {
         context: &RequestContext,
         request: ChatExecutionRequest,
     ) -> Result<mpsc::Receiver<ChatStreamEvent>, ApiError> {
-        let mut selected = self.select(&request, true)?;
-        let remote = self.execution_for(&selected)?;
-        let mut worker_events = spawn_remote_chat_stream_with_execution(
-            &remote,
-            request_timeout_secs,
-            context,
-            request,
-        )
-        .await?;
-        selected
-            .dispatch
-            .mark_accepted()
-            .map_err(map_registry_error)?;
+        let StartedDispatch {
+            remote,
+            stream,
+            selected,
+            ..
+        } = self
+            .start(request_timeout_secs, context, request, true)
+            .await?;
+        let registry = self.registry.clone();
+        let key = selected.key.clone();
+        let mut worker_events =
+            spawn_started_remote_chat_stream_with_execution(&remote, stream, move |error| {
+                report_stream_error(&registry, &key, error)
+            });
 
         let (public_tx, public_rx) = mpsc::channel(FORWARDED_CHAT_STREAM_CAPACITY);
         tokio::spawn(async move {
@@ -168,11 +180,85 @@ impl RemoteChatDispatcher {
         Ok(public_rx)
     }
 
-    fn select(
+    async fn start(
+        &self,
+        request_timeout_secs: u64,
+        context: &RequestContext,
+        request: ChatExecutionRequest,
+        streaming: bool,
+    ) -> Result<StartedDispatch, ApiError> {
+        let selection = self.selection_request(&request, streaming)?;
+        let mut selected = self
+            .registry
+            .select_and_reserve(&selection)
+            .map_err(map_registry_error)?;
+        let remote = self.execution_for(&selected)?;
+        let invocation =
+            prepare_remote_chat_invocation(&remote, request_timeout_secs, context, request)?;
+        let started = Instant::now();
+
+        match start_remote_chat_invocation(&remote, invocation.clone()).await {
+            Ok(stream) => {
+                selected
+                    .dispatch
+                    .mark_accepted()
+                    .map_err(map_registry_error)?;
+                return Ok(StartedDispatch {
+                    remote,
+                    stream,
+                    selected,
+                    started,
+                });
+            }
+            Err(error) => {
+                report_start_error(&self.registry, &selected, &error);
+                if !retryable_before_acceptance(&error) {
+                    return Err(map_worker_client_error(error));
+                }
+            }
+        }
+
+        let excluded = selected.key.clone();
+        drop(selected);
+        let mut alternate = self
+            .registry
+            .select_and_reserve_excluding(&selection, Some(&excluded))
+            .map_err(map_registry_error)?;
+        let alternate_remote = self.execution_for(&alternate)?;
+        let remaining = context
+            .remaining_budget(Duration::from_secs(request_timeout_secs.max(1)))
+            .filter(|budget| !budget.is_zero())
+            .ok_or_else(|| ApiError {
+                status: axum::http::StatusCode::REQUEST_TIMEOUT,
+                message: "Chat request deadline expired before alternate dispatch".into(),
+            })?;
+        let alternate_invocation =
+            retarget_remote_chat_invocation(&invocation, &alternate_remote, remaining)?;
+        match start_remote_chat_invocation(&alternate_remote, alternate_invocation).await {
+            Ok(stream) => {
+                alternate
+                    .dispatch
+                    .mark_accepted()
+                    .map_err(map_registry_error)?;
+                Ok(StartedDispatch {
+                    remote: alternate_remote,
+                    stream,
+                    selected: alternate,
+                    started,
+                })
+            }
+            Err(error) => {
+                report_start_error(&self.registry, &alternate, &error);
+                Err(map_worker_client_error(error))
+            }
+        }
+    }
+
+    fn selection_request(
         &self,
         request: &ChatExecutionRequest,
         streaming: bool,
-    ) -> Result<SelectedWorker, ApiError> {
+    ) -> Result<WorkerSelectionRequest, ApiError> {
         if request.variant != self.config.public_model_variant {
             return Err(ApiError::bad_request(format!(
                 "Requested model is incompatible with remote deployment {}",
@@ -194,7 +280,7 @@ impl RemoteChatDispatcher {
             .max(1);
         let public_model = ModelAlias::new(self.config.public_model_variant.dir_name())
             .map_err(|error| ApiError::internal(format!("Invalid public model alias: {error}")))?;
-        let selection = WorkerSelectionRequest {
+        Ok(WorkerSelectionRequest {
             protocol_version: PROTOCOL_V1,
             deployment_id: self.config.deployment_id.clone(),
             public_model,
@@ -210,10 +296,7 @@ impl RemoteChatDispatcher {
             // bytes are bounded here and context limits are enforced there.
             context_tokens: None,
             output_tokens: Some(output_tokens),
-        };
-        self.registry
-            .select_and_reserve(&selection)
-            .map_err(map_registry_error)
+        })
     }
 
     fn execution_for(&self, selected: &SelectedWorker) -> Result<RemoteChatExecution, ApiError> {
@@ -233,6 +316,70 @@ impl RemoteChatDispatcher {
     }
 }
 
+struct StartedDispatch {
+    remote: RemoteChatExecution,
+    stream: InvocationStream,
+    selected: SelectedWorker,
+    started: Instant,
+}
+
+fn retryable_before_acceptance(error: &WorkerClientError) -> bool {
+    match error {
+        WorkerClientError::ConnectionNotEstablished(_)
+        | WorkerClientError::Deadline(DeadlinePhase::InFlightPermit) => true,
+        WorkerClientError::Rejected { rejection } if !rejection.accepted => matches!(
+            rejection.code,
+            RejectionCode::CapacityExhausted
+                | RejectionCode::QueueWaitExceeded
+                | RejectionCode::WrongWorkerIncarnation
+                | RejectionCode::WrongModelGeneration
+                | RejectionCode::UnknownDeployment
+                | RejectionCode::ModelNotReady
+                | RejectionCode::WorkerDraining
+        ),
+        _ => false,
+    }
+}
+
+fn report_start_error(
+    registry: &WorkerRegistry,
+    selected: &SelectedWorker,
+    error: &WorkerClientError,
+) {
+    if matches!(error, WorkerClientError::Rejected { rejection } if !rejection.accepted) {
+        let _ = registry.report_worker_reachable(&selected.key);
+    } else {
+        report_stream_error(registry, &selected.key, error);
+    }
+}
+
+fn report_stream_error(
+    registry: &WorkerRegistry,
+    key: &crate::worker_registry::WorkerInstanceKey,
+    error: &WorkerClientError,
+) {
+    if counts_as_transport_failure(error) {
+        let _ = registry.report_worker_transport_failure(key);
+    }
+}
+
+fn counts_as_transport_failure(error: &WorkerClientError) -> bool {
+    matches!(
+        error,
+        WorkerClientError::ConnectionNotEstablished(_)
+            | WorkerClientError::Transport(_)
+            | WorkerClientError::HttpStatus { .. }
+            | WorkerClientError::Deadline(DeadlinePhase::ResponseHeaders)
+            | WorkerClientError::Deadline(DeadlinePhase::StreamProgress)
+            | WorkerClientError::Deadline(DeadlinePhase::TotalInvocation)
+            | WorkerClientError::ResponseTooLarge { .. }
+            | WorkerClientError::InvalidJson(_)
+            | WorkerClientError::Ndjson(_)
+            | WorkerClientError::Protocol(_)
+            | WorkerClientError::InterruptedUnknown
+    )
+}
+
 fn map_registry_error(error: WorkerRegistryError) -> ApiError {
     match error {
         WorkerRegistryError::NoEligibleWorker | WorkerRegistryError::LocalDispatchLimitReached => {
@@ -246,18 +393,24 @@ fn map_registry_error(error: WorkerRegistryError) -> ApiError {
 mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
 
+    use axum::body::{Body, Bytes};
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::response::Response;
+    use axum::routing::post;
+    use axum::Router;
     use izwi_core::{ChatMessage, ChatRequestConfig, ChatRole};
     use izwi_hooks::Principal;
-    use izwi_serving_client::{
-        mock::{MockFault, MockWorker, MockWorkerConfig},
-        WorkerClient, WorkerClientConfig,
-    };
+    use izwi_serving_client::{WorkerClient, WorkerClientConfig};
     use izwi_serving_protocol::{
         ArtifactRevision, BackendKind, Capability, CapacitySnapshot, CredentialId,
-        DeviceAssignment, LoadedDeployment, ModelGeneration, ModelReadiness, NodeId,
-        ServiceBearerToken, ServiceCredentials, WorkerDescriptor, WorkerFeature, WorkerId,
-        WorkerProcessState, WorkerStatus,
+        DeviceAssignment, FinishReason, InvocationEvent, InvocationEventKind, InvocationRejection,
+        InvocationRequest, LoadedDeployment, ModelGeneration, ModelReadiness, NodeId,
+        ServiceBearerToken, ServiceCredentials, Usage, WorkerDescriptor, WorkerFeature, WorkerId,
+        WorkerProcessState, WorkerStatus, INVOCATIONS_PATH, NDJSON_MEDIA_TYPE,
     };
 
     use crate::worker_registry::{ApprovedDeployment, ApprovedWorker, WorkerRegistryConfig};
@@ -279,6 +432,152 @@ mod tests {
 
     fn client(endpoint: &str) -> WorkerClient {
         WorkerClient::new(endpoint, credentials(), WorkerClientConfig::default()).unwrap()
+    }
+
+    #[derive(Clone)]
+    enum ScriptedResponse {
+        Reject(RejectionCode),
+        AcceptedWithoutAcknowledgement,
+        PartialThenDisconnect,
+        Success(String),
+    }
+
+    #[derive(Clone)]
+    struct ScriptedState {
+        response: ScriptedResponse,
+        delay: Duration,
+        requests: Arc<Mutex<Vec<InvocationRequest>>>,
+    }
+
+    struct ScriptedWorker {
+        address: SocketAddr,
+        requests: Arc<Mutex<Vec<InvocationRequest>>>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl ScriptedWorker {
+        async fn spawn(response: ScriptedResponse, delay: Duration) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let state = ScriptedState {
+                response,
+                delay,
+                requests: Arc::clone(&requests),
+            };
+            let app = Router::new()
+                .route(INVOCATIONS_PATH, post(scripted_invoke))
+                .with_state(state);
+            let server = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            Self {
+                address,
+                requests,
+                server,
+            }
+        }
+
+        fn endpoint(&self) -> String {
+            format!("http://{}/", self.address)
+        }
+
+        fn requests(&self) -> Vec<InvocationRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for ScriptedWorker {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    async fn scripted_invoke(State(state): State<ScriptedState>, body: Bytes) -> Response<Body> {
+        let request: InvocationRequest = serde_json::from_slice(&body).unwrap();
+        state.requests.lock().unwrap().push(request.clone());
+        if !state.delay.is_zero() {
+            tokio::time::sleep(state.delay).await;
+        }
+        match state.response {
+            ScriptedResponse::Reject(code) => Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&InvocationRejection::new(
+                        request.request_id,
+                        request.attempt_id,
+                        code,
+                        "scripted rejection",
+                    ))
+                    .unwrap(),
+                ))
+                .unwrap(),
+            ScriptedResponse::AcceptedWithoutAcknowledgement => Response::builder()
+                .status(StatusCode::OK)
+                .header(axum::http::header::CONTENT_TYPE, NDJSON_MEDIA_TYPE)
+                .body(Body::empty())
+                .unwrap(),
+            ScriptedResponse::PartialThenDisconnect => accepted_response(
+                &request,
+                vec![InvocationEventKind::TextDelta {
+                    text: "partial".into(),
+                }],
+            ),
+            ScriptedResponse::Success(text) => accepted_response(
+                &request,
+                vec![
+                    InvocationEventKind::TextDelta { text },
+                    InvocationEventKind::Completed {
+                        finish_reason: FinishReason::Stop,
+                        usage: Some(Usage {
+                            input_tokens: 1,
+                            output_tokens: 1,
+                        }),
+                    },
+                ],
+            ),
+        }
+    }
+
+    fn accepted_response(
+        request: &InvocationRequest,
+        following: Vec<InvocationEventKind>,
+    ) -> Response<Body> {
+        let mut events = vec![InvocationEventKind::Accepted {
+            worker_id: id::<WorkerId>("scripted-worker"),
+            node_id: id::<NodeId>("node-a"),
+            incarnation_id: request.expected_worker_incarnation.clone(),
+            deployment_id: request.deployment_id.clone(),
+            model_generation: request.expected_model_generation,
+        }];
+        events.extend(following);
+        let mut encoded = Vec::new();
+        for (sequence, event) in events.into_iter().enumerate() {
+            encoded.extend(
+                serde_json::to_vec(&InvocationEvent {
+                    schema_version: PROTOCOL_V1,
+                    request_id: request.request_id.clone(),
+                    attempt_id: request.attempt_id.clone(),
+                    sequence: sequence as u64,
+                    event,
+                })
+                .unwrap(),
+            );
+            encoded.push(b'\n');
+        }
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(axum::http::header::CONTENT_TYPE, NDJSON_MEDIA_TYPE)
+            .body(Body::from(encoded))
+            .unwrap()
+    }
+
+    async fn refused_endpoint() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{address}/")
     }
 
     fn deployment() -> LoadedDeployment {
@@ -416,72 +715,221 @@ mod tests {
             1,
         );
         let dispatcher = dispatcher(registry);
+        let selection = dispatcher.selection_request(&request(), false).unwrap();
 
-        let first = dispatcher.select(&request(), false).unwrap();
+        let first = dispatcher.registry.select_and_reserve(&selection).unwrap();
         assert_eq!(first.key.worker_id.as_str(), "worker-a");
-        let second = dispatcher.select(&request(), false).unwrap();
+        let second = dispatcher.registry.select_and_reserve(&selection).unwrap();
         assert_eq!(second.key.worker_id.as_str(), "worker-b");
 
         drop(first);
         drop(second);
     }
 
-    #[tokio::test]
-    async fn authoritative_capacity_rejection_is_not_retried() {
-        let mock_config = MockWorkerConfig {
-            worker_id: id::<WorkerId>("worker-a"),
-            node_id: id::<NodeId>("node-a"),
-            incarnation_id: id("inc-a"),
-            deployment_id: id::<DeploymentId>("chat-prod"),
-            public_model: ModelAlias::new(ModelVariant::Qwen34BGguf.dir_name()).unwrap(),
-            model_generation: ModelGeneration::new(1).unwrap(),
-            credentials: credentials(),
-            output_cadence: Duration::from_millis(5),
-            fault: MockFault::Hang,
-            ..MockWorkerConfig::default()
+    #[test]
+    fn retry_classifier_is_an_explicit_allowlist() {
+        let rejection = |code| WorkerClientError::Rejected {
+            rejection: InvocationRejection::new(id("request-1"), id("attempt-1"), code, "test"),
         };
-        let worker = MockWorker::spawn(mock_config).await.unwrap();
-        let worker_client = client(&worker.endpoint());
+        for code in [
+            RejectionCode::CapacityExhausted,
+            RejectionCode::QueueWaitExceeded,
+            RejectionCode::WrongWorkerIncarnation,
+            RejectionCode::WrongModelGeneration,
+            RejectionCode::UnknownDeployment,
+            RejectionCode::ModelNotReady,
+            RejectionCode::WorkerDraining,
+        ] {
+            assert!(retryable_before_acceptance(&rejection(code)), "{code:?}");
+        }
+        for code in [
+            RejectionCode::Unauthenticated,
+            RejectionCode::Unauthorized,
+            RejectionCode::UnsupportedProtocolVersion,
+            RejectionCode::IncompatibleTask,
+            RejectionCode::InvalidRequest,
+            RejectionCode::DuplicateAttemptConflict,
+            RejectionCode::PolicyDenied,
+        ] {
+            assert!(!retryable_before_acceptance(&rejection(code)), "{code:?}");
+        }
+        assert!(retryable_before_acceptance(&WorkerClientError::Deadline(
+            DeadlinePhase::InFlightPermit,
+        )));
+        assert!(!retryable_before_acceptance(&WorkerClientError::Deadline(
+            DeadlinePhase::ResponseHeaders,
+        )));
+        assert!(!retryable_before_acceptance(
+            &WorkerClientError::HttpStatus {
+                status: "503".parse().unwrap(),
+                body: "generic".into(),
+            },
+        ));
+
+        let mut invalid_accepted = match rejection(RejectionCode::CapacityExhausted) {
+            WorkerClientError::Rejected { rejection } => rejection,
+            _ => unreachable!(),
+        };
+        invalid_accepted.accepted = true;
+        assert!(!retryable_before_acceptance(&WorkerClientError::Rejected {
+            rejection: invalid_accepted,
+        },));
+    }
+
+    #[tokio::test]
+    async fn connection_not_established_retries_once_for_streaming() {
+        let worker_b =
+            ScriptedWorker::spawn(ScriptedResponse::Success("from-b".into()), Duration::ZERO).await;
         let registry = WorkerRegistry::new(WorkerRegistryConfig::default()).unwrap();
-        register(&registry, "worker-a", "inc-a", worker_client.clone(), 1);
+        register(
+            &registry,
+            "worker-a",
+            "inc-a",
+            client(&refused_endpoint().await),
+            1,
+        );
         register(
             &registry,
             "worker-b",
             "inc-b",
-            client("http://127.0.0.1:19102"),
+            client(&worker_b.endpoint()),
             1,
         );
-
-        // Occupy worker-a outside the registry so its last status is stale in
-        // exactly the way a real multi-gateway deployment can observe.
-        let pinned = RemoteChatExecution::new(
-            worker_client,
-            RemoteChatExecutionConfig {
-                public_model_variant: ModelVariant::Qwen34BGguf,
-                expected_worker_incarnation: id("inc-a"),
-                deployment_id: id::<DeploymentId>("chat-prod"),
-                expected_model_generation: ModelGeneration::new(1).unwrap(),
-                policy_revision: id::<PolicyRevision>("policy-v1"),
-                max_queue_wait: Duration::ZERO,
-                max_output_tokens: 128,
-                max_output_bytes: 4096,
-            },
-        )
-        .unwrap();
         let context = RequestContext::new("test-request".into(), Principal::local_anonymous());
-        let occupying_stream =
-            spawn_remote_chat_stream_with_execution(&pinned, 2, &context, request())
+
+        let mut events = dispatcher(registry)
+            .stream(2, &context, request())
+            .await
+            .unwrap();
+        assert!(matches!(
+            events.recv().await,
+            Some(ChatStreamEvent::Started)
+        ));
+        assert!(matches!(
+            events.recv().await,
+            Some(ChatStreamEvent::Delta(ref text)) if text == "from-b"
+        ));
+        assert!(matches!(
+            events.recv().await,
+            Some(ChatStreamEvent::Completed(_))
+        ));
+        assert_eq!(worker_b.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn capacity_rejection_retries_with_same_request_and_fresh_attempt() {
+        let worker_a = ScriptedWorker::spawn(
+            ScriptedResponse::Reject(RejectionCode::CapacityExhausted),
+            Duration::from_millis(25),
+        )
+        .await;
+        let worker_b =
+            ScriptedWorker::spawn(ScriptedResponse::Success("from-b".into()), Duration::ZERO).await;
+        let registry = WorkerRegistry::new(WorkerRegistryConfig::default()).unwrap();
+        register(
+            &registry,
+            "worker-a",
+            "inc-a",
+            client(&worker_a.endpoint()),
+            1,
+        );
+        register(
+            &registry,
+            "worker-b",
+            "inc-b",
+            client(&worker_b.endpoint()),
+            1,
+        );
+        let context = RequestContext::new("test-request".into(), Principal::local_anonymous());
+
+        let generation = dispatcher(registry)
+            .generate(2, &context, request())
+            .await
+            .unwrap();
+        assert_eq!(generation.text, "from-b");
+        let first = worker_a.requests();
+        let alternate = worker_b.requests();
+        assert_eq!(first.len(), 1);
+        assert_eq!(alternate.len(), 1);
+        assert_eq!(first[0].request_id, alternate[0].request_id);
+        assert_ne!(first[0].attempt_id, alternate[0].attempt_id);
+        assert!(alternate[0].remaining_time_ms < first[0].remaining_time_ms);
+    }
+
+    #[tokio::test]
+    async fn uncertain_acceptance_and_partial_output_never_retry() {
+        for first_response in [
+            ScriptedResponse::AcceptedWithoutAcknowledgement,
+            ScriptedResponse::PartialThenDisconnect,
+        ] {
+            let worker_a = ScriptedWorker::spawn(first_response, Duration::ZERO).await;
+            let worker_b = ScriptedWorker::spawn(
+                ScriptedResponse::Success("must-not-run".into()),
+                Duration::ZERO,
+            )
+            .await;
+            let registry = WorkerRegistry::new(WorkerRegistryConfig::default()).unwrap();
+            register(
+                &registry,
+                "worker-a",
+                "inc-a",
+                client(&worker_a.endpoint()),
+                1,
+            );
+            register(
+                &registry,
+                "worker-b",
+                "inc-b",
+                client(&worker_b.endpoint()),
+                1,
+            );
+            let context = RequestContext::new("test-request".into(), Principal::local_anonymous());
+
+            let error = dispatcher(registry)
+                .generate(2, &context, request())
                 .await
-                .unwrap();
-        assert_eq!(worker.active_invocations(), 1);
+                .unwrap_err();
+            assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+            assert!(worker_b.requests().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_is_bounded_to_one_alternate() {
+        let worker_c = ScriptedWorker::spawn(
+            ScriptedResponse::Success("must-not-run".into()),
+            Duration::ZERO,
+        )
+        .await;
+        let registry = WorkerRegistry::new(WorkerRegistryConfig::default()).unwrap();
+        register(
+            &registry,
+            "worker-a",
+            "inc-a",
+            client(&refused_endpoint().await),
+            1,
+        );
+        register(
+            &registry,
+            "worker-b",
+            "inc-b",
+            client(&refused_endpoint().await),
+            1,
+        );
+        register(
+            &registry,
+            "worker-c",
+            "inc-c",
+            client(&worker_c.endpoint()),
+            1,
+        );
+        let context = RequestContext::new("test-request".into(), Principal::local_anonymous());
 
         let error = dispatcher(registry)
             .generate(2, &context, request())
             .await
             .unwrap_err();
-        assert_eq!(error.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
-        assert!(error.message.contains("capacity"), "{}", error.message);
-
-        drop(occupying_stream);
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert!(worker_c.requests().is_empty());
     }
 }
