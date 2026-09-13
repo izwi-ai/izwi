@@ -743,6 +743,40 @@ impl ArtifactStore {
         }
     }
 
+    pub(crate) async fn delete_speech_history_audio(
+        &self,
+        route_kind: &str,
+        record_id: &str,
+        tenant: &ArtifactTenant,
+        id: &ArtifactId,
+    ) -> Result<bool, ArtifactStoreError> {
+        self.resolve_active(tenant, id).await?;
+        let Some(intent) = self
+            .metadata
+            .delete_opaque_speech_history_record(
+                route_kind,
+                record_id,
+                id.as_str(),
+                tenant.as_str(),
+            )
+            .await
+            .map_err(ArtifactStoreError::Metadata)?
+        else {
+            return Ok(false);
+        };
+        // Logical deletion is already durable. Provider failure is recorded on
+        // this exact intent and retried by bounded maintenance.
+        if let Err(error) = self.cleanup_intent(&intent).await {
+            tracing::warn!(
+                artifact_id = id.as_str(),
+                record_id,
+                error = %error,
+                "Opaque speech-history audio is logically deleted; immediate provider cleanup bookkeeping failed"
+            );
+        }
+        Ok(true)
+    }
+
     /// Process a bounded page of already-fenced provider deletions.
     ///
     /// Pending rows are retained with capped backoff after provider failure.
@@ -1391,7 +1425,7 @@ mod tests {
         collections::{BTreeMap, BTreeSet},
         io::Cursor,
         sync::{
-            atomic::{AtomicBool, AtomicU64, Ordering},
+            atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
             Arc as StdArc, Mutex,
         },
         time::{SystemTime, UNIX_EPOCH},
@@ -1412,6 +1446,61 @@ mod tests {
             },
         )
         .expect("artifact store")
+    }
+
+    async fn insert_opaque_speech_history_relation(
+        db: &StoreDatabase,
+        record_id: &str,
+        tenant: &ArtifactTenant,
+        descriptor: &ArtifactDescriptor,
+    ) {
+        use sea_orm::ConnectionTrait;
+
+        let connection = db.connection().await.unwrap();
+        connection
+            .execute_raw(
+                crate::db::raw::statement(
+                    connection,
+                    r#"
+                    INSERT INTO speech_history_records (
+                        id, created_at, route_kind, processing_status, model_id,
+                        input_text, generation_time_ms, audio_mime_type,
+                        audio_filename, audio_storage_path, audio_media_asset_id,
+                        audio_artifact_tenant
+                    ) VALUES (?1, 1, 'text_to_speech', 'ready', 'FishAudio-S2-Pro',
+                              'fixture', 1.0, ?2, ?3, '', ?4, ?5)
+                    "#,
+                    vec![
+                        record_id.into(),
+                        descriptor.content_type.clone().into(),
+                        descriptor.filename.clone().into(),
+                        descriptor.id.as_str().into(),
+                        tenant.as_str().into(),
+                    ],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn put_test_speech_artifact(
+        store: &ArtifactStore,
+        tenant: &ArtifactTenant,
+        label: &str,
+    ) -> ArtifactDescriptor {
+        store
+            .put(
+                tenant,
+                ArtifactWrite {
+                    content_type: "audio/wav".to_string(),
+                    filename: Some(format!("{label}.wav")),
+                    bytes: label.as_bytes().to_vec(),
+                    retention: ArtifactRetention::Durable,
+                },
+            )
+            .await
+            .unwrap()
     }
 
     async fn active_tts_lease(
@@ -2624,6 +2713,401 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn opaque_speech_delete_atomically_hides_row_and_retries_provider_cleanup() {
+        use sea_orm::ConnectionTrait;
+
+        let root = tempfile::tempdir().unwrap();
+        let db = StoreDatabase::new(root.path().join("speech-delete.sqlite3"));
+        let clock = Arc::new(AtomicI64::new(1_000));
+        let mut metadata = BatchRuntimeStore::initialize_with_database(db.clone());
+        metadata.set_test_clock(clock.clone());
+        let metadata = Arc::new(metadata);
+        let provider = Arc::new(MemoryMediaProvider::default());
+        provider.set_now_unix_ms(1_000);
+        let store = ArtifactStore::new(
+            metadata.clone(),
+            provider.clone(),
+            ArtifactStoreLimits::default(),
+        )
+        .unwrap();
+        let tenant = ArtifactTenant::parse("tenant-speech-delete").unwrap();
+        let descriptor = put_test_speech_artifact(&store, &tenant, "history").await;
+        insert_opaque_speech_history_relation(&db, "speech-delete", &tenant, &descriptor).await;
+        assert!(matches!(
+            store.delete(&tenant, &descriptor.id).await,
+            Err(ArtifactStoreError::Metadata(_))
+        ));
+        assert_eq!(
+            store.stat(&tenant, &descriptor.id).await.unwrap(),
+            descriptor
+        );
+        provider.fail_deletes.store(true, Ordering::SeqCst);
+
+        assert!(
+            store
+                .delete_speech_history_audio(
+                    "text_to_speech",
+                    "speech-delete",
+                    &tenant,
+                    &descriptor.id,
+                )
+                .await
+                .unwrap()
+        );
+        let connection = db.connection().await.unwrap();
+        assert!(connection
+            .query_one_raw(
+                crate::db::raw::statement(
+                    connection,
+                    "SELECT 1 FROM speech_history_records WHERE id = 'speech-delete'",
+                    vec![],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            store.stat(&tenant, &descriptor.id).await,
+            Err(ArtifactStoreError::NotFound)
+        ));
+        assert_eq!(provider.object_count(), 1);
+        drop(store);
+
+        clock.store(2_000, Ordering::SeqCst);
+        provider.fail_deletes.store(false, Ordering::SeqCst);
+        let mut reopened_metadata = BatchRuntimeStore::initialize_with_database(db);
+        reopened_metadata.set_test_clock(clock);
+        let reopened = ArtifactStore::new(
+            Arc::new(reopened_metadata),
+            provider.clone(),
+            ArtifactStoreLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(reopened.cleanup_due(64).await.unwrap().completed, 1);
+        assert_eq!(provider.object_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn opaque_speech_delete_capacity_failure_rolls_back_row_and_tombstone() {
+        use sea_orm::ConnectionTrait;
+
+        let root = tempfile::tempdir().unwrap();
+        let db = StoreDatabase::new(root.path().join("speech-delete-capacity.sqlite3"));
+        let mut metadata = BatchRuntimeStore::initialize_with_database(db.clone());
+        metadata.set_artifact_cleanup_capacity_for_test(0);
+        let provider = Arc::new(MemoryMediaProvider::default());
+        let store = ArtifactStore::new(
+            Arc::new(metadata),
+            provider.clone(),
+            ArtifactStoreLimits::default(),
+        )
+        .unwrap();
+        let tenant = ArtifactTenant::parse("tenant-speech-capacity").unwrap();
+        let descriptor = put_test_speech_artifact(&store, &tenant, "history").await;
+        insert_opaque_speech_history_relation(&db, "speech-capacity", &tenant, &descriptor).await;
+
+        assert!(matches!(
+            store
+                .delete_speech_history_audio(
+                    "text_to_speech",
+                    "speech-capacity",
+                    &tenant,
+                    &descriptor.id,
+                )
+                .await,
+            Err(ArtifactStoreError::Metadata(_))
+        ));
+        assert_eq!(
+            store.stat(&tenant, &descriptor.id).await.unwrap(),
+            descriptor
+        );
+        let connection = db.connection().await.unwrap();
+        assert!(connection
+            .query_one_raw(
+                crate::db::raw::statement(
+                    connection,
+                    "SELECT 1 FROM speech_history_records WHERE id = 'speech-capacity'",
+                    vec![],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(provider.object_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn opaque_speech_delete_rejects_mismatched_authoritative_relation() {
+        use sea_orm::ConnectionTrait;
+
+        let root = tempfile::tempdir().unwrap();
+        let db = StoreDatabase::new(root.path().join("speech-delete-mismatch.sqlite3"));
+        let metadata = Arc::new(BatchRuntimeStore::initialize_with_database(db.clone()));
+        let provider = Arc::new(MemoryMediaProvider::default());
+        let store =
+            ArtifactStore::new(metadata.clone(), provider.clone(), Default::default()).unwrap();
+        let tenant = ArtifactTenant::parse("tenant-speech-mismatch").unwrap();
+        let descriptor = put_test_speech_artifact(&store, &tenant, "history").await;
+        insert_opaque_speech_history_relation(&db, "speech-mismatch", &tenant, &descriptor).await;
+        let connection = db.connection().await.unwrap();
+
+        connection
+            .execute_raw(
+                crate::db::raw::statement(
+                    connection,
+                    "UPDATE speech_history_records SET processing_status = 'processing' WHERE id = 'speech-mismatch'",
+                    vec![],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(!store
+            .delete_speech_history_audio(
+                "text_to_speech",
+                "speech-mismatch",
+                &tenant,
+                &descriptor.id,
+            )
+            .await
+            .unwrap());
+        connection
+            .execute_raw(
+                crate::db::raw::statement(
+                    connection,
+                    "UPDATE speech_history_records SET processing_status = 'ready', audio_mime_type = 'audio/mpeg' WHERE id = 'speech-mismatch'",
+                    vec![],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .delete_speech_history_audio(
+                    "text_to_speech",
+                    "speech-mismatch",
+                    &tenant,
+                    &descriptor.id,
+                )
+                .await,
+            Err(ArtifactStoreError::Metadata(_))
+        ));
+        connection
+            .execute_raw(
+                crate::db::raw::statement(
+                    connection,
+                    "UPDATE speech_history_records SET audio_mime_type = 'audio/wav' WHERE id = 'speech-mismatch'",
+                    vec![],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        connection
+            .execute_raw(
+                crate::db::raw::statement(
+                    connection,
+                    "UPDATE media_assets SET retention_policy = 'artifact_job' WHERE id = ?1",
+                    vec![descriptor.id.as_str().into()],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .delete_speech_history_audio(
+                    "text_to_speech",
+                    "speech-mismatch",
+                    &tenant,
+                    &descriptor.id,
+                )
+                .await,
+            Err(ArtifactStoreError::Metadata(_))
+        ));
+        connection
+            .execute_raw(
+                crate::db::raw::statement(
+                    connection,
+                    "UPDATE media_assets SET retention_policy = 'artifact_durable', metadata_json = ?1 WHERE id = ?2",
+                    vec![
+                        serde_json::json!({
+                            "artifact_store": {"version": 1, "tenant_id": "other-tenant"}
+                        })
+                        .to_string()
+                        .into(),
+                        descriptor.id.as_str().into(),
+                    ],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(metadata
+            .delete_opaque_speech_history_record(
+                "text_to_speech",
+                "speech-mismatch",
+                descriptor.id.as_str(),
+                tenant.as_str(),
+            )
+            .await
+            .is_err());
+
+        assert!(connection
+            .query_one_raw(
+                crate::db::raw::statement(
+                    connection,
+                    "SELECT 1 FROM speech_history_records WHERE id = 'speech-mismatch'",
+                    vec![],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(provider.object_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn opaque_speech_delete_acknowledges_post_commit_cleanup_bookkeeping_failure() {
+        use sea_orm::ConnectionTrait;
+
+        let root = tempfile::tempdir().unwrap();
+        let db = StoreDatabase::new(root.path().join("speech-delete-bookkeeping.sqlite3"));
+        let metadata = Arc::new(BatchRuntimeStore::initialize_with_database(db.clone()));
+        let provider = Arc::new(MemoryMediaProvider::default());
+        let store = ArtifactStore::new(metadata, provider.clone(), Default::default()).unwrap();
+        let tenant = ArtifactTenant::parse("tenant-speech-bookkeeping").unwrap();
+        let descriptor = put_test_speech_artifact(&store, &tenant, "history").await;
+        insert_opaque_speech_history_relation(&db, "speech-bookkeeping", &tenant, &descriptor)
+            .await;
+        let connection = db.connection().await.unwrap();
+        connection
+            .execute_raw(
+                crate::db::raw::statement(
+                    connection,
+                    r#"
+                    CREATE TRIGGER reject_cleanup_intent_delete
+                    BEFORE DELETE ON artifact_cleanup_intents
+                    BEGIN
+                        SELECT RAISE(FAIL, 'injected cleanup bookkeeping failure');
+                    END
+                    "#,
+                    vec![],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(store
+            .delete_speech_history_audio(
+                "text_to_speech",
+                "speech-bookkeeping",
+                &tenant,
+                &descriptor.id,
+            )
+            .await
+            .unwrap());
+        assert!(matches!(
+            store.stat(&tenant, &descriptor.id).await,
+            Err(ArtifactStoreError::NotFound)
+        ));
+        assert_eq!(provider.object_count(), 0);
+        assert_eq!(
+            store
+                .metadata
+                .due_artifact_cleanup_intents(64)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        connection
+            .execute_raw(
+                crate::db::raw::statement(
+                    connection,
+                    "DROP TRIGGER reject_cleanup_intent_delete",
+                    vec![],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.cleanup_due(64).await.unwrap().completed, 1);
+    }
+
+    #[tokio::test]
+    async fn opaque_speech_delete_waits_for_runtime_ownership_teardown() {
+        use sea_orm::ConnectionTrait;
+
+        let root = tempfile::tempdir().unwrap();
+        let db = StoreDatabase::new(root.path().join("speech-delete-owner.sqlite3"));
+        let metadata = Arc::new(BatchRuntimeStore::initialize_with_database(db.clone()));
+        let provider = Arc::new(MemoryMediaProvider::default());
+        let store = ArtifactStore::new(metadata.clone(), provider, Default::default()).unwrap();
+        let tenant = ArtifactTenant::from_scheduling_key(None);
+        let descriptor = put_test_speech_artifact(&store, &tenant, "history").await;
+        insert_opaque_speech_history_relation(&db, "speech-owner", &tenant, &descriptor).await;
+        let job = metadata
+            .create_job(NewRuntimeJob {
+                job_kind: RuntimeJobKind::TtsSpeech,
+                status: RuntimeJobStatus::Queued,
+                priority: 0,
+                model_id: Some("FishAudio-S2-Pro".into()),
+                capability: Some("tts".into()),
+                route_record_kind: Some("text_to_speech".into()),
+                route_record_id: Some("speech-owner".into()),
+                input_media_asset_id: None,
+                input_text_asset_id: None,
+                request_json: serde_json::json!({"tenant_key": null}),
+                model_snapshot_json: serde_json::json!({}),
+                retry_policy_json: serde_json::json!({}),
+                max_attempts: 1,
+                idempotency_key: None,
+                correlation_id: None,
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            store
+                .delete_speech_history_audio(
+                    "text_to_speech",
+                    "speech-owner",
+                    &tenant,
+                    &descriptor.id,
+                )
+                .await,
+            Err(ArtifactStoreError::Metadata(_))
+        ));
+        let connection = db.connection().await.unwrap();
+        assert!(connection
+            .query_one_raw(
+                crate::db::raw::statement(
+                    connection,
+                    "SELECT 1 FROM speech_history_records WHERE id = 'speech-owner'",
+                    vec![],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .is_some());
+
+        metadata.cancel_job(&job.id, None).await.unwrap().unwrap();
+        assert!(store
+            .delete_speech_history_audio("text_to_speech", "speech-owner", &tenant, &descriptor.id,)
+            .await
+            .unwrap());
+        assert!(metadata.retry_job(&job.id).await.unwrap().is_none());
     }
 
     #[tokio::test]

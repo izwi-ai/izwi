@@ -853,104 +853,212 @@ impl BatchRuntimeStore {
             .await
             .context("Failed to start artifact cleanup transaction")?;
         lock_artifact_cleanup_capacity(&tx).await?;
-
-        let Some(asset) = tx
-            .query_one_raw(raw::statement(
-                &tx,
-                r#"
-                SELECT storage_key, deleted_at
-                FROM media_assets
-                WHERE id = ?1
-                  AND asset_kind = 'opaque_artifact'
-                  AND storage_namespace = 'artifact_store_v1'
-                "#,
-                vec![id.into()],
-            )?)
-            .await
-            .context("Failed to load opaque artifact for deletion")?
+        let Some((newly_deleted, _)) = tombstone_media_asset_with_cleanup_in(
+            &tx,
+            id,
+            tenant_scope,
+            reason,
+            self.artifact_cleanup_capacity(),
+            self.now_millis(),
+        )
+        .await?
         else {
             tx.rollback().await?;
             return Ok(false);
-        };
-        let storage_key: String = asset.try_get_by_index(0)?;
-        validate_artifact_cleanup_storage_key(&storage_key)?;
-        let already_deleted = asset.try_get_by_index::<Option<i64>>(1)?.is_some();
-
-        let existing_tenant = tx
-            .query_one_raw(raw::statement(
-                &tx,
-                "SELECT tenant_scope FROM artifact_cleanup_intents WHERE storage_key = ?1",
-                vec![storage_key.clone().into()],
-            )?)
-            .await
-            .context("Failed to inspect existing artifact cleanup intent")?
-            .map(|row| row.try_get_by_index::<String>(0))
-            .transpose()?;
-        if let Some(existing_tenant) = existing_tenant {
-            anyhow::ensure!(
-                existing_tenant == tenant_scope,
-                "Artifact cleanup key is already owned by another tenant"
-            );
-        } else {
-            let count = tx
-                .query_one_raw(raw::statement(
-                    &tx,
-                    "SELECT COUNT(*) FROM artifact_cleanup_intents",
-                    vec![],
-                )?)
-                .await
-                .context("Failed to count artifact cleanup intents")?
-                .ok_or_else(|| anyhow!("Artifact cleanup count returned no row"))?
-                .try_get_by_index::<i64>(0)?;
-            let capacity = self.artifact_cleanup_capacity();
-            anyhow::ensure!(
-                u64::try_from(count)? < capacity,
-                "Artifact cleanup capacity exhausted ({capacity} pending intents)"
-            );
-            let now = self.now_millis();
-            tx.execute_raw(raw::statement(
-                &tx,
-                r#"
-                INSERT INTO artifact_cleanup_intents (
-                    id, created_at, updated_at, available_at, storage_key,
-                    tenant_scope, reason, attempt_count, last_error
-                )
-                VALUES (?1, ?2, ?2, ?2, ?3, ?4, ?5, 0, NULL)
-                "#,
-                vec![
-                    new_uuid().into(),
-                    now.into(),
-                    storage_key.into(),
-                    tenant_scope.into(),
-                    reason.as_db_value().into(),
-                ],
-            )?)
-            .await
-            .context("Failed to persist artifact cleanup intent")?;
-        }
-
-        let newly_deleted = if already_deleted {
-            false
-        } else {
-            let now = self.now_millis();
-            tx.execute_raw(raw::statement(
-                &tx,
-                r#"
-                UPDATE media_assets
-                SET updated_at = ?1, deleted_at = ?1
-                WHERE id = ?2 AND deleted_at IS NULL
-                "#,
-                vec![now.into(), id.into()],
-            )?)
-            .await
-            .context("Failed to tombstone media asset")?
-            .rows_affected()
-                == 1
         };
         tx.commit()
             .await
             .context("Failed to commit artifact cleanup intent")?;
         Ok(newly_deleted)
+    }
+
+    /// Atomically remove one speech-history row while tombstoning its exact
+    /// tenant-scoped opaque audio and retaining the physical cleanup intent.
+    pub(crate) async fn delete_opaque_speech_history_record(
+        &self,
+        route_kind: &str,
+        record_id: &str,
+        media_asset_id: &str,
+        tenant_scope: &str,
+    ) -> anyhow::Result<Option<ArtifactCleanupIntent>> {
+        validate_artifact_cleanup_tenant(tenant_scope)?;
+        let db = self.db.connection().await?;
+        let tx = db
+            .begin_with_options(runtime_write_transaction_options())
+            .await
+            .context("Failed to start opaque speech-history deletion transaction")?;
+        lock_tts_admission_capacity(&tx).await?;
+        lock_artifact_cleanup_capacity(&tx).await?;
+        let lock_clause = match tx.get_database_backend() {
+            DbBackend::Sqlite => "",
+            DbBackend::Postgres => " FOR UPDATE OF h, m",
+            DbBackend::MySql => " FOR UPDATE",
+            backend => bail!("Unsupported speech-history database backend: {backend:?}"),
+        };
+        let relation_sql = format!(
+            r#"
+            SELECT m.id, m.metadata_json, m.retention_policy, m.content_type,
+                   m.filename, h.audio_mime_type, h.audio_filename
+            FROM speech_history_records h
+            JOIN media_assets m ON m.id = h.audio_media_asset_id
+            WHERE h.route_kind = ?1
+              AND h.id = ?2
+              AND h.audio_storage_path = ''
+              AND h.audio_media_asset_id = ?3
+              AND h.audio_artifact_tenant = ?4
+              AND h.processing_status = 'ready'
+              AND m.asset_kind = 'opaque_artifact'
+              AND m.storage_namespace = 'artifact_store_v1'
+              AND m.deleted_at IS NULL
+            LIMIT 1{lock_clause}
+            "#
+        );
+        let relation = tx
+            .query_one_raw(raw::statement(
+                &tx,
+                relation_sql,
+                vec![
+                    route_kind.into(),
+                    record_id.into(),
+                    media_asset_id.into(),
+                    tenant_scope.into(),
+                ],
+            )?)
+            .await
+            .context("Failed to lock opaque speech-history audio relation")?;
+        let Some(relation) = relation else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let metadata_json: String = relation.try_get_by_index(1)?;
+        let metadata: serde_json::Value = serde_json::from_str(&metadata_json)
+            .context("Opaque artifact tenant metadata is invalid")?;
+        anyhow::ensure!(
+            metadata
+                .get("artifact_store")
+                .and_then(|value| value.get("version"))
+                .and_then(serde_json::Value::as_u64)
+                == Some(1)
+                && metadata
+                    .get("artifact_store")
+                    .and_then(|value| value.get("tenant_id"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(tenant_scope),
+            "Opaque speech-history artifact is not owned by the requested tenant"
+        );
+        let retention_policy: String = relation.try_get_by_index(2)?;
+        let media_content_type: String = relation.try_get_by_index(3)?;
+        let media_filename: Option<String> = relation.try_get_by_index(4)?;
+        let history_content_type: String = relation.try_get_by_index(5)?;
+        let history_filename: Option<String> = relation.try_get_by_index(6)?;
+        anyhow::ensure!(
+            retention_policy == "artifact_durable"
+                && media_content_type == history_content_type
+                && media_filename == history_filename,
+            "Opaque speech-history artifact metadata does not match a durable record"
+        );
+
+        let wrong_tenant_job = tx
+            .query_one_raw(raw::statement(
+                &tx,
+                r#"
+                SELECT 1
+                FROM runtime_jobs
+                WHERE job_kind = 'tts_speech'
+                  AND route_record_kind = ?1
+                  AND route_record_id = ?2
+                  AND COALESCE(admission_tenant, 'anonymous') <> ?3
+                LIMIT 1
+                "#,
+                vec![route_kind.into(), record_id.into(), tenant_scope.into()],
+            )?)
+            .await
+            .context("Failed to validate speech-history runtime tenant ownership")?;
+        anyhow::ensure!(
+            wrong_tenant_job.is_none(),
+            "Speech-history runtime ownership does not match the artifact tenant"
+        );
+        let active_job = tx
+            .query_one_raw(raw::statement(
+                &tx,
+                r#"
+                SELECT 1
+                FROM runtime_jobs
+                WHERE job_kind = 'tts_speech'
+                  AND route_record_kind = ?1
+                  AND route_record_id = ?2
+                  AND COALESCE(admission_tenant, 'anonymous') = ?3
+                  AND status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing')
+                LIMIT 1
+                "#,
+                vec![route_kind.into(), record_id.into(), tenant_scope.into()],
+            )?)
+            .await
+            .context("Failed to inspect active speech-history runtime ownership")?;
+        anyhow::ensure!(
+            active_job.is_none(),
+            "Opaque speech-history record is still owned by an active runtime job"
+        );
+        tx.execute_raw(raw::statement(
+            &tx,
+            r#"
+            UPDATE runtime_jobs
+            SET error_code = 'speech_replay_expired'
+            WHERE job_kind = 'tts_speech'
+              AND route_record_kind = ?1
+              AND route_record_id = ?2
+              AND COALESCE(admission_tenant, 'anonymous') = ?3
+              AND status IN ('failed', 'cancelled', 'expired')
+            "#,
+            vec![route_kind.into(), record_id.into(), tenant_scope.into()],
+        )?)
+        .await
+        .context("Failed to fence speech-history runtime retries")?;
+
+        // Remove the protected reference first inside this transaction. The
+        // tombstone helper rejects every still-referenced asset; any later
+        // error rolls this deletion back with the tombstone and outbox write.
+        let deleted = tx
+            .execute_raw(raw::statement(
+                &tx,
+                r#"
+                DELETE FROM speech_history_records
+                WHERE route_kind = ?1
+                  AND id = ?2
+                  AND audio_storage_path = ''
+                  AND audio_media_asset_id = ?3
+                  AND audio_artifact_tenant = ?4
+                "#,
+                vec![
+                    route_kind.into(),
+                    record_id.into(),
+                    media_asset_id.into(),
+                    tenant_scope.into(),
+                ],
+            )?)
+            .await
+            .context("Failed to delete opaque speech-history row")?;
+        if deleted.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        let Some((_, intent)) = tombstone_media_asset_with_cleanup_in(
+            &tx,
+            media_asset_id,
+            tenant_scope,
+            ArtifactCleanupReason::ArtifactDeleted,
+            self.artifact_cleanup_capacity(),
+            self.now_millis(),
+        )
+        .await?
+        else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        tx.commit()
+            .await
+            .context("Failed to commit opaque speech-history deletion")?;
+        Ok(Some(intent))
     }
 
     pub(crate) async fn due_artifact_cleanup_intents(
@@ -5633,6 +5741,29 @@ async fn lock_durable_idempotency<C: ConnectionTrait>(db: &C) -> anyhow::Result<
     Ok(())
 }
 
+async fn lock_tts_admission_capacity<C: ConnectionTrait>(db: &C) -> anyhow::Result<()> {
+    let insert_sql = match db.get_database_backend() {
+        DbBackend::Sqlite | DbBackend::Postgres => {
+            "INSERT INTO runtime_admission_locks (id, lock_value) VALUES ('tts', 1) ON CONFLICT (id) DO NOTHING"
+        }
+        DbBackend::MySql => {
+            "INSERT IGNORE INTO runtime_admission_locks (id, lock_value) VALUES ('tts', 1)"
+        }
+        backend => bail!("Unsupported TTS admission database backend: {backend:?}"),
+    };
+    db.execute_raw(raw::statement(db, insert_sql, vec![])?)
+        .await
+        .context("Failed to initialize TTS admission lock")?;
+    db.execute_raw(raw::statement(
+        db,
+        "UPDATE runtime_admission_locks SET lock_value = lock_value WHERE id = 'tts'",
+        vec![],
+    )?)
+    .await
+    .context("Failed to lock TTS admission capacity")?;
+    Ok(())
+}
+
 async fn lock_artifact_cleanup_capacity<C: ConnectionTrait>(db: &C) -> anyhow::Result<()> {
     let insert_sql = match db.get_database_backend() {
         DbBackend::Sqlite | DbBackend::Postgres => {
@@ -6535,6 +6666,143 @@ fn map_media_asset(row: &QueryResult) -> anyhow::Result<MediaAsset> {
         deleted_at: opt_i64_to_u64(row.try_get_by_index(19)?)?,
         metadata_json: parse_json_value(row.try_get_by_index::<String>(20)?, json!({})),
     })
+}
+
+async fn tombstone_media_asset_with_cleanup_in<C: ConnectionTrait>(
+    db: &C,
+    id: &str,
+    tenant_scope: &str,
+    reason: ArtifactCleanupReason,
+    capacity: u64,
+    now: i64,
+) -> anyhow::Result<Option<(bool, ArtifactCleanupIntent)>> {
+    let history_reference = db
+        .query_one_raw(raw::statement(
+            db,
+            r#"
+            SELECT 1
+            FROM speech_history_records
+            WHERE audio_media_asset_id = ?1
+            LIMIT 1
+            "#,
+            vec![id.into()],
+        )?)
+        .await
+        .context("Failed to inspect opaque artifact speech-history ownership")?;
+    anyhow::ensure!(
+        history_reference.is_none(),
+        "Opaque artifact is still owned by a speech-history record"
+    );
+    let Some(asset) = db
+        .query_one_raw(raw::statement(
+            db,
+            r#"
+            SELECT storage_key, deleted_at
+            FROM media_assets
+            WHERE id = ?1
+              AND asset_kind = 'opaque_artifact'
+              AND storage_namespace = 'artifact_store_v1'
+            "#,
+            vec![id.into()],
+        )?)
+        .await
+        .context("Failed to load opaque artifact for deletion")?
+    else {
+        return Ok(None);
+    };
+    let storage_key: String = asset.try_get_by_index(0)?;
+    validate_artifact_cleanup_storage_key(&storage_key)?;
+    let already_deleted = asset.try_get_by_index::<Option<i64>>(1)?.is_some();
+
+    let existing = db
+        .query_one_raw(raw::statement(
+            db,
+            r#"
+            SELECT id, created_at, updated_at, available_at, storage_key,
+                   tenant_scope, reason, attempt_count, last_error
+            FROM artifact_cleanup_intents
+            WHERE storage_key = ?1
+            "#,
+            vec![storage_key.clone().into()],
+        )?)
+        .await
+        .context("Failed to inspect existing artifact cleanup intent")?;
+    let intent = match existing.as_ref() {
+        Some(row) => {
+            let intent = map_artifact_cleanup_intent(row)?;
+            anyhow::ensure!(
+                intent.tenant_scope == tenant_scope,
+                "Artifact cleanup key is already owned by another tenant"
+            );
+            intent
+        }
+        None => {
+            let count = db
+                .query_one_raw(raw::statement(
+                    db,
+                    "SELECT COUNT(*) FROM artifact_cleanup_intents",
+                    vec![],
+                )?)
+                .await
+                .context("Failed to count artifact cleanup intents")?
+                .ok_or_else(|| anyhow!("Artifact cleanup count returned no row"))?
+                .try_get_by_index::<i64>(0)?;
+            anyhow::ensure!(
+                u64::try_from(count)? < capacity,
+                "Artifact cleanup capacity exhausted ({capacity} pending intents)"
+            );
+            let intent_id = new_uuid();
+            db.execute_raw(raw::statement(
+                db,
+                r#"
+                INSERT INTO artifact_cleanup_intents (
+                    id, created_at, updated_at, available_at, storage_key,
+                    tenant_scope, reason, attempt_count, last_error
+                )
+                VALUES (?1, ?2, ?2, ?2, ?3, ?4, ?5, 0, NULL)
+                "#,
+                vec![
+                    intent_id.clone().into(),
+                    now.into(),
+                    storage_key.clone().into(),
+                    tenant_scope.into(),
+                    reason.as_db_value().into(),
+                ],
+            )?)
+            .await
+            .context("Failed to persist artifact cleanup intent")?;
+            ArtifactCleanupIntent {
+                id: intent_id,
+                created_at: u64::try_from(now)?,
+                updated_at: u64::try_from(now)?,
+                available_at: u64::try_from(now)?,
+                storage_key: storage_key.clone(),
+                tenant_scope: tenant_scope.to_string(),
+                reason,
+                attempt_count: 0,
+                last_error: None,
+            }
+        }
+    };
+
+    let newly_deleted = if already_deleted {
+        false
+    } else {
+        db.execute_raw(raw::statement(
+            db,
+            r#"
+            UPDATE media_assets
+            SET updated_at = ?1, deleted_at = ?1
+            WHERE id = ?2 AND deleted_at IS NULL
+            "#,
+            vec![now.into(), id.into()],
+        )?)
+        .await
+        .context("Failed to tombstone media asset")?
+        .rows_affected()
+            == 1
+    };
+    Ok(Some((newly_deleted, intent)))
 }
 
 fn map_artifact_cleanup_intent(row: &QueryResult) -> anyhow::Result<ArtifactCleanupIntent> {

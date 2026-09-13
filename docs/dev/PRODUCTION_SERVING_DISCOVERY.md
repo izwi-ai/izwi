@@ -157,9 +157,11 @@ deletable for local upgrade compatibility. Speech-history rows can now retain an
 exact tenant plus opaque artifact ID and stream that artifact with terminal size
 and SHA-256 verification; legacy path rows remain readable and deletable for
 local upgrade compatibility. The unique artifact-reference index prevents two
-history rows from claiming the same object. No public speech producer writes the
-opaque history form yet, and opaque completion, replacement, and deletion stay
-fail-closed until they share one transactional settlement path. The final speech
+history rows from claiming the same object. Opaque deletion atomically removes
+the history row, tombstones the media row, and retains a bounded cleanup intent
+before provider cleanup is attempted. No public speech producer writes the
+opaque history form yet, and opaque completion or replacement stays fail-closed
+until it shares one transactional settlement path. The final speech
 WAV, saved voices, references, other job outputs, Studio, media routes, and
 multimodal inputs still retain legacy provider paths. Their tenant and fleet
 ownership gates remain Phase 6 work; this partial adoption does not enable a new

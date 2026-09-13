@@ -432,10 +432,12 @@ audio producers, references, other media, and gateway audio transport retain
 their existing provider path until explicitly migrated. Speech-history storage
 can consume an exact tenant-scoped opaque reference and exposes it through the
 existing bounded streaming response; it rejects incomplete, ambiguous, wrong-
-tenant, metadata-mismatched, or multiply-owned references. Opaque completion,
-replacement, and deletion deliberately fail until transactional settlement is
-enabled. This read-only consumer support does not by itself migrate a producer
-or enable a gateway audio route.
+tenant, metadata-mismatched, or multiply-owned references. Opaque deletion
+atomically removes the history row, tombstones the media row, and retains its
+bounded cleanup intent; provider failure leaves that intent for retry. Opaque
+completion and replacement deliberately fail until transactional settlement is
+enabled. This consumer and deletion support does not by itself migrate a
+producer or enable a gateway audio route.
 
 Reserved-write protocol v1 exposes reserved file publication as a separate
 capability. The built-in local provider streams a finalized file with a fixed

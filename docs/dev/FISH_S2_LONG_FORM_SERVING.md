@@ -58,10 +58,11 @@ transaction; runtime replay rows contain no provider key. Reads verify tenant,
 canonical `audio/pcm-f32le`, size, and SHA-256 before decoding. Tombstone-first
 deletion retains a durable cleanup intent across provider failure. Existing
 raw-key replay rows remain supported for local upgrade compatibility. Speech
-history can consume and stream an exact tenant-scoped opaque artifact reference,
-but completion and deletion stay fenced until artifact/history settlement is
-transactional. The Fish producer does not publish the final WAV through that
-path yet.
+history can consume and stream an exact tenant-scoped opaque artifact reference.
+Deletion atomically removes that reference while tombstoning the artifact and
+retaining its cleanup intent. Completion stays fenced until final-audio and
+history settlement is transactional. The Fish producer does not publish the
+final WAV through that path yet.
 
 The provider contract includes an explicit reserved-file capability for that
 future final-WAV migration. It copies and hashes finalized spools with fixed

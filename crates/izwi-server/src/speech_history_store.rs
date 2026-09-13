@@ -422,6 +422,14 @@ struct SpeechAudioLocation {
     audio_filename: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct SpeechAudioRow {
+    raw_storage_path: String,
+    reference: Option<SpeechAudioReference>,
+    audio_mime_type: String,
+    audio_filename: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct SpeechHistoryStore {
     db: StoreDatabase,
@@ -1128,19 +1136,26 @@ impl SpeechHistoryStore {
         record_id: String,
     ) -> anyhow::Result<bool> {
         let db = self.db.connection().await?;
-        let audio_storage_path = match fetch_audio_location(db, route_kind, &record_id)
-            .await?
-            .map(|location| location.reference)
-        {
+        let Some(audio_row) = fetch_audio_row(db, route_kind, &record_id).await? else {
+            return Ok(false);
+        };
+        let audio_storage_path = match audio_row.reference {
             Some(SpeechAudioReference::LegacyPath(path)) => Some(path),
-            Some(SpeechAudioReference::Opaque { .. }) => anyhow::bail!(
-                "Opaque speech history audio deletion requires atomic artifact settlement"
-            ),
+            Some(SpeechAudioReference::Opaque { id, tenant }) => {
+                return self
+                    .artifact_store
+                    .delete_speech_history_audio(route_kind.as_db_value(), &record_id, &tenant, &id)
+                    .await
+                    .context("Failed to atomically delete opaque speech history audio");
+            }
             None => None,
         };
         let result = speech_history_records::Entity::delete_many()
             .filter(speech_history_records::Column::RouteKind.eq(route_kind.as_db_value()))
             .filter(speech_history_records::Column::Id.eq(record_id))
+            .filter(speech_history_records::Column::AudioStoragePath.eq(audio_row.raw_storage_path))
+            .filter(speech_history_records::Column::AudioMediaAssetId.is_null())
+            .filter(speech_history_records::Column::AudioArtifactTenant.is_null())
             .exec(db)
             .await
             .context("Failed to delete speech history record")?;
@@ -1249,6 +1264,21 @@ async fn fetch_audio_location(
     route_kind: SpeechRouteKind,
     record_id: &str,
 ) -> anyhow::Result<Option<SpeechAudioLocation>> {
+    let row = fetch_audio_row(db, route_kind, record_id).await?;
+    Ok(row.and_then(|row| {
+        row.reference.map(|reference| SpeechAudioLocation {
+            reference,
+            audio_mime_type: row.audio_mime_type,
+            audio_filename: row.audio_filename,
+        })
+    }))
+}
+
+async fn fetch_audio_row(
+    db: &sea_orm::DatabaseConnection,
+    route_kind: SpeechRouteKind,
+    record_id: &str,
+) -> anyhow::Result<Option<SpeechAudioRow>> {
     let row = db
         .query_one_raw(raw::statement(
             db,
@@ -1265,7 +1295,8 @@ async fn fetch_audio_location(
     let Some(row) = row else {
         return Ok(None);
     };
-    let legacy = sanitize_media_path(row.try_get_by_index::<Option<String>>(0)?.as_deref());
+    let raw_storage_path = row.try_get_by_index::<String>(0)?;
+    let legacy = sanitize_media_path(Some(raw_storage_path.as_str()));
     let media_asset_id: Option<String> = row.try_get_by_index(1)?;
     let artifact_tenant: Option<String> = row.try_get_by_index(2)?;
     let opaque = match (media_asset_id, artifact_tenant) {
@@ -1284,7 +1315,8 @@ async fn fetch_audio_location(
     };
     let audio_mime_type: String = row.try_get_by_index(3)?;
     let audio_filename: Option<String> = row.try_get_by_index(4)?;
-    Ok(reference.map(|reference| SpeechAudioLocation {
+    Ok(Some(SpeechAudioRow {
+        raw_storage_path,
         reference,
         audio_mime_type,
         audio_filename,
@@ -1505,7 +1537,7 @@ pub const fn default_list_limit() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::artifact_store::ArtifactWrite;
+    use crate::artifact_store::{ArtifactStoreError, ArtifactWrite};
     use crate::batch_runtime::{
         store::{BatchRuntimeStore, NewJobStage, NewRuntimeJob},
         types::{RuntimeJobKind, RuntimeJobStatus, RuntimeStageStatus},
@@ -1969,7 +2001,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn opaque_audio_reopens_streams_and_fences_unsettled_lifecycle_changes() {
+    async fn opaque_audio_reopens_streams_deletes_atomically_and_fences_replacement() {
         use tokio::io::AsyncReadExt;
 
         let _guard = env_lock();
@@ -2137,12 +2169,11 @@ mod tests {
         assert!(reopened
             .delete_record(SpeechRouteKind::TextToSpeech, pending.id)
             .await
-            .is_err());
-        assert!(reopened
-            .artifact_store
-            .stat(&tenant, &descriptor.id)
-            .await
-            .is_ok());
+            .unwrap());
+        assert!(matches!(
+            reopened.artifact_store.stat(&tenant, &descriptor.id).await,
+            Err(ArtifactStoreError::NotFound)
+        ));
         clear_env();
     }
 
