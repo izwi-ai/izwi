@@ -10,6 +10,10 @@ use super::types::{DeviceClass, ResourceTarget, RuntimeBackendClass};
 use crate::{
     db::{raw, StoreDatabase},
     ids::new_uuid,
+    speech_history_store::{
+        sanitize_audio_mime_type, sanitize_optional_text, NewSpeechHistoryRecord,
+        SpeechHistoryProcessingStatus, SpeechHistoryRecord, SpeechRouteKind,
+    },
 };
 use anyhow::{anyhow, bail, Context};
 use sea_orm::{
@@ -36,6 +40,8 @@ pub struct BatchRuntimeStore {
     test_clock: Option<Arc<AtomicI64>>,
     #[cfg(test)]
     test_tts_admission_limits: Option<(usize, usize)>,
+    #[cfg(test)]
+    test_durable_tts_acceptance_failpoint: Option<DurableTtsAcceptanceFailpoint>,
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +93,49 @@ pub struct NewRuntimeJob {
     pub max_attempts: u32,
     pub idempotency_key: Option<String>,
     pub correlation_id: Option<String>,
+}
+
+/// The bounded, single-stage durable graph used by the first text-only TTS
+/// acceptance path. Reference media is deliberately excluded until object
+/// publication has its own crash-safe ownership ledger.
+#[derive(Debug, Clone)]
+pub struct NewDurableTextTtsAcceptance {
+    pub projection: NewSpeechHistoryRecord,
+    pub request_json: serde_json::Value,
+    pub model_snapshot_json: serde_json::Value,
+    pub retry_policy_json: serde_json::Value,
+    pub priority: i32,
+    pub max_attempts: u32,
+    pub correlation_id: Option<String>,
+    pub stage_kind: String,
+    pub queue_class: QueueClass,
+    pub resource_hints: StageResourceHints,
+    pub reservation: Option<DurableIdempotencyReservation>,
+    pub idempotency_retention_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct DurableTextTtsAcceptance {
+    pub record: SpeechHistoryRecord,
+    pub job: RuntimeJob,
+    pub stage: JobStage,
+    pub input_artifact: RuntimeArtifact,
+}
+
+#[derive(Debug, Clone)]
+pub enum DurableTextTtsAcceptanceOutcome {
+    Committed(DurableTextTtsAcceptance),
+    ReservationLost,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurableTtsAcceptanceFailpoint {
+    Projection,
+    TextAsset,
+    Job,
+    Artifact,
+    Stage,
+    Idempotency,
 }
 
 #[derive(Debug, Clone)]
@@ -299,6 +348,11 @@ pub const MAX_DURABLE_IDEMPOTENCY_CANONICAL_REQUEST_BYTES: usize = 1024 * 1024;
 pub const MAX_DURABLE_IDEMPOTENCY_RESULT_BYTES: usize = 64 * 1024;
 pub const MAX_DURABLE_IDEMPOTENCY_RESERVATION_TTL_MS: u64 = 10 * 60 * 1_000;
 pub const MAX_DURABLE_IDEMPOTENCY_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+const MAX_DURABLE_TTS_TEXT_BYTES: usize = 1024 * 1024;
+const MAX_DURABLE_TTS_REQUEST_JSON_BYTES: usize = 1024 * 1024;
+const MAX_DURABLE_TTS_METADATA_JSON_BYTES: usize = 64 * 1024;
+const MAX_DURABLE_TTS_OPTIONAL_FIELD_BYTES: usize = 64 * 1024;
+const MAX_DURABLE_TTS_CORRELATION_BYTES: usize = 256;
 const MAX_DURABLE_IDEMPOTENCY_RECORDS: u64 = 65_536;
 const DEFAULT_DURABLE_IDEMPOTENCY_PRUNE_LIMIT: usize = 64;
 const MAX_DURABLE_IDEMPOTENCY_PRUNE_LIMIT: usize = 512;
@@ -463,6 +517,8 @@ impl BatchRuntimeStore {
             test_clock: None,
             #[cfg(test)]
             test_tts_admission_limits: None,
+            #[cfg(test)]
+            test_durable_tts_acceptance_failpoint: None,
         }
     }
 
@@ -471,12 +527,33 @@ impl BatchRuntimeStore {
         self.test_clock = Some(clock);
     }
 
+    #[cfg(test)]
+    fn set_durable_tts_acceptance_failpoint(
+        &mut self,
+        failpoint: Option<DurableTtsAcceptanceFailpoint>,
+    ) {
+        self.test_durable_tts_acceptance_failpoint = failpoint;
+    }
+
     fn now_millis(&self) -> i64 {
         #[cfg(test)]
         if let Some(clock) = &self.test_clock {
             return clock.load(Ordering::SeqCst);
         }
         current_timestamp_millis()
+    }
+
+    fn inject_durable_tts_acceptance_failure(
+        &self,
+        failpoint: DurableTtsAcceptanceFailpoint,
+    ) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if self.test_durable_tts_acceptance_failpoint == Some(failpoint) {
+            bail!("Injected durable text TTS acceptance failure after {failpoint:?}");
+        }
+        #[cfg(not(test))]
+        let _ = failpoint;
+        Ok(())
     }
 
     pub async fn connection(&self) -> anyhow::Result<&DatabaseConnection> {
@@ -840,6 +917,446 @@ impl BatchRuntimeStore {
         self.get_job(&id)
             .await?
             .ok_or_else(|| anyhow!("Created runtime job was not found"))
+    }
+
+    /// Atomically publish one text-only TTS job graph and, when supplied, its
+    /// durable idempotency result. No worker can observe the queued stage
+    /// before the projection, input, job, and replay record are all committed.
+    pub async fn accept_durable_text_tts(
+        &self,
+        input: NewDurableTextTtsAcceptance,
+    ) -> anyhow::Result<DurableTextTtsAcceptanceOutcome> {
+        anyhow::ensure!(
+            input.projection.route_kind == SpeechRouteKind::TextToSpeech,
+            "Durable text TTS acceptance requires a text-to-speech projection"
+        );
+        anyhow::ensure!(
+            input.projection.processing_status == SpeechHistoryProcessingStatus::Pending
+                && input.projection.processing_error.is_none(),
+            "Durable text TTS acceptance requires a clean pending projection"
+        );
+        anyhow::ensure!(
+            input.projection.audio_bytes.is_empty()
+                && input.projection.reference_text.is_none()
+                && input.projection.saved_voice_id.is_none(),
+            "Durable text TTS acceptance does not accept reference or output media"
+        );
+        anyhow::ensure!(
+            input.projection.generation_time_ms == 0.0
+                && input.projection.audio_duration_secs.is_none()
+                && input.projection.rtf.is_none()
+                && input.projection.tokens_generated.is_none(),
+            "Durable text TTS acceptance requires an unexecuted projection"
+        );
+        anyhow::ensure!(
+            input.max_attempts > 0,
+            "Durable text TTS acceptance requires at least one attempt"
+        );
+        anyhow::ensure!(
+            input.queue_class == QueueClass::BatchTts,
+            "Durable text TTS acceptance requires the batch TTS queue"
+        );
+        validate_bounded_field("stage kind", &input.stage_kind, 128)?;
+
+        anyhow::ensure!(
+            !input.projection.input_text.is_empty()
+                && input.projection.input_text.len() <= MAX_DURABLE_TTS_TEXT_BYTES,
+            "Durable text TTS input must be between 1 and {MAX_DURABLE_TTS_TEXT_BYTES} bytes"
+        );
+        for (name, value) in [
+            ("model ID", input.projection.model_id.as_deref()),
+            ("speaker", input.projection.speaker.as_deref()),
+            ("language", input.projection.language.as_deref()),
+            (
+                "voice description",
+                input.projection.voice_description.as_deref(),
+            ),
+            ("audio filename", input.projection.audio_filename.as_deref()),
+        ] {
+            validate_optional_field_bytes(name, value, MAX_DURABLE_TTS_OPTIONAL_FIELD_BYTES)?;
+        }
+        validate_optional_field_bytes(
+            "correlation ID",
+            input.correlation_id.as_deref(),
+            MAX_DURABLE_TTS_CORRELATION_BYTES,
+        )?;
+        anyhow::ensure!(
+            input.projection.audio_mime_type.len() <= MAX_DURABLE_TTS_OPTIONAL_FIELD_BYTES,
+            "Durable text TTS audio MIME type exceeds {MAX_DURABLE_TTS_OPTIONAL_FIELD_BYTES} bytes"
+        );
+
+        let model_id = sanitize_optional_text(input.projection.model_id.as_deref(), 160)
+            .ok_or_else(|| anyhow!("Durable text TTS acceptance requires a model ID"))?;
+        let speaker = sanitize_optional_text(input.projection.speaker.as_deref(), 120);
+        let language = sanitize_optional_text(input.projection.language.as_deref(), 80);
+        let voice_description =
+            sanitize_optional_text(input.projection.voice_description.as_deref(), 2_000);
+        let input_text = input.projection.input_text.trim().to_string();
+        anyhow::ensure!(
+            !input_text.is_empty(),
+            "Durable text TTS acceptance requires non-empty input text"
+        );
+        let speed = input
+            .projection
+            .speed
+            .filter(|value| value.is_finite() && *value > 0.0);
+        let audio_mime_type = sanitize_audio_mime_type(&input.projection.audio_mime_type);
+        let audio_filename =
+            sanitize_optional_text(input.projection.audio_filename.as_deref(), 260);
+        let request_json_string = bounded_json_string(
+            &input.request_json,
+            MAX_DURABLE_TTS_REQUEST_JSON_BYTES,
+            "Durable text TTS request",
+        )?;
+        let model_snapshot_json_string = bounded_json_string(
+            &input.model_snapshot_json,
+            MAX_DURABLE_TTS_METADATA_JSON_BYTES,
+            "Durable text TTS model snapshot",
+        )?;
+        let retry_policy_json_string = bounded_json_string(
+            &input.retry_policy_json,
+            MAX_DURABLE_TTS_METADATA_JSON_BYTES,
+            "Durable text TTS retry policy",
+        )?;
+        let resource_hints = input.resource_hints.normalized();
+        let resource_hints_json = bounded_json_string(
+            &json!(resource_hints.clone()),
+            MAX_DURABLE_TTS_METADATA_JSON_BYTES,
+            "Durable text TTS resource hints",
+        )?;
+        let admission_tenant = speech_admission_tenant(&input.request_json)?;
+
+        if let Some(reservation) = input.reservation.as_ref() {
+            validate_durable_idempotency_identity(
+                &reservation.tenant_scope,
+                &reservation.operation,
+                &reservation.idempotency_key,
+                reservation.digest_version,
+                &reservation.request_digest,
+            )?;
+            validate_bounded_field("reservation token", &reservation.reservation_token, 64)?;
+            anyhow::ensure!(
+                (1..=MAX_DURABLE_IDEMPOTENCY_RETENTION_MS)
+                    .contains(&input.idempotency_retention_ms),
+                "Durable idempotency retention must be between 1 and {MAX_DURABLE_IDEMPOTENCY_RETENTION_MS} milliseconds"
+            );
+        }
+
+        let now = self.now_millis();
+        let now_u64 = nonnegative_timestamp(now)?;
+        let record_id = new_uuid();
+        let text_asset_id = new_uuid();
+        let job_id = new_uuid();
+        let artifact_id = new_uuid();
+        let stage_id = new_uuid();
+        let text_sha256 = sha256_hex(input_text.as_bytes());
+        let record = SpeechHistoryRecord {
+            id: record_id.clone(),
+            created_at: now_u64,
+            route_kind: SpeechRouteKind::TextToSpeech,
+            processing_status: SpeechHistoryProcessingStatus::Pending,
+            processing_error: None,
+            model_id: Some(model_id.clone()),
+            speaker: speaker.clone(),
+            language: language.clone(),
+            saved_voice_id: None,
+            speed,
+            input_text: input_text.clone(),
+            voice_description: voice_description.clone(),
+            reference_text: None,
+            generation_time_ms: 0.0,
+            audio_duration_secs: None,
+            rtf: None,
+            tokens_generated: None,
+            audio_mime_type: audio_mime_type.clone(),
+            audio_filename: audio_filename.clone(),
+        };
+        let response_json = serde_json::to_value(&record)
+            .context("Failed to encode durable text TTS acceptance response")?;
+        let response_json_string = input
+            .reservation
+            .as_ref()
+            .map(|_| {
+                bounded_json_string(
+                    &response_json,
+                    MAX_DURABLE_IDEMPOTENCY_RESULT_BYTES,
+                    "Durable idempotency result",
+                )
+            })
+            .transpose()?;
+        let structure_json = json_to_db_string(
+            &json!({"source": "tts_input", "route_record_id": record_id.clone()}),
+            "{}",
+        )?;
+        let artifact_metadata_json = json_to_db_string(
+            &json!({"route_record_id": record_id.clone(), "input_kind": "text"}),
+            "{}",
+        )?;
+        let input_artifact_ids_json = json_to_db_string(&json!([artifact_id.clone()]), "[]")?;
+
+        let db = self.db.connection().await?;
+        let tx = db
+            .begin_with_options(runtime_write_transaction_options())
+            .await
+            .context("Failed to start durable text TTS acceptance transaction")?;
+
+        if let Some(reservation) = input.reservation.as_ref() {
+            lock_durable_idempotency(&tx).await?;
+            let Some(stored) = load_durable_idempotency_with(
+                &tx,
+                &reservation.tenant_scope,
+                &reservation.operation,
+                &reservation.idempotency_key,
+            )
+            .await?
+            else {
+                tx.rollback().await?;
+                return Ok(DurableTextTtsAcceptanceOutcome::ReservationLost);
+            };
+            if stored.state != "reserved"
+                || stored.expires_at <= now_u64
+                || stored.digest_version != reservation.digest_version
+                || stored.request_digest != reservation.request_digest
+                || stored.reservation_token != reservation.reservation_token
+            {
+                tx.rollback().await?;
+                return Ok(DurableTextTtsAcceptanceOutcome::ReservationLost);
+            }
+        }
+
+        self.check_tts_admission(&tx, &admission_tenant).await?;
+        tx.execute_raw(raw::statement(
+            &tx,
+            r#"
+            INSERT INTO speech_history_records (
+                id, created_at, route_kind, processing_status, processing_error,
+                runtime_stage_id, runtime_attempt_token, model_id, speaker,
+                language, saved_voice_id, speed, input_text, voice_description,
+                reference_text, generation_time_ms, audio_duration_secs, rtf,
+                tokens_generated, audio_mime_type, audio_filename, audio_storage_path
+            )
+            VALUES (?1, ?2, 'text_to_speech', 'pending', NULL, NULL, NULL, ?3,
+                    ?4, ?5, NULL, ?6, ?7, ?8, NULL, 0.0, NULL, NULL, NULL,
+                    ?9, ?10, '')
+            "#,
+            vec![
+                record_id.clone().into(),
+                now.into(),
+                model_id.clone().into(),
+                opt_string(speaker),
+                opt_string(language.clone()),
+                opt_f64(speed),
+                input_text.clone().into(),
+                opt_string(voice_description),
+                audio_mime_type.clone().into(),
+                opt_string(audio_filename.clone()),
+            ],
+        )?)
+        .await
+        .context("Failed to create durable text TTS projection")?;
+        self.inject_durable_tts_acceptance_failure(DurableTtsAcceptanceFailpoint::Projection)?;
+
+        tx.execute_raw(raw::statement(
+            &tx,
+            r#"
+            INSERT INTO text_assets (
+                id, created_at, updated_at, raw_text, normalized_text,
+                language_hint, character_count, sha256, safety_status,
+                retention_policy, structure_json
+            )
+            VALUES (?1, ?2, ?2, ?3, ?3, ?4, ?5, ?6, 'unchecked', 'default', ?7)
+            "#,
+            vec![
+                text_asset_id.clone().into(),
+                now.into(),
+                input_text.clone().into(),
+                opt_string(language),
+                u64_to_i64_value(input_text.chars().count() as u64)?,
+                text_sha256.clone().into(),
+                structure_json.into(),
+            ],
+        )?)
+        .await
+        .context("Failed to create durable text TTS input")?;
+        self.inject_durable_tts_acceptance_failure(DurableTtsAcceptanceFailpoint::TextAsset)?;
+
+        tx.execute_raw(raw::statement(
+            &tx,
+            r#"
+            INSERT INTO runtime_jobs (
+                id, created_at, updated_at, queued_at, started_at, finished_at,
+                job_kind, status, priority, model_id, capability,
+                route_record_kind, route_record_id, input_media_asset_id,
+                input_text_asset_id, request_json, model_snapshot_json,
+                progress_json, error_code, error_message, attempt_count,
+                max_attempts, retry_policy_json, idempotency_key,
+                correlation_id, cancellation_reason, admission_tenant
+            )
+            VALUES (?1, ?2, ?2, ?2, NULL, NULL, 'tts_speech', 'queued', ?3,
+                    ?4, 'tts', 'text_to_speech', ?5, NULL, ?6, ?7, ?8,
+                    NULL, NULL, NULL, 0, ?9, ?10, ?11, ?12, NULL, ?13)
+            "#,
+            vec![
+                job_id.clone().into(),
+                now.into(),
+                input.priority.into(),
+                model_id.clone().into(),
+                record_id.clone().into(),
+                text_asset_id.clone().into(),
+                request_json_string.into(),
+                model_snapshot_json_string.into(),
+                u32_to_i64_value(input.max_attempts).into(),
+                retry_policy_json_string.into(),
+                opt_string(
+                    input
+                        .reservation
+                        .as_ref()
+                        .map(|reservation| reservation.idempotency_key.clone()),
+                ),
+                opt_string(input.correlation_id),
+                admission_tenant.into(),
+            ],
+        )?)
+        .await
+        .context("Failed to create durable text TTS job")?;
+        self.inject_durable_tts_acceptance_failure(DurableTtsAcceptanceFailpoint::Job)?;
+
+        tx.execute_raw(raw::statement(
+            &tx,
+            r#"
+            INSERT INTO runtime_artifacts (
+                id, job_id, stage_id, created_at, artifact_kind,
+                artifact_role, media_asset_id, text_asset_id, storage_key,
+                content_type, filename, size_bytes, sha256, metadata_json,
+                retention_policy
+            )
+            VALUES (?1, ?2, NULL, ?3, 'text', 'input_original', NULL, ?4,
+                    NULL, 'text/plain', ?5, ?6, ?7, ?8, 'default')
+            "#,
+            vec![
+                artifact_id.clone().into(),
+                job_id.clone().into(),
+                now.into(),
+                text_asset_id.clone().into(),
+                format!("{record_id}.input.txt").into(),
+                u64_to_i64_value(input_text.len() as u64)?,
+                text_sha256.into(),
+                artifact_metadata_json.into(),
+            ],
+        )?)
+        .await
+        .context("Failed to create durable text TTS input artifact")?;
+        self.inject_durable_tts_acceptance_failure(DurableTtsAcceptanceFailpoint::Artifact)?;
+
+        tx.execute_raw(raw::statement(
+            &tx,
+            r#"
+            INSERT INTO job_stages (
+                id, job_id, created_at, updated_at, sequence, stage_kind,
+                queue_class, resource_hints_json, resource_target,
+                required_backend, required_device_class,
+                min_resource_memory_bytes, resource_concurrency_weight,
+                status, capability, model_id, worker_id, lease_expires_at,
+                available_at, attempt_token, attempt_count, max_attempts,
+                input_artifact_ids_json, output_artifact_ids_json,
+                progress_json, started_at, finished_at, error_code,
+                error_message, cancellation_state
+            )
+            VALUES (?1, ?2, ?3, ?3, 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                    ?11, 'queued', 'tts', ?12, NULL, NULL, ?3, NULL, 0, ?13,
+                    ?14, '[]', NULL, NULL, NULL, NULL, NULL, NULL)
+            "#,
+            vec![
+                stage_id.clone().into(),
+                job_id.clone().into(),
+                now.into(),
+                input.stage_kind.into(),
+                input.queue_class.as_db_value().into(),
+                resource_hints_json.into(),
+                resource_hints.target.as_db_value().into(),
+                opt_string(
+                    resource_hints
+                        .backend
+                        .map(|backend| backend.as_db_value().to_string()),
+                ),
+                opt_string(
+                    resource_hints
+                        .device_class
+                        .map(|device| device.as_db_value().to_string()),
+                ),
+                opt_u64(resource_hints.min_memory_bytes),
+                u32_to_i64_value(resource_hints.concurrency_weight).into(),
+                model_id.into(),
+                u32_to_i64_value(input.max_attempts).into(),
+                input_artifact_ids_json.into(),
+            ],
+        )?)
+        .await
+        .context("Failed to create durable text TTS stage")?;
+        self.inject_durable_tts_acceptance_failure(DurableTtsAcceptanceFailpoint::Stage)?;
+
+        if let Some(reservation) = input.reservation.as_ref() {
+            let expires_at = now_u64
+                .checked_add(input.idempotency_retention_ms)
+                .context("Durable idempotency retention expiry overflow")?;
+            let result = tx
+                .execute_raw(raw::statement(
+                    &tx,
+                    r#"
+                    UPDATE durable_idempotency_keys_v2
+                    SET state = 'committed', updated_at = ?1, expires_at = ?2,
+                        runtime_job_id = ?3, response_json = ?4
+                    WHERE tenant_scope = ?5 AND operation = ?6
+                      AND idempotency_key = ?7 AND state = 'reserved'
+                      AND reservation_token = ?8 AND digest_version = ?9
+                      AND request_digest = ?10 AND expires_at > ?1
+                    "#,
+                    vec![
+                        now.into(),
+                        i64::try_from(expires_at)?.into(),
+                        job_id.clone().into(),
+                        response_json_string
+                            .clone()
+                            .expect("keyed response was bounded")
+                            .into(),
+                        reservation.tenant_scope.clone().into(),
+                        reservation.operation.clone().into(),
+                        reservation.idempotency_key.clone().into(),
+                        reservation.reservation_token.clone().into(),
+                        i64::from(reservation.digest_version).into(),
+                        reservation.request_digest.clone().into(),
+                    ],
+                )?)
+                .await
+                .context("Failed to commit durable text TTS idempotency result")?;
+            if result.rows_affected() != 1 {
+                tx.rollback().await?;
+                return Ok(DurableTextTtsAcceptanceOutcome::ReservationLost);
+            }
+            self.inject_durable_tts_acceptance_failure(DurableTtsAcceptanceFailpoint::Idempotency)?;
+        }
+
+        let job = get_job_with(&tx, &job_id)
+            .await?
+            .ok_or_else(|| anyhow!("Created durable text TTS job was not found"))?;
+        let stage = get_stage_with(&tx, &stage_id)
+            .await?
+            .ok_or_else(|| anyhow!("Created durable text TTS stage was not found"))?;
+        let input_artifact = get_artifact_with(&tx, &artifact_id)
+            .await?
+            .ok_or_else(|| anyhow!("Created durable text TTS artifact was not found"))?;
+        tx.commit()
+            .await
+            .context("Failed to commit durable text TTS acceptance transaction")?;
+
+        Ok(DurableTextTtsAcceptanceOutcome::Committed(
+            DurableTextTtsAcceptance {
+                record,
+                job,
+                stage,
+                input_artifact,
+            },
+        ))
     }
 
     pub async fn get_job(&self, id: &str) -> anyhow::Result<Option<RuntimeJob>> {
@@ -3645,6 +4162,18 @@ fn validate_bounded_field(name: &str, value: &str, max_bytes: usize) -> anyhow::
     Ok(())
 }
 
+fn validate_optional_field_bytes(
+    name: &str,
+    value: Option<&str>,
+    max_bytes: usize,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        value.is_none_or(|value| value.len() <= max_bytes),
+        "{name} exceeds {max_bytes} bytes"
+    );
+    Ok(())
+}
+
 fn nonnegative_timestamp(now: i64) -> anyhow::Result<u64> {
     u64::try_from(now).context("Durable idempotency clock preceded the Unix epoch")
 }
@@ -3904,6 +4433,21 @@ async fn get_stage_with<C: ConnectionTrait>(db: &C, id: &str) -> anyhow::Result<
         .await
         .context("Failed to load runtime job stage")?;
     row.as_ref().map(map_job_stage).transpose()
+}
+
+async fn get_artifact_with<C: ConnectionTrait>(
+    db: &C,
+    id: &str,
+) -> anyhow::Result<Option<RuntimeArtifact>> {
+    let row = db
+        .query_one_raw(raw::statement(
+            db,
+            RUNTIME_ARTIFACT_COLUMNS_SQL,
+            vec![id.into()],
+        )?)
+        .await
+        .context("Failed to load runtime artifact")?;
+    row.as_ref().map(map_runtime_artifact).transpose()
 }
 
 async fn complete_job_if_all_stages_finished_with<C: ConnectionTrait>(
@@ -4624,6 +5168,81 @@ mod tests {
             request_digest: sha256_hex(payload),
             reservation_ttl_ms,
         }
+    }
+
+    fn durable_text_tts_acceptance(
+        reservation: Option<DurableIdempotencyReservation>,
+    ) -> NewDurableTextTtsAcceptance {
+        NewDurableTextTtsAcceptance {
+            projection: NewSpeechHistoryRecord {
+                route_kind: SpeechRouteKind::TextToSpeech,
+                processing_status: SpeechHistoryProcessingStatus::Pending,
+                processing_error: None,
+                model_id: Some("Kokoro-82M".to_string()),
+                speaker: Some("af_heart".to_string()),
+                language: Some("en".to_string()),
+                saved_voice_id: None,
+                speed: Some(1.0),
+                input_text: "hello durable world".to_string(),
+                voice_description: None,
+                reference_text: None,
+                generation_time_ms: 0.0,
+                audio_duration_secs: None,
+                rtf: None,
+                tokens_generated: None,
+                audio_mime_type: "audio/wav".to_string(),
+                audio_filename: Some("speech.wav".to_string()),
+                audio_bytes: Vec::new(),
+            },
+            request_json: json!({
+                "tenant_key": null,
+                "route_kind": "text_to_speech",
+                "model_id": "Kokoro-82M",
+                "input_text": "hello durable world",
+                "request": {"speaker": "af_heart", "speed": 1.0}
+            }),
+            model_snapshot_json: json!({"version": 1, "model_id": "Kokoro-82M"}),
+            retry_policy_json: json!({"max_attempts": 2}),
+            priority: 0,
+            max_attempts: 2,
+            correlation_id: Some("durable-test-request".to_string()),
+            stage_kind: "tts_synthesize".to_string(),
+            queue_class: QueueClass::BatchTts,
+            resource_hints: StageResourceHints::default(),
+            reservation,
+            idempotency_retention_ms: 60_000,
+        }
+    }
+
+    async fn durable_text_tts_row_counts(store: &BatchRuntimeStore) -> [u64; 6] {
+        let db = store.connection().await.expect("database");
+        let mut counts = [0_u64; 6];
+        for (index, table) in [
+            "speech_history_records",
+            "text_assets",
+            "runtime_jobs",
+            "runtime_artifacts",
+            "job_stages",
+            "durable_idempotency_keys_v2",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let row = db
+                .query_one_raw(
+                    raw::statement(db, format!("SELECT COUNT(*) FROM {table}"), vec![])
+                        .expect("count statement"),
+                )
+                .await
+                .expect("count query")
+                .expect("count row");
+            counts[index] = u64::try_from(
+                row.try_get_by_index::<i64>(0)
+                    .expect("nonnegative row count"),
+            )
+            .expect("nonnegative row count");
+        }
+        counts
     }
 
     #[test]
@@ -5531,6 +6150,279 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("result exceeds"));
+    }
+
+    #[tokio::test]
+    async fn durable_text_tts_acceptance_rolls_back_every_partial_graph_failpoint() {
+        for failpoint in [
+            DurableTtsAcceptanceFailpoint::Projection,
+            DurableTtsAcceptanceFailpoint::TextAsset,
+            DurableTtsAcceptanceFailpoint::Job,
+            DurableTtsAcceptanceFailpoint::Artifact,
+            DurableTtsAcceptanceFailpoint::Stage,
+            DurableTtsAcceptanceFailpoint::Idempotency,
+        ] {
+            let (mut store, _root) = build_store();
+            let request = durable_idempotency_request(
+                "tenant-a",
+                "speech.text_to_speech.create.v1",
+                "rollback-key",
+                b"hello durable world",
+                60_000,
+            );
+            let reservation = match store
+                .reserve_durable_idempotency(request.clone())
+                .await
+                .expect("reserve acceptance")
+            {
+                DurableIdempotencyBegin::Acquired(reservation) => reservation,
+                outcome => panic!("unexpected reservation outcome: {outcome:?}"),
+            };
+            store.set_durable_tts_acceptance_failpoint(Some(failpoint));
+            let error = store
+                .accept_durable_text_tts(durable_text_tts_acceptance(Some(reservation)))
+                .await
+                .expect_err("failpoint must roll back acceptance");
+            assert!(error.to_string().contains("Injected durable text TTS"));
+            assert_eq!(
+                durable_text_tts_row_counts(&store).await,
+                [0, 0, 0, 0, 0, 1],
+                "partial graph survived {failpoint:?}"
+            );
+            assert!(store
+                .claim_next_stage("worker-after-rollback", 60_000)
+                .await
+                .expect("claim after rollback")
+                .is_none());
+            assert!(matches!(
+                store
+                    .reserve_durable_idempotency(request)
+                    .await
+                    .expect("reservation remains fenced"),
+                DurableIdempotencyBegin::InProgress { .. }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_text_tts_acceptance_has_one_graph_and_replays_after_reopen() {
+        let (store, root) = build_store();
+        let request = durable_idempotency_request(
+            "tenant-a",
+            "speech.text_to_speech.create.v1",
+            "reopen-key",
+            b"hello durable world",
+            60_000,
+        );
+        let (first, second) = tokio::join!(
+            store.reserve_durable_idempotency(request.clone()),
+            store.reserve_durable_idempotency(request.clone()),
+        );
+        let outcomes = [
+            first.expect("first reservation"),
+            second.expect("second reservation"),
+        ];
+        let reservation = outcomes
+            .iter()
+            .find_map(|outcome| match outcome {
+                DurableIdempotencyBegin::Acquired(reservation) => Some(reservation.clone()),
+                _ => None,
+            })
+            .expect("one reservation owner");
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, DurableIdempotencyBegin::Acquired(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, DurableIdempotencyBegin::InProgress { .. }))
+                .count(),
+            1
+        );
+
+        let accepted = match store
+            .accept_durable_text_tts(durable_text_tts_acceptance(Some(reservation)))
+            .await
+            .expect("atomic acceptance")
+        {
+            DurableTextTtsAcceptanceOutcome::Committed(accepted) => accepted,
+            DurableTextTtsAcceptanceOutcome::ReservationLost => {
+                panic!("reservation unexpectedly lost")
+            }
+        };
+        assert_eq!(
+            durable_text_tts_row_counts(&store).await,
+            [1, 1, 1, 1, 1, 1]
+        );
+        assert_eq!(accepted.job.status, RuntimeJobStatus::Queued);
+        assert_eq!(accepted.stage.status, RuntimeStageStatus::Queued);
+        assert_eq!(
+            accepted.stage.input_artifact_ids,
+            vec![accepted.input_artifact.id.clone()]
+        );
+        assert_eq!(accepted.input_artifact.job_id, accepted.job.id);
+
+        drop(store);
+        let reopened = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
+            root.path().join("runtime.sqlite"),
+        ));
+        let replay = match reopened
+            .reserve_durable_idempotency(request)
+            .await
+            .expect("replay after reopen")
+        {
+            DurableIdempotencyBegin::Replay(replay) => replay,
+            outcome => panic!("unexpected reopened outcome: {outcome:?}"),
+        };
+        assert_eq!(replay.runtime_job_id, accepted.job.id);
+        assert_eq!(
+            replay.response_json["id"].as_str(),
+            Some(accepted.record.id.as_str())
+        );
+        assert_eq!(
+            durable_text_tts_row_counts(&reopened).await,
+            [1, 1, 1, 1, 1, 1]
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_text_tts_acceptance_fences_expiry_and_bounds_replay_response() {
+        let (mut store, _root) = build_store();
+        let clock = Arc::new(AtomicI64::new(1_000));
+        store.set_test_clock(clock.clone());
+        let reservation = match store
+            .reserve_durable_idempotency(durable_idempotency_request(
+                "tenant-a",
+                "speech.text_to_speech.create.v1",
+                "expired-key",
+                b"expired",
+                10,
+            ))
+            .await
+            .expect("expired reservation")
+        {
+            DurableIdempotencyBegin::Acquired(reservation) => reservation,
+            outcome => panic!("unexpected reservation outcome: {outcome:?}"),
+        };
+        clock.store(1_010, Ordering::SeqCst);
+        assert!(matches!(
+            store
+                .accept_durable_text_tts(durable_text_tts_acceptance(Some(reservation)))
+                .await
+                .expect("expired acceptance outcome"),
+            DurableTextTtsAcceptanceOutcome::ReservationLost
+        ));
+        assert_eq!(
+            durable_text_tts_row_counts(&store).await,
+            [0, 0, 0, 0, 0, 1]
+        );
+
+        clock.store(2_000, Ordering::SeqCst);
+        let reservation = match store
+            .reserve_durable_idempotency(durable_idempotency_request(
+                "tenant-a",
+                "speech.text_to_speech.create.v1",
+                "bounded-key",
+                b"bounded",
+                60_000,
+            ))
+            .await
+            .expect("bounded reservation")
+        {
+            DurableIdempotencyBegin::Acquired(reservation) => reservation,
+            outcome => panic!("unexpected reservation outcome: {outcome:?}"),
+        };
+        let mut acceptance = durable_text_tts_acceptance(Some(reservation));
+        acceptance.projection.input_text = "x".repeat(MAX_DURABLE_IDEMPOTENCY_RESULT_BYTES + 1);
+        assert!(
+            acceptance.clone().projection.input_text.len() > MAX_DURABLE_IDEMPOTENCY_RESULT_BYTES
+        );
+        assert!(store
+            .accept_durable_text_tts(acceptance)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("result exceeds"));
+        assert_eq!(
+            durable_text_tts_row_counts(&store).await,
+            [0, 0, 0, 0, 0, 1]
+        );
+
+        let mut oversized_text = durable_text_tts_acceptance(None);
+        oversized_text.projection.input_text = "x".repeat(MAX_DURABLE_TTS_TEXT_BYTES + 1);
+        assert!(store
+            .accept_durable_text_tts(oversized_text)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("input must be between"));
+
+        let mut oversized_metadata = durable_text_tts_acceptance(None);
+        oversized_metadata.model_snapshot_json =
+            json!({"metadata": "x".repeat(MAX_DURABLE_TTS_METADATA_JSON_BYTES)});
+        assert!(store
+            .accept_durable_text_tts(oversized_metadata)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("model snapshot exceeds"));
+        assert_eq!(
+            durable_text_tts_row_counts(&store).await,
+            [0, 0, 0, 0, 0, 1]
+        );
+    }
+
+    #[tokio::test]
+    async fn unkeyed_text_tts_acceptance_is_atomic_and_only_claimable_after_commit() {
+        let (mut store, _root) = build_store();
+        let mut acceptance = durable_text_tts_acceptance(None);
+        acceptance.idempotency_retention_ms = 0;
+        store.set_durable_tts_acceptance_failpoint(Some(DurableTtsAcceptanceFailpoint::Stage));
+        assert!(store
+            .accept_durable_text_tts(acceptance.clone())
+            .await
+            .is_err());
+        assert_eq!(
+            durable_text_tts_row_counts(&store).await,
+            [0, 0, 0, 0, 0, 0]
+        );
+        assert!(store
+            .claim_next_stage("worker-before-commit", 60_000)
+            .await
+            .expect("claim rolled-back graph")
+            .is_none());
+
+        store.set_durable_tts_acceptance_failpoint(None);
+        let accepted = match store
+            .accept_durable_text_tts(acceptance)
+            .await
+            .expect("unkeyed acceptance")
+        {
+            DurableTextTtsAcceptanceOutcome::Committed(accepted) => accepted,
+            DurableTextTtsAcceptanceOutcome::ReservationLost => {
+                panic!("unkeyed acceptance cannot lose a reservation")
+            }
+        };
+        assert_eq!(
+            durable_text_tts_row_counts(&store).await,
+            [1, 1, 1, 1, 1, 0]
+        );
+        let claimed = store
+            .claim_next_stage("worker-after-commit", 60_000)
+            .await
+            .expect("claim committed graph")
+            .expect("queued stage");
+        assert_eq!(claimed.job.id, accepted.job.id);
+        assert_eq!(claimed.stage.id, accepted.stage.id);
+        assert!(store
+            .claim_next_stage("other-worker", 60_000)
+            .await
+            .expect("second claim")
+            .is_none());
     }
 
     #[tokio::test]

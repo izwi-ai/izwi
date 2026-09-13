@@ -1275,7 +1275,7 @@ fn input_preview(content: &str) -> String {
     truncate_string(&normalized, 180)
 }
 
-fn sanitize_optional_text(raw: Option<&str>, max_chars: usize) -> Option<String> {
+pub(crate) fn sanitize_optional_text(raw: Option<&str>, max_chars: usize) -> Option<String> {
     let normalized = raw
         .unwrap_or("")
         .split_whitespace()
@@ -1288,7 +1288,7 @@ fn sanitize_optional_text(raw: Option<&str>, max_chars: usize) -> Option<String>
     }
 }
 
-fn sanitize_audio_mime_type(raw: &str) -> String {
+pub(crate) fn sanitize_audio_mime_type(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         "audio/wav".to_string()
