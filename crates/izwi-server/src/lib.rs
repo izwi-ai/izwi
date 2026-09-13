@@ -36,6 +36,7 @@ mod diarization_store;
 mod entity;
 mod error;
 mod gateway;
+mod gateway_deployments;
 mod gateway_security;
 mod ids;
 mod logging;
@@ -70,7 +71,7 @@ use izwi_core::{
 use izwi_hooks::EnterpriseHooks;
 use izwi_serving_client::{WorkerClient, WorkerClientConfig};
 use izwi_serving_protocol::{
-    CredentialId, DeploymentId, IncarnationId, ModelGeneration, NodeId, PolicyRevision,
+    CredentialId, DeploymentId, IncarnationId, ModelAlias, ModelGeneration, NodeId, PolicyRevision,
     ServiceBearerToken, ServiceCredentials, TaskKind, WorkerDescriptor, WorkerId, WorkerStatus,
 };
 use logging::{LogFormat, SERVICE_NAME, SERVICE_VERSION};
@@ -153,6 +154,18 @@ struct ServerArgs {
         value_name = "URL"
     )]
     gateway_worker_endpoints: Vec<String>,
+
+    /// Statically approved worker routing entries. Repeat this option (or use
+    /// a comma-separated environment value) with
+    /// URL|TASK|PUBLIC_MODEL|DEPLOYMENT_ID|MODEL_GENERATION. This cannot be
+    /// combined with the legacy gateway worker endpoint list.
+    #[arg(
+        long = "gateway-worker-approval",
+        env = "IZWI_GATEWAY_WORKER_APPROVALS",
+        value_delimiter = ',',
+        value_name = "APPROVAL"
+    )]
+    gateway_worker_approvals: Vec<gateway_deployments::GatewayWorkerApproval>,
 
     /// Rotatable private worker credential identifier required by gateway mode.
     #[arg(long, env = "IZWI_GATEWAY_WORKER_CREDENTIAL_ID")]
@@ -460,7 +473,7 @@ async fn gateway_state(
     enterprise_hooks: EnterpriseHooks,
     perimeter: GatewayPerimeterConfig,
 ) -> anyhow::Result<(gateway::GatewayState, Option<GatewayWorkerStatusPoller>)> {
-    if args.gateway_worker_endpoints.is_empty() {
+    if args.gateway_worker_endpoints.is_empty() && args.gateway_worker_approvals.is_empty() {
         let remote = gateway_remote_execution(args, serve_config)?;
         return Ok((
             gateway::GatewayState::new(
@@ -476,7 +489,7 @@ async fn gateway_state(
 
     if args.worker_endpoint.is_some() {
         anyhow::bail!(
-            "--worker-endpoint cannot be combined with --gateway-worker-endpoint; use the former for pinned compatibility or repeat the latter for registry routing"
+            "--worker-endpoint cannot be combined with registry worker endpoints or approvals; use it only for pinned compatibility"
         );
     }
     if args.worker_incarnation.is_some() {
@@ -486,21 +499,15 @@ async fn gateway_state(
     }
 
     validate_gateway_limits(args)?;
-    let deployment_id = DeploymentId::new(required_gateway_value(
-        &args.worker_deployment,
-        "--worker-deployment",
-    )?)?;
-    let public_model = parse_model_variant(required_gateway_value(
+    let public_model_variant = parse_model_variant(required_gateway_value(
         &args.public_model,
         "--public-model",
     )?)?;
-    let expected_generation = ModelGeneration::new(
-        args.worker_model_generation
-            .ok_or_else(|| anyhow::anyhow!("gateway mode requires --worker-model-generation"))?,
-    )?;
+    let public_model = ModelAlias::new(public_model_variant.dir_name())?;
+    let worker_approvals = configured_gateway_worker_approvals(args, &public_model)?;
     let credentials = gateway_worker_credentials(args)?;
     let registry_config = worker_registry::WorkerRegistryConfig {
-        max_workers: args.gateway_worker_endpoints.len(),
+        max_workers: worker_approvals.len(),
         max_deployments_per_worker: 32,
         max_local_dispatches: args.gateway_max_in_flight,
         status_ttl: Duration::from_millis(args.gateway_worker_status_ttl_ms),
@@ -516,14 +523,15 @@ async fn gateway_state(
 
     let mut endpoints = BTreeSet::new();
     let mut approved_worker_ids = BTreeSet::new();
-    let mut polling_workers = Vec::with_capacity(args.gateway_worker_endpoints.len());
-    for configured_endpoint in &args.gateway_worker_endpoints {
-        let endpoint = configured_endpoint.trim();
+    let mut polling_workers = Vec::with_capacity(worker_approvals.len());
+    let mut deployment_table = gateway_deployments::GatewayDeploymentTable::default();
+    for approval in worker_approvals {
+        let endpoint = approval.endpoint.trim();
         if endpoint.is_empty() {
-            anyhow::bail!("--gateway-worker-endpoint values must not be empty");
+            anyhow::bail!("configured gateway worker endpoints must not be empty");
         }
         if !endpoints.insert(endpoint.to_string()) {
-            anyhow::bail!("duplicate --gateway-worker-endpoint: {endpoint}");
+            anyhow::bail!("duplicate configured gateway worker endpoint: {endpoint}");
         }
         let client = WorkerClient::new(endpoint, credentials.clone(), client_config.clone())?;
         let descriptor = client.descriptor().await.with_context(|| {
@@ -539,23 +547,29 @@ async fn gateway_state(
                 descriptor.worker_id
             );
         }
-        let expectation = initial_gateway_worker_expectation(
-            client,
-            &descriptor,
-            &status,
-            &deployment_id,
-            public_model.dir_name(),
-            expected_generation,
-        )?;
+        let expectation =
+            initial_gateway_worker_expectation(client, &descriptor, &status, &approval)?;
+        deployment_table
+            .approve_replica(expectation.deployment.clone())
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         approve_gateway_worker(&registry, &expectation, descriptor, status)?;
         polling_workers.push(expectation);
     }
 
+    let chat_deployment = deployment_table
+        .select(TaskKind::Chat, &public_model)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "configured gateway worker approvals do not include chat model {}",
+                public_model
+            )
+        })?;
+
     let dispatcher = app::remote_chat_dispatch::RemoteChatDispatcher::new(
         registry.clone(),
         app::remote_chat_dispatch::RemoteChatDispatchConfig {
-            public_model_variant: public_model,
-            deployment_id,
+            public_model_variant,
+            deployment_id: chat_deployment.deployment_id().clone(),
             policy_revision: PolicyRevision::new(args.gateway_policy_revision.trim())?,
             backend_policy: gateway_backend_policy(args.backend.as_ref()),
             max_queue_wait: Duration::from_millis(args.gateway_worker_queue_wait_ms),
@@ -604,9 +618,7 @@ fn initial_gateway_worker_expectation(
     client: WorkerClient,
     descriptor: &WorkerDescriptor,
     status: &WorkerStatus,
-    deployment_id: &DeploymentId,
-    public_model: &str,
-    expected_generation: ModelGeneration,
+    approval: &gateway_deployments::GatewayWorkerApproval,
 ) -> anyhow::Result<GatewayWorkerExpectation> {
     if status.worker_id != descriptor.worker_id
         || status.node_id != descriptor.node_id
@@ -617,22 +629,22 @@ fn initial_gateway_worker_expectation(
     let selected_deployment = status
         .deployments
         .iter()
-        .find(|deployment| deployment.deployment_id == *deployment_id)
+        .find(|deployment| deployment.deployment_id == approval.deployment_id)
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "worker {} does not advertise configured deployment {}",
                 descriptor.worker_id,
-                deployment_id
+                approval.deployment_id
             )
         })?;
-    if selected_deployment.public_model.as_str() != public_model
-        || selected_deployment.model_generation != expected_generation
-        || selected_deployment.task != TaskKind::Chat
+    if selected_deployment.public_model != approval.public_model
+        || selected_deployment.model_generation != approval.model_generation
+        || selected_deployment.task != approval.task
     {
         anyhow::bail!(
-            "worker {} deployment {} does not match configured chat model/generation",
+            "worker {} deployment {} does not match its configured task/model/generation",
             descriptor.worker_id,
-            deployment_id
+            approval.deployment_id
         );
     }
     let validated_capacity = configured_worker_capacity(status)?;
@@ -643,6 +655,45 @@ fn initial_gateway_worker_expectation(
         deployment: worker_registry::ApprovedDeployment::from_loaded(selected_deployment),
         validated_capacity,
     })
+}
+
+fn configured_gateway_worker_approvals(
+    args: &ServerArgs,
+    legacy_public_model: &ModelAlias,
+) -> anyhow::Result<Vec<gateway_deployments::GatewayWorkerApproval>> {
+    if !args.gateway_worker_approvals.is_empty() {
+        if !args.gateway_worker_endpoints.is_empty() {
+            anyhow::bail!(
+                "--gateway-worker-approval cannot be combined with --gateway-worker-endpoint"
+            );
+        }
+        if args.worker_deployment.is_some() || args.worker_model_generation.is_some() {
+            anyhow::bail!(
+                "--worker-deployment and --worker-model-generation apply only to legacy --gateway-worker-endpoint configuration"
+            );
+        }
+        return Ok(args.gateway_worker_approvals.clone());
+    }
+
+    let deployment_id = DeploymentId::new(required_gateway_value(
+        &args.worker_deployment,
+        "--worker-deployment",
+    )?)?;
+    let model_generation = ModelGeneration::new(
+        args.worker_model_generation
+            .ok_or_else(|| anyhow::anyhow!("gateway mode requires --worker-model-generation"))?,
+    )?;
+    Ok(args
+        .gateway_worker_endpoints
+        .iter()
+        .map(|endpoint| gateway_deployments::GatewayWorkerApproval {
+            endpoint: endpoint.clone(),
+            task: TaskKind::Chat,
+            public_model: legacy_public_model.clone(),
+            deployment_id: deployment_id.clone(),
+            model_generation,
+        })
+        .collect())
 }
 
 fn configured_worker_capacity(status: &WorkerStatus) -> anyhow::Result<u32> {
@@ -776,9 +827,14 @@ fn validate_gateway_limits(args: &ServerArgs) -> anyhow::Result<()> {
     if args.gateway_worker_queue_wait_ms == 0 {
         anyhow::bail!("--gateway-worker-queue-wait-ms must be non-zero");
     }
-    if args.gateway_worker_endpoints.len() > MAX_CONFIGURED_GATEWAY_WORKERS {
+    let configured_workers = args
+        .gateway_worker_endpoints
+        .len()
+        .checked_add(args.gateway_worker_approvals.len())
+        .ok_or_else(|| anyhow::anyhow!("configured gateway worker count overflowed"))?;
+    if configured_workers > MAX_CONFIGURED_GATEWAY_WORKERS {
         anyhow::bail!(
-            "at most {MAX_CONFIGURED_GATEWAY_WORKERS} --gateway-worker-endpoint values are supported"
+            "at most {MAX_CONFIGURED_GATEWAY_WORKERS} gateway worker endpoints or approvals are supported"
         );
     }
     let ttl = Duration::from_millis(args.gateway_worker_status_ttl_ms);
@@ -1694,7 +1750,7 @@ mod tests {
         let error = validate_gateway_limits(&args).expect_err("worker list must be bounded");
         assert!(error
             .to_string()
-            .contains("--gateway-worker-endpoint values"));
+            .contains("gateway worker endpoints or approvals"));
     }
 
     #[tokio::test]
@@ -1769,15 +1825,15 @@ mod tests {
         let descriptor = client.descriptor().await.expect("descriptor should load");
         let status = client.status().await.expect("status should load");
         let deployment_id = worker.config().deployment_id.clone();
-        let expected = initial_gateway_worker_expectation(
-            client,
-            &descriptor,
-            &status,
-            &deployment_id,
-            model.dir_name(),
-            worker.config().model_generation,
-        )
-        .expect("initial worker should match configuration");
+        let approval = gateway_deployments::GatewayWorkerApproval {
+            endpoint: worker.endpoint(),
+            task: TaskKind::Chat,
+            public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
+            deployment_id,
+            model_generation: worker.config().model_generation,
+        };
+        let expected = initial_gateway_worker_expectation(client, &descriptor, &status, &approval)
+            .expect("initial worker should match configuration");
         let registry =
             worker_registry::WorkerRegistry::new(worker_registry::WorkerRegistryConfig::default())
                 .expect("registry should initialize");
