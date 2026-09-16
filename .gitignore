@@ -28,6 +28,8 @@
 .env.local
 opencode.json
 
+.opencode/*
+
 # Test outputs
 # *.wav
 # *.mp3
