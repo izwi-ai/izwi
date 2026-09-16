@@ -24,9 +24,11 @@ dirs = { workspace = true }
 izwi-core = { path = "../izwi-core", default-features = false }
 izwi-serving-protocol = { path = "../izwi-serving-protocol" }
 izwi-serving-supervisor = { path = "../izwi-serving-supervisor" }
+rustls-pemfile = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-rustls = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }

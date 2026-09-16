@@ -15,6 +15,11 @@ use std::{
 };
 use tokio::io::AsyncReadExt;
 
+const WORKER_TLS_CERT_REF_ENV: &str = "IZWI_WORKER_TLS_CERT_REF";
+const WORKER_TLS_KEY_REF_ENV: &str = "IZWI_WORKER_TLS_KEY_REF";
+const WORKER_TLS_CLIENT_CA_REF_ENV: &str = "IZWI_WORKER_TLS_CLIENT_CA_REF";
+const MAX_TLS_PEM_FILE_BYTES: u64 = 256 * 1024;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -127,16 +132,34 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(process.bind)
         .await
         .with_context(|| format!("bind private worker at {}", process.bind))?;
-    tracing::info!(address = %process.bind, model = %process.public_model, backend = ?process.assignment.backend(), "worker ready");
-    axum::serve(listener, worker.router())
-        .with_graceful_shutdown(shutdown_signal(
-            worker,
-            process.managed,
-            process.drain_grace,
-            process.cancellation_grace,
-        ))
-        .await
-        .context("serve private worker")
+    tracing::info!(
+        address = %process.bind,
+        model = %process.public_model,
+        backend = ?process.assignment.backend(),
+        tls = process.tls.is_some(),
+        "worker ready"
+    );
+    let shutdown = shutdown_signal(
+        worker.clone(),
+        process.managed,
+        process.drain_grace,
+        process.cancellation_grace,
+    );
+    if let Some(tls) = process.tls {
+        let tls_listener = TlsListener {
+            inner: listener,
+            acceptor: tls.acceptor,
+        };
+        axum::serve(tls_listener, worker.router())
+            .with_graceful_shutdown(shutdown)
+            .await
+            .context("serve private TLS worker")
+    } else {
+        axum::serve(listener, worker.router())
+            .with_graceful_shutdown(shutdown)
+            .await
+            .context("serve private worker")
+    }
 }
 
 struct ManagedLockContext {
@@ -261,6 +284,7 @@ async fn wait_until_idle<E: izwi_serving_worker::InvocationExecutor>(
 
 struct WorkerProcessConfig {
     bind: SocketAddr,
+    tls: Option<WorkerTlsConfig>,
     models_dir: PathBuf,
     variant: ModelVariant,
     public_model: ModelAlias,
@@ -299,11 +323,17 @@ impl WorkerProcessConfig {
         let bind: SocketAddr = env_or("IZWI_WORKER_BIND", "127.0.0.1:9470")
             .parse()
             .context("parse IZWI_WORKER_BIND")?;
-        if !bind.ip().is_loopback() {
-            bail!("plaintext worker transport may bind only to a loopback address");
+        let tls = WorkerTlsConfig::from_env()?;
+        if tls.is_none() && !bind.ip().is_loopback() {
+            bail!(
+                "plaintext worker transport may bind only to a loopback address; \
+                 configure {WORKER_TLS_CERT_REF_ENV} and {WORKER_TLS_KEY_REF_ENV} for \
+                 non-loopback TLS"
+            );
         }
         Ok(Self {
             bind,
+            tls,
             models_dir: std::env::var_os("IZWI_MODELS_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(default_models_dir),
@@ -357,6 +387,172 @@ impl WorkerProcessConfig {
             DeviceAssignment::Cpu { thread_budget, .. } => usize::from(*thread_budget),
             DeviceAssignment::Metal { .. } | DeviceAssignment::Cuda { .. } => 1,
         }
+    }
+}
+
+struct WorkerTlsConfig {
+    acceptor: tokio_rustls::TlsAcceptor,
+}
+
+impl std::fmt::Debug for WorkerTlsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerTlsConfig")
+            .field("acceptor", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl WorkerTlsConfig {
+    fn from_env() -> anyhow::Result<Option<Self>> {
+        let cert_ref = std::env::var(WORKER_TLS_CERT_REF_ENV).ok();
+        let key_ref = std::env::var(WORKER_TLS_KEY_REF_ENV).ok();
+        let client_ca_ref = std::env::var(WORKER_TLS_CLIENT_CA_REF_ENV).ok();
+
+        match (cert_ref, key_ref) {
+            (Some(cert_ref), Some(key_ref)) => {
+                let cert_bytes = load_pem_file(&cert_ref, "server certificate")?;
+                let key_bytes = load_pem_file(&key_ref, "server private key")?;
+                let cert_items = rustls_pemfile::read_all(&mut cert_bytes.as_slice())
+                    .map_err(|_| anyhow::anyhow!("server certificate PEM is invalid"))?;
+                let key_items = rustls_pemfile::read_all(&mut key_bytes.as_slice())
+                    .map_err(|_| anyhow::anyhow!("server private key PEM is invalid"))?;
+                let certs: Vec<_> = cert_items
+                    .into_iter()
+                    .filter_map(|item| match item {
+                        rustls_pemfile::Item::X509Certificate(der) => {
+                            Some(tokio_rustls::rustls::pki_types::CertificateDer::from(der))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if certs.is_empty() {
+                    bail!("server certificate file contains no certificate PEM blocks");
+                }
+                let key = key_items
+                    .into_iter()
+                    .filter_map(|item| match item {
+                        rustls_pemfile::Item::PKCS8Key(der) => {
+                            Some(tokio_rustls::rustls::pki_types::PrivateKeyDer::Pkcs8(
+                                tokio_rustls::rustls::pki_types::PrivatePkcs8KeyDer::from(der),
+                            ))
+                        }
+                        rustls_pemfile::Item::RSAKey(der) => {
+                            Some(tokio_rustls::rustls::pki_types::PrivateKeyDer::Pkcs1(
+                                tokio_rustls::rustls::pki_types::PrivatePkcs1KeyDer::from(der),
+                            ))
+                        }
+                        rustls_pemfile::Item::ECKey(der) => {
+                            Some(tokio_rustls::rustls::pki_types::PrivateKeyDer::Sec1(
+                                tokio_rustls::rustls::pki_types::PrivateSec1KeyDer::from(der),
+                            ))
+                        }
+                        _ => None,
+                    })
+                    .next()
+                    .context("server private key file contains no key PEM blocks")?;
+
+                let config = if let Some(ca_ref) = client_ca_ref {
+                    let ca_bytes = load_pem_file(&ca_ref, "client CA")?;
+                    let ca_items = rustls_pemfile::read_all(&mut ca_bytes.as_slice())
+                        .map_err(|_| anyhow::anyhow!("client CA PEM is invalid"))?;
+                    let client_certs: Vec<_> = ca_items
+                        .into_iter()
+                        .filter_map(|item| match item {
+                            rustls_pemfile::Item::X509Certificate(der) => Some(der),
+                            _ => None,
+                        })
+                        .collect();
+                    if client_certs.is_empty() {
+                        bail!("client CA file contains no certificate PEM blocks");
+                    }
+                    let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+                    for cert in client_certs {
+                        roots
+                            .add(tokio_rustls::rustls::pki_types::CertificateDer::from(cert))
+                            .map_err(|e| anyhow::anyhow!("invalid client CA certificate: {e}"))?;
+                    }
+                    let verifier = tokio_rustls::rustls::server::WebPkiClientVerifier::builder(
+                        Arc::new(roots),
+                    )
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("invalid client CA verifier: {e}"))?;
+                    tokio_rustls::rustls::ServerConfig::builder()
+                        .with_client_cert_verifier(verifier)
+                        .with_single_cert(certs, key)
+                        .map_err(|e| anyhow::anyhow!("invalid mTLS configuration: {e}"))?
+                } else {
+                    tokio_rustls::rustls::ServerConfig::builder()
+                        .with_no_client_auth()
+                        .with_single_cert(certs, key)
+                        .map_err(|e| anyhow::anyhow!("invalid server TLS configuration: {e}"))?
+                };
+
+                Ok(Some(Self {
+                    acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(config)),
+                }))
+            }
+            (Some(_), None) => bail!(
+                "{WORKER_TLS_CERT_REF_ENV} is set but {WORKER_TLS_KEY_REF_ENV} is missing; \
+                 both are required for TLS"
+            ),
+            (None, Some(_)) => bail!(
+                "{WORKER_TLS_KEY_REF_ENV} is set but {WORKER_TLS_CERT_REF_ENV} is missing; \
+                 both are required for TLS"
+            ),
+            (None, None) => Ok(None),
+        }
+    }
+}
+
+fn load_pem_file(reference: &str, label: &str) -> anyhow::Result<Vec<u8>> {
+    let path = reference
+        .strip_prefix("file:")
+        .with_context(|| format!("{label} reference must be a file: path"))?;
+    let path = Path::new(path);
+    if !path.is_absolute() {
+        bail!("{label} reference must be an absolute file: path");
+    }
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("read {label} metadata at {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("{label} reference must point to a regular file");
+    }
+    if metadata.len() > MAX_TLS_PEM_FILE_BYTES {
+        bail!("{label} file exceeds {MAX_TLS_PEM_FILE_BYTES} bytes");
+    }
+    let bytes =
+        std::fs::read(path).with_context(|| format!("read {label} at {}", path.display()))?;
+    Ok(bytes)
+}
+
+struct TlsListener {
+    inner: tokio::net::TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+}
+
+impl axum::serve::Listener for TlsListener {
+    type Io = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+    type Addr = std::net::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            match self.inner.accept().await {
+                Ok((stream, addr)) => match self.acceptor.accept(stream).await {
+                    Ok(tls_stream) => return (tls_stream, addr),
+                    Err(error) => {
+                        tracing::warn!(%error, "worker TLS handshake failed");
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!(%error, "worker TCP accept failed");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.inner.local_addr()
     }
 }
 
@@ -625,5 +821,38 @@ mod tests {
                 expected_device_uuid: "GPU-0123".into(),
             }
         );
+    }
+
+    #[test]
+    fn tls_config_rejects_partial_cert_and_key_pair() {
+        std::env::remove_var(WORKER_TLS_CERT_REF_ENV);
+        std::env::remove_var(WORKER_TLS_KEY_REF_ENV);
+        std::env::remove_var(WORKER_TLS_CLIENT_CA_REF_ENV);
+        assert!(WorkerTlsConfig::from_env().unwrap().is_none());
+
+        std::env::set_var(WORKER_TLS_CERT_REF_ENV, "file:/tmp/cert.pem");
+        assert!(WorkerTlsConfig::from_env().is_err());
+
+        std::env::remove_var(WORKER_TLS_CERT_REF_ENV);
+        std::env::set_var(WORKER_TLS_KEY_REF_ENV, "file:/tmp/key.pem");
+        assert!(WorkerTlsConfig::from_env().is_err());
+
+        std::env::remove_var(WORKER_TLS_KEY_REF_ENV);
+        assert!(WorkerTlsConfig::from_env().unwrap().is_none());
+    }
+
+    #[test]
+    fn tls_config_rejects_non_file_references_and_relative_paths() {
+        std::env::set_var(WORKER_TLS_CERT_REF_ENV, "http://example.com/cert.pem");
+        std::env::set_var(WORKER_TLS_KEY_REF_ENV, "file:relative/key.pem");
+        let result = WorkerTlsConfig::from_env();
+        assert!(result.is_err());
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("file: path"),
+            "error should mention file: path requirement: {error}"
+        );
+        std::env::remove_var(WORKER_TLS_CERT_REF_ENV);
+        std::env::remove_var(WORKER_TLS_KEY_REF_ENV);
     }
 }
