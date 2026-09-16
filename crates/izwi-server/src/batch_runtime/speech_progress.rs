@@ -42,6 +42,9 @@ pub struct SpeechCheckpoint {
     pub active_segment: Option<u32>,
     /// Set before the first journal publication; interrupted publication is incomplete.
     pub publication_started: bool,
+    /// Set only by the atomic final-audio settlement transaction.
+    #[serde(default)]
+    pub final_audio_published: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -85,6 +88,7 @@ impl SpeechCheckpoint {
             max_journal_bytes,
             active_segment: None,
             publication_started: false,
+            final_audio_published: false,
         })
     }
 

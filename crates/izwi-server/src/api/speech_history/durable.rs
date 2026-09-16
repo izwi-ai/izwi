@@ -1,6 +1,8 @@
 use super::*;
 use crate::api::tts_long_form::{generate_speech_plan_stream_with_progress, SpeechTextPlan};
+use crate::artifact_store::{ArtifactFileWrite, ArtifactRetention};
 use crate::batch_runtime::speech_progress::{SpeechCheckpoint, SpeechPcmBatch};
+use crate::batch_runtime::store::SpeechHistoryFinalization;
 
 pub(crate) struct DurableSpeechProgress {
     state: AppState,
@@ -8,6 +10,18 @@ pub(crate) struct DurableSpeechProgress {
     artifact_tenant: crate::artifact_store::ArtifactTenant,
     checkpoint: SpeechCheckpoint,
 }
+
+fn opaque_final_audio_enabled() -> bool {
+    matches!(
+        std::env::var("IZWI_TTS_OPAQUE_FINAL_WAV_ENABLED")
+            .ok()
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
 impl DurableSpeechProgress {
     async fn new(
         state: &AppState,
@@ -283,6 +297,65 @@ pub(super) async fn synthesize_fish_record(
             .await?;
         let filename = default_audio_filename(route_kind, "wav");
         let checksum = sha256_file(file.path()).await?;
+        let duration = file.sample_count() as f64 / file.sample_rate() as f64;
+        if let Some(attempt) = attempt.filter(|_| opaque_final_audio_enabled()) {
+            projection_attempt
+                .context("Speech final audio settlement is missing its projection attempt")?;
+            let mut final_checkpoint = progress
+                .as_ref()
+                .context("Speech final audio settlement is missing its checkpoint")?
+                .checkpoint
+                .clone();
+            final_checkpoint.final_audio_published = true;
+            let artifact = state
+                .artifact_store
+                .put_attempt_speech_history_file(
+                    &crate::artifact_store::ArtifactTenant::from_scheduling_key(tenant_key),
+                    attempt.lease(),
+                    ArtifactFileWrite {
+                        content_type: "audio/wav".to_string(),
+                        filename: Some(filename.clone()),
+                        path: file.path().to_path_buf(),
+                        size_bytes: file.len(),
+                        sha256: checksum,
+                        retention: ArtifactRetention::Durable,
+                    },
+                    SpeechHistoryFinalization {
+                        route_kind,
+                        record_id: record_id.clone(),
+                        model_id: Some(model_id),
+                        speaker: req.speaker.clone(),
+                        language: req.language.clone(),
+                        saved_voice_id: req.saved_voice_id.clone(),
+                        speed: req.speed.map(f64::from),
+                        input_text: input_text.clone(),
+                        voice_description: req.voice_description.clone(),
+                        reference_text: req.reference_text.clone(),
+                        generation_time_ms: stats.execution_ms as f64,
+                        audio_duration_secs: Some(duration),
+                        rtf: Some(if duration > 0.0 {
+                            stats.execution_ms as f64 / 1000.0 / duration
+                        } else {
+                            0.0
+                        }),
+                        tokens_generated: Some(stats.tokens),
+                        audio_mime_type: "audio/wav".to_string(),
+                        audio_filename: Some(filename.clone()),
+                        artifact_metadata_json: serde_json::json!({
+                            "sample_rate": file.sample_rate(),
+                            "sample_count": file.sample_count(),
+                        }),
+                        progress: serde_json::to_value(final_checkpoint)?,
+                    },
+                )
+                .await?;
+            let record = state
+                .speech_history_store
+                .get_record(route_kind, record_id)
+                .await?
+                .context("Speech final audio settlement did not produce a route record")?;
+            return Ok::<_, anyhow::Error>((record, Some(artifact)));
+        }
         let mut storage_key = state
             .media_ingest
             .persist_generated_audio_file(
@@ -330,7 +403,6 @@ pub(super) async fn synthesize_fish_record(
         } else {
             None
         };
-        let duration = file.sample_count() as f64 / file.sample_rate() as f64;
         let completion = CompleteSpeechHistoryRecord {
             model_id: Some(model_id),
             speaker: req.speaker,

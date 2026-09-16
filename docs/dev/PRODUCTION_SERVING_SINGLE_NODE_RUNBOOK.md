@@ -427,17 +427,20 @@ provider key. `NotFound` means both absent and unable to commit later for that
 expired write ID. The reservation ledger is capped at 65,536 and each cleanup
 scan at 64. New durable Fish PCM replay chunks use tenant-scoped opaque artifact
 IDs and an atomic attempt-publication transaction; provider keys remain private.
-Existing raw-key replay rows stay compatible. Final WAVs, saved voices, history
-audio producers, references, other media, and gateway audio transport retain
-their existing provider path until explicitly migrated. Speech-history storage
-can consume an exact tenant-scoped opaque reference and exposes it through the
-existing bounded streaming response; it rejects incomplete, ambiguous, wrong-
-tenant, metadata-mismatched, or multiply-owned references. Opaque deletion
-atomically removes the history row, tombstones the media row, and retains its
-bounded cleanup intent; provider failure leaves that intent for retry. Opaque
-completion and replacement deliberately fail until transactional settlement is
-enabled. This consumer and deletion support does not by itself migrate a
-producer or enable a gateway audio route.
+Existing raw-key replay rows stay compatible. Durable Fish final WAV publication
+can be enabled with `IZWI_TTS_OPAQUE_FINAL_WAV_ENABLED=1` after the reserved-file
+provider and atomic settlement checks pass; the default remains legacy for
+rollout safety. Saved voices, other history-audio producers, references, other
+media, and gateway audio transport retain their existing provider path until
+explicitly migrated. Speech-history storage can consume an exact tenant-scoped
+opaque reference and exposes it through the existing bounded streaming
+response; it rejects incomplete, ambiguous, wrong-tenant, metadata-mismatched,
+or multiply-owned references. Opaque deletion atomically removes the history
+row, tombstones the media row, and retains its bounded cleanup intent; provider
+failure leaves that intent for retry. The final settlement transaction binds
+the opaque media, exact attempt output, Ready projection, checkpoint, stage,
+job, and reservation in one commit. This does not enable a gateway audio route
+or migrate the remaining local producers.
 
 Reserved-write protocol v1 exposes reserved file publication as a separate
 capability. The built-in local provider streams a finalized file with a fixed

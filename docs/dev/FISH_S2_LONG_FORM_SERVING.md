@@ -60,15 +60,21 @@ deletion retains a durable cleanup intent across provider failure. Existing
 raw-key replay rows remain supported for local upgrade compatibility. Speech
 history can consume and stream an exact tenant-scoped opaque artifact reference.
 Deletion atomically removes that reference while tombstoning the artifact and
-retaining its cleanup intent. Completion stays fenced until final-audio and
-history settlement is transactional. The Fish producer does not publish the
-final WAV through that path yet.
+retaining its cleanup intent. Durable Fish final WAV publication is now
+available behind the default-off `IZWI_TTS_OPAQUE_FINAL_WAV_ENABLED` rollout
+gate: a reserved file write is atomically settled with the opaque media row,
+exact attempt output, Ready history projection, final checkpoint marker, stage,
+job, and reservation consumption. When the gate is disabled, local and durable
+Fish requests keep the legacy provider path. Other speech producers remain on
+their existing path until separately migrated.
 
-The provider contract includes an explicit reserved-file capability for that
-future final-WAV migration. It copies and hashes finalized spools with fixed
-64 KiB buffers and retains the same write-ID expiry/recovery fence. A provider
-that supports reserved byte writes but not reserved files must keep final-WAV
-fleet readiness disabled; there is no fallback to an unreserved file upload.
+The provider contract includes an explicit reserved-file capability for final
+WAV publication. It copies and hashes finalized spools with fixed 64 KiB
+buffers and retains the same write-ID expiry/recovery fence. A provider that
+supports reserved byte writes but not reserved files must keep the final-WAV
+gate disabled; there is no fallback to an unreserved file upload. Enable the
+gate only after the serialized settlement and restart/failure tests pass for
+the selected provider.
 
 Media providers must implement reserved writes plus the bounded file publication
 and streaming read interfaces used by long speech. A legacy whole-byte
