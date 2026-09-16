@@ -26,6 +26,7 @@ const DEFAULT_TENANT_ID: &str = "default";
 
 const API_KEY_REF_ENV: &str = "IZWI_GATEWAY_API_KEY_REF";
 const METRICS_API_KEY_REF_ENV: &str = "IZWI_GATEWAY_METRICS_API_KEY_REF";
+const ADMIN_API_KEY_REF_ENV: &str = "IZWI_GATEWAY_ADMIN_API_KEY_REF";
 const PRINCIPAL_ID_ENV: &str = "IZWI_GATEWAY_API_PRINCIPAL_ID";
 const TENANT_ID_ENV: &str = "IZWI_GATEWAY_TENANT_ID";
 const MAX_CHAT_BODY_ENV: &str = "IZWI_GATEWAY_MAX_CHAT_BODY_BYTES";
@@ -37,6 +38,8 @@ pub struct GatewayPerimeterConfig {
     api_key_ref: Arc<str>,
     metrics_api_key: Option<Arc<[u8]>>,
     metrics_api_key_ref: Option<Arc<str>>,
+    admin_api_key: Option<Arc<[u8]>>,
+    admin_api_key_ref: Option<Arc<str>>,
     principal: Principal,
     max_chat_body_bytes: usize,
     trusted_ingress_tls: bool,
@@ -53,6 +56,11 @@ impl fmt::Debug for GatewayPerimeterConfig {
                 &self.metrics_api_key.as_ref().map(|_| "[REDACTED]"),
             )
             .field("metrics_api_key_ref", &self.metrics_api_key_ref)
+            .field(
+                "admin_api_key",
+                &self.admin_api_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("admin_api_key_ref", &self.admin_api_key_ref)
             .field("principal", &"[REDACTED]")
             .field("max_chat_body_bytes", &self.max_chat_body_bytes)
             .field("trusted_ingress_tls", &self.trusted_ingress_tls)
@@ -79,6 +87,7 @@ impl GatewayPerimeterConfig {
             .into_string()
             .map_err(|_| GatewayPerimeterConfigError::InvalidSecret)?;
         let metrics_credential = optional_metrics_credential_from_env()?;
+        let admin_credential = optional_admin_credential_from_env(&api_key)?;
         let principal_id = bounded_identity_env(PRINCIPAL_ID_ENV, DEFAULT_PRINCIPAL_ID)?;
         let tenant_id = bounded_identity_env(TENANT_ID_ENV, DEFAULT_TENANT_ID)?;
         let max_chat_body_bytes = bounded_body_limit_from_env()?;
@@ -91,6 +100,7 @@ impl GatewayPerimeterConfig {
             max_chat_body_bytes,
             trusted_ingress_tls,
             metrics_credential,
+            admin_credential,
         )
     }
 
@@ -108,6 +118,7 @@ impl GatewayPerimeterConfig {
             "test-tenant".to_string(),
             max_chat_body_bytes,
             true,
+            None,
             None,
         )
     }
@@ -128,6 +139,22 @@ impl GatewayPerimeterConfig {
         Ok(self)
     }
 
+    #[doc(hidden)]
+    pub fn with_admin_api_key_for_test(
+        mut self,
+        admin_api_key: impl Into<String>,
+    ) -> Result<Self, GatewayPerimeterConfigError> {
+        let admin_api_key = admin_api_key.into();
+        validate_secret(&admin_api_key)
+            .map_err(|_| GatewayPerimeterConfigError::InvalidAdminSecret)?;
+        if constant_time_eq(admin_api_key.as_bytes(), self.api_key.as_ref()) {
+            return Err(GatewayPerimeterConfigError::ReusedAdminSecret);
+        }
+        self.admin_api_key = Some(Arc::from(admin_api_key.into_bytes()));
+        self.admin_api_key_ref = Some(Arc::from("test-only"));
+        Ok(self)
+    }
+
     fn new(
         api_key: String,
         api_key_ref: String,
@@ -136,6 +163,7 @@ impl GatewayPerimeterConfig {
         max_chat_body_bytes: usize,
         trusted_ingress_tls: bool,
         metrics_credential: Option<(String, String)>,
+        admin_credential: Option<(String, String)>,
     ) -> Result<Self, GatewayPerimeterConfigError> {
         validate_secret(&api_key)?;
         if metrics_credential
@@ -145,6 +173,11 @@ impl GatewayPerimeterConfig {
             })
         {
             return Err(GatewayPerimeterConfigError::ReusedMetricsSecret);
+        }
+        if admin_credential.as_ref().is_some_and(|(admin_api_key, _)| {
+            constant_time_eq(admin_api_key.as_bytes(), api_key.as_bytes())
+        }) {
+            return Err(GatewayPerimeterConfigError::ReusedAdminSecret);
         }
         if !(MIN_GATEWAY_CHAT_BODY_BYTES..=MAX_GATEWAY_CHAT_BODY_BYTES)
             .contains(&max_chat_body_bytes)
@@ -161,6 +194,10 @@ impl GatewayPerimeterConfig {
                 .as_ref()
                 .map(|(secret, _)| Arc::from(secret.as_bytes())),
             metrics_api_key_ref: metrics_credential.map(|(_, secret_ref)| Arc::from(secret_ref)),
+            admin_api_key: admin_credential
+                .as_ref()
+                .map(|(secret, _)| Arc::from(secret.as_bytes())),
+            admin_api_key_ref: admin_credential.map(|(_, secret_ref)| Arc::from(secret_ref)),
             principal: Principal {
                 id: principal_id,
                 display_name: None,
@@ -186,6 +223,16 @@ impl GatewayPerimeterConfig {
 
     pub(crate) fn authenticate_metrics(&self, headers: &HeaderMap) -> bool {
         self.metrics_api_key
+            .as_deref()
+            .is_some_and(|expected| authenticate_bearer(headers, expected))
+    }
+
+    pub(crate) fn admin_enabled(&self) -> bool {
+        self.admin_api_key.is_some()
+    }
+
+    pub(crate) fn authenticate_admin(&self, headers: &HeaderMap) -> bool {
+        self.admin_api_key
             .as_deref()
             .is_some_and(|expected| authenticate_bearer(headers, expected))
     }
@@ -266,6 +313,14 @@ pub enum GatewayPerimeterConfigError {
     InvalidMetricsSecret,
     #[error("gateway metrics API key must differ from the public inference key")]
     ReusedMetricsSecret,
+    #[error("gateway admin API key reference must be a bounded env:VARIABLE reference")]
+    InvalidAdminSecretReference,
+    #[error("gateway admin API key environment reference is not set")]
+    MissingAdminSecret,
+    #[error("gateway admin API key does not satisfy the bounded credential policy")]
+    InvalidAdminSecret,
+    #[error("gateway admin API key must differ from the public inference key")]
+    ReusedAdminSecret,
     #[error("gateway principal or tenant identity is invalid")]
     InvalidIdentity,
     #[error("gateway chat body limit is outside the supported range")]
@@ -300,6 +355,33 @@ fn optional_metrics_credential_from_env(
         .into_string()
         .map_err(|_| GatewayPerimeterConfigError::InvalidMetricsSecret)?;
     validate_secret(&secret).map_err(|_| GatewayPerimeterConfigError::InvalidMetricsSecret)?;
+    Ok(Some((secret, secret_ref)))
+}
+
+fn optional_admin_credential_from_env(
+    inference_key: &str,
+) -> Result<Option<(String, String)>, GatewayPerimeterConfigError> {
+    let Some(secret_ref) = std::env::var_os(ADMIN_API_KEY_REF_ENV) else {
+        return Ok(None);
+    };
+    let secret_ref = secret_ref
+        .into_string()
+        .map_err(|_| GatewayPerimeterConfigError::InvalidAdminSecretReference)?;
+    if secret_ref.is_empty() || secret_ref.len() > MAX_SECRET_REF_BYTES {
+        return Err(GatewayPerimeterConfigError::InvalidAdminSecretReference);
+    }
+    let variable = secret_ref
+        .strip_prefix("env:")
+        .filter(|name| valid_env_name(name))
+        .ok_or(GatewayPerimeterConfigError::InvalidAdminSecretReference)?;
+    let secret = std::env::var_os(variable)
+        .ok_or(GatewayPerimeterConfigError::MissingAdminSecret)?
+        .into_string()
+        .map_err(|_| GatewayPerimeterConfigError::InvalidAdminSecret)?;
+    validate_secret(&secret).map_err(|_| GatewayPerimeterConfigError::InvalidAdminSecret)?;
+    if constant_time_eq(secret.as_bytes(), inference_key.as_bytes()) {
+        return Err(GatewayPerimeterConfigError::ReusedAdminSecret);
+    }
     Ok(Some((secret, secret_ref)))
 }
 
@@ -533,6 +615,7 @@ mod tests {
             DEFAULT_GATEWAY_MAX_CHAT_BODY_BYTES,
             false,
             None,
+            None,
         )
         .unwrap();
         let defaults = ServeRuntimeConfig::default();
@@ -563,6 +646,7 @@ mod tests {
             "tenant".to_string(),
             DEFAULT_GATEWAY_MAX_CHAT_BODY_BYTES,
             true,
+            None,
             None,
         )
         .unwrap();

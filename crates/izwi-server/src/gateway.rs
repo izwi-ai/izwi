@@ -619,6 +619,40 @@ async fn api_not_found() -> StatusCode {
     StatusCode::NOT_FOUND
 }
 
+async fn gateway_drain(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
+    if !state.perimeter.admin_enabled() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if !state.perimeter.authenticate_admin(&headers) {
+        let mut response = StatusCode::UNAUTHORIZED.into_response();
+        response.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            axum::http::HeaderValue::from_static("Bearer realm=\"izwi-gateway-admin\""),
+        );
+        return response;
+    }
+    state.begin_drain();
+    let lifecycle = state.lifecycle.snapshot();
+    (
+        StatusCode::ACCEPTED,
+        Json(GatewayDrainResponse {
+            status: "draining",
+            draining: true,
+            ready: !lifecycle.ready,
+            uptime_secs: now_saturating_sub(lifecycle.started_at),
+        }),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Serialize)]
+struct GatewayDrainResponse {
+    status: &'static str,
+    draining: bool,
+    ready: bool,
+    uptime_secs: u64,
+}
+
 async fn gateway_metrics(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
     if !state.perimeter.metrics_enabled() {
         return StatusCode::NOT_FOUND.into_response();
@@ -780,6 +814,7 @@ pub fn create_gateway_router(state: GatewayState, serve_config: &ServeRuntimeCon
     let app = Router::new()
         .route("/livez", get(live_check))
         .route("/readyz", get(ready_check))
+        .route("/internal/admin/drain", post(gateway_drain))
         .route("/internal/metrics", get(gateway_metrics))
         .route("/internal/metrics/prometheus", get(gateway_metrics))
         .route(
@@ -891,6 +926,23 @@ mod tests {
     fn get(path: &str) -> Request<Body> {
         Request::builder()
             .uri(path)
+            .body(Body::empty())
+            .expect("request should build")
+    }
+
+    fn post(path: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .body(Body::empty())
+            .expect("request should build")
+    }
+
+    fn post_with_bearer(path: &str, bearer: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("authorization", format!("Bearer {bearer}"))
             .body(Body::empty())
             .expect("request should build")
     }
@@ -1932,6 +1984,65 @@ mod tests {
         assert_eq!(snapshot.auth_rejections, 2);
         assert_eq!(snapshot.http_2xx, 1);
         assert_eq!(snapshot.http_4xx, 2);
+    }
+
+    #[tokio::test]
+    async fn admin_drain_endpoint_requires_its_own_key_and_404s_without_it() {
+        let app = create_gateway_router(
+            unreachable_gateway_state(test_perimeter()),
+            &ServeRuntimeConfig::default(),
+        );
+        assert_eq!(
+            send_raw(app.clone(), post("/internal/admin/drain"))
+                .await
+                .status(),
+            StatusCode::NOT_FOUND,
+            "drain endpoint must 404 when admin key is not configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_drain_endpoint_rejects_inference_key_and_accepts_admin_key() {
+        const TEST_ADMIN_API_KEY: &str = "test-admin-api-key-999888";
+        let perimeter = test_perimeter()
+            .with_admin_api_key_for_test(TEST_ADMIN_API_KEY)
+            .unwrap();
+        let state = unreachable_gateway_state(perimeter);
+        let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
+        assert_eq!(
+            send_raw(
+                app.clone(),
+                post_with_bearer("/internal/admin/drain", TEST_API_KEY)
+            )
+            .await
+            .status(),
+            StatusCode::UNAUTHORIZED,
+            "public inference key must not authorize admin drain"
+        );
+        let response = send_raw(
+            app.clone(),
+            post_with_bearer("/internal/admin/drain", TEST_ADMIN_API_KEY),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let lifecycle = state.lifecycle.snapshot();
+        assert!(
+            lifecycle.draining,
+            "drain endpoint must set the draining flag"
+        );
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["status"], "draining");
+        assert_eq!(body["draining"], true);
+        assert_eq!(
+            send_raw(app, post("/internal/admin/drain")).await.status(),
+            StatusCode::UNAUTHORIZED,
+            "drain without auth still 401s even after drain started"
+        );
     }
 
     #[tokio::test]
