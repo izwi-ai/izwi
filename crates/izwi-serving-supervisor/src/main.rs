@@ -87,9 +87,53 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
 
     let started_at = Instant::now();
     let mut metrics = SupervisorMetrics::default();
+
+    if let Some(canary_id) = options.canary_worker_id.as_ref() {
+        let canary_index = slots
+            .iter()
+            .position(|slot| &slot.worker_id == canary_id)
+            .ok_or_else(|| SupervisorError::CanaryWorkerNotFound {
+                worker_id: canary_id.clone(),
+            })?;
+        eprintln!(
+            "launching canary worker {} first; remaining workers will start after it reaches readiness",
+            canary_id
+        );
+        launch_slot(
+            &node,
+            &locks,
+            &inherited_environment,
+            &mut slots[canary_index],
+            &mut shutdown_rx,
+            started_at,
+            &mut metrics,
+        )
+        .await;
+        if slots[canary_index].process.is_none() {
+            eprintln!(
+                "canary worker {} failed to reach readiness; aborting rollout",
+                canary_id
+            );
+            return Err(SupervisorError::CanaryReadinessFailed {
+                worker_id: canary_id.clone(),
+            });
+        }
+        eprintln!(
+            "canary worker {} is ready; launching remaining workers",
+            canary_id
+        );
+    }
+
     for slot in &mut slots {
         if *shutdown_rx.borrow() {
             break;
+        }
+        if options
+            .canary_worker_id
+            .as_ref()
+            .is_some_and(|id| &slot.worker_id == id)
+        {
+            continue;
         }
         launch_slot(
             &node,
@@ -656,6 +700,7 @@ struct CliOptions {
     cpu_ids: Vec<u16>,
     allocatable_host_memory_bytes: u64,
     validate_only: bool,
+    canary_worker_id: Option<WorkerId>,
 }
 
 enum ParseOutcome {
@@ -679,6 +724,7 @@ impl CliOptions {
         let mut cpu_ids = None;
         let mut allocatable_host_memory_bytes = None;
         let mut validate_only = false;
+        let mut canary_worker_id = None;
         let mut index = 0;
         while index < arguments.len() {
             let name = arguments[index]
@@ -717,6 +763,14 @@ impl CliOptions {
                         .ok_or_else(|| SupervisorError::InvalidOption(name.to_string()))?;
                     set_once(&mut allocatable_host_memory_bytes, parsed, name)?;
                 }
+                "--canary-worker-id" => {
+                    let value = value
+                        .to_str()
+                        .ok_or_else(|| SupervisorError::InvalidOption(name.to_string()))?;
+                    let id = WorkerId::new(value)
+                        .map_err(|_| SupervisorError::InvalidOption(name.to_string()))?;
+                    set_once(&mut canary_worker_id, id, name)?;
+                }
                 _ => return Err(SupervisorError::UnknownOption(name.to_string())),
             }
             index += 2;
@@ -730,6 +784,7 @@ impl CliOptions {
                 SupervisorError::MissingOption("--allocatable-host-memory-bytes"),
             )?,
             validate_only,
+            canary_worker_id,
         }))
     }
 }
@@ -821,6 +876,10 @@ enum SupervisorError {
         environment: String,
         source: izwi_serving_protocol::IdentifierError,
     },
+    #[error("canary worker {worker_id} was not found in the node configuration")]
+    CanaryWorkerNotFound { worker_id: WorkerId },
+    #[error("canary worker {worker_id} failed to reach readiness; rollout aborted")]
+    CanaryReadinessFailed { worker_id: WorkerId },
 }
 
 #[cfg(test)]
@@ -1038,5 +1097,67 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn canary_worker_id_is_parsed_and_validated() {
+        let ParseOutcome::Run(options) = CliOptions::parse([
+            OsString::from("--config"),
+            OsString::from("/x"),
+            OsString::from("--cpu-worker-binary"),
+            OsString::from("/w"),
+            OsString::from("--cpu-ids"),
+            OsString::from("0,1"),
+            OsString::from("--allocatable-host-memory-bytes"),
+            OsString::from("4294967296"),
+            OsString::from("--canary-worker-id"),
+            OsString::from("canary-worker-1"),
+        ])
+        .unwrap() else {
+            panic!("expected Run outcome");
+        };
+        assert_eq!(
+            options.canary_worker_id.as_ref().unwrap().as_str(),
+            "canary-worker-1"
+        );
+    }
+
+    #[test]
+    fn canary_worker_id_is_optional() {
+        let ParseOutcome::Run(options) = CliOptions::parse([
+            OsString::from("--config"),
+            OsString::from("/x"),
+            OsString::from("--cpu-worker-binary"),
+            OsString::from("/w"),
+            OsString::from("--cpu-ids"),
+            OsString::from("0,1"),
+            OsString::from("--allocatable-host-memory-bytes"),
+            OsString::from("4294967296"),
+        ])
+        .unwrap() else {
+            panic!("expected Run outcome");
+        };
+        assert!(options.canary_worker_id.is_none());
+    }
+
+    #[test]
+    fn duplicate_canary_worker_id_is_rejected() {
+        let result = CliOptions::parse([
+            OsString::from("--config"),
+            OsString::from("/x"),
+            OsString::from("--cpu-worker-binary"),
+            OsString::from("/w"),
+            OsString::from("--cpu-ids"),
+            OsString::from("0,1"),
+            OsString::from("--allocatable-host-memory-bytes"),
+            OsString::from("4294967296"),
+            OsString::from("--canary-worker-id"),
+            OsString::from("canary-1"),
+            OsString::from("--canary-worker-id"),
+            OsString::from("canary-2"),
+        ]);
+        assert!(result.is_err());
+        let error = result.err().unwrap().to_string();
+        assert!(error.contains("repeated"));
     }
 }
