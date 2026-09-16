@@ -2355,6 +2355,481 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn speech_final_file_settlement_recovers_after_provider_write_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let provider = Arc::new(MemoryMediaProvider::default());
+        let db_path = root.path().join("speech-provider-fail.sqlite3");
+        let metadata = Arc::new(BatchRuntimeStore::initialize_with_database(
+            StoreDatabase::new(db_path),
+        ));
+        let mut store = ArtifactStore::new(
+            metadata.clone(),
+            provider.clone(),
+            ArtifactStoreLimits {
+                max_file_object_bytes: 256 * 1024,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        store.set_reservation_lifetime_for_test(Duration::from_millis(10));
+        let tenant = ArtifactTenant::from_scheduling_key(None);
+        let record_id = "speech-provider-fail";
+        let lease = active_tts_speech_lease(&metadata, None, record_id).await;
+
+        provider.set_now_unix_ms(u64::MAX);
+
+        let bytes = vec![0x7a; 2048];
+        let path = root.path().join("speech.wav");
+        tokio::fs::write(&path, &bytes).await.unwrap();
+
+        let result = store
+            .put_attempt_speech_history_file(
+                &tenant,
+                &lease,
+                ArtifactFileWrite {
+                    content_type: "audio/wav".into(),
+                    filename: Some("speech.wav".into()),
+                    path,
+                    size_bytes: bytes.len() as u64,
+                    sha256: sha256_hex(&bytes),
+                    retention: ArtifactRetention::Durable,
+                },
+                SpeechHistoryFinalization {
+                    route_kind: SpeechRouteKind::TextToSpeech,
+                    record_id: record_id.into(),
+                    model_id: Some("FishAudio-S2-Pro".into()),
+                    speaker: None,
+                    language: None,
+                    saved_voice_id: None,
+                    speed: None,
+                    input_text: "fixture".into(),
+                    voice_description: None,
+                    reference_text: None,
+                    generation_time_ms: 1.0,
+                    audio_duration_secs: Some(0.1),
+                    rtf: Some(0.01),
+                    tokens_generated: Some(1),
+                    audio_mime_type: "audio/wav".into(),
+                    audio_filename: Some("speech.wav".into()),
+                    artifact_metadata_json: serde_json::json!({
+                        "sample_rate": 16_000,
+                        "sample_count": 800,
+                    }),
+                    progress: serde_json::json!({"final_audio_published": true}),
+                },
+            )
+            .await;
+        assert!(
+            matches!(result, Err(ArtifactStoreError::Provider)),
+            "provider failure should return Provider error"
+        );
+        assert_eq!(
+            provider.object_count(),
+            0,
+            "no provider object should exist after a failed write"
+        );
+
+        use sea_orm::ConnectionTrait;
+        let connection = metadata.connection().await.unwrap();
+        let reservation_count = connection
+            .query_one_raw(
+                crate::db::raw::statement(
+                    connection,
+                    "SELECT COUNT(*) FROM provider_write_reservations WHERE state = 'cleanup_pending'",
+                    vec![],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get_by_index::<i64>(0)
+            .unwrap();
+        assert_eq!(
+            reservation_count, 1,
+            "abandoned reservation should be cleanup_pending"
+        );
+
+        provider.set_now_unix_ms(0);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let report = store.cleanup_due(64).await.unwrap();
+        assert_eq!(
+            report.completed, 1,
+            "cleanup should delete the abandoned reservation"
+        );
+        assert_eq!(provider.object_count(), 0);
+        let remaining = connection
+            .query_one_raw(
+                crate::db::raw::statement(
+                    connection,
+                    "SELECT COUNT(*) FROM provider_write_reservations",
+                    vec![],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get_by_index::<i64>(0)
+            .unwrap();
+        assert_eq!(remaining, 0, "all reservations should be cleaned up");
+    }
+
+    #[tokio::test]
+    async fn speech_final_file_settlement_recovers_orphaned_stored_reservation_after_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let provider = Arc::new(MemoryMediaProvider::default());
+        let db_path = root.path().join("speech-crash-reopen.sqlite3");
+        let metadata = Arc::new(BatchRuntimeStore::initialize_with_database(
+            StoreDatabase::new(db_path.clone()),
+        ));
+        let mut store = ArtifactStore::new(
+            metadata.clone(),
+            provider.clone(),
+            ArtifactStoreLimits {
+                max_file_object_bytes: 256 * 1024,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        store.set_reservation_lifetime_for_test(Duration::from_millis(10));
+        let tenant = ArtifactTenant::from_scheduling_key(None);
+        let record_id = "speech-crash-reopen";
+        let _lease = active_tts_speech_lease(&metadata, None, record_id).await;
+        let bytes = vec![0x42; 1024];
+        let path = root.path().join("speech.wav");
+        tokio::fs::write(&path, &bytes).await.unwrap();
+
+        let stored = store
+            .store_reserved_file(
+                &tenant,
+                ArtifactFileWrite {
+                    content_type: "audio/wav".into(),
+                    filename: Some("speech.wav".into()),
+                    path: path.clone(),
+                    size_bytes: bytes.len() as u64,
+                    sha256: sha256_hex(&bytes),
+                    retention: ArtifactRetention::Durable,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(provider.object_count(), 1, "provider object should exist");
+
+        drop(store);
+        drop(metadata);
+
+        let reopened_metadata = Arc::new(BatchRuntimeStore::initialize_with_database(
+            StoreDatabase::new(db_path),
+        ));
+        let reopened_store = ArtifactStore::new(
+            reopened_metadata.clone(),
+            provider.clone(),
+            ArtifactStoreLimits {
+                max_file_object_bytes: 256 * 1024,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        use sea_orm::ConnectionTrait;
+        let connection = reopened_metadata.connection().await.unwrap();
+        let state = connection
+            .query_one_raw(
+                crate::db::raw::statement(
+                    connection,
+                    "SELECT state FROM provider_write_reservations LIMIT 1",
+                    vec![],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get_by_index::<String>(0)
+            .unwrap();
+        assert_eq!(
+            state, "stored",
+            "reservation should still be stored after reopen"
+        );
+
+        let history_status = connection
+            .query_one_raw(
+                crate::db::raw::statement(
+                    connection,
+                    "SELECT processing_status FROM speech_history_records WHERE id = ?1",
+                    vec![record_id.into()],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get_by_index::<String>(0)
+            .unwrap();
+        assert_eq!(
+            history_status, "processing",
+            "history record should still be processing"
+        );
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let report = reopened_store.cleanup_due(64).await.unwrap();
+        assert_eq!(
+            report.completed, 1,
+            "cleanup should recover the orphaned stored reservation"
+        );
+        assert_eq!(
+            provider.object_count(),
+            0,
+            "provider object should be deleted after cleanup"
+        );
+
+        let _ = stored;
+    }
+
+    #[tokio::test]
+    async fn speech_final_file_settlement_replacement_settles_after_stale_attempt_loses_ownership()
+    {
+        let root = tempfile::tempdir().unwrap();
+        let provider = Arc::new(MemoryMediaProvider::default());
+        let metadata = Arc::new(BatchRuntimeStore::initialize_with_database(
+            StoreDatabase::new(root.path().join("speech-stale-reclaim.sqlite3")),
+        ));
+        let mut store = ArtifactStore::new(
+            metadata.clone(),
+            provider.clone(),
+            ArtifactStoreLimits {
+                max_file_object_bytes: 256 * 1024,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        store.set_reservation_lifetime_for_test(Duration::from_millis(10));
+        let tenant = ArtifactTenant::from_scheduling_key(None);
+        let record_id = "speech-stale-reclaim";
+
+        let job = metadata
+            .create_job(NewRuntimeJob {
+                job_kind: RuntimeJobKind::TtsSpeech,
+                status: RuntimeJobStatus::Queued,
+                priority: 0,
+                model_id: Some("FishAudio-S2-Pro".into()),
+                capability: Some("tts".into()),
+                route_record_kind: Some(SpeechRouteKind::TextToSpeech.as_db_value().into()),
+                route_record_id: Some(record_id.to_string()),
+                input_media_asset_id: None,
+                input_text_asset_id: None,
+                request_json: serde_json::json!({"tenant_key": None::<[u8;32]>}),
+                model_snapshot_json: serde_json::json!({"version": 1}),
+                retry_policy_json: serde_json::json!({}),
+                max_attempts: 2,
+                idempotency_key: None,
+                correlation_id: None,
+            })
+            .await
+            .unwrap();
+        metadata
+            .create_stage(NewJobStage {
+                job_id: job.id,
+                sequence: 0,
+                stage_kind: "tts_synthesize".into(),
+                status: RuntimeStageStatus::Queued,
+                capability: Some("tts".into()),
+                model_id: Some("FishAudio-S2-Pro".into()),
+                max_attempts: 2,
+                input_artifact_ids: vec![],
+            })
+            .await
+            .unwrap();
+        let first_claimed = metadata
+            .claim_next_stage("stale-worker", 60_000)
+            .await
+            .unwrap()
+            .unwrap();
+        let first_lease = first_claimed.lease().unwrap();
+        {
+            use sea_orm::ConnectionTrait;
+            let connection = metadata.connection().await.unwrap();
+            connection
+                .execute_raw(
+                    crate::db::raw::statement(
+                        connection,
+                        r#"
+                        INSERT INTO speech_history_records (
+                            id, created_at, route_kind, processing_status, model_id,
+                            input_text, generation_time_ms, audio_mime_type,
+                            audio_filename, audio_storage_path, audio_media_asset_id,
+                            audio_artifact_tenant, runtime_stage_id, runtime_attempt_token
+                        ) VALUES (?1, 1, 'text_to_speech', 'processing', 'FishAudio-S2-Pro',
+                                  'fixture', 0.0, 'audio/wav', 'speech.wav', '', NULL,
+                                  NULL, ?2, ?3)
+                        "#,
+                        vec![
+                            record_id.into(),
+                            first_lease.stage_id.clone().into(),
+                            first_lease.attempt_token.clone().into(),
+                        ],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let first_bytes = vec![0x31; 2048];
+        let first_path = root.path().join("speech-first.wav");
+        tokio::fs::write(&first_path, &first_bytes).await.unwrap();
+        let first_stored = store
+            .store_reserved_file(
+                &tenant,
+                ArtifactFileWrite {
+                    content_type: "audio/wav".into(),
+                    filename: Some("speech.wav".into()),
+                    path: first_path,
+                    size_bytes: first_bytes.len() as u64,
+                    sha256: sha256_hex(&first_bytes),
+                    retention: ArtifactRetention::Durable,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            provider.object_count(),
+            1,
+            "first provider object should exist"
+        );
+
+        metadata
+            .fail_stage(
+                &first_lease,
+                true,
+                Some("stale_error".into()),
+                Some("stale".into()),
+            )
+            .await
+            .unwrap();
+
+        use sea_orm::ConnectionTrait;
+        let connection = metadata.connection().await.unwrap();
+        let first_reservation_state = connection
+            .query_one_raw(
+                crate::db::raw::statement(
+                    connection,
+                    "SELECT state FROM provider_write_reservations WHERE write_id = ?1",
+                    vec![first_stored.reservation.write_id.clone().into()],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get_by_index::<String>(0)
+            .unwrap();
+        assert_eq!(
+            first_reservation_state, "stored",
+            "first reservation should still be stored (settlement never attempted)"
+        );
+
+        let second_lease = metadata
+            .claim_next_stage("replacement-worker", 60_000)
+            .await
+            .unwrap()
+            .unwrap()
+            .lease()
+            .unwrap();
+
+        {
+            use sea_orm::ConnectionTrait;
+            let connection = metadata.connection().await.unwrap();
+            connection
+                .execute_raw(
+                    crate::db::raw::statement(
+                        connection,
+                        r#"
+                        UPDATE speech_history_records
+                        SET runtime_stage_id = ?1, runtime_attempt_token = ?2,
+                            processing_status = 'processing'
+                        WHERE id = ?3
+                        "#,
+                        vec![
+                            second_lease.stage_id.clone().into(),
+                            second_lease.attempt_token.clone().into(),
+                            record_id.into(),
+                        ],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let second_bytes = vec![0x52; 4096];
+        let second_path = root.path().join("speech-second.wav");
+        tokio::fs::write(&second_path, &second_bytes).await.unwrap();
+        let artifact = store
+            .put_attempt_speech_history_file(
+                &tenant,
+                &second_lease,
+                ArtifactFileWrite {
+                    content_type: "audio/wav".into(),
+                    filename: Some("speech.wav".into()),
+                    path: second_path,
+                    size_bytes: second_bytes.len() as u64,
+                    sha256: sha256_hex(&second_bytes),
+                    retention: ArtifactRetention::Durable,
+                },
+                SpeechHistoryFinalization {
+                    route_kind: SpeechRouteKind::TextToSpeech,
+                    record_id: record_id.into(),
+                    model_id: Some("FishAudio-S2-Pro".into()),
+                    speaker: None,
+                    language: None,
+                    saved_voice_id: None,
+                    speed: None,
+                    input_text: "fixture".into(),
+                    voice_description: None,
+                    reference_text: None,
+                    generation_time_ms: 2.0,
+                    audio_duration_secs: Some(0.2),
+                    rtf: Some(0.02),
+                    tokens_generated: Some(2),
+                    audio_mime_type: "audio/wav".into(),
+                    audio_filename: Some("speech.wav".into()),
+                    artifact_metadata_json: serde_json::json!({
+                        "sample_rate": 16_000,
+                        "sample_count": 1600,
+                    }),
+                    progress: serde_json::json!({"final_audio_published": true}),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            artifact.publication_key.as_deref(),
+            Some("speech-final-audio/v1")
+        );
+        assert_eq!(
+            provider.object_count(),
+            2,
+            "two provider objects: stale (pending cleanup) and replacement"
+        );
+
+        let stage = metadata
+            .get_stage(&second_lease.stage_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stage.status, RuntimeStageStatus::Completed);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let report = store.cleanup_due(64).await.unwrap();
+        assert!(
+            report.completed >= 1,
+            "cleanup should remove the stale reservation's provider object"
+        );
+    }
+
+    #[tokio::test]
     async fn verified_stream_reader_handles_empty_reads_and_rejects_short_or_long_bodies() {
         async fn read(bytes: &[u8], expected: &[u8]) -> std::io::Result<Vec<u8>> {
             let mut reader = VerifiedArtifactReader {

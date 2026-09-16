@@ -401,6 +401,23 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
             "Failed to reconcile speech history records during startup: {err}"
         )),
     }
+    match state
+        .artifact_store
+        .cleanup_due(DEFAULT_RUNTIME_MAINTENANCE_BATCH_LIMIT)
+        .await
+    {
+        Ok(report) if report.completed > 0 => {
+            info!(
+                completed = report.completed,
+                deferred = report.deferred,
+                "Reconciled orphaned provider write reservations and artifact cleanup intents"
+            );
+        }
+        Ok(_) => {}
+        Err(err) => startup_warnings.push(format!(
+            "Failed to reconcile orphaned artifact cleanup state during startup: {err}"
+        )),
+    }
     startup_warnings.extend(preload_configured_models(&state).await);
     startup_warnings.extend(warmup_preloaded_asr_models(&state).await);
     if !startup_warnings.is_empty() {
