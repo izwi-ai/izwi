@@ -588,9 +588,11 @@ win) and claims one short-lived capacity unit per dispatch; selection steers
 away from peer-filled workers while the worker remains the atomic admission
 arbiter, so a lost race degrades to one alternate dispatch. Claims expire by
 TTL (`FLEET_CLAIM_TTL`, 30s), which is the crash-recovery path — no explicit
-recovery protocol. Unset means single-gateway operation with purely
-process-local state. Multi-site fleets needing PostgreSQL-backed shared state
-remain a separate adapter gate.
+recovery protocol. Each gateway also releases its own leftover claims at
+startup (same `IZWI_GATEWAY_ID` after a restart), so capacity frees
+immediately instead of waiting out the TTL. Unset means single-gateway
+operation with purely process-local state. Multi-site fleets needing
+PostgreSQL-backed shared state remain a separate adapter gate.
 
 **Operator drain.** Configure `IZWI_GATEWAY_ADMIN_API_KEY_REF` to a bounded
 `env:VARIABLE` secret that differs from the inference key. Then
