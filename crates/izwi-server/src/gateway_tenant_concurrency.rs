@@ -34,6 +34,12 @@ pub struct GatewayTenantConcurrencyConfig {
 }
 
 impl GatewayTenantConcurrencyConfig {
+    pub fn max_active_per_tenant(&self) -> usize {
+        self.max_active_per_tenant
+    }
+    pub fn max_owned_work(&self) -> usize {
+        self.max_owned_work
+    }
     pub fn new(
         max_active_per_tenant: usize,
         max_owned_work: usize,

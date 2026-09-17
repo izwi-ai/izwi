@@ -37,6 +37,7 @@ mod entity;
 mod error;
 mod gateway;
 mod gateway_deployments;
+mod gateway_fleet;
 mod gateway_rate_quota;
 mod gateway_security;
 mod gateway_tenant_concurrency;
@@ -87,6 +88,7 @@ use state::AppState;
 pub use app::chat::{RemoteChatExecution, RemoteChatExecutionConfig};
 pub use app::remote_chat_dispatch::{RemoteChatDispatchConfig, RemoteChatDispatcher};
 pub use gateway::{create_gateway_router, GatewayState};
+pub use gateway_fleet::{FleetPartition, FleetPartitionError};
 pub use gateway_rate_quota::{GatewayRateQuotaConfig, GatewayRateQuotaConfigError};
 pub use gateway_security::{GatewayPerimeterConfig, GatewayPerimeterConfigError};
 pub use gateway_tenant_concurrency::{
@@ -490,6 +492,42 @@ fn validate_role_topology(role: ServerRole, topology: GatewayTopology) -> anyhow
     Ok(())
 }
 
+/// Apply a fleet partition to the per-gateway quota budgets.
+///
+/// When `partition` is `Some`, each per-tenant rate and concurrency limit is
+/// divided by the fleet size (floored to 1), so N gateways each own a strict
+/// non-overlapping slice of the total configured budget. No shared atomic
+/// counter or coordination service is required. A crashed gateway releases
+/// its partition immediately; the other gateways' partitions are unaffected.
+fn apply_fleet_partition(
+    rate_quota: GatewayRateQuotaConfig,
+    tenant_concurrency: GatewayTenantConcurrencyConfig,
+    partition: Option<crate::gateway_fleet::FleetPartition>,
+) -> (GatewayRateQuotaConfig, GatewayTenantConcurrencyConfig) {
+    let Some(partition) = partition else {
+        return (rate_quota, tenant_concurrency);
+    };
+    let requests = partition.partition_limit(rate_quota.requests_per_minute());
+    let burst = partition.partition_limit(rate_quota.burst_requests());
+    let tracked = rate_quota.max_tracked_tenants();
+    let rate_quota = GatewayRateQuotaConfig::new(requests, burst, tracked)
+        .expect("partitioned rate-quota must remain valid");
+    let per_tenant = u32::try_from(tenant_concurrency.max_active_per_tenant())
+        .ok()
+        .map(|value| partition.partition_concurrency(value))
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(1);
+    let owned = u32::try_from(tenant_concurrency.max_owned_work())
+        .ok()
+        .map(|value| partition.partition_concurrency(value))
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(1);
+    let tenant_concurrency =
+        GatewayTenantConcurrencyConfig::new(per_tenant.max(1).min(owned.max(1)), owned.max(1))
+            .expect("partitioned tenant concurrency must remain valid");
+    (rate_quota, tenant_concurrency)
+}
+
 async fn run_gateway(
     args: ServerArgs,
     serve_config: ServeRuntimeConfig,
@@ -497,8 +535,11 @@ async fn run_gateway(
 ) -> anyhow::Result<()> {
     logging::init_tracing(args.log_format);
     let perimeter = GatewayPerimeterConfig::from_env()?;
+    let fleet_partition = crate::gateway_fleet::FleetPartition::from_env()?;
     let rate_quota = GatewayRateQuotaConfig::from_env()?;
     let tenant_concurrency = GatewayTenantConcurrencyConfig::from_env(args.gateway_max_in_flight)?;
+    let (rate_quota, tenant_concurrency) =
+        apply_fleet_partition(rate_quota, tenant_concurrency, fleet_partition);
     perimeter.validate_public_ingress(&serve_config)?;
     let (state, _status_poller) =
         gateway_state(&args, &serve_config, enterprise_hooks, perimeter).await?;

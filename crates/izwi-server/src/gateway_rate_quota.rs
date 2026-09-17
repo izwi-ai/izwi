@@ -36,6 +36,15 @@ pub struct GatewayRateQuotaConfig {
 }
 
 impl GatewayRateQuotaConfig {
+    pub fn requests_per_minute(&self) -> u32 {
+        self.requests_per_minute
+    }
+    pub fn burst_requests(&self) -> u32 {
+        self.burst_requests
+    }
+    pub fn max_tracked_tenants(&self) -> usize {
+        self.max_tracked_tenants
+    }
     pub fn new(
         requests_per_minute: u32,
         burst_requests: u32,
