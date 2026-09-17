@@ -604,6 +604,32 @@ const POST_COMPATIBILITY_SCHEMA: &[&str] = &[
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_artifacts_attempt_publication ON runtime_artifacts(stage_id, producer_attempt_token, publication_key);",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_media_assets_source_profile ON media_assets(source_asset_id, canonical_profile_version);",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_speech_history_audio_media_asset ON speech_history_records(audio_media_asset_id);",
+    r#"
+    CREATE TABLE IF NOT EXISTS fleet_worker_observations (
+        worker_id TEXT PRIMARY KEY,
+        node_id TEXT NOT NULL,
+        incarnation_id TEXT NOT NULL,
+        status_sequence INTEGER NOT NULL,
+        process_state TEXT NOT NULL,
+        available_admission_credits INTEGER NOT NULL,
+        active_invocations INTEGER NOT NULL,
+        deployments_json TEXT NOT NULL,
+        observed_at INTEGER NOT NULL,
+        observer_gateway_id TEXT NOT NULL
+    );
+    "#,
+    "CREATE INDEX IF NOT EXISTS idx_fleet_worker_observations_observed ON fleet_worker_observations(observed_at ASC);",
+    r#"
+    CREATE TABLE IF NOT EXISTS fleet_capacity_claims (
+        claim_id TEXT PRIMARY KEY,
+        worker_id TEXT NOT NULL,
+        incarnation_id TEXT NOT NULL,
+        gateway_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL
+    );
+    "#,
+    "CREATE INDEX IF NOT EXISTS idx_fleet_capacity_claims_worker ON fleet_capacity_claims(worker_id ASC, expires_at ASC);",
 ];
 
 const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[

@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::signal;
 use tokio::sync::oneshot;
@@ -746,11 +747,43 @@ async fn gateway_state(
         },
     )
     .map_err(|error| anyhow::anyhow!(error.message))?;
+
+    // Multi-gateway fleets share worker observations and capacity claims
+    // through one SQLite coordination file. Unset means single-gateway
+    // operation with purely process-local state.
+    let fleet = match crate::gateway_fleet::fleet_db_path_from_env()? {
+        Some(path) => {
+            let store = crate::batch_runtime::store::BatchRuntimeStore::initialize_with_database(
+                crate::db::StoreDatabase::new(path),
+            );
+            store
+                .connection()
+                .await
+                .context("Failed to open fleet coordination database")?;
+            let coordinator = Arc::new(app::fleet_coordinator::FleetCoordinator::new(
+                store,
+                crate::gateway_fleet::gateway_identity(),
+            ));
+            info!(
+                service = SERVICE_NAME,
+                version = SERVICE_VERSION,
+                gateway_id = coordinator.gateway_id(),
+                "Fleet coordination enabled: worker observations and capacity claims are shared"
+            );
+            Some(coordinator)
+        }
+        None => None,
+    };
+    let mut dispatcher = dispatcher;
+    if let Some(coordinator) = fleet.clone() {
+        dispatcher = dispatcher.with_fleet_coordinator(coordinator);
+    }
     let polling_interval = Duration::from_millis(args.gateway_worker_status_poll_ms);
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = polling_workers
         .into_iter()
         .map(|expected| {
             let registry = registry.clone();
+            let fleet = fleet.clone();
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(polling_interval);
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -758,7 +791,9 @@ async fn gateway_state(
                 ticker.tick().await;
                 loop {
                     ticker.tick().await;
-                    if let Err(error) = refresh_gateway_worker_status(&registry, &expected).await {
+                    if let Err(error) =
+                        refresh_gateway_worker_status(&registry, &expected, fleet.as_deref()).await
+                    {
                         warn!(
                             worker_id = %expected.worker_id,
                             error = %error,
@@ -1069,8 +1104,12 @@ fn approve_gateway_worker(
 async fn refresh_gateway_worker_status(
     registry: &worker_registry::WorkerRegistry,
     expected: &GatewayWorkerExpectation,
+    fleet: Option<&app::fleet_coordinator::FleetCoordinator>,
 ) -> anyhow::Result<()> {
     let status = validate_gateway_worker_status(expected, expected.client.status().await?)?;
+    if let Some(coordinator) = fleet {
+        coordinator.publish_and_refresh(&status).await;
+    }
     match registry.observe_status(status.clone()) {
         Ok(()) => Ok(()),
         Err(worker_registry::WorkerRegistryError::UnknownOrStaleIncarnation) => {

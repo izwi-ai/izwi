@@ -313,6 +313,8 @@ mod tests {
         "artifact_cleanup_intents",
         "provider_write_reservations",
         "durable_idempotency_keys_v2",
+        "fleet_worker_observations",
+        "fleet_capacity_claims",
     ];
 
     const EXPECTED_COMPAT_COLUMNS: &[(&str, &str)] = &[

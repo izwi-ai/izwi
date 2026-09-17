@@ -5,6 +5,7 @@
 //! one alternate attempt only when the first attempt is provably unaccepted;
 //! uncertain acceptance and accepted execution never fail over.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use izwi_core::{ChatGeneration, ModelVariant};
@@ -21,6 +22,7 @@ use super::chat::{
     spawn_started_remote_chat_stream_with_tenant, start_remote_chat_invocation_with_tenant,
     ChatExecutionRequest, ChatStreamEvent, RemoteChatExecution, RemoteChatExecutionConfig,
 };
+use super::fleet_coordinator::{FleetClaimGuard, FleetCoordinator};
 use crate::api::request_context::RequestContext;
 use crate::error::ApiError;
 use crate::gateway_tenant_concurrency::{BoundTenantWorkLease, UnboundTenantWorkLease};
@@ -70,6 +72,7 @@ impl RemoteChatDispatchConfig {
 pub struct RemoteChatDispatcher {
     registry: WorkerRegistry,
     config: RemoteChatDispatchConfig,
+    fleet: Option<Arc<FleetCoordinator>>,
 }
 
 impl RemoteChatDispatcher {
@@ -78,7 +81,18 @@ impl RemoteChatDispatcher {
         config: RemoteChatDispatchConfig,
     ) -> Result<Self, ApiError> {
         config.validate()?;
-        Ok(Self { registry, config })
+        Ok(Self {
+            registry,
+            config,
+            fleet: None,
+        })
+    }
+
+    /// Attach cluster capacity coordination. Without a coordinator the
+    /// dispatcher behaves exactly as before (single-gateway profile).
+    pub fn with_fleet_coordinator(mut self, coordinator: Arc<FleetCoordinator>) -> Self {
+        self.fleet = Some(coordinator);
+        self
     }
 
     pub fn registry(&self) -> &WorkerRegistry {
@@ -134,12 +148,14 @@ impl RemoteChatDispatcher {
             mut stream,
             tenant_work,
             selected,
+            fleet_claim,
             started,
         } = self
             .start(request_timeout_secs, context, request, false, tenant_work)
             .await?;
         let key = selected.key.clone();
         let _dispatch = selected.dispatch;
+        let _fleet_claim = fleet_claim;
         let registry = self.registry.clone();
         collect_started_remote_chat_with_tenant(
             &remote,
@@ -168,6 +184,7 @@ impl RemoteChatDispatcher {
             stream,
             tenant_work,
             selected,
+            fleet_claim,
             ..
         } = self
             .start(request_timeout_secs, context, request, true, tenant_work)
@@ -188,6 +205,7 @@ impl RemoteChatDispatcher {
             // Dropping either receiver propagates cancellation toward the
             // exact accepted attempt; there is intentionally no reselection.
             let _dispatch = selected.dispatch;
+            let _fleet_claim = fleet_claim;
             loop {
                 let event = tokio::select! {
                     event = worker_events.recv() => event,
@@ -230,10 +248,21 @@ impl RemoteChatDispatcher {
         tenant_work: UnboundTenantWorkLease,
     ) -> Result<StartedDispatch, ApiError> {
         let selection = self.selection_request(&request, streaming)?;
-        let mut selected = self
-            .registry
-            .select_and_reserve(&selection)
-            .map_err(map_registry_error)?;
+        let mut selected = match &self.fleet {
+            Some(fleet) => self.registry.select_and_reserve_with_fleet_at(
+                &selection,
+                None,
+                &fleet.snapshot_view(),
+                Instant::now(),
+            ),
+            None => self.registry.select_and_reserve(&selection),
+        }
+        .map_err(map_registry_error)?;
+        // Best-effort cluster visibility: publish this dispatch to peer
+        // gateways when coordinated, but never gate on it. A lost race only
+        // costs one worker-arbitrated attempt through the existing alternate
+        // path below.
+        let mut fleet_claim = self.claim_for(&selected).await;
         let remote = self.execution_for(&selected)?;
         let invocation =
             prepare_remote_chat_invocation(&remote, request_timeout_secs, context, request)?;
@@ -256,6 +285,7 @@ impl RemoteChatDispatcher {
                     stream: started_invocation.stream,
                     tenant_work: started_invocation.tenant_work,
                     selected,
+                    fleet_claim,
                     started,
                 });
             }
@@ -276,6 +306,7 @@ impl RemoteChatDispatcher {
 
         let excluded = selected.key.clone();
         drop(selected);
+        drop(fleet_claim.take());
         let remaining_before_backoff = context
             .remaining_budget(Duration::from_secs(request_timeout_secs.max(1)))
             .filter(|budget| !budget.is_zero())
@@ -284,10 +315,19 @@ impl RemoteChatDispatcher {
             return Err(alternate_deadline_error());
         }
         tokio::time::sleep(retry_delay.0).await;
-        let mut alternate = self
-            .registry
-            .select_and_reserve_excluding(&selection, Some(&excluded))
-            .map_err(map_registry_error)?;
+        let mut alternate = match &self.fleet {
+            Some(fleet) => self.registry.select_and_reserve_with_fleet_at(
+                &selection,
+                Some(&excluded),
+                &fleet.snapshot_view(),
+                Instant::now(),
+            ),
+            None => self
+                .registry
+                .select_and_reserve_excluding(&selection, Some(&excluded)),
+        }
+        .map_err(map_registry_error)?;
+        let alternate_fleet_claim = self.claim_for(&alternate).await;
         let alternate_remote = self.execution_for(&alternate)?;
         let remaining = context
             .remaining_budget(Duration::from_secs(request_timeout_secs.max(1)))
@@ -312,6 +352,7 @@ impl RemoteChatDispatcher {
                     stream: started_invocation.stream,
                     tenant_work: started_invocation.tenant_work,
                     selected: alternate,
+                    fleet_claim: alternate_fleet_claim,
                     started,
                 })
             }
@@ -320,6 +361,14 @@ impl RemoteChatDispatcher {
                 Err(map_worker_client_error(failure.error))
             }
         }
+    }
+
+    /// Publish one cluster capacity claim for a selected worker. Returns None
+    /// without a coordinator, or when peers already hold every observable
+    /// credit; both cases proceed to invoke and let the worker arbitrate.
+    async fn claim_for(&self, selected: &SelectedWorker) -> Option<FleetClaimGuard> {
+        let fleet = self.fleet.as_ref()?;
+        fleet.claim(&selected.key, selected.available_credits).await
     }
 
     fn selection_request(
@@ -420,6 +469,7 @@ struct StartedDispatch {
     stream: InvocationStream,
     tenant_work: BoundTenantWorkLease,
     selected: SelectedWorker,
+    fleet_claim: Option<FleetClaimGuard>,
     started: Instant,
 }
 
@@ -509,11 +559,14 @@ mod tests {
     use izwi_serving_client::{WorkerClient, WorkerClientConfig};
     use izwi_serving_protocol::{
         ArtifactRevision, BackendKind, Capability, CapacitySnapshot, CredentialId,
-        DeviceAssignment, FinishReason, InvocationEvent, InvocationEventKind, InvocationRejection,
-        InvocationRequest, LoadedDeployment, ModelGeneration, ModelReadiness, NodeId,
-        ServiceBearerToken, ServiceCredentials, Usage, WorkerDescriptor, WorkerFeature, WorkerId,
-        WorkerProcessState, WorkerStatus, INVOCATIONS_PATH, NDJSON_MEDIA_TYPE,
+        DeviceAssignment, FinishReason, IncarnationId, InvocationEvent, InvocationEventKind,
+        InvocationRejection, InvocationRequest, LoadedDeployment, ModelGeneration, ModelReadiness,
+        NodeId, ServiceBearerToken, ServiceCredentials, Usage, WorkerDescriptor, WorkerFeature,
+        WorkerId, WorkerProcessState, WorkerStatus, INVOCATIONS_PATH, NDJSON_MEDIA_TYPE,
     };
+
+    use crate::batch_runtime::store::BatchRuntimeStore;
+    use crate::db::StoreDatabase;
 
     use crate::worker_registry::{ApprovedDeployment, ApprovedWorker, WorkerRegistryConfig};
 
@@ -1077,6 +1130,99 @@ mod tests {
         assert_eq!(first[0].request_id, alternate[0].request_id);
         assert_ne!(first[0].attempt_id, alternate[0].attempt_id);
         assert!(alternate[0].remaining_time_ms < first[0].remaining_time_ms);
+    }
+
+    fn fleet_coordinator() -> (
+        Arc<crate::app::fleet_coordinator::FleetCoordinator>,
+        tempfile::TempDir,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let store = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
+            root.path().join("fleet.sqlite3"),
+        ));
+        (
+            Arc::new(crate::app::fleet_coordinator::FleetCoordinator::new(
+                store,
+                "gateway-test".to_string(),
+            )),
+            root,
+        )
+    }
+
+    #[tokio::test]
+    async fn fleet_claim_is_published_and_released_across_generate() {
+        let worker = ScriptedWorker::spawn(
+            ScriptedResponse::Success("from-fleet".into()),
+            Duration::ZERO,
+        )
+        .await;
+        let registry = WorkerRegistry::new(WorkerRegistryConfig::default()).unwrap();
+        register(
+            &registry,
+            "worker-a",
+            "inc-a",
+            client(&worker.endpoint()),
+            1,
+        );
+        let (coordinator, _root) = fleet_coordinator();
+        let store = coordinator.store();
+        let context = RequestContext::new("test-request".into(), Principal::local_anonymous());
+        let generation = dispatcher(registry)
+            .with_fleet_coordinator(Arc::clone(&coordinator))
+            .generate(2, &context, request(), tenant_work())
+            .await
+            .unwrap();
+        assert_eq!(generation.text, "from-fleet");
+        for _ in 0..200 {
+            if store.count_live_fleet_claims("worker-a").await.unwrap() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            store.count_live_fleet_claims("worker-a").await.unwrap(),
+            0,
+            "the dispatch claim guard must release its cluster claim when the request completes"
+        );
+    }
+
+    #[tokio::test]
+    async fn fleet_claim_loss_still_invokes_and_succeeds() {
+        let worker = ScriptedWorker::spawn(
+            ScriptedResponse::Success("from-fleet".into()),
+            Duration::ZERO,
+        )
+        .await;
+        let registry = WorkerRegistry::new(WorkerRegistryConfig::default()).unwrap();
+        register(
+            &registry,
+            "worker-a",
+            "inc-a",
+            client(&worker.endpoint()),
+            1,
+        );
+        let (coordinator, _root) = fleet_coordinator();
+        // A peer holds the only observable credit, but this gateway's cached
+        // snapshot is stale (empty): selection proceeds, the claim loses, and
+        // the worker arbitrates the invocation to success.
+        let peer = coordinator
+            .claim(
+                &crate::worker_registry::WorkerInstanceKey {
+                    worker_id: id::<WorkerId>("worker-a"),
+                    incarnation_id: id::<IncarnationId>("inc-a"),
+                },
+                1,
+            )
+            .await
+            .expect("peer claim");
+        let context = RequestContext::new("test-request".into(), Principal::local_anonymous());
+        let generation = dispatcher(registry)
+            .with_fleet_coordinator(Arc::clone(&coordinator))
+            .generate(2, &context, request(), tenant_work())
+            .await
+            .unwrap();
+        assert_eq!(generation.text, "from-fleet");
+        drop(peer);
     }
 
     #[tokio::test]

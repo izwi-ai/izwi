@@ -116,6 +116,27 @@ impl WorkerInstanceKey {
     }
 }
 
+/// Cluster-wide capacity claims for one worker incarnation, as observed by
+/// peer gateways sharing a fleet coordination store.
+///
+/// Selection consults this synchronously, so implementations must serve
+/// locally cached views (populated on the status-poller cadence), never
+/// live I/O under the registry lock. The worker remains the atomic
+/// admission arbiter; cluster claims only steer selection away from
+/// workers that peers have already filled.
+pub trait FleetCapacityView: Send + Sync {
+    fn cluster_claims(&self, worker: &WorkerInstanceKey) -> u64;
+}
+
+/// Single-gateway behavior: only local dispatches count against capacity.
+pub struct NoFleetCapacity;
+
+impl FleetCapacityView for NoFleetCapacity {
+    fn cluster_claims(&self, _worker: &WorkerInstanceKey) -> u64 {
+        0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ApprovedWorker {
     pub descriptor: WorkerDescriptor,
@@ -247,6 +268,10 @@ pub struct SelectedWorker {
     pub backend: BackendKind,
     pub client: WorkerClient,
     pub dispatch: LocalDispatchGuard,
+    /// Observed admission credits at select time, after local and cluster
+    /// claims are accounted. Fleet coordinators use this as the atomic cap
+    /// for a cluster capacity claim; it is advisory, never authority.
+    pub available_credits: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -510,7 +535,7 @@ impl WorkerRegistry {
                 continue;
             };
             snapshot.ready_workers += 1;
-            if observed_credit_available(&inner, key, &observation.status.capacity) {
+            if observed_credit_available(&inner, key, &observation.status.capacity, 0) {
                 snapshot.workers_with_observed_credit += 1;
             }
             let _ = deployment;
@@ -574,12 +599,29 @@ impl WorkerRegistry {
         excluded: Option<&WorkerInstanceKey>,
         now: Instant,
     ) -> Result<SelectedWorker, WorkerRegistryError> {
+        self.select_and_reserve_with_fleet_at(request, excluded, &NoFleetCapacity, now)
+    }
+
+    /// Fleet-aware selection: peer gateways' cluster claims count against a
+    /// worker's observed credits alongside local dispatches. A worker with no
+    /// observable cluster capacity left is skipped even when its last direct
+    /// status still advertises credits, so two gateways racing for the last
+    /// credit do not both dispatch at it. The selected worker still admits
+    /// atomically; a fleet-level overestimate only costs one alternate
+    /// dispatch, never duplicate execution.
+    pub fn select_and_reserve_with_fleet_at(
+        &self,
+        request: &WorkerSelectionRequest,
+        excluded: Option<&WorkerInstanceKey>,
+        fleet: &dyn FleetCapacityView,
+        now: Instant,
+    ) -> Result<SelectedWorker, WorkerRegistryError> {
         let mut inner = lock_recover(&self.inner);
         if inner.dispatches.len() >= inner.config.max_local_dispatches {
             return Err(WorkerRegistryError::LocalDispatchLimitReached);
         }
 
-        let mut selected: Option<(WorkerInstanceKey, LoadedDeployment, u64, u32)> = None;
+        let mut selected: Option<(WorkerInstanceKey, LoadedDeployment, u64, u32, u32)> = None;
         for (key, record) in &inner.workers {
             if excluded == Some(key) {
                 continue;
@@ -598,17 +640,21 @@ impl WorkerRegistry {
             let Some(deployment) = eligible_deployment(record, observation, request) else {
                 continue;
             };
-            if !observed_credit_available(&inner, key, &observation.status.capacity) {
+            let cluster_claims = fleet.cluster_claims(key);
+            if !observed_credit_available(&inner, key, &observation.status.capacity, cluster_claims)
+            {
                 continue;
             }
             let local = unreconciled_dispatches(&inner, key) as u64;
             let outstanding = u64::from(observation.status.capacity.active_invocations)
                 .saturating_add(u64::from(observation.status.capacity.queued_invocations))
-                .saturating_add(local);
+                .saturating_add(local)
+                .saturating_add(cluster_claims);
             let capacity = record.registration.validated_capacity;
+            let available = observation.status.capacity.available_admission_credits;
 
             let replace = selected.as_ref().is_none_or(
-                |(selected_key, _, selected_outstanding, selected_capacity)| {
+                |(selected_key, _, selected_outstanding, selected_capacity, _)| {
                     let candidate_score = u128::from(outstanding) * u128::from(*selected_capacity);
                     let selected_score = u128::from(*selected_outstanding) * u128::from(capacity);
                     candidate_score < selected_score
@@ -616,11 +662,18 @@ impl WorkerRegistry {
                 },
             );
             if replace {
-                selected = Some((key.clone(), deployment.clone(), outstanding, capacity));
+                selected = Some((
+                    key.clone(),
+                    deployment.clone(),
+                    outstanding,
+                    capacity,
+                    available,
+                ));
             }
         }
 
-        let (key, deployment, _, _) = selected.ok_or(WorkerRegistryError::NoEligibleWorker)?;
+        let (key, deployment, _, _, available_credits) =
+            selected.ok_or(WorkerRegistryError::NoEligibleWorker)?;
         let (selected_client, node_id, circuit_probe) = {
             let record = inner
                 .workers
@@ -661,6 +714,7 @@ impl WorkerRegistry {
                 worker: key,
                 circuit_probe,
             },
+            available_credits,
         })
     }
 
@@ -1041,10 +1095,11 @@ fn observed_credit_available(
     inner: &RegistryInner,
     worker: &WorkerInstanceKey,
     capacity: &izwi_serving_protocol::CapacitySnapshot,
+    cluster_claims: u64,
 ) -> bool {
-    let local = unreconciled_dispatches(inner, worker);
+    let local = unreconciled_dispatches(inner, worker) as u64;
     capacity.available_admission_credits > 0
-        && local < capacity.available_admission_credits as usize
+        && local.saturating_add(cluster_claims) < u64::from(capacity.available_admission_credits)
 }
 
 fn unreconciled_dispatches(inner: &RegistryInner, worker: &WorkerInstanceKey) -> usize {
@@ -1648,6 +1703,77 @@ mod tests {
             .unwrap();
         let selected = registry.select_and_reserve_at(&selection(), now).unwrap();
         assert_eq!(selected.key.worker_id.as_str(), "worker-a");
+    }
+
+    struct StubFleetCapacity {
+        claims: BTreeMap<(String, String), u64>,
+    }
+
+    impl FleetCapacityView for StubFleetCapacity {
+        fn cluster_claims(&self, worker: &WorkerInstanceKey) -> u64 {
+            self.claims
+                .get(&(
+                    worker.worker_id.as_str().to_string(),
+                    worker.incarnation_id.as_str().to_string(),
+                ))
+                .copied()
+                .unwrap_or(0)
+        }
+    }
+
+    #[test]
+    fn fleet_cluster_claims_steer_selection_away_from_peer_filled_workers() {
+        let registry = WorkerRegistry::new(WorkerRegistryConfig::default()).unwrap();
+        let worker_a = registration("worker-a", "inc-a", BackendKind::Cpu, 9101, 4);
+        let worker_b = registration("worker-b", "inc-b", BackendKind::Cpu, 9102, 4);
+        let descriptor_a = worker_a.descriptor.clone();
+        let descriptor_b = worker_b.descriptor.clone();
+        registry.approve(worker_a).unwrap();
+        registry.approve(worker_b).unwrap();
+        let now = Instant::now();
+        for descriptor in [&descriptor_a, &descriptor_b] {
+            registry
+                .observe_status_at(
+                    status(
+                        descriptor,
+                        1,
+                        vec![deployment("chat-prod", "lfm2", BackendKind::Cpu)],
+                        capacity(4, 0, 2),
+                    ),
+                    now,
+                )
+                .unwrap();
+        }
+        let peers_filled_a = StubFleetCapacity {
+            claims: BTreeMap::from([(("worker-a".to_string(), "inc-a".to_string()), 2)]),
+        };
+        let selected = registry
+            .select_and_reserve_with_fleet_at(&selection(), None, &peers_filled_a, now)
+            .unwrap();
+        assert_eq!(
+            selected.key.worker_id.as_str(),
+            "worker-b",
+            "peer claims consume worker-a's observed credits"
+        );
+        drop(selected);
+        let peers_filled_both = StubFleetCapacity {
+            claims: BTreeMap::from([
+                (("worker-a".to_string(), "inc-a".to_string()), 2),
+                (("worker-b".to_string(), "inc-b".to_string()), 5),
+            ]),
+        };
+        assert!(
+            matches!(
+                registry.select_and_reserve_with_fleet_at(
+                    &selection(),
+                    None,
+                    &peers_filled_both,
+                    now
+                ),
+                Err(WorkerRegistryError::NoEligibleWorker)
+            ),
+            "no worker is eligible when cluster claims exhaust all observed credits"
+        );
     }
 
     #[test]

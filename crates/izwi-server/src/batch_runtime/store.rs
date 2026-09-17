@@ -729,7 +729,7 @@ impl BatchRuntimeStore {
         self.test_durable_tts_acceptance_failpoint = failpoint;
     }
 
-    fn now_millis(&self) -> i64 {
+    pub(crate) fn now_millis(&self) -> i64 {
         #[cfg(test)]
         if let Some(clock) = &self.test_clock {
             return clock.load(Ordering::SeqCst);

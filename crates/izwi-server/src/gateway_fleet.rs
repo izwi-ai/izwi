@@ -16,8 +16,11 @@ use std::fmt;
 
 const FLEET_PARTITION_ENV: &str = "IZWI_GATEWAY_FLEET_PARTITION";
 const FLEET_SIZE_ENV: &str = "IZWI_GATEWAY_FLEET_SIZE";
+const FLEET_DB_PATH_ENV: &str = "IZWI_GATEWAY_FLEET_DB_PATH";
+const GATEWAY_ID_ENV: &str = "IZWI_GATEWAY_ID";
 const MAX_ENV_VALUE_BYTES: usize = 20;
 const MAX_FLEET_SIZE: u32 = 256;
+const MAX_DB_PATH_BYTES: usize = 4096;
 
 /// A bounded fleet partition index and total size.
 ///
@@ -105,6 +108,50 @@ pub enum FleetPartitionError {
     PartitionWithoutSize,
     #[error("IZWI_GATEWAY_FLEET_SIZE is set but IZWI_GATEWAY_FLEET_PARTITION is missing")]
     MissingPartition,
+    #[error("IZWI_GATEWAY_FLEET_DB_PATH must be a bounded absolute path")]
+    InvalidDbPath,
+    #[error("IZWI_GATEWAY_ID exceeds its encoded size limit")]
+    InvalidGatewayId,
+}
+
+/// Resolve the shared fleet coordination database path, if configured.
+/// All gateways pointing at the same file share worker observations and
+/// capacity claims. Unset means single-gateway operation with no shared
+/// state at all.
+pub fn fleet_db_path_from_env() -> Result<Option<std::path::PathBuf>, FleetPartitionError> {
+    let Some(raw) = std::env::var_os(FLEET_DB_PATH_ENV) else {
+        return Ok(None);
+    };
+    let raw = raw
+        .into_string()
+        .map_err(|_| FleetPartitionError::InvalidDbPath)?;
+    if raw.is_empty() || raw.len() > MAX_DB_PATH_BYTES {
+        return Err(FleetPartitionError::InvalidDbPath);
+    }
+    let path = std::path::PathBuf::from(raw);
+    if !path.is_absolute() {
+        return Err(FleetPartitionError::InvalidDbPath);
+    }
+    Ok(Some(path))
+}
+
+/// Stable gateway identity for fleet claim ownership. Operator-set via
+/// `IZWI_GATEWAY_ID`; otherwise unique per process boot. A restarted
+/// gateway never inherits its predecessor's in-flight claims — TTL expiry
+/// and worker-authoritative teardown own that recovery.
+pub fn gateway_identity() -> String {
+    match std::env::var(GATEWAY_ID_ENV) {
+        Ok(id)
+            if !id.is_empty()
+                && id.len() <= 128
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')) =>
+        {
+            id
+        }
+        _ => format!("gateway-{}", std::process::id()),
+    }
 }
 
 fn parse_bounded_u32(os_value: &std::ffi::OsStr, _name: &str) -> Option<u32> {
@@ -184,5 +231,31 @@ mod tests {
         let p = FleetPartition::new(1, 4).unwrap();
         assert_eq!(p.partition_concurrency(8), 2);
         assert_eq!(p.partition_concurrency(1), 1);
+    }
+
+    #[test]
+    fn fleet_db_path_requires_absolute_bounded_paths() {
+        std::env::remove_var("IZWI_GATEWAY_FLEET_DB_PATH");
+        assert!(fleet_db_path_from_env().unwrap().is_none());
+        std::env::set_var("IZWI_GATEWAY_FLEET_DB_PATH", "relative/fleet.sqlite3");
+        assert_eq!(
+            fleet_db_path_from_env(),
+            Err(FleetPartitionError::InvalidDbPath)
+        );
+        std::env::set_var("IZWI_GATEWAY_FLEET_DB_PATH", "/var/lib/izwi/fleet.sqlite3");
+        assert_eq!(
+            fleet_db_path_from_env().unwrap().unwrap().to_str(),
+            Some("/var/lib/izwi/fleet.sqlite3")
+        );
+        std::env::remove_var("IZWI_GATEWAY_FLEET_DB_PATH");
+    }
+
+    #[test]
+    fn gateway_identity_prefers_bounded_operator_value() {
+        std::env::set_var("IZWI_GATEWAY_ID", "gateway-east-1");
+        assert_eq!(gateway_identity(), "gateway-east-1");
+        std::env::set_var("IZWI_GATEWAY_ID", "not valid!!");
+        assert!(gateway_identity().starts_with("gateway-"));
+        std::env::remove_var("IZWI_GATEWAY_ID");
     }
 }
