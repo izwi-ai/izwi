@@ -1776,6 +1776,72 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn circuit_opens_on_partition_and_recovers_through_half_open_probe() {
+        // End-to-end partition behavior with real time: repeated transport
+        // failures (a severed gateway/worker link) trip the breaker and stop
+        // selection; cooldown alone does not restore eligibility; a newer
+        // authenticated status admits exactly one half-open probe, whose
+        // acceptance closes the circuit and resumes normal selection.
+        let registry = WorkerRegistry::new(WorkerRegistryConfig {
+            circuit_failure_threshold: 3,
+            circuit_open_duration: Duration::from_millis(50),
+            ..WorkerRegistryConfig::default()
+        })
+        .unwrap();
+        let worker = registration("worker-a", "inc-a", BackendKind::Cpu, 9101, 2);
+        let descriptor = worker.descriptor.clone();
+        registry.approve(worker).unwrap();
+        let observe = |registry: &WorkerRegistry, sequence: u64| {
+            registry
+                .observe_status_at(
+                    status(
+                        &descriptor,
+                        sequence,
+                        vec![deployment("chat-prod", "lfm2", BackendKind::Cpu)],
+                        capacity(2, 0, 2),
+                    ),
+                    Instant::now(),
+                )
+                .unwrap()
+        };
+        observe(&registry, 1);
+        let selected = registry
+            .select_and_reserve_at(&selection(), Instant::now())
+            .unwrap();
+        let key = selected.key.clone();
+        drop(selected);
+
+        for _ in 0..3 {
+            registry.report_worker_transport_failure(&key).unwrap();
+        }
+        assert!(
+            matches!(
+                registry.select_and_reserve_at(&selection(), Instant::now()),
+                Err(WorkerRegistryError::NoEligibleWorker)
+            ),
+            "an open circuit must stop selection even with a fresh observation"
+        );
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(
+            matches!(
+                registry.select_and_reserve_at(&selection(), Instant::now()),
+                Err(WorkerRegistryError::NoEligibleWorker)
+            ),
+            "cooldown alone must not restore eligibility without a newer status"
+        );
+
+        observe(&registry, 2);
+        let mut probe = registry
+            .select_and_reserve_at(&selection(), Instant::now())
+            .expect("a newer status must admit exactly one half-open probe");
+        probe.dispatch.mark_accepted().unwrap();
+        drop(probe);
+        registry
+            .select_and_reserve_at(&selection(), Instant::now())
+            .expect("acceptance must close the circuit and resume selection");
+    }
+
     #[test]
     fn local_dispatches_are_bounded_and_affect_selection() {
         let registry = WorkerRegistry::new(WorkerRegistryConfig {

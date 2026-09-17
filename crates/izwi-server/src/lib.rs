@@ -764,10 +764,12 @@ async fn gateway_state(
                 store,
                 crate::gateway_fleet::gateway_identity(),
             ));
+            let released = coordinator.release_own_claims().await;
             info!(
                 service = SERVICE_NAME,
                 version = SERVICE_VERSION,
                 gateway_id = coordinator.gateway_id(),
+                released_own_claims = released,
                 "Fleet coordination enabled: worker observations and capacity claims are shared"
             );
             Some(coordinator)

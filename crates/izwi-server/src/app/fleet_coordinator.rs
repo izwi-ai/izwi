@@ -104,6 +104,17 @@ impl FleetCoordinator {
         &self.gateway_id
     }
 
+    /// Release every claim still owned by this gateway identity. Called once
+    /// at startup: a fresh boot owns nothing, so leftovers from a previous
+    /// process under the same operator-set identity are dropped immediately
+    /// instead of shadowing cluster capacity until TTL expiry.
+    pub async fn release_own_claims(&self) -> u64 {
+        self.store
+            .release_gateway_claims(&self.gateway_id)
+            .await
+            .unwrap_or(0)
+    }
+
     #[cfg(test)]
     pub(crate) fn store(&self) -> &BatchRuntimeStore {
         &self.store
@@ -243,5 +254,58 @@ mod tests {
             coordinator.claim(&key, 1).await.is_none(),
             "second claim must lose when one credit is observable"
         );
+    }
+
+    #[tokio::test]
+    async fn peer_gateway_claims_are_visible_across_coordinators() {
+        // Rolling-replacement equivalent: two gateway identities share one
+        // coordination store. The replacement sees the predecessor's claims
+        // and cannot overspend the same worker credit.
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("shared-fleet.sqlite3");
+        let build = |gateway: &str| {
+            Arc::new(FleetCoordinator::new(
+                BatchRuntimeStore::initialize_with_database(StoreDatabase::new(db_path.clone())),
+                gateway.to_string(),
+            ))
+        };
+        let old = build("gateway-old");
+        let new = build("gateway-new");
+        let key = worker_key();
+        let _held = old.claim(&key, 1).await.expect("predecessor claim");
+        assert!(
+            new.claim(&key, 1).await.is_none(),
+            "replacement gateway must observe the predecessor's live claim"
+        );
+        assert_eq!(
+            new.release_own_claims().await,
+            0,
+            "a gateway never releases another gateway's claims"
+        );
+        drop(_held);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            new.claim(&key, 1).await.is_some(),
+            "capacity is reusable after the predecessor's claim is released"
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinator_degrades_to_uncoordinated_on_store_outage() {
+        // Store outage equivalent: when the coordination database is
+        // unreachable, claims fail closed to None and dispatch proceeds
+        // uncoordinated (the worker still arbitrates admission).
+        let root = tempfile::tempdir().unwrap();
+        let dead_path = root.path().join("gone").join("fleet.sqlite3");
+        let coordinator = Arc::new(FleetCoordinator::new(
+            BatchRuntimeStore::initialize_with_database(StoreDatabase::new(dead_path)),
+            "gateway-outage".to_string(),
+        ));
+        let key = worker_key();
+        assert!(
+            coordinator.claim(&key, 4).await.is_none(),
+            "claims must fail to None, never panic, on store outage"
+        );
+        assert_eq!(coordinator.release_own_claims().await, 0);
     }
 }

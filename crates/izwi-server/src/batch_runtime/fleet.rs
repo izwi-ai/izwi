@@ -300,6 +300,36 @@ impl BatchRuntimeStore {
         Ok(deleted.rows_affected() == 1)
     }
 
+    /// Release every claim owned by `gateway_id`, returning how many were
+    /// released. Called once at gateway startup: a fresh boot owns nothing,
+    /// so leftovers from a previous process with the same operator-set
+    /// identity are released immediately instead of waiting out their TTL.
+    /// The operator must ensure the previous process is actually dead (the
+    /// documented drain-before-restart procedure); claims are advisory and
+    /// the worker remains the admission arbiter, so a mistaken release only
+    /// costs selection precision, never correctness.
+    pub async fn release_gateway_claims(&self, gateway_id: &str) -> anyhow::Result<u64> {
+        validate_fleet_id("gateway ID", gateway_id)?;
+        let db = self.connection().await?;
+        let deleted = db
+            .execute_raw(raw::statement(
+                db,
+                r#"
+                DELETE FROM fleet_capacity_claims
+                WHERE claim_id IN (
+                    SELECT claim_id FROM fleet_capacity_claims
+                    WHERE gateway_id = ?1
+                    ORDER BY created_at ASC
+                    LIMIT 1024
+                )
+                "#,
+                vec![gateway_id.to_string().into()],
+            )?)
+            .await
+            .context("Failed to release gateway fleet claims")?;
+        Ok(u64::try_from(deleted.rows_affected())?)
+    }
+
     /// Count live (unexpired) claims for one worker.
     pub async fn count_live_fleet_claims(&self, worker_id: &str) -> anyhow::Result<u64> {
         validate_fleet_id("worker ID", worker_id)?;
@@ -542,6 +572,34 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "reaped capacity is reusable"
+        );
+    }
+
+    #[tokio::test]
+    async fn fleet_gateway_restart_releases_only_its_own_claims() {
+        let (store, _root) = test_store_at(1_000);
+        for _ in 0..2 {
+            store
+                .try_claim_fleet_capacity("worker-a", "inc-1", "gateway-a", 4, 60_000)
+                .await
+                .unwrap()
+                .expect("gateway-a claim");
+        }
+        store
+            .try_claim_fleet_capacity("worker-a", "inc-1", "gateway-b", 4, 60_000)
+            .await
+            .unwrap()
+            .expect("gateway-b claim");
+        assert_eq!(
+            store.release_gateway_claims("gateway-a").await.unwrap(),
+            2,
+            "a restarting gateway releases exactly its own leftovers"
+        );
+        assert_eq!(store.count_live_fleet_claims("worker-a").await.unwrap(), 1);
+        assert_eq!(
+            store.release_gateway_claims("gateway-a").await.unwrap(),
+            0,
+            "releasing twice is idempotent"
         );
     }
 
