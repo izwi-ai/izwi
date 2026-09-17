@@ -22,7 +22,7 @@
 use super::store::BatchRuntimeStore;
 use crate::db::raw;
 use anyhow::Context;
-use sea_orm::ConnectionTrait;
+use sea_orm::{ConnectionTrait, DbBackend};
 
 const MAX_FLEET_ID_BYTES: usize = 256;
 const MAX_FLEET_DEPLOYMENTS_JSON_BYTES: usize = 64 * 1024;
@@ -124,16 +124,7 @@ impl BatchRuntimeStore {
         let inserted = db
             .execute_raw(raw::statement(
                 db,
-                r#"
-                INSERT INTO fleet_worker_observations (
-                    worker_id, node_id, incarnation_id, status_sequence,
-                    process_state, available_admission_credits,
-                    active_invocations, deployments_json, observed_at,
-                    observer_gateway_id
-                )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-                ON CONFLICT(worker_id) DO NOTHING
-                "#,
+                fleet_insert_observation_sql(db.get_database_backend())?,
                 vec![
                     input.worker_id.clone().into(),
                     input.node_id.clone().into(),
@@ -208,15 +199,7 @@ impl BatchRuntimeStore {
         let deleted = db
             .execute_raw(raw::statement(
                 db,
-                r#"
-                DELETE FROM fleet_worker_observations
-                WHERE worker_id IN (
-                    SELECT worker_id FROM fleet_worker_observations
-                    WHERE observed_at <= ?1
-                    ORDER BY observed_at ASC
-                    LIMIT ?2
-                )
-                "#,
+                fleet_prune_observations_sql(db.get_database_backend())?,
                 vec![
                     now.saturating_sub(i64::try_from(max_age_ms)?).into(),
                     i64::try_from(bounded_maintenance_batch(limit))?.into(),
@@ -251,17 +234,7 @@ impl BatchRuntimeStore {
         let inserted = db
             .execute_raw(raw::statement(
                 db,
-                r#"
-                INSERT INTO fleet_capacity_claims (
-                    claim_id, worker_id, incarnation_id, gateway_id,
-                    created_at, expires_at
-                )
-                SELECT ?1, ?2, ?3, ?4, ?5, ?6
-                WHERE (
-                    SELECT COUNT(*) FROM fleet_capacity_claims
-                    WHERE worker_id = ?2 AND expires_at > ?5
-                ) < ?7
-                "#,
+                fleet_claim_sql(db.get_database_backend())?,
                 vec![
                     claim_id.clone().into(),
                     worker_id.to_string().into(),
@@ -355,15 +328,7 @@ impl BatchRuntimeStore {
         let deleted = db
             .execute_raw(raw::statement(
                 db,
-                r#"
-                DELETE FROM fleet_capacity_claims
-                WHERE claim_id IN (
-                    SELECT claim_id FROM fleet_capacity_claims
-                    WHERE expires_at <= ?1
-                    ORDER BY expires_at ASC
-                    LIMIT ?2
-                )
-                "#,
+                fleet_reap_sql(db.get_database_backend())?,
                 vec![
                     now.into(),
                     i64::try_from(bounded_maintenance_batch(limit))?.into(),
@@ -377,6 +342,111 @@ impl BatchRuntimeStore {
 
 fn fleet_observer_gateway_id() -> String {
     std::env::var("IZWI_GATEWAY_ID").unwrap_or_else(|_| "gateway".to_string())
+}
+
+/// Backend-conditional SQL for fleet coordination.
+///
+/// SQLite is the supported and tested fleet deployment (a shared file with
+/// WAL). PostgreSQL forms are standard SQL and follow the same patterns as
+/// the durable store, but no PostgreSQL or MySQL instance exists on this
+/// host, so those paths are implemented best-effort for operator validation
+/// and must pass the provider conformance suite before any fleet claim.
+fn fleet_insert_observation_sql(backend: DbBackend) -> anyhow::Result<&'static str> {
+    match backend {
+        DbBackend::Sqlite | DbBackend::Postgres => Ok(r#"
+            INSERT INTO fleet_worker_observations (
+                worker_id, node_id, incarnation_id, status_sequence,
+                process_state, available_admission_credits,
+                active_invocations, deployments_json, observed_at,
+                observer_gateway_id
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ON CONFLICT(worker_id) DO NOTHING
+        "#),
+        DbBackend::MySql => Ok(r#"
+            INSERT IGNORE INTO fleet_worker_observations (
+                worker_id, node_id, incarnation_id, status_sequence,
+                process_state, available_admission_credits,
+                active_invocations, deployments_json, observed_at,
+                observer_gateway_id
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        "#),
+        backend => anyhow::bail!("Unsupported fleet coordination database backend: {backend:?}"),
+    }
+}
+
+fn fleet_prune_observations_sql(backend: DbBackend) -> anyhow::Result<&'static str> {
+    match backend {
+        DbBackend::Sqlite | DbBackend::Postgres => Ok(r#"
+            DELETE FROM fleet_worker_observations
+            WHERE worker_id IN (
+                SELECT worker_id FROM fleet_worker_observations
+                WHERE observed_at <= ?1
+                ORDER BY observed_at ASC
+                LIMIT ?2
+            )
+        "#),
+        // MySQL rejects LIMIT inside an IN-subquery and forbids naming the
+        // target table there; the single-table ORDER BY ... LIMIT form is
+        // the portable equivalent.
+        DbBackend::MySql => Ok(
+            "DELETE FROM fleet_worker_observations WHERE observed_at <= ?1 ORDER BY observed_at ASC LIMIT ?2",
+        ),
+        backend => anyhow::bail!("Unsupported fleet coordination database backend: {backend:?}"),
+    }
+}
+
+fn fleet_claim_sql(backend: DbBackend) -> anyhow::Result<&'static str> {
+    match backend {
+        DbBackend::Sqlite | DbBackend::Postgres => Ok(r#"
+            INSERT INTO fleet_capacity_claims (
+                claim_id, worker_id, incarnation_id, gateway_id,
+                created_at, expires_at
+            )
+            SELECT ?1, ?2, ?3, ?4, ?5, ?6
+            WHERE (
+                SELECT COUNT(*) FROM fleet_capacity_claims
+                WHERE worker_id = ?2 AND expires_at > ?5
+            ) < ?7
+        "#),
+        // MySQL forbids naming the insert target inside the SELECT's
+        // subquery (error 1093); the doubly-nested derived table lifts the
+        // count out of the target-table scope.
+        DbBackend::MySql => Ok(r#"
+            INSERT INTO fleet_capacity_claims (
+                claim_id, worker_id, incarnation_id, gateway_id,
+                created_at, expires_at
+            )
+            SELECT ?1, ?2, ?3, ?4, ?5, ?6
+            FROM DUAL
+            WHERE (
+                SELECT COUNT(*) FROM (
+                    SELECT 1 AS one FROM fleet_capacity_claims
+                    WHERE worker_id = ?2 AND expires_at > ?5
+                ) AS live_claims
+            ) < ?7
+        "#),
+        backend => anyhow::bail!("Unsupported fleet coordination database backend: {backend:?}"),
+    }
+}
+
+fn fleet_reap_sql(backend: DbBackend) -> anyhow::Result<&'static str> {
+    match backend {
+        DbBackend::Sqlite | DbBackend::Postgres => Ok(r#"
+            DELETE FROM fleet_capacity_claims
+            WHERE claim_id IN (
+                SELECT claim_id FROM fleet_capacity_claims
+                WHERE expires_at <= ?1
+                ORDER BY expires_at ASC
+                LIMIT ?2
+            )
+        "#),
+        DbBackend::MySql => Ok(
+            "DELETE FROM fleet_capacity_claims WHERE expires_at <= ?1 ORDER BY expires_at ASC LIMIT ?2",
+        ),
+        backend => anyhow::bail!("Unsupported fleet coordination database backend: {backend:?}"),
+    }
 }
 
 #[cfg(test)]
@@ -604,6 +674,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fleet_capacity_claims_are_atomic_across_connections() {
+        // Multi-gateway equivalent on one host: two independent store
+        // handles (separate pools, as two gateway processes would hold)
+        // race claims against the same SQLite file. WAL serializes the
+        // writers and the single-statement check-and-insert keeps the
+        // cluster-wide total exact.
+        let root = tempfile::tempdir().expect("temp dir");
+        let db_path = root.path().join("shared-fleet.sqlite3");
+        let mut stores = Vec::new();
+        for _ in 0..2 {
+            let mut store = BatchRuntimeStore::initialize_with_database(
+                crate::db::StoreDatabase::new(db_path.clone()),
+            );
+            store.set_test_clock(Arc::new(AtomicI64::new(1_000)));
+            stores.push(store);
+        }
+        let mut handles = Vec::new();
+        // Warm both connections (running migrations) before the race so the
+        // test measures claim atomicity, not first-open migration contention.
+        // Production gateways serialize the same way at boot.
+        for store in &stores {
+            store.count_live_fleet_claims("worker-a").await.unwrap();
+        }
+        for index in 0..8u32 {
+            let store = stores[(index % 2) as usize].clone();
+            handles.push(tokio::spawn(async move {
+                store
+                    .try_claim_fleet_capacity(
+                        "worker-a",
+                        "inc-1",
+                        &format!("gateway-{index}"),
+                        3,
+                        60_000,
+                    )
+                    .await
+            }));
+        }
+        let mut acquired = 0u32;
+        for handle in handles {
+            if handle.await.unwrap().unwrap().is_some() {
+                acquired += 1;
+            }
+        }
+        assert_eq!(
+            acquired, 3,
+            "exactly the observable credits may be claimed across connections"
+        );
+        assert_eq!(
+            stores[1].count_live_fleet_claims("worker-a").await.unwrap(),
+            3,
+            "either connection observes the same cluster total"
+        );
+    }
+
+    #[tokio::test]
     async fn fleet_inputs_are_bounded() {
         let (store, _root) = test_store_at(1_000);
         let mut oversized = observation(1, "inc-1");
@@ -618,5 +743,37 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn fleet_sql_dialects_select_the_documented_constructs() {
+        use sea_orm::DbBackend;
+        // SQLite and PostgreSQL share the conflict-tolerant and
+        // subselect forms; MySQL uses INSERT IGNORE, single-table
+        // bounded deletes, and the derived-table claim fence.
+        // PostgreSQL/MySQL statements are best-effort here (no such
+        // database on this host); they must pass the provider
+        // conformance suite before any fleet claim.
+        let insert_pg = fleet_insert_observation_sql(DbBackend::Postgres).unwrap();
+        assert!(insert_pg.contains("ON CONFLICT"));
+        let insert_mysql = fleet_insert_observation_sql(DbBackend::MySql).unwrap();
+        assert!(insert_mysql.contains("INSERT IGNORE"));
+        assert!(!insert_mysql.contains("ON CONFLICT"));
+
+        let claim_pg = fleet_claim_sql(DbBackend::Postgres).unwrap();
+        assert!(!claim_pg.contains("DUAL"));
+        let claim_mysql = fleet_claim_sql(DbBackend::MySql).unwrap();
+        assert!(claim_mysql.contains("FROM DUAL"));
+        assert!(claim_mysql.contains("live_claims"));
+
+        let reap_pg = fleet_reap_sql(DbBackend::Postgres).unwrap();
+        assert!(reap_pg.contains("IN ("));
+        let reap_mysql = fleet_reap_sql(DbBackend::MySql).unwrap();
+        assert!(!reap_mysql.contains("IN ("));
+        assert!(reap_mysql.contains("ORDER BY expires_at ASC LIMIT"));
+
+        let prune_mysql = fleet_prune_observations_sql(DbBackend::MySql).unwrap();
+        assert!(!prune_mysql.contains("IN ("));
+        assert!(prune_mysql.contains("ORDER BY observed_at ASC LIMIT"));
     }
 }
