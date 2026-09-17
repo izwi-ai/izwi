@@ -88,4 +88,24 @@ if "${verifier}" --terminal-archive "${archive}" >/dev/null 2>&1; then
     exit 1
 fi
 
+cp "${example_config}" "${stage}/izwi-serving-node.example.toml"
+python3 - "${stage}/izwi-serving-node.example.toml" << 'PYEOF'
+import sys
+import tomllib
+
+path = sys.argv[1]
+with open(path, "rb") as handle:
+    config = tomllib.load(handle)
+assert config.get("schema_version") == 2, "node example must pin schema version 2"
+workers = config.get("workers", [])
+assert len(workers) >= 1, "node example must declare at least one worker"
+for worker in workers:
+    assert worker.get("worker_id"), "every example worker needs an identity"
+    assert worker.get("bearer_token_env"), "example secrets must stay in the environment"
+    assert "bearer_token" not in worker, "example must never inline a secret"
+    deployment = worker.get("deployment", {})
+    assert deployment.get("model_generation", 0) != 0, "example generation must be non-zero"
+print("node example topology contract passed.")
+PYEOF
+
 echo "Native serving package contract passed."
