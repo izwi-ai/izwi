@@ -878,7 +878,7 @@ mod tests {
         mock::{MockFault, MockWorker, MockWorkerConfig},
         WorkerClient, WorkerClientConfig,
     };
-    use izwi_serving_protocol::{ModelAlias, ModelGeneration, PolicyRevision};
+    use izwi_serving_protocol::{ModelAlias, ModelGeneration, PolicyRevision, WorkerStatus};
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
@@ -889,6 +889,7 @@ mod tests {
     use crate::gateway_security::MAX_GATEWAY_REQUEST_ID_BYTES;
     use crate::worker_registry::{
         ApprovedDeployment, ApprovedWorker, BackendPolicy, WorkerRegistry, WorkerRegistryConfig,
+        WorkerRegistryError,
     };
 
     const TEST_API_KEY: &str = "test-public-api-key-123456";
@@ -1254,6 +1255,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gateway_crash_cannot_duplicate_execution_and_recovery_is_explicit() {
+        let model = ModelVariant::Qwen34BGguf;
+        let worker_config = MockWorkerConfig {
+            public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
+            fault: MockFault::Hang,
+            cancellation_delay: Duration::from_millis(100),
+            ..MockWorkerConfig::default()
+        };
+        let credentials = worker_config.credentials.clone();
+        let incarnation = worker_config.incarnation_id.clone();
+        let deployment = worker_config.deployment_id.clone();
+        let generation = worker_config.model_generation;
+        let worker = MockWorker::spawn(worker_config.clone())
+            .await
+            .expect("mock worker should bind");
+        let endpoint = worker.endpoint();
+        let bootstrapping = |endpoint: &str| {
+            let client = WorkerClient::new(
+                &endpoint,
+                credentials.clone(),
+                WorkerClientConfig::default(),
+            )
+            .expect("worker client should initialize");
+            let remote = RemoteChatExecution::new(
+                client,
+                crate::app::chat::RemoteChatExecutionConfig {
+                    public_model_variant: model,
+                    expected_worker_incarnation: incarnation.clone(),
+                    deployment_id: deployment.clone(),
+                    expected_model_generation: generation,
+                    policy_revision: PolicyRevision::new("test-policy-v1")
+                        .expect("static policy revision"),
+                    max_queue_wait: Duration::ZERO,
+                    max_output_tokens: 128,
+                    max_output_bytes: 4096,
+                    slow_consumer_timeout: Duration::from_millis(100),
+                },
+            )
+            .expect("remote execution should initialize");
+            let state = GatewayState::new(remote, EnterpriseHooks::noop(), test_perimeter(), 2, 4)
+                .with_tenant_concurrency_config(
+                    GatewayTenantConcurrencyConfig::new(1, 2).expect("test tenant limit"),
+                );
+            state.lifecycle.mark_ready();
+            let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
+            (app, state)
+        };
+        let stream_request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": model.dir_name(),
+                        "messages": [{"role": "user", "content": "crash mid-stream"}],
+                        "stream": true,
+                        "max_tokens": 8
+                    })
+                    .to_string(),
+                ))
+                .expect("stream request should build")
+        };
+
+        let (app, state) = bootstrapping(&endpoint);
+        let response = send(app.clone(), stream_request()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(worker.active_invocations(), 1);
+
+        // Simulate a gateway crash: drop the response, router, and all
+        // gateway state without any graceful teardown or cancellation.
+        drop((response, app, state));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            worker.active_invocations(),
+            1,
+            "execution ownership survives gateway death on the worker"
+        );
+
+        // A restarted gateway has no memory of the orphaned work. Its fresh
+        // tenant view admits, but the worker authoritatively rejects the
+        // second concurrent invocation instead of duplicating execution.
+        let (restarted_app, _) = bootstrapping(&endpoint);
+        let rejected = send(restarted_app.clone(), stream_request()).await;
+        assert_ne!(
+            rejected.status(),
+            StatusCode::OK,
+            "a crashed gateway's orphan must surface as rejection, never duplicate execution"
+        );
+        assert_eq!(worker.active_invocations(), 1);
+
+        // The orphan cannot be cancelled without its attempt identity, which
+        // died with the gateway — exactly the production crash case. Recovery
+        // proceeds by replacing the worker: the orphan dies with its process
+        // (fate sharing), and a fresh worker under the same approved identity
+        // resumes service for the restarted gateway.
+        drop(worker);
+        let worker_next = MockWorker::spawn(worker_config)
+            .await
+            .expect("replacement mock worker should bind");
+        let (resumed_app, _) = bootstrapping(&worker_next.endpoint());
+        assert_eq!(
+            send(resumed_app, stream_request()).await.status(),
+            StatusCode::OK,
+            "service resumes once the orphaned worker is replaced"
+        );
+    }
+
+    #[tokio::test]
     async fn registry_stream_disconnect_releases_only_after_exact_worker_teardown() {
         let model = ModelVariant::Qwen34BGguf;
         let (state, worker) = registry_gateway_state_with_config(
@@ -1314,6 +1424,151 @@ mod tests {
         let admitted_again = send(app, request()).await;
         assert_eq!(admitted_again.status(), StatusCode::OK);
         drop(admitted_again);
+    }
+
+    async fn approve_worker(registry: &WorkerRegistry, worker: &MockWorker) -> WorkerStatus {
+        let client = WorkerClient::new(
+            &worker.endpoint(),
+            worker.config().credentials.clone(),
+            WorkerClientConfig::default(),
+        )
+        .expect("worker client should initialize");
+        let descriptor = client
+            .descriptor()
+            .await
+            .expect("descriptor should be available");
+        let status = client.status().await.expect("status should be available");
+        let deployment = status
+            .deployments
+            .first()
+            .expect("mock deployment should exist")
+            .clone();
+        registry
+            .approve(ApprovedWorker {
+                descriptor,
+                client,
+                approved_deployments: BTreeMap::from([(
+                    deployment.deployment_id.clone(),
+                    ApprovedDeployment::from_loaded(&deployment),
+                )]),
+                validated_capacity: status.capacity.max_active_invocations
+                    + status.capacity.max_queued_invocations,
+            })
+            .expect("worker should be approved");
+        registry
+            .observe_status(status.clone())
+            .expect("initial status should be valid");
+        status
+    }
+
+    #[tokio::test]
+    async fn gateway_worker_loss_fails_over_to_replacement_incarnation() {
+        let model = ModelVariant::Qwen34BGguf;
+        let deployment_id = MockWorkerConfig::default().deployment_id;
+        let incarnation = |suffix: &str| MockWorkerConfig {
+            worker_id: "mock-worker-fleet".try_into().expect("test id valid"),
+            node_id: "mock-node-fleet".try_into().expect("test id valid"),
+            incarnation_id: format!("mock-incarnation-{suffix}")
+                .try_into()
+                .expect("test incarnation should be valid"),
+            public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
+            output_text: format!("from-{suffix}"),
+            ..MockWorkerConfig::default()
+        };
+        let worker_a = MockWorker::spawn(incarnation("one"))
+            .await
+            .expect("first mock worker should bind");
+        // Short status TTL keeps the loss simulation fast; production uses
+        // seconds, which only changes how long a dead worker shadows routing.
+        let registry = WorkerRegistry::new(WorkerRegistryConfig {
+            status_ttl: Duration::from_millis(50),
+            ..WorkerRegistryConfig::default()
+        })
+        .expect("registry should initialize");
+        let stale_a = approve_worker(&registry, &worker_a).await;
+        let dispatcher = RemoteChatDispatcher::new(
+            registry.clone(),
+            RemoteChatDispatchConfig {
+                public_model_variant: model,
+                deployment_id,
+                policy_revision: PolicyRevision::new("test-policy-v1")
+                    .expect("static policy revision"),
+                backend_policy: BackendPolicy::ANY,
+                max_queue_wait: Duration::ZERO,
+                max_output_tokens: 128,
+                max_output_bytes: 4096,
+                slow_consumer_timeout: Duration::from_millis(100),
+            },
+        )
+        .expect("dispatcher should initialize");
+        let state = GatewayState::with_dispatcher(
+            dispatcher,
+            EnterpriseHooks::noop(),
+            test_perimeter(),
+            5,
+            2,
+        );
+        state.lifecycle.mark_ready();
+        let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+        let chat = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": model.dir_name(),
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "stream": false,
+                        "max_tokens": 8
+                    })
+                    .to_string(),
+                ))
+                .expect("chat request should build")
+        };
+        let first = send(app.clone(), chat()).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(first.into_body(), 64 * 1024)
+            .await
+            .expect("response should be bounded");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("response should be JSON")
+                ["choices"][0]["message"]["content"],
+            "from-one"
+        );
+
+        // Kill the worker process. After the status TTL expires, the dead
+        // incarnation must stop receiving traffic instead of hanging it.
+        drop(worker_a);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            send(app.clone(), chat()).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "expired observations must fail fast, never route to a dead worker"
+        );
+
+        // A replacement incarnation for the same logical worker takes over.
+        let worker_b = MockWorker::spawn(incarnation("two"))
+            .await
+            .expect("replacement mock worker should bind");
+        approve_worker(&registry, &worker_b).await;
+        let second = send(app.clone(), chat()).await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(second.into_body(), 64 * 1024)
+            .await
+            .expect("response should be bounded");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("response should be JSON")
+                ["choices"][0]["message"]["content"],
+            "from-two",
+            "traffic must resume on the replacement incarnation"
+        );
+
+        // A late status from the dead incarnation must not resurrect it.
+        assert_eq!(
+            registry.observe_status(stale_a),
+            Err(WorkerRegistryError::UnknownOrStaleIncarnation)
+        );
     }
 
     #[tokio::test]
