@@ -9029,6 +9029,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_same_key_reservations_never_double_acquire() {
+        // Fleet regression: two gateways (or two retries) may race to reserve
+        // the same idempotency key. The conflict-tolerant insert must let
+        // exactly one caller acquire; the loser observes the winner's exact
+        // state instead of creating duplicate work. This holds on SQLite via
+        // the named admission lock and on PostgreSQL/MySQL via the
+        // ON CONFLICT/INSERT IGNORE key fence.
+        let (mut store, _root) = build_store();
+        let clock = Arc::new(AtomicI64::new(1_000));
+        store.set_test_clock(clock);
+        let first_request =
+            durable_idempotency_request("tenant-a", "job.create", "race-key", b"one", 500);
+        let second_request = first_request.clone();
+        let (first, second) = tokio::join!(
+            store.reserve_durable_idempotency(first_request),
+            store.reserve_durable_idempotency(second_request)
+        );
+        let first = first.expect("first concurrent reserve");
+        let second = second.expect("second concurrent reserve");
+        let acquired = usize::from(matches!(first, DurableIdempotencyBegin::Acquired(_)))
+            + usize::from(matches!(second, DurableIdempotencyBegin::Acquired(_)));
+        assert_eq!(
+            acquired, 1,
+            "exactly one concurrent caller may acquire, got {first:?} and {second:?}"
+        );
+        for outcome in [&first, &second] {
+            match outcome {
+                DurableIdempotencyBegin::Acquired(_)
+                | DurableIdempotencyBegin::InProgress { .. } => {}
+                other => panic!("loser must observe the winner, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn durable_idempotency_reservations_expire_and_fence_stale_commits() {
         let (mut store, _root) = build_store();
         let clock = Arc::new(AtomicI64::new(1_000));
