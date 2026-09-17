@@ -580,6 +580,18 @@ Each gateway refreshes its cached view every
 newly approved workers are adopted on rolling gateway restart, never
 mid-stream.
 
+**Fleet coordination database (optional).** Point every gateway at the same
+SQLite file with `IZWI_GATEWAY_FLEET_DB_PATH=/absolute/path/fleet.sqlite3`
+to share worker observations and capacity claims. Each gateway publishes its
+polled worker statuses (monotonic per incarnation; incarnation changes always
+win) and claims one short-lived capacity unit per dispatch; selection steers
+away from peer-filled workers while the worker remains the atomic admission
+arbiter, so a lost race degrades to one alternate dispatch. Claims expire by
+TTL (`FLEET_CLAIM_TTL`, 30s), which is the crash-recovery path — no explicit
+recovery protocol. Unset means single-gateway operation with purely
+process-local state. Multi-site fleets needing PostgreSQL-backed shared state
+remain a separate adapter gate.
+
 **Operator drain.** Configure `IZWI_GATEWAY_ADMIN_API_KEY_REF` to a bounded
 `env:VARIABLE` secret that differs from the inference key. Then
 `POST /internal/admin/drain` with that bearer credential returns 202 and
@@ -616,7 +628,7 @@ to unrelated local-engine tests elsewhere in the repository.
 | Real CUDA execution | No NVIDIA device was available | Not established; supervisor executable rejects CUDA configs |
 | Physical multi-GPU | Parser/topology and mock-replica tests only | Not established |
 | Multi-machine | Worker binary terminates server-side TLS/mTLS from bounded file references (unit-tested parsing; plaintext non-loopback rejected). Client HTTPS trust, fleet topology policy, and v1 approvals exist. No separate-machine handshake, remote artifact/state path, or partition test was exercised | Not supported as an operational profile |
-| Multi-gateway | Conservatively partitioned quotas (1/N slices, unit-tested), shared approvals file with TTL-cached views (unit-tested), registry circuit/replacement-incarnation fencing (unit-tested), concurrent idempotency keys proven never to double-acquire (test). No shared atomic registry/quota authority, no gateway-crash/store-outage/partition fleet tests | Not supported as an operational profile |
+| Multi-gateway | Conservatively partitioned quotas (1/N slices, unit-tested), shared approvals file with TTL-cached views (unit-tested), shared SQLite coordination for observations and atomic capacity claims (tested, incl. concurrent idempotency keys never double-acquiring), registry circuit/replacement-incarnation fencing (unit-tested). Single-host equivalents proven: worker kill fails over to a replacement incarnation, gateway crash cannot duplicate execution, crashing workers are quarantined. No shared atomic registry/quota authority beyond SQLite, no multi-machine/store-outage tests | Not supported as an operational profile |
 | Soak/load/performance | Closed-loop gateway chat benchmark harness exists (`scripts/bench/run-gateway-chat-benchmark.py`) reporting TTFT/latency percentiles, throughput, and completed/rejected/failed rates; no hours-long soak or representative production load matrix has been run | Not established |
 
 Before any production claim, complete the open route, quota, observability,
