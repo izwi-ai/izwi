@@ -40,6 +40,7 @@ mod gateway_deployments;
 mod gateway_fleet;
 mod gateway_rate_quota;
 mod gateway_security;
+mod gateway_shared_approvals;
 mod gateway_tenant_concurrency;
 mod gateway_worker_tls;
 mod ids;
@@ -536,6 +537,26 @@ async fn run_gateway(
     logging::init_tracing(args.log_format);
     let perimeter = GatewayPerimeterConfig::from_env()?;
     let fleet_partition = crate::gateway_fleet::FleetPartition::from_env()?;
+    if let Some(partition) = fleet_partition {
+        info!(
+            service = SERVICE_NAME,
+            version = SERVICE_VERSION,
+            partition = partition.index(),
+            fleet_size = partition.size(),
+            "Gateway fleet partition active: per-tenant budgets are divided across gateways"
+        );
+    }
+    if let Ok(Some(shared)) = crate::gateway_shared_approvals::SharedApprovalsConfig::from_env() {
+        match crate::gateway_shared_approvals::SharedApprovalsView::load(shared) {
+            Ok(view) => info!(
+                service = SERVICE_NAME,
+                version = SERVICE_VERSION,
+                approvals = view.approvals().len(),
+                "Shared fleet approvals loaded: all gateways reading this file approve the same worker set"
+            ),
+            Err(error) => warn!(error = %error, "Shared fleet approvals file could not be loaded at startup"),
+        }
+    }
     let rate_quota = GatewayRateQuotaConfig::from_env()?;
     let tenant_concurrency = GatewayTenantConcurrencyConfig::from_env(args.gateway_max_in_flight)?;
     let (rate_quota, tenant_concurrency) =
@@ -640,7 +661,8 @@ async fn gateway_state(
         "--public-model",
     )?)?;
     let public_model = ModelAlias::new(public_model_variant.dir_name())?;
-    let worker_approvals = configured_gateway_worker_approvals(args, &public_model)?;
+    let (worker_approvals, shared_approvals_view) =
+        configured_gateway_worker_approvals(args, &public_model)?;
     let credentials = gateway_worker_credentials(args)?;
     let registry_config = worker_registry::WorkerRegistryConfig {
         max_workers: worker_approvals.len(),
@@ -725,7 +747,7 @@ async fn gateway_state(
     )
     .map_err(|error| anyhow::anyhow!(error.message))?;
     let polling_interval = Duration::from_millis(args.gateway_worker_status_poll_ms);
-    let tasks = polling_workers
+    let mut tasks: Vec<tokio::task::JoinHandle<()>> = polling_workers
         .into_iter()
         .map(|expected| {
             let registry = registry.clone();
@@ -747,6 +769,45 @@ async fn gateway_state(
             })
         })
         .collect();
+
+    // Multi-gateway fleets: keep a locally cached fresh view of the shared
+    // approvals file. When an operator changes the fleet's approved worker
+    // set, every gateway logs the drift within one TTL. Admission itself is
+    // lifecycle-gated: newly approved workers are adopted on the next
+    // rolling gateway restart, so a file change can never destabilize live
+    // admission mid-stream.
+    if let Some(view) = shared_approvals_view {
+        let ttl = view.ttl();
+        let watched = std::sync::Arc::new(tokio::sync::Mutex::new(view));
+        tasks.push(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(ttl);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let mut guard = watched.lock().await;
+                match guard.refresh_if_due() {
+                    Ok(true) => {
+                        let endpoints: Vec<&str> = guard
+                            .approvals()
+                            .iter()
+                            .map(|approval| approval.endpoint.as_str())
+                            .collect();
+                        info!(
+                            service = SERVICE_NAME,
+                            version = SERVICE_VERSION,
+                            approvals = endpoints.len(),
+                            "Shared fleet approvals refreshed"
+                        );
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        warn!(error = %error, "Shared fleet approvals refresh failed; retaining previous view");
+                    }
+                }
+            }
+        }));
+    }
 
     Ok((
         gateway::GatewayState::with_dispatcher(
@@ -813,8 +874,11 @@ fn initial_gateway_worker_expectation(
 fn configured_gateway_worker_approvals(
     args: &ServerArgs,
     legacy_public_model: &ModelAlias,
-) -> anyhow::Result<Vec<gateway_deployments::GatewayWorkerApproval>> {
-    if !args.gateway_worker_approvals.is_empty() {
+) -> anyhow::Result<(
+    Vec<gateway_deployments::GatewayWorkerApproval>,
+    Option<gateway_shared_approvals::SharedApprovalsView>,
+)> {
+    let mut merged = if !args.gateway_worker_approvals.is_empty() {
         if !args.gateway_worker_endpoints.is_empty() {
             anyhow::bail!(
                 "--gateway-worker-approval cannot be combined with --gateway-worker-endpoint"
@@ -825,29 +889,44 @@ fn configured_gateway_worker_approvals(
                 "--worker-deployment and --worker-model-generation apply only to legacy --gateway-worker-endpoint configuration"
             );
         }
-        return Ok(args.gateway_worker_approvals.clone());
-    }
+        args.gateway_worker_approvals.clone()
+    } else {
+        let deployment_id = DeploymentId::new(required_gateway_value(
+            &args.worker_deployment,
+            "--worker-deployment",
+        )?)?;
+        let model_generation =
+            ModelGeneration::new(args.worker_model_generation.ok_or_else(|| {
+                anyhow::anyhow!("gateway mode requires --worker-model-generation")
+            })?)?;
+        args.gateway_worker_endpoints
+            .iter()
+            .map(|endpoint| gateway_deployments::GatewayWorkerApproval {
+                endpoint: endpoint.clone(),
+                identity: gateway_deployments::GatewayWorkerApprovalIdentity::DiscoverFromAuthenticatedEndpoint,
+                task: TaskKind::Chat,
+                public_model: legacy_public_model.clone(),
+                deployment_id: deployment_id.clone(),
+                model_generation,
+            })
+            .collect()
+    };
 
-    let deployment_id = DeploymentId::new(required_gateway_value(
-        &args.worker_deployment,
-        "--worker-deployment",
-    )?)?;
-    let model_generation = ModelGeneration::new(
-        args.worker_model_generation
-            .ok_or_else(|| anyhow::anyhow!("gateway mode requires --worker-model-generation"))?,
-    )?;
-    Ok(args
-        .gateway_worker_endpoints
-        .iter()
-        .map(|endpoint| gateway_deployments::GatewayWorkerApproval {
-            endpoint: endpoint.clone(),
-            identity: gateway_deployments::GatewayWorkerApprovalIdentity::DiscoverFromAuthenticatedEndpoint,
-            task: TaskKind::Chat,
-            public_model: legacy_public_model.clone(),
-            deployment_id: deployment_id.clone(),
-            model_generation,
-        })
-        .collect())
+    // Multi-gateway fleets keep one authoritative approvals file that every
+    // gateway reads, so all gateways approve the same worker set. Shared
+    // entries augment (never replace) explicit CLI approvals; the existing
+    // duplicate-endpoint check below rejects any conflict fail-closed.
+    let shared_view = match gateway_shared_approvals::SharedApprovalsConfig::from_env() {
+        Ok(Some(config)) => {
+            let view = gateway_shared_approvals::SharedApprovalsView::load(config)
+                .map_err(|error| anyhow::anyhow!("shared fleet approvals: {error}"))?;
+            merged.extend(view.approvals().iter().cloned());
+            Some(view)
+        }
+        Ok(None) => None,
+        Err(error) => anyhow::bail!("shared fleet approvals: {error}"),
+    };
+    Ok((merged, shared_view))
 }
 
 fn validate_gateway_topology_policy(
