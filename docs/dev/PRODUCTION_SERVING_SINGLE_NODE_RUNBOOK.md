@@ -591,8 +591,11 @@ TTL (`FLEET_CLAIM_TTL`, 30s), which is the crash-recovery path — no explicit
 recovery protocol. Each gateway also releases its own leftover claims at
 startup (same `IZWI_GATEWAY_ID` after a restart), so capacity frees
 immediately instead of waiting out the TTL. Unset means single-gateway
-operation with purely process-local state. Multi-site fleets needing
-PostgreSQL-backed shared state remain a separate adapter gate.
+operation with purely process-local state. The fleet tables ship
+backend-conditional SQL for PostgreSQL/MySQL written best-effort against
+house idioms but never executed here; multi-site fleets needing
+PostgreSQL-backed shared state remain a separate adapter gate behind the
+provider conformance suite.
 
 **Operator drain.** Configure `IZWI_GATEWAY_ADMIN_API_KEY_REF` to a bounded
 `env:VARIABLE` secret that differs from the inference key. Then
@@ -630,7 +633,7 @@ to unrelated local-engine tests elsewhere in the repository.
 | Real CUDA execution | No NVIDIA device was available | Not established; supervisor executable rejects CUDA configs |
 | Physical multi-GPU | Parser/topology and mock-replica tests only | Not established |
 | Multi-machine | Worker binary terminates server-side TLS/mTLS from bounded file references (unit-tested parsing; plaintext non-loopback rejected). Client HTTPS trust, fleet topology policy, and v1 approvals exist. No separate-machine handshake, remote artifact/state path, or partition test was exercised | Not supported as an operational profile |
-| Multi-gateway | Conservatively partitioned quotas (1/N slices, unit-tested), shared approvals file with TTL-cached views (unit-tested), shared SQLite coordination for observations and atomic capacity claims (tested, incl. concurrent idempotency keys never double-acquiring), registry circuit/replacement-incarnation fencing (unit-tested). Single-host equivalents proven: worker kill fails over to a replacement incarnation, gateway crash cannot duplicate execution, crashing workers are quarantined. No shared atomic registry/quota authority beyond SQLite, no multi-machine/store-outage tests | Not supported as an operational profile |
+| Multi-gateway | Conservatively partitioned quotas (1/N slices, unit-tested), shared approvals file with TTL-cached views (unit-tested), shared SQLite coordination for observations and atomic capacity claims (tested, incl. multi-connection same-file atomicity and concurrent idempotency keys never double-acquiring), backend-conditional fleet SQL for PostgreSQL/MySQL written best-effort but unvalidated, registry circuit/replacement-incarnation fencing (unit-tested). Single-host equivalents proven: worker kill fails over to a replacement incarnation, gateway crash cannot duplicate execution, crashing workers are quarantined, reconnects re-approve same-generation workers and fail closed on generation drift. No multi-machine/store-outage tests | Not supported as an operational profile |
 | Soak/load/performance | Closed-loop gateway chat benchmark harness exists (`scripts/bench/run-gateway-chat-benchmark.py`) reporting TTFT/latency percentiles, throughput, and completed/rejected/failed rates; no hours-long soak or representative production load matrix has been run | Not established |
 
 Before any production claim, complete the open route, quota, observability,
