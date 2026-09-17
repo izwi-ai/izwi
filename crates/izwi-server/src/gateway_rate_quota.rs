@@ -280,6 +280,38 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_tenant_does_not_affect_other_tenants() {
+        let quota = GatewayRateQuota::new(GatewayRateQuotaConfig::new(60, 1, 4).unwrap());
+        assert_eq!(
+            quota.check_at(key(1), Duration::ZERO).unwrap(),
+            GatewayRateDecision::Allowed
+        );
+        assert_eq!(
+            quota.check_at(key(1), Duration::ZERO).unwrap(),
+            GatewayRateDecision::Limited,
+            "tenant 1 exhausts its own burst"
+        );
+        assert_eq!(
+            quota.check_at(key(2), Duration::ZERO).unwrap(),
+            GatewayRateDecision::Allowed,
+            "tenant 2 is unaffected by tenant 1's exhaustion"
+        );
+        assert_eq!(
+            quota.check_at(key(2), Duration::ZERO).unwrap(),
+            GatewayRateDecision::Limited
+        );
+        assert_eq!(
+            quota.check_at(key(2), Duration::from_secs(1)).unwrap(),
+            GatewayRateDecision::Allowed,
+            "tenants refill on their own clocks"
+        );
+        assert_eq!(
+            quota.check_at(key(1), Duration::from_secs(1)).unwrap(),
+            GatewayRateDecision::Allowed
+        );
+    }
+
+    #[test]
     fn tenant_state_is_hard_bounded_and_evicts_least_recently_used() {
         let quota = GatewayRateQuota::new(GatewayRateQuotaConfig::new(60, 1, 2).unwrap());
         assert_eq!(

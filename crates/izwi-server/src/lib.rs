@@ -1905,7 +1905,9 @@ mod tests {
     use crate::test_support::env_lock;
     use izwi_core::ModelVariant;
     use izwi_serving_client::mock::{MockWorker, MockWorkerConfig};
-    use izwi_serving_protocol::{IncarnationId, ModelAlias, NodeId, WorkerId};
+    use izwi_serving_protocol::{
+        IncarnationId, ModelAlias, NodeId, WorkerDescriptor, WorkerId, WorkerStatus,
+    };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
@@ -2914,6 +2916,98 @@ mod tests {
             izwi_core::PerformanceConfigOverrides::from_user_config(Some(&missing))
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    async fn reconnect_expectation(
+        config: izwi_serving_client::mock::MockWorkerConfig,
+    ) -> (
+        izwi_serving_client::mock::MockWorker,
+        GatewayWorkerExpectation,
+        WorkerDescriptor,
+        WorkerStatus,
+    ) {
+        use izwi_serving_client::{WorkerClient, WorkerClientConfig};
+
+        let worker = MockWorker::spawn(config).await.expect("mock binds");
+        let client = WorkerClient::new(
+            &worker.endpoint(),
+            worker.config().credentials.clone(),
+            WorkerClientConfig::default(),
+        )
+        .expect("client initializes");
+        let descriptor = client.descriptor().await.expect("descriptor");
+        let status = client.status().await.expect("status");
+        let deployment = worker_registry::ApprovedDeployment::from_loaded(
+            status.deployments.first().expect("deployment"),
+        );
+        let validated_capacity = configured_worker_capacity(&status).expect("valid capacity");
+        let expected = GatewayWorkerExpectation {
+            client,
+            worker_id: descriptor.worker_id.clone(),
+            node_id: descriptor.node_id.clone(),
+            deployment,
+            validated_capacity,
+        };
+        (worker, expected, descriptor, status)
+    }
+
+    #[tokio::test]
+    async fn restarted_worker_reconnects_with_same_generation_and_fails_closed_on_drift() {
+        use izwi_serving_client::mock::MockWorkerConfig;
+        use izwi_serving_protocol::{IncarnationId, ModelGeneration, WorkerId};
+
+        let registry =
+            worker_registry::WorkerRegistry::new(worker_registry::WorkerRegistryConfig::default())
+                .expect("registry initializes");
+        let base = MockWorkerConfig {
+            worker_id: WorkerId::new("mock-worker-1").expect("test id"),
+            node_id: NodeId::new("mock-node-1").expect("test id"),
+            ..MockWorkerConfig::default()
+        };
+
+        // Generation 1, incarnation 1: initial approval.
+        let (worker_a, expected_a, descriptor_a, status_a) =
+            reconnect_expectation(MockWorkerConfig {
+                incarnation_id: IncarnationId::new("mock-incarnation-1").expect("test id"),
+                ..base.clone()
+            })
+            .await;
+        approve_gateway_worker(&registry, &expected_a, descriptor_a, status_a.clone())
+            .expect("initial approval");
+
+        // The worker restarts with the same generation but a new incarnation.
+        // The poller's refresh path re-approves it without operator action.
+        drop(worker_a);
+        let (_worker_b, expected_b, _, _) = reconnect_expectation(MockWorkerConfig {
+            incarnation_id: IncarnationId::new("mock-incarnation-2").expect("test id"),
+            ..base.clone()
+        })
+        .await;
+        refresh_gateway_worker_status(&registry, &expected_b, None)
+            .await
+            .expect("same-generation restart must reconnect");
+        let expected_b_deployment = expected_b.deployment.clone();
+        assert!(
+            registry.observe_status(status_a).is_err(),
+            "the dead incarnation's late statuses must stay fenced after replacement"
+        );
+
+        // A restart that changes the model generation fails closed: the
+        // expectation pins the operator-approved generation, so a worker
+        // advertising a new generation is never silently adopted.
+        let (_worker_c, mut expected_c, _, _) = reconnect_expectation(MockWorkerConfig {
+            incarnation_id: IncarnationId::new("mock-incarnation-3").expect("test id"),
+            model_generation: ModelGeneration::new(2).expect("non-zero"),
+            ..base
+        })
+        .await;
+        expected_c.deployment = expected_b_deployment;
+        assert!(
+            refresh_gateway_worker_status(&registry, &expected_c, None)
+                .await
+                .is_err(),
+            "generation drift must fail closed instead of silently adopting"
         );
     }
 }
