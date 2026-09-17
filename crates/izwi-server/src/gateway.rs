@@ -615,8 +615,8 @@ async fn ready_check(State(state): State<GatewayState>) -> Response {
         .into_response()
 }
 
-async fn api_not_found() -> StatusCode {
-    StatusCode::NOT_FOUND
+async fn api_not_found() -> Response {
+    ApiError::not_found("unknown gateway route").into_response()
 }
 
 async fn gateway_drain(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
@@ -1984,6 +1984,101 @@ mod tests {
         assert_eq!(snapshot.auth_rejections, 2);
         assert_eq!(snapshot.http_2xx, 1);
         assert_eq!(snapshot.http_4xx, 2);
+    }
+
+    #[tokio::test]
+    async fn gateway_conformance_error_envelopes_and_advertised_surface() {
+        let state = unreachable_gateway_state(test_perimeter());
+        let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+
+        // The OpenAPI document must expose exactly the advertised gateway
+        // surface: text-only chat plus public probes/docs. Any unmigrated
+        // route in the document is a migration-ledger violation.
+        let openapi = send_raw(app.clone(), get("/openapi.json")).await;
+        assert_eq!(openapi.status(), StatusCode::OK);
+        let document: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(openapi.into_body(), 256 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let mut paths: Vec<&str> = document["paths"]
+            .as_object()
+            .expect("openapi document must have paths")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        paths.sort_unstable();
+        for advertised in ["/livez", "/openapi.json", "/readyz", "/v1/chat/completions"] {
+            assert!(
+                paths.contains(&advertised),
+                "gateway OpenAPI must advertise {advertised}, got {paths:?}"
+            );
+        }
+        for gated in [
+            "/v1/models",
+            "/v1/audio/speech",
+            "/v1/audio/transcriptions",
+            "/v1/responses",
+            "/v1/admin/models",
+            "/v1/voice/sessions",
+            "/v1/media",
+            "/v1/voices",
+            "/v1/studio/projects",
+            "/v1/jobs",
+        ] {
+            assert!(
+                !paths.contains(&gated),
+                "gateway OpenAPI must not advertise unmigrated route {gated}"
+            );
+        }
+
+        // 401, 404, and 413 must share one bounded OpenAI-style envelope
+        // and carry a server-authored request id.
+        let unauthorized = send_raw(app.clone(), post("/v1/chat/completions")).await;
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        let unauthorized_body = error_envelope(unauthorized).await;
+        assert_eq!(unauthorized_body["error"]["type"], "authentication_error");
+        assert!(unauthorized_body["error"]["message"].is_string());
+
+        let not_found = send_raw(app.clone(), get_with_bearer("/v1/models", TEST_API_KEY)).await;
+        assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
+        let not_found_body = error_envelope(not_found).await;
+        assert_eq!(not_found_body["error"]["type"], "not_found_error");
+        assert!(not_found_body["error"]["message"].is_string());
+
+        let oversized = send_raw(
+            app.clone(),
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", format!("Bearer {TEST_API_KEY}"))
+                .header("content-type", "application/json")
+                .body(Body::from(vec![b'x'; 2 * 1024 * 1024]))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(
+            oversized
+                .headers()
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok())
+                .is_some(),
+            "413 rejection must still carry a server-authored request id"
+        );
+    }
+
+    async fn error_envelope(response: Response) -> serde_json::Value {
+        response
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .expect("error response must carry a server-authored request id");
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("error response must be bounded");
+        serde_json::from_slice(&body).expect("error response must be JSON")
     }
 
     #[tokio::test]
