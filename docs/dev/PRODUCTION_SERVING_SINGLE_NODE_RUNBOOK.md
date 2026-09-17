@@ -556,6 +556,51 @@ and worker metrics plus supervisor diagnostics remain operational evidence, not
 teardown proof; only the exact-attempt terminal paths described above release
 accepted-work ownership.
 
+## Fleet operation (multi-gateway)
+
+Single-node operation is the only supported profile. The controls below let
+operators *prepare* a multi-gateway fleet; they do not make one operationally
+supported. Remote TLS termination, separate-machine handshakes, partition
+behavior, and multi-gateway crash recovery remain explicit release gates.
+
+**Partitioned quotas.** Set `IZWI_GATEWAY_FLEET_SIZE=N` and
+`IZWI_GATEWAY_FLEET_PARTITION=i` (0-based, `i < N`) on each gateway. Every
+gateway owns a strict 1/N slice (floored to 1) of the configured tenant
+request-rate and concurrency budgets, so the fleet total cannot exceed the
+configured limits and a crashed gateway releases its partition with no effect
+on its peers. No shared atomic counter or coordination service is required.
+
+**Shared approvals.** Point every gateway at the same bounded approvals file
+with `IZWI_GATEWAY_SHARED_APPROVALS_PATH=/absolute/path/approvals.txt`
+(max 64 KiB, 256 entries, one 5-field standalone or 8-field v1 approval per
+line, `#` comments and blank lines skipped). CLI approvals remain explicit;
+shared entries augment them and duplicate endpoints fail closed at startup.
+Each gateway refreshes its cached view every
+`IZWI_GATEWAY_SHARED_APPROVALS_TTL_MS` (1s–1h, default 30s) and logs drift;
+newly approved workers are adopted on rolling gateway restart, never
+mid-stream.
+
+**Operator drain.** Configure `IZWI_GATEWAY_ADMIN_API_KEY_REF` to a bounded
+`env:VARIABLE` secret that differs from the inference key. Then
+`POST /internal/admin/drain` with that bearer credential returns 202 and
+marks the gateway draining (same path as SIGTERM). The endpoint returns 404
+when no admin key is configured and 401 for the inference key.
+
+**Canary rollout.** Start the supervisor with
+`--canary-worker-id <worker-id>` to launch that worker first. Remaining
+workers start only after the canary reaches readiness; if it fails, the
+supervisor exits without launching the rest. Pair this with a fresh model
+generation on the canary worker and a known-good generation elsewhere for a
+safe rollout with implicit rollback.
+
+**Worker TLS.** The worker terminates TLS when both
+`IZWI_WORKER_TLS_CERT_REF` and `IZWI_WORKER_TLS_KEY_REF` name bounded
+absolute `file:` PEM paths (256 KiB each), optionally requiring client
+certificates via `IZWI_WORKER_TLS_CLIENT_CA_REF` (mTLS). Non-loopback binds
+are rejected without TLS. The bundled supervisor still launches CPU workers
+only; remote deployment needs an operator-managed ingress plus
+separate-machine handshake evidence before any support claim.
+
 ## Evidence and support matrix
 
 The labels below apply to this separated production-serving architecture, not
@@ -570,8 +615,9 @@ to unrelated local-engine tests elsewhere in the repository.
 | CUDA compilation | No CUDA toolchain was available and no serving-specific CUDA build was run | Not established |
 | Real CUDA execution | No NVIDIA device was available | Not established; supervisor executable rejects CUDA configs |
 | Physical multi-GPU | Parser/topology and mock-replica tests only | Not established |
-| Multi-machine | Worker-client URL validation accepts certificate-verified HTTPS; no native worker TLS listener, remote artifact/state path, partition test, or deployment was exercised | Not supported as an operational profile |
-| Soak/load/performance | No hours-long soak, representative production load matrix, latency/throughput measurement, or resource-efficiency benchmark for this architecture | Not established |
+| Multi-machine | Worker binary terminates server-side TLS/mTLS from bounded file references (unit-tested parsing; plaintext non-loopback rejected). Client HTTPS trust, fleet topology policy, and v1 approvals exist. No separate-machine handshake, remote artifact/state path, or partition test was exercised | Not supported as an operational profile |
+| Multi-gateway | Conservatively partitioned quotas (1/N slices, unit-tested), shared approvals file with TTL-cached views (unit-tested), registry circuit/replacement-incarnation fencing (unit-tested), concurrent idempotency keys proven never to double-acquire (test). No shared atomic registry/quota authority, no gateway-crash/store-outage/partition fleet tests | Not supported as an operational profile |
+| Soak/load/performance | Closed-loop gateway chat benchmark harness exists (`scripts/bench/run-gateway-chat-benchmark.py`) reporting TTFT/latency percentiles, throughput, and completed/rejected/failed rates; no hours-long soak or representative production load matrix has been run | Not established |
 
 Before any production claim, complete the open route, quota, observability,
 artifact/state, mTLS, HA, accelerator, overload, soak, and performance gates in
