@@ -12,6 +12,8 @@ environment variable must be replaced and validated against the target host.
 - `multi-device-cuda.toml` assigns one NVIDIA GPU UUID to each worker. Two
   workers advertise the same deployment identity as independent replicas; a
   third worker demonstrates a distinct deployment on another device.
+- `docker-compose.serving.yml` (in `config/serving/`) demonstrates the
+  separated gateway-and-worker container topology under Docker Compose.
 
 The current node schema configures workers and exactly one task-specific
 deployment/capability contract per worker. It does not accept gateway settings,

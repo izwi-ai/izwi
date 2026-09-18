@@ -324,11 +324,21 @@ impl WorkerProcessConfig {
             .parse()
             .context("parse IZWI_WORKER_BIND")?;
         let tls = WorkerTlsConfig::from_env()?;
-        if tls.is_none() && !bind.ip().is_loopback() {
+        let allow_insecure_plaintext = std::env::var("IZWI_WORKER_ALLOW_INSECURE_PLAINTEXT_BIND")
+            .ok()
+            .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE"));
+        if tls.is_none() && !bind.ip().is_loopback() && !allow_insecure_plaintext {
             bail!(
                 "plaintext worker transport may bind only to a loopback address; \
                  configure {WORKER_TLS_CERT_REF_ENV} and {WORKER_TLS_KEY_REF_ENV} for \
-                 non-loopback TLS"
+                 non-loopback TLS, or explicitly acknowledge container networking with \
+                 IZWI_WORKER_ALLOW_INSECURE_PLAINTEXT_BIND=1"
+            );
+        }
+        if allow_insecure_plaintext && !bind.ip().is_loopback() {
+            tracing::warn!(
+                address = %bind,
+                "binding plaintext worker to non-loopback address via IZWI_WORKER_ALLOW_INSECURE_PLAINTEXT_BIND"
             );
         }
         Ok(Self {
@@ -785,6 +795,8 @@ fn default_models_dir() -> PathBuf {
 mod tests {
     use super::*;
 
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn protocol_assignments_map_to_strict_runtime_assignments() {
         assert_eq!(
@@ -825,6 +837,7 @@ mod tests {
 
     #[test]
     fn tls_config_rejects_partial_cert_and_key_pair() {
+        let _lock = ENV_LOCK.lock().unwrap();
         std::env::remove_var(WORKER_TLS_CERT_REF_ENV);
         std::env::remove_var(WORKER_TLS_KEY_REF_ENV);
         std::env::remove_var(WORKER_TLS_CLIENT_CA_REF_ENV);
@@ -843,6 +856,7 @@ mod tests {
 
     #[test]
     fn tls_config_rejects_non_file_references_and_relative_paths() {
+        let _lock = ENV_LOCK.lock().unwrap();
         std::env::set_var(WORKER_TLS_CERT_REF_ENV, "http://example.com/cert.pem");
         std::env::set_var(WORKER_TLS_KEY_REF_ENV, "file:relative/key.pem");
         let result = WorkerTlsConfig::from_env();
@@ -854,5 +868,32 @@ mod tests {
         );
         std::env::remove_var(WORKER_TLS_CERT_REF_ENV);
         std::env::remove_var(WORKER_TLS_KEY_REF_ENV);
+    }
+
+    #[test]
+    fn non_loopback_plaintext_bind_fails_closed_without_acknowledgement() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("IZWI_WORKER_ALLOW_INSECURE_PLAINTEXT_BIND");
+        std::env::remove_var(WORKER_TLS_CERT_REF_ENV);
+        std::env::remove_var(WORKER_TLS_KEY_REF_ENV);
+        std::env::set_var("IZWI_WORKER_BIND", "0.0.0.0:9470");
+        std::env::set_var("IZWI_WORKER_ARTIFACT_REVISION", "test-rev");
+        std::env::set_var("IZWI_WORKER_CREDENTIAL_ID", "test-cred");
+        std::env::set_var("IZWI_WORKER_BEARER_TOKEN", "test-token-12345678");
+
+        let result = WorkerProcessConfig::from_env();
+        assert!(result.is_err());
+        let error = result.err().unwrap().to_string();
+        assert!(error.contains("plaintext worker transport may bind only to a loopback address"));
+
+        std::env::set_var("IZWI_WORKER_ALLOW_INSECURE_PLAINTEXT_BIND", "1");
+        let result = WorkerProcessConfig::from_env();
+        assert!(result.is_ok());
+
+        std::env::remove_var("IZWI_WORKER_ALLOW_INSECURE_PLAINTEXT_BIND");
+        std::env::remove_var("IZWI_WORKER_BIND");
+        std::env::remove_var("IZWI_WORKER_ARTIFACT_REVISION");
+        std::env::remove_var("IZWI_WORKER_CREDENTIAL_ID");
+        std::env::remove_var("IZWI_WORKER_BEARER_TOKEN");
     }
 }
