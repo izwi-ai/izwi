@@ -1779,6 +1779,19 @@ mod tests {
         assert_eq!(read.bytes, b"bounded artifact");
         assert_eq!(read.descriptor, descriptor);
 
+        use tokio::io::AsyncReadExt;
+        let mut stream = store
+            .read_stream(&tenant, &descriptor.id)
+            .await
+            .expect("stream artifact");
+        let mut streamed_bytes = Vec::new();
+        stream
+            .reader
+            .read_to_end(&mut streamed_bytes)
+            .await
+            .expect("stream to end");
+        assert_eq!(streamed_bytes, b"bounded artifact");
+
         let public_json = serde_json::to_string(&descriptor).unwrap();
         assert!(!public_json.contains("generated/"));
         assert!(!public_json.contains("private/object"));
@@ -1840,9 +1853,31 @@ mod tests {
 
     #[tokio::test]
     async fn deterministic_remote_like_provider_conforms_to_opaque_artifact_contract() {
+        use tokio::io::AsyncReadExt;
         let root = tempfile::tempdir().unwrap();
         let provider = Arc::new(MemoryMediaProvider::default());
-        assert_provider_conformance(&root, provider).await;
+        assert_provider_conformance(&root, provider.clone()).await;
+
+        let store = conformance_store(&root, provider);
+        let tenant = ArtifactTenant::parse("tenant-remote").unwrap();
+        let descriptor = store
+            .put(
+                &tenant,
+                ArtifactWrite {
+                    content_type: "audio/wav".into(),
+                    filename: Some("remote-sample.wav".into()),
+                    bytes: b"streamable remote artifact payload".to_vec(),
+                    retention: ArtifactRetention::Durable,
+                },
+            )
+            .await
+            .unwrap();
+        let mut stream = store.read_stream(&tenant, &descriptor.id).await.unwrap();
+        let mut streamed = Vec::new();
+        stream.reader.read_to_end(&mut streamed).await.unwrap();
+        assert_eq!(streamed, b"streamable remote artifact payload");
+        assert_eq!(stream.descriptor.content_type, "audio/wav");
+        assert_eq!(stream.descriptor.size_bytes, 34);
     }
 
     #[test]

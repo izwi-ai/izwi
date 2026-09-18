@@ -2324,6 +2324,43 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn enabled_gateway_chat_route_eliminates_raw_local_path_assumptions() {
+        let state = unreachable_gateway_state(test_perimeter());
+        let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+
+        // Attempting to inject file path references or media content in chat request
+        // must fail closed at the gateway perimeter before reaching any execution.
+        let file_path_injection = json!({
+            "model": "LFM2.5-1.2B-Instruct-GGUF",
+            "messages": [{
+                "role": "user",
+                "content": "test message with no local paths"
+            }],
+            "tools": [{"type": "function", "function": {"name": "test"}}],
+            "max_tokens": 16
+        });
+        let response = send_raw(
+            app.clone(),
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", format!("Bearer {TEST_API_KEY}"))
+                .header("content-type", "application/json")
+                .body(Body::from(file_path_injection.to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = error_envelope(response).await;
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        let msg = body["error"]["message"].as_str().unwrap_or_default();
+        // Assert no server directories or local path leaks
+        assert!(!msg.contains("/var/lib/izwi"));
+        assert!(!msg.contains("/app/"));
+        assert!(!msg.contains("/etc/"));
+    }
+
     async fn error_envelope(response: Response) -> serde_json::Value {
         response
             .headers()
