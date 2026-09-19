@@ -37,6 +37,7 @@ pub struct WorkerRegistryConfig {
     pub status_ttl: Duration,
     pub circuit_failure_threshold: u32,
     pub circuit_open_duration: Duration,
+    pub randomized_tie_breaking: bool,
 }
 
 impl WorkerRegistryConfig {
@@ -90,6 +91,7 @@ impl Default for WorkerRegistryConfig {
             status_ttl: Duration::from_secs(10),
             circuit_failure_threshold: 3,
             circuit_open_duration: Duration::from_secs(30),
+            randomized_tie_breaking: false,
         }
     }
 }
@@ -657,8 +659,15 @@ impl WorkerRegistry {
                 |(selected_key, _, selected_outstanding, selected_capacity, _)| {
                     let candidate_score = u128::from(outstanding) * u128::from(*selected_capacity);
                     let selected_score = u128::from(*selected_outstanding) * u128::from(capacity);
-                    candidate_score < selected_score
-                        || (candidate_score == selected_score && key < selected_key)
+                    if candidate_score < selected_score {
+                        true
+                    } else if candidate_score > selected_score {
+                        false
+                    } else if inner.config.randomized_tie_breaking {
+                        uuid::Uuid::new_v4().as_bytes()[0] % 2 == 0
+                    } else {
+                        key < selected_key
+                    }
                 },
             );
             if replace {
@@ -1703,6 +1712,58 @@ mod tests {
             .unwrap();
         let selected = registry.select_and_reserve_at(&selection(), now).unwrap();
         assert_eq!(selected.key.worker_id.as_str(), "worker-a");
+    }
+
+    #[test]
+    fn randomized_tie_breaking_distributes_choices_across_equal_workers() {
+        let config = WorkerRegistryConfig {
+            randomized_tie_breaking: true,
+            ..WorkerRegistryConfig::default()
+        };
+        let registry = WorkerRegistry::new(config).unwrap();
+        let worker_a = registration("worker-a", "inc-a", BackendKind::Cpu, 9101, 10);
+        let worker_b = registration("worker-b", "inc-b", BackendKind::Cpu, 9102, 10);
+        let descriptor_a = worker_a.descriptor.clone();
+        let descriptor_b = worker_b.descriptor.clone();
+        registry.approve(worker_b).unwrap();
+        registry.approve(worker_a).unwrap();
+        let now = Instant::now();
+        registry
+            .observe_status_at(
+                status(
+                    &descriptor_a,
+                    1,
+                    vec![deployment("chat-prod", "lfm2", BackendKind::Cpu)],
+                    capacity(10, 0, 10),
+                ),
+                now,
+            )
+            .unwrap();
+        registry
+            .observe_status_at(
+                status(
+                    &descriptor_b,
+                    1,
+                    vec![deployment("chat-prod", "lfm2", BackendKind::Cpu)],
+                    capacity(10, 0, 10),
+                ),
+                now,
+            )
+            .unwrap();
+
+        let mut a_selected = 0;
+        let mut b_selected = 0;
+        for _ in 0..100 {
+            let selected = registry.select_and_reserve_at(&selection(), now).unwrap();
+            if selected.key.worker_id.as_str() == "worker-a" {
+                a_selected += 1;
+            } else if selected.key.worker_id.as_str() == "worker-b" {
+                b_selected += 1;
+            }
+            drop(selected);
+        }
+        assert!(a_selected > 0, "worker-a was never selected");
+        assert!(b_selected > 0, "worker-b was never selected");
     }
 
     struct StubFleetCapacity {
