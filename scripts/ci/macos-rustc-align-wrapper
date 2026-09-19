@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""Rustc wrapper for macOS that guarantees 8-byte LINKEDIT string pool alignment.
+
+On macOS 15+ (Sequoia / macOS 27) with Apple's ld-27037+, the linker writes the symbol
+string table immediately after the indirect symbol table without padding. When the
+number of indirect symbols is odd, the string table offset is misaligned (stroff % 8 == 4),
+causing dyld to reject proc-macro dylibs with:
+    mis-aligned LINKEDIT string pool, fileOffset=...
+This wrapper intercepts rustc invocations, inspects any generated .dylib files, pads
+stroff to an 8-byte boundary, updates LC_SYMTAB and LC_SEGMENT_64 (__LINKEDIT), and
+re-applies ad-hoc code signature.
+"""
+import glob
+import os
+import struct
+import subprocess
+import sys
+
+def align_dylib(path):
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "rb") as f:
+            header = f.read(32)
+        if len(header) < 32:
+            return
+        magic = struct.unpack("<I", header[:4])[0]
+        if magic != 0xfeedfacf:
+            return
+
+        with open(path, "rb") as f:
+            data = f.read()
+
+        magic, cputype, cpusubtype, filetype, ncmds, sizeofcmds, flags, reserved = struct.unpack_from("<IiiIIIII", data, 0)
+        offset = 32
+        symtab_offset = None
+        linkedit_cmd_offset = None
+
+        for _ in range(ncmds):
+            cmd, cmdsize = struct.unpack_from("<II", data, offset)
+            if cmd == 0x19 and data[offset + 8:offset + 24].rstrip(b"\x00") == b"__LINKEDIT":
+                linkedit_cmd_offset = offset
+            elif cmd == 0x02:
+                symtab_offset = offset
+            offset += cmdsize
+
+        if symtab_offset is None or linkedit_cmd_offset is None:
+            return
+
+        symoff, nsyms, stroff, strsize = struct.unpack_from("<IIII", data, symtab_offset + 8)
+        pad = (8 - (stroff % 8)) % 8
+        if pad == 0:
+            return
+
+        # Pad the string table to 8-byte boundary
+        subprocess.run(
+            ["codesign", "--remove-signature", path],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        with open(path, "rb") as f:
+            data = f.read()
+
+        magic, cputype, cpusubtype, filetype, ncmds, sizeofcmds, flags, reserved = struct.unpack_from("<IiiIIIII", data, 0)
+        offset = 32
+        symtab_offset = None
+        linkedit_cmd_offset = None
+
+        for _ in range(ncmds):
+            cmd, cmdsize = struct.unpack_from("<II", data, offset)
+            if cmd == 0x19 and data[offset + 8:offset + 24].rstrip(b"\x00") == b"__LINKEDIT":
+                linkedit_cmd_offset = offset
+            elif cmd == 0x02:
+                symtab_offset = offset
+            offset += cmdsize
+
+        if symtab_offset is not None and linkedit_cmd_offset is not None:
+            symoff, nsyms, stroff, strsize = struct.unpack_from("<IIII", data, symtab_offset + 8)
+            pad = (8 - (stroff % 8)) % 8
+            if pad > 0:
+                new_data = data[:stroff] + (b"\x00" * pad) + data[stroff:]
+                new_stroff = stroff + pad
+                new_data = new_data[:symtab_offset + 16] + struct.pack("<I", new_stroff) + new_data[symtab_offset + 20:]
+
+                vmaddr, vmsize, fileoff, filesize, maxprot, initprot, nsects, flags = struct.unpack_from(
+                    "<QQQQiiII", new_data, linkedit_cmd_offset + 24
+                )
+                new_filesize = filesize + pad
+                new_data = new_data[:linkedit_cmd_offset + 48] + struct.pack("<Q", new_filesize) + new_data[linkedit_cmd_offset + 56:]
+
+                with open(path, "wb") as f:
+                    f.write(new_data)
+
+            subprocess.run(
+                ["codesign", "-f", "-s", "-", path],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+    except Exception:
+        pass
+
+def main():
+    # Forward all arguments to the actual rustc compiler
+    res = subprocess.run(sys.argv[1:])
+    if res.returncode != 0:
+        sys.exit(res.returncode)
+
+    if sys.platform != "darwin":
+        sys.exit(0)
+
+    # Inspect command line arguments to locate any output dylibs
+    out_file = None
+    out_dir = None
+    crate_name = None
+    extra_filename = ""
+
+    for i, arg in enumerate(sys.argv):
+        if arg == "-o" and i + 1 < len(sys.argv):
+            out_file = sys.argv[i + 1]
+        elif arg == "--out-dir" and i + 1 < len(sys.argv):
+            out_dir = sys.argv[i + 1]
+        elif arg == "--crate-name" and i + 1 < len(sys.argv):
+            crate_name = sys.argv[i + 1]
+        elif arg == "-C" and i + 1 < len(sys.argv) and sys.argv[i + 1].startswith("extra-filename="):
+            extra_filename = sys.argv[i + 1][len("extra-filename="):]
+
+    candidates = []
+    if out_file and out_file.endswith(".dylib"):
+        candidates.append(out_file)
+    if out_dir and crate_name:
+        candidates.append(os.path.join(out_dir, f"lib{crate_name}{extra_filename}.dylib"))
+        candidates.extend(glob.glob(os.path.join(out_dir, f"lib{crate_name}*.dylib")))
+
+    for p in set(candidates):
+        align_dylib(p)
+
+    sys.exit(0)
+
+if __name__ == "__main__":
+    main()
