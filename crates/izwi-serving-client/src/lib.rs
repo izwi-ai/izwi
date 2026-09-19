@@ -478,7 +478,11 @@ impl WorkerClient {
         mut request: InvocationRequest,
     ) -> Result<InvocationStream, WorkerClientError> {
         request.validate()?;
-        let total_deadline = Instant::now() + Duration::from_millis(request.remaining_time_ms);
+        let total_deadline = Instant::now()
+            .checked_add(Duration::from_millis(request.remaining_time_ms))
+            .ok_or(WorkerClientError::InvalidInvocation(
+                izwi_serving_protocol::ContractValidationError::InvalidExecutionBudget,
+            ))?;
         let encoded = serde_json::to_vec(&request)?;
         if encoded.len() > self.inner.config.max_request_json_bytes {
             return Err(WorkerClientError::RequestTooLarge {

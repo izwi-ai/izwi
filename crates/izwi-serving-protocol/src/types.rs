@@ -11,6 +11,7 @@ pub const MAX_CHAT_MESSAGE_BYTES: usize = 256 * 1024;
 pub const MAX_STOP_SEQUENCES: usize = 16;
 pub const MAX_STOP_SEQUENCE_BYTES: usize = 1024;
 pub const MAX_CALLER_REGIONS: usize = 32;
+pub const MAX_REMAINING_TIME_MS: u64 = 86_400_000; // 24 hours
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SchemaVersion {
@@ -355,7 +356,7 @@ impl InvocationRequest {
                 actual: self.input.task(),
             });
         }
-        if self.remaining_time_ms == 0 {
+        if self.remaining_time_ms == 0 || self.remaining_time_ms > MAX_REMAINING_TIME_MS {
             return Err(ContractValidationError::InvalidExecutionBudget);
         }
         if self.output_limits.max_tokens == 0 || self.output_limits.max_bytes == 0 {
@@ -703,6 +704,20 @@ mod tests {
         assert!(matches!(
             request.validate(),
             Err(ContractValidationError::InvalidMessageLength { index: 0 })
+        ));
+
+        let mut request = request_fixture();
+        request.remaining_time_ms = 0;
+        assert!(matches!(
+            request.validate(),
+            Err(ContractValidationError::InvalidExecutionBudget)
+        ));
+
+        let mut request = request_fixture();
+        request.remaining_time_ms = MAX_REMAINING_TIME_MS + 1;
+        assert!(matches!(
+            request.validate(),
+            Err(ContractValidationError::InvalidExecutionBudget)
         ));
     }
 
