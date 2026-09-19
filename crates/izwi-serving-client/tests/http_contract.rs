@@ -792,3 +792,35 @@ async fn request_body_is_bounded_before_any_post() {
     ));
     assert_eq!(worker.active_invocations(), 0);
 }
+
+#[tokio::test]
+async fn duplicate_attempt_returns_unretryable_conflict_response() {
+    let worker = MockWorker::spawn(MockWorkerConfig {
+        output_cadence: Duration::from_millis(50),
+        cancellation_delay: Duration::from_millis(150),
+        ..MockWorkerConfig::default()
+    })
+    .await
+    .unwrap();
+    let client = client(&worker);
+    let invocation = request(worker.config(), "dup-attempt");
+    let duplicate = invocation.clone();
+
+    let first_task = tokio::spawn({
+        let client = client.clone();
+        async move { client.invoke_collect(invocation).await }
+    });
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let dup_error = client.invoke_collect(duplicate).await.unwrap_err();
+    assert!(matches!(
+        dup_error,
+        WorkerClientError::HttpStatus { status, ref body }
+            if status == reqwest::StatusCode::CONFLICT && body.contains("attempt is already owned")
+    ));
+    assert!(!dup_error.proves_attempt_unaccepted());
+
+    let first_result = first_task.await.unwrap();
+    assert!(first_result.is_ok());
+}

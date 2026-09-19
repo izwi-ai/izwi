@@ -434,20 +434,20 @@ async fn invoke(State(state): State<Arc<MockState>>, headers: HeaderMap, body: B
         if let Some(existing) = table.records.get(&request.attempt_id) {
             let same = existing.identity.request_id == request.request_id
                 && existing.digest == request.request_digest;
-            return rejection(
-                &request,
-                StatusCode::CONFLICT,
-                if same {
-                    RejectionCode::CapacityExhausted
-                } else {
-                    RejectionCode::DuplicateAttemptConflict
-                },
-                if same {
-                    "attempt is already owned by this worker"
-                } else {
-                    "attempt identity was reused with different content"
-                },
-            );
+            if same {
+                return (
+                    StatusCode::CONFLICT,
+                    "attempt is already owned; acceptance is unknown, query or cancel it",
+                )
+                    .into_response();
+            } else {
+                return rejection(
+                    &request,
+                    StatusCode::CONFLICT,
+                    RejectionCode::DuplicateAttemptConflict,
+                    "attempt identity was reused with different content",
+                );
+            }
         }
     }
 
