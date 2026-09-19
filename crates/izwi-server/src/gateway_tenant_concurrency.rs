@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use izwi_serving_client::WorkerClient;
+use izwi_serving_client::{WorkerClient, WorkerClientError};
 use izwi_serving_protocol::AttemptIdentity;
 
 const TENANT_MAX_CONCURRENT_ENV: &str = "IZWI_GATEWAY_TENANT_MAX_CONCURRENT";
@@ -26,6 +26,10 @@ const INITIAL_RECONCILE_DELAY: Duration = Duration::from_millis(250);
 #[cfg(test)]
 const INITIAL_RECONCILE_DELAY: Duration = Duration::from_millis(5);
 const MAX_RECONCILE_DELAY: Duration = Duration::from_secs(5);
+#[cfg(not(test))]
+const MAX_RECONCILE_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const MAX_RECONCILE_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GatewayTenantConcurrencyConfig {
@@ -280,6 +284,7 @@ async fn reconcile_until_stopped(
     attempt: BoundAttempt,
 ) {
     let mut delay = INITIAL_RECONCILE_DELAY;
+    let start = tokio::time::Instant::now();
     loop {
         if !owner.attempt_still_owned(lease_id, &attempt.identity) {
             return;
@@ -287,21 +292,38 @@ async fn reconcile_until_stopped(
         // Exact cancellation is idempotent. Reissue it after transient
         // transport failures instead of assuming one best-effort request will
         // eventually stop the admitted execution.
-        if attempt
-            .client
-            .cancel_attempt(&attempt.identity)
-            .await
-            .is_ok_and(|response| response.disposition.confirms_execution_stopped())
-        {
-            owner.release_if_attempt(lease_id, &attempt.identity);
-            return;
+        match attempt.client.cancel_attempt(&attempt.identity).await {
+            Ok(response) if response.disposition.confirms_execution_stopped() => {
+                owner.release_if_attempt(lease_id, &attempt.identity);
+                return;
+            }
+            Err(WorkerClientError::HttpStatus { status, .. }) if status.as_u16() == 409 => {
+                // A 409 Conflict from cancel_attempt indicates the worker restarted under a
+                // new IncarnationId or the attempt's incarnation is dead. Since execution cannot
+                // survive across worker incarnation restarts, this confirms execution has stopped.
+                owner.release_if_attempt(lease_id, &attempt.identity);
+                return;
+            }
+            _ => {}
         }
-        if attempt
-            .client
-            .query_attempt(&attempt.identity)
-            .await
-            .is_ok_and(|response| response.state.proves_execution_stopped())
-        {
+        match attempt.client.query_attempt(&attempt.identity).await {
+            Ok(response) if response.state.proves_execution_stopped() => {
+                owner.release_if_attempt(lease_id, &attempt.identity);
+                return;
+            }
+            Err(WorkerClientError::HttpStatus { status, .. }) if status.as_u16() == 409 => {
+                // Incarnation mismatch on query confirms the target incarnation is dead.
+                owner.release_if_attempt(lease_id, &attempt.identity);
+                return;
+            }
+            _ => {}
+        }
+        if start.elapsed() >= MAX_RECONCILE_TIMEOUT {
+            tracing::warn!(
+                lease_id,
+                attempt = ?attempt.identity,
+                "reconciliation timed out waiting for worker teardown proof; reclaiming tenant concurrency lease"
+            );
             owner.release_if_attempt(lease_id, &attempt.identity);
             return;
         }
@@ -463,5 +485,109 @@ mod tests {
             assert!(GatewayTenantConcurrencyConfig::from_env(4).is_err());
         }
         std::env::remove_var(TENANT_MAX_CONCURRENT_ENV);
+    }
+
+    #[tokio::test]
+    async fn reconcile_releases_lease_on_incarnation_conflict() {
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use axum::Router;
+        use izwi_serving_client::WorkerClientConfig;
+        use izwi_serving_protocol::{
+            AttemptId, AttemptIdentity, CallerId, CredentialId, DeploymentId, IncarnationId,
+            ModelGeneration, RequestId, ServiceBearerToken, ServiceCredentials, TenantId,
+        };
+
+        let app = Router::new().route(
+            "/internal/v1/invocations/{attempt_id}/cancel",
+            post(|| async { StatusCode::CONFLICT }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let credentials = ServiceCredentials {
+            credential_id: CredentialId::new("test").unwrap(),
+            bearer_token: ServiceBearerToken::new("test-token").unwrap(),
+        };
+        let client = WorkerClient::new(
+            &format!("http://{addr}"),
+            credentials,
+            WorkerClientConfig::default(),
+        )
+        .unwrap();
+
+        let identity = AttemptIdentity {
+            request_id: RequestId::new("req-conflict").unwrap(),
+            attempt_id: AttemptId::new("att-conflict").unwrap(),
+            tenant_id: TenantId::new("tenant-1").unwrap(),
+            caller_id: CallerId::new("caller-1").unwrap(),
+            incarnation_id: IncarnationId::new("inc-conflict").unwrap(),
+            deployment_id: DeploymentId::new("dep-conflict").unwrap(),
+            model_generation: ModelGeneration::new(1).unwrap(),
+        };
+
+        let ownership = GatewayTenantConcurrency::new(config(1, 1));
+        let lease = ownership.try_reserve([1; 32]).unwrap();
+        let bound = lease.bind(client, identity);
+        assert_eq!(ownership.active_owned_work(), 1);
+
+        drop(bound);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(ownership.active_owned_work(), 0);
+        assert!(lock_recover(&ownership.inner.state)
+            .tenant_counts
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconcile_releases_lease_on_orphan_timeout() {
+        use izwi_serving_client::WorkerClientConfig;
+        use izwi_serving_protocol::{
+            AttemptId, AttemptIdentity, CallerId, CredentialId, DeploymentId, IncarnationId,
+            ModelGeneration, RequestId, ServiceBearerToken, ServiceCredentials, TenantId,
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let credentials = ServiceCredentials {
+            credential_id: CredentialId::new("test").unwrap(),
+            bearer_token: ServiceBearerToken::new("test-token").unwrap(),
+        };
+        let client_config = WorkerClientConfig {
+            connect_timeout: Duration::from_millis(20),
+            request_timeout: Duration::from_millis(20),
+            ..WorkerClientConfig::default()
+        };
+        let client =
+            WorkerClient::new(&format!("http://{addr}"), credentials, client_config).unwrap();
+
+        let identity = AttemptIdentity {
+            request_id: RequestId::new("req-orphan").unwrap(),
+            attempt_id: AttemptId::new("att-orphan").unwrap(),
+            tenant_id: TenantId::new("tenant-1").unwrap(),
+            caller_id: CallerId::new("caller-1").unwrap(),
+            incarnation_id: IncarnationId::new("inc-orphan").unwrap(),
+            deployment_id: DeploymentId::new("dep-orphan").unwrap(),
+            model_generation: ModelGeneration::new(1).unwrap(),
+        };
+
+        let ownership = GatewayTenantConcurrency::new(config(1, 1));
+        let lease = ownership.try_reserve([2; 32]).unwrap();
+        let bound = lease.bind(client, identity);
+        assert_eq!(ownership.active_owned_work(), 1);
+
+        drop(bound);
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(ownership.active_owned_work(), 0);
+        assert!(lock_recover(&ownership.inner.state)
+            .tenant_counts
+            .is_empty());
     }
 }
