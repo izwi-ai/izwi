@@ -12,9 +12,25 @@ re-applies ad-hoc code signature.
 """
 import glob
 import os
+import re
 import struct
 import subprocess
 import sys
+
+def get_jobserver_fds():
+    """Extract and validate open file descriptors passed by Cargo's jobserver."""
+    fds = set()
+    for var_name in ("CARGO_MAKEFLAGS", "MAKEFLAGS", "MFLAGS"):
+        val = os.environ.get(var_name, "")
+        for m in re.finditer(r"--jobserver-(?:fds|auth)=(\d+),(\d+)", val):
+            for g in (m.group(1), m.group(2)):
+                try:
+                    fd = int(g)
+                    os.fstat(fd)
+                    fds.add(fd)
+                except (ValueError, OSError):
+                    pass
+    return tuple(sorted(fds))
 
 def align_dylib(path):
     if not os.path.exists(path):
@@ -103,8 +119,9 @@ def align_dylib(path):
         pass
 
 def main():
-    # Forward all arguments to the actual rustc compiler
-    res = subprocess.run(sys.argv[1:])
+    pass_fds = get_jobserver_fds()
+    # Forward all arguments to the actual rustc compiler, preserving jobserver file descriptors
+    res = subprocess.run(sys.argv[1:], pass_fds=pass_fds)
     if res.returncode != 0:
         sys.exit(res.returncode)
 
