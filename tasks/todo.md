@@ -18614,3 +18614,12 @@ touched code. Both bench manifests 0 rejected.
 
 DS0.5 scoped keys; DS1.2–1.5 enablement per DS1_CONV_STATE_SPIKE_ANALYSIS.md;
 DS2+ phases.
+
+# DS1.2a — 2026-09-23 (part 3)
+
+- `0d6c10c2` — feat(core): qwen38 hybrid prefix-sharing policy declaration.
+  IZWI_ENABLE_PREFIX_CACHING + non-MTP -> attention CommittedPages +
+  recurrent/conv CommittedSnapshots (page-aligned interval); MTP stays
+  private; default unchanged. Verified: qwen38 139/139, core lib 2624/2624.
+- Next: DS1.2b managed-cache publication/fork wiring (DS1.2 requirements in
+  DS1_CONV_STATE_SPIKE_ANALYSIS.md), then correctness suite + default-on.
