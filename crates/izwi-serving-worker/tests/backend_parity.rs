@@ -25,6 +25,7 @@ impl Drop for ChildGuard {
 }
 
 const PARITY_PROMPTS: [&str; 3] = ["hello", "ab", "a"];
+const STARTUP_DEADLINE: Duration = Duration::from_secs(30);
 
 fn uid<T: TryFrom<String>>(prefix: &str, suffix: usize) -> T
 where
@@ -36,6 +37,7 @@ where
 async fn collect_lane_outputs(
     models_dir: &std::path::Path,
     backend_env: &[(&str, &str)],
+    startup_deadline: Duration,
 ) -> Vec<String> {
     let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = reservation.local_addr().unwrap();
@@ -72,7 +74,7 @@ async fn collect_lane_outputs(
         },
     )
     .unwrap();
-    let descriptor = tokio::time::timeout(Duration::from_secs(30), async {
+    let descriptor = tokio::time::timeout(startup_deadline, async {
         loop {
             match client.descriptor().await {
                 Ok(descriptor) => break descriptor,
@@ -149,8 +151,8 @@ async fn collect_lane_outputs(
 async fn cpu_outputs_are_deterministic_across_worker_processes() {
     let models = tempfile::tempdir().unwrap();
     write_tiny_lfm_fixture(models.path());
-    let first = collect_lane_outputs(models.path(), &[]).await;
-    let second = collect_lane_outputs(models.path(), &[]).await;
+    let first = collect_lane_outputs(models.path(), &[], STARTUP_DEADLINE).await;
+    let second = collect_lane_outputs(models.path(), &[], STARTUP_DEADLINE).await;
     assert_eq!(
         first, second,
         "the CPU lane must be deterministic run to run"
@@ -161,13 +163,41 @@ async fn cpu_outputs_are_deterministic_across_worker_processes() {
     );
 }
 
+/// The strict Metal assignment lane requires the operator-provided device
+/// identity (`metal:<registryID>`). Tests discover it from the host's default
+/// GPU; when that is impossible the leg is recorded as not-run, never passed.
+#[cfg(feature = "metal")]
+fn host_metal_device_id() -> Option<String> {
+    let output = std::process::Command::new("swift")
+        .args(["-e", "import Metal; if let d = MTLCreateSystemDefaultDevice() { print(\"metal:\" + String(d.registryID)) }"])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let id = stdout.trim().to_string();
+    (output.status.success() && id.starts_with("metal:")).then_some(id)
+}
+
 #[cfg(feature = "metal")]
 #[tokio::test]
 async fn metal_outputs_match_cpu_outputs_on_the_parity_fixture() {
+    let Some(device_id) = host_metal_device_id() else {
+        println!("metal parity leg not run: host default GPU registryID unavailable");
+        return;
+    };
     let models = tempfile::tempdir().unwrap();
     write_tiny_lfm_fixture(models.path());
-    let cpu = collect_lane_outputs(models.path(), &[]).await;
-    let metal = collect_lane_outputs(models.path(), &[("IZWI_BACKEND", "metal")]).await;
+    let cpu = collect_lane_outputs(models.path(), &[], STARTUP_DEADLINE).await;
+    // Cold Metal starts compile the MSL shader cache; allow a generous deadline.
+    let metal = collect_lane_outputs(
+        models.path(),
+        &[
+            ("IZWI_BACKEND", "metal"),
+            ("IZWI_WORKER_EXPECTED_DEVICE_ID", device_id.as_str()),
+            ("IZWI_METAL_DEVICE_ORDINAL", "0"),
+        ],
+        Duration::from_secs(120),
+    )
+    .await;
     assert_eq!(
         cpu, metal,
         "greedy decode on the unified-memory lane must match the CPU lane on the parity fixture"

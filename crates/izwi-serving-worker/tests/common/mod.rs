@@ -133,3 +133,14 @@ pub fn write_tiny_lfm_fixture(models_dir: &Path) -> PathBuf {
     .unwrap();
     model_dir
 }
+
+/// Explicit fixture generation for benchmark runs (DS0.7): run with
+/// `IZWI_BENCH_FIXTURE_DIR=<models root> cargo test -p izwi-serving-worker \
+///  --test backend_parity generate_benchmark_fixture -- --ignored`
+#[test]
+#[ignore = "explicit benchmark fixture generation"]
+fn generate_benchmark_fixture() {
+    let root = std::env::var("IZWI_BENCH_FIXTURE_DIR").expect("set IZWI_BENCH_FIXTURE_DIR");
+    let dir = write_tiny_lfm_fixture(std::path::Path::new(&root));
+    println!("fixture model dir: {}", dir.display());
+}

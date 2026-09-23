@@ -1,0 +1,36 @@
+{
+  "completed": 120,
+  "concurrency": 4,
+  "failed": 0,
+  "failures": {},
+  "latency_ms": {
+    "max": 1947.676042036619,
+    "p50": 35.404833004577085,
+    "p95": 129.01531603129112,
+    "p99": 1599.331275237495
+  },
+  "max_tokens": 16,
+  "metadata": {
+    "backend": "cpu",
+    "build": "debug",
+    "gateway_tenant_max_concurrent": 32,
+    "gateway_worker_approval": "standalone pinned",
+    "host": "apple-silicon-macOS-27",
+    "model": "LFM2.5-1.2B-Instruct-GGUF tiny synthetic 2-layer fixture (not the 1.2B artifact)",
+    "note": "DS0.7 baseline for prefix-reuse comparison; not a production capacity claim",
+    "profile": "ds07-cpu-baseline",
+    "worker_max_active": 8,
+    "worker_threads": 1
+  },
+  "rejected": 0,
+  "requests": 120,
+  "route": "POST /v1/chat/completions",
+  "stream": true,
+  "throughput_req_per_s": 51.59677784603695,
+  "ttft_ms": {
+    "p50": 35.391124489251524,
+    "p95": 129.00851660233454,
+    "p99": 1599.3239042331734
+  },
+  "wall_secs": 2.325726624985691
+}
