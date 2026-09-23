@@ -3288,19 +3288,21 @@ fn prefix_enabled_for_domain(
     contract: &InferenceStateContract,
     domain_id: crate::kv::CacheDomainId,
 ) -> bool {
+    // Only paged-attention domains participate in cross-request prefix
+    // reuse today: their attach path is the token-page index below. Tensor
+    // domains that declare `CommittedSnapshots` must NOT route through the
+    // paged lookup — they fork via committed tensor snapshots, which lands
+    // with DS1.2b (see docs/dev/DS1_CONV_STATE_SPIKE_ANALYSIS.md). Until that
+    // publication path exists, snapshot declarations stay admission-inert so
+    // an opted-in hybrid contract cannot attach wrong state.
     contract.domains.iter().any(|domain| {
         if domain.id() != domain_id {
             return false;
         }
-        match domain {
-            StateDomainSpec::PagedAttention(spec) => {
-                matches!(spec.header.prefix, PrefixPolicy::CommittedPages { .. })
-            }
-            _ => matches!(
-                domain.prefix_policy(),
-                PrefixPolicy::CommittedSnapshots { .. }
-            ),
-        }
+        matches!(domain, StateDomainSpec::PagedAttention(spec) if matches!(
+            spec.header.prefix,
+            PrefixPolicy::CommittedPages { .. }
+        ))
     })
 }
 
