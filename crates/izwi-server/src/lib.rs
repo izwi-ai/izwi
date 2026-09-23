@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::signal;
 use tokio::sync::oneshot;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const DESKTOP_OWNER_PIPE_ENV: &str = "IZWI_DESKTOP_OWNER_PIPE";
 
@@ -624,6 +624,49 @@ impl Drop for GatewayWorkerStatusPoller {
     }
 }
 
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Deterministic per-worker poll cadence: ±10% of the configured interval,
+/// drawn from the worker identity so co-configured pollers de-synchronize
+/// (serving plan §5.2 "status every 2 seconds with jitter") while the exact
+/// cadence stays reproducible under test.
+fn jittered_poll_interval(base: Duration, seed: u64) -> Duration {
+    let mut state = seed | 1;
+    let draw = splitmix64(&mut state);
+    let per_mille = 90 + (draw % 21);
+    let millis = base.as_millis().saturating_mul(u128::from(per_mille)) / 100;
+    Duration::from_millis(millis as u64).max(Duration::from_millis(1))
+}
+
+fn poll_jitter_seed(worker_id: &WorkerId, node_id: &NodeId) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    worker_id.hash(&mut hasher);
+    node_id.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The widest jittered cadence (110% of the poll interval) must stay below the
+/// freshness TTL, or a healthy worker would flap expired between observations.
+fn validate_status_cadence(ttl: Duration, poll: Duration) -> anyhow::Result<()> {
+    if poll.is_zero() {
+        anyhow::bail!("--gateway-worker-status-poll-ms must be non-zero");
+    }
+    let widest = poll.as_millis().saturating_mul(11) / 10;
+    if widest >= ttl.as_millis() {
+        anyhow::bail!(
+            "--gateway-worker-status-poll-ms must be at least 10% below the status TTL to leave room for poll jitter"
+        );
+    }
+    Ok(())
+}
+
 async fn gateway_state(
     args: &ServerArgs,
     serve_config: &ServeRuntimeConfig,
@@ -786,8 +829,18 @@ async fn gateway_state(
         .map(|expected| {
             let registry = registry.clone();
             let fleet = fleet.clone();
+            let cadence = jittered_poll_interval(
+                polling_interval,
+                poll_jitter_seed(&expected.worker_id, &expected.node_id),
+            );
+            debug!(
+                worker_id = %expected.worker_id,
+                configured_poll_ms = polling_interval.as_millis() as u64,
+                jittered_poll_ms = cadence.as_millis() as u64,
+                "Worker status poller cadence"
+            );
             tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(polling_interval);
+                let mut ticker = tokio::time::interval(cadence);
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 // The initial observation was recorded synchronously above.
                 ticker.tick().await;
@@ -1217,11 +1270,7 @@ fn validate_gateway_limits(args: &ServerArgs) -> anyhow::Result<()> {
     if ttl.is_zero() || ttl > MAX_GATEWAY_STATUS_TTL {
         anyhow::bail!("--gateway-worker-status-ttl-ms is outside the supported range");
     }
-    if poll.is_zero() || poll >= ttl {
-        anyhow::bail!(
-            "--gateway-worker-status-poll-ms must be non-zero and less than the status TTL"
-        );
-    }
+    validate_status_cadence(ttl, poll)?;
     Ok(())
 }
 
@@ -1910,6 +1959,63 @@ mod tests {
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn jittered_poll_interval_is_deterministic_and_bounded() {
+        let base = Duration::from_millis(2_000);
+        for seed in [0u64, 1, 0xDEAD_BEEF, u64::MAX, 123_456_789] {
+            let first = jittered_poll_interval(base, seed);
+            let second = jittered_poll_interval(base, seed);
+            assert_eq!(first, second, "seed {seed} must be deterministic");
+            assert!(
+                first >= Duration::from_millis(1_800) && first <= Duration::from_millis(2_200),
+                "seed {seed} cadence {first:?} outside ±10% of the configured interval"
+            );
+        }
+    }
+
+    #[test]
+    fn jittered_poll_interval_never_collapses_and_desynchronizes_workers() {
+        assert_eq!(
+            jittered_poll_interval(Duration::from_millis(1), 7),
+            Duration::from_millis(1),
+            "sub-millisecond jittered cadences must clamp to 1ms, not a zero tokio interval"
+        );
+        let cadences: Vec<u64> = (0u64..16)
+            .map(|seed| {
+                let worker_id =
+                    WorkerId::new(format!("worker-{seed}").as_str()).expect("static worker id");
+                let node_id = NodeId::new("node-a").expect("static node id");
+                jittered_poll_interval(
+                    Duration::from_millis(2_000),
+                    poll_jitter_seed(&worker_id, &node_id),
+                )
+                .as_millis() as u64
+            })
+            .collect();
+        let distinct: std::collections::BTreeSet<u64> = cadences.iter().copied().collect();
+        assert!(
+            distinct.len() >= 3,
+            "co-configured workers must spread across at least 3 distinct cadences, got {distinct:?}"
+        );
+    }
+
+    #[test]
+    fn status_cadence_validation_leaves_room_for_jitter() {
+        validate_status_cadence(Duration::from_millis(10_000), Duration::from_millis(2_000))
+            .expect("production defaults leave ample jitter headroom");
+        validate_status_cadence(Duration::from_millis(10_000), Duration::from_millis(9_090))
+            .expect("widest jittered cadence 9999ms stays below the 10s TTL");
+        assert!(
+            validate_status_cadence(Duration::from_millis(10_000), Duration::from_millis(0))
+                .is_err()
+        );
+        assert!(
+            validate_status_cadence(Duration::from_millis(10_000), Duration::from_millis(9_500))
+                .is_err(),
+            "a jittered 10450ms cadence would flap a 10s TTL expired"
+        );
+    }
 
     #[test]
     fn durable_worker_concurrency_tracks_runtime_and_operator_ceiling() {
