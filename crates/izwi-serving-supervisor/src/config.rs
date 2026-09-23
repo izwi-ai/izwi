@@ -22,6 +22,8 @@ pub const MAX_ACTIVE_INVOCATIONS_PER_WORKER: u32 = 1024;
 pub const MAX_REQUEST_BYTES_PER_WORKER: usize = 64 * 1024 * 1024;
 pub const MAX_RETAINED_ATTEMPTS_PER_WORKER: usize = 65_536;
 pub const MAX_EXECUTION_PROFILE_LABEL_BYTES: usize = 128;
+pub const DEFAULT_MODEL_LOAD_SLOTS: u32 = 1;
+pub const MAX_MODEL_LOAD_SLOTS: u32 = 64;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -38,6 +40,16 @@ pub struct NodeConfig {
     pub restart: RestartPolicy,
     #[serde(default)]
     pub shutdown: ShutdownPolicy,
+    /// Upper bound on simultaneous model load/warm-up stages across the node.
+    /// One is the historical, memory-spike-safe default: managed workers
+    /// serialize the construct/load/warm-up stage on a node-wide lease before
+    /// they begin serving.
+    #[serde(default = "default_max_parallel_model_loads")]
+    pub max_parallel_model_loads: u32,
+}
+
+fn default_max_parallel_model_loads() -> u32 {
+    DEFAULT_MODEL_LOAD_SLOTS
 }
 
 impl NodeConfig {
@@ -73,6 +85,13 @@ impl NodeConfig {
                 requested: self.host_memory_budget_bytes,
                 available: inventory.allocatable_host_memory_bytes,
             });
+        }
+        if self.max_parallel_model_loads == 0
+            || self.max_parallel_model_loads > MAX_MODEL_LOAD_SLOTS
+        {
+            return Err(ConfigError::InvalidModelLoadSlots(
+                self.max_parallel_model_loads,
+            ));
         }
         validate_directory("working_directory", &self.working_directory)?;
         self.readiness.validate()?;
@@ -654,6 +673,8 @@ pub enum ConfigError {
     ZeroBudget(&'static str),
     #[error("host memory budget requests {requested} bytes; available budget is {available}")]
     HostMemoryOvercommit { requested: u64, available: u64 },
+    #[error("max_parallel_model_loads must be between 1 and {MAX_MODEL_LOAD_SLOTS}; got {0}")]
+    InvalidModelLoadSlots(u32),
     #[error("effective CPU inventory is empty")]
     EmptyCpuInventory,
     #[error("host inventory repeats {backend:?} device {device}")]
@@ -1077,6 +1098,29 @@ mod tests {
             readiness: ReadinessPolicy::default(),
             restart: RestartPolicy::default(),
             shutdown: ShutdownPolicy::default(),
+            max_parallel_model_loads: DEFAULT_MODEL_LOAD_SLOTS,
+        }
+    }
+
+    #[test]
+    fn model_load_slot_bounds_are_validated() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = cpu_config(directory.path());
+        config.max_parallel_model_loads = 4;
+        config
+            .validate(&inventory(), &catalog(executable(directory.path())))
+            .expect("a bounded parallel-load count is valid");
+
+        for invalid in [0, MAX_MODEL_LOAD_SLOTS + 1] {
+            let mut config = cpu_config(directory.path());
+            config.max_parallel_model_loads = invalid;
+            assert!(
+                matches!(
+                    config.validate(&inventory(), &catalog(executable(directory.path()))),
+                    Err(ConfigError::InvalidModelLoadSlots(_))
+                ),
+                "max_parallel_model_loads = {invalid} must be rejected"
+            );
         }
     }
 

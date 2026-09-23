@@ -7,6 +7,10 @@ node_id = "node-a"
 working_directory = "/var/lib/izwi"
 runtime_directory = "/run/izwi"
 host_memory_budget_bytes = 4294967296
+# Node-wide bound on simultaneous model load/warm-up stages. The default of 1
+# fully serializes loads (memory-spike-safe); raise it only after validating
+# the host's load-peak memory headroom.
+max_parallel_model_loads = 1
 
 [readiness]
 startup_timeout_ms = 120000

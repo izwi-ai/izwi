@@ -25,6 +25,7 @@ pub const WORKER_INCARNATION_ENV: &str = "IZWI_WORKER_INCARNATION_ID";
 pub const WORKER_OWNERSHIP_LOCK_ENV: &str = "IZWI_WORKER_OWNERSHIP_LOCK";
 pub const WORKER_GENERATION_FENCE_ENV: &str = "IZWI_WORKER_GENERATION_FENCE_LOCK";
 pub const WORKER_MODEL_LOAD_LOCK_ENV: &str = "IZWI_WORKER_MODEL_LOAD_LOCK";
+pub const WORKER_MODEL_LOAD_SLOTS_ENV: &str = "IZWI_WORKER_MODEL_LOAD_SLOTS";
 pub const MAX_INHERITED_ENV_VALUE_BYTES: usize = 64 * 1024;
 pub const MAX_INHERITED_ENV_TOTAL_BYTES: usize = 256 * 1024;
 
@@ -328,6 +329,10 @@ pub fn build_child_launch_spec(
         WORKER_MODEL_LOAD_LOCK_ENV,
         locks.model_load().as_os_str().to_owned(),
     );
+    set(
+        WORKER_MODEL_LOAD_SLOTS_ENV,
+        node.config().max_parallel_model_loads.to_string().into(),
+    );
 
     match &worker.assignment {
         DeviceAssignment::Cpu {
@@ -440,7 +445,7 @@ mod tests {
     use crate::{
         BinaryCatalog, BinaryRecord, CapabilityProfileConfig, DeploymentConfig, HostInventory,
         NodeConfig, ReadinessPolicy, RestartPolicy, ShutdownPolicy, WorkerBinaryFlavor,
-        WorkerConfig, NODE_CONFIG_SCHEMA_VERSION,
+        WorkerConfig, DEFAULT_MODEL_LOAD_SLOTS, NODE_CONFIG_SCHEMA_VERSION,
     };
     use izwi_serving_protocol::{
         ArtifactRevision, BackendKind, CancellationBehavior, CredentialId, DeploymentId,
@@ -482,6 +487,7 @@ mod tests {
             working_directory: directory.into(),
             runtime_directory: directory.join("run"),
             host_memory_budget_bytes: 4096,
+            max_parallel_model_loads: DEFAULT_MODEL_LOAD_SLOTS,
             workers: vec![WorkerConfig {
                 worker_id: id("worker-a"),
                 bind: "127.0.0.1:9470".parse().unwrap(),

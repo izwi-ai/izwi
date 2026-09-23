@@ -891,7 +891,7 @@ mod tests {
     };
     use izwi_serving_supervisor::{
         CapabilityProfileConfig, DeploymentConfig, ReadinessPolicy, RestartPolicy, ShutdownPolicy,
-        WorkerConfig, NODE_CONFIG_SCHEMA_VERSION,
+        WorkerConfig, DEFAULT_MODEL_LOAD_SLOTS, NODE_CONFIG_SCHEMA_VERSION,
     };
     use std::collections::BTreeSet;
 
@@ -909,6 +909,7 @@ mod tests {
             working_directory: PathBuf::from("/work"),
             runtime_directory: PathBuf::from("/run"),
             host_memory_budget_bytes: 1024,
+            max_parallel_model_loads: DEFAULT_MODEL_LOAD_SLOTS,
             workers: vec![WorkerConfig {
                 worker_id: id("worker-a"),
                 bind: "127.0.0.1:9470".parse().unwrap(),

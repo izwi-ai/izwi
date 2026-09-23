@@ -64,8 +64,40 @@ impl LockNamespace {
     ///
     /// Resident workers keep their assignment-specific resource lease, but release
     /// this lease as soon as their configured deployment has completed warm-up.
+    /// Index 0 is the historical single-slot identity so a default (one-slot)
+    /// node contends on exactly the same lock file as earlier generations.
     pub fn model_load_path(&self) -> PathBuf {
-        self.path_for("model-load", b"node-model-load-stage")
+        self.model_load_slot_path(0)
+    }
+
+    /// One of up to `max_parallel_model_loads` node-wide model-load slots.
+    pub fn model_load_slot_path(&self, index: u32) -> PathBuf {
+        if index == 0 {
+            self.path_for("model-load", b"node-model-load-stage")
+        } else {
+            self.path_for(
+                "model-load",
+                format!("node-model-load-stage#{index}").as_bytes(),
+            )
+        }
+    }
+
+    /// Acquires one model-load slot under the node's configured parallelism.
+    ///
+    /// Tries every slot non-blockingly in order, then falls back to blocking on
+    /// slot 0 so contention (including workers from an older generation that
+    /// only know the single-slot file) resolves against the shared identity.
+    pub fn acquire_model_load_slot(
+        &self,
+        slots: u32,
+        metadata: &[u8],
+    ) -> Result<LockLease, LockError> {
+        for index in 0..slots.saturating_sub(1) {
+            if let Ok(lease) = self.try_exclusive(&self.model_load_slot_path(index), metadata) {
+                return Ok(lease);
+            }
+        }
+        self.lock_exclusive(&self.model_load_slot_path(0), metadata)
     }
 
     pub fn resource_path(&self, resource_identity: &[u8]) -> PathBuf {
@@ -286,6 +318,57 @@ mod tests {
         assert!(name.starts_with("resource-"));
         assert!(!name.contains("GPU"));
         assert!(!name.contains(".."));
+    }
+
+    #[test]
+    fn model_load_slot_zero_keeps_the_legacy_identity_and_higher_slots_differ() {
+        let directory = tempfile::tempdir().unwrap();
+        let namespace = LockNamespace::open(directory.path().join("locks")).unwrap();
+        assert_eq!(
+            namespace.model_load_slot_path(0),
+            namespace.model_load_path(),
+            "slot 0 must stay byte-identical to the historical single-slot file"
+        );
+        let one = namespace.model_load_slot_path(1);
+        let two = namespace.model_load_slot_path(2);
+        assert_ne!(one, two);
+        assert_ne!(one, namespace.model_load_path());
+        assert_eq!(one.parent(), Some(namespace.directory()));
+    }
+
+    #[test]
+    fn model_load_slots_never_exceed_the_configured_parallelism() {
+        let directory = tempfile::tempdir().unwrap();
+        let namespace =
+            std::sync::Arc::new(LockNamespace::open(directory.path().join("locks")).unwrap());
+        let slots = 2_u32;
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handles: Vec<_> = (0..6)
+            .map(|worker| {
+                let namespace = namespace.clone();
+                let active = active.clone();
+                let peak = peak.clone();
+                std::thread::spawn(move || {
+                    let metadata = format!(r#"{{"worker":"w{worker}"}}"#).into_bytes();
+                    let lease = namespace
+                        .acquire_model_load_slot(slots, &metadata)
+                        .expect("slot acquisition resolves");
+                    let now = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(15));
+                    let _ = active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    drop(lease);
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert!(
+            peak.load(std::sync::atomic::Ordering::SeqCst) <= slots as usize,
+            "concurrent model-load stages must stay within the configured slot bound"
+        );
     }
 
     #[test]

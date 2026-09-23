@@ -3,7 +3,8 @@ use izwi_core::{backends::RuntimeDeviceAssignment, EngineConfig, ModelVariant, R
 use izwi_serving_protocol::*;
 use izwi_serving_supervisor::{
     try_acquire_worker_fences, LockLease, LockNamespace, WorkerFenceLeases, WorkerLockPaths,
-    WORKER_GENERATION_FENCE_ENV, WORKER_MODEL_LOAD_LOCK_ENV, WORKER_OWNERSHIP_LOCK_ENV,
+    WORKER_GENERATION_FENCE_ENV, WORKER_MODEL_LOAD_LOCK_ENV, WORKER_MODEL_LOAD_SLOTS_ENV,
+    WORKER_OWNERSHIP_LOCK_ENV,
 };
 use izwi_serving_worker::{
     warm_up_chat_runtime, RuntimeChatExecutor, WorkerConfig, WorkerService,
@@ -165,6 +166,25 @@ async fn main() -> anyhow::Result<()> {
 struct ManagedLockContext {
     namespace: LockNamespace,
     paths: WorkerLockPaths,
+    model_load_slots: u32,
+}
+
+/// Parses the supervisor-provided model-load slot count. Absent means the
+/// historical single-slot node; values outside the supervisor's validated
+/// range are rejected rather than clamped so a misconfigured node fails loudly.
+fn model_load_slots_from(raw: Option<&str>) -> anyhow::Result<u32> {
+    const MAX_SLOTS: u32 = izwi_serving_supervisor::MAX_MODEL_LOAD_SLOTS;
+    let Some(raw) = raw else {
+        return Ok(izwi_serving_supervisor::DEFAULT_MODEL_LOAD_SLOTS);
+    };
+    let slots: u32 = raw
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("IZWI_WORKER_MODEL_LOAD_SLOTS must be an unsigned integer"))?;
+    if slots == 0 || slots > MAX_SLOTS {
+        bail!("IZWI_WORKER_MODEL_LOAD_SLOTS must be between 1 and {MAX_SLOTS}");
+    }
+    Ok(slots)
 }
 
 fn managed_lock_context(
@@ -190,7 +210,13 @@ fn managed_lock_context(
     {
         bail!("managed worker lock paths do not match the assigned resource and node namespace");
     }
-    Ok(Some(ManagedLockContext { namespace, paths }))
+    Ok(Some(ManagedLockContext {
+        namespace,
+        paths,
+        model_load_slots: model_load_slots_from(
+            std::env::var(WORKER_MODEL_LOAD_SLOTS_ENV).ok().as_deref(),
+        )?,
+    }))
 }
 
 fn acquire_managed_worker_fences(
@@ -230,9 +256,9 @@ fn acquire_model_load_stage(
     );
     locks
         .namespace
-        .lock_exclusive(locks.paths.model_load(), metadata.as_bytes())
+        .acquire_model_load_slot(locks.model_load_slots, metadata.as_bytes())
         .map(Some)
-        .context("wait for the node model-load stage")
+        .context("wait for a node model-load stage slot")
 }
 
 async fn shutdown_signal<E: izwi_serving_worker::InvocationExecutor>(
@@ -796,6 +822,21 @@ mod tests {
     use super::*;
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn model_load_slots_parse_is_bounded_and_defaults_to_one() {
+        assert_eq!(model_load_slots_from(None).unwrap(), 1);
+        assert_eq!(model_load_slots_from(Some("1")).unwrap(), 1);
+        assert_eq!(model_load_slots_from(Some(" 4 ")).unwrap(), 4);
+        assert_eq!(
+            model_load_slots_from(Some("64")).unwrap(),
+            izwi_serving_supervisor::MAX_MODEL_LOAD_SLOTS
+        );
+        assert!(model_load_slots_from(Some("0")).is_err());
+        assert!(model_load_slots_from(Some("65")).is_err());
+        assert!(model_load_slots_from(Some("two")).is_err());
+        assert!(model_load_slots_from(Some("-1")).is_err());
+    }
 
     #[test]
     fn protocol_assignments_map_to_strict_runtime_assignments() {
