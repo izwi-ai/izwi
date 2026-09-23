@@ -3811,6 +3811,7 @@ dependencies = [
  "izwi-serving-protocol",
  "izwi-vad",
  "libc",
+ "reqwest 0.11.27",
  "scalar_api_reference",
  "sea-orm",
  "serde",

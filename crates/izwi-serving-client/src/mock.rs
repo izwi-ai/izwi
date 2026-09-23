@@ -53,6 +53,7 @@ pub struct MockWorkerConfig {
     pub max_active_invocations: usize,
     pub max_request_bytes: usize,
     pub max_retained_attempts: usize,
+    pub max_output_tokens: u32,
     pub output_text: String,
     pub output_cadence: Duration,
     pub cancellation_delay: Duration,
@@ -83,6 +84,7 @@ impl Default for MockWorkerConfig {
             max_active_invocations: 1,
             max_request_bytes: DEFAULT_MOCK_REQUEST_LIMIT,
             max_retained_attempts: 64,
+            max_output_tokens: 1024,
             output_text: "deterministic mock response".into(),
             output_cadence: Duration::from_millis(5),
             cancellation_delay: Duration::from_millis(25),
@@ -359,7 +361,7 @@ fn deployment(config: &MockWorkerConfig) -> LoadedDeployment {
             output_formats: BTreeSet::from([OutputFormat::Text]),
             max_input_bytes: config.max_request_bytes as u64,
             max_context_tokens: Some(4096),
-            max_output_tokens: Some(1024),
+            max_output_tokens: Some(config.max_output_tokens),
         },
     }
 }

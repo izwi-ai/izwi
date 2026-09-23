@@ -89,3 +89,5 @@ libc = "0.2"
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 izwi-serving-client = { path = "../izwi-serving-client", features = ["mock-worker"] }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
