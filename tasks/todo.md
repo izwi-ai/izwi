@@ -18623,3 +18623,12 @@ DS2+ phases.
   private; default unchanged. Verified: qwen38 139/139, core lib 2624/2624.
 - Next: DS1.2b managed-cache publication/fork wiring (DS1.2 requirements in
   DS1_CONV_STATE_SPIKE_ANALYSIS.md), then correctness suite + default-on.
+
+# DS1.2b safety gate — 2026-09-23 (part 4)
+
+- fix: prefix_enabled_for_domain restricted to PagedAttention+CommittedPages.
+  Tensor CommittedSnapshots declarations stay admission-inert until the
+  managed-cache fork/attach path lands (DS1.2b: snapshot index per arena,
+  fork-at-cursor attach, publish-on-interval in stage_commit_with_prefix_
+  updates; design in DS1_CONV_STATE_SPIKE_ANALYSIS.md).
+- Verified: engine::cache 152/152, qwen38 139/139. Next session: DS1.2b.
