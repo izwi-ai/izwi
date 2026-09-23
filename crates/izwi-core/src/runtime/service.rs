@@ -2,12 +2,12 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::FutureExt;
-use tokio::sync::{Mutex, Notify, RwLock, broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex, Notify, RwLock};
 use tokio::task::yield_now;
 use tracing::{debug, error, info_span, warn};
 
@@ -24,21 +24,25 @@ use crate::engine::metrics::{
     ENGINE_SCHEDULER_CAPACITY_REPLAY_TOKENS_TOTAL, ENGINE_SCHEDULER_CAPACITY_SUSPENSIONS_TOTAL,
 };
 use crate::engine::{
-    AdapterBindingKey, ENGINE_EXECUTOR_BATCH_WORKSPACE_BYTES_TOTAL,
+    engine_batch_metrics_snapshot, engine_stream_metrics_snapshot, AdapterBindingKey,
+    Engine as CoreEngine, EngineAudioInput, EngineCoreConfig, EngineCoreRequest, EngineOutput,
+    EngineStreamPolicy, EngineTask, GenerationParams, OutputFinishReason, ResourceAmount,
+    ResourceVector, SessionKey, StreamingOutput, TaskType, WorkUnit, WorkerConfig, WorkloadClass,
+    ENGINE_EXECUTOR_BATCH_WORKSPACE_BYTES_TOTAL,
     ENGINE_EXECUTOR_BATCH_WORKSPACE_DOMAIN_BYTES_TOTAL,
     ENGINE_EXECUTOR_CONTINUOUS_ENVELOPE_SCALAR_FALLBACKS_TOTAL,
     ENGINE_EXECUTOR_DEADLINE_PHASE_ROWS_TOTAL, ENGINE_EXECUTOR_DISPATCH_STATE_ROWS_TOTAL,
     ENGINE_EXECUTOR_FAILURE_ORIGIN_ROWS_TOTAL, ENGINE_EXECUTOR_MODEL_DECODE_CALLS_TOTAL,
-    ENGINE_EXECUTOR_MODEL_SCALAR_ROW_DISPATCHES_TOTAL,
+    ENGINE_EXECUTOR_MODEL_SCALAR_ROW_DISPATCHES_TOTAL, ENGINE_EXECUTOR_MODEL_TENSOR_BATCHES_TOTAL,
     ENGINE_EXECUTOR_MODEL_TENSOR_BATCH_MAX_WIDTH, ENGINE_EXECUTOR_MODEL_TENSOR_BATCH_ROWS_TOTAL,
-    ENGINE_EXECUTOR_MODEL_TENSOR_BATCHES_TOTAL, ENGINE_EXECUTOR_MODEL_TENSOR_MULTIROW_CALLS_TOTAL,
+    ENGINE_EXECUTOR_MODEL_TENSOR_MULTIROW_CALLS_TOTAL,
     ENGINE_EXECUTOR_PHYSICAL_BATCH_REJECTIONS_TOTAL,
-    ENGINE_EXECUTOR_REQUEST_PARALLEL_BATCHES_TOTAL,
+    ENGINE_EXECUTOR_REQUEST_PARALLEL_BATCHES_TOTAL, ENGINE_EXECUTOR_TENSOR_BATCHES_TOTAL,
     ENGINE_EXECUTOR_TENSOR_BATCH_CAPACITY_ROWS_TOTAL, ENGINE_EXECUTOR_TENSOR_BATCH_FILL_RATIO,
     ENGINE_EXECUTOR_TENSOR_BATCH_MATERIALIZED_ELEMENTS_TOTAL,
     ENGINE_EXECUTOR_TENSOR_BATCH_MAX_WIDTH, ENGINE_EXECUTOR_TENSOR_BATCH_PADDING_RATIO,
     ENGINE_EXECUTOR_TENSOR_BATCH_ROWS_TOTAL, ENGINE_EXECUTOR_TENSOR_BATCH_USEFUL_ELEMENTS_TOTAL,
-    ENGINE_EXECUTOR_TENSOR_BATCHES_TOTAL, ENGINE_EXECUTOR_TENSOR_CONTINUOUS_BATCHES_TOTAL,
+    ENGINE_EXECUTOR_TENSOR_CONTINUOUS_BATCHES_TOTAL,
     ENGINE_EXECUTOR_TENSOR_CONTINUOUS_MULTIROW_BATCHES_TOTAL,
     ENGINE_EXECUTOR_TENSOR_STATIC_BATCHES_TOTAL, ENGINE_KV_CACHE_ALLOCATED_BLOCKS,
     ENGINE_KV_CACHE_EVICTIONS_TOTAL, ENGINE_KV_CACHE_FREE_BLOCKS,
@@ -49,12 +53,8 @@ use crate::engine::{
     ENGINE_SCHEDULER_INCREMENTAL_PREFILL_TOKENS_COMMITTED_TOTAL,
     ENGINE_SCHEDULER_MULTISPAN_PREFILL_REQUESTS_TOTAL, ENGINE_SCHEDULER_QUEUE_DEPTH,
     ENGINE_SCHEDULER_RUNNING_REQUESTS, ENGINE_STREAM_BACKPRESSURE_TOTAL,
-    ENGINE_STREAM_CHECKPOINT_REJECTIONS_TOTAL, ENGINE_STREAM_CHECKPOINTS_COMMITTED_TOTAL,
-    ENGINE_STREAM_DELIVERY_FAILURES_TOTAL, Engine as CoreEngine, EngineAudioInput,
-    EngineCoreConfig, EngineCoreRequest, EngineOutput, EngineStreamPolicy, EngineTask,
-    GenerationParams, OutputFinishReason, REQUEST_DEADLINE_EXCEEDED, ResourceAmount,
-    ResourceVector, SessionKey, StreamingOutput, TaskType, WorkUnit, WorkerConfig, WorkloadClass,
-    engine_batch_metrics_snapshot, engine_stream_metrics_snapshot,
+    ENGINE_STREAM_CHECKPOINTS_COMMITTED_TOTAL, ENGINE_STREAM_CHECKPOINT_REJECTIONS_TOTAL,
+    ENGINE_STREAM_DELIVERY_FAILURES_TOTAL, REQUEST_DEADLINE_EXCEEDED,
 };
 use crate::error::{Error, Result};
 use crate::model::ModelResidencyLease;
@@ -71,7 +71,7 @@ use crate::models::architectures::vibevoice::asr::{
     VibeVoiceAsrPreparationDecision, VibeVoiceAsrPreparedArtifact, VibeVoiceAsrPreparedGeometry,
 };
 use crate::models::architectures::vibevoice::tts::{
-    VibeVoiceSpeakerReference, VibeVoiceTtsGenerationParams, vibevoice_tts_auto_max_frames_for_text,
+    vibevoice_tts_auto_max_frames_for_text, VibeVoiceSpeakerReference, VibeVoiceTtsGenerationParams,
 };
 use crate::models::architectures::voxtral::tts::VoxtralTtsGenerationParams;
 use crate::models::architectures::whisper::asr::{
@@ -96,10 +96,11 @@ use crate::runtime::lifecycle::controller::ModelLifecycleController;
 use crate::runtime::pipeline::{PipelineExecutor, PipelineGraph};
 use crate::runtime::routing::RouteSource;
 use crate::runtime::telemetry::{
-    EngineRuntimeTelemetrySnapshot, RuntimeObservationContext, RuntimeStageObservation,
-    RuntimeStageOutcome, RuntimeStageOutputCounters, RuntimeStageTiming, RuntimeTelemetryCollector,
-    RuntimeTelemetrySnapshot, push_engine_labeled_metric, push_engine_labeled_metric_f64,
-    push_engine_metric, push_engine_metric_f64, push_engine_physical_execution_metrics,
+    push_engine_labeled_metric, push_engine_labeled_metric_f64, push_engine_metric,
+    push_engine_metric_f64, push_engine_physical_execution_metrics, EngineRuntimeTelemetrySnapshot,
+    RuntimeObservationContext, RuntimeStageObservation, RuntimeStageOutcome,
+    RuntimeStageOutputCounters, RuntimeStageTiming, RuntimeTelemetryCollector,
+    RuntimeTelemetrySnapshot,
 };
 use crate::runtime::types::{ChatGeneration, RuntimeRequestContext};
 use crate::runtime_models::{LoadedModelDiagnostics, ModelRegistry};
@@ -2629,10 +2630,7 @@ impl RuntimeChatInvocationDriver {
         RuntimeChatTeardownDisposition::Completed
     }
 
-    fn finish_with_terminal_error(
-        &mut self,
-        error: Error,
-    ) -> RuntimeChatTeardownDisposition {
+    fn finish_with_terminal_error(&mut self, error: Error) -> RuntimeChatTeardownDisposition {
         self.record_error(&error);
         self.guard.disarm();
         let disposition = if matches!(error, Error::Cancelled(_)) {
@@ -2669,10 +2667,7 @@ impl RuntimeChatInvocationDriver {
         }
     }
 
-    async fn fail_and_confirm(
-        &mut self,
-        error: Error,
-    ) -> Option<RuntimeChatTeardownDisposition> {
+    async fn fail_and_confirm(&mut self, error: Error) -> Option<RuntimeChatTeardownDisposition> {
         match self.cancel_and_confirm().await {
             Some(_) => {
                 self.record_error(&error);
@@ -7773,37 +7768,29 @@ mod tests {
         order.observe(request_id, &first).unwrap();
 
         let duplicate = StreamingOutput::new(request_id.to_string(), 0, vec![0.0], 24_000);
-        assert!(
-            order
-                .observe(request_id, &duplicate)
-                .unwrap_err()
-                .to_string()
-                .contains("not greater")
-        );
+        assert!(order
+            .observe(request_id, &duplicate)
+            .unwrap_err()
+            .to_string()
+            .contains("not greater"));
         let wrong_request = StreamingOutput::new("stale".to_string(), 1, vec![0.0], 24_000);
-        assert!(
-            order
-                .observe(request_id, &wrong_request)
-                .unwrap_err()
-                .to_string()
-                .contains("carried request ID")
-        );
-        assert!(
-            order
-                .require_final(request_id)
-                .unwrap_err()
-                .to_string()
-                .contains("without a final marker")
-        );
+        assert!(order
+            .observe(request_id, &wrong_request)
+            .unwrap_err()
+            .to_string()
+            .contains("carried request ID"));
+        assert!(order
+            .require_final(request_id)
+            .unwrap_err()
+            .to_string()
+            .contains("without a final marker"));
 
         let gap = StreamingOutput::new(request_id.to_string(), 4, Vec::new(), 0);
-        assert!(
-            order
-                .observe(request_id, &gap)
-                .unwrap_err()
-                .to_string()
-                .contains("did not match expected 1")
-        );
+        assert!(order
+            .observe(request_id, &gap)
+            .unwrap_err()
+            .to_string()
+            .contains("did not match expected 1"));
 
         // Gaps remain valid only for an explicitly lossy DropNewest transport,
         // while every observed sequence must still advance monotonically.
@@ -7815,13 +7802,11 @@ mod tests {
         order.require_final(request_id).unwrap();
 
         let after_final = StreamingOutput::new(request_id.to_string(), 5, vec![0.0], 24_000);
-        assert!(
-            order
-                .observe(request_id, &after_final)
-                .unwrap_err()
-                .to_string()
-                .contains("after its final marker")
-        );
+        assert!(order
+            .observe(request_id, &after_final)
+            .unwrap_err()
+            .to_string()
+            .contains("after its final marker"));
     }
 
     #[test]
@@ -7993,30 +7978,26 @@ mod tests {
         assert_eq!(contract.model_instance_id, instance);
         assert_eq!(contract.execution_group_id, group);
 
-        assert!(
-            loaded_contract_for_residency(
-                &lease,
-                Some(&bundle),
-                CapabilityKind::StreamingTts,
-                false,
-                group,
-                BackendKind::Cpu,
-                Some(ExecutionTargetKind::TokenEngine),
-            )
-            .is_err()
-        );
-        assert!(
-            loaded_contract_for_residency(
-                &lease,
-                Some(&bundle),
-                CapabilityKind::StreamingTts,
-                false,
-                crate::engine::ExecutionGroupId::new(group.get() + 1),
-                BackendKind::Cpu,
-                Some(ExecutionTargetKind::DirectModel),
-            )
-            .is_err()
-        );
+        assert!(loaded_contract_for_residency(
+            &lease,
+            Some(&bundle),
+            CapabilityKind::StreamingTts,
+            false,
+            group,
+            BackendKind::Cpu,
+            Some(ExecutionTargetKind::TokenEngine),
+        )
+        .is_err());
+        assert!(loaded_contract_for_residency(
+            &lease,
+            Some(&bundle),
+            CapabilityKind::StreamingTts,
+            false,
+            crate::engine::ExecutionGroupId::new(group.get() + 1),
+            BackendKind::Cpu,
+            Some(ExecutionTargetKind::DirectModel),
+        )
+        .is_err());
     }
 
     async fn pending_streaming_guard_fixture(
@@ -8097,13 +8078,11 @@ mod tests {
 
         assert!(matches!(duplicate, Err(Error::InvalidInput(_))));
         assert_eq!(runtime.completion_waiters.lock().await.len(), 1);
-        assert!(
-            runtime
-                .completion_waiters
-                .lock()
-                .await
-                .contains_key("same-request")
-        );
+        assert!(runtime
+            .completion_waiters
+            .lock()
+            .await
+            .contains_key("same-request"));
         drop(original);
         runtime
             .remove_waiter("same-request", original_registration)
@@ -8317,12 +8296,10 @@ mod tests {
         step_entered_rx.await.expect("step lock was not acquired");
 
         drop(guard);
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), receiver)
-                .await
-                .expect("cleanup did not remove its waiter before exact abort")
-                .is_err()
-        );
+        assert!(tokio::time::timeout(Duration::from_secs(1), receiver)
+            .await
+            .expect("cleanup did not remove its waiter before exact abort")
+            .is_err());
         assert_eq!(runtime.coordinator_snapshot().active_jobs, 1);
         assert_eq!(
             runtime
@@ -8400,13 +8377,11 @@ mod tests {
             "the core lock was released too early"
         );
         assert_eq!(runtime.coordinator_snapshot().active_jobs, 0);
-        assert!(
-            !runtime
-                .completion_waiters
-                .lock()
-                .await
-                .contains_key(&request_id)
-        );
+        assert!(!runtime
+            .completion_waiters
+            .lock()
+            .await
+            .contains_key(&request_id));
 
         release_step_tx.send(()).expect("release step lock");
         step_lock.await.expect("step-lock task");
@@ -8495,13 +8470,11 @@ mod tests {
                 .active_residency_leases(residency_variant),
             0
         );
-        assert!(
-            !runtime
-                .completion_waiters
-                .lock()
-                .await
-                .contains_key(&request_id)
-        );
+        assert!(!runtime
+            .completion_waiters
+            .lock()
+            .await
+            .contains_key(&request_id));
 
         release_step_tx.send(()).expect("release step lock");
         step_lock.await.expect("step-lock task");
@@ -8557,13 +8530,11 @@ mod tests {
                 runtime.core_engine.request_session_key(&request_id).await,
                 None
             );
-            assert!(
-                !runtime
-                    .completion_waiters
-                    .lock()
-                    .await
-                    .contains_key(&request_id)
-            );
+            assert!(!runtime
+                .completion_waiters
+                .lock()
+                .await
+                .contains_key(&request_id));
         }
     }
 
@@ -8668,12 +8639,10 @@ mod tests {
             !callback_invoked.load(Ordering::Acquire),
             "an expired request invoked synchronous callback code"
         );
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), receiver)
-                .await
-                .expect("deadline cleanup did not remove its exact waiter")
-                .is_err()
-        );
+        assert!(tokio::time::timeout(Duration::from_secs(1), receiver)
+            .await
+            .expect("deadline cleanup did not remove its exact waiter")
+            .is_err());
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 if runtime.coordinator_snapshot().active_jobs == 0
@@ -8716,12 +8685,10 @@ mod tests {
         .expect("hung callback outlived the absolute request deadline")
         .expect_err("hung callback unexpectedly succeeded");
         assert!(matches!(err, Error::Timeout(id) if id == request_id));
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), receiver)
-                .await
-                .expect("deadline cleanup did not remove its exact waiter")
-                .is_err()
-        );
+        assert!(tokio::time::timeout(Duration::from_secs(1), receiver)
+            .await
+            .expect("deadline cleanup did not remove its exact waiter")
+            .is_err());
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 if runtime.coordinator_snapshot().active_jobs == 0
@@ -8776,12 +8743,10 @@ mod tests {
         .expect("callback failure waited for the in-flight core step")
         .expect_err("failing callback unexpectedly succeeded");
         assert!(err.to_string().contains("streaming callback failed"));
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), receiver)
-                .await
-                .expect("detached cleanup did not remove its exact waiter")
-                .is_err()
-        );
+        assert!(tokio::time::timeout(Duration::from_secs(1), receiver)
+            .await
+            .expect("detached cleanup did not remove its exact waiter")
+            .is_err());
         assert_eq!(runtime.coordinator_snapshot().active_jobs, 1);
         assert_eq!(
             runtime
@@ -8856,12 +8821,10 @@ mod tests {
 
         tokio::task::yield_now().await;
         cleanup.abort();
-        assert!(
-            cleanup
-                .await
-                .expect_err("cleanup task unexpectedly completed")
-                .is_cancelled()
-        );
+        assert!(cleanup
+            .await
+            .expect_err("cleanup task unexpectedly completed")
+            .is_cancelled());
         assert_eq!(isolated_coordinator.snapshot().active_jobs, 1);
         assert_eq!(
             runtime
@@ -8881,13 +8844,11 @@ mod tests {
             .await
         );
         assert!(receiver.await.is_err());
-        assert!(
-            runtime
-                .core_engine
-                .abort_request_session(&session)
-                .await
-                .expect("manual exact abort")
-        );
+        assert!(runtime
+            .core_engine
+            .abort_request_session(&session)
+            .await
+            .expect("manual exact abort"));
         assert_eq!(isolated_coordinator.snapshot().active_jobs, 1);
         assert_eq!(
             runtime
@@ -9157,13 +9118,11 @@ mod tests {
             None,
         );
 
-        assert!(
-            runtime
-                .core_engine
-                .abort_request_session(&old_session)
-                .await
-                .expect("old exact abort")
-        );
+        assert!(runtime
+            .core_engine
+            .abort_request_session(&old_session)
+            .await
+            .expect("old exact abort"));
         let old_terminal = runtime
             .core_engine
             .step_for_dispatch()
@@ -9312,8 +9271,8 @@ mod tests {
     #[tokio::test]
     async fn runtime_concurrency_metrics_preserve_real_width_and_recovery_counts() {
         use crate::engine::metrics::{
-            EngineModelCall, record_capacity_replay, record_capacity_suspension,
-            record_engine_model_call,
+            record_capacity_replay, record_capacity_suspension, record_engine_model_call,
+            EngineModelCall,
         };
         let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
         let before = runtime.engine_telemetry_snapshot().await;
@@ -9348,13 +9307,9 @@ mod tests {
             serde_json::json!(after.capacity_replay_tokens_total)
         );
         let payload = runtime.telemetry_prometheus().await;
-        assert!(
-            payload
-                .contains("izwi_engine_executor_model_tensor_batch_width_calls_total{width=\"3\"}")
-        );
-        assert!(
-            payload.contains("# TYPE izwi_engine_scheduler_capacity_suspensions_total counter")
-        );
+        assert!(payload
+            .contains("izwi_engine_executor_model_tensor_batch_width_calls_total{width=\"3\"}"));
+        assert!(payload.contains("# TYPE izwi_engine_scheduler_capacity_suspensions_total counter"));
         assert!(
             payload.contains("# TYPE izwi_engine_scheduler_capacity_replay_tokens_total counter")
         );
@@ -9368,22 +9323,16 @@ mod tests {
 
         assert!(payload.contains("izwi_engine_scheduler_queue_depth"));
         assert!(payload.contains("izwi_engine_scheduler_running_requests"));
-        assert!(
-            payload
-                .contains("izwi_engine_kv_cache_allocated_blocks{accounting=\"physical_pages\"}")
-        );
-        assert!(
-            payload
-                .contains("izwi_engine_kv_cache_utilization_ratio{accounting=\"physical_pages\"}")
-        );
+        assert!(payload
+            .contains("izwi_engine_kv_cache_allocated_blocks{accounting=\"physical_pages\"}"));
+        assert!(payload
+            .contains("izwi_engine_kv_cache_utilization_ratio{accounting=\"physical_pages\"}"));
         assert!(payload.contains(
             "izwi_engine_kv_cache_memory_capacity_bytes{accounting=\"resident_paged_plus_authorized_tensor\"}"
         ));
         assert!(payload.contains("allocated physical KV-cache pages"));
-        assert!(
-            payload
-                .contains("Resident managed KV pages plus authorized retained tensor-state bytes")
-        );
+        assert!(payload
+            .contains("Resident managed KV pages plus authorized retained tensor-state bytes"));
         assert!(!payload.contains("izwi_engine_kv_cache_soft_max_blocks"));
         assert!(!payload.contains("izwi_engine_kv_cache_copy_on_write_splits_total"));
         assert!(payload.contains("izwi_engine_stream_backpressure_total"));
@@ -9405,22 +9354,15 @@ mod tests {
         assert!(payload.contains("izwi_engine_executor_model_tensor_batch_rows_total"));
         assert!(payload.contains("izwi_engine_executor_model_tensor_batch_max_width"));
         assert!(payload.contains("izwi_engine_executor_model_scalar_row_dispatches_total"));
-        assert!(
-            payload.contains("izwi_engine_executor_continuous_envelope_scalar_fallbacks_total")
-        );
+        assert!(payload.contains("izwi_engine_executor_continuous_envelope_scalar_fallbacks_total"));
         assert!(payload.contains("izwi_engine_executor_physical_batch_rejections_total"));
-        assert!(
-            payload
-                .contains("izwi_engine_executor_dispatch_state_rows_total{state=\"not_started\"}")
-        );
+        assert!(payload
+            .contains("izwi_engine_executor_dispatch_state_rows_total{state=\"not_started\"}"));
         assert!(
             payload.contains("izwi_engine_executor_failure_origin_rows_total{origin=\"model\"}")
         );
-        assert!(
-            payload.contains(
-                "izwi_engine_executor_deadline_phase_rows_total{phase=\"dispatch_wait\"}"
-            )
-        );
+        assert!(payload
+            .contains("izwi_engine_executor_deadline_phase_rows_total{phase=\"dispatch_wait\"}"));
         assert!(payload.contains(
             "izwi_engine_executor_batch_workspace_domain_bytes_total{domain=\"device\"}"
         ));
@@ -9433,11 +9375,8 @@ mod tests {
         assert!(payload.contains(
             "izwi_engine_executor_physical_fallbacks_total{reason=\"uncertified_profile\"}"
         ));
-        assert!(
-            payload.contains(
-                "izwi_engine_executor_physical_defers_total{reason=\"workspace_capacity\"}"
-            )
-        );
+        assert!(payload
+            .contains("izwi_engine_executor_physical_defers_total{reason=\"workspace_capacity\"}"));
         assert!(payload.contains(
             "izwi_engine_executor_physical_workspace_high_water_bytes{domain=\"device\"}"
         ));
@@ -9498,12 +9437,10 @@ mod tests {
 
         assert!(runtime.is_draining());
         assert!(runtime.telemetry_snapshot().await.coordinator.draining);
-        assert!(
-            runtime
-                .telemetry_prometheus()
-                .await
-                .contains("izwi_inference_coordinator_draining 1")
-        );
+        assert!(runtime
+            .telemetry_prometheus()
+            .await
+            .contains("izwi_inference_coordinator_draining 1"));
     }
 
     #[test]

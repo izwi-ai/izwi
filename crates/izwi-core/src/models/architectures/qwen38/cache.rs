@@ -9,10 +9,10 @@ use crate::error::{Error, Result};
 use crate::kv::v2::{
     AttentionMask, AttentionPattern, BoundedShape, CheckpointPolicy, InferenceStateContract,
     KeyEncoding, PageSizeConstraint, PagedAttentionDomainSpec, PagedAttentionLayerSpec,
-    PlacementPolicy, PrefixPolicy, ShapeAxis, ShapeDimension, ShapeExtent, StateClock,
-    StateComponentId, StateDType, StateDomainHeader, StateDomainId, StateDomainSpec, StateGroupId,
-    StateGroupSpec, StateScope, TensorComponentSpec, TensorRole, TensorStateDomainSpec,
-    CURRENT_INFERENCE_STATE_ABI,
+    PlacementPolicy, PositionSemantics, PrefixPolicy, ShapeAxis, ShapeDimension, ShapeExtent,
+    StateClock, StateComponentId, StateDType, StateDomainHeader, StateDomainId, StateDomainSpec,
+    StateGroupId, StateGroupSpec, StateScope, TensorComponentSpec, TensorRole,
+    TensorStateDomainSpec, CURRENT_INFERENCE_STATE_ABI,
 };
 
 use super::chat::Qwen38TextConfig;
@@ -27,7 +27,13 @@ pub(crate) fn qwen38_composite_cache_contract(
     attention_dtype: DType,
     preferred_page_tokens: usize,
 ) -> Result<InferenceStateContract> {
-    qwen38_composite_cache_contract_with_mtp(config, attention_dtype, preferred_page_tokens, false)
+    qwen38_composite_cache_contract_with_mtp(
+        config,
+        attention_dtype,
+        preferred_page_tokens,
+        false,
+        false,
+    )
 }
 
 pub(crate) fn qwen38_composite_cache_contract_with_mtp(
@@ -35,6 +41,7 @@ pub(crate) fn qwen38_composite_cache_contract_with_mtp(
     attention_dtype: DType,
     preferred_page_tokens: usize,
     mtp_enabled: bool,
+    prefix_caching: bool,
 ) -> Result<InferenceStateContract> {
     if config.full_attention_interval == 0 {
         return Err(Error::InvalidInput(
@@ -107,12 +114,35 @@ pub(crate) fn qwen38_composite_cache_contract_with_mtp(
         ));
     }
 
-    let retained_header = |id| StateDomainHeader {
+    // DS1.2: cross-request prefix reuse for the hybrid contract. Attention
+    // domains publish committed pages; the recurrent and conv domains publish
+    // transactional tensor snapshots aligned to page boundaries (spike
+    // DS1_CONV_STATE_SPIKE_ANALYSIS.md). MTP draft state does not share.
+    let share_prefixes = prefix_caching && !mtp_enabled;
+    let attention_prefix = || {
+        if share_prefixes {
+            PrefixPolicy::CommittedPages {
+                positions: PositionSemantics::Absolute,
+            }
+        } else {
+            PrefixPolicy::Disabled
+        }
+    };
+    let tensor_prefix = || {
+        if share_prefixes {
+            PrefixPolicy::CommittedSnapshots {
+                interval_steps: u64::from(preferred),
+            }
+        } else {
+            PrefixPolicy::Disabled
+        }
+    };
+    let retained_header = |id, prefix: PrefixPolicy| StateDomainHeader {
         id,
         scope: StateScope::Retained,
         clock: StateClock::DecoderTokens,
         placement: PlacementPolicy::BackendLocalWithHostOffload,
-        prefix: PrefixPolicy::Disabled,
+        prefix,
         checkpoint: CheckpointPolicy::Transactional,
     };
     let tensor_components = |layers: &[(u32, u64)], role: TensorRole| {
@@ -144,17 +174,17 @@ pub(crate) fn qwen38_composite_cache_contract_with_mtp(
     };
     let mut domains = vec![
         StateDomainSpec::PagedAttention(PagedAttentionDomainSpec {
-            header: retained_header(FULL_ATTENTION_DOMAIN),
+            header: retained_header(FULL_ATTENTION_DOMAIN, attention_prefix()),
             layers: attention_layers,
             page_size,
             accepted_dtypes: vec![dtype],
         }),
         StateDomainSpec::Tensor(TensorStateDomainSpec {
-            header: retained_header(RECURRENT_STATE_DOMAIN),
+            header: retained_header(RECURRENT_STATE_DOMAIN, tensor_prefix()),
             components: tensor_components(&recurrent_layers, TensorRole::RecurrentHidden)?,
         }),
         StateDomainSpec::Tensor(TensorStateDomainSpec {
-            header: retained_header(CONVOLUTION_STATE_DOMAIN),
+            header: retained_header(CONVOLUTION_STATE_DOMAIN, tensor_prefix()),
             components: tensor_components(&convolution_layers, TensorRole::ConvolutionState)?,
         }),
     ];
@@ -165,7 +195,7 @@ pub(crate) fn qwen38_composite_cache_contract_with_mtp(
     ];
     if mtp_enabled {
         domains.push(StateDomainSpec::PagedAttention(PagedAttentionDomainSpec {
-            header: retained_header(MTP_ATTENTION_DOMAIN),
+            header: retained_header(MTP_ATTENTION_DOMAIN, PrefixPolicy::Disabled),
             layers: vec![PagedAttentionLayerSpec {
                 model_layer: as_u32(config.block_count, "MTP model layer")?,
                 query_heads,
@@ -291,10 +321,41 @@ mod tests {
     }
 
     #[test]
+    fn prefix_caching_declares_shareable_policies_and_mtp_stays_private() {
+        let config = config();
+        let shared =
+            qwen38_composite_cache_contract_with_mtp(&config, DType::F16, 32, false, true).unwrap();
+        let StateDomainSpec::PagedAttention(attention) = &shared.domains[0] else {
+            panic!("expected paged-attention domain");
+        };
+        let StateDomainSpec::Tensor(recurrent) = &shared.domains[1] else {
+            panic!("expected recurrent domain");
+        };
+        assert_eq!(
+            attention.header.prefix,
+            PrefixPolicy::CommittedPages {
+                positions: PositionSemantics::Absolute,
+            }
+        );
+        assert_eq!(
+            recurrent.header.prefix,
+            PrefixPolicy::CommittedSnapshots { interval_steps: 32 }
+        );
+
+        // MTP draft state never participates in cross-request sharing.
+        let with_mtp =
+            qwen38_composite_cache_contract_with_mtp(&config, DType::F16, 32, true, true).unwrap();
+        assert!(with_mtp
+            .domains
+            .iter()
+            .all(|domain| { domain.header().prefix == PrefixPolicy::Disabled }));
+    }
+
+    #[test]
     fn mtp_contract_adds_one_transactional_attention_domain() {
         let config = config();
         let contract =
-            qwen38_composite_cache_contract_with_mtp(&config, DType::F16, 32, true).unwrap();
+            qwen38_composite_cache_contract_with_mtp(&config, DType::F16, 32, true, false).unwrap();
         assert_eq!(contract.domains.len(), 4);
         assert_eq!(
             contract.groups[0].domains,
@@ -362,7 +423,8 @@ mod tests {
         use crate::kv::InferenceStateCapability;
 
         let contract =
-            qwen38_composite_cache_contract_with_mtp(&config(), DType::F16, 32, true).unwrap();
+            qwen38_composite_cache_contract_with_mtp(&config(), DType::F16, 32, true, false)
+                .unwrap();
         let mut manager = ManagedKvCacheManager::default();
         let runtime = manager
             .bind_request(

@@ -2532,8 +2532,7 @@ impl DeviceCapacityProbe {
                 Some(capacity) => (capacity, capacity),
                 None => host_memory_snapshot()?,
             };
-            let (host_total, host_available) =
-                self.apply_host_cap(host_total, host_available);
+            let (host_total, host_available) = self.apply_host_cap(host_total, host_available);
             capacity_vector.host_bytes = ResourceAmount::Known(host_total);
             available_vector.host_bytes = ResourceAmount::Known(host_available);
         }
@@ -2577,13 +2576,17 @@ impl DeviceCapacityProvider {
         };
         let configured_host_cap = if backend == BackendKind::Cuda {
             match std::env::var("IZWI_CUDA_HOST_MEMORY_BUDGET_BYTES") {
-                Ok(raw) => Some(raw.parse::<u64>().ok().filter(|value| *value > 0).ok_or_else(
-                    || {
-                        Error::ConfigError(
-                            "IZWI_CUDA_HOST_MEMORY_BUDGET_BYTES must be a positive integer".into(),
-                        )
-                    },
-                )?),
+                Ok(raw) => Some(
+                    raw.parse::<u64>()
+                        .ok()
+                        .filter(|value| *value > 0)
+                        .ok_or_else(|| {
+                            Error::ConfigError(
+                                "IZWI_CUDA_HOST_MEMORY_BUDGET_BYTES must be a positive integer"
+                                    .into(),
+                            )
+                        })?,
+                ),
                 Err(std::env::VarError::NotPresent) => None,
                 Err(err) => {
                     return Err(Error::ConfigError(format!(

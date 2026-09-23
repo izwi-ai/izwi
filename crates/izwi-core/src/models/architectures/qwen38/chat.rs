@@ -802,6 +802,7 @@ pub struct Qwen38ChatModel {
     text_model: Qwen38TextModel,
     mtp_policy: Qwen38MtpPolicy,
     mtp_head: Option<Qwen38MtpHead>,
+    prefix_caching: bool,
 }
 
 fn qwen38_fp8_execution_mode(
@@ -953,6 +954,12 @@ impl Qwen38ChatModel {
             text_model,
             mtp_policy,
             mtp_head,
+            prefix_caching: std::env::var(crate::serve_runtime::ENV_ENABLE_PREFIX_CACHING)
+                .map(|value| {
+                    value.trim().eq_ignore_ascii_case("1")
+                        || value.trim().eq_ignore_ascii_case("true")
+                })
+                .unwrap_or(false),
         })
     }
 
@@ -1032,6 +1039,7 @@ impl Qwen38ChatModel {
             attention_dtype,
             preferred_page_tokens,
             self.mtp_policy.enabled(),
+            self.prefix_caching,
         )
     }
 
