@@ -18578,3 +18578,39 @@ Plan: `docs/dev/PRODUCTION_DISTRIBUTED_SERVING_PLAN.md` (committed this session,
 - DS0.8 cross-backend fixture parity harness.
 - Real Metal inference execution evidence (build with `metal` feature on this
   host; supervision is already proven).
+
+# Distributed Serving DS0 completion + DS1.1 — 2026-09-23 (part 2)
+
+## Commits
+
+- `4dd909fd` — docs(serving): consolidated Section-19 delivery report (DS0.2)
+- `0e737c27` — test(worker): backend parity harness (DS0.8)
+- `f3bb1802` — feat(serving): DS0.7 CPU/Metal baseline manifests + Metal parity
+- `f65319de` — feat(core): committed-state fork proof, DS1.1 GO verdict
+
+## What was built
+
+- DS0.2: consolidated delivery report at
+  docs/dev/PRODUCTION_SERVING_DELIVERY_REPORT.md.
+- DS0.8: tests/backend_parity.rs — CPU determinism across worker processes;
+  Metal leg (metal-feature build) asserts greedy Metal outputs equal CPU on
+  the tiny LFM fixture, with host GPU discovery via `swift` (registryID).
+- DS0.7: first real Metal inference execution — 120 gateway-routed
+  generations on a metal-feature worker with strict device identity
+  (metal:4294969884 verified), plus CPU baseline. Manifests in
+  benchmarks/manifests/ds07-{cpu,metal}-baseline.json. Gateway tenant
+  concurrency default (8) must be raised for benchmarks (429 class).
+- DS1.1: spike GO — retained tensor state forks at a committed cursor
+  transactionally (prototype test), so hybrid prefix reuse is sound via
+  attach-by-fork. Analysis + DS1.2 requirements in
+  docs/dev/DS1_CONV_STATE_SPIKE_ANALYSIS.md.
+
+## Verification
+
+worker: 12+5+3 parity (metal build); core tensor 15/15; fmt/clippy clean on
+touched code. Both bench manifests 0 rejected.
+
+## Still open
+
+DS0.5 scoped keys; DS1.2–1.5 enablement per DS1_CONV_STATE_SPIKE_ANALYSIS.md;
+DS2+ phases.
