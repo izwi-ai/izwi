@@ -1,11 +1,12 @@
 use izwi_serving_client::WorkerClientConfig;
 use izwi_serving_protocol::{
-    BackendKind, DeviceAssignment, IncarnationId, ServiceBearerToken, ServiceCredentials, WorkerId,
+    BackendKind, DeviceId, IncarnationId, ServiceBearerToken, ServiceCredentials, WorkerId,
 };
 use izwi_serving_supervisor::{
-    build_child_launch_spec, BinaryCatalog, BinaryRecord, HostInventory, LockNamespace, NodeConfig,
-    ResolvedWorkerSecret, RestartController, RestartDecision, SupervisedWorker,
-    ValidatedNodeConfig, WorkerBinaryFlavor, WorkerLockPaths, MAX_NODE_CONFIG_BYTES,
+    build_child_launch_spec, BinaryCatalog, BinaryRecord, CudaDeviceInventory, HostInventory,
+    LockNamespace, MetalDeviceInventory, NodeConfig, ResolvedWorkerSecret, RestartController,
+    RestartDecision, SupervisedWorker, ValidatedNodeConfig, WorkerBinaryFlavor, WorkerLockPaths,
+    MAX_NODE_CONFIG_BYTES,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -22,8 +23,9 @@ use tokio::{
     time::{Instant, MissedTickBehavior},
 };
 
-const MAX_CLI_ARGUMENTS: usize = 16;
+const MAX_CLI_ARGUMENTS: usize = 24;
 const MAX_CPU_IDS: usize = 1024;
+const MAX_DEVICE_DECLARATIONS: usize = 64;
 const MAX_DIAGNOSTIC_RESPONSE_BYTES: usize = 16 * 1024;
 const TRUNCATED_DIAGNOSTIC_SUFFIX: &str = "\ndiagnostic_output=truncated\n";
 const SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -37,28 +39,70 @@ async fn main() -> Result<(), SupervisorError> {
             return Ok(());
         }
     };
-    run(options).await
+    run(*options).await
 }
 
 async fn run(options: CliOptions) -> Result<(), SupervisorError> {
     let validate_only = options.validate_only;
     let config_bytes = read_bounded(&options.config, MAX_NODE_CONFIG_BYTES)?;
     let config = NodeConfig::parse_bounded(&config_bytes)?;
-    require_cpu_only(&config)?;
+    ensure_flavor_binaries(&config, &options)?;
 
     let inventory = HostInventory {
         effective_cpu_ids: options.cpu_ids,
         allocatable_host_memory_bytes: options.allocatable_host_memory_bytes,
-        metal_devices: Vec::new(),
-        cuda_devices: Vec::new(),
+        metal_devices: options
+            .metal_devices
+            .iter()
+            .map(|(device_id, index)| MetalDeviceInventory {
+                device_id: device_id.clone(),
+                process_local_device_index: *index,
+                // Declared Metal devices are Apple Silicon unified-memory GPUs;
+                // config validation rejects any non-unified declaration.
+                unified_memory: true,
+            })
+            .collect(),
+        cuda_devices: options
+            .cuda_devices
+            .iter()
+            .map(
+                |(device_uuid, host_index, total_memory_bytes)| CudaDeviceInventory {
+                    device_uuid: device_uuid.clone(),
+                    host_device_index: *host_index,
+                    total_memory_bytes: *total_memory_bytes,
+                },
+            )
+            .collect(),
     };
-    let binaries = BinaryCatalog::new([(
-        WorkerBinaryFlavor::Cpu,
-        BinaryRecord {
-            path: options.cpu_worker_binary,
-            supported_backends: vec![BackendKind::Cpu],
-        },
-    )]);
+    let mut binary_records = Vec::new();
+    if let Some(path) = options.cpu_worker_binary.as_ref() {
+        binary_records.push((
+            WorkerBinaryFlavor::Cpu,
+            BinaryRecord {
+                path: path.clone(),
+                supported_backends: vec![BackendKind::Cpu],
+            },
+        ));
+    }
+    if let Some(path) = options.metal_worker_binary.as_ref() {
+        binary_records.push((
+            WorkerBinaryFlavor::Metal,
+            BinaryRecord {
+                path: path.clone(),
+                supported_backends: vec![BackendKind::Metal],
+            },
+        ));
+    }
+    if let Some(path) = options.cuda_worker_binary.as_ref() {
+        binary_records.push((
+            WorkerBinaryFlavor::Cuda,
+            BinaryRecord {
+                path: path.clone(),
+                supported_backends: vec![BackendKind::Cuda],
+            },
+        ));
+    }
+    let binaries = BinaryCatalog::new(binary_records);
     let node = config.validate(&inventory, &binaries)?;
     let mut slots = resolve_slots(&node)?;
     if validate_only {
@@ -635,14 +679,26 @@ async fn drain_all(
     }
 }
 
-fn require_cpu_only(config: &NodeConfig) -> Result<(), SupervisorError> {
+/// Every binary flavor referenced by the node configuration must have an
+/// operator-provided path. Configuration validation rejects flavor/backend
+/// mismatches; this only proves the operator supplied the binaries they
+/// configured. The supervisor never probes or initializes accelerators:
+/// device inventory is operator-declared and verified by the worker's own
+/// assigned-device selection at startup.
+fn ensure_flavor_binaries(
+    config: &NodeConfig,
+    options: &CliOptions,
+) -> Result<(), SupervisorError> {
     for worker in &config.workers {
-        if !matches!(worker.assignment, DeviceAssignment::Cpu { .. })
-            || worker.binary != WorkerBinaryFlavor::Cpu
-        {
-            return Err(SupervisorError::UnsupportedDeviceLane {
+        let (provided, option) = match worker.binary {
+            WorkerBinaryFlavor::Cpu => (&options.cpu_worker_binary, "--cpu-worker-binary"),
+            WorkerBinaryFlavor::Metal => (&options.metal_worker_binary, "--metal-worker-binary"),
+            WorkerBinaryFlavor::Cuda => (&options.cuda_worker_binary, "--cuda-worker-binary"),
+        };
+        if provided.is_none() {
+            return Err(SupervisorError::MissingFlavorBinary {
+                option,
                 worker: worker.worker_id.clone(),
-                backend: worker.assignment.backend(),
                 binary: worker.binary,
             });
         }
@@ -696,15 +752,19 @@ async fn wait_for_shutdown_request() {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CliOptions {
     config: PathBuf,
-    cpu_worker_binary: PathBuf,
+    cpu_worker_binary: Option<PathBuf>,
+    metal_worker_binary: Option<PathBuf>,
+    cuda_worker_binary: Option<PathBuf>,
     cpu_ids: Vec<u16>,
+    metal_devices: Vec<(DeviceId, u32)>,
+    cuda_devices: Vec<(DeviceId, u32, u64)>,
     allocatable_host_memory_bytes: u64,
     validate_only: bool,
     canary_worker_id: Option<WorkerId>,
 }
 
 enum ParseOutcome {
-    Run(CliOptions),
+    Run(Box<CliOptions>),
     Help,
 }
 
@@ -721,7 +781,11 @@ impl CliOptions {
         }
         let mut config = None;
         let mut cpu_worker_binary = None;
+        let mut metal_worker_binary = None;
+        let mut cuda_worker_binary = None;
         let mut cpu_ids = None;
+        let mut metal_devices = Vec::new();
+        let mut cuda_devices = Vec::new();
         let mut allocatable_host_memory_bytes = None;
         let mut validate_only = false;
         let mut canary_worker_id = None;
@@ -745,6 +809,24 @@ impl CliOptions {
                 "--config" => set_once(&mut config, PathBuf::from(value), name)?,
                 "--cpu-worker-binary" => {
                     set_once(&mut cpu_worker_binary, PathBuf::from(value), name)?
+                }
+                "--metal-worker-binary" => {
+                    set_once(&mut metal_worker_binary, PathBuf::from(value), name)?
+                }
+                "--cuda-worker-binary" => {
+                    set_once(&mut cuda_worker_binary, PathBuf::from(value), name)?
+                }
+                "--metal-devices" => {
+                    let value = value
+                        .to_str()
+                        .ok_or_else(|| SupervisorError::InvalidOption(name.to_string()))?;
+                    metal_devices.extend(parse_metal_devices(value)?);
+                }
+                "--cuda-devices" => {
+                    let value = value
+                        .to_str()
+                        .ok_or_else(|| SupervisorError::InvalidOption(name.to_string()))?;
+                    cuda_devices.extend(parse_cuda_devices(value)?);
                 }
                 "--cpu-ids" => {
                     let value = value
@@ -775,17 +857,20 @@ impl CliOptions {
             }
             index += 2;
         }
-        Ok(ParseOutcome::Run(Self {
+        Ok(ParseOutcome::Run(Box::new(Self {
             config: config.ok_or(SupervisorError::MissingOption("--config"))?,
-            cpu_worker_binary: cpu_worker_binary
-                .ok_or(SupervisorError::MissingOption("--cpu-worker-binary"))?,
+            cpu_worker_binary,
+            metal_worker_binary,
+            cuda_worker_binary,
             cpu_ids: cpu_ids.ok_or(SupervisorError::MissingOption("--cpu-ids"))?,
+            metal_devices,
+            cuda_devices,
             allocatable_host_memory_bytes: allocatable_host_memory_bytes.ok_or(
                 SupervisorError::MissingOption("--allocatable-host-memory-bytes"),
             )?,
             validate_only,
             canary_worker_id,
-        }))
+        })))
     }
 }
 
@@ -813,11 +898,87 @@ fn parse_cpu_ids(value: &str) -> Result<Vec<u16>, SupervisorError> {
     Ok(seen.into_iter().collect())
 }
 
+/// Declares Metal devices as `device_id@process_local_index` pairs. Devices
+/// are declared by the operator (from `system_profiler`/`ioreg`) because the
+/// supervisor never probes or initializes accelerators; the worker's own
+/// assigned-device selection verifies the real identity at startup.
+fn parse_metal_devices(value: &str) -> Result<Vec<(DeviceId, u32)>, SupervisorError> {
+    const OPTION: &str = "--metal-devices";
+    let invalid = |reason: String| SupervisorError::InvalidDeviceDeclaration {
+        option: OPTION,
+        reason,
+    };
+    if value.is_empty() || value.len() > 16 * 1024 {
+        return Err(invalid("expected device_id@index".into()));
+    }
+    let mut seen = BTreeSet::new();
+    let mut devices = Vec::new();
+    for item in value.split(',') {
+        let Some((id, index)) = item.split_once('@') else {
+            return Err(invalid(format!("expected device_id@index, got {item:?}")));
+        };
+        let device_id =
+            DeviceId::new(id).map_err(|_| invalid(format!("invalid device id {id:?}")))?;
+        let index: u32 = index
+            .parse()
+            .map_err(|_| invalid(format!("invalid process-local index {index:?}")))?;
+        if !seen.insert(device_id.clone()) || seen.len() > MAX_DEVICE_DECLARATIONS {
+            return Err(invalid("duplicate or excessive device declarations".into()));
+        }
+        devices.push((device_id, index));
+    }
+    Ok(devices)
+}
+
+/// Declares CUDA devices as `device_uuid@host_device_index@total_memory_bytes`.
+fn parse_cuda_devices(value: &str) -> Result<Vec<(DeviceId, u32, u64)>, SupervisorError> {
+    const OPTION: &str = "--cuda-devices";
+    let invalid = |reason: String| SupervisorError::InvalidDeviceDeclaration {
+        option: OPTION,
+        reason,
+    };
+    if value.is_empty() || value.len() > 16 * 1024 {
+        return Err(invalid(
+            "expected uuid@host_index@total_memory_bytes".into(),
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    let mut devices = Vec::new();
+    for item in value.split(',') {
+        let fields: Vec<&str> = item.split('@').collect();
+        let [uuid, host_index, total_memory_bytes] = fields.as_slice() else {
+            return Err(invalid(format!(
+                "expected uuid@host_index@total_memory_bytes, got {item:?}"
+            )));
+        };
+        let device_uuid =
+            DeviceId::new(*uuid).map_err(|_| invalid(format!("invalid device uuid {uuid:?}")))?;
+        let host_index: u32 = host_index
+            .parse()
+            .map_err(|_| invalid(format!("invalid host device index {host_index:?}")))?;
+        let total_memory_bytes: u64 = total_memory_bytes
+            .parse()
+            .map_err(|_| invalid(format!("invalid total memory bytes {total_memory_bytes:?}")))?;
+        if total_memory_bytes == 0
+            || !seen.insert(device_uuid.clone())
+            || seen.len() > MAX_DEVICE_DECLARATIONS
+        {
+            return Err(invalid(
+                "duplicate, zero-memory, or excessive device declarations".into(),
+            ));
+        }
+        devices.push((device_uuid, host_index, total_memory_bytes));
+    }
+    Ok(devices)
+}
+
 fn print_usage() {
     eprintln!(
-        "Usage: izwi-serving-supervisor \\\n  --config PATH \\\n  --cpu-worker-binary PATH \\\n  --cpu-ids 0,1,... \\\n  --allocatable-host-memory-bytes BYTES\n\n\
-This executable intentionally accepts CPU workers only. CPU IDs and allocatable host memory\n\
-must come from an operator or a trusted launcher; it does not probe or initialize accelerators."
+        "Usage: izwi-serving-supervisor \\\n  --config PATH \\\n  --cpu-ids 0,1,... \\\n  --allocatable-host-memory-bytes BYTES \\\n  [--cpu-worker-binary PATH] [--metal-worker-binary PATH] [--cuda-worker-binary PATH] \\\n  [--metal-devices id@index,...] [--cuda-devices uuid@host_index@total_memory_bytes,...]\n\n\
+Every binary flavor referenced by the node configuration must be provided. Device\n\
+declarations come from the operator (the supervisor never probes or initializes\n\
+accelerators); each worker verifies its assigned device identity at startup and\n\
+the supervisor admits nothing before that worker reports readiness."
     );
     eprintln!(
         "Optional: --validate-only resolves configuration and service credentials, prints bounded redacted diagnostics, and exits without acquiring locks or launching workers."
@@ -859,11 +1020,18 @@ enum SupervisorError {
     Lock(#[from] izwi_serving_supervisor::LockError),
     #[error(transparent)]
     Lifecycle(#[from] izwi_serving_supervisor::LifecycleError),
-    #[error("worker {worker} requires unsupported {backend:?}/{binary:?}; this executable supports explicit CPU assignments only")]
-    UnsupportedDeviceLane {
+    #[error(
+        "worker {worker} references binary flavor {binary:?}; provide its binary via {option}"
+    )]
+    MissingFlavorBinary {
+        option: &'static str,
         worker: WorkerId,
-        backend: BackendKind,
         binary: WorkerBinaryFlavor,
+    },
+    #[error("{option} is invalid: {reason}")]
+    InvalidDeviceDeclaration {
+        option: &'static str,
+        reason: String,
     },
     #[error("worker {worker} secret environment variable {environment} is not set")]
     MissingSecret {
@@ -885,6 +1053,7 @@ enum SupervisorError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use izwi_serving_protocol::DeviceAssignment;
     use izwi_serving_protocol::{
         ArtifactRevision, CancellationBehavior, CredentialId, DeploymentId, DeviceId, InputFormat,
         ModelAlias, ModelGeneration, NodeId, OutputFormat, TaskKind,
@@ -971,9 +1140,14 @@ mod tests {
         assert_eq!(options.cpu_ids, vec![1, 3]);
         assert_eq!(options.allocatable_host_memory_bytes, 4096);
         assert!(options.validate_only);
+        // Worker binary paths are optional at the CLI level: the missing one is
+        // reported against the flavor the node configuration actually references.
+        assert_eq!(options.cpu_worker_binary, Some(PathBuf::from("/worker")));
+        assert!(options.metal_worker_binary.is_none());
+        assert!(options.cuda_worker_binary.is_none());
         assert!(matches!(
             CliOptions::parse([OsString::from("--config"), OsString::from("/x")]),
-            Err(SupervisorError::MissingOption("--cpu-worker-binary"))
+            Err(SupervisorError::MissingOption("--cpu-ids"))
         ));
         assert!(matches!(
             parse_cpu_ids("1,1"),
@@ -1085,19 +1259,61 @@ mod tests {
     }
 
     #[test]
-    fn accelerator_lanes_are_rejected_without_fallback() {
-        let assignment = DeviceAssignment::Metal {
+    fn ensure_flavor_binaries_requires_the_configured_lanes() {
+        let metal = DeviceAssignment::Metal {
             device_id: id::<DeviceId>("metal:1"),
             process_local_device_index: 0,
             shared_memory_limit_bytes: 512,
         };
+        let options = CliOptions {
+            config: PathBuf::from("/x"),
+            cpu_worker_binary: Some(PathBuf::from("/cpu-worker")),
+            metal_worker_binary: None,
+            cuda_worker_binary: None,
+            cpu_ids: vec![0, 1],
+            metal_devices: Vec::new(),
+            cuda_devices: Vec::new(),
+            allocatable_host_memory_bytes: 4294967296,
+            validate_only: false,
+            canary_worker_id: None,
+        };
         assert!(matches!(
-            require_cpu_only(&config(assignment, WorkerBinaryFlavor::Metal)),
-            Err(SupervisorError::UnsupportedDeviceLane {
-                backend: BackendKind::Metal,
+            ensure_flavor_binaries(&config(metal.clone(), WorkerBinaryFlavor::Metal), &options),
+            Err(SupervisorError::MissingFlavorBinary {
+                option: "--metal-worker-binary",
+                binary: WorkerBinaryFlavor::Metal,
                 ..
             })
         ));
+
+        let mut with_metal = options.clone();
+        with_metal.metal_worker_binary = Some(PathBuf::from("/metal-worker"));
+        ensure_flavor_binaries(&config(metal, WorkerBinaryFlavor::Metal), &with_metal)
+            .expect("a declared metal lane with its binary passes the flavor check");
+    }
+
+    #[test]
+    fn device_declarations_parse_and_fail_closed() {
+        let metal = parse_metal_devices("metal:0x1@0,metal:0x2@1").unwrap();
+        assert_eq!(
+            metal,
+            vec![
+                (DeviceId::new("metal:0x1").unwrap(), 0),
+                (DeviceId::new("metal:0x2").unwrap(), 1)
+            ]
+        );
+        assert!(parse_metal_devices("metal:0x1").is_err());
+        assert!(parse_metal_devices("metal:0x1@0,metal:0x1@0").is_err());
+        assert!(parse_metal_devices("").is_err());
+
+        let cuda = parse_cuda_devices("GPU-abc@0@8589934592").unwrap();
+        assert_eq!(
+            cuda,
+            vec![(DeviceId::new("GPU-abc").unwrap(), 0, 8_589_934_592u64)]
+        );
+        assert!(parse_cuda_devices("GPU-abc@0").is_err());
+        assert!(parse_cuda_devices("GPU-abc@0@0").is_err());
+        assert!(parse_cuda_devices("GPU-abc@1@8589934592@extra").is_err());
     }
 
     #[test]
