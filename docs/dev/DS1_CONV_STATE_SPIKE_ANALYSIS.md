@@ -39,6 +39,28 @@ shared spans rebuild linear-attention and conv state."
    parity through the DS0.8 harness still needs a prefix-enabled hybrid
    fixture executing end-to-end (the tiny LFM fixture keeps declarations
    disabled); it gates default-on, which remains off.
+5. **DS1.5 process findings (2026-09-24)** — a disk-loadable tiny hybrid
+   qwen38 fixture (`IZWI_ALLOW_SYNTHETIC_QWEN38_GEOMETRY`, worker fixture
+   builder in `izwi-serving-worker/tests/common`) executes end-to-end through
+   the real worker: aligned-chunk snapshot publication works and is
+   observable on the worker's `/internal/v1/metrics/prometheus` (managed-KV
+   counters). Two soundness/integration defects were found and fixed or
+   fenced:
+   - **FIXED** — the managed-side first-chunk clamp could reduce the commit
+     target below the scheduled input span (when the scheduler-level clamp
+     did not apply to the same chunk), so the model appended pages past its
+     block table ("physical paged append ends at N, beyond capacity M").
+     The clamp now only engages when the scheduled span already ends at or
+     below the boundary; alignment is the scheduler's responsibility.
+   - **OPEN (blocks DS1.5 attach evidence)** — after a session attaches a
+     published snapshot at cursor C, the scheduler still issues the prefill
+     span from 0 while the model must append from C, so the paged append
+     overruns the block table and the stream closes without a final marker.
+     The scheduler/executor must clip (or replay) the scheduled span to the
+     attach cursor. Reproduce with
+     `cargo test -p izwi-serving-worker --test prefix_attach_repro -- --ignored`.
+     Until this lands, DS1.5 records publish-side evidence only and
+     `enable_prefix_caching` stays opt-in (default off).
 
 # Original spike analysis (2026-09-23)
 
