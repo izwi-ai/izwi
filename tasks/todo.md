@@ -18632,3 +18632,118 @@ DS2+ phases.
   fork-at-cursor attach, publish-on-interval in stage_commit_with_prefix_
   updates; design in DS1_CONV_STATE_SPIKE_ANALYSIS.md).
 - Verified: engine::cache 152/152, qwen38 139/139. Next session: DS1.2b.
+
+# DS1.2b — managed tensor-snapshot publication + attach-by-fork — 2026-09-23 (part 5)
+
+Plan (from DS1_CONV_STATE_SPIKE_ANALYSIS.md requirement 2 + the DS1.2b handoff):
+wire the managed cache so hybrid contracts that declare
+`PrefixPolicy::CommittedSnapshots` publish committed tensor snapshots keyed by
+the shared paged page-chain digest, and attaching invocations fork them
+(DS1.1 prototype recipe: read -> begin -> stage_replace -> commit at the fork
+cursor). DINV-02 tenant salt + model generation binding is inherited because
+the snapshot key IS the page-chain digest (namespace fingerprint binds salt,
+model revision, plan). Default stays off (declarations only exist behind
+`enable_prefix_caching`).
+
+Key design decisions:
+- Snapshot key = digest of the last paged prefix page whose end equals the
+  snapshot cursor. Tensor reuse can therefore never exceed or diverge from
+  paged reuse; a miss truncates the paged match back to the nearest
+  snapshot-backed boundary (sound partial reuse).
+- Publish only when the fresh first-chunk commit cursor is interval-aligned
+  (cursor % interval_steps == 0) and pages were accepted through that cursor.
+- Strict gate `tensor_snapshot_prefix_policy`: exactly one paged-attention
+  domain (CommittedPages), every tensor domain CommittedSnapshots with one
+  shared interval, all in exactly one consistency group, no append/ring
+  domains. Anything else stays admission-inert (MTP variant included).
+- Legacy (AllDomains) transaction mode only; clocked/selected requests never
+  publish or attach. Legacy commit already forces tensor cursor == paged
+  accepted cursor, which the model derives from `physical_kv.context_len()`,
+  so the fork needs zero model/handler changes.
+- Scheduler alignment: first prefill chunk (num_computed == 0) of an
+  Incremental-prefill request whose sealed contract passes the gate is clamped
+  down to the interval boundary via a new ExecutionProfile field. This makes
+  published snapshots reachable by longer-prompt attachers (system prompt /
+  history reuse). Identical-length siblings would need zero-ingest prefill
+  authority (unchanged-prefix fence) - deliberately deferred.
+- Snapshot index bounds derived, no new config: entries <= arena sequence
+  capacity, bytes <= authorized tensor envelope; LRU eviction on insert.
+
+## Items
+
+- [x] 1. `engine/cache/tensor_snapshots.rs`: strict policy gate
+      (`tensor_snapshot_prefix_policy`) + bounded LRU `TensorStateSnapshotIndex`
+      (publish idempotent, lookup verifies cursor, byte+entry bounds) + unit tests.
+- [x] 2. Telemetry: `tensor_snapshot_publishes/attaches/truncations/evictions`.
+- [x] 3. managed.rs wiring: per-model snapshot sharing (policy + paged arena +
+      index) at bind; target clamp + truncating reconcile + fork in
+      prepare_inner; publish in finalize's post-commit infallible section;
+      graceful no-reuse fallback on fork Backpressure; hard error on fork
+      validation failure.
+- [x] 4. Scheduler alignment: `ExecutionProfile::managed_snapshot_prefill_interval`
+      from the sealed contract gate; RequestMetadata field; clamp at both
+      prefill target sites when num_computed == 0 and mode is Incremental.
+- [x] 5. Correctness suite: aligned publish + fork attach + value identity;
+      unaligned commit publishes nothing + truncates to 0; salt/generation
+      isolation; abort never publishes; restarted generation never attaches;
+      inert contracts unchanged; scheduler clamp tests.
+- [x] 6. Verify: engine::cache + kv + scheduler + tensor tests, clippy -D
+      warnings, fmt (leaf files), check-serving-boundary.sh.
+- [x] 7. Update DS1_CONV_STATE_SPIKE_ANALYSIS.md status + record session.
+
+## DS1.2b completion review — 2026-09-24
+
+All plan items landed. Commits (this session):
+- feat(core): managed tensor-snapshot publication and attach-by-fork (DS1.2b)
+- feat(core): align the first prefill chunk to the declared snapshot interval (DS1.2b)
+- docs(serving): record DS1.2b enablement status
+- docs(tasks): record DS1.2b session
+
+What was built
+- `engine/cache/tensor_snapshots.rs`: strict `tensor_snapshot_prefix_policy`
+  gate (exactly one paged-attention domain with CommittedPages, every tensor
+  domain CommittedSnapshots with one shared interval, one consistency group)
+  + bounded LRU `TensorStateSnapshotIndex` (entries <= arena sequence
+  capacity, bytes <= authorized tensor envelope, idempotent republish,
+  cursor-conflict rejection).
+- Snapshot keys are the paged page-chain digests at the snapshot boundary, so
+  DINV-02 tenant salt + model generation binding is inherited from the
+  `KvPrefixNamespace` fingerprint and tensor reuse can never diverge from the
+  paged reuse the same lookup authenticated.
+- managed.rs: sharing surface derived at bind (interval must sit on the
+  resolved page grid); `finalize` publishes after the legacy tensor commit
+  when the accepted cursor is the aligned boundary of accepted pages;
+  `prepare_inner` reconciles the paged match by walking back to the nearest
+  snapshot-backed boundary (zero reuse fallback when the session cannot fork)
+  and forks via the DS1.1 recipe (read -> begin -> stage_replace -> commit at
+  the fork cursor) on a fresh sequence, with full rollback on failure.
+  Fork-seed transaction ids descend from u64::MAX, plan-id txns ascend.
+- The post-lookup clamp only engages when nothing attached; pages the lookup
+  matched but the reconcile dropped are excluded from re-publication (one
+  digest must keep exactly one block binding). Saltless managers keep their
+  exact pre-DS1.2b behavior (clamp gated on namespace presence).
+- `prefix_enabled_for_domain` now requires the full sharing gate for any
+  contract with tensor domains, closing the 9c8dc83a hybrid-attach hazard
+  completely (hybrid paged attach fires only when tensor can fork).
+- Scheduler: `ExecutionProfile::managed_snapshot_prefill_interval` from the
+  sealed contract gate; metadata carries it; first prefill chunk
+  (num_computed == 0, Incremental mode) clamps down to the interval boundary
+  at both prefill scheduling sites.
+- Telemetry: tensor_snapshot_publishes/attaches/truncations/evictions.
+
+Verification
+- izwi-core lib: 2634 passed / 0 failed (26 new tests: 3 index/gate, 6
+  manager correctness incl. fork value-identity under source continuation,
+  1 scheduler alignment, telemetry).
+- clippy -D warnings clean (lib + tests); rustfmt on leaf files;
+  check-serving-boundary.sh passes; izwi-server compiles.
+
+Deliberately still open
+- Identical-length sibling reuse needs zero-ingest prefill authority over the
+  unchanged-prefix fence (documented in the design doc; deferred).
+- DS0.8-harness CPU/Metal parity with a prefix-enabled hybrid fixture gates
+  default-on; `enable_prefix_caching` stays opt-in (default off).
+- DS1.5: benchmark snapshot hit rate (interval alignment trades hit rate for
+  soundness by design).
+
+# End of DS1.2b session
