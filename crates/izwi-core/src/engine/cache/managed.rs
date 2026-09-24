@@ -1659,11 +1659,23 @@ impl ManagedKvCacheManager {
                         // pages end on. The residual tokens are served by the
                         // next prefill chunk. An attached session keeps its
                         // exact target and simply commits the residual span.
+                        //
+                        // The reduction is only sound when the scheduled input
+                        // span already ends at (or below) the boundary — the
+                        // scheduler's first-chunk alignment guarantees that.
+                        // Truncating a commit target below the span the
+                        // executor is about to append would leave the model
+                        // writing pages past its block table.
                         if tensor_attach.is_none() && prefix_match.reused_tokens == 0 {
                             let interval = u64::from(*interval_tokens);
                             let target = u64::from(target_committed_tokens);
                             let boundary = target - target % interval;
-                            if boundary > 0 && boundary < target {
+                            let span_fits_boundary = domain_sequence_input
+                                .map(|input| {
+                                    u64::try_from(input.end).is_ok_and(|end| end <= boundary)
+                                })
+                                .unwrap_or(false);
+                            if span_fits_boundary && boundary > 0 && boundary < target {
                                 target_committed_tokens =
                                     u32::try_from(boundary).map_err(|_| {
                                         Error::InvalidInput(
@@ -7373,6 +7385,9 @@ mod tests {
             .unwrap()
             .unwrap();
         let arena = runtime.tensor_state().unwrap().clone();
+        // The scheduler's first-chunk alignment clips the executed span to the
+        // snapshot boundary (64 of the 65-token prompt); prepare must accept
+        // that span and publish at the aligned cursor.
         let tokens = (0..65_u32).collect::<Vec<u32>>();
         let session = SessionKey::new("aligned".into(), 1);
         let request = prefix_request(model, tokens);
@@ -7381,7 +7396,7 @@ mod tests {
                 &runtime,
                 68,
                 &session,
-                &sequence_work(0, 65),
+                &sequence_work(0, 64),
                 Some(&request),
             )
             .unwrap()
@@ -7408,6 +7423,40 @@ mod tests {
             .expect("sharing surface exists for the contract");
         assert_eq!(sharing.index.len(), 1);
         assert_eq!(manager.telemetry_snapshot().tensor_snapshot_publishes, 1);
+    }
+
+    #[test]
+    fn hybrid_commit_target_never_falls_below_the_scheduled_span() {
+        // A span the scheduler did not align (65 tokens, interval 64) must
+        // commit in full: truncating the commit target below the appended span
+        // would leave the model writing pages past its block table.
+        let model = ModelInstanceId::new(607);
+        let mut manager = ManagedKvCacheManager::with_prefix_cache_salt(None, Some([26; 32]));
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                4,
+                32,
+                &CacheCapability::Managed(hybrid_snapshot_contract()),
+            )
+            .unwrap()
+            .unwrap();
+        let tokens = (0..65_u32).collect::<Vec<u32>>();
+        let session = SessionKey::new("unaligned".into(), 1);
+        let request = prefix_request(model, tokens);
+        let reservation = manager
+            .prepare(
+                &runtime,
+                69,
+                &session,
+                &sequence_work(0, 65),
+                Some(&request),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(reservation.domains[0].target_committed_tokens, 65);
+        assert_eq!(manager.telemetry_snapshot().tensor_snapshot_publishes, 0);
     }
 
     #[test]
