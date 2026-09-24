@@ -144,3 +144,385 @@ fn generate_benchmark_fixture() {
     let dir = write_tiny_lfm_fixture(std::path::Path::new(&root));
     println!("fixture model dir: {}", dir.display());
 }
+
+const QWEN38_FIXTURE_REVISION: &str = "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a";
+
+fn bf16_bytes(values: &[f32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| half::bf16::from_f32(*value).to_bits().to_le_bytes())
+        .collect()
+}
+
+struct Qwen38FixtureTensor {
+    name: String,
+    dtype: safetensors::Dtype,
+    shape: Vec<usize>,
+    data: Vec<u8>,
+}
+
+fn qwen38_dense(name: impl Into<String>, shape: &[usize], values: &[f32]) -> Qwen38FixtureTensor {
+    Qwen38FixtureTensor {
+        name: name.into(),
+        dtype: safetensors::Dtype::BF16,
+        shape: shape.to_vec(),
+        data: bf16_bytes(values),
+    }
+}
+
+/// A zero block-FP8 projection weight plus its unit `weight_scale_inv`.
+fn qwen38_fp8_projection(
+    name: impl Into<String>,
+    shape: [usize; 2],
+    block: [usize; 2],
+) -> Vec<Qwen38FixtureTensor> {
+    let name = name.into();
+    let scale_shape = [shape[0].div_ceil(block[0]), shape[1].div_ceil(block[1])];
+    vec![
+        Qwen38FixtureTensor {
+            name: name.clone(),
+            dtype: safetensors::Dtype::F8_E4M3,
+            shape: shape.to_vec(),
+            data: vec![0; shape[0] * shape[1]],
+        },
+        qwen38_dense(
+            name.replace(".weight", ".weight_scale_inv"),
+            &scale_shape,
+            &vec![1.0; scale_shape[0] * scale_shape[1]],
+        ),
+    ]
+}
+
+/// Tiny synthetic hybrid Qwen3.8 checkpoint (DS1.5): one linear-attention block
+/// plus one full-attention block, so the DS1.2b committed-snapshot sharing gate
+/// accepts the sealed managed contract. The geometry requires
+/// `IZWI_ALLOW_SYNTHETIC_QWEN38_GEOMETRY=1` in the loading process; the values
+/// mirror the in-process recovery fixtures in izwi-core exactly.
+pub fn write_tiny_qwen38_hybrid_fixture(models_dir: &Path) -> PathBuf {
+    use safetensors::tensor::TensorView;
+    use std::collections::BTreeMap;
+
+    const HIDDEN: usize = 4;
+    const FF: usize = 4;
+    const Q_WIDTH: usize = 8; // 2 heads * head_dim 2 * 2 (gated)
+    const KV_WIDTH: usize = 2; // 1 kv head * head_dim 2
+    const OUTPUT_WIDTH: usize = 4; // 2 heads * head_dim 2
+    const BLOCK: [usize; 2] = [2, 2];
+
+    let model_dir = models_dir.join("Qwen3.8-27B-FP8");
+    std::fs::create_dir_all(&model_dir).unwrap();
+
+    // --- config.json: synthetic hybrid geometry (structural checks still run).
+    let text_config = serde_json::json!({
+        "attention_bias": false,
+        "attention_dropout": 0.0,
+        "attn_output_gate": true,
+        "bos_token_id": 2,
+        "dtype": "bfloat16",
+        "eos_token_id": 2,
+        "full_attention_interval": 2,
+        "head_dim": 2,
+        "hidden_act": "silu",
+        "hidden_size": HIDDEN,
+        "intermediate_size": FF,
+        "layer_types": ["linear_attention", "full_attention"],
+        "linear_conv_kernel_dim": 3,
+        "linear_key_head_dim": 1,
+        "linear_num_key_heads": 1,
+        "linear_num_value_heads": 1,
+        "linear_value_head_dim": 1,
+        "mamba_ssm_dtype": "float32",
+        "max_position_embeddings": 512,
+        "model_type": "qwen3_5_text",
+        "mtp_num_hidden_layers": 1,
+        "mtp_use_dedicated_embeddings": false,
+        "num_attention_heads": 2,
+        "num_hidden_layers": 2,
+        "num_key_value_heads": 1,
+        "output_gate_type": "swish",
+        "partial_rotary_factor": 1.0,
+        "rms_norm_eps": 1e-6,
+        "tie_word_embeddings": false,
+        "use_cache": true,
+        "vocab_size": 8,
+        "rope_parameters": {
+            "mrope_interleaved": true,
+            "mrope_section": [1, 0, 0],
+            "partial_rotary_factor": 1.0,
+            "rope_theta": 10000.0,
+            "rope_type": "default"
+        }
+    });
+    let config = serde_json::json!({
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
+        "language_model_only": false,
+        "model_type": "qwen3_5",
+        "tie_word_embeddings": false,
+        "quantization_config": {
+            "activation_scheme": "dynamic",
+            "fmt": "e4m3",
+            "quant_method": "fp8",
+            "weight_block_size": [2, 2]
+        },
+        "text_config": text_config
+    });
+    std::fs::write(model_dir.join("config.json"), config.to_string()).unwrap();
+
+    // --- mtp.safetensors: the full MTP checkpoint contract (validated on load,
+    // executed only when MTP is enabled).
+    let mut fc = vec![0.0f32; HIDDEN * HIDDEN * 2];
+    for row in 0..HIDDEN {
+        fc[row * HIDDEN * 2 + row] = 1.0;
+    }
+    let mut mtp_tensors = vec![
+        qwen38_dense("mtp.fc.weight", &[HIDDEN, HIDDEN * 2], &fc),
+        qwen38_dense(
+            "mtp.pre_fc_norm_embedding.weight",
+            &[HIDDEN],
+            &[0.0; HIDDEN],
+        ),
+        qwen38_dense("mtp.pre_fc_norm_hidden.weight", &[HIDDEN], &[0.0; HIDDEN]),
+        qwen38_dense("mtp.norm.weight", &[HIDDEN], &[0.0; HIDDEN]),
+        qwen38_dense(
+            "mtp.layers.0.input_layernorm.weight",
+            &[HIDDEN],
+            &[0.0; HIDDEN],
+        ),
+        qwen38_dense(
+            "mtp.layers.0.post_attention_layernorm.weight",
+            &[HIDDEN],
+            &[0.0; HIDDEN],
+        ),
+        qwen38_dense("mtp.layers.0.self_attn.q_norm.weight", &[2], &[0.0; 2]),
+        qwen38_dense("mtp.layers.0.self_attn.k_norm.weight", &[2], &[0.0; 2]),
+    ];
+    for (name, shape) in [
+        ("mtp.layers.0.mlp.gate_proj.weight", [FF, HIDDEN]),
+        ("mtp.layers.0.mlp.up_proj.weight", [FF, HIDDEN]),
+        ("mtp.layers.0.mlp.down_proj.weight", [HIDDEN, FF]),
+        ("mtp.layers.0.self_attn.q_proj.weight", [Q_WIDTH, HIDDEN]),
+        ("mtp.layers.0.self_attn.k_proj.weight", [KV_WIDTH, HIDDEN]),
+        ("mtp.layers.0.self_attn.v_proj.weight", [KV_WIDTH, HIDDEN]),
+        (
+            "mtp.layers.0.self_attn.o_proj.weight",
+            [HIDDEN, OUTPUT_WIDTH],
+        ),
+    ] {
+        mtp_tensors.extend(qwen38_fp8_projection(name, shape, BLOCK));
+    }
+    assert_eq!(
+        mtp_tensors.len(),
+        22,
+        "MTP tensor count must match the loader's manifest"
+    );
+
+    // --- target.safetensors: the text backbone. Block 1 (full attention)
+    // reuses the MTP layer tensors; BLOCK 0 (linear attention) gets the MTP
+    // MLP/norms plus a nonzero DeltaNet set so attach state depends on conv
+    // history and recurrent state, not only the token cursor.
+    let mut target_tensors: Vec<Qwen38FixtureTensor> = Vec::new();
+    for tensor in &mtp_tensors {
+        if tensor.name.starts_with("mtp.layers.0.") {
+            target_tensors.push(Qwen38FixtureTensor {
+                name: tensor
+                    .name
+                    .replacen("mtp.layers.0.", "model.language_model.layers.1.", 1),
+                dtype: tensor.dtype,
+                shape: tensor.shape.clone(),
+                data: tensor.data.clone(),
+            });
+        }
+    }
+    for tensor in &mtp_tensors {
+        if tensor.name.contains(".mlp.")
+            || tensor.name.ends_with(".input_layernorm.weight")
+            || tensor.name.ends_with(".post_attention_layernorm.weight")
+        {
+            target_tensors.push(Qwen38FixtureTensor {
+                name: tensor
+                    .name
+                    .replacen("mtp.layers.0.", "model.language_model.layers.0.", 1),
+                dtype: tensor.dtype,
+                shape: tensor.shape.clone(),
+                data: tensor.data.clone(),
+            });
+        }
+    }
+    // Dense linear-attention math tensors (the loader requires these dense,
+    // without scale companions).
+    for (name, shape, value) in [
+        ("dt_bias", vec![1usize], 0.1f32),
+        ("A_log", vec![1], -1.0),
+        ("conv1d.weight", vec![3, 1, 3], 0.25),
+        ("norm.weight", vec![1], 1.0),
+        ("in_proj_a.weight", vec![1, 4], 0.125),
+        ("in_proj_b.weight", vec![1, 4], 0.125),
+    ] {
+        target_tensors.push(qwen38_dense(
+            format!("model.language_model.layers.0.linear_attn.{name}"),
+            &shape,
+            &vec![value; shape.iter().product::<usize>()],
+        ));
+    }
+    // Linear-attention projections are block-FP8 pairs in the checkpoint
+    // contract; the loader rejects dense weights that carry a scale companion
+    // and requires the scale name for every projection.
+    for (name, shape) in [
+        ("in_proj_qkv", [3usize, 4]),
+        ("in_proj_z", [1, 4]),
+        ("out_proj", [4, 1]),
+    ] {
+        target_tensors.extend(qwen38_fp8_projection(
+            format!("model.language_model.layers.0.linear_attn.{name}.weight"),
+            shape,
+            BLOCK,
+        ));
+    }
+    let mut embedding = vec![0.125f32; 8 * HIDDEN];
+    for row in 0..8 {
+        if row % 4 == row / 4 % 4 {
+            for column in 0..HIDDEN {
+                embedding[row * HIDDEN + column] = 1.0;
+            }
+        }
+    }
+    target_tensors.push(qwen38_dense(
+        "model.language_model.embed_tokens.weight",
+        &[8, HIDDEN],
+        &embedding,
+    ));
+    target_tensors.push(qwen38_dense("lm_head.weight", &[8, HIDDEN], &embedding));
+    target_tensors.push(qwen38_dense(
+        "model.language_model.norm.weight",
+        &[HIDDEN],
+        &[0.0; HIDDEN],
+    ));
+
+    // --- write shards + index.
+    let write_shard = |path: &Path, tensors: &[Qwen38FixtureTensor]| {
+        let views = tensors
+            .iter()
+            .map(|tensor| {
+                (
+                    tensor.name.clone(),
+                    TensorView::new(tensor.dtype, tensor.shape.clone(), &tensor.data).unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        safetensors::serialize_to_file(&views, &None, path).unwrap();
+    };
+    write_shard(&model_dir.join("mtp.safetensors"), &mtp_tensors);
+    write_shard(&model_dir.join("target.safetensors"), &target_tensors);
+
+    let mut weight_map = serde_json::Map::new();
+    for tensor in mtp_tensors.iter().chain(target_tensors.iter()) {
+        let shard = if tensor.name.starts_with("mtp.") {
+            "mtp.safetensors"
+        } else {
+            "target.safetensors"
+        };
+        weight_map.insert(tensor.name.clone(), serde_json::json!(shard));
+    }
+    std::fs::write(
+        model_dir.join("model.safetensors.index.json"),
+        serde_json::json!({ "weight_map": weight_map }).to_string(),
+    )
+    .unwrap();
+
+    // --- tokenizer: WordLevel over an 8-token vocab (ids 0-7 cover every
+    // model output). Specials live in tokenizer_config.json; qwen38 chat
+    // encoding splits them out as literals before the inner tokenizer runs.
+    let tokenizer = serde_json::json!({
+        "version": "1.0",
+        "truncation": null,
+        "padding": null,
+        "added_tokens": [],
+        "normalizer": null,
+        "pre_tokenizer": { "type": "Whitespace" },
+        "post_processor": null,
+        "decoder": null,
+        "model": {
+            "type": "WordLevel",
+            "vocab": {
+                "<|pad|>": 0,
+                "<|im_start|>": 1,
+                "<|im_end|>": 2,
+                "<|image_pad|>": 3,
+                "<|video_pad|>": 4,
+                "a": 5,
+                "b": 6,
+                "c": 7
+            },
+            "unk_token": "a"
+        }
+    });
+    std::fs::write(model_dir.join("tokenizer.json"), tokenizer.to_string()).unwrap();
+    let tokenizer_config = serde_json::json!({
+        "added_tokens_decoder": {
+            "0": { "content": "<|pad|>", "special": true },
+            "1": { "content": "<|im_start|>", "special": true },
+            "2": { "content": "<|im_end|>", "special": true },
+            "3": { "content": "<|image_pad|>", "special": true },
+            "4": { "content": "<|video_pad|>", "special": true }
+        },
+        "eos_token": "<|im_end|>",
+        "chat_template": "{% for message in messages %}{{ message['content'] }}{% endfor %}"
+    });
+    std::fs::write(
+        model_dir.join("tokenizer_config.json"),
+        tokenizer_config.to_string(),
+    )
+    .unwrap();
+
+    // The downloader's qwen38 bundle-completeness gate requires every metadata
+    // file of the published bundle to exist, even when unused (tokenizer.json
+    // wins over vocab.json+merges; render_prompt builds the template inline).
+    std::fs::write(model_dir.join("generation_config.json"), "{}").unwrap();
+    std::fs::write(
+        model_dir.join("chat_template.jinja"),
+        "{% for message in messages %}{{ message['content'] }}{% endfor %}",
+    )
+    .unwrap();
+    std::fs::write(model_dir.join("vocab.json"), "{}").unwrap();
+    std::fs::write(model_dir.join("merges.txt"), "").unwrap();
+    std::fs::write(model_dir.join("preprocessor_config.json"), "{}").unwrap();
+    std::fs::write(model_dir.join("video_preprocessor_config.json"), "{}").unwrap();
+
+    let manifest = ArtifactManifest {
+        schema_version: 1,
+        variant: ModelVariant::Qwen3827BFp8,
+        repo_id: ModelVariant::Qwen3827BFp8.repo_id().into(),
+        revision: QWEN38_FIXTURE_REVISION.into(),
+        files: vec![
+            "chat_template.jinja".into(),
+            "config.json".into(),
+            "generation_config.json".into(),
+            "merges.txt".into(),
+            "model.safetensors.index.json".into(),
+            "mtp.safetensors".into(),
+            "preprocessor_config.json".into(),
+            "target.safetensors".into(),
+            "tokenizer.json".into(),
+            "tokenizer_config.json".into(),
+            "video_preprocessor_config.json".into(),
+            "vocab.json".into(),
+        ],
+    };
+    std::fs::write(
+        model_dir.join("izwi-artifact.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    model_dir
+}
+
+/// Explicit fixture generation for the DS1.5 prefix benchmark runs: run with
+/// `IZWI_BENCH_FIXTURE_DIR=<models root> cargo test -p izwi-serving-worker \
+///  --test backend_parity generate_qwen38_benchmark_fixture -- --ignored`
+#[test]
+#[ignore = "explicit benchmark fixture generation"]
+fn generate_qwen38_benchmark_fixture() {
+    let root = std::env::var("IZWI_BENCH_FIXTURE_DIR").expect("set IZWI_BENCH_FIXTURE_DIR");
+    let dir = write_tiny_qwen38_hybrid_fixture(std::path::Path::new(&root));
+    println!("fixture model dir: {}", dir.display());
+}

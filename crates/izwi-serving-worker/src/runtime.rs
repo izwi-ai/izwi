@@ -8,6 +8,7 @@ use izwi_core::{
     ChatMessage as CoreChatMessage, ChatRole as CoreChatRole, Error as CoreError, GenerationParams,
     ModelVariant, RuntimeChatInvocation, RuntimeChatInvocationEvent, RuntimeChatInvocationRequest,
     RuntimeChatTeardownDisposition, RuntimeRequestContext, RuntimeService,
+    RuntimeTelemetrySnapshot,
 };
 use izwi_serving_protocol::{
     ChatRole, FinishReason, InvocationErrorCode, InvocationInput, InvocationRequest, RejectionCode,
@@ -142,6 +143,10 @@ impl RuntimeChatExecutor {
 
 #[async_trait]
 impl InvocationExecutor for RuntimeChatExecutor {
+    async fn runtime_telemetry(&self) -> Option<RuntimeTelemetrySnapshot> {
+        Some(self.runtime.telemetry_snapshot().await)
+    }
+
     async fn admit(
         &self,
         request: &InvocationRequest,

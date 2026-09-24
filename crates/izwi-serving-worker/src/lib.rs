@@ -15,6 +15,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use izwi_core::RuntimeTelemetrySnapshot;
 use izwi_serving_protocol::*;
 use std::{
     collections::{HashMap, VecDeque},
@@ -228,6 +229,14 @@ pub trait InvocationExecutor: Send + Sync + 'static {
         &self,
         request: &InvocationRequest,
     ) -> Result<AdmittedInvocation, AdmissionFailure>;
+
+    /// Engine-owned runtime telemetry when the executor embeds a serving
+    /// runtime. Surfaced on the worker's metrics endpoint so serving evidence
+    /// (managed-KV prefix and tensor-snapshot counters) is observable in the
+    /// gateway/worker topology. Executors without an engine return `None`.
+    async fn runtime_telemetry(&self) -> Option<RuntimeTelemetrySnapshot> {
+        None
+    }
 }
 
 #[derive(Clone)]
@@ -319,7 +328,11 @@ impl WorkerMetrics {
         Self::add_duration(&self.inner.cancellation_to_stop_micros, duration);
     }
 
-    fn render_prometheus<E>(&self, state: &WorkerState<E>) -> String {
+    fn render_prometheus<E>(
+        &self,
+        state: &WorkerState<E>,
+        engine_telemetry: Option<&RuntimeTelemetrySnapshot>,
+    ) -> String {
         let active = state.config.max_active_invocations - state.capacity.available_permits();
         let retained_attempts = state
             .attempts
@@ -471,6 +484,66 @@ impl WorkerMetrics {
             "Oversized or unavailable event deliveries.",
             self.inner.event_delivery_failures.load(Ordering::Relaxed)
         );
+        if let Some(telemetry) = engine_telemetry {
+            // Managed-KV serving evidence from the embedded engine (DS1.4
+            // process-level surfacing; per-deployment attribution stays with
+            // the engine snapshot). Names mirror the server's engine metrics.
+            let counters = &telemetry.engine.kv_cache.counters;
+            metric!(
+                "izwi_engine_kv_cache_hits_total",
+                "counter",
+                "Managed-KV committed prefix hits.",
+                counters.prefix_hits
+            );
+            metric!(
+                "izwi_engine_kv_cache_misses_total",
+                "counter",
+                "Managed-KV committed prefix misses.",
+                counters.prefix_misses
+            );
+            metric!(
+                "izwi_engine_kv_cache_evictions_total",
+                "counter",
+                "Managed-KV committed prefix evictions.",
+                counters.prefix_evictions
+            );
+            metric!(
+                "izwi_engine_kv_cache_reused_tokens_total",
+                "counter",
+                "Tokens served from committed prefix state.",
+                counters.reused_tokens
+            );
+            metric!(
+                "izwi_engine_kv_cache_avoided_prefill_tokens_total",
+                "counter",
+                "Prefill tokens avoided by committed prefix reuse.",
+                counters.avoided_prefill_tokens
+            );
+            metric!(
+                "izwi_engine_tensor_snapshot_publishes_total",
+                "counter",
+                "Committed tensor snapshots published for cross-request fork.",
+                counters.tensor_snapshot_publishes
+            );
+            metric!(
+                "izwi_engine_tensor_snapshot_attaches_total",
+                "counter",
+                "Committed tensor snapshots attached by a fork.",
+                counters.tensor_snapshot_attaches
+            );
+            metric!(
+                "izwi_engine_tensor_snapshot_truncations_total",
+                "counter",
+                "Paged matches truncated back to snapshot-backed boundaries.",
+                counters.tensor_snapshot_truncations
+            );
+            metric!(
+                "izwi_engine_tensor_snapshot_evictions_total",
+                "counter",
+                "Committed tensor snapshots evicted from the snapshot index.",
+                counters.tensor_snapshot_evictions
+            );
+        }
         debug_assert!(output.len() <= MAX_PROMETHEUS_RESPONSE_BYTES);
         output
     }
@@ -831,12 +904,15 @@ async fn metrics<E: InvocationExecutor>(
             .fetch_add(1, Ordering::Relaxed);
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    let engine_telemetry = state.executor.runtime_telemetry().await;
     (
         [(
             axum::http::header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
-        state.metrics.render_prometheus(&state),
+        state
+            .metrics
+            .render_prometheus(&state, engine_telemetry.as_ref()),
     )
         .into_response()
 }

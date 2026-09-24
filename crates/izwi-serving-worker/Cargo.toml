@@ -35,9 +35,11 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 candle-core = { workspace = true }
+half = { workspace = true }
 izwi-serving-client = { path = "../izwi-serving-client" }
 izwi-hooks = { path = "../izwi-hooks" }
 izwi-server = { path = "../izwi-server" }
+safetensors = { workspace = true }
 tempfile = "3.10"
 tokenizers = { workspace = true }
 tower = { workspace = true }

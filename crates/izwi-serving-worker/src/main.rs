@@ -43,6 +43,28 @@ async fn main() -> anyhow::Result<()> {
     // node. Static supervisor validation bounds resident budgets; the runtime's
     // resource authority performs the exact load-peak reservation below.
     let model_load_stage = acquire_model_load_stage(&process, managed_locks.as_ref())?;
+    // Serving-policy env (mirrors the single-process server's resolution):
+    // prefix caching requires an explicit namespace, and chunked prefill is
+    // opt-in. Defaults keep worker behavior identical to before.
+    let enable_prefix_caching = parse_env_flag("IZWI_ENABLE_PREFIX_CACHING");
+    let managed_prefix_cache_salt = std::env::var("IZWI_MANAGED_PREFIX_CACHE_SALT")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if enable_prefix_caching && managed_prefix_cache_salt.is_none() {
+        bail!("IZWI_ENABLE_PREFIX_CACHING=1 requires IZWI_MANAGED_PREFIX_CACHE_SALT");
+    }
+    let enable_chunked_prefill = parse_env_flag("IZWI_ENABLE_CHUNKED_PREFILL");
+    let engine_defaults = izwi_core::config::EngineConfig::default();
+    let max_sequence_length =
+        match std::env::var("IZWI_MAX_SEQUENCE_LENGTH") {
+            Ok(raw) if !raw.trim().is_empty() => Some(
+                izwi_core::config::ContextLengthPreference::explicit(raw.trim().parse().map_err(
+                    |error| anyhow::anyhow!("invalid IZWI_MAX_SEQUENCE_LENGTH: {error}"),
+                )?)?,
+            ),
+            _ => None,
+        };
     let engine = EngineConfig {
         models_dir: process.models_dir.clone(),
         max_loaded_models: Some(1),
@@ -51,6 +73,18 @@ async fn main() -> anyhow::Result<()> {
         max_retained_sequences: process.max_active_invocations,
         max_staged_transactions: process.max_active_invocations,
         num_threads: process.thread_budget(),
+        enable_prefix_caching,
+        managed_prefix_cache_salt,
+        max_prefix_cache_pages: parse_env(
+            "IZWI_MAX_PREFIX_CACHE_PAGES",
+            engine_defaults.max_prefix_cache_pages,
+        )?,
+        enable_chunked_prefill,
+        chunked_prefill_threshold: parse_env(
+            "IZWI_CHUNKED_PREFILL_THRESHOLD",
+            engine_defaults.chunked_prefill_threshold,
+        )?,
+        max_sequence_length: max_sequence_length.unwrap_or(engine_defaults.max_sequence_length),
         ..EngineConfig::default()
     };
     // A worker process owns one explicitly assigned backend for its entire life.
@@ -338,8 +372,8 @@ impl WorkerProcessConfig {
         let model = env_or("IZWI_WORKER_MODEL", "LFM2.5-1.2B-Instruct-GGUF");
         let variant = izwi_core::parse_chat_model_variant(Some(&model))
             .with_context(|| format!("parse IZWI_WORKER_MODEL={model}"))?;
-        if variant != ModelVariant::Lfm2512BInstructGguf {
-            bail!("serving worker currently supports only LFM2.5-1.2B-Instruct-GGUF");
+        if variant != ModelVariant::Lfm2512BInstructGguf && variant != ModelVariant::Qwen3827BFp8 {
+            bail!("serving worker supports only LFM2.5-1.2B-Instruct-GGUF and Qwen3.8-27B-FP8");
         }
         let assignment = parse_assignment()?;
         let max_active_invocations = parse_env("IZWI_WORKER_MAX_ACTIVE", 1usize)?;
@@ -808,6 +842,13 @@ where
             .map_err(|error| anyhow::anyhow!("invalid {name}: {error}")),
         Err(_) => Ok(fallback),
     }
+}
+
+fn parse_env_flag(name: &str) -> bool {
+    std::env::var(name).ok().is_some_and(|value| {
+        let value = value.trim();
+        value == "1" || value.eq_ignore_ascii_case("true")
+    })
 }
 
 fn default_models_dir() -> PathBuf {
