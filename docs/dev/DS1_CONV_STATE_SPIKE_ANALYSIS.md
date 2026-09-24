@@ -6,6 +6,42 @@ Date: 2026-09-23. Scope: the serving plan's deliberate block on
 as "unsound until the recurrent/conv checkpoint-boundary spike answers how
 shared spans rebuild linear-attention and conv state."
 
+## DS1.2 enablement status (updated 2026-09-24)
+
+1. **DONE (DS1.2a)** — qwen38 declares `CommittedSnapshots` on its recurrent +
+   conv tensor domains and `CommittedPages` on the paged-attention domain,
+   behind `enable_prefix_caching`, with MTP kept private.
+2. **DONE (DS1.2b)** — the managed cache publishes committed tensor snapshots
+   and attaches them by fork. `engine/cache/tensor_snapshots.rs` holds the
+   strict sharing gate (`tensor_snapshot_prefix_policy`: exactly one paged
+   domain with `CommittedPages`, every tensor domain `CommittedSnapshots` with
+   one shared interval, one consistency group) and the bounded LRU
+   `TensorStateSnapshotIndex`. Snapshots are keyed by the digest of the paged
+   page-chain page whose end equals the snapshot cursor, so tenant salt +
+   model generation binding (DINV-02) are inherited from the paged namespace
+   instead of re-derived, and tensor reuse can never exceed or diverge from
+   the paged reuse the same lookup authenticated. Publication happens in
+   `finalize` only when the legacy commit cursor is interval-aligned and pages
+   were accepted through that boundary; attach walks the matched paged chain
+   back to the nearest snapshot-backed boundary (falling back to zero reuse)
+   and seeds the fresh sequence with the DS1.1 prototype recipe
+   (read → begin → stage_replace → commit). The scheduler aligns the
+   first prefill chunk of a sharing contract to the declared interval via
+   `ExecutionProfile::managed_snapshot_prefill_interval`, so a published
+   boundary is reachable by longer-prompt attachers (system prompts, growing
+   histories). Identical-length sibling sessions would need zero-ingest
+   prefill authority over the unchanged-prefix fence — deliberately deferred.
+3. **DONE (DS1.2a/DS1.2b)** — MTP stays private and any contract the strict
+   gate rejects keeps its declarations admission-inert.
+4. **PARTIAL** — the correctness suite covers aligned publish + fork attach +
+   value identity under source continuation, off-boundary non-publication,
+   truncation, salt-less rejection, abort, and inert contracts. Backend
+   parity through the DS0.8 harness still needs a prefix-enabled hybrid
+   fixture executing end-to-end (the tiny LFM fixture keeps declarations
+   disabled); it gates default-on, which remains off.
+
+# Original spike analysis (2026-09-23)
+
 ## Question
 
 When request B attaches to a token-identical shared prefix of length N that
