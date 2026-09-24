@@ -69,6 +69,7 @@ use crate::backends::{
     can_parallelize_requests, BackendContext, BackendKind, BackendPreference, BackendRouter,
     BackendSelectionSource,
 };
+use crate::engine::cache::tensor_snapshots::declared_snapshot_prefill_interval;
 use crate::error::{Error, Result};
 use crate::kv::{CacheDomainId, KvArenaId, KvGroupId, KvStorageDType, KvStorageFormat};
 use crate::model::ModelVariant;
@@ -3369,6 +3370,12 @@ impl ModelExecutor for NativeExecutor {
             profile.preferred_decode_tokens = preferred_decode_tokens;
             profile.sustained_decode_quantum = sustained_decode_quantum;
         }
+        // DS1.2b: hybrid contracts that declare committed-snapshot sharing get
+        // their first prefill chunk aligned to the declared interval by the
+        // scheduler so the fresh commit cursor can publish a snapshot.
+        profile.managed_snapshot_prefill_interval = request
+            .v2_state_descriptor()
+            .and_then(declared_snapshot_prefill_interval);
         Some(profile)
     }
 

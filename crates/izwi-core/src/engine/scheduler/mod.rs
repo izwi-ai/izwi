@@ -13,6 +13,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 use tracing::debug;
 
+use super::cache::tensor_snapshots::declared_snapshot_prefill_interval;
 use super::config::EngineCoreConfig;
 use super::execution::{
     CacheMode, ExecutionProfile, NativeBatchMode, PrefillMode, RealtimePreparationMode,
@@ -538,6 +539,10 @@ struct RequestMetadata {
     capacity_blocked_on: Option<SessionKey>,
     /// Retained per-session bound after a pre-execution workspace rejection.
     workspace_prefill_token_cap: Option<usize>,
+    /// DS1.2b: declared `CommittedSnapshots` interval of the loaded contract.
+    /// The first prefill chunk is aligned to this boundary so the committed
+    /// tensor state can publish a snapshot for cross-request fork.
+    managed_snapshot_prefill_interval: Option<u32>,
 }
 
 impl RequestMetadata {
@@ -720,6 +725,9 @@ impl Scheduler {
                     .map(|stage| usize::try_from(stage.max_work_units).unwrap_or(usize::MAX))
                     .min()
             }),
+            managed_snapshot_prefill_interval: request
+                .v2_state_descriptor()
+                .and_then(declared_snapshot_prefill_interval),
         };
 
         self.requests.insert(request.id.clone(), metadata);
@@ -781,6 +789,9 @@ impl Scheduler {
                             .min()
                     },
                 ),
+                managed_snapshot_prefill_interval: request
+                    .v2_state_descriptor()
+                    .and_then(declared_snapshot_prefill_interval),
             },
         );
         self.running.insert(
@@ -936,7 +947,35 @@ impl Scheduler {
             preferred_decode_tokens: profile.preferred_decode_tokens.max(1),
             sustained_decode_quantum: profile.effective_sustained_decode_quantum(),
         };
+        metadata.managed_snapshot_prefill_interval = profile.managed_snapshot_prefill_interval;
         true
+    }
+
+    /// DS1.2b: align the first prefill chunk of a snapshot-sharing contract to
+    /// the declared snapshot interval, so its commit cursor is a boundary the
+    /// manager can publish a committed tensor snapshot at. Later chunks and
+    /// non-incremental modes keep their exact targets.
+    fn align_first_prefill_chunk(
+        metadata: &RequestMetadata,
+        num_computed: usize,
+        target_tokens: usize,
+    ) -> usize {
+        let Some(interval) = metadata.managed_snapshot_prefill_interval else {
+            return target_tokens;
+        };
+        if num_computed != 0 || metadata.cache_policy.prefill != PrefillMode::Incremental {
+            return target_tokens;
+        }
+        let interval = usize::try_from(interval).unwrap_or(0);
+        if interval < 2 {
+            return target_tokens;
+        }
+        let boundary = target_tokens - target_tokens % interval;
+        if boundary >= interval && boundary < target_tokens {
+            boundary
+        } else {
+            target_tokens
+        }
     }
 
     /// Schedule requests for the next step.
@@ -1532,6 +1571,8 @@ impl Scheduler {
                 continue;
             }
 
+            let target_tokens =
+                Self::align_first_prefill_chunk(&metadata, num_computed, target_tokens);
             let original_target_tokens = target_tokens;
             let num_tokens = target_tokens;
             self.record_prefill_backoff(original_target_tokens, num_tokens);
@@ -1639,6 +1680,7 @@ impl Scheduler {
                 break;
             }
 
+            let target_tokens = Self::align_first_prefill_chunk(&metadata, 0, target_tokens);
             let original_target_tokens = target_tokens;
             let num_tokens = target_tokens;
             self.record_prefill_backoff(original_target_tokens, num_tokens);
@@ -3370,6 +3412,61 @@ mod tests {
     use crate::engine::ExecutionMode;
     use crate::models::shared::chat::{ChatMessage, ChatRole};
     use std::time::Duration;
+
+    fn snapshot_metadata(interval: Option<u32>, prefill: PrefillMode) -> RequestMetadata {
+        RequestMetadata {
+            request_id: RequestId::new(),
+            sequence_id: 1,
+            task_type: TaskType::Chat,
+            model_variant: None,
+            priority: Priority::Normal,
+            workload_class: WorkloadClass::default(),
+            tenant_key: None,
+            arrival_time: std::time::Instant::now(),
+            deadline_at: std::time::Instant::now() + Duration::from_secs(60),
+            hard_deadline: None,
+            total_prompt_tokens: 0,
+            max_tokens: usize::MAX,
+            cache_policy: RequestCachePolicy {
+                mode: None,
+                prefill,
+                decode_batch: NativeBatchMode::None,
+                recompute_safe: false,
+                cache_release_safe: false,
+                preferred_decode_tokens: 1,
+                sustained_decode_quantum: false,
+            },
+            retry_not_before: None,
+            replay_prompt_tokens: None,
+            capacity_blocked_on: None,
+            workspace_prefill_token_cap: None,
+            managed_snapshot_prefill_interval: interval,
+        }
+    }
+
+    #[test]
+    fn first_prefill_chunk_aligns_to_the_declared_snapshot_interval() {
+        let metadata = snapshot_metadata(Some(32), PrefillMode::Incremental);
+        assert_eq!(Scheduler::align_first_prefill_chunk(&metadata, 0, 65), 64);
+        assert_eq!(Scheduler::align_first_prefill_chunk(&metadata, 0, 64), 64);
+        assert_eq!(
+            Scheduler::align_first_prefill_chunk(&metadata, 0, 31),
+            31,
+            "targets below one interval keep their exact span"
+        );
+        assert_eq!(
+            Scheduler::align_first_prefill_chunk(&metadata, 32, 65),
+            65,
+            "continuation chunks keep their exact span"
+        );
+
+        // Without a declared interval or without incremental prefill, the
+        // scheduler changes nothing.
+        let unshared = snapshot_metadata(None, PrefillMode::Incremental);
+        assert_eq!(Scheduler::align_first_prefill_chunk(&unshared, 0, 65), 65);
+        let full = snapshot_metadata(Some(32), PrefillMode::Full);
+        assert_eq!(Scheduler::align_first_prefill_chunk(&full, 0, 65), 65);
+    }
 
     fn small_scheduler() -> Scheduler {
         let config = SchedulerConfig {

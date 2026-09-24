@@ -1243,6 +1243,12 @@ pub struct ExecutionProfile {
     pub compute_dtype: String,
     pub kv_dtype: String,
     pub cache_namespace: Option<String>,
+    /// DS1.2b: declared `CommittedSnapshots` interval of a hybrid managed
+    /// contract. The scheduler aligns the first prefill chunk of such a
+    /// request to this boundary so the committed tensor state can be published
+    /// for cross-request fork. `None` keeps scheduling unchanged.
+    #[serde(default)]
+    pub managed_snapshot_prefill_interval: Option<u32>,
 }
 
 impl ExecutionProfile {
@@ -1280,6 +1286,7 @@ impl ExecutionProfile {
             compute_dtype: "unknown".to_string(),
             kv_dtype: "none".to_string(),
             cache_namespace: None,
+            managed_snapshot_prefill_interval: None,
         }
     }
 
