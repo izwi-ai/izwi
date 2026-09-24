@@ -17,6 +17,10 @@ pub struct ManagedKvTelemetrySnapshot {
     pub prefix_evictions: u64,
     pub prefix_copy_on_write_pages: u64,
     pub prefix_rejections: u64,
+    pub tensor_snapshot_publishes: u64,
+    pub tensor_snapshot_attaches: u64,
+    pub tensor_snapshot_truncations: u64,
+    pub tensor_snapshot_evictions: u64,
     /// Live gauge projected by the manager's runtime snapshot.
     pub prefix_retained_pages: u64,
     pub reused_tokens: u64,
@@ -39,6 +43,10 @@ pub struct ManagedKvTelemetry {
     prefix_evictions: AtomicU64,
     prefix_copy_on_write_pages: AtomicU64,
     prefix_rejections: AtomicU64,
+    tensor_snapshot_publishes: AtomicU64,
+    tensor_snapshot_attaches: AtomicU64,
+    tensor_snapshot_truncations: AtomicU64,
+    tensor_snapshot_evictions: AtomicU64,
     reused_tokens: AtomicU64,
     avoided_prefill_tokens: AtomicU64,
     decode_dispatches: AtomicU64,
@@ -95,6 +103,25 @@ impl ManagedKvTelemetry {
         self.prefix_rejections.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_tensor_snapshot_publish(&self) {
+        self.tensor_snapshot_publishes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_tensor_snapshot_attach(&self) {
+        self.tensor_snapshot_attaches
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_tensor_snapshot_truncation(&self) {
+        self.tensor_snapshot_truncations
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_tensor_snapshot_eviction(&self, count: usize) {
+        add_usize(&self.tensor_snapshot_evictions, count);
+    }
+
     pub fn record_decode_dispatch(&self) {
         self.decode_dispatches.fetch_add(1, Ordering::Relaxed);
     }
@@ -120,6 +147,10 @@ impl ManagedKvTelemetry {
             prefix_evictions: load(&self.prefix_evictions),
             prefix_copy_on_write_pages: load(&self.prefix_copy_on_write_pages),
             prefix_rejections: load(&self.prefix_rejections),
+            tensor_snapshot_publishes: load(&self.tensor_snapshot_publishes),
+            tensor_snapshot_attaches: load(&self.tensor_snapshot_attaches),
+            tensor_snapshot_truncations: load(&self.tensor_snapshot_truncations),
+            tensor_snapshot_evictions: load(&self.tensor_snapshot_evictions),
             prefix_retained_pages: 0,
             reused_tokens: load(&self.reused_tokens),
             avoided_prefill_tokens: load(&self.avoided_prefill_tokens),
@@ -152,6 +183,10 @@ mod tests {
         metrics.record_prefix_hit(16);
         metrics.record_prefix_copy_on_write(2);
         metrics.record_prefix_rejection();
+        metrics.record_tensor_snapshot_publish();
+        metrics.record_tensor_snapshot_attach();
+        metrics.record_tensor_snapshot_truncation();
+        metrics.record_tensor_snapshot_eviction(3);
         metrics.record_commit();
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.pages_zeroed, 2);
@@ -162,6 +197,10 @@ mod tests {
         assert_eq!(snapshot.avoided_prefill_tokens, 16);
         assert_eq!(snapshot.prefix_copy_on_write_pages, 2);
         assert_eq!(snapshot.prefix_rejections, 1);
+        assert_eq!(snapshot.tensor_snapshot_publishes, 1);
+        assert_eq!(snapshot.tensor_snapshot_attaches, 1);
+        assert_eq!(snapshot.tensor_snapshot_truncations, 1);
+        assert_eq!(snapshot.tensor_snapshot_evictions, 3);
         assert_eq!(snapshot.prefix_retained_pages, 0);
         assert_eq!(snapshot.transaction_commits, 1);
     }

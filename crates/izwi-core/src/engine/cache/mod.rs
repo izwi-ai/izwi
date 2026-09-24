@@ -9,4 +9,5 @@ pub(crate) mod physical;
 pub mod prefix;
 pub(crate) mod retained_static_attention;
 pub mod telemetry;
+pub(crate) mod tensor_snapshots;
 pub mod window;

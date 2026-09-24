@@ -15,10 +15,14 @@ use super::coordinator::{
     KvWindowReserveRequest, KvWriteReceipt,
 };
 use super::prefix::{
-    CoordinatedPrefixIndex, KvPrefixNamespace, KvPrefixPageKey, KvPrefixPublication,
+    CoordinatedPrefixIndex, KvPrefixMatch, KvPrefixNamespace, KvPrefixPageKey, KvPrefixPublication,
     StagedPrefixCommit,
 };
 use super::telemetry::{ManagedKvTelemetry, ManagedKvTelemetrySnapshot};
+use super::tensor_snapshots::{
+    tensor_snapshot_byte_size, tensor_snapshot_prefix_policy, TensorSnapshotPrefixPolicy,
+    TensorStateSnapshotIndex,
+};
 #[cfg(feature = "cuda")]
 use crate::backends::kv::CudaKvBackendRuntime;
 #[cfg(feature = "metal")]
@@ -29,8 +33,8 @@ use crate::backends::kv::{
 };
 use crate::backends::state::{
     negotiate_state_plan, PhysicalStateSequenceId, PhysicalStateTransactionId,
-    StateBackendPlanRequest, StateBackendRegistry, TensorStateArena, TensorStateCapacity,
-    TensorStateSelection,
+    StateBackendPlanRequest, StateBackendRegistry, StateComponentValue, TensorStateArena,
+    TensorStateCapacity, TensorStateSelection,
 };
 use crate::backends::BackendKind;
 use crate::engine::{
@@ -43,8 +47,8 @@ use crate::error::{Error, Result};
 use crate::kv::v2::{
     AllocationReceipt, AttentionPattern, CapacityStrategy, GroupCapacityRequest,
     InferenceStateContract, PrefixPolicy, ResidencyMeasurement, ResolvedStatePlan,
-    StateAllocationLedger, StateDomainSpec, StateResourceVector, StateRuntimeAllocationPlan,
-    WorkspaceContract, WorkspacePlacement,
+    StateAllocationLedger, StateDomainId, StateDomainSpec, StateResourceVector,
+    StateRuntimeAllocationPlan, WorkspaceContract, WorkspacePlacement,
 };
 #[cfg(test)]
 use crate::kv::CacheDomainId;
@@ -366,6 +370,7 @@ struct ManagedKvModelState {
     capacity_claims: HashMap<SessionKey, Vec<(KvArenaId, u32)>>,
     incremental_claim_sessions: HashSet<SessionKey>,
     tensor_sequences: HashMap<SessionKey, PhysicalStateSequenceId>,
+    tensor_snapshots: Option<TensorSnapshotSharing>,
     resource_lease: Option<ResourceLease>,
     materialized_resources: ResourceVector,
     allocation_ledger: StateAllocationLedger,
@@ -378,6 +383,20 @@ struct PendingPrefixCommit {
     publications: Vec<KvPrefixPublication>,
 }
 
+/// DS1.2b: cross-request sharing of committed tensor snapshots for one hybrid
+/// contract. The snapshot key is the paged page-chain digest whose page ends
+/// at the snapshot cursor, so tensor reuse can never exceed or diverge from
+/// the paged reuse the same lookup just authenticated.
+struct TensorSnapshotSharing {
+    policy: TensorSnapshotPrefixPolicy,
+    /// The paged group's arena whose prefix index publishes that chain.
+    paged_arena: KvArenaId,
+    /// Resolved page tokens of the paged group; the declared snapshot interval
+    /// must be a multiple of it so boundaries are also page boundaries.
+    interval_tokens: u32,
+    index: TensorStateSnapshotIndex,
+}
+
 /// Engine-owned managed-cache registry. Arena backing is allocated once per
 /// exact model instance; row transactions only change page ownership.
 pub(crate) struct ManagedKvCacheManager {
@@ -385,6 +404,9 @@ pub(crate) struct ManagedKvCacheManager {
     resource_authority: Option<Arc<ResourceAuthority>>,
     next_arena_generation: u32,
     next_tensor_sequence: u64,
+    /// Fork-seed transaction ids descend from the top of the id space so they
+    /// never collide with plan-id transaction ids that ascend from zero.
+    next_tensor_fork_transaction: u64,
     telemetry: Arc<ManagedKvTelemetry>,
     prefix_cache_salt: Option<[u8; 32]>,
     max_prefix_cache_pages: usize,
@@ -457,6 +479,7 @@ impl ManagedKvCacheManager {
             resource_authority,
             next_arena_generation: 1,
             next_tensor_sequence: 1,
+            next_tensor_fork_transaction: 0,
             telemetry: Arc::new(ManagedKvTelemetry::default()),
             prefix_cache_salt: None,
             max_prefix_cache_pages: 0,
@@ -1167,6 +1190,35 @@ impl ManagedKvCacheManager {
             .as_ref()
             .map(|arena| arena.capacity().authorized_bytes())
             .unwrap_or(0);
+        // DS1.2b: derive the snapshot-sharing surface from the strict contract
+        // gate. The declared snapshot interval must land on the resolved page
+        // grid, and the index inherits the tensor arena's own authorization
+        // envelope as its byte bound.
+        let tensor_snapshots = tensor_snapshot_prefix_policy(contract).and_then(|policy| {
+            let group = plan
+                .groups
+                .iter()
+                .find(|group| group.domain == policy.paged_domain)?;
+            let capacity = tensor_capacity.as_ref()?;
+            let interval_tokens = u32::try_from(policy.interval_steps).ok()?;
+            if interval_tokens == 0
+                || !policy
+                    .interval_steps
+                    .is_multiple_of(u64::from(group.page_tokens))
+            {
+                return None;
+            }
+            Some(TensorSnapshotSharing {
+                paged_arena: group.arena,
+                interval_tokens,
+                index: TensorStateSnapshotIndex::with_telemetry(
+                    usize::try_from(capacity.sequence_capacity()).unwrap_or(1),
+                    capacity.committed_capacity_bytes(),
+                    self.telemetry.clone(),
+                ),
+                policy,
+            })
+        });
         let runtime = Arc::new(ManagedKvModelRuntime {
             plan: Arc::new(plan),
             state_plan_v2: Arc::new(state_plan_v2),
@@ -1191,6 +1243,7 @@ impl ManagedKvCacheManager {
                 capacity_claims: HashMap::new(),
                 incremental_claim_sessions: HashSet::new(),
                 tensor_sequences: HashMap::new(),
+                tensor_snapshots,
                 resource_lease,
                 materialized_resources,
                 allocation_ledger,
@@ -1474,6 +1527,22 @@ impl ManagedKvCacheManager {
 
         let mut domains = Vec::with_capacity(runtime.plan.groups.len());
         let mut pending_prefixes = Vec::new();
+        // DS1.2b: snapshot-sharing facts copied out of `state` so the paged
+        // group loop can consult them while mutating coordinators. Clocked
+        // (selected) transactions have no fork path and never share.
+        let snapshot_sharing = if selected_tensor_state.is_none() {
+            state.tensor_snapshots.as_ref().map(|sharing| {
+                (
+                    sharing.policy.clone(),
+                    sharing.paged_arena,
+                    sharing.interval_tokens,
+                )
+            })
+        } else {
+            None
+        };
+        let mut tensor_attach: Option<(u64, Arc<[(StateDomainId, Arc<[StateComponentValue]>)]>)> =
+            None;
         for group in &runtime.plan.groups {
             let domain_sequence_input = match (sequence_input, sequence_phase, request) {
                 (Some(input), Some(phase), Some(request)) => {
@@ -1488,7 +1557,7 @@ impl ManagedKvCacheManager {
             let snapshot = coordinator
                 .snapshot(session, group.domain)
                 .map_err(coordinator_error)?;
-            let target_committed_tokens = match (domain_sequence_input, realtime_cache_append) {
+            let mut target_committed_tokens = match (domain_sequence_input, realtime_cache_append) {
                 (Some(input), None) => u32::try_from(input.end).map_err(|_| {
                     Error::InvalidInput("managed KV token position exceeds u32".to_string())
                 })?,
@@ -1535,7 +1604,7 @@ impl ManagedKvCacheManager {
             // Published pages remain available to unrelated fresh sessions,
             // but this restarted session must rebuild its first generation
             // span instead of attaching a prefix and beginning above zero.
-            let prefix_match =
+            let mut prefix_match =
                 if prefix_eligible && session_generation == ManagedSessionGeneration::INITIAL {
                     if let Some(namespace) = namespace.as_ref() {
                         let reusable_tokens =
@@ -1559,7 +1628,68 @@ impl ManagedKvCacheManager {
                 } else {
                     Default::default()
                 };
+            // DS1.2b: tensor domains may only follow a paged attach when a
+            // committed snapshot exists at the attach cursor. Walk the matched
+            // chain back to the nearest snapshot-backed boundary, falling back
+            // to zero reuse when none exists or the session cannot fork.
+            let mut publication_start_tokens;
+            if prefix_eligible {
+                if let Some((policy, paged_arena, interval_tokens)) = &snapshot_sharing {
+                    if *paged_arena == group.arena && policy.paged_domain == group.domain {
+                        let pre_tensor_reused = prefix_match.reused_tokens;
+                        if let Some(sharing) = state.tensor_snapshots.as_mut() {
+                            match reconcile_tensor_snapshot_attach(
+                                sharing,
+                                group.page_tokens,
+                                &mut prefix_match,
+                                needs_tensor_sequence,
+                                &self.telemetry,
+                            ) {
+                                Ok(Some(attach)) => tensor_attach = Some(attach),
+                                Ok(None) => {}
+                                Err(error) => {
+                                    abort_domains(state, txn_id, &domains);
+                                    return Err(error);
+                                }
+                            }
+                        }
+                        // Nothing attached: align the fresh commit cursor to the
+                        // declared snapshot interval so the committed tensor
+                        // state can be published at the same boundary the paged
+                        // pages end on. The residual tokens are served by the
+                        // next prefill chunk. An attached session keeps its
+                        // exact target and simply commits the residual span.
+                        if tensor_attach.is_none() && prefix_match.reused_tokens == 0 {
+                            let interval = u64::from(*interval_tokens);
+                            let target = u64::from(target_committed_tokens);
+                            let boundary = target - target % interval;
+                            if boundary > 0 && boundary < target {
+                                target_committed_tokens =
+                                    u32::try_from(boundary).map_err(|_| {
+                                        Error::InvalidInput(
+                                            "managed KV snapshot boundary exceeds u32".into(),
+                                        )
+                                    })?;
+                            }
+                        }
+                        // Pages the lookup matched but the reconcile dropped are
+                        // already published by another session under the same
+                        // digests; republishing them from fresh blocks would
+                        // bind one digest to two blocks. Publish only pages the
+                        // lookup did not already see.
+                        publication_start_tokens =
+                            pre_tensor_reused.max(prefix_match.reused_tokens);
+                    } else {
+                        publication_start_tokens = prefix_match.reused_tokens;
+                    }
+                } else {
+                    publication_start_tokens = prefix_match.reused_tokens;
+                }
+            } else {
+                publication_start_tokens = prefix_match.reused_tokens;
+            }
             let execution_start_tokens = snapshot.committed_tokens.max(prefix_match.reused_tokens);
+            publication_start_tokens = publication_start_tokens.max(execution_start_tokens);
             let sliding_window = sliding_window_for_domain(&state.contract, group.domain)?;
             let target_window_start = sliding_window
                 .map(|window| {
@@ -1783,7 +1913,7 @@ impl ManagedKvCacheManager {
                         .expect("prefix namespace requires a request")
                         .prompt_tokens,
                     group.page_tokens,
-                    execution_start_tokens,
+                    publication_start_tokens,
                     target_committed_tokens,
                     domains
                         .last()
@@ -1828,6 +1958,59 @@ impl ManagedKvCacheManager {
                     state.tensor_sequences.insert(session.clone(), sequence);
                     (sequence, true)
                 };
+            // DS1.2b: attach-by-fork. Seed the freshly registered sequence with
+            // the committed snapshot (read -> begin -> stage -> commit at the
+            // fork cursor, the DS1.1 prototype recipe) so the executor's
+            // tensor updates stage on top of the attach cursor exactly as the
+            // paged window does.
+            if let Some((fork_cursor, snapshot_domains)) = tensor_attach.take() {
+                if !newly_registered {
+                    abort_domains(state, txn_id, &domains);
+                    state.pending_prefixes.remove(&txn_id);
+                    return Err(Error::InferenceError(
+                        "managed tensor snapshot attach requires a fresh sequence".into(),
+                    ));
+                }
+                let fork_result = (|| -> Result<()> {
+                    let fork_transaction = self.next_tensor_fork_transaction;
+                    self.next_tensor_fork_transaction =
+                        fork_transaction.checked_add(1).ok_or_else(|| {
+                            Error::InferenceError(
+                                "tensor fork transaction space is exhausted".into(),
+                            )
+                        })?;
+                    let seed = PhysicalStateTransactionId::new(u64::MAX - fork_transaction)?;
+                    let staged = (|| -> Result<()> {
+                        arena.begin(seed, sequence)?;
+                        for (domain, components) in snapshot_domains.iter() {
+                            arena.stage_replace(
+                                seed,
+                                *domain,
+                                0,
+                                fork_cursor,
+                                components.iter().cloned().collect(),
+                            )?;
+                        }
+                        arena.commit(seed, fork_cursor)
+                    })();
+                    if staged.is_err() {
+                        let _ = arena.abort(seed);
+                    }
+                    staged
+                })();
+                if let Err(error) = fork_result {
+                    abort_domains(state, txn_id, &domains);
+                    state.pending_prefixes.remove(&txn_id);
+                    state.tensor_sequences.remove(session);
+                    arena.release(sequence).map_err(|release_error| {
+                        Error::InferenceError(format!(
+                            "tensor snapshot fork failed ({error}); newly registered sequence rollback also failed: {release_error}"
+                        ))
+                    })?;
+                    return Err(error);
+                }
+                self.telemetry.record_tensor_snapshot_attach();
+            }
             let managed_reservation = if let Some(selections) = selected_tensor_state.as_ref() {
                 ManagedClockedStateReservation::selected(
                     runtime.plan().model_instance,
@@ -2072,6 +2255,12 @@ impl ManagedKvCacheManager {
             KvCoordinatorCommitPlan,
             Option<StagedPrefixCommit>,
         )>::with_capacity(reservation.domains.len());
+        // DS1.2b: snapshot boundary (chain digest, cursor end) captured from
+        // the accepted paged publications of the sharing arena.
+        let mut snapshot_boundary: Option<([u8; 32], u64)> = None;
+        // DS1.2b: committed cursor of a legacy tensor transaction, set after
+        // `arena.commit` succeeds.
+        let mut tensor_commit_cursor: Option<u64> = None;
         for domain in &reservation.domains {
             let prefix = if let Some(index) = pending
                 .iter()
@@ -2089,6 +2278,21 @@ impl ManagedKvCacheManager {
                 if publication.publications.is_empty() {
                     None
                 } else {
+                    // DS1.2b: the snapshot boundary is the accepted page whose
+                    // end equals the committed cursor; capture it for the
+                    // tensor publication after the state commits.
+                    if let Some(sharing) = state.tensor_snapshots.as_ref() {
+                        if sharing.paged_arena == domain.arena {
+                            let last = publication.publications.last().expect("non-empty");
+                            if let Some(end) = last
+                                .key
+                                .start_position
+                                .checked_add(last.key.tokens.len() as u64)
+                            {
+                                snapshot_boundary = Some((last.key.digest(), end));
+                            }
+                        }
+                    }
                     let staged_prefix = state
                         .prefix_indexes
                         .get(&domain.arena)
@@ -2172,6 +2376,15 @@ impl ManagedKvCacheManager {
                 abort_reservation(state, reservation);
                 return Err(error);
             }
+            if clocked_state.selections().is_none() {
+                // DS1.2b: a legacy transaction committed every shared tensor
+                // domain at one cursor; record it for the snapshot publication
+                // below. Clocked completions publish only selected groups and
+                // never share.
+                tensor_commit_cursor = reservation.domains.first().map(|domain| {
+                    u64::from(accepted_prefix.unwrap_or(domain.target_committed_tokens))
+                });
+            }
         }
         // Every fallible operation has succeeded. Applying these plans cannot
         // fail, and the engine state lock prevents an interleaving mutation.
@@ -2191,6 +2404,23 @@ impl ManagedKvCacheManager {
         }
         state.pending_prefixes.remove(&reservation.txn_id);
         state.exact_target_transactions.remove(&reservation.txn_id);
+        // DS1.2b: publish the committed tensor snapshot when the commit cursor
+        // is the aligned boundary of the accepted page chain. This runs after
+        // every fallible operation, so a skipped publication only loses reuse
+        // and never leaves committed state without its paged chain.
+        if let Some((digest, boundary)) = snapshot_boundary {
+            if tensor_commit_cursor.is_some_and(|cursor| cursor == boundary) {
+                let published = publish_tensor_snapshot(state, reservation, digest, boundary);
+                match published {
+                    Ok(true) => self.telemetry.record_tensor_snapshot_publish(),
+                    Ok(false) => {}
+                    Err(error) => tracing::warn!(
+                        error = %error,
+                        "committed tensor snapshot publication skipped"
+                    ),
+                }
+            }
+        }
         self.telemetry.record_commit();
         Ok(())
     }
@@ -3288,14 +3518,12 @@ fn prefix_enabled_for_domain(
     contract: &InferenceStateContract,
     domain_id: crate::kv::CacheDomainId,
 ) -> bool {
-    // Only paged-attention domains participate in cross-request prefix
-    // reuse today: their attach path is the token-page index below. Tensor
-    // domains that declare `CommittedSnapshots` must NOT route through the
-    // paged lookup — they fork via committed tensor snapshots, which lands
-    // with DS1.2b (see docs/dev/DS1_CONV_STATE_SPIKE_ANALYSIS.md). Until that
-    // publication path exists, snapshot declarations stay admission-inert so
-    // an opted-in hybrid contract cannot attach wrong state.
-    contract.domains.iter().any(|domain| {
+    // Only paged-attention domains route through the token-page index below.
+    // For a hybrid contract the paged attach is sound only when the tensor
+    // domains can fork their committed snapshots at the same cursor, so the
+    // strict sharing gate must accept the whole contract; contracts without
+    // tensor domains keep the plain paged behavior.
+    let paged_shareable = contract.domains.iter().any(|domain| {
         if domain.id() != domain_id {
             return false;
         }
@@ -3303,7 +3531,16 @@ fn prefix_enabled_for_domain(
             spec.header.prefix,
             PrefixPolicy::CommittedPages { .. }
         ))
-    })
+    });
+    if !paged_shareable {
+        return false;
+    }
+    let tensor_domains = contract
+        .domains
+        .iter()
+        .filter(|domain| matches!(domain, StateDomainSpec::Tensor(_)))
+        .count();
+    tensor_domains == 0 || tensor_snapshot_prefix_policy(contract).is_some()
 }
 
 fn sliding_window_for_domain(
@@ -3448,6 +3685,97 @@ fn reservation_for_group(
         required_pages.saturating_sub(blocks.len()),
     ));
     Ok(KvGroupReservation { group, blocks })
+}
+
+/// DS1.2b: reconcile a paged prefix match with the committed tensor snapshot
+/// index. The fork cursor must equal the paged attach cursor, so the matched
+/// chain is walked back to the nearest boundary holding a committed snapshot;
+/// a chain with no snapshot anywhere falls back to zero reuse rather than
+/// attaching attention pages the tensor domains cannot follow.
+#[allow(clippy::type_complexity)]
+fn reconcile_tensor_snapshot_attach(
+    sharing: &mut TensorSnapshotSharing,
+    page_tokens: u32,
+    prefix_match: &mut KvPrefixMatch,
+    can_fork: bool,
+    telemetry: &ManagedKvTelemetry,
+) -> Result<Option<(u64, Arc<[(StateDomainId, Arc<[StateComponentValue]>)]>)>> {
+    if prefix_match.reused_tokens == 0 {
+        return Ok(None);
+    }
+    if !can_fork {
+        // The session already owns a live tensor sequence, so a fork would
+        // cross a non-zero cursor. Only zero reuse is sound.
+        telemetry.record_tensor_snapshot_truncation();
+        prefix_match.blocks.clear();
+        prefix_match.page_digests.clear();
+        prefix_match.reused_tokens = 0;
+        return Ok(None);
+    }
+    while !prefix_match.page_digests.is_empty() {
+        let boundary = u64::from(prefix_match.reused_tokens);
+        let digest = prefix_match
+            .page_digests
+            .last()
+            .copied()
+            .expect("non-empty page digest chain");
+        if let Some(domains) = sharing.index.lookup(digest, boundary)? {
+            return Ok(Some((boundary, domains)));
+        }
+        prefix_match.page_digests.pop();
+        prefix_match.blocks.pop();
+        prefix_match.reused_tokens = prefix_match
+            .reused_tokens
+            .checked_sub(page_tokens)
+            .expect("matched chain holds complete pages");
+        telemetry.record_tensor_snapshot_truncation();
+    }
+    Ok(None)
+}
+
+/// DS1.2b: build and index the committed snapshot for one aligned legacy
+/// commit. `Ok(false)` means the boundary was already published identically.
+fn publish_tensor_snapshot(
+    state: &mut ManagedKvModelState,
+    reservation: &ManagedCacheReservation,
+    digest: [u8; 32],
+    boundary: u64,
+) -> Result<bool> {
+    let Some(sharing) = state.tensor_snapshots.as_mut() else {
+        return Ok(false);
+    };
+    let interval = u64::from(sharing.interval_tokens);
+    if boundary == 0 || !boundary.is_multiple_of(interval) {
+        return Ok(false);
+    }
+    let Some(clocked) = reservation.clocked_state.as_ref() else {
+        return Ok(false);
+    };
+    let sequence = PhysicalStateSequenceId::new(clocked.sequence())?;
+    let arena = state.runtime.tensor_state().ok_or_else(|| {
+        Error::InferenceError("tensor snapshot publication lost its physical arena".into())
+    })?;
+    let mut entry = Vec::with_capacity(sharing.policy.tensor_domains.len());
+    let mut byte_size = 0_u64;
+    for domain in sharing.policy.tensor_domains.iter() {
+        let snapshot = arena.read(sequence, *domain)?.ok_or_else(|| {
+            Error::InferenceError(
+                "committed tensor snapshot publication found no domain state".into(),
+            )
+        })?;
+        if snapshot.cursor != boundary {
+            return Err(Error::InferenceError(
+                "committed tensor snapshot cursor disagrees with its paged boundary".into(),
+            ));
+        }
+        byte_size = byte_size
+            .checked_add(tensor_snapshot_byte_size(&snapshot.components))
+            .ok_or_else(|| Error::InferenceError("tensor snapshot byte total overflow".into()))?;
+        entry.push((*domain, snapshot.components));
+    }
+    sharing
+        .index
+        .publish(digest, boundary, entry.into(), byte_size)
 }
 
 fn abort_domains(
@@ -3855,6 +4183,41 @@ mod tests {
             domains: vec![CacheDomainId::new(3)],
             prefix_shareable: false,
         });
+        contract.validate().unwrap();
+        contract
+    }
+
+    fn hybrid_snapshot_contract() -> InferenceStateContract {
+        let mut contract = test_contract();
+        let domain = CacheDomainId::new(2);
+        contract
+            .domains
+            .push(StateDomainSpec::Tensor(TensorStateDomainSpec {
+                header: StateDomainHeader {
+                    id: domain,
+                    scope: StateScope::Retained,
+                    clock: StateClock::DecoderTokens,
+                    placement: crate::kv::v2::PlacementPolicy::BackendLocalWithHostOffload,
+                    prefix: PrefixPolicy::CommittedSnapshots { interval_steps: 32 },
+                    checkpoint: crate::kv::v2::CheckpointPolicy::Transactional,
+                },
+                components: vec![TensorComponentSpec {
+                    id: StateComponentId::new(1),
+                    role: TensorRole::RecurrentHidden,
+                    shape: BoundedShape {
+                        dimensions: vec![ShapeDimension {
+                            axis: ShapeAxis::Hidden,
+                            extent: ShapeExtent::Fixed { value: 4 },
+                        }],
+                    },
+                    accepted_dtypes: vec![KvStorageDType::F32],
+                }],
+            }));
+        contract.groups = vec![StateGroupSpec {
+            id: crate::kv::v2::StateGroupId::new(1),
+            domains: vec![CacheDomainId::new(1), domain],
+            prefix_shareable: true,
+        }];
         contract.validate().unwrap();
         contract
     }
@@ -6653,6 +7016,432 @@ mod tests {
                 coordinator.check_invariants().unwrap();
             }
         }
+    }
+
+    fn hybrid_tensor_values(sequence_values: &[f32]) -> Vec<StateComponentValue> {
+        vec![StateComponentValue {
+            component: StateComponentId::new(1),
+            tensor: Some(
+                Tensor::from_slice(sequence_values, sequence_values.len(), &Device::Cpu).unwrap(),
+            ),
+        }]
+    }
+
+    fn read_hybrid_tensor(
+        arena: &crate::backends::state::TensorStateArena,
+        sequence: u64,
+    ) -> (u64, Vec<f32>) {
+        let snapshot = arena
+            .read(
+                PhysicalStateSequenceId::new(sequence).unwrap(),
+                StateDomainId::new(2),
+            )
+            .unwrap()
+            .expect("tensor domain state");
+        let values = snapshot.components[0]
+            .tensor
+            .as_ref()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        (snapshot.cursor, values)
+    }
+
+    #[test]
+    fn tensor_snapshot_publishes_on_aligned_commit_and_forks_attaching_state() {
+        let model = ModelInstanceId::new(601);
+        let mut manager = ManagedKvCacheManager::with_prefix_cache_salt(None, Some([21; 32]));
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                12,
+                32,
+                &CacheCapability::Managed(hybrid_snapshot_contract()),
+            )
+            .unwrap()
+            .unwrap();
+        let arena = runtime.tensor_state().unwrap().clone();
+
+        // Session A commits an aligned 64-token prompt with tensor state.
+        let tokens = (0..64_u32).collect::<Vec<u32>>();
+        let session_a = SessionKey::new("snapshot-first".into(), 1);
+        let request_a = prefix_request(model, tokens.clone());
+        let first = manager
+            .prepare(
+                &runtime,
+                61,
+                &session_a,
+                &sequence_work(0, 64),
+                Some(&request_a),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.domains[0].target_committed_tokens, 64);
+        arena
+            .stage_replace(
+                PhysicalStateTransactionId::new(61).unwrap(),
+                StateDomainId::new(2),
+                0,
+                64,
+                hybrid_tensor_values(&[7.0; 4]),
+            )
+            .unwrap();
+        manager
+            .finalize(
+                &first,
+                Some(&first.completed_write_receipt_for_test()),
+                true,
+            )
+            .unwrap();
+        let sharing = manager.models[&model]
+            .tensor_snapshots
+            .as_ref()
+            .expect("hybrid contract shares snapshots");
+        assert_eq!(sharing.index.len(), 1);
+        assert_eq!(manager.telemetry_snapshot().tensor_snapshot_publishes, 1);
+
+        // Session B shares the first 64 tokens and forks the snapshot.
+        let mut longer = tokens;
+        longer.extend([777, 778, 779]);
+        let session_b = SessionKey::new("snapshot-second".into(), 1);
+        let request_b = prefix_request(model, longer);
+        let second = manager
+            .prepare(
+                &runtime,
+                62,
+                &session_b,
+                &sequence_work(0, 67),
+                Some(&request_b),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.domains[0].execution_start_tokens, 64);
+        let telemetry = manager.telemetry_snapshot();
+        assert_eq!(telemetry.tensor_snapshot_attaches, 1);
+        assert_eq!(telemetry.tensor_snapshot_truncations, 0);
+        assert_eq!(telemetry.reused_tokens, 64);
+        let sequence_b = second
+            .clocked_state
+            .as_ref()
+            .expect("tensor reservation")
+            .sequence();
+        let (cursor, values) = read_hybrid_tensor(&arena, sequence_b);
+        assert_eq!(cursor, 64);
+        assert_eq!(values, vec![7.0; 4], "fork seeds the committed values");
+
+        // Session A may keep advancing; the fork and the published snapshot
+        // hold their own component handles.
+        let continuation = manager
+            .prepare(
+                &runtime,
+                63,
+                &session_a,
+                &sequence_work(64, 72),
+                Some(&request_a),
+            )
+            .unwrap()
+            .unwrap();
+        arena
+            .stage_replace(
+                PhysicalStateTransactionId::new(63).unwrap(),
+                StateDomainId::new(2),
+                64,
+                72,
+                hybrid_tensor_values(&[5.0; 4]),
+            )
+            .unwrap();
+        manager
+            .finalize(
+                &continuation,
+                Some(&continuation.completed_write_receipt_for_test()),
+                true,
+            )
+            .unwrap();
+        let (cursor_b, values_b) = read_hybrid_tensor(&arena, sequence_b);
+        assert_eq!(cursor_b, 64);
+        assert_eq!(values_b, vec![7.0; 4], "fork is isolated from the source");
+
+        // Session B advances from the fork cursor and commits its own span.
+        arena
+            .stage_replace(
+                PhysicalStateTransactionId::new(62).unwrap(),
+                StateDomainId::new(2),
+                64,
+                67,
+                hybrid_tensor_values(&[9.0; 4]),
+            )
+            .unwrap();
+        let receipt = second
+            .completed_write_receipt_for_prefix_for_test(67, 32)
+            .unwrap();
+        manager.finalize(&second, Some(&receipt), true).unwrap();
+        let (cursor_b, values_b) = read_hybrid_tensor(&arena, sequence_b);
+        assert_eq!(cursor_b, 67);
+        assert_eq!(values_b, vec![9.0; 4]);
+        manager.models[&model]
+            .coordinators
+            .values()
+            .for_each(|coordinator| coordinator.check_invariants().unwrap());
+    }
+
+    #[test]
+    fn tensor_snapshot_attach_truncates_to_zero_without_a_published_boundary() {
+        let model = ModelInstanceId::new(602);
+        let mut manager = ManagedKvCacheManager::with_prefix_cache_salt(None, Some([22; 32]));
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                12,
+                32,
+                &CacheCapability::Managed(hybrid_snapshot_contract()),
+            )
+            .unwrap()
+            .unwrap();
+        let arena = runtime.tensor_state().unwrap().clone();
+
+        let tokens = (0..64_u32).collect::<Vec<u32>>();
+        let session_a = SessionKey::new("truncate-first".into(), 1);
+        let request_a = prefix_request(model, tokens.clone());
+        let first = manager
+            .prepare(
+                &runtime,
+                64,
+                &session_a,
+                &sequence_work(0, 64),
+                Some(&request_a),
+            )
+            .unwrap()
+            .unwrap();
+        arena
+            .stage_replace(
+                PhysicalStateTransactionId::new(64).unwrap(),
+                StateDomainId::new(2),
+                0,
+                64,
+                hybrid_tensor_values(&[7.0; 4]),
+            )
+            .unwrap();
+        manager
+            .finalize(
+                &first,
+                Some(&first.completed_write_receipt_for_test()),
+                true,
+            )
+            .unwrap();
+
+        // Only the boundary at 64 was published; a request sharing just the
+        // first page cannot fork and must not attach paged pages either.
+        let diverging = {
+            let mut tokens = tokens;
+            tokens.truncate(32);
+            tokens.extend([900, 901, 902, 903]);
+            tokens
+        };
+        let session_b = SessionKey::new("truncate-second".into(), 1);
+        let request_b = prefix_request(model, diverging);
+        let second = manager
+            .prepare(
+                &runtime,
+                65,
+                &session_b,
+                &sequence_work(0, 36),
+                Some(&request_b),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.domains[0].execution_start_tokens, 0);
+        let telemetry = manager.telemetry_snapshot();
+        assert_eq!(telemetry.tensor_snapshot_attaches, 0);
+        assert_eq!(telemetry.tensor_snapshot_truncations, 1);
+        manager.finalize(&second, None, false).unwrap();
+    }
+
+    #[test]
+    fn tensor_snapshot_publication_requires_the_tenant_salt() {
+        let model = ModelInstanceId::new(603);
+        let mut manager = ManagedKvCacheManager::default();
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                4,
+                32,
+                &CacheCapability::Managed(hybrid_snapshot_contract()),
+            )
+            .unwrap()
+            .unwrap();
+        let arena = runtime.tensor_state().unwrap().clone();
+        let tokens = (0..64_u32).collect::<Vec<u32>>();
+        let session = SessionKey::new("unsalted".into(), 1);
+        let request = prefix_request(model, tokens);
+        let reservation = manager
+            .prepare(
+                &runtime,
+                66,
+                &session,
+                &sequence_work(0, 64),
+                Some(&request),
+            )
+            .unwrap()
+            .unwrap();
+        arena
+            .stage_replace(
+                PhysicalStateTransactionId::new(66).unwrap(),
+                StateDomainId::new(2),
+                0,
+                64,
+                hybrid_tensor_values(&[7.0; 4]),
+            )
+            .unwrap();
+        manager
+            .finalize(
+                &reservation,
+                Some(&reservation.completed_write_receipt_for_test()),
+                true,
+            )
+            .unwrap();
+        let sharing = manager.models[&model]
+            .tensor_snapshots
+            .as_ref()
+            .expect("sharing surface exists for the contract");
+        assert_eq!(sharing.index.len(), 0, "no salt publishes nothing");
+        assert_eq!(manager.telemetry_snapshot().tensor_snapshot_publishes, 0);
+        assert_eq!(manager.telemetry_snapshot().prefix_rejections, 1);
+    }
+
+    #[test]
+    fn aborted_hybrid_commit_publishes_no_tensor_snapshot() {
+        let model = ModelInstanceId::new(604);
+        let mut manager = ManagedKvCacheManager::with_prefix_cache_salt(None, Some([23; 32]));
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                4,
+                32,
+                &CacheCapability::Managed(hybrid_snapshot_contract()),
+            )
+            .unwrap()
+            .unwrap();
+        let arena = runtime.tensor_state().unwrap().clone();
+        let tokens = (0..64_u32).collect::<Vec<u32>>();
+        let session = SessionKey::new("aborted".into(), 1);
+        let request = prefix_request(model, tokens);
+        let reservation = manager
+            .prepare(
+                &runtime,
+                67,
+                &session,
+                &sequence_work(0, 64),
+                Some(&request),
+            )
+            .unwrap()
+            .unwrap();
+        arena
+            .stage_replace(
+                PhysicalStateTransactionId::new(67).unwrap(),
+                StateDomainId::new(2),
+                0,
+                64,
+                hybrid_tensor_values(&[7.0; 4]),
+            )
+            .unwrap();
+        manager.finalize(&reservation, None, false).unwrap();
+        let sharing = manager.models[&model]
+            .tensor_snapshots
+            .as_ref()
+            .expect("sharing surface exists for the contract");
+        assert_eq!(sharing.index.len(), 0);
+        assert_eq!(manager.telemetry_snapshot().tensor_snapshot_publishes, 0);
+        assert_eq!(manager.telemetry_snapshot().transaction_aborts, 1);
+    }
+
+    #[test]
+    fn hybrid_first_chunk_target_aligns_to_the_snapshot_interval() {
+        let model = ModelInstanceId::new(605);
+        let mut manager = ManagedKvCacheManager::with_prefix_cache_salt(None, Some([24; 32]));
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                4,
+                32,
+                &CacheCapability::Managed(hybrid_snapshot_contract()),
+            )
+            .unwrap()
+            .unwrap();
+        let arena = runtime.tensor_state().unwrap().clone();
+        let tokens = (0..65_u32).collect::<Vec<u32>>();
+        let session = SessionKey::new("aligned".into(), 1);
+        let request = prefix_request(model, tokens);
+        let reservation = manager
+            .prepare(
+                &runtime,
+                68,
+                &session,
+                &sequence_work(0, 65),
+                Some(&request),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(reservation.domains[0].target_committed_tokens, 64);
+        arena
+            .stage_replace(
+                PhysicalStateTransactionId::new(68).unwrap(),
+                StateDomainId::new(2),
+                0,
+                64,
+                hybrid_tensor_values(&[7.0; 4]),
+            )
+            .unwrap();
+        let receipt = reservation
+            .completed_write_receipt_for_prefix_for_test(64, 32)
+            .unwrap();
+        manager
+            .finalize(&reservation, Some(&receipt), true)
+            .unwrap();
+        let sharing = manager.models[&model]
+            .tensor_snapshots
+            .as_ref()
+            .expect("sharing surface exists for the contract");
+        assert_eq!(sharing.index.len(), 1);
+        assert_eq!(manager.telemetry_snapshot().tensor_snapshot_publishes, 1);
+    }
+
+    #[test]
+    fn snapshot_declarations_stay_inert_for_non_sharing_contracts() {
+        let model = ModelInstanceId::new(606);
+        let mut manager = ManagedKvCacheManager::with_prefix_cache_salt(None, Some([25; 32]));
+        // The composite fixture keeps its tensor prefix disabled, so the gate
+        // rejects it and nothing clamps or publishes.
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                4,
+                32,
+                &CacheCapability::Managed(composite_tensor_contract()),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(manager.models[&model].tensor_snapshots.is_none());
+        let tokens = (0..65_u32).collect::<Vec<u32>>();
+        let session = SessionKey::new("inert".into(), 1);
+        let request = prefix_request(model, tokens);
+        let reservation = manager
+            .prepare(
+                &runtime,
+                69,
+                &session,
+                &sequence_work(0, 65),
+                Some(&request),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(reservation.domains[0].target_committed_tokens, 65);
+        manager.finalize(&reservation, None, false).unwrap();
     }
 
     #[test]
