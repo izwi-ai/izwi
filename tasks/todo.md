@@ -18747,3 +18747,139 @@ Deliberately still open
   soundness by design).
 
 # End of DS1.2b session
+
+# DS1.5 — prefix-heavy/prefix-cold benchmark evidence + hybrid parity — 2026-09-24
+
+Continuation: DS1.2b landed (snapshot publish/fork + scheduler alignment, default off).
+Next per plan/memory: DS1.5 benchmark evidence + DS1.6 parity leg that gates the
+default-on decision.
+
+Key exploration findings (do not re-derive):
+- LFM2 ShortConv is a RING domain; the DS1.2b gate (`tensor_snapshot_prefix_policy`)
+  excludes ring/append/static domains, so the tiny LFM fixture cannot share prefixes.
+  The DS1.5 fixture must be a qwen38-family hybrid (Tensor domains qualify).
+- The qwen38 in-process fixture machinery exists (mtp::tests `tiny_config` +
+  `write_tiny_checkpoint`, chat/recovery_tests `model_fixture(hybrid=true)`) but the
+  DISK load path pins the 27B geometry in `Qwen38NativeConfig::from_json`
+  (validate_hf_config). A process-level fixture needs an explicit env-gated
+  synthetic-geometry acceptance (fails closed without the env).
+- Engine KV telemetry (prefix_hits/misses, tensor_snapshot_publishes/attaches/
+  truncations/evictions, reused_tokens) lives in ManagedKvTelemetrySnapshot,
+  flows into RuntimeTelemetrySnapshot via engine_telemetry_snapshot, exposed by
+  the server's /internal/metrics — but NOT by the worker's
+  /internal/v1/metrics/prometheus. RuntimeChatExecutor holds Arc<RuntimeService>,
+  so an optional executor hook can surface it for the worker.
+- Scheduler first-chunk clamp engages only when cache_policy.prefill ==
+  Incremental → benchmark rig must set IZWI_ENABLE_CHUNKED_PREFILL=1 (+ threshold).
+  Interval = IZWI_KV_PAGE_SIZE (default 64) = preferred page tokens = snapshot
+  interval. MTP must be disabled (IZWI_CUDA_MTP=off) or the gate stays inert.
+
+## Plan
+
+Fixture strategy: tiny synthetic qwen38 hybrid checkpoint (2 blocks: linear
+attention + full attention, vocab 8, hidden 4, head_dim 2, partial rotary 1.0,
+mrope sections [1,0,0], ssm dims 1, fp8 block [2,2], context 512) written to
+disk like the DS0.7 LFM fixture, loaded by the REAL worker binary.
+
+- [ ] 1. izwi-core: `Qwen38NativeConfig::from_json` env-gated synthetic geometry
+      (`IZWI_ALLOW_SYNTHETIC_QWEN38_GEOMETRY`): skip pinned-value checks, keep
+      structural checks (layer_types pattern vs full_attention_interval, rope
+      section sum vs rotary dims, ssm_inner_size product, quantization config
+      structure, positivity). Fails closed; loud log when active; unit tests
+      via an internal policy parameter (no env mutation in tests).
+- [ ] 2. worker tests/common: `write_tiny_qwen38_hybrid_fixture(models_dir)` —
+      config.json + target.safetensors + index + tokenizer files + chat template
+      + izwi-artifact.json (variant Qwen3827BFp8, revision
+      tiny-qwen38-hybrid-fixture-v1). Ignored `generate_qwen38_benchmark_fixture`
+      test mirroring DS0.7's fixture generation.
+- [ ] 3. worker: `InvocationExecutor::runtime_telemetry()` optional async hook
+      (default None); RuntimeChatExecutor returns the RuntimeService snapshot;
+      /internal/v1/metrics/prometheus gains managed-KV counters (prefix hits/
+      misses/evictions, reused/avoided tokens, tensor_snapshot_*). Mock worker
+      unaffected.
+- [ ] 4. backend_parity: qwen38 hybrid prefix leg — CPU determinism across
+      processes with prefix caching ON (chunked prefill, salt, MTP off, page 16),
+      outputs of attach requests == publish-run outputs, Metal leg (metal
+      feature) == CPU, counters parsed from worker metrics prove publishes>0
+      and attaches>0.
+- [ ] 5. run-gateway-chat-benchmark.py: --workload {default,shared,cold} with
+      --prefix-tokens/--suffix-tokens (shared = constant long system prompt +
+      per-request user suffix; cold = unique per-request prompts of the same
+      total length). Default behavior unchanged; unit tests updated.
+- [ ] 6. scripts/bench/run-ds15-prefix-benchmark.sh: fixture generation, worker
+      (lane env) + gateway (approval URL, API key, raised tenant concurrency,
+      prefix caching env, chunked prefill, page size 16) orchestration, python
+      harness per workload per lane, worker prometheus counters before/after,
+      manifests benchmarks/manifests/ds15-{lane}-{shared,cold}.json + counters.
+- [ ] 7. Run on CPU and Metal lanes; verify attaches>0/publishes>0 on shared,
+      ==0 on cold; record TTFT delta.
+- [ ] 8. Verify: qwen38/native/cache tests, engine cache, worker suites, parity
+      legs, gateway process test, clippy -D warnings, fmt, boundary check.
+- [ ] 9. Docs: DS1 analysis status, plan checkboxes (DS1.5, DS1.6 CPU/Metal leg;
+      CUDA not-run), support matrix, delivery report, ledger, memory, commits.
+
+## DS1.5 session review — 2026-09-24 (part 1)
+
+Scope: DS1.5 benchmark evidence + the hybrid fixture that gates default-on.
+Outcome: the fixture path works end to end and publishes snapshots; the
+attach (fork) path fails in real executions and is now the documented
+DS1.5 blocker. No benchmark manifests were produced this session.
+
+### What landed
+
+- `Qwen38NativeConfig` synthetic-geometry gate
+  (`IZWI_ALLOW_SYNTHETIC_QWEN38_GEOMETRY`, fails closed): skips the pinned
+  27B value checks but keeps structural validation (layer pattern, rope
+  coverage, SSM width product, FP8 routing, positivity). 3 unit tests via an
+  internal policy parameter.
+- Serving worker accepts `IZWI_WORKER_MODEL=Qwen3.8-27B-FP8` and wires
+  `IZWI_ENABLE_PREFIX_CACHING` (+ salt requirement),
+  `IZWI_MAX_PREFIX_CACHE_PAGES`, `IZWI_ENABLE_CHUNKED_PREFILL`,
+  `IZWI_CHUNKED_PREFILL_THRESHOLD`, `IZWI_MAX_SEQUENCE_LENGTH` into its
+  EngineConfig (previously ignored entirely by the worker process).
+- `write_tiny_qwen38_hybrid_fixture` in worker tests/common: a disk-loadable
+  tiny hybrid qwen38 (1 linear-attention + 1 full-attention block) that
+  passes the real downloader bundle gate, native config validation, MTP
+  manifest validation, and executes through the engine. Ignored
+  `generate_qwen38_benchmark_fixture` test mirrors DS0.7.
+- Worker `/internal/v1/metrics/prometheus` now surfaces engine managed-KV
+  counters (prefix hits/misses/evictions, reused/avoided tokens,
+  tensor_snapshot_publishes/attaches/truncations/evictions) via a new
+  optional `InvocationExecutor::runtime_telemetry()` hook (mock workers
+  return None). DS1.4 process-level surfacing.
+- Fixes found by the fixture work:
+  - `config.rs default_kv_page_size` now delegates to the env-aware paged.rs
+    version — the engine's page hint and a contract's declared snapshot
+    interval can no longer disagree about the page grid (16 vs 64
+    split-brain silently disabled snapshot sharing).
+  - fixture-mode load admission: memory estimate derived from the actual
+    checkpoint (not the pinned 112 GiB constants) and the portable context
+    reserve no longer subtracts the 80 GiB catalog inference size from the
+    fixture's fit budget (arena capacity depended on ambient free RAM).
+  - DS1.2b clamp soundness: the managed-side first-chunk clamp no longer
+    reduces the commit target below the scheduled input span (the model used
+    to append past its block table). Scheduler alignment remains the span
+    authority; tests rewritten to the sound contract.
+
+### Verification
+
+- izwi-core lib 2638/2638 (3 new geometry tests, 1 rewritten + 1 new clamp
+  test); izwi-serving-worker lib+bin+integration green (CPU parity leg, real
+  CPU process); izwi-server lib 678/678.
+- clippy -D warnings clean on touched code (documented pre-existing denies
+  elsewhere); fmt clean; `git diff --check` clean; boundary check passes.
+- Process smoke: worker loads the fixture, serves chat, publishes a snapshot
+  at an aligned chunk cursor, counters visible on the worker metrics
+  endpoint.
+
+### DS1.5 blocker (next session, before benchmark runs)
+
+Attach-by-fork crashes real executions: after attaching a published snapshot
+at cursor C, the scheduler still issues the prefill span from 0 while the
+model appends from C ("physical paged append ends at N, beyond capacity M";
+stream closes without a final marker). The scheduler/executor must clip or
+replay the scheduled span to the attach cursor. Reproduce:
+`cargo test -p izwi-serving-worker --test prefix_attach_repro -- --ignored`
+(ignored diagnostic, documents the failure). After it lands: DS1.5
+prefix-heavy/prefix-cold runs on CPU+Metal (prompts must fit the fixture's
+per-sequence page grant), DS0.8-harness parity leg, default-on decision.
