@@ -176,6 +176,15 @@ fn portable_context_ceiling(
 fn portable_context_reserve_bytes(variant: ModelVariant, configured_reserve_bytes: u64) -> u64 {
     const GIB: u64 = 1024 * 1024 * 1024;
 
+    // Synthetic fixture loads must not inherit the pinned 27B catalog
+    // inference size: their actual residency is tiny, so subtracting it from
+    // the 80 GiB catalog value would reserve an absurd request-scoped budget
+    // and collapse the portable context fit.
+    if variant == ModelVariant::Qwen3827BFp8
+        && crate::models::architectures::qwen38::native::synthetic_geometry_enabled()
+    {
+        return configured_reserve_bytes;
+    }
     let total_inference_bytes = (variant.memory_required_gb() as f64 * GIB as f64).ceil() as u64;
     let resident_bytes = model_memory_estimate(variant).resident_bytes;
     configured_reserve_bytes.saturating_add(total_inference_bytes.saturating_sub(resident_bytes))
@@ -490,6 +499,31 @@ fn qwen38_resource_plan(backend: BackendKind) -> ModelResourcePlan {
             ResourceAmount::Known(QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES);
     }
     plan
+}
+
+/// Fixture-mode qwen38 estimate (synthetic geometry opt-in): derived from the
+/// actual checkpoint inventory instead of the pinned 27B constants, while
+/// reserving the same portable conversion scratch the pinned estimate carries.
+fn qwen38_synthetic_fixture_estimate(model_path: &Path) -> Result<ModelMemoryEstimate> {
+    let overflow = || Error::ModelLoadError("Qwen3.8 fixture memory estimate overflow".into());
+    let Some((file_bytes, largest_tensor_bytes)) = checkpoint_tensor_inventory(model_path)? else {
+        return Err(Error::ModelLoadError(
+            "Synthetic Qwen3.8 fixture has no readable tensor inventory".into(),
+        ));
+    };
+    // The portable load path materializes expanded F32 projections from the
+    // FP8/BF16 source bytes; a 4x envelope covers the resident expansion and
+    // the portable conversion scratch bounds the load peak like the pinned
+    // estimate does.
+    let resident_bytes = file_bytes.checked_mul(4).ok_or_else(overflow)?;
+    let load_peak_bytes = resident_bytes
+        .checked_add(QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES)
+        .and_then(|bytes| bytes.checked_add(largest_tensor_bytes.next_power_of_two()))
+        .ok_or_else(overflow)?;
+    Ok(ModelMemoryEstimate {
+        load_peak_bytes,
+        resident_bytes,
+    })
 }
 
 fn fish_s2_resource_plan(
@@ -1184,6 +1218,12 @@ impl ModelLifecycleController {
                     &self.backend_router.context().device.device,
                     &self.config.performance,
                 );
+            }
+            if crate::models::architectures::qwen38::native::synthetic_geometry_enabled() {
+                // Fixture load (benchmark/CI): price the actual checkpoint
+                // instead of the pinned 27B constants.
+                let estimate = qwen38_synthetic_fixture_estimate(model_path)?;
+                return Ok(model_resource_plan(backend, estimate));
             }
             return Ok(qwen38_resource_plan(backend));
         }

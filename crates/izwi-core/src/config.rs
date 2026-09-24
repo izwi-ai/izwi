@@ -772,7 +772,11 @@ fn default_kv_cache_dtype() -> String {
 }
 
 fn default_kv_page_size() -> usize {
-    64
+    // One env-resolved source of truth shared with the model-contract side
+    // (`models::shared::attention::paged::default_kv_page_size`), so the
+    // engine's page hint and a contract's declared snapshot interval can never
+    // disagree about the configured page grid.
+    crate::models::shared::attention::paged::default_kv_page_size()
 }
 
 impl EngineConfig {
