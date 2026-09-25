@@ -149,3 +149,63 @@ multi-turn histories) hit while short ones do not.
   in DS1.5's benchmark manifest.
 - MTP interaction is the only genuinely unresolved correctness item; it is
   scoped out of first enablement rather than blocking.
+
+## DS1.5 benchmark session (2026-09-25) — executed evidence and two rig findings
+
+The attach fix (ae540d3c) unlocked the benchmark runs. Executed
+`scripts/bench/run-ds15-prefix-benchmark.sh` on CPU and Metal against the real
+gateway + real worker with the tiny hybrid qwen38 fixture:
+
+| Lane | Workload | Completed | Publishes | Attaches | Avoided prefill tokens |
+|---|---|---|---|---|---|
+| CPU  | shared | 40/40 | 1 | 36 | 4736 |
+| CPU  | cold   | 40/40 | 40 | 0  | 0 |
+| Metal| shared | 40/40 | 1 | 36 | 4736 |
+| Metal| cold   | 40/40 | 40 | 0  | 0 |
+
+TTFT p50 shared vs cold ≈ +0.6 ms (CPU) and ≈ −0.1 ms (Metal) — indistinguishable
+at fixture scale, as expected: ~130-token prefill is microseconds, so the reuse
+evidence is the counter delta, not wall clock. The manifests carry the speed
+numbers under the standing no-speed-claim framing.
+
+### Finding 1: every request carries a ~43-token structural shared prefix
+
+The engine's qwen38 chat template defaults to `enable_thinking: true` with
+reasoning effort **Xhigh** (`ChatReasoningEffort::default()` is Xhigh), so
+`render_prompt` prepends the Xhigh reasoning-instruction system block to every
+request. The fixture tokenizer is WordLevel over `{a,b,c}` with unk→"a", and the
+instruction prose is out-of-vocabulary — the block tokenizes to 41 identical unk
+tokens (43 with role/position tokens). With 16-token KV pages, EVERY request —
+prefix-cold ones included — shares that block's 2 pages by construction (observed
+as reused=64 = 32 tokens × 2 prefix-enabled domains). **Benchmark/evaluation rigs
+on this model family must set the KV page size above the structural block
+(the rig uses 64) or cold-workload isolation is impossible.** Production
+tokenizers make the block's token identities content-unique, so the requirement
+is a fixture artifact, not an engine defect — but any future "disable thinking"
+request knob would also remove it.
+
+### Finding 2: the gateway sheds on stale capacity credits; closed-loop clients must retry
+
+With gateway `max-in-flight` equal to the worker's active capacity, the gateway
+still rejected ~80% of an instantly-submitted closed-loop burst: it dispatches
+only within the last-observed capacity credits, and credits refresh on the 200 ms
+status poll — a client that retries nothing burns its whole submission set
+against stale credits (worker-side `admitted==completed==11, rejected=0` while
+the client saw 31 rejections). The harness gained `--max-retries` (default 0 =
+legacy behavior); the rig runs 40, which absorbs the credit race entirely.
+
+### Rig notes (do not re-derive)
+
+- Workloads: `--workload shared` = byte-identical system prefix + per-request
+  base-3 positional marker over the fixture vocab; `--workload cold` = marker
+  + filler, unique per request. English filler collapses to unk under the
+  fixture tokenizer and destroys cold isolation — prompts must be built from
+  the tokenizer's real vocabulary.
+- Reuse depth is capped by the publishing session's FIRST chunk (unchanged);
+  the rig sets the chunk threshold to ~2× the word budget so the whole prompt
+  commits in one prefix-eligible chunk.
+- 36/40 shared attaches (not 39): concurrent attachers race the publisher's
+  first commit; the four non-attaching requests prefill fully and complete —
+  correctness is unaffected.
+- Cold-lane evictions (37) are the expected behavior of unique prompts cycling
+  through a bounded snapshot index.

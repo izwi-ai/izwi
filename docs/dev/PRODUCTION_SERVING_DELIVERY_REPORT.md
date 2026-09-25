@@ -62,13 +62,21 @@ protocol 16; client 5 + 23 contract (mock-worker feature); supervisor 31 lib
 multi-lane); worker 12 lib + 5 bin + real-CPU-process; boundary gate passes;
 fmt/clippy clean on touched code (pre-existing denies documented).
 
+DS1.x additions (verified 2026-09-25): worker suites incl. the
+`prefix_attach_repro` regression and the qwen38 hybrid prefix parity leg
+(CPU ×2 processes + Metal, attached prefill bit-identical to fresh);
+izwi-core qwen38 attach + engine cache suites green; gateway benchmark
+harness 18 unit tests; DS1.5 runner smoke test.
+
 ## Tests not executed and why
 
 - CUDA/Metal *inference*, multi-GPU, multi-machine, soak, overload matrices:
   no accelerator/fabric hardware in the work environment (Metal build/run is
   the next local lane).
 - PG/MySQL fleet SQL execution: no PostgreSQL/MySQL instance in CI yet (DS5).
-- Live benchmark runs: harness exists; runs pending (DS0.7).
+- Live benchmark runs on real production-sized models and CUDA lanes:
+  fixture-scale DS0.7/DS1.5 runs executed (see below); speed claims still
+  require real-model runs.
 
 ## API / configuration compatibility changes
 
@@ -88,9 +96,13 @@ fleet mode is on.
 
 ## Measured performance and test conditions
 
-None published. The closed-loop harness
-(`scripts/bench/run-gateway-chat-benchmark.py`) requires operator-supplied
-metadata and records rejections/latencies; DS0.7 produces the first manifests.
+Fixture-scale only; no speed claim. DS0.7 baseline manifests plus DS1.5
+prefix-caching evidence (`benchmarks/manifests/ds15-{cpu,metal}-{shared,cold}.json`
++ summaries, 2026-09-25): gateway-routed shared-prefix workloads attach
+committed prefixes (36 attaches, 4736 avoided-prefill tokens per lane) while
+cold workloads reuse nothing (0 attaches); TTFT delta ≈ 0 at fixture scale —
+prefill of ~130 tiny tokens is microseconds, so reuse is counter-proven, not
+wall-clock-proven. Real-model TTFT/throughput claims remain future work.
 
 ## Security / deployment assumptions
 
@@ -109,6 +121,7 @@ No destructive migrations shipped.
 
 ## Next highest-priority task
 
-DS1.1 — the conv/recurrent checkpoint-boundary spike that gates committed
-cross-request prefix reuse for hybrid-attention chat models (the engine's
-largest throughput lever), preceded by the DS0.7/DS0.8 measurement baseline.
+DS1.6 completion — per-backend prefix-reuse enablement in the capability
+catalog (CPU+Metal parity evidence is already green) and the DS1.2b
+default-on decision; then DS2 cache-aware routing. DS0.5 scoped per-principal
+API keys remains a standalone security slice.
