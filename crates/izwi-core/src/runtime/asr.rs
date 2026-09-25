@@ -710,7 +710,15 @@ enum RealtimeAsrExecutionPath {
 
 fn realtime_asr_execution_path(variant: ModelVariant) -> RealtimeAsrExecutionPath {
     match variant.family() {
-        ModelFamily::Voxtral | ModelFamily::NemotronAsr => RealtimeAsrExecutionPath::Engine,
+        // Voxtral publishes a paged managed state runtime, which is what the
+        // Engine's realtime session admission requires. Nemotron publishes a
+        // retained tensor state runtime (its realtime contract has no
+        // paged-attention domains), so it executes on the direct native
+        // streaming path; routing it through Engine admission fails closed
+        // with "requires a physical managed state runtime" (a regression
+        // from 7215003a that the single-node server masked behind its
+        // chunked fallback).
+        ModelFamily::Voxtral => RealtimeAsrExecutionPath::Engine,
         _ => RealtimeAsrExecutionPath::Direct,
     }
 }
@@ -4526,7 +4534,7 @@ mod tests {
         );
         assert_eq!(
             realtime_asr_execution_path(ModelVariant::Nemotron35AsrStreaming06B),
-            RealtimeAsrExecutionPath::Engine
+            RealtimeAsrExecutionPath::Direct
         );
         assert_eq!(
             realtime_asr_execution_path(ModelVariant::VoxtralMini4BRealtime2602),
@@ -4594,7 +4602,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nemotron_public_push_and_finish_select_the_engine_session_path() {
+    async fn nemotron_public_push_and_finish_select_the_direct_native_path() {
         let runtime = RuntimeService::new(EngineConfig {
             backend: BackendPreference::Cpu,
             ..Default::default()
@@ -4629,23 +4637,25 @@ mod tests {
             engine_chunk_index: 0,
         };
 
+        // Nemotron routes to the direct native streaming path: the fixture
+        // omits its loaded model, so both operations fail closed there.
         let push = runtime
             .push_asr_realtime_samples(&mut stream, &[0.0], 16_000)
             .await
-            .expect_err("fixture intentionally omits the Engine session");
+            .expect_err("fixture intentionally omits the native stream model");
         assert!(push
             .to_string()
-            .contains("Engine realtime ASR session is unavailable"));
-        assert!(!push.to_string().contains("model is unavailable"));
+            .contains("realtime ASR stream model is unavailable"));
+        assert!(!push.to_string().contains("Engine realtime ASR session"));
 
         let finish = runtime
             .finish_asr_realtime_stream(&mut stream)
             .await
-            .expect_err("fixture intentionally omits the Engine session");
+            .expect_err("fixture intentionally omits the native stream model");
         assert!(finish
             .to_string()
-            .contains("Engine realtime ASR session is unavailable"));
-        assert!(!finish.to_string().contains("model is unavailable"));
+            .contains("realtime ASR stream model is unavailable"));
+        assert!(!finish.to_string().contains("Engine realtime ASR session"));
     }
 
     #[test]
