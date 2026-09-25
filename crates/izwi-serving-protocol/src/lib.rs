@@ -1,15 +1,18 @@
 //! Backend-neutral contracts for communication between Izwi gateways and workers.
 //!
 //! This crate deliberately contains no inference-engine or accelerator dependencies. It defines
-//! the private HTTP wire schema and bounded incremental NDJSON decoding used at the process
-//! boundary. Public API compatibility remains the gateway's responsibility.
+//! the private HTTP wire schema, the bounded incremental NDJSON decoding used at the process
+//! boundary, and the versioned realtime WebSocket subprotocol. Public API compatibility remains
+//! the gateway's responsibility.
 
 mod identity;
 mod ndjson;
+mod realtime;
 mod types;
 
 pub use identity::*;
 pub use ndjson::*;
+pub use realtime::*;
 pub use types::*;
 
 /// The only protocol major version implemented by this crate.
@@ -17,9 +20,11 @@ pub const PROTOCOL_MAJOR_VERSION: u16 = 1;
 /// The latest additive protocol minor version implemented by this crate.
 ///
 /// Minor 1 adds optional per-deployment routing signals on `LoadedDeployment`.
-/// All version gates tolerate any minor within major 1: older workers omit
-/// the fields and newer workers only add optional ones.
-pub const PROTOCOL_MINOR_VERSION: u16 = 1;
+/// Minor 2 adds the realtime WebSocket subprotocol (`realtime` module), the
+/// `WorkerFeature::RealtimeSocket` and `InputFormat::Text` variants. All
+/// version gates tolerate any minor within major 1: older workers omit the
+/// fields and newer workers only add optional ones.
+pub const PROTOCOL_MINOR_VERSION: u16 = 2;
 pub const PROTOCOL_V1: SchemaVersion =
     SchemaVersion::new(PROTOCOL_MAJOR_VERSION, PROTOCOL_MINOR_VERSION);
 

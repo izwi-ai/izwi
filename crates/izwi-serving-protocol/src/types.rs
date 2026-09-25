@@ -107,6 +107,8 @@ pub enum InputFormat {
     PcmAudio,
     EncodedAudio,
     ArtifactReference,
+    /// Bounded plain text input (realtime TTS-stream stage, protocol minor 2).
+    Text,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -191,6 +193,9 @@ pub enum WorkerFeature {
     Streaming,
     Cancellation,
     AttemptQuery,
+    /// Worker serves realtime sessions on `GET /internal/v1/realtime` via the
+    /// `izwi-realtime-v1` WebSocket subprotocol (protocol minor 2).
+    RealtimeSocket,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -704,9 +709,9 @@ mod tests {
     #[test]
     fn current_version_is_compatible_with_additive_minor_only() {
         assert!(PROTOCOL_V1.is_supported_by(PROTOCOL_V1));
-        assert!(PROTOCOL_V1.is_supported_by(SchemaVersion::new(1, 2)));
+        assert!(PROTOCOL_V1.is_supported_by(SchemaVersion::new(1, 3)));
         assert!(SchemaVersion::new(1, 0).is_supported_by(PROTOCOL_V1));
-        assert!(!SchemaVersion::new(1, 2).is_supported_by(PROTOCOL_V1));
+        assert!(!SchemaVersion::new(1, 3).is_supported_by(PROTOCOL_V1));
         assert!(!PROTOCOL_V1.is_supported_by(SchemaVersion::new(2, 0)));
         // Additive-minor tolerance: within one major, any minor interoperates.
         assert!(SchemaVersion::new(1, 0).shares_major_with(PROTOCOL_V1));
