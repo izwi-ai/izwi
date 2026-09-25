@@ -39,6 +39,7 @@ mod error;
 mod gateway;
 mod gateway_deployments;
 mod gateway_fleet;
+mod gateway_principal_keys;
 mod gateway_rate_quota;
 mod gateway_security;
 mod gateway_shared_approvals;
@@ -607,11 +608,33 @@ async fn run_gateway(
     let (rate_quota, tenant_concurrency) =
         apply_fleet_partition(rate_quota, tenant_concurrency, fleet_partition);
     perimeter.validate_public_ingress(&serve_config)?;
+    // DS0.5 scoped credentials: the manifest is the only activation switch.
+    // Unset keeps the durable store untouched and authentication byte-identical.
+    let principal_keys = match crate::gateway_principal_keys::manifest_path_from_env()? {
+        Some(manifest_path) => {
+            let store = crate::db::sqlite::StoreDatabase::from_default_path()?;
+            let directory = crate::gateway_principal_keys::GatewayPrincipalDirectory::bootstrap(
+                &store,
+                &manifest_path,
+                &perimeter,
+            )
+            .await?;
+            info!(
+                service = SERVICE_NAME,
+                version = SERVICE_VERSION,
+                principals = directory.len(),
+                "Gateway scoped principal keys loaded from the durable store"
+            );
+            directory
+        }
+        None => crate::gateway_principal_keys::GatewayPrincipalDirectory::empty(),
+    };
     let (state, _status_poller) =
         gateway_state(&args, &serve_config, enterprise_hooks, perimeter).await?;
     let state = state
         .with_rate_quota_config(rate_quota)
-        .with_tenant_concurrency_config(tenant_concurrency);
+        .with_tenant_concurrency_config(tenant_concurrency)
+        .with_principal_keys(principal_keys);
     state.lifecycle.mark_ready();
 
     info!(

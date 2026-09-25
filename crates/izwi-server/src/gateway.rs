@@ -49,6 +49,7 @@ pub struct GatewayState {
     pub(crate) enterprise_hooks: EnterpriseHooks,
     pub(crate) lifecycle: ServerLifecycle,
     pub(crate) perimeter: GatewayPerimeterConfig,
+    pub(crate) principal_keys: crate::gateway_principal_keys::GatewayPrincipalDirectory,
     pub request_timeout_secs: u64,
     request_admission: Arc<Semaphore>,
     rate_quota: GatewayRateQuota,
@@ -75,6 +76,7 @@ impl GatewayState {
             enterprise_hooks,
             lifecycle: ServerLifecycle::new(),
             perimeter,
+            principal_keys: crate::gateway_principal_keys::GatewayPrincipalDirectory::empty(),
             request_timeout_secs: request_timeout_secs.max(1),
             request_admission: Arc::new(Semaphore::new(max_in_flight)),
             rate_quota: GatewayRateQuota::new(GatewayRateQuotaConfig::default()),
@@ -101,6 +103,7 @@ impl GatewayState {
             enterprise_hooks,
             lifecycle: ServerLifecycle::new(),
             perimeter,
+            principal_keys: crate::gateway_principal_keys::GatewayPrincipalDirectory::empty(),
             request_timeout_secs: request_timeout_secs.max(1),
             request_admission: Arc::new(Semaphore::new(max_in_flight)),
             rate_quota: GatewayRateQuota::new(GatewayRateQuotaConfig::default()),
@@ -123,6 +126,17 @@ impl GatewayState {
         config: GatewayTenantConcurrencyConfig,
     ) -> Self {
         self.tenant_concurrency = GatewayTenantConcurrency::new(config);
+        self
+    }
+
+    /// Install the scoped per-principal key directory (DS0.5). The default is
+    /// an empty directory: authentication then behaves exactly as before the
+    /// scoped-key feature existed.
+    pub(crate) fn with_principal_keys(
+        mut self,
+        principal_keys: crate::gateway_principal_keys::GatewayPrincipalDirectory,
+    ) -> Self {
+        self.principal_keys = principal_keys;
         self
     }
 
@@ -620,10 +634,14 @@ async fn api_not_found() -> Response {
 }
 
 async fn gateway_drain(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
-    if !state.perimeter.admin_enabled() {
+    let admin_available = state.perimeter.admin_enabled() || state.principal_keys.has_role("admin");
+    if !admin_available {
         return StatusCode::NOT_FOUND.into_response();
     }
-    if !state.perimeter.authenticate_admin(&headers) {
+    let admin_authorized = (state.perimeter.admin_enabled()
+        && state.perimeter.authenticate_admin(&headers))
+        || state.principal_keys.authorize(&headers, "admin");
+    if !admin_authorized {
         let mut response = StatusCode::UNAUTHORIZED.into_response();
         response.headers_mut().insert(
             header::WWW_AUTHENTICATE,
@@ -654,10 +672,15 @@ struct GatewayDrainResponse {
 }
 
 async fn gateway_metrics(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
-    if !state.perimeter.metrics_enabled() {
+    let metrics_available =
+        state.perimeter.metrics_enabled() || state.principal_keys.has_role("metrics");
+    if !metrics_available {
         return StatusCode::NOT_FOUND.into_response();
     }
-    if !state.perimeter.authenticate_metrics(&headers) {
+    let metrics_authorized = (state.perimeter.metrics_enabled()
+        && state.perimeter.authenticate_metrics(&headers))
+        || state.principal_keys.authorize(&headers, "metrics");
+    if !metrics_authorized {
         state
             .metrics
             .inner
@@ -965,6 +988,23 @@ mod tests {
                 json!({
                     "model": ModelVariant::Qwen34BGguf.dir_name(),
                     "messages": [{"role": "user", "content": "quota test"}],
+                    "max_tokens": max_tokens
+                })
+                .to_string(),
+            ))
+            .expect("chat request should build")
+    }
+
+    fn chat_request_with_bearer(bearer: &str, max_tokens: usize) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", format!("Bearer {bearer}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": ModelVariant::Qwen34BGguf.dir_name(),
+                    "messages": [{"role": "user", "content": "scoped principal test"}],
                     "max_tokens": max_tokens
                 })
                 .to_string(),
@@ -2432,6 +2472,202 @@ mod tests {
             send_raw(app, post("/internal/admin/drain")).await.status(),
             StatusCode::UNAUTHORIZED,
             "drain without auth still 401s even after drain started"
+        );
+    }
+
+    const TEST_SCOPED_INFERENCE_KEY: &str = "scoped-inference-key-123456";
+    const TEST_SCOPED_OPS_KEY: &str = "scoped-ops-metrics-key-654321";
+    const TEST_SCOPED_OTHER_TENANT_KEY: &str = "scoped-other-tenant-key-246810";
+
+    async fn scoped_key_directory(
+        entries: &str,
+    ) -> crate::gateway_principal_keys::GatewayPrincipalDirectory {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let manifest = dir.path().join("principals.json");
+        std::fs::write(&manifest, entries).expect("manifest write");
+        let store = crate::db::sqlite::StoreDatabase::new(dir.path().join("store.sqlite3"));
+        crate::gateway_principal_keys::GatewayPrincipalDirectory::bootstrap(
+            &store,
+            &manifest,
+            &test_perimeter(),
+        )
+        .await
+        .expect("scoped principal directory should bootstrap")
+    }
+
+    #[tokio::test]
+    async fn scoped_principal_key_authenticates_the_inference_route() {
+        let _guard = crate::test_support::env_lock();
+        std::env::set_var("IZWI_TEST_GW_SCOPED_A", TEST_SCOPED_INFERENCE_KEY);
+        let directory = scoped_key_directory(
+            r#"{"version":1,"principals":[{"principal_id":"svc-alpha","roles":["inference"],"tenant_id":"tenant-alpha","key_ref":"env:IZWI_TEST_GW_SCOPED_A"}]}"#,
+        )
+        .await;
+        std::env::remove_var("IZWI_TEST_GW_SCOPED_A");
+
+        let app = create_gateway_router(
+            unreachable_gateway_state(test_perimeter()).with_principal_keys(directory),
+            &ServeRuntimeConfig::default(),
+        );
+        let response = send_raw(app, chat_request_with_bearer(TEST_SCOPED_INFERENCE_KEY, 4)).await;
+        assert_ne!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "a valid scoped principal key must pass gateway authentication"
+        );
+        assert_ne!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "an inference-role principal must reach the route"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_principal_without_inference_role_is_forbidden_on_chat() {
+        let _guard = crate::test_support::env_lock();
+        std::env::set_var("IZWI_TEST_GW_SCOPED_B", TEST_SCOPED_OPS_KEY);
+        let directory = scoped_key_directory(
+            r#"{"version":1,"principals":[{"principal_id":"ops","roles":["metrics","admin"],"key_ref":"env:IZWI_TEST_GW_SCOPED_B"}]}"#,
+        )
+        .await;
+        std::env::remove_var("IZWI_TEST_GW_SCOPED_B");
+
+        let app = create_gateway_router(
+            unreachable_gateway_state(test_perimeter()).with_principal_keys(directory),
+            &ServeRuntimeConfig::default(),
+        );
+        let response = send_raw(app, chat_request_with_bearer(TEST_SCOPED_OPS_KEY, 4)).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "a metrics/admin-only principal must not run inference"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_role_keys_open_internal_endpoints_without_dedicated_credentials() {
+        let _guard = crate::test_support::env_lock();
+        std::env::set_var("IZWI_TEST_GW_SCOPED_A", TEST_SCOPED_INFERENCE_KEY);
+        std::env::set_var("IZWI_TEST_GW_SCOPED_B", TEST_SCOPED_OPS_KEY);
+        let directory = scoped_key_directory(
+            r#"{"version":1,"principals":[
+                {"principal_id":"svc-alpha","roles":["inference"],"tenant_id":"tenant-alpha","key_ref":"env:IZWI_TEST_GW_SCOPED_A"},
+                {"principal_id":"ops","roles":["metrics","admin"],"key_ref":"env:IZWI_TEST_GW_SCOPED_B"}]}"#,
+        )
+        .await;
+        std::env::remove_var("IZWI_TEST_GW_SCOPED_A");
+        std::env::remove_var("IZWI_TEST_GW_SCOPED_B");
+
+        let state = unreachable_gateway_state(test_perimeter()).with_principal_keys(directory);
+        let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
+
+        let metrics = send_raw(
+            app.clone(),
+            get_with_bearer("/internal/metrics", TEST_SCOPED_OPS_KEY),
+        )
+        .await;
+        assert_eq!(
+            metrics.status(),
+            StatusCode::OK,
+            "a metrics-role scoped principal must open the metrics endpoint"
+        );
+        let drain = send_raw(
+            app.clone(),
+            post_with_bearer("/internal/admin/drain", TEST_SCOPED_OPS_KEY),
+        )
+        .await;
+        assert_eq!(
+            drain.status(),
+            StatusCode::ACCEPTED,
+            "an admin-role scoped principal must open the drain endpoint"
+        );
+
+        let inference_on_metrics = send_raw(
+            app.clone(),
+            get_with_bearer("/internal/metrics", TEST_SCOPED_INFERENCE_KEY),
+        )
+        .await;
+        assert_eq!(
+            inference_on_metrics.status(),
+            StatusCode::UNAUTHORIZED,
+            "an inference-only principal must not open the metrics endpoint"
+        );
+        let garbage = send_raw(
+            app,
+            get_with_bearer("/internal/metrics", "wrong-principal-key-000000"),
+        )
+        .await;
+        assert_eq!(garbage.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn internal_endpoints_stay_not_found_without_any_role_capability() {
+        let app = create_gateway_router(
+            unreachable_gateway_state(test_perimeter()),
+            &ServeRuntimeConfig::default(),
+        );
+        assert_eq!(
+            send_raw(app.clone(), get("/internal/metrics"))
+                .await
+                .status(),
+            StatusCode::NOT_FOUND,
+            "metrics stays 404 without a dedicated key or a scoped metrics principal"
+        );
+        assert_eq!(
+            send_raw(app, post("/internal/admin/drain")).await.status(),
+            StatusCode::NOT_FOUND,
+            "drain stays 404 without a dedicated key or a scoped admin principal"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_principal_tenant_scope_partitions_the_rate_quota() {
+        let _guard = crate::test_support::env_lock();
+        std::env::set_var("IZWI_TEST_GW_SCOPED_A", TEST_SCOPED_INFERENCE_KEY);
+        std::env::set_var("IZWI_TEST_GW_SCOPED_B", TEST_SCOPED_OTHER_TENANT_KEY);
+        let directory = scoped_key_directory(
+            r#"{"version":1,"principals":[
+                {"principal_id":"svc-alpha","roles":["inference"],"tenant_id":"tenant-alpha","key_ref":"env:IZWI_TEST_GW_SCOPED_A"},
+                {"principal_id":"svc-beta","roles":["inference"],"tenant_id":"tenant-beta","key_ref":"env:IZWI_TEST_GW_SCOPED_B"}]}"#,
+        )
+        .await;
+        std::env::remove_var("IZWI_TEST_GW_SCOPED_A");
+        std::env::remove_var("IZWI_TEST_GW_SCOPED_B");
+
+        let state = unreachable_gateway_state(test_perimeter())
+            .with_rate_quota_config(GatewayRateQuotaConfig::new(1, 1, 4).unwrap())
+            .with_principal_keys(directory);
+        let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
+
+        let tenant_a_first = send_raw(
+            app.clone(),
+            chat_request_with_bearer(TEST_SCOPED_INFERENCE_KEY, 4),
+        )
+        .await;
+        assert_ne!(
+            tenant_a_first.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "tenant-alpha starts with a full quota bucket"
+        );
+        let tenant_a_second = send_raw(
+            app.clone(),
+            chat_request_with_bearer(TEST_SCOPED_INFERENCE_KEY, 4),
+        )
+        .await;
+        assert_eq!(
+            tenant_a_second.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "tenant-alpha must exhaust its own bucket"
+        );
+        let tenant_b_first = send_raw(
+            app,
+            chat_request_with_bearer(TEST_SCOPED_OTHER_TENANT_KEY, 4),
+        )
+        .await;
+        assert_ne!(
+            tenant_b_first.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "tenant-beta must hold an independent quota bucket"
         );
     }
 

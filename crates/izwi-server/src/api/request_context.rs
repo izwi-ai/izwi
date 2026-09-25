@@ -135,13 +135,29 @@ pub async fn attach_gateway_request_context(
             "Gateway request headers exceed the configured limit",
         );
     }
-    let Some(principal) = state.perimeter.authenticate(req.headers()) else {
-        return gateway_rejection_response(
-            StatusCode::UNAUTHORIZED,
-            &correlation_id,
-            "Valid gateway API key required",
-        );
+    // Bootstrap root key first (unchanged backward-compatible path), then the
+    // DS0.5 scoped per-principal directory. Both yield a fully constructed
+    // Principal; quota and concurrency identity derive from it downstream.
+    let principal = match state.perimeter.authenticate(req.headers()) {
+        Some(principal) => principal,
+        None => match state.principal_keys.authenticate(req.headers()) {
+            Some(principal) => principal,
+            None => {
+                return gateway_rejection_response(
+                    StatusCode::UNAUTHORIZED,
+                    &correlation_id,
+                    "Valid gateway API key required",
+                )
+            }
+        },
     };
+    if !principal.roles.iter().any(|role| role == "inference") {
+        return gateway_rejection_response(
+            StatusCode::FORBIDDEN,
+            &correlation_id,
+            "Gateway principal lacks the inference role",
+        );
+    }
     let request_envelope = build_gateway_request_envelope(&req, &correlation_id);
     let resource = ResourceDescriptor::http_route(req.uri().path());
     let decision = match state
