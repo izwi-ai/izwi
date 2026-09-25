@@ -89,6 +89,52 @@ Keep secrets in the service manager or secret store that creates the process
 environment. Do not put them in node TOML, command-line arguments, shell
 history, logs, or health-check URLs.
 
+### Scoped per-principal keys (DS0.5)
+
+Beyond the shared root key, the gateway accepts individually scoped API keys.
+Every scoped key carries a server-authored principal id, a role set
+(`inference`/`admin`/`metrics`), and an optional tenant scope. Rate quotas and
+tenant concurrency leases derive from the authenticated principal's tenant
+scope, so two tenants never share a bucket even when they share a gateway.
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `IZWI_GATEWAY_PRINCIPAL_KEYS_MANIFEST` | Bounded path to a JSON principals manifest; unset keeps the durable store untouched | unset |
+
+Manifest shape (all fields are validated fail-closed; unknown fields are
+rejected; `key_ref` must be a bounded `env:VARIABLE` or `file:PATH` reference —
+inline key material is rejected):
+
+```json
+{
+  "version": 1,
+  "principals": [
+    {
+      "principal_id": "svc-alpha",
+      "roles": ["inference"],
+      "tenant_id": "tenant-alpha",
+      "key_ref": "env:ALPHA_GATEWAY_KEY"
+    }
+  ]
+}
+```
+
+Semantics:
+
+- The shared `IZWI_GATEWAY_API_KEY` remains valid as the bootstrap root
+  principal and is unchanged. Scoped key material must never reuse any
+  perimeter credential or another scoped key.
+- Roles gate routes: `inference` for `/v1/chat/completions`, `metrics` for
+  `/internal/metrics`, `admin` for `/internal/admin/drain`. A principal
+  without the `inference` role is rejected with 403 on inference routes.
+- Only salted HMAC-SHA256 digests are persisted, in the
+  `gateway_principal_keys` table of the durable store. Key material lives
+  exclusively in the referenced environment variables or files.
+- Bootstrap is idempotent: each boot re-provisions manifest entries (rotation
+  = change the reference, restart) and leaves unlisted store entries intact.
+  Revocation = delete the row (`DELETE FROM gateway_principal_keys WHERE
+  principal_id = ...`) and restart.
+
 ### Private worker credential
 
 Each node worker entry contains a `credential_id` and a `bearer_token_env`
