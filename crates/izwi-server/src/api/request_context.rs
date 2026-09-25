@@ -66,7 +66,7 @@ impl RequestContext {
     }
 }
 
-pub(super) fn principal_namespace(principal: &Principal) -> String {
+pub(crate) fn principal_namespace(principal: &Principal) -> String {
     match &principal.tenant_id {
         Some(tenant) => format!("tenant:{tenant}"),
         None => format!("principal:{}", principal.id),

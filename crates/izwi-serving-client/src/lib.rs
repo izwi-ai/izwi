@@ -366,6 +366,11 @@ impl WorkerClient {
         })
     }
 
+    /// The normalized base endpoint this client dials.
+    pub fn endpoint(&self) -> String {
+        self.inner.endpoint.to_string()
+    }
+
     pub fn uses_https(&self) -> bool {
         self.inner.endpoint.scheme() == "https"
     }

@@ -349,3 +349,280 @@ async fn gateway_process_authenticates_scoped_principal_keys_from_the_durable_st
     let _ = gateway.kill();
     let _ = gateway.wait();
 }
+
+/// Process-level DS3.6 leg: with IZWI_GATEWAY_REALTIME=on the gateway
+/// exposes /v1/realtime/ws, authenticates the public client, selects the
+/// approved speech_to_text worker, and relays an izwi-realtime-v1 session
+/// end to end. With the flag off (the T01 gateway above), the route 404s.
+#[tokio::test]
+async fn gateway_realtime_relay_relays_v1_sessions_through_the_real_binary() {
+    use futures::{SinkExt, StreamExt};
+    use izwi_serving_protocol::{
+        decode_realtime_audio_frame, encode_realtime_audio_frame, AttemptId, CallerId,
+        GatewayAttestedCallerContext, InvocationEventKind, ModelGeneration, PermittedAction,
+        PolicyRevision, RealtimeAudioCodec, RealtimeAudioSpec, RealtimeClientFrame,
+        RealtimeServerFrame, RealtimeSessionAdmit, RealtimeStageInput, RequestId, ServiceClass,
+        SessionId, TaskKind, TenantId, PROTOCOL_V1, REALTIME_SUBPROTOCOL,
+    };
+    use std::collections::BTreeSet;
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::HeaderValue, Message};
+
+    let model = ModelVariant::Qwen34BGguf;
+    let model_alias = ModelAlias::new(model.dir_name()).expect("static model alias");
+    // The gateway always boots its chat route, so one chat worker is
+    // approved alongside the realtime ASR worker under test.
+    let chat_worker = MockWorker::spawn(MockWorkerConfig {
+        worker_id: izwi_serving_protocol::WorkerId::try_from("mock-chat-worker").expect("identity"),
+        node_id: izwi_serving_protocol::NodeId::try_from("mock-chat-node").expect("identity"),
+        public_model: model_alias.clone(),
+        ..MockWorkerConfig::default()
+    })
+    .await
+    .expect("mock chat worker binds");
+    let worker = MockWorker::spawn(MockWorkerConfig {
+        worker_id: izwi_serving_protocol::WorkerId::try_from("mock-asr-worker").expect("identity"),
+        node_id: izwi_serving_protocol::NodeId::try_from("mock-asr-node").expect("identity"),
+        deployment_id: izwi_serving_protocol::DeploymentId::try_from("mock-asr-v1")
+            .expect("static identity"),
+        public_model: model_alias,
+        realtime: Some(izwi_serving_client::mock::MockRealtimeKnobs {
+            delta_per_frame: "partial ".into(),
+            final_text: "gateway relayed transcript".into(),
+            push_cadence: Duration::from_millis(1),
+            disconnect_after_frames: None,
+        }),
+        ..MockWorkerConfig::default()
+    })
+    .await
+    .expect("mock realtime worker binds");
+
+    let port = {
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("probe listener binds");
+        probe.local_addr().expect("probe addr").port()
+    };
+    let approval = format!(
+        "{}|speech_to_text|{}|mock-asr-v1|1",
+        worker.endpoint(),
+        model.dir_name()
+    );
+
+    let mut gateway = Command::new(env!("CARGO_BIN_EXE_izwi-server"))
+        .args([
+            "--role",
+            "gateway",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+            "--public-model",
+            model.dir_name(),
+            "--gateway-worker-approval",
+            &format!(
+                "{}|chat|{}|mock-chat-v1|1",
+                chat_worker.endpoint(),
+                model.dir_name()
+            ),
+            "--gateway-worker-approval",
+            &approval,
+            "--gateway-realtime",
+            "on",
+        ])
+        .env("IZWI_GATEWAY_API_KEY", GATEWAY_API_KEY)
+        .env("IZWI_GATEWAY_WORKER_CREDENTIAL_ID", "mock-credential-1")
+        .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", "mock-secret-token")
+        .env("IZWI_GATEWAY_WORKER_STATUS_POLL_MS", "200")
+        .env("IZWI_GATEWAY_WORKER_STATUS_TTL_MS", "5000")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("gateway binary spawns");
+    let stderr_capture = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let stderr_store = std::sync::Arc::clone(&stderr_capture);
+    if let Some(stderr) = gateway.stderr.take() {
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader};
+            for line in BufReader::new(stderr).lines().flatten() {
+                if let Ok(mut collected) = stderr_store.lock() {
+                    collected.push_str(&line);
+                    collected.push('\n');
+                }
+            }
+        });
+    }
+
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut ready = false;
+    while Instant::now() < deadline {
+        match client.get(format!("{base}/readyz")).send().await {
+            Ok(response) if response.status().is_success() => {
+                ready = true;
+                break;
+            }
+            _ => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+    if !ready {
+        let _ = gateway.kill();
+        let _ = gateway.wait();
+        panic!(
+            "gateway never became ready; stderr:\n{}",
+            stderr_capture
+                .lock()
+                .map(|buf| buf.clone())
+                .unwrap_or_default()
+        );
+    }
+
+    // Public client: the perimeter API key, the v1 subprotocol, and the same
+    // admit shape a direct worker client sends.
+    let mut request = format!("ws://127.0.0.1:{port}/v1/realtime/ws")
+        .into_client_request()
+        .expect("websocket request");
+    let headers = request.headers_mut();
+    headers.insert(
+        "sec-websocket-protocol",
+        HeaderValue::from_static(REALTIME_SUBPROTOCOL),
+    );
+    headers.insert(
+        "authorization",
+        HeaderValue::from_str(&format!("Bearer {GATEWAY_API_KEY}")).unwrap(),
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("gateway upgrades the realtime session");
+
+    let admit = RealtimeSessionAdmit {
+        schema_version: PROTOCOL_V1,
+        session_id: SessionId::try_from("gateway-session-1").expect("identity"),
+        request_id: RequestId::try_from("gateway-request-1").expect("identity"),
+        attempt_id: AttemptId::try_from("gateway-attempt-1").expect("identity"),
+        expected_worker_incarnation: izwi_serving_protocol::IncarnationId::try_from("ignored")
+            .expect("identity"),
+        deployment_id: izwi_serving_protocol::DeploymentId::try_from("mock-asr-v1")
+            .expect("identity"),
+        expected_model_generation: ModelGeneration::new(1).unwrap(),
+        caller: GatewayAttestedCallerContext {
+            tenant_id: TenantId::try_from("spoofed-tenant").expect("identity"),
+            caller_id: CallerId::try_from("spoofed-caller").expect("identity"),
+            policy_revision: PolicyRevision::try_from("spoofed-policy").expect("identity"),
+            permitted_actions: BTreeSet::from([PermittedAction::Invoke]),
+            allowed_data_regions: vec![],
+        },
+        task: TaskKind::SpeechToText,
+        service_class: ServiceClass::Realtime,
+        remaining_time_ms: 60_000,
+        input: RealtimeStageInput::AudioStream {
+            spec: RealtimeAudioSpec {
+                codec: RealtimeAudioCodec::PcmI16Le,
+                sample_rate: 16_000,
+                channels: 1,
+            },
+            language: None,
+        },
+    };
+    ws.send(Message::Text(
+        serde_json::to_string(&RealtimeClientFrame::Admit {
+            admit: Box::new(admit),
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    async fn next_server_frame(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> RealtimeServerFrame {
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(10), ws.next())
+                .await
+                .expect("frame arrives")
+                .expect("stream open")
+                .expect("no transport error");
+            match message {
+                Message::Text(text) => {
+                    return serde_json::from_str::<RealtimeServerFrame>(&text)
+                        .unwrap_or_else(|error| panic!("server frame decodes: {error}: {text}"))
+                }
+                Message::Close(frame) => panic!("unexpected close: {frame:?}"),
+                _ => continue,
+            }
+        }
+    }
+
+    let admitted = next_server_frame(&mut ws).await;
+    let RealtimeServerFrame::Admitted { session_id, .. } = &admitted else {
+        panic!("expected admitted frame, got {admitted:?}");
+    };
+    assert_eq!(session_id.as_str(), "gateway-session-1");
+
+    let accepted = next_server_frame(&mut ws).await;
+    let RealtimeServerFrame::Event { event } = &accepted else {
+        panic!("expected accepted event");
+    };
+    assert!(matches!(event.event, InvocationEventKind::Accepted { .. }));
+
+    for sequence in 1..=2u32 {
+        ws.send(Message::Binary(
+            encode_realtime_audio_frame(sequence, false, &[0i16.to_le_bytes(); 8].concat())
+                .unwrap()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        let frame = next_server_frame(&mut ws).await;
+        let RealtimeServerFrame::Event { event } = frame else {
+            panic!("expected delta event, got {frame:?}");
+        };
+        assert!(matches!(event.event, InvocationEventKind::TextDelta { .. }));
+    }
+
+    ws.send(Message::Text(
+        serde_json::to_string(&RealtimeClientFrame::Finish)
+            .unwrap()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let final_delta = next_server_frame(&mut ws).await;
+    let RealtimeServerFrame::Event { event } = final_delta else {
+        panic!("expected final delta");
+    };
+    let InvocationEventKind::TextDelta { text } = event.event else {
+        panic!("expected final transcript delta, got {:?}", event.event);
+    };
+    assert_eq!(text, "gateway relayed transcript");
+    let completed = next_server_frame(&mut ws).await;
+    let RealtimeServerFrame::Event { event } = completed else {
+        panic!("expected completed");
+    };
+    assert!(matches!(event.event, InvocationEventKind::Completed { .. }));
+
+    // One terminal outcome, then a clean close from the worker path.
+    let close = loop {
+        let message = tokio::time::timeout(Duration::from_secs(10), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if let Message::Close(frame) = message {
+            break frame.expect("close frame");
+        }
+    };
+    assert_eq!(u16::from(close.code), 1000);
+
+    // Decoding sanity on the audio path the relay forwards (header passes
+    // through verbatim).
+    let probe = encode_realtime_audio_frame(9, false, &[1, 2, 3, 4]).unwrap();
+    let (_header, payload) = decode_realtime_audio_frame(&probe).unwrap();
+    assert_eq!(payload, &[1, 2, 3, 4]);
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+}

@@ -56,6 +56,10 @@ pub struct GatewayState {
     tenant_concurrency: GatewayTenantConcurrency,
     max_output_tokens: u32,
     metrics: GatewayMetrics,
+    /// Realtime relay surface (DS3.6). `None` keeps the gateway
+    /// byte-identical to the pre-realtime shape.
+    pub(crate) realtime_relay:
+        Option<std::sync::Arc<crate::app::realtime_relay::GatewayRealtimeRelay>>,
 }
 
 impl GatewayState {
@@ -83,6 +87,7 @@ impl GatewayState {
             tenant_concurrency: GatewayTenantConcurrency::new(tenant_concurrency_config),
             max_output_tokens,
             metrics: GatewayMetrics::default(),
+            realtime_relay: None,
         }
     }
 
@@ -110,6 +115,7 @@ impl GatewayState {
             tenant_concurrency: GatewayTenantConcurrency::new(tenant_concurrency_config),
             max_output_tokens,
             metrics: GatewayMetrics::default(),
+            realtime_relay: None,
         }
     }
 
@@ -132,6 +138,16 @@ impl GatewayState {
     /// Install the scoped per-principal key directory (DS0.5). The default is
     /// an empty directory: authentication then behaves exactly as before the
     /// scoped-key feature existed.
+    /// Install the realtime relay surface (DS3.6). Absent keeps the public
+    /// surface unchanged.
+    pub(crate) fn with_realtime_relay(
+        mut self,
+        relay: crate::app::realtime_relay::GatewayRealtimeRelay,
+    ) -> Self {
+        self.realtime_relay = Some(std::sync::Arc::new(relay));
+        self
+    }
+
     pub(crate) fn with_principal_keys(
         mut self,
         principal_keys: crate::gateway_principal_keys::GatewayPrincipalDirectory,
@@ -815,11 +831,17 @@ pub fn create_gateway_router(state: GatewayState, serve_config: &ServeRuntimeCon
             },
         );
 
-    let v1_routes = Router::new()
-        .route(
-            "/chat/completions",
-            post(crate::api::openai::chat::completions::gateway_completions),
-        )
+    let mut v1_routes = Router::new().route(
+        "/chat/completions",
+        post(crate::api::openai::chat::completions::gateway_completions),
+    );
+    if state.realtime_relay.is_some() {
+        v1_routes = v1_routes.route(
+            "/realtime/ws",
+            get(crate::app::realtime_relay::relay_socket),
+        );
+    }
+    let v1_routes = v1_routes
         .fallback(api_not_found)
         .layer(middleware::from_fn_with_state(
             state.clone(),

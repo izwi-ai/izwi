@@ -82,7 +82,7 @@ use izwi_serving_client::{WorkerClient, WorkerClientConfig};
 use izwi_serving_protocol::{
     CredentialId, DeploymentId, IncarnationId, ModelAlias, ModelGeneration, NdjsonLimits, NodeId,
     PolicyRevision, ServiceBearerToken, ServiceCredentials, TaskKind, WorkerDescriptor, WorkerId,
-    WorkerStatus,
+    WorkerStatus, MAX_REMAINING_TIME_MS,
 };
 use logging::{LogFormat, SERVICE_NAME, SERVICE_VERSION};
 use persistence::PersistenceContext;
@@ -329,6 +329,24 @@ struct ServerArgs {
     /// Lifetime of a conversation pin.
     #[arg(long, env = "IZWI_GATEWAY_SESSION_PIN_TTL_SECS", default_value_t = 600)]
     gateway_session_pin_ttl_secs: u64,
+
+    /// Realtime relay (DS3.6): expose /v1/realtime/ws and forward
+    /// izwi-realtime-v1 sessions to eligible speech_to_text workers.
+    /// `off` keeps the gateway byte-identical to the pre-realtime shape.
+    #[arg(long, env = "IZWI_GATEWAY_REALTIME", default_value = "off")]
+    gateway_realtime: String,
+
+    /// Bounded concurrent realtime sessions through the relay.
+    #[arg(long, env = "IZWI_GATEWAY_REALTIME_MAX_SESSIONS", default_value_t = 64)]
+    gateway_realtime_max_sessions: usize,
+
+    /// End-to-end budget minted into each relayed worker session (ms).
+    #[arg(
+        long,
+        env = "IZWI_GATEWAY_REALTIME_SESSION_BUDGET_MS",
+        default_value_t = 600_000
+    )]
+    gateway_realtime_session_budget_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -742,6 +760,11 @@ async fn gateway_state(
 ) -> anyhow::Result<(gateway::GatewayState, Option<GatewayWorkerStatusPoller>)> {
     validate_gateway_topology_source(args)?;
     if args.gateway_worker_endpoints.is_empty() && args.gateway_worker_approvals.is_empty() {
+        if args.gateway_realtime == "on" {
+            anyhow::bail!(
+                "--gateway-realtime requires registry-based worker routing (approvals or endpoints); pinned single-worker mode does not support it"
+            );
+        }
         let remote = gateway_remote_execution(args, serve_config)?;
         return Ok((
             gateway::GatewayState::new(
@@ -972,16 +995,48 @@ async fn gateway_state(
         }));
     }
 
-    Ok((
-        gateway::GatewayState::with_dispatcher(
-            dispatcher,
-            enterprise_hooks,
-            perimeter,
-            serve_config.request_timeout_secs,
-            args.gateway_max_in_flight,
-        ),
-        Some(GatewayWorkerStatusPoller { tasks }),
-    ))
+    let state = gateway::GatewayState::with_dispatcher(
+        dispatcher,
+        enterprise_hooks,
+        perimeter,
+        serve_config.request_timeout_secs,
+        args.gateway_max_in_flight,
+    );
+    let state = if args.gateway_realtime == "on" {
+        // The relay targets the approved speech_to_text deployment; boot
+        // fails closed when no approved worker advertises one.
+        let realtime_deployment = deployment_table
+            .select(TaskKind::SpeechToText, &public_model)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--gateway-realtime is on but no approved worker advertises speech_to_text model {public_model}"
+                )
+            })?;
+        let relay = app::realtime_relay::GatewayRealtimeRelay::new(
+            registry,
+            app::realtime_relay::RealtimeRelayConfig {
+                deployment_id: realtime_deployment.deployment_id().clone(),
+                public_model: public_model.clone(),
+                policy_revision: PolicyRevision::new(args.gateway_policy_revision.trim())?,
+                backend_policy: gateway_backend_policy(args.backend.as_ref()),
+                max_sessions: args.gateway_realtime_max_sessions,
+                session_budget: Duration::from_millis(args.gateway_realtime_session_budget_ms),
+            },
+            credentials,
+        )
+        .map_err(|error| anyhow::anyhow!(error))?;
+        info!(
+            service = SERVICE_NAME,
+            version = SERVICE_VERSION,
+            deployment = %realtime_deployment.deployment_id(),
+            max_sessions = args.gateway_realtime_max_sessions,
+            "Gateway realtime relay enabled for izwi-realtime-v1 sessions"
+        );
+        state.with_realtime_relay(relay)
+    } else {
+        state
+    };
+    Ok((state, Some(GatewayWorkerStatusPoller { tasks })))
 }
 
 fn initial_gateway_worker_expectation(
@@ -1346,6 +1401,7 @@ fn validate_gateway_limits(args: &ServerArgs) -> anyhow::Result<()> {
     validate_status_cadence(ttl, poll)?;
     validate_router_cache_affinity_args(args)?;
     validate_session_pin_args(args)?;
+    validate_realtime_relay_args(args)?;
     Ok(())
 }
 
@@ -1388,6 +1444,32 @@ fn validate_session_pin_args(args: &ServerArgs) -> anyhow::Result<()> {
     let ttl = Duration::from_secs(args.gateway_session_pin_ttl_secs);
     if ttl.is_zero() || ttl > app::remote_chat_dispatch::MAX_SESSION_PIN_TTL {
         anyhow::bail!("--gateway-session-pin-ttl-secs is outside the supported range");
+    }
+    Ok(())
+}
+
+/// Parses and bounds-checks the realtime relay knobs (DS3.6).
+fn validate_realtime_relay_args(args: &ServerArgs) -> anyhow::Result<()> {
+    match args.gateway_realtime.as_str() {
+        "on" | "off" => {}
+        other => anyhow::bail!("--gateway-realtime must be `on` or `off`, got `{other}`"),
+    }
+    if args.gateway_realtime == "off" {
+        return Ok(());
+    }
+    if args.gateway_realtime_max_sessions == 0
+        || args.gateway_realtime_max_sessions > app::realtime_relay::MAX_RELAY_SESSIONS
+    {
+        anyhow::bail!(
+            "--gateway-realtime-max-sessions must be between 1 and {}",
+            app::realtime_relay::MAX_RELAY_SESSIONS
+        );
+    }
+    let budget = Duration::from_millis(args.gateway_realtime_session_budget_ms);
+    if budget.is_zero() || budget > Duration::from_millis(MAX_REMAINING_TIME_MS) {
+        anyhow::bail!(
+            "--gateway-realtime-session-budget-ms must be between 1 and {MAX_REMAINING_TIME_MS}"
+        );
     }
     Ok(())
 }
