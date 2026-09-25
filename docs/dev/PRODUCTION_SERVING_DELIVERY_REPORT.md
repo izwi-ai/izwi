@@ -68,6 +68,16 @@ DS1.x additions (verified 2026-09-25): worker suites incl. the
 izwi-core qwen38 attach + engine cache suites green; gateway benchmark
 harness 18 unit tests; DS1.5 runner smoke test.
 
+DS1.6 additions (verified 2026-09-25): catalog prefix-reuse inventory tests;
+prefix engagement/leniency unit tests (config, engine config, serve_runtime
+tri-state); worker suites green with the new catalog-auto admission leg (no
+prefix env, counters assert through normal admission) and the independent
+kill-switch leg; backend_parity 4 CPU legs + both Metal legs green on the
+metal-feature build (`--include-ignored`); izwi-core lib 2647, cli 72,
+server 678 (one unrelated pre-existing cancellation-race flake reproduced
+once and passed on retry and on the clean tree); clippy/fmt clean on touched
+code.
+
 ## Tests not executed and why
 
 - CUDA/Metal *inference*, multi-GPU, multi-machine, soak, overload matrices:
@@ -121,7 +131,8 @@ No destructive migrations shipped.
 
 ## Next highest-priority task
 
-DS1.6 completion — per-backend prefix-reuse enablement in the capability
-catalog (CPU+Metal parity evidence is already green) and the DS1.2b
-default-on decision; then DS2 cache-aware routing. DS0.5 scoped per-principal
-API keys remains a standalone security slice.
+DS2 cache-aware routing (the registry currently routes by load only), then
+DS0.5 scoped per-principal API keys as a standalone security slice. DS1 is
+complete including DS1.6: committed prefix reuse is default-on through the
+evidence-gated catalog-auto mode (see the support matrix's per-family table
+and the DS1 analysis decision record).

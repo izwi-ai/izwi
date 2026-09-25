@@ -209,3 +209,43 @@ legacy behavior); the rig runs 40, which absorbs the credit race entirely.
   correctness is unaffected.
 - Cold-lane evictions (37) are the expected behavior of unique prompts cycling
   through a bounded snapshot index.
+
+
+## DS1.6 default-on decision (2026-09-25)
+
+Committed cross-request prefix reuse is now default-on for supported chat
+cells through an evidence-gated **catalog-auto** mode, decided after the DS1.5
+counter-evidence completed:
+
+- **The table:** `catalog/prefix_reuse.rs` carries one cell per model family
+  per backend lane (the `cuda_support.rs` pattern). qwen3.8 hybrid engages on
+  CPU and Metal (process-parity legs); dense qwen3/gemma3 engage on CPU (DS1.2
+  fixture suite); every CUDA cell is not-run; qwen3.5/LFM2 hybrid families and
+  non-chat families are excluded by design. A family that passes on one lane
+  but not another is enabled only on the evidenced lane.
+- **The modes:** explicit `IZWI_ENABLE_PREFIX_CACHING=1` keeps today's
+  semantics (requires `IZWI_MANAGED_PREFIX_CACHE_SALT`, bypasses the table —
+  the operator asked for it and benchmark rigs depend on it); an explicit `0`
+  is the kill switch and disables auto; `IZWI_PREFIX_REUSE_AUTO` pins the mode
+  explicitly. With no explicit choice, worker/CLI/server serving surfaces
+  resolve catalog-auto (named constant
+  `serve_runtime::PREFIX_REUSE_CATALOG_AUTO_DEFAULT`). Library
+  `EngineConfig::default()` stays fail-closed.
+- **The mechanics:** catalog-auto resolves one namespace per runtime — the
+  operator's salt, or a generated per-process one (never serialized). The
+  model registry carries the resolved mode; every shareable contract builder
+  (qwen3.8 hybrid, dense qwen3, gemma3, voxtral LM) derives its per-domain
+  prefix policy from the catalog verdict for the loaded family on the active
+  backend, which also removed the qwen3.8 env side-channel
+  (`qwen38/chat.rs` re-read `IZWI_ENABLE_PREFIX_CACHING` at load time). A
+  zero safe page budget (reserve >= capacity, e.g. tiny page sizes) degrades
+  auto to Disabled with a recorded `fallback_reason` instead of failing
+  startup; explicit enablement keeps the fail-closed error.
+- **Admission evidence:** `backend_parity` gained two legs on the real worker:
+  `qwen38_prefix_reuse_engages_by_default_without_explicit_operator_choice`
+  (no prefix env at all — publishes/attaches/reused counters assert through
+  normal admission on the CPU lane) and `explicit_zero_prefix_caching_keeps_
+  reuse_off` (kill switch records zero reuse). The DS1.5 prefix lanes stay
+  green, including the metal-feature leg.
+- **Not claimed:** no wall-clock speedup claim (fixture scale), no CUDA
+  engagement, no dense-family Metal engagement until a lane parity leg exists.

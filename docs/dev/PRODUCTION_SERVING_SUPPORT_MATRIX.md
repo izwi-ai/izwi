@@ -18,6 +18,29 @@ is never promoted to real hardware or performance evidence.
 | Multiple machines | One gateway | Versioned node/worker-pinned HTTPS approvals | Fleet topology fails closed without mTLS client identity, HTTPS, and exact operator-pinned node/worker IDs; the bundled worker remains loopback-only and no proxy enforcement, separate-machine handshake, or artifact path was exercised | Not supported as an operational profile |
 | Multiple gateways | Two or more gateways | Any worker fleet | Worker admission stays authoritative, but registry, circuit state, tenant rate state, durable providers, and active-work quota ownership are not shared authorities | Not supported; Phase 8 gates remain open |
 
+## Committed prefix reuse by model family and backend (DS1.6)
+
+The catalog (`crates/izwi-core/src/catalog/prefix_reuse.rs`) records one cell
+per model family per backend lane; serving surfaces default to catalog-auto,
+which engages reuse only for cells with lane evidence. An explicit
+`IZWI_ENABLE_PREFIX_CACHING=1` bypasses the table (salt required); an explicit
+`0` is the kill switch. Auto degrades to Disabled with a recorded reason when
+the runtime's page budget cannot fit a safe prefix reserve.
+
+| Family | CPU | Metal | CUDA |
+|---|---|---|---|
+| Qwen3.8 chat (hybrid) | Supported — process parity (`backend_parity` prefix leg) | Supported — process parity (metal-feature leg) | Not enabled — no lane evidence |
+| Qwen3 chat (dense) | Supported — DS1.2 fixture suite | Not enabled — contract declared, no lane parity | Not enabled — no lane evidence |
+| Gemma3 chat (dense) | Supported — DS1.2 fixture suite | Not enabled — contract declared, no lane parity | Not enabled — no lane evidence |
+| Voxtral (LM) | Not enabled — contract declared, no lane parity | Not enabled | Not enabled |
+| Qwen3.5 chat (hybrid) | Excluded — hybrid reuse unproven (DS1.1 scope) | Excluded | Excluded |
+| LFM2 chat (hybrid) | Excluded — hybrid reuse unproven | Excluded | Excluded |
+| ASR / TTS / diarization / aligner families | Excluded — managed reuse is chat-task-gated | Excluded | Excluded |
+
+This is an evidence statement, not a performance certificate: reuse on the
+fixture lanes is counter-proven (counters + output equivalence), not
+wall-clock-proven.
+
 The only remotely advertised inference route in gateway mode is text-only
 `POST /v1/chat/completions`, including its existing JSON and SSE response forms.
 Every other route family remains explicitly local-only or absent as recorded in
