@@ -18883,3 +18883,513 @@ replay the scheduled span to the attach cursor. Reproduce:
 (ignored diagnostic, documents the failure). After it lands: DS1.5
 prefix-heavy/prefix-cold runs on CPU+Metal (prompts must fit the fixture's
 per-sequence page grant), DS0.8-harness parity leg, default-on decision.
+
+## DS1.5 attach-span clipping session — 2026-09-25
+
+Task: fix the DS1.2b attach blocker before the DS1.5 benchmark runs. After a
+fresh session attaches a published snapshot / reused paged prefix at cursor C
+(`execution_start_tokens = C`), the scheduler still issues the logical span
+`[0..N)` and the qwen38 model fed `prompt_ids[0..N)` while its physical cache
+was already at C — either the fail-closed "cache holds X but the next span
+starts at Y" guard or `physical paged append ends at N, beyond capacity M`.
+
+### Root cause (code-walked 2026-09-25)
+
+- Manager (cache/managed.rs:1703): `execution_start_tokens =
+  snapshot.committed_tokens.max(prefix_match.reused_tokens)`; executor builds
+  the row cache with `context_len = execution_start_tokens`
+  (executor.rs:734-742). Receipt math (execution.rs:1890) expects backend
+  writes for exactly `[execution_start..target)` — so the append contract is
+  `[C..N)`.
+- Scheduler passes the logical span `[0..N)` verbatim (by design: it is the
+  progress/authority layer; cache lookup happens after scheduling).
+- qwen38 model side assumes a fresh reservation:
+  `begin_chunked_prefill_state_physical` rejects `cache.context_len() != 0`,
+  and `continue_chunked_prefill_physical` requires `prefill_progress ==
+  span_start == cache.context_len()`, then feeds from `prefill_progress`.
+- qwen3/gemma3 already solve this exact problem model-side:
+  `continue_resumable_prefill` feeds `prompt_ids[physical_start..span_end)`
+  (physical cache cursor), keeps `prefill_progress` as the LOGICAL scheduler
+  cursor, treats `span_start == 0` as the attach-capable first span, and sets
+  `prefill_progress = span_end` after each span. The handler passes scheduler
+  spans verbatim; `tokens_processed` = scheduled span length already.
+- Second half of the bug: the handler's fresh-request branch binds the hybrid
+  tensor sequence but never restores the forked DeltaNet/conv state from the
+  tensor arena, so an attached fresh session would run linear-attention layers
+  from empty state while full-attention KV was at C (silent corruption). The
+  stateful branch already restores every step; `restore_tensor_domains`
+  no-ops on an empty sequence, so the fresh branch can restore unconditionally.
+
+### Plan
+
+- [ ] 1. qwen38 `begin_chunked_prefill_state_physical`: accept an attached
+      cache (`context_len() < prompt len` instead of `== 0`); keep
+      `prefill_progress: 0`; MTP cache still must be empty (Disabled domain).
+- [ ] 2. qwen38 `continue_chunked_prefill_physical`: mirror qwen3's logical vs
+      physical split — logical guard `prefill_progress == span_start`; physical
+      `physical_start = cache.context_len()`; for `span_start > 0` require
+      `physical_start == span_start`, for the first span allow
+      `0 < physical_start < span_end`; feed
+      `prompt_ids[physical_start..span_end]` + matching positions; MTP
+      known-rows from `physical_start`; land `prefill_progress = span_end`.
+- [ ] 3. handler_chat.rs fresh branch: after
+      `bind_hybrid_tensor_sequence`, restore hybrid tensor state from the
+      arena so attached fresh sessions adopt the forked state (no-op when the
+      sequence is empty).
+- [ ] 4. Core unit test (qwen38 chat): hybrid fixture; prefill a prefix into a
+      cache, rebuild the attached view at cursor C (`reservation()` helper),
+      run attached chunked prefill + decode, assert identical outputs to the
+      fresh run; also assert span guards fail closed on bad spans.
+- [ ] 5. Un-ignore worker `prefix_attach_repro` (publishes>=1, attaches>=1,
+      reused>=16, second request completes) and prove it green.
+- [ ] 6. Verify: izwi-core lib suite, worker suites, clippy -D warnings on
+      touched code, fmt, boundary check. Commit. Docs/ledger/memory.
+- Scheduler/manager/receipt layers intentionally unchanged: `tokens_processed`
+  stays the scheduled span length, receipts already expect `[C..N)` slots,
+  `prefill_progress` lands on `span_end` satisfying the registry post-check.
+- Known boundary left fail-closed (pre-existing): chunked prefill DISABLED +
+  prefix hit still errors in the monolithic begin paths; DS1.5 benchmark lanes
+  run with chunked prefill enabled.
+
+### Findings (2026-09-25, continued) — the clip alone is not enough
+
+Running the un-ignored repro after the model-side clip surfaced two deeper
+defects; the row error was invisible until a temporary `row failed terminally`
+error log (kept) at core.rs's terminal-release site:
+
+1. The attach request's first chunk (scheduled [0..32), threshold 32, page 16)
+   matched only one page: the manager lookup is bounded by
+   `target_committed_tokens - 1`, and the aligned first chunk commits exactly
+   to the snapshot boundary — so a boundary equal to the chunk end is
+   unreachable by construction. The reconcile then truncated the match to 0
+   (truncations=1, attaches=0) and the session recomputed.
+2. That recompute then died at commit with "prefix digest is already bound to
+   different tokens, position, namespace, or page": the publication range
+   republished page identities the earlier session already bound to its own
+   blocks. Capacity-preemption recomputes would hit the same collision.
+
+### Revised plan
+
+- [x] 1a. Model-side clip + fresh hybrid tensor restore + attach unit test.
+- [x] 1b. Prefix index: content-identical republication (same digest, same
+      key, different private block) is skipped, keeping the original binding;
+      only a same-digest/different-key collision stays a reject. Test
+      rewritten to the new contract.
+- [ ] 1c. Commit 1 with suites + clippy + fmt (repro stays ignored with the
+      updated reason).
+- [ ] 2a. Manager read-only prefix probe (lookup + snapshot reconcile over the
+      full prompt) exposed for admission; engine core probes after the managed
+      runtime is installed and stores the cursor on the EngineCoreRequest.
+- [ ] 2b. Scheduler: RequestMetadata.managed_prefix_cursor; the first prefill
+      span plans [cursor..min(cursor+budget, total)) with num_computed=cursor
+      and RunningRequest progress starting at the cursor; a reset API clears
+      cursor+progress for the cursor-lost retry.
+- [ ] 2c. Manager prepare: when the scheduled span starts exactly at the
+      expected cursor on a fresh table, attach directly (re-verify pages +
+      snapshot); a realized cursor below the expected one returns a typed
+      sentinel backpressure the engine turns into rollback + cursor reset +
+      deferred retry.
+- [ ] 2d. Handler begin condition accepts num_computed == the request's
+      expected cursor (never-executed jumped request).
+- [ ] 2e. Un-ignore the repro; prove attaches>=1, reused>=16, outputs
+      complete; full suites; commit 2; docs/ledger/memory.
+
+### DS1.5 attach-span clipping — session result (2026-09-25)
+
+Committed ae540d3c "feat(serving): attach shared KV prefixes at the
+admission-probed cursor". The un-ignored `prefix_attach_repro` now passes:
+publishes>=1, attaches=1, truncations=0, both requests complete; the new core
+test `attached_prefill_matches_the_fresh_run_and_fails_closed_on_bad_spans`
+proves attached chunked prefill is numerically identical to a fresh run
+(single-span and chunked, real hybrid fixture, real tensor-state fork) and
+that unclipped/stale/empty spans fail closed.
+
+What actually fixed it (three stacked defects, all landed in one slice):
+1. Model side: qwen38 begin seeds the logical prefill cursor from the
+   attached physical cursor and accepts a non-empty reservation; the handler
+   adopts the forked hybrid tensor state on the fresh RESUMABLE path only (a
+   monolithic begin already consumed its prompt — unconditional restore broke
+   the LFM2 parity warmup with "retained ShortConv state disappeared") and
+   clips spans to the state's own cursor; qwen3/gemma3 begins seed their
+   cursors too.
+2. Scheduler side: admission probes the managed prefix index over the FULL
+   prompt (the manager-side attach was unreachable for multi-chunk prompts —
+   the first-chunk lookup is bounded by target-1 and the aligned first chunk
+   commits exactly to the snapshot boundary). The first span plans
+   [cursor..residual) with progress starting at the cursor; prepare
+   re-verifies and attaches at the expected cursor; a cursor evicted between
+   probe and prepare degrades to a typed MANAGED_PREFIX_CURSOR_LOST
+   backpressure that resets to zero-start. Replay suspend and recompute
+   restart clear the cursor (context-0 rebuilds).
+3. Index side: content-identical republication of a bound page identity is
+   skipped instead of rejected ("prefix digest is already bound" killed
+   recompute commits; capacity-preemption recomputes would hit the same).
+
+Also: terminal row failures now log kind+message at error level (rows used to
+die invisibly; the caller only saw a closed stream).
+
+Diagnostics for the next session (DS1.5 benchmark runs):
+- Reuse depth is capped by the publishing session's FIRST chunk: only
+  prefix-eligible (fresh, start==0) spans publish page identities. The
+  benchmark's shared workload should set IZWI_CHUNKED_PREFILL_THRESHOLD at or
+  above the shared prefix length so the publisher commits its whole prefix in
+  one aligned chunk (then attaches reach the deepest published boundary).
+  Widening mid-session publication to chunks 2+ is a deliberate follow-up,
+  not part of this slice.
+- Verification evidence: izwi-core lib 2639/2639 (x2 runs), worker lib+bin+
+  integration suites green (backend_parity 1/1, prefix_attach_repro 1/1,
+  real_cpu_process 1/1), clippy 0 warnings on izwi-core lib+tests,
+  pre-existing warnings documented elsewhere untouched, fmt clean, commit
+  contains exactly the 12 slice files.
+
+# DS1.5 — prefix benchmark evidence + parity leg — 2026-09-25 (continued)
+
+Continuation: the attach fix (ae540d3c) landed last session. Items 1-3 of the
+09-24 plan are done (synthetic-geometry gate, qwen38 fixture writer, worker
+telemetry hook + prometheus counters). This session: items 4-9.
+
+Design constraints verified this session (do not re-derive):
+- Gateway chat dispatch sends `context_tokens: None` (remote_chat_dispatch.rs:126),
+  so the worker's hardcoded capability `max_context_tokens=Some(32)`
+  (worker main.rs:148) does NOT gate long prompts on /v1/chat/completions;
+  `output_tokens` IS checked — keep --max-tokens <= 32.
+- Gateway start pattern (gateway_only_process.rs:51-72): `izwi-server --role
+  gateway --host H --port P --public-model Qwen3.8-27B-FP8
+  --gateway-worker-approval "http://W|chat|Qwen3.8-27B-FP8|DEPLOYMENT|1"` with
+  env IZWI_GATEWAY_API_KEY, IZWI_GATEWAY_WORKER_CREDENTIAL_ID,
+  IZWI_GATEWAY_WORKER_BEARER_TOKEN; readiness = /livez then /readyz. Worker is
+  passive (no registration); approval URL + shared credential pair.
+- Fixture generation: `IZWI_BENCH_FIXTURE_DIR=<root> cargo test -p
+  izwi-serving-worker --test backend_parity generate_qwen38_benchmark_fixture
+  -- --ignored` writes <root>/Qwen3.8-27B-FP8, revision
+  017b9c7af6b5689d5dd426a76e0bc077eb5ca20a (= QWEN38_FIXTURE_REVISION; the
+  worker's IZWI_WORKER_ARTIFACT_REVISION must equal it).
+- WorkerClient has no metrics method; the parity leg reads counters with a raw
+  HTTP/1.0 GET of /internal/v1/metrics/prometheus (same bearer token), parsing
+  izwi_engine_kv_cache_{hits,misses,evictions,reused_tokens}_total,
+  izwi_engine_kv_cache_avoided_prefill_tokens_total,
+  izwi_engine_tensor_snapshot_{publishes,attaches,truncations,evictions}_total.
+- Metal lane env: IZWI_BACKEND=metal + IZWI_WORKER_EXPECTED_DEVICE_ID
+  (metal:<registryID> via swift MTLCreateSystemDefaultDevice) +
+  IZWI_METAL_DEVICE_ORDINAL=0; no CPU budget envs; 120s startup deadline.
+- Chunked-prefill threshold must be >= shared prefix length (publisher first
+  chunk caps reuse depth).
+
+- [ ] 4. backend_parity qwen38 hybrid prefix leg: CPU determinism across two
+      worker processes with prefix caching ON (salt, chunked prefill, MTP off,
+      page 16); attach-run outputs == publish-run outputs; counters parsed from
+      worker metrics prove publishes>=1 and attaches>=1 per process; Metal leg
+      (metal feature) outputs == CPU outputs; Metal without host GPU records
+      not-run.
+- [ ] 5. run-gateway-chat-benchmark.py: --workload {default,shared,cold} with
+      --prefix-tokens/--suffix-tokens (shared = constant system prefix +
+      per-request unique user suffix; cold = unique per-request prompts of the
+      same total length; default = unchanged fixed prompt). Unit tests updated.
+- [ ] 6. scripts/bench/run-ds15-prefix-benchmark.sh + test-run-ds15-prefix-benchmark.sh
+      companion: fixture generation (skipped when present), worker (lane env) +
+      gateway orchestration (approval URL, API key, raised tenant concurrency),
+      python harness per workload per lane, worker prometheus counters
+      before/after, manifests benchmarks/manifests/ds15-{lane}-{workload}.json
+      with counters + TTFT deltas.
+- [ ] 7. Run shared+cold on CPU and Metal lanes; verify attaches>0/publishes>0
+      on shared, attaches==0 on cold; record TTFT delta.
+- [ ] 8. Verify: qwen38 native/cache tests, engine cache tests, worker suites
+      (lib+bin+integration), parity legs, clippy -D warnings on touched code,
+      fmt, boundary check.
+- [ ] 9. Docs: DS1 analysis status, plan checkboxes (DS1.5, DS1.6 CPU/Metal leg;
+      CUDA not-run), support matrix, delivery report, ledger, memory, commits.
+
+## DS1.5 benchmark evidence session — result (2026-09-25)
+
+All DS1.5 plan items (4-9) executed. Commits: worker parity leg; bench
+workloads + rig; evidence manifests + docs.
+
+- [x] 4. `backend_parity` qwen38 hybrid prefix leg: two CPU worker processes
+      produce identical outputs with prefix caching on; per-process
+      publishes>=1/attaches>=1/reused>=16 asserted from the worker prometheus
+      text (raw HTTP/1.0 GET, bearer + credential-id headers); Metal leg
+      (metal feature) bit-identical to CPU, not-run without a host GPU.
+- [x] 5. Harness `--workload {default,shared,cold}` + `--prefix-tokens`/
+      `--suffix-tokens`/`--vocab`/`--max-retries` (default 0 = legacy).
+      18 unit tests.
+- [x] 6. `run-ds15-prefix-benchmark.sh` + companion smoke test (dry-run plan,
+      arg validation, jq manifest shape). Orchestrates fixture generation,
+      worker+gateway, per-workload runs, counter capture, manifests, gates.
+- [x] 7. CPU and Metal lanes green: shared 40/40 completed, 36 attaches,
+      4736 avoided-prefill tokens, 1 publish; cold 40/40, 0 attaches,
+      40 publishes. TTFT p50 delta ~0 at fixture scale (expected; prefill is
+      microseconds at this size — reuse is counter-proven). Manifests
+      benchmarks/manifests/ds15-{cpu,metal}-{shared,cold}.json + summaries.
+- [x] 8. Worker lib 12 / bin 5 / integration green (parity 2, repro 1,
+      real_cpu_process 1); metal-feature parity 4/4; izwi-core qwen38 attach
+      1/1 + engine cache 162/162; clippy on touched code clean (pre-existing
+      warnings untouched); fmt clean.
+- [x] 9. Docs: plan DS1.5 checked (DS1.6 progress note), DS1 analysis doc
+      benchmark section, support matrix Metal cell, delivery report, ledger,
+      memory.
+
+Two rig findings recorded in the DS1 analysis doc (do not re-derive):
+1. Every qwen38 request carries a ~43-token Xhigh reasoning-instruction block
+   that tokenizes to 41 identical unk tokens on the fixture tokenizer — with
+   16-token pages even cold requests share 2 pages (reused=64 = 32 x 2
+   domains). The rig uses kv_page_size=64 so the first page boundary lands in
+   per-request content; cold isolation is impossible below that.
+2. The gateway sheds on stale capacity credits (200ms status poll): a
+   closed-loop client without retries burned 80% of submissions while the
+   worker itself rejected nothing (admitted==completed, rejected=0). The
+   harness gained --max-retries; the rig runs 40.
+
+Open next: DS1.6 completion (per-backend catalog enablement + default-on
+decision), DS0.5, DS2.
+
+## DS1.6 completion session — per-backend catalog enablement + default-on decision (2026-09-25)
+
+Decision (recorded in DS1 analysis doc + support matrix): prefix reuse becomes
+**default-on through an evidence-gated Auto mode at the product serving
+surfaces**. Library `EngineConfig::default()` stays fail-closed (flag off, no
+auto). Auto consults a new catalog capability (`catalog/prefix_reuse.rs`,
+cuda_support.rs pattern — one cell per model family per backend) and engages
+only cells with real parity evidence: qwen38 CPU+Metal (process parity legs),
+dense qwen3/gemma3 CPU (DS1.2 fixture suite). CUDA cells stay not-run; qwen35,
+lfm2, ASR/TTS stay excluded. Explicit `IZWI_ENABLE_PREFIX_CACHING=1` keeps
+today's semantics (requires salt; bypasses the catalog — operator asked for it).
+Kill switch: `IZWI_ENABLE_PREFIX_CACHING=0` (or config false) disables auto.
+Auto generates an ephemeral per-process namespace salt when the operator did
+not provide one; explicit enable still hard-fails without a salt.
+
+- [ ] 1. `catalog/prefix_reuse.rs`: `PrefixReuseSupport { level, evidence,
+      reason }` + `ModelFamily`/`ModelVariant` cell tables per `BackendKind`,
+      `engages()` helper, `ModelInfo.prefix_reuse` embedding, inventory tests
+      (every variant × backend; disabled variants fail-closed).
+- [ ] 2. Config/engine plumbing: `PrefixReuseMode {Disabled, Explicit,
+      CatalogAuto}` on the model registry; `EngineConfig`/`EngineCoreConfig`
+      `prefix_reuse_catalog_auto` (serde default false); auto resolution
+      helper + ephemeral salt (rand, logged once, never serialized);
+      RuntimeService mapping; EngineCore policy resolution honors auto.
+- [ ] 3. Model-level gating: registry threads the decision into qwen38 (fix
+      the `IZWI_ENABLE_PREFIX_CACHING` env side-channel in
+      `qwen38/chat.rs:959`), gemma3, qwen3, voxtral contract builders
+      (dense `CommittedPages` becomes conditional); builder unit tests for
+      explicit/auto-unsupported/auto-supported/off.
+- [ ] 4. Product surfaces: serve_runtime auto default (named constant) +
+      kill switch on explicit false; worker main env-presence resolution;
+      CLI env passthrough; deployment/runbook template exposure; Auto-mode
+      admission test — real worker process with NO prefix env, qwen38
+      fixture, CPU lane: attach counters > 0 through normal admission.
+- [ ] 5. Verify: izwi-core lib + engine cache + kv_public_compatibility +
+      qwen38 contract tests; worker lib/bin/integration (real_cpu_process,
+      parity, repro); metal-feature parity leg; clippy -D warnings on touched
+      code; rustfmt on exact files (skip_children); boundary check.
+- [ ] 6. Docs: plan DS1.6 checkbox + note; support-matrix per-model-family
+      prefix-reuse table (DS1 acceptance); DS1 analysis decision record;
+      delivery report; ledger; memory. tasks/ stays untracked.
+
+## DS1.6 completion session — result (2026-09-25)
+
+All 6 items executed. Commits: 04c4f7ae (catalog table), b1c1fd48 (engine/
+registry/model gating), f904de98 (product surfaces + parity legs),
+3ef80aee (docs).
+
+- [x] 1. `catalog/prefix_reuse.rs`: `PrefixReuseSupport {level, evidence,
+      reason}` per family × BackendKind + `PrefixReuseMode {Disabled,
+      Explicit, CatalogAuto}` + `prefix_reuse_engages()`; inventory tests
+      cover every variant × backend, disabled variants fail closed.
+- [x] 2. `EngineConfig`/`EngineCoreConfig.prefix_reuse_catalog_auto` (library
+      default false); `resolve_prefix_engagement` + `apply_prefix_engagement`
+      resolve ONE namespace per runtime (explicit keeps the fail-closed salt
+      contract; auto generates a per-process uuid namespace); registry gains
+      `with_prefix_reuse_mode`; RuntimeService maps mode + reconciles a
+      degraded policy. Zero safe page budget degrades auto to Disabled with
+      fallback_reason (explicit still errors) — found because the default LFM
+      fixture leg (page size 1, capacity 1024) refused startup otherwise.
+- [x] 3. Registry threads the mode into chat/voxtral loaders; qwen3.8 env
+      side-channel removed (flag threaded); dense qwen3/gemma3/voxtral LM
+      contracts now conditional (`CommittedPages` vs `Disabled`, group
+      `prefix_shareable` follows); ASR/TTS callers pass false explicitly.
+- [x] 4. serve_runtime named constant `PREFIX_REUSE_CATALOG_AUTO_DEFAULT` +
+      tri-state (explicit flag kills auto; `IZWI_PREFIX_REUSE_AUTO` pins);
+      worker main env-presence resolution; CLI exports the resolved tri-state
+      instead of forcing the legacy bool. New `backend_parity` legs:
+      catalog-auto admission (no prefix env → counters prove reuse) and
+      independent kill switch (explicit 0 → zero reuse counters).
+- [x] 5. Verified: izwi-core lib 2647 + conformance 7 + kv_public 3; worker
+      lib 12 / bin 5 / parity 4 / repro 1 / real_cpu_process 1; metal-feature
+      build 6/6 incl. both Metal parity legs (--include-ignored); cli 72;
+      server 678 (one pre-existing cancellation-race flake reproduced once,
+      passed on retry + on clean tree); clippy/fmt clean on touched files;
+      boundary gate passes.
+- [x] 6. Docs: plan DS1.6 checked, support matrix per-family table, DS1
+      analysis decision record, delivery report + verification line, memory.
+
+Next: DS2 cache-aware routing (DS2.1 protocol fields first), then DS0.5.
+
+## DS2 session — cache-aware routing and richer status signals (started 2026-09-25)
+
+Plan: docs/dev/PRODUCTION_DISTRIBUTED_SERVING_PLAN.md §DS2 (DINV-01/03/10, T29-T31).
+Outcome target: registry routes by cache locality; evidence gates the default.
+
+- [ ] 1. DS2.1 Protocol: bump PROTOCOL_MINOR_VERSION 0→1; add 6 Option fields to
+      LoadedDeployment (kv_cache_usage_pct, prefix_hits_total,
+      prefix_queries_total, prefix_evictions_total, tokens_out_per_s_ema,
+      observation_cost_units); relax the two registry is_supported_by gates to
+      major-only so (1,0) workers stay registrable (additive tolerance both
+      directions); protocol absent/present decode tests; registry test that a
+      (1,0) status registers and observes.
+- [ ] 2. DS2.2 Worker exposure: status() populates fields from
+      executor.runtime_telemetry() (kv pct = coordinator allocated/capacity,
+      queries = hits+misses, evictions, cost units = permit model); worker
+      tokens_out_per_s EMA recorded at ExecutionEvent::Completed; mock worker
+      configurable knobs; worker tests.
+- [ ] 3. DS2.3 Registry affinity: WorkerRegistryConfig gains cache_affinity +
+      min_hit_ratio + max_kv_usage_pct (bounded, default off); two-track
+      selection (affinity-eligible candidates preferred, else exact current
+      scoring); ServerArgs env IZWI_GATEWAY_ROUTER_CACHE_AFFINITY /
+      _MIN_HIT_RATIO / _MAX_KV_USAGE_PCT; unit tests (warm worker preferred,
+      absent signals degrade to capacity scoring).
+- [ ] 4. DS2.4 Conversation pinning: hashed conversation key (sha256 of
+      normalized first-N-token prefix; no raw content leaves the gateway),
+      bounded LRU+TTL pin table in RemoteChatDispatcher, preferred-worker
+      selection path, pinned-but-uneligible → normal admission; env
+      IZWI_GATEWAY_SESSION_PIN / _MAX_ENTRIES / _TTL_SECS (default off); key
+      derivation + bounds tests.
+- [ ] 5. DS2.5 Evidence: multi_turn workload in run-gateway-chat-benchmark.py
+      (real growing history, per-turn POST); 2-worker rig script modeled on
+      run-ds15-prefix-benchmark.sh; routing off/on manifests on CPU lane (Metal
+      if memory allows); commit manifests.
+- [ ] 6. Docs: plan checkboxes, honest default (off unless measured TTFT win),
+      delivery report, ledger, memory; tasks/ stays untracked.
+
+## DS2 session — result (2026-09-25)
+
+All 6 items executed. Commits: 141d44a1 (protocol minor-1 fields + major-only
+gates), 345fcdad (worker status exposure), 2816963a (cache-affinity routing),
+667ff619 (conversation pinning), 3791f647 (CPU evidence), 85b02cd2 (Metal
+evidence), plus the plan-doc update.
+
+- [x] 1. Protocol: LoadedDeployment +6 Option signal fields; PROTOCOL_MINOR
+      0→1; registry's three is_supported_by gates relaxed to
+      shares_major_with (major-only) so (1,0) workers stay registrable;
+      absent/present decode tests; minor-0 registry test. Mock gained
+      MockRoutingSignals (had to land here: the crate wouldn't compile
+      otherwise).
+- [x] 2. Worker: apply_kv_routing_signals (allocated/capacity pages, hits,
+      hits+misses, evictions); TokensOutEma (alpha 0.3, CAS loop, zero-bits =
+      unset) recorded at ExecutionEvent::Completed; observation_cost_units=1
+      (permit model). real_cpu_process test asserts signals end-to-end.
+- [x] 3. Registry: Candidate struct + consider_candidate two/three-track
+      selection (pinned > warm > any, each track scored identically);
+      CacheAffinityConfig (default off, ratio [0,1], usage (0,100], NaN
+      rejected); IZWI_GATEWAY_ROUTER_CACHE_* args validated in
+      validate_gateway_limits; tests: warm preferred, off unchanged, weak/
+      full/absent signals degrade, config bounds.
+- [x] 4. Pinning: conversation_key = sha256 of normalized (role,token) pairs
+      of system prompt + first user message, cap 256 tokens — FIXED REGION
+      (a whole-history hash is unstable for short conversations and would
+      never pin; found by the key-stability test failing). ConversationPins
+      bounded LRU + TTL in the dispatcher; select_and_reserve_preferring*
+      registry path; pins recorded on accepted dispatches incl. failover;
+      IZWI_GATEWAY_SESSION_PIN* envs; e2e scripted-worker tests.
+- [x] 5. Evidence: multi_turn workload (real replies replayed, per-turn
+      retries) + run-ds2-routing-benchmark.sh (2 workers/leg, per-worker
+      counters). CPU: attaches 15→19, hits 35→46, avoided 3520→4288, TTFT
+      p50 60.6→42.2ms. Metal: 11→20, 24→48, 327→310ms. DEFAULT STAYS OFF:
+      TTFT direction flipped once across runs at fixture scale; robust TTFT
+      win at production scale gates the flip (documented in plan).
+- [x] 6. Docs: plan DS2 checkboxes + env names; delivery notes; memory.
+
+Rig findings (would have cost time to rediscover): two workers need distinct
+IZWI_WORKER_ID values (gateway rejects duplicate logical workers); the harness
+multi_turn path originally had no retry loop and a swallowed failed-branch —
+4 conversations silently vanished as rejected=0/failed=0; jq `def` takes
+`;`-separated args, not commas.
+
+Verification: protocol 18/18, worker lib 14/14, real_cpu_process 1/1,
+registry 27/27, dispatcher 15/15, izwi-server lib 688/688; clippy clean on
+touched code (pre-existing warnings untouched); rustfmt direct + git-status
+check per file.
+
+Next: DS0.5 scoped per-principal API keys, then DS3 realtime voice over the
+worker boundary.
+
+# Plan — DS0.5 Scoped per-principal gateway API keys — 2026-09-25
+
+Scope (docs/dev/PRODUCTION_DISTRIBUTED_SERVING_PLAN.md DS0.5): per-principal API
+keys on the gateway carrying `principal_id`, role set
+(`inference`/`admin`/`metrics`), optional tenant scope; stored as salted hashes
+in the existing durable store; provisioned at boot via bounded `env:`/`file:`
+refs. The shared `IZWI_GATEWAY_API_KEY` remains the bootstrap root principal.
+Tenant rate quotas and concurrency leases already key off the authenticated
+principal's tenant scope (`api/request_context.rs` `principal_namespace`), so
+the limiters need no changes once the principal carries the tenant.
+
+Design decisions:
+
+- Activation: single env `IZWI_GATEWAY_PRINCIPAL_KEYS_MANIFEST` (bounded path
+  to a JSON manifest). Unset -> empty directory, durable store never opened,
+  behavior byte-identical to today. Set -> gateway opens `StoreDatabase`
+  (`IZWI_DB_PATH` respected), upserts manifest entries, then loads all entries.
+- Manifest: `{"version":1,"principals":[{"principal_id","roles","tenant_id"?,
+  "key_ref"}]}`; `key_ref` must be `env:VAR` or `file:PATH` (inline secrets
+  rejected); max 256 principals; identities bounded to the existing charset;
+  roles are a non-empty subset of inference/admin/metrics.
+- Hashing: per-entry 16-byte OS-random salt, HMAC-SHA256(salt, key), stored as
+  hex in a new `gateway_principal_keys` table. Keys are uniform-random
+  high-entropy bearer tokens, so a fast MAC is the correct construction; an
+  argon2-class password KDF would add ~100ms to every request.
+- Authn flow: middleware tries the perimeter root key first (backward compat),
+  then the scoped directory. The inference route requires the `inference` role
+  (403 otherwise). `/internal/admin/drain` and `/internal/metrics` open when
+  the dedicated key is configured OR a scoped entry carries the role; wrong
+  credentials -> 401, nothing configured -> 404 (both unchanged).
+
+- [ ] Add `gateway_principal_keys` table to the migrator + expected-tables test
+- [ ] New `gateway_principal_keys.rs`: fail-closed manifest parsing, `env:`/
+      `file:` ref resolution, salted HMAC hashing, store upsert/load, directory
+      authenticate/authorize with role checks, Debug redaction
+- [ ] Wire `run_gateway`: manifest config, store open only when configured,
+      directory into `GatewayState` via `with_principal_keys`
+- [ ] Middleware + drain/metrics role checks in request_context.rs / gateway.rs
+- [ ] Cargo: add `hmac` + `rand` to workspace and izwi-server
+- [ ] Tests: manifest/ref/hash unit tests; store round-trip + rotation;
+      middleware authn and role gating; tenant quota isolation between scoped
+      principals; process-test leg through the real gateway binary
+- [ ] Docs: DS0.5 checkbox + completion note in the plan; runbook env docs;
+      review section here
+
+## Review — DS0.5
+
+- `gateway_principal_keys.rs` implements the full DS0.5 surface: fail-closed
+  manifest parsing (bounded path, JSON `deny_unknown_fields`, explicit version
+  1, 1-256 principals, bounded identities, canonical duplicate-free role
+  subsets of inference/admin/metrics), `env:`/`file:` key-reference resolution
+  (inline material rejected; file contents whitespace-trimmed; the same
+  16-4096 printable-byte credential policy as the perimeter key), pairwise and
+  perimeter reuse rejection, per-entry 16-byte OS-random salt with
+  HMAC-SHA256(salt, key) digests, durable `gateway_principal_keys` table
+  (hex salt/hash via idempotent upsert), and an in-memory directory whose
+  `authenticate` evaluates every entry (constant total cost, no match-position
+  leakage) with a redacted `Debug`.
+- Provisioning semantics: the manifest bootstraps; the store is the system of
+  record. Each boot re-provisions listed principals (rotation = change the
+  ref, restart) and leaves unlisted rows intact; revocation = DELETE the row
+  and restart. Both documented in the runbook's Security boundary section.
+- Gateway integration: `GatewayState.with_principal_keys`; middleware tries
+  the perimeter root key first (byte-identical backward compatibility), then
+  the directory; the inference route requires the `inference` role (403).
+  `/internal/admin/drain` and `/internal/metrics` open when the dedicated key
+  is configured OR a scoped principal carries the role; wrong credentials 401,
+  nothing configured 404 — both unchanged. With the manifest unset the durable
+  store is never opened. Tenant rate quota and tenant concurrency needed zero
+  code changes: identity flows from the authenticated principal's namespace.
+- Proof: 10 new module tests (manifest bounds, ref resolution, salt/digest
+  behavior, store round-trip + rotation + malformed-record rejection,
+  bootstrap authn/roles, restart-from-store, canonical roles), 5 new gateway
+  tests (scoped key authenticates inference, non-inference role 403, scoped
+  metrics/admin open the side-channels while inference-only stays 401,
+  endpoints stay 404 with no capability, tenant-scoped rate-quota partitioning),
+  and a second process leg booting the real gateway binary with a manifest
+  (scoped key serves remote inference, root key still works, ops role 403 on
+  chat, unknown key 401, ops role opens metrics). `cargo test -p izwi-server`:
+  703 lib + 2 process tests green. One transient pre-existing batch-runtime
+  cancellation-timing flake was observed once in an unrelated module and
+  passed on rerun.
