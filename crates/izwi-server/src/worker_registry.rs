@@ -648,6 +648,22 @@ impl WorkerRegistry {
     ) -> Result<SelectedWorker, WorkerRegistryError> {
         self.select_and_reserve_with_fleet_at(request, excluded, &NoFleetCapacity, now)
     }
+
+    /// Single-gateway conversation-pinned selection (DS2.4). See
+    /// `select_and_reserve_preferring_with_fleet_at` for the contract.
+    pub fn select_and_reserve_preferring(
+        &self,
+        request: &WorkerSelectionRequest,
+        preferred: &WorkerInstanceKey,
+    ) -> Result<SelectedWorker, WorkerRegistryError> {
+        self.select_and_reserve_preferring_with_fleet_at(
+            request,
+            preferred,
+            None,
+            &NoFleetCapacity,
+            Instant::now(),
+        )
+    }
 }
 
 /// One eligible worker considered by selection, carrying the exact scoring
@@ -719,6 +735,33 @@ impl WorkerRegistry {
         fleet: &dyn FleetCapacityView,
         now: Instant,
     ) -> Result<SelectedWorker, WorkerRegistryError> {
+        self.select_and_reserve_inner(request, None, excluded, fleet, now)
+    }
+
+    /// Conversation-pinned selection (DS2.4): the preferred worker wins when
+    /// it is independently eligible - fresh status, healthy circuit, matched
+    /// deployment, and observable credits. A pinned-but-uneligible worker
+    /// degrades to the normal two-stage admission, never to a failed request
+    /// (DINV-03).
+    pub fn select_and_reserve_preferring_with_fleet_at(
+        &self,
+        request: &WorkerSelectionRequest,
+        preferred: &WorkerInstanceKey,
+        excluded: Option<&WorkerInstanceKey>,
+        fleet: &dyn FleetCapacityView,
+        now: Instant,
+    ) -> Result<SelectedWorker, WorkerRegistryError> {
+        self.select_and_reserve_inner(request, Some(preferred), excluded, fleet, now)
+    }
+
+    fn select_and_reserve_inner(
+        &self,
+        request: &WorkerSelectionRequest,
+        preferred: Option<&WorkerInstanceKey>,
+        excluded: Option<&WorkerInstanceKey>,
+        fleet: &dyn FleetCapacityView,
+        now: Instant,
+    ) -> Result<SelectedWorker, WorkerRegistryError> {
         let mut inner = lock_recover(&self.inner);
         if inner.dispatches.len() >= inner.config.max_local_dispatches {
             return Err(WorkerRegistryError::LocalDispatchLimitReached);
@@ -726,6 +769,7 @@ impl WorkerRegistry {
 
         let mut selected: Option<Candidate> = None;
         let mut warm: Option<Candidate> = None;
+        let mut pinned: Option<Candidate> = None;
         for (key, record) in &inner.workers {
             if excluded == Some(key) {
                 continue;
@@ -777,6 +821,13 @@ impl WorkerRegistry {
                     inner.config.randomized_tie_breaking,
                 );
             }
+            if preferred == Some(key) {
+                consider_candidate(
+                    &mut pinned,
+                    candidate.clone(),
+                    inner.config.randomized_tie_breaking,
+                );
+            }
             consider_candidate(
                 &mut selected,
                 candidate,
@@ -789,7 +840,8 @@ impl WorkerRegistry {
             deployment,
             available: available_credits,
             ..
-        } = warm
+        } = pinned
+            .or(warm)
             .or(selected)
             .ok_or(WorkerRegistryError::NoEligibleWorker)?;
         let (selected_client, node_id, circuit_probe) = {
@@ -1876,6 +1928,93 @@ mod tests {
             .select_and_reserve_at(&selection(), Instant::now())
             .unwrap();
         assert_eq!(selected.key.worker_id.as_str(), "worker-minor0");
+    }
+
+    #[test]
+    fn pinned_worker_wins_when_eligible_and_degrades_when_not() {
+        let registry = WorkerRegistry::new(WorkerRegistryConfig::default()).unwrap();
+        let worker_a = registration("worker-a", "inc-a", BackendKind::Cpu, 9112, 4);
+        let worker_b = registration("worker-b", "inc-b", BackendKind::Cpu, 9113, 4);
+        let descriptor_a = worker_a.descriptor.clone();
+        let descriptor_b = worker_b.descriptor.clone();
+        registry.approve(worker_a).unwrap();
+        registry.approve(worker_b).unwrap();
+        let now = Instant::now();
+        registry
+            .observe_status_at(
+                status(
+                    &descriptor_a,
+                    1,
+                    vec![deployment("chat-prod", "lfm2", BackendKind::Cpu)],
+                    capacity(4, 0, 4),
+                ),
+                now,
+            )
+            .unwrap();
+        registry
+            .observe_status_at(
+                status(
+                    &descriptor_b,
+                    1,
+                    vec![deployment("chat-prod", "lfm2", BackendKind::Cpu)],
+                    capacity(4, 0, 4),
+                ),
+                now,
+            )
+            .unwrap();
+        let selection = selection();
+        let request = &selection;
+
+        // Unpinned: the stable identity tie-break picks worker-a.
+        let selected = registry.select_and_reserve_at(request, now).unwrap();
+        drop(selected);
+        assert_eq!(
+            registry
+                .select_and_reserve_at(request, now)
+                .unwrap()
+                .key
+                .worker_id
+                .as_str(),
+            "worker-a"
+        );
+
+        // Pinned: worker-b wins even though worker-a holds the identity tie-break.
+        let pinned_b = WorkerInstanceKey {
+            worker_id: id::<WorkerId>("worker-b"),
+            incarnation_id: id::<IncarnationId>("inc-b"),
+        };
+        let selected = registry
+            .select_and_reserve_preferring(request, &pinned_b)
+            .unwrap();
+        assert_eq!(selected.key.worker_id.as_str(), "worker-b");
+        drop(selected);
+
+        // Pinned-but-uneligible (exhausted credits): normal admission (DINV-03).
+        registry
+            .observe_status_at(
+                status(
+                    &descriptor_b,
+                    2,
+                    vec![deployment("chat-prod", "lfm2", BackendKind::Cpu)],
+                    capacity(4, 4, 0),
+                ),
+                now,
+            )
+            .unwrap();
+        let selected = registry
+            .select_and_reserve_preferring(request, &pinned_b)
+            .unwrap();
+        assert_eq!(selected.key.worker_id.as_str(), "worker-a");
+
+        // Pinned-but-unknown incarnation: normal admission.
+        let unknown = WorkerInstanceKey {
+            worker_id: id::<WorkerId>("worker-b"),
+            incarnation_id: id::<IncarnationId>("inc-unknown"),
+        };
+        let selected = registry
+            .select_and_reserve_preferring(request, &unknown)
+            .unwrap();
+        assert_eq!(selected.key.worker_id.as_str(), "worker-a");
     }
 
     fn affinity_registry(enabled: bool) -> WorkerRegistry {

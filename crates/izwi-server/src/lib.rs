@@ -310,6 +310,24 @@ struct ServerArgs {
         default_value_t = 85.0
     )]
     gateway_router_cache_max_kv_usage_pct: f64,
+
+    /// Conversation pinning (DS2.4): route a conversation's turns to the
+    /// worker that served its earlier turns. Off by default until measured
+    /// evidence (DS2.5) supports the default flip.
+    #[arg(long, env = "IZWI_GATEWAY_SESSION_PIN", default_value = "off")]
+    gateway_session_pin: String,
+
+    /// Bounded size of the conversation pin table.
+    #[arg(
+        long,
+        env = "IZWI_GATEWAY_SESSION_PIN_MAX_ENTRIES",
+        default_value_t = 4_096
+    )]
+    gateway_session_pin_max_entries: usize,
+
+    /// Lifetime of a conversation pin.
+    #[arg(long, env = "IZWI_GATEWAY_SESSION_PIN_TTL_SECS", default_value_t = 600)]
+    gateway_session_pin_ttl_secs: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -818,6 +836,7 @@ async fn gateway_state(
             max_output_tokens: 4096,
             max_output_bytes: 512 * 1024,
             slow_consumer_timeout: Duration::from_millis(args.gateway_slow_consumer_timeout_ms),
+            session_pin: session_pin_config(args),
         },
     )
     .map_err(|error| anyhow::anyhow!(error.message))?;
@@ -1303,6 +1322,7 @@ fn validate_gateway_limits(args: &ServerArgs) -> anyhow::Result<()> {
     }
     validate_status_cadence(ttl, poll)?;
     validate_router_cache_affinity_args(args)?;
+    validate_session_pin_args(args)?;
     Ok(())
 }
 
@@ -1325,6 +1345,35 @@ fn validate_router_cache_affinity_args(args: &ServerArgs) -> anyhow::Result<()> 
         anyhow::bail!("--gateway-router-cache-max-kv-usage-pct must be between 0 and 100");
     }
     Ok(())
+}
+
+/// Parses and bounds-checks the conversation-pinning knobs, mirroring the
+/// dispatcher-side `SessionPinConfig` bounds.
+fn validate_session_pin_args(args: &ServerArgs) -> anyhow::Result<()> {
+    match args.gateway_session_pin.as_str() {
+        "on" | "off" => {}
+        other => anyhow::bail!("--gateway-session-pin must be `on` or `off`, got `{other}`"),
+    }
+    if args.gateway_session_pin_max_entries == 0
+        || args.gateway_session_pin_max_entries > app::remote_chat_dispatch::MAX_SESSION_PIN_ENTRIES
+    {
+        anyhow::bail!(
+            "--gateway-session-pin-max-entries must be between 1 and {}",
+            app::remote_chat_dispatch::MAX_SESSION_PIN_ENTRIES
+        );
+    }
+    let ttl = Duration::from_secs(args.gateway_session_pin_ttl_secs);
+    if ttl.is_zero() || ttl > app::remote_chat_dispatch::MAX_SESSION_PIN_TTL {
+        anyhow::bail!("--gateway-session-pin-ttl-secs is outside the supported range");
+    }
+    Ok(())
+}
+
+fn session_pin_config(args: &ServerArgs) -> Option<app::remote_chat_dispatch::SessionPinConfig> {
+    (args.gateway_session_pin == "on").then_some(app::remote_chat_dispatch::SessionPinConfig {
+        max_entries: args.gateway_session_pin_max_entries,
+        ttl: Duration::from_secs(args.gateway_session_pin_ttl_secs),
+    })
 }
 
 fn gateway_worker_client_config(
