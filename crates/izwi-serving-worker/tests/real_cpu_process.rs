@@ -133,6 +133,39 @@ async fn separate_cpu_worker_executes_tiny_lfm_over_real_http() {
         matches!(&event.event, InvocationEventKind::TextDelta { text } if !text.is_empty())
     }));
 
+    // The engine-backed worker must advertise routing signals once it has
+    // completed one invocation: KV counters come from the engine snapshot,
+    // the tokens/s EMA from the completed invocation, and the cost unit from
+    // the worker's own permit model.
+    let status = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match client.status().await {
+                Ok(status) => break status,
+                Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+            }
+        }
+    })
+    .await
+    .expect("status after a completed invocation");
+    let deployment = &status.deployments[0];
+    let usage_pct = deployment
+        .kv_cache_usage_pct
+        .expect("engine-backed worker reports managed-KV utilization");
+    assert!((0.0..=100.0).contains(&usage_pct));
+    let hits = deployment
+        .prefix_hits_total
+        .expect("engine-backed worker reports prefix hits");
+    let queries = deployment
+        .prefix_queries_total
+        .expect("engine-backed worker reports prefix queries");
+    assert!(hits <= queries);
+    assert!(deployment.prefix_evictions_total.is_some());
+    let tokens_per_s = deployment
+        .tokens_out_per_s_ema
+        .expect("completed invocation records a tokens/s EMA");
+    assert!(tokens_per_s.is_finite() && tokens_per_s > 0.0);
+    assert_eq!(deployment.observation_cost_units, Some(1));
+
     let remote = RemoteChatExecution::new(
         client,
         RemoteChatExecutionConfig {

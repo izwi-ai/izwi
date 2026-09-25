@@ -15,7 +15,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use izwi_core::RuntimeTelemetrySnapshot;
+use izwi_core::{ManagedKvRuntimeSnapshot, RuntimeTelemetrySnapshot};
 use izwi_serving_protocol::*;
 use std::{
     collections::{HashMap, VecDeque},
@@ -291,6 +291,56 @@ struct WorkerMetricCounters {
     cancellation_to_stop_observations: AtomicU64,
     cancellation_to_stop_micros: AtomicU64,
     event_delivery_failures: AtomicU64,
+    tokens_out_ema: TokensOutEma,
+}
+
+/// Exponentially weighted output tokens-per-second over completed
+/// invocations. A statistical routing signal, so relaxed ordering and a
+/// benign last-writer race between concurrent completions are acceptable.
+/// A recorded rate is strictly positive, which makes zero bits mean "no
+/// observation yet" without a separate flag.
+#[derive(Default)]
+struct TokensOutEma {
+    bits: AtomicU64,
+}
+
+impl TokensOutEma {
+    const ALPHA: f64 = 0.3;
+
+    fn record(&self, output_tokens: u64, elapsed: Duration) {
+        let secs = elapsed.as_secs_f64();
+        if output_tokens == 0 || !secs.is_finite() || secs <= 0.0 {
+            return;
+        }
+        let sample = output_tokens as f64 / secs;
+        if !sample.is_finite() {
+            return;
+        }
+        let mut current = self.bits.load(Ordering::Relaxed);
+        loop {
+            let next = match f64::from_bits(current) {
+                0.0 => sample,
+                previous => Self::ALPHA * sample + (1.0 - Self::ALPHA) * previous,
+            };
+            match self.bits.compare_exchange_weak(
+                current,
+                next.to_bits(),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn load(&self) -> Option<f64> {
+        match f64::from_bits(self.bits.load(Ordering::Relaxed)) {
+            0.0 => None,
+            value if value.is_finite() => Some(value),
+            _ => None,
+        }
+    }
 }
 
 impl WorkerMetrics {
@@ -848,6 +898,29 @@ async fn descriptor<E: InvocationExecutor>(
     Json(state.config.descriptor.clone()).into_response()
 }
 
+/// Map managed-KV engine counters onto the deployment's optional routing
+/// signals. Usage follows the engine's own Prometheus utilization ratio
+/// (allocated over capacity pages); queries are hits plus misses because the
+/// engine counts lookups as one or the other.
+fn apply_kv_routing_signals(
+    deployment: &mut LoadedDeployment,
+    kv_cache: &ManagedKvRuntimeSnapshot,
+) {
+    let coordinator = &kv_cache.totals.coordinator;
+    if coordinator.capacity_pages > 0 {
+        deployment.kv_cache_usage_pct =
+            Some((coordinator.allocated_pages as f64 / coordinator.capacity_pages as f64) * 100.0);
+    }
+    deployment.prefix_hits_total = Some(kv_cache.counters.prefix_hits);
+    deployment.prefix_queries_total = Some(
+        kv_cache
+            .counters
+            .prefix_hits
+            .saturating_add(kv_cache.counters.prefix_misses),
+    );
+    deployment.prefix_evictions_total = Some(kv_cache.counters.prefix_evictions);
+}
+
 async fn status<E: InvocationExecutor>(
     State(state): State<Arc<WorkerState<E>>>,
     headers: HeaderMap,
@@ -866,6 +939,17 @@ async fn status<E: InvocationExecutor>(
     if draining {
         deployment.readiness = ModelReadiness::Draining;
     }
+    // Optional routing signals: populated only while the executor embeds an
+    // engine that reports them. Absence stays "signal unavailable" for the
+    // gateway, matching the additive protocol contract.
+    let engine_telemetry = state.executor.runtime_telemetry().await;
+    if let Some(telemetry) = engine_telemetry.as_ref() {
+        apply_kv_routing_signals(&mut deployment, &telemetry.engine.kv_cache);
+    }
+    deployment.tokens_out_per_s_ema = state.metrics.inner.tokens_out_ema.load();
+    // The worker's permit model prices one admission credit per concurrent
+    // invocation, matching `outstanding_cost_units: active` below.
+    deployment.observation_cost_units = Some(1);
     Json(WorkerStatus {
         schema_version: PROTOCOL_V1,
         worker_id: state.config.descriptor.worker_id.clone(),
@@ -1467,6 +1551,11 @@ async fn run_invocation<E: InvocationExecutor>(
                                 }
                             }
                         }
+                        state
+                            .metrics
+                            .inner
+                            .tokens_out_ema
+                            .record(output_tokens, execution_started_at.elapsed());
                         terminal = Some(TerminalEvent::Completed {
                             finish_reason,
                             usage: Usage {
@@ -2798,5 +2887,46 @@ mod tests {
             service.state.reserve_attempt(&request),
             ReserveAttempt::Reserved
         );
+    }
+
+    #[test]
+    fn tokens_out_ema_ignores_empty_and_starts_from_the_first_sample() {
+        let ema = TokensOutEma::default();
+        assert_eq!(ema.load(), None);
+        ema.record(0, Duration::from_secs(1));
+        assert_eq!(ema.load(), None);
+        ema.record(10, Duration::from_secs(0));
+        assert_eq!(ema.load(), None);
+
+        ema.record(10, Duration::from_secs(1));
+        assert_eq!(ema.load(), Some(10.0));
+        ema.record(20, Duration::from_secs(1));
+        let updated = ema.load().unwrap();
+        assert!((updated - (TokensOutEma::ALPHA * 20.0 + 0.7 * 10.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn kv_routing_signals_follow_engine_counters_and_zero_capacity_stays_unavailable() {
+        let mut kv_cache = ManagedKvRuntimeSnapshot::default();
+        kv_cache.totals.coordinator.capacity_pages = 8;
+        kv_cache.totals.coordinator.allocated_pages = 2;
+        kv_cache.counters.prefix_hits = 5;
+        kv_cache.counters.prefix_misses = 3;
+        kv_cache.counters.prefix_evictions = 1;
+
+        let mut deployment = config().deployment;
+        apply_kv_routing_signals(&mut deployment, &kv_cache);
+        assert_eq!(deployment.kv_cache_usage_pct, Some(25.0));
+        assert_eq!(deployment.prefix_hits_total, Some(5));
+        assert_eq!(deployment.prefix_queries_total, Some(8));
+        assert_eq!(deployment.prefix_evictions_total, Some(1));
+
+        let mut empty = ManagedKvRuntimeSnapshot::default();
+        empty.counters.prefix_hits = 2;
+        empty.counters.prefix_misses = 1;
+        let mut deployment = config().deployment;
+        apply_kv_routing_signals(&mut deployment, &empty);
+        assert_eq!(deployment.kv_cache_usage_pct, None);
+        assert_eq!(deployment.prefix_queries_total, Some(3));
     }
 }
