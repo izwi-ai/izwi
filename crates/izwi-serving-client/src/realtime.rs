@@ -150,10 +150,24 @@ pub async fn connect(
             "realtime admission is not a valid izwi-realtime-v1 admit",
         ));
     }
-    let ws_url = base
+    let mut ws_url = base
         .join(REALTIME_WS_PATH.trim_start_matches('/'))
-        .map_err(|error| RealtimeClientError::InvalidEndpoint(error.to_string()))?
-        .to_string();
+        .map_err(|error| RealtimeClientError::InvalidEndpoint(error.to_string()))?;
+    let ws_scheme = match ws_url.scheme() {
+        "https" => "wss",
+        "http" => "ws",
+        other => {
+            return Err(RealtimeClientError::InvalidEndpoint(format!(
+                "unsupported endpoint scheme {other}"
+            )))
+        }
+    };
+    ws_url.set_scheme(ws_scheme).map_err(|_| {
+        RealtimeClientError::InvalidConfiguration(
+            "endpoint scheme cannot be converted to a websocket scheme",
+        )
+    })?;
+    let ws_url = ws_url.to_string();
     let mut request: tokio_tungstenite::tungstenite::http::Request<()> =
         ws_url.into_client_request().map_err(|error| {
             RealtimeClientError::InvalidEndpoint(format!("websocket request: {error}"))
@@ -382,7 +396,10 @@ impl RealtimeSession {
                             ))
                         })?;
                     match frame {
-                        RealtimeServerFrame::Event { event } => self.validate_event(event)?,
+                        RealtimeServerFrame::Event { event } => {
+                            let event = self.validate_event(event)?;
+                            return Ok(Some(event));
+                        }
                         RealtimeServerFrame::Pong => continue,
                         RealtimeServerFrame::Admitted { .. } => {
                             return Err(RealtimeClientError::Protocol(
@@ -432,7 +449,10 @@ impl RealtimeSession {
 
     /// One Accepted first, strictly contiguous sequences, matching identity,
     /// exactly one terminal outcome, nothing after it.
-    fn validate_event(&mut self, event: InvocationEvent) -> Result<(), RealtimeClientError> {
+    fn validate_event(
+        &mut self,
+        event: InvocationEvent,
+    ) -> Result<InvocationEvent, RealtimeClientError> {
         if event.schema_version.major != PROTOCOL_V1.major {
             return Err(RealtimeClientError::Protocol(format!(
                 "event schema major {} is not supported",
@@ -494,7 +514,7 @@ impl RealtimeSession {
             }
         }
         self.last_event_sequence = Some(event.sequence);
-        Ok(())
+        Ok(event)
     }
 }
 
