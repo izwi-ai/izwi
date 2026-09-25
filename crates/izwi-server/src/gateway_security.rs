@@ -217,6 +217,22 @@ impl GatewayPerimeterConfig {
         Some(self.principal.clone())
     }
 
+    /// Constant-time membership test of `candidate` against every perimeter
+    /// credential. Scoped key provisioning uses this to reject material that
+    /// would alias a perimeter credential.
+    pub(crate) fn contains_credential(&self, candidate: &[u8]) -> bool {
+        let matches_api_key = constant_time_eq(candidate, self.api_key.as_ref());
+        let matches_metrics_key = self
+            .metrics_api_key
+            .as_ref()
+            .is_some_and(|key| constant_time_eq(candidate, key.as_ref()));
+        let matches_admin_key = self
+            .admin_api_key
+            .as_ref()
+            .is_some_and(|key| constant_time_eq(candidate, key.as_ref()));
+        matches_api_key || matches_metrics_key || matches_admin_key
+    }
+
     pub(crate) fn metrics_enabled(&self) -> bool {
         self.metrics_api_key.is_some()
     }
@@ -269,32 +285,34 @@ impl GatewayPerimeterConfig {
     }
 }
 
-fn authenticate_bearer(headers: &HeaderMap, expected: &[u8]) -> bool {
+/// Parse and bound-check the single `Bearer <token>` authorization value
+/// without comparing it to any expectation. The token charset is restricted
+/// exactly as [`authenticate_bearer`] so downstream hash comparisons operate
+/// on the same accepted language.
+pub(crate) fn bearer_token<'a>(headers: &'a HeaderMap) -> Option<&'a str> {
     let mut authorization_values = headers.get_all(header::AUTHORIZATION).iter();
-    let Some(value) = authorization_values
+    let value = authorization_values
         .next()
-        .and_then(|value| value.to_str().ok())
-    else {
-        return false;
-    };
+        .and_then(|value| value.to_str().ok())?;
     if authorization_values.next().is_some() {
-        return false;
+        return None;
     }
     if value.len() > MAX_API_KEY_BYTES.saturating_add(7) {
-        return false;
+        return None;
     }
-    let Some((scheme, supplied)) = value.split_once(' ') else {
-        return false;
-    };
+    let (scheme, supplied) = value.split_once(' ')?;
     if !scheme.eq_ignore_ascii_case("bearer")
         || supplied.is_empty()
         || supplied.len() > MAX_API_KEY_BYTES
         || supplied.chars().any(char::is_whitespace)
-        || !constant_time_eq(supplied.as_bytes(), expected)
     {
-        return false;
+        return None;
     }
-    true
+    Some(supplied)
+}
+
+fn authenticate_bearer(headers: &HeaderMap, expected: &[u8]) -> bool {
+    bearer_token(headers).is_some_and(|supplied| constant_time_eq(supplied.as_bytes(), expected))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -385,13 +403,31 @@ fn optional_admin_credential_from_env(
     Ok(Some((secret, secret_ref)))
 }
 
-fn validate_secret(secret: &str) -> Result<(), GatewayPerimeterConfigError> {
+pub(crate) fn validate_secret(secret: &str) -> Result<(), GatewayPerimeterConfigError> {
     if !(MIN_API_KEY_BYTES..=MAX_API_KEY_BYTES).contains(&secret.len())
         || !secret.as_bytes().iter().all(|byte| byte.is_ascii_graphic())
     {
         return Err(GatewayPerimeterConfigError::InvalidSecret);
     }
     Ok(())
+}
+
+/// Shared bounded-identity policy for principal and tenant identifiers:
+/// `[A-Za-z0-9_-.:]`, 1..=128 bytes.
+pub(crate) fn valid_identity(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_IDENTITY_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
+pub(crate) fn valid_env_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_SECRET_REF_BYTES.saturating_sub(4)
+        && name.bytes().enumerate().all(|(index, byte)| {
+            byte == b'_' || byte.is_ascii_alphabetic() || (index > 0 && byte.is_ascii_digit())
+        })
 }
 
 fn bounded_identity_env(name: &str, default: &str) -> Result<String, GatewayPerimeterConfigError> {
@@ -430,14 +466,6 @@ fn bool_from_env(name: &str) -> Result<bool, GatewayPerimeterConfigError> {
     }
 }
 
-fn valid_env_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= MAX_SECRET_REF_BYTES.saturating_sub(4)
-        && name.bytes().enumerate().all(|(index, byte)| {
-            byte == b'_' || byte.is_ascii_alphabetic() || (index > 0 && byte.is_ascii_digit())
-        })
-}
-
 fn is_loopback_host(host: &str) -> bool {
     let host = host.trim().trim_start_matches('[').trim_end_matches(']');
     host.eq_ignore_ascii_case("localhost")
@@ -446,7 +474,7 @@ fn is_loopback_host(host: &str) -> bool {
             .is_ok_and(|address| address.is_loopback())
 }
 
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     let mut difference = left.len() ^ right.len();
     for index in 0..MAX_API_KEY_BYTES {
         difference |= usize::from(

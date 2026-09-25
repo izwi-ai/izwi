@@ -594,6 +594,19 @@ const BASELINE_SCHEMA: &[&str] = &[
     );
     "#,
     "CREATE INDEX IF NOT EXISTS idx_runtime_worker_heartbeats_last ON runtime_worker_heartbeats(last_heartbeat_at DESC);",
+    // DS0.5 scoped credentials: only salted HMAC digests of gateway API keys
+    // are persisted here; key material lives exclusively in env:/file: refs.
+    r#"
+    CREATE TABLE IF NOT EXISTS gateway_principal_keys (
+        principal_id TEXT PRIMARY KEY,
+        roles_json TEXT NOT NULL,
+        tenant_id TEXT NULL,
+        key_salt TEXT NOT NULL,
+        key_hash TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    );
+    "#,
 ];
 
 const POST_COMPATIBILITY_SCHEMA: &[&str] = &[

@@ -315,6 +315,7 @@ mod tests {
         "durable_idempotency_keys_v2",
         "fleet_worker_observations",
         "fleet_capacity_claims",
+        "gateway_principal_keys",
     ];
 
     const EXPECTED_COMPAT_COLUMNS: &[(&str, &str)] = &[
