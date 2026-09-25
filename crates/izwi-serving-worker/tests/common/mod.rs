@@ -145,7 +145,7 @@ fn generate_benchmark_fixture() {
     println!("fixture model dir: {}", dir.display());
 }
 
-const QWEN38_FIXTURE_REVISION: &str = "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a";
+pub const QWEN38_FIXTURE_REVISION: &str = "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a";
 
 fn bf16_bytes(values: &[f32]) -> Vec<u8> {
     values
