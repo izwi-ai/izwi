@@ -7,6 +7,11 @@
 //! root holding `Nemotron-3.5-ASR-Streaming-0.6B` and run with
 //! `--ignored`. The artifact is staged read-only (symlinks plus a generated
 //! deployment manifest) so the run never mutates the local cache.
+//!
+//! Backend selection: `IZWI_RT_EVIDENCE_BACKEND=cpu|metal` (default cpu).
+//! The Metal lane additionally requires the metal-feature worker binary,
+//! `IZWI_WORKER_EXPECTED_DEVICE_ID=metal:<registryID>`, and
+//! `IZWI_METAL_DEVICE_ORDINAL` — same contract as the parity tests.
 
 mod common;
 
@@ -107,7 +112,15 @@ async fn real_cpu_worker_streams_asr_through_the_realtime_subprotocol() {
     let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = reservation.local_addr().unwrap();
     drop(reservation);
-    let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_izwi-serving-worker"))
+    let backend = std::env::var("IZWI_RT_EVIDENCE_BACKEND")
+        .unwrap_or_else(|_| "cpu".to_string())
+        .to_ascii_lowercase();
+    let expected_backend = match backend.as_str() {
+        "metal" => BackendKind::Metal,
+        _ => BackendKind::Cpu,
+    };
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_izwi-serving-worker"));
+    command
         .env("IZWI_WORKER_BIND", address.to_string())
         .env("IZWI_WORKER_TASK", "speech_to_text")
         .env("IZWI_WORKER_MODEL", variant.dir_name())
@@ -120,10 +133,18 @@ async fn real_cpu_worker_streams_asr_through_the_realtime_subprotocol() {
         .env("RUST_LOG", "warn")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .unwrap();
-    let child = ChildGuard(child);
+        .stderr(Stdio::inherit());
+    if backend == "metal" {
+        for (name, value) in [
+            ("IZWI_BACKEND", "metal"),
+            ("IZWI_WORKER_EXPECTED_DEVICE_ID", ""),
+            ("IZWI_METAL_DEVICE_ORDINAL", "0"),
+        ] {
+            let inherited = std::env::var(name).unwrap_or(value.to_string());
+            command.env(name, inherited);
+        }
+    }
+    let child = ChildGuard(command.spawn().unwrap());
 
     let credentials = ServiceCredentials {
         credential_id: id("real-rt-credential"),
@@ -137,8 +158,9 @@ async fn real_cpu_worker_streams_asr_through_the_realtime_subprotocol() {
     .unwrap();
 
     // Startup includes the real model load plus a bounded synthetic-utterance
-    // ASR warm-up: allow minutes, not seconds.
-    let descriptor = tokio::time::timeout(Duration::from_secs(600), async {
+    // ASR warm-up: allow minutes, not seconds (Metal also compiles MSL
+    // shaders cold).
+    let descriptor = tokio::time::timeout(Duration::from_secs(900), async {
         loop {
             match client.descriptor().await {
                 Ok(descriptor) => break descriptor,
@@ -148,7 +170,7 @@ async fn real_cpu_worker_streams_asr_through_the_realtime_subprotocol() {
     })
     .await
     .expect("real worker loads and warms the ASR model before the deadline");
-    assert_eq!(descriptor.assignment.backend(), BackendKind::Cpu);
+    assert_eq!(descriptor.assignment.backend(), expected_backend);
     assert!(descriptor.features.contains(&WorkerFeature::RealtimeSocket));
     let status = client.status().await.expect("worker status");
     let deployment = status
@@ -259,7 +281,7 @@ async fn real_cpu_worker_streams_asr_through_the_realtime_subprotocol() {
         "the real worker must produce a transcript for the fixture audio"
     );
     println!(
-        "DS3.7 realtime CPU evidence: frames={frames} deltas={deltas} transcript={transcript:?}"
+        "DS3.7 realtime {backend} evidence: frames={frames} deltas={deltas} transcript={transcript:?}"
     );
 
     // The attempt stays queryable over HTTP through the shared attempt table.

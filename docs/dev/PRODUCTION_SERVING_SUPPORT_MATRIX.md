@@ -33,6 +33,7 @@ the runtime's page budget cannot fit a safe prefix reserve.
 | Qwen3 chat (dense) | Supported — DS1.2 fixture suite | Not enabled — contract declared, no lane parity | Not enabled — no lane evidence |
 | Gemma3 chat (dense) | Supported — DS1.2 fixture suite | Not enabled — contract declared, no lane parity | Not enabled — no lane evidence |
 | Voxtral (LM) | Not enabled — contract declared, no lane parity | Not enabled | Not enabled |
+| Nemotron streaming ASR (`izwi-realtime-v1`) | Supported — real process evidence: the real worker binary with the real `Nemotron-3.5-ASR-Streaming-0.6B` artifact streamed `data/fox.wav` (36 frames, 24 kHz) through the WebSocket subprotocol → transcript "The quick brown fox jumps.", one Completed terminal, clean close (`real_cpu_realtime.rs`, ignored test, `IZWI_RT_EVIDENCE_BACKEND=cpu`) | Supported — same test with the metal-feature worker and device identity `metal:<registryID>` verified at startup (`IZWI_RT_EVIDENCE_BACKEND=metal`) | Not enabled — no lane evidence |
 | Qwen3.5 chat (hybrid) | Excluded — hybrid reuse unproven (DS1.1 scope) | Excluded | Excluded |
 | LFM2 chat (hybrid) | Excluded — hybrid reuse unproven | Excluded | Excluded |
 | ASR / TTS / diarization / aligner families | Excluded — managed reuse is chat-task-gated | Excluded | Excluded |
