@@ -284,6 +284,32 @@ struct ServerArgs {
         default_value_t = 2_000
     )]
     gateway_worker_status_poll_ms: u64,
+
+    /// Cache-affinity routing (DS2.3): prefer workers whose same-deployment
+    /// prefix-hit ratio and KV headroom exceed the thresholds below. Off by
+    /// default until measured evidence (DS2.5) supports the default flip.
+    #[arg(
+        long,
+        env = "IZWI_GATEWAY_ROUTER_CACHE_AFFINITY",
+        default_value = "off"
+    )]
+    gateway_router_cache_affinity: String,
+
+    /// Minimum prefix hit ratio for a worker to count as warm (0.0-1.0).
+    #[arg(
+        long,
+        env = "IZWI_GATEWAY_ROUTER_CACHE_MIN_HIT_RATIO",
+        default_value_t = 0.25
+    )]
+    gateway_router_cache_min_hit_ratio: f64,
+
+    /// Maximum managed-KV utilization percent still considered headroom (0-100].
+    #[arg(
+        long,
+        env = "IZWI_GATEWAY_ROUTER_CACHE_MAX_KV_USAGE_PCT",
+        default_value_t = 85.0
+    )]
+    gateway_router_cache_max_kv_usage_pct: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -713,6 +739,11 @@ async fn gateway_state(
         max_deployments_per_worker: 32,
         max_local_dispatches: args.gateway_max_in_flight,
         status_ttl: Duration::from_millis(args.gateway_worker_status_ttl_ms),
+        cache_affinity: worker_registry::CacheAffinityConfig {
+            enabled: args.gateway_router_cache_affinity == "on",
+            min_prefix_hit_ratio: args.gateway_router_cache_min_hit_ratio,
+            max_kv_usage_pct: args.gateway_router_cache_max_kv_usage_pct,
+        },
         ..worker_registry::WorkerRegistryConfig::default()
     };
     let registry = worker_registry::WorkerRegistry::new(registry_config)
@@ -1271,6 +1302,28 @@ fn validate_gateway_limits(args: &ServerArgs) -> anyhow::Result<()> {
         anyhow::bail!("--gateway-worker-status-ttl-ms is outside the supported range");
     }
     validate_status_cadence(ttl, poll)?;
+    validate_router_cache_affinity_args(args)?;
+    Ok(())
+}
+
+/// Parses and bounds-checks the cache-affinity routing knobs. Fail-closed on
+/// any out-of-range or non-`on|off` value so typos never silently disable or
+/// enable locality routing.
+fn validate_router_cache_affinity_args(args: &ServerArgs) -> anyhow::Result<()> {
+    match args.gateway_router_cache_affinity.as_str() {
+        "on" | "off" => {}
+        other => {
+            anyhow::bail!("--gateway-router-cache-affinity must be `on` or `off`, got `{other}`")
+        }
+    }
+    let ratio = args.gateway_router_cache_min_hit_ratio;
+    if ratio.is_nan() || !(0.0..=1.0).contains(&ratio) {
+        anyhow::bail!("--gateway-router-cache-min-hit-ratio must be between 0.0 and 1.0");
+    }
+    let usage = args.gateway_router_cache_max_kv_usage_pct;
+    if usage.is_nan() || !(0.0..=100.0).contains(&usage) || usage == 0.0 {
+        anyhow::bail!("--gateway-router-cache-max-kv-usage-pct must be between 0 and 100");
+    }
     Ok(())
 }
 

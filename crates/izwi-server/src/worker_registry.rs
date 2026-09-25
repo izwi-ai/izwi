@@ -29,7 +29,49 @@ const MAX_STATUS_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_CIRCUIT_FAILURE_THRESHOLD: u32 = 1024;
 const MAX_CIRCUIT_OPEN_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Cache-affinity routing policy: prefer workers whose same-deployment
+/// prefix-hit ratio and managed-KV headroom exceed the configured thresholds.
+/// Disabled by default; the default may flip only with measured DS2.5
+/// evidence of a TTFT win.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CacheAffinityConfig {
+    pub enabled: bool,
+    /// Minimum prefix hits over queries for a worker to count as warm.
+    pub min_prefix_hit_ratio: f64,
+    /// Maximum managed-KV utilization percent still considered "headroom".
+    pub max_kv_usage_pct: f64,
+}
+
+impl Default for CacheAffinityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_prefix_hit_ratio: 0.25,
+            max_kv_usage_pct: 85.0,
+        }
+    }
+}
+
+impl CacheAffinityConfig {
+    fn validate(&self) -> Result<(), WorkerRegistryError> {
+        if self.min_prefix_hit_ratio.is_nan() || !(0.0..=1.0).contains(&self.min_prefix_hit_ratio) {
+            return Err(WorkerRegistryError::InvalidConfig(
+                "min_prefix_hit_ratio is outside the supported range",
+            ));
+        }
+        if self.max_kv_usage_pct.is_nan()
+            || !(0.0..=100.0).contains(&self.max_kv_usage_pct)
+            || self.max_kv_usage_pct <= 0.0
+        {
+            return Err(WorkerRegistryError::InvalidConfig(
+                "max_kv_usage_pct is outside the supported range",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct WorkerRegistryConfig {
     pub max_workers: usize,
     pub max_deployments_per_worker: usize,
@@ -38,6 +80,7 @@ pub struct WorkerRegistryConfig {
     pub circuit_failure_threshold: u32,
     pub circuit_open_duration: Duration,
     pub randomized_tie_breaking: bool,
+    pub cache_affinity: CacheAffinityConfig,
 }
 
 impl WorkerRegistryConfig {
@@ -78,6 +121,7 @@ impl WorkerRegistryConfig {
                 "circuit_open_duration is outside the supported range",
             ));
         }
+        self.cache_affinity.validate()?;
         Ok(())
     }
 }
@@ -92,6 +136,7 @@ impl Default for WorkerRegistryConfig {
             circuit_failure_threshold: 3,
             circuit_open_duration: Duration::from_secs(30),
             randomized_tie_breaking: false,
+            cache_affinity: CacheAffinityConfig::default(),
         }
     }
 }
@@ -603,7 +648,63 @@ impl WorkerRegistry {
     ) -> Result<SelectedWorker, WorkerRegistryError> {
         self.select_and_reserve_with_fleet_at(request, excluded, &NoFleetCapacity, now)
     }
+}
 
+/// One eligible worker considered by selection, carrying the exact scoring
+/// inputs the capacity-weighted comparison consumes.
+#[derive(Debug, Clone)]
+struct Candidate {
+    key: WorkerInstanceKey,
+    deployment: LoadedDeployment,
+    outstanding: u64,
+    capacity: u32,
+    available: u32,
+}
+
+impl Candidate {
+    /// Cross-multiplied capacity-weighted comparison with the pre-DS2
+    /// tie-breaking semantics.
+    fn beats(&self, incumbent: &Candidate, randomized: bool) -> bool {
+        let candidate_score = u128::from(self.outstanding) * u128::from(incumbent.capacity);
+        let incumbent_score = u128::from(incumbent.outstanding) * u128::from(self.capacity);
+        if candidate_score < incumbent_score {
+            true
+        } else if candidate_score > incumbent_score {
+            false
+        } else if randomized {
+            uuid::Uuid::new_v4().as_bytes()[0] % 2 == 0
+        } else {
+            self.key < incumbent.key
+        }
+    }
+}
+
+fn consider_candidate(track: &mut Option<Candidate>, candidate: Candidate, randomized: bool) {
+    match track {
+        Some(incumbent) if !candidate.beats(incumbent, randomized) => {}
+        _ => *track = Some(candidate),
+    }
+}
+
+/// Stage-(a) affinity test: the worker's deployment must report all routing
+/// signals, exceed the hit-ratio threshold, and still have KV headroom.
+/// Absent or stale signals degrade cleanly to the capacity-weighted fallback.
+fn cache_affinity_eligible(config: &CacheAffinityConfig, deployment: &LoadedDeployment) -> bool {
+    let (Some(usage_pct), Some(hits), Some(queries)) = (
+        deployment.kv_cache_usage_pct,
+        deployment.prefix_hits_total,
+        deployment.prefix_queries_total,
+    ) else {
+        return false;
+    };
+    if queries == 0 {
+        return false;
+    }
+    (hits as f64) / (queries as f64) >= config.min_prefix_hit_ratio
+        && usage_pct <= config.max_kv_usage_pct
+}
+
+impl WorkerRegistry {
     /// Fleet-aware selection: peer gateways' cluster claims count against a
     /// worker's observed credits alongside local dispatches. A worker with no
     /// observable cluster capacity left is skipped even when its last direct
@@ -623,7 +724,8 @@ impl WorkerRegistry {
             return Err(WorkerRegistryError::LocalDispatchLimitReached);
         }
 
-        let mut selected: Option<(WorkerInstanceKey, LoadedDeployment, u64, u32, u32)> = None;
+        let mut selected: Option<Candidate> = None;
+        let mut warm: Option<Candidate> = None;
         for (key, record) in &inner.workers {
             if excluded == Some(key) {
                 continue;
@@ -655,34 +757,41 @@ impl WorkerRegistry {
             let capacity = record.registration.validated_capacity;
             let available = observation.status.capacity.available_admission_credits;
 
-            let replace = selected.as_ref().is_none_or(
-                |(selected_key, _, selected_outstanding, selected_capacity, _)| {
-                    let candidate_score = u128::from(outstanding) * u128::from(*selected_capacity);
-                    let selected_score = u128::from(*selected_outstanding) * u128::from(capacity);
-                    if candidate_score < selected_score {
-                        true
-                    } else if candidate_score > selected_score {
-                        false
-                    } else if inner.config.randomized_tie_breaking {
-                        uuid::Uuid::new_v4().as_bytes()[0] % 2 == 0
-                    } else {
-                        key < selected_key
-                    }
-                },
-            );
-            if replace {
-                selected = Some((
-                    key.clone(),
-                    deployment.clone(),
-                    outstanding,
-                    capacity,
-                    available,
-                ));
+            let candidate = Candidate {
+                key: key.clone(),
+                deployment: deployment.clone(),
+                outstanding,
+                capacity,
+                available,
+            };
+            // Stage (a): cache-affinity candidates compete among themselves;
+            // stage (b): every eligible candidate competes on the exact
+            // capacity-weighted score. A warm worker wins only over its warm
+            // peers; if none is warm, scoring is unchanged from before DS2.
+            let warm_candidate = inner.config.cache_affinity.enabled
+                && cache_affinity_eligible(&inner.config.cache_affinity, &candidate.deployment);
+            if warm_candidate {
+                consider_candidate(
+                    &mut warm,
+                    candidate.clone(),
+                    inner.config.randomized_tie_breaking,
+                );
             }
+            consider_candidate(
+                &mut selected,
+                candidate,
+                inner.config.randomized_tie_breaking,
+            );
         }
 
-        let (key, deployment, _, _, available_credits) =
-            selected.ok_or(WorkerRegistryError::NoEligibleWorker)?;
+        let Candidate {
+            key,
+            deployment,
+            available: available_credits,
+            ..
+        } = warm
+            .or(selected)
+            .ok_or(WorkerRegistryError::NoEligibleWorker)?;
         let (selected_client, node_id, circuit_probe) = {
             let record = inner
                 .workers
@@ -1232,6 +1341,22 @@ mod tests {
         }
     }
 
+    fn warm_deployment(
+        name: &str,
+        alias: &str,
+        backend: BackendKind,
+        usage_pct: f64,
+        hits: u64,
+        queries: u64,
+    ) -> LoadedDeployment {
+        LoadedDeployment {
+            kv_cache_usage_pct: Some(usage_pct),
+            prefix_hits_total: Some(hits),
+            prefix_queries_total: Some(queries),
+            ..deployment(name, alias, backend)
+        }
+    }
+
     fn capacity(max: u32, active: u32, credits: u32) -> CapacitySnapshot {
         CapacitySnapshot {
             max_active_invocations: max,
@@ -1751,6 +1876,223 @@ mod tests {
             .select_and_reserve_at(&selection(), Instant::now())
             .unwrap();
         assert_eq!(selected.key.worker_id.as_str(), "worker-minor0");
+    }
+
+    fn affinity_registry(enabled: bool) -> WorkerRegistry {
+        WorkerRegistry::new(WorkerRegistryConfig {
+            cache_affinity: CacheAffinityConfig {
+                enabled,
+                ..CacheAffinityConfig::default()
+            },
+            ..WorkerRegistryConfig::default()
+        })
+        .unwrap()
+    }
+
+    fn two_workers_with_one_warm(registry: &WorkerRegistry) {
+        let worker_a = registration("worker-cold", "inc-cold", BackendKind::Cpu, 9104, 4);
+        let worker_b = registration("worker-warm", "inc-warm", BackendKind::Cpu, 9105, 4);
+        let descriptor_a = worker_a.descriptor.clone();
+        let descriptor_b = worker_b.descriptor.clone();
+        registry.approve(worker_a).unwrap();
+        registry.approve(worker_b).unwrap();
+        let now = Instant::now();
+        registry
+            .observe_status_at(
+                status(
+                    &descriptor_a,
+                    1,
+                    vec![deployment("chat-prod", "lfm2", BackendKind::Cpu)],
+                    capacity(4, 0, 4),
+                ),
+                now,
+            )
+            .unwrap();
+        registry
+            .observe_status_at(
+                status(
+                    &descriptor_b,
+                    1,
+                    vec![warm_deployment(
+                        "chat-prod",
+                        "lfm2",
+                        BackendKind::Cpu,
+                        20.0,
+                        5,
+                        10,
+                    )],
+                    capacity(4, 2, 2),
+                ),
+                now,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn cache_affinity_prefers_warm_worker_and_off_keeps_capacity_scoring() {
+        let warm_registry = affinity_registry(true);
+        two_workers_with_one_warm(&warm_registry);
+        let selected = warm_registry
+            .select_and_reserve_at(&selection(), Instant::now())
+            .unwrap();
+        // The warm worker is preferred despite the cold worker's lower load.
+        assert_eq!(selected.key.worker_id.as_str(), "worker-warm");
+
+        // With the policy off (the shipping default), the exact pre-DS2
+        // capacity-weighted score picks the unloaded cold worker.
+        let cold_registry = affinity_registry(false);
+        two_workers_with_one_warm(&cold_registry);
+        let selected = cold_registry
+            .select_and_reserve_at(&selection(), Instant::now())
+            .unwrap();
+        assert_eq!(selected.key.worker_id.as_str(), "worker-cold");
+    }
+
+    #[test]
+    fn weak_or_absent_signals_degrade_to_capacity_scoring() {
+        // Below-threshold hit ratio: the worker is not warm.
+        let registry = affinity_registry(true);
+        let worker_a = registration("worker-cold", "inc-cold", BackendKind::Cpu, 9106, 4);
+        let worker_b = registration("worker-weak", "inc-weak", BackendKind::Cpu, 9107, 4);
+        let descriptor_a = worker_a.descriptor.clone();
+        let descriptor_b = worker_b.descriptor.clone();
+        registry.approve(worker_a).unwrap();
+        registry.approve(worker_b).unwrap();
+        let now = Instant::now();
+        registry
+            .observe_status_at(
+                status(
+                    &descriptor_a,
+                    1,
+                    vec![deployment("chat-prod", "lfm2", BackendKind::Cpu)],
+                    capacity(4, 0, 4),
+                ),
+                now,
+            )
+            .unwrap();
+        registry
+            .observe_status_at(
+                status(
+                    &descriptor_b,
+                    1,
+                    vec![warm_deployment(
+                        "chat-prod",
+                        "lfm2",
+                        BackendKind::Cpu,
+                        20.0,
+                        1,
+                        10,
+                    )],
+                    capacity(4, 2, 2),
+                ),
+                now,
+            )
+            .unwrap();
+        let selected = registry.select_and_reserve_at(&selection(), now).unwrap();
+        assert_eq!(selected.key.worker_id.as_str(), "worker-cold");
+
+        // Warm ratio but no KV headroom: not warm either.
+        let registry = affinity_registry(true);
+        let worker_a = registration("worker-cold", "inc-cold", BackendKind::Cpu, 9108, 4);
+        let worker_b = registration("worker-full", "inc-full", BackendKind::Cpu, 9109, 4);
+        let descriptor_a = worker_a.descriptor.clone();
+        let descriptor_b = worker_b.descriptor.clone();
+        registry.approve(worker_a).unwrap();
+        registry.approve(worker_b).unwrap();
+        let now = Instant::now();
+        registry
+            .observe_status_at(
+                status(
+                    &descriptor_a,
+                    1,
+                    vec![deployment("chat-prod", "lfm2", BackendKind::Cpu)],
+                    capacity(4, 0, 4),
+                ),
+                now,
+            )
+            .unwrap();
+        registry
+            .observe_status_at(
+                status(
+                    &descriptor_b,
+                    1,
+                    vec![warm_deployment(
+                        "chat-prod",
+                        "lfm2",
+                        BackendKind::Cpu,
+                        95.0,
+                        5,
+                        10,
+                    )],
+                    capacity(4, 2, 2),
+                ),
+                now,
+            )
+            .unwrap();
+        let selected = registry.select_and_reserve_at(&selection(), now).unwrap();
+        assert_eq!(selected.key.worker_id.as_str(), "worker-cold");
+
+        // No signals on either worker: exactly the pre-DS2 score wins.
+        let registry = affinity_registry(true);
+        let worker_a = registration("worker-cold", "inc-cold", BackendKind::Cpu, 9110, 4);
+        let worker_b = registration("worker-blind", "inc-blind", BackendKind::Cpu, 9111, 4);
+        let descriptor_a = worker_a.descriptor.clone();
+        let descriptor_b = worker_b.descriptor.clone();
+        registry.approve(worker_a).unwrap();
+        registry.approve(worker_b).unwrap();
+        let now = Instant::now();
+        registry
+            .observe_status_at(
+                status(
+                    &descriptor_a,
+                    1,
+                    vec![deployment("chat-prod", "lfm2", BackendKind::Cpu)],
+                    capacity(4, 0, 4),
+                ),
+                now,
+            )
+            .unwrap();
+        registry
+            .observe_status_at(
+                status(
+                    &descriptor_b,
+                    1,
+                    vec![deployment("chat-prod", "lfm2", BackendKind::Cpu)],
+                    capacity(4, 2, 2),
+                ),
+                now,
+            )
+            .unwrap();
+        let selected = registry.select_and_reserve_at(&selection(), now).unwrap();
+        assert_eq!(selected.key.worker_id.as_str(), "worker-cold");
+    }
+
+    #[test]
+    fn cache_affinity_config_bounds_are_fail_closed() {
+        let invalid = |min_ratio: f64, max_pct: f64| {
+            WorkerRegistry::new(WorkerRegistryConfig {
+                cache_affinity: CacheAffinityConfig {
+                    enabled: true,
+                    min_prefix_hit_ratio: min_ratio,
+                    max_kv_usage_pct: max_pct,
+                },
+                ..WorkerRegistryConfig::default()
+            })
+            .is_err()
+        };
+        assert!(invalid(f64::NAN, 85.0));
+        assert!(invalid(1.5, 85.0));
+        assert!(invalid(0.25, 0.0));
+        assert!(invalid(0.25, 101.0));
+        assert!(invalid(0.25, f64::NAN));
+        assert!(WorkerRegistry::new(WorkerRegistryConfig {
+            cache_affinity: CacheAffinityConfig {
+                enabled: true,
+                ..CacheAffinityConfig::default()
+            },
+            ..WorkerRegistryConfig::default()
+        })
+        .is_ok());
     }
 
     #[test]
