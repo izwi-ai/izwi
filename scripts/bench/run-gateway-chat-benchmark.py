@@ -63,7 +63,8 @@ def marker_word_count(vocab):
     return max(2, math.ceil(math.log(MARKER_UNIQUE_REQUESTS, base)))
 
 
-def build_messages(workload, prefix_tokens, suffix_tokens, index, vocab=None):
+def build_messages(workload, prefix_tokens, suffix_tokens, index, vocab=None,
+                   history=None):
     """Chat messages for the requested workload.
 
     Sizing treats one whitespace-delimited word as one token: approximate for
@@ -80,11 +81,27 @@ def build_messages(workload, prefix_tokens, suffix_tokens, index, vocab=None):
       unique user suffix; the cross-request share is exactly the prefix.
     - cold: a per-request unique user message of the same total length; the
       leading positional marker keeps the common token prefix below one page.
+    - multi_turn: one conversation per `index`: a conversation-unique system
+      prefix (leading positional marker keeps cross-conversation sharing under
+      one page) plus the accumulated user/assistant history. `history` is a
+      list of (user_words, assistant_text) pairs; the caller supplies the real
+      assistant replies so the engine sees a genuine growing prefix.
     """
     words = list(vocab) if vocab is not None else BENCH_VOCAB
     if workload == "default":
         return [{"role": "user", "content": "Say the word ready."}]
     marker_len = marker_word_count(words)
+    if workload == "multi_turn":
+        if history is None:
+            raise ValueError("multi_turn requires conversation history")
+        prefix_words = _marker_words(index, words)
+        prefix_words += _filler_words(prefix_tokens - len(prefix_words), index + 1, words)
+        messages = [{"role": "system", "content": " ".join(prefix_words)}]
+        for (user_words, assistant_text) in history:
+            messages.append({"role": "user", "content": " ".join(user_words)})
+            if assistant_text is not None:
+                messages.append({"role": "assistant", "content": assistant_text})
+        return messages
     if workload == "shared":
         if suffix_tokens < marker_len + 1:
             raise ValueError(
@@ -110,6 +127,15 @@ def build_messages(workload, prefix_tokens, suffix_tokens, index, vocab=None):
         user_words += _filler_words(total - len(user_words), index + 1, words)
         return [{"role": "user", "content": " ".join(user_words)}]
     raise ValueError(f"unknown workload: {workload}")
+
+
+def conversation_turn_words(suffix_tokens, index, turn, vocab):
+    """Deterministic per-turn user words, unique per conversation and turn."""
+    words = list(vocab) if vocab is not None else BENCH_VOCAB
+    user_words = _marker_words(index * 16 + turn, words)
+    user_words += _filler_words(max(1, suffix_tokens - len(user_words)),
+                                (index + 1) * 16 + turn, words)
+    return user_words[:max(1, suffix_tokens)]
 
 
 def build_request(gateway, api_key, model, messages, max_tokens, stream, request_id):
@@ -140,46 +166,27 @@ def percentile(values, quantile):
     return values[lo] + (values[hi] - values[lo]) * (index - lo)
 
 
-def run_one(gateway, api_key, model, max_tokens, stream, index,
-            workload="default", prefix_tokens=0, suffix_tokens=0, vocab=None,
-            max_retries=0):
-    """Run one request; return (ok, rejected, ttft_ms, latency_ms, detail).
-
-    A capacity rejection (429/503) is retried up to `max_retries` times with a
-    short backoff before it is reported as rejected; the gateway sheds load on
-    stale capacity credits, so a closed-loop client without retries sheds most
-    of its own load no matter how lightly it is actually loaded.
-    """
-    messages = build_messages(workload, prefix_tokens, suffix_tokens, index, vocab)
-    for attempt in range(max_retries + 1):
-        request = build_request(
-            gateway, api_key, model, messages, max_tokens, stream, f"bench-{index:06d}"
-            if attempt == 0 else f"bench-{index:06d}-r{attempt}"
-        )
-        started = time.monotonic()
-        ok, rejected, ttft_ms, latency_ms, detail = run_attempt(
-            request, stream, started
-        )
-        if ok or not rejected or attempt == max_retries:
-            return (ok, rejected and attempt == max_retries, ttft_ms, latency_ms, detail)
-        time.sleep(min(0.025 * 2 ** attempt, 0.2))
-    raise AssertionError("unreachable")
-
-
 def run_attempt(request, stream, started):
-    """Run one HTTP attempt; return (ok, rejected, ttft_ms, latency_ms, detail)."""
+    """Run one HTTP attempt.
+
+    Returns (ok, rejected, ttft_ms, latency_ms, detail, reply_text) where
+    reply_text carries the assistant reply for multi-turn history replay.
+    """
     try:
         with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECS) as response:
             if response.status == 429 or response.status == 503:
                 response.read(4096)
-                return (False, True, None, (time.monotonic() - started) * 1000.0, response.status)
+                return (False, True, None, (time.monotonic() - started) * 1000.0,
+                        response.status, None)
             if response.status != 200:
                 response.read(4096)
-                return (False, False, None, (time.monotonic() - started) * 1000.0, response.status)
+                return (False, False, None, (time.monotonic() - started) * 1000.0,
+                        response.status, None)
             ttft_ms = None
             total = 0
             events = 0
             buf = b""
+            reply_parts = []
             if stream:
                 while True:
                     chunk = response.read(65536)
@@ -187,11 +194,13 @@ def run_attempt(request, stream, started):
                         break
                     total += len(chunk)
                     if total > MAX_RESPONSE_BODY_BYTES:
-                        return (False, False, None, (time.monotonic() - started) * 1000.0, "oversize")
+                        return (False, False, None, (time.monotonic() - started) * 1000.0,
+                                "oversize", None)
                     for raw in chunk.split(b"\n"):
                         buf += raw
                         if len(buf) > MAX_EVENT_LINE_BYTES:
-                            return (False, False, None, (time.monotonic() - started) * 1000.0, "oversize-line")
+                            return (False, False, None, (time.monotonic() - started) * 1000.0,
+                                    "oversize-line", None)
                         if raw.endswith(b"\r"):
                             raw = raw[:-1]
                         if raw.startswith(b"data:"):
@@ -201,9 +210,19 @@ def run_attempt(request, stream, started):
                                 break
                             events += 1
                             if events > MAX_SSE_EVENTS:
-                                return (False, False, None, (time.monotonic() - started) * 1000.0, "too-many-events")
+                                return (False, False, None,
+                                        (time.monotonic() - started) * 1000.0,
+                                        "too-many-events", None)
                             if ttft_ms is None:
                                 ttft_ms = (time.monotonic() - started) * 1000.0
+                            try:
+                                event = json.loads(line.decode("utf-8"))
+                                delta = event.get("choices", [{}])[0].get("delta", {})
+                                text = delta.get("content")
+                                if isinstance(text, str):
+                                    reply_parts.append(text)
+                            except (ValueError, IndexError):
+                                pass
                             buf = b""
                     else:
                         continue
@@ -211,20 +230,90 @@ def run_attempt(request, stream, started):
             else:
                 body = response.read(MAX_RESPONSE_BODY_BYTES + 1)
                 if len(body) > MAX_RESPONSE_BODY_BYTES:
-                    return (False, False, None, (time.monotonic() - started) * 1000.0, "oversize")
+                    return (False, False, None, (time.monotonic() - started) * 1000.0,
+                            "oversize", None)
                 parsed = json.loads(body.decode("utf-8"))
                 if not parsed.get("choices"):
-                    return (False, False, None, (time.monotonic() - started) * 1000.0, "empty-choices")
+                    return (False, False, None, (time.monotonic() - started) * 1000.0,
+                            "empty-choices", None)
+                message = parsed.get("choices", [{}])[0].get("message", {})
+                if isinstance(message.get("content"), str):
+                    reply_parts.append(message["content"])
             latency_ms = (time.monotonic() - started) * 1000.0
-            return (True, False, ttft_ms, latency_ms, None)
+            return (True, False, ttft_ms, latency_ms, None, "".join(reply_parts))
     except urllib.error.HTTPError as error:
         try:
             error.read(4096)
         except Exception:
             pass
-        return (False, error.code in (429, 503), None, (time.monotonic() - started) * 1000.0, error.code)
+        return (False, error.code in (429, 503), None, (time.monotonic() - started) * 1000.0,
+                error.code, None)
     except Exception as error:
-        return (False, False, None, (time.monotonic() - started) * 1000.0, type(error).__name__)
+        return (False, False, None, (time.monotonic() - started) * 1000.0,
+                type(error).__name__, None)
+
+
+def run_one(gateway, api_key, model, max_tokens, stream, index,
+            workload="default", prefix_tokens=0, suffix_tokens=0, vocab=None,
+            max_retries=0, turns=0):
+    """Run one request (or one multi-turn conversation); return stats.
+
+    For multi_turn, `index` selects the conversation and `turns` its length:
+    the conversation's turns run sequentially against the growing real
+    history (assistant replies come from the model), and the returned stats
+    cover all turns with `detail` carrying the turn-level TTFTs.
+    """
+    if workload == "multi_turn":
+        ttfts = []
+        latencies = []
+        history = []
+        reply = None
+        for turn in range(turns):
+            user_words = conversation_turn_words(suffix_tokens, index, turn, vocab)
+            history.append([user_words, None])
+            messages = build_messages(workload, prefix_tokens, suffix_tokens,
+                                      index, vocab, history)
+            # A capacity rejection is retried with short backoff exactly like
+            # the single-shot workloads: the gateway sheds load on stale
+            # capacity credits, and an unretried turn drops the conversation.
+            for attempt in range(max_retries + 1):
+                request = build_request(
+                    gateway, api_key, model, messages, max_tokens, stream,
+                    f"bench-{index:06d}-t{turn:02d}"
+                    if attempt == 0 else f"bench-{index:06d}-t{turn:02d}-r{attempt}",
+                )
+                started = time.monotonic()
+                ok, rejected, ttft_ms, latency_ms, detail, reply = run_attempt(
+                    request, stream, started
+                )
+                if ok or not rejected or attempt == max_retries:
+                    break
+                time.sleep(min(0.025 * 2 ** attempt, 0.2))
+            history[-1][1] = reply
+            if not ok:
+                return (False, rejected, ttft_ms, latency_ms,
+                        f"turn-{turn}:{detail}", None)
+            if ttft_ms is not None:
+                ttfts.append(ttft_ms)
+            latencies.append(latency_ms)
+        # Turn-level observations ride in detail; the conversation-level
+        # aggregates stay None so the record carries every turn's TTFT.
+        return (True, False, None, None,
+                {"ttfts": ttfts, "latencies": latencies}, None)
+    messages = build_messages(workload, prefix_tokens, suffix_tokens, index, vocab)
+    for attempt in range(max_retries + 1):
+        request = build_request(
+            gateway, api_key, model, messages, max_tokens, stream, f"bench-{index:06d}"
+            if attempt == 0 else f"bench-{index:06d}-r{attempt}"
+        )
+        started = time.monotonic()
+        ok, rejected, ttft_ms, latency_ms, detail, _ = run_attempt(
+            request, stream, started
+        )
+        if ok or not rejected or attempt == max_retries:
+            return (ok, rejected and attempt == max_retries, ttft_ms, latency_ms, detail, None)
+        time.sleep(min(0.025 * 2 ** attempt, 0.2))
+    raise AssertionError("unreachable")
 
 
 def main():
@@ -238,11 +327,19 @@ def main():
     parser.add_argument("--stream", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--workload",
-        choices=["default", "shared", "cold"],
+        choices=["default", "shared", "cold", "multi_turn"],
         default="default",
         help="default: fixed prompt; shared: constant system prefix + per-request "
         "unique user suffix (prefix-cache reuse expected); cold: unique "
-        "per-request prompts of the same total length (no reuse expected)",
+        "per-request prompts of the same total length (no reuse expected); "
+        "multi_turn: one growing conversation per request with real assistant "
+        "replies replayed into the history (routing/locality evidence)",
+    )
+    parser.add_argument(
+        "--turns",
+        type=int,
+        default=4,
+        help="turns per conversation for the multi_turn workload",
     )
     parser.add_argument(
         "--prefix-tokens",
@@ -277,12 +374,19 @@ def main():
 
     if args.max_retries < 0 or args.max_retries > 1000:
         parser.error("--max-retries must be between 0 and 1000")
+    if args.turns < 2 or args.turns > 16:
+        parser.error("--turns must be between 2 and 16")
     if args.requests <= 0 or args.requests > 100000:
         parser.error("--requests must be between 1 and 100000")
     if args.concurrency <= 0 or args.concurrency > 64:
         parser.error("--concurrency must be between 1 and 64")
     if args.max_tokens <= 0 or args.max_tokens > 4096:
         parser.error("--max-tokens must be between 1 and 4096")
+    vocab = [word for word in args.vocab.split(",") if word]
+    if len(vocab) < 2:
+        parser.error("--vocab needs at least two distinct words")
+    if len(set(vocab)) != len(vocab):
+        parser.error("--vocab words must be distinct")
     if args.workload in ("shared", "cold"):
         if args.prefix_tokens <= 0 or args.prefix_tokens > 4096:
             parser.error("--prefix-tokens must be between 1 and 4096 for shared/cold")
@@ -290,11 +394,27 @@ def main():
             parser.error("--suffix-tokens must be between 1 and 4096 for shared/cold")
         if args.prefix_tokens + args.suffix_tokens > 4096:
             parser.error("--prefix-tokens + --suffix-tokens must not exceed 4096")
-    vocab = [word for word in args.vocab.split(",") if word]
-    if len(vocab) < 2:
-        parser.error("--vocab needs at least two distinct words")
-    if len(set(vocab)) != len(vocab):
-        parser.error("--vocab words must be distinct")
+    if args.workload == "multi_turn":
+        if args.prefix_tokens <= 0 or args.prefix_tokens > 4096:
+            parser.error("--prefix-tokens must be between 1 and 4096 for multi_turn")
+        if args.suffix_tokens <= 0 or args.suffix_tokens > 4096:
+            parser.error("--suffix-tokens must be between 1 and 4096 for multi_turn")
+        if args.prefix_tokens < marker_word_count(vocab) + 1:
+            parser.error(
+                f"multi_turn needs --prefix-tokens >= {marker_word_count(vocab) + 1} "
+                "for a conversation-unique system marker"
+            )
+        if args.suffix_tokens < marker_word_count(vocab):
+            parser.error(
+                f"multi_turn needs --suffix-tokens >= {marker_word_count(vocab)} "
+                "for per-turn marker uniqueness"
+            )
+        # Turn request ids draw per-(conversation, turn) markers over the same
+        # uniqueness budget: 16 conversations per marker digit block.
+        if args.requests * 16 > MARKER_UNIQUE_REQUESTS:
+            parser.error(
+                f"multi_turn supports at most {MARKER_UNIQUE_REQUESTS // 16} conversations"
+            )
     if args.workload in ("shared", "cold"):
         try:
             build_messages(args.workload, args.prefix_tokens, args.suffix_tokens, 0, vocab)
@@ -315,22 +435,31 @@ def main():
                 run_one, args.gateway.rstrip("/"), args.api_key, args.model,
                 args.max_tokens, args.stream, index,
                 args.workload, args.prefix_tokens, args.suffix_tokens, vocab,
-                args.max_retries,
+                args.max_retries, args.turns,
             )
             for index in range(args.requests)
         ]
         for future in concurrent.futures.as_completed(futures):
-            ok, was_rejected, ttft_ms, latency_ms, detail = future.result()
-            latencies.append(latency_ms)
+            ok, was_rejected, ttft_ms, latency_ms, detail, _ = future.result()
             if ok:
                 completed += 1
                 if ttft_ms is not None:
                     ttfts.append(ttft_ms)
+                    latencies.append(latency_ms)
+                elif detail and isinstance(detail, dict):
+                    ttfts.extend(value for value in detail.get("ttfts", []) if value)
+                    latencies.extend(
+                        value for value in detail.get("latencies", []) if value
+                    )
             elif was_rejected:
                 rejected += 1
+                if latency_ms is not None:
+                    latencies.append(latency_ms)
             else:
                 failed += 1
                 failures[str(detail)] = failures.get(str(detail), 0) + 1
+                if latency_ms is not None:
+                    latencies.append(latency_ms)
     wall_secs = time.monotonic() - started
 
     record = {
@@ -338,9 +467,12 @@ def main():
         "max_retries": args.max_retries,
         "stream": args.stream,
         "workload": args.workload,
-        "prefix_tokens": args.prefix_tokens if args.workload in ("shared", "cold") else 0,
-        "suffix_tokens": args.suffix_tokens if args.workload in ("shared", "cold") else 0,
-        "vocab": vocab if args.workload in ("shared", "cold") else None,
+        "turns": args.turns if args.workload == "multi_turn" else 0,
+        "prefix_tokens": args.prefix_tokens
+        if args.workload in ("shared", "cold", "multi_turn") else 0,
+        "suffix_tokens": args.suffix_tokens
+        if args.workload in ("shared", "cold", "multi_turn") else 0,
+        "vocab": vocab if args.workload in ("shared", "cold", "multi_turn") else None,
         "requests": args.requests,
         "concurrency": args.concurrency,
         "max_tokens": args.max_tokens,
