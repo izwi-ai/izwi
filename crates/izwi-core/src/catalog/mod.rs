@@ -7,6 +7,7 @@
 
 mod cuda_support;
 mod metadata;
+mod prefix_reuse;
 mod variant;
 
 pub use cuda_support::{
@@ -17,6 +18,10 @@ pub use cuda_support::{
 pub use metadata::{
     ChatModelCapabilities, ChatReasoningEffort, ModelInfo, ModelStatus, ModelVariant,
     SpeechModelCapabilities,
+};
+pub use prefix_reuse::{
+    prefix_reuse_engages, PrefixReuseEvidenceLevel, PrefixReuseMode, PrefixReuseSupport,
+    PrefixReuseSupportLevel,
 };
 pub use variant::{
     parse_chat_model_variant, parse_model_variant, parse_tts_model_variant,
