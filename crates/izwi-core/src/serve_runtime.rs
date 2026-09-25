@@ -17,6 +17,12 @@ pub const ENV_PHYSICAL_EXECUTION_MODE: &str = "IZWI_PHYSICAL_EXECUTION_MODE";
 pub const ENV_MAX_PHYSICAL_IN_FLIGHT: &str = "IZWI_MAX_PHYSICAL_IN_FLIGHT";
 pub const ENV_MAX_SCHEDULER_BATCH_SIZE: &str = "IZWI_MAX_SCHEDULER_BATCH_SIZE";
 pub const ENV_ENABLE_PREFIX_CACHING: &str = "IZWI_ENABLE_PREFIX_CACHING";
+pub const ENV_PREFIX_REUSE_AUTO: &str = "IZWI_PREFIX_REUSE_AUTO";
+/// Shipped serving default (DS1.6): when the operator made no explicit
+/// prefix-caching choice, committed prefix reuse engages per loaded model
+/// where the catalog cell has backend-lane evidence. Encode the choice in
+/// this named constant and preserve the explicit kill switch.
+pub const PREFIX_REUSE_CATALOG_AUTO_DEFAULT: bool = true;
 pub const ENV_MANAGED_PREFIX_CACHE_SALT: &str = "IZWI_MANAGED_PREFIX_CACHE_SALT";
 pub const ENV_MAX_PREFIX_CACHE_PAGES: &str = "IZWI_MAX_PREFIX_CACHE_PAGES";
 pub const ENV_ENABLE_CHUNKED_PREFILL: &str = "IZWI_ENABLE_CHUNKED_PREFILL";
@@ -51,6 +57,7 @@ pub struct ServeRuntimeConfig {
     pub max_physical_in_flight: PhysicalInFlightLimit,
     pub max_scheduler_batch_size: usize,
     pub enable_prefix_caching: bool,
+    pub prefix_reuse_catalog_auto: bool,
     pub managed_prefix_cache_salt: Option<String>,
     pub max_prefix_cache_pages: usize,
     pub enable_chunked_prefill: bool,
@@ -82,6 +89,7 @@ impl Default for ServeRuntimeConfig {
             max_physical_in_flight: PhysicalInFlightLimit::default(),
             max_scheduler_batch_size: default_max_scheduler_batch_size(),
             enable_prefix_caching: default_enable_prefix_caching(),
+            prefix_reuse_catalog_auto: PREFIX_REUSE_CATALOG_AUTO_DEFAULT,
             managed_prefix_cache_salt: default_managed_prefix_cache_salt(),
             max_prefix_cache_pages: default_max_prefix_cache_pages(),
             enable_chunked_prefill: default_enable_chunked_prefill(),
@@ -146,6 +154,12 @@ impl ServeRuntimeConfig {
         }
         if let Some(enable_prefix_caching) = overrides.enable_prefix_caching {
             self.enable_prefix_caching = enable_prefix_caching;
+            // An explicit prefix-caching choice replaces the catalog-auto
+            // default: true is explicit enablement, false is the kill switch.
+            self.prefix_reuse_catalog_auto = false;
+        }
+        if let Some(prefix_reuse_catalog_auto) = overrides.prefix_reuse_catalog_auto {
+            self.prefix_reuse_catalog_auto = prefix_reuse_catalog_auto;
         }
         if let Some(managed_prefix_cache_salt) = overrides.managed_prefix_cache_salt.as_ref() {
             self.managed_prefix_cache_salt = Some(managed_prefix_cache_salt.clone());
@@ -206,6 +220,7 @@ impl ServeRuntimeConfig {
             max_physical_in_flight: self.max_physical_in_flight,
             max_scheduler_batch_size: self.max_scheduler_batch_size,
             enable_prefix_caching: self.enable_prefix_caching,
+            prefix_reuse_catalog_auto: self.prefix_reuse_catalog_auto,
             managed_prefix_cache_salt: self.managed_prefix_cache_salt.clone(),
             max_prefix_cache_pages: self.max_prefix_cache_pages,
             enable_chunked_prefill: self.enable_chunked_prefill,
@@ -238,6 +253,7 @@ pub struct ServeRuntimeConfigOverrides {
     pub max_physical_in_flight: Option<PhysicalInFlightLimit>,
     pub max_scheduler_batch_size: Option<usize>,
     pub enable_prefix_caching: Option<bool>,
+    pub prefix_reuse_catalog_auto: Option<bool>,
     pub managed_prefix_cache_salt: Option<String>,
     pub max_prefix_cache_pages: Option<usize>,
     pub enable_chunked_prefill: Option<bool>,
@@ -275,6 +291,7 @@ impl ServeRuntimeConfigOverrides {
             ),
             max_scheduler_batch_size: read_env_usize(ENV_MAX_SCHEDULER_BATCH_SIZE, &[]),
             enable_prefix_caching: read_env_bool(ENV_ENABLE_PREFIX_CACHING, &[]),
+            prefix_reuse_catalog_auto: read_env_bool(ENV_PREFIX_REUSE_AUTO, &[]),
             managed_prefix_cache_salt: read_env_string(ENV_MANAGED_PREFIX_CACHE_SALT, &[]),
             max_prefix_cache_pages: read_env_usize(ENV_MAX_PREFIX_CACHE_PAGES, &[]),
             enable_chunked_prefill: read_env_bool(ENV_ENABLE_CHUNKED_PREFILL, &[]),
@@ -679,6 +696,60 @@ mod tests {
         assert!(engine.enable_chunked_prefill);
         assert_eq!(engine.chunked_prefill_threshold, 512);
         clear_env();
+    }
+
+    #[test]
+    fn prefix_reuse_auto_is_the_default_and_explicit_choices_replace_it() {
+        let _guard = crate::env_test_lock().lock().expect("env lock poisoned");
+        clear_env();
+
+        // No explicit choice anywhere: the shipped catalog-auto default.
+        let resolved = ServeRuntimeConfig::from_sources(
+            &ServeRuntimeConfigOverrides::default(),
+            &ServeRuntimeConfigOverrides::from_env(),
+            &ServeRuntimeConfigOverrides::default(),
+        );
+        assert!(!resolved.enable_prefix_caching);
+        assert!(resolved.prefix_reuse_catalog_auto);
+        let engine = resolved.engine_config();
+        assert!(!engine.enable_prefix_caching);
+        assert!(engine.prefix_reuse_catalog_auto);
+
+        // An explicit zero is the kill switch: auto off, flag off.
+        std::env::set_var(ENV_ENABLE_PREFIX_CACHING, "0");
+        let resolved = ServeRuntimeConfig::from_sources(
+            &ServeRuntimeConfigOverrides::default(),
+            &ServeRuntimeConfigOverrides::from_env(),
+            &ServeRuntimeConfigOverrides::default(),
+        );
+        assert!(!resolved.enable_prefix_caching);
+        assert!(!resolved.prefix_reuse_catalog_auto);
+        assert!(!resolved.engine_config().prefix_reuse_catalog_auto);
+
+        // The auto env can pin the mode explicitly without enabling reuse.
+        std::env::remove_var(ENV_ENABLE_PREFIX_CACHING);
+        std::env::set_var(ENV_PREFIX_REUSE_AUTO, "false");
+        let resolved = ServeRuntimeConfig::from_sources(
+            &ServeRuntimeConfigOverrides::default(),
+            &ServeRuntimeConfigOverrides::from_env(),
+            &ServeRuntimeConfigOverrides::default(),
+        );
+        assert!(!resolved.enable_prefix_caching);
+        assert!(!resolved.prefix_reuse_catalog_auto);
+
+        // An explicit true is explicit enablement, not catalog-auto.
+        std::env::set_var(ENV_ENABLE_PREFIX_CACHING, "true");
+        std::env::set_var(ENV_MANAGED_PREFIX_CACHE_SALT, "tenant-a");
+        let resolved = ServeRuntimeConfig::from_sources(
+            &ServeRuntimeConfigOverrides::default(),
+            &ServeRuntimeConfigOverrides::from_env(),
+            &ServeRuntimeConfigOverrides::default(),
+        );
+        assert!(resolved.enable_prefix_caching);
+        assert!(!resolved.prefix_reuse_catalog_auto);
+        std::env::remove_var(ENV_ENABLE_PREFIX_CACHING);
+        std::env::remove_var(ENV_MANAGED_PREFIX_CACHE_SALT);
+        std::env::remove_var(ENV_PREFIX_REUSE_AUTO);
     }
 
     #[test]

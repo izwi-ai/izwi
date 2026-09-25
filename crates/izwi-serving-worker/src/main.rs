@@ -44,9 +44,18 @@ async fn main() -> anyhow::Result<()> {
     // resource authority performs the exact load-peak reservation below.
     let model_load_stage = acquire_model_load_stage(&process, managed_locks.as_ref())?;
     // Serving-policy env (mirrors the single-process server's resolution):
-    // prefix caching requires an explicit namespace, and chunked prefill is
-    // opt-in. Defaults keep worker behavior identical to before.
-    let enable_prefix_caching = parse_env_flag("IZWI_ENABLE_PREFIX_CACHING");
+    // an explicit prefix-caching choice replaces the catalog-auto default
+    // (true = explicit enablement requiring a namespace, false = kill
+    // switch); with no explicit choice, catalog-auto engages reuse per
+    // loaded model where the catalog cell has backend-lane evidence.
+    // Chunked prefill remains opt-in.
+    let explicit_prefix_caching = env_flag_value("IZWI_ENABLE_PREFIX_CACHING");
+    let enable_prefix_caching = explicit_prefix_caching.unwrap_or(false);
+    let prefix_reuse_catalog_auto = match explicit_prefix_caching {
+        Some(_) => false,
+        None => env_flag_value(izwi_core::serve_runtime::ENV_PREFIX_REUSE_AUTO)
+            .unwrap_or(izwi_core::serve_runtime::PREFIX_REUSE_CATALOG_AUTO_DEFAULT),
+    };
     let managed_prefix_cache_salt = std::env::var("IZWI_MANAGED_PREFIX_CACHE_SALT")
         .ok()
         .map(|value| value.trim().to_string())
@@ -74,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
         max_staged_transactions: process.max_active_invocations,
         num_threads: process.thread_budget(),
         enable_prefix_caching,
+        prefix_reuse_catalog_auto,
         managed_prefix_cache_salt,
         max_prefix_cache_pages: parse_env(
             "IZWI_MAX_PREFIX_CACHE_PAGES",
@@ -842,6 +852,18 @@ where
             .map_err(|error| anyhow::anyhow!("invalid {name}: {error}")),
         Err(_) => Ok(fallback),
     }
+}
+
+/// Read a tri-state env flag: `None` when unset or unrecognized, so an
+/// absent variable is distinguishable from an explicit `0`/`false`.
+fn env_flag_value(name: &str) -> Option<bool> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        })
 }
 
 fn parse_env_flag(name: &str) -> bool {

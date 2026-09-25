@@ -74,6 +74,8 @@ pub struct RuntimeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enable_prefix_caching: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_reuse_catalog_auto: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed_prefix_cache_salt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_prefix_cache_pages: Option<usize>,
@@ -107,6 +109,7 @@ impl RuntimeConfig {
             && self.max_scheduler_batch_size.is_none()
             && self.max_loaded_models.is_none()
             && self.enable_prefix_caching.is_none()
+            && self.prefix_reuse_catalog_auto.is_none()
             && self.managed_prefix_cache_salt.is_none()
             && self.max_prefix_cache_pages.is_none()
             && self.enable_chunked_prefill.is_none()
@@ -197,6 +200,7 @@ impl Config {
                 max_scheduler_batch_size: Some(defaults.max_scheduler_batch_size),
                 max_loaded_models: Some(defaults.max_loaded_models),
                 enable_prefix_caching: Some(defaults.enable_prefix_caching),
+                prefix_reuse_catalog_auto: Some(defaults.prefix_reuse_catalog_auto),
                 managed_prefix_cache_salt: defaults.managed_prefix_cache_salt.clone(),
                 max_prefix_cache_pages: Some(defaults.max_prefix_cache_pages),
                 enable_chunked_prefill: Some(defaults.enable_chunked_prefill),
@@ -237,6 +241,7 @@ impl Config {
             max_scheduler_batch_size: self.runtime.max_scheduler_batch_size,
             max_loaded_models: self.runtime.max_loaded_models,
             enable_prefix_caching: self.runtime.enable_prefix_caching,
+            prefix_reuse_catalog_auto: self.runtime.prefix_reuse_catalog_auto,
             managed_prefix_cache_salt: self.runtime.managed_prefix_cache_salt.clone(),
             max_prefix_cache_pages: self.runtime.max_prefix_cache_pages,
             enable_chunked_prefill: self.runtime.enable_chunked_prefill,
@@ -299,6 +304,9 @@ impl Config {
             }
             "runtime.enable_prefix_caching" => {
                 self.runtime.enable_prefix_caching = Some(parse_bool(value)?)
+            }
+            "runtime.prefix_reuse_catalog_auto" => {
+                self.runtime.prefix_reuse_catalog_auto = Some(parse_bool(value)?)
             }
             "runtime.managed_prefix_cache_salt" => {
                 self.runtime.managed_prefix_cache_salt = Some(parse_string(value)?)
@@ -394,6 +402,10 @@ impl Config {
             "runtime.enable_prefix_caching" => {
                 self.runtime.enable_prefix_caching.map(toml::Value::Boolean)
             }
+            "runtime.prefix_reuse_catalog_auto" => self
+                .runtime
+                .prefix_reuse_catalog_auto
+                .map(toml::Value::Boolean),
             "runtime.managed_prefix_cache_salt" => self
                 .runtime
                 .managed_prefix_cache_salt
@@ -575,6 +587,7 @@ mod tests {
                 max_scheduler_batch_size: Some(9),
                 max_loaded_models: Some(1),
                 enable_prefix_caching: Some(true),
+                prefix_reuse_catalog_auto: Some(false),
                 managed_prefix_cache_salt: Some("tenant-a".to_string()),
                 max_prefix_cache_pages: Some(64),
                 enable_chunked_prefill: Some(true),

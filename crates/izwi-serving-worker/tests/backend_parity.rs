@@ -348,7 +348,19 @@ async fn collect_prefix_lane(
     assignment_env: &[(&str, &str)],
     startup_deadline: Duration,
 ) -> PrefixLane {
-    let lane_env = prefix_lane_env(assignment_env);
+    collect_prefix_lane_with_env(
+        models_dir,
+        prefix_lane_env(assignment_env),
+        startup_deadline,
+    )
+    .await
+}
+
+async fn collect_prefix_lane_with_env(
+    models_dir: &std::path::Path,
+    lane_env: Vec<(String, String)>,
+    startup_deadline: Duration,
+) -> PrefixLane {
     let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = reservation.local_addr().unwrap();
     drop(reservation);
@@ -498,6 +510,74 @@ async fn qwen38_shared_prefix_lane_is_deterministic_and_attaches_across_processe
     );
     assert_prefix_counters(&first.counters, "publish run");
     assert_prefix_counters(&second.counters, "attach run");
+}
+
+/// The DS1.6 catalog-auto leg: the worker starts with NO explicit prefix
+/// choice at all — no IZWI_ENABLE_PREFIX_CACHING, no IZWI_PREFIX_REUSE_AUTO —
+/// so the shipped Auto default must engage reuse through the catalog cell.
+/// The qwen38 CPU lane is a process-parity-supported cell, so this is the
+/// default-on admission evidence: reuse reaches a real worker through normal
+/// admission without any operator opt-in.
+fn auto_prefix_lane_env(assignment: &[(&str, &str)]) -> Vec<(String, String)> {
+    prefix_lane_env(assignment)
+        .into_iter()
+        .filter(|(key, _)| {
+            key != "IZWI_ENABLE_PREFIX_CACHING" && key != "IZWI_MANAGED_PREFIX_CACHE_SALT"
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn qwen38_prefix_reuse_engages_by_default_without_explicit_operator_choice() {
+    let models = tempfile::tempdir().unwrap();
+    write_tiny_qwen38_hybrid_fixture(models.path());
+    let lane = collect_prefix_lane_with_env(
+        models.path(),
+        auto_prefix_lane_env(&[("IZWI_BACKEND", "cpu")]),
+        STARTUP_DEADLINE,
+    )
+    .await;
+    assert!(
+        lane.outputs.iter().all(|output| !output.is_empty()),
+        "catalog-auto fixtures must produce non-empty outputs"
+    );
+    assert_prefix_counters(&lane.counters, "catalog-auto run");
+}
+
+/// The kill switch stays independent: an explicit zero disables reuse even
+/// though a namespace salt and a supported catalog cell are available.
+fn off_prefix_lane_env(assignment: &[(&str, &str)]) -> Vec<(String, String)> {
+    prefix_lane_env(assignment)
+        .into_iter()
+        .map(|(key, value)| {
+            if key == "IZWI_ENABLE_PREFIX_CACHING" {
+                (key, "0".to_string())
+            } else {
+                (key, value)
+            }
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn explicit_zero_prefix_caching_keeps_reuse_off() {
+    let models = tempfile::tempdir().unwrap();
+    write_tiny_qwen38_hybrid_fixture(models.path());
+    let lane = collect_prefix_lane_with_env(
+        models.path(),
+        off_prefix_lane_env(&[("IZWI_BACKEND", "cpu")]),
+        STARTUP_DEADLINE,
+    )
+    .await;
+    assert!(
+        lane.outputs.iter().all(|output| !output.is_empty()),
+        "kill-switch fixtures must still produce non-empty outputs"
+    );
+    for (key, value) in &lane.counters {
+        if key.contains("tensor_snapshot") || key.contains("reused_tokens") {
+            assert_eq!(*value, 0, "kill-switch run must record zero {key} activity");
+        }
+    }
 }
 
 /// The Metal lane of the DS1.5 prefix leg: attached prefill on the unified
