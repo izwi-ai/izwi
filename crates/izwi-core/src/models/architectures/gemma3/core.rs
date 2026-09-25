@@ -584,6 +584,7 @@ impl Gemma3PhysicalModel {
         domain: StateDomainId,
         storage_dtype: DType,
         preferred_page_tokens: usize,
+        prefix_reuse: bool,
     ) -> Result<InferenceStateContract> {
         let storage_dtype = match storage_dtype {
             DType::F32 => StateDType::F32,
@@ -637,8 +638,12 @@ impl Gemma3PhysicalModel {
                     scope: StateScope::Retained,
                     clock: StateClock::DecoderTokens,
                     placement: PlacementPolicy::BackendLocalWithHostOffload,
-                    prefix: PrefixPolicy::CommittedPages {
-                        positions: PositionSemantics::Absolute,
+                    prefix: if prefix_reuse {
+                        PrefixPolicy::CommittedPages {
+                            positions: PositionSemantics::Absolute,
+                        }
+                    } else {
+                        PrefixPolicy::Disabled
                     },
                     checkpoint: CheckpointPolicy::CopyOnWrite,
                 },
@@ -654,7 +659,7 @@ impl Gemma3PhysicalModel {
             groups: vec![StateGroupSpec {
                 id: StateGroupId::new(domain.get()),
                 domains: vec![domain],
-                prefix_shareable: true,
+                prefix_shareable: prefix_reuse,
             }],
         };
         contract.validate()?;
@@ -1094,7 +1099,7 @@ mod tests {
         )
         .unwrap();
         let contract = model
-            .managed_inference_state_contract(StateDomainId::new(3), DType::F32, 4)
+            .managed_inference_state_contract(StateDomainId::new(3), DType::F32, 4, false)
             .unwrap();
         let StateDomainSpec::PagedAttention(domain) = &contract.domains[0] else {
             panic!("Gemma contract must contain paged attention");

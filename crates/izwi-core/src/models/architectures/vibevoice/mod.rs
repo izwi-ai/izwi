@@ -113,7 +113,8 @@ pub(crate) fn vibevoice_invocation_contract(
     let mut groups = Vec::with_capacity(domains.len());
     for domain in domains {
         let contract =
-            model.managed_inference_state_contract(*domain, dtype, preferred_page_tokens)?;
+            // Managed prefix reuse is chat-task-gated; VibeVoice routes never share.
+            model.managed_inference_state_contract(*domain, dtype, preferred_page_tokens, false)?;
         state_domains.extend(contract.domains);
         groups.extend(contract.groups);
     }

@@ -2924,10 +2924,46 @@ impl RuntimeService {
         mut config: EngineConfig,
         backend_context: crate::backends::BackendContext,
     ) -> Result<Self> {
+        // Resolve catalog-auto prefix reuse (DS1.6) once, before the fail-closed
+        // cache-policy boundary: explicit operator enablement keeps its salt
+        // contract, catalog-auto engages with the operator namespace or a
+        // generated per-process one, and the registry consults the catalog cell
+        // of each loaded family on the active backend.
+        let prefix_reuse_mode = if config.enable_prefix_caching {
+            crate::catalog::PrefixReuseMode::Explicit
+        } else if config.prefix_reuse_catalog_auto {
+            crate::catalog::PrefixReuseMode::CatalogAuto
+        } else {
+            crate::catalog::PrefixReuseMode::Disabled
+        };
+        let (prefix_engaged, prefix_namespace) = crate::config::resolve_prefix_engagement(
+            config.enable_prefix_caching,
+            config.prefix_reuse_catalog_auto,
+            config.managed_prefix_cache_salt.as_deref(),
+        );
+        if prefix_engaged {
+            config.enable_prefix_caching = true;
+            if let Some(namespace) = prefix_namespace {
+                config.managed_prefix_cache_salt = Some(namespace);
+            }
+        }
+        // The auto flag stays set for catalog-auto engagements so the policy
+        // resolver can degrade instead of failing startup on a zero budget.
         // Reject unsupported or unsafe cache policy before any model registry,
         // device arena, or readiness state can be created.
         let cache_policy =
             config.resolved_kv_cache_policy(EngineCoreConfig::default().max_blocks)?;
+        if prefix_engaged
+            && matches!(
+                cache_policy.effective.prefix,
+                crate::config::PrefixCachePolicy::Disabled
+            )
+        {
+            // Catalog-auto degraded on this runtime's page budget; the
+            // resolved policy is the truth for the engine core as well.
+            config.enable_prefix_caching = false;
+            config.managed_prefix_cache_salt = None;
+        }
         configure_runtime_threading(config.num_threads.max(1));
         let model_manager = Arc::new(ModelManager::new(config.clone())?);
 
@@ -2955,11 +2991,14 @@ impl RuntimeService {
             }
         }
 
-        let model_registry = Arc::new(ModelRegistry::new_with_performance(
-            config.models_dir.clone(),
-            device.clone(),
-            config.performance.clone(),
-        ));
+        let model_registry = Arc::new(
+            ModelRegistry::new_with_performance(
+                config.models_dir.clone(),
+                device.clone(),
+                config.performance.clone(),
+            )
+            .with_prefix_reuse_mode(prefix_reuse_mode),
+        );
 
         let mut core_config = EngineCoreConfig::for_qwen3_tts();
         core_config.portable_context_auto = config.max_sequence_length.explicit_tokens().is_none();
@@ -2980,6 +3019,10 @@ impl RuntimeService {
         core_config.kv_cache_dtype = cache_policy.effective.dtype.to_string();
         core_config.enable_prefix_caching = config.enable_prefix_caching;
         core_config.managed_prefix_cache_salt = config.managed_prefix_cache_salt.clone();
+        // Prefix engagement is fully resolved above (the engine core reuses
+        // the resolved namespace verbatim), but the auto marker is carried so
+        // the core's own budget check degrades instead of failing startup.
+        core_config.prefix_reuse_catalog_auto = config.prefix_reuse_catalog_auto;
         core_config.max_prefix_cache_pages = match &cache_policy.effective.prefix {
             PrefixCachePolicy::Disabled => 0,
             PrefixCachePolicy::Namespaced { max_pages, .. } => *max_pages,

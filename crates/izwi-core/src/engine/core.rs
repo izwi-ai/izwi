@@ -3044,8 +3044,12 @@ impl EngineCore {
         managed_resource_authority: Option<Arc<super::ResourceAuthority>>,
         managed_worker: Option<(BackendKind, candle_core::Device)>,
     ) -> Result<Self> {
+        let mut config = config;
         // Direct EngineCore users must cross the same fail-closed cache-policy
         // boundary as RuntimeService users before workers or arenas start.
+        // Catalog-auto prefix reuse resolves to one namespace here so the
+        // policy and the managed cache salt cannot diverge.
+        config.apply_prefix_engagement();
         let cache_policy = config.resolved_kv_cache_policy()?;
         // Create scheduler
         let scheduler_config = SchedulerConfig::from(&config);

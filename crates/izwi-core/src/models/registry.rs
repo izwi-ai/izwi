@@ -13,7 +13,7 @@ use tracing::info;
 
 use crate::backends::state::PhysicalStateTransactionId;
 use crate::backends::{BackendKind, DTypeSelectionRequest, DeviceProfile};
-use crate::catalog::{ModelFamily, ModelTask};
+use crate::catalog::{prefix_reuse_engages, ModelFamily, ModelTask, PrefixReuseMode};
 use crate::engine::{
     InvocationStaticAttentionLease, InvocationTensorLease, RetainedStaticAttentionRuntimeV2,
     RetainedStaticAttentionSequenceId, RetainedTensorStateRuntimeV2, StageDescriptor, WorkCost,
@@ -129,9 +129,15 @@ type ChatLoaderFn = fn(
     ModelVariant,
     DeviceProfile,
     &crate::performance::PerformanceConfig,
+    crate::catalog::PrefixReuseMode,
 ) -> Result<NativeChatModel>;
 type DiarizationLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<NativeDiarizationModel>;
-type VoxtralLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<VoxtralRealtimeModel>;
+type VoxtralLoaderFn = fn(
+    &Path,
+    ModelVariant,
+    DeviceProfile,
+    crate::catalog::PrefixReuseMode,
+) -> Result<VoxtralRealtimeModel>;
 type VoxtralTtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<VoxtralTtsModel>;
 type VibeVoiceTtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<VibeVoiceTtsModel>;
 type FishS2TtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<FishS2TtsModel>;
@@ -278,9 +284,14 @@ fn load_qwen_chat_model(
     variant: ModelVariant,
     device: DeviceProfile,
     _performance: &crate::performance::PerformanceConfig,
+    prefix_reuse: PrefixReuseMode,
 ) -> Result<NativeChatModel> {
+    let prefix_reuse = prefix_reuse_engages(variant, BackendKind::from(device.kind), prefix_reuse);
     Ok(NativeChatModel::Qwen3(Qwen3ChatModel::load(
-        model_dir, variant, device,
+        model_dir,
+        variant,
+        device,
+        prefix_reuse,
     )?))
 }
 
@@ -289,9 +300,14 @@ fn load_gemma_chat_model(
     variant: ModelVariant,
     device: DeviceProfile,
     _performance: &crate::performance::PerformanceConfig,
+    prefix_reuse: PrefixReuseMode,
 ) -> Result<NativeChatModel> {
+    let prefix_reuse = prefix_reuse_engages(variant, BackendKind::from(device.kind), prefix_reuse);
     Ok(NativeChatModel::Gemma3(Gemma3ChatModel::load(
-        model_dir, variant, device,
+        model_dir,
+        variant,
+        device,
+        prefix_reuse,
     )?))
 }
 
@@ -310,6 +326,7 @@ fn load_lfm2_chat_model(
     variant: ModelVariant,
     device: DeviceProfile,
     _performance: &crate::performance::PerformanceConfig,
+    _prefix_reuse: PrefixReuseMode,
 ) -> Result<NativeChatModel> {
     Ok(NativeChatModel::Lfm2(Lfm2ChatModel::load(
         model_dir, variant, device,
@@ -321,6 +338,7 @@ fn load_qwen35_chat_model(
     variant: ModelVariant,
     device: DeviceProfile,
     _performance: &crate::performance::PerformanceConfig,
+    _prefix_reuse: PrefixReuseMode,
 ) -> Result<NativeChatModel> {
     Ok(NativeChatModel::Qwen35(Qwen35ChatModel::load(
         model_dir, variant, device,
@@ -332,9 +350,17 @@ fn load_qwen38_chat_model(
     variant: ModelVariant,
     device: DeviceProfile,
     performance: &crate::performance::PerformanceConfig,
+    prefix_reuse: PrefixReuseMode,
 ) -> Result<NativeChatModel> {
+    let prefix_reuse = prefix_reuse_engages(variant, BackendKind::from(device.kind), prefix_reuse);
     Ok(NativeChatModel::Qwen38(
-        Qwen38ChatModel::load_with_performance(model_dir, variant, device, performance)?,
+        Qwen38ChatModel::load_with_performance(
+            model_dir,
+            variant,
+            device,
+            performance,
+            prefix_reuse,
+        )?,
     ))
 }
 
@@ -350,10 +376,12 @@ fn load_lfm25_audio_model(
 
 fn load_voxtral_model(
     model_dir: &Path,
-    _variant: ModelVariant,
+    variant: ModelVariant,
     device: DeviceProfile,
+    prefix_reuse: PrefixReuseMode,
 ) -> Result<VoxtralRealtimeModel> {
-    VoxtralRealtimeModel::load(model_dir, device)
+    let prefix_reuse = prefix_reuse_engages(variant, BackendKind::from(device.kind), prefix_reuse);
+    VoxtralRealtimeModel::load(model_dir, device, prefix_reuse)
 }
 
 fn load_voxtral_tts_model(
@@ -5318,6 +5346,7 @@ impl NativeChatModel {
 #[derive(Clone)]
 pub struct ModelRegistry {
     performance: crate::performance::PerformanceConfig,
+    prefix_reuse: PrefixReuseMode,
     models_dir: PathBuf,
     device: DeviceProfile,
     asr_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<NativeAsrModel>>>>>,
@@ -5537,6 +5566,7 @@ impl ModelRegistry {
     ) -> Self {
         Self {
             performance: performance.snapshot_env(),
+            prefix_reuse: PrefixReuseMode::default(),
             models_dir,
             device,
             asr_models: Arc::new(RwLock::new(HashMap::new())),
@@ -5556,6 +5586,14 @@ impl ModelRegistry {
     /// Immutable policy captured for this registry's model loads.
     pub fn performance(&self) -> &crate::performance::PerformanceConfig {
         &self.performance
+    }
+
+    /// Pin the prefix-reuse decision mode for every model this registry
+    /// loads. The registry default is fail-closed; the serving layer resolves
+    /// the catalog-auto default before handing the registry out.
+    pub fn with_prefix_reuse_mode(mut self, prefix_reuse: PrefixReuseMode) -> Self {
+        self.prefix_reuse = prefix_reuse;
+        self
     }
 
     pub(crate) fn publish_effective_context(
@@ -6001,9 +6039,11 @@ impl ModelRegistry {
                 let device = self.device.clone();
                 let loader = registration.loader;
                 let performance = self.performance.clone();
+                let prefix_reuse = self.prefix_reuse;
                 move || async move {
                     tokio::task::spawn_blocking(move || {
-                        let model = loader(&model_dir, variant, device, &performance)?;
+                        let model =
+                            loader(&model_dir, variant, device, &performance, prefix_reuse)?;
                         Ok::<NativeChatModel, Error>(model)
                     })
                     .await
@@ -6108,11 +6148,14 @@ impl ModelRegistry {
                 let model_dir = model_dir.to_path_buf();
                 let device = self.device.clone();
                 let loader = registration.loader;
+                let prefix_reuse = self.prefix_reuse;
                 move || async move {
-                    tokio::task::spawn_blocking(move || loader(&model_dir, variant, device))
-                        .await
-                        .map_err(|e| Error::ModelLoadError(e.to_string()))?
-                        .map(Arc::new)
+                    tokio::task::spawn_blocking(move || {
+                        loader(&model_dir, variant, device, prefix_reuse)
+                    })
+                    .await
+                    .map_err(|e| Error::ModelLoadError(e.to_string()))?
+                    .map(Arc::new)
                 }
             })
             .await?;

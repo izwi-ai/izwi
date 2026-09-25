@@ -873,7 +873,7 @@ impl InferenceStateContractProvider for Qwen38ChatModel {
 impl Qwen38ChatModel {
     pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
         let performance = crate::performance::PerformanceConfig::default().resolve_env()?;
-        Self::load_with_performance(model_dir, variant, device, &performance)
+        Self::load_with_performance(model_dir, variant, device, &performance, false)
     }
 
     pub fn load_with_performance(
@@ -881,6 +881,7 @@ impl Qwen38ChatModel {
         variant: ModelVariant,
         device: DeviceProfile,
         performance: &crate::performance::PerformanceConfig,
+        prefix_reuse: bool,
     ) -> Result<Self> {
         performance.validate()?;
         if variant != ModelVariant::Qwen3827BFp8 {
@@ -956,12 +957,7 @@ impl Qwen38ChatModel {
             text_model,
             mtp_policy,
             mtp_head,
-            prefix_caching: std::env::var(crate::serve_runtime::ENV_ENABLE_PREFIX_CACHING)
-                .map(|value| {
-                    value.trim().eq_ignore_ascii_case("1")
-                        || value.trim().eq_ignore_ascii_case("true")
-                })
-                .unwrap_or(false),
+            prefix_caching: prefix_reuse,
         })
     }
 

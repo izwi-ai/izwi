@@ -2518,6 +2518,7 @@ impl Qwen3Model {
         domain: StateDomainId,
         storage_dtype: DType,
         preferred_page_tokens: usize,
+        prefix_reuse: bool,
     ) -> Result<InferenceStateContract> {
         let attention = self.cfg.attention_geometry()?;
         let cache_domain = qwen3_decoder_cache_domain(Qwen3DecoderCacheGeometry {
@@ -2531,8 +2532,12 @@ impl Qwen3Model {
             sliding_window: self.cfg.sliding_window(),
             storage_dtype,
             preferred_page_tokens,
-            prefix: PrefixPolicy::CommittedPages {
-                positions: crate::kv::v2::PositionSemantics::Absolute,
+            prefix: if prefix_reuse {
+                PrefixPolicy::CommittedPages {
+                    positions: crate::kv::v2::PositionSemantics::Absolute,
+                }
+            } else {
+                PrefixPolicy::Disabled
             },
         })?;
         let contract = InferenceStateContract {
@@ -2541,7 +2546,7 @@ impl Qwen3Model {
             groups: vec![StateGroupSpec {
                 id: StateGroupId::new(domain.get()),
                 domains: vec![domain],
-                prefix_shareable: true,
+                prefix_shareable: prefix_reuse,
             }],
         };
         contract.validate()?;

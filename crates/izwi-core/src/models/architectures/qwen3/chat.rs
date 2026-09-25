@@ -233,6 +233,8 @@ pub struct Qwen3ChatModel {
     compute_dtype: DType,
     tokenizer: ChatTokenizer,
     text_model: Qwen3Model,
+    /// DS1.6 catalog verdict for committed prefix reuse on the load backend.
+    prefix_reuse: bool,
 }
 
 impl InferenceStateContractProvider for Qwen3ChatModel {
@@ -248,6 +250,7 @@ impl InferenceStateContractProvider for Qwen3ChatModel {
                 StateDomainId::new(1),
                 self.compute_dtype,
                 default_kv_page_size(),
+                self.prefix_reuse,
             )?,
         ))
     }
@@ -262,14 +265,23 @@ impl Qwen3ChatModel {
         })
     }
 
-    pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
+    pub fn load(
+        model_dir: &Path,
+        variant: ModelVariant,
+        device: DeviceProfile,
+        prefix_reuse: bool,
+    ) -> Result<Self> {
         if variant.is_qwen_chat_gguf() {
-            return Self::load_gguf(model_dir, variant, device);
+            return Self::load_gguf(model_dir, variant, device, prefix_reuse);
         }
-        Self::load_safetensors(model_dir, device)
+        Self::load_safetensors(model_dir, device, prefix_reuse)
     }
 
-    fn load_safetensors(model_dir: &Path, device: DeviceProfile) -> Result<Self> {
+    fn load_safetensors(
+        model_dir: &Path,
+        device: DeviceProfile,
+        prefix_reuse: bool,
+    ) -> Result<Self> {
         let config_path = model_dir.join("config.json");
         let config_str = fs::read_to_string(config_path)?;
         let config = parse_qwen3_config(&config_str)?;
@@ -319,10 +331,16 @@ impl Qwen3ChatModel {
             compute_dtype: dtype,
             tokenizer,
             text_model,
+            prefix_reuse,
         })
     }
 
-    fn load_gguf(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
+    fn load_gguf(
+        model_dir: &Path,
+        variant: ModelVariant,
+        device: DeviceProfile,
+        prefix_reuse: bool,
+    ) -> Result<Self> {
         let gguf_name = match variant {
             ModelVariant::Qwen306BGguf => "Qwen3-0.6B-Q8_0.gguf",
             ModelVariant::Qwen317BGguf => "Qwen3-1.7B-Q8_0.gguf",
@@ -365,6 +383,7 @@ impl Qwen3ChatModel {
             compute_dtype: dtype,
             tokenizer,
             text_model,
+            prefix_reuse,
         })
     }
 

@@ -526,6 +526,8 @@ impl Qwen3AsrModel {
             crate::kv::v2::StateDomainId::new(1),
             self.text_dtype,
             default_kv_page_size(),
+            // Managed prefix reuse is chat-task-gated; ASR never shares.
+            false,
         )?;
         let max_sequence = self.text_context_tokens.ok_or_else(|| {
             Error::ModelLoadError(

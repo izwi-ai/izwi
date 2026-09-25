@@ -499,6 +499,7 @@ pub(crate) fn resolve_kv_cache_policy(
     max_prefix_cache_pages: usize,
     total_capacity_pages: usize,
     max_sequence_length: usize,
+    prefix_lenient_zero_budget: bool,
 ) -> Result<ResolvedKvCachePolicy> {
     if page_size == 0 {
         return Err(Error::ConfigError(
@@ -552,6 +553,21 @@ pub(crate) fn resolve_kv_cache_policy(
         } => {
             let effective_pages = (*max_pages).min(prefix_capacity);
             if effective_pages == 0 {
+                // Catalog-auto degrades to Disabled with a recorded reason;
+                // explicit operator enablement keeps the fail-closed error.
+                if prefix_lenient_zero_budget {
+                    return Ok(ResolvedKvCachePolicy {
+                        requested,
+                        fallback_reason: Some(format!(
+                            "catalog-auto prefix cache has no safe page budget: capacity_pages={total_capacity_pages}, reserved_request_pages={request_reserve_pages}; reuse disabled"
+                        )),
+                        effective: EffectiveKvCachePolicy {
+                            page_size,
+                            dtype,
+                            prefix: PrefixCachePolicy::Disabled,
+                        },
+                    });
+                }
                 return Err(Error::ConfigError(format!(
                     "prefix cache has no safe page budget: capacity_pages={total_capacity_pages}, reserved_request_pages={request_reserve_pages}"
                 )));
@@ -580,6 +596,40 @@ pub(crate) fn resolve_kv_cache_policy(
         requested,
         fallback_reason,
     })
+}
+
+/// Ephemeral per-process namespace for catalog-auto prefix reuse. The value
+/// only has to be stable within one process (the managed cache is in-memory),
+/// and it is never serialized to health or diagnostics output.
+pub(crate) fn generate_prefix_namespace_salt() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// Resolve prefix-reuse engagement for a configuration boundary.
+///
+/// Returns `(engaged, namespace)`. Explicit operator enablement keeps the
+/// fail-closed contract: a missing namespace yields `(true, None)` so the
+/// policy resolver rejects the configuration. Catalog-auto mode engages with
+/// the operator's namespace or a generated per-process one.
+pub(crate) fn resolve_prefix_engagement(
+    enable_prefix_caching: bool,
+    prefix_reuse_catalog_auto: bool,
+    prefix_namespace: Option<&str>,
+) -> (bool, Option<String>) {
+    if enable_prefix_caching {
+        (true, prefix_namespace.map(str::to_string))
+    } else if prefix_reuse_catalog_auto {
+        (
+            true,
+            Some(
+                prefix_namespace
+                    .map(str::to_string)
+                    .unwrap_or_else(generate_prefix_namespace_salt),
+            ),
+        )
+    } else {
+        (false, None)
+    }
 }
 
 /// Main engine configuration
@@ -670,6 +720,15 @@ pub struct EngineConfig {
     #[serde(default = "default_max_prefix_cache_pages")]
     pub max_prefix_cache_pages: usize,
 
+    /// Catalog-gated prefix-reuse default (DS1.6). When `enable_prefix_caching`
+    /// is false and this is true, the serving layer engages committed prefix
+    /// reuse per loaded model only where the catalog cell has backend-lane
+    /// evidence, with a generated per-process namespace when the operator did
+    /// not name one. Library defaults keep this false; product serving
+    /// surfaces resolve it to the shipped default.
+    #[serde(default)]
+    pub prefix_reuse_catalog_auto: bool,
+
     /// Enable scheduler-level chunked prefill so long prompts are admitted in
     /// bounded token quanta instead of one monolithic prefill transaction.
     #[serde(default = "default_enable_chunked_prefill")]
@@ -703,6 +762,7 @@ impl Default for EngineConfig {
             enable_prefix_caching: default_enable_prefix_caching(),
             managed_prefix_cache_salt: default_managed_prefix_cache_salt(),
             max_prefix_cache_pages: default_max_prefix_cache_pages(),
+            prefix_reuse_catalog_auto: false,
             enable_chunked_prefill: default_enable_chunked_prefill(),
             chunked_prefill_threshold: default_chunked_prefill_threshold(),
         }
@@ -808,6 +868,9 @@ impl EngineConfig {
             // Portable automatic context is resolved during model loading. Keep
             // the historical reserve until that effective value is available.
             self.portable_context_ceiling(),
+            // Catalog-auto reuse degrades instead of failing startup when the
+            // safe page budget is zero; explicit enablement stays fail-closed.
+            self.prefix_reuse_catalog_auto,
         )
     }
 }
@@ -988,8 +1051,8 @@ fn get_num_cpus() -> usize {
 #[cfg(test)]
 mod managed_kv_default_tests {
     use super::{
-        BatchSizePreference, ContextLengthPreference, EngineConfig, KvCacheDtype,
-        PhysicalExecutionMode, PhysicalInFlightLimit, PrefixCachePolicy,
+        resolve_prefix_engagement, BatchSizePreference, ContextLengthPreference, EngineConfig,
+        KvCacheDtype, PhysicalExecutionMode, PhysicalInFlightLimit, PrefixCachePolicy,
     };
     use crate::backends::BackendKind;
 
@@ -1099,6 +1162,42 @@ mod managed_kv_default_tests {
             let error = config.resolved_kv_cache_policy(1024).unwrap_err();
             assert!(error.to_string().contains("not production-ready"));
         }
+    }
+
+    #[test]
+    fn prefix_engagement_resolution_keeps_explicit_fail_closed_and_generates_auto_namespaces() {
+        // Explicit enablement without a namespace stays engaged-with-none so
+        // the policy resolver rejects it.
+        let (engaged, namespace) = resolve_prefix_engagement(true, false, None);
+        assert!(engaged);
+        assert!(namespace.is_none());
+
+        // Explicit enablement with a namespace keeps it verbatim.
+        let (engaged, namespace) = resolve_prefix_engagement(true, false, Some("tenant-a"));
+        assert!(engaged);
+        assert_eq!(namespace.as_deref(), Some("tenant-a"));
+
+        // Catalog-auto engages with the operator namespace when present.
+        let (engaged, namespace) = resolve_prefix_engagement(false, true, Some("tenant-a"));
+        assert!(engaged);
+        assert_eq!(namespace.as_deref(), Some("tenant-a"));
+
+        // Catalog-auto generates a per-process namespace otherwise.
+        let (engaged, first) = resolve_prefix_engagement(false, true, None);
+        assert!(engaged);
+        let generated_first = first.expect("auto generates a namespace");
+        assert!(!generated_first.is_empty());
+        let (_, second) = resolve_prefix_engagement(false, true, None);
+        assert_ne!(
+            generated_first,
+            second.expect("auto generates a namespace"),
+            "generated namespaces must be process-unique"
+        );
+
+        // Disabled keeps reuse off.
+        let (engaged, namespace) = resolve_prefix_engagement(false, false, Some("tenant-a"));
+        assert!(!engaged);
+        assert!(namespace.is_none());
     }
 
     #[test]

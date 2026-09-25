@@ -431,6 +431,8 @@ pub struct Gemma3ChatModel {
     variant: ModelVariant,
     device: DeviceProfile,
     compute_dtype: DType,
+    /// DS1.6 catalog verdict for committed prefix reuse on the load backend.
+    prefix_reuse: bool,
     tokenizer: GemmaTokenizer,
     text_model: Gemma3PhysicalModel,
 }
@@ -442,6 +444,7 @@ impl InferenceStateContractProvider for Gemma3ChatModel {
                 StateDomainId::new(1),
                 self.compute_dtype,
                 default_kv_page_size(),
+                self.prefix_reuse,
             )?,
         ))
     }
@@ -458,7 +461,12 @@ impl Gemma3ChatModel {
         Ok(context)
     }
 
-    pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
+    pub fn load(
+        model_dir: &Path,
+        variant: ModelVariant,
+        device: DeviceProfile,
+        prefix_reuse: bool,
+    ) -> Result<Self> {
         let tokenizer = GemmaTokenizer::load(model_dir)?;
 
         let config_path = model_dir.join("config.json");
@@ -597,6 +605,7 @@ impl Gemma3ChatModel {
             compute_dtype: dtype,
             tokenizer,
             text_model,
+            prefix_reuse,
         })
     }
 

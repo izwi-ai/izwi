@@ -55,6 +55,8 @@ pub struct VoxtralLM {
     device: Device,
     cfg: Qwen3Config,
     use_mrope: bool,
+    /// DS1.6 catalog verdict for committed prefix reuse on the load backend.
+    prefix_reuse: bool,
 }
 
 struct VoxtralLayer {
@@ -93,7 +95,7 @@ struct VoxtralAdaRmsNorm {
 }
 
 impl VoxtralLM {
-    pub fn load(cfg: Qwen3Config, vb: VarBuilder) -> Result<Self> {
+    pub fn load(cfg: Qwen3Config, vb: VarBuilder, prefix_reuse: bool) -> Result<Self> {
         cfg.attention_geometry()?;
         let embed_tokens = load_embedding_from_candidates(&vb, &cfg)?;
 
@@ -123,6 +125,7 @@ impl VoxtralLM {
             device: vb.device().clone(),
             cfg,
             use_mrope,
+            prefix_reuse,
         })
     }
 
@@ -164,8 +167,12 @@ impl VoxtralLM {
             sliding_window: self.cfg.sliding_window(),
             storage_dtype,
             preferred_page_tokens,
-            prefix: PrefixPolicy::CommittedPages {
-                positions: PositionSemantics::Absolute,
+            prefix: if self.prefix_reuse {
+                PrefixPolicy::CommittedPages {
+                    positions: PositionSemantics::Absolute,
+                }
+            } else {
+                PrefixPolicy::Disabled
             },
         })?;
         let contract = InferenceStateContract {
@@ -174,7 +181,7 @@ impl VoxtralLM {
             groups: vec![StateGroupSpec {
                 id: StateGroupId::new(domain.get()),
                 domains: vec![domain],
-                prefix_shareable: true,
+                prefix_shareable: self.prefix_reuse,
             }],
         };
         contract.validate()?;
@@ -1069,7 +1076,12 @@ mod tests {
                 Tensor::from_vec(values(shape.0 * shape.1, offset), shape, device).unwrap(),
             );
         }
-        VoxtralLM::load(cfg, VarBuilder::from_tensors(tensors, DType::F32, device)).unwrap()
+        VoxtralLM::load(
+            cfg,
+            VarBuilder::from_tensors(tensors, DType::F32, device),
+            false,
+        )
+        .unwrap()
     }
 
     fn shared_decode_caches(
