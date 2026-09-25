@@ -158,6 +158,14 @@ async fn main() -> anyhow::Result<()> {
             max_context_tokens: Some(32),
             max_output_tokens: Some(32),
         },
+        // Routing signals are per-status observations populated from engine
+        // telemetry at status time, never static startup metadata.
+        kv_cache_usage_pct: None,
+        prefix_hits_total: None,
+        prefix_queries_total: None,
+        prefix_evictions_total: None,
+        tokens_out_per_s_ema: None,
+        observation_cost_units: None,
     };
     let worker = WorkerService::new(
         WorkerConfig {

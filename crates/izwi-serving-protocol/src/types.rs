@@ -28,6 +28,13 @@ impl SchemaVersion {
     pub const fn is_supported_by(self, peer: Self) -> bool {
         self.major == peer.major && self.minor <= peer.minor
     }
+
+    /// Additive-minor tolerance: peers sharing this major version always
+    /// interoperate. Older peers omit optional fields (decoded as absent);
+    /// newer peers only ever add fields this version already tolerates.
+    pub const fn shares_major_with(self, peer: Self) -> bool {
+        self.major == peer.major
+    }
 }
 
 impl Default for SchemaVersion {
@@ -142,7 +149,14 @@ pub enum ModelReadiness {
     Failed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One model deployment loaded on a worker.
+///
+/// The routing-signal fields are additive (protocol minor 1): workers set them
+/// only when the engine reports them, and receivers must treat absence as
+/// "signal unavailable" rather than as a zero observation. Counters are
+/// process-cumulative for the deployment's engine; rates are receiver-facing
+/// observations, not benchmarks.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LoadedDeployment {
     pub deployment_id: DeploymentId,
     pub public_model: ModelAlias,
@@ -155,6 +169,20 @@ pub struct LoadedDeployment {
     pub tokenizer_revision: Option<ArtifactRevision>,
     pub readiness: ModelReadiness,
     pub capability: Capability,
+    /// Managed-KV arena utilization, percent 0-100.
+    pub kv_cache_usage_pct: Option<f64>,
+    /// Cumulative managed-KV shared-prefix hits.
+    pub prefix_hits_total: Option<u64>,
+    /// Cumulative shared-prefix lookups (hits plus misses).
+    pub prefix_queries_total: Option<u64>,
+    /// Cumulative shared-prefix evictions under arena pressure.
+    pub prefix_evictions_total: Option<u64>,
+    /// Exponentially weighted output tokens per second over completed
+    /// invocations, as observed by the worker.
+    pub tokens_out_per_s_ema: Option<f64>,
+    /// Admission-credit units one observation (invocation) of this deployment
+    /// is priced at by the worker's own permit model.
+    pub observation_cost_units: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -199,7 +227,7 @@ pub struct CapacitySnapshot {
     pub outstanding_cost_units: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkerStatus {
     pub schema_version: SchemaVersion,
     pub worker_id: WorkerId,
@@ -675,9 +703,113 @@ mod tests {
 
     #[test]
     fn current_version_is_compatible_with_additive_minor_only() {
-        assert!(PROTOCOL_V1.is_supported_by(SchemaVersion::new(1, 1)));
-        assert!(!SchemaVersion::new(1, 1).is_supported_by(PROTOCOL_V1));
+        assert!(PROTOCOL_V1.is_supported_by(PROTOCOL_V1));
+        assert!(PROTOCOL_V1.is_supported_by(SchemaVersion::new(1, 2)));
+        assert!(SchemaVersion::new(1, 0).is_supported_by(PROTOCOL_V1));
+        assert!(!SchemaVersion::new(1, 2).is_supported_by(PROTOCOL_V1));
         assert!(!PROTOCOL_V1.is_supported_by(SchemaVersion::new(2, 0)));
+        // Additive-minor tolerance: within one major, any minor interoperates.
+        assert!(SchemaVersion::new(1, 0).shares_major_with(PROTOCOL_V1));
+        assert!(PROTOCOL_V1.shares_major_with(SchemaVersion::new(1, 0)));
+        assert!(!PROTOCOL_V1.shares_major_with(SchemaVersion::new(2, 0)));
+    }
+
+    fn status_fixture() -> WorkerStatus {
+        WorkerStatus {
+            schema_version: PROTOCOL_V1,
+            worker_id: id("worker-1"),
+            node_id: id("node-1"),
+            incarnation_id: id("inc-1"),
+            status_sequence: 7,
+            process_state: WorkerProcessState::Running,
+            deployments: vec![LoadedDeployment {
+                deployment_id: id("chat-deployment-v1"),
+                public_model: id("model-a"),
+                artifact_revision: id("artifact-1"),
+                model_generation: ModelGeneration::new(3).unwrap(),
+                task: TaskKind::Chat,
+                backend: BackendKind::Cpu,
+                precision: "mock".into(),
+                execution_representation: "deterministic-text".into(),
+                tokenizer_revision: None,
+                readiness: ModelReadiness::Ready,
+                capability: Capability {
+                    task: TaskKind::Chat,
+                    streaming: true,
+                    realtime: false,
+                    cancellation: CancellationBehavior::Cooperative,
+                    accepted_input_formats: BTreeSet::from([InputFormat::ChatMessages]),
+                    output_formats: BTreeSet::from([OutputFormat::Text]),
+                    max_input_bytes: 1024,
+                    max_context_tokens: None,
+                    max_output_tokens: Some(32),
+                },
+                kv_cache_usage_pct: None,
+                prefix_hits_total: None,
+                prefix_queries_total: None,
+                prefix_evictions_total: None,
+                tokens_out_per_s_ema: None,
+                observation_cost_units: None,
+            }],
+            capacity: CapacitySnapshot {
+                max_active_invocations: 4,
+                active_invocations: 1,
+                max_queued_invocations: 0,
+                queued_invocations: 0,
+                max_sessions: 0,
+                reserved_sessions: 0,
+                available_admission_credits: 3,
+                outstanding_cost_units: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn status_without_routing_signals_decodes_as_unavailable() {
+        let status = status_fixture();
+        let mut value = serde_json::to_value(&status).unwrap();
+        assert!(value["deployments"][0]["prefix_hits_total"].is_null());
+        // Simulate a minor-0 worker: strip every optional routing signal.
+        for field in [
+            "kv_cache_usage_pct",
+            "prefix_hits_total",
+            "prefix_queries_total",
+            "prefix_evictions_total",
+            "tokens_out_per_s_ema",
+            "observation_cost_units",
+        ] {
+            value["deployments"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+        }
+        value["schema_version"] = json!({ "major": 1, "minor": 0 });
+        let decoded: WorkerStatus = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.schema_version, SchemaVersion::new(1, 0));
+        let deployment = &decoded.deployments[0];
+        assert!(deployment.kv_cache_usage_pct.is_none());
+        assert!(deployment.prefix_hits_total.is_none());
+        assert!(deployment.prefix_queries_total.is_none());
+        assert!(deployment.prefix_evictions_total.is_none());
+        assert!(deployment.tokens_out_per_s_ema.is_none());
+        assert!(deployment.observation_cost_units.is_none());
+    }
+
+    #[test]
+    fn status_round_trips_present_routing_signals() {
+        let mut status = status_fixture();
+        let deployment = &mut status.deployments[0];
+        deployment.kv_cache_usage_pct = Some(42.5);
+        deployment.prefix_hits_total = Some(11);
+        deployment.prefix_queries_total = Some(20);
+        deployment.prefix_evictions_total = Some(2);
+        deployment.tokens_out_per_s_ema = Some(18.75);
+        deployment.observation_cost_units = Some(1);
+        let encoded = serde_json::to_vec(&status).unwrap();
+        let decoded: WorkerStatus = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, status);
+        assert_eq!(decoded.deployments[0].kv_cache_usage_pct, Some(42.5));
+        assert_eq!(decoded.deployments[0].tokens_out_per_s_ema, Some(18.75));
     }
 
     #[test]

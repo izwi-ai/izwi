@@ -15,7 +15,11 @@ pub use types::*;
 /// The only protocol major version implemented by this crate.
 pub const PROTOCOL_MAJOR_VERSION: u16 = 1;
 /// The latest additive protocol minor version implemented by this crate.
-pub const PROTOCOL_MINOR_VERSION: u16 = 0;
+///
+/// Minor 1 adds optional per-deployment routing signals on `LoadedDeployment`.
+/// All version gates tolerate any minor within major 1: older workers omit
+/// the fields and newer workers only add optional ones.
+pub const PROTOCOL_MINOR_VERSION: u16 = 1;
 pub const PROTOCOL_V1: SchemaVersion =
     SchemaVersion::new(PROTOCOL_MAJOR_VERSION, PROTOCOL_MINOR_VERSION);
 

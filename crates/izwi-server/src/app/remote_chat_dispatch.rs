@@ -773,6 +773,12 @@ mod tests {
                 max_context_tokens: Some(4096),
                 max_output_tokens: Some(128),
             },
+            kv_cache_usage_pct: None,
+            prefix_hits_total: None,
+            prefix_queries_total: None,
+            prefix_evictions_total: None,
+            tokens_out_per_s_ema: None,
+            observation_cost_units: None,
         }
     }
 

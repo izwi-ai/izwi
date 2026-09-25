@@ -896,11 +896,14 @@ fn validate_registration(
     {
         return Err(WorkerRegistryError::MetadataLimitExceeded);
     }
-    if !PROTOCOL_V1.is_supported_by(descriptor.schema_version)
+    // Additive-minor tolerance: any worker speaking major version 1 can
+    // register, whatever minor it implements. Optional routing-signal fields
+    // decode as absent on older workers and are ignored where unsupported.
+    if !PROTOCOL_V1.shares_major_with(descriptor.schema_version)
         || !descriptor
             .supported_protocol_versions
             .iter()
-            .any(|version| PROTOCOL_V1.is_supported_by(*version))
+            .any(|version| PROTOCOL_V1.shares_major_with(*version))
     {
         return Err(WorkerRegistryError::IncompatibleProtocol);
     }
@@ -921,7 +924,7 @@ fn validate_status(
     {
         return Err(WorkerRegistryError::IdentityMismatch);
     }
-    if !PROTOCOL_V1.is_supported_by(status.schema_version) {
+    if !PROTOCOL_V1.shares_major_with(status.schema_version) {
         return Err(WorkerRegistryError::IncompatibleProtocol);
     }
     if status.status_sequence == 0
@@ -1040,13 +1043,13 @@ fn eligible_deployment<'a>(
     if observation.status.process_state != WorkerProcessState::Running
         || !request
             .protocol_version
-            .is_supported_by(observation.status.schema_version)
+            .shares_major_with(observation.status.schema_version)
         || !record
             .registration
             .descriptor
             .supported_protocol_versions
             .iter()
-            .any(|version| request.protocol_version.is_supported_by(*version))
+            .any(|version| request.protocol_version.shares_major_with(*version))
         || !record
             .registration
             .approved_deployments
@@ -1220,6 +1223,12 @@ mod tests {
                 max_context_tokens: Some(1024),
                 max_output_tokens: Some(128),
             },
+            kv_cache_usage_pct: None,
+            prefix_hits_total: None,
+            prefix_queries_total: None,
+            prefix_evictions_total: None,
+            tokens_out_per_s_ema: None,
+            observation_cost_units: None,
         }
     }
 
@@ -1712,6 +1721,36 @@ mod tests {
             .unwrap();
         let selected = registry.select_and_reserve_at(&selection(), now).unwrap();
         assert_eq!(selected.key.worker_id.as_str(), "worker-a");
+    }
+
+    #[test]
+    fn minor_zero_worker_registers_observes_and_stays_selectable() {
+        let registry = WorkerRegistry::new(WorkerRegistryConfig::default()).unwrap();
+        let worker = registration("worker-minor0", "inc-minor0", BackendKind::Cpu, 9103, 2);
+        let mut descriptor = worker.descriptor.clone();
+        descriptor.schema_version = SchemaVersion::new(1, 0);
+        descriptor.supported_protocol_versions = vec![SchemaVersion::new(1, 0)];
+        let minor_zero_worker = ApprovedWorker {
+            descriptor: descriptor.clone(),
+            ..worker
+        };
+        registry.approve(minor_zero_worker).unwrap();
+
+        let mut minor_zero_status = status(
+            &descriptor,
+            1,
+            vec![deployment("chat-prod", "lfm2", BackendKind::Cpu)],
+            capacity(2, 0, 2),
+        );
+        minor_zero_status.schema_version = SchemaVersion::new(1, 0);
+        registry
+            .observe_status_at(minor_zero_status, Instant::now())
+            .unwrap();
+
+        let selected = registry
+            .select_and_reserve_at(&selection(), Instant::now())
+            .unwrap();
+        assert_eq!(selected.key.worker_id.as_str(), "worker-minor0");
     }
 
     #[test]

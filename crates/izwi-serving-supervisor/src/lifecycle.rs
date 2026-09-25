@@ -746,6 +746,12 @@ mod tests {
                 tokenizer_revision: expected.tokenizer_revision.clone(),
                 readiness: ModelReadiness::Ready,
                 capability: expected.capability.clone(),
+                kv_cache_usage_pct: None,
+                prefix_hits_total: None,
+                prefix_queries_total: None,
+                prefix_evictions_total: None,
+                tokens_out_per_s_ema: None,
+                observation_cost_units: None,
             }],
             capacity: CapacitySnapshot {
                 max_active_invocations: expected.max_active_invocations,

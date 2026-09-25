@@ -59,6 +59,21 @@ pub struct MockWorkerConfig {
     pub cancellation_delay: Duration,
     pub fault: MockFault,
     pub ready: bool,
+    /// Optional per-deployment routing signals advertised on the status
+    /// endpoint. `None` keeps the mock's minor-0 shape (signals absent).
+    pub routing_signals: Option<MockRoutingSignals>,
+}
+
+/// Configurable engine-signal values a mock worker advertises so gateway
+/// routing tests can exercise warm/cold/stale signal combinations.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MockRoutingSignals {
+    pub kv_cache_usage_pct: f64,
+    pub prefix_hits_total: u64,
+    pub prefix_queries_total: u64,
+    pub prefix_evictions_total: u64,
+    pub tokens_out_per_s_ema: f64,
+    pub observation_cost_units: u64,
 }
 
 impl Default for MockWorkerConfig {
@@ -90,6 +105,7 @@ impl Default for MockWorkerConfig {
             cancellation_delay: Duration::from_millis(25),
             fault: MockFault::None,
             ready: true,
+            routing_signals: None,
         }
     }
 }
@@ -363,6 +379,12 @@ fn deployment(config: &MockWorkerConfig) -> LoadedDeployment {
             max_context_tokens: Some(4096),
             max_output_tokens: Some(config.max_output_tokens),
         },
+        kv_cache_usage_pct: config.routing_signals.map(|s| s.kv_cache_usage_pct),
+        prefix_hits_total: config.routing_signals.map(|s| s.prefix_hits_total),
+        prefix_queries_total: config.routing_signals.map(|s| s.prefix_queries_total),
+        prefix_evictions_total: config.routing_signals.map(|s| s.prefix_evictions_total),
+        tokens_out_per_s_ema: config.routing_signals.map(|s| s.tokens_out_per_s_ema),
+        observation_cost_units: config.routing_signals.map(|s| s.observation_cost_units),
     }
 }
 
