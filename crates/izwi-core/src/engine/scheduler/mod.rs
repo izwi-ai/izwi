@@ -543,6 +543,11 @@ struct RequestMetadata {
     /// The first prefill chunk is aligned to this boundary so the committed
     /// tensor state can publish a snapshot for cross-request fork.
     managed_snapshot_prefill_interval: Option<u32>,
+    /// DS1.5: admission-time managed prefix cursor. Tokens below this cursor
+    /// are already resident (shared pages plus a forked tensor snapshot), so
+    /// the first prefill span starts here instead of zero. `None` means a
+    /// conventional zero-start prefill.
+    managed_prefix_cursor: Option<u32>,
 }
 
 impl RequestMetadata {
@@ -728,6 +733,7 @@ impl Scheduler {
             managed_snapshot_prefill_interval: request
                 .v2_state_descriptor()
                 .and_then(declared_snapshot_prefill_interval),
+            managed_prefix_cursor: request.managed_prefix_cursor(),
         };
 
         self.requests.insert(request.id.clone(), metadata);
@@ -792,6 +798,7 @@ impl Scheduler {
                 managed_snapshot_prefill_interval: request
                     .v2_state_descriptor()
                     .and_then(declared_snapshot_prefill_interval),
+                managed_prefix_cursor: request.managed_prefix_cursor(),
             },
         );
         self.running.insert(
@@ -1637,7 +1644,9 @@ impl Scheduler {
                 continue;
             }
 
-            // Calculate tokens for this prefill.
+            // Calculate tokens for this prefill. A probed managed prefix
+            // cursor makes the shared-prefix span start above zero; the
+            // chunk budget then applies to the residual tokens.
             let full_prefill = metadata.cache_policy.prefill == PrefillMode::Full;
             if force_full_prefill_service && !full_prefill {
                 deferred_waiting.push(request_id);
@@ -1651,7 +1660,12 @@ impl Scheduler {
                 deferred_waiting.push(request_id);
                 continue;
             }
-            let mut target_tokens = metadata.prefill_tokens();
+            let prefix_start = metadata
+                .managed_prefix_cursor
+                .map(|cursor| cursor as usize)
+                .unwrap_or(0)
+                .min(metadata.prefill_tokens().saturating_sub(1));
+            let mut target_tokens = metadata.prefill_tokens().saturating_sub(prefix_start);
 
             // Apply chunked prefill if enabled and prompt is long
             if !full_prefill
@@ -1680,16 +1694,20 @@ impl Scheduler {
                 break;
             }
 
-            let target_tokens = Self::align_first_prefill_chunk(&metadata, 0, target_tokens);
+            let target_tokens =
+                Self::align_first_prefill_chunk(&metadata, prefix_start, target_tokens);
             let original_target_tokens = target_tokens;
             let num_tokens = target_tokens;
+            let span_end = prefix_start.saturating_add(num_tokens);
             self.record_prefill_backoff(original_target_tokens, num_tokens);
 
-            // Create running state
+            // Create running state. A jumped request counts its shared
+            // prefix as already-committed progress so prefill completion
+            // still lands at the full prompt length.
             let running = RunningRequest {
                 request_id: request_id.clone(),
                 sequence_id: metadata.sequence_id,
-                num_tokens_processed: 0,
+                num_tokens_processed: prefix_start,
                 num_tokens_generated: 0,
                 // Scheduling is not a commit. A failed/retryable prefill must
                 // remain a prefill until update_after_step confirms that the
@@ -1716,12 +1734,12 @@ impl Scheduler {
                 sequence_id: metadata.sequence_id,
                 num_tokens,
                 is_prefill: true,
-                num_computed_tokens: 0,
+                num_computed_tokens: prefix_start,
                 work: WorkUnit::SequenceStep {
                     phase: SequencePhase::Prefill,
                     input: InputRange {
-                        start: 0,
-                        end: num_tokens,
+                        start: prefix_start,
+                        end: span_end,
                     },
                     max_output_steps: num_tokens.max(1),
                     auxiliary_state: None,
@@ -2285,6 +2303,26 @@ impl Scheduler {
         true
     }
 
+    /// DS1.5: a probed managed prefix cursor could not be honored (pages or
+    /// the tensor snapshot were evicted between admission and prepare).
+    /// Clear the cursor and reset prefill progress so the request replans as
+    /// a conventional zero-start prefill.
+    pub(crate) fn reset_managed_prefix_cursor(&mut self, request_id: &RequestId) -> bool {
+        let Some(metadata) = self.requests.get_mut(request_id) else {
+            return false;
+        };
+        if metadata.managed_prefix_cursor.is_none() {
+            return false;
+        }
+        metadata.managed_prefix_cursor = None;
+        if let Some(running) = self.running.get_mut(request_id) {
+            running.num_tokens_processed = 0;
+            running.prefill_complete = false;
+            running.prefill_in_flight = false;
+        }
+        true
+    }
+
     /// Defer the next execution quantum for an exact session. This clears an
     /// uncommitted prefill marker without changing committed progress.
     pub(crate) fn defer_execution_retry(
@@ -2334,6 +2372,9 @@ impl Scheduler {
             return false;
         }
         metadata.replay_prompt_tokens = Some(replay_tokens.max(metadata.total_prompt_tokens));
+        // A replay rebuilds from a fresh context-0 reservation; a probed
+        // cursor must not survive into the replayed spans.
+        metadata.managed_prefix_cursor = None;
         metadata.capacity_blocked_on = Some(survivor);
         running.num_tokens_processed = 0;
         running.prefill_complete = false;
@@ -2418,6 +2459,13 @@ impl Scheduler {
         if running.sequence_id != session.epoch {
             return false;
         }
+        // A restart rebuilds its first generation span from zero (a semantic
+        // restart requires an exact context-0 physical cache); drop any
+        // probed prefix cursor.
+        self.requests
+            .get_mut(&session.request_id)
+            .expect("request existed above")
+            .managed_prefix_cursor = None;
 
         running.num_tokens_processed = 0;
         running.incremental_prefill_quanta_committed = 0;
@@ -3441,6 +3489,7 @@ mod tests {
             capacity_blocked_on: None,
             workspace_prefill_token_cap: None,
             managed_snapshot_prefill_interval: interval,
+            managed_prefix_cursor: None,
         }
     }
 

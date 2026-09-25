@@ -177,9 +177,16 @@ impl CommittedPrefixIndex {
         }
         let digest = key.digest();
         if let Some(existing) = self.entries.get(&digest) {
-            if existing.key != key || existing.block != block {
+            if existing.key != key {
                 return Err(KvPrefixIndexError::DigestConflict);
             }
+            if existing.block == block {
+                return Ok(Vec::new());
+            }
+            // The exact page is already published under this identity from
+            // another session's block. The index deliberately keeps one block
+            // per digest: the recomputing session's private page is simply
+            // not shared, and the original binding stays authoritative.
             return Ok(Vec::new());
         }
         if self.entries.values().any(|entry| entry.block == block) {
@@ -603,15 +610,17 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_publication_is_idempotent_but_conflicting_binding_fails() {
+    fn duplicate_publication_is_idempotent_and_keeps_the_original_binding() {
         let mut index = CommittedPrefixIndex::new(2);
         let key = KvPrefixPageKey::new(&namespace(1), None, 0, vec![1, 2]).unwrap();
         index.publish(key.clone(), 2, block(0)).unwrap();
+        // Identical republication from the owning block is a no-op.
         assert!(index.publish(key.clone(), 2, block(0)).unwrap().is_empty());
-        assert_eq!(
-            index.publish(key, 2, block(1)).unwrap_err(),
-            KvPrefixIndexError::DigestConflict
-        );
+        // A recomputing session re-publishes the same page identity from its
+        // own private block; the index keeps one authoritative binding per
+        // digest instead of rejecting the commit.
+        assert!(index.publish(key.clone(), 2, block(1)).unwrap().is_empty());
+        assert_eq!(index.lookup(&key).unwrap().unwrap().block, block(0));
     }
 
     #[test]

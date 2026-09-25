@@ -4316,6 +4316,17 @@ impl NativeChatPreparedPrompt {
 }
 
 impl NativeChatDecodeState {
+    /// DS1.5: the state's logical prefill cursor, which begins at an
+    /// attached managed prefix cursor for resumable prefill families.
+    pub(crate) fn prefill_progress(&self) -> Option<usize> {
+        match self {
+            Self::Qwen3(state) => Some(state.prefill_progress()),
+            Self::Qwen35(state) => Some(state.prefill_progress()),
+            Self::Qwen38(state) => Some(state.prefill_progress()),
+            Self::Gemma3(state) => Some(state.prefill_progress()),
+            Self::Lfm2(state) => Some(state.prefill_progress()),
+        }
+    }
     pub(crate) fn begin_continuous_quantum(
         &mut self,
         cache: PhysicalPagedKvCache,

@@ -1,5 +1,7 @@
 //! Native Qwen3.8 chat model loader and text generation.
 
+#[cfg(test)]
+mod attach_tests;
 mod device_sampling;
 #[cfg(test)]
 pub(crate) mod recovery_tests;
@@ -1525,12 +1527,17 @@ impl Qwen38ChatModel {
         mtp_cache: Option<PhysicalPagedKvCache>,
     ) -> Result<ChatDecodeState> {
         let prepared = resolve_prepared_prompt(prepared, || self.prepare_prompt(messages, config))?;
+        // A managed prefix attach hands the state a reservation whose physical
+        // cursor already sits above zero (shared pages plus a forked tensor
+        // snapshot). The logical prefill cursor starts at the attached
+        // cursor; the state must still compute at least one private token.
+        let prefill_start = cache.context_len();
         if prepared.prompt_ids.is_empty()
-            || cache.context_len() != 0
+            || prefill_start >= prepared.prompt_ids.len()
             || mtp_cache.as_ref().is_some_and(|mtp| mtp.context_len() != 0)
         {
             return Err(Error::InvalidInput(
-                "Qwen3.8 chunked prefill requires a non-empty prompt and an empty reservation"
+                "Qwen3.8 chunked prefill requires a non-empty prompt with a cache cursor below it"
                     .into(),
             ));
         }
@@ -1565,7 +1572,7 @@ impl Qwen38ChatModel {
             max_new_tokens: max_new_tokens.max(1),
             finished: false,
             next_text_position: prepared.next_text_position,
-            prefill_progress: 0,
+            prefill_progress: prefill_start,
             config: config.clone(),
             rng,
             draft_rng,

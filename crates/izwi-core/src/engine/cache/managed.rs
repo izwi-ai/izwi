@@ -1301,6 +1301,84 @@ impl ManagedKvCacheManager {
         self.prepare_with_admission(runtime, txn_id, session, work, request, false)
     }
 
+    /// DS1.5: read-only admission probe for the managed prefix cursor.
+    ///
+    /// Returns the largest committed boundary the first prefill span may
+    /// start above: complete shared pages plus, for snapshot-sharing
+    /// contracts, a committed tensor snapshot at that exact boundary. The
+    /// scheduler plans the first span from this cursor; prepare re-verifies
+    /// the same lookup transactionally before any attach is staged, so a
+    /// boundary that disappears between admission and execution degrades to
+    /// the cursor-lost retry instead of a stale attach.
+    pub(crate) fn probe_managed_prefix(
+        &mut self,
+        runtime: &ManagedKvModelRuntime,
+        request: &EngineCoreRequest,
+    ) -> Result<Option<u32>> {
+        let namespace = managed_prefix_namespace(Some(request), runtime, self.prefix_cache_salt)?;
+        let Some(namespace) = namespace else {
+            return Ok(None);
+        };
+        let Some(state) = self.models.get_mut(&runtime.plan.model_instance) else {
+            return Ok(None);
+        };
+        if state.closing {
+            return Ok(None);
+        }
+        // The cursor must leave at least one private prompt token; a fully
+        // cached prompt has no executable first span.
+        let prompt_tokens = request.prompt_tokens.as_slice();
+        if prompt_tokens.len() < 2 {
+            return Ok(None);
+        }
+        let reusable = prompt_tokens.len() - 1;
+        for group in runtime.plan.groups.iter() {
+            if !prefix_enabled_for_domain(&state.contract, group.domain) {
+                continue;
+            }
+            let prefix_index = state.prefix_indexes.get_mut(&group.arena).ok_or_else(|| {
+                Error::InferenceError(
+                    "resolved arena has no prefix index for the prefix probe".into(),
+                )
+            })?;
+            let mut matched = prefix_index
+                .lookup_longest(&namespace, &prompt_tokens[..reusable], group.page_tokens)
+                .map_err(prefix_error)?;
+            if matched.reused_tokens == 0 {
+                continue;
+            }
+            // Snapshot-sharing contracts may only start above a boundary that
+            // also carries a committed tensor snapshot; walk the matched chain
+            // back the same way prepare's reconcile does, without touching
+            // attach/truncation telemetry (no fork happens here).
+            if let Some(sharing) = state.tensor_snapshots.as_mut() {
+                if sharing.paged_arena == group.arena && sharing.policy.paged_domain == group.domain
+                {
+                    while !matched.page_digests.is_empty() {
+                        let boundary = u64::from(matched.reused_tokens);
+                        let digest = matched
+                            .page_digests
+                            .last()
+                            .copied()
+                            .expect("matched chain holds complete pages");
+                        if sharing.index.lookup(digest, boundary)?.is_some() {
+                            return Ok(Some(matched.reused_tokens));
+                        }
+                        matched.page_digests.pop();
+                        matched.blocks.pop();
+                        matched.reused_tokens = matched
+                            .reused_tokens
+                            .checked_sub(group.page_tokens)
+                            .expect("matched chain holds complete pages");
+                    }
+                    continue;
+                }
+            }
+            return Ok(Some(matched.reused_tokens));
+        }
+        Ok(None)
+    }
+
     /// Incremental admission is only safe for execution adapters that can
     /// replay an already-streamed request after capacity preemption.
     pub(crate) fn prepare_incremental(
@@ -1604,6 +1682,18 @@ impl ManagedKvCacheManager {
             // Published pages remain available to unrelated fresh sessions,
             // but this restarted session must rebuild its first generation
             // span instead of attaching a prefix and beginning above zero.
+            // DS1.5: an admission probe may have scheduled this span to start
+            // exactly at a verified shared-prefix cursor. A fresh table whose
+            // span starts there attaches directly instead of recomputing the
+            // resident prefix.
+            let expected_attach_cursor = request
+                .and_then(|req| req.managed_prefix_cursor())
+                .filter(|cursor| {
+                    *cursor > 0
+                        && snapshot.committed_tokens == 0
+                        && domain_sequence_input
+                            .is_some_and(|input| input.start == *cursor as usize)
+                });
             let mut prefix_match =
                 if prefix_eligible && session_generation == ManagedSessionGeneration::INITIAL {
                     if let Some(namespace) = namespace.as_ref() {
@@ -1625,9 +1715,59 @@ impl ManagedKvCacheManager {
                         self.telemetry.record_prefix_rejection();
                         Default::default()
                     }
+                } else if let Some(cursor) = expected_attach_cursor {
+                    if let Some(namespace) = namespace.as_ref() {
+                        let reusable_tokens = cursor as usize;
+                        state
+                            .prefix_indexes
+                            .get_mut(&group.arena)
+                            .expect("resolved arena has a prefix index")
+                            .lookup_longest(
+                                namespace,
+                                &request
+                                    .expect("prefix namespace requires a request")
+                                    .prompt_tokens[..reusable_tokens],
+                                group.page_tokens,
+                            )
+                            .map_err(prefix_error)?
+                    } else {
+                        Default::default()
+                    }
                 } else {
                     Default::default()
                 };
+            if let Some(cursor) = expected_attach_cursor {
+                // The attach must reconcile the same snapshot boundary the
+                // probe verified; a shorter realized cursor means the shared
+                // state was evicted under us and the scheduled span is stale.
+                if let Some((policy, paged_arena, _interval)) = &snapshot_sharing {
+                    if *paged_arena == group.arena && policy.paged_domain == group.domain {
+                        if let Some(sharing) = state.tensor_snapshots.as_mut() {
+                            match reconcile_tensor_snapshot_attach(
+                                sharing,
+                                group.page_tokens,
+                                &mut prefix_match,
+                                needs_tensor_sequence,
+                                &self.telemetry,
+                            ) {
+                                Ok(Some(attach)) => tensor_attach = Some(attach),
+                                Ok(None) => {}
+                                Err(error) => {
+                                    abort_domains(state, txn_id, &domains);
+                                    return Err(error);
+                                }
+                            }
+                        }
+                    }
+                }
+                if prefix_match.reused_tokens != cursor {
+                    abort_domains(state, txn_id, &domains);
+                    return Err(Error::Backpressure(format!(
+                        "{MANAGED_PREFIX_CURSOR_LOST}: admission probed cursor {cursor} but the index now offers {}",
+                        prefix_match.reused_tokens
+                    )));
+                }
+            }
             // DS1.2b: tensor domains may only follow a paged attach when a
             // committed snapshot exists at the attach cursor. Walk the matched
             // chain back to the nearest snapshot-backed boundary, falling back
@@ -1915,7 +2055,7 @@ impl ManagedKvCacheManager {
                 provisional_groups: prepared.provisional_groups,
                 writable_blocks: prepared.writable_blocks,
             });
-            if prefix_eligible {
+            if prefix_eligible || expected_attach_cursor.is_some() {
                 let Some(namespace) = namespace.as_ref() else {
                     continue;
                 };
@@ -3457,6 +3597,13 @@ fn full_context_sequence_capacity(plan: &ResolvedKvPlan, reach: u64) -> u64 {
         .min()
         .unwrap_or(0)
 }
+
+/// DS1.5: sentinel reason prefix for a probed prefix cursor that could not be
+/// honored at prepare time (pages or the tensor snapshot were evicted between
+/// admission and execution). The engine matches this reason, resets the
+/// request's cursor, and replans a conventional zero-start prefill instead of
+/// retrying a stale attach.
+pub(crate) const MANAGED_PREFIX_CURSOR_LOST: &str = "managed prefix cursor lost";
 
 fn managed_prefix_namespace(
     request: Option<&EngineCoreRequest>,

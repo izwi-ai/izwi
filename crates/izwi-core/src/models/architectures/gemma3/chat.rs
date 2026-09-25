@@ -646,13 +646,15 @@ impl Gemma3ChatModel {
                 "Gemma resumable prefill requires at least one private prompt token".into(),
             ));
         }
+        // DS1.5: a managed prefix attach starts the logical cursor at the
+        // attached physical cursor.
         let position = cache.context_len();
         Ok(ChatDecodeState {
             cache,
             unconsumed_logits: None,
             position,
             pending_token: None,
-            prefill_progress: 0,
+            prefill_progress: position,
             generated_ids: Vec::new(),
             sampler: ChatSampler::new(config.clone(), prompt_ids),
             assembled: String::new(),

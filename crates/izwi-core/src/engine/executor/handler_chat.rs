@@ -21,8 +21,19 @@ use super::{
 const FALLBACK_CHAT_STREAM_BATCH_PIECES: usize = 4;
 const FALLBACK_CHAT_STREAM_BATCH_BYTES: usize = 32;
 
-fn begins_resumable_prefill_state(scheduled: &ScheduledRequest, resumable_prefill: bool) -> bool {
-    scheduled.is_prefill && resumable_prefill && scheduled.num_computed_tokens == 0
+fn begins_resumable_prefill_state(
+    scheduled: &ScheduledRequest,
+    resumable_prefill: bool,
+    request: &EngineCoreRequest,
+) -> bool {
+    scheduled.is_prefill
+        && resumable_prefill
+        && (scheduled.num_computed_tokens == 0
+            // DS1.5: a jumped request starts its first span at the probed
+            // prefix cursor before it has ever executed.
+            || Some(
+                u32::try_from(scheduled.num_computed_tokens).unwrap_or(u32::MAX),
+            ) == request.managed_prefix_cursor())
 }
 
 fn finish_resumable_prefill_step(
@@ -512,14 +523,20 @@ impl NativeExecutor {
                     request.id.clone(),
                 )));
             }
-            if scheduled.is_prefill && resumable_prefill && scheduled.num_computed_tokens > 0 {
+            if scheduled.is_prefill
+                && resumable_prefill
+                && scheduled.num_computed_tokens > 0
+                && !begins_resumable_prefill_state(scheduled, resumable_prefill, request)
+            {
                 return Err(Error::InferenceError(format!(
                     "resumable prefill request {} lost its decode state before span continuation; retry requires a fresh prompt",
                     request.id
                 )));
             }
             let mut decode_state = match managed_cache.take() {
-                Some(cache) if begins_resumable_prefill_state(scheduled, resumable_prefill) => {
+                Some(cache)
+                    if begins_resumable_prefill_state(scheduled, resumable_prefill, request) =>
+                {
                     Self::run_blocking(|| {
                         model.start_resumable_prefill_state_managed(
                             messages,
@@ -591,6 +608,16 @@ impl NativeExecutor {
             };
             if let Some(reservation) = tensor_reservation {
                 decode_state.bind_hybrid_tensor_sequence(reservation.sequence)?;
+                // Only a resumable begin starts above zero on an attached
+                // prefix: adopt the forked hybrid tensor state before the
+                // first span. A monolithic begin already consumed its prompt
+                // inside the begin call, and an empty fresh sequence restores
+                // nothing, so both must skip the restore.
+                if begins_resumable_prefill_state(scheduled, resumable_prefill, request) {
+                    if let Some(arena) = tensor_arena.as_ref() {
+                        decode_state.restore_hybrid_tensor_state(arena)?;
+                    }
+                }
             }
             state_lease.install_state(ActiveChatDecode {
                 variant,
@@ -654,7 +681,17 @@ impl NativeExecutor {
                     input_tokens_committed: 0,
                     finished: false,
                 }
-            } else if let Some((span_start, span_end)) = resumable_span {
+            } else if let Some((scheduled_start, span_end)) = resumable_span {
+                // A managed prefix attach leaves the state's logical prefill
+                // cursor at the attached physical cursor, which can sit above
+                // the scheduler's span start. The model always feeds from its
+                // own cursor; the scheduler still receives the scheduled span
+                // length as progress.
+                let span_start = active_state
+                    .state
+                    .prefill_progress()
+                    .unwrap_or(scheduled_start)
+                    .max(scheduled_start);
                 let prefill_complete = Self::run_blocking(|| {
                     model.continue_resumable_prefill(
                         &mut active_state.state,
@@ -1098,8 +1135,9 @@ mod tests {
             },
         };
 
-        assert!(begins_resumable_prefill_state(&scheduled, true));
-        assert!(!begins_resumable_prefill_state(&scheduled, false));
+        let request = EngineCoreRequest::tts("resumable-prefill-state");
+        assert!(begins_resumable_prefill_state(&scheduled, true, &request));
+        assert!(!begins_resumable_prefill_state(&scheduled, false, &request));
         assert_eq!(resumable_prefill_span(&scheduled, 16).unwrap(), (0, 16));
     }
 

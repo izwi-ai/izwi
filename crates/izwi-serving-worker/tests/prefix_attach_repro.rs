@@ -1,11 +1,10 @@
-//! DS1.5 diagnostic (ignored): the DS1.2b attach-by-fork path fails in real
-//! executions. After a session attaches a published tensor snapshot at cursor
-//! C, the scheduler still issues the prefill span from 0 while the model must
-//! append from C, so the paged append overruns the block table
-//! ("physical paged append ends at N, beyond capacity M") and the stream
-//! closes without a final marker. Run with `--ignored` while debugging the
-//! scheduler/executor span clipping; do not enable in CI until the attach
-//! span clipping lands.
+//! DS1.5 regression: a session that attaches a published tensor snapshot /
+//! reused paged prefix at cursor C must complete. The scheduler still issues
+//! the logical span from 0, so the model side clips its feed to the attached
+//! physical cursor (`continue_chunked_prefill_physical`); before that clip
+//! landed, the paged append overran the block table ("physical paged append
+//! ends at N, beyond capacity M") and the stream closed without a final
+//! marker.
 
 mod common;
 
@@ -79,8 +78,11 @@ async fn run_chat(
 }
 
 #[tokio::test]
-#[ignore = "DS1.2b attach span clipping is unresolved; run with --ignored to debug"]
 async fn attach_after_publish_completes_without_error() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::try_new("izwi_core=trace,warn").unwrap())
+        .with_test_writer()
+        .try_init();
     // Serving-policy env must be set before the runtime is constructed.
     std::env::set_var("IZWI_ALLOW_SYNTHETIC_QWEN38_GEOMETRY", "1");
     std::env::set_var("IZWI_CUDA_MTP", "off");

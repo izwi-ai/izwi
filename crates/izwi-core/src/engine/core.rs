@@ -2758,6 +2758,24 @@ impl EngineCore {
             }) {
                 Some(Ok(reservation)) => reservation,
                 None => None,
+                Some(Err(Error::Backpressure(reason)))
+                    if reason
+                        .starts_with(crate::engine::cache::managed::MANAGED_PREFIX_CURSOR_LOST) =>
+                {
+                    // The probed prefix vanished before execution. Drop the
+                    // cursor and replan this request as a zero-start prefill.
+                    if !self
+                        .scheduler
+                        .reset_managed_prefix_cursor(&scheduled.request_id)
+                    {
+                        warn!(
+                            request_id = %scheduled.request_id,
+                            "prefix cursor lost without scheduler cursor state"
+                        );
+                    }
+                    capacity_blocked.push(scheduled.clone());
+                    continue;
+                }
                 Some(Err(Error::Backpressure(reason))) => {
                     super::metrics::record_engine_physical_defer(
                         super::metrics::EnginePhysicalDeferReason::ManagedCacheCapacity,
@@ -3160,7 +3178,24 @@ impl EngineCore {
                 })?;
                 runtime.validate_against(self.managed_kv_cache.worker_backend(), execution)?;
                 if let Some(physical) = runtime.managed_kv_runtime() {
-                    request.install_managed_cache_runtime(physical)?;
+                    request.install_managed_cache_runtime(physical.clone())?;
+                    // DS1.5: probe the managed prefix index at admission so
+                    // the first prefill span can start above an already-
+                    // resident shared prefix. The probe self-gates on the
+                    // prefix namespace; a probe error plans a zero-start
+                    // prefill and leaves the row to surface the underlying
+                    // index failure at prepare time.
+                    match self
+                        .managed_kv_cache
+                        .probe_managed_prefix(&physical, &request)
+                    {
+                        Ok(cursor) => request.set_managed_prefix_cursor(cursor),
+                        Err(error) => warn!(
+                            request_id = %request_id,
+                            error = %error,
+                            "managed prefix probe failed; planning a zero-start prefill"
+                        ),
+                    }
                 }
             }
         }
@@ -4757,6 +4792,14 @@ impl EngineCore {
 
             // Update scheduler state only from the authoritative disposition.
             if let Some(cause) = Self::terminal_release_cause(&disposition) {
+                if let ExecutionDisposition::Failed(failure) = &disposition {
+                    tracing::error!(
+                        request_id = %request_id,
+                        kind = ?failure.kind,
+                        message = %failure.message,
+                        "row failed terminally"
+                    );
+                }
                 self.begin_terminal_release(&session, cause).await;
                 self.requests.remove(&request_id);
                 self.request_start_times.remove(&request_id);
