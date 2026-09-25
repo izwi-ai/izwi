@@ -7,9 +7,10 @@ use izwi_serving_supervisor::{
     WORKER_OWNERSHIP_LOCK_ENV,
 };
 use izwi_serving_worker::{
-    warm_up_chat_runtime, RuntimeChatExecutor, WorkerConfig, WorkerService,
-    DEFAULT_ATTEMPT_RETENTION, DEFAULT_EVENT_CHANNEL_CAPACITY, DEFAULT_MAX_EVENT_BYTES,
-    DEFAULT_MAX_REQUEST_BYTES, DEFAULT_MAX_RETAINED_ATTEMPTS,
+    warm_up_asr_runtime, warm_up_chat_runtime, RuntimeChatExecutor, RuntimeRealtimeAsrExecutor,
+    WorkerConfig, WorkerService, DEFAULT_ATTEMPT_RETENTION, DEFAULT_EVENT_CHANNEL_CAPACITY,
+    DEFAULT_MAX_EVENT_BYTES, DEFAULT_MAX_REQUEST_BYTES, DEFAULT_MAX_RETAINED_ATTEMPTS,
+    REALTIME_SESSION_DEFAULT_LIMITS,
 };
 use std::{
     collections::BTreeSet, net::SocketAddr, path::Path, path::PathBuf, sync::Arc, time::Duration,
@@ -107,13 +108,27 @@ async fn main() -> anyhow::Result<()> {
         .load_model(process.variant)
         .await
         .with_context(|| format!("load selected model {}", process.public_model))?;
-    warm_up_chat_runtime(
-        &runtime,
-        process.variant,
-        std::time::Duration::from_secs(30),
-    )
-    .await
-    .context("warm selected model before binding")?;
+    match process.task {
+        TaskKind::Chat => {
+            warm_up_chat_runtime(
+                &runtime,
+                process.variant,
+                std::time::Duration::from_secs(30),
+            )
+            .await
+            .context("warm selected model before binding")?;
+        }
+        TaskKind::SpeechToText => {
+            warm_up_asr_runtime(
+                &runtime,
+                process.variant,
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .context("warm selected realtime ASR model before binding")?;
+        }
+        TaskKind::TextToSpeech => bail!("realtime text_to_speech workers are not implemented yet"),
+    }
     // Resident model memory stays charged to this worker's runtime and resource
     // lease. Only the transient node-wide load stage is released here.
     drop(model_load_stage);
@@ -126,6 +141,9 @@ async fn main() -> anyhow::Result<()> {
     if process.streaming {
         features.insert(WorkerFeature::Streaming);
     }
+    if process.task == TaskKind::SpeechToText {
+        features.insert(WorkerFeature::RealtimeSocket);
+    }
     let descriptor = WorkerDescriptor {
         schema_version: PROTOCOL_V1,
         supported_protocol_versions: vec![PROTOCOL_V1],
@@ -136,72 +154,135 @@ async fn main() -> anyhow::Result<()> {
         assignment: process.assignment.clone(),
         features,
     };
-    let deployment = LoadedDeployment {
-        deployment_id: process.deployment_id.clone(),
-        public_model: process.public_model.clone(),
-        artifact_revision: process.artifact_revision.clone(),
-        model_generation: process.model_generation,
-        task: TaskKind::Chat,
-        backend: process.assignment.backend(),
-        precision: "gguf-q4_k_m".into(),
-        execution_representation: "native-lfm2".into(),
-        tokenizer_revision: None,
-        readiness: ModelReadiness::Ready,
-        capability: Capability {
+    let deployment = match process.task {
+        TaskKind::Chat => LoadedDeployment {
+            deployment_id: process.deployment_id.clone(),
+            public_model: process.public_model.clone(),
+            artifact_revision: process.artifact_revision.clone(),
+            model_generation: process.model_generation,
             task: TaskKind::Chat,
-            streaming: process.streaming,
-            realtime: false,
-            cancellation: CancellationBehavior::Cooperative,
-            accepted_input_formats: BTreeSet::from([InputFormat::ChatMessages]),
-            output_formats: BTreeSet::from([OutputFormat::Text]),
-            max_input_bytes: process.max_request_bytes as u64,
-            max_context_tokens: Some(32),
-            max_output_tokens: Some(32),
+            backend: process.assignment.backend(),
+            precision: "gguf-q4_k_m".into(),
+            execution_representation: "native-lfm2".into(),
+            tokenizer_revision: None,
+            readiness: ModelReadiness::Ready,
+            capability: Capability {
+                task: TaskKind::Chat,
+                streaming: process.streaming,
+                realtime: false,
+                cancellation: CancellationBehavior::Cooperative,
+                accepted_input_formats: BTreeSet::from([InputFormat::ChatMessages]),
+                output_formats: BTreeSet::from([OutputFormat::Text]),
+                max_input_bytes: process.max_request_bytes as u64,
+                max_context_tokens: Some(32),
+                max_output_tokens: Some(32),
+            },
+            // Routing signals are per-status observations populated from engine
+            // telemetry at status time, never static startup metadata.
+            kv_cache_usage_pct: None,
+            prefix_hits_total: None,
+            prefix_queries_total: None,
+            prefix_evictions_total: None,
+            tokens_out_per_s_ema: None,
+            observation_cost_units: None,
         },
-        // Routing signals are per-status observations populated from engine
-        // telemetry at status time, never static startup metadata.
-        kv_cache_usage_pct: None,
-        prefix_hits_total: None,
-        prefix_queries_total: None,
-        prefix_evictions_total: None,
-        tokens_out_per_s_ema: None,
-        observation_cost_units: None,
+        TaskKind::SpeechToText => LoadedDeployment {
+            deployment_id: process.deployment_id.clone(),
+            public_model: process.public_model.clone(),
+            artifact_revision: process.artifact_revision.clone(),
+            model_generation: process.model_generation,
+            task: TaskKind::SpeechToText,
+            backend: process.assignment.backend(),
+            precision: "fp16".into(),
+            execution_representation: match variant_family_name(&process.variant) {
+                "nemotron_asr" => "native-nemotron-realtime".into(),
+                _ => "native-voxtral-realtime".into(),
+            },
+            tokenizer_revision: None,
+            readiness: ModelReadiness::Ready,
+            capability: Capability {
+                task: TaskKind::SpeechToText,
+                streaming: true,
+                realtime: true,
+                cancellation: CancellationBehavior::Cooperative,
+                accepted_input_formats: BTreeSet::from([InputFormat::PcmAudio]),
+                output_formats: BTreeSet::from([OutputFormat::Text]),
+                max_input_bytes: process.max_request_bytes as u64,
+                // Realtime sessions carry audio, not chat context; the
+                // session-level byte budget in the subprotocol bounds input.
+                max_context_tokens: None,
+                max_output_tokens: None,
+            },
+            kv_cache_usage_pct: None,
+            prefix_hits_total: None,
+            prefix_queries_total: None,
+            prefix_evictions_total: None,
+            tokens_out_per_s_ema: None,
+            observation_cost_units: None,
+        },
+        TaskKind::TextToSpeech => bail!("realtime text_to_speech workers are not implemented yet"),
     };
-    let worker = WorkerService::new(
-        WorkerConfig {
-            descriptor,
-            deployment,
-            credentials,
-            max_active_invocations: process.max_active_invocations,
-            max_request_bytes: process.max_request_bytes,
-            max_retained_attempts: process.max_retained_attempts,
-            attempt_retention: process.attempt_retention,
-            event_channel_capacity: DEFAULT_EVENT_CHANNEL_CAPACITY,
-            max_event_bytes: DEFAULT_MAX_EVENT_BYTES,
-        },
-        RuntimeChatExecutor::new(runtime, process.variant, process.streaming),
-    )?;
+    let worker_config = WorkerConfig {
+        descriptor,
+        deployment,
+        credentials,
+        max_active_invocations: process.max_active_invocations,
+        max_request_bytes: process.max_request_bytes,
+        max_retained_attempts: process.max_retained_attempts,
+        attempt_retention: process.attempt_retention,
+        event_channel_capacity: DEFAULT_EVENT_CHANNEL_CAPACITY,
+        max_event_bytes: DEFAULT_MAX_EVENT_BYTES,
+        realtime_session_limits: REALTIME_SESSION_DEFAULT_LIMITS,
+    };
+    let result = match process.task {
+        TaskKind::Chat => {
+            let worker = WorkerService::new(
+                worker_config,
+                RuntimeChatExecutor::new(runtime, process.variant, process.streaming),
+            )?;
+            serve_worker(worker, &process).await
+        }
+        TaskKind::SpeechToText => {
+            let worker = WorkerService::new(
+                worker_config,
+                RuntimeRealtimeAsrExecutor::new(runtime, process.variant),
+            )?;
+            serve_worker(worker, &process).await
+        }
+        TaskKind::TextToSpeech => {
+            bail!("realtime text_to_speech workers are not implemented yet")
+        }
+    };
+    result
+}
 
+/// Binds the constructed worker service and serves it with the same
+/// TLS/plain rules for every executor type.
+async fn serve_worker<E: izwi_serving_worker::InvocationExecutor>(
+    worker: WorkerService<E>,
+    process: &WorkerProcessConfig,
+) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(process.bind)
         .await
         .with_context(|| format!("bind private worker at {}", process.bind))?;
-    tracing::info!(
-        address = %process.bind,
-        model = %process.public_model,
-        backend = ?process.assignment.backend(),
-        tls = process.tls.is_some(),
-        "worker ready"
-    );
     let shutdown = shutdown_signal(
         worker.clone(),
         process.managed,
         process.drain_grace,
         process.cancellation_grace,
     );
-    if let Some(tls) = process.tls {
+    tracing::info!(
+        address = %process.bind,
+        model = %process.public_model,
+        task = ?process.task,
+        backend = ?process.assignment.backend(),
+        tls = process.tls.is_some(),
+        "worker ready"
+    );
+    if let Some(tls) = &process.tls {
         let tls_listener = TlsListener {
             inner: listener,
-            acceptor: tls.acceptor,
+            acceptor: tls.acceptor.clone(),
         };
         axum::serve(tls_listener, worker.router())
             .with_graceful_shutdown(shutdown)
@@ -364,6 +445,7 @@ struct WorkerProcessConfig {
     bind: SocketAddr,
     tls: Option<WorkerTlsConfig>,
     models_dir: PathBuf,
+    task: TaskKind,
     variant: ModelVariant,
     public_model: ModelAlias,
     worker_id: WorkerId,
@@ -387,12 +469,47 @@ struct WorkerProcessConfig {
 
 impl WorkerProcessConfig {
     fn from_env() -> anyhow::Result<Self> {
-        let model = env_or("IZWI_WORKER_MODEL", "LFM2.5-1.2B-Instruct-GGUF");
-        let variant = izwi_core::parse_chat_model_variant(Some(&model))
-            .with_context(|| format!("parse IZWI_WORKER_MODEL={model}"))?;
-        if variant != ModelVariant::Lfm2512BInstructGguf && variant != ModelVariant::Qwen3827BFp8 {
-            bail!("serving worker supports only LFM2.5-1.2B-Instruct-GGUF and Qwen3.8-27B-FP8");
-        }
+        let task = parse_worker_task()?;
+        let model = env_or(
+            "IZWI_WORKER_MODEL",
+            match task {
+                TaskKind::Chat => "LFM2.5-1.2B-Instruct-GGUF",
+                TaskKind::SpeechToText => "Nemotron-3.5-ASR-Streaming-0.6B",
+                // parse_worker_task never returns this arm.
+                TaskKind::TextToSpeech => {
+                    anyhow::bail!("realtime text_to_speech workers are not implemented yet")
+                }
+            },
+        );
+        let variant = match task {
+            TaskKind::Chat => {
+                let variant = izwi_core::parse_chat_model_variant(Some(&model))
+                    .with_context(|| format!("parse IZWI_WORKER_MODEL={model}"))?;
+                if variant != ModelVariant::Lfm2512BInstructGguf
+                    && variant != ModelVariant::Qwen3827BFp8
+                {
+                    bail!("serving worker supports only LFM2.5-1.2B-Instruct-GGUF and Qwen3.8-27B-FP8 for chat");
+                }
+                variant
+            }
+            TaskKind::SpeechToText => {
+                // Only families with proven realtime stream decode can serve
+                // realtime ASR sessions; anything else fails closed at boot.
+                let variant = izwi_core::parse_model_variant(&model)
+                    .with_context(|| format!("parse IZWI_WORKER_MODEL={model}"))?;
+                match variant.family() {
+                    izwi_core::catalog::ModelFamily::NemotronAsr
+                    | izwi_core::catalog::ModelFamily::Voxtral => variant,
+                    other => bail!(
+                        "realtime speech_to_text workers support only Nemotron ASR and Voxtral families; {model} is {other:?}"
+                    ),
+                }
+            }
+            // parse_worker_task never returns this arm.
+            TaskKind::TextToSpeech => {
+                anyhow::bail!("realtime text_to_speech workers are not implemented yet")
+            }
+        };
         let assignment = parse_assignment()?;
         let max_active_invocations = parse_env("IZWI_WORKER_MAX_ACTIVE", 1usize)?;
         if max_active_invocations == 0 {
@@ -425,6 +542,7 @@ impl WorkerProcessConfig {
             models_dir: std::env::var_os("IZWI_MODELS_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(default_models_dir),
+            task,
             variant,
             public_model: ModelAlias::new(model)?,
             worker_id: WorkerId::new(env_or("IZWI_WORKER_ID", "local-cpu-1"))?,
@@ -837,8 +955,33 @@ fn verify_artifact_manifest(process: &WorkerProcessConfig) -> anyhow::Result<()>
     Ok(())
 }
 
+/// Stable family label for the deployment's execution representation.
+fn variant_family_name(variant: &ModelVariant) -> &'static str {
+    match variant.family() {
+        izwi_core::catalog::ModelFamily::NemotronAsr => "nemotron_asr",
+        izwi_core::catalog::ModelFamily::Voxtral => "voxtral",
+        _ => "other",
+    }
+}
+
 fn env_or(name: &str, fallback: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| fallback.into())
+}
+
+/// Parses `IZWI_WORKER_TASK`. Chat remains the default so existing
+/// deployments are byte-identical; `text_to_speech` is rejected explicitly
+/// rather than falling back to chat.
+fn parse_worker_task() -> anyhow::Result<TaskKind> {
+    match env_or("IZWI_WORKER_TASK", "chat").trim().to_ascii_lowercase().as_str() {
+        "chat" => Ok(TaskKind::Chat),
+        "speech_to_text" => Ok(TaskKind::SpeechToText),
+        "text_to_speech" => Err(anyhow::anyhow!(
+            "IZWI_WORKER_TASK=text_to_speech is reserved for the realtime TTS stage, which is not implemented on workers yet"
+        )),
+        other => Err(anyhow::anyhow!(
+            "invalid IZWI_WORKER_TASK={other}; expected chat or speech_to_text"
+        )),
+    }
 }
 
 fn required_env(name: &str) -> anyhow::Result<String> {

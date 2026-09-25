@@ -652,3 +652,62 @@ mod tests {
         let _ = AttemptState::Queued;
     }
 }
+
+/// Worker-to-gateway WebSocket close codes for realtime sessions. Values use
+/// the WebSocket private-use 4xxx range; the terminal-event vocabulary (not
+/// the close code) is the authoritative outcome signal, and orderly session
+/// ends close with code 1000.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RealtimeSessionCloseCode {
+    ProtocolViolation,
+    Unauthorized,
+    PolicyDenied,
+    UnknownDeployment,
+    WrongWorkerIncarnation,
+    WrongModelGeneration,
+    IncompatibleTask,
+    DuplicateAttempt,
+    CapacityExhausted,
+    ModelNotReady,
+    Draining,
+    AdmitTimeout,
+    Internal,
+}
+
+impl RealtimeSessionCloseCode {
+    pub const fn code(self) -> u16 {
+        match self {
+            Self::ProtocolViolation => 4400,
+            Self::Unauthorized => 4401,
+            Self::PolicyDenied => 4403,
+            Self::UnknownDeployment => 4404,
+            Self::DuplicateAttempt => 4409,
+            Self::WrongModelGeneration => 4410,
+            Self::WrongWorkerIncarnation => 4412,
+            Self::IncompatibleTask => 4413,
+            Self::CapacityExhausted => 4429,
+            Self::ModelNotReady => 4453,
+            Self::Draining => 4450,
+            Self::AdmitTimeout => 4440,
+            Self::Internal => 4500,
+        }
+    }
+
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::ProtocolViolation => "protocol violation",
+            Self::Unauthorized => "unauthorized",
+            Self::PolicyDenied => "caller policy does not permit realtime sessions",
+            Self::UnknownDeployment => "deployment is not loaded",
+            Self::DuplicateAttempt => "attempt identity was reused",
+            Self::WrongModelGeneration => "model generation changed",
+            Self::WrongWorkerIncarnation => "worker incarnation changed",
+            Self::IncompatibleTask => "task is incompatible with deployment",
+            Self::CapacityExhausted => "worker capacity is exhausted",
+            Self::ModelNotReady => "deployment is not ready",
+            Self::Draining => "worker is draining",
+            Self::AdmitTimeout => "session admission timed out",
+            Self::Internal => "internal worker error",
+        }
+    }
+}

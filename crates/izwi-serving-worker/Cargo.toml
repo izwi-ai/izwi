@@ -21,6 +21,7 @@ async-trait = { workspace = true }
 axum = { workspace = true }
 bytes = { workspace = true }
 dirs = { workspace = true }
+futures = { workspace = true }
 izwi-core = { path = "../izwi-core", default-features = false }
 izwi-serving-protocol = { path = "../izwi-serving-protocol" }
 izwi-serving-supervisor = { path = "../izwi-serving-supervisor" }
@@ -44,3 +45,4 @@ tempfile = "3.10"
 tokenizers = { workspace = true }
 tower = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+tokio-tungstenite = "0.29"

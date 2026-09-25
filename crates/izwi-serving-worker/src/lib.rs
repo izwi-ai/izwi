@@ -30,9 +30,13 @@ use std::{
 use tokio::sync::{mpsc, watch, OwnedRwLockReadGuard, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::time::Instant;
 
+mod realtime;
 mod runtime;
 
-pub use runtime::{warm_up_chat_runtime, RuntimeChatExecutor};
+pub use realtime::{RuntimeRealtimeSessionLimits, REALTIME_SESSION_DEFAULT_LIMITS};
+pub use runtime::{
+    warm_up_asr_runtime, warm_up_chat_runtime, RuntimeChatExecutor, RuntimeRealtimeAsrExecutor,
+};
 
 pub const DEFAULT_MAX_REQUEST_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MAX_RETAINED_ATTEMPTS: usize = 1024;
@@ -55,6 +59,9 @@ pub struct WorkerConfig {
     pub attempt_retention: Duration,
     pub event_channel_capacity: usize,
     pub max_event_bytes: usize,
+    /// Per-realtime-session transport bounds; always within the protocol's
+    /// hard caps. Ignored by deployments that do not serve realtime.
+    pub realtime_session_limits: RuntimeRealtimeSessionLimits,
 }
 
 impl WorkerConfig {
@@ -76,23 +83,56 @@ impl WorkerConfig {
         if self.descriptor.assignment.backend() != self.deployment.backend {
             return Err(WorkerConfigError::BackendMismatch);
         }
-        if self.deployment.task != TaskKind::Chat
-            || self.deployment.capability.task != TaskKind::Chat
-            || !self
-                .deployment
-                .capability
-                .accepted_input_formats
-                .contains(&InputFormat::ChatMessages)
-            || !self
-                .deployment
-                .capability
-                .output_formats
-                .contains(&OutputFormat::Text)
-        {
-            return Err(WorkerConfigError::UnsupportedDeployment);
+        match self.deployment.task {
+            TaskKind::Chat => {
+                if self.deployment.capability.task != TaskKind::Chat
+                    || !self
+                        .deployment
+                        .capability
+                        .accepted_input_formats
+                        .contains(&InputFormat::ChatMessages)
+                    || !self
+                        .deployment
+                        .capability
+                        .output_formats
+                        .contains(&OutputFormat::Text)
+                {
+                    return Err(WorkerConfigError::UnsupportedDeployment);
+                }
+            }
+            TaskKind::SpeechToText => {
+                if self.deployment.capability.task != TaskKind::SpeechToText
+                    || !self.deployment.capability.realtime
+                    || !self
+                        .deployment
+                        .capability
+                        .accepted_input_formats
+                        .contains(&InputFormat::PcmAudio)
+                    || !self
+                        .deployment
+                        .capability
+                        .output_formats
+                        .contains(&OutputFormat::Text)
+                    || !self
+                        .descriptor
+                        .features
+                        .contains(&WorkerFeature::RealtimeSocket)
+                {
+                    return Err(WorkerConfigError::UnsupportedDeployment);
+                }
+            }
+            // Realtime TTS-stage execution is not implemented on the worker
+            // yet; advertising it would create a deployment no session can
+            // serve. The protocol contract already fits it (protocol minor 2).
+            TaskKind::TextToSpeech => {
+                return Err(WorkerConfigError::UnsupportedDeployment);
+            }
         }
         if self.max_active_invocations == 0 {
             return Err(WorkerConfigError::ZeroActiveCapacity);
+        }
+        if self.realtime_session_limits.validate().is_err() {
+            return Err(WorkerConfigError::InvalidRealtimeLimits);
         }
         if self.max_request_bytes == 0 {
             return Err(WorkerConfigError::ZeroRequestLimit);
@@ -139,6 +179,8 @@ pub enum WorkerConfigError {
     EventChannelCapacity,
     #[error("max_event_bytes must be at least 2048")]
     EventLimit,
+    #[error("realtime session limits must be non-zero and within the protocol caps")]
+    InvalidRealtimeLimits,
 }
 
 /// A rejection returned before runtime ownership has been accepted.
@@ -237,6 +279,46 @@ pub trait InvocationExecutor: Send + Sync + 'static {
     async fn runtime_telemetry(&self) -> Option<RuntimeTelemetrySnapshot> {
         None
     }
+
+    /// Realtime stage runner when the executor embeds a runtime able to serve
+    /// realtime WebSocket sessions (`izwi-realtime-v1`). Executors without
+    /// realtime support return `None`, and the realtime socket route fails
+    /// closed rather than advertising an unusable surface.
+    fn realtime_runner(&self) -> Option<std::sync::Arc<dyn RealtimeStageRunner>> {
+        None
+    }
+}
+
+/// Per-session realtime ASR stream handle produced by a
+/// [`RealtimeStageRunner`]. Every push is one input quantum: cancellation
+/// lands between pushes, never mid-decode. Dropping the handle releases the
+/// stage's engine leases — the worker's teardown confirmation for the ASR
+/// stage.
+#[async_trait::async_trait]
+pub trait RealtimeAsrStageStream: Send {
+    /// Pushes one frame of audio at the stream's sample rate.
+    async fn push_samples(
+        &mut self,
+        samples: &[f32],
+        sample_rate: u32,
+    ) -> Result<Vec<izwi_core::RuntimeAsrRealtimeEvent>, izwi_core::Error>;
+
+    /// Finalizes the stream and returns the final transcript events.
+    async fn finish(&mut self)
+        -> Result<Vec<izwi_core::RuntimeAsrRealtimeEvent>, izwi_core::Error>;
+}
+
+/// Execution surface for one realtime stage on this worker's runtime.
+#[async_trait::async_trait]
+pub trait RealtimeStageRunner: Send + Sync + 'static {
+    /// The stage task this runner serves.
+    fn stage_task(&self) -> TaskKind;
+
+    /// Starts a realtime ASR stream for the deployed variant.
+    async fn start_asr_stream(
+        &self,
+        language: Option<&str>,
+    ) -> Result<Box<dyn RealtimeAsrStageStream>, izwi_core::Error>;
 }
 
 #[derive(Clone)]
@@ -611,7 +693,7 @@ impl<E> WorkerState<E> {
         record.evict_after.is_some_and(|deadline| deadline <= now)
     }
 
-    fn evict_expired_record(&self, table: &mut AttemptTable, now: Instant) -> bool {
+    fn evict_expired_record(table: &mut AttemptTable, now: Instant) -> bool {
         let Some(index) = table.order.iter().position(|attempt_id| {
             table
                 .records
@@ -649,33 +731,66 @@ impl<E> WorkerState<E> {
 
     fn reserve_attempt(&self, request: &InvocationRequest) -> ReserveAttempt {
         let mut table = self.attempts.lock().expect("worker attempt table poisoned");
+        Self::reserve_new_attempt(
+            &mut table,
+            AttemptIdentity::from(request),
+            request.request_digest.clone(),
+            self.config.max_retained_attempts,
+        )
+    }
+
+    /// Realtime sessions reserve attempts in the same table with the same
+    /// fencing identity model, so `query_attempt`/`cancel_attempt` over HTTP
+    /// behave identically for them.
+    fn reserve_realtime_session(&self, admit: &RealtimeSessionAdmit) -> ReserveAttempt {
+        let mut table = self.attempts.lock().expect("worker attempt table poisoned");
+        Self::reserve_new_attempt(
+            &mut table,
+            AttemptIdentity {
+                request_id: admit.request_id.clone(),
+                attempt_id: admit.attempt_id.clone(),
+                tenant_id: admit.caller.tenant_id.clone(),
+                caller_id: admit.caller.caller_id.clone(),
+                incarnation_id: admit.expected_worker_incarnation.clone(),
+                deployment_id: admit.deployment_id.clone(),
+                model_generation: admit.expected_model_generation,
+            },
+            realtime::realtime_attempt_digest(admit),
+            self.config.max_retained_attempts,
+        )
+    }
+
+    fn reserve_new_attempt(
+        table: &mut AttemptTable,
+        identity: AttemptIdentity,
+        digest: RequestDigest,
+        max_retained_attempts: usize,
+    ) -> ReserveAttempt {
         if table
             .records
-            .get(&request.attempt_id)
+            .get(&identity.attempt_id)
             .is_some_and(|record| Self::record_is_expired(record, Instant::now()))
         {
-            Self::remove_record(&mut table, &request.attempt_id);
+            Self::remove_record(table, &identity.attempt_id);
         }
-        if let Some(existing) = table.records.get(&request.attempt_id) {
-            return if existing.identity == AttemptIdentity::from(request)
-                && existing.digest == request.request_digest
-            {
+        if let Some(existing) = table.records.get(&identity.attempt_id) {
+            return if existing.identity == identity && existing.digest == digest {
                 ReserveAttempt::AlreadyOwned
             } else {
                 ReserveAttempt::Conflict
             };
         }
-        while table.records.len() >= self.config.max_retained_attempts {
-            if !self.evict_expired_record(&mut table, Instant::now()) {
+        while table.records.len() >= max_retained_attempts {
+            if !Self::evict_expired_record(table, Instant::now()) {
                 return ReserveAttempt::Full;
             }
         }
-        table.order.push_back(request.attempt_id.clone());
+        table.order.push_back(identity.attempt_id.clone());
         table.records.insert(
-            request.attempt_id.clone(),
+            identity.attempt_id.clone(),
             AttemptRecord {
-                identity: AttemptIdentity::from(request),
-                digest: request.request_digest.clone(),
+                identity,
+                digest,
                 state: AttemptState::Queued,
                 last_sequence: None,
                 cancel_requested: false,
@@ -731,7 +846,7 @@ impl<E> WorkerState<E> {
             return;
         }
         while table.records.len() >= self.config.max_retained_attempts {
-            if !self.evict_expired_record(&mut table, Instant::now()) {
+            if !Self::evict_expired_record(&mut table, Instant::now()) {
                 return;
             }
         }
@@ -811,6 +926,7 @@ impl<E: InvocationExecutor> WorkerService<E> {
             .route(WORKER_STATUS_PATH, get(status::<E>))
             .route(WORKER_METRICS_PATH, get(metrics::<E>))
             .route(INVOCATIONS_PATH, post(invoke::<E>))
+            .route(REALTIME_WS_PATH, get(realtime::realtime_socket::<E>))
             .route(
                 &format!("{INVOCATIONS_PATH}/{{attempt_id}}"),
                 get(query_attempt::<E>),
@@ -2087,6 +2203,7 @@ mod tests {
             attempt_retention: Duration::from_secs(300),
             event_channel_capacity: 4,
             max_event_bytes: 4096,
+            realtime_session_limits: REALTIME_SESSION_DEFAULT_LIMITS,
         }
     }
 

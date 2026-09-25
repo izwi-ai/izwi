@@ -1,18 +1,18 @@
 use super::{
     AdmissionFailure, AdmittedExecution, AdmittedInvocation, ExecutionEvent, ExecutionFailure,
-    ExecutionTeardown, InvocationExecutor,
+    ExecutionTeardown, InvocationExecutor, RealtimeAsrStageStream, RealtimeStageRunner,
 };
 use async_trait::async_trait;
 use izwi_core::{
     engine::{OutputFinishReason, WorkloadClass},
     ChatMessage as CoreChatMessage, ChatRole as CoreChatRole, Error as CoreError, GenerationParams,
-    ModelVariant, RuntimeChatInvocation, RuntimeChatInvocationEvent, RuntimeChatInvocationRequest,
-    RuntimeChatTeardownDisposition, RuntimeRequestContext, RuntimeService,
-    RuntimeTelemetrySnapshot,
+    ModelVariant, RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream, RuntimeChatInvocation,
+    RuntimeChatInvocationEvent, RuntimeChatInvocationRequest, RuntimeChatTeardownDisposition,
+    RuntimeRequestContext, RuntimeService, RuntimeTelemetrySnapshot,
 };
 use izwi_serving_protocol::{
     ChatRole, FinishReason, InvocationErrorCode, InvocationInput, InvocationRequest, RejectionCode,
-    ServiceClass,
+    ServiceClass, TaskKind,
 };
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 
@@ -300,7 +300,7 @@ fn map_admission_error(error: CoreError) -> AdmissionFailure {
     AdmissionFailure::new(code, error.to_string())
 }
 
-fn map_execution_error(error: CoreError) -> ExecutionFailure {
+pub(crate) fn map_execution_error(error: CoreError) -> ExecutionFailure {
     let code = match error {
         CoreError::Timeout(_) => InvocationErrorCode::DeadlineExceeded,
         CoreError::InvalidInput(_) => InvocationErrorCode::InvalidInput,
@@ -312,5 +312,164 @@ fn map_execution_error(error: CoreError) -> ExecutionFailure {
     ExecutionFailure {
         code,
         message: error.to_string(),
+    }
+}
+
+const ASR_WARMUP_SAMPLE_RATE: u32 = 16_000;
+const ASR_WARMUP_FRAME_SAMPLES: usize = 1_600;
+const ASR_WARMUP_FRAMES: usize = 5;
+
+/// Execute one bounded realtime-ASR stream before a worker advertises
+/// readiness: start the stream, push a few frames of 16 kHz silence, and
+/// finish. This proves the deployed variant resolves back through the
+/// runtime's own ASR model resolution and that the realtime stream decode
+/// path actually executes; the caller must not bind a listener on failure.
+pub async fn warm_up_asr_runtime(
+    runtime: &RuntimeService,
+    variant: ModelVariant,
+    timeout: Duration,
+) -> Result<(), CoreError> {
+    if timeout.is_zero() {
+        return Err(CoreError::ConfigError(
+            "worker warm-up timeout must be non-zero".into(),
+        ));
+    }
+    let model_name = variant.dir_name();
+    let resolved = izwi_core::resolve_asr_model_variant(Some(model_name));
+    if resolved != variant {
+        return Err(CoreError::ConfigError(format!(
+            "worker ASR model {model_name} does not resolve back to the deployed variant"
+        )));
+    }
+    let started = tokio::time::timeout(
+        timeout,
+        runtime.try_start_asr_realtime_stream(Some(model_name), None, None),
+    )
+    .await
+    .map_err(|_| CoreError::Timeout("worker startup warm-up".into()))??;
+    let Some(mut stream) = started else {
+        return Err(CoreError::ConfigError(format!(
+            "deployed ASR model {model_name} does not support realtime stream decode"
+        )));
+    };
+    let silence = vec![0.0_f32; ASR_WARMUP_FRAME_SAMPLES];
+    for _ in 0..ASR_WARMUP_FRAMES {
+        let pushed = tokio::time::timeout(
+            timeout,
+            runtime.push_asr_realtime_samples(&mut stream, &silence, ASR_WARMUP_SAMPLE_RATE),
+        )
+        .await
+        .map_err(|_| CoreError::Timeout("worker startup warm-up".into()))??;
+        drop(pushed);
+    }
+    tokio::time::timeout(timeout, runtime.finish_asr_realtime_stream(&mut stream))
+        .await
+        .map_err(|_| CoreError::Timeout("worker startup warm-up".into()))??;
+    Ok(())
+}
+
+/// Serve realtime ASR sessions for one already loaded ASR model variant.
+///
+/// HTTP invocations are rejected for this executor: speech-to-text workers
+/// serve realtime WebSocket sessions only, and the deployment's capability
+/// gates keep chat traffic away before this executor is ever consulted.
+pub struct RuntimeRealtimeAsrExecutor {
+    runtime: Arc<RuntimeService>,
+    variant: ModelVariant,
+}
+
+impl RuntimeRealtimeAsrExecutor {
+    pub fn new(runtime: Arc<RuntimeService>, variant: ModelVariant) -> Self {
+        Self { runtime, variant }
+    }
+}
+
+#[async_trait]
+impl InvocationExecutor for RuntimeRealtimeAsrExecutor {
+    async fn runtime_telemetry(&self) -> Option<RuntimeTelemetrySnapshot> {
+        Some(self.runtime.telemetry_snapshot().await)
+    }
+
+    async fn admit(
+        &self,
+        _request: &InvocationRequest,
+    ) -> Result<AdmittedInvocation, AdmissionFailure> {
+        Err(AdmissionFailure::new(
+            RejectionCode::IncompatibleTask,
+            "speech_to_text workers serve realtime WebSocket sessions only; HTTP invocations are not accepted",
+        ))
+    }
+
+    fn realtime_runner(&self) -> Option<Arc<dyn RealtimeStageRunner>> {
+        Some(Arc::new(RuntimeRealtimeAsrRunner {
+            runtime: Arc::clone(&self.runtime),
+            variant: self.variant,
+        }))
+    }
+}
+
+/// Realtime ASR stage execution against the worker's runtime.
+pub struct RuntimeRealtimeAsrRunner {
+    runtime: Arc<RuntimeService>,
+    variant: ModelVariant,
+}
+
+#[async_trait]
+impl RealtimeStageRunner for RuntimeRealtimeAsrRunner {
+    fn stage_task(&self) -> TaskKind {
+        TaskKind::SpeechToText
+    }
+
+    async fn start_asr_stream(
+        &self,
+        language: Option<&str>,
+    ) -> Result<Box<dyn RealtimeAsrStageStream>, CoreError> {
+        let model_name = self.variant.dir_name();
+        let resolved = izwi_core::resolve_asr_model_variant(Some(model_name));
+        if resolved != self.variant {
+            return Err(CoreError::ConfigError(format!(
+                "worker ASR model {model_name} does not resolve back to the deployed variant"
+            )));
+        }
+        let started = self
+            .runtime
+            .try_start_asr_realtime_stream(Some(model_name), language, None)
+            .await?;
+        let stream = started.ok_or_else(|| {
+            CoreError::ConfigError(format!(
+                "deployed ASR model {model_name} does not support realtime stream decode"
+            ))
+        })?;
+        Ok(Box::new(RuntimeAsrStageStream {
+            runtime: Arc::clone(&self.runtime),
+            stream,
+        }))
+    }
+}
+
+/// Adapts the runtime's ASR realtime stream onto the worker's opaque stage
+/// stream handle. Dropping the adapter drops the runtime stream, which
+/// releases its job, session, and residency leases.
+struct RuntimeAsrStageStream {
+    runtime: Arc<RuntimeService>,
+    stream: RuntimeAsrRealtimeStream,
+}
+
+#[async_trait]
+impl RealtimeAsrStageStream for RuntimeAsrStageStream {
+    async fn push_samples(
+        &mut self,
+        samples: &[f32],
+        sample_rate: u32,
+    ) -> Result<Vec<RuntimeAsrRealtimeEvent>, CoreError> {
+        self.runtime
+            .push_asr_realtime_samples(&mut self.stream, samples, sample_rate)
+            .await
+    }
+
+    async fn finish(&mut self) -> Result<Vec<RuntimeAsrRealtimeEvent>, CoreError> {
+        self.runtime
+            .finish_asr_realtime_stream(&mut self.stream)
+            .await
     }
 }
