@@ -52,15 +52,31 @@ shared spans rebuild linear-attention and conv state."
      block table ("physical paged append ends at N, beyond capacity M").
      The clamp now only engages when the scheduled span already ends at or
      below the boundary; alignment is the scheduler's responsibility.
-   - **OPEN (blocks DS1.5 attach evidence)** — after a session attaches a
-     published snapshot at cursor C, the scheduler still issues the prefill
-     span from 0 while the model must append from C, so the paged append
-     overruns the block table and the stream closes without a final marker.
-     The scheduler/executor must clip (or replay) the scheduled span to the
-     attach cursor. Reproduce with
-     `cargo test -p izwi-serving-worker --test prefix_attach_repro -- --ignored`.
-     Until this lands, DS1.5 records publish-side evidence only and
-     `enable_prefix_caching` stays opt-in (default off).
+   - **FIXED (2026-09-25) — attach-span clipping** — after a session attached
+     a published snapshot at cursor C, the scheduler still issued the prefill
+     span from 0 while the model appended from C, so the paged append
+     overran the block table ("physical paged append ends at N, beyond
+     capacity M") and the stream closed without a final marker. Three
+     integration defects were involved: (1) the model side assumed an empty
+     reservation; (2) the manager-side attach was unreachable for
+     multi-chunk prompts because the first-chunk lookup is bounded by
+     `target - 1` and the aligned first chunk commits exactly to the
+     snapshot boundary; (3) a truncated/recomputing session died at commit
+     with "prefix digest is already bound" when it republished page
+     identities another session had bound. The fix: admission probes the
+     managed prefix index (read-only, full-prompt lookup + snapshot
+     reconcile) and the scheduler plans the first prefill span from the
+     probed cursor; the manager re-verifies transactionally and attaches
+     there (a cursor evicted in between degrades to a typed backpressure
+     that resets to a zero-start prefill); the model side seeds its logical
+     prefill cursor from the attached physical cursor and the handler clips
+     spans to the state's own cursor; the prefix index skips
+     content-identical republication instead of rejecting it. Enabled as a
+     standing regression: `cargo test -p izwi-serving-worker --test
+     prefix_attach_repro` (publishes>=1, attach=1, no truncations,
+     completion). Note for DS1.5 benchmark depth: a session publishes page
+     identities only from its first prefill chunk, so deep cross-request
+     reuse wants a chunk threshold at or above the shared prefix length.
 
 # Original spike analysis (2026-09-23)
 
