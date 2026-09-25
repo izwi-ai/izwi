@@ -19,6 +19,7 @@ use tokio::{sync::OwnedSemaphorePermit, time::Instant};
 
 #[cfg(any(test, feature = "mock-worker"))]
 pub mod mock;
+pub mod realtime;
 
 pub const DEFAULT_MAX_REQUEST_JSON_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MAX_CONTROL_BODY_BYTES: usize = 512 * 1024;
@@ -315,35 +316,13 @@ impl WorkerClient {
         config: WorkerClientConfig,
     ) -> Result<Self, WorkerClientError> {
         validate_config(&config)?;
-        let mut endpoint = reqwest::Url::parse(endpoint)
-            .map_err(|error| WorkerClientError::InvalidEndpoint(error.to_string()))?;
-        if endpoint.cannot_be_a_base() || endpoint.host_str().is_none() {
-            return Err(WorkerClientError::InvalidConfiguration(
-                "endpoint must be an absolute hierarchical URL",
-            ));
-        }
-        let numeric_loopback = endpoint
-            .host_str()
-            .map(|host| host.trim_start_matches('[').trim_end_matches(']'))
-            .and_then(|host| host.parse::<std::net::IpAddr>().ok())
-            .is_some_and(|host| host.is_loopback());
-        if endpoint.scheme() != "https" && !(endpoint.scheme() == "http" && numeric_loopback) {
-            return Err(WorkerClientError::InvalidConfiguration(
-                "worker endpoints must use certificate-verified HTTPS or numeric loopback HTTP",
-            ));
-        }
-        if !endpoint.username().is_empty()
-            || endpoint.password().is_some()
-            || endpoint.query().is_some()
-            || endpoint.fragment().is_some()
-        {
-            return Err(WorkerClientError::InvalidConfiguration(
-                "worker endpoints must not contain user info, query parameters, or fragments",
-            ));
-        }
-        if !endpoint.path().ends_with('/') {
-            endpoint.set_path(&format!("{}/", endpoint.path()));
-        }
+        let endpoint =
+            validated_session_endpoint(endpoint).map_err(|rejection| match rejection {
+                EndpointRejection::Parse(error) => WorkerClientError::InvalidEndpoint(error),
+                EndpointRejection::Policy(message) => {
+                    WorkerClientError::InvalidConfiguration(message)
+                }
+            })?;
         if endpoint.scheme() != "https" && config.tls.is_configured() {
             return Err(WorkerClientError::InvalidConfiguration(
                 "custom TLS trust or mTLS identity requires an HTTPS worker endpoint",
@@ -754,6 +733,48 @@ impl Drop for PendingInvocationGuard {
         }
         spawn_cancel(self.client.clone(), self.identity.clone());
     }
+}
+
+/// Shared endpoint rules for every session transport (HTTP and WebSocket):
+/// an absolute hierarchical URL using certificate-verified HTTPS or numeric
+/// loopback HTTP, without user info, query parameters, or fragments, and
+/// normalized to a trailing slash.
+pub(crate) enum EndpointRejection {
+    Parse(String),
+    Policy(&'static str),
+}
+
+fn validated_session_endpoint(endpoint: &str) -> Result<reqwest::Url, EndpointRejection> {
+    let mut endpoint = reqwest::Url::parse(endpoint)
+        .map_err(|error| EndpointRejection::Parse(error.to_string()))?;
+    if endpoint.cannot_be_a_base() || endpoint.host_str().is_none() {
+        return Err(EndpointRejection::Policy(
+            "endpoint must be an absolute hierarchical URL",
+        ));
+    }
+    let numeric_loopback = endpoint
+        .host_str()
+        .map(|host| host.trim_start_matches('[').trim_end_matches(']'))
+        .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+        .is_some_and(|host| host.is_loopback());
+    if endpoint.scheme() != "https" && !(endpoint.scheme() == "http" && numeric_loopback) {
+        return Err(EndpointRejection::Policy(
+            "worker endpoints must use certificate-verified HTTPS or numeric loopback HTTP",
+        ));
+    }
+    if !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return Err(EndpointRejection::Policy(
+            "worker endpoints must not contain user info, query parameters, or fragments",
+        ));
+    }
+    if !endpoint.path().ends_with('/') {
+        endpoint.set_path(&format!("{}/", endpoint.path()));
+    }
+    Ok(endpoint)
 }
 
 fn validate_config(config: &WorkerClientConfig) -> Result<(), WorkerClientError> {
