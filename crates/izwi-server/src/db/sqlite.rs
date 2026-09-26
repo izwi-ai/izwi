@@ -20,16 +20,59 @@ pub async fn initialize_default() -> anyhow::Result<DatabaseConnection> {
 }
 
 pub async fn connect_default() -> anyhow::Result<DatabaseConnection> {
-    let db_path = storage_layout::resolve_db_path();
+    let source = storage_layout::resolve_database_source()?;
     let media_root = storage_layout::resolve_media_root();
-    storage_layout::ensure_storage_dirs(&db_path, &media_root)
-        .context("Failed to prepare storage layout for SeaORM")?;
+    if let storage_layout::DatabaseSource::Path(db_path) = &source {
+        storage_layout::ensure_storage_dirs(db_path, &media_root)
+            .context("Failed to prepare storage layout for SeaORM")?;
+    }
 
-    connect_path(&db_path).await
+    connect_source(&source).await
 }
 
 pub async fn connect_path(db_path: &Path) -> anyhow::Result<DatabaseConnection> {
     let mut options = ConnectOptions::new(sqlite_url(db_path));
+    apply_sqlite_options(&mut options);
+
+    Database::connect(options).await.with_context(|| {
+        format!(
+            "Unable to open SeaORM SQLite database at {}",
+            db_path.display()
+        )
+    })
+}
+
+/// Connect to a database by URL. SQLite URLs keep the file-mode options the
+/// path form provides; server backends (PostgreSQL, MySQL) connect with the
+/// same bounded pool settings and no filesystem side effects.
+pub async fn connect_url(url: &str) -> anyhow::Result<DatabaseConnection> {
+    let mut options = ConnectOptions::new(url.to_string());
+    if url.trim_start().starts_with("sqlite://") {
+        apply_sqlite_options(&mut options);
+    } else {
+        options
+            .max_connections(SQLITE_MAX_CONNECTIONS)
+            .min_connections(1)
+            .connect_timeout(SQLITE_BUSY_TIMEOUT)
+            .acquire_timeout(SQLITE_BUSY_TIMEOUT)
+            .sqlx_logging(false);
+    }
+
+    Database::connect(options)
+        .await
+        .with_context(|| format!("Unable to open SeaORM database at {url}"))
+}
+
+async fn connect_source(
+    source: &storage_layout::DatabaseSource,
+) -> anyhow::Result<DatabaseConnection> {
+    match source {
+        storage_layout::DatabaseSource::Path(path) => connect_path(path).await,
+        storage_layout::DatabaseSource::Url(url) => connect_url(url).await,
+    }
+}
+
+fn apply_sqlite_options(options: &mut ConnectOptions) {
     options
         .max_connections(SQLITE_MAX_CONNECTIONS)
         .min_connections(1)
@@ -43,33 +86,40 @@ pub async fn connect_path(db_path: &Path) -> anyhow::Result<DatabaseConnection> 
                 .foreign_keys(true)
                 .journal_mode(SqliteJournalMode::Wal)
         });
-
-    Database::connect(options).await.with_context(|| {
-        format!(
-            "Unable to open SeaORM SQLite database at {}",
-            db_path.display()
-        )
-    })
 }
 
 #[derive(Clone)]
 pub struct StoreDatabase {
-    db_path: Option<PathBuf>,
+    source: Option<storage_layout::DatabaseSource>,
     connection: Arc<OnceCell<DatabaseConnection>>,
 }
 
 impl StoreDatabase {
     pub fn from_default_path() -> anyhow::Result<Self> {
-        let db_path = storage_layout::resolve_db_path();
+        let source = storage_layout::resolve_database_source()?;
         let media_root = storage_layout::resolve_media_root();
-        storage_layout::ensure_storage_dirs(&db_path, &media_root)
-            .context("Failed to prepare storage layout for SeaORM store")?;
-        Ok(Self::new(db_path))
+        if let storage_layout::DatabaseSource::Path(db_path) = &source {
+            storage_layout::ensure_storage_dirs(db_path, &media_root)
+                .context("Failed to prepare storage layout for SeaORM store")?;
+        }
+        Ok(Self {
+            source: Some(source),
+            connection: Arc::new(OnceCell::new()),
+        })
     }
 
     pub fn new(db_path: PathBuf) -> Self {
         Self {
-            db_path: Some(db_path),
+            source: Some(storage_layout::DatabaseSource::Path(db_path)),
+            connection: Arc::new(OnceCell::new()),
+        }
+    }
+
+    /// Address the store through a bounded database URL (DS5 fleet profile:
+    /// the coordination store may be a shared PostgreSQL database).
+    pub fn from_url(url: String) -> Self {
+        Self {
+            source: Some(storage_layout::DatabaseSource::Url(url)),
             connection: Arc::new(OnceCell::new()),
         }
     }
@@ -80,20 +130,20 @@ impl StoreDatabase {
             .map_err(|_| ())
             .expect("new OnceCell should accept initial database connection");
         Self {
-            db_path: None,
+            source: None,
             connection: Arc::new(cell),
         }
     }
 
     pub async fn connection(&self) -> anyhow::Result<&DatabaseConnection> {
-        if let Some(db_path) = self.db_path.clone() {
+        if let Some(source) = self.source.clone() {
             return self
                 .connection
                 .get_or_try_init(|| async move {
-                    let db = connect_path(&db_path).await?;
+                    let db = connect_source(&source).await?;
                     Migrator::up(&db)
                         .await
-                        .context("Failed to run SQLite migrations for SeaORM store")?;
+                        .context("Failed to run migrations for SeaORM store")?;
                     Ok(db)
                 })
                 .await;
@@ -108,7 +158,7 @@ impl StoreDatabase {
 impl fmt::Debug for StoreDatabase {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StoreDatabase")
-            .field("db_path", &self.db_path)
+            .field("source", &self.source)
             .field("has_connection", &self.connection.get().is_some())
             .finish()
     }
@@ -130,6 +180,24 @@ mod tests {
     use crate::voice_defaults::DEFAULT_VOICE_PROFILE_ID;
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
     use std::collections::BTreeSet;
+
+    #[tokio::test]
+    async fn url_source_migrates_a_sqlite_database_without_a_path() {
+        let _guard = env_lock();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("url-sourced.sqlite3");
+        let url = sqlite_url(&db_path);
+
+        let store = StoreDatabase::from_url(url);
+        let db = store.connection().await.expect("url-sourced store opens");
+        assert_eq!(db.get_database_backend(), DbBackend::Sqlite);
+
+        let tables = user_tables(db).await.expect("table list");
+        for table in EXPECTED_TABLES {
+            assert!(tables.contains(*table), "{table} table exists");
+        }
+        assert!(db_path.exists(), "sqlite url created the database file");
+    }
 
     #[tokio::test]
     async fn default_connection_preserves_sqlite_pragmas() {

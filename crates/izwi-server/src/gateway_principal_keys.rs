@@ -19,7 +19,7 @@ use crate::gateway_security::{
 };
 use hmac::{Hmac, Mac};
 use izwi_hooks::Principal;
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend};
 use serde::Deserialize;
 use sha2::Sha256;
 use std::fmt;
@@ -330,9 +330,24 @@ async fn upsert_principal_key(
     record: &StoredPrincipalKey,
 ) -> anyhow::Result<()> {
     let now = current_timestamp_millis();
-    db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        r#"
+    let assignments = match db.get_database_backend() {
+        DbBackend::MySql => {
+            r#"
+        INSERT INTO gateway_principal_keys (
+            principal_id, roles_json, tenant_id, key_salt, key_hash, created_at, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+        AS new
+        ON DUPLICATE KEY UPDATE
+            roles_json = new.roles_json,
+            tenant_id = new.tenant_id,
+            key_salt = new.key_salt,
+            key_hash = new.key_hash,
+            updated_at = new.updated_at
+        "#
+        }
+        _ => {
+            r#"
         INSERT INTO gateway_principal_keys (
             principal_id, roles_json, tenant_id, key_salt, key_hash, created_at, updated_at
         )
@@ -343,7 +358,12 @@ async fn upsert_principal_key(
             key_salt = excluded.key_salt,
             key_hash = excluded.key_hash,
             updated_at = excluded.updated_at
-        "#,
+        "#
+        }
+    };
+    db.execute_raw(crate::db::raw::statement(
+        db,
+        assignments,
         vec![
             record.principal_id.clone().into(),
             serde_json::to_string(&record.roles)?.into(),
@@ -352,7 +372,7 @@ async fn upsert_principal_key(
             to_hex(&record.hash).into(),
             now.into(),
         ],
-    ))
+    )?)
     .await?;
     Ok(())
 }
@@ -361,11 +381,12 @@ async fn load_principal_keys(
     db: &DatabaseConnection,
 ) -> Result<Vec<StoredPrincipalKey>, GatewayPrincipalKeysError> {
     let rows = db
-        .query_all_raw(Statement::from_string(
-            DbBackend::Sqlite,
-            "SELECT principal_id, roles_json, tenant_id, key_salt, key_hash FROM gateway_principal_keys ORDER BY principal_id"
-                .to_string(),
-        ))
+        .query_all_raw(
+            crate::db::raw::statement_without_values(
+                db,
+                "SELECT principal_id, roles_json, tenant_id, key_salt, key_hash FROM gateway_principal_keys ORDER BY principal_id",
+            ),
+        )
         .await
         .map_err(|_| GatewayPrincipalKeysError::InvalidStoredRecord)?;
     if rows.len() > MAX_GATEWAY_PRINCIPAL_KEYS {

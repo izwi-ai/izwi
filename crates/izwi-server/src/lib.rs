@@ -888,12 +888,21 @@ async fn gateway_state(
     .map_err(|error| anyhow::anyhow!(error.message))?;
 
     // Multi-gateway fleets share worker observations and capacity claims
-    // through one SQLite coordination file. Unset means single-gateway
-    // operation with purely process-local state.
-    let fleet = match crate::gateway_fleet::fleet_db_path_from_env()? {
-        Some(path) => {
+    // through one coordination database — a SQLite file by default, or a
+    // server-backed database URL for shared fleets (DS5). Unset means
+    // single-gateway operation with purely process-local state.
+    let fleet = match crate::gateway_fleet::fleet_database_from_env()? {
+        Some(fleet_database) => {
+            let store_database = match fleet_database {
+                crate::gateway_fleet::FleetDatabase::Path(path) => {
+                    crate::db::StoreDatabase::new(path)
+                }
+                crate::gateway_fleet::FleetDatabase::Url(url) => {
+                    crate::db::StoreDatabase::from_url(url)
+                }
+            };
             let store = crate::batch_runtime::store::BatchRuntimeStore::initialize_with_database(
-                crate::db::StoreDatabase::new(path),
+                store_database,
             );
             store
                 .connection()

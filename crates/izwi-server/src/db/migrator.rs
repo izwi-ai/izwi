@@ -1,3 +1,4 @@
+use crate::db::raw;
 use crate::voice_defaults::{
     DEFAULT_VOICE_AGENT_SYSTEM_PROMPT, DEFAULT_VOICE_PROFILE_ID, DEFAULT_VOICE_PROFILE_NAME,
 };
@@ -8,8 +9,10 @@ pub struct Migrator;
 
 impl Migrator {
     pub async fn up(db: &DatabaseConnection) -> anyhow::Result<()> {
+        let backend = db.get_database_backend();
         for statement in BASELINE_SCHEMA {
-            db.execute_unprepared(statement).await?;
+            db.execute_unprepared(&dialect_ddl(backend, statement))
+                .await?;
         }
 
         for column in COMPATIBILITY_COLUMNS {
@@ -17,12 +20,95 @@ impl Migrator {
         }
 
         for statement in POST_COMPATIBILITY_SCHEMA {
-            db.execute_unprepared(statement).await?;
+            db.execute_unprepared(&dialect_ddl(backend, statement))
+                .await?;
         }
 
         ensure_default_voice_profile(db).await?;
         Ok(())
     }
+}
+
+/// Translate the shared SQLite-flavored DDL into the target backend's
+/// dialect. The schema is deliberately portable (TEXT/INTEGER/REAL, no
+/// stored procedures); only three constructs need translation:
+///
+/// - `INTEGER` holds epoch-milli timestamps and counters, which overflow a
+///   4-byte server INTEGER: promote to BIGINT.
+/// - `REAL` maps to a 4-byte float on PostgreSQL: promote to DOUBLE
+///   PRECISION so f64 values round-trip exactly.
+/// - `COLLATE NOCASE` is a SQLite-only collation. The case-insensitive
+///   uniqueness contract on `saved_voices.name` becomes a LOWER(name)
+///   functional unique index on PostgreSQL; remaining occurrences are
+///   dropped (server default collations are case-sensitive on PostgreSQL).
+pub fn dialect_ddl(backend: DbBackend, sql: &str) -> String {
+    match backend {
+        DbBackend::Sqlite => sql.to_string(),
+        DbBackend::Postgres => {
+            let sql = sql.replace(
+                "ON saved_voices(name COLLATE NOCASE)",
+                "ON saved_voices(LOWER(name))",
+            );
+            let sql = replace_word(&sql, "COLLATE NOCASE", "");
+            let sql = replace_word(&sql, "INTEGER", "BIGINT");
+            replace_word(&sql, "REAL", "DOUBLE PRECISION")
+        }
+        DbBackend::MySql => {
+            let sql = replace_word(sql, "COLLATE NOCASE", "");
+            let sql = replace_word(&sql, "INTEGER", "BIGINT");
+            replace_word(&sql, "REAL", "DOUBLE")
+        }
+        _ => sql.to_string(),
+    }
+}
+
+/// Replace whole-word occurrences of `word` with `replacement`, leaving
+/// identifier substrings (for example `max_words`) and single-quoted SQL
+/// string literals untouched.
+fn replace_word(haystack: &str, word: &str, replacement: &str) -> String {
+    let boundary = |byte: Option<&u8>| {
+        byte.is_none_or(|candidate| !candidate.is_ascii_alphanumeric() && *candidate != b'_')
+    };
+    let bytes = haystack.as_bytes();
+    let mut result = String::with_capacity(haystack.len());
+    let mut segment_start = 0;
+    let mut cursor = 0;
+    let mut in_single_quote = false;
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'\'' {
+            let is_escaped_quote = in_single_quote && bytes.get(cursor + 1) == Some(&b'\'');
+            in_single_quote = if is_escaped_quote {
+                in_single_quote
+            } else {
+                !in_single_quote
+            };
+            cursor += if is_escaped_quote { 2 } else { 1 };
+            continue;
+        }
+        if in_single_quote || bytes[cursor] >= 0x80 {
+            cursor += 1;
+            continue;
+        }
+        if haystack[cursor..].starts_with(word) {
+            let end = cursor + word.len();
+            let before = if cursor == 0 {
+                None
+            } else {
+                Some(&bytes[cursor - 1])
+            };
+            let after = bytes.get(end);
+            if boundary(before) && boundary(after) {
+                result.push_str(&haystack[segment_start..cursor]);
+                result.push_str(replacement);
+                segment_start = end;
+            }
+            cursor = end;
+            continue;
+        }
+        cursor += 1;
+    }
+    result.push_str(&haystack[segment_start..]);
+    result
 }
 
 struct CompatibilityColumn {
@@ -1005,9 +1091,10 @@ async fn ensure_column(
     if table_has_column(db, column.table, column.column).await? {
         return Ok(());
     }
+    let definition = dialect_ddl(db.get_database_backend(), column.definition);
     db.execute_unprepared(&format!(
         "ALTER TABLE {} ADD COLUMN {} {}",
-        column.table, column.column, column.definition
+        column.table, column.column, definition
     ))
     .await?;
     Ok(())
@@ -1018,28 +1105,45 @@ async fn table_has_column(
     table: &str,
     target: &str,
 ) -> anyhow::Result<bool> {
-    let rows = db
-        .query_all_raw(Statement::from_string(
-            DbBackend::Sqlite,
-            format!("PRAGMA table_info({table})"),
-        ))
-        .await?;
-    for row in rows {
-        let name: String = row.try_get_by_index(1)?;
-        if name == target {
-            return Ok(true);
+    match db.get_database_backend() {
+        DbBackend::Sqlite => {
+            let rows = db
+                .query_all_raw(Statement::from_string(
+                    DbBackend::Sqlite,
+                    format!("PRAGMA table_info({table})"),
+                ))
+                .await?;
+            for row in rows {
+                let name: String = row.try_get_by_index(1)?;
+                if name == target {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        backend => {
+            let sql = match backend {
+                DbBackend::Postgres => {
+                    "SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = ?1 AND column_name = ?2 LIMIT 1"
+                }
+                DbBackend::MySql => {
+                    "SELECT 1 FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ?1 AND column_name = ?2 LIMIT 1"
+                }
+                other => anyhow::bail!("Unsupported migration backend: {other:?}"),
+            };
+            let statement = raw::statement(db, sql, vec![table.into(), target.into()])?;
+            Ok(db.query_one_raw(statement).await?.is_some())
         }
     }
-    Ok(false)
 }
 
 async fn ensure_default_voice_profile(db: &DatabaseConnection) -> anyhow::Result<()> {
     let exists = db
-        .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
+        .query_one_raw(raw::statement(
+            db,
             "SELECT 1 FROM voice_profiles WHERE id = ?1 LIMIT 1",
             vec![DEFAULT_VOICE_PROFILE_ID.into()],
-        ))
+        )?)
         .await?
         .is_some();
     if exists {
@@ -1047,8 +1151,8 @@ async fn ensure_default_voice_profile(db: &DatabaseConnection) -> anyhow::Result
     }
 
     let now = current_timestamp_millis();
-    db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
+    db.execute_raw(raw::statement(
+        db,
         r#"
         INSERT INTO voice_profiles (
             id,
@@ -1066,7 +1170,7 @@ async fn ensure_default_voice_profile(db: &DatabaseConnection) -> anyhow::Result
             DEFAULT_VOICE_AGENT_SYSTEM_PROMPT.into(),
             now.into(),
         ],
-    ))
+    )?)
     .await?;
 
     Ok(())
@@ -1077,4 +1181,79 @@ fn current_timestamp_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sqlite_ddl_passes_through_unchanged() {
+        let sql =
+            "CREATE TABLE t (id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, score REAL NULL);";
+        assert_eq!(dialect_ddl(DbBackend::Sqlite, sql), sql);
+    }
+
+    #[test]
+    fn postgres_ddl_promotes_integer_and_real_and_drops_nocase() {
+        let sql = "CREATE TABLE t (id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, score REAL NOT NULL);";
+        assert_eq!(
+            dialect_ddl(DbBackend::Postgres, sql),
+            "CREATE TABLE t (id TEXT PRIMARY KEY, created_at BIGINT NOT NULL, score DOUBLE PRECISION NOT NULL);"
+        );
+    }
+
+    #[test]
+    fn postgres_ddl_does_not_rewrite_word_fragments() {
+        let sql = "INSERT INTO t (message) VALUES ('INTEGER REAL'); -- general_max_words";
+        assert_eq!(
+            dialect_ddl(DbBackend::Postgres, sql),
+            "INSERT INTO t (message) VALUES ('INTEGER REAL'); -- general_max_words"
+        );
+    }
+
+    #[test]
+    fn postgres_ddl_respects_escaped_quotes_and_multibyte_literals() {
+        let sql = "INSERT INTO t (message) VALUES ('it''s INTEGER wide — résumé REAL');";
+        assert_eq!(
+            dialect_ddl(DbBackend::Postgres, sql),
+            "INSERT INTO t (message) VALUES ('it''s INTEGER wide — résumé REAL');"
+        );
+        let sql = "ALTER TABLE résumé ADD COLUMN count INTEGER NULL";
+        assert_eq!(
+            dialect_ddl(DbBackend::Postgres, sql),
+            "ALTER TABLE résumé ADD COLUMN count BIGINT NULL"
+        );
+    }
+
+    #[test]
+    fn postgres_saved_voices_nocase_index_becomes_lower_functional_index() {
+        let sql = "CREATE UNIQUE INDEX IF NOT EXISTS idx_saved_voices_name_nocase ON saved_voices(name COLLATE NOCASE);";
+        assert_eq!(
+            dialect_ddl(DbBackend::Postgres, sql),
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_saved_voices_name_nocase ON saved_voices(LOWER(name));"
+        );
+    }
+
+    #[test]
+    fn postgres_saved_voices_column_drops_nocase_collation() {
+        let sql = "name TEXT NOT NULL COLLATE NOCASE,";
+        assert_eq!(
+            dialect_ddl(DbBackend::Postgres, sql),
+            "name TEXT NOT NULL ,"
+        );
+    }
+
+    #[test]
+    fn compatibility_column_definitions_are_promoted_for_postgres() {
+        assert_eq!(
+            dialect_ddl(DbBackend::Postgres, "INTEGER NOT NULL DEFAULT 0"),
+            "BIGINT NOT NULL DEFAULT 0"
+        );
+        assert_eq!(
+            dialect_ddl(DbBackend::Postgres, "REAL NULL"),
+            "DOUBLE PRECISION NULL"
+        );
+        assert_eq!(dialect_ddl(DbBackend::MySql, "INTEGER NULL"), "BIGINT NULL");
+    }
 }

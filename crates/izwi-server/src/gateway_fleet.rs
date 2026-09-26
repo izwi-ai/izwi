@@ -108,17 +108,26 @@ pub enum FleetPartitionError {
     PartitionWithoutSize,
     #[error("IZWI_GATEWAY_FLEET_SIZE is set but IZWI_GATEWAY_FLEET_PARTITION is missing")]
     MissingPartition,
-    #[error("IZWI_GATEWAY_FLEET_DB_PATH must be a bounded absolute path")]
+    #[error("IZWI_GATEWAY_FLEET_DB_PATH must be a bounded absolute path or database URL")]
     InvalidDbPath,
     #[error("IZWI_GATEWAY_ID exceeds its encoded size limit")]
     InvalidGatewayId,
 }
 
-/// Resolve the shared fleet coordination database path, if configured.
-/// All gateways pointing at the same file share worker observations and
+/// A bounded fleet coordination database reference: a SQLite file path
+/// (the historical form) or a bounded database URL such as `postgres://`
+/// for a shared server-backed coordination store (DS5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FleetDatabase {
+    Path(std::path::PathBuf),
+    Url(String),
+}
+
+/// Resolve the shared fleet coordination database reference, if configured.
+/// All gateways pointing at the same database share worker observations and
 /// capacity claims. Unset means single-gateway operation with no shared
 /// state at all.
-pub fn fleet_db_path_from_env() -> Result<Option<std::path::PathBuf>, FleetPartitionError> {
+pub fn fleet_database_from_env() -> Result<Option<FleetDatabase>, FleetPartitionError> {
     let Some(raw) = std::env::var_os(FLEET_DB_PATH_ENV) else {
         return Ok(None);
     };
@@ -128,11 +137,19 @@ pub fn fleet_db_path_from_env() -> Result<Option<std::path::PathBuf>, FleetParti
     if raw.is_empty() || raw.len() > MAX_DB_PATH_BYTES {
         return Err(FleetPartitionError::InvalidDbPath);
     }
-    let path = std::path::PathBuf::from(raw);
+    if raw.contains("://") {
+        let source = crate::storage_layout::database_source_from_raw(&raw)
+            .map_err(|_| FleetPartitionError::InvalidDbPath)?;
+        return Ok(Some(match source {
+            crate::storage_layout::DatabaseSource::Url(url) => FleetDatabase::Url(url),
+            crate::storage_layout::DatabaseSource::Path(path) => FleetDatabase::Path(path),
+        }));
+    }
+    let path = std::path::PathBuf::from(&raw);
     if !path.is_absolute() {
         return Err(FleetPartitionError::InvalidDbPath);
     }
-    Ok(Some(path))
+    Ok(Some(FleetDatabase::Path(path)))
 }
 
 /// Stable gateway identity for fleet claim ownership. Operator-set via
@@ -234,18 +251,49 @@ mod tests {
     }
 
     #[test]
-    fn fleet_db_path_requires_absolute_bounded_paths() {
+    fn fleet_db_requires_absolute_bounded_paths_or_database_urls() {
         std::env::remove_var("IZWI_GATEWAY_FLEET_DB_PATH");
-        assert!(fleet_db_path_from_env().unwrap().is_none());
+        assert!(fleet_database_from_env().unwrap().is_none());
         std::env::set_var("IZWI_GATEWAY_FLEET_DB_PATH", "relative/fleet.sqlite3");
         assert_eq!(
-            fleet_db_path_from_env(),
+            fleet_database_from_env(),
             Err(FleetPartitionError::InvalidDbPath)
         );
         std::env::set_var("IZWI_GATEWAY_FLEET_DB_PATH", "/var/lib/izwi/fleet.sqlite3");
         assert_eq!(
-            fleet_db_path_from_env().unwrap().unwrap().to_str(),
-            Some("/var/lib/izwi/fleet.sqlite3")
+            fleet_database_from_env().unwrap().unwrap(),
+            FleetDatabase::Path(std::path::PathBuf::from("/var/lib/izwi/fleet.sqlite3"))
+        );
+        std::env::remove_var("IZWI_GATEWAY_FLEET_DB_PATH");
+    }
+
+    #[test]
+    fn fleet_db_accepts_bounded_database_urls_and_rejects_unknown_schemes() {
+        std::env::set_var(
+            "IZWI_GATEWAY_FLEET_DB_PATH",
+            "postgres://fleet:fleet@db.internal:5432/izwi_fleet",
+        );
+        assert_eq!(
+            fleet_database_from_env().unwrap().unwrap(),
+            FleetDatabase::Url("postgres://fleet:fleet@db.internal:5432/izwi_fleet".to_string())
+        );
+        std::env::set_var(
+            "IZWI_GATEWAY_FLEET_DB_PATH",
+            "sqlite:///var/lib/izwi/fleet.db",
+        );
+        assert_eq!(
+            fleet_database_from_env().unwrap().unwrap(),
+            FleetDatabase::Url("sqlite:///var/lib/izwi/fleet.db".to_string())
+        );
+        std::env::set_var("IZWI_GATEWAY_FLEET_DB_PATH", "oracle://db.internal/izwi");
+        assert_eq!(
+            fleet_database_from_env(),
+            Err(FleetPartitionError::InvalidDbPath)
+        );
+        std::env::set_var("IZWI_GATEWAY_FLEET_DB_PATH", "postgres://");
+        assert_eq!(
+            fleet_database_from_env(),
+            Err(FleetPartitionError::InvalidDbPath)
         );
         std::env::remove_var("IZWI_GATEWAY_FLEET_DB_PATH");
     }
