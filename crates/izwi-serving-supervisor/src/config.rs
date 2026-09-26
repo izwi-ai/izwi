@@ -318,6 +318,12 @@ pub struct WorkerConfig {
     pub attempt_retention_secs: u64,
     #[serde(default = "default_streaming")]
     pub streaming: bool,
+    /// Host KV pool budget (DS4) for hierarchical offload on this worker.
+    /// Zero (the default) keeps offload off; a positive value must fit inside
+    /// the assignment's own host/shared memory limit so the aggregate
+    /// host-memory check remains truthful.
+    #[serde(default)]
+    pub host_kv_pool_budget_bytes: u64,
 }
 
 impl WorkerConfig {
@@ -379,6 +385,39 @@ impl WorkerConfig {
             return Err(ConfigError::InvalidDirectory {
                 field: "models_directory",
                 path: self.deployment.models_directory.clone(),
+            });
+        }
+        self.validate_kv_pool_budget()?;
+        Ok(())
+    }
+
+    /// The DS4 host KV pool budget is a sub-budget of the assignment's own
+    /// host (CPU/CUDA) or shared unified (Metal) memory limit, so the
+    /// aggregate host-memory overcommit check needs no new term.
+    fn validate_kv_pool_budget(&self) -> Result<(), ConfigError> {
+        if self.host_kv_pool_budget_bytes == 0 {
+            return Ok(());
+        }
+        let (limit, field) = match &self.assignment {
+            DeviceAssignment::Cpu {
+                host_memory_limit_bytes,
+                ..
+            }
+            | DeviceAssignment::Cuda {
+                host_memory_limit_bytes,
+                ..
+            } => (*host_memory_limit_bytes, "host_memory_limit_bytes"),
+            DeviceAssignment::Metal {
+                shared_memory_limit_bytes,
+                ..
+            } => (*shared_memory_limit_bytes, "shared_memory_limit_bytes"),
+        };
+        if self.host_kv_pool_budget_bytes > limit {
+            return Err(ConfigError::KvPoolBudgetExceedsWorkerLimit {
+                worker: self.worker_id.clone(),
+                budget: self.host_kv_pool_budget_bytes,
+                field,
+                limit,
             });
         }
         Ok(())
@@ -717,6 +756,15 @@ pub enum ConfigError {
         worker: WorkerId,
         field: &'static str,
         maximum: u64,
+    },
+    #[error(
+        "worker {worker} host_kv_pool_budget_bytes ({budget}) exceeds its assignment {field} ({limit})"
+    )]
+    KvPoolBudgetExceedsWorkerLimit {
+        worker: WorkerId,
+        budget: u64,
+        field: &'static str,
+        limit: u64,
     },
     #[error("worker {worker} repeats CPU {cpu} in its affinity")]
     DuplicateCpuAffinity { worker: WorkerId, cpu: u16 },
@@ -1093,6 +1141,7 @@ mod tests {
                 max_request_bytes: 4096,
                 max_retained_attempts: 2,
                 attempt_retention_secs: 30,
+                host_kv_pool_budget_bytes: 0,
                 streaming: true,
             }],
             readiness: ReadinessPolicy::default(),
@@ -1302,6 +1351,25 @@ max_output_tokens = 32
         assert!(matches!(
             streaming.validate(&inventory(), &binaries),
             Err(ConfigError::CapabilityStreamingMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn validates_host_kv_pool_budget_against_the_assignment_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let binaries = catalog(executable(directory.path()));
+
+        // A pool budget at the assignment's own host limit is a valid
+        // sub-budget; the aggregate host-memory check is unchanged.
+        let mut fitting = cpu_config(directory.path());
+        fitting.workers[0].host_kv_pool_budget_bytes = 512;
+        fitting.validate(&inventory(), &binaries).unwrap();
+
+        let mut over = cpu_config(directory.path());
+        over.workers[0].host_kv_pool_budget_bytes = 513;
+        assert!(matches!(
+            over.validate(&inventory(), &binaries),
+            Err(ConfigError::KvPoolBudgetExceedsWorkerLimit { .. })
         ));
     }
 

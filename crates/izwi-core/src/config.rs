@@ -737,6 +737,30 @@ pub struct EngineConfig {
     /// Prompt length (tokens) above which chunked prefill applies.
     #[serde(default = "default_chunked_prefill_threshold")]
     pub chunked_prefill_threshold: usize,
+
+    /// Host KV pool budget in bytes for hierarchical offload (DS4). A positive
+    /// budget opts this engine into demoting committed prefix pages to a host
+    /// tier bounded by this pool; zero (the default) keeps the feature fully
+    /// dormant. The pool is charged to the same node memory ledger as the
+    /// device arenas (DINV-05).
+    #[serde(default)]
+    pub kv_host_pool_budget_bytes: u64,
+
+    /// Device-arena pressure ratio at which demotion steps start.
+    #[serde(default = "default_kv_offload_high_watermark")]
+    pub kv_offload_high_watermark: f32,
+
+    /// Pressure ratio demotion steps drain toward before stopping.
+    #[serde(default = "default_kv_offload_low_watermark")]
+    pub kv_offload_low_watermark: f32,
+
+    /// Maximum pages with a demotion copy in flight at once.
+    #[serde(default = "default_kv_offload_max_in_flight_pages")]
+    pub kv_offload_max_in_flight_pages: usize,
+
+    /// Maximum host-resident pages promoted back in one prepare.
+    #[serde(default = "default_kv_offload_max_promotion_pages")]
+    pub kv_offload_max_promotion_pages: usize,
 }
 
 impl Default for EngineConfig {
@@ -765,6 +789,11 @@ impl Default for EngineConfig {
             prefix_reuse_catalog_auto: false,
             enable_chunked_prefill: default_enable_chunked_prefill(),
             chunked_prefill_threshold: default_chunked_prefill_threshold(),
+            kv_host_pool_budget_bytes: 0,
+            kv_offload_high_watermark: default_kv_offload_high_watermark(),
+            kv_offload_low_watermark: default_kv_offload_low_watermark(),
+            kv_offload_max_in_flight_pages: default_kv_offload_max_in_flight_pages(),
+            kv_offload_max_promotion_pages: default_kv_offload_max_promotion_pages(),
         }
     }
 }
@@ -787,6 +816,22 @@ fn default_enable_chunked_prefill() -> bool {
 
 fn default_chunked_prefill_threshold() -> usize {
     192
+}
+
+fn default_kv_offload_high_watermark() -> f32 {
+    0.85
+}
+
+fn default_kv_offload_low_watermark() -> f32 {
+    0.70
+}
+
+fn default_kv_offload_max_in_flight_pages() -> usize {
+    8
+}
+
+fn default_kv_offload_max_promotion_pages() -> usize {
+    64
 }
 
 fn default_models_dir() -> PathBuf {

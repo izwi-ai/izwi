@@ -23,6 +23,11 @@ pub struct ManagedKvTelemetrySnapshot {
     pub tensor_snapshot_evictions: u64,
     /// Live gauge projected by the manager's runtime snapshot.
     pub prefix_retained_pages: u64,
+    /// Live gauge projected by the manager from host-pool occupancy (DS4).
+    pub kv_host_pages: u64,
+    pub demotions_total: u64,
+    pub promotions_total: u64,
+    pub promotion_latency_ns_total: u64,
     pub reused_tokens: u64,
     pub avoided_prefill_tokens: u64,
     pub decode_dispatches: u64,
@@ -47,6 +52,9 @@ pub struct ManagedKvTelemetry {
     tensor_snapshot_attaches: AtomicU64,
     tensor_snapshot_truncations: AtomicU64,
     tensor_snapshot_evictions: AtomicU64,
+    demotions_total: AtomicU64,
+    promotions_total: AtomicU64,
+    promotion_latency_ns_total: AtomicU64,
     reused_tokens: AtomicU64,
     avoided_prefill_tokens: AtomicU64,
     decode_dispatches: AtomicU64,
@@ -122,6 +130,19 @@ impl ManagedKvTelemetry {
         add_usize(&self.tensor_snapshot_evictions, count);
     }
 
+    /// Demoted pages left the device arena for the host pool (DS4).
+    pub fn record_demotion(&self, pages: usize) {
+        add_usize(&self.demotions_total, pages);
+    }
+
+    /// Promoted pages returned from the host pool to the device arena (DS4),
+    /// with the accumulated promotion copy latency in nanoseconds.
+    pub fn record_promotion(&self, pages: usize, latency_ns: u64) {
+        add_usize(&self.promotions_total, pages);
+        self.promotion_latency_ns_total
+            .fetch_add(latency_ns, Ordering::Relaxed);
+    }
+
     pub fn record_decode_dispatch(&self) {
         self.decode_dispatches.fetch_add(1, Ordering::Relaxed);
     }
@@ -152,6 +173,10 @@ impl ManagedKvTelemetry {
             tensor_snapshot_truncations: load(&self.tensor_snapshot_truncations),
             tensor_snapshot_evictions: load(&self.tensor_snapshot_evictions),
             prefix_retained_pages: 0,
+            kv_host_pages: 0,
+            demotions_total: load(&self.demotions_total),
+            promotions_total: load(&self.promotions_total),
+            promotion_latency_ns_total: load(&self.promotion_latency_ns_total),
             reused_tokens: load(&self.reused_tokens),
             avoided_prefill_tokens: load(&self.avoided_prefill_tokens),
             decode_dispatches: load(&self.decode_dispatches),

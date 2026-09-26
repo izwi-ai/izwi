@@ -9,6 +9,7 @@
 mod accelerator;
 mod cpu;
 mod cuda_tuning;
+mod host_pool;
 #[cfg(test)]
 mod precision_tests;
 
@@ -34,6 +35,7 @@ pub use accelerator::{
     CandleAttentionPlanCacheStats,
 };
 pub use cpu::{CpuKvArena, CpuKvBackendRuntime};
+pub use host_pool::KvHostPool;
 
 /// Whether this binary contains a complete managed-KV runtime for a backend.
 /// Capability publication and live worker binding share this gate so a loaded

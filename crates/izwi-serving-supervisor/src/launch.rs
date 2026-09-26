@@ -297,6 +297,14 @@ pub fn build_child_launch_spec(
         worker.attempt_retention_secs.to_string().into(),
     );
     set("IZWI_WORKER_STREAMING", worker.streaming.to_string().into());
+    // DS4 hierarchical offload is opt-in: the worker only sees a pool budget
+    // when the operator configured one for this assignment.
+    if worker.host_kv_pool_budget_bytes > 0 {
+        set(
+            "IZWI_KV_HOST_POOL_BUDGET_BYTES",
+            worker.host_kv_pool_budget_bytes.to_string().into(),
+        );
+    }
     set(
         "IZWI_WORKER_DRAIN_GRACE_MS",
         node.config().shutdown.drain_grace_ms.to_string().into(),
@@ -474,14 +482,14 @@ mod tests {
         path
     }
 
-    fn validated(directory: &Path, assignment: DeviceAssignment) -> ValidatedNodeConfig {
+    fn node_config(directory: &Path, assignment: &DeviceAssignment) -> NodeConfig {
         let backend = assignment.backend();
         let flavor = match backend {
             BackendKind::Cpu => WorkerBinaryFlavor::Cpu,
             BackendKind::Metal => WorkerBinaryFlavor::Metal,
             BackendKind::Cuda => WorkerBinaryFlavor::Cuda,
         };
-        let config = NodeConfig {
+        NodeConfig {
             schema_version: NODE_CONFIG_SCHEMA_VERSION,
             node_id: id::<NodeId>("node-a"),
             working_directory: directory.into(),
@@ -522,18 +530,30 @@ mod tests {
                 max_retained_attempts: 2,
                 attempt_retention_secs: 30,
                 streaming: true,
+                host_kv_pool_budget_bytes: 0,
             }],
             readiness: ReadinessPolicy::default(),
             restart: RestartPolicy::default(),
             shutdown: ShutdownPolicy::default(),
-        };
+        }
+    }
+
+    fn validated(directory: &Path, assignment: DeviceAssignment) -> ValidatedNodeConfig {
+        validate_node_config(directory, node_config(directory, &assignment), &assignment)
+    }
+
+    fn validate_node_config(
+        directory: &Path,
+        config: NodeConfig,
+        assignment: &DeviceAssignment,
+    ) -> ValidatedNodeConfig {
         let mut inventory = HostInventory {
             effective_cpu_ids: vec![0, 1],
             allocatable_host_memory_bytes: 8192,
             metal_devices: Vec::new(),
             cuda_devices: Vec::new(),
         };
-        match &assignment {
+        match assignment {
             DeviceAssignment::Metal {
                 device_id,
                 process_local_device_index,
@@ -554,6 +574,12 @@ mod tests {
             }),
             DeviceAssignment::Cpu { .. } => {}
         }
+        let backend = assignment.backend();
+        let flavor = match backend {
+            BackendKind::Cpu => WorkerBinaryFlavor::Cpu,
+            BackendKind::Metal => WorkerBinaryFlavor::Metal,
+            BackendKind::Cuda => WorkerBinaryFlavor::Cuda,
+        };
         let catalog = BinaryCatalog::new([(
             flavor,
             BinaryRecord {
@@ -572,7 +598,17 @@ mod tests {
     }
 
     fn build(directory: &Path, assignment: DeviceAssignment) -> ChildLaunchSpec {
-        let validated = validated(directory, assignment.clone());
+        build_with(directory, assignment, |_| {})
+    }
+
+    fn build_with(
+        directory: &Path,
+        assignment: DeviceAssignment,
+        mutate: impl FnOnce(&mut NodeConfig),
+    ) -> ChildLaunchSpec {
+        let mut config = node_config(directory, &assignment);
+        mutate(&mut config);
+        let validated = validate_node_config(directory, config, &assignment);
         let inherited = BTreeMap::from([
             (OsString::from("PATH"), OsString::from("/bin")),
             (OsString::from("UNSAFE_PARENT_SECRET"), OsString::from("no")),
@@ -596,6 +632,29 @@ mod tests {
             &locks,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn pool_budget_env_is_set_only_when_configured() {
+        let directory = tempfile::tempdir().unwrap();
+        let assignment = DeviceAssignment::Cpu {
+            thread_budget: 2,
+            affinity: vec![0, 1],
+            host_memory_limit_bytes: 1024,
+        };
+
+        let without = build(directory.path(), assignment.clone());
+        assert!(!without
+            .environment
+            .contains_key(OsStr::new("IZWI_KV_HOST_POOL_BUDGET_BYTES")));
+
+        let with = build_with(directory.path(), assignment, |config| {
+            config.workers[0].host_kv_pool_budget_bytes = 512;
+        });
+        assert_eq!(
+            env_value(&with, "IZWI_KV_HOST_POOL_BUDGET_BYTES"),
+            OsStr::new("512")
+        );
     }
 
     #[test]

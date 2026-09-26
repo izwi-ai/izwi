@@ -95,6 +95,34 @@ async fn main() -> anyhow::Result<()> {
             "IZWI_CHUNKED_PREFILL_THRESHOLD",
             engine_defaults.chunked_prefill_threshold,
         )?,
+        // DS4 hierarchical offload: explicit opt-in via a positive host pool
+        // budget; the kill switch forces it off even when a budget is set.
+        kv_host_pool_budget_bytes: if env_flag_value(izwi_core::serve_runtime::ENV_KV_HOST_OFFLOAD)
+            == Some(false)
+        {
+            0
+        } else {
+            parse_env(
+                izwi_core::serve_runtime::ENV_KV_HOST_POOL_BUDGET_BYTES,
+                engine_defaults.kv_host_pool_budget_bytes,
+            )?
+        },
+        kv_offload_high_watermark: parse_env(
+            izwi_core::serve_runtime::ENV_KV_OFFLOAD_HIGH_WATERMARK,
+            engine_defaults.kv_offload_high_watermark,
+        )?,
+        kv_offload_low_watermark: parse_env(
+            izwi_core::serve_runtime::ENV_KV_OFFLOAD_LOW_WATERMARK,
+            engine_defaults.kv_offload_low_watermark,
+        )?,
+        kv_offload_max_in_flight_pages: parse_env(
+            izwi_core::serve_runtime::ENV_KV_OFFLOAD_MAX_IN_FLIGHT_PAGES,
+            engine_defaults.kv_offload_max_in_flight_pages,
+        )?,
+        kv_offload_max_promotion_pages: parse_env(
+            izwi_core::serve_runtime::ENV_KV_OFFLOAD_MAX_PROMOTION_PAGES,
+            engine_defaults.kv_offload_max_promotion_pages,
+        )?,
         max_sequence_length: max_sequence_length.unwrap_or(engine_defaults.max_sequence_length),
         ..EngineConfig::default()
     };
