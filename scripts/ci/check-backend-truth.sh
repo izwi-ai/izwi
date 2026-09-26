@@ -366,6 +366,7 @@ run_cargo_cpu() {
     cargo check --locked -p izwi-server
     cargo test --locked -p izwi-core --lib --tests
     cargo test --locked -p izwi-server --lib
+    cargo test --locked -p izwi-server --test fleet_rig
     scripts/bench/run_kv_cache_matrix.sh --lane default --iterations 1 --warmup 0
     scripts/ci/run-kv-lifecycle-soak.sh --profile pr
 }
@@ -382,6 +383,21 @@ run_cargo_fleet_stores() {
     fi
 
     cargo test --locked -p izwi-server --features db-postgres --lib fleet_postgres
+}
+
+run_fleet_rig_postgres() {
+    require_command cargo
+
+    # DS5.2 PostgreSQL lane: the multi-process gateway rig against a
+    # server-backed coordination database, including the store-outage
+    # degradation leg. The database must be disposable — the rig drops and
+    # re-migrates its schema, and it is briefly closed to new connections.
+    if [[ -z "${IZWI_TEST_FLEET_RIG_PG_URL:-}" ]]; then
+        echo "IZWI_TEST_FLEET_RIG_PG_URL must point at a disposable PostgreSQL database" >&2
+        exit 1
+    fi
+
+    cargo test --locked -p izwi-server --features db-postgres --test fleet_rig
 }
 
 run_cargo_metal() {
@@ -611,6 +627,9 @@ main() {
             ;;
         cargo-fleet-stores)
             run_cargo_fleet_stores
+            ;;
+        cargo-fleet-rig-postgres)
+            run_fleet_rig_postgres
             ;;
         cargo-metal)
             run_cargo_metal

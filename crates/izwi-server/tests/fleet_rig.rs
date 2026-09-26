@@ -29,6 +29,8 @@
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use anyhow::anyhow;
+
 use izwi_core::ModelVariant;
 use izwi_server::batch_runtime::store::BatchRuntimeStore;
 use izwi_serving_client::mock::{MockWorker, MockWorkerConfig};
@@ -692,4 +694,197 @@ async fn fleet_recovers_after_a_gateway_death_and_expired_claims() {
         marker.contains(WORKER_ONE_MARKER) || marker.contains(WORKER_TWO_MARKER),
         "the surviving gateway routes through an approved fleet worker, got {marker:?}"
     );
+}
+
+/// DS5.2 PostgreSQL lane: the same multi-process rig against a server-backed
+/// coordination database, plus the DINV-06 outage contract at process level —
+/// terminating every database backend mid-flight degrades the fleet to
+/// worker-authoritative admission (dispatches still succeed, nothing panics)
+/// and the store recovers on reconnect. Skipped unless the `db-postgres`
+/// feature is enabled and `IZWI_TEST_FLEET_RIG_PG_URL` points at a
+/// disposable PostgreSQL database (its tables are dropped and re-migrated).
+#[cfg(feature = "db-postgres")]
+#[tokio::test]
+async fn fleet_rig_postgres_lane_shares_admission_and_degrades_on_outage() {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let Ok(fleet_url) = std::env::var("IZWI_TEST_FLEET_RIG_PG_URL") else {
+        eprintln!("skipping: IZWI_TEST_FLEET_RIG_PG_URL is not set");
+        return;
+    };
+
+    // Clean slate for the coordination schema.
+    let rig = BatchRuntimeStore::initialize_with_database_url(fleet_url.clone());
+    {
+        let db = rig.connection().await.expect("postgres connection opens");
+        let rows = db
+            .query_all_raw(Statement::from_string(
+                db.get_database_backend(),
+                "SELECT tablename FROM pg_tables WHERE schemaname = current_schema()".to_string(),
+            ))
+            .await
+            .expect("table list");
+        for row in rows {
+            let table: String = row.try_get_by_index(0).expect("table name");
+            db.execute_unprepared(&format!("DROP TABLE IF EXISTS \"{table}\" CASCADE"))
+                .await
+                .expect("table drops");
+        }
+    }
+    // Reconnect to force a fresh migration run on the cleaned database.
+    let rig = BatchRuntimeStore::initialize_with_database_url(fleet_url.clone());
+    rig.count_live_fleet_claims(WORKER_ONE_ID)
+        .await
+        .expect("migrations run on the cleaned database");
+
+    let worker_one = MockWorker::spawn(worker_config(WORKER_ONE_ID, WORKER_ONE_MARKER))
+        .await
+        .expect("mock worker binds");
+    let worker_two = MockWorker::spawn(worker_config(WORKER_TWO_ID, WORKER_TWO_MARKER))
+        .await
+        .expect("mock worker binds");
+    let approvals = vec![
+        approval_for(&worker_one, MODEL.dir_name()),
+        approval_for(&worker_two, MODEL.dir_name()),
+    ];
+    let gateway_a = spawn_gateway("gateway-a", &fleet_url, &approvals, Vec::new()).await;
+    let gateway_b = spawn_gateway("gateway-b", &fleet_url, &approvals, Vec::new()).await;
+    wait_ready(&gateway_a).await;
+    wait_ready(&gateway_b).await;
+
+    // T07 across processes on PostgreSQL: the claim fence holds under
+    // concurrent dispatch from both gateways.
+    let sampler_store = BatchRuntimeStore::initialize_with_database_url(fleet_url.clone());
+    let sampler = tokio::spawn(async move {
+        let mut max_live: u64 = 0;
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while Instant::now() < deadline {
+            max_live = max_live.max(
+                sampler_store
+                    .count_live_fleet_claims(WORKER_ONE_ID)
+                    .await
+                    .unwrap_or(0),
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        max_live
+    });
+    let client = reqwest::Client::new();
+    let mut handles = Vec::new();
+    for index in 0..6u32 {
+        let client = client.clone();
+        let base = if index % 2 == 0 {
+            gateway_a.base.clone()
+        } else {
+            gateway_b.base.clone()
+        };
+        handles.push(tokio::spawn(async move { chat(&client, &base).await }));
+    }
+    for handle in handles {
+        let (status, body) = handle.await.expect("chat task joins");
+        assert!(
+            status == 200 || status == 503,
+            "concurrent admission must resolve to served-or-shed, got {status}: {body}"
+        );
+    }
+    let max_live = sampler.await.expect("sampler joins");
+    assert!(
+        max_live <= 1,
+        "the PostgreSQL claim fence must never exceed the worker's single credit, saw {max_live}"
+    );
+
+    // Claim steering through the server-backed store.
+    let held = rig
+        .try_claim_fleet_capacity(
+            WORKER_ONE_ID,
+            "mock-incarnation-1",
+            "gateway-rig",
+            1,
+            60_000,
+        )
+        .await
+        .expect("rig claim")
+        .expect("the rig holds worker one's only credit");
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let (status, body) = chat(&client, &gateway_b.base).await;
+    assert_eq!(status, 200);
+    assert!(
+        response_marker(&body).contains(WORKER_TWO_MARKER),
+        "dispatch must avoid the claimed worker on PostgreSQL, got {:?}",
+        response_marker(&body)
+    );
+
+    // DINV-06: close the database to new connections and terminate every
+    // existing backend. The gateways' claim and publish calls fail, dispatch
+    // degrades to worker-authoritative, and nothing panics.
+    {
+        let db = rig.connection().await.expect("rig connection");
+        let row = db
+            .query_one_raw(Statement::from_string(
+                db.get_database_backend(),
+                "SELECT current_database()".to_string(),
+            ))
+            .await
+            .expect("database name")
+            .expect("database row");
+        let database: String = row.try_get_by_index(0).expect("database name value");
+        db.execute_unprepared(&format!("ALTER DATABASE \"{database}\" CONNECTION LIMIT 0"))
+            .await
+            .expect("connection limit closes the database");
+        db.execute_unprepared(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid()",
+        )
+        .await
+        .ok();
+    }
+    let (status, body) = chat(&client, &gateway_a.base).await;
+    assert_eq!(
+        status, 200,
+        "an unreachable coordination store must degrade to uncoordinated dispatch, got {body}"
+    );
+    assert!(
+        response_marker(&body).contains(WORKER_ONE_MARKER)
+            || response_marker(&body).contains(WORKER_TWO_MARKER),
+        "the degraded dispatch still executes on a fleet worker"
+    );
+
+    // Reopen the database: the store recovers, the rig reconnects, and the
+    // fleet keeps serving.
+    {
+        let db = rig.connection().await.expect("rig connection");
+        let row = db
+            .query_one_raw(Statement::from_string(
+                db.get_database_backend(),
+                "SELECT current_database()".to_string(),
+            ))
+            .await
+            .expect("database name")
+            .expect("database row");
+        let database: String = row.try_get_by_index(0).expect("database name value");
+        db.execute_unprepared(&format!(
+            "ALTER DATABASE \"{database}\" CONNECTION LIMIT -1"
+        ))
+        .await
+        .expect("connection limit reopens the database");
+    }
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    // Terminated pool connections surface one error apiece before the pool
+    // reconnects, so recovery probes retry briefly.
+    let mut recovered = Err(anyhow::anyhow!("rig store never recovered"));
+    for _ in 0..8 {
+        match rig.count_live_fleet_claims(WORKER_ONE_ID).await {
+            Ok(_) => {
+                recovered = Ok(());
+                break;
+            }
+            Err(error) => recovered = Err(error),
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+    recovered.expect("the rig store reconnects after the outage");
+    rig.release_fleet_capacity(&held, "gateway-rig")
+        .await
+        .expect("rig release after recovery");
+    let (status, _) = chat(&client, &gateway_b.base).await;
+    assert_eq!(status, 200, "the fleet serves after the store recovers");
 }

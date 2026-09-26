@@ -123,6 +123,7 @@ jobs:
 
     env:
       IZWI_TEST_FLEET_PG_URL: postgres://izwi:izwi@localhost:5432/izwi_fleet_test
+      IZWI_TEST_FLEET_RIG_PG_URL: postgres://izwi:izwi@localhost:5432/izwi_fleet_rig
 
     steps:
       - name: Checkout
@@ -144,8 +145,15 @@ jobs:
           workspaces: |
             . -> target
 
+      - name: Create the fleet rig database
+        run: |
+          PGPASSWORD=izwi psql -h localhost -U izwi -d postgres -c "CREATE DATABASE izwi_fleet_rig"
+
       - name: Run fleet store validation
         run: scripts/ci/check-backend-truth.sh cargo-fleet-stores
+
+      - name: Run the fleet rig PostgreSQL lane
+        run: scripts/ci/check-backend-truth.sh cargo-fleet-rig-postgres
 
   cargo-cuda:
     name: CUDA Compile (Driverless)
