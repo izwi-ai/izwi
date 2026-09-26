@@ -22,7 +22,7 @@
 use super::store::BatchRuntimeStore;
 use crate::db::raw;
 use anyhow::Context;
-use sea_orm::{ConnectionTrait, DbBackend};
+use sea_orm::{ConnectionTrait, DbBackend, TransactionTrait};
 
 const MAX_FLEET_ID_BYTES: usize = 256;
 const MAX_FLEET_DEPLOYMENTS_JSON_BYTES: usize = 64 * 1024;
@@ -212,8 +212,14 @@ impl BatchRuntimeStore {
 
     /// Atomically claim one unit of cluster capacity for a worker when fewer
     /// than `available` live claims exist. Returns the claim ID, or None when
-    /// the worker has no observable cluster capacity left. One statement, so
-    /// concurrent gateways cannot overspend the same credit.
+    /// the worker has no observable cluster capacity left.
+    ///
+    /// SQLite executes one statement whose count-and-insert runs under the
+    /// database's single-writer lock, so concurrent gateways cannot overspend
+    /// the same credit. PostgreSQL has no such writer serialization: two
+    /// concurrent `INSERT ... SELECT` snapshots can both observe the same
+    /// claim count and overspend, so the claim runs in a transaction guarded
+    /// by a worker-keyed advisory lock (auto-released at commit).
     pub async fn try_claim_fleet_capacity(
         &self,
         worker_id: &str,
@@ -231,27 +237,48 @@ impl BatchRuntimeStore {
         let now = self.fleet_now();
         let claim_id = crate::ids::new_uuid();
         let db = self.connection().await?;
-        let inserted = db
-            .execute_raw(raw::statement(
-                db,
-                fleet_claim_sql(db.get_database_backend())?,
-                vec![
-                    claim_id.clone().into(),
-                    worker_id.to_string().into(),
-                    incarnation_id.to_string().into(),
-                    gateway_id.to_string().into(),
-                    now.into(),
-                    now.saturating_add(i64::try_from(ttl_ms)?).into(),
-                    i64::from(available).into(),
-                ],
+        let backend = db.get_database_backend();
+        let claim_values = vec![
+            claim_id.clone().into(),
+            worker_id.to_string().into(),
+            incarnation_id.to_string().into(),
+            gateway_id.to_string().into(),
+            now.into(),
+            now.saturating_add(i64::try_from(ttl_ms)?).into(),
+            i64::from(available).into(),
+        ];
+        let affected = if backend == DbBackend::Postgres {
+            let tx = db
+                .begin()
+                .await
+                .context("Failed to open fleet claim transaction")?;
+            tx.execute_raw(raw::statement(
+                &tx,
+                "SELECT pg_advisory_xact_lock(hashtextextended(?1, 0))",
+                vec![worker_id.to_string().into()],
             )?)
             .await
-            .context("Failed to claim fleet capacity")?;
-        Ok(if inserted.rows_affected() == 1 {
-            Some(claim_id)
+            .context("Failed to lock fleet worker for claiming")?;
+            let inserted = tx
+                .execute_raw(raw::statement(
+                    &tx,
+                    fleet_claim_sql(backend)?,
+                    claim_values,
+                )?)
+                .await
+                .context("Failed to claim fleet capacity")?;
+            tx.commit()
+                .await
+                .context("Failed to commit fleet capacity claim")?;
+            inserted.rows_affected()
         } else {
-            None
-        })
+            let inserted = db
+                .execute_raw(raw::statement(db, fleet_claim_sql(backend)?, claim_values)?)
+                .await
+                .context("Failed to claim fleet capacity")?;
+            inserted.rows_affected()
+        };
+        Ok(if affected == 1 { Some(claim_id) } else { None })
     }
 
     /// Release one capacity claim. Only the owning gateway may release it.
