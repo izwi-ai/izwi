@@ -1,18 +1,20 @@
 use super::{
     AdmissionFailure, AdmittedExecution, AdmittedInvocation, ExecutionEvent, ExecutionFailure,
     ExecutionTeardown, InvocationExecutor, RealtimeAsrStageStream, RealtimeStageRunner,
+    RealtimeTtsStageStream,
 };
 use async_trait::async_trait;
 use izwi_core::{
     engine::{OutputFinishReason, WorkloadClass},
-    ChatMessage as CoreChatMessage, ChatRole as CoreChatRole, Error as CoreError, GenerationParams,
-    ModelVariant, RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream, RuntimeChatInvocation,
-    RuntimeChatInvocationEvent, RuntimeChatInvocationRequest, RuntimeChatTeardownDisposition,
-    RuntimeRequestContext, RuntimeService, RuntimeTelemetrySnapshot,
+    AudioChunk, ChatMessage as CoreChatMessage, ChatRole as CoreChatRole, Error as CoreError,
+    GenerationConfig, GenerationParams, GenerationRequest, ModelVariant, RuntimeAsrRealtimeEvent,
+    RuntimeAsrRealtimeStream, RuntimeChatInvocation, RuntimeChatInvocationEvent,
+    RuntimeChatInvocationRequest, RuntimeChatTeardownDisposition, RuntimeRequestContext,
+    RuntimeService, RuntimeTelemetrySnapshot,
 };
 use izwi_serving_protocol::{
-    ChatRole, FinishReason, InvocationErrorCode, InvocationInput, InvocationRequest, RejectionCode,
-    ServiceClass, TaskKind,
+    ChatRole, FinishReason, InvocationErrorCode, InvocationInput, InvocationRequest,
+    RealtimeAudioCodec, RealtimeAudioSpec, RejectionCode, ServiceClass, TaskKind,
 };
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 
@@ -471,5 +473,230 @@ impl RealtimeAsrStageStream for RuntimeAsrStageStream {
         self.runtime
             .finish_asr_realtime_stream(&mut self.stream)
             .await
+    }
+}
+
+const TTS_WARMUP_TEXT: &str = "Warm up.";
+const TTS_WARMUP_MAX_CHUNKS: usize = 8;
+
+/// Execute one bounded streaming synthesis before a worker advertises
+/// readiness: synthesize a short sentence through the same
+/// [`RuntimeService::generate_streaming`] surface the realtime stage uses and
+/// require at least the terminal chunk. This proves the deployed variant
+/// resolves and that streaming synthesis actually executes; the caller must
+/// not bind a listener on failure.
+pub async fn warm_up_tts_runtime(
+    runtime: &Arc<RuntimeService>,
+    variant: ModelVariant,
+    timeout: Duration,
+) -> Result<(), CoreError> {
+    if timeout.is_zero() {
+        return Err(CoreError::ConfigError(
+            "worker warm-up timeout must be non-zero".into(),
+        ));
+    }
+    let runtime_context = RuntimeRequestContext::new(WorkloadClass::Realtime)
+        .with_deadline(std::time::Instant::now() + timeout);
+    let request = GenerationRequest::new(TTS_WARMUP_TEXT)
+        .with_config(GenerationConfig {
+            streaming: true,
+            options: GenerationParams {
+                max_tokens: 0,
+                ..GenerationParams::default()
+            },
+        })
+        .with_model_variant(variant)
+        .with_runtime_context(runtime_context);
+    let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel::<AudioChunk>(4);
+    let generation_runtime = Arc::clone(runtime);
+    let generation = tokio::spawn(async move {
+        let _ = generation_runtime
+            .generate_streaming(request, chunk_tx)
+            .await;
+    });
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    let mut chunks = 0usize;
+    let mut saw_final = false;
+    let outcome = loop {
+        tokio::select! {
+            () = &mut deadline => break Err(CoreError::Timeout("worker startup warm-up".into())),
+            chunk = chunk_rx.recv() => match chunk {
+                Some(chunk) => {
+                    chunks = chunks.saturating_add(1);
+                    saw_final = saw_final || chunk.is_final;
+                    if chunks > TTS_WARMUP_MAX_CHUNKS {
+                        break Err(CoreError::InferenceError(
+                            "worker startup warm-up exceeded its output bounds".into(),
+                        ));
+                    }
+                }
+                None => {
+                    break if saw_final {
+                        Ok(chunks)
+                    } else {
+                        Err(CoreError::InferenceError(
+                            "worker startup warm-up ended without completion".into(),
+                        ))
+                    }
+                }
+            },
+        }
+    };
+    drop(chunk_rx);
+    let _ = generation.await;
+    let chunks = outcome?;
+    if chunks == 0 {
+        return Err(CoreError::InferenceError(
+            "worker startup warm-up ended without any synthesized audio".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Serve realtime TTS sessions for one already loaded TTS model variant.
+///
+/// HTTP invocations are rejected for this executor: text-to-speech workers
+/// serve realtime WebSocket sessions only, and the deployment's capability
+/// gates keep chat traffic away before this executor is ever consulted.
+pub struct RuntimeRealtimeTtsExecutor {
+    runtime: Arc<RuntimeService>,
+    variant: ModelVariant,
+    output_audio: RealtimeAudioSpec,
+}
+
+impl RuntimeRealtimeTtsExecutor {
+    /// The output spec is resolved from the loaded runtime's codec rate, the
+    /// same surface the single-node realtime voice route announces.
+    pub async fn new(runtime: Arc<RuntimeService>, variant: ModelVariant) -> Self {
+        let sample_rate = runtime.sample_rate().await;
+        Self {
+            runtime,
+            variant,
+            output_audio: RealtimeAudioSpec {
+                codec: RealtimeAudioCodec::PcmI16Le,
+                sample_rate,
+                channels: 1,
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl InvocationExecutor for RuntimeRealtimeTtsExecutor {
+    async fn runtime_telemetry(&self) -> Option<RuntimeTelemetrySnapshot> {
+        Some(self.runtime.telemetry_snapshot().await)
+    }
+
+    async fn admit(
+        &self,
+        _request: &InvocationRequest,
+    ) -> Result<AdmittedInvocation, AdmissionFailure> {
+        Err(AdmissionFailure::new(
+            RejectionCode::IncompatibleTask,
+            "text_to_speech workers serve realtime WebSocket sessions only; HTTP invocations are not accepted",
+        ))
+    }
+
+    fn realtime_runner(&self) -> Option<Arc<dyn RealtimeStageRunner>> {
+        Some(Arc::new(RuntimeRealtimeTtsRunner {
+            runtime: Arc::clone(&self.runtime),
+            variant: self.variant,
+            output_audio: self.output_audio,
+        }))
+    }
+}
+
+/// Realtime TTS stage execution against the worker's runtime.
+pub struct RuntimeRealtimeTtsRunner {
+    runtime: Arc<RuntimeService>,
+    variant: ModelVariant,
+    output_audio: RealtimeAudioSpec,
+}
+
+#[async_trait]
+impl RealtimeStageRunner for RuntimeRealtimeTtsRunner {
+    fn stage_task(&self) -> TaskKind {
+        TaskKind::TextToSpeech
+    }
+
+    async fn start_asr_stream(
+        &self,
+        _language: Option<&str>,
+    ) -> Result<Box<dyn RealtimeAsrStageStream>, CoreError> {
+        Err(CoreError::ConfigError(
+            "text_to_speech workers do not serve realtime ASR sessions".into(),
+        ))
+    }
+
+    fn output_audio_spec(&self) -> Option<RealtimeAudioSpec> {
+        Some(self.output_audio)
+    }
+
+    async fn start_tts_stream(
+        &self,
+        text: String,
+        deadline: std::time::Instant,
+    ) -> Result<Box<dyn RealtimeTtsStageStream>, CoreError> {
+        let runtime_context =
+            RuntimeRequestContext::new(WorkloadClass::Realtime).with_deadline(deadline);
+        let request = GenerationRequest::new(text)
+            .with_config(GenerationConfig {
+                streaming: true,
+                // Zero mirrors the single-node realtime voice route: audio
+                // token generation is bounded by the model, not a text ceiling.
+                options: GenerationParams {
+                    max_tokens: 0,
+                    ..GenerationParams::default()
+                },
+            })
+            .with_model_variant(self.variant)
+            .with_runtime_context(runtime_context);
+        // A dropped receiver is the natural cancellation signal: the
+        // generation task observes the closed channel and unwinds. The abort
+        // handle only backstops a task wedged outside a send.
+        let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel::<AudioChunk>(32);
+        let generation_runtime = Arc::clone(&self.runtime);
+        let generation = tokio::spawn(async move {
+            generation_runtime
+                .generate_streaming(request, chunk_tx)
+                .await
+        });
+        Ok(Box::new(RuntimeTtsStageStream {
+            chunks: chunk_rx,
+            generation: Some(generation),
+        }))
+    }
+}
+
+struct RuntimeTtsStageStream {
+    chunks: tokio::sync::mpsc::Receiver<AudioChunk>,
+    generation: Option<tokio::task::JoinHandle<Result<(), CoreError>>>,
+}
+
+impl Drop for RuntimeTtsStageStream {
+    fn drop(&mut self) {
+        if let Some(generation) = self.generation.take() {
+            generation.abort();
+        }
+    }
+}
+
+#[async_trait]
+impl RealtimeTtsStageStream for RuntimeTtsStageStream {
+    async fn next_chunk(&mut self) -> Result<Option<AudioChunk>, CoreError> {
+        match self.chunks.recv().await {
+            Some(chunk) => Ok(Some(chunk)),
+            None => match self.generation.take() {
+                None => Ok(None),
+                Some(generation) => match generation.await {
+                    Ok(Ok(())) => Ok(None),
+                    Ok(Err(error)) => Err(error),
+                    Err(join_error) => Err(CoreError::InferenceError(format!(
+                        "synthesis task ended abnormally: {join_error}"
+                    ))),
+                },
+            },
+        }
     }
 }

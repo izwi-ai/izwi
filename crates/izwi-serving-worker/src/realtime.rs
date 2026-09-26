@@ -11,8 +11,8 @@
 //! bounds on the stream itself).
 
 use super::{
-    InvocationExecutor, RealtimeAsrStageStream, RealtimeStageRunner, WorkerState,
-    EVENT_ENVELOPE_ALLOWANCE,
+    InvocationExecutor, RealtimeAsrStageStream, RealtimeStageRunner, RealtimeTtsStageStream,
+    WorkerState, EVENT_ENVELOPE_ALLOWANCE,
 };
 use crate::runtime::map_execution_error;
 use axum::{
@@ -28,11 +28,11 @@ use futures::{
     SinkExt, StreamExt,
 };
 use izwi_serving_protocol::{
-    decode_realtime_audio_frame, AttemptState, InvocationErrorCode, InvocationEvent,
-    InvocationEventKind, ModelReadiness, PermittedAction, RealtimeAudioCodec, RealtimeAudioSpec,
-    RealtimeClientFrame, RealtimeServerFrame, RealtimeSessionAdmit, RealtimeSessionBounds,
-    RealtimeSessionCloseCode, RequestDigest, TaskKind, WorkerFeature,
-    MAX_REALTIME_AUDIO_FRAME_BYTES, MAX_REALTIME_INPUT_TEXT_BYTES, PROTOCOL_V1,
+    decode_realtime_audio_frame, encode_realtime_audio_frame, AttemptState, InvocationErrorCode,
+    InvocationEvent, InvocationEventKind, ModelReadiness, PermittedAction, RealtimeAudioCodec,
+    RealtimeAudioSpec, RealtimeClientFrame, RealtimeServerFrame, RealtimeSessionAdmit,
+    RealtimeSessionBounds, RealtimeSessionCloseCode, RealtimeStageInput, RequestDigest, TaskKind,
+    WorkerFeature, MAX_REALTIME_AUDIO_FRAME_BYTES, MAX_REALTIME_INPUT_TEXT_BYTES, PROTOCOL_V1,
     REALTIME_SUBPROTOCOL,
 };
 use std::{
@@ -101,12 +101,16 @@ enum ClientControl {
     Finish,
     Cancel,
     Ping,
-    Input,
+    /// Bounded text input for the TTS-stream stage; the reader already
+    /// enforced `MAX_REALTIME_INPUT_TEXT_BYTES`.
+    Input(String),
     Violation(&'static str),
 }
 
 enum OutboundMessage {
     Text(String),
+    /// One binary audio frame toward the gateway (TTS-stream stage).
+    Binary(Vec<u8>),
     /// Normal session end (code 1000) or a pre-admission/close rejection.
     Close(Option<RealtimeSessionCloseCode>),
 }
@@ -163,7 +167,10 @@ pub async fn realtime_socket<E: InvocationExecutor>(
             .descriptor
             .features
             .contains(&WorkerFeature::RealtimeSocket)
-        || !matches!(state.config.deployment.task, TaskKind::SpeechToText)
+        || !matches!(
+            state.config.deployment.task,
+            TaskKind::SpeechToText | TaskKind::TextToSpeech
+        )
     {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -194,7 +201,15 @@ async fn run_realtime_session<E: InvocationExecutor>(
     let (sink, mut source) = socket.split();
     let writer = tokio::spawn(writer_task(sink, outbound_rx));
 
-    let mut session = match admit_session(&state, &mut source, &outbound_tx, limits).await {
+    let mut session = match admit_session(
+        &state,
+        &mut source,
+        &outbound_tx,
+        limits,
+        runner.output_audio_spec(),
+    )
+    .await
+    {
         Ok(session) => session,
         Err(failure) => {
             let _ = outbound_tx
@@ -208,14 +223,25 @@ async fn run_realtime_session<E: InvocationExecutor>(
 
     let (control_tx, control_rx) = mpsc::channel::<ClientControl>(8);
     let (audio_tx, audio_rx) = mpsc::channel::<AudioFrame>(limits.max_in_flight_frames);
-    let reader = tokio::spawn(reader_task(source, control_tx, audio_tx, limits));
+    let mut reader = tokio::spawn(reader_task(source, control_tx, audio_tx, limits));
     session.run(&runner, control_rx, audio_rx).await;
     session.finish();
-    reader.abort();
-    // The session dropped its sender; deliver a final close if the terminal
-    // publication could not queue one, then let the writer drain and exit.
+    // Deliver a final close if the terminal publication could not queue one,
+    // then let the writer drain and exit.
     let _ = outbound_tx.send(OutboundMessage::Close(None)).await;
     drop(outbound_tx);
+    // Drain the reader before the socket closes: aborting it with inbound
+    // frames still buffered would turn the orderly close into a TCP reset and
+    // could cost the client its terminal event. The reader exits on the close
+    // handshake, on a failed send (its receivers are gone), or on transport
+    // end; the abort is only a backstop for a client that never completes the
+    // handshake.
+    if tokio::time::timeout(TERMINATION_JOIN_TIMEOUT, &mut reader)
+        .await
+        .is_err()
+    {
+        reader.abort();
+    }
     let _ = tokio::time::timeout(TERMINATION_JOIN_TIMEOUT, writer).await;
 }
 
@@ -226,6 +252,7 @@ async fn writer_task(
     while let Some(message) = rx.recv().await {
         let outbound = match message {
             OutboundMessage::Text(text) => Message::Text(Utf8Bytes::from(text)),
+            OutboundMessage::Binary(bytes) => Message::Binary(bytes.into()),
             OutboundMessage::Close(code) => {
                 let frame = code
                     .map(|code| CloseFrame {
@@ -267,7 +294,7 @@ async fn reader_task(
                         Ok(RealtimeClientFrame::Ping) => Some(ClientControl::Ping),
                         Ok(RealtimeClientFrame::Input { text }) => {
                             if text.len() <= MAX_REALTIME_INPUT_TEXT_BYTES {
-                                Some(ClientControl::Input)
+                                Some(ClientControl::Input(text))
                             } else {
                                 Some(ClientControl::Violation("input text exceeds bound"))
                             }
@@ -404,8 +431,9 @@ impl<E: InvocationExecutor> RealtimeSession<E> {
         }
         match runner.stage_task() {
             TaskKind::SpeechToText => self.run_asr_stage(runner, control_rx, audio_rx).await,
-            // WorkerConfig::validate rejects TTS deployments until that stage
-            // lands; this arm keeps the session total if that ever changes.
+            TaskKind::TextToSpeech => self.run_tts_stage(runner, control_rx).await,
+            // WorkerConfig::validate only admits the two stages above; this
+            // arm keeps the session total if that ever changes.
             _ => {
                 self.terminate_failed(
                     InvocationErrorCode::Internal,
@@ -481,7 +509,7 @@ impl<E: InvocationExecutor> RealtimeSession<E> {
                         Some(ClientControl::Ping) => {
                             let _ = self.send_server_frame(&RealtimeServerFrame::Pong);
                         }
-                        Some(ClientControl::Input) => {
+                        Some(ClientControl::Input(_)) => {
                             terminal = Some(StageTerminal::Failed {
                                 code: InvocationErrorCode::InvalidInput,
                                 message: "text input is not valid for speech_to_text sessions".into(),
@@ -709,6 +737,337 @@ impl<E: InvocationExecutor> RealtimeSession<E> {
         Some(StageTerminal::Completed { text: final_text })
     }
 
+    /// TTS-stream stage: the client accumulates the utterance with `Input`
+    /// frames, `Finish` commits synthesis, and audio streams out as binary
+    /// IRTA frames while the model generates. Cancellation semantics are
+    /// identical to the ASR stage; teardown is confirmed when the synthesis
+    /// forwarder exits after the session drops its chunk receiver.
+    async fn run_tts_stage(
+        &mut self,
+        runner: &Arc<dyn RealtimeStageRunner>,
+        mut control_rx: mpsc::Receiver<ClientControl>,
+    ) {
+        if !matches!(self.admit.input, RealtimeStageInput::TextStream) {
+            self.terminate_failed(
+                InvocationErrorCode::InvalidInput,
+                "text_to_speech sessions require a text-stream admission",
+            );
+            return;
+        }
+        let limits = self.state.config.realtime_session_limits;
+        let max_frame_bytes = limits.max_frame_bytes;
+        let session_budget = limits.max_session_audio_bytes;
+
+        // The sender moves into the synthesis forwarder on Finish, so the
+        // receiver below returns `None` exactly when synthesis ends. Before
+        // that, the open channel keeps this arm parked.
+        let (chunks_tx, mut chunks_rx) =
+            mpsc::channel::<Result<izwi_core::AudioChunk, izwi_core::Error>>(8);
+        let mut chunks_tx = Some(chunks_tx);
+        let mut synthesis: Option<tokio::task::JoinHandle<()>> = None;
+        let mut text = String::new();
+        let mut text_bytes = 0u64;
+        let mut finish_submitted = false;
+        let mut audio_sequence = 0u32;
+        let mut audio_bytes_out = 0u64;
+        let mut emitted_final = false;
+        let mut cancellation_requested = *self.cancel.borrow();
+        let mut timed_out = false;
+        let mut terminal: Option<StageTerminal> = None;
+        if cancellation_requested {
+            self.mark_cancellation();
+        }
+
+        while terminal.is_none() && !cancellation_requested {
+            let deadline = tokio::time::sleep_until(
+                tokio::time::Instant::from_std(self.started_at) + self.remaining_time,
+            );
+            tokio::pin!(deadline);
+            tokio::select! {
+                biased;
+                () = &mut deadline => {
+                    timed_out = true;
+                    cancellation_requested = true;
+                    self.mark_cancellation();
+                }
+                _ = self.outbound.closed() => {
+                    cancellation_requested = true;
+                    self.mark_cancellation();
+                }
+                changed = self.cancel.changed(), if !cancellation_requested => {
+                    if changed.is_ok() && *self.cancel.borrow() {
+                        cancellation_requested = true;
+                        self.mark_cancellation();
+                    }
+                }
+                inbound = control_rx.recv() => {
+                    match inbound {
+                        Some(ClientControl::Finish) => {
+                            if finish_submitted {
+                                terminal = Some(StageTerminal::Failed {
+                                    code: InvocationErrorCode::InvalidInput,
+                                    message: "finish was already submitted".into(),
+                                });
+                            } else {
+                                finish_submitted = true;
+                                let utterance = std::mem::take(&mut text);
+                                if utterance.is_empty() {
+                                    // Mirror the ASR stage: finishing without
+                                    // input is a successful empty result.
+                                    terminal = Some(StageTerminal::Completed { text: None });
+                                } else {
+                                    self.state.update_attempt(
+                                        &self.admit.attempt_id,
+                                        AttemptState::Running,
+                                        Some(0),
+                                    );
+                                    let deadline_at = tokio::time::Instant::from_std(
+                                        self.started_at,
+                                    ) + self.remaining_time;
+                                    match runner
+                                        .start_tts_stream(utterance, deadline_at.into_std())
+                                        .await
+                                    {
+                                        Ok(stream) => {
+                                            // Finish is processed at most once;
+                                            // the take makes that hold for the
+                                            // sender too.
+                                            if let Some(chunks_tx) = chunks_tx.take() {
+                                                synthesis = Some(tokio::spawn(
+                                                    forward_synthesis(stream, chunks_tx),
+                                                ));
+                                            }
+                                        }
+                                        Err(error) => {
+                                            let failure = map_execution_error(error);
+                                            terminal = Some(StageTerminal::Failed {
+                                                code: failure.code,
+                                                message: failure.message,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Some(ClientControl::Cancel) => {
+                            cancellation_requested = true;
+                            self.mark_cancellation();
+                        }
+                        Some(ClientControl::Ping) => {
+                            let _ = self.send_server_frame(&RealtimeServerFrame::Pong);
+                        }
+                        Some(ClientControl::Input(incoming)) => {
+                            if finish_submitted {
+                                terminal = Some(StageTerminal::Failed {
+                                    code: InvocationErrorCode::InvalidInput,
+                                    message: "input after finish".into(),
+                                });
+                            } else {
+                                text_bytes = text_bytes.saturating_add(incoming.len() as u64);
+                                if text_bytes > session_budget {
+                                    terminal = Some(StageTerminal::Failed {
+                                        code: InvocationErrorCode::InvalidInput,
+                                        message: "session text budget exhausted".into(),
+                                    });
+                                } else {
+                                    text.push_str(&incoming);
+                                }
+                            }
+                        }
+                        Some(ClientControl::Violation(reason)) => {
+                            terminal = Some(StageTerminal::Failed {
+                                code: InvocationErrorCode::InvalidInput,
+                                message: reason.into(),
+                            });
+                        }
+                        // Reader gone: the peer disconnected mid-session.
+                        None => {
+                            cancellation_requested = true;
+                            self.mark_cancellation();
+                        }
+                    }
+                }
+                chunk = chunks_rx.recv() => {
+                    match chunk {
+                        Some(Ok(chunk)) => {
+                            if let Err(failure) = self.emit_audio_chunk(
+                                &chunk,
+                                max_frame_bytes,
+                                session_budget,
+                                &mut audio_sequence,
+                                &mut audio_bytes_out,
+                                &mut emitted_final,
+                            ) {
+                                match failure {
+                                    StageTerminal::Disconnected => {
+                                        cancellation_requested = true;
+                                        self.mark_cancellation();
+                                    }
+                                    terminal_failure => terminal = Some(terminal_failure),
+                                }
+                            }
+                        }
+                        Some(Err(error)) => {
+                            let failure = map_execution_error(error);
+                            terminal = Some(StageTerminal::Failed {
+                                code: failure.code,
+                                message: failure.message,
+                            });
+                        }
+                        // The forwarder only exits after the synthesis stream
+                        // ended; guarantee the final-flagged frame the contract
+                        // promises whenever audio was emitted.
+                        None => {
+                            if !emitted_final && audio_sequence > 0 {
+                                let failure = self.emit_audio_frame(
+                                    &[],
+                                    true,
+                                    max_frame_bytes,
+                                    session_budget,
+                                    &mut audio_sequence,
+                                    &mut audio_bytes_out,
+                                    &mut emitted_final,
+                                );
+                                if let Err(StageTerminal::Disconnected) = failure {
+                                    cancellation_requested = true;
+                                    self.mark_cancellation();
+                                } else if let Err(terminal_failure) = failure {
+                                    terminal = Some(terminal_failure);
+                                }
+                            }
+                            if terminal.is_none() {
+                                terminal = Some(StageTerminal::Completed { text: None });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Teardown confirmation for the TTS stage: dropping the receiver makes
+        // the forwarder's next send fail, which drops the synthesis stream and
+        // releases the runtime's request leases. The abort backstop covers a
+        // generation wedged outside a channel send.
+        drop(chunks_rx);
+        if let Some(synthesis) = synthesis.take() {
+            if tokio::time::timeout(TERMINATION_JOIN_TIMEOUT, synthesis)
+                .await
+                .is_err()
+            {
+                self.state
+                    .metrics
+                    .inner
+                    .unconfirmed_teardown
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        if timed_out {
+            self.terminate_failed(
+                InvocationErrorCode::DeadlineExceeded,
+                "session deadline elapsed; execution teardown is confirmed",
+            );
+            return;
+        }
+        if cancellation_requested {
+            self.terminate_cancelled();
+            return;
+        }
+        match terminal.expect("loop exit carries a terminal outcome") {
+            StageTerminal::Completed { .. } => {
+                self.publish_terminal(
+                    AttemptState::Completed,
+                    InvocationEventKind::Completed {
+                        finish_reason: izwi_serving_protocol::FinishReason::Stop,
+                        usage: None,
+                    },
+                );
+            }
+            StageTerminal::Failed { code, message } => {
+                self.terminate_failed(code, &message);
+            }
+            StageTerminal::Disconnected => {
+                self.terminate_cancelled();
+            }
+        }
+    }
+
+    /// Converts one synthesized chunk into bounded IRTA binary frames. The
+    /// protocol's per-frame cap may split a chunk across several frames; only
+    /// the terminal frame carries the final flag. The gateway is expected to
+    /// drain audio continuously — a full outbound queue is treated as a lost
+    /// peer so the cancellation ladder stays responsive.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_audio_chunk(
+        &mut self,
+        chunk: &izwi_core::AudioChunk,
+        max_frame_bytes: usize,
+        session_budget: u64,
+        audio_sequence: &mut u32,
+        audio_bytes_out: &mut u64,
+        emitted_final: &mut bool,
+    ) -> Result<(), StageTerminal> {
+        if chunk.samples.is_empty() && !chunk.is_final {
+            return Ok(());
+        }
+        let mut payload = Vec::with_capacity(chunk.samples.len() * 2);
+        for &sample in &chunk.samples {
+            let quantized = (sample.clamp(-1.0, 1.0) * 32_767.0) as i16;
+            payload.extend_from_slice(&quantized.to_le_bytes());
+        }
+        let pieces: Vec<&[u8]> = if payload.is_empty() {
+            vec![&payload]
+        } else {
+            payload.chunks(max_frame_bytes.max(1)).collect()
+        };
+        let last = pieces.len().saturating_sub(1);
+        for (index, piece) in pieces.iter().enumerate() {
+            let is_final = chunk.is_final && index == last;
+            self.emit_audio_frame(
+                piece,
+                is_final,
+                max_frame_bytes,
+                session_budget,
+                audio_sequence,
+                audio_bytes_out,
+                emitted_final,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Emits one bounded audio frame on the session's outbound audio sequence.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_audio_frame(
+        &mut self,
+        payload: &[u8],
+        is_final: bool,
+        _max_frame_bytes: usize,
+        session_budget: u64,
+        audio_sequence: &mut u32,
+        audio_bytes_out: &mut u64,
+        emitted_final: &mut bool,
+    ) -> Result<(), StageTerminal> {
+        *audio_sequence = audio_sequence.saturating_add(1);
+        *audio_bytes_out = audio_bytes_out.saturating_add(payload.len() as u64);
+        if *audio_bytes_out > session_budget {
+            return Err(StageTerminal::Failed {
+                code: InvocationErrorCode::OutputLimitExceeded,
+                message: "session audio output budget exhausted".into(),
+            });
+        }
+        let frame = encode_realtime_audio_frame(*audio_sequence, is_final, payload)
+            .expect("worker frames respect the protocol caps");
+        match self.outbound.try_send(OutboundMessage::Binary(frame)) {
+            Ok(()) => {
+                if is_final {
+                    *emitted_final = true;
+                }
+                Ok(())
+            }
+            Err(_) => Err(StageTerminal::Disconnected),
+        }
+    }
+
     fn terminate_cancelled(&mut self) {
         self.publish_terminal(
             AttemptState::Cancelled,
@@ -769,6 +1128,30 @@ enum StageTerminal {
     Disconnected,
 }
 
+/// Bridges the synthesis stream into the session loop so audio chunks can be
+/// selected alongside control frames. The forwarder ends when the stream ends
+/// or the session drops its receiver; the stream drop releases the runtime's
+/// request leases in both cases.
+async fn forward_synthesis(
+    mut stream: Box<dyn RealtimeTtsStageStream>,
+    chunks_tx: mpsc::Sender<Result<izwi_core::AudioChunk, izwi_core::Error>>,
+) {
+    loop {
+        match stream.next_chunk().await {
+            Ok(Some(chunk)) => {
+                if chunks_tx.send(Ok(chunk)).await.is_err() {
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(error) => {
+                let _ = chunks_tx.send(Err(error)).await;
+                break;
+            }
+        }
+    }
+}
+
 fn language_arg(admit: &RealtimeSessionAdmit) -> Option<&str> {
     match &admit.input {
         izwi_serving_protocol::RealtimeStageInput::AudioStream { language, .. } => {
@@ -786,6 +1169,7 @@ async fn admit_session<E: InvocationExecutor>(
     source: &mut SplitStream<WebSocket>,
     outbound_tx: &mpsc::Sender<OutboundMessage>,
     limits: RuntimeRealtimeSessionLimits,
+    output_audio: Option<RealtimeAudioSpec>,
 ) -> Result<RealtimeSession<E>, AdmitFailure> {
     let admit_deadline = tokio::time::sleep(limits.admit_timeout);
     tokio::pin!(admit_deadline);
@@ -898,7 +1282,7 @@ async fn admit_session<E: InvocationExecutor>(
         incarnation_id: state.config.descriptor.incarnation_id.clone(),
         deployment_id: state.config.deployment.deployment_id.clone(),
         model_generation: state.config.deployment.model_generation,
-        output_audio: None,
+        output_audio,
         bounds,
     };
     let _ = outbound_tx

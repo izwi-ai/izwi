@@ -7,10 +7,10 @@ use izwi_serving_supervisor::{
     WORKER_OWNERSHIP_LOCK_ENV,
 };
 use izwi_serving_worker::{
-    warm_up_asr_runtime, warm_up_chat_runtime, RuntimeChatExecutor, RuntimeRealtimeAsrExecutor,
-    WorkerConfig, WorkerService, DEFAULT_ATTEMPT_RETENTION, DEFAULT_EVENT_CHANNEL_CAPACITY,
-    DEFAULT_MAX_EVENT_BYTES, DEFAULT_MAX_REQUEST_BYTES, DEFAULT_MAX_RETAINED_ATTEMPTS,
-    REALTIME_SESSION_DEFAULT_LIMITS,
+    warm_up_asr_runtime, warm_up_chat_runtime, warm_up_tts_runtime, RuntimeChatExecutor,
+    RuntimeRealtimeAsrExecutor, RuntimeRealtimeTtsExecutor, WorkerConfig, WorkerService,
+    DEFAULT_ATTEMPT_RETENTION, DEFAULT_EVENT_CHANNEL_CAPACITY, DEFAULT_MAX_EVENT_BYTES,
+    DEFAULT_MAX_REQUEST_BYTES, DEFAULT_MAX_RETAINED_ATTEMPTS, REALTIME_SESSION_DEFAULT_LIMITS,
 };
 use std::{
     collections::BTreeSet, net::SocketAddr, path::Path, path::PathBuf, sync::Arc, time::Duration,
@@ -127,7 +127,15 @@ async fn main() -> anyhow::Result<()> {
             .await
             .context("warm selected realtime ASR model before binding")?;
         }
-        TaskKind::TextToSpeech => bail!("realtime text_to_speech workers are not implemented yet"),
+        TaskKind::TextToSpeech => {
+            warm_up_tts_runtime(
+                &runtime,
+                process.variant,
+                std::time::Duration::from_secs(120),
+            )
+            .await
+            .context("warm selected realtime TTS model before binding")?;
+        }
     }
     // Resident model memory stays charged to this worker's runtime and resource
     // lease. Only the transient node-wide load stage is released here.
@@ -141,7 +149,10 @@ async fn main() -> anyhow::Result<()> {
     if process.streaming {
         features.insert(WorkerFeature::Streaming);
     }
-    if process.task == TaskKind::SpeechToText {
+    if matches!(
+        process.task,
+        TaskKind::SpeechToText | TaskKind::TextToSpeech
+    ) {
         features.insert(WorkerFeature::RealtimeSocket);
     }
     let descriptor = WorkerDescriptor {
@@ -220,7 +231,37 @@ async fn main() -> anyhow::Result<()> {
             tokens_out_per_s_ema: None,
             observation_cost_units: None,
         },
-        TaskKind::TextToSpeech => bail!("realtime text_to_speech workers are not implemented yet"),
+        TaskKind::TextToSpeech => LoadedDeployment {
+            deployment_id: process.deployment_id.clone(),
+            public_model: process.public_model.clone(),
+            artifact_revision: process.artifact_revision.clone(),
+            model_generation: process.model_generation,
+            task: TaskKind::TextToSpeech,
+            backend: process.assignment.backend(),
+            precision: "fp32".into(),
+            execution_representation: "native-tts-realtime".into(),
+            tokenizer_revision: None,
+            readiness: ModelReadiness::Ready,
+            capability: Capability {
+                task: TaskKind::TextToSpeech,
+                streaming: true,
+                realtime: true,
+                cancellation: CancellationBehavior::Cooperative,
+                accepted_input_formats: BTreeSet::from([InputFormat::Text]),
+                output_formats: BTreeSet::from([OutputFormat::PcmAudio]),
+                max_input_bytes: process.max_request_bytes as u64,
+                // Realtime sessions carry bounded text, not chat context; the
+                // session-level byte budget in the subprotocol bounds input.
+                max_context_tokens: None,
+                max_output_tokens: None,
+            },
+            kv_cache_usage_pct: None,
+            prefix_hits_total: None,
+            prefix_queries_total: None,
+            prefix_evictions_total: None,
+            tokens_out_per_s_ema: None,
+            observation_cost_units: None,
+        },
     };
     let worker_config = WorkerConfig {
         descriptor,
@@ -250,7 +291,11 @@ async fn main() -> anyhow::Result<()> {
             serve_worker(worker, &process).await
         }
         TaskKind::TextToSpeech => {
-            bail!("realtime text_to_speech workers are not implemented yet")
+            let worker = WorkerService::new(
+                worker_config,
+                RuntimeRealtimeTtsExecutor::new(runtime, process.variant).await,
+            )?;
+            serve_worker(worker, &process).await
         }
     };
     result
@@ -475,10 +520,7 @@ impl WorkerProcessConfig {
             match task {
                 TaskKind::Chat => "LFM2.5-1.2B-Instruct-GGUF",
                 TaskKind::SpeechToText => "Nemotron-3.5-ASR-Streaming-0.6B",
-                // parse_worker_task never returns this arm.
-                TaskKind::TextToSpeech => {
-                    anyhow::bail!("realtime text_to_speech workers are not implemented yet")
-                }
+                TaskKind::TextToSpeech => "Kokoro-82M",
             },
         );
         let variant = match task {
@@ -505,9 +547,22 @@ impl WorkerProcessConfig {
                     ),
                 }
             }
-            // parse_worker_task never returns this arm.
             TaskKind::TextToSpeech => {
-                anyhow::bail!("realtime text_to_speech workers are not implemented yet")
+                // Only families with a streaming synthesis surface can serve
+                // realtime TTS sessions; anything else fails closed at boot.
+                let variant = izwi_core::parse_model_variant(&model)
+                    .with_context(|| format!("parse IZWI_WORKER_MODEL={model}"))?;
+                match variant.family() {
+                    izwi_core::catalog::ModelFamily::Qwen3Tts
+                    | izwi_core::catalog::ModelFamily::KokoroTts
+                    | izwi_core::catalog::ModelFamily::VoxtralTts
+                    | izwi_core::catalog::ModelFamily::VibeVoiceTts
+                    | izwi_core::catalog::ModelFamily::FishS2Tts
+                    | izwi_core::catalog::ModelFamily::Lfm25Audio => variant,
+                    other => bail!(
+                        "realtime text_to_speech workers support only TTS synthesis families; {model} is {other:?}"
+                    ),
+                }
             }
         };
         let assignment = parse_assignment()?;
@@ -969,17 +1024,18 @@ fn env_or(name: &str, fallback: &str) -> String {
 }
 
 /// Parses `IZWI_WORKER_TASK`. Chat remains the default so existing
-/// deployments are byte-identical; `text_to_speech` is rejected explicitly
-/// rather than falling back to chat.
+/// deployments are byte-identical.
 fn parse_worker_task() -> anyhow::Result<TaskKind> {
-    match env_or("IZWI_WORKER_TASK", "chat").trim().to_ascii_lowercase().as_str() {
+    match env_or("IZWI_WORKER_TASK", "chat")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "chat" => Ok(TaskKind::Chat),
         "speech_to_text" => Ok(TaskKind::SpeechToText),
-        "text_to_speech" => Err(anyhow::anyhow!(
-            "IZWI_WORKER_TASK=text_to_speech is reserved for the realtime TTS stage, which is not implemented on workers yet"
-        )),
+        "text_to_speech" => Ok(TaskKind::TextToSpeech),
         other => Err(anyhow::anyhow!(
-            "invalid IZWI_WORKER_TASK={other}; expected chat or speech_to_text"
+            "invalid IZWI_WORKER_TASK={other}; expected chat, speech_to_text, or text_to_speech"
         )),
     }
 }

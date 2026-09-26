@@ -35,7 +35,8 @@ mod runtime;
 
 pub use realtime::{RuntimeRealtimeSessionLimits, REALTIME_SESSION_DEFAULT_LIMITS};
 pub use runtime::{
-    warm_up_asr_runtime, warm_up_chat_runtime, RuntimeChatExecutor, RuntimeRealtimeAsrExecutor,
+    warm_up_asr_runtime, warm_up_chat_runtime, warm_up_tts_runtime, RuntimeChatExecutor,
+    RuntimeRealtimeAsrExecutor, RuntimeRealtimeTtsExecutor,
 };
 
 pub const DEFAULT_MAX_REQUEST_BYTES: usize = 1024 * 1024;
@@ -121,11 +122,26 @@ impl WorkerConfig {
                     return Err(WorkerConfigError::UnsupportedDeployment);
                 }
             }
-            // Realtime TTS-stage execution is not implemented on the worker
-            // yet; advertising it would create a deployment no session can
-            // serve. The protocol contract already fits it (protocol minor 2).
             TaskKind::TextToSpeech => {
-                return Err(WorkerConfigError::UnsupportedDeployment);
+                if self.deployment.capability.task != TaskKind::TextToSpeech
+                    || !self.deployment.capability.realtime
+                    || !self
+                        .deployment
+                        .capability
+                        .accepted_input_formats
+                        .contains(&InputFormat::Text)
+                    || !self
+                        .deployment
+                        .capability
+                        .output_formats
+                        .contains(&OutputFormat::PcmAudio)
+                    || !self
+                        .descriptor
+                        .features
+                        .contains(&WorkerFeature::RealtimeSocket)
+                {
+                    return Err(WorkerConfigError::UnsupportedDeployment);
+                }
             }
         }
         if self.max_active_invocations == 0 {
@@ -308,6 +324,17 @@ pub trait RealtimeAsrStageStream: Send {
         -> Result<Vec<izwi_core::RuntimeAsrRealtimeEvent>, izwi_core::Error>;
 }
 
+/// Per-session realtime TTS stream handle produced by a
+/// [`RealtimeStageRunner`]. Synthesis runs against the worker's runtime and
+/// audio chunks arrive on the handle until the stream ends; dropping the
+/// handle aborts the synthesis and releases the stage's runtime leases — the
+/// worker's teardown confirmation for the TTS stage.
+#[async_trait::async_trait]
+pub trait RealtimeTtsStageStream: Send {
+    /// Receives the next synthesized audio chunk; `Ok(None)` ends the stream.
+    async fn next_chunk(&mut self) -> Result<Option<izwi_core::AudioChunk>, izwi_core::Error>;
+}
+
 /// Execution surface for one realtime stage on this worker's runtime.
 #[async_trait::async_trait]
 pub trait RealtimeStageRunner: Send + Sync + 'static {
@@ -319,6 +346,26 @@ pub trait RealtimeStageRunner: Send + Sync + 'static {
         &self,
         language: Option<&str>,
     ) -> Result<Box<dyn RealtimeAsrStageStream>, izwi_core::Error>;
+
+    /// The output audio spec announced in the `Admitted` frame for stages
+    /// that emit audio (TTS-stream). `None` for input-only stages.
+    fn output_audio_spec(&self) -> Option<RealtimeAudioSpec> {
+        None
+    }
+
+    /// Starts realtime TTS synthesis of the committed utterance text.
+    /// Synthesis must stop by the given deadline; the session's own
+    /// cancellation ladder remains authoritative.
+    async fn start_tts_stream(
+        &self,
+        text: String,
+        deadline: std::time::Instant,
+    ) -> Result<Box<dyn RealtimeTtsStageStream>, izwi_core::Error> {
+        let _ = (text, deadline);
+        Err(izwi_core::Error::ConfigError(
+            "stage does not serve realtime TTS sessions".into(),
+        ))
+    }
 }
 
 #[derive(Clone)]
