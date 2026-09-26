@@ -719,7 +719,10 @@ newly approved workers are adopted on rolling gateway restart, never
 mid-stream.
 
 **Fleet coordination database (optional).** Point every gateway at the same
-SQLite file with `IZWI_GATEWAY_FLEET_DB_PATH=/absolute/path/fleet.sqlite3`
+coordination database — a SQLite file with
+`IZWI_GATEWAY_FLEET_DB_PATH=/absolute/path/fleet.sqlite3`, or a shared
+PostgreSQL database with
+`IZWI_GATEWAY_FLEET_DB_PATH=postgres://user:pass@db-host:5432/izwi_fleet` —
 to share worker observations and capacity claims. Each gateway publishes its
 polled worker statuses (monotonic per incarnation; incarnation changes always
 win) and claims one short-lived capacity unit per dispatch; selection steers
@@ -729,11 +732,23 @@ TTL (`FLEET_CLAIM_TTL`, 30s), which is the crash-recovery path — no explicit
 recovery protocol. Each gateway also releases its own leftover claims at
 startup (same `IZWI_GATEWAY_ID` after a restart), so capacity frees
 immediately instead of waiting out the TTL. Unset means single-gateway
-operation with purely process-local state. The fleet tables ship
-backend-conditional SQL for PostgreSQL/MySQL written best-effort against
-house idioms but never executed here; multi-site fleets needing
-PostgreSQL-backed shared state remain a separate adapter gate behind the
-provider conformance suite.
+operation with purely process-local state.
+
+PostgreSQL is the validated server-backed store: the migrator promotes the
+shared DDL per backend and the fleet store execution suite runs against real
+PostgreSQL in CI (`scripts/ci/check-backend-truth.sh cargo-fleet-stores`).
+To run it locally against a disposable Homebrew PostgreSQL database:
+
+```
+brew services start postgresql@18
+createdb izwi_ds5_test
+IZWI_TEST_FLEET_PG_URL=postgres://$(whoami)@localhost/izwi_ds5_test \
+  cargo test -p izwi-server --features db-postgres --lib fleet_postgres
+```
+
+MySQL dialect SQL remains written but unvalidated — it has never been
+executed against a live MySQL server, so MySQL-backed fleet coordination
+stays explicitly unsupported.
 
 **Operator drain.** Configure `IZWI_GATEWAY_ADMIN_API_KEY_REF` to a bounded
 `env:VARIABLE` secret that differs from the inference key. Then

@@ -9,6 +9,9 @@ Usage: scripts/ci/check-backend-truth.sh <command>
 Commands:
   hygiene       Run repository format, Clippy, all-target, diff, and shell gates
   cargo-cpu     Run CPU-focused cargo checks and core scheduler regressions
+  cargo-fleet-stores
+                Run fleet/durable store execution tests against real PostgreSQL
+                (requires IZWI_TEST_FLEET_PG_URL at a disposable database)
   cargo-metal   Require macOS 15+ and run Metal-focused validation
   cargo-metal-fallback
                 Require macOS 12-14 and prove Metal-enabled code falls back to CPU
@@ -367,6 +370,20 @@ run_cargo_cpu() {
     scripts/ci/run-kv-lifecycle-soak.sh --profile pr
 }
 
+run_cargo_fleet_stores() {
+    require_command cargo
+
+    # DS5.1: execute the fleet coordination store and the durable store
+    # against real PostgreSQL. The database must be disposable — every test
+    # drops its tables and re-runs the migrations.
+    if [[ -z "${IZWI_TEST_FLEET_PG_URL:-}" ]]; then
+        echo "IZWI_TEST_FLEET_PG_URL must point at a disposable PostgreSQL database" >&2
+        exit 1
+    fi
+
+    cargo test --locked -p izwi-server --features db-postgres --lib fleet_postgres
+}
+
 run_cargo_metal() {
     require_command cargo
 
@@ -591,6 +608,9 @@ main() {
             ;;
         cargo-cpu)
             run_cargo_cpu
+            ;;
+        cargo-fleet-stores)
+            run_cargo_fleet_stores
             ;;
         cargo-metal)
             run_cargo_metal
