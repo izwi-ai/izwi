@@ -1238,6 +1238,20 @@ impl KvCacheCoordinator {
         Ok(())
     }
 
+    /// Whether a page holds no ownership beyond its durable prefix reference,
+    /// making it a DS4 demotion candidate. Active-request ownership (tables,
+    /// reservations, execution pins, or an in-flight transfer) excludes the
+    /// page; those keep resolving through preemption instead.
+    pub fn page_is_offload_candidate(&self, block: CacheBlockRef) -> KvCoordinatorResult<bool> {
+        self.validate_block(block, None)?;
+        let slot = &self.slots[block.index as usize];
+        Ok(slot.prefix_refs > 0
+            && slot.table_refs == 0
+            && slot.reservations == 0
+            && slot.execution_pins == 0
+            && slot.transfer_pins == 0)
+    }
+
     pub fn unpin_transfer(&mut self, blocks: &[CacheBlockRef]) -> KvCoordinatorResult<()> {
         let unique = unique_blocks(blocks)?;
         for block in &unique {

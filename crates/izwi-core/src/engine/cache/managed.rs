@@ -14,6 +14,7 @@ use super::coordinator::{
     KvCoordinatorTableResetPlan, KvGroupReservation, KvReserveRequest, KvSnapshot,
     KvWindowReserveRequest, KvWriteReceipt,
 };
+use super::offload::{self, DemoteOutcome, HostOffloadPolicy};
 use super::prefix::{
     CoordinatedPrefixIndex, KvPrefixMatch, KvPrefixNamespace, KvPrefixPageKey, KvPrefixPublication,
     StagedPrefixCommit,
@@ -371,6 +372,9 @@ struct ManagedKvModelState {
     incremental_claim_sessions: HashSet<SessionKey>,
     tensor_sequences: HashMap<SessionKey, PhysicalStateSequenceId>,
     tensor_snapshots: Option<TensorSnapshotSharing>,
+    /// DS4 host-tier state: one bounded pool + chain index per arena when
+    /// hierarchical offload is engaged for this engine.
+    host_offload: Option<offload::ModelOffload>,
     resource_lease: Option<ResourceLease>,
     materialized_resources: ResourceVector,
     allocation_ledger: StateAllocationLedger,
@@ -410,6 +414,7 @@ pub(crate) struct ManagedKvCacheManager {
     telemetry: Arc<ManagedKvTelemetry>,
     prefix_cache_salt: Option<[u8; 32]>,
     max_prefix_cache_pages: usize,
+    host_offload_policy: Option<offload::HostOffloadPolicy>,
     worker_backend: BackendKind,
     worker_device_location: DeviceLocation,
     worker_device: Device,
@@ -483,6 +488,7 @@ impl ManagedKvCacheManager {
             telemetry: Arc::new(ManagedKvTelemetry::default()),
             prefix_cache_salt: None,
             max_prefix_cache_pages: 0,
+            host_offload_policy: None,
             worker_backend: backend,
             worker_device_location: device.location(),
             worker_device: device.clone(),
@@ -720,6 +726,12 @@ impl ManagedKvCacheManager {
         manager
     }
 
+    /// Enables DS4 hierarchical offload with the resolved policy. A `None`
+    /// policy (no host budget) keeps offload fully dormant.
+    pub(crate) fn set_host_offload_policy(&mut self, policy: Option<HostOffloadPolicy>) {
+        self.host_offload_policy = policy;
+    }
+
     pub(crate) fn telemetry_snapshot(&self) -> ManagedKvTelemetrySnapshot {
         self.telemetry.snapshot()
     }
@@ -889,6 +901,20 @@ impl ManagedKvCacheManager {
         models.sort_by_key(|model| model.model_instance);
         let mut counters = self.telemetry.snapshot();
         counters.prefix_retained_pages = totals.coordinator.prefix_refs;
+        counters.kv_host_pages = self.models.values().fold(0_u64, |total, state| {
+            total
+                + state
+                    .host_offload
+                    .as_ref()
+                    .map(|offload| {
+                        offload
+                            .arenas
+                            .values()
+                            .map(|arena| arena.pool.resident_pages() as u64)
+                            .sum::<u64>()
+                    })
+                    .unwrap_or(0)
+        });
         ManagedKvRuntimeSnapshot {
             memory_accounting: "resident_paged_plus_authorized_tensor",
             totals,
@@ -1101,7 +1127,7 @@ impl ManagedKvCacheManager {
 
         let maximum_state_resources = allocation_plan.maximum_resources(&state_plan_v2)?;
         let resources = managed_state_resources(backend, maximum_state_resources)?;
-        let materialized_resources = managed_state_resources(
+        let mut materialized_resources = managed_state_resources(
             backend,
             allocation_plan.initial_state_resources(&state_plan_v2)?,
         )?;
@@ -1190,6 +1216,45 @@ impl ManagedKvCacheManager {
             .as_ref()
             .map(|arena| arena.capacity().authorized_bytes())
             .unwrap_or(0);
+        // DS4: build the host tier when offload is engaged and committed
+        // prefix pages exist to demote. The pool's byte ceiling is charged to
+        // the node memory ledger up front (DINV-05) — the budget is the
+        // operator's declared ceiling for host-tier pages.
+        let host_offload = match self
+            .host_offload_policy
+            .filter(|_| self.max_prefix_cache_pages > 0)
+        {
+            Some(policy) => {
+                let mut offload = offload::ModelOffload {
+                    arenas: HashMap::with_capacity(plan.groups.len()),
+                };
+                for arena in arenas.values() {
+                    offload.arenas.insert(
+                        arena.id(),
+                        offload::ArenaOffload::new(
+                            crate::backends::kv::arena_page_bytes(arena.config()),
+                            policy.budget_bytes,
+                        )?,
+                    );
+                }
+                let charge = match backend {
+                    BackendKind::Metal => ResourceVector {
+                        unified_bytes: ResourceAmount::Known(policy.budget_bytes),
+                        ..ResourceVector::zero()
+                    },
+                    _ => ResourceVector {
+                        host_bytes: ResourceAmount::Known(policy.budget_bytes),
+                        ..ResourceVector::zero()
+                    },
+                };
+                materialized_resources = materialized_resources.checked_add(charge)?;
+                if let Some(lease) = resource_lease.as_ref() {
+                    lease.record_materialized_usage(materialized_resources)?;
+                }
+                Some(offload)
+            }
+            None => None,
+        };
         // DS1.2b: derive the snapshot-sharing surface from the strict contract
         // gate. The declared snapshot interval must land on the resolved page
         // grid, and the index inherits the tensor arena's own authorization
@@ -1244,6 +1309,7 @@ impl ManagedKvCacheManager {
                 incremental_claim_sessions: HashSet::new(),
                 tensor_sequences: HashMap::new(),
                 tensor_snapshots,
+                host_offload,
                 resource_lease,
                 materialized_resources,
                 allocation_ledger,
@@ -1434,6 +1500,62 @@ impl ManagedKvCacheManager {
         result
     }
 
+    /// DS4: drain demotion work for one model — when a device arena's
+    /// pressure crosses the high watermark, move LRU committed prefix
+    /// subtrees to the host pool until the low watermark, the bounded step
+    /// budget, the victim supply, or the host budget runs out. Bounded and
+    /// synchronous: steps run inside the manager's own critical section.
+    fn run_host_offload_tick(
+        policy: Option<HostOffloadPolicy>,
+        state: &mut ManagedKvModelState,
+        telemetry: &ManagedKvTelemetry,
+    ) {
+        fn pressure(coordinator: &KvCacheCoordinator) -> Option<f32> {
+            let stats = coordinator.stats();
+            (stats.capacity_pages > 0)
+                .then(|| stats.allocated_pages as f32 / stats.capacity_pages as f32)
+        }
+        let Some(policy) = policy else { return };
+        let Some(offload) = state.host_offload.as_mut() else {
+            return;
+        };
+        let arena_ids: Vec<KvArenaId> = offload.arenas.keys().copied().collect();
+        for arena_id in arena_ids {
+            let Some(coordinator) = state.coordinators.get_mut(&arena_id) else {
+                continue;
+            };
+            if pressure(coordinator).is_none_or(|current| current < policy.high_watermark) {
+                continue;
+            }
+            let Some(arena) = state.runtime.arena(arena_id) else {
+                continue;
+            };
+            let Some(index) = state.prefix_indexes.get_mut(&arena_id) else {
+                continue;
+            };
+            let Some(arena_offload) = offload.arenas.get_mut(&arena_id) else {
+                continue;
+            };
+            let mut steps = policy.max_in_flight_pages;
+            while steps > 0 {
+                if pressure(coordinator).is_none_or(|current| current <= policy.low_watermark) {
+                    break;
+                }
+                match offload::demote_step(
+                    coordinator,
+                    index,
+                    arena.as_ref(),
+                    arena_offload,
+                    telemetry,
+                ) {
+                    Ok(DemoteOutcome::Demoted { .. }) => steps -= 1,
+                    Ok(_) => break,
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+
     fn prepare_inner(
         &mut self,
         runtime: &ManagedKvModelRuntime,
@@ -1579,6 +1701,10 @@ impl ManagedKvCacheManager {
                 "request carries a stale managed KV runtime".to_string(),
             ));
         }
+        // DS4: drain demotion before capacity claims so pages freed to the
+        // host tier are visible to this very reservation.
+        let host_offload_policy = self.host_offload_policy;
+        Self::run_host_offload_tick(host_offload_policy, state, &self.telemetry);
         let installed_claim = if let Some(request) = request {
             if incremental && sequence_input.is_some() {
                 ensure_incremental_capacity_claim(state, session, request, work)?
@@ -4032,7 +4158,7 @@ fn candle_dtype(dtype: KvStorageDType) -> Result<DType> {
     }
 }
 
-fn coordinator_error(error: impl fmt::Display) -> Error {
+pub(crate) fn coordinator_error(error: impl fmt::Display) -> Error {
     Error::InferenceError(format!(
         "managed KV coordinator rejected transaction: {error}"
     ))

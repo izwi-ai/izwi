@@ -296,6 +296,18 @@ pub struct KvPrefixMatch {
     pub reused_tokens: u32,
 }
 
+/// Non-removing view of one LRU subtree, returned by
+/// [`CommittedPrefixIndex::lru_subtree`] for the DS4 demotion picker. The
+/// keys are cloned so the host chain index can re-register the pages under
+/// their exact identity.
+#[derive(Debug, Clone)]
+pub struct LruSubtreeView {
+    pub root_digest: [u8; 32],
+    pub digests: Vec<[u8; 32]>,
+    pub keys: Vec<KvPrefixPageKey>,
+    pub blocks: Vec<CacheBlockRef>,
+}
+
 /// Couples index visibility to coordinator ownership. Index changes are built
 /// on a private clone, the coordinator atomically commits table/ref mutations,
 /// and only then is the staged index made visible to admission lookups.
@@ -493,6 +505,75 @@ impl CoordinatedPrefixIndex {
             return Ok(blocks);
         }
         Ok(Vec::new())
+    }
+
+    /// Inspect the least-recently-used subtree without removing it, refreshing
+    /// its access ticks. The DS4 demotion picker uses this to select the same
+    /// victim an eviction would remove while protecting the selection from a
+    /// concurrent eviction pass until the transfer pins land.
+    pub fn lru_subtree(&mut self) -> Option<LruSubtreeView> {
+        let root = self
+            .index
+            .entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_access)
+            .map(|(digest, _)| *digest)?;
+        let access = self.index.tick().ok()?;
+        let mut digests = Vec::new();
+        let mut keys = Vec::new();
+        let mut blocks = Vec::new();
+        let mut pending = vec![root];
+        while let Some(digest) = pending.pop() {
+            let (key, block) = match self.index.entries.get(&digest) {
+                Some(entry) => (entry.key.clone(), entry.block),
+                None => continue,
+            };
+            pending.extend(
+                self.index
+                    .entries
+                    .iter()
+                    .filter_map(|(child_digest, child)| {
+                        (child.key.previous_page == Some(digest)).then_some(*child_digest)
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            if let Some(entry) = self.index.entries.get_mut(&digest) {
+                entry.last_access = access;
+            }
+            digests.push(digest);
+            keys.push(key);
+            blocks.push(block);
+        }
+        Some(LruSubtreeView {
+            root_digest: root,
+            digests,
+            keys,
+            blocks,
+        })
+    }
+
+    /// Remove an exact subtree from the device index and release exactly its
+    /// durable prefix references (DS4 demotion completion). The arena pages
+    /// recycle once nothing else holds them. A failure leaves the live index
+    /// untouched.
+    pub fn remove_subtree(
+        &mut self,
+        coordinator: &mut KvCacheCoordinator,
+        digests: &[[u8; 32]],
+    ) -> Result<(), KvPrefixIndexError> {
+        let mut staged = self.index.clone();
+        let mut blocks = Vec::new();
+        for digest in digests {
+            if let Some(block) = staged.remove(*digest) {
+                blocks.push(block);
+            }
+        }
+        if blocks.is_empty() {
+            return Ok(());
+        }
+        coordinator.release_prefixes(&blocks)?;
+        self.index = staged;
+        Ok(())
     }
 }
 

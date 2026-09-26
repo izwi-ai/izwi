@@ -146,6 +146,27 @@ pub struct EngineCoreConfig {
     #[serde(default = "default_max_prefix_cache_pages")]
     pub max_prefix_cache_pages: usize,
 
+    /// Host KV pool budget in bytes for hierarchical offload (DS4). Zero (the
+    /// default) keeps the feature fully dormant.
+    #[serde(default)]
+    pub kv_host_pool_budget_bytes: u64,
+
+    /// Device-arena pressure ratio at which demotion steps start.
+    #[serde(default = "default_kv_offload_high_watermark")]
+    pub kv_offload_high_watermark: f32,
+
+    /// Pressure ratio demotion steps drain toward before stopping.
+    #[serde(default = "default_kv_offload_low_watermark")]
+    pub kv_offload_low_watermark: f32,
+
+    /// Maximum pages with a demotion copy in flight at once.
+    #[serde(default = "default_kv_offload_max_in_flight_pages")]
+    pub kv_offload_max_in_flight_pages: usize,
+
+    /// Maximum host-resident pages promoted back in one prepare.
+    #[serde(default = "default_kv_offload_max_promotion_pages")]
+    pub kv_offload_max_promotion_pages: usize,
+
     /// Catalog-gated prefix-reuse default (DS1.6). Honored once when the
     /// engine core is constructed: catalog-auto mode engages the managed
     /// prefix namespace with the operator's salt or a generated per-process
@@ -381,6 +402,22 @@ fn default_enable_prefix_caching() -> bool {
 fn default_managed_prefix_cache_salt() -> Option<String> {
     None
 }
+fn default_kv_offload_high_watermark() -> f32 {
+    0.85
+}
+
+fn default_kv_offload_low_watermark() -> f32 {
+    0.70
+}
+
+fn default_kv_offload_max_in_flight_pages() -> usize {
+    8
+}
+
+fn default_kv_offload_max_promotion_pages() -> usize {
+    64
+}
+
 fn default_max_prefix_cache_pages() -> usize {
     128
 }
@@ -408,6 +445,11 @@ impl Default for EngineCoreConfig {
             enable_prefix_caching: default_enable_prefix_caching(),
             managed_prefix_cache_salt: default_managed_prefix_cache_salt(),
             max_prefix_cache_pages: default_max_prefix_cache_pages(),
+            kv_host_pool_budget_bytes: 0,
+            kv_offload_high_watermark: default_kv_offload_high_watermark(),
+            kv_offload_low_watermark: default_kv_offload_low_watermark(),
+            kv_offload_max_in_flight_pages: default_kv_offload_max_in_flight_pages(),
+            kv_offload_max_promotion_pages: default_kv_offload_max_promotion_pages(),
             prefix_reuse_catalog_auto: false,
             enable_chunked_prefill: default_chunked_prefill(),
             enable_cuda_incremental_chat: default_cuda_incremental_chat(),

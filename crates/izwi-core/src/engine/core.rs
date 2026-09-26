@@ -3068,7 +3068,7 @@ impl EngineCore {
             crate::config::PrefixCachePolicy::Namespaced { max_pages, .. } => max_pages,
         };
 
-        let (managed_kv_cache, physical_state) = match managed_worker {
+        let (mut managed_kv_cache, physical_state) = match managed_worker {
             Some((backend, device)) => (
                 ManagedKvCacheManager::for_worker_with_prefix_cache_policy(
                     managed_resource_authority.clone(),
@@ -3088,6 +3088,11 @@ impl EngineCore {
                 PhysicalStateManager::cpu(managed_resource_authority),
             ),
         };
+        // DS4 hierarchical offload is explicit opt-in: a resolved policy only
+        // exists when the operator configured a host pool budget.
+        managed_kv_cache.set_host_offload_policy(
+            crate::engine::cache::offload::HostOffloadPolicy::resolve(&config)?,
+        );
 
         Ok(Self {
             config,

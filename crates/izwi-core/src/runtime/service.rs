@@ -3029,6 +3029,14 @@ impl RuntimeService {
         };
         core_config.enable_chunked_prefill = config.enable_chunked_prefill;
         core_config.chunked_prefill_threshold = config.chunked_prefill_threshold.max(1);
+        // DS4 hierarchical offload: explicit opt-in through the host pool
+        // budget; the manager materializes pools only where committed prefix
+        // pages exist.
+        core_config.kv_host_pool_budget_bytes = config.kv_host_pool_budget_bytes;
+        core_config.kv_offload_high_watermark = config.kv_offload_high_watermark;
+        core_config.kv_offload_low_watermark = config.kv_offload_low_watermark;
+        core_config.kv_offload_max_in_flight_pages = config.kv_offload_max_in_flight_pages;
+        core_config.kv_offload_max_promotion_pages = config.kv_offload_max_promotion_pages;
 
         let mut worker_config = WorkerConfig::from(&core_config);
         worker_config.models_dir = config.models_dir.clone();
