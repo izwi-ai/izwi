@@ -25,17 +25,18 @@ template in `PRODUCTION_SERVING_RELEASE_CHECKLIST.md`.
 | P1 Contracts & mock harness | Done | Versioned protocol, bounded parsing, mock worker, 23 real-HTTP contract tests |
 | P2 Real CPU vertical slice | Done | Real-process worker test; public chat route end to end |
 | P3 Supervisor & assignments | Done for CPU; DS0.6 lifted the Metal/CUDA supervision gate (process-evidenced); real accelerator execution still hardware-gated |
-| P4 Registry & multi-worker routing | Done (code) | T02/T07/T09 real-HTTP tests; multi-process fleet rig open (P4.3-full) |
-| P5 Safeguards, streams, retry | Done | Perimeter, tenant limits, bounded SSE, one-alternate retry, drain; scoped per-principal keys open (DS0.5) |
+| P4 Registry & multi-worker routing | Done | T02/T07/T09 real-HTTP tests; the multi-process fleet rig landed with DS5.2 |
+| P5 Safeguards, streams, retry | Done | Perimeter, tenant limits, bounded SSE, one-alternate retry, drain; DS0.5 scoped per-principal keys closed |
 | P6 Durable jobs, artifacts | Done for the single-node text profile | Voice route migration remains gated per ledger |
 | P7 Secure one-gateway fleet | Done (code) | TLS/mTLS, topology policy, remote artifact transport; separate-machine handshake evidence open |
-| P8 Multi-gateway correctness | Done (code, SQLite) | Partitioned quotas, claims, outage degradation; PG/MySQL execution + shared-atomic default open (DS5) |
+| P8 Multi-gateway correctness | Done | Partitioned quotas, claims, outage degradation; DS5 validated the shared stores and posture with real processes |
 | P9 Operational release | Partial | Validate-only, drain, canary, packaging, benchmark harness done; soak/benchmark runs open |
-| DS0 Foundations | 6 of 9 done | DS0.1/0.3/0.4/0.6 closed; DS0.5 scoped per-principal keys closed (manifest bootstrap + salted-HMAC store + role-gated perimeter); DS0.2 (this report), DS0.7, DS0.8 open |
+| DS0 Foundations | Done (9 of 9) | DS0.1 process gateway proof, DS0.2 this report, DS0.3 poll jitter, DS0.4 model-load slots, DS0.5 scoped per-principal keys, DS0.6 multi-lane supervision, DS0.7 CPU/Metal baselines, DS0.8 backend parity harness |
 | DS1 Committed prefix reuse | Done | DS1.1–DS1.6 closed: paged reuse, tensor-snapshot forks, admission probe + cursor-lost re-plan, catalog-auto default-on with per-family evidence cells |
 | DS2 Cache-aware routing | Done | Protocol minor-1 routing signals, worker exposure, cache affinity + conversation pinning (default OFF), CPU+Metal 2-worker evidence |
 | DS3 Realtime voice over the worker boundary | Done | `izwi-realtime-v1` end to end (worker route, client transport, gateway relay behind flag), TTS-stream stage, DS3.4 public envelope translation |
 | DS4 Hierarchical KV offload | Done | DS4.1–DS4.5 closed: design note + ADR 0004, host pool substrate, demotion, promotion, counters, engine-level acceptance, CPU+Metal benchmark evidence (CUDA `not run`) |
+| DS5 Fleet authority | Done | DS5.1 PostgreSQL validated (URL connect path, dialect-aware migrator, execution suites in CI; the PG claim race needed a worker-keyed advisory lock), DS5.2 two-gateway/two-worker fleet rig (SQLite + PG lanes: T07/T20/P8.1/steering/crash+TTL/DINV-06 outage), DS5.3 explicit fleet posture + claim-TTL env + maintenance sweep, DS5.4 T25 generation-fence process evidence, DS5.5 ADR 0005 + docs; MySQL recorded unvalidated (error 1170 TEXT-key burden) |
 
 ## Supported deployment profiles
 
@@ -46,7 +47,11 @@ template in `PRODUCTION_SERVING_RELEASE_CHECKLIST.md`.
   target hardware.
 - **Secure multi-machine (one gateway):** code-complete, not an operational
   claim until separate-machine TLS handshake and node-loss evidence exist.
-- **Multi-gateway fleet:** not a supported claim (Phase 8/DS5 gates open).
+- **Multi-gateway fleet:** supported on the validated store lanes (shared
+  SQLite on one host, shared PostgreSQL for a server-backed fleet) per
+  DS5.2's process rig and ADR 0005; admission stays worker-authoritative,
+  MySQL coordination stays unvalidated, and separate-machine TLS handshakes
+  remain a separate gate.
 
 ## Actual backend/model/hardware cells tested
 
@@ -107,7 +112,12 @@ Prometheus endpoint renders the DS4 counters.
 - CUDA/Metal *inference*, multi-GPU, multi-machine, soak, overload matrices:
   no accelerator/fabric hardware in the work environment (Metal build/run is
   the next local lane).
-- PG/MySQL fleet SQL execution: no PostgreSQL/MySQL instance in CI yet (DS5).
+- MySQL fleet SQL execution: recorded unvalidated — a live MySQL 8 probe
+  fails on the first table (`TEXT PRIMARY KEY` needs a key length, MySQL
+  error 1170); validating MySQL means a dedicated schema variant (ADR 0005).
+  PostgreSQL fleet and durable-store execution runs in CI
+  (`backend-truth.yml` fleet-stores job) and locally against Homebrew
+  PostgreSQL 18.
 - Live benchmark runs on real production-sized models and CUDA lanes:
   fixture-scale DS0.7/DS1.5 runs executed (see below); speed claims still
   require real-model runs.
@@ -160,9 +170,10 @@ No destructive migrations shipped.
 
 ## Next highest-priority task
 
-DS0.7 packaging evidence and the remaining DS0 items, then the DS5
-multi-gateway durability lanes (PG/MySQL execution). DS4 is complete
-including its benchmark evidence: hierarchical offload is explicit opt-in
-and counter-proven on the CPU and Metal fixture lanes (see the support
-matrix's offload table and the DS4 design note's as-built deviations).
-CUDA offload stays `not run` until hardware evidence exists.
+DS5 is complete: the multi-gateway fleet profile is validated on SQLite and
+PostgreSQL coordination stores with real two-gateway process evidence
+(ADR 0005), the supervisor generation fence is process-proven, and MySQL
+stays honestly unvalidated. Next per the plan: the remaining DS0 remnant is
+none (DS0.1–DS0.8 closed), so the next phase is DS6 (declarative rollout
+with canary promotion), with CUDA lanes staying `not run` until hardware
+evidence exists.

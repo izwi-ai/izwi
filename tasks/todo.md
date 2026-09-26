@@ -19824,3 +19824,95 @@ are the calibration lever for the tiny arena.
 
 Next: DS0.7 packaging evidence / remaining DS0 items, or DS5 multi-gateway durability.
 CUDA offload stays not run until hardware.
+
+---
+
+## DS5 — Fleet authority: shared admission, validated stores, multi-process rig — session 2026-09-26
+
+Plan approved (plan mode). Confirmed decisions: PostgreSQL is the validated
+server-backed store with MySQL as a timeboxed best-effort (demoted honestly);
+the rig's two workers are in-process MockWorkers on real loopback TCP (no
+worker binary exists) — deviation recorded.
+
+- [x] DS5.1a PG connect path (commit 6034e5a9): `StoreDatabase` resolves a
+      `DatabaseSource` (path | bounded URL); `IZWI_DATABASE_URL` for the
+      durable store, fleet env accepts `postgres://`/`mysql://`/`sqlite://`;
+      migrator dialect transform (INTEGER→BIGINT — epoch millis overflow a
+      4-byte server INTEGER; REAL→DOUBLE PRECISION; `COLLATE NOCASE` →
+      `LOWER(name)` functional unique index on PG); `table_has_column`
+      information_schema split; principal-key upsert backend-aware.
+- [x] DS5.1b PG execution suite (commit c68aaeda):
+      `batch_runtime/fleet_postgres_execution.rs` (feature `db-postgres`,
+      `IZWI_TEST_FLEET_PG_URL` skip-if-unset): full schema + promoted types on
+      PG, monotonic observations, cross-connection claim atomicity, TTL/reap/
+      release, principal-key upsert, BIGINT round-trip. Surfaced a REAL PG
+      correctness fix: two concurrent `INSERT...SELECT` claim snapshots can
+      both see the same count and overspend a credit (SQLite's single-writer
+      lock had serialized them) — PG claims now run in a transaction guarded
+      by a worker-keyed `pg_advisory_xact_lock`.
+- [x] DS5.1c CI (commit 59433880): `fleet-stores` job (postgres:18 service
+      container) + `cargo-fleet-stores` target in check-backend-truth.sh;
+      runbook documents URL fleet references + local brew PG recipe.
+- [x] DS5.3 posture formalization (commit b3c044bc): startup posture log
+      (selection_mode=shared_atomic_claims default when fleet DB set;
+      quota_mode partitioned_1_of_n | worker_authoritative);
+      `IZWI_GATEWAY_FLEET_CLAIM_TTL_MS` (bounded 100ms–300s, default 30s);
+      60s maintenance sweep (reap expired claims, prune >24h observations) —
+      closes the unwired-reap gap found in exploration.
+- [x] DS5.2 fleet rig (commits 4 files `fleet_rig.rs` + `8c97b85d`): two REAL
+      izwi-server gateway processes, distinct IZWI_GATEWAY_IDs, one shared
+      fleet DB: T07 concurrent admission (claims fence never exceeds the
+      worker's single credit; 503-shed is the designed loss path), T20
+      partitioned quotas (combined admission ≤ budget; each ≤ half-burst+1),
+      P8.1 shared approvals (disjoint CLI/shared sets — duplicates fail
+      closed) + monotonic observation merge, claim steering both directions,
+      forged crashed-gateway claim → TTL recovery without any release
+      protocol, survivor keeps serving after peer death. PG lane adds DINV-06
+      process outage: `CONNECTION LIMIT 0` + terminate backends → dispatch
+      degrades uncoordinated (200s, no panic) → reopen → recovery.
+- [x] DS5.4 T25 (commit, supervisor crate): `tests/generation_fence_collision.rs`
+      — live collision exits Contended at the node lease; after SIGKILL of
+      supervisor #1 the orphaned fenced worker keeps the shared generation
+      lease and the replacement exits Contended at the generation barrier;
+      once it exits the fence frees and a replacement supervisor starts,
+      launches workers, and stops gracefully. Fake worker is a python script
+      whose process holds the flock itself (a sh wrapper strands the lock in
+      an unaddressable orphan).
+- [x] DS5.5 docs (this commit): ADR 0005; runbook fleet section → validated
+      store lanes + claim-TTL/sweep; support matrix multi-gateway row →
+      supported on validated lanes; delivery report reconciled (stale DS0
+      row/next-task line fixed); plan DS0/DS1/DS5 checkboxes reconciled.
+
+MySQL (timeboxed, honest demotion): live mysql:8 probe — migrator fails on
+the first table with error 1170 (TEXT key needs a length); validation would
+require a dedicated schema variant (VARCHAR lengths, prefix indexes, no
+partial indexes). Recorded unvalidated in ADR 0005/docs; probe scratch not
+committed.
+
+Real gaps surfaced and fixed en route:
+- PG claim overspend race (above) — the DS5.1 execution suite caught it.
+- Simultaneous fleet boot on one SQLite file races journal-mode setup before
+  busy_timeout applies → gateway retries the fleet-DB open (10 × 500ms)
+  before failing closed.
+- gateway_fleet unit tests mutated process env without `env_lock` → flaked
+  under parallel test threads (pre-existing hazard; all 8 env tests locked).
+- Supervisor lib tests had not compiled since DS4.3 (LoadedDeployment
+  counter fields missing in a lifecycle test initializer) — repaired.
+- Fleet DB open resilience + `BatchRuntimeStore::initialize_with_database_
+  path/url` public inspection constructors.
+
+### Review
+
+Verified at HEAD: izwi-server lib 726 green (incl. 6 PG execution tests when
+`db-postgres` + local PG are present; 723 SQLite-only by default), fleet rig
+5/5 SQLite (8× stability runs) + PG lane green 3×, supervisor suite fully
+green (33 lib + 8 bin + all process tests incl. new T25), boundary gate
+passes, clippy clean on touched files, fmt clean. Env quirks: created
+`izwi_ds5_test` + `izwi_ds5_rig` databases on the running brew postgresql@18;
+rig flakes were all diagnosed and hardened (port race → bounded respawn on
+"Address already in use"; stale-credit 503s → poll-interval spacing; wait
+deadline 60s). Disk hit 100% mid-session — removed target/debug/incremental
+(34G) per the host-constraint lesson.
+
+Next: DS6 (declarative rollout, canary promotion) per the plan's dependency
+order. CUDA lanes remain `not run` until hardware.

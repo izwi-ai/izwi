@@ -16,7 +16,7 @@ is never promoted to real hardware or performance evidence.
 | One machine, Apple silicon | One gateway | Metal worker (metal-feature build, device identity `metal:<registryID>` verified at startup) | **Real Metal inference executed**: 120 gateway-routed generations through a metal worker (debug build, tiny synthetic fixture, `benchmarks/manifests/ds07-metal-baseline.json`); `backend_parity.rs` proves greedy Metal outputs equal CPU outputs on the fixture, including the DS1.5 committed-prefix attach leg (`benchmarks/manifests/ds15-metal-summary.json`); supervisor launch + exact device identity process-evidenced (`multi_lane_launch.rs`) | Development Metal lane proven on the fixture; not a production model, capacity, soak, or performance certificate |
 | One machine, NVIDIA | One gateway | CUDA-capable worker binary via `--cuda-worker-binary` | The supervisor accepts, validates, and launches CUDA assignments with exact declared UUID and device-visibility environment (process test `multi_lane_launch.rs`); no CUDA toolchain or NVIDIA device was available in this work session | Supervision code-complete; CUDA execution not run — no CUDA or multi-GPU support claim |
 | Multiple machines | One gateway | Versioned node/worker-pinned HTTPS approvals | Fleet topology fails closed without mTLS client identity, HTTPS, and exact operator-pinned node/worker IDs; the bundled worker remains loopback-only and no proxy enforcement, separate-machine handshake, or artifact path was exercised | Not supported as an operational profile |
-| Multiple gateways | Two or more gateways | Any worker fleet | Worker admission stays authoritative, but registry, circuit state, tenant rate state, durable providers, and active-work quota ownership are not shared authorities | Not supported; Phase 8 gates remain open |
+| Multiple gateways | Two or more gateways | Any worker fleet | Two real gateway processes over one shared coordination database prove T07 (atomic admission), T20 (partitioned quota not multiplied), P8.1 (shared approvals + monotonic observation registry), claim steering, gateway-crash + TTL recovery, and store-outage degradation (`tests/fleet_rig.rs`, SQLite and PostgreSQL lanes); capacity claims steer selection while the worker remains the atomic admission arbiter (ADR 0005) | Supported on the validated store lanes: SQLite (one host) and PostgreSQL (shared fleet); MySQL coordination SQL remains written but unvalidated; circuit state and accepted-work ownership stay per-gateway |
 
 ## Committed prefix reuse by model family and backend (DS1.6)
 
@@ -83,8 +83,12 @@ gateway loss.
 - Gateway-local admission, circuit, metrics, tenant rate state, and accepted-work
   ownership reset with the process. Within one live gateway, accepted-work
   ownership survives public timeout/disconnect until exact worker teardown is
-  proven; it is not a crash-persistent or shared fleet authority. This is one
-  reason the multiple-gateway and strict fleet-quota profiles remain unsupported.
+  proven; it is not a crash-persistent or shared fleet authority. Fleet
+  gateways share worker observations, capacity-claim steering, and (when
+  partitioned) quota slicing through the coordination database; admission
+  itself stays worker-authoritative and accepted-work ownership stays
+  gateway-local. The T25 supervisor generation fence is process-evidenced
+  (`tests/generation_fence_collision.rs`).
 - Gateway mode intentionally owns no SQLite database, model runtime, accelerator,
   process-local session, or durable artifact provider. Durable/local workflows do
   not fail over through a replacement gateway because they are not advertised by

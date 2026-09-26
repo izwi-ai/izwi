@@ -53,17 +53,17 @@ izwi-serving-supervisor          validates, starts, fences, restarts, drains
   deployments. The gateway selects from a bounded, fresh registry. A worker's
   admission result remains authoritative when gateway load observations are
   stale.
-- No Kubernetes, broker, external database, or cloud service is required. The
-  gateway and synchronous chat path do not require SQLite. Existing durable job
-  and artifact code remains in the local server profile and is not made a
-  gateway dependency.
+- No Kubernetes, broker, or cloud service is required. The gateway and
+  synchronous chat path do not require SQLite. Single-node profiles need no
+  external database; the multi-gateway fleet profile shares one coordination
+  database (SQLite on one host or PostgreSQL for a server-backed fleet).
+  Durable job and artifact code remains in the local server profile and is not
+  made a gateway dependency.
 
-The `izwi-serving-supervisor` executable currently accepts CPU workers only and
-requires an operator-supplied CPU-ID inventory and allocatable host-memory
-ceiling. Although the shared schema and worker support strict Metal/CUDA
-assignments, there is no launcher inventory integration for those lanes yet.
-Never change an explicit Metal or CUDA assignment to CPU merely to make
-validation pass.
+The `izwi-serving-supervisor` executable supervises CPU, Metal, and CUDA
+worker lanes (ADR 0003), requiring an operator-declared device inventory and
+allocatable host-memory ceiling. Never change an explicit Metal or CUDA
+assignment to CPU merely to make validation pass.
 
 ## Security boundary
 
@@ -696,10 +696,15 @@ accepted-work ownership.
 
 ## Fleet operation (multi-gateway)
 
-Single-node operation is the only supported profile. The controls below let
-operators *prepare* a multi-gateway fleet; they do not make one operationally
-supported. Remote TLS termination, separate-machine handshakes, partition
-behavior, and multi-gateway crash recovery remain explicit release gates.
+Multi-gateway operation is validated on two coordination-store lanes:
+a shared SQLite file on one host, or a shared PostgreSQL database for a
+server-backed fleet (see the coordination database section below). The
+authority contract is unchanged from single-node operation: the worker
+remains the atomic admission arbiter, capacity claims only steer selection,
+and an unreachable coordination store degrades to worker-authoritative
+admission — dispatches keep succeeding, nothing panics (ADR 0005). Remote
+TLS termination and separate-machine handshakes remain explicit release
+gates.
 
 **Partitioned quotas.** Set `IZWI_GATEWAY_FLEET_SIZE=N` and
 `IZWI_GATEWAY_FLEET_PARTITION=i` (0-based, `i < N`) on each gateway. Every
@@ -707,6 +712,9 @@ gateway owns a strict 1/N slice (floored to 1) of the configured tenant
 request-rate and concurrency budgets, so the fleet total cannot exceed the
 configured limits and a crashed gateway releases its partition with no effect
 on its peers. No shared atomic counter or coordination service is required.
+Partitioning is the explicitly-chosen quota fallback; without it, each
+gateway's tenant budget is enforced worker-authoritatively. Every gateway
+logs its effective posture at startup (`selection_mode`, `quota_mode`).
 
 **Shared approvals.** Point every gateway at the same bounded approvals file
 with `IZWI_GATEWAY_SHARED_APPROVALS_PATH=/absolute/path/approvals.txt`
@@ -728,8 +736,11 @@ polled worker statuses (monotonic per incarnation; incarnation changes always
 win) and claims one short-lived capacity unit per dispatch; selection steers
 away from peer-filled workers while the worker remains the atomic admission
 arbiter, so a lost race degrades to one alternate dispatch. Claims expire by
-TTL (`FLEET_CLAIM_TTL`, 30s), which is the crash-recovery path — no explicit
-recovery protocol. Each gateway also releases its own leftover claims at
+TTL — `IZWI_GATEWAY_FLEET_CLAIM_TTL_MS`, bounded 100ms–300s, default 30000 —
+which is the crash-recovery path: no explicit recovery protocol. A slow
+background sweep additionally reaps expired claims and prunes observation
+rows for workers that stopped reporting beyond 24h, so a long-lived fleet
+does not leak rows. Each gateway also releases its own leftover claims at
 startup (same `IZWI_GATEWAY_ID` after a restart), so capacity frees
 immediately instead of waiting out the TTL. Unset means single-gateway
 operation with purely process-local state.
