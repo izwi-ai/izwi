@@ -22,12 +22,24 @@ use izwi_serving_protocol::WorkerStatus;
 
 use crate::{
     batch_runtime::store::BatchRuntimeStore,
+    gateway_fleet::DEFAULT_FLEET_CLAIM_TTL_MS,
     worker_registry::{FleetCapacityView, WorkerInstanceKey},
 };
 
-/// Claim TTL: long enough to cover select-to-invoke latency, short enough
-/// that a crashed gateway's claims stop shadowing capacity quickly.
-pub const FLEET_CLAIM_TTL: Duration = Duration::from_secs(30);
+/// How long stale observation rows are retained before the maintenance sweep
+/// prunes them. Observations are one row per worker (upserted, not appended),
+/// so retention only bounds rows from workers that stopped reporting; 24h is
+/// far beyond any plausible freshness window a reader would use while still
+/// keeping the table tight on a long-lived fleet.
+pub(crate) const FLEET_OBSERVATION_RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// Bounded batch size for one maintenance-sweep pass, matching the store's
+/// bounded reap/prune helpers.
+pub(crate) const FLEET_MAINTENANCE_BATCH: usize = 1024;
+
+/// Cadence of the background maintenance sweep. Slow by design: the reader
+/// side already ignores expired rows, so the sweep only reclaims space.
+pub(crate) const FLEET_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Locally cached fresh view of peer gateways' cluster claims, refreshed on
 /// the worker status-poller cadence. Selection reads this synchronously and
@@ -95,9 +107,16 @@ impl FleetCoordinator {
         Self {
             store,
             gateway_id,
-            claim_ttl: FLEET_CLAIM_TTL,
+            claim_ttl: Duration::from_millis(DEFAULT_FLEET_CLAIM_TTL_MS),
             snapshot: FleetCapacitySnapshot::default(),
         }
+    }
+
+    /// Override the claim TTL (DS5.3: `IZWI_GATEWAY_FLEET_CLAIM_TTL_MS`).
+    /// Unset keeps the historical 30s default.
+    pub fn with_claim_ttl(mut self, claim_ttl: Duration) -> Self {
+        self.claim_ttl = claim_ttl;
+        self
     }
 
     pub fn gateway_id(&self) -> &str {
@@ -193,6 +212,29 @@ impl FleetCoordinator {
             claims,
         );
     }
+
+    /// One bounded maintenance pass: physically remove expired claims (the
+    /// reader-side TTL already stopped counting them) and prune observation
+    /// rows for workers that stopped reporting. DS5.3 wires this onto a
+    /// slow production cadence so a validated fleet profile does not leak
+    /// rows; failures are swallowed by the caller, consistent with the
+    /// store-outage degradation contract.
+    pub async fn maintenance_sweep(&self) -> (u64, u64) {
+        let reaped = self
+            .store
+            .reap_expired_fleet_claims(FLEET_MAINTENANCE_BATCH)
+            .await
+            .unwrap_or(0);
+        let pruned = self
+            .store
+            .prune_stale_fleet_observations(
+                u64::try_from(FLEET_OBSERVATION_RETENTION_MS).unwrap_or(u64::MAX),
+                FLEET_MAINTENANCE_BATCH,
+            )
+            .await
+            .unwrap_or(0);
+        (reaped, pruned)
+    }
 }
 
 #[cfg(test)]
@@ -209,6 +251,26 @@ mod tests {
         store.set_test_clock(Arc::new(AtomicI64::new(1_000)));
         (
             Arc::new(FleetCoordinator::new(store, "gateway-test".to_string())),
+            root,
+        )
+    }
+
+    /// Build a coordinator with an explicit claim TTL and expose the store's
+    /// test clock so tests can advance fleet time through the shared atomic.
+    fn coordinator_with(
+        claim_ttl: Duration,
+    ) -> (Arc<FleetCoordinator>, Arc<AtomicI64>, tempfile::TempDir) {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
+            root.path().join("fleet-coord.sqlite3"),
+        ));
+        let clock = Arc::new(AtomicI64::new(1_000));
+        store.set_test_clock(clock.clone());
+        (
+            Arc::new(
+                FleetCoordinator::new(store, "gateway-test".to_string()).with_claim_ttl(claim_ttl),
+            ),
+            clock,
             root,
         )
     }
@@ -307,5 +369,69 @@ mod tests {
             "claims must fail to None, never panic, on store outage"
         );
         assert_eq!(coordinator.release_own_claims().await, 0);
+    }
+
+    #[tokio::test]
+    async fn claim_ttl_override_bounds_the_shadowing_window() {
+        let (coordinator, clock, _root) = coordinator_with(Duration::from_millis(500));
+        let key = worker_key();
+        let _guard = coordinator.claim(&key, 2).await.expect("claim");
+        assert_eq!(
+            coordinator
+                .store()
+                .count_live_fleet_claims("worker-a")
+                .await
+                .unwrap(),
+            1,
+            "the claim is live while the TTL holds"
+        );
+        clock.store(1_501, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            coordinator
+                .store()
+                .count_live_fleet_claims("worker-a")
+                .await
+                .unwrap(),
+            0,
+            "the overridden TTL expires the claim"
+        );
+    }
+
+    #[tokio::test]
+    async fn maintenance_sweep_reaps_expired_claims_and_prunes_stale_observations() {
+        let (coordinator, clock, _root) = coordinator_with(Duration::from_millis(500));
+        let key = worker_key();
+        let _guard = coordinator.claim(&key, 2).await.expect("claim");
+        let observation = crate::batch_runtime::fleet::FleetWorkerObservation {
+            worker_id: "worker-a".to_string(),
+            node_id: "node-1".to_string(),
+            incarnation_id: "inc-a".to_string(),
+            status_sequence: 1,
+            process_state: "running".to_string(),
+            available_admission_credits: 2,
+            active_invocations: 0,
+            deployments_json: "{}".to_string(),
+        };
+        assert!(coordinator
+            .store()
+            .observe_fleet_worker(&observation)
+            .await
+            .unwrap());
+        // Advance past both the claim TTL and the observation retention.
+        clock.store(
+            1_000 + FLEET_OBSERVATION_RETENTION_MS + 1,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        let (reaped, pruned) = coordinator.maintenance_sweep().await;
+        assert_eq!(reaped, 1, "the sweep physically removes the expired claim");
+        assert_eq!(pruned, 1, "the sweep prunes the stale observation row");
+        assert_eq!(
+            coordinator
+                .store()
+                .count_live_fleet_claims("worker-a")
+                .await
+                .unwrap(),
+            0
+        );
     }
 }

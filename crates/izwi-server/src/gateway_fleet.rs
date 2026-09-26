@@ -17,10 +17,18 @@ use std::fmt;
 const FLEET_PARTITION_ENV: &str = "IZWI_GATEWAY_FLEET_PARTITION";
 const FLEET_SIZE_ENV: &str = "IZWI_GATEWAY_FLEET_SIZE";
 const FLEET_DB_PATH_ENV: &str = "IZWI_GATEWAY_FLEET_DB_PATH";
+const FLEET_CLAIM_TTL_MS_ENV: &str = "IZWI_GATEWAY_FLEET_CLAIM_TTL_MS";
 const GATEWAY_ID_ENV: &str = "IZWI_GATEWAY_ID";
 const MAX_ENV_VALUE_BYTES: usize = 20;
 const MAX_FLEET_SIZE: u32 = 256;
 const MAX_DB_PATH_BYTES: usize = 4096;
+/// Claim TTL: long enough to cover select-to-invoke latency, short enough
+/// that a crashed gateway's claims stop shadowing capacity quickly. This is
+/// the historical 30s default; the env override exists so fleet rigs and
+/// operators can shrink the recovery window.
+pub const DEFAULT_FLEET_CLAIM_TTL_MS: u64 = 30_000;
+const MIN_FLEET_CLAIM_TTL_MS: u64 = 100;
+const MAX_FLEET_CLAIM_TTL_MS: u64 = 300_000;
 
 /// A bounded fleet partition index and total size.
 ///
@@ -112,6 +120,10 @@ pub enum FleetPartitionError {
     InvalidDbPath,
     #[error("IZWI_GATEWAY_ID exceeds its encoded size limit")]
     InvalidGatewayId,
+    #[error(
+        "IZWI_GATEWAY_FLEET_CLAIM_TTL_MS must be a bounded millisecond value between {MIN_FLEET_CLAIM_TTL_MS} and {MAX_FLEET_CLAIM_TTL_MS}"
+    )]
+    InvalidClaimTtl,
 }
 
 /// A bounded fleet coordination database reference: a SQLite file path
@@ -169,6 +181,29 @@ pub fn gateway_identity() -> String {
         }
         _ => format!("gateway-{}", std::process::id()),
     }
+}
+
+/// Resolve the fleet capacity-claim TTL. Unset keeps the historical 30s
+/// default, which is the documented crash-recovery window; operators and
+/// fleet rigs may shrink it (bounded 100ms–300s) for faster reclaim.
+pub fn fleet_claim_ttl_from_env() -> Result<std::time::Duration, FleetPartitionError> {
+    let Some(raw) = std::env::var_os(FLEET_CLAIM_TTL_MS_ENV) else {
+        return Ok(std::time::Duration::from_millis(DEFAULT_FLEET_CLAIM_TTL_MS));
+    };
+    let raw = raw
+        .into_string()
+        .map_err(|_| FleetPartitionError::InvalidClaimTtl)?;
+    if raw.is_empty() || raw.len() > MAX_ENV_VALUE_BYTES || !raw.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(FleetPartitionError::InvalidClaimTtl);
+    }
+    let millis: u64 = raw
+        .parse()
+        .map_err(|_| FleetPartitionError::InvalidClaimTtl)?;
+    if !(MIN_FLEET_CLAIM_TTL_MS..=MAX_FLEET_CLAIM_TTL_MS).contains(&millis) {
+        return Err(FleetPartitionError::InvalidClaimTtl);
+    }
+    Ok(std::time::Duration::from_millis(millis))
 }
 
 fn parse_bounded_u32(os_value: &std::ffi::OsStr, _name: &str) -> Option<u32> {
@@ -305,5 +340,28 @@ mod tests {
         std::env::set_var("IZWI_GATEWAY_ID", "not valid!!");
         assert!(gateway_identity().starts_with("gateway-"));
         std::env::remove_var("IZWI_GATEWAY_ID");
+    }
+
+    #[test]
+    fn fleet_claim_ttl_defaults_and_bounds() {
+        std::env::remove_var("IZWI_GATEWAY_FLEET_CLAIM_TTL_MS");
+        assert_eq!(
+            fleet_claim_ttl_from_env().unwrap(),
+            std::time::Duration::from_millis(DEFAULT_FLEET_CLAIM_TTL_MS)
+        );
+        std::env::set_var("IZWI_GATEWAY_FLEET_CLAIM_TTL_MS", "250");
+        assert_eq!(
+            fleet_claim_ttl_from_env().unwrap(),
+            std::time::Duration::from_millis(250)
+        );
+        for invalid in ["99", "300001", "-1", "abc", ""] {
+            std::env::set_var("IZWI_GATEWAY_FLEET_CLAIM_TTL_MS", invalid);
+            assert_eq!(
+                fleet_claim_ttl_from_env(),
+                Err(FleetPartitionError::InvalidClaimTtl),
+                "{invalid} must be rejected"
+            );
+        }
+        std::env::remove_var("IZWI_GATEWAY_FLEET_CLAIM_TTL_MS");
     }
 }

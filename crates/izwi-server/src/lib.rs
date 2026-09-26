@@ -607,7 +607,7 @@ async fn run_gateway(
             version = SERVICE_VERSION,
             partition = partition.index(),
             fleet_size = partition.size(),
-            "Gateway fleet partition active: per-tenant budgets are divided across gateways"
+            "Gateway fleet partition active: per-tenant budgets are divided across gateways (explicit quota fallback; the worker stays the atomic admission arbiter)"
         );
     }
     if let Ok(Some(shared)) = crate::gateway_shared_approvals::SharedApprovalsConfig::from_env() {
@@ -890,7 +890,13 @@ async fn gateway_state(
     // Multi-gateway fleets share worker observations and capacity claims
     // through one coordination database — a SQLite file by default, or a
     // server-backed database URL for shared fleets (DS5). Unset means
-    // single-gateway operation with purely process-local state.
+    // single-gateway operation with purely process-local state. When the
+    // coordination database is set, the shared-atomic claim path is the
+    // default selection posture: the worker remains the atomic admission
+    // arbiter, and 1/N partitioning stays the explicitly-chosen quota
+    // fallback (`IZWI_GATEWAY_FLEET_PARTITION`/`_SIZE`).
+    let fleet_claim_ttl = crate::gateway_fleet::fleet_claim_ttl_from_env()?;
+    let mut fleet_maintenance: Option<tokio::task::JoinHandle<()>> = None;
     let fleet = match crate::gateway_fleet::fleet_database_from_env()? {
         Some(fleet_database) => {
             let store_database = match fleet_database {
@@ -908,18 +914,51 @@ async fn gateway_state(
                 .connection()
                 .await
                 .context("Failed to open fleet coordination database")?;
-            let coordinator = Arc::new(app::fleet_coordinator::FleetCoordinator::new(
-                store,
-                crate::gateway_fleet::gateway_identity(),
-            ));
+            let coordinator = Arc::new(
+                app::fleet_coordinator::FleetCoordinator::new(
+                    store,
+                    crate::gateway_fleet::gateway_identity(),
+                )
+                .with_claim_ttl(fleet_claim_ttl),
+            );
             let released = coordinator.release_own_claims().await;
             info!(
                 service = SERVICE_NAME,
                 version = SERVICE_VERSION,
                 gateway_id = coordinator.gateway_id(),
                 released_own_claims = released,
+                claim_ttl_ms = fleet_claim_ttl.as_millis() as u64,
+                selection_mode = "shared_atomic_claims",
+                // Parsed once already in run_gateway; re-read here so the
+                // posture log names the effective quota mode.
+                quota_mode = if crate::gateway_fleet::FleetPartition::from_env()?.is_some() {
+                    "partitioned_1_of_n"
+                } else {
+                    "worker_authoritative"
+                },
                 "Fleet coordination enabled: worker observations and capacity claims are shared"
             );
+            let maintenance_coordinator = coordinator.clone();
+            fleet_maintenance = Some(tokio::spawn(async move {
+                let mut ticker =
+                    tokio::time::interval(app::fleet_coordinator::FLEET_MAINTENANCE_INTERVAL);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                // The first tick fires immediately; the boot path just
+                // released this gateway's own claims, so sweep on the cadence.
+                ticker.tick().await;
+                loop {
+                    ticker.tick().await;
+                    let (reaped, pruned) = maintenance_coordinator.maintenance_sweep().await;
+                    if reaped > 0 || pruned > 0 {
+                        debug!(
+                            service = SERVICE_NAME,
+                            reaped_claims = reaped,
+                            pruned_observations = pruned,
+                            "Fleet coordination maintenance sweep"
+                        );
+                    }
+                }
+            }));
             Some(coordinator)
         }
         None => None,
@@ -964,6 +1003,9 @@ async fn gateway_state(
             })
         })
         .collect();
+    if let Some(maintenance) = fleet_maintenance {
+        tasks.push(maintenance);
+    }
 
     // Multi-gateway fleets: keep a locally cached fresh view of the shared
     // approvals file. When an operator changes the fleet's approved worker
