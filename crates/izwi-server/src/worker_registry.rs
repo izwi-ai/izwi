@@ -624,7 +624,12 @@ impl WorkerRegistry {
                     )
                 })
                 .and_then(|observation| eligible_deployment(record, observation, request))
-                .is_some()
+                .is_some_and(|deployment| {
+                    inner.generation_gate.as_ref().is_none_or(|gate| {
+                        gate(request.task, &request.public_model)
+                            .is_none_or(|eligible| deployment.model_generation == eligible)
+                    })
+                })
         })
     }
 

@@ -80,9 +80,9 @@ use izwi_core::{
 use izwi_hooks::EnterpriseHooks;
 use izwi_serving_client::{WorkerClient, WorkerClientConfig};
 use izwi_serving_protocol::{
-    CredentialId, DeploymentId, IncarnationId, ModelAlias, ModelGeneration, NdjsonLimits, NodeId,
-    PolicyRevision, ServiceBearerToken, ServiceCredentials, TaskKind, WorkerDescriptor, WorkerId,
-    WorkerStatus, MAX_REMAINING_TIME_MS,
+    render_approvals_text, CredentialId, DeploymentId, IncarnationId, ModelAlias, ModelGeneration,
+    ModelReadiness, NdjsonLimits, NodeId, PolicyRevision, ServiceBearerToken, ServiceCredentials,
+    TaskKind, WorkerDescriptor, WorkerId, WorkerStatus, MAX_REMAINING_TIME_MS,
 };
 use logging::{LogFormat, SERVICE_NAME, SERVICE_VERSION};
 use persistence::PersistenceContext;
@@ -795,7 +795,7 @@ async fn gateway_state(
         "--public-model",
     )?)?;
     let public_model = ModelAlias::new(public_model_variant.dir_name())?;
-    let (worker_approvals, shared_approvals_view) =
+    let (cli_approvals, worker_approvals, shared_approvals_view) =
         configured_gateway_worker_approvals(args, &public_model)?;
     let credentials = gateway_worker_credentials(args)?;
     let registry_config = worker_registry::WorkerRegistryConfig {
@@ -815,6 +815,29 @@ async fn gateway_state(
     let worker_tls = gateway_worker_tls::worker_client_tls_from_env()?;
     validate_gateway_topology_policy(args.gateway_topology, &worker_approvals, &worker_tls)?;
     let client_config = gateway_worker_client_config(args, worker_tls);
+
+    // DS6: the approval view defines the pool/generation structure before any
+    // worker is validated, so a rollout window in the approvals reaches
+    // selection and the replica path accepts both window generations. The
+    // table is shared: the approvals refresh adopts changed views and the
+    // poller completes pending cutovers at runtime.
+    let rendered_view = render_approvals_text(&worker_approvals);
+    let deployment_table = {
+        let mut table = gateway_deployments::GatewayDeploymentTable::default();
+        table
+            .apply_view(&worker_approvals)
+            .map_err(|error| anyhow::anyhow!("configured approvals view: {error}"))?;
+        Arc::new(std::sync::Mutex::new(table))
+    };
+    registry.set_generation_gate({
+        let deployment_table = Arc::clone(&deployment_table);
+        Arc::new(move |task, public_model| {
+            let table = deployment_table
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            table.eligible_generation(task, public_model)
+        })
+    });
 
     let mut endpoints = BTreeSet::new();
     let mut configured_workers = Vec::with_capacity(worker_approvals.len());
@@ -837,7 +860,6 @@ async fn gateway_state(
 
     let mut approved_worker_ids = BTreeSet::new();
     let mut polling_workers = Vec::with_capacity(configured_workers.len());
-    let mut deployment_table = gateway_deployments::GatewayDeploymentTable::default();
     for (approval, client) in configured_workers {
         let endpoint = approval.endpoint.trim();
         let descriptor = client.descriptor().await.with_context(|| {
@@ -855,27 +877,62 @@ async fn gateway_state(
         }
         let expectation =
             initial_gateway_worker_expectation(client, &descriptor, &status, &approval)?;
-        deployment_table
-            .approve_replica(expectation.deployment.clone())
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let cutover_completed = {
+            let mut table = deployment_table
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            table
+                .approve_replica(expectation.deployment.clone())
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            status
+                .deployments
+                .iter()
+                .find(|deployment| {
+                    deployment.deployment_id == expectation.deployment.deployment_id
+                        && deployment.readiness == ModelReadiness::Ready
+                })
+                .is_some_and(|deployment| {
+                    table.observe_generation_ready(
+                        expectation.deployment.task,
+                        &expectation.deployment.public_model,
+                        &expectation.deployment.deployment_id,
+                        deployment.model_generation,
+                    )
+                })
+        };
+        if cutover_completed {
+            info!(
+                worker_id = %expectation.worker_id,
+                deployment = %expectation.deployment.deployment_id,
+                generation = expectation.deployment.model_generation.get(),
+                "Rollout cutover completed at boot: successor generation is admission-eligible"
+            );
+        }
         approve_gateway_worker(&registry, &expectation, descriptor, status)?;
         polling_workers.push(expectation);
     }
 
-    let chat_deployment = deployment_table
-        .select(TaskKind::Chat, &public_model)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "configured gateway worker approvals do not include chat model {}",
-                public_model
-            )
-        })?;
+    let chat_deployment = {
+        let table = deployment_table
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        table
+            .select(TaskKind::Chat, &public_model)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "configured gateway worker approvals do not include chat model {}",
+                    public_model
+                )
+            })?
+            .deployment_id()
+            .clone()
+    };
 
     let dispatcher = app::remote_chat_dispatch::RemoteChatDispatcher::new(
         registry.clone(),
         app::remote_chat_dispatch::RemoteChatDispatchConfig {
             public_model_variant,
-            deployment_id: chat_deployment.deployment_id().clone(),
+            deployment_id: chat_deployment.clone(),
             policy_revision: PolicyRevision::new(args.gateway_policy_revision.trim())?,
             backend_policy: gateway_backend_policy(args.backend.as_ref()),
             max_queue_wait: Duration::from_millis(args.gateway_worker_queue_wait_ms),
@@ -984,6 +1041,7 @@ async fn gateway_state(
         .map(|expected| {
             let registry = registry.clone();
             let fleet = fleet.clone();
+            let poller_deployment_table = Arc::clone(&deployment_table);
             let cadence = jittered_poll_interval(
                 polling_interval,
                 poll_jitter_seed(&expected.worker_id, &expected.node_id),
@@ -1001,14 +1059,44 @@ async fn gateway_state(
                 ticker.tick().await;
                 loop {
                     ticker.tick().await;
-                    if let Err(error) =
-                        refresh_gateway_worker_status(&registry, &expected, fleet.as_deref()).await
+                    match refresh_gateway_worker_status(&registry, &expected, fleet.as_deref())
+                        .await
                     {
-                        warn!(
-                            worker_id = %expected.worker_id,
-                            error = %error,
-                            "Worker status refresh failed"
-                        );
+                        Ok(status) => {
+                            // DS6: a Ready observation of a pending rollout
+                            // successor completes the cutover atomically in
+                            // the deployment table (DINV-07).
+                            let cutover = status.deployments.iter().find(|deployment| {
+                                deployment.deployment_id == expected.deployment.deployment_id
+                                    && deployment.readiness == ModelReadiness::Ready
+                            });
+                            let completed = cutover.is_some_and(|deployment| {
+                                let mut table = poller_deployment_table
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                table.observe_generation_ready(
+                                    deployment.task,
+                                    &deployment.public_model,
+                                    &deployment.deployment_id,
+                                    deployment.model_generation,
+                                )
+                            });
+                            if completed {
+                                info!(
+                                    worker_id = %expected.worker_id,
+                                    deployment = %expected.deployment.deployment_id,
+                                    generation = expected.deployment.model_generation.get(),
+                                    "Rollout cutover completed: successor generation is admission-eligible"
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            warn!(
+                                worker_id = %expected.worker_id,
+                                error = %error,
+                                "Worker status refresh failed"
+                            );
+                        }
                     }
                 }
             })
@@ -1019,34 +1107,51 @@ async fn gateway_state(
     }
 
     // Multi-gateway fleets: keep a locally cached fresh view of the shared
-    // approvals file. When an operator changes the fleet's approved worker
-    // set, every gateway logs the drift within one TTL. Admission itself is
-    // lifecycle-gated: newly approved workers are adopted on the next
-    // rolling gateway restart, so a file change can never destabilize live
-    // admission mid-stream.
+    // approvals file and adopt changed views at runtime (DS6). The rollout
+    // coordinator drives generation transitions through atomic file writes;
+    // adoption applies the DINV-07 eligibility rule in one table mutation.
+    // A rejected view retains the previous approval state fail-closed.
     if let Some(view) = shared_approvals_view {
         let ttl = view.ttl();
         let watched = std::sync::Arc::new(tokio::sync::Mutex::new(view));
+        let refresh_table = Arc::clone(&deployment_table);
+        let refresh_cli_approvals = cli_approvals.clone();
         tasks.push(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(ttl);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             ticker.tick().await;
+            let mut last_applied = Some(rendered_view);
             loop {
                 ticker.tick().await;
                 let mut guard = watched.lock().await;
                 match guard.refresh_if_due() {
                     Ok(true) => {
-                        let endpoints: Vec<&str> = guard
-                            .approvals()
-                            .iter()
-                            .map(|approval| approval.endpoint.as_str())
-                            .collect();
-                        info!(
-                            service = SERVICE_NAME,
-                            version = SERVICE_VERSION,
-                            approvals = endpoints.len(),
-                            "Shared fleet approvals refreshed"
-                        );
+                        let mut effective = refresh_cli_approvals.clone();
+                        effective.extend(guard.approvals().iter().cloned());
+                        let rendered = render_approvals_text(&effective);
+                        if last_applied.as_deref() == Some(rendered.as_str()) {
+                            continue;
+                        }
+                        match refresh_table
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .apply_view(&effective)
+                        {
+                            Ok(outcome) => {
+                                last_applied = Some(rendered);
+                                info!(
+                                    service = SERVICE_NAME,
+                                    version = SERVICE_VERSION,
+                                    approvals = effective.len(),
+                                    added_generations = outcome.added.len(),
+                                    removed_generations = outcome.removed.len(),
+                                    "Shared fleet approvals adopted: deployment pool generations updated"
+                                );
+                            }
+                            Err(error) => {
+                                warn!(error = %error, "Shared fleet approvals view rejected; retaining previous approval state");
+                            }
+                        }
                     }
                     Ok(false) => {}
                     Err(error) => {
@@ -1069,12 +1174,22 @@ async fn gateway_state(
         // fails closed only when no realtime stage can be served at all. A
         // missing individual stage refuses its admits with a policy close at
         // session time.
-        let asr_deployment_id = deployment_table
-            .select(TaskKind::SpeechToText, &public_model)
-            .map(|deployment| deployment.deployment_id().clone());
-        let tts_deployment_id = deployment_table
-            .select(TaskKind::TextToSpeech, &public_model)
-            .map(|deployment| deployment.deployment_id().clone());
+        let asr_deployment_id = {
+            let table = deployment_table
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            table
+                .select(TaskKind::SpeechToText, &public_model)
+                .map(|deployment| deployment.deployment_id().clone())
+        };
+        let tts_deployment_id = {
+            let table = deployment_table
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            table
+                .select(TaskKind::TextToSpeech, &public_model)
+                .map(|deployment| deployment.deployment_id().clone())
+        };
         if asr_deployment_id.is_none() && tts_deployment_id.is_none() {
             return Err(anyhow::anyhow!(
                 "--gateway-realtime is on but no approved worker advertises a realtime speech_to_text or text_to_speech model {public_model}"
@@ -1164,8 +1279,10 @@ fn configured_gateway_worker_approvals(
     legacy_public_model: &ModelAlias,
 ) -> anyhow::Result<(
     Vec<gateway_deployments::GatewayWorkerApproval>,
+    Vec<gateway_deployments::GatewayWorkerApproval>,
     Option<gateway_shared_approvals::SharedApprovalsView>,
 )> {
+    // Returns (CLI-only approvals, effective merged view, shared file view).
     let mut merged = if !args.gateway_worker_approvals.is_empty() {
         if !args.gateway_worker_endpoints.is_empty() {
             anyhow::bail!(
@@ -1204,6 +1321,7 @@ fn configured_gateway_worker_approvals(
     // gateway reads, so all gateways approve the same worker set. Shared
     // entries augment (never replace) explicit CLI approvals; the existing
     // duplicate-endpoint check below rejects any conflict fail-closed.
+    let cli_only = merged.clone();
     let shared_view = match gateway_shared_approvals::SharedApprovalsConfig::from_env() {
         Ok(Some(config)) => {
             let view = gateway_shared_approvals::SharedApprovalsView::load(config)
@@ -1214,7 +1332,7 @@ fn configured_gateway_worker_approvals(
         Ok(None) => None,
         Err(error) => anyhow::bail!("shared fleet approvals: {error}"),
     };
-    Ok((merged, shared_view))
+    Ok((cli_only, merged, shared_view))
 }
 
 fn validate_gateway_topology_policy(
@@ -1358,16 +1476,17 @@ async fn refresh_gateway_worker_status(
     registry: &worker_registry::WorkerRegistry,
     expected: &GatewayWorkerExpectation,
     fleet: Option<&app::fleet_coordinator::FleetCoordinator>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<WorkerStatus> {
     let status = validate_gateway_worker_status(expected, expected.client.status().await?)?;
     if let Some(coordinator) = fleet {
         coordinator.publish_and_refresh(&status).await;
     }
     match registry.observe_status(status.clone()) {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(status),
         Err(worker_registry::WorkerRegistryError::UnknownOrStaleIncarnation) => {
             let descriptor = expected.client.descriptor().await?;
-            approve_gateway_worker(registry, expected, descriptor, status)
+            approve_gateway_worker(registry, expected, descriptor, status.clone())?;
+            Ok(status)
         }
         Err(error) => Err(anyhow::anyhow!(error.to_string())),
     }
