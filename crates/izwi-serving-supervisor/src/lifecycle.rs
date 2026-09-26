@@ -752,6 +752,10 @@ mod tests {
                 prefix_evictions_total: None,
                 tokens_out_per_s_ema: None,
                 observation_cost_units: None,
+                kv_host_pages: None,
+                kv_demotions_total: None,
+                kv_promotions_total: None,
+                kv_promotion_latency_avg_seconds: None,
             }],
             capacity: CapacitySnapshot {
                 max_active_invocations: expected.max_active_invocations,
