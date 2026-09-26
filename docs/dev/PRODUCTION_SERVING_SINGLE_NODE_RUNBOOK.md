@@ -535,26 +535,34 @@ runtime, SQLite/provider state, and full route set.
 ### Realtime relay preview (DS3.6, off by default)
 
 `IZWI_GATEWAY_REALTIME=on` exposes `GET /v1/realtime/ws` (WebSocket,
-subprotocol `izwi-realtime-v1`) and relays sessions to approved
-speech_to_text workers. The gateway is off unless the operator sets the flag;
-pinned single-worker gateway mode rejects it. Knobs:
+subprotocol `izwi-realtime-v1`) and relays sessions to approved realtime
+workers, resolving each admit's task to its stage pool: the approved
+speech_to_text deployment serves ASR-stream sessions, and an approved
+text_to_speech deployment (same public model) serves TTS-stream sessions.
+The gateway is off unless the operator sets the flag; pinned single-worker
+gateway mode rejects it. Boot fails closed only when no realtime stage can be
+served at all; a missing individual stage refuses its admits with a policy
+close at session time. Knobs:
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `IZWI_GATEWAY_REALTIME` | `on`/`off`; `on` requires an approved speech_to_text deployment at boot or the gateway exits fail-closed | `off` |
+| `IZWI_GATEWAY_REALTIME` | `on`/`off`; `on` requires an approved speech_to_text or text_to_speech deployment at boot or the gateway exits fail-closed | `off` |
 | `IZWI_GATEWAY_REALTIME_MAX_SESSIONS` | Bounded concurrent relayed sessions per gateway | `64` |
 | `IZWI_GATEWAY_REALTIME_SESSION_BUDGET_MS` | End-to-end worker session budget minted into each admit | `600000` |
 
-Worker side: speech_to_text workers are configured with
-`IZWI_WORKER_TASK=speech_to_text` and
-`IZWI_WORKER_MODEL=Nemotron-3.5-ASR-Streaming-0.6B` (or a Voxtral realtime
-variant). `IZWI_WORKER_TASK=text_to_speech` is rejected until that stage
-lands. Client identity: the gateway mints the attested caller context from
-the authenticated principal; the client's session/request/attempt ids pass
-through, so a worker-subprotocol client library works against the gateway
-unchanged. Owner loss (worker stream lost without a terminal) surfaces as an
-explicit internal-error event followed by a close; reconnecting is always a
-new session with no resume.
+Worker side: ASR workers are configured with `IZWI_WORKER_TASK=speech_to_text`
+and `IZWI_WORKER_MODEL=Nemotron-3.5-ASR-Streaming-0.6B` (or a Voxtral
+realtime variant). TTS workers use `IZWI_WORKER_TASK=text_to_speech` with a
+TTS synthesis family (e.g. `Kokoro-82M`); boot includes a bounded streaming
+warm-up and fails closed if synthesis does not produce audio. Each stage
+session takes its own tenant lease and dispatch slot; the relay never holds
+one stage's permit while awaiting another stage's admission. Client identity:
+the gateway mints the attested caller context from the authenticated
+principal; the client's session/request/attempt ids pass through, so a
+worker-subprotocol client library works against the gateway unchanged. Owner
+loss (worker stream lost without a terminal) surfaces as an explicit
+internal-error event followed by a close; reconnecting is always a new
+session with no resume.
 
 ## Drain, shutdown, and restart
 
