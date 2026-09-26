@@ -48,7 +48,8 @@ use crate::engine::{
     ENGINE_KV_CACHE_EVICTIONS_TOTAL, ENGINE_KV_CACHE_FREE_BLOCKS,
     ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS, ENGINE_KV_CACHE_HITS_TOTAL,
     ENGINE_KV_CACHE_MEMORY_CAPACITY_BYTES, ENGINE_KV_CACHE_MEMORY_USED_BYTES,
-    ENGINE_KV_CACHE_MISSES_TOTAL, ENGINE_KV_CACHE_UTILIZATION_RATIO,
+    ENGINE_KV_CACHE_MISSES_TOTAL, ENGINE_KV_CACHE_UTILIZATION_RATIO, ENGINE_KV_DEMOTIONS_TOTAL,
+    ENGINE_KV_HOST_PAGES, ENGINE_KV_PROMOTIONS_TOTAL, ENGINE_KV_PROMOTION_LATENCY_AVG_SECONDS,
     ENGINE_SCHEDULER_INCREMENTAL_PREFILL_QUANTA_COMMITTED_TOTAL,
     ENGINE_SCHEDULER_INCREMENTAL_PREFILL_TOKENS_COMMITTED_TOTAL,
     ENGINE_SCHEDULER_MULTISPAN_PREFILL_REQUESTS_TOTAL, ENGINE_SCHEDULER_QUEUE_DEPTH,
@@ -7275,6 +7276,32 @@ impl RuntimeService {
             payload,
             ENGINE_KV_CACHE_EVICTIONS_TOTAL,
             snapshot.kv_cache.counters.prefix_evictions,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_KV_HOST_PAGES,
+            snapshot.kv_cache.counters.kv_host_pages,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_KV_DEMOTIONS_TOTAL,
+            snapshot.kv_cache.counters.demotions_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_KV_PROMOTIONS_TOTAL,
+            snapshot.kv_cache.counters.promotions_total,
+        );
+        push_engine_metric_f64(
+            payload,
+            ENGINE_KV_PROMOTION_LATENCY_AVG_SECONDS,
+            if snapshot.kv_cache.counters.promotions_total > 0 {
+                snapshot.kv_cache.counters.promotion_latency_ns_total as f64
+                    / snapshot.kv_cache.counters.promotions_total as f64
+                    / 1e9
+            } else {
+                0.0
+            },
         );
         push_engine_labeled_metric(
             payload,

@@ -140,6 +140,10 @@ pub struct MockRoutingSignals {
     pub prefix_hits_total: u64,
     pub prefix_queries_total: u64,
     pub prefix_evictions_total: u64,
+    pub kv_host_pages: u64,
+    pub kv_demotions_total: u64,
+    pub kv_promotions_total: u64,
+    pub kv_promotion_latency_avg_seconds: f64,
     pub tokens_out_per_s_ema: f64,
     pub observation_cost_units: u64,
 }
@@ -513,6 +517,12 @@ fn deployment(config: &MockWorkerConfig) -> LoadedDeployment {
         prefix_hits_total: config.routing_signals.map(|s| s.prefix_hits_total),
         prefix_queries_total: config.routing_signals.map(|s| s.prefix_queries_total),
         prefix_evictions_total: config.routing_signals.map(|s| s.prefix_evictions_total),
+        kv_host_pages: config.routing_signals.map(|s| s.kv_host_pages),
+        kv_demotions_total: config.routing_signals.map(|s| s.kv_demotions_total),
+        kv_promotions_total: config.routing_signals.map(|s| s.kv_promotions_total),
+        kv_promotion_latency_avg_seconds: config
+            .routing_signals
+            .map(|s| s.kv_promotion_latency_avg_seconds),
         tokens_out_per_s_ema: config.routing_signals.map(|s| s.tokens_out_per_s_ema),
         observation_cost_units: config.routing_signals.map(|s| s.observation_cost_units),
     }

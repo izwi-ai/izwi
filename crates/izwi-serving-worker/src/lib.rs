@@ -1082,6 +1082,20 @@ fn apply_kv_routing_signals(
             .saturating_add(kv_cache.counters.prefix_misses),
     );
     deployment.prefix_evictions_total = Some(kv_cache.counters.prefix_evictions);
+    // DS4 hierarchical offload signals: absent on engines without the feature
+    // compiled, zero on engines with the feature but no host budget.
+    deployment.kv_host_pages = Some(kv_cache.counters.kv_host_pages);
+    deployment.kv_demotions_total = Some(kv_cache.counters.demotions_total);
+    deployment.kv_promotions_total = Some(kv_cache.counters.promotions_total);
+    deployment.kv_promotion_latency_avg_seconds = if kv_cache.counters.promotions_total > 0 {
+        Some(
+            kv_cache.counters.promotion_latency_ns_total as f64
+                / kv_cache.counters.promotions_total as f64
+                / 1e9,
+        )
+    } else {
+        Some(0.0)
+    };
 }
 
 async fn status<E: InvocationExecutor>(
@@ -2237,6 +2251,10 @@ mod tests {
                     max_output_tokens: Some(32),
                 },
                 kv_cache_usage_pct: None,
+                kv_host_pages: None,
+                kv_demotions_total: None,
+                kv_promotions_total: None,
+                kv_promotion_latency_avg_seconds: None,
                 prefix_hits_total: None,
                 prefix_queries_total: None,
                 prefix_evictions_total: None,

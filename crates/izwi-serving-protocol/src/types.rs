@@ -179,6 +179,14 @@ pub struct LoadedDeployment {
     pub prefix_queries_total: Option<u64>,
     /// Cumulative shared-prefix evictions under arena pressure.
     pub prefix_evictions_total: Option<u64>,
+    /// Host-resident offloaded KV pages currently held by the DS4 host pool.
+    pub kv_host_pages: Option<u64>,
+    /// Cumulative pages demoted from the device arena to the host pool (DS4).
+    pub kv_demotions_total: Option<u64>,
+    /// Cumulative host pages promoted back into the device arena (DS4).
+    pub kv_promotions_total: Option<u64>,
+    /// Mean promotion copy latency in seconds across promoted pages (DS4).
+    pub kv_promotion_latency_avg_seconds: Option<f64>,
     /// Exponentially weighted output tokens per second over completed
     /// invocations, as observed by the worker.
     pub tokens_out_per_s_ema: Option<f64>,
@@ -753,6 +761,10 @@ mod tests {
                 prefix_hits_total: None,
                 prefix_queries_total: None,
                 prefix_evictions_total: None,
+                kv_host_pages: None,
+                kv_demotions_total: None,
+                kv_promotions_total: None,
+                kv_promotion_latency_avg_seconds: None,
                 tokens_out_per_s_ema: None,
                 observation_cost_units: None,
             }],
@@ -780,6 +792,10 @@ mod tests {
             "prefix_hits_total",
             "prefix_queries_total",
             "prefix_evictions_total",
+            "kv_host_pages",
+            "kv_demotions_total",
+            "kv_promotions_total",
+            "kv_promotion_latency_avg_seconds",
             "tokens_out_per_s_ema",
             "observation_cost_units",
         ] {
@@ -796,6 +812,10 @@ mod tests {
         assert!(deployment.prefix_hits_total.is_none());
         assert!(deployment.prefix_queries_total.is_none());
         assert!(deployment.prefix_evictions_total.is_none());
+        assert!(deployment.kv_host_pages.is_none());
+        assert!(deployment.kv_demotions_total.is_none());
+        assert!(deployment.kv_promotions_total.is_none());
+        assert!(deployment.kv_promotion_latency_avg_seconds.is_none());
         assert!(deployment.tokens_out_per_s_ema.is_none());
         assert!(deployment.observation_cost_units.is_none());
     }
@@ -808,12 +828,18 @@ mod tests {
         deployment.prefix_hits_total = Some(11);
         deployment.prefix_queries_total = Some(20);
         deployment.prefix_evictions_total = Some(2);
+        deployment.kv_host_pages = Some(7);
+        deployment.kv_demotions_total = Some(24);
+        deployment.kv_promotions_total = Some(12);
+        deployment.kv_promotion_latency_avg_seconds = Some(0.000_25);
         deployment.tokens_out_per_s_ema = Some(18.75);
         deployment.observation_cost_units = Some(1);
         let encoded = serde_json::to_vec(&status).unwrap();
         let decoded: WorkerStatus = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded, status);
         assert_eq!(decoded.deployments[0].kv_cache_usage_pct, Some(42.5));
+        assert_eq!(decoded.deployments[0].kv_host_pages, Some(7));
+        assert_eq!(decoded.deployments[0].kv_promotions_total, Some(12));
         assert_eq!(decoded.deployments[0].tokens_out_per_s_ema, Some(18.75));
     }
 
