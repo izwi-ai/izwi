@@ -722,6 +722,24 @@ impl WorkerMetrics {
                 "Committed tensor snapshots evicted from the snapshot index.",
                 counters.tensor_snapshot_evictions
             );
+            metric!(
+                "izwi_engine_kv_cache_host_pages",
+                "gauge",
+                "Host-resident offloaded KV pages currently held by the DS4 host pool.",
+                counters.kv_host_pages
+            );
+            metric!(
+                "izwi_engine_kv_cache_demotions_total",
+                "counter",
+                "Pages demoted from device arenas to the DS4 host pool.",
+                counters.demotions_total
+            );
+            metric!(
+                "izwi_engine_kv_cache_promotions_total",
+                "counter",
+                "Pages promoted from the DS4 host pool back into device arenas.",
+                counters.promotions_total
+            );
         }
         debug_assert!(output.len() <= MAX_PROMETHEUS_RESPONSE_BYTES);
         output
